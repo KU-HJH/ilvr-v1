@@ -1,6 +1,7 @@
 """Validation helpers for the CoMT JSONL dataset and referenced images."""
 
 import json
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,10 @@ class DatasetValidationError(ValueError):
     pass
 
 
+class UnsafeArchiveError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class ValidationReport:
     train_records: int
@@ -18,6 +23,49 @@ class ValidationReport:
     unique_images: int
     missing_images: int
     corrupt_images: int
+
+
+def safe_extract_tar(archive_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        for member in members:
+            target = (root / member.name).resolve()
+            if not target.is_relative_to(root) or member.isdev():
+                raise UnsafeArchiveError(f"Unsafe archive member: {member.name}")
+            if member.issym():
+                link_target = (target.parent / member.linkname).resolve()
+                if not link_target.is_relative_to(root):
+                    raise UnsafeArchiveError(f"Unsafe archive link: {member.name}")
+            if member.islnk():
+                link_target = (root / member.linkname).resolve()
+                if not link_target.is_relative_to(root):
+                    raise UnsafeArchiveError(f"Unsafe archive link: {member.name}")
+        archive.extractall(destination, members=members, filter="data")
+
+
+def locate_image_root(extraction_root: Path, references: set[str]) -> Path:
+    if any(Path(reference).is_absolute() for reference in references):
+        raise DatasetValidationError("Image references must be relative for archive root discovery")
+    candidates = [extraction_root]
+    candidates.extend(
+        path for path in extraction_root.iterdir() if path.is_dir()
+    )
+    matches = []
+    for candidate in candidates:
+        if all(
+            (candidate / reference).resolve().is_relative_to(candidate.resolve())
+            and (candidate / reference).is_file()
+            for reference in references
+        ):
+            matches.append(candidate)
+    if len(matches) != 1:
+        checked = ", ".join(str(path) for path in candidates)
+        raise DatasetValidationError(
+            f"Unable to locate unique image root; candidates checked: {checked}"
+        )
+    return matches[0]
 
 
 def validate_dataset(
