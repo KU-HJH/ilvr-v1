@@ -145,6 +145,9 @@ class ComtDatasetTests(unittest.TestCase):
         self.assertEqual(manifest["records"], {"train": 1, "test": 1})
         self.assertEqual(manifest["images"]["missing"], 0)
         self.assertEqual(manifest["images"]["corrupt"], 0)
+        self.assertEqual(manifest["files"]["TRAIN.jsonl"]["bytes"], self.train.stat().st_size)
+        self.assertEqual(manifest["files"]["TEST.jsonl"]["bytes"], self.test.stat().st_size)
+        self.assertEqual(manifest["files"]["comt.tar.gz"]["bytes"], archive.stat().st_size)
         self.assertTrue((self.root / "data/images_comt/creation/input.png").is_file())
 
     def test_prepare_does_not_replace_existing_complete_dataset(self):
@@ -165,6 +168,42 @@ class ComtDatasetTests(unittest.TestCase):
         with mock.patch("scripts.comt_dataset.download_sources") as download:
             prepare_dataset(self.root / "data", revision="abc123")
         download.assert_not_called()
+
+    def test_prepare_force_rebuilds_existing_complete_dataset(self):
+        archive = self.root / "comt.tar.gz"
+        self.write_tar(
+            archive,
+            {
+                "COMT/creation/input.png": self.png_bytes(),
+                "COMT/creation/helper.png": self.png_bytes(),
+            },
+        )
+        initial_sources = {
+            "TRAIN.jsonl": self.train,
+            "TEST.jsonl": self.test,
+            "comt.tar.gz": archive,
+        }
+        with (
+            mock.patch("scripts.comt_dataset.resolve_revision", return_value="abc123"),
+            mock.patch("scripts.comt_dataset.download_sources", return_value=initial_sources),
+        ):
+            prepare_dataset(self.root / "data", revision="abc123")
+
+        replacement_train = self.root / "replacement_TRAIN.jsonl"
+        self.write_jsonl(replacement_train, [self.train_record, self.train_record])
+        replacement_sources = {
+            "TRAIN.jsonl": replacement_train,
+            "TEST.jsonl": self.test,
+            "comt.tar.gz": archive,
+        }
+        with (
+            mock.patch("scripts.comt_dataset.resolve_revision", return_value="def456"),
+            mock.patch("scripts.comt_dataset.download_sources", return_value=replacement_sources),
+        ):
+            manifest_path = prepare_dataset(self.root / "data", revision="def456", force=True)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["source"]["revision"], "def456")
+        self.assertEqual(manifest["records"], {"train": 2, "test": 1})
 
     def test_prepare_rejects_incomplete_existing_final_layout(self):
         data_dir = self.root / "data"

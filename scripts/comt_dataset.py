@@ -76,7 +76,7 @@ def prepare_dataset(
         "comt_manifest.json": data_dir / "comt_manifest.json",
     }
     existing = [path.exists() for path in final_paths.values()]
-    if all(existing):
+    if all(existing) and not force:
         validate_dataset(
             final_paths["TRAIN.jsonl"], final_paths["TEST.jsonl"], final_paths["images_comt"]
         )
@@ -117,9 +117,18 @@ def prepare_dataset(
             {
                 "source": {"repository": repo_id, "revision": resolved_revision},
                 "files": {
-                    "TRAIN.jsonl": {"sha256": sha256_file(ready_train)},
-                    "TEST.jsonl": {"sha256": sha256_file(ready_test)},
-                    "comt.tar.gz": {"sha256": sha256_file(sources["comt.tar.gz"])},
+                    "TRAIN.jsonl": {
+                        "sha256": sha256_file(ready_train),
+                        "bytes": sources["TRAIN.jsonl"].stat().st_size,
+                    },
+                    "TEST.jsonl": {
+                        "sha256": sha256_file(ready_test),
+                        "bytes": sources["TEST.jsonl"].stat().st_size,
+                    },
+                    "comt.tar.gz": {
+                        "sha256": sha256_file(sources["comt.tar.gz"]),
+                        "bytes": sources["comt.tar.gz"].stat().st_size,
+                    },
                 },
                 "records": {"train": report.train_records, "test": report.test_records},
                 "images": {
