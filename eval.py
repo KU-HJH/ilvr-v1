@@ -32,10 +32,6 @@ ACTION_MAP = {
 
 BASE_MODEL_ID = ""  
 
-BASE_DATASET_DIR = ''
-
-
-
 def get_eval_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", type=str, required=True,
@@ -48,6 +44,11 @@ def get_eval_args():
                         help="Path to save per-sample evaluation results.")
     parser.add_argument("--cache_dir", type=str, default="./cache",
                         help="Hugging Face cache directory.")
+    parser.add_argument(
+        "--image-root",
+        default="data/images_comt",
+        help="Root directory for relative image paths in the dataset JSONL.",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
@@ -106,31 +107,24 @@ def load_model(model_dir: str, cache_dir: str):
     return model
 
 
-def _resolve_image_paths(image_input: Union[str, List[str]]) -> List[str]:
+def _resolve_image_paths(
+    image_input: Union[str, List[str], None], image_root: str
+) -> List[str]:
     """
     Resolve image paths from either a single string or a list of strings.
 
-    - Relative paths are resolved using BASE_DATASET_DIR.
+    - Relative paths are resolved using image_root.
     - Absolute paths are returned unchanged.
     """
-    if image_input is None:
-        return []
-
-    if isinstance(image_input, str):
-        p = image_input
-        if not os.path.isabs(p):
-            p = os.path.join(BASE_DATASET_DIR, p)
-        return [p]
-
-    if isinstance(image_input, list):
-        outs = []
-        for p in image_input:
-            if not os.path.isabs(p):
-                p = os.path.join(BASE_DATASET_DIR, p)
-            outs.append(p)
-        return outs
-
-    return []
+    paths = [] if image_input is None else (
+        [image_input] if isinstance(image_input, str) else image_input
+    )
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise ValueError("image_input must be a string, a list of strings, or null")
+    return [
+        path if os.path.isabs(path) else os.path.join(image_root, path)
+        for path in paths
+    ]
 
 
 def open_images(paths: List[str]) -> List[Image.Image]:
@@ -294,13 +288,14 @@ def run_one_example(
     processor,
     sample: Dict[str, Any],
     gen_kwargs: Dict[str, Any],
+    image_root: str,
 ) -> Dict[str, Any]:
     """
     Run inference on a single example and return raw output,
     extracted final answer, and inference time.
     """
     text_input = sample.get("text_input", "")
-    img_list = _resolve_image_paths(sample.get("image_input", []))
+    img_list = _resolve_image_paths(sample.get("image_input", []), image_root)
     images = open_images(img_list) if img_list else None
 
     # Align with training: put image entries into user.content, then append text
@@ -381,6 +376,7 @@ def run_one_example(
 
 def main():
     args = get_eval_args()
+    image_root = os.path.abspath(os.path.expanduser(args.image_root))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -417,7 +413,7 @@ def main():
     logging.info(f"Starting evaluation: num_samples={total}")
     for i, sample in enumerate(data):
         try:
-            pred = run_one_example(model, processor, sample, gen_kwargs)
+            pred = run_one_example(model, processor, sample, gen_kwargs, image_root)
             sample_infer_time = pred.get("inference_time", None)
             if sample_infer_time is not None:
                 total_inference_time += sample_infer_time

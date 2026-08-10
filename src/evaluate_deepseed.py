@@ -25,7 +25,6 @@ ACTION_MAP = {
 
 
 BASE_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"  
-BASE_DATASET_DIR = ''
 
 
 def get_eval_args():
@@ -35,6 +34,11 @@ def get_eval_args():
     parser.add_argument("--task_name", type=str, required=True, help="Task name for bookkeeping.")
     parser.add_argument("--output_json_path", type=str, default="evaluation_results.jsonl", help="Where to save per-sample results.")
     parser.add_argument("--cache_dir", type=str, default="./cache", help="HF cache dir.")
+    parser.add_argument(
+        "--image-root",
+        default="data/images_comt",
+        help="Root directory for relative image paths in the dataset JSONL.",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
@@ -75,23 +79,18 @@ def load_model(model_dir: str, cache_dir: str):
         pass
     return model
 
-def _resolve_image_paths(image_input: Union[str, List[str]]) -> List[str]:
-
-    if image_input is None:
-        return []
-    if isinstance(image_input, str):
-        p = image_input
-        if not os.path.isabs(p):
-            p = os.path.join(BASE_DATASET_DIR, p)
-        return [p]
-    if isinstance(image_input, list):
-        outs = []
-        for p in image_input:
-            if not os.path.isabs(p):
-                p = os.path.join(BASE_DATASET_DIR, p)
-            outs.append(p)
-        return outs
-    return []
+def _resolve_image_paths(
+    image_input: Union[str, List[str], None], image_root: str
+) -> List[str]:
+    paths = [] if image_input is None else (
+        [image_input] if isinstance(image_input, str) else image_input
+    )
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise ValueError("image_input must be a string, a list of strings, or null")
+    return [
+        path if os.path.isabs(path) else os.path.join(image_root, path)
+        for path in paths
+    ]
 
 def open_images(paths: List[str]) -> List[Image.Image]:
     imgs = []
@@ -199,9 +198,15 @@ def normalize_for_match(ans: str) -> str:
         pass
     return low
 
-def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+def run_one_example(
+    model,
+    processor,
+    sample: Dict[str, Any],
+    gen_kwargs: Dict[str, Any],
+    image_root: str,
+) -> Dict[str, Any]:
     text_input = sample.get("text_input", "")
-    img_list = _resolve_image_paths(sample.get("image_input", []))
+    img_list = _resolve_image_paths(sample.get("image_input", []), image_root)
     images = open_images(img_list) if img_list else None
 
 
@@ -253,6 +258,7 @@ def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[s
 
 def main():
     args = get_eval_args()
+    image_root = os.path.abspath(os.path.expanduser(args.image_root))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
     logging.info(f"Loading model: {args.model_dir}")
@@ -285,7 +291,7 @@ def main():
     logging.info(f"Starting evaluation: num_samples={total}")
     for i, sample in enumerate(data):
         try:
-            pred = run_one_example(model, processor, sample, gen_kwargs)
+            pred = run_one_example(model, processor, sample, gen_kwargs, image_root)
             out_text = pred["raw_output"]
             assistant_only = pred["assistant_only"]
 

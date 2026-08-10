@@ -1,3 +1,4 @@
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,11 @@ from src.task_deepseed import interleaved_latent_cot_preprocess_function
 
 class ImageRootConfigurationTests(unittest.TestCase):
     def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "root_eval", Path(__file__).resolve().parents[1] / "eval.py"
+        )
+        self.eval_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.eval_module)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.image_root = self.root / "images_comt"
@@ -48,3 +54,17 @@ class ImageRootConfigurationTests(unittest.TestCase):
                 self.train_record,
                 image_root=self.root / "wrong",
             )
+
+    def test_evaluation_resolves_relative_paths_under_explicit_root(self):
+        resolved = self.eval_module._resolve_image_paths(
+            ["creation/input.png"],
+            str(self.image_root),
+        )
+        self.assertEqual(resolved, [str(self.image_root / "creation/input.png")])
+
+    def test_evaluation_preserves_absolute_paths(self):
+        absolute = str(self.image_root / "creation/input.png")
+        self.assertEqual(
+            self.eval_module._resolve_image_paths(absolute, "/ignored"),
+            [absolute],
+        )
