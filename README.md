@@ -64,19 +64,49 @@ accelerate config
 
 We utilize the CoMT dataset (Chain of Multi-modal Thought) as an example for constructing training data. For more details about the benchmark, please refer to the [CoMT paper](https://arxiv.org/abs/2412.12932).
 
-### Download and Validate Data
+### Download All Required Assets
 
-Prepare the complete dataset from the official [shuai22/comt](https://huggingface.co/datasets/shuai22/comt) Hugging Face endpoint:
+Run the unified downloader from the repository root. It uses the mandated
+virtual environment, resumes interrupted Hugging Face transfers, and validates
+each artifact before reporting it ready.
 
 ```bash
-source ./venv/ilvr-venv/bin/activate
-python -m scripts.prepare_comt prepare --data-dir data
-python -m scripts.prepare_comt validate --data-dir data
+./venv/ilvr-venv/bin/python -m scripts.download_assets
 ```
 
-Preparation downloads `TRAIN.jsonl`, `TEST.jsonl`, and `comt.tar.gz`, validates every referenced image, and promotes the finished files only after validation succeeds. It records the resolved official revision, checksums, sizes, and validation counts in `data/comt_manifest.json`. The Hugging Face downloader and `data/.staging/` retain downloaded work when a transfer is interrupted, so rerunning the same command resumes safely. Do not substitute a mirror for the official endpoint.
+| Artifact | Local path | Approximate size |
+| --- | --- | ---: |
+| Qwen2.5-VL 3B experiment base | `models/Qwen2.5-VL-3B-Instruct/` | 7.52 GB |
+| Complete prepared CoMT dataset | `data/` | 11.5 GB |
+| Published ILVR comparison checkpoint | `models/comt_ckpt/` | 31.8 GB |
 
-Dataset preparation only constructs and validates local data; it does not start model training.
+Download or retry one asset without touching completed assets:
+
+```bash
+./venv/ilvr-venv/bin/python -m scripts.download_assets --only model
+./venv/ilvr-venv/bin/python -m scripts.download_assets --only dataset
+./venv/ilvr-venv/bin/python -m scripts.download_assets --only checkpoint
+```
+
+Use `--only all` to request the same complete asset set as the default command.
+
+Allow at least 51 GB for final payloads plus additional temporary/resume
+metadata. `models/comt_ckpt` is the project's published 7B-derived comparison
+checkpoint. It is not an adapter and must not be combined with the 3B base
+model.
+
+The downloader removes `HF_HUB_OFFLINE` only inside its own process. It honors
+caller-provided `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `HF_TOKEN`, and
+`HF_ENDPOINT` values; without `HF_ENDPOINT`, it uses the official Hugging Face
+service. It never selects a third-party mirror automatically. Partial Hub
+downloads and `data/.staging/` are retained so the same command can resume.
+
+For its `dataset` asset, the unified downloader prepares `TRAIN.jsonl`,
+`TEST.jsonl`, and `comt.tar.gz`, validates every referenced image, and promotes
+the finished files only after validation succeeds. It records the resolved
+official revision, checksums, sizes, and validation counts in
+`data/comt_manifest.json`. Dataset preparation only constructs and validates
+local data; it does not start model training.
 
 **Expected Directory Structure:**
 ```text
@@ -106,29 +136,37 @@ The dataset follows the JSONL format:
 
 We provide a shell script `run_training.sh` to launch distributed training.
 
-### 1. Run Training
-Start training with the following command:
+### Run the 3B Experiment
+
+Training defaults to the downloaded `models/Qwen2.5-VL-3B-Instruct` base,
+`data/TRAIN.jsonl`, and `data/images_comt`:
 
 ```bash
 bash run_training.sh
 ```
 
-The launcher derives its defaults from its own repository directory. Override any local layout without editing the script, for example:
+Override the base model without editing the launcher:
 
 ```bash
-DATA_PATH=/path/to/TRAIN.jsonl IMAGE_ROOT=/path/to/images_comt bash run_training.sh
+MODEL_NAME=/path/to/another-base-model bash run_training.sh
 ```
 
-### 2. Run Evaluation
+### Evaluate
 
-Evaluation uses `data/TEST.jsonl` and `data/images_comt` by default. Supply the trained model directory, optionally overriding the test data or image root:
+Evaluation defaults to the published `models/comt_ckpt` comparison checkpoint
+and `data/TEST.jsonl`:
 
 ```bash
-MODEL_DIR=/path/to/checkpoint TEST_DATA_PATH=/path/to/TEST.jsonl IMAGE_ROOT=/path/to/images_comt bash eval.sh
+bash eval.sh
+```
+
+Evaluate a newly trained 3B checkpoint with:
+
+```bash
+MODEL_DIR=/path/to/trained-3b-checkpoint bash eval.sh
 ```
 
 **Default Hyperparameters:**
-- Base Model: `Qwen/Qwen2.5-VL-7B-Instruct`
 - Epochs: 15
 - Gradient Accumulation Steps: 8
 - Latent Size: 8
