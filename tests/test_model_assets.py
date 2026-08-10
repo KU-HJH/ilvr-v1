@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.model_assets import MODEL_SPEC, SnapshotValidationError, verify_model_snapshot
+from scripts.model_assets import (
+    MODEL_SPEC,
+    SnapshotValidationError,
+    ensure_model_snapshot,
+    verify_model_snapshot,
+)
 
 
 REQUIRED_METADATA = (
@@ -87,3 +92,52 @@ class ModelSnapshotVerificationTests(unittest.TestCase):
         (self.root / "model-00003-of-00003.safetensors").write_bytes(b"extra")
         with self.assertRaisesRegex(SnapshotValidationError, "unindexed weight files"):
             verify_model_snapshot(self.root, MODEL_SPEC)
+
+
+class ModelSnapshotAcquisitionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.models_dir = Path(self.temporary.name) / "models"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_fetches_expected_repository_into_expected_directory(self):
+        calls = []
+
+        def fake_fetch(**kwargs):
+            calls.append(kwargs)
+            destination = Path(kwargs["local_dir"])
+            write_snapshot(
+                destination,
+                MODEL_SPEC.index_filename,
+                ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"),
+            )
+            return str(destination)
+
+        result = ensure_model_snapshot(MODEL_SPEC, self.models_dir, fake_fetch)
+
+        self.assertEqual(result, self.models_dir / "Qwen2.5-VL-3B-Instruct")
+        self.assertEqual(
+            calls,
+            [{
+                "repo_id": "Qwen/Qwen2.5-VL-3B-Instruct",
+                "local_dir": self.models_dir / "Qwen2.5-VL-3B-Instruct",
+            }],
+        )
+
+    def test_reuses_complete_snapshot_without_fetching(self):
+        destination = self.models_dir / MODEL_SPEC.directory_name
+        write_snapshot(
+            destination,
+            MODEL_SPEC.index_filename,
+            ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"),
+        )
+
+        def forbidden_fetch(**kwargs):
+            self.fail(f"unexpected network fetch: {kwargs}")
+
+        self.assertEqual(
+            ensure_model_snapshot(MODEL_SPEC, self.models_dir, forbidden_fetch),
+            destination,
+        )

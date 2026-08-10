@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 class SnapshotValidationError(ValueError):
@@ -43,6 +45,30 @@ REQUIRED_METADATA = (
     "tokenizer.json",
     "tokenizer_config.json",
 )
+
+SnapshotFetch = Callable[..., str]
+
+
+def _default_snapshot_fetch(**kwargs: Any) -> str:
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(**kwargs)
+
+
+def ensure_model_snapshot(
+    spec: ModelAssetSpec,
+    models_dir: Path,
+    snapshot_fetch: SnapshotFetch | None = None,
+) -> Path:
+    destination = Path(models_dir) / spec.directory_name
+    try:
+        return verify_model_snapshot(destination, spec)
+    except SnapshotValidationError:
+        pass
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fetch = snapshot_fetch or _default_snapshot_fetch
+    fetch(repo_id=spec.repo_id, local_dir=destination)
+    return verify_model_snapshot(destination, spec)
 
 
 def _resolve_indexed_shards(
