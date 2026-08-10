@@ -64,11 +64,19 @@ accelerate config
 
 We utilize the CoMT dataset (Chain of Multi-modal Thought) as an example for constructing training data. For more details about the benchmark, please refer to the [CoMT paper](https://arxiv.org/abs/2412.12932).
 
-### Download Data
-We provide the processed data on HuggingFace. Please download it from [shuai22/comt](https://huggingface.co/datasets/shuai22/comt) and organize the directory as follows.
+### Download and Validate Data
 
-1. Download `TRAIN.jsonl`, `TEST.jsonl`, and `comt.tar.gz`.
-2. Extract the images from the tarball.
+Prepare the complete dataset from the official [shuai22/comt](https://huggingface.co/datasets/shuai22/comt) Hugging Face endpoint:
+
+```bash
+source ./venv/ilvr-venv/bin/activate
+python -m scripts.prepare_comt prepare --data-dir data
+python -m scripts.prepare_comt validate --data-dir data
+```
+
+Preparation downloads `TRAIN.jsonl`, `TEST.jsonl`, and `comt.tar.gz`, validates every referenced image, and promotes the finished files only after validation succeeds. It records the resolved official revision, checksums, sizes, and validation counts in `data/comt_manifest.json`. The Hugging Face downloader and `data/.staging/` retain downloaded work when a transfer is interrupted, so rerunning the same command resumes safely. Do not substitute a mirror for the official endpoint.
+
+Dataset preparation only constructs and validates local data; it does not start model training.
 
 **Expected Directory Structure:**
 ```text
@@ -76,9 +84,10 @@ ILVR/
 ├── data/
 │   ├── TRAIN.jsonl
 │   ├── TEST.jsonl
-│   └── images_comt/      <-- Extracted from comt.tar.gz
+│   ├── images_comt/      <-- Extracted from comt.tar.gz
 │       ├── creation/
 │       └── ...
+│   └── comt_manifest.json <-- Source revision, file hashes, and validation metrics
 ├── src/
 ├── transformers/
 ├── run_training.sh
@@ -97,30 +106,25 @@ The dataset follows the JSONL format:
 
 We provide a shell script `run_training.sh` to launch distributed training.
 
-### 1. Configure Script
-Open `run_training.sh` and modify the paths to match your local setup:
-
-```bash
-# In run_training.sh:
-
-# Path to the directory containing TRAIN.jsonl
-DATA_PATH="/path/to/your/data" 
-
-# Directory to save model checkpoints
-SAVE_MODEL_PATH="/path/to/save/checkpoints"
-
-# File path for training logs
-LOG_FILE="/path/to/save/train.log"
-
-# (Optional) HuggingFace Cache Directory
-export HF_HOME="/path/to/cache" 
-```
-
-### 2. Run Training
+### 1. Run Training
 Start training with the following command:
 
 ```bash
 bash run_training.sh
+```
+
+The launcher derives its defaults from its own repository directory. Override any local layout without editing the script, for example:
+
+```bash
+DATA_PATH=/path/to/TRAIN.jsonl IMAGE_ROOT=/path/to/images_comt bash run_training.sh
+```
+
+### 2. Run Evaluation
+
+Evaluation uses `data/TEST.jsonl` and `data/images_comt` by default. Supply the trained model directory, optionally overriding the test data or image root:
+
+```bash
+MODEL_DIR=/path/to/checkpoint TEST_DATA_PATH=/path/to/TEST.jsonl IMAGE_ROOT=/path/to/images_comt bash eval.sh
 ```
 
 **Default Hyperparameters:**
@@ -149,4 +153,3 @@ This codebase is built upon [Qwen-VL](https://github.com/QwenLM/Qwen-VL) 、 [Tr
 
 ## 📄 License
 This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
-
