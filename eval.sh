@@ -5,7 +5,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 VENV_BIN="${REPO_ROOT}/venv/ilvr-venv/bin"
 
 export HF_HUB_OFFLINE=1
-MODEL_DIR="${MODEL_DIR:-}"
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models/comt_ckpt}"
 TEST_DATA_PATH="${TEST_DATA_PATH:-${REPO_ROOT}/data/TEST.jsonl}"
 IMAGE_ROOT="${IMAGE_ROOT:-${REPO_ROOT}/data/images_comt}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results}"

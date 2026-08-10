@@ -15,7 +15,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE=1
 unset CUDA_VISIBLE_DEVICES
 
-MODEL_NAME="Qwen/Qwen2.5-VL-7B-Instruct"
+MODEL_NAME="${MODEL_NAME:-${REPO_ROOT}/models/Qwen2.5-VL-3B-Instruct}"
 TASK_NAME="zebra-cot"
 EPOCHS=15
 GRAD_ACCUM_STEPS=8
