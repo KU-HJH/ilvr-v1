@@ -90,6 +90,13 @@ Download or retry one asset without touching completed assets:
 
 Use `--only all` to request the same complete asset set as the default command.
 
+Prepare or validate only the CoMT dataset with the independent commands:
+
+```bash
+./venv/ilvr-venv/bin/python -m scripts.prepare_comt prepare --data-dir data
+./venv/ilvr-venv/bin/python -m scripts.prepare_comt validate --data-dir data
+```
+
 Allow at least 51 GB for final payloads plus additional temporary/resume
 metadata. `models/comt_ckpt` is the project's published 7B-derived comparison
 checkpoint. It is not an adapter and must not be combined with the 3B base
@@ -151,6 +158,13 @@ Override the base model without editing the launcher:
 MODEL_NAME=/path/to/another-base-model bash run_training.sh
 ```
 
+Override the training data and image paths together when using another prepared
+dataset:
+
+```bash
+DATA_PATH=/path/to/TRAIN.jsonl IMAGE_ROOT=/path/to/images_comt bash run_training.sh
+```
+
 ### Evaluate
 
 Evaluation defaults to the published `models/comt_ckpt` comparison checkpoint
@@ -164,6 +178,12 @@ Evaluate a newly trained 3B checkpoint with:
 
 ```bash
 MODEL_DIR=/path/to/trained-3b-checkpoint bash eval.sh
+```
+
+Override the evaluation checkpoint, test split, and image root together:
+
+```bash
+MODEL_DIR=/path/to/checkpoint TEST_DATA_PATH=/path/to/TEST.jsonl IMAGE_ROOT=/path/to/images_comt bash eval.sh
 ```
 
 **Default Hyperparameters:**

@@ -1,5 +1,6 @@
 import json
 import io
+import re
 import tarfile
 import tempfile
 import unittest
@@ -19,6 +20,11 @@ from scripts.comt_dataset import (
 
 
 class ComtDatasetTests(unittest.TestCase):
+    REBUILD_COMMAND = (
+        "./venv/ilvr-venv/bin/python -m scripts.prepare_comt prepare "
+        "--data-dir data --force"
+    )
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
@@ -72,6 +78,33 @@ class ComtDatasetTests(unittest.TestCase):
             info.type = tarfile.SYMTYPE
             info.linkname = target
             archive.addfile(info)
+
+    def prepare_complete_dataset(self):
+        archive = self.root / "comt.tar.gz"
+        self.write_tar(
+            archive,
+            {
+                "COMT/creation/input.png": self.png_bytes(),
+                "COMT/creation/helper.png": self.png_bytes(),
+            },
+        )
+        sources = {
+            "TRAIN.jsonl": self.train,
+            "TEST.jsonl": self.test,
+            "comt.tar.gz": archive,
+        }
+        with (
+            mock.patch("scripts.comt_dataset.resolve_revision", return_value="abc123"),
+            mock.patch("scripts.comt_dataset.download_sources", return_value=sources),
+        ):
+            prepare_dataset(self.root / "data", revision="abc123")
+        return self.root / "data"
+
+    def assert_reuse_requires_rebuild(self, data_dir):
+        with self.assertRaisesRegex(
+            DatasetValidationError, re.escape(self.REBUILD_COMMAND)
+        ):
+            prepare_dataset(data_dir, revision="abc123")
 
     def test_validate_complete_dataset(self):
         report = validate_dataset(self.train, self.test, self.image_root)
@@ -168,6 +201,60 @@ class ComtDatasetTests(unittest.TestCase):
         with mock.patch("scripts.comt_dataset.download_sources") as download:
             prepare_dataset(self.root / "data", revision="abc123")
         download.assert_not_called()
+
+    def test_prepare_reuse_rejects_empty_malformed_and_non_object_manifests(self):
+        data_dir = self.prepare_complete_dataset()
+        manifest_path = data_dir / "comt_manifest.json"
+        for label, content in (
+            ("empty", b""),
+            ("malformed", b"{"),
+            ("array", b"[]"),
+            ("null", b"null"),
+        ):
+            with self.subTest(label=label):
+                manifest_path.write_bytes(content)
+                self.assert_reuse_requires_rebuild(data_dir)
+
+    def test_prepare_reuse_rejects_directory_at_manifest_path(self):
+        data_dir = self.prepare_complete_dataset()
+        manifest_path = data_dir / "comt_manifest.json"
+        manifest_path.unlink()
+        manifest_path.mkdir()
+
+        self.assert_reuse_requires_rebuild(data_dir)
+
+    def test_prepare_reuse_rejects_train_changed_after_manifest_was_written(self):
+        data_dir = self.prepare_complete_dataset()
+        with (data_dir / "TRAIN.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(self.train_record) + "\n")
+
+        self.assert_reuse_requires_rebuild(data_dir)
+
+    def test_prepare_reuse_rejects_manifest_metadata_and_report_mismatches(self):
+        data_dir = self.prepare_complete_dataset()
+        manifest_path = data_dir / "comt_manifest.json"
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mutations = {
+            "empty source repository": lambda value: value["source"].update(repository=""),
+            "empty source revision": lambda value: value["source"].update(revision=""),
+            "missing archive entry": lambda value: value["files"].pop("comt.tar.gz"),
+            "invalid TRAIN digest": lambda value: value["files"]["TRAIN.jsonl"].update(
+                sha256="not-a-sha256"
+            ),
+            "wrong TRAIN bytes": lambda value: value["files"]["TRAIN.jsonl"].update(
+                bytes=value["files"]["TRAIN.jsonl"]["bytes"] + 1
+            ),
+            "wrong train count": lambda value: value["records"].update(train=2),
+            "wrong image count": lambda value: value["images"].update(unique=3),
+            "nonzero missing images": lambda value: value["images"].update(missing=1),
+            "nonzero corrupt images": lambda value: value["images"].update(corrupt=1),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                manifest = json.loads(json.dumps(original))
+                mutate(manifest)
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                self.assert_reuse_requires_rebuild(data_dir)
 
     def test_prepare_force_rebuilds_existing_complete_dataset(self):
         archive = self.root / "comt.tar.gz"

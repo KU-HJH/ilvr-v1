@@ -99,6 +99,27 @@ class ModelSnapshotVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(SnapshotValidationError, "unindexed weight files"):
             verify_model_snapshot(self.root, MODEL_SPEC)
 
+    def test_rejects_array_weight_index_as_validation_error(self):
+        write_snapshot(self.root, MODEL_SPEC.index_filename, self.shards)
+        (self.root / MODEL_SPEC.index_filename).write_bytes(b"[]")
+
+        with self.assertRaisesRegex(SnapshotValidationError, "invalid weight index"):
+            verify_model_snapshot(self.root, MODEL_SPEC)
+
+    def test_rejects_null_weight_index_as_validation_error(self):
+        write_snapshot(self.root, MODEL_SPEC.index_filename, self.shards)
+        (self.root / MODEL_SPEC.index_filename).write_bytes(b"null")
+
+        with self.assertRaisesRegex(SnapshotValidationError, "invalid weight index"):
+            verify_model_snapshot(self.root, MODEL_SPEC)
+
+    def test_rejects_invalid_utf8_weight_index_as_validation_error(self):
+        write_snapshot(self.root, MODEL_SPEC.index_filename, self.shards)
+        (self.root / MODEL_SPEC.index_filename).write_bytes(b"\xff")
+
+        with self.assertRaisesRegex(SnapshotValidationError, "invalid weight index"):
+            verify_model_snapshot(self.root, MODEL_SPEC)
+
 
 class ModelSnapshotAcquisitionTests(unittest.TestCase):
     def setUp(self):
@@ -224,7 +245,9 @@ class UnifiedAssetDownloadTests(unittest.TestCase):
     def test_online_setup_removes_only_offline_flag(self):
         environment = {
             "HF_HUB_OFFLINE": "1",
+            "HTTP_PROXY": "http://plain-proxy.example:3128",
             "HTTPS_PROXY": "http://proxy.example:8080",
+            "NO_PROXY": "localhost,127.0.0.1,.internal.example",
             "HF_TOKEN": "secret-token",
             "HF_ENDPOINT": "https://configured.example",
         }
@@ -232,7 +255,9 @@ class UnifiedAssetDownloadTests(unittest.TestCase):
         self.assertEqual(
             environment,
             {
+                "HTTP_PROXY": "http://plain-proxy.example:3128",
                 "HTTPS_PROXY": "http://proxy.example:8080",
+                "NO_PROXY": "localhost,127.0.0.1,.internal.example",
                 "HF_TOKEN": "secret-token",
                 "HF_ENDPOINT": "https://configured.example",
             },

@@ -37,6 +37,8 @@ class LauncherDefaultsTests(unittest.TestCase):
         environment = os.environ.copy()
         environment.pop("MODEL_NAME", None)
         environment.pop("MODEL_DIR", None)
+        environment.pop("WARM_UP_STEPS", None)
+        environment.pop("SAVE_STEPS", None)
         environment["CAPTURE_FILE"] = str(self.capture)
         environment.update(overrides or {})
         return subprocess.run(
@@ -62,12 +64,16 @@ class LauncherDefaultsTests(unittest.TestCase):
         model_index = arguments.index("--model")
         data_index = arguments.index("--data_path")
         image_index = arguments.index("--image-root")
+        warm_up_index = arguments.index("--warm_up_steps")
+        save_index = arguments.index("--save_steps")
         self.assertEqual(
             arguments[model_index + 1],
             str(self.sandbox / "models/Qwen2.5-VL-3B-Instruct"),
         )
         self.assertEqual(arguments[data_index + 1], str(self.sandbox / "data/TRAIN.jsonl"))
         self.assertEqual(arguments[image_index + 1], str(self.sandbox / "data/images_comt"))
+        self.assertEqual(arguments[warm_up_index + 1], "10")
+        self.assertEqual(arguments[save_index + 1], "612")
 
     def test_evaluation_launcher_passes_published_checkpoint_and_test_data(self):
         self.write_executable(
@@ -100,6 +106,22 @@ class LauncherDefaultsTests(unittest.TestCase):
         self.assertEqual(
             arguments[arguments.index("--model") + 1], "/custom/three-billion"
         )
+
+    def test_training_launcher_honors_numeric_overrides(self):
+        self.write_executable(self.bin_dir / "python", "echo 1\n")
+        self.write_executable(
+            self.bin_dir / "accelerate",
+            'printf "%s\\n" "$@" > "$CAPTURE_FILE"\n',
+        )
+
+        result = self.run_launcher(
+            "run_training.sh", {"WARM_UP_STEPS": "21", "SAVE_STEPS": "987"}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = self.capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(arguments[arguments.index("--warm_up_steps") + 1], "21")
+        self.assertEqual(arguments[arguments.index("--save_steps") + 1], "987")
 
     def test_evaluation_launcher_honors_model_override(self):
         custom_model = self.sandbox / "custom-checkpoint"

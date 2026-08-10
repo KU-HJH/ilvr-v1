@@ -101,8 +101,10 @@ def verify_model_snapshot(directory: Path, spec: ModelAssetSpec) -> Path:
             raise SnapshotValidationError(f"{spec.key}: missing or empty file: {name}")
     try:
         index = json.loads((directory / spec.index_filename).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SnapshotValidationError(f"{spec.key}: invalid weight index") from exc
+    if not isinstance(index, dict):
+        raise SnapshotValidationError(f"{spec.key}: invalid weight index")
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise SnapshotValidationError(f"{spec.key}: weight_map must be a non-empty object")

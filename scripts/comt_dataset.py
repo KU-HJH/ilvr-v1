@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import shutil
 import tarfile
 from dataclasses import dataclass
@@ -14,6 +15,11 @@ from PIL import Image, UnidentifiedImageError
 
 SOURCE_REPO = "shuai22/comt"
 SOURCE_FILES = ("TRAIN.jsonl", "TEST.jsonl", "comt.tar.gz")
+REBUILD_COMMAND = (
+    "./venv/ilvr-venv/bin/python -m scripts.prepare_comt prepare "
+    "--data-dir data --force"
+)
+SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 
 
 class DatasetValidationError(ValueError):
@@ -77,8 +83,14 @@ def prepare_dataset(
     }
     existing = [path.exists() for path in final_paths.values()]
     if all(existing) and not force:
-        validate_dataset(
+        report = validate_dataset(
             final_paths["TRAIN.jsonl"], final_paths["TEST.jsonl"], final_paths["images_comt"]
+        )
+        validate_manifest(
+            final_paths["comt_manifest.json"],
+            final_paths["TRAIN.jsonl"],
+            final_paths["TEST.jsonl"],
+            report,
         )
         return final_paths["comt_manifest.json"]
     if any(existing) and not force:
@@ -157,6 +169,93 @@ def prepare_dataset(
     for name, final_path in final_paths.items():
         shutil.move(str(ready_dir / name), str(final_path))
     return final_paths["comt_manifest.json"]
+
+
+def _manifest_error(reason: str) -> DatasetValidationError:
+    return DatasetValidationError(
+        f"Existing CoMT manifest is invalid ({reason}); rebuild using: {REBUILD_COMMAND}"
+    )
+
+
+def _manifest_count(container: dict, key: str, *, positive: bool) -> int:
+    value = container.get(key)
+    minimum = 1 if positive else 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        qualifier = "positive" if positive else "nonnegative"
+        raise _manifest_error(f"{key} must be a {qualifier} integer")
+    return value
+
+
+def validate_manifest(
+    manifest_path: Path,
+    train_path: Path,
+    test_path: Path,
+    report: ValidationReport,
+) -> None:
+    manifest_path = Path(manifest_path)
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise _manifest_error("manifest path is not a regular file")
+    try:
+        if manifest_path.stat().st_size == 0:
+            raise _manifest_error("manifest file is empty")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _manifest_error("manifest is not readable JSON") from exc
+    if not isinstance(manifest, dict) or not manifest:
+        raise _manifest_error("manifest must be a non-empty JSON object")
+
+    source = manifest.get("source")
+    if not isinstance(source, dict):
+        raise _manifest_error("source must be an object")
+    for key in ("repository", "revision"):
+        value = source.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise _manifest_error(f"source {key} must be a non-empty string")
+
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise _manifest_error("files must be an object")
+    for filename in SOURCE_FILES:
+        metadata = files.get(filename)
+        if not isinstance(metadata, dict):
+            raise _manifest_error(f"missing file metadata for {filename}")
+        digest = metadata.get("sha256")
+        if not isinstance(digest, str) or SHA256_PATTERN.fullmatch(digest) is None:
+            raise _manifest_error(f"invalid SHA-256 for {filename}")
+        _manifest_count(metadata, "bytes", positive=True)
+
+    for filename, path in (("TRAIN.jsonl", train_path), ("TEST.jsonl", test_path)):
+        metadata = files[filename]
+        try:
+            current_bytes = Path(path).stat().st_size
+            current_digest = sha256_file(Path(path))
+        except OSError as exc:
+            raise _manifest_error(f"unable to verify {filename}") from exc
+        if metadata["bytes"] != current_bytes or metadata["sha256"] != current_digest:
+            raise _manifest_error(f"{filename} does not match recorded metadata")
+
+    records = manifest.get("records")
+    if not isinstance(records, dict):
+        raise _manifest_error("records must be an object")
+    if (
+        _manifest_count(records, "train", positive=True) != report.train_records
+        or _manifest_count(records, "test", positive=True) != report.test_records
+    ):
+        raise _manifest_error("record counts do not match the dataset")
+
+    images = manifest.get("images")
+    if not isinstance(images, dict):
+        raise _manifest_error("images must be an object")
+    image_metrics = {
+        "unique": report.unique_images,
+        "missing": report.missing_images,
+        "corrupt": report.corrupt_images,
+    }
+    for key, expected in image_metrics.items():
+        if _manifest_count(images, key, positive=False) != expected:
+            raise _manifest_error("image metrics do not match the dataset")
+    if images["missing"] != 0 or images["corrupt"] != 0:
+        raise _manifest_error("manifest records missing or corrupt images")
 
 
 def safe_extract_tar(archive_path: Path, destination: Path) -> None:
