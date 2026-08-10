@@ -3,6 +3,7 @@ import io
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from PIL import Image
@@ -11,6 +12,7 @@ from scripts.comt_dataset import (
     DatasetValidationError,
     UnsafeArchiveError,
     locate_image_root,
+    prepare_dataset,
     safe_extract_tar,
     validate_dataset,
 )
@@ -121,6 +123,55 @@ class ComtDatasetTests(unittest.TestCase):
         safe_extract_tar(archive, extracted)
         located = locate_image_root(extracted, {"creation/input.png"})
         self.assertEqual(located, extracted / "COMT")
+
+    def test_prepare_promotes_only_validated_dataset_and_writes_manifest(self):
+        archive = self.root / "comt.tar.gz"
+        self.write_tar(
+            archive,
+            {
+                "COMT/creation/input.png": self.png_bytes(),
+                "COMT/creation/helper.png": self.png_bytes(),
+            },
+        )
+        sources = {"TRAIN.jsonl": self.train, "TEST.jsonl": self.test, "comt.tar.gz": archive}
+        with (
+            mock.patch("scripts.comt_dataset.resolve_revision", return_value="abc123"),
+            mock.patch("scripts.comt_dataset.download_sources", return_value=sources),
+        ):
+            manifest_path = prepare_dataset(self.root / "data", revision="abc123")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["source"]["repository"], "shuai22/comt")
+        self.assertEqual(manifest["source"]["revision"], "abc123")
+        self.assertEqual(manifest["records"], {"train": 1, "test": 1})
+        self.assertEqual(manifest["images"]["missing"], 0)
+        self.assertEqual(manifest["images"]["corrupt"], 0)
+        self.assertTrue((self.root / "data/images_comt/creation/input.png").is_file())
+
+    def test_prepare_does_not_replace_existing_complete_dataset(self):
+        archive = self.root / "comt.tar.gz"
+        self.write_tar(
+            archive,
+            {
+                "COMT/creation/input.png": self.png_bytes(),
+                "COMT/creation/helper.png": self.png_bytes(),
+            },
+        )
+        sources = {"TRAIN.jsonl": self.train, "TEST.jsonl": self.test, "comt.tar.gz": archive}
+        with (
+            mock.patch("scripts.comt_dataset.resolve_revision", return_value="abc123"),
+            mock.patch("scripts.comt_dataset.download_sources", return_value=sources),
+        ):
+            prepare_dataset(self.root / "data", revision="abc123")
+        with mock.patch("scripts.comt_dataset.download_sources") as download:
+            prepare_dataset(self.root / "data", revision="abc123")
+        download.assert_not_called()
+
+    def test_prepare_rejects_incomplete_existing_final_layout(self):
+        data_dir = self.root / "data"
+        data_dir.mkdir()
+        (data_dir / "TRAIN.jsonl").write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(FileExistsError, "incomplete dataset"):
+            prepare_dataset(data_dir, revision="abc123")
 
 
 if __name__ == "__main__":
