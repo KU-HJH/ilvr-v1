@@ -1,9 +1,6 @@
 from PIL import Image
 import os
 
-TRAIN_IMAGE_ROOT = "/mnt/public/users/dongshuai/LVR/ILVR_PUB/COMT"
-TEST_IMAGE_ROOT  = ""
-
 # ====== Utility Functions ======
 def _to_list(x):
     if x is None:
@@ -20,12 +17,13 @@ def _assert_exists(p: str):
         raise FileNotFoundError(f"Image path not found: {p}")
 
 
-def interleaved_latent_cot_preprocess_function(sample):
+def interleaved_latent_cot_preprocess_function(sample, *, image_root):
+    root = os.fspath(image_root)
     
     # Process user content (Input images)
     user_content = []
     for image_rel in _to_list(sample.get('image_input', [])):
-        full_image_path = _resolve_path(TRAIN_IMAGE_ROOT, image_rel)
+        full_image_path = _resolve_path(root, image_rel)
         _assert_exists(full_image_path)
         user_content.append({"type": "image", "image": full_image_path})
     user_content.append({"type": "text", "text": sample.get("text_input", "")})
@@ -44,7 +42,7 @@ def interleaved_latent_cot_preprocess_function(sample):
             helper_rel = step.get('helper_image', None)
             if not helper_rel:
                 raise ValueError(f"Latent step is missing 'helper_image': {step}")
-            helper_path = _resolve_path(TRAIN_IMAGE_ROOT, helper_rel)
+            helper_path = _resolve_path(root, helper_rel)
             _assert_exists(helper_path)
             assistant_content.append({"type": "image", "image": helper_path})
         else:
@@ -57,15 +55,16 @@ def interleaved_latent_cot_preprocess_function(sample):
     return conversations
 
 
-def single_input_image_preprocess_function(sample):
+def single_input_image_preprocess_function(sample, *, image_root):
+    root = os.fspath(image_root)
     
     inp_path  = sample.get("image_input")
     out_path  = sample.get("image_output")
     if inp_path is None or out_path is None:
         raise ValueError("Sample is missing 'image_input' or 'image_output'")
 
-    inp_full = _resolve_path(TRAIN_IMAGE_ROOT, inp_path) if not os.path.isabs(inp_path) else inp_path
-    out_full = _resolve_path(TRAIN_IMAGE_ROOT, out_path) if not os.path.isabs(out_path) else out_path
+    inp_full = _resolve_path(root, inp_path)
+    out_full = _resolve_path(root, out_path)
     _assert_exists(inp_full)
     _assert_exists(out_full)
 
@@ -88,12 +87,13 @@ def single_input_image_preprocess_function(sample):
     return conversations
 
 
-def single_input_image_test_preprocess_function(sample):
+def single_input_image_test_preprocess_function(sample, *, image_root):
+    root = os.fspath(image_root)
     inp_path  = sample.get("image_input")
     if inp_path is None:
         raise ValueError("Sample is missing 'image_input'")
 
-    inp_full = _resolve_path(TEST_IMAGE_ROOT, inp_path) if not os.path.isabs(inp_path) else inp_path
+    inp_full = _resolve_path(root, inp_path)
     _assert_exists(inp_full)
 
     conversations = [
@@ -108,10 +108,11 @@ def single_input_image_test_preprocess_function(sample):
     return conversations
 
 
-def multiple_input_images_preprocess_function(sample):
+def multiple_input_images_preprocess_function(sample, *, image_root):
+    root = os.fspath(image_root)
     user_content = []
     for rel in _to_list(sample.get('image_input', [])):
-        full = _resolve_path(TRAIN_IMAGE_ROOT, rel) if not os.path.isabs(rel) else rel
+        full = _resolve_path(root, rel)
         _assert_exists(full)
         user_content.append({"type": "image", "image": full})
     user_content.append({"type": "text", "text": sample.get("text_input", "")})
@@ -119,7 +120,7 @@ def multiple_input_images_preprocess_function(sample):
     out_path = sample.get("image_output")
     if out_path is None:
         raise ValueError("Sample is missing 'image_output'")
-    out_full = _resolve_path(TRAIN_IMAGE_ROOT, out_path) if not os.path.isabs(out_path) else out_path
+    out_full = _resolve_path(root, out_path)
     _assert_exists(out_full)
 
     conversations = [
@@ -134,10 +135,11 @@ def multiple_input_images_preprocess_function(sample):
     ]
     return conversations
 
-def multiple_input_images_test_preprocess_function(sample):
+def multiple_input_images_test_preprocess_function(sample, *, image_root):
+    root = os.fspath(image_root)
     user_content = []
     for rel in _to_list(sample.get('image_input', [])):
-        full = _resolve_path(TEST_IMAGE_ROOT, rel) if not os.path.isabs(rel) else rel
+        full = _resolve_path(root, rel)
         _assert_exists(full)
         user_content.append({"type": "image", "image": full})
     user_content.append({"type": "text", "text": sample.get("text_input", "")})
@@ -146,10 +148,11 @@ def multiple_input_images_test_preprocess_function(sample):
     return conversations
 
 
-def interleaved_latent_cot_test_preprocess_function(sample):
+def interleaved_latent_cot_test_preprocess_function(sample, *, image_root):
+    root = os.fspath(image_root)
     user_content = []
     for rel in _to_list(sample.get('image_input', [])):
-        full = _resolve_path(TEST_IMAGE_ROOT, rel) if not os.path.isabs(rel) else rel
+        full = _resolve_path(root, rel)
         _assert_exists(full)
         user_content.append({"type": "image", "image": full})
     user_content.append({"type": "text", "text": sample.get("text_input", "")})

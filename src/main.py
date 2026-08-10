@@ -160,7 +160,11 @@ def main_train():
     logging.info(f"Moving model to CUDA device: {torch.cuda.current_device()} ...")
     
 
-    preprocess_function = task_preporcess_config[args.task]
+    image_root = os.path.abspath(os.path.expanduser(args.image_root))
+    preprocess_function = partial(
+        task_preporcess_config[args.task],
+        image_root=image_root,
+    )
     train_dataset = load_jsonl_dataset(args.data_path)
     train_dataset = [preprocess_function(sample) for sample in train_dataset]
 

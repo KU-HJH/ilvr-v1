@@ -25,6 +25,11 @@ def get_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--epochs", type=float, default=2)
     parser.add_argument("--data_path", type=str, default='PathToJsonlData')
+    parser.add_argument(
+        "--image-root",
+        default="data/images_comt",
+        help="Root directory for relative image paths in the dataset JSONL.",
+    )
     parser.add_argument("--log_file", type=str, default='./log.txt')
     parser.add_argument("--save_model_path", type=str, default='./checkpoints/model_stage1')
     parser.add_argument("--load_model_path", type=str, default='./checkpoints/model_stage1')
