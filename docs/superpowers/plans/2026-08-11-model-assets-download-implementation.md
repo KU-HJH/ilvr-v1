@@ -169,28 +169,20 @@ REQUIRED_METADATA = (
 
 def verify_model_snapshot(directory: Path, spec: ModelAssetSpec) -> Path:
     directory = Path(directory)
-    for name in (*REQUIRED_METADATA, spec.index_filename):
-        path = directory / name
-        if not path.is_file() or path.stat().st_size == 0:
-            raise SnapshotValidationError(f"{spec.key}: missing or empty file: {name}")
-    try:
-        index = json.loads((directory / spec.index_filename).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SnapshotValidationError(f"{spec.key}: invalid weight index") from exc
-    weight_map = index.get("weight_map")
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise SnapshotValidationError(f"{spec.key}: weight_map must be a non-empty object")
+    index = json.loads((directory / spec.index_filename).read_text(encoding="utf-8"))
+    weight_map = index["weight_map"]
     shards = set(weight_map.values())
     if len(shards) != spec.expected_shards:
         raise SnapshotValidationError(
             f"{spec.key}: expected {spec.expected_shards} indexed shards, found {len(shards)}"
         )
-    for shard in shards:
-        path = directory / shard
-        if not path.is_file() or path.stat().st_size == 0:
-            raise SnapshotValidationError(f"{spec.key}: missing or empty shard: {shard}")
     return directory
 ```
+
+This is deliberately only the success-path minimum. Missing/empty files,
+unsafe paths, malformed indexes, and unindexed weights remain unimplemented so
+the next behavior tests fail for the intended reasons before their production
+checks are added.
 
 - [ ] **Step 4: Run the focused test and verify GREEN**
 
@@ -259,11 +251,12 @@ Run:
 ./venv/ilvr-venv/bin/python -m unittest tests.test_model_assets -v
 ```
 
-Expected: the missing/empty cases PASS with the initial implementation; traversal, absolute-path, and unindexed-file cases FAIL because those protections are absent.
+Expected: all six new tests FAIL because the initial success-path verifier does
+not yet validate metadata, shard contents, path safety, or extra weight files.
 
-- [ ] **Step 7: Implement safe indexed-path parsing and exact shard-set verification**
+- [ ] **Step 7: Implement complete file, index, path, and shard verification**
 
-Replace the shard loop in `verify_model_snapshot` with a helper and exact local set check:
+Add the safe path helper:
 
 ```python
 def _resolve_indexed_shards(
@@ -288,28 +281,46 @@ def _resolve_indexed_shards(
     return shards
 ```
 
-After checking `expected_shards`, verify each resolved shard, then compare it with all regular files matching `*{spec.weight_suffix}` below the snapshot root:
+Replace `verify_model_snapshot` with the complete implementation. It first
+checks metadata and the index, validates the index shape, then checks resolved
+shards and all local weight files:
 
 ```python
-indexed_shards = _resolve_indexed_shards(directory, weight_map, spec)
-if len(indexed_shards) != spec.expected_shards:
-    raise SnapshotValidationError(
-        f"{spec.key}: expected {spec.expected_shards} indexed shards, "
-        f"found {len(indexed_shards)}"
-    )
-for shard in indexed_shards:
-    if not shard.is_file() or shard.stat().st_size == 0:
-        raise SnapshotValidationError(f"{spec.key}: missing or empty shard: {shard.name}")
-local_weights = {
-    path.resolve()
-    for path in directory.rglob(f"*{spec.weight_suffix}")
-    if path.is_file()
-}
-extras = sorted(path.name for path in local_weights - indexed_shards)
-if extras:
-    raise SnapshotValidationError(
-        f"{spec.key}: unindexed weight files: {', '.join(extras)}"
-    )
+def verify_model_snapshot(directory: Path, spec: ModelAssetSpec) -> Path:
+    directory = Path(directory)
+    for name in (*REQUIRED_METADATA, spec.index_filename):
+        path = directory / name
+        if not path.is_file() or path.stat().st_size == 0:
+            raise SnapshotValidationError(f"{spec.key}: missing or empty file: {name}")
+    try:
+        index = json.loads((directory / spec.index_filename).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SnapshotValidationError(f"{spec.key}: invalid weight index") from exc
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise SnapshotValidationError(f"{spec.key}: weight_map must be a non-empty object")
+    indexed_shards = _resolve_indexed_shards(directory, weight_map, spec)
+    if len(indexed_shards) != spec.expected_shards:
+        raise SnapshotValidationError(
+            f"{spec.key}: expected {spec.expected_shards} indexed shards, "
+            f"found {len(indexed_shards)}"
+        )
+    for shard in indexed_shards:
+        if not shard.is_file() or shard.stat().st_size == 0:
+            raise SnapshotValidationError(
+                f"{spec.key}: missing or empty shard: {shard.name}"
+            )
+    local_weights = {
+        path.resolve()
+        for path in directory.rglob(f"*{spec.weight_suffix}")
+        if path.is_file()
+    }
+    extras = sorted(path.name for path in local_weights - indexed_shards)
+    if extras:
+        raise SnapshotValidationError(
+            f"{spec.key}: unindexed weight files: {', '.join(extras)}"
+        )
+    return directory
 ```
 
 - [ ] **Step 8: Run the verifier tests and full existing suite**
@@ -934,6 +945,39 @@ class LauncherDefaultsTests(unittest.TestCase):
         data_index = arguments.index("--test_data_path")
         self.assertEqual(arguments[model_index + 1], str(self.sandbox / "models/comt_ckpt"))
         self.assertEqual(arguments[data_index + 1], str(self.sandbox / "data/TEST.jsonl"))
+
+    def test_training_launcher_honors_model_override(self):
+        self.write_executable(self.bin_dir / "python", "echo 1\n")
+        self.write_executable(
+            self.bin_dir / "accelerate",
+            'printf "%s\\n" "$@" > "$CAPTURE_FILE"\n',
+        )
+
+        result = self.run_launcher(
+            "run_training.sh", {"MODEL_NAME": "/custom/three-billion"}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = self.capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            arguments[arguments.index("--model") + 1], "/custom/three-billion"
+        )
+
+    def test_evaluation_launcher_honors_model_override(self):
+        custom_model = self.sandbox / "custom-checkpoint"
+        custom_model.mkdir()
+        self.write_executable(
+            self.bin_dir / "python",
+            'printf "%s\\n" "$@" > "$CAPTURE_FILE"\n',
+        )
+
+        result = self.run_launcher("eval.sh", {"MODEL_DIR": str(custom_model)})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = self.capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            arguments[arguments.index("--model_dir") + 1], str(custom_model)
+        )
 ```
 
 - [ ] **Step 2: Run launcher tests and verify RED**
@@ -944,7 +988,10 @@ Run:
 ./venv/ilvr-venv/bin/python -m unittest tests.test_launcher_defaults -v
 ```
 
-Expected: training test FAIL because the launcher passes the 7B Hub ID; evaluation test FAIL because empty `MODEL_DIR` is rejected.
+Expected: the training default and training override tests FAIL because the
+launcher hard-codes the 7B Hub ID; the evaluation default test FAIL because an
+empty `MODEL_DIR` is rejected. The evaluation override characterization test
+PASSes because that override is existing behavior which this task must preserve.
 
 - [ ] **Step 3: Implement environment-overridable local model defaults**
 
@@ -962,40 +1009,15 @@ MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models/comt_ckpt}"
 
 Retain each launcher's existing directory/file checks, repository-local virtual environment, explicit image root, and offline runtime export.
 
-- [ ] **Step 4: Add override behavior tests**
+- [ ] **Step 4: Run all launcher behavior tests and verify GREEN**
 
-The Step 1 helper already accepts an optional environment mapping. Add these exact tests:
+Run:
 
-```python
-def test_training_launcher_honors_model_override(self):
-    self.write_executable(self.bin_dir / "python", "echo 1\n")
-    self.write_executable(
-        self.bin_dir / "accelerate",
-        'printf "%s\\n" "$@" > "$CAPTURE_FILE"\n',
-    )
-
-    result = self.run_launcher(
-        "run_training.sh", {"MODEL_NAME": "/custom/three-billion"}
-    )
-
-    self.assertEqual(result.returncode, 0, result.stderr)
-    arguments = self.capture.read_text(encoding="utf-8").splitlines()
-    self.assertEqual(arguments[arguments.index("--model") + 1], "/custom/three-billion")
-
-def test_evaluation_launcher_honors_model_override(self):
-    custom_model = self.sandbox / "custom-checkpoint"
-    custom_model.mkdir()
-    self.write_executable(
-        self.bin_dir / "python",
-        'printf "%s\\n" "$@" > "$CAPTURE_FILE"\n',
-    )
-
-    result = self.run_launcher("eval.sh", {"MODEL_DIR": str(custom_model)})
-
-    self.assertEqual(result.returncode, 0, result.stderr)
-    arguments = self.capture.read_text(encoding="utf-8").splitlines()
-    self.assertEqual(arguments[arguments.index("--model_dir") + 1], str(custom_model))
+```bash
+./venv/ilvr-venv/bin/python -m unittest tests.test_launcher_defaults -v
 ```
+
+Expected: all four default/override behavior tests PASS.
 
 - [ ] **Step 5: Run launcher tests, syntax checks, and full suite**
 
