@@ -57,6 +57,8 @@ def get_args():
     )
     parser.add_argument("--max_seq_length_train", type=int, default=8192,
         help="Stage-2")  # 改默认 8192
+    parser.add_argument("--ew_config", type=str, default=None)
+    parser.add_argument("--deepspeed_config", type=str, default="configs/config_stage3.json")
     # global_pad_to 已存在，保留
 # 其余不变
 

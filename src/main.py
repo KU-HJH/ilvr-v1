@@ -22,6 +22,7 @@ from qwen_vl_utils import process_vision_info
 from utils_deepseed import *
 from task_deepseed import *
 from trainer import CustomTrainerStage1
+from evidence_window.config import EvidenceWindowConfig
 
 # ==============================================================
 # Collate Functions
@@ -98,6 +99,11 @@ def collate_fn_stage1(examples, processor, args):
 def main_train():
     seed_everything(seed=42)
     args = get_args()
+    ew_config = (
+        EvidenceWindowConfig.disabled()
+        if args.ew_config is None
+        else EvidenceWindowConfig.from_json(args.ew_config)
+    )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -135,6 +141,14 @@ def main_train():
     latent_token_idx = processor.tokenizer("<|latent_pad|>", return_tensors="pt")["input_ids"][0,0].item()
     latent_start_idx = processor.tokenizer("<|latent_start|>", return_tensors="pt")["input_ids"][0,0].item()
     latent_end_idx   = processor.tokenizer("<|latent_end|>", return_tensors="pt")["input_ids"][0,0].item()
+    pad_token_idx = processor.tokenizer("<|endoftext|>", return_tensors="pt")["input_ids"][0,0].item()
+    latent_token_ids = {
+        "start": int(latent_start_idx),
+        "end": int(latent_end_idx),
+        "pad": int(latent_token_idx),
+        "padding": int(pad_token_idx),
+        "special": tuple(int(x) for x in processor.tokenizer.all_special_ids),
+    }
     config.latent_token_id = int(latent_token_idx)
     config.latent_start_id = int(latent_start_idx)
     config.latent_end_id   = int(latent_end_idx)
@@ -206,7 +220,7 @@ def main_train():
         logging_dir='./logs/',
         logging_strategy='steps',
         max_seq_length=32768 if args.stage == 'stage1' else args.max_seq_length_train,
-        deepspeed="configs/config_stage3.json",
+        deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False if args.stage == 'stage2' else None,
     )
     
