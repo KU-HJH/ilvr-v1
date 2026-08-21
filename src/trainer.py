@@ -6,9 +6,11 @@ import torch.nn.functional as F
 import math
 import copy
 import logging
+import weakref
 import deepspeed
 from dataclasses import dataclass
 from typing import Any, List, Mapping
+from transformers import TrainerCallback
 
 from evidence_window.config import EvidenceWindowConfig
 from evidence_window.engine import (
@@ -51,6 +53,22 @@ class _EMATeacher:
             p_t.data.mul_(d).add_(p_s.data, alpha=(1.0 - d))
 
 
+class _EMAOptimizerStepCallback(TrainerCallback):
+    """Advance the trainer-owned EMA after one successful optimizer step."""
+
+    def __init__(self, trainer: "CustomTrainerStage1") -> None:
+        self._trainer_ref = weakref.ref(trainer)
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        del args, state, control, kwargs
+        trainer = self._trainer_ref()
+        if trainer is None:
+            return
+        if bool(getattr(trainer.accelerator, "optimizer_step_was_skipped", False)):
+            return
+        trainer._update_ema_after_optimizer_step()
+
+
 @dataclass
 class _ILVRLossContext:
     loss: torch.Tensor
@@ -81,6 +99,12 @@ class CustomTrainerStage1(SFTTrainer):
         self.ce_weight = float(ce_weight)
         self.image_pool_k = int(image_pool_k)
         self._ema = _EMATeacher(self.model, decay=float(ema_tau))
+        self._ema_update_count = 0
+        if not any(
+            isinstance(callback, _EMAOptimizerStepCallback)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(_EMAOptimizerStepCallback(self))
         self.evidence_window_config = (
             EvidenceWindowConfig.disabled()
             if evidence_window_config is None
@@ -1197,20 +1221,22 @@ class CustomTrainerStage1(SFTTrainer):
             return [cls._move_tensors(item, device) for item in value]
         return value
 
-    def optimizer_step(self, *args, **kwargs):
-        super().optimizer_step(*args, **kwargs)
-        if not hasattr(self, "_ema") or self._ema is None:
-            return
+    @property
+    def ema_update_count(self) -> int:
+        return self._ema_update_count
+
+    @torch.no_grad()
+    def _update_ema_after_optimizer_step(self) -> None:
         d = float(self._ema.decay)
-        with torch.no_grad():
-            if _HAS_DS and any(hasattr(p, "ds_id") for p in self.model.parameters()):
-                for p_t, p_s in zip(self._ema.teacher.parameters(), self.model.parameters()):
-                    with deepspeed.zero.GatheredParameters(p_s, modifier_rank=0):
-                        if p_s.data.numel() == 0:
-                            continue
-                        p_data = p_s.data
-                        if p_data.device != p_t.data.device:
-                            p_data = p_data.to(p_t.data.device)
-                        p_t.data.mul_(d).add_(p_data, alpha=(1.0 - d))
-            else:
-                self._ema.update(self.model)
+        if _HAS_DS and any(hasattr(p, "ds_id") for p in self.model.parameters()):
+            for p_t, p_s in zip(self._ema.teacher.parameters(), self.model.parameters()):
+                with deepspeed.zero.GatheredParameters(p_s, modifier_rank=0):
+                    if p_s.data.numel() == 0:
+                        continue
+                    p_data = p_s.data
+                    if p_data.device != p_t.data.device:
+                        p_data = p_data.to(p_t.data.device)
+                    p_t.data.mul_(d).add_(p_data, alpha=(1.0 - d))
+        else:
+            self._ema.update(self.model)
+        self._ema_update_count += 1

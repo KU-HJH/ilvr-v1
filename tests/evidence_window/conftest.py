@@ -7,6 +7,7 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from transformers.trainer_callback import CallbackHandler, DefaultFlowCallback
 
 import trainer as trainer_module
 from evidence_window.config import EvidenceWindowConfig
@@ -161,6 +162,7 @@ class TinyAccelerator:
         self.prepared_models: list[torch.nn.Module] = []
         self.state = SimpleNamespace(deepspeed_plugin=None)
         self.num_processes = 1
+        self.optimizer_step_was_skipped = False
 
     def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
         return model
@@ -208,6 +210,13 @@ def tiny_trainer_factory(monkeypatch, tmp_path):
         instance.accelerator = TinyAccelerator()
         instance._metrics = defaultdict(list)
         instance._parent_init_kwargs = dict(kwargs)
+        instance.callback_handler = CallbackHandler(
+            [DefaultFlowCallback],
+            model=instance.model,
+            processing_class=instance.tokenizer,
+            optimizer=None,
+            lr_scheduler=None,
+        )
 
     monkeypatch.setattr(trainer_module.SFTTrainer, "__init__", fake_sft_init)
 
@@ -220,6 +229,7 @@ def tiny_trainer_factory(monkeypatch, tmp_path):
         condition_logits_dtype: torch.dtype | None = None,
         sim_weight: float = 0.7,
         ce_weight: float = 1.3,
+        ema_tau: float = 0.999,
     ) -> tuple[CustomTrainerStage1, TinyLatentLM]:
         model = (
             TinyLatentLM(
@@ -245,6 +255,7 @@ def tiny_trainer_factory(monkeypatch, tmp_path):
             tokenizer=SimpleNamespace(),
             sim_weight=sim_weight,
             ce_weight=ce_weight,
+            ema_tau=ema_tau,
             **kwargs,
         )
         trainer._ew_engine = getattr(trainer, "_ew_engine", None)
