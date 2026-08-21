@@ -67,34 +67,35 @@ def extract_interleaved_layout(
     native_predecessor = torch.full(
         (batch_size, max_windows), -1, dtype=torch.long, device=device
     )
+    evidence_end = torch.full((batch_size, max_evidence), -1, dtype=torch.long, device=device)
+    window_start = torch.full((batch_size, max_windows), -1, dtype=torch.long, device=device)
 
     for row_index, (evidence, windows) in enumerate(rows):
-        for evidence_index, (_, _, mask) in enumerate(evidence):
+        for evidence_index, (_, end, mask) in enumerate(evidence):
             evidence_token_mask[row_index, evidence_index] = mask
             evidence_valid[row_index, evidence_index] = mask.any()
+            evidence_end[row_index, evidence_index] = end
         for window_index, (start, predecessor, mask) in enumerate(windows):
-            del start  # Temporal positions were needed below to construct pair masks.
             window_token_mask[row_index, window_index] = mask
             window_valid[row_index, window_index] = True
             native_predecessor[row_index, window_index] = predecessor
+            window_start[row_index, window_index] = start
 
-    causal_pair_mask = torch.zeros(
-        (batch_size, max_evidence, max_windows), dtype=torch.bool, device=device
+    causal_pair_mask = (
+        evidence_valid.unsqueeze(-1)
+        & window_valid.unsqueeze(1)
+        & (evidence_end.unsqueeze(-1) < window_start.unsqueeze(1))
     )
-    for row_index, (evidence, windows) in enumerate(rows):
-        for evidence_index, (_, evidence_end, _) in enumerate(evidence):
-            if not evidence_valid[row_index, evidence_index]:
-                continue
-            for window_index, (window_start, _, _) in enumerate(windows):
-                if evidence_end < window_start:
-                    causal_pair_mask[row_index, evidence_index, window_index] = True
 
     training_pair_mask = torch.zeros_like(causal_pair_mask)
-    for row_index in range(batch_size):
-        for window_index in range(max_windows):
-            predecessor = native_predecessor[row_index, window_index].item()
-            if predecessor >= 0 and causal_pair_mask[row_index, predecessor, window_index]:
-                training_pair_mask[row_index, predecessor, window_index] = True
+    if max_evidence and max_windows:
+        predecessor = native_predecessor.clamp_min(0)
+        predecessor_is_causal = causal_pair_mask.gather(1, predecessor.unsqueeze(1)).squeeze(1)
+        training_pair_mask.scatter_(
+            1,
+            predecessor.unsqueeze(1),
+            (native_predecessor.ge(0) & predecessor_is_causal).unsqueeze(1),
+        )
 
     return InterleavedLayout(
         evidence_token_mask=evidence_token_mask,
@@ -134,43 +135,46 @@ def _extract_row(
     active_latent_mask: torch.Tensor,
     token_ids: TokenIds,
 ) -> tuple[list[tuple[int, int, torch.Tensor]], list[tuple[int, int, torch.Tensor]]]:
-    """Parse one sequence once, returning structural spans and nonempty windows."""
+    """Parse delimiter coordinates and vectorized interval masks for one sequence."""
     length = input_ids.shape[0]
     active_attention = attention_mask.to(dtype=torch.bool)
     excluded_ids = set(token_ids.special)
     excluded_ids.update(
         {token_ids.latent_start, token_ids.latent_end, token_ids.latent_pad, token_ids.padding}
     )
+    positions = torch.arange(length, device=input_ids.device)
+    excluded = torch.isin(input_ids, input_ids.new_tensor(tuple(excluded_ids)))
+    reasoning = active_attention & labels.ne(-100) & ~excluded
+    delimiter_codes = torch.where(
+        active_attention & input_ids.eq(token_ids.latent_start),
+        1,
+        torch.where(active_attention & input_ids.eq(token_ids.latent_end), -1, 0),
+    )
+    delimiter_positions = delimiter_codes.ne(0).nonzero(as_tuple=False).flatten()
+    event_positions = delimiter_positions.tolist()
+    event_codes = delimiter_codes[delimiter_positions].tolist()
     evidence: list[tuple[int, int, torch.Tensor]] = []
     windows: list[tuple[int, int, torch.Tensor]] = []
     open_start: int | None = None
     text_start = 0
 
-    for position in range(length):
-        if not active_attention[position].item():
-            continue
-        token = input_ids[position].item()
-        if token == token_ids.latent_start:
+    for position, code in zip(event_positions, event_codes):
+        if code == 1:
             if open_start is not None:
                 raise ValueError("nested latent delimiter")
             _append_window_if_nonempty(
-                windows,
-                input_ids,
-                attention_mask,
-                labels,
+                windows, reasoning, positions,
                 text_start,
                 position,
                 len(evidence) - 1,
-                excluded_ids,
             )
             open_start = position
-        elif token == token_ids.latent_end:
+        else:
             if open_start is None:
                 raise ValueError("unmatched latent delimiter")
-            evidence_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-            if position > open_start + 1:
-                interior = active_latent_mask[open_start + 1 : position].to(dtype=torch.bool)
-                evidence_mask[open_start + 1 : position] = interior
+            evidence_mask = active_latent_mask.to(dtype=torch.bool) & (
+                (positions > open_start) & (positions < position)
+            )
             evidence.append((open_start, position, evidence_mask))
             open_start = None
             text_start = position + 1
@@ -178,39 +182,26 @@ def _extract_row(
     if open_start is not None:
         raise ValueError("unmatched latent delimiter")
     _append_window_if_nonempty(
-        windows,
-        input_ids,
-        attention_mask,
-        labels,
+        windows, reasoning, positions,
         text_start,
         length,
         len(evidence) - 1,
-        excluded_ids,
     )
     return evidence, windows
 
 
 def _append_window_if_nonempty(
     windows: list[tuple[int, int, torch.Tensor]],
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    labels: torch.Tensor,
+    reasoning: torch.Tensor,
+    positions: torch.Tensor,
     start: int,
     stop: int,
     predecessor: int,
-    excluded_ids: set[int],
 ) -> None:
-    """Append a text interval only when it contains eligible supervised tokens."""
+    """Append a nonempty vectorized reasoning interval."""
     if start >= stop:
         return
-    mask = torch.zeros_like(input_ids, dtype=torch.bool)
-    for position in range(start, stop):
-        if (
-            attention_mask[position].item()
-            and labels[position].item() != -100
-            and input_ids[position].item() not in excluded_ids
-        ):
-            mask[position] = True
-    if mask.any():
-        window_start = mask.nonzero(as_tuple=False)[0, 0].item()
-        windows.append((window_start, predecessor, mask))
+    mask = reasoning & (positions >= start) & (positions < stop)
+    reasoning_positions = mask.nonzero(as_tuple=False).flatten().tolist()
+    if reasoning_positions:
+        windows.append((reasoning_positions[0], predecessor, mask))

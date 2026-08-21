@@ -107,3 +107,17 @@ def test_nested_delimiter_fails():
     ids = torch.tensor([[90, 92, 90, 92, 91, 91]])
     with pytest.raises(ValueError, match="nested"):
         extract_interleaved_layout(ids, torch.ones_like(ids), ids, ids.eq(92), TOKENS)
+
+
+def test_layout_extraction_avoids_scalar_tensor_reads(monkeypatch):
+    """Scalar reads would synchronize every inspected CUDA token to the host."""
+    ids = torch.tensor([[10, 90, 92, 91, 20, 21, 90, 92, 91, 30]])
+
+    def scalar_read_is_forbidden(*_args, **_kwargs):
+        raise AssertionError("layout extraction performed a scalar tensor read")
+
+    monkeypatch.setattr(torch.Tensor, "item", scalar_read_is_forbidden)
+    layout = extract_interleaved_layout(ids, torch.ones_like(ids), ids, ids.eq(92), TOKENS)
+
+    assert layout.evidence_token_mask.nonzero().tolist() == [[0, 0, 2], [0, 1, 7]]
+    assert layout.window_token_mask.nonzero().tolist() == [[0, 0, 0], [0, 1, 4], [0, 1, 5], [0, 2, 9]]
