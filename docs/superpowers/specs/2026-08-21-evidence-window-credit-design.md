@@ -1,7 +1,7 @@
 # Evidence–Window Credit Learning for ILVR
 
 **Date:** 2026-08-21  
-**Status:** Design approved in conversation; written specification pending review  
+**Status:** Implemented and CPU/synthetic verified; 7B/B200 validation pending
 **Target branch/worktree:** `ours-trial1`
 
 ## 1. Summary

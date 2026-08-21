@@ -129,6 +129,218 @@ bash run_training.sh
 - Gradient Accumulation Steps: 8
 - Latent Size: 8
 
+### Evidence-window diagnostics and training objectives
+
+Evidence-window training asks a local question: when one generated visual
+evidence span is replaced by a zero latent while the token history stays fixed,
+how much does that span change each later reasoning window? The implementation
+is optional. With no `--ew_config`, or with
+`configs/evidence_window/baseline.json`, the original ILVR path is exact: no
+reference model, evidence-window layout, auxiliary forward, or auxiliary metric
+buffer is constructed.
+
+#### Native spans and the zero-latent intervention
+
+For an example `b`, visual evidence `V_j` is the interior of a matched
+`<|latent_start|> ... <|latent_end|>` range, excluding the delimiters. Only
+positions selected by the post-selection `image_out_mask` (`firstK_mask` in the
+trainer) are active evidence positions; unused latent-pad template positions do
+not participate in an intervention.
+
+`R_0` is the supervised assistant-text run before the first visual span and has
+no visual predecessor. For each `V_j`, its native downstream reasoning window
+is the supervised text after `V_j` and before the next latent span, assistant
+termination, or padding. A reasoning token must have `attention_mask == 1`,
+`labels != -100`, lie outside every latent span, and not be a tokenizer special
+token. Adjacent latent spans do not create empty windows. EW preference training
+uses the adjacent native pair; all causally earlier `V_j -> R_k` pairs remain
+available to relation diagnostics and distillation.
+
+The conditions are:
+
+- `full`: all active EMA-selected latent vectors are injected;
+- `all_null`: all active latent vectors are replaced by zero; and
+- `loo(j)`: only active vectors in `V_j` are replaced by zero.
+
+The intervention copies the compact latent-value tensor. It preserves input
+IDs, labels, all text and other visual evidence, sequence length, attention
+masks, positions, and RoPE layout. It is therefore a zero-latent,
+frozen-token-history LOO dependency measurement. It includes effects propagated
+through recomputed hidden representations, but it is not the total causal
+effect of removing evidence and regenerating the text trajectory.
+
+#### Implemented objective
+
+For target position `t`, every auxiliary role uses the causal score
+
+```text
+log p_t(C) = log_softmax(logits[:, t-1, :])[target_t]
+S_k^M(C)   = sum over t in R_k of log p_t^M(C)
+```
+
+Preference scores use sums, not length normalization. With policy `pi`, fixed
+reference `ref`, and `m_k^all = [S_k^pi(full)-S_k^pi(all_null)] -
+[S_k^ref(full)-S_k^ref(all_null)]`, the implemented losses are:
+
+```text
+M_global = sum_k m_k^all
+L_global = -log sigmoid(beta * M_global)
+L_window = mean_k[-log sigmoid(beta * m_k^all)]
+
+m_jk = [S_k^pi(full)-S_k^pi(loo(j))]
+       - [S_k^ref(full)-S_k^ref(loo(j))]
+L_EW = mean over adjacent native pairs of -log sigmoid(beta * m_jk)
+```
+
+Relation distillation uses all selected causal predecessor pairs:
+
+```text
+C_jk^M = [S_k^M(full)-S_k^M(loo(j))] / |R_k|
+q_M(j|k) = softmax_j(C_jk^M / temperature)
+L_rel = mean_k JSD(q_EMA(.|k), q_policy(.|k))
+L_mag = mean_(j,k) Huber(C_jk^policy, C_jk^EMA)
+```
+
+JSD skips windows with fewer than two valid candidates; magnitude loss still
+uses single-candidate windows. Logit-residual KD compares
+`W_lm_head * (h_full - h_loo(j))` between policy and EMA at selected causal
+predictor positions. It supports Huber or cosine distance and chunks the LM-head
+vocabulary, so it never materializes a full `[selected_tokens, vocabulary]`
+residual matrix.
+
+The complete implemented objective is:
+
+```text
+L = L_ILVR
+  + lambda_global * L_global
+  + lambda_window * L_window
+  + lambda_EW * L_EW
+  + lambda_rel * L_rel
+  + lambda_mag * L_mag
+  + lambda_logit * L_logit_residual
+```
+
+`L_ILVR` remains the existing weighted CE plus latent similarity objective, with
+its original CE fallback. Coefficients are independent and default to zero.
+
+All policy, fixed-reference, and EMA causal target scores share the same bounded
+FP32 reduction. At most a `[B, 32, vocabulary]` token chunk is cast to FP32 for
+log-softmax/gather; grad-enabled policy chunks are checkpointed and recomputed
+during backward. The retained score tensor is only `[B, T]`. This does not
+change the model forward/autocast dtype or the original ILVR CE calculation.
+
+#### Forward schedule and fixed models
+
+The original policy `full` output is reused. On one rank, each role performs at
+most `O(1 + J_selected)` full-sequence conditions, never one forward per
+evidence-window pair. Conditions shared by objectives are cached. In distributed
+training, ranks first pad to the global evidence width and take the union of
+selected evidence ordinals. Every rank then executes the same canonical padded
+ledger, giving `O(1 + J_global_selected)` conditions per role; missing local
+conditions are graph-free dummy forwards with unchanged latents. This keeps
+collective-bearing model schedules aligned even when local examples have
+different evidence counts.
+
+The EMA teacher selects latent targets and supplies relation/residual targets.
+It receives no gradients and updates exactly once after each successful Trainer
+optimizer step, not after each gradient-accumulation microbatch. It is never the
+DPO reference.
+
+Two fixed-reference modes are available:
+
+- `adapter_disabled` runs the active PEFT wrapper under `disable_adapter()` and
+  `torch.no_grad()`. It is valid only when all trainable parameters are adapter
+  parameters and the shared base is frozen. It adds no full base-model copy.
+- `frozen_copy` snapshots the initialized policy before optimizer updates,
+  switches it to evaluation/no-grad mode, prepares it as an evaluation model,
+  and excludes it from optimizer groups and policy checkpoints.
+
+ZeRO-2 does not partition frozen parameters. Consequently, a frozen 7B-class
+reference is replicated on every data-parallel rank while the existing full EMA
+teacher also remains resident. Expect roughly another 15–17 GB of BF16 weights
+per rank before activations, optimizer state, or gradients. Startup logging
+reports reference parameter count/bytes/dtypes, detected ZeRO stage, replication
+under ZeRO-2, EMA coexistence, the selected intervention/cap, all objective
+coefficients, diagnostics, and any active nonzero dropout.
+
+#### Configurations and launch examples
+
+`--ew_config PATH` loads a strict version-1 JSON config; unknown keys, negative
+coefficients, invalid caps, unsupported interventions, and preference modes
+without a fixed reference fail at startup. `--deepspeed_config PATH` selects the
+DeepSpeed file and otherwise remains `configs/config_stage3.json`. Preference
+experiments with LoRA should pass both `--use_lora` and `--lora_dropout 0` so
+condition contrasts do not use different dropout masks.
+
+The shipped variants are:
+
+| Config | Active behavior |
+| --- | --- |
+| `baseline.json` | Exact disabled ILVR path |
+| `diagnostic_global.json` | Global all-null saturation metrics only |
+| `window_preference.json` | Independent all-null window preference |
+| `loo_window_preference.json` | Adjacent-pair EW preference |
+| `relation_kd.json` | Relation JSD and magnitude KD |
+| `logit_residual.json` | Chunked EMA logit-residual KD |
+| `loo_relation_combined.json` | EW preference plus both relation losses |
+| `frozen_reference_zero2.json` | Frozen-reference EW preference plus global diagnostics |
+
+For a LoRA EW run, add the usual dataset/output arguments used by
+`run_training.sh`:
+
+```bash
+source ./venv/ilvr-venv/bin/activate
+accelerate launch --num_processes="${NUM_PROCESSES}" src/main.py \
+  --stage stage1 --task zebra-cot \
+  --data_path /path/to/TRAIN.jsonl \
+  --save_model_path /path/to/output \
+  --log_file /path/to/train.log \
+  --cache_dir /path/to/cache \
+  --use_lora --lora_dropout 0 \
+  --ew_config configs/evidence_window/loo_window_preference.json
+```
+
+The explicit frozen-reference ZeRO-2 variant is launched with the stage-2
+configuration; the program never switches stages implicitly:
+
+```bash
+source ./venv/ilvr-venv/bin/activate
+accelerate launch --num_processes="${NUM_PROCESSES}" src/main.py \
+  --stage stage1 --task zebra-cot \
+  --data_path /path/to/TRAIN.jsonl \
+  --save_model_path /path/to/output \
+  --log_file /path/to/train.log \
+  --cache_dir /path/to/cache \
+  --lora_dropout 0 \
+  --ew_config configs/evidence_window/frozen_reference_zero2.json \
+  --deepspeed_config configs/config_stage2.json
+```
+
+`max_spans_per_example=0` and `max_tokens_per_window=0` mean full coverage.
+Positive caps select deterministic evenly spaced items and include temporal
+endpoints when possible. `vocab_chunk_size` bounds logit-residual vocabulary
+work. Global preference is implemented but the shipped global file is
+diagnostic-only; set `preference.lambda_global` explicitly in a copied config to
+train that ablation. JSD and magnitude coefficients may likewise be enabled
+independently.
+
+Training logs use bounded scalar keys for ILVR/auxiliary losses, global/window/
+EW margins, the exact global outer coefficient, student/EMA relation summaries,
+and selected LOO/residual counts. Numerator/count sufficient statistics are
+reduced across ranks before means are emitted. Matrix dumps are off when
+`matrix_dump_interval=0`; when enabled, each rank writes a numeric JSONL file in
+`matrix_dump_dir` with only opaque rank/step/local-counter identifiers—never raw
+text, sample IDs, or image paths.
+
+Current limitations: there is no arbitrary attention blocking, hidden-state
+residual KD, group/pair ablation, Shapley attribution, or supervised evidence-
+window link selector. Adjacent-pair EW training can miss long-range requirements;
+single-evidence LOO cannot identify synergy or redundancy. The helper-image
+producer remains per-device batch size one. CPU/synthetic validation is
+complete, including previously recorded two-rank schedule/metric tests and a
+real two-rank ZeRO-2 frozen-reference smoke; the full 7B/B200 optimizer-smoke
+matrix still requires separately approved large-model validation.
+
 ---
 
 ## 📝 Citation
@@ -149,4 +361,3 @@ This codebase is built upon [Qwen-VL](https://github.com/QwenLM/Qwen-VL) 、 [Tr
 
 ## 📄 License
 This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
-
