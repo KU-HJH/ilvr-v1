@@ -96,7 +96,7 @@ class EvidenceWindowEngine:
         policy_full = self._prepare_output(
             policy_full,
             role="policy",
-            need_hidden=self.config.residual.lambda_logit > 0,
+            need_hidden=self._needs_hidden("policy", Condition("full")),
             layout=layout,
             condition=Condition("full"),
         )
@@ -136,9 +136,7 @@ class EvidenceWindowEngine:
                     layout.evidence_token_mask,
                     condition.evidence_index,
                 )
-            need_hidden = (
-                self.config.residual.lambda_logit > 0 and role in {"policy", "ema"}
-            )
+            need_hidden = self._needs_hidden(role, condition)
             if role == "policy":
                 output = forward(role, condition, values, need_hidden)
             else:
@@ -283,6 +281,13 @@ class EvidenceWindowEngine:
             if indices:
                 selected[batch_index, indices] = True
         return selected
+
+    def _needs_hidden(self, role: str, condition: Condition) -> bool:
+        return (
+            self.config.residual.lambda_logit > 0
+            and role in {"policy", "ema"}
+            and condition.kind in {"full", "loo"}
+        )
 
     def _add_all_null_results(
         self,

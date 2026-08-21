@@ -8,6 +8,7 @@ from evidence_window.config import (
     LOOConfig,
     PreferenceConfig,
     ReferenceConfig,
+    ResidualConfig,
 )
 from evidence_window.engine import (
     Condition,
@@ -229,6 +230,47 @@ def test_combined_objectives_reuse_reference_full_exactly_once():
         ("reference", "all_null", None),
         ("reference", "loo", 0),
     }
+
+
+def test_logit_residual_hidden_states_are_requested_only_for_full_and_loo():
+    config = EvidenceWindowConfig(
+        reference=ReferenceConfig(mode="adapter_disabled"),
+        preference=PreferenceConfig(
+            beta=1.0,
+            lambda_window=1.0,
+            lambda_ew=1.0,
+        ),
+        residual=ResidualConfig(lambda_logit=1.0),
+    )
+    calls: list[tuple[str, str, int | None, bool]] = []
+
+    def forward(role, condition, values, need_hidden):
+        del values
+        calls.append((role, condition.kind, condition.evidence_index, need_hidden))
+        hidden_states = torch.zeros((1, 1, 2)) if need_hidden else None
+        return ModelConditionOutput(torch.zeros((1, 1)), hidden_states)
+
+    full_hidden_states = torch.ones((1, 1, 2), requires_grad=True)
+    policy_full = ModelConditionOutput(
+        torch.zeros((1, 1), requires_grad=True),
+        full_hidden_states,
+    )
+    EvidenceWindowEngine(config).compute(
+        _scalar_layout(),
+        torch.ones((1, 1, 1)),
+        policy_full,
+        forward,
+    )
+
+    assert ("policy", "full", None, True) not in calls
+    assert ("policy", "loo", 0, True) in calls
+    assert ("policy", "all_null", None, False) in calls
+    assert all(
+        not need_hidden
+        for role, _, _, need_hidden in calls
+        if role == "reference"
+    )
+    assert policy_full.hidden_states is full_hidden_states
 
 
 def test_loo_cap_masks_unselected_pairs_and_calls_only_selected_conditions():
