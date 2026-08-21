@@ -4,7 +4,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from evidence_window.config import EvidenceWindowConfig, ResidualConfig
+from evidence_window.config import (
+    EvidenceWindowConfig,
+    PreferenceConfig,
+    ReferenceConfig,
+    RelationConfig,
+    ResidualConfig,
+)
 from evidence_window.engine import (
     Condition,
     EvidenceWindowEngine,
@@ -402,4 +408,172 @@ def test_engine_rejects_missing_role_specific_head_provider_when_residual_is_act
                 torch.zeros((1, 2, 2), requires_grad=True),
             ),
             forward,
+        )
+
+
+def test_combined_ew_residual_runs_residual_first_and_reuses_reduced_cache(monkeypatch):
+    """EW must reuse residual condition scores after full hidden tensors are dropped."""
+    config = EvidenceWindowConfig(
+        reference=ReferenceConfig(mode="adapter_disabled"),
+        preference=PreferenceConfig(beta=1.0, lambda_ew=1.0),
+        residual=ResidualConfig(lambda_logit=1.0, vocab_chunk_size=1),
+    )
+    engine = EvidenceWindowEngine(config)
+    prepared: dict[tuple[str, str, int | None], ModelConditionOutput] = {}
+    original_prepare = engine._prepare_output
+
+    def traced_prepare(output, *, role, need_hidden, layout, condition):
+        result = original_prepare(
+            output,
+            role=role,
+            need_hidden=need_hidden,
+            layout=layout,
+            condition=condition,
+        )
+        prepared[(role, condition.kind, condition.evidence_index)] = result
+        return result
+
+    monkeypatch.setattr(engine, "_prepare_output", traced_prepare)
+    calls: list[tuple[str, str, int | None, bool]] = []
+
+    def forward(role, condition, values, need_hidden):
+        del values
+        calls.append((role, condition.kind, condition.evidence_index, need_hidden))
+        hidden = torch.zeros((1, 6, 2)) if need_hidden else None
+        return ModelConditionOutput(torch.zeros((1, 6)), hidden)
+
+    result = engine.compute(
+        _two_pair_layout(),
+        torch.ones((1, 2, 1)),
+        ModelConditionOutput(
+            torch.zeros((1, 6), requires_grad=True),
+            torch.zeros((1, 6, 2), requires_grad=True),
+        ),
+        forward,
+        lm_head_weight=lambda role: torch.eye(2, requires_grad=role == "policy"),
+    )
+
+    assert set(result.losses) == {"ew_dpo", "logit_residual"}
+    assert calls.count(("policy", "loo", 0, True)) == 1
+    assert calls.count(("policy", "loo", 1, True)) == 1
+    assert calls.count(("ema", "full", None, True)) == 1
+    assert calls.count(("ema", "loo", 0, True)) == 1
+    assert calls.count(("ema", "loo", 1, True)) == 1
+    assert calls.index(("ema", "full", None, True)) < next(
+        index for index, call in enumerate(calls) if call[0] == "reference"
+    )
+    assert all(not need_hidden for role, _, _, need_hidden in calls if role == "reference")
+    for key in [
+        ("policy", "full", None),
+        ("policy", "loo", 0),
+        ("policy", "loo", 1),
+        ("ema", "full", None),
+        ("ema", "loo", 0),
+        ("ema", "loo", 1),
+    ]:
+        assert prepared[key].hidden_states is None
+
+
+def test_relation_only_causal_loo_does_not_request_hidden_with_residual_enabled():
+    """Only evidence with selected adjacent targets may retain residual hidden states."""
+    layout = _layout(
+        torch.tensor([[[1, 0, 0, 0], [0, 1, 0, 0]]], dtype=torch.bool),
+        torch.tensor([[[0, 0, 0, 1]]], dtype=torch.bool),
+        torch.ones((1, 2, 1), dtype=torch.bool),
+        torch.tensor([[[0], [1]]], dtype=torch.bool),
+    )
+    config = EvidenceWindowConfig(
+        relation=RelationConfig(lambda_magnitude=1.0),
+        residual=ResidualConfig(lambda_logit=1.0, vocab_chunk_size=1),
+    )
+    calls: list[tuple[str, str, int | None, bool]] = []
+
+    def forward(role, condition, values, need_hidden):
+        del values
+        calls.append((role, condition.kind, condition.evidence_index, need_hidden))
+        hidden = torch.zeros((1, 4, 2)) if need_hidden else None
+        return ModelConditionOutput(torch.zeros((1, 4)), hidden)
+
+    result = EvidenceWindowEngine(config).compute(
+        layout,
+        torch.ones((1, 2, 1)),
+        ModelConditionOutput(
+            torch.zeros((1, 4), requires_grad=True),
+            torch.zeros((1, 4, 2), requires_grad=True),
+        ),
+        forward,
+        lm_head_weight=lambda role: torch.eye(2, requires_grad=role == "policy"),
+    )
+
+    assert set(result.losses) == {"relation_magnitude", "logit_residual"}
+    assert calls.count(("policy", "loo", 0, False)) == 1
+    assert calls.count(("ema", "loo", 0, False)) == 1
+    assert calls.count(("policy", "loo", 1, True)) == 1
+    assert calls.count(("ema", "loo", 1, True)) == 1
+    assert calls.count(("ema", "full", None, True)) == 1
+    assert sum(role == "policy" and kind == "loo" for role, kind, _, _ in calls) == 2
+    assert sum(role == "ema" and kind == "loo" for role, kind, _, _ in calls) == 2
+
+
+def test_empty_actual_residual_targets_need_neither_hidden_nor_head_provider():
+    """A target at position zero has no causal predictor and schedules no residual work."""
+    layout = _layout(
+        torch.ones((1, 1, 1), dtype=torch.bool),
+        torch.ones((1, 1, 1), dtype=torch.bool),
+        torch.ones((1, 1, 1), dtype=torch.bool),
+        torch.ones((1, 1, 1), dtype=torch.bool),
+    )
+    policy_logps = torch.zeros((1, 1), requires_grad=True)
+
+    def unexpected_forward(*_args):
+        raise AssertionError("empty residual targets must not execute a condition")
+
+    result = EvidenceWindowEngine(
+        EvidenceWindowConfig(residual=ResidualConfig(lambda_logit=1.0))
+    ).compute(
+        layout,
+        torch.ones((1, 1, 1)),
+        ModelConditionOutput(policy_logps),
+        unexpected_forward,
+    )
+
+    assert result.losses["logit_residual"].item() == 0.0
+    assert result.losses["logit_residual"].requires_grad
+    assert result.metric_sums["residual/selected_token_count"][0].item() == 0
+    result.total_loss.backward()
+    assert torch.equal(policy_logps.grad, torch.zeros_like(policy_logps))
+
+
+@pytest.mark.parametrize("mismatched_role", ["policy", "ema"])
+def test_loo_hidden_width_mismatch_raises_contextual_value_error(mismatched_role):
+    """A role's incompatible full/LOO widths must fail before tensor subtraction."""
+    layout = _layout(
+        torch.ones((1, 1, 2), dtype=torch.bool),
+        torch.tensor([[[0, 1]]], dtype=torch.bool),
+        torch.ones((1, 1, 1), dtype=torch.bool),
+        torch.ones((1, 1, 1), dtype=torch.bool),
+    )
+    config = EvidenceWindowConfig(residual=ResidualConfig(lambda_logit=1.0))
+
+    def forward(role, condition, values, need_hidden):
+        del values
+        width = 3 if role == mismatched_role and condition.kind == "loo" else 2
+        return ModelConditionOutput(
+            torch.zeros((1, 2)),
+            torch.zeros((1, 2, width)) if need_hidden else None,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{mismatched_role}/loo\(0\).*hidden width.*{mismatched_role}/full",
+    ):
+        EvidenceWindowEngine(config).compute(
+            layout,
+            torch.ones((1, 2, 1)),
+            ModelConditionOutput(
+                torch.zeros((1, 2), requires_grad=True),
+                torch.zeros((1, 2, 2), requires_grad=True),
+            ),
+            forward,
+            lm_head_weight=lambda role: torch.ones((2, 2)),
         )

@@ -102,24 +102,7 @@ class EvidenceWindowEngine:
         """Compute enabled preference objectives from a reused policy/full output."""
         self._validate_inputs(layout, latent_values, policy_full, forward)
         need_residual = self.config.residual.lambda_logit > 0
-        if need_residual and not callable(lm_head_weight):
-            raise ValueError("active logit residual requires an LM-head weight provider")
-        policy_full = self._prepare_output(
-            policy_full,
-            role="policy",
-            need_hidden=self._needs_hidden("policy", Condition("full")),
-            layout=layout,
-            condition=Condition("full"),
-        )
         active_mask = layout.evidence_token_mask.any(dim=1)
-        cache: dict[tuple[str, str, int | None], ModelConditionOutput] = {
-            ("policy", "full", None): policy_full
-        }
-        zero = policy_full.token_logps.sum() * 0.0
-        total_loss = zero
-        losses: dict[str, torch.Tensor] = {}
-        metric_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-
         need_all_null = (
             self.config.preference.lambda_global > 0
             or self.config.preference.lambda_window > 0
@@ -133,6 +116,43 @@ class EvidenceWindowEngine:
         loo_selected = self._selected_evidence(layout, need_loo)
         preference_pair_mask = layout.training_pair_mask & loo_selected.unsqueeze(-1)
         relation_pair_mask = layout.causal_pair_mask & loo_selected.unsqueeze(-1)
+        residual_selections: dict[int, list[tuple[int, torch.Tensor]]] = {}
+        residual_tokens_per_row = torch.zeros(
+            preference_pair_mask.shape[0],
+            dtype=torch.long,
+            device=preference_pair_mask.device,
+        )
+        if need_residual:
+            residual_selections, residual_tokens_per_row = (
+                self._selected_residual_predictors(layout, preference_pair_mask)
+            )
+        if residual_selections and not callable(lm_head_weight):
+            raise ValueError("active logit residual requires an LM-head weight provider")
+
+        def needs_hidden(role: str, condition: Condition) -> bool:
+            if role not in {"policy", "ema"} or not residual_selections:
+                return False
+            if condition.kind == "full":
+                return True
+            return (
+                condition.kind == "loo"
+                and condition.evidence_index in residual_selections
+            )
+
+        policy_full = self._prepare_output(
+            policy_full,
+            role="policy",
+            need_hidden=needs_hidden("policy", Condition("full")),
+            layout=layout,
+            condition=Condition("full"),
+        )
+        cache: dict[tuple[str, str, int | None], ModelConditionOutput] = {
+            ("policy", "full", None): policy_full
+        }
+        zero = policy_full.token_logps.sum() * 0.0
+        total_loss = zero
+        losses: dict[str, torch.Tensor] = {}
+        metric_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         def get(role: str, condition: Condition) -> ModelConditionOutput:
             key = (role, condition.kind, condition.evidence_index)
@@ -151,7 +171,7 @@ class EvidenceWindowEngine:
                     layout.evidence_token_mask,
                     condition.evidence_index,
                 )
-            need_hidden = self._needs_hidden(role, condition)
+            need_hidden = needs_hidden(role, condition)
             if role == "policy":
                 output = forward(role, condition, values, need_hidden)
             else:
@@ -166,6 +186,91 @@ class EvidenceWindowEngine:
             )
             cache[key] = output
             return output
+
+        if need_residual:
+            if residual_selections:
+                assert lm_head_weight is not None
+                policy_full_hidden = self._required_hidden_states(
+                    policy_full,
+                    role="policy",
+                    condition=Condition("full"),
+                )
+                ema_full = get("ema", Condition("full"))
+                ema_full_hidden = self._required_hidden_states(
+                    ema_full,
+                    role="ema",
+                    condition=Condition("full"),
+                )
+                student_residuals: list[torch.Tensor] = []
+                teacher_residuals: list[torch.Tensor] = []
+                for evidence_index, selections in residual_selections.items():
+                    policy_loo = get("policy", Condition("loo", evidence_index))
+                    ema_loo = get("ema", Condition("loo", evidence_index))
+                    policy_loo_hidden = self._required_hidden_states(
+                        policy_loo,
+                        role="policy",
+                        condition=Condition("loo", evidence_index),
+                    )
+                    ema_loo_hidden = self._required_hidden_states(
+                        ema_loo,
+                        role="ema",
+                        condition=Condition("loo", evidence_index),
+                    )
+                    self._validate_hidden_width(
+                        policy_loo_hidden,
+                        full_hidden_states=policy_full_hidden,
+                        role="policy",
+                        condition=Condition("loo", evidence_index),
+                    )
+                    self._validate_hidden_width(
+                        ema_loo_hidden,
+                        full_hidden_states=ema_full_hidden,
+                        role="ema",
+                        condition=Condition("loo", evidence_index),
+                    )
+                    for batch_index, predictor_positions in selections:
+                        student_residuals.append(
+                            policy_full_hidden[batch_index].index_select(
+                                0, predictor_positions
+                            )
+                            - policy_loo_hidden[batch_index].index_select(
+                                0, predictor_positions
+                            )
+                        )
+                        teacher_residuals.append(
+                            ema_full_hidden[batch_index].index_select(
+                                0, predictor_positions
+                            )
+                            - ema_loo_hidden[batch_index].index_select(
+                                0, predictor_positions
+                            )
+                        )
+                    policy_loo.hidden_states = None
+                    ema_loo.hidden_states = None
+                student_dh = torch.cat(student_residuals, dim=0)
+                teacher_dh = torch.cat(teacher_residuals, dim=0)
+                policy_full.hidden_states = None
+                ema_full.hidden_states = None
+                residual_loss = chunked_logit_residual_loss(
+                    student_dh,
+                    teacher_dh,
+                    lm_head_weight("policy"),
+                    lm_head_weight("ema"),
+                    self.config.residual.metric,
+                    self.config.residual.vocab_chunk_size,
+                    self.config.residual.huber_delta,
+                )
+            else:
+                residual_loss = zero
+            self._require_finite("logit residual loss", residual_loss, layout)
+            losses["logit_residual"] = residual_loss
+            total_loss = total_loss + self.config.residual.lambda_logit * residual_loss
+            metric_sums["residual/selected_token_count"] = (
+                residual_tokens_per_row.detach().sum(),
+                residual_tokens_per_row.new_tensor(
+                    residual_tokens_per_row.shape[0]
+                ).detach(),
+            )
 
         if need_all_null:
             visual_window_mask = layout.causal_pair_mask.any(dim=1)
@@ -264,96 +369,6 @@ class EvidenceWindowEngine:
             metric_sums["preference/ew_margin_mean"] = self._masked_sum_and_count(
                 ew_margins,
                 preference_pair_mask,
-            )
-
-        if need_residual:
-            assert lm_head_weight is not None
-            selected_by_evidence, residual_tokens_per_row = (
-                self._selected_residual_predictors(
-                    layout,
-                    preference_pair_mask,
-                )
-            )
-            policy_full_hidden = self._required_hidden_states(
-                policy_full,
-                role="policy",
-                condition=Condition("full"),
-            )
-            if selected_by_evidence:
-                ema_full = get("ema", Condition("full"))
-                ema_full_hidden = self._required_hidden_states(
-                    ema_full,
-                    role="ema",
-                    condition=Condition("full"),
-                )
-                student_residuals: list[torch.Tensor] = []
-                teacher_residuals: list[torch.Tensor] = []
-                for evidence_index, selections in selected_by_evidence.items():
-                    policy_loo = get("policy", Condition("loo", evidence_index))
-                    ema_loo = get("ema", Condition("loo", evidence_index))
-                    policy_loo_hidden = self._required_hidden_states(
-                        policy_loo,
-                        role="policy",
-                        condition=Condition("loo", evidence_index),
-                    )
-                    ema_loo_hidden = self._required_hidden_states(
-                        ema_loo,
-                        role="ema",
-                        condition=Condition("loo", evidence_index),
-                    )
-                    for batch_index, predictor_positions in selections:
-                        student_residuals.append(
-                            policy_full_hidden[batch_index].index_select(
-                                0, predictor_positions
-                            )
-                            - policy_loo_hidden[batch_index].index_select(
-                                0, predictor_positions
-                            )
-                        )
-                        teacher_residuals.append(
-                            ema_full_hidden[batch_index].index_select(
-                                0, predictor_positions
-                            )
-                            - ema_loo_hidden[batch_index].index_select(
-                                0, predictor_positions
-                            )
-                        )
-                    policy_loo.hidden_states = None
-                    ema_loo.hidden_states = None
-                student_dh = torch.cat(student_residuals, dim=0)
-                teacher_dh = torch.cat(teacher_residuals, dim=0)
-                policy_full.hidden_states = None
-                ema_full.hidden_states = None
-                residual_loss = chunked_logit_residual_loss(
-                    student_dh,
-                    teacher_dh,
-                    lm_head_weight("policy"),
-                    lm_head_weight("ema"),
-                    self.config.residual.metric,
-                    self.config.residual.vocab_chunk_size,
-                    self.config.residual.huber_delta,
-                )
-            else:
-                student_weight = lm_head_weight("policy")
-                self._validate_empty_residual_weight(
-                    student_weight,
-                    policy_full_hidden,
-                )
-                residual_loss = (
-                    policy_full_hidden.reshape(-1)[:1].sum() * 0.0
-                    + student_weight.reshape(-1)[0] * 0.0
-                )
-                policy_full.hidden_states = None
-            self._require_finite("logit residual loss", residual_loss, layout)
-            losses["logit_residual"] = residual_loss
-            total_loss = (
-                total_loss + self.config.residual.lambda_logit * residual_loss
-            )
-            metric_sums["residual/selected_token_count"] = (
-                residual_tokens_per_row.detach().sum(),
-                residual_tokens_per_row.new_tensor(
-                    residual_tokens_per_row.shape[0]
-                ).detach(),
             )
 
         relations: dict[str, torch.Tensor] = {}
@@ -470,13 +485,6 @@ class EvidenceWindowEngine:
                 selected[batch_index, indices] = True
         return selected
 
-    def _needs_hidden(self, role: str, condition: Condition) -> bool:
-        return (
-            self.config.residual.lambda_logit > 0
-            and role in {"policy", "ema"}
-            and condition.kind in {"full", "loo"}
-        )
-
     def _selected_residual_predictors(
         self,
         layout: InterleavedLayout,
@@ -526,22 +534,20 @@ class EvidenceWindowEngine:
         return output.hidden_states
 
     @staticmethod
-    def _validate_empty_residual_weight(
-        weight: torch.Tensor,
+    def _validate_hidden_width(
         hidden_states: torch.Tensor,
+        *,
+        full_hidden_states: torch.Tensor,
+        role: str,
+        condition: Condition,
     ) -> None:
-        if (
-            not torch.is_tensor(weight)
-            or weight.ndim != 2
-            or not weight.is_floating_point()
-        ):
-            raise ValueError("policy LM-head weight must be a floating-point matrix")
-        if weight.device != hidden_states.device:
-            raise ValueError("policy LM-head weight and hidden states must share a device")
-        if weight.shape[0] == 0:
-            raise ValueError("policy LM-head vocabulary must be nonempty")
-        if weight.shape[1] != hidden_states.shape[-1]:
-            raise ValueError("policy LM-head hidden size must match hidden states")
+        if hidden_states.shape[-1] != full_hidden_states.shape[-1]:
+            assert condition.kind == "loo"
+            raise ValueError(
+                f"{role}/loo({condition.evidence_index}) hidden width "
+                f"{hidden_states.shape[-1]} must match {role}/full width "
+                f"{full_hidden_states.shape[-1]}"
+            )
 
     def _add_all_null_results(
         self,

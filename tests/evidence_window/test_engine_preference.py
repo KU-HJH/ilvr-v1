@@ -247,16 +247,21 @@ def test_logit_residual_hidden_states_are_requested_only_for_full_and_loo():
     def forward(role, condition, values, need_hidden):
         del values
         calls.append((role, condition.kind, condition.evidence_index, need_hidden))
-        hidden_states = torch.zeros((1, 1, 2)) if need_hidden else None
-        return ModelConditionOutput(torch.zeros((1, 1)), hidden_states)
+        hidden_states = torch.zeros((1, 2, 2)) if need_hidden else None
+        return ModelConditionOutput(torch.zeros((1, 2)), hidden_states)
 
-    full_hidden_states = torch.ones((1, 1, 2), requires_grad=True)
+    full_hidden_states = torch.ones((1, 2, 2), requires_grad=True)
     policy_full = ModelConditionOutput(
-        torch.zeros((1, 1), requires_grad=True),
+        torch.zeros((1, 2), requires_grad=True),
         full_hidden_states,
     )
     EvidenceWindowEngine(config).compute(
-        _scalar_layout(),
+        _layout(
+            torch.tensor([[[1, 0]]], dtype=torch.bool),
+            torch.tensor([[[0, 1]]], dtype=torch.bool),
+            torch.ones((1, 1, 1), dtype=torch.bool),
+            torch.ones((1, 1, 1), dtype=torch.bool),
+        ),
         torch.ones((1, 1, 1)),
         policy_full,
         forward,
