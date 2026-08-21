@@ -12,11 +12,14 @@ from typing import Any, List, Mapping
 
 from evidence_window.config import EvidenceWindowConfig
 from evidence_window.engine import (
+    ConditionExecutionPlan,
     EvidenceWindowEngine,
     EvidenceWindowResult,
     ModelConditionOutput,
+    build_condition_execution_plan,
+    pad_evidence_layout,
 )
-from evidence_window.layout import TokenIds, extract_interleaved_layout
+from evidence_window.layout import InterleavedLayout, TokenIds, extract_interleaved_layout
 from evidence_window.metrics import MatrixJsonlWriter, reduce_sufficient_statistics
 from evidence_window.reference import build_reference_provider
 from evidence_window.scores import chunked_causal_target_logps
@@ -153,6 +156,36 @@ class CustomTrainerStage1(SFTTrainer):
             config.loo.intervention,
             config.loo.max_spans_per_example,
             config.reference.mode,
+        )
+        logging.info(
+            "Evidence-window objective: ce_weight=%s, sim_weight=%s, beta=%s, "
+            "lambda_global=%s, "
+            "lambda_window=%s, lambda_ew=%s, lambda_jsd=%s, "
+            "lambda_magnitude=%s, lambda_logit=%s, relation_temperature=%s, "
+            "relation_huber_delta=%s, residual_metric=%s, "
+            "residual_huber_delta=%s, vocab_chunk_size=%d, "
+            "max_residual_tokens_per_window=%d; diagnostics: "
+            "global_saturation=%s, contribution_threshold=%s, "
+            "matrix_dump_interval=%d, matrix_dump_dir=%s",
+            self.ce_weight,
+            self.sim_weight,
+            config.preference.beta,
+            config.preference.lambda_global,
+            config.preference.lambda_window,
+            config.preference.lambda_ew,
+            config.relation.lambda_jsd,
+            config.relation.lambda_magnitude,
+            config.residual.lambda_logit,
+            config.relation.temperature,
+            config.relation.huber_delta,
+            config.residual.metric,
+            config.residual.huber_delta,
+            config.residual.vocab_chunk_size,
+            config.residual.max_tokens_per_window,
+            str(config.diagnostics.global_saturation).lower(),
+            config.diagnostics.contribution_threshold,
+            config.diagnostics.matrix_dump_interval,
+            config.diagnostics.matrix_dump_dir,
         )
         if self._reference is not None:
             witness = self._reference.witness
@@ -643,9 +676,6 @@ class CustomTrainerStage1(SFTTrainer):
             ordinal_families=(),
             split=split,
         )
-        if context.latent_hidden_states is None:
-            return (context.loss, context.outputs) if return_outputs else context.loss
-
         auxiliary = self._compute_evidence_window(model, context)
         metric_sums = dict(auxiliary.metric_sums)
         ordinal_families = []
@@ -664,8 +694,63 @@ class CustomTrainerStage1(SFTTrainer):
             split=split,
         )
         self._maybe_dump_evidence_window_matrices(auxiliary)
-        loss = context.loss + auxiliary.total_loss
+        weighted_auxiliary = self._compose_globally_weighted_auxiliary_loss(
+            context.loss,
+            auxiliary,
+        )
+        loss = context.loss + weighted_auxiliary
         return (loss, context.outputs) if return_outputs else loss
+
+    def _active_auxiliary_objectives(self) -> tuple[tuple[str, float], ...]:
+        config = self.evidence_window_config
+        candidates = (
+            ("global_preference", config.preference.lambda_global),
+            ("window_preference", config.preference.lambda_window),
+            ("ew_dpo", config.preference.lambda_ew),
+            ("relation_jsd", config.relation.lambda_jsd),
+            ("relation_magnitude", config.relation.lambda_magnitude),
+            ("logit_residual", config.residual.lambda_logit),
+        )
+        return tuple((key, coefficient) for key, coefficient in candidates if coefficient > 0)
+
+    def _compose_globally_weighted_auxiliary_loss(
+        self,
+        zero_source: torch.Tensor,
+        auxiliary: EvidenceWindowResult | None,
+    ) -> torch.Tensor:
+        graph_zero = zero_source * 0.0
+        total = graph_zero
+        world_size = (
+            distributed.get_world_size()
+            if distributed.is_available() and distributed.is_initialized()
+            else 1
+        )
+        for key, coefficient in self._active_auxiliary_objectives():
+            local_loss = graph_zero
+            local_count = torch.zeros(
+                (),
+                dtype=torch.float64,
+                device=zero_source.device,
+            )
+            if auxiliary is not None:
+                local_loss = auxiliary.losses.get(key, graph_zero)
+                statistics = auxiliary.metric_sums.get(f"loss/{key}")
+                if statistics is not None:
+                    local_count = statistics[1].detach().to(
+                        device=zero_source.device,
+                        dtype=torch.float64,
+                    )
+            global_count = local_count.clone()
+            if distributed.is_available() and distributed.is_initialized():
+                distributed.all_reduce(global_count, op=distributed.ReduceOp.SUM)
+            if global_count.item() <= 0:
+                total = total + local_loss * 0.0
+                continue
+            scale = (world_size * local_count / global_count).to(
+                dtype=local_loss.dtype
+            )
+            total = total + coefficient * scale * local_loss
+        return total
 
     def _accumulate_evidence_window_metrics(
         self,
@@ -745,11 +830,13 @@ class CustomTrainerStage1(SFTTrainer):
             numerator, count = synchronized[key]
             reduced = reduce_sufficient_statistics(numerator, count)
             reduced_count = float(reduced.count.detach().cpu().item())
-            if self._is_ordinal_metric(key) and reduced_count <= 0:
+            if reduced_count <= 0:
                 continue
             reduced_numerator = float(reduced.numerator.detach().cpu().item())
             reduced_metrics[key] = (
-                reduced_numerator / reduced_count if reduced_count > 0 else 0.0
+                reduced_numerator
+                if key.endswith("/entropy_valid_count")
+                else reduced_numerator / reduced_count
             )
         return reduced_metrics
 
@@ -808,6 +895,7 @@ class CustomTrainerStage1(SFTTrainer):
                     {
                         f"relation/{role}/top1_ratio",
                         f"relation/{role}/normalized_entropy",
+                        f"relation/{role}/entropy_valid_count",
                         f"relation/{role}/above_threshold_count",
                     }
                 )
@@ -897,17 +985,35 @@ class CustomTrainerStage1(SFTTrainer):
                 "enabled evidence-window loss requires model input(s): "
                 + ", ".join(sorted(missing))
             )
-        if context.image_out_mask is None or context.latent_hidden_states is None:
-            raise RuntimeError("evidence-window context has no active latent condition")
+        input_ids = context.model_inputs["input_ids"]
+        active_mask = context.image_out_mask
+        if active_mask is None:
+            active_mask = torch.zeros_like(input_ids, dtype=torch.bool)
 
         layout = extract_interleaved_layout(
-            context.model_inputs["input_ids"],
+            input_ids,
             context.model_inputs["attention_mask"],
             context.model_inputs["labels"],
-            context.image_out_mask,
+            active_mask,
             self._token_ids,
         )
+        layout, execution_plan = self._synchronize_evidence_window_plan(layout)
         labels = context.model_inputs["labels"]
+        latent_values = context.latent_hidden_states
+        if latent_values is None:
+            hidden_states = self._final_hidden_states(context.outputs)
+            if hidden_states is not None:
+                hidden_size = int(hidden_states.shape[-1])
+                latent_dtype = hidden_states.dtype
+            else:
+                input_embeddings = model.get_input_embeddings().weight
+                hidden_size = int(input_embeddings.shape[-1])
+                latent_dtype = input_embeddings.dtype
+            latent_values = torch.empty(
+                (input_ids.shape[0], 0, hidden_size),
+                dtype=latent_dtype,
+                device=input_ids.device,
+            )
         policy_full = ModelConditionOutput(
             token_logps=self._evidence_token_logps(
                 context.outputs.logits,
@@ -918,7 +1024,11 @@ class CustomTrainerStage1(SFTTrainer):
 
         def forward(role, condition, latent_values, need_hidden):
             del condition
-            condition_inputs = self._condition_inputs(context, latent_values)
+            condition_inputs = self._condition_inputs(
+                context,
+                latent_values,
+                active_mask,
+            )
             return self._forward_evidence_condition(
                 role,
                 model,
@@ -933,23 +1043,62 @@ class CustomTrainerStage1(SFTTrainer):
 
         return self._ew_engine.compute(
             layout,
-            context.latent_hidden_states,
+            latent_values,
             policy_full,
             forward,
             lm_head_weight=lm_head_weight,
+            execution_plan=execution_plan,
+        )
+
+    def _synchronize_evidence_window_plan(
+        self,
+        layout: InterleavedLayout,
+    ) -> tuple[InterleavedLayout, ConditionExecutionPlan]:
+        """Agree on padded evidence ordinals before any auxiliary forward."""
+        if self._ew_engine is None:
+            raise RuntimeError("evidence-window runtime is not initialized")
+        device = layout.evidence_token_mask.device
+        global_count = torch.tensor(
+            layout.evidence_token_mask.shape[1],
+            dtype=torch.long,
+            device=device,
+        )
+        is_distributed = distributed.is_available() and distributed.is_initialized()
+        if is_distributed:
+            distributed.all_reduce(global_count, op=distributed.ReduceOp.MAX)
+        padded = pad_evidence_layout(layout, int(global_count.item()))
+        local_indices = self._ew_engine.selected_evidence_indices(padded)
+        participation = torch.zeros(
+            int(global_count.item()),
+            dtype=torch.long,
+            device=device,
+        )
+        if local_indices:
+            participation[list(local_indices)] = 1
+        if is_distributed and participation.numel():
+            distributed.all_reduce(participation, op=distributed.ReduceOp.MAX)
+        global_indices = tuple(
+            participation.nonzero(as_tuple=False).flatten().tolist()
+        )
+        return padded, build_condition_execution_plan(
+            self.evidence_window_config,
+            global_indices,
         )
 
     @staticmethod
     def _condition_inputs(
         context: _ILVRLossContext,
         latent_values: torch.Tensor,
+        image_out_mask: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         values = dict(context.model_inputs)
         values.pop("labels", None)
         values.pop("pixel_values_latent", None)
         values.pop("image_grid_thw_latent", None)
         values["latent_hidden_states"] = latent_values
-        values["image_out_mask"] = context.image_out_mask
+        values["image_out_mask"] = (
+            context.image_out_mask if image_out_mask is None else image_out_mask
+        )
         values["return_dict"] = True
         return values
 

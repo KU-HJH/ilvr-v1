@@ -61,6 +61,23 @@ class ModelConditionOutput:
     hidden_states: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class ConditionRequest:
+    """One globally ordered auxiliary model forward."""
+
+    role: Literal["policy", "reference", "ema"]
+    condition: Condition
+    need_hidden: bool = False
+
+
+@dataclass(frozen=True)
+class ConditionExecutionPlan:
+    """Canonical cross-rank condition ledger for selected evidence ordinals."""
+
+    evidence_indices: tuple[int, ...]
+    requests: tuple[ConditionRequest, ...]
+
+
 @dataclass
 class EvidenceWindowResult:
     """Auxiliary objective and sufficient statistics returned to the trainer."""
@@ -81,6 +98,100 @@ ConditionForward = Callable[
 LMHeadWeight = Callable[[Literal["policy", "ema"]], torch.Tensor]
 
 
+def build_condition_execution_plan(
+    config: EvidenceWindowConfig,
+    evidence_indices: tuple[int, ...] | list[int],
+) -> ConditionExecutionPlan:
+    """Build the unique forward order every distributed rank must execute."""
+    if not isinstance(config, EvidenceWindowConfig):
+        raise TypeError("config must be an EvidenceWindowConfig")
+    indices = tuple(int(index) for index in evidence_indices)
+    if any(index < 0 for index in indices) or tuple(sorted(set(indices))) != indices:
+        raise ValueError("evidence indices must be sorted, unique, and nonnegative")
+
+    requests: list[ConditionRequest] = []
+    positions: dict[tuple[str, str, int | None], int] = {}
+
+    def add(role: str, condition: Condition, need_hidden: bool = False) -> None:
+        key = (role, condition.kind, condition.evidence_index)
+        previous = positions.get(key)
+        if previous is not None:
+            if need_hidden and not requests[previous].need_hidden:
+                raise RuntimeError("condition plan requested hidden states after score-only use")
+            return
+        positions[key] = len(requests)
+        requests.append(ConditionRequest(role, condition, need_hidden))
+
+    need_residual = config.residual.lambda_logit > 0
+    need_all_null = (
+        config.preference.lambda_global > 0
+        or config.preference.lambda_window > 0
+        or config.diagnostics.global_saturation
+    )
+    need_ew = config.preference.lambda_ew > 0
+    need_relation = (
+        config.relation.lambda_jsd > 0
+        or config.relation.lambda_magnitude > 0
+        or config.diagnostics.matrix_dump_interval > 0
+    )
+
+    if need_residual and indices:
+        add("ema", Condition("full"), True)
+        for index in indices:
+            add("policy", Condition("loo", index), True)
+            add("ema", Condition("loo", index), True)
+    if need_all_null:
+        add("policy", Condition("all_null"))
+        add("reference", Condition("full"))
+        add("reference", Condition("all_null"))
+    if need_ew and indices:
+        add("reference", Condition("full"))
+        for index in indices:
+            add("policy", Condition("loo", index), need_residual)
+            add("reference", Condition("loo", index))
+    if need_relation and indices:
+        add("ema", Condition("full"), need_residual)
+        for index in indices:
+            add("policy", Condition("loo", index), need_residual)
+            add("ema", Condition("loo", index), need_residual)
+    return ConditionExecutionPlan(indices, tuple(requests))
+
+
+def pad_evidence_layout(
+    layout: InterleavedLayout,
+    evidence_count: int,
+) -> InterleavedLayout:
+    """Pad only the evidence dimension with invalid dummy ordinals."""
+    if isinstance(evidence_count, bool) or not isinstance(evidence_count, int):
+        raise TypeError("evidence_count must be an integer")
+    current = int(layout.evidence_token_mask.shape[1])
+    if evidence_count < current:
+        raise ValueError("evidence_count cannot truncate the local layout")
+    if evidence_count == current:
+        return layout
+    amount = evidence_count - current
+
+    def pad(tensor: torch.Tensor, trailing_shape: tuple[int, ...]) -> torch.Tensor:
+        zeros = torch.zeros(
+            (tensor.shape[0], amount, *trailing_shape),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        return torch.cat((tensor, zeros), dim=1)
+
+    token_count = int(layout.evidence_token_mask.shape[2])
+    window_count = int(layout.window_token_mask.shape[1])
+    return InterleavedLayout(
+        evidence_token_mask=pad(layout.evidence_token_mask, (token_count,)),
+        window_token_mask=layout.window_token_mask,
+        evidence_valid=pad(layout.evidence_valid, ()),
+        window_valid=layout.window_valid,
+        causal_pair_mask=pad(layout.causal_pair_mask, (window_count,)),
+        training_pair_mask=pad(layout.training_pair_mask, (window_count,)),
+        native_predecessor=layout.native_predecessor,
+    )
+
+
 class EvidenceWindowEngine:
     """Execute each required condition once and compose preference losses."""
 
@@ -98,6 +209,7 @@ class EvidenceWindowEngine:
         forward: ConditionForward,
         *,
         lm_head_weight: LMHeadWeight | None = None,
+        execution_plan: ConditionExecutionPlan | None = None,
     ) -> EvidenceWindowResult:
         """Compute enabled preference objectives from a reused policy/full output."""
         self._validate_inputs(layout, latent_values, policy_full, forward)
@@ -127,6 +239,24 @@ class EvidenceWindowEngine:
             residual_selections, residual_tokens_per_row = (
                 self._selected_residual_predictors(layout, preference_pair_mask)
             )
+        if execution_plan is None:
+            local_indices: set[int] = set()
+            if self.config.preference.lambda_ew > 0 or need_relation:
+                local_indices.update(
+                    loo_selected.any(dim=0).nonzero(as_tuple=False).flatten().tolist()
+                )
+            if need_residual:
+                local_indices.update(residual_selections)
+            execution_plan = build_condition_execution_plan(
+                self.config,
+                sorted(local_indices),
+            )
+        if any(
+            index >= layout.evidence_token_mask.shape[1]
+            for index in execution_plan.evidence_indices
+        ):
+            raise ValueError("condition plan evidence index exceeds the padded layout")
+        planned_indices = execution_plan.evidence_indices
         if residual_selections and not callable(lm_head_weight):
             raise ValueError("active logit residual requires an LM-head weight provider")
 
@@ -154,6 +284,7 @@ class EvidenceWindowEngine:
         total_loss = zero
         losses: dict[str, torch.Tensor] = {}
         metric_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        actual_requests: list[ConditionRequest] = []
 
         def get(role: str, condition: Condition) -> ModelConditionOutput:
             key = (role, condition.kind, condition.evidence_index)
@@ -166,13 +297,17 @@ class EvidenceWindowEngine:
                 values = apply_all_null(latent_values)
             else:
                 assert condition.evidence_index is not None
-                values = apply_zero_latent_loo(
-                    latent_values,
-                    active_mask,
-                    layout.evidence_token_mask,
-                    condition.evidence_index,
-                )
+                if loo_selected[:, condition.evidence_index].any():
+                    values = apply_zero_latent_loo(
+                        latent_values,
+                        active_mask,
+                        layout.evidence_token_mask,
+                        condition.evidence_index,
+                    )
+                else:
+                    values = latent_values
             need_hidden = needs_hidden(role, condition)
+            actual_requests.append(ConditionRequest(role, condition, need_hidden))
             if role == "policy":
                 output = forward(role, condition, values, need_hidden)
             else:
@@ -189,24 +324,32 @@ class EvidenceWindowEngine:
             return output
 
         if need_residual:
+            student_residuals: list[torch.Tensor] = []
+            teacher_residuals: list[torch.Tensor] = []
+            policy_full_hidden = None
             if residual_selections:
-                assert lm_head_weight is not None
                 policy_full_hidden = self._required_hidden_states(
                     policy_full,
                     role="policy",
                     condition=Condition("full"),
                 )
+            ema_full = None
+            ema_full_hidden = None
+            if planned_indices:
                 ema_full = get("ema", Condition("full"))
-                ema_full_hidden = self._required_hidden_states(
-                    ema_full,
-                    role="ema",
-                    condition=Condition("full"),
-                )
-                student_residuals: list[torch.Tensor] = []
-                teacher_residuals: list[torch.Tensor] = []
-                for evidence_index, selections in residual_selections.items():
-                    policy_loo = get("policy", Condition("loo", evidence_index))
-                    ema_loo = get("ema", Condition("loo", evidence_index))
+                if residual_selections:
+                    ema_full_hidden = self._required_hidden_states(
+                        ema_full,
+                        role="ema",
+                        condition=Condition("full"),
+                    )
+            for evidence_index in planned_indices:
+                policy_loo = get("policy", Condition("loo", evidence_index))
+                ema_loo = get("ema", Condition("loo", evidence_index))
+                selections = residual_selections.get(evidence_index, [])
+                if selections:
+                    assert policy_full_hidden is not None
+                    assert ema_full_hidden is not None
                     policy_loo_hidden = self._required_hidden_states(
                         policy_loo,
                         role="policy",
@@ -246,11 +389,14 @@ class EvidenceWindowEngine:
                                 0, predictor_positions
                             )
                         )
-                    policy_loo.hidden_states = None
-                    ema_loo.hidden_states = None
+                policy_loo.hidden_states = None
+                ema_loo.hidden_states = None
+            if student_residuals:
+                assert callable(lm_head_weight)
                 student_dh = torch.cat(student_residuals, dim=0)
                 teacher_dh = torch.cat(teacher_residuals, dim=0)
                 policy_full.hidden_states = None
+                assert ema_full is not None
                 ema_full.hidden_states = None
                 residual_loss = chunked_logit_residual_loss(
                     student_dh,
@@ -262,6 +408,9 @@ class EvidenceWindowEngine:
                     self.config.residual.huber_delta,
                 )
             else:
+                policy_full.hidden_states = None
+                if ema_full is not None:
+                    ema_full.hidden_states = None
                 residual_loss = zero
             self._require_finite("logit residual loss", residual_loss, layout)
             losses["logit_residual"] = residual_loss
@@ -282,10 +431,10 @@ class EvidenceWindowEngine:
 
         if need_all_null:
             visual_window_mask = layout.causal_pair_mask.any(dim=1)
+            policy_null = get("policy", Condition("all_null"))
+            reference_full = get("reference", Condition("full"))
+            reference_null = get("reference", Condition("all_null"))
             if visual_window_mask.any():
-                policy_null = get("policy", Condition("all_null"))
-                reference_full = get("reference", Condition("full"))
-                reference_null = get("reference", Condition("all_null"))
                 all_null_effect = reference_adjusted_effect(
                     policy_full.token_logps,
                     policy_null.token_logps,
@@ -330,13 +479,17 @@ class EvidenceWindowEngine:
             token_effects: list[torch.Tensor] = []
             reference_full: ModelConditionOutput | None = None
             zero_effect = policy_full.token_logps * 0.0
+            if planned_indices:
+                reference_full = get("reference", Condition("full"))
+                for evidence_index in planned_indices:
+                    get("policy", Condition("loo", evidence_index))
+                    get("reference", Condition("loo", evidence_index))
             for evidence_index in range(evidence_count):
                 if not loo_selected[:, evidence_index].any():
                     token_effects.append(zero_effect)
                     continue
                 policy_loo = get("policy", Condition("loo", evidence_index))
-                if reference_full is None:
-                    reference_full = get("reference", Condition("full"))
+                assert reference_full is not None
                 reference_loo = get("reference", Condition("loo", evidence_index))
                 token_effects.append(
                     reference_adjusted_effect(
@@ -394,6 +547,12 @@ class EvidenceWindowEngine:
 
         relations: dict[str, torch.Tensor] = {}
         if need_relation:
+            ema_full: ModelConditionOutput | None = None
+            if planned_indices:
+                ema_full = get("ema", Condition("full"))
+                for evidence_index in planned_indices:
+                    get("policy", Condition("loo", evidence_index))
+                    get("ema", Condition("loo", evidence_index))
             if relation_pair_mask.any():
                 evidence_count = layout.evidence_token_mask.shape[1]
                 window_lengths = layout.window_token_mask.sum(dim=-1)
@@ -401,7 +560,7 @@ class EvidenceWindowEngine:
                     policy_full.token_logps,
                     layout.window_token_mask,
                 )
-                ema_full = get("ema", Condition("full"))
+                assert ema_full is not None
                 ema_full_sums = masked_token_sums(
                     ema_full.token_logps,
                     layout.window_token_mask,
@@ -477,7 +636,21 @@ class EvidenceWindowEngine:
             selected_per_row = loo_selected.sum(dim=1)
             metric_sums["loo/selected_span_count"] = (
                 selected_per_row.detach().sum(),
-                selected_per_row.new_tensor(selected_per_row.shape[0]).detach(),
+                selected_per_row.detach().gt(0).sum(),
+            )
+
+        expected_keys = tuple(
+            (request.role, request.condition.kind, request.condition.evidence_index)
+            for request in execution_plan.requests
+        )
+        actual_keys = tuple(
+            (request.role, request.condition.kind, request.condition.evidence_index)
+            for request in actual_requests
+        )
+        if actual_keys != expected_keys:
+            raise RuntimeError(
+                "condition execution differed from the canonical plan: "
+                f"expected={expected_keys!r}, actual={actual_keys!r}"
             )
 
         self._require_finite("total evidence-window loss", total_loss, layout)
@@ -505,6 +678,33 @@ class EvidenceWindowEngine:
             if indices:
                 selected[batch_index, indices] = True
         return selected
+
+    def selected_evidence_indices(self, layout: InterleavedLayout) -> tuple[int, ...]:
+        """Return locally selected ordinals without executing model conditions."""
+        need_relation = (
+            self.config.relation.lambda_jsd > 0
+            or self.config.relation.lambda_magnitude > 0
+            or self.config.diagnostics.matrix_dump_interval > 0
+        )
+        need_loo = (
+            self.config.preference.lambda_ew > 0
+            or need_relation
+            or self.config.residual.lambda_logit > 0
+        )
+        selected = self._selected_evidence(layout, need_loo)
+        indices: set[int] = set()
+        if self.config.preference.lambda_ew > 0 or need_relation:
+            indices.update(
+                selected.any(dim=0).nonzero(as_tuple=False).flatten().tolist()
+            )
+        if self.config.residual.lambda_logit > 0:
+            pair_mask = layout.training_pair_mask & selected.unsqueeze(-1)
+            residual_selections, _ = self._selected_residual_predictors(
+                layout,
+                pair_mask,
+            )
+            indices.update(residual_selections)
+        return tuple(sorted(indices))
 
     def _selected_residual_predictors(
         self,
@@ -674,6 +874,11 @@ class EvidenceWindowEngine:
                 metric_sums[
                     f"relation/{role}/normalized_entropy"
                 ] = self._masked_sum_and_count(zeros, window_valid)
+                zero_count = zeros.new_zeros(())
+                metric_sums[f"relation/{role}/entropy_valid_count"] = (
+                    zero_count,
+                    zero_count,
+                )
                 metric_sums[
                     f"relation/{role}/above_threshold_count"
                 ] = self._masked_sum_and_count(zeros, window_valid)
@@ -692,6 +897,13 @@ class EvidenceWindowEngine:
             ] = self._masked_sum_and_count(
                 summaries.normalized_entropy,
                 summaries.entropy_valid,
+            )
+            entropy_valid_count = summaries.entropy_valid.detach().sum().to(
+                dtype=values.dtype
+            )
+            metric_sums[f"relation/{role}/entropy_valid_count"] = (
+                entropy_valid_count,
+                entropy_valid_count,
             )
             metric_sums[
                 f"relation/{role}/above_threshold_count"
@@ -874,9 +1086,13 @@ class EvidenceWindowEngine:
 
 __all__ = [
     "Condition",
+    "ConditionExecutionPlan",
     "ConditionForward",
+    "ConditionRequest",
     "EvidenceWindowEngine",
     "EvidenceWindowResult",
     "LMHeadWeight",
     "ModelConditionOutput",
+    "build_condition_execution_plan",
+    "pad_evidence_layout",
 ]
