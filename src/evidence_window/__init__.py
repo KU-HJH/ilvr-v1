@@ -1,6 +1,13 @@
 """Configuration and runtime helpers for evidence-window training."""
 
 from .config import EvidenceWindowConfig
+from .engine import (
+    Condition,
+    ConditionForward,
+    EvidenceWindowEngine,
+    EvidenceWindowResult,
+    ModelConditionOutput,
+)
 from .layout import InterleavedLayout, TokenIds, extract_interleaved_layout
 from .interventions import apply_all_null, apply_zero_latent_loo, select_loo_spans
 from .losses import (
@@ -32,6 +39,11 @@ from .reference import (
 
 __all__ = [
     "EvidenceWindowConfig",
+    "Condition",
+    "ConditionForward",
+    "EvidenceWindowEngine",
+    "EvidenceWindowResult",
+    "ModelConditionOutput",
     "InterleavedLayout",
     "TokenIds",
     "extract_interleaved_layout",
