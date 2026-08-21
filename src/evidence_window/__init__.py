@@ -24,7 +24,9 @@ from .metrics import (
     reduce_sufficient_statistics,
 )
 from .scores import (
+    DEFAULT_CAUSAL_TOKEN_CHUNK_SIZE,
     causal_token_logps,
+    chunked_causal_target_logps,
     evidence_window_margins,
     masked_token_sums,
     reference_adjusted_effect,
@@ -50,7 +52,9 @@ __all__ = [
     "apply_zero_latent_loo",
     "apply_all_null",
     "select_loo_spans",
+    "DEFAULT_CAUSAL_TOKEN_CHUNK_SIZE",
     "causal_token_logps",
+    "chunked_causal_target_logps",
     "masked_token_sums",
     "reference_adjusted_effect",
     "evidence_window_margins",

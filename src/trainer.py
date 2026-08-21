@@ -13,7 +13,7 @@ from evidence_window.config import EvidenceWindowConfig
 from evidence_window.engine import EvidenceWindowEngine, ModelConditionOutput
 from evidence_window.layout import TokenIds, extract_interleaved_layout
 from evidence_window.reference import build_reference_provider
-from evidence_window.scores import causal_token_logps
+from evidence_window.scores import chunked_causal_target_logps
 
 try:
     from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
@@ -644,8 +644,8 @@ class CustomTrainerStage1(SFTTrainer):
         )
         labels = context.model_inputs["labels"]
         policy_full = ModelConditionOutput(
-            token_logps=causal_token_logps(
-                context.outputs.logits.float(),
+            token_logps=self._evidence_token_logps(
+                context.outputs.logits,
                 labels.to(context.outputs.logits.device),
             ),
             hidden_states=self._final_hidden_states(context.outputs),
@@ -722,12 +722,25 @@ class CustomTrainerStage1(SFTTrainer):
         else:
             with torch.no_grad():
                 outputs = call()
-        token_logps = causal_token_logps(
-            outputs.logits.float(),
+        token_logps = self._evidence_token_logps(
+            outputs.logits,
             role_labels.to(outputs.logits.device),
         )
         hidden_states = self._final_hidden_states(outputs) if need_hidden else None
         return ModelConditionOutput(token_logps, hidden_states)
+
+    @staticmethod
+    def _evidence_token_logps(
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        target_logps = chunked_causal_target_logps(logits, labels)
+        if logits.shape[1] == 0:
+            return target_logps
+        return torch.cat(
+            (target_logps.new_zeros((logits.shape[0], 1)), target_logps),
+            dim=1,
+        )
 
     @staticmethod
     def _final_hidden_states(outputs: object) -> torch.Tensor | None:

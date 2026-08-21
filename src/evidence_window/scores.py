@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+import operator
+
 import torch
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+
+# Caps each temporary FP32 vocabulary activation at [B, 32, V].  Auxiliary
+# evidence scoring deliberately uses a fixed implementation detail rather than
+# adding another experiment knob.
+DEFAULT_CAUSAL_TOKEN_CHUNK_SIZE = 32
 
 
 def causal_token_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -38,6 +48,91 @@ def causal_token_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tens
     )
     selected = selected * valid.to(dtype=selected.dtype)
     return torch.cat((logits.new_zeros((logits.shape[0], 1)), selected), dim=1)
+
+
+def chunked_causal_target_logps(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    token_chunk_size: int = DEFAULT_CAUSAL_TOKEN_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Return causal target scores in bounded FP32 token chunks.
+
+    The result has shape ``[B, max(T - 1, 0)]``: result position ``t - 1``
+    scores label position ``t``.  Ignored labels (``-100``) have exactly zero
+    score.  Grad-enabled chunks are checkpointed so backward recomputes the
+    bounded FP32 log-softmax instead of retaining every vocabulary activation.
+    """
+    if not torch.is_tensor(logits) or logits.ndim != 3:
+        raise ValueError("logits must have shape [B, T, V]")
+    if not torch.is_tensor(labels) or labels.ndim != 2:
+        raise ValueError("labels must have shape [B, T]")
+    if labels.shape != logits.shape[:2]:
+        raise ValueError("labels must have shape [B, T] matching logits")
+    if labels.device != logits.device:
+        raise ValueError("labels and logits must be on the same device")
+    if labels.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
+        raise ValueError("labels must have an integer dtype")
+    if isinstance(token_chunk_size, bool):
+        raise ValueError("token_chunk_size must be a positive integer")
+    try:
+        token_chunk_size = operator.index(token_chunk_size)
+    except TypeError as exc:
+        raise ValueError("token_chunk_size must be a positive integer") from exc
+    if token_chunk_size <= 0:
+        raise ValueError("token_chunk_size must be a positive integer")
+
+    targets = labels[:, 1:]
+    valid = targets.ne(-100)
+    if valid.any():
+        valid_targets = targets[valid]
+        if valid_targets.min() < 0 or valid_targets.max() >= logits.shape[-1]:
+            raise ValueError("labels contain a target outside the logits vocabulary")
+    if targets.shape[1] == 0:
+        return torch.empty(
+            (logits.shape[0], 0),
+            dtype=torch.float32,
+            device=logits.device,
+        )
+
+    safe_targets = targets.clamp_min(0).to(dtype=torch.long)
+    chunks = []
+    for start in range(0, targets.shape[1], token_chunk_size):
+        stop = min(start + token_chunk_size, targets.shape[1])
+        chunk_logits = logits[:, start:stop]
+        chunk_targets = safe_targets[:, start:stop]
+        chunk_valid = valid[:, start:stop]
+        if torch.is_grad_enabled() and chunk_logits.requires_grad:
+            selected = checkpoint(
+                _fp32_target_logps_chunk,
+                chunk_logits,
+                chunk_targets,
+                chunk_valid,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            selected = _fp32_target_logps_chunk(
+                chunk_logits,
+                chunk_targets,
+                chunk_valid,
+            )
+        chunks.append(selected)
+    return torch.cat(chunks, dim=1)
+
+
+def _fp32_target_logps_chunk(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    fp32_logits = logits.float()
+    selected = (
+        F.log_softmax(fp32_logits, dim=-1)
+        .gather(-1, targets.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    return selected * valid.to(dtype=torch.float32)
 
 
 def masked_token_sums(scores: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
