@@ -124,7 +124,7 @@ class EvidenceWindowConfig:
             self.diagnostics.matrix_dump_interval,
             "diagnostics.matrix_dump_interval",
         )
-        _require_number(
+        _require_nonnegative(
             self.diagnostics.contribution_threshold,
             "diagnostics.contribution_threshold",
         )

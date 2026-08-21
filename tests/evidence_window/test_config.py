@@ -82,6 +82,15 @@ def test_invalid_values_fail_at_startup(tmp_path, section, value):
         EvidenceWindowConfig.from_json(path)
 
 
+def test_negative_contribution_threshold_fails(tmp_path):
+    path = tmp_path / "invalid.json"
+    path.write_text(
+        json.dumps({"version": 1, "diagnostics": {"contribution_threshold": -0.1}})
+    )
+    with pytest.raises(ValueError, match="contribution_threshold"):
+        EvidenceWindowConfig.from_json(path)
+
+
 def test_nested_unknown_key_fails(tmp_path):
     path = tmp_path / "bad.json"
     path.write_text(json.dumps({"version": 1, "relation": {"unknown": True}}))
