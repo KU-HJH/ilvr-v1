@@ -22,6 +22,13 @@ from .scores import (
     masked_token_sums,
     reference_adjusted_effect,
 )
+from .reference import (
+    AdapterDisabledReference,
+    FrozenCopyReference,
+    ParameterWitness,
+    ReferenceProvider,
+    build_reference_provider,
+)
 
 __all__ = [
     "EvidenceWindowConfig",
@@ -44,4 +51,9 @@ __all__ = [
     "global_outer_coefficient",
     "reduce_sufficient_statistics",
     "MatrixJsonlWriter",
+    "AdapterDisabledReference",
+    "FrozenCopyReference",
+    "ParameterWitness",
+    "ReferenceProvider",
+    "build_reference_provider",
 ]
