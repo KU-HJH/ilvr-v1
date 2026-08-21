@@ -289,7 +289,7 @@ For a LoRA EW run, add the usual dataset/output arguments used by
 `run_training.sh`:
 
 ```bash
-source ./venv/ilvr-venv/bin/activate
+source /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/venv/ilvr-venv/bin/activate
 accelerate launch --num_processes="${NUM_PROCESSES}" src/main.py \
   --stage stage1 --task zebra-cot \
   --data_path /path/to/TRAIN.jsonl \
@@ -304,7 +304,7 @@ The explicit frozen-reference ZeRO-2 variant is launched with the stage-2
 configuration; the program never switches stages implicitly:
 
 ```bash
-source ./venv/ilvr-venv/bin/activate
+source /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/venv/ilvr-venv/bin/activate
 accelerate launch --num_processes="${NUM_PROCESSES}" src/main.py \
   --stage stage1 --task zebra-cot \
   --data_path /path/to/TRAIN.jsonl \
