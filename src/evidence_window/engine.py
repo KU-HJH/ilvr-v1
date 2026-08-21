@@ -111,6 +111,7 @@ class EvidenceWindowEngine:
         need_relation = (
             self.config.relation.lambda_jsd > 0
             or self.config.relation.lambda_magnitude > 0
+            or self.config.diagnostics.matrix_dump_interval > 0
         )
         need_loo = self.config.preference.lambda_ew > 0 or need_relation or need_residual
         loo_selected = self._selected_evidence(layout, need_loo)
@@ -265,8 +266,15 @@ class EvidenceWindowEngine:
             self._require_finite("logit residual loss", residual_loss, layout)
             losses["logit_residual"] = residual_loss
             total_loss = total_loss + self.config.residual.lambda_logit * residual_loss
+            residual_count = residual_tokens_per_row.detach().sum()
+            self._add_loss_metric(
+                metric_sums,
+                "logit_residual",
+                residual_loss,
+                residual_count,
+            )
             metric_sums["residual/selected_token_count"] = (
-                residual_tokens_per_row.detach().sum(),
+                residual_count,
                 residual_tokens_per_row.new_tensor(
                     residual_tokens_per_row.shape[0]
                 ).detach(),
@@ -369,6 +377,19 @@ class EvidenceWindowEngine:
             metric_sums["preference/ew_margin_mean"] = self._masked_sum_and_count(
                 ew_margins,
                 preference_pair_mask,
+            )
+            self._add_loss_metric(
+                metric_sums,
+                "ew_dpo",
+                ew_loss,
+                preference_pair_mask.detach().sum(),
+            )
+            self._add_ordinal_metrics(
+                metric_sums,
+                "preference/ew_margin",
+                ew_margins,
+                preference_pair_mask,
+                layout.native_predecessor,
             )
 
         relations: dict[str, torch.Tensor] = {}
@@ -562,10 +583,22 @@ class EvidenceWindowEngine:
             loss = global_preference_loss(window_margins, valid, beta)
             self._require_finite("global preference loss", loss, layout)
             losses["global_preference"] = loss
+            self._add_loss_metric(
+                metric_sums,
+                "global_preference",
+                loss,
+                valid.any(dim=1).detach().sum(),
+            )
         if self.config.preference.lambda_window > 0:
             loss = window_preference_loss(window_margins, valid, beta)
             self._require_finite("window preference loss", loss, layout)
             losses["window_preference"] = loss
+            self._add_loss_metric(
+                metric_sums,
+                "window_preference",
+                loss,
+                valid.detach().sum(),
+            )
 
         global_margins = (window_margins * valid.to(window_margins.dtype)).sum(dim=1)
         row_valid = valid.any(dim=1)
@@ -582,6 +615,13 @@ class EvidenceWindowEngine:
             window_margins,
             valid,
         )
+        self._add_ordinal_metrics(
+            metric_sums,
+            "preference/window_margin",
+            window_margins,
+            valid,
+            layout.native_predecessor,
+        )
 
     def _add_relation_results(
         self,
@@ -593,7 +633,7 @@ class EvidenceWindowEngine:
         layout: InterleavedLayout,
     ) -> None:
         if self.config.relation.lambda_jsd > 0:
-            loss, _ = masked_relation_jsd(
+            loss, count = masked_relation_jsd(
                 student,
                 teacher,
                 valid,
@@ -601,8 +641,14 @@ class EvidenceWindowEngine:
             )
             self._require_finite("relation JSD loss", loss, layout)
             losses["relation_jsd"] = loss
+            self._add_loss_metric(
+                metric_sums,
+                "relation_jsd",
+                loss,
+                count.detach(),
+            )
         if self.config.relation.lambda_magnitude > 0:
-            loss, _ = masked_relation_huber(
+            loss, count = masked_relation_huber(
                 student,
                 teacher,
                 valid,
@@ -610,6 +656,12 @@ class EvidenceWindowEngine:
             )
             self._require_finite("relation magnitude loss", loss, layout)
             losses["relation_magnitude"] = loss
+            self._add_loss_metric(
+                metric_sums,
+                "relation_magnitude",
+                loss,
+                count.detach(),
+            )
 
         window_valid = valid.any(dim=1)
         for role, values in (("student", student), ("teacher", teacher)):
@@ -659,6 +711,45 @@ class EvidenceWindowEngine:
             (detached_values * detached_mask).sum(),
             detached_mask.sum(),
         )
+
+    @staticmethod
+    def _add_loss_metric(
+        metric_sums: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        name: str,
+        loss: torch.Tensor,
+        count: torch.Tensor,
+    ) -> None:
+        detached_count = count.detach()
+        metric_sums[f"loss/{name}"] = (
+            loss.detach() * detached_count.to(dtype=loss.dtype),
+            detached_count,
+        )
+
+    @classmethod
+    def _add_ordinal_metrics(
+        cls,
+        metric_sums: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        prefix: str,
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        native_predecessor: torch.Tensor,
+    ) -> None:
+        ordinals = sorted(
+            ordinal
+            for ordinal in native_predecessor.detach().unique().tolist()
+            if ordinal >= 0
+        )
+        for ordinal in ordinals:
+            ordinal_mask = native_predecessor.eq(ordinal)
+            if mask.ndim == 3:
+                ordinal_mask = ordinal_mask.unsqueeze(1).expand_as(mask)
+            ordinal_mask = mask & ordinal_mask
+            if not ordinal_mask.any().item():
+                continue
+            metric_sums[f"{prefix}/{ordinal}"] = cls._masked_sum_and_count(
+                values,
+                ordinal_mask,
+            )
 
     def _prepare_output(
         self,

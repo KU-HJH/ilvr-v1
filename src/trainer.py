@@ -1,5 +1,6 @@
 from trl import SFTTrainer
 import torch
+import torch.distributed as distributed
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -10,8 +11,13 @@ from dataclasses import dataclass
 from typing import Any, List, Mapping
 
 from evidence_window.config import EvidenceWindowConfig
-from evidence_window.engine import EvidenceWindowEngine, ModelConditionOutput
+from evidence_window.engine import (
+    EvidenceWindowEngine,
+    EvidenceWindowResult,
+    ModelConditionOutput,
+)
 from evidence_window.layout import TokenIds, extract_interleaved_layout
+from evidence_window.metrics import MatrixJsonlWriter, reduce_sufficient_statistics
 from evidence_window.reference import build_reference_provider
 from evidence_window.scores import chunked_causal_target_logps
 
@@ -83,7 +89,12 @@ class CustomTrainerStage1(SFTTrainer):
         self._ew_engine = None
         self._reference = None
         self._token_ids = None
+        self._ew_pending_metrics = None
+        self._ew_matrix_writer = None
+        self._ew_matrix_observation_counter = 0
+        self._ew_last_matrix_dump_step = None
         if not self.evidence_window_config.is_disabled:
+            self._ew_pending_metrics = {"train": {}, "eval": {}}
             self._token_ids = self._resolve_token_ids(latent_token_ids)
             self._ew_engine = EvidenceWindowEngine(self.evidence_window_config)
             if self.evidence_window_config.residual.lambda_logit > 0:
@@ -616,11 +627,265 @@ class CustomTrainerStage1(SFTTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         context = self._compute_ilvr_loss_context(model, inputs, num_items_in_batch)
-        if self._ew_engine is None or context.latent_hidden_states is None:
+        if self._ew_engine is None:
             return (context.loss, context.outputs) if return_outputs else context.loss
+        batch_size = int(context.model_inputs["input_ids"].shape[0])
+        batch_count = context.loss.new_tensor(batch_size).detach()
+        split = "train" if model.training else "eval"
+        self._accumulate_evidence_window_metrics(
+            {
+                "loss/ilvr": (
+                    context.loss.detach()
+                    * batch_count.to(dtype=context.loss.dtype),
+                    batch_count,
+                )
+            },
+            ordinal_families=(),
+            split=split,
+        )
+        if context.latent_hidden_states is None:
+            return (context.loss, context.outputs) if return_outputs else context.loss
+
         auxiliary = self._compute_evidence_window(model, context)
+        metric_sums = dict(auxiliary.metric_sums)
+        ordinal_families = []
+        config = self.evidence_window_config
+        if (
+            config.preference.lambda_global > 0
+            or config.preference.lambda_window > 0
+            or config.diagnostics.global_saturation
+        ):
+            ordinal_families.append("preference/window_margin")
+        if config.preference.lambda_ew > 0:
+            ordinal_families.append("preference/ew_margin")
+        self._accumulate_evidence_window_metrics(
+            metric_sums,
+            ordinal_families=ordinal_families,
+            split=split,
+        )
+        self._maybe_dump_evidence_window_matrices(auxiliary)
         loss = context.loss + auxiliary.total_loss
         return (loss, context.outputs) if return_outputs else loss
+
+    def _accumulate_evidence_window_metrics(
+        self,
+        metric_sums: Mapping[str, tuple[torch.Tensor, torch.Tensor]],
+        *,
+        ordinal_families: tuple[str, ...] | list[str],
+        split: str = "train",
+    ) -> None:
+        if not metric_sums:
+            return
+        if self._ew_pending_metrics is None:
+            self._ew_pending_metrics = {"train": {}, "eval": {}}
+        if split not in {"train", "eval"}:
+            raise ValueError("metric split must be 'train' or 'eval'")
+        del ordinal_families
+
+        pending = self._ew_pending_metrics[split]
+        for key, (numerator, count) in metric_sums.items():
+            local_numerator = numerator.detach().to(dtype=torch.float64)
+            local_count = count.detach().to(
+                device=local_numerator.device,
+                dtype=torch.float64,
+            )
+            previous = pending.get(key)
+            if previous is None:
+                pending[key] = (local_numerator, local_count)
+            else:
+                pending[key] = (
+                    previous[0] + local_numerator,
+                    previous[1] + local_count,
+                )
+
+    def _reduce_evidence_window_metrics(self, split: str) -> dict[str, float]:
+        if split not in {"train", "eval"}:
+            raise ValueError("metric split must be 'train' or 'eval'")
+        if self._ew_pending_metrics is None:
+            return {}
+
+        synchronized = dict(self._ew_pending_metrics[split])
+        if synchronized:
+            device = next(iter(synchronized.values()))[0].device
+        else:
+            device = self._module_device(self.model)
+        has_pending = torch.tensor(
+            1.0 if synchronized else 0.0,
+            dtype=torch.float64,
+            device=device,
+        )
+        if distributed.is_available() and distributed.is_initialized():
+            distributed.all_reduce(has_pending, op=distributed.ReduceOp.SUM)
+        if has_pending.item() == 0:
+            return {}
+
+        zero = torch.zeros((), dtype=torch.float64, device=device)
+        for key in self._expected_evidence_metric_keys():
+            synchronized.setdefault(key, (zero, zero))
+
+        for family in self._ordinal_metric_families():
+            prefix = family + "/"
+            local_ordinals = [
+                int(key[len(prefix):])
+                for key in synchronized
+                if key.startswith(prefix) and key[len(prefix):].isdigit()
+            ]
+            max_ordinal = torch.tensor(
+                max(local_ordinals, default=-1),
+                dtype=torch.long,
+                device=device,
+            )
+            if distributed.is_available() and distributed.is_initialized():
+                distributed.all_reduce(max_ordinal, op=distributed.ReduceOp.MAX)
+            for ordinal in range(int(max_ordinal.item()) + 1):
+                synchronized.setdefault(f"{family}/{ordinal}", (zero, zero))
+
+        reduced_metrics = {}
+        for key in sorted(synchronized):
+            numerator, count = synchronized[key]
+            reduced = reduce_sufficient_statistics(numerator, count)
+            reduced_count = float(reduced.count.detach().cpu().item())
+            if self._is_ordinal_metric(key) and reduced_count <= 0:
+                continue
+            reduced_numerator = float(reduced.numerator.detach().cpu().item())
+            reduced_metrics[key] = (
+                reduced_numerator / reduced_count if reduced_count > 0 else 0.0
+            )
+        return reduced_metrics
+
+    def _ordinal_metric_families(self) -> tuple[str, ...]:
+        config = self.evidence_window_config
+        families = []
+        if (
+            config.preference.lambda_global > 0
+            or config.preference.lambda_window > 0
+            or config.diagnostics.global_saturation
+        ):
+            families.append("preference/window_margin")
+        if config.preference.lambda_ew > 0:
+            families.append("preference/ew_margin")
+        return tuple(families)
+
+    def _expected_evidence_metric_keys(self) -> set[str]:
+        config = self.evidence_window_config
+        keys = {"loss/ilvr"}
+        need_all_null = (
+            config.preference.lambda_global > 0
+            or config.preference.lambda_window > 0
+            or config.diagnostics.global_saturation
+        )
+        need_relation = (
+            config.relation.lambda_jsd > 0
+            or config.relation.lambda_magnitude > 0
+            or config.diagnostics.matrix_dump_interval > 0
+        )
+        need_loo = (
+            config.preference.lambda_ew > 0
+            or need_relation
+            or config.residual.lambda_logit > 0
+        )
+        if config.preference.lambda_global > 0:
+            keys.add("loss/global_preference")
+        if config.preference.lambda_window > 0:
+            keys.add("loss/window_preference")
+        if need_all_null:
+            keys.update(
+                {
+                    "preference/global_margin",
+                    "preference/global_outer_weight",
+                    "preference/window_margin_mean",
+                }
+            )
+        if config.preference.lambda_ew > 0:
+            keys.update({"loss/ew_dpo", "preference/ew_margin_mean"})
+        if config.relation.lambda_jsd > 0:
+            keys.add("loss/relation_jsd")
+        if config.relation.lambda_magnitude > 0:
+            keys.add("loss/relation_magnitude")
+        if need_relation:
+            for role in ("student", "teacher"):
+                keys.update(
+                    {
+                        f"relation/{role}/top1_ratio",
+                        f"relation/{role}/normalized_entropy",
+                        f"relation/{role}/above_threshold_count",
+                    }
+                )
+        if config.residual.lambda_logit > 0:
+            keys.update({"loss/logit_residual", "residual/selected_token_count"})
+        if need_loo:
+            keys.add("loo/selected_span_count")
+        return keys
+
+    @staticmethod
+    def _is_ordinal_metric(key: str) -> bool:
+        return any(
+            key.startswith(prefix)
+            and key[len(prefix):].isdigit()
+            for prefix in (
+                "preference/window_margin/",
+                "preference/ew_margin/",
+            )
+        )
+
+    def _maybe_dump_evidence_window_matrices(
+        self,
+        auxiliary: EvidenceWindowResult,
+    ) -> None:
+        diagnostics = self.evidence_window_config.diagnostics
+        interval = diagnostics.matrix_dump_interval
+        if interval <= 0:
+            return
+        state = getattr(self, "state", None)
+        step = getattr(state, "global_step", None)
+        if isinstance(step, bool) or not isinstance(step, int):
+            return
+        if step <= 0 or step % interval != 0 or step == self._ew_last_matrix_dump_step:
+            return
+
+        relation = auxiliary.relations.get("student")
+        pair_mask = auxiliary.relation_pair_mask
+        if relation is None:
+            relation = auxiliary.ew_margins
+            pair_mask = auxiliary.preference_pair_mask
+        if relation is None:
+            return
+
+        if self._ew_matrix_writer is None:
+            rank = getattr(self.accelerator, "process_index", None)
+            if rank is None:
+                rank = (
+                    distributed.get_rank()
+                    if distributed.is_available() and distributed.is_initialized()
+                    else 0
+                )
+            self._ew_matrix_writer = MatrixJsonlWriter(
+                diagnostics.matrix_dump_dir,
+                rank=int(rank),
+            )
+        self._ew_matrix_writer.write(
+            step,
+            self._ew_matrix_observation_counter,
+            relation.detach(),
+            pair_mask.detach(),
+        )
+        self._ew_matrix_observation_counter += 1
+        self._ew_last_matrix_dump_step = step
+
+    def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        pending = self._ew_pending_metrics
+        if pending is None:
+            super().log(logs, start_time)
+            return
+
+        is_evaluation = any(key.startswith("eval_") for key in logs)
+        split = "eval" if is_evaluation else "train"
+        reduced = self._reduce_evidence_window_metrics(split)
+        combined = dict(logs)
+        for key, value in reduced.items():
+            combined[f"eval_{key}" if is_evaluation else key] = value
+        super().log(combined, start_time)
+        pending[split].clear()
 
     def _compute_evidence_window(self, model, context: _ILVRLossContext):
         if self._ew_engine is None or self._token_ids is None:

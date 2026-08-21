@@ -165,6 +165,7 @@ class EvidenceWindowConfig:
             self.relation.lambda_jsd > 0
             or self.relation.lambda_magnitude > 0
             or self.residual.lambda_logit > 0
+            or self.diagnostics.matrix_dump_interval > 0
         )
 
         if role == "policy":
@@ -175,11 +176,12 @@ class EvidenceWindowConfig:
                 conditions.update({"full", "loo"})
             return frozenset(conditions)
         if role == "reference":
+            conditions = set()
             if needs_global:
-                return frozenset({"full", "all_null"})
+                conditions.update({"full", "all_null"})
             if needs_loo_preference:
-                return frozenset({"full", "loo"})
-            return frozenset()
+                conditions.update({"full", "loo"})
+            return frozenset(conditions)
         if needs_relation:
             return frozenset({"full", "loo"})
         return frozenset()

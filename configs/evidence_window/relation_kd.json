@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "reference": {"mode": "none"},
+  "preference": {"beta": 0.1, "lambda_global": 0.0, "lambda_window": 0.0, "lambda_ew": 0.0},
+  "relation": {"lambda_jsd": 1.0, "lambda_magnitude": 1.0, "temperature": 1.0, "huber_delta": 1.0},
+  "residual": {"lambda_logit": 0.0, "metric": "huber", "huber_delta": 1.0, "vocab_chunk_size": 4096, "max_tokens_per_window": 0},
+  "loo": {"intervention": "zero_latent", "max_spans_per_example": 0},
+  "diagnostics": {"global_saturation": false, "contribution_threshold": 0.0, "matrix_dump_interval": 0, "matrix_dump_dir": "evidence_window_matrices"}
+}
