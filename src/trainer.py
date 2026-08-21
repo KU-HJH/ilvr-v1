@@ -4,8 +4,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import copy
+import logging
 import deepspeed
-from typing import List
+from dataclasses import dataclass
+from typing import Any, List, Mapping
+
+from evidence_window.config import EvidenceWindowConfig
+from evidence_window.engine import EvidenceWindowEngine, ModelConditionOutput
+from evidence_window.layout import TokenIds, extract_interleaved_layout
+from evidence_window.reference import build_reference_provider
+from evidence_window.scores import causal_token_logps
 
 try:
     from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
@@ -34,6 +42,15 @@ class _EMATeacher:
             p_t.data.mul_(d).add_(p_s.data, alpha=(1.0 - d))
 
 
+@dataclass
+class _ILVRLossContext:
+    loss: torch.Tensor
+    outputs: object
+    latent_hidden_states: torch.Tensor | None
+    image_out_mask: torch.Tensor | None
+    model_inputs: dict[str, Any]
+
+
 class CustomTrainerStage1(SFTTrainer):
     def __init__(
         self,
@@ -44,6 +61,8 @@ class CustomTrainerStage1(SFTTrainer):
         image_pool_k: int = 8,
         ce_weight: float = 1.0,
         helper_group_L: int = 256,
+        evidence_window_config: EvidenceWindowConfig | None = None,
+        latent_token_ids: Mapping[str, Any] | TokenIds | None = None,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -53,6 +72,110 @@ class CustomTrainerStage1(SFTTrainer):
         self.ce_weight = float(ce_weight)
         self.image_pool_k = int(image_pool_k)
         self._ema = _EMATeacher(self.model, decay=float(ema_tau))
+        self.evidence_window_config = (
+            EvidenceWindowConfig.disabled()
+            if evidence_window_config is None
+            else evidence_window_config
+        )
+        if not isinstance(self.evidence_window_config, EvidenceWindowConfig):
+            raise TypeError("evidence_window_config must be an EvidenceWindowConfig")
+        self.evidence_window_config.validate()
+        self._ew_engine = None
+        self._reference = None
+        self._token_ids = None
+        if not self.evidence_window_config.is_disabled:
+            self._token_ids = self._resolve_token_ids(latent_token_ids)
+            self._ew_engine = EvidenceWindowEngine(self.evidence_window_config)
+            if self.evidence_window_config.residual.lambda_logit > 0:
+                self._output_embedding_weight(self.model, role="policy")
+                self._output_embedding_weight(self._ema.teacher, role="ema")
+            self._reference = build_reference_provider(
+                self.evidence_window_config.reference,
+                self.model,
+                self.accelerator,
+            )
+            self._log_evidence_window_startup()
+
+    @staticmethod
+    def _resolve_token_ids(
+        configured: Mapping[str, Any] | TokenIds | None,
+    ) -> TokenIds:
+        if isinstance(configured, TokenIds):
+            return configured
+        if configured is None or not isinstance(configured, Mapping):
+            raise ValueError("enabled evidence-window training requires latent_token_ids")
+        required = {"start", "end", "pad", "padding", "special"}
+        missing = required - set(configured)
+        if missing:
+            raise ValueError(
+                "latent_token_ids missing required key(s): " + ", ".join(sorted(missing))
+            )
+        scalar_values = {}
+        for source, target in (
+            ("start", "latent_start"),
+            ("end", "latent_end"),
+            ("pad", "latent_pad"),
+            ("padding", "padding"),
+        ):
+            value = configured[source]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"latent_token_ids.{source} must be an integer")
+            scalar_values[target] = int(value)
+        special = configured["special"]
+        if isinstance(special, (str, bytes)):
+            raise ValueError("latent_token_ids.special must be an iterable of integers")
+        try:
+            special_values = frozenset(special)
+        except TypeError as exc:
+            raise ValueError(
+                "latent_token_ids.special must be an iterable of integers"
+            ) from exc
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in special_values):
+            raise ValueError("latent_token_ids.special must contain only integers")
+        return TokenIds(special=frozenset(int(value) for value in special_values), **scalar_values)
+
+    def _log_evidence_window_startup(self) -> None:
+        config = self.evidence_window_config
+        logging.info(
+            "Evidence-window enabled: intervention=%s, max_loo_spans_per_example=%d, "
+            "reference=%s, ema_teacher=true",
+            config.loo.intervention,
+            config.loo.max_spans_per_example,
+            config.reference.mode,
+        )
+        if self._reference is not None:
+            witness = self._reference.witness
+            zero_stage = self._deepspeed_zero_stage()
+            logging.info(
+                "Evidence-window fixed reference: parameters=%d, parameter_bytes=%d, "
+                "dtypes=%s, zero_stage=%s, ema_coexists=true",
+                witness.parameter_count,
+                witness.parameter_bytes,
+                ",".join(witness.dtypes),
+                "none" if zero_stage is None else zero_stage,
+            )
+            if config.reference.mode == "frozen_copy" and zero_stage == 2:
+                logging.info(
+                    "Evidence-window frozen reference is rank-local replicated under ZeRO-2"
+                )
+        nonzero_dropout = [
+            f"{name}={module.p}"
+            for name, module in self.model.named_modules()
+            if isinstance(module, nn.Dropout) and float(module.p) > 0
+        ]
+        if nonzero_dropout:
+            logging.warning(
+                "Evidence-window condition contrasts have nonzero dropout: %s",
+                ", ".join(nonzero_dropout),
+            )
+
+    def _deepspeed_zero_stage(self) -> int | None:
+        state = getattr(self.accelerator, "state", None)
+        plugin = getattr(state, "deepspeed_plugin", None)
+        if plugin is None:
+            return None
+        stage = getattr(plugin, "zero_stage", None)
+        return int(stage) if stage is not None else None
 
     def _find_latent_segments(self, input_ids, latent_start_id, latent_end_id, latent_pad_id):
         ids = input_ids[0].tolist()
@@ -409,7 +532,7 @@ class CustomTrainerStage1(SFTTrainer):
         firstK_mask = self._build_firstK_mask(ids, seg_pad_indices, Kstars)
         return latents, firstK_mask
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def _compute_ilvr_loss_context(self, model, inputs, num_items_in_batch=None):
         k = getattr(self.model.config, "latent_size", 8)
         teacher_latents, firstK_mask = self._teacher_build_latents(inputs, k=k, p=self.coverage_p)
         
@@ -426,7 +549,7 @@ class CustomTrainerStage1(SFTTrainer):
             ce_loss, outputs = super().compute_loss(
                 model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
             )
-            return (ce_loss, outputs) if return_outputs else ce_loss
+            return _ILVRLossContext(ce_loss, outputs, None, None, dict(inputs))
 
         if teacher_latents.dim() == 2:
             teacher_latents = teacher_latents.unsqueeze(0)
@@ -435,7 +558,7 @@ class CustomTrainerStage1(SFTTrainer):
             ce_loss, outputs = super().compute_loss(
                 model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
             )
-            return (ce_loss, outputs) if return_outputs else ce_loss
+            return _ILVRLossContext(ce_loss, outputs, None, None, dict(inputs))
 
         mod_inputs = dict(inputs)
         mod_inputs.pop("pixel_values_latent", None)
@@ -446,17 +569,35 @@ class CustomTrainerStage1(SFTTrainer):
             model, mod_inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
         )
         if self.sim_weight == 0.0:
-            return (ce_loss, outputs) if return_outputs else ce_loss
+            return _ILVRLossContext(
+                ce_loss,
+                outputs,
+                mod_inputs["latent_hidden_states"],
+                firstK_mask,
+                mod_inputs,
+            )
 
         pred_h = outputs.hidden_states
         inp_h  = outputs.inputs_embeds
         B, T, H = pred_h.shape
         if T <= 1:
-            return (ce_loss, outputs) if return_outputs else ce_loss
+            return _ILVRLossContext(
+                ce_loss,
+                outputs,
+                mod_inputs["latent_hidden_states"],
+                firstK_mask,
+                mod_inputs,
+            )
 
         mask = mod_inputs["image_out_mask"][:, -(T - 1):].to(pred_h.device).bool()
         if not mask.any():
-            return (ce_loss, outputs) if return_outputs else ce_loss
+            return _ILVRLossContext(
+                ce_loss,
+                outputs,
+                mod_inputs["latent_hidden_states"],
+                firstK_mask,
+                mod_inputs,
+            )
 
         pred = pred_h[..., :-1, :][mask].contiguous().float()
         gt   = inp_h[...,  1:, :][mask].contiguous().detach().float()
@@ -465,7 +606,169 @@ class CustomTrainerStage1(SFTTrainer):
         cos = F.cosine_similarity(gt, pred, dim=-1).mean()
         sim_loss = 1.0 - cos
         loss = self.ce_weight * ce_loss + self.sim_weight * sim_loss
-        return (loss, outputs) if return_outputs else loss
+        return _ILVRLossContext(
+            loss,
+            outputs,
+            mod_inputs["latent_hidden_states"],
+            firstK_mask,
+            mod_inputs,
+        )
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        context = self._compute_ilvr_loss_context(model, inputs, num_items_in_batch)
+        if self._ew_engine is None or context.latent_hidden_states is None:
+            return (context.loss, context.outputs) if return_outputs else context.loss
+        auxiliary = self._compute_evidence_window(model, context)
+        loss = context.loss + auxiliary.total_loss
+        return (loss, context.outputs) if return_outputs else loss
+
+    def _compute_evidence_window(self, model, context: _ILVRLossContext):
+        if self._ew_engine is None or self._token_ids is None:
+            raise RuntimeError("evidence-window runtime is not initialized")
+        required = {"input_ids", "attention_mask", "labels"}
+        missing = required - set(context.model_inputs)
+        if missing:
+            raise ValueError(
+                "enabled evidence-window loss requires model input(s): "
+                + ", ".join(sorted(missing))
+            )
+        if context.image_out_mask is None or context.latent_hidden_states is None:
+            raise RuntimeError("evidence-window context has no active latent condition")
+
+        layout = extract_interleaved_layout(
+            context.model_inputs["input_ids"],
+            context.model_inputs["attention_mask"],
+            context.model_inputs["labels"],
+            context.image_out_mask,
+            self._token_ids,
+        )
+        labels = context.model_inputs["labels"]
+        policy_full = ModelConditionOutput(
+            token_logps=causal_token_logps(
+                context.outputs.logits,
+                labels.to(context.outputs.logits.device),
+            ),
+            hidden_states=self._final_hidden_states(context.outputs),
+        )
+
+        def forward(role, condition, latent_values, need_hidden):
+            del condition
+            condition_inputs = self._condition_inputs(context, latent_values)
+            return self._forward_evidence_condition(
+                role,
+                model,
+                condition_inputs,
+                labels,
+                need_hidden,
+            )
+
+        def lm_head_weight(role):
+            role_model = model if role == "policy" else self._ema.teacher
+            return self._output_embedding_weight(role_model, role=role)
+
+        return self._ew_engine.compute(
+            layout,
+            context.latent_hidden_states,
+            policy_full,
+            forward,
+            lm_head_weight=lm_head_weight,
+        )
+
+    @staticmethod
+    def _condition_inputs(
+        context: _ILVRLossContext,
+        latent_values: torch.Tensor,
+    ) -> dict[str, Any]:
+        values = dict(context.model_inputs)
+        values.pop("labels", None)
+        values.pop("pixel_values_latent", None)
+        values.pop("image_grid_thw_latent", None)
+        values["latent_hidden_states"] = latent_values
+        values["image_out_mask"] = context.image_out_mask
+        values["return_dict"] = True
+        return values
+
+    def _forward_evidence_condition(
+        self,
+        role: str,
+        policy_model: nn.Module,
+        inputs: Mapping[str, Any],
+        labels: torch.Tensor,
+        need_hidden: bool,
+    ) -> ModelConditionOutput:
+        if role == "policy":
+            role_model = policy_model
+            role_inputs = dict(inputs)
+            role_labels = labels
+            call = lambda: role_model(**role_inputs)
+        elif role == "reference":
+            if self._reference is None:
+                raise RuntimeError("reference condition requested without a fixed reference")
+            role_inputs = dict(inputs)
+            role_labels = labels
+            call = lambda: self._reference.forward(policy_model, role_inputs)
+        elif role == "ema":
+            role_model = self._ema.teacher
+            device = self._module_device(role_model)
+            role_inputs = self._move_tensors(inputs, device)
+            role_labels = labels.to(device)
+            call = lambda: role_model(**role_inputs)
+        else:
+            raise ValueError(f"unsupported evidence-window role: {role}")
+
+        role_inputs["output_hidden_states"] = need_hidden
+        if role == "policy":
+            outputs = call()
+        else:
+            with torch.no_grad():
+                outputs = call()
+        token_logps = causal_token_logps(
+            outputs.logits,
+            role_labels.to(outputs.logits.device),
+        )
+        hidden_states = self._final_hidden_states(outputs) if need_hidden else None
+        return ModelConditionOutput(token_logps, hidden_states)
+
+    @staticmethod
+    def _final_hidden_states(outputs: object) -> torch.Tensor | None:
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if isinstance(hidden_states, (tuple, list)):
+            return hidden_states[-1] if hidden_states else None
+        return hidden_states
+
+    def _output_embedding_weight(self, model: nn.Module, *, role: str) -> torch.Tensor:
+        unwrapped = self.accelerator.unwrap_model(model)
+        get_head = getattr(unwrapped, "get_output_embeddings", None)
+        if not callable(get_head):
+            raise ValueError(f"{role} model must expose get_output_embeddings()")
+        output_head = get_head()
+        weight = getattr(output_head, "weight", None)
+        if not torch.is_tensor(weight):
+            raise ValueError(f"{role} output embedding must expose a weight tensor")
+        if getattr(output_head, "bias", None) is not None:
+            raise ValueError(
+                f"residual KD requires a bias-free {role} output embedding"
+            )
+        return weight
+
+    @staticmethod
+    def _module_device(module: nn.Module) -> torch.device:
+        try:
+            return next(module.parameters()).device
+        except StopIteration as exc:
+            raise ValueError("condition model must own at least one parameter") from exc
+
+    @classmethod
+    def _move_tensors(cls, value: Any, device: torch.device) -> Any:
+        if torch.is_tensor(value):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {key: cls._move_tensors(item, device) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(cls._move_tensors(item, device) for item in value)
+        if isinstance(value, list):
+            return [cls._move_tensors(item, device) for item in value]
+        return value
 
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)

@@ -237,6 +237,8 @@ def main_train():
         image_pool_k=getattr(args, "image_pool_k", 8),
         helper_group_L=getattr(args, "helper_group_L", 256),
         ce_weight=getattr(args, "ce_weight", 1.0),
+        evidence_window_config=ew_config,
+        latent_token_ids=latent_token_ids,
     )
     
 
