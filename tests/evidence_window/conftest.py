@@ -52,13 +52,19 @@ class TinyVisual(torch.nn.Module):
 class TinyLatentLM(torch.nn.Module):
     """Small causal LM with observable full/all-null/LOO condition calls."""
 
-    def __init__(self, *, output_bias: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        output_bias: bool = False,
+        condition_logits_dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.config = SimpleNamespace(latent_size=8)
         self.embed_tokens = torch.nn.Embedding(128, 4)
         self.projection = torch.nn.Linear(4, 4, bias=False)
         self.lm_head = torch.nn.Linear(4, 128, bias=output_bias)
         self.visual = TinyVisual(4)
+        self.condition_logits_dtype = condition_logits_dtype
         with torch.no_grad():
             values = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4)
             self.embed_tokens.weight.copy_((values.remainder(17) - 8) / 16)
@@ -135,6 +141,10 @@ class TinyLatentLM(torch.nn.Module):
         contextual = inputs_embeds.cumsum(dim=1)
         hidden_states = F.layer_norm(self.projection(contextual), (4,))
         logits = self.lm_head(hidden_states)
+        if self.condition_logits_dtype is not None:
+            logits = logits.to(dtype=self.condition_logits_dtype)
+            if labels is not None:
+                logits = logits.float()
         if labels is None or labels.shape[1] <= 1:
             loss = logits.sum() * 0.0
         else:
@@ -207,10 +217,18 @@ def tiny_trainer_factory(monkeypatch, tmp_path):
         latent_token_ids: dict | None = None,
         model: TinyLatentLM | None = None,
         output_bias: bool = False,
+        condition_logits_dtype: torch.dtype | None = None,
         sim_weight: float = 0.7,
         ce_weight: float = 1.3,
     ) -> tuple[CustomTrainerStage1, TinyLatentLM]:
-        model = TinyLatentLM(output_bias=output_bias) if model is None else model
+        model = (
+            TinyLatentLM(
+                output_bias=output_bias,
+                condition_logits_dtype=condition_logits_dtype,
+            )
+            if model is None
+            else model
+        )
         kwargs = {}
         if evidence_window_config is not None:
             kwargs["evidence_window_config"] = evidence_window_config

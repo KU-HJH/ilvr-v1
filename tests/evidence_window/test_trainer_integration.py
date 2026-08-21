@@ -14,6 +14,7 @@ from evidence_window.config import (
     ResidualConfig,
 )
 from evidence_window.engine import EvidenceWindowEngine
+from evidence_window.scores import reference_adjusted_effect
 
 
 TOKEN_IDS = {
@@ -325,6 +326,85 @@ def test_residual_kd_rejects_any_output_head_bias_at_startup(tiny_trainer_factor
             latent_token_ids=TOKEN_IDS,
             output_bias=True,
         )
+
+
+@pytest.mark.parametrize("condition_logits_dtype", [torch.bfloat16, torch.float16])
+def test_auxiliary_scores_normalize_labels_dependent_logits_to_float32(
+    condition_logits_dtype,
+    tiny_trainer_factory,
+    legacy_latent_case,
+    monkeypatch,
+):
+    try:
+        torch.zeros((1, 2), dtype=condition_logits_dtype).log_softmax(-1)
+    except RuntimeError:
+        pytest.skip(f"CPU log_softmax does not support {condition_logits_dtype}")
+
+    config = EvidenceWindowConfig(
+        reference=ReferenceConfig(mode="frozen_copy"),
+        preference=PreferenceConfig(beta=1.0, lambda_ew=1.0),
+        relation=RelationConfig(lambda_magnitude=1.0),
+    )
+    trainer, model = tiny_trainer_factory(
+        evidence_window_config=config,
+        latent_token_ids=TOKEN_IDS,
+        condition_logits_dtype=condition_logits_dtype,
+        sim_weight=0.0,
+    )
+    outputs_by_condition = {}
+    results = []
+    original_compute = trainer._ew_engine.compute
+
+    def recording_compute(layout, latent_values, policy_full, forward, **kwargs):
+        outputs_by_condition[("policy", "full", None)] = policy_full
+
+        def recording_forward(role, condition, values, need_hidden):
+            output = forward(role, condition, values, need_hidden)
+            outputs_by_condition[(role, condition.kind, condition.evidence_index)] = output
+            return output
+
+        result = original_compute(
+            layout,
+            latent_values,
+            policy_full,
+            recording_forward,
+            **kwargs,
+        )
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(trainer._ew_engine, "compute", recording_compute)
+    trainer.compute_loss(model, dict(legacy_latent_case["inputs"]))
+
+    assert len(results) == 1
+    reference_full = outputs_by_condition[("reference", "full", None)].token_logps
+    for evidence_index in (0, 1):
+        token_margin = reference_adjusted_effect(
+            outputs_by_condition[("policy", "full", None)].token_logps,
+            outputs_by_condition[("policy", "loo", evidence_index)].token_logps,
+            reference_full,
+            outputs_by_condition[("reference", "loo", evidence_index)].token_logps,
+        )
+        assert torch.allclose(
+            token_margin,
+            torch.zeros_like(token_margin),
+            atol=1e-7,
+            rtol=0.0,
+        )
+    assert torch.allclose(
+        results[0].ew_margins,
+        torch.zeros_like(results[0].ew_margins),
+        atol=1e-7,
+        rtol=0.0,
+    )
+    assert {
+        output.token_logps.dtype for output in outputs_by_condition.values()
+    } == {torch.float32}
+    assert {role for role, _, _ in outputs_by_condition} == {
+        "policy",
+        "reference",
+        "ema",
+    }
 
 
 def test_main_wires_loaded_config_and_resolved_token_ids_into_trainer(

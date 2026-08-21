@@ -645,7 +645,7 @@ class CustomTrainerStage1(SFTTrainer):
         labels = context.model_inputs["labels"]
         policy_full = ModelConditionOutput(
             token_logps=causal_token_logps(
-                context.outputs.logits,
+                context.outputs.logits.float(),
                 labels.to(context.outputs.logits.device),
             ),
             hidden_states=self._final_hidden_states(context.outputs),
@@ -723,7 +723,7 @@ class CustomTrainerStage1(SFTTrainer):
             with torch.no_grad():
                 outputs = call()
         token_logps = causal_token_logps(
-            outputs.logits,
+            outputs.logits.float(),
             role_labels.to(outputs.logits.device),
         )
         hidden_states = self._final_hidden_states(outputs) if need_hidden else None
