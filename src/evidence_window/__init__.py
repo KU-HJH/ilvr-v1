@@ -7,6 +7,14 @@ from .losses import (
     global_preference_loss,
     window_preference_loss,
 )
+from .metrics import (
+    ContributionSummaries,
+    MatrixJsonlWriter,
+    MetricBatch,
+    contribution_summaries,
+    global_outer_coefficient,
+    reduce_sufficient_statistics,
+)
 from .scores import (
     causal_token_logps,
     evidence_window_margins,
@@ -26,4 +34,10 @@ __all__ = [
     "global_preference_loss",
     "window_preference_loss",
     "evidence_window_preference_loss",
+    "MetricBatch",
+    "ContributionSummaries",
+    "contribution_summaries",
+    "global_outer_coefficient",
+    "reduce_sufficient_statistics",
+    "MatrixJsonlWriter",
 ]
