@@ -107,6 +107,7 @@ def masked_relation_jsd(
     """Average JSD over windows with at least two causal evidence candidates."""
     _validate_relation_loss_inputs(student, teacher, mask)
     temperature_value = _validate_positive_finite(temperature, "temperature")
+    accumulation_dtype = _relation_accumulation_dtype(student, teacher)
     teacher = teacher.detach()
     window_losses: list[torch.Tensor] = []
     for batch_index in range(student.shape[0]):
@@ -114,12 +115,18 @@ def masked_relation_jsd(
             valid = mask[batch_index, :, window_index].to(dtype=torch.bool)
             if valid.sum().item() < 2:
                 continue
+            student_values = student[batch_index, valid, window_index].to(
+                dtype=accumulation_dtype
+            )
+            teacher_values = teacher[batch_index, valid, window_index].to(
+                dtype=accumulation_dtype
+            )
             student_log_probability = F.log_softmax(
-                student[batch_index, valid, window_index] / temperature_value,
+                student_values / temperature_value,
                 dim=0,
             )
             teacher_log_probability = F.log_softmax(
-                teacher[batch_index, valid, window_index] / temperature_value,
+                teacher_values / temperature_value,
                 dim=0,
             )
             midpoint_log_probability = torch.logaddexp(
@@ -136,12 +143,15 @@ def masked_relation_jsd(
                 teacher_probability
                 * (teacher_log_probability - midpoint_log_probability)
             ).sum()
-            window_losses.append(0.5 * (student_kl + teacher_kl))
+            jsd = 0.5 * (student_kl + teacher_kl)
+            if torch.equal(student_values, teacher_values):
+                jsd = jsd * 0.0
+            window_losses.append(_guard_jsd_roundoff(jsd))
 
     count = student.new_tensor(len(window_losses), dtype=torch.long)
     if not window_losses:
-        return student.sum() * 0.0, count
-    return torch.stack(window_losses).mean(), count
+        return student.to(dtype=accumulation_dtype).sum() * 0.0, count
+    return _guard_jsd_roundoff(torch.stack(window_losses).mean()), count
 
 
 def masked_relation_huber(
@@ -210,3 +220,30 @@ def _validate_positive_finite(value: float, name: str) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a finite positive number")
     return float(value)
+
+
+def _relation_accumulation_dtype(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+) -> torch.dtype:
+    dtype = torch.promote_types(student.dtype, teacher.dtype)
+    if dtype in {torch.float16, torch.bfloat16}:
+        return torch.float32
+    return dtype
+
+
+def _guard_jsd_roundoff(value: torch.Tensor) -> torch.Tensor:
+    tolerance = 8.0 * torch.finfo(value.dtype).eps
+    if torch.isfinite(value).item():
+        detached = value.detach().item()
+        if detached < -tolerance or detached > math.log(2.0) + tolerance:
+            raise FloatingPointError(
+                f"JSD outside theoretical bounds before roundoff guard: {detached}"
+            )
+    upper_bound = value.new_tensor(math.log(2.0))
+    if upper_bound.item() > math.log(2.0):
+        upper_bound = torch.nextafter(
+            upper_bound,
+            value.new_tensor(-math.inf),
+        )
+    return value.clamp(min=0.0, max=upper_bound)

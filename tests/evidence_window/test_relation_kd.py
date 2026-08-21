@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 
 from evidence_window.config import (
@@ -88,6 +90,74 @@ def test_jsd_excludes_single_candidate_window_and_detaches_teacher():
     assert student.grad is not None
     assert student.grad[0, 1, 0].item() == 0.0
     assert teacher.grad is None
+
+
+def test_bfloat16_jsd_identity_is_exactly_zero_and_within_theoretical_bounds():
+    """Low-precision cancellation must not make identical distributions negative."""
+    values = torch.tensor(
+        [6.15625, -1.171875, -8.6875, 2.28125, -4.34375, -5.59375],
+        dtype=torch.bfloat16,
+    ).view(1, 6, 1)
+    student = values.clone().requires_grad_()
+    mask = torch.ones_like(values, dtype=torch.bool)
+
+    loss, count = masked_relation_jsd(student, values, mask, 1.0)
+
+    assert count.item() == 1
+    assert torch.isfinite(loss)
+    assert 0.0 <= loss.item() <= math.log(2.0)
+    assert loss.item() == 0.0
+
+
+def test_bfloat16_jsd_is_symmetric_and_gradient_descent_moves_toward_teacher():
+    """A quantized local perturbation must retain JSD symmetry and useful direction."""
+    teacher = torch.tensor(
+        [2.0625, -1.015625, -0.203125, 2.71875, -6.15625, -1.53125],
+        dtype=torch.bfloat16,
+    ).view(1, 6, 1)
+    student = teacher.clone()
+    student[0, 0, 0] = 2.078125
+    student.requires_grad_()
+    reverse_student = teacher.clone().requires_grad_()
+    mask = torch.ones_like(teacher, dtype=torch.bool)
+
+    loss, _ = masked_relation_jsd(student, teacher, mask, 1.0)
+    reverse_loss, _ = masked_relation_jsd(
+        reverse_student,
+        student.detach(),
+        mask,
+        1.0,
+    )
+
+    assert torch.isfinite(loss)
+    assert 0.0 <= loss.item() <= math.log(2.0)
+    assert torch.allclose(loss, reverse_loss, atol=1e-7, rtol=1e-5)
+    loss.backward()
+    displacement = student.detach().float() - teacher.float()
+    gradient_alignment = (displacement * student.grad.float()).sum()
+    assert gradient_alignment.item() > 0.0
+
+
+def test_float16_extreme_finite_logits_at_low_temperature_have_finite_jsd():
+    """Temperature scaling must not overflow before stable softmax arithmetic."""
+    student = torch.tensor(
+        [65000.0, -65000.0, 32000.0, -32000.0, 1.0, -1.0],
+        dtype=torch.float16,
+    ).view(1, 6, 1).requires_grad_()
+    teacher = torch.tensor(
+        [-65000.0, 65000.0, -32000.0, 32000.0, -1.0, 1.0],
+        dtype=torch.float16,
+    ).view(1, 6, 1)
+    mask = torch.ones_like(student, dtype=torch.bool)
+
+    loss, count = masked_relation_jsd(student, teacher, mask, 1e-4)
+
+    assert count.item() == 1
+    assert torch.isfinite(loss)
+    assert 0.0 <= loss.item() <= math.log(2.0)
+    loss.backward()
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
 
 
 def test_huber_retains_negative_relations_and_detaches_teacher():
