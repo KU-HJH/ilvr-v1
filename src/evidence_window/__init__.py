@@ -2,6 +2,7 @@
 
 from .config import EvidenceWindowConfig
 from .layout import InterleavedLayout, TokenIds, extract_interleaved_layout
+from .interventions import apply_all_null, apply_zero_latent_loo, select_loo_spans
 from .losses import (
     evidence_window_preference_loss,
     global_preference_loss,
@@ -27,6 +28,9 @@ __all__ = [
     "InterleavedLayout",
     "TokenIds",
     "extract_interleaved_layout",
+    "apply_zero_latent_loo",
+    "apply_all_null",
+    "select_loo_spans",
     "causal_token_logps",
     "masked_token_sums",
     "reference_adjusted_effect",
