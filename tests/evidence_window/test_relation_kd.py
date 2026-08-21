@@ -5,6 +5,7 @@ import math
 import torch
 
 from evidence_window.config import (
+    DiagnosticsConfig,
     EvidenceWindowConfig,
     LOOConfig,
     PreferenceConfig,
@@ -285,6 +286,39 @@ def test_engine_builds_all_causal_student_teacher_relations_with_cached_conditio
         if key[0] == "policy"
     )
     assert all(tensor.grad is None for key, tensor in outputs.items() if key[0] == "ema")
+
+
+def test_matrix_dump_only_relations_and_student_conditions_are_graph_free():
+    config = EvidenceWindowConfig(
+        diagnostics=DiagnosticsConfig(matrix_dump_interval=1),
+    )
+    policy_parameter = torch.tensor(2.0, requires_grad=True)
+    policy_grad_enabled = []
+
+    def forward(role, condition, values, need_hidden):
+        del condition, values, need_hidden
+        if role == "policy":
+            policy_grad_enabled.append(torch.is_grad_enabled())
+            return ModelConditionOutput(policy_parameter * torch.ones((1, 1)))
+        return ModelConditionOutput(torch.zeros((1, 1)))
+
+    policy_full = torch.ones((1, 1), requires_grad=True)
+    result = EvidenceWindowEngine(config).compute(
+        _layout(
+            torch.ones((1, 1, 1), dtype=torch.bool),
+            torch.ones((1, 1, 1), dtype=torch.bool),
+            torch.ones((1, 1, 1), dtype=torch.bool),
+            torch.ones((1, 1, 1), dtype=torch.bool),
+        ),
+        torch.ones((1, 1, 1)),
+        ModelConditionOutput(policy_full),
+        forward,
+    )
+
+    assert policy_grad_enabled == [False]
+    assert not result.relations["student"].requires_grad
+    assert result.relations["student"].grad_fn is None
+    assert policy_parameter.grad is None
 
 
 def test_relation_structure_and_magnitude_are_independently_configurable():

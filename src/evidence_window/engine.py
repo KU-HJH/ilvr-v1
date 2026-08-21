@@ -229,6 +229,7 @@ class EvidenceWindowEngine:
         loo_selected = self._selected_evidence(layout, need_loo)
         preference_pair_mask = layout.training_pair_mask & loo_selected.unsqueeze(-1)
         relation_pair_mask = layout.causal_pair_mask & loo_selected.unsqueeze(-1)
+        visual_window_mask = layout.causal_pair_mask.any(dim=1)
         residual_selections: dict[int, list[tuple[int, torch.Tensor]]] = {}
         residual_tokens_per_row = torch.zeros(
             preference_pair_mask.shape[0],
@@ -286,29 +287,82 @@ class EvidenceWindowEngine:
         metric_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         actual_requests: list[ConditionRequest] = []
 
+        relation_loss_enabled = (
+            self.config.relation.lambda_jsd > 0
+            or self.config.relation.lambda_magnitude > 0
+        )
+
+        def condition_has_local_effect(role: str, condition: Condition) -> bool:
+            if condition.kind == "full":
+                return True
+            if condition.kind == "all_null":
+                return bool(visual_window_mask.any().item())
+            assert condition.evidence_index is not None
+            evidence_index = condition.evidence_index
+            ew_pair = (
+                self.config.preference.lambda_ew > 0
+                and bool(preference_pair_mask[:, evidence_index].any().item())
+            )
+            relation_pair = (
+                need_relation
+                and bool(relation_pair_mask[:, evidence_index].any().item())
+            )
+            residual_target = evidence_index in residual_selections
+            if role == "reference":
+                return ew_pair
+            if role == "ema":
+                return relation_pair or residual_target
+            return ew_pair or relation_pair or residual_target
+
+        def policy_condition_has_local_gradient(condition: Condition) -> bool:
+            if condition.kind == "full":
+                return True
+            if condition.kind == "all_null":
+                preference_enabled = (
+                    self.config.preference.lambda_global > 0
+                    or self.config.preference.lambda_window > 0
+                )
+                return preference_enabled and condition_has_local_effect(
+                    "policy", condition
+                )
+            assert condition.evidence_index is not None
+            evidence_index = condition.evidence_index
+            return (
+                (
+                    self.config.preference.lambda_ew > 0
+                    and bool(preference_pair_mask[:, evidence_index].any().item())
+                )
+                or (
+                    relation_loss_enabled
+                    and bool(relation_pair_mask[:, evidence_index].any().item())
+                )
+                or evidence_index in residual_selections
+            )
+
         def get(role: str, condition: Condition) -> ModelConditionOutput:
             key = (role, condition.kind, condition.evidence_index)
             cached = cache.get(key)
             if cached is not None:
                 return cached
-            if condition.kind == "full":
+            has_local_effect = condition_has_local_effect(role, condition)
+            if condition.kind == "full" or not has_local_effect:
                 values = latent_values
             elif condition.kind == "all_null":
                 values = apply_all_null(latent_values)
             else:
                 assert condition.evidence_index is not None
-                if loo_selected[:, condition.evidence_index].any():
-                    values = apply_zero_latent_loo(
-                        latent_values,
-                        active_mask,
-                        layout.evidence_token_mask,
-                        condition.evidence_index,
-                    )
-                else:
-                    values = latent_values
+                values = apply_zero_latent_loo(
+                    latent_values,
+                    active_mask,
+                    layout.evidence_token_mask,
+                    condition.evidence_index,
+                )
             need_hidden = needs_hidden(role, condition)
             actual_requests.append(ConditionRequest(role, condition, need_hidden))
-            if role == "policy":
+            policy_needs_gradient = (
+                role == "policy" and policy_condition_has_local_gradient(condition)
+            )
+            if policy_needs_gradient:
                 output = forward(role, condition, values, need_hidden)
             else:
                 with torch.no_grad():
@@ -320,6 +374,15 @@ class EvidenceWindowEngine:
                 layout=layout,
                 condition=condition,
             )
+            if role == "policy" and not policy_needs_gradient:
+                output = ModelConditionOutput(
+                    token_logps=output.token_logps.detach(),
+                    hidden_states=(
+                        None
+                        if output.hidden_states is None
+                        else output.hidden_states.detach()
+                    ),
+                )
             cache[key] = output
             return output
 
@@ -430,7 +493,6 @@ class EvidenceWindowEngine:
             )
 
         if need_all_null:
-            visual_window_mask = layout.causal_pair_mask.any(dim=1)
             policy_null = get("policy", Condition("all_null"))
             reference_full = get("reference", Condition("full"))
             reference_null = get("reference", Condition("all_null"))
@@ -600,6 +662,8 @@ class EvidenceWindowEngine:
                     window_lengths,
                     relation_pair_mask,
                 ).detach()
+                if not relation_loss_enabled:
+                    student_relations = student_relations.detach()
             else:
                 student_relations = policy_full.token_logps.sum() * 0.0 + torch.zeros(
                     relation_pair_mask.shape,

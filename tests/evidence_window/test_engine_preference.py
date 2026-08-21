@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from evidence_window.config import (
+    DiagnosticsConfig,
     EvidenceWindowConfig,
     LOOConfig,
     PreferenceConfig,
@@ -14,6 +15,7 @@ from evidence_window.engine import (
     Condition,
     EvidenceWindowEngine,
     ModelConditionOutput,
+    build_condition_execution_plan,
 )
 from evidence_window.layout import InterleavedLayout
 
@@ -330,6 +332,138 @@ def test_empty_pair_set_skips_conditions_and_returns_finite_differentiable_zero(
     assert result.total_loss.item() == 0.0
     result.total_loss.backward()
     assert torch.equal(policy_full.grad, torch.zeros_like(policy_full))
+
+
+def test_dummy_loo_is_graph_free_but_later_locally_used_loo_keeps_gradients():
+    layout = _layout(
+        torch.tensor([[[0, 0], [1, 0]]], dtype=torch.bool),
+        torch.tensor([[[0, 1]]], dtype=torch.bool),
+        torch.tensor([[[0], [1]]], dtype=torch.bool),
+        torch.tensor([[[0], [1]]], dtype=torch.bool),
+    )
+    config = _ew_config()
+    plan = build_condition_execution_plan(config, (0, 1))
+    dummy_parameter = torch.tensor(2.0, requires_grad=True)
+    real_parameter = torch.tensor(3.0, requires_grad=True)
+    calls = []
+    outputs = {}
+
+    def forward(role, condition, values, need_hidden):
+        del need_hidden
+        key = (role, condition.kind, condition.evidence_index)
+        calls.append((*key, torch.is_grad_enabled()))
+        if role == "policy":
+            parameter = (
+                dummy_parameter if condition.evidence_index == 0 else real_parameter
+            )
+            output = ModelConditionOutput(parameter * torch.ones((1, 2)))
+            outputs[key] = output
+            if condition.evidence_index == 0:
+                assert torch.equal(values, torch.ones((1, 1, 1)))
+            else:
+                assert not values.any()
+            return output
+        return ModelConditionOutput(torch.zeros((1, 2)))
+
+    result = EvidenceWindowEngine(config).compute(
+        layout,
+        torch.ones((1, 1, 1)),
+        ModelConditionOutput(torch.zeros((1, 2), requires_grad=True)),
+        forward,
+        execution_plan=plan,
+    )
+
+    assert calls == [
+        ("reference", "full", None, False),
+        ("policy", "loo", 0, False),
+        ("reference", "loo", 0, False),
+        ("policy", "loo", 1, True),
+        ("reference", "loo", 1, False),
+    ]
+    assert not outputs[("policy", "loo", 0)].token_logps.requires_grad
+    assert outputs[("policy", "loo", 0)].token_logps.grad_fn is None
+    assert outputs[("policy", "loo", 0)].hidden_states is None
+    assert outputs[("policy", "loo", 1)].token_logps.requires_grad
+    result.total_loss.backward()
+    assert dummy_parameter.grad is None
+    assert real_parameter.grad is not None and real_parameter.grad.abs() > 0
+
+
+def test_locally_empty_all_null_runs_in_order_without_building_a_graph():
+    layout = _layout(
+        torch.tensor([[[1, 0]]], dtype=torch.bool),
+        torch.tensor([[[0, 1]]], dtype=torch.bool),
+        torch.zeros((1, 1, 1), dtype=torch.bool),
+        torch.zeros((1, 1, 1), dtype=torch.bool),
+    )
+    config = EvidenceWindowConfig(
+        reference=ReferenceConfig(mode="adapter_disabled"),
+        preference=PreferenceConfig(lambda_window=1.0),
+    )
+    parameter = torch.tensor(2.0, requires_grad=True)
+    calls = []
+    policy_output = None
+
+    def forward(role, condition, values, need_hidden):
+        nonlocal policy_output
+        del need_hidden
+        assert torch.equal(values, torch.ones((1, 1, 1)))
+        calls.append((role, condition.kind, torch.is_grad_enabled()))
+        if role == "policy":
+            policy_output = ModelConditionOutput(parameter * torch.ones((1, 2)))
+            return policy_output
+        return ModelConditionOutput(torch.zeros((1, 2)))
+
+    policy_full = torch.zeros((1, 2), requires_grad=True)
+    result = EvidenceWindowEngine(config).compute(
+        layout,
+        torch.ones((1, 1, 1)),
+        ModelConditionOutput(policy_full),
+        forward,
+    )
+
+    assert calls == [
+        ("policy", "all_null", False),
+        ("reference", "full", False),
+        ("reference", "all_null", False),
+    ]
+    assert policy_output is not None
+    assert not policy_output.token_logps.requires_grad
+    assert policy_output.token_logps.grad_fn is None
+    assert policy_output.hidden_states is None
+    result.total_loss.backward()
+    assert parameter.grad is None
+
+
+def test_diagnostic_only_all_null_policy_condition_is_graph_free():
+    config = EvidenceWindowConfig(
+        reference=ReferenceConfig(mode="adapter_disabled"),
+        diagnostics=DiagnosticsConfig(global_saturation=True),
+    )
+    parameter = torch.tensor(2.0, requires_grad=True)
+    policy_output = None
+    policy_grad_enabled = None
+
+    def forward(role, condition, values, need_hidden):
+        nonlocal policy_output, policy_grad_enabled
+        del condition, values, need_hidden
+        if role == "policy":
+            policy_grad_enabled = torch.is_grad_enabled()
+            policy_output = ModelConditionOutput(parameter * torch.ones((1, 1)))
+            return policy_output
+        return ModelConditionOutput(torch.zeros((1, 1)))
+
+    EvidenceWindowEngine(config).compute(
+        _scalar_layout(),
+        torch.ones((1, 1, 1)),
+        ModelConditionOutput(torch.zeros((1, 1), requires_grad=True)),
+        forward,
+    )
+
+    assert policy_grad_enabled is False
+    assert policy_output is not None
+    assert not policy_output.token_logps.requires_grad
+    assert policy_output.token_logps.grad_fn is None
 
 
 def test_nonfinite_enabled_output_raises_with_numeric_layout_only():
