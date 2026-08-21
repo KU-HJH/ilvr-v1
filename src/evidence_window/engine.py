@@ -15,9 +15,12 @@ from .layout import InterleavedLayout
 from .losses import (
     evidence_window_preference_loss,
     global_preference_loss,
+    masked_relation_huber,
+    masked_relation_jsd,
+    relation_matrix,
     window_preference_loss,
 )
-from .metrics import global_outer_coefficient
+from .metrics import contribution_summaries, global_outer_coefficient
 from .scores import (
     evidence_window_margins,
     masked_token_sums,
@@ -114,7 +117,11 @@ class EvidenceWindowEngine:
             or self.config.preference.lambda_window > 0
             or self.config.diagnostics.global_saturation
         )
-        need_loo = self.config.preference.lambda_ew > 0
+        need_relation = (
+            self.config.relation.lambda_jsd > 0
+            or self.config.relation.lambda_magnitude > 0
+        )
+        need_loo = self.config.preference.lambda_ew > 0 or need_relation
         loo_selected = self._selected_evidence(layout, need_loo)
         preference_pair_mask = layout.training_pair_mask & loo_selected.unsqueeze(-1)
         relation_pair_mask = layout.causal_pair_mask & loo_selected.unsqueeze(-1)
@@ -197,7 +204,7 @@ class EvidenceWindowEngine:
                 )
 
         ew_margins: torch.Tensor | None = None
-        if need_loo:
+        if self.config.preference.lambda_ew > 0:
             evidence_count = layout.evidence_token_mask.shape[1]
             token_effects: list[torch.Tensor] = []
             reference_full: ModelConditionOutput | None = None
@@ -250,6 +257,89 @@ class EvidenceWindowEngine:
                 ew_margins,
                 preference_pair_mask,
             )
+
+        relations: dict[str, torch.Tensor] = {}
+        if need_relation:
+            if relation_pair_mask.any():
+                evidence_count = layout.evidence_token_mask.shape[1]
+                window_lengths = layout.window_token_mask.sum(dim=-1)
+                policy_full_sums = masked_token_sums(
+                    policy_full.token_logps,
+                    layout.window_token_mask,
+                )
+                ema_full = get("ema", Condition("full"))
+                ema_full_sums = masked_token_sums(
+                    ema_full.token_logps,
+                    layout.window_token_mask,
+                )
+                policy_loo_sums: list[torch.Tensor] = []
+                ema_loo_sums: list[torch.Tensor] = []
+                for evidence_index in range(evidence_count):
+                    if not loo_selected[:, evidence_index].any():
+                        policy_loo_sums.append(policy_full_sums)
+                        ema_loo_sums.append(ema_full_sums)
+                        continue
+                    policy_loo = get("policy", Condition("loo", evidence_index))
+                    ema_loo = get("ema", Condition("loo", evidence_index))
+                    policy_loo_sums.append(
+                        masked_token_sums(
+                            policy_loo.token_logps,
+                            layout.window_token_mask,
+                        )
+                    )
+                    ema_loo_sums.append(
+                        masked_token_sums(
+                            ema_loo.token_logps,
+                            layout.window_token_mask,
+                        )
+                    )
+                policy_loo_by_evidence = torch.stack(policy_loo_sums, dim=1)
+                ema_loo_by_evidence = torch.stack(ema_loo_sums, dim=1)
+                student_relations = relation_matrix(
+                    policy_full_sums,
+                    policy_loo_by_evidence,
+                    window_lengths,
+                    relation_pair_mask,
+                )
+                teacher_relations = relation_matrix(
+                    ema_full_sums,
+                    ema_loo_by_evidence,
+                    window_lengths,
+                    relation_pair_mask,
+                ).detach()
+            else:
+                student_relations = policy_full.token_logps.sum() * 0.0 + torch.zeros(
+                    relation_pair_mask.shape,
+                    dtype=policy_full.token_logps.dtype,
+                    device=policy_full.token_logps.device,
+                )
+                teacher_relations = torch.zeros_like(student_relations).detach()
+
+            self._require_finite("student relation matrix", student_relations, layout)
+            self._require_finite("teacher relation matrix", teacher_relations, layout)
+            relations = {
+                "student": student_relations,
+                "teacher": teacher_relations,
+            }
+            self._add_relation_results(
+                student_relations,
+                teacher_relations,
+                relation_pair_mask,
+                losses,
+                metric_sums,
+                layout,
+            )
+            if self.config.relation.lambda_jsd > 0:
+                total_loss = total_loss + (
+                    self.config.relation.lambda_jsd * losses["relation_jsd"]
+                )
+            if self.config.relation.lambda_magnitude > 0:
+                total_loss = total_loss + (
+                    self.config.relation.lambda_magnitude
+                    * losses["relation_magnitude"]
+                )
+
+        if need_loo:
             selected_per_row = loo_selected.sum(dim=1)
             metric_sums["loo/selected_span_count"] = (
                 selected_per_row.detach().sum(),
@@ -262,7 +352,7 @@ class EvidenceWindowEngine:
             losses=losses,
             metric_sums=metric_sums,
             ew_margins=ew_margins,
-            relations={},
+            relations=relations,
             preference_pair_mask=preference_pair_mask,
             relation_pair_mask=relation_pair_mask,
         )
@@ -322,6 +412,71 @@ class EvidenceWindowEngine:
             window_margins,
             valid,
         )
+
+    def _add_relation_results(
+        self,
+        student: torch.Tensor,
+        teacher: torch.Tensor,
+        valid: torch.Tensor,
+        losses: dict[str, torch.Tensor],
+        metric_sums: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        layout: InterleavedLayout,
+    ) -> None:
+        if self.config.relation.lambda_jsd > 0:
+            loss, _ = masked_relation_jsd(
+                student,
+                teacher,
+                valid,
+                self.config.relation.temperature,
+            )
+            self._require_finite("relation JSD loss", loss, layout)
+            losses["relation_jsd"] = loss
+        if self.config.relation.lambda_magnitude > 0:
+            loss, _ = masked_relation_huber(
+                student,
+                teacher,
+                valid,
+                self.config.relation.huber_delta,
+            )
+            self._require_finite("relation magnitude loss", loss, layout)
+            losses["relation_magnitude"] = loss
+
+        window_valid = valid.any(dim=1)
+        for role, values in (("student", student), ("teacher", teacher)):
+            if values.shape[1] == 0:
+                zeros = values.new_zeros(window_valid.shape)
+                metric_sums[f"relation/{role}/top1_ratio"] = self._masked_sum_and_count(
+                    zeros,
+                    window_valid,
+                )
+                metric_sums[
+                    f"relation/{role}/normalized_entropy"
+                ] = self._masked_sum_and_count(zeros, window_valid)
+                metric_sums[
+                    f"relation/{role}/above_threshold_count"
+                ] = self._masked_sum_and_count(zeros, window_valid)
+                continue
+            summaries = contribution_summaries(
+                values,
+                valid,
+                self.config.diagnostics.contribution_threshold,
+            )
+            metric_sums[f"relation/{role}/top1_ratio"] = self._masked_sum_and_count(
+                summaries.top1_ratio,
+                window_valid,
+            )
+            metric_sums[
+                f"relation/{role}/normalized_entropy"
+            ] = self._masked_sum_and_count(
+                summaries.normalized_entropy,
+                summaries.entropy_valid,
+            )
+            metric_sums[
+                f"relation/{role}/above_threshold_count"
+            ] = self._masked_sum_and_count(
+                summaries.above_threshold_count,
+                window_valid,
+            )
 
     @staticmethod
     def _masked_sum_and_count(
