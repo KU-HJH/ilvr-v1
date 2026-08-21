@@ -260,6 +260,7 @@ def test_logit_residual_hidden_states_are_requested_only_for_full_and_loo():
         torch.ones((1, 1, 1)),
         policy_full,
         forward,
+        lm_head_weight=lambda role: torch.eye(2),
     )
 
     assert ("policy", "full", None, True) not in calls

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import operator
 
 import torch
 import torch.nn.functional as F
@@ -174,6 +175,176 @@ def masked_relation_huber(
     if not count.bool().item():
         return student.sum() * 0.0, count
     return values.masked_select(valid).mean(), count
+
+
+def select_residual_tokens(mask: torch.Tensor, cap: int) -> torch.Tensor:
+    """Select deterministic target positions, including temporal endpoints."""
+    if not torch.is_tensor(mask) or mask.ndim != 1:
+        raise ValueError("mask must have shape [T]")
+    if isinstance(cap, bool):
+        raise TypeError("cap must be an integer")
+    try:
+        cap_value = operator.index(cap)
+    except TypeError as exc:
+        raise TypeError("cap must be an integer") from exc
+    if cap_value < 0:
+        raise ValueError("cap must be non-negative")
+
+    eligible = mask.to(dtype=torch.bool).nonzero(as_tuple=False).flatten()
+    target = eligible.numel() if cap_value == 0 else min(cap_value, eligible.numel())
+    if target == eligible.numel():
+        return eligible
+    if target == 0:
+        return eligible[:0]
+    if target == 1:
+        return eligible[:1]
+
+    positions = {
+        round(index * (eligible.numel() - 1) / (target - 1))
+        for index in range(target)
+    }
+    for position in range(eligible.numel()):
+        if len(positions) >= target:
+            break
+        positions.add(position)
+    selected_positions = torch.tensor(
+        sorted(positions),
+        dtype=torch.long,
+        device=eligible.device,
+    )
+    return eligible.index_select(0, selected_positions)
+
+
+def chunked_logit_residual_loss(
+    student_dh: torch.Tensor,
+    teacher_dh: torch.Tensor,
+    student_weight: torch.Tensor,
+    teacher_weight: torch.Tensor,
+    metric: str,
+    chunk_size: int,
+    delta: float,
+) -> torch.Tensor:
+    """Compare exact LM-head residuals without allocating ``[tokens, vocab]``."""
+    chunk_size_value, delta_value = _validate_logit_residual_inputs(
+        student_dh,
+        teacher_dh,
+        student_weight,
+        teacher_weight,
+        metric,
+        chunk_size,
+        delta,
+    )
+    accumulation_dtype = _residual_accumulation_dtype(
+        student_dh,
+        teacher_dh,
+        student_weight,
+        teacher_weight,
+    )
+    student_values = student_dh.to(dtype=accumulation_dtype)
+    teacher_values = teacher_dh.detach().to(dtype=accumulation_dtype)
+    zero = (
+        student_values.reshape(-1)[:1].sum() * 0.0
+        + student_weight.reshape(-1)[0].to(dtype=accumulation_dtype) * 0.0
+    )
+    if student_dh.shape[0] == 0:
+        return zero
+
+    if metric == "huber":
+        total = zero
+        count = 0
+        for start in range(0, student_weight.shape[0], chunk_size_value):
+            stop = min(start + chunk_size_value, student_weight.shape[0])
+            student_chunk = student_weight[start:stop].to(dtype=accumulation_dtype)
+            teacher_chunk = teacher_weight[start:stop].detach().to(
+                dtype=accumulation_dtype
+            )
+            student_logits = torch.matmul(student_values, student_chunk.transpose(0, 1))
+            teacher_logits = torch.matmul(teacher_values, teacher_chunk.transpose(0, 1))
+            total = total + F.huber_loss(
+                student_logits,
+                teacher_logits,
+                delta=delta_value,
+                reduction="sum",
+            )
+            count += student_logits.numel()
+        return total / count
+
+    dots = student_values.new_zeros(student_values.shape[0])
+    student_norm_sq = torch.zeros_like(dots)
+    teacher_norm_sq = torch.zeros_like(dots)
+    for start in range(0, student_weight.shape[0], chunk_size_value):
+        stop = min(start + chunk_size_value, student_weight.shape[0])
+        student_chunk = student_weight[start:stop].to(dtype=accumulation_dtype)
+        teacher_chunk = teacher_weight[start:stop].detach().to(
+            dtype=accumulation_dtype
+        )
+        student_logits = torch.matmul(student_values, student_chunk.transpose(0, 1))
+        teacher_logits = torch.matmul(teacher_values, teacher_chunk.transpose(0, 1))
+        dots = dots + (student_logits * teacher_logits).sum(dim=-1)
+        student_norm_sq = student_norm_sq + student_logits.square().sum(dim=-1)
+        teacher_norm_sq = teacher_norm_sq + teacher_logits.square().sum(dim=-1)
+
+    epsilon = 1e-8
+    denominator = (
+        student_norm_sq.sqrt().clamp_min(epsilon)
+        * teacher_norm_sq.sqrt().clamp_min(epsilon)
+    )
+    similarity = (dots / denominator).clamp(min=-1.0, max=1.0)
+    return (1.0 - similarity).mean()
+
+
+def _validate_logit_residual_inputs(
+    student_dh: torch.Tensor,
+    teacher_dh: torch.Tensor,
+    student_weight: torch.Tensor,
+    teacher_weight: torch.Tensor,
+    metric: str,
+    chunk_size: int,
+    delta: float,
+) -> tuple[int, float]:
+    tensors = {
+        "student_dh": student_dh,
+        "teacher_dh": teacher_dh,
+        "student_weight": student_weight,
+        "teacher_weight": teacher_weight,
+    }
+    for name, value in tensors.items():
+        if not torch.is_tensor(value) or value.ndim != 2 or not value.is_floating_point():
+            raise ValueError(f"{name} must be a floating-point tensor with two dimensions")
+    if teacher_dh.shape[0] != student_dh.shape[0]:
+        raise ValueError("student and teacher residuals must have the same token count")
+    if student_weight.shape[1] != student_dh.shape[1]:
+        raise ValueError("student LM-head hidden size must match student residuals")
+    if teacher_weight.shape[1] != teacher_dh.shape[1]:
+        raise ValueError("teacher LM-head hidden size must match teacher residuals")
+    if student_weight.shape[0] != teacher_weight.shape[0]:
+        raise ValueError("student and teacher vocabulary sizes must match")
+    if student_weight.shape[0] == 0:
+        raise ValueError("LM-head vocabulary must be nonempty")
+    devices = {value.device for value in tensors.values()}
+    if len(devices) != 1:
+        raise ValueError("residual and LM-head tensors must be on the same device")
+    if metric not in {"huber", "cosine"}:
+        raise ValueError("metric must be 'huber' or 'cosine'")
+    if isinstance(chunk_size, bool):
+        raise ValueError("chunk_size must be a positive integer")
+    try:
+        chunk_size_value = operator.index(chunk_size)
+    except TypeError as exc:
+        raise ValueError("chunk_size must be a positive integer") from exc
+    if chunk_size_value <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    delta_value = _validate_positive_finite(delta, "delta")
+    return chunk_size_value, delta_value
+
+
+def _residual_accumulation_dtype(*values: torch.Tensor) -> torch.dtype:
+    dtype = values[0].dtype
+    for value in values[1:]:
+        dtype = torch.promote_types(dtype, value.dtype)
+    if dtype in {torch.float16, torch.bfloat16}:
+        return torch.float32
+    return dtype
 
 
 def _validate_margin_mask(margins: torch.Tensor, valid: torch.Tensor) -> None:
