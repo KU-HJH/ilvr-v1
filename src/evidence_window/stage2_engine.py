@@ -93,8 +93,6 @@ class Stage2EvidenceWindowEngine:
         }
         if not active_weights:
             return self._empty_result(layout)
-        if residual_weight > 0.0:
-            _prevalidate_hidden_reference(reference_targets, layout)
         edges = select_stage2_edges(
             layout,
             self.config.loo.max_evidence_edges_per_window,
@@ -109,6 +107,8 @@ class Stage2EvidenceWindowEngine:
         )
         if global_edge_count == 0:
             return self._empty_result(layout, active_objectives=active_weights)
+        if residual_weight > 0.0 and edges:
+            _prevalidate_hidden_reference(reference_targets, layout)
 
         # ZeRO parameter gathers and DDP buffer broadcasts happen inside model
         # forwards, so every rank must execute the same number before any

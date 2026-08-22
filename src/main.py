@@ -454,12 +454,15 @@ def main_train():
     else:
         logging.info("no checkpoint，train from start。")
 
-    configured_zero_stage = (
-        stage2_zero_stage
-        if stage2_zero_stage is not None
-        else read_deepspeed_zero_stage(args.deepspeed_config)
-    )
-    logging.info("start training (DeepSpeed ZeRO-%s Mode)...", configured_zero_stage)
+    if args.stage == "stage2":
+        configured_zero_stage = (
+            stage2_zero_stage
+            if stage2_zero_stage is not None
+            else read_deepspeed_zero_stage(args.deepspeed_config)
+        )
+        logging.info("start training (DeepSpeed ZeRO-%s Mode)...", configured_zero_stage)
+    else:
+        logging.info("start Stage-1 training...")
     trainer.train(resume_from_checkpoint=last_checkpoint)
 
     final_model_path = training_args.output_dir

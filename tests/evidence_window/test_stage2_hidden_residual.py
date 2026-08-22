@@ -1,4 +1,6 @@
 from dataclasses import replace
+import multiprocessing
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -39,7 +41,7 @@ TOKEN_IDS = {
 class _TinyTrainerModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(stage="stage1")
+        self.config = SimpleNamespace(stage="stage1", hidden_size=2)
         self.embedding = torch.nn.Embedding(100, 2)
         self.head = torch.nn.Linear(2, 100, bias=False)
         self.calls = []
@@ -101,6 +103,16 @@ def _trainer_batch():
         "labels": torch.tensor([[-100, -100, -100, 5, 6]]),
         "ew_sample_indices": torch.tensor([17]),
         "ew_plan_types": (("latent", "text"),),
+    }
+
+
+def _no_edge_trainer_batch():
+    return {
+        "input_ids": torch.tensor([[5, 6]]),
+        "attention_mask": torch.ones((1, 2), dtype=torch.long),
+        "labels": torch.tensor([[5, 6]]),
+        "ew_sample_indices": torch.tensor([17]),
+        "ew_plan_types": (("text",),),
     }
 
 
@@ -439,6 +451,167 @@ def test_online_reference_requests_hidden_inside_no_grad():
     assert targets.hidden_residuals.requires_grad is False
     assert [call["hidden"] for call in model.calls] == [True, True]
     assert all(call["grad_enabled"] is False for call in model.calls)
+
+
+def test_online_residual_with_globally_no_edges_returns_finite_ce_without_aux_replay(
+    monkeypatch, tmp_path
+):
+    """No-edge batches need neither policy nor reference hidden residual replay."""
+    def fake_sft_init(instance, *args, **kwargs):
+        del args
+        instance.model = kwargs["model"]
+        instance.args = SimpleNamespace(output_dir=str(tmp_path))
+        instance.state = SimpleNamespace(global_step=1, max_steps=1)
+        instance.accelerator = SimpleNamespace(
+            process_index=0,
+            prepare_model=lambda model, evaluation_mode=False: model,
+        )
+
+    monkeypatch.setattr(trainer_stage2_module.SFTTrainer, "__init__", fake_sft_init)
+    policy = _TinyTrainerModel()
+    reference = _TinyTrainerModel()
+    config = Stage2EvidenceWindowConfig(
+        reference=Stage2ReferenceConfig(
+            mode="online_frozen", checkpoint="same-stage1"
+        ),
+        residual=Stage2ResidualConfig(enabled=True, lambda_res=1.0),
+    )
+    trainer = CustomTrainerStage2(
+        model=policy,
+        evidence_window_config=config,
+        latent_token_ids=TOKEN_IDS,
+        reference_model_factory=lambda: reference,
+        deepspeed_zero_stage=2,
+        policy_initialization_checkpoint="same-stage1",
+    )
+
+    loss = trainer.compute_loss(policy, _no_edge_trainer_batch())
+
+    assert torch.isfinite(loss)
+    assert len(policy.calls) == 1
+    assert reference.calls == []
+
+
+def _asymmetric_hidden_target_worker(rank, init_file, result_dir):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+
+    class Provider:
+        @staticmethod
+        def get_batch(sample_indices, layout, *, require_hidden_residuals=False):
+            assert require_hidden_residuals is True
+            width = 3 if rank == 0 else 2
+            return ReferenceBatchTargets(
+                sample_indices=tuple(sample_indices.tolist()),
+                contributions=torch.zeros_like(
+                    layout.causal_pair_mask, dtype=torch.float32
+                ),
+                pair_mask=layout.causal_pair_mask.clone(),
+                hidden_residuals=torch.zeros((*layout.causal_pair_mask.shape, width)),
+            )
+
+    def fake_sft_init(instance, *args, **kwargs):
+        del args
+        instance.model = kwargs["model"]
+        instance.args = SimpleNamespace(output_dir=result_dir)
+        instance.state = SimpleNamespace(global_step=1, max_steps=1)
+        instance.accelerator = SimpleNamespace(process_index=rank)
+
+    trainer_stage2_module.SFTTrainer.__init__ = fake_sft_init
+    model = _TinyTrainerModel()
+    trainer = CustomTrainerStage2(
+        model=model,
+        evidence_window_config=_residual_config(),
+        latent_token_ids=TOKEN_IDS,
+        reference_provider=Provider(),
+    )
+    try:
+        trainer.compute_loss(model, _trainer_batch())
+        outcome = "unexpected success"
+    except Exception as exc:
+        outcome = f"{type(exc).__name__}: {exc}; policy_calls={len(model.calls)}"
+    finally:
+        Path(result_dir, f"rank-{rank}.txt").write_text(outcome, encoding="utf-8")
+        torch.distributed.destroy_process_group()
+
+
+def test_asymmetric_hidden_target_preflight_fails_collectively_before_policy_replay(
+    tmp_path,
+):
+    """One malformed target must not strand its peer in the engine edge collective."""
+    context = multiprocessing.get_context("spawn")
+    init_file = tmp_path / "gloo-init"
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    processes = [
+        context.Process(
+            target=_asymmetric_hidden_target_worker,
+            args=(rank, str(init_file), str(result_dir)),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+
+    assert alive == [], "malformed reference stranded a peer in engine collectives"
+    outcomes = [
+        (result_dir / f"rank-{rank}.txt").read_text(encoding="utf-8")
+        for rank in range(2)
+    ]
+    assert outcomes[0] == outcomes[1]
+    assert "distributed reference target lookup failed" in outcomes[0]
+    assert "hidden width" in outcomes[0]
+    assert "policy_calls=1" in outcomes[0]
+
+
+def test_nonresidual_reference_lookup_skips_hidden_edge_and_width_collectives(
+    monkeypatch,
+):
+    """EW/relation lookup must not pay residual-only edge-count or width collectives."""
+    reductions = []
+    monkeypatch.setattr(trainer_stage2_module.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(trainer_stage2_module.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(trainer_stage2_module.distributed, "get_world_size", lambda: 1)
+
+    def record_success(value, op):
+        reductions.append(op)
+
+    monkeypatch.setattr(
+        trainer_stage2_module.distributed,
+        "all_reduce",
+        record_success,
+    )
+    monkeypatch.setattr(
+        trainer_stage2_module.distributed,
+        "all_gather_object",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("non-residual lookup entered hidden-width gather")
+        ),
+    )
+    layout = _one_edge_layout()
+    provider = _RecordingReferenceProvider()
+
+    targets = trainer_stage2_module._coordinated_reference_lookup(
+        provider,
+        torch.tensor([17]),
+        layout,
+        require_hidden_residuals=False,
+        max_evidence_edges_per_window=0,
+        policy_hidden_width=2,
+    )
+
+    assert targets.sample_indices == (17,)
+    assert len(reductions) == 2
 
 
 def test_zero_edge_rank_matches_remote_residual_replay_slots_with_hidden_graph():

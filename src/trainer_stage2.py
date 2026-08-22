@@ -17,7 +17,11 @@ from evidence_window.scores import chunked_causal_target_logps
 from evidence_window.stage2_config import Stage2EvidenceWindowConfig
 from evidence_window.stage2_effects import Stage2ConditionOutput
 from evidence_window.stage2_engine import Stage2EvidenceWindowEngine, Stage2EvidenceWindowResult
-from evidence_window.stage2_layout import extract_stage2_layout, validate_plan_types
+from evidence_window.stage2_layout import (
+    extract_stage2_layout,
+    select_stage2_edges,
+    validate_plan_types,
+)
 from evidence_window.stage2_reference import (
     OnlineFrozenStage2Reference,
     build_stage2_reference_provider,
@@ -237,6 +241,7 @@ class CustomTrainerStage2(SFTTrainer):
                 max_evidence_edges_per_window=(
                     self.evidence_window_config.loo.max_evidence_edges_per_window
                 ),
+                policy_hidden_width=_configured_hidden_width(model),
             )
         auxiliary = self._ew_engine.compute(
             layout,
@@ -464,6 +469,7 @@ def _coordinated_reference_lookup(
     labels=None,
     contribution_reduction: str = "mean",
     max_evidence_edges_per_window: int = 0,
+    policy_hidden_width: int | None = None,
 ):
     """Make sample-specific artifact failures collective before model replays."""
     targets = None
@@ -500,6 +506,140 @@ def _coordinated_reference_lookup(
     except Exception as exc:
         local_error = f"{type(exc).__name__}: {exc}"
 
+    _raise_coordinated_reference_error(local_error, layout)
+
+    assert targets is not None
+    expected_pair = torch.zeros_like(layout.causal_pair_mask)
+    for edge in select_stage2_edges(layout, max_evidence_edges_per_window):
+        expected_pair[
+            edge.batch_index,
+            edge.evidence_index,
+            edge.window_index,
+        ] = True
+    local_edge_count = int(expected_pair.sum().item())
+    global_edge_count = torch.tensor(
+        local_edge_count,
+        dtype=torch.long,
+        device=layout.causal_pair_mask.device,
+    )
+    if (
+        require_hidden_residuals
+        and distributed.is_available()
+        and distributed.is_initialized()
+    ):
+        distributed.all_reduce(global_edge_count, op=distributed.ReduceOp.SUM)
+
+    local_error = None
+    target_hidden_width = None
+    needs_local_hidden = (
+        require_hidden_residuals
+        and int(global_edge_count.item()) > 0
+        and local_edge_count > 0
+    )
+    try:
+        target_hidden_width = _validate_reference_targets_before_policy_replay(
+            targets,
+            layout,
+            expected_pair,
+            require_hidden_residuals=needs_local_hidden,
+        )
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+
+    width_record = (
+        int(needs_local_hidden),
+        target_hidden_width,
+        policy_hidden_width if needs_local_hidden else None,
+    )
+    width_records = [width_record]
+    if (
+        require_hidden_residuals
+        and int(global_edge_count.item()) > 0
+        and distributed.is_available()
+        and distributed.is_initialized()
+    ):
+        width_records = [None] * distributed.get_world_size()
+        distributed.all_gather_object(width_records, width_record)
+    width_error = _hidden_width_consensus_error(width_records)
+    if local_error is None and width_error is not None:
+        local_error = width_error
+    _raise_coordinated_reference_error(local_error, layout)
+    return targets
+
+
+def _validate_reference_targets_before_policy_replay(
+    targets: ReferenceBatchTargets,
+    layout: Stage2InterleavedLayout,
+    expected_pair: torch.Tensor,
+    *,
+    require_hidden_residuals: bool,
+) -> int | None:
+    expected_shape = layout.causal_pair_mask.shape
+    contributions = targets.contributions
+    if (
+        not torch.is_tensor(contributions)
+        or contributions.shape != expected_shape
+        or not contributions.is_floating_point()
+        or not torch.isfinite(contributions).all()
+    ):
+        raise ValueError(
+            "reference contributions must be finite floating point with shape [B, J, K]"
+        )
+    pair_mask = targets.pair_mask
+    if (
+        not torch.is_tensor(pair_mask)
+        or pair_mask.dtype is not torch.bool
+        or pair_mask.shape != expected_shape
+    ):
+        raise ValueError("reference pair_mask must be boolean with shape [B, J, K]")
+    if not torch.equal(pair_mask.to(device=expected_pair.device), expected_pair):
+        raise ValueError("reference pair_mask does not match selected policy edges")
+
+    hidden = targets.hidden_residuals
+    if hidden is None:
+        if require_hidden_residuals:
+            raise ValueError("reference hidden residuals are required for local edges")
+        return None
+    if (
+        not torch.is_tensor(hidden)
+        or hidden.ndim != 4
+        or hidden.shape[:3] != expected_shape
+        or hidden.shape[-1] <= 0
+        or not hidden.is_floating_point()
+        or not torch.isfinite(hidden).all()
+    ):
+        raise ValueError(
+            "reference hidden residuals must be finite floating point with shape [B, J, K, H]"
+        )
+    return int(hidden.shape[-1]) if require_hidden_residuals else None
+
+
+def _hidden_width_consensus_error(width_records) -> str | None:
+    active_records = [record for record in width_records if record[0] > 0]
+    if not active_records:
+        return None
+    target_widths = sorted(
+        {record[1] for record in active_records if record[1] is not None}
+    )
+    policy_widths = sorted(
+        {record[2] for record in active_records if record[2] is not None}
+    )
+    if len(policy_widths) > 1:
+        return f"ValueError: policy hidden width differs across ranks: {policy_widths}"
+    if policy_widths and target_widths != policy_widths:
+        return (
+            "ValueError: reference hidden width(s) "
+            f"{target_widths} do not match policy hidden width {policy_widths[0]}"
+        )
+    if not policy_widths and len(target_widths) > 1:
+        return f"ValueError: reference hidden width differs across ranks: {target_widths}"
+    return None
+
+
+def _raise_coordinated_reference_error(
+    local_error: str | None,
+    layout: Stage2InterleavedLayout,
+) -> None:
     if distributed.is_available() and distributed.is_initialized():
         failed = torch.tensor(
             int(local_error is not None),
@@ -515,8 +655,16 @@ def _coordinated_reference_lookup(
     elif local_error is not None:
         raise ValueError(f"reference target lookup failed: {local_error}")
 
-    assert targets is not None
-    return targets
+
+def _configured_hidden_width(model) -> int | None:
+    config = getattr(model, "config", None)
+    for candidate in (
+        getattr(config, "hidden_size", None),
+        getattr(getattr(config, "text_config", None), "hidden_size", None),
+    ):
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+            return candidate
+    return None
 
 
 def _resolve_token_ids(configured: Mapping[str, Any] | TokenIds | None) -> TokenIds:
