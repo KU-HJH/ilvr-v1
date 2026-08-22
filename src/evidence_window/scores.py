@@ -148,6 +148,24 @@ def masked_token_sums(scores: torch.Tensor, masks: torch.Tensor) -> torch.Tensor
     return torch.einsum("bt,bnt->bn", scores, masks.to(dtype=scores.dtype))
 
 
+def window_scores(
+    token_logps: torch.Tensor,
+    window_token_mask: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Aggregate token log-probabilities inside each reasoning window."""
+    if reduction not in {"mean", "sum"}:
+        raise ValueError("reduction must be 'mean' or 'sum'")
+    if not torch.is_tensor(window_token_mask) or window_token_mask.dtype is not torch.bool:
+        raise ValueError("window_token_mask must be boolean")
+
+    sums = masked_token_sums(token_logps, window_token_mask)
+    if reduction == "sum":
+        return sums
+    counts = window_token_mask.sum(dim=-1).clamp_min(1).to(dtype=sums.dtype)
+    return sums / counts
+
+
 def reference_adjusted_effect(
     policy_full: torch.Tensor,
     policy_cf: torch.Tensor,
