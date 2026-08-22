@@ -96,6 +96,35 @@ def test_two_unblocked_sdpa_calls_match(tiny_qwen, text_batch):
     torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
 
 
+def test_disabled_sliding_window_leaves_distant_causal_keys_allowed():
+    """A configured-but-disabled window must not deprive distant evidence."""
+    config = _tiny_config()
+    config.use_sliding_window = False
+    config.sliding_window = 2
+    model = Qwen2_5_VLModel(config).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+    inputs_embeds = model.embed_tokens(input_ids)
+
+    mask = model._build_auxiliary_sdpa_mask(
+        attention_mask=torch.ones_like(input_ids),
+        attention_block_mask=None,
+        input_tensor=inputs_embeds,
+        cache_position=torch.arange(input_ids.shape[1]),
+    )
+
+    assert mask[0, 0, 5, 0].item() == 0.0
+
+
+def test_enabled_sliding_window_rejects_auxiliary_sdpa(tiny_qwen, text_batch):
+    """One shared auxiliary mask cannot preserve layer-selective sliding semantics."""
+    tiny_qwen.config.use_sliding_window = True
+    tiny_qwen.config.sliding_window = 2
+    tiny_qwen.config.max_window_layers = 1
+
+    with pytest.raises(ValueError, match="sliding-window"):
+        tiny_qwen(**text_batch, attention_backend_override="sdpa")
+
+
 def test_default_forward_does_not_enter_sdpa_override(tiny_qwen, text_batch):
     """A default CE forward entering the auxiliary path would break compatibility."""
 

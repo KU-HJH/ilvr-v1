@@ -1511,8 +1511,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             attentions=all_self_attns,
         )
 
-    @staticmethod
     def _validate_attention_override(
+        self,
         *,
         attention_backend_override: Optional[str],
         attention_block_mask: Optional[torch.Tensor],
@@ -1528,6 +1528,10 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             return
         if use_cache:
             raise ValueError("the auxiliary SDPA override requires use_cache=False")
+        if self.config.use_sliding_window:
+            raise ValueError(
+                "the auxiliary SDPA override does not support sliding-window attention"
+            )
         if attention_mask is not None and attention_mask.ndim != 2:
             raise ValueError("the auxiliary SDPA override requires a 2D attention_mask")
         if attention_block_mask is None:
@@ -1559,6 +1563,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             batch_size=input_tensor.shape[0],
             config=self.config,
             past_key_values=None,
+            apply_sliding_window=False,
         )
         if attention_block_mask is not None:
             causal_mask = causal_mask.masked_fill(
@@ -1660,6 +1665,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         batch_size: int,
         config: Qwen2_5_VLConfig,
         past_key_values: Cache,
+        apply_sliding_window: bool = True,
     ):
         """
         Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
@@ -1694,7 +1700,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
             )
             diagonal_attend_mask = torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-            if config.sliding_window is not None:
+            if apply_sliding_window and config.sliding_window is not None:
                 # if we have sliding window, we should not attend to tokens beyond sliding window length, so we mask them out also
                 # the check is needed to verify is current checkpoint was trained with sliding window or not
                 if not isinstance(past_key_values, SlidingWindowCache) or sequence_length > target_length:
