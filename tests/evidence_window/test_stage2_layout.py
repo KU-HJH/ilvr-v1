@@ -140,3 +140,10 @@ def test_plan_mismatch_reports_source_row_index():
 
     with pytest.raises(ValueError, match="row 17"):
         validate_plan_types(layout, (("text", "latent", "text", "latent"),), [17])
+
+
+def test_leading_latent_sequence_plan_is_valid():
+    """Forcing an initial text step rejects source plans that begin with latent evidence."""
+    layout = _layout([90, 92, 91, 10])
+
+    validate_plan_types(layout, (("latent", "text"),), [17])
