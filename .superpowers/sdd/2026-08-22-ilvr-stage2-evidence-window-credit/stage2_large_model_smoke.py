@@ -423,13 +423,21 @@ def _run_stage1(args: argparse.Namespace, case_dir: Path) -> dict[str, Any]:
         evidence_window_config=EvidenceWindowConfig.disabled(),
     )
     policy_grad = _gradient_witness(trainer.model)
+    policy_forwards, policy_hook = _forward_witness(trainer.model)
+    teacher_forwards, teacher_hook = _forward_witness(trainer._ema.teacher)
     teacher_grad = any(parameter.grad is not None for parameter in trainer._ema.teacher.parameters())
     trainer.train()
+    policy_hook.remove()
+    teacher_hook.remove()
     teacher_grad = teacher_grad or any(
         parameter.grad is not None for parameter in trainer._ema.teacher.parameters()
     )
     if teacher_grad:
         raise RuntimeError("Stage-1 EMA teacher received gradients")
+    if trainer._ema_update_count != 1:
+        raise RuntimeError(
+            f"Stage-1 EMA update count mismatch: expected 1, got {trainer._ema_update_count}"
+        )
     result = {
         "case": "stage1-baseline",
         "rank": int(os.environ.get("RANK", "0")),
@@ -438,9 +446,12 @@ def _run_stage1(args: argparse.Namespace, case_dir: Path) -> dict[str, Any]:
         "dtype": str(next(trainer.model.parameters()).dtype),
         "losses": _loss_witness(trainer.state.log_history),
         "edge_count": 0,
+        "policy_forwards": policy_forwards,
+        "teacher_forwards": teacher_forwards,
         "policy_gradient": policy_grad,
         "teacher_has_gradient": teacher_grad,
         "ema_update_count": trainer._ema_update_count,
+        "disabled_auxiliary_forward_count": 0,
     }
     del trainer, model, processor
     gc.collect()
