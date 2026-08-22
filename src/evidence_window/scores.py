@@ -166,6 +166,24 @@ def window_scores(
     return sums / counts
 
 
+def causal_prediction_query_mask(target_token_mask: torch.Tensor) -> torch.Tensor:
+    """Map target positions to the decoder query rows that predict them.
+
+    In a causal language model, the logits at query row ``t - 1`` score the
+    label at target position ``t``.  The returned boolean mask keeps the same
+    sequence length and shifts every target position one row to the left;
+    position-zero targets have no causal predictor and are therefore dropped.
+    """
+    if not torch.is_tensor(target_token_mask) or target_token_mask.dtype is not torch.bool:
+        raise ValueError("target_token_mask must be boolean")
+    if target_token_mask.ndim != 3:
+        raise ValueError("target_token_mask must have shape [B, K, T]")
+    query_mask = torch.zeros_like(target_token_mask)
+    if target_token_mask.shape[-1] > 1:
+        query_mask[..., :-1] = target_token_mask[..., 1:]
+    return query_mask
+
+
 def reference_adjusted_effect(
     policy_full: torch.Tensor,
     policy_cf: torch.Tensor,

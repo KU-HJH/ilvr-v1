@@ -82,12 +82,51 @@ def test_one_matched_full_forward_plus_one_exact_forward_per_selected_edge():
     assert torch.equal(effects.pair_mask, layout.causal_pair_mask)
     for (block_mask, need_hidden), edge in zip(calls[1:], edges):
         assert need_hidden is False
+        predictor_queries = torch.zeros_like(
+            layout.window_token_mask[edge.batch_index, edge.window_index]
+        )
+        predictor_queries[:-1] = layout.window_token_mask[
+            edge.batch_index, edge.window_index, 1:
+        ]
         expected = (
-            layout.window_token_mask[edge.batch_index, edge.window_index][:, None]
+            predictor_queries[:, None]
             & layout.evidence_token_mask[edge.batch_index, edge.evidence_index][None, :]
         )
         assert torch.equal(block_mask[edge.batch_index], expected)
         assert not block_mask[torch.arange(block_mask.shape[0]) != edge.batch_index].any()
+
+
+def test_one_token_window_blocks_its_predictor_query_and_gets_nonzero_effect():
+    """Blocking target row t instead of predictor row t-1 makes a one-token edge score zero."""
+    layout = Stage2InterleavedLayout(
+        evidence_token_mask=torch.tensor([[[1, 1, 1, 0]]], dtype=torch.bool),
+        window_token_mask=torch.tensor([[[0, 0, 0, 1]]], dtype=torch.bool),
+        evidence_valid=torch.tensor([[1]], dtype=torch.bool),
+        window_valid=torch.tensor([[1]], dtype=torch.bool),
+        causal_pair_mask=torch.tensor([[[1]]], dtype=torch.bool),
+    )
+    calls = []
+
+    def forward(block_mask, need_hidden):
+        del need_hidden
+        calls.append(block_mask)
+        token_logps = torch.tensor([[0.0, 0.0, 0.0, 5.0]])
+        if block_mask is not None and block_mask[0, 2, :3].all():
+            token_logps[0, 3] = 2.0
+        return Stage2ConditionOutput(token_logps, None)
+
+    effects = compute_stage2_effects(
+        layout,
+        [EvidenceWindowEdge(0, 0, 0)],
+        forward,
+        "mean",
+        False,
+    )
+
+    expected_block = torch.zeros((1, 4, 4), dtype=torch.bool)
+    expected_block[0, 2, :3] = True
+    assert torch.equal(calls[1], expected_block)
+    assert effects.contributions[0, 0, 0].item() == 3.0
 
 
 def test_contributions_are_exact_full_minus_pair_loo_for_heterogeneous_batch():
@@ -97,10 +136,10 @@ def test_contributions_are_exact_full_minus_pair_loo_for_heterogeneous_batch():
     full = torch.tensor([[10.0, 2.0, 99.0, 4.0, 6.0], [8.0, 5.0, 7.0, 0.0, 0.0]])
 
     loo_by_edge = {
-        (0, 1, 0): torch.tensor([[10.0, 1.0, 99.0, 4.0, 6.0], [8.0, 5.0, 7.0, 0.0, 0.0]]),
-        (0, 3, 0): torch.tensor([[10.0, 2.0, 99.0, 1.0, 3.0], [8.0, 5.0, 7.0, 0.0, 0.0]]),
-        (0, 3, 2): torch.tensor([[10.0, 2.0, 99.0, 3.0, 5.0], [8.0, 5.0, 7.0, 0.0, 0.0]]),
-        (1, 1, 0): torch.tensor([[10.0, 2.0, 99.0, 4.0, 6.0], [8.0, 1.0, 3.0, 0.0, 0.0]]),
+        (0, 0, 0): torch.tensor([[10.0, 1.0, 99.0, 4.0, 6.0], [8.0, 5.0, 7.0, 0.0, 0.0]]),
+        (0, 2, 0): torch.tensor([[10.0, 2.0, 99.0, 1.0, 3.0], [8.0, 5.0, 7.0, 0.0, 0.0]]),
+        (0, 2, 2): torch.tensor([[10.0, 2.0, 99.0, 3.0, 5.0], [8.0, 5.0, 7.0, 0.0, 0.0]]),
+        (1, 0, 0): torch.tensor([[10.0, 2.0, 99.0, 4.0, 6.0], [8.0, 1.0, 3.0, 0.0, 0.0]]),
     }
 
     def forward(block_mask, need_hidden):
@@ -120,6 +159,36 @@ def test_contributions_are_exact_full_minus_pair_loo_for_heterogeneous_batch():
 
     assert torch.equal(effects.contributions, expected)
     assert torch.isfinite(effects.contributions).all()
+
+
+def test_sum_reduction_is_used_for_a_real_selected_edge():
+    """Routing real edges through mean despite explicit sum changes length-dependent credit."""
+    layout = Stage2InterleavedLayout(
+        evidence_token_mask=torch.tensor([[[1, 0, 0, 0, 0]]], dtype=torch.bool),
+        window_token_mask=torch.tensor([[[0, 0, 0, 1, 1]]], dtype=torch.bool),
+        evidence_valid=torch.tensor([[1]], dtype=torch.bool),
+        window_valid=torch.tensor([[1]], dtype=torch.bool),
+        causal_pair_mask=torch.tensor([[[1]]], dtype=torch.bool),
+    )
+
+    def forward(block_mask, need_hidden):
+        del need_hidden
+        token_logps = (
+            torch.tensor([[0.0, 0.0, 0.0, 4.0, 6.0]])
+            if block_mask is None
+            else torch.tensor([[0.0, 0.0, 0.0, 1.0, 3.0]])
+        )
+        return Stage2ConditionOutput(token_logps, None)
+
+    effects = compute_stage2_effects(
+        layout,
+        [EvidenceWindowEdge(0, 0, 0)],
+        forward,
+        "sum",
+        False,
+    )
+
+    assert effects.contributions[0, 0, 0].item() == 6.0
 
 
 def test_full_and_loo_policy_branches_both_receive_gradients():
@@ -142,7 +211,7 @@ def test_full_and_loo_policy_branches_both_receive_gradients():
 
 
 def test_hidden_residual_is_window_mean_full_minus_loo():
-    """Reversing or globally pooling the residual changes evidence-effect semantics."""
+    """Pooling target rows instead of causal predictor rows misaligns residuals and logits."""
     layout = Stage2InterleavedLayout(
         evidence_token_mask=torch.tensor([[[1, 1, 0, 0]]], dtype=torch.bool),
         window_token_mask=torch.tensor([[[0, 0, 1, 1]]], dtype=torch.bool),
@@ -150,8 +219,8 @@ def test_hidden_residual_is_window_mean_full_minus_loo():
         window_valid=torch.tensor([[1]], dtype=torch.bool),
         causal_pair_mask=torch.tensor([[[1]]], dtype=torch.bool),
     )
-    full_hidden = torch.tensor([[[50.0, 50.0], [40.0, 40.0], [4.0, 8.0], [6.0, 10.0]]])
-    loo_hidden = torch.tensor([[[1.0, 1.0], [2.0, 2.0], [1.0, 5.0], [3.0, 7.0]]])
+    full_hidden = torch.tensor([[[50.0, 50.0], [4.0, 8.0], [6.0, 10.0], [100.0, 100.0]]])
+    loo_hidden = torch.tensor([[[1.0, 1.0], [1.0, 5.0], [3.0, 7.0], [0.0, 0.0]]])
     hidden_requests = []
 
     def forward(block_mask, need_hidden):

@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
 from .attention import build_window_local_block_mask
-from .scores import window_scores
+from .scores import causal_prediction_query_mask, window_scores
 from .stage2_layout import EvidenceWindowEdge, Stage2InterleavedLayout
 
 
 @dataclass(frozen=True)
 class Stage2ConditionOutput:
-    """Reduced output from one matched auxiliary policy condition."""
+    """Reduced output with token log-probs aligned to their target positions."""
 
     token_logps: torch.Tensor
     final_hidden_state: torch.Tensor | None
@@ -42,10 +42,11 @@ def compute_stage2_effects(
 ) -> Stage2EvidenceEffects:
     """Compute one matched full forward and one exact LOO forward per edge.
 
-    Each LOO forward blocks only the selected reasoning-window queries from the
-    selected evidence keys.  Scores and residuals are retained only for that
-    edge's target window, while both current-policy branches remain attached to
-    autograd.
+    Token log-probabilities are aggregated at target positions ``t``.  The
+    attention intervention and hidden residual instead use causal decoder query
+    rows ``t - 1``, because those representations produce the logits that score
+    each target.  This shift preserves sequence length and positions.  Both
+    current-policy branches remain attached to autograd.
     """
     _validate_layout(layout)
     if not callable(forward):
@@ -55,6 +56,9 @@ def compute_stage2_effects(
     edges = tuple(edges)
     if len(set(edges)) != len(edges):
         raise ValueError("edges must be unique")
+
+    prediction_query_mask = causal_prediction_query_mask(layout.window_token_mask)
+    intervention_layout = replace(layout, window_token_mask=prediction_query_mask)
 
     full = forward(None, need_hidden)
     _validate_output(full, layout, need_hidden=need_hidden)
@@ -73,7 +77,7 @@ def compute_stage2_effects(
         )
 
     for edge in edges:
-        block_mask = build_window_local_block_mask(layout, edge)
+        block_mask = build_window_local_block_mask(intervention_layout, edge)
         loo = forward(block_mask, need_hidden)
         _validate_output(loo, layout, need_hidden=need_hidden, matched_to=full)
 
@@ -101,10 +105,18 @@ def compute_stage2_effects(
             assert full.final_hidden_state is not None
             assert loo.final_hidden_state is not None
             full_hidden = _mean_window_hidden(
-                full.final_hidden_state[batch_index : batch_index + 1], window_mask
+                full.final_hidden_state[batch_index : batch_index + 1],
+                prediction_query_mask[
+                    batch_index : batch_index + 1,
+                    window_index : window_index + 1,
+                ],
             )[0, 0]
             loo_hidden = _mean_window_hidden(
-                loo.final_hidden_state[batch_index : batch_index + 1], window_mask
+                loo.final_hidden_state[batch_index : batch_index + 1],
+                prediction_query_mask[
+                    batch_index : batch_index + 1,
+                    window_index : window_index + 1,
+                ],
             )[0, 0]
             hidden_residuals = hidden_residuals + selector.unsqueeze(-1).to(
                 hidden_residuals.dtype
