@@ -157,9 +157,15 @@ def stage2_relation_jsd(
     )
     eligible = pair_mask.sum(dim=1) >= 2
     if not eligible.any():
-        # One finite element is sufficient to retain the policy graph. Summing
-        # an extreme but finite tensor before multiplying by zero can overflow.
-        return policy_contributions.reshape(-1)[:1].to(dtype=torch.float32).sum() * 0.0
+        # One finite element is sufficient to retain the policy graph. Form
+        # zero in its original dtype before narrowing: an FP64 value can be
+        # finite yet exceed FP32 range. The empty sum is safe because it has no
+        # values to overflow and still retains an empty policy graph.
+        if policy_contributions.numel():
+            zero = policy_contributions.reshape(-1)[0] * 0.0
+        else:
+            zero = policy_contributions.sum()
+        return zero.to(dtype=torch.float32)
 
     # Never evaluate -inf - -inf on invalid entries. Mask those log values to
     # the same finite constant before logaddexp; their resulting zero terms are

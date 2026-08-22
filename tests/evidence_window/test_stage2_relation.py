@@ -182,6 +182,26 @@ def test_extreme_single_candidate_keeps_exact_graph_connected_zero():
     assert torch.equal(policy.grad, torch.zeros_like(policy))
 
 
+def test_float64_single_candidate_forms_graph_zero_before_fp32_narrowing():
+    """A finite FP64 policy value above FP32 range must not become inf times zero."""
+    from evidence_window.losses import stage2_relation_jsd
+
+    magnitude = torch.finfo(torch.float64).max * 0.75
+    policy = torch.tensor([[[magnitude]]], dtype=torch.float64, requires_grad=True)
+    reference = torch.tensor([[[-magnitude]]], dtype=torch.float64, requires_grad=True)
+    mask = torch.ones_like(policy, dtype=torch.bool)
+
+    loss = stage2_relation_jsd(policy, reference, mask, 1e-4)
+
+    assert loss.dtype is torch.float32
+    assert loss.item() == 0.0
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert policy.grad is not None
+    assert torch.equal(policy.grad, torch.zeros_like(policy))
+    assert reference.grad is None
+
+
 def test_relation_only_engine_runs_policy_effects_uses_fixed_target_and_own_schedule():
     """Relation-only training must not be suppressed by a zero EW coefficient."""
     from evidence_window.losses import stage2_relation_jsd
