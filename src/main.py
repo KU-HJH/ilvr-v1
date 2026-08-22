@@ -29,6 +29,9 @@ from evidence_window.stage2_config import (
     read_deepspeed_zero_stage,
 )
 from evidence_window.artifacts import ArtifactIdentity
+from evidence_window.stage2_reference import (
+    validate_online_reference_checkpoint_identity,
+)
 from stage2_data import build_stage2_record, collate_fn_stage2
 from trainer_stage2 import CustomTrainerStage2
 
@@ -193,6 +196,7 @@ def load_stage2_online_reference_model(
     args,
     ew_config,
     *,
+    policy_checkpoint,
     tokenizer_size,
     latent_token_ids,
 ):
@@ -207,6 +211,10 @@ def load_stage2_online_reference_model(
         raise ValueError("online reference loading requires enabled online_frozen mode")
     checkpoint = ew_config.reference.checkpoint
     assert checkpoint is not None
+    checkpoint = validate_online_reference_checkpoint_identity(
+        policy_checkpoint,
+        checkpoint,
+    )
     reference_config = Qwen2_5_VLConfig.from_pretrained(
         checkpoint,
         cache_dir=args.cache_dir,
@@ -254,10 +262,17 @@ def main_train():
     model_path = resolve_policy_model_path(args)
     ew_config = resolve_evidence_window_config(args)
     stage2_zero_stage = None
+    online_reference_checkpoint = None
     if args.stage == "stage2":
         stage2_zero_stage = read_deepspeed_zero_stage(args.deepspeed_config)
         # This runs before processor, policy, or optional reference allocation.
         ew_config.validate_runtime(stage2_zero_stage)
+        if not ew_config.is_disabled and ew_config.reference.mode == "online_frozen":
+            assert ew_config.reference.checkpoint is not None
+            online_reference_checkpoint = validate_online_reference_checkpoint_identity(
+                model_path,
+                ew_config.reference.checkpoint,
+            )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -326,6 +341,7 @@ def main_train():
         online_reference_model = load_stage2_online_reference_model(
             args,
             ew_config,
+            policy_checkpoint=(online_reference_checkpoint or model_path),
             tokenizer_size=len(processor.tokenizer),
             latent_token_ids=latent_token_ids,
         )
@@ -424,6 +440,7 @@ def main_train():
                 lambda model=online_reference_model: model
             )
             trainer_kwargs["deepspeed_zero_stage"] = stage2_zero_stage
+            trainer_kwargs["policy_initialization_checkpoint"] = model_path
     trainer = CustomTrainer(**trainer_kwargs)
     
 

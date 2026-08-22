@@ -10,6 +10,7 @@ not supported.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any, Iterator, Protocol, Sequence
 
 import torch
@@ -53,6 +54,9 @@ class OnlineFrozenStage2Reference:
         model_factory: Callable[[], torch.nn.Module],
         accelerator: Any,
         zero_stage: int,
+        *,
+        policy_checkpoint: str,
+        reference_checkpoint: str,
     ) -> "OnlineFrozenStage2Reference":
         """Build and prepare an independently owned frozen model.
 
@@ -65,6 +69,10 @@ class OnlineFrozenStage2Reference:
             raise ValueError("online frozen Stage-2 reference is incompatible with ZeRO-3")
         if zero_stage not in {1, 2}:
             raise ValueError("online frozen Stage-2 reference requires ZeRO-1 or ZeRO-2")
+        validate_online_reference_checkpoint_identity(
+            policy_checkpoint,
+            reference_checkpoint,
+        )
         if not callable(model_factory):
             raise TypeError("online reference model_factory must be callable")
         prepare_model = getattr(accelerator, "prepare_model", None)
@@ -112,40 +120,70 @@ class OnlineFrozenStage2Reference:
         number of edge slots.  Ranks with fewer local edges fill the remainder
         with all-false masks, matching the policy engine's collective order.
         """
-        if not isinstance(layout, Stage2InterleavedLayout):
-            raise TypeError("layout must be a Stage2InterleavedLayout")
-        indices = _sample_index_tuple(sample_indices)
-        if len(indices) != layout.causal_pair_mask.shape[0]:
-            raise ValueError("sample indices must have one entry per batch row")
-        if not isinstance(model_inputs, Mapping):
-            raise TypeError("model_inputs must be a mapping")
-        if "labels" in model_inputs:
-            raise ValueError("online reference model_inputs must not include labels")
-        expected_labels = (
-            layout.window_token_mask.shape[0],
-            layout.window_token_mask.shape[-1],
-        )
-        if not torch.is_tensor(labels) or labels.shape != expected_labels:
-            raise ValueError("online reference labels must have shape [B, T]")
-        if contribution_reduction not in {"mean", "sum"}:
-            raise ValueError("contribution reduction must be mean or sum")
-        if (
-            isinstance(max_evidence_edges_per_window, bool)
-            or not isinstance(max_evidence_edges_per_window, int)
-            or max_evidence_edges_per_window < 0
-        ):
-            raise ValueError("max evidence edges per window must be nonnegative")
-        if not isinstance(require_hidden_residuals, bool):
-            raise ValueError("require_hidden_residuals must be boolean")
+        validated: dict[str, Any] = {}
 
-        coordinator = (
-            _distributed_edge_counts
-            if edge_count_coordinator is None
-            else edge_count_coordinator
+        def validate_local_inputs() -> None:
+            if not isinstance(layout, Stage2InterleavedLayout):
+                raise TypeError("layout must be a Stage2InterleavedLayout")
+            indices = _sample_index_tuple(sample_indices)
+            if len(indices) != layout.causal_pair_mask.shape[0]:
+                raise ValueError("sample indices must have one entry per batch row")
+            if not isinstance(model_inputs, Mapping):
+                raise TypeError("model_inputs must be a mapping")
+            if "labels" in model_inputs:
+                raise ValueError("online reference model_inputs must not include labels")
+            expected_labels = (
+                layout.window_token_mask.shape[0],
+                layout.window_token_mask.shape[-1],
+            )
+            if not torch.is_tensor(labels) or labels.shape != expected_labels:
+                raise ValueError("online reference labels must have shape [B, T]")
+            if contribution_reduction not in {"mean", "sum"}:
+                raise ValueError("contribution reduction must be mean or sum")
+            if (
+                isinstance(max_evidence_edges_per_window, bool)
+                or not isinstance(max_evidence_edges_per_window, int)
+                or max_evidence_edges_per_window < 0
+            ):
+                raise ValueError("max evidence edges per window must be nonnegative")
+            if not isinstance(require_hidden_residuals, bool):
+                raise ValueError("require_hidden_residuals must be boolean")
+            coordinator = (
+                _distributed_edge_counts
+                if edge_count_coordinator is None
+                else edge_count_coordinator
+            )
+            if not callable(coordinator):
+                raise TypeError("edge_count_coordinator must be callable")
+            reserved = {
+                "attention_block_mask",
+                "attention_backend_override",
+                "output_hidden_states",
+                "return_dict",
+                "use_cache",
+            }
+            conflict = reserved & set(model_inputs)
+            if conflict:
+                raise ValueError(
+                    "online reference model_inputs contain reserved key(s): "
+                    + ", ".join(sorted(conflict))
+                )
+            validated.update(
+                indices=indices,
+                coordinator=coordinator,
+                edges=select_stage2_edges(
+                    layout, max_evidence_edges_per_window
+                ),
+                fixed_inputs=dict(model_inputs),
+            )
+
+        _collective_online_preflight(
+            validate_local_inputs,
+            device=_online_preflight_device(layout),
         )
-        if not callable(coordinator):
-            raise TypeError("edge_count_coordinator must be callable")
-        edges = select_stage2_edges(layout, max_evidence_edges_per_window)
+        indices = validated["indices"]
+        coordinator = validated["coordinator"]
+        edges = validated["edges"]
         global_count, global_max = coordinator(
             len(edges), layout.causal_pair_mask.device
         )
@@ -161,20 +199,7 @@ class OnlineFrozenStage2Reference:
                 hidden_residuals=None,
             )
 
-        reserved = {
-            "attention_block_mask",
-            "attention_backend_override",
-            "output_hidden_states",
-            "return_dict",
-            "use_cache",
-        }
-        conflict = reserved & set(model_inputs)
-        if conflict:
-            raise ValueError(
-                "online reference model_inputs contain reserved key(s): "
-                + ", ".join(sorted(conflict))
-            )
-        fixed_inputs = dict(model_inputs)
+        fixed_inputs = validated["fixed_inputs"]
 
         def fixed_forward(block_mask, need_hidden):
             output = self.model(
@@ -234,6 +259,7 @@ def build_stage2_reference_provider(
     model_factory: Callable[[], torch.nn.Module] | None = None,
     accelerator: Any = None,
     zero_stage: int | None = None,
+    policy_checkpoint: str | None = None,
 ) -> Stage2ReferenceProvider | None:
     """Build only the configured immutable reference source."""
     if not isinstance(config, Stage2EvidenceWindowConfig):
@@ -244,6 +270,7 @@ def build_stage2_reference_provider(
             model_factory,
             accelerator,
             zero_stage,
+            policy_checkpoint,
         )
         if any(value is not None for value in construction_values):
             raise ValueError(
@@ -255,13 +282,75 @@ def build_stage2_reference_provider(
             raise ValueError("online frozen reference does not accept an artifact identity")
         if zero_stage is None:
             raise ValueError("online frozen reference requires an explicit ZeRO stage")
-        return OnlineFrozenStage2Reference.create(model_factory, accelerator, zero_stage)
-    if any(value is not None for value in (model_factory, accelerator, zero_stage)):
+        if policy_checkpoint is None:
+            raise ValueError(
+                "online frozen reference requires the policy initialization checkpoint"
+            )
+        assert config.reference.checkpoint is not None
+        return OnlineFrozenStage2Reference.create(
+            model_factory,
+            accelerator,
+            zero_stage,
+            policy_checkpoint=policy_checkpoint,
+            reference_checkpoint=config.reference.checkpoint,
+        )
+    if any(
+        value is not None
+        for value in (model_factory, accelerator, zero_stage, policy_checkpoint)
+    ):
         raise ValueError("precomputed reference does not accept online model inputs")
     assert config.reference.artifact is not None
     if expected_identity is None:
         raise ValueError("precomputed reference requires an independent expected identity")
     return PrecomputedReferenceProvider(config.reference.artifact, expected_identity)
+
+
+def validate_online_reference_checkpoint_identity(
+    policy_checkpoint: str,
+    reference_checkpoint: str,
+) -> str:
+    """Require the reference to be the exact Stage-1 policy initialization.
+
+    Existing local paths compare by canonical resolved path so symlink aliases
+    are accepted. Non-local model identifiers compare as exact explicit
+    strings. This deliberately does not read or hash checkpoint weights.
+    The returned identifier is canonical for local paths and unchanged for
+    remote identifiers, so tokenizer and model configuration are loaded from
+    the same source that initialized the policy.
+    """
+    values = {
+        "policy initialization checkpoint": policy_checkpoint,
+        "online reference checkpoint": reference_checkpoint,
+    }
+    for name, value in values.items():
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be a nonempty explicit identifier")
+
+    policy_path = Path(policy_checkpoint).expanduser()
+    reference_path = Path(reference_checkpoint).expanduser()
+    policy_local = policy_path.exists()
+    reference_local = reference_path.exists()
+    if policy_local or reference_local:
+        if not (policy_local and reference_local):
+            raise ValueError(
+                "online frozen reference must use the exact Stage-1 checkpoint "
+                "that initialized the policy"
+            )
+        policy_identity = policy_path.resolve(strict=True)
+        reference_identity = reference_path.resolve(strict=True)
+        if policy_identity != reference_identity:
+            raise ValueError(
+                "online frozen reference must use the exact Stage-1 checkpoint "
+                "that initialized the policy"
+            )
+        return str(policy_identity)
+
+    if policy_checkpoint != reference_checkpoint:
+        raise ValueError(
+            "online frozen reference must use the exact Stage-1 checkpoint "
+            "identifier that initialized the policy"
+        )
+    return policy_checkpoint
 
 
 def _sample_index_tuple(values: Sequence[int] | torch.Tensor) -> tuple[int, ...]:
@@ -298,6 +387,53 @@ def _distributed_edge_counts(local_count: int, device: torch.device) -> tuple[in
     return int(total.item()), int(maximum.item())
 
 
+def _online_preflight_device(layout: Any) -> torch.device:
+    pair_mask = getattr(layout, "causal_pair_mask", None)
+    if torch.is_tensor(pair_mask):
+        return pair_mask.device
+    if (
+        distributed.is_available()
+        and distributed.is_initialized()
+        and distributed.get_backend() == "nccl"
+    ):
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _collective_online_preflight(
+    operation: Callable[[], None],
+    *,
+    device: torch.device,
+) -> None:
+    """Reach error consensus before any rank enters reference collectives."""
+    local_exception: Exception | None = None
+    local_error: str | None = None
+    try:
+        operation()
+    except Exception as exc:
+        local_exception = exc
+        local_error = f"{type(exc).__name__}: {exc}"
+
+    if distributed.is_available() and distributed.is_initialized():
+        failed = torch.tensor(
+            int(local_error is not None), dtype=torch.long, device=device
+        )
+        distributed.all_reduce(failed, op=distributed.ReduceOp.MAX)
+        if failed.item():
+            errors: list[str | None] = [None] * distributed.get_world_size()
+            distributed.all_gather_object(errors, local_error)
+            details = "; ".join(
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(errors)
+                if error is not None
+            )
+            raise RuntimeError(
+                f"distributed online reference preflight failed: {details}"
+            )
+    elif local_exception is not None:
+        raise local_exception
+
+
 def _validate_coordinated_counts(local: int, total: int, maximum: int) -> None:
     for name, value in (("total", total), ("maximum", maximum)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -312,4 +448,5 @@ __all__ = [
     "OnlineFrozenStage2Reference",
     "Stage2ReferenceProvider",
     "build_stage2_reference_provider",
+    "validate_online_reference_checkpoint_identity",
 ]

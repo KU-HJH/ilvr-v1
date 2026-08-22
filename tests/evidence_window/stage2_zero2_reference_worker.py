@@ -65,7 +65,11 @@ def main():
                 name: value.detach().clone() for name, value in policy.named_parameters()
             }
             reference = OnlineFrozenStage2Reference.create(
-                TinyModel, accelerator, zero_stage=2
+                TinyModel,
+                accelerator,
+                zero_stage=2,
+                policy_checkpoint="tiny-stage1",
+                reference_checkpoint="tiny-stage1",
             )
             before = {
                 name: value.detach().clone()

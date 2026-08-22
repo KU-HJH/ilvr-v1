@@ -36,6 +36,7 @@ class CustomTrainerStage2(SFTTrainer):
         reference_identity: ArtifactIdentity | None = None,
         reference_model_factory=None,
         deepspeed_zero_stage: int | None = None,
+        policy_initialization_checkpoint: str | None = None,
         **kwargs,
     ):
         config = (
@@ -55,12 +56,24 @@ class CustomTrainerStage2(SFTTrainer):
             config.validate_runtime(deepspeed_zero_stage)
             if not callable(reference_model_factory):
                 raise TypeError("online frozen Stage-2 reference requires a model factory")
+            if not policy_initialization_checkpoint:
+                raise ValueError(
+                    "online frozen Stage-2 reference requires the policy initialization "
+                    "checkpoint identity"
+                )
             if reference_provider is not None or reference_identity is not None:
                 raise ValueError(
                     "online frozen Stage-2 reference does not accept an artifact "
                     "provider or identity"
                 )
-        elif reference_model_factory is not None or deepspeed_zero_stage is not None:
+        elif any(
+            value is not None
+            for value in (
+                reference_model_factory,
+                deepspeed_zero_stage,
+                policy_initialization_checkpoint,
+            )
+        ):
             raise ValueError(
                 "online reference construction inputs require enabled online_frozen mode"
             )
@@ -89,6 +102,7 @@ class CustomTrainerStage2(SFTTrainer):
                 model_factory=reference_model_factory,
                 accelerator=self.accelerator,
                 zero_stage=deepspeed_zero_stage,
+                policy_checkpoint=policy_initialization_checkpoint,
             )
         else:
             self._stage2_reference_provider = (
@@ -142,6 +156,12 @@ class CustomTrainerStage2(SFTTrainer):
         if self.evidence_window_config.is_disabled:
             return (ce_loss, outputs) if return_outputs else ce_loss
 
+        progress = self._training_progress()
+        active_objectives = self._active_auxiliary_objectives(progress)
+        if not active_objectives:
+            self._record_ce_metric(ce_loss, model_inputs, model.training)
+            return (ce_loss, outputs) if return_outputs else ce_loss
+
         required = {"input_ids", "attention_mask", "labels"}
         missing = required - set(model_inputs)
         if missing:
@@ -185,9 +205,14 @@ class CustomTrainerStage2(SFTTrainer):
             hidden = _final_hidden_state(condition_outputs) if need_hidden else None
             return Stage2ConditionOutput(token_logps, hidden)
 
-        progress = self._training_progress()
         reference_targets = None
-        if self._stage2_reference_provider is not None:
+        active_reference_objectives = (
+            active_objectives & self._reference_dependent_objective_names()
+        )
+        if (
+            self._stage2_reference_provider is not None
+            and active_reference_objectives
+        ):
             if sample_indices is None:
                 raise ValueError(
                     "fixed-reference Stage-2 requires deterministic ew_sample_indices"
@@ -227,6 +252,40 @@ class CustomTrainerStage2(SFTTrainer):
         self._maybe_dump_evidence_window_matrices(auxiliary)
         loss = ce_loss + self._globally_scaled_auxiliary(ce_loss, auxiliary)
         return (loss, outputs) if return_outputs else loss
+
+    def _active_auxiliary_objectives(self, progress: float) -> frozenset[str]:
+        """Return scheduled objectives that require work at this step.
+
+        Tasks 11/12 can attach relation and residual computation to the same
+        scheduling gate without reintroducing reference replay during CE-only
+        warmup.
+        """
+        return frozenset(
+            name
+            for name in ("ew", "relation", "residual")
+            if self.evidence_window_config.effective_weight(name, progress) > 0.0
+        )
+
+    def _reference_dependent_objective_names(self) -> frozenset[str]:
+        names = {"relation", "residual"}
+        if self.evidence_window_config.reference.mode != "none":
+            names.add("ew")
+        return frozenset(names)
+
+    def _record_ce_metric(
+        self,
+        ce_loss: torch.Tensor,
+        model_inputs: Mapping[str, Any],
+        training: bool,
+    ) -> None:
+        input_ids = model_inputs.get("input_ids")
+        if not torch.is_tensor(input_ids) or input_ids.ndim < 1:
+            raise ValueError("enabled Stage-2 requires batched input_ids")
+        batch_count = ce_loss.new_tensor(float(input_ids.shape[0]))
+        self._accumulate_evidence_window_metrics(
+            {"loss/ce": (ce_loss.detach() * batch_count, batch_count)},
+            split="train" if training else "eval",
+        )
 
     def _training_progress(self) -> float:
         state = getattr(self, "state", None)

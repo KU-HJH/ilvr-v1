@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import multiprocessing
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,7 @@ from evidence_window.stage2_config import (
     Stage2EvidenceWindowConfig,
     Stage2PreferenceConfig,
     Stage2ReferenceConfig,
+    Stage2ScheduleConfig,
 )
 from evidence_window.stage2_layout import Stage2InterleavedLayout
 from trainer_stage2 import CustomTrainerStage2
@@ -32,6 +35,16 @@ def _online_type():
     reference_type = getattr(module, "OnlineFrozenStage2Reference", None)
     assert reference_type is not None, "online frozen Stage-2 reference is missing"
     return reference_type
+
+
+def _create_online(model_factory, accelerator, zero_stage):
+    return _online_type().create(
+        model_factory,
+        accelerator,
+        zero_stage=zero_stage,
+        policy_checkpoint="approved-stage1",
+        reference_checkpoint="approved-stage1",
+    )
 
 
 class _Accelerator:
@@ -131,12 +144,13 @@ def _batch():
     }
 
 
-def _online_config():
+def _online_config(*, checkpoint="approved-stage1", schedule=None):
     return Stage2EvidenceWindowConfig(
         reference=Stage2ReferenceConfig(
-            mode="online_frozen", checkpoint="/approved/stage1"
+            mode="online_frozen", checkpoint=checkpoint
         ),
         preference=Stage2PreferenceConfig(enabled=True, lambda_ew=1.0, beta=0.4),
+        schedule=Stage2ScheduleConfig() if schedule is None else schedule,
     )
 
 
@@ -149,7 +163,7 @@ def test_zero3_rejects_before_factory_or_model_allocation():
         return _TinyStage2Model()
 
     with pytest.raises(ValueError, match="ZeRO-3"):
-        _online_type().create(factory, _Accelerator(), zero_stage=3)
+        _create_online(factory, _Accelerator(), zero_stage=3)
 
     assert calls == []
 
@@ -166,7 +180,7 @@ def test_independent_reference_is_stage2_frozen_eval_before_prepare(zero_stage):
         return model
 
     accelerator = _Accelerator()
-    reference = _online_type().create(factory, accelerator, zero_stage=zero_stage)
+    reference = _create_online(factory, accelerator, zero_stage=zero_stage)
 
     assert reference.model is created[0]
     assert reference.model is not policy
@@ -180,7 +194,7 @@ def test_independent_reference_is_stage2_frozen_eval_before_prepare(zero_stage):
 def test_online_reference_uses_matched_sdpa_edges_and_dummy_slots_without_gradients():
     """Reference effects must use the same exact intervention and replay count as policy."""
     model = _TinyStage2Model()
-    reference = _online_type().create(lambda: model, _Accelerator(), zero_stage=2)
+    reference = _create_online(lambda: model, _Accelerator(), zero_stage=2)
     inputs = {
         "input_ids": torch.tensor([[90, 92, 91, 5, 6]]),
         "attention_mask": torch.ones((1, 5), dtype=torch.long),
@@ -209,7 +223,7 @@ def test_online_reference_uses_matched_sdpa_edges_and_dummy_slots_without_gradie
     assert all(call["grad_enabled"] is False for call in model.calls)
 
     no_edge_model = _TinyStage2Model()
-    no_edge_reference = _online_type().create(
+    no_edge_reference = _create_online(
         lambda: no_edge_model, _Accelerator(), zero_stage=1
     )
     no_edge_targets = no_edge_reference.get_batch(
@@ -252,6 +266,7 @@ def test_reference_checkpoint_loader_sets_stage2_bf16_flash_attention(monkeypatc
     model = main_module.load_stage2_online_reference_model(
         args,
         _online_config(),
+        policy_checkpoint="approved-stage1",
         tokenizer_size=131,
         latent_token_ids={"pad": 92, "start": 90, "end": 91},
     )
@@ -264,7 +279,7 @@ def test_reference_checkpoint_loader_sets_stage2_bf16_flash_attention(monkeypatc
     assert config.latent_end_id == 91
     assert model.resized_to == 131
     model_call = next(item for item in loaded if item[0] == "model")
-    assert model_call[1] == "/approved/stage1"
+    assert model_call[1] == "approved-stage1"
     assert model_call[2]["torch_dtype"] is torch.bfloat16
     assert model_call[2]["attn_implementation"] == "flash_attention_2"
 
@@ -294,6 +309,7 @@ def test_online_dpo_keeps_reference_fixed_and_policy_trainable(monkeypatch, tmp_
         latent_token_ids=TOKEN_IDS,
         reference_model_factory=lambda: reference_model,
         deepspeed_zero_stage=2,
+        policy_initialization_checkpoint="approved-stage1",
     )
     optimizer = torch.optim.SGD(policy.parameters(), lr=0.1)
 
@@ -332,9 +348,163 @@ def test_online_reference_failure_is_reported_before_policy_auxiliary_replay(
         latent_token_ids=TOKEN_IDS,
         reference_model_factory=lambda: _TinyStage2Model(fail_reference=True),
         deepspeed_zero_stage=1,
+        policy_initialization_checkpoint="approved-stage1",
     )
 
     with pytest.raises(ValueError, match="reference.*failed"):
         trainer.compute_loss(policy, _batch())
 
     assert len(policy.calls) == 1
+
+
+def test_mismatched_checkpoint_identity_rejects_before_factory(tmp_path):
+    """Shape-compatible weights from another run must never become the DPO reference."""
+    policy_checkpoint = tmp_path / "policy-stage1"
+    reference_checkpoint = tmp_path / "other-stage1"
+    policy_checkpoint.mkdir()
+    reference_checkpoint.mkdir()
+    calls = []
+
+    with pytest.raises(ValueError, match="exact Stage-1.*initializ"):
+        _online_type().create(
+            lambda: calls.append("allocated") or _TinyStage2Model(),
+            _Accelerator(),
+            zero_stage=2,
+            policy_checkpoint=str(policy_checkpoint),
+            reference_checkpoint=str(reference_checkpoint),
+        )
+    assert calls == []
+
+    with pytest.raises(ValueError, match="exact Stage-1.*initializ"):
+        _online_type().create(
+            lambda: calls.append("allocated") or _TinyStage2Model(),
+            _Accelerator(),
+            zero_stage=1,
+            policy_checkpoint="org/stage1-policy",
+            reference_checkpoint="org/shape-compatible-policy",
+        )
+    assert calls == []
+
+
+def test_canonical_local_checkpoint_identity_accepts_symlink(tmp_path):
+    """Two local spellings of the same checkpoint must retain exact identity."""
+    checkpoint = tmp_path / "stage1"
+    checkpoint.mkdir()
+    alias = tmp_path / "stage1-alias"
+    alias.symlink_to(checkpoint, target_is_directory=True)
+
+    reference = _online_type().create(
+        _TinyStage2Model,
+        _Accelerator(),
+        zero_stage=1,
+        policy_checkpoint=str(checkpoint),
+        reference_checkpoint=str(alias),
+    )
+
+    assert reference.model.config.stage == "stage2"
+
+
+def _distributed_preflight_worker(rank, init_file, result_dir):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+    model = _TinyStage2Model()
+    try:
+        reference = _create_online(lambda: model, _Accelerator(), zero_stage=1)
+        labels = torch.tensor([[-100, -100, -100, 5, 6]])
+        if rank == 1:
+            labels = labels[:, :-1]
+        reference.get_batch(
+            [rank],
+            _one_edge_layout(),
+            model_inputs={
+                "input_ids": torch.tensor([[90, 92, 91, 5, 6]]),
+                "attention_mask": torch.ones((1, 5), dtype=torch.long),
+            },
+            labels=labels,
+            contribution_reduction="mean",
+            max_evidence_edges_per_window=0,
+        )
+        outcome = "unexpected success"
+    except Exception as exc:
+        outcome = f"{type(exc).__name__}: {exc}; calls={len(model.calls)}"
+    finally:
+        Path(result_dir, f"rank-{rank}.txt").write_text(outcome, encoding="utf-8")
+        torch.distributed.destroy_process_group()
+
+
+def test_rank_local_preflight_failure_reaches_consensus_without_model_calls(tmp_path):
+    """One bad rank must not strand peers in the first edge-count all-reduce."""
+    context = multiprocessing.get_context("spawn")
+    init_file = tmp_path / "gloo-init"
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    processes = [
+        context.Process(
+            target=_distributed_preflight_worker,
+            args=(rank, str(init_file), str(result_dir)),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=15)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+
+    assert alive == [], "rank-local validation stranded a peer in a collective"
+    outcomes = [
+        (result_dir / f"rank-{rank}.txt").read_text(encoding="utf-8")
+        for rank in range(2)
+    ]
+    assert all("distributed online reference preflight failed" in value for value in outcomes)
+    assert all("labels must have shape" in value for value in outcomes)
+    assert all("calls=0" in value for value in outcomes)
+
+
+@pytest.mark.parametrize(
+    ("schedule", "progress", "active"),
+    [
+        (Stage2ScheduleConfig(ew_warmup_ratio=0.5, ew_ramp_ratio=0.25), 0.5, False),
+        (Stage2ScheduleConfig(ew_warmup_ratio=0.5, ew_ramp_ratio=0.25), 0.625, True),
+        (Stage2ScheduleConfig(ew_warmup_ratio=0.5, ew_ramp_ratio=0.0), 0.5, True),
+    ],
+)
+def test_online_reference_respects_warmup_and_ramp_call_counts(
+    monkeypatch, tmp_path, schedule, progress, active
+):
+    """CE-only schedule regions must execute no policy or reference replay."""
+    accelerator = _Accelerator()
+
+    def fake_init(instance, *args, **kwargs):
+        del args
+        instance.model = kwargs["model"]
+        instance.args = SimpleNamespace(output_dir=str(tmp_path))
+        instance.state = SimpleNamespace(
+            global_step=int(progress * 1000), max_steps=1000
+        )
+        instance.accelerator = accelerator
+
+    monkeypatch.setattr(trainer_stage2_module.SFTTrainer, "__init__", fake_init)
+    policy = _TinyStage2Model()
+    reference_model = _TinyStage2Model()
+    trainer = CustomTrainerStage2(
+        model=policy,
+        evidence_window_config=_online_config(schedule=schedule),
+        latent_token_ids=TOKEN_IDS,
+        reference_model_factory=lambda: reference_model,
+        deepspeed_zero_stage=1,
+        policy_initialization_checkpoint="approved-stage1",
+    )
+
+    loss = trainer.compute_loss(policy, _batch())
+
+    assert torch.isfinite(loss)
+    assert len(policy.calls) == (3 if active else 1)
+    assert len(reference_model.calls) == (2 if active else 0)
