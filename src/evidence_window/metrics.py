@@ -39,12 +39,75 @@ class MetricBatch:
 
 @dataclass(frozen=True)
 class ContributionSummaries:
-    """Positive-mass-only descriptive summaries for each ``[B, K]`` window."""
+    """Descriptive contribution summaries for each ``[B, K]`` window."""
 
     top1_ratio: torch.Tensor
     normalized_entropy: torch.Tensor
     entropy_valid: torch.Tensor
     above_threshold_count: torch.Tensor
+
+
+def softmax_contribution_summaries(
+    relations: torch.Tensor,
+    pair_mask: torch.Tensor,
+    temperature: float,
+    threshold: float,
+) -> ContributionSummaries:
+    """Return descriptive softmax concentration over valid evidence candidates.
+
+    Entropy is reported only as a measurement.  It is never transformed into
+    an optimization target, and the threshold count uses raw signed
+    contributions rather than softmax mass.
+    """
+    _validate_relation_inputs(relations, pair_mask)
+    temperature_value = _validate_positive_finite(temperature, "temperature")
+    _validate_threshold(threshold)
+
+    valid = pair_mask.to(dtype=torch.bool)
+    candidate_count = valid.sum(dim=1)
+    batch_size, evidence_count, window_count = relations.shape
+    if evidence_count == 0:
+        zeros = relations.new_zeros((batch_size, window_count))
+        return ContributionSummaries(
+            top1_ratio=zeros,
+            normalized_entropy=zeros,
+            entropy_valid=torch.zeros_like(zeros, dtype=torch.bool),
+            above_threshold_count=torch.zeros_like(zeros, dtype=torch.long),
+        )
+
+    accumulation_dtype = (
+        torch.float32
+        if relations.dtype in {torch.float16, torch.bfloat16}
+        else relations.dtype
+    )
+    scaled = relations.to(dtype=accumulation_dtype) / temperature_value
+    masked = scaled.masked_fill(~valid, -torch.inf)
+    any_candidate = candidate_count.gt(0)
+    safe_masked = torch.where(
+        any_candidate.unsqueeze(1),
+        masked,
+        torch.zeros_like(masked),
+    )
+    probability = torch.softmax(safe_masked, dim=1) * valid.to(dtype=accumulation_dtype)
+    top1_ratio = probability.max(dim=1).values
+    epsilon = torch.finfo(accumulation_dtype).eps
+    entropy = -(probability * probability.clamp_min(epsilon).log()).sum(dim=1)
+    entropy_valid = candidate_count.gt(1)
+    normalized_entropy = entropy / candidate_count.clamp_min(2).to(
+        dtype=accumulation_dtype
+    ).log()
+    normalized_entropy = torch.where(
+        entropy_valid,
+        normalized_entropy,
+        torch.zeros_like(normalized_entropy),
+    )
+    above_threshold_count = ((relations > threshold) & valid).sum(dim=1)
+    return ContributionSummaries(
+        top1_ratio=top1_ratio,
+        normalized_entropy=normalized_entropy,
+        entropy_valid=entropy_valid,
+        above_threshold_count=above_threshold_count,
+    )
 
 
 def contribution_summaries(

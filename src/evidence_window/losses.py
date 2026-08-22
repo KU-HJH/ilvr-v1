@@ -64,6 +64,19 @@ def evidence_window_preference_loss(
     return (-F.logsigmoid(beta_value * margins) * effective_weights).sum() / count
 
 
+def stage2_ew_preference_loss(
+    contributions: torch.Tensor,
+    pair_mask: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
+    """Reference-free Stage-2 loss with one independent sigmoid per edge.
+
+    This deliberately does not aggregate contributions into a sequence margin;
+    global aggregation is reserved for saturation diagnostics.
+    """
+    return evidence_window_preference_loss(contributions, pair_mask, beta)
+
+
 def relation_matrix(
     full_window_sums: torch.Tensor,
     loo_window_sums: torch.Tensor,

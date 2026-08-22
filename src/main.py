@@ -303,6 +303,7 @@ def main_train():
         )
     else:
         trainer_kwargs["processing_class"] = processor.tokenizer
+        trainer_kwargs["latent_token_ids"] = latent_token_ids
     trainer = CustomTrainer(**trainer_kwargs)
     
 

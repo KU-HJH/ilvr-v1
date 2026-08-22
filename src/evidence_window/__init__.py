@@ -21,6 +21,7 @@ from .interventions import apply_all_null, apply_zero_latent_loo, select_loo_spa
 from .losses import (
     evidence_window_preference_loss,
     global_preference_loss,
+    stage2_ew_preference_loss,
     window_preference_loss,
 )
 from .metrics import (
@@ -30,7 +31,9 @@ from .metrics import (
     contribution_summaries,
     global_outer_coefficient,
     reduce_sufficient_statistics,
+    softmax_contribution_summaries,
 )
+from .stage2_engine import Stage2EvidenceWindowEngine, Stage2EvidenceWindowResult
 from .scores import (
     DEFAULT_CAUSAL_TOKEN_CHUNK_SIZE,
     causal_token_logps,
@@ -76,11 +79,15 @@ __all__ = [
     "global_preference_loss",
     "window_preference_loss",
     "evidence_window_preference_loss",
+    "stage2_ew_preference_loss",
     "MetricBatch",
     "ContributionSummaries",
     "contribution_summaries",
     "global_outer_coefficient",
     "reduce_sufficient_statistics",
+    "softmax_contribution_summaries",
+    "Stage2EvidenceWindowEngine",
+    "Stage2EvidenceWindowResult",
     "MatrixJsonlWriter",
     "AdapterDisabledReference",
     "FrozenCopyReference",
