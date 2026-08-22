@@ -130,16 +130,11 @@ def resolve_policy_model_path(args):
 def resolve_evidence_window_config(args):
     """Parse only the evidence-window configuration version valid for a stage."""
     if args.stage == "stage1":
-        config = (
+        return (
             EvidenceWindowConfig.disabled()
             if args.ew_config is None
             else EvidenceWindowConfig.from_json(args.ew_config)
         )
-        if not config.is_disabled:
-            raise ValueError(
-                "Stage 1 accepts only no EW config or a disabled version-1 EW config"
-            )
-        return config
     if args.stage == "stage2":
         return (
             Stage2EvidenceWindowConfig.disabled()
@@ -267,6 +262,15 @@ def main_train():
         stage2_zero_stage = read_deepspeed_zero_stage(args.deepspeed_config)
         # This runs before processor, policy, or optional reference allocation.
         ew_config.validate_runtime(stage2_zero_stage)
+        if (
+            not ew_config.is_disabled
+            and getattr(args, "use_lora", False)
+            and float(getattr(args, "lora_dropout", 0.0)) != 0.0
+        ):
+            raise ValueError(
+                "active Stage-2 evidence-window objectives require lora_dropout "
+                "to be zero"
+            )
         if not ew_config.is_disabled and ew_config.reference.mode == "online_frozen":
             assert ew_config.reference.checkpoint is not None
             online_reference_checkpoint = validate_online_reference_checkpoint_identity(

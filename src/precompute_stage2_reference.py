@@ -71,6 +71,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError("max evidence edges per window must be nonnegative")
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("batch size must be positive and workers nonnegative")
+    if args.batch_size != 1:
+        raise ValueError("Stage-2 reference precompute requires model batch size 1")
     if args.dataset_sha256_witness is not None:
         _validate_sha256(args.dataset_sha256_witness)
     return args
@@ -237,8 +239,13 @@ def precompute(args: argparse.Namespace) -> None:
 
 
 def _precheck_artifact(artifact_dir: Path) -> None:
-    if (artifact_dir / "manifest.json").exists():
-        raise FileExistsError("reference artifact manifest already exists")
+    if not artifact_dir.exists():
+        return
+    if not artifact_dir.is_dir() or any(artifact_dir.iterdir()):
+        raise FileExistsError(
+            "reference artifact destination must be an empty directory; "
+            "refusing a nonempty or non-directory destination"
+        )
 
 
 def _produce_rank_shard(

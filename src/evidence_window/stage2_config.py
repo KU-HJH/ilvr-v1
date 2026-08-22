@@ -188,6 +188,8 @@ class Stage2EvidenceWindowConfig:
         return frozenset(outputs)
 
     def validate_runtime(self, zero_stage: int) -> None:
+        if self.is_disabled:
+            return
         if not _is_integer(zero_stage) or zero_stage not in {0, 1, 2, 3}:
             raise ValueError("ZeRO stage must be an integer from 0 through 3")
         if self.reference.mode != "online_frozen":

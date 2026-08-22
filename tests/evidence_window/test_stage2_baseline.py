@@ -6,7 +6,10 @@ import torch
 import main as main_module
 import trainer_stage2 as trainer_stage2_module
 from evidence_window.config import EvidenceWindowConfig
-from evidence_window.stage2_config import Stage2EvidenceWindowConfig
+from evidence_window.stage2_config import (
+    Stage2EvidenceWindowConfig,
+    Stage2PreferenceConfig,
+)
 from main import (
     prepare_training_dataset,
     resolve_evidence_window_config,
@@ -114,7 +117,7 @@ def test_stage2_requires_existing_stage1_checkpoint(tmp_path):
     assert resolve_policy_model_path(stage_args("stage1")) == "registry/base-model"
 
 
-def test_stage1_accepts_only_disabled_v1_configuration(tmp_path):
+def test_stage1_accepts_enabled_historical_v1_configuration(tmp_path):
     disabled_path = tmp_path / "disabled-v1.json"
     disabled_path.write_text('{"version": 1}', encoding="utf-8")
     enabled_path = tmp_path / "enabled-v1.json"
@@ -127,8 +130,16 @@ def test_stage1_accepts_only_disabled_v1_configuration(tmp_path):
     assert resolve_evidence_window_config(
         stage_args("stage1", ew_config=disabled_path)
     ).is_disabled
-    with pytest.raises(ValueError, match="Stage 1.*disabled version-1"):
-        resolve_evidence_window_config(stage_args("stage1", ew_config=enabled_path))
+    enabled = resolve_evidence_window_config(
+        stage_args("stage1", ew_config=enabled_path)
+    )
+    assert isinstance(enabled, EvidenceWindowConfig)
+    assert not enabled.is_disabled
+
+    version2_path = tmp_path / "version2.json"
+    version2_path.write_text('{"version": 2}', encoding="utf-8")
+    with pytest.raises(ValueError, match="version must be 1"):
+        resolve_evidence_window_config(stage_args("stage1", ew_config=version2_path))
 
 
 def test_stage2_accepts_only_version2_configuration(tmp_path):
@@ -147,6 +158,126 @@ def test_stage2_accepts_only_version2_configuration(tmp_path):
     )
     with pytest.raises(ValueError, match="version must be 2"):
         resolve_evidence_window_config(stage_args("stage2", ew_config=version1_path))
+
+
+def test_active_stage2_rejects_default_lora_dropout_before_processor_load(
+    tmp_path, monkeypatch
+):
+    """The CLI default must fail before allocating processor, policy, or reference."""
+    checkpoint = tmp_path / "stage1"
+    checkpoint.mkdir()
+    args = SimpleNamespace(
+        stage="stage2",
+        model="registry/base-model",
+        load_model_path=str(checkpoint),
+        ew_config=None,
+        deepspeed_config="unused.json",
+        log_file=str(tmp_path / "train.log"),
+        cache_dir=str(tmp_path / "cache"),
+        use_lora=True,
+        lora_dropout=0.05,
+    )
+    active = Stage2EvidenceWindowConfig(
+        preference=Stage2PreferenceConfig(enabled=True, lambda_ew=1.0)
+    )
+    loads = []
+    monkeypatch.setattr(main_module, "seed_everything", lambda seed: None)
+    monkeypatch.setattr(main_module, "get_args", lambda: args)
+    monkeypatch.setattr(main_module, "resolve_evidence_window_config", lambda _args: active)
+    monkeypatch.setattr(main_module, "read_deepspeed_zero_stage", lambda _path: 1)
+    monkeypatch.setattr(
+        main_module.AutoProcessor,
+        "from_pretrained",
+        lambda *args, **kwargs: loads.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="lora_dropout.*zero"):
+        main_module.main_train()
+
+    assert loads == []
+
+
+def test_active_stage2_accepts_zero_lora_dropout_until_processor_load(
+    tmp_path, monkeypatch
+):
+    """A zero-dropout LoRA launch must pass the cheap auxiliary preflight."""
+    checkpoint = tmp_path / "stage1"
+    checkpoint.mkdir()
+    args = SimpleNamespace(
+        stage="stage2",
+        model="registry/base-model",
+        load_model_path=str(checkpoint),
+        ew_config=None,
+        deepspeed_config="unused.json",
+        log_file=str(tmp_path / "train.log"),
+        cache_dir=str(tmp_path / "cache"),
+        use_lora=True,
+        lora_dropout=0.0,
+    )
+    active = Stage2EvidenceWindowConfig(
+        preference=Stage2PreferenceConfig(enabled=True, lambda_ew=1.0)
+    )
+    loads = []
+
+    class ProcessorReached(RuntimeError):
+        pass
+
+    def reached(*args, **kwargs):
+        loads.append((args, kwargs))
+        raise ProcessorReached
+
+    monkeypatch.setattr(main_module, "seed_everything", lambda seed: None)
+    monkeypatch.setattr(main_module, "get_args", lambda: args)
+    monkeypatch.setattr(main_module, "resolve_evidence_window_config", lambda _args: active)
+    monkeypatch.setattr(main_module, "read_deepspeed_zero_stage", lambda _path: 1)
+    monkeypatch.setattr(main_module.AutoProcessor, "from_pretrained", reached)
+
+    with pytest.raises(ProcessorReached):
+        main_module.main_train()
+
+    assert len(loads) == 1
+
+
+def test_disabled_stage2_allows_default_lora_dropout_until_processor_load(
+    tmp_path, monkeypatch
+):
+    """The CE-only baseline must not inherit matched-replay dropout constraints."""
+    checkpoint = tmp_path / "stage1"
+    checkpoint.mkdir()
+    args = SimpleNamespace(
+        stage="stage2",
+        model="registry/base-model",
+        load_model_path=str(checkpoint),
+        ew_config=None,
+        deepspeed_config="unused.json",
+        log_file=str(tmp_path / "train.log"),
+        cache_dir=str(tmp_path / "cache"),
+        use_lora=True,
+        lora_dropout=0.05,
+    )
+    loads = []
+
+    class ProcessorReached(RuntimeError):
+        pass
+
+    def reached(*args, **kwargs):
+        loads.append((args, kwargs))
+        raise ProcessorReached
+
+    monkeypatch.setattr(main_module, "seed_everything", lambda seed: None)
+    monkeypatch.setattr(main_module, "get_args", lambda: args)
+    monkeypatch.setattr(
+        main_module,
+        "resolve_evidence_window_config",
+        lambda _args: Stage2EvidenceWindowConfig.disabled(),
+    )
+    monkeypatch.setattr(main_module, "read_deepspeed_zero_stage", lambda _path: 1)
+    monkeypatch.setattr(main_module.AutoProcessor, "from_pretrained", reached)
+
+    with pytest.raises(ProcessorReached):
+        main_module.main_train()
+
+    assert len(loads) == 1
 
 
 def test_stage2_dataset_enumerates_raw_rows_into_helper_free_records():

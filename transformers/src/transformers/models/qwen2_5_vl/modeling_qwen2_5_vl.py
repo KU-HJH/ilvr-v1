@@ -2118,6 +2118,17 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        if self.config.stage == "stage2" and not generate_mode:
+            stage2_batch_size = (
+                input_ids.shape[0]
+                if input_ids is not None
+                else inputs_embeds.shape[0]
+            )
+            if stage2_batch_size != 1:
+                raise NotImplementedError(
+                    "Stage-2 latent replay currently requires batch_size == 1."
+                )
+
         # ===================================================================
         # 1. 基础 Embedding 构建 (文本 + 视觉输入注入)
         # ===================================================================

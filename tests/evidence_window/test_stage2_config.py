@@ -44,6 +44,11 @@ def test_online_frozen_rejected_for_zero3(tmp_path):
         cfg.validate_runtime(read_deepspeed_zero_stage(ds))
 
 
+def test_disabled_config_skips_auxiliary_zero_runtime_validation():
+    """A CE-only baseline must not depend on auxiliary ZeRO constraints."""
+    Stage2EvidenceWindowConfig.disabled().validate_runtime(None)
+
+
 def test_residual_precomputed_reference_requests_hidden_states():
     cfg = Stage2EvidenceWindowConfig.from_dict(
         {

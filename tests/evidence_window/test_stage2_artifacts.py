@@ -1,6 +1,7 @@
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -533,6 +534,50 @@ def test_precompute_identity_reuses_supplied_dataset_witness_without_rehash(
     )
 
     assert identity.dataset_sha256 == "c" * 64
+
+
+def test_precompute_cli_rejects_model_batch_larger_than_one():
+    """The heterogeneous Stage-2 model path must not silently score batched rows."""
+    with pytest.raises(ValueError, match="batch size 1"):
+        precompute_module.parse_args(
+            [
+                "--data-path", "/data.jsonl",
+                "--reference-checkpoint", "/checkpoint",
+                "--reference-checkpoint-id", "stage1",
+                "--reference-checkpoint-witness", "sealed",
+                "--artifact-dir", "/artifact",
+                "--tokenizer-id", "tokenizer",
+                "--model-config-id", "model",
+                "--batch-size", "2",
+            ]
+        )
+
+
+@pytest.mark.parametrize("entry_name", ["partial.pt", "shard-rank-00000.pt"])
+def test_nonempty_artifact_destination_fails_before_model_load(
+    tmp_path, monkeypatch, entry_name
+):
+    """A partial/reserved artifact directory must fail before loading a model."""
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    (artifact_dir / entry_name).write_bytes(b"partial")
+    args = SimpleNamespace(
+        artifact_dir=str(artifact_dir),
+        dataset_sha256_witness="c" * 64,
+    )
+    loads = []
+    monkeypatch.setattr(precompute_module, "_initialize_distributed_if_requested", lambda: None)
+    monkeypatch.setattr(precompute_module.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        precompute_module,
+        "_produce_rank_shard",
+        lambda *args, **kwargs: loads.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="artifact precheck.*nonempty"):
+        precompute_module.precompute(args)
+
+    assert loads == []
 
 
 @pytest.mark.parametrize(

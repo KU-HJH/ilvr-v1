@@ -268,3 +268,20 @@ def test_stage2_prefix_calls_slice_padding_and_both_block_axes():
     for prefix_length, (seen_padding, seen_block) in zip((2, 5, 7), observed):
         assert torch.equal(seen_padding, padding_mask[:, :prefix_length])
         assert torch.equal(seen_block, block_mask[:, :prefix_length, :prefix_length])
+
+
+def test_stage2_model_rejects_batch_larger_than_one_before_latent_replay():
+    """Unsupported heterogeneous Stage-2 rows must fail instead of sharing prefixes."""
+    model = Qwen2_5_VLForConditionalGeneration(_tiny_config(stage="stage2")).eval()
+    input_ids = torch.tensor(
+        [[1, 9, 2, 3], [1, 2, 9, 3]],
+        dtype=torch.long,
+    )
+
+    with pytest.raises(NotImplementedError, match="batch_size == 1"):
+        model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            use_cache=False,
+            return_dict=True,
+        )

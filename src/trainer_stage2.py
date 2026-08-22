@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import logging
+import math
 from typing import Any
 
 import torch
 import torch.distributed as distributed
+from torch import nn
 from trl import SFTTrainer
 
 from evidence_window.layout import TokenIds
@@ -166,24 +168,24 @@ class CustomTrainerStage2(SFTTrainer):
             self._record_ce_metric(ce_loss, model_inputs, model.training)
             return (ce_loss, outputs) if return_outputs else ce_loss
 
-        required = {"input_ids", "attention_mask", "labels"}
-        missing = required - set(model_inputs)
-        if missing:
-            raise ValueError(
-                "enabled Stage-2 evidence-window loss requires model input(s): "
-                + ", ".join(sorted(missing))
-            )
-        if (sample_indices is None) != (plan_types is None):
-            raise ValueError("Stage-2 plan types and sample indices must be provided together")
-
-        layout = extract_stage2_layout(
-            model_inputs["input_ids"],
-            model_inputs["attention_mask"],
-            model_inputs["labels"],
-            self._token_ids,
+        active_reference_objectives = (
+            active_objectives & self._reference_dependent_objective_names()
         )
-        if plan_types is not None:
-            validate_plan_types(layout, plan_types, sample_indices)
+        layout = _coordinated_auxiliary_preflight(
+            model,
+            model_inputs,
+            sample_indices,
+            plan_types,
+            token_ids=self._token_ids,
+            max_evidence_edges_per_window=(
+                self.evidence_window_config.loo.max_evidence_edges_per_window
+            ),
+            requires_sample_indices=(
+                self._stage2_reference_provider is not None
+                and bool(active_reference_objectives)
+            ),
+            collective_device=ce_loss.device,
+        )
 
         labels = model_inputs["labels"]
         auxiliary_inputs = dict(model_inputs)
@@ -210,9 +212,6 @@ class CustomTrainerStage2(SFTTrainer):
             return Stage2ConditionOutput(token_logps, hidden)
 
         reference_targets = None
-        active_reference_objectives = (
-            active_objectives & self._reference_dependent_objective_names()
-        )
         if (
             self._stage2_reference_provider is not None
             and active_reference_objectives
@@ -457,6 +456,124 @@ def _final_hidden_state(outputs) -> torch.Tensor:
     if not torch.is_tensor(hidden):
         raise ValueError("Stage-2 residual output requires a final hidden-state tensor")
     return hidden
+
+
+def _coordinated_auxiliary_preflight(
+    model,
+    model_inputs: Mapping[str, Any],
+    sample_indices,
+    plan_types,
+    *,
+    token_ids: TokenIds,
+    max_evidence_edges_per_window: int,
+    requires_sample_indices: bool,
+    collective_device: torch.device,
+) -> Stage2InterleavedLayout:
+    """Validate every rank before any reference or edge-replay collective."""
+    layout = None
+    local_exception: Exception | None = None
+    local_error: str | None = None
+    try:
+        required = {"input_ids", "attention_mask", "labels"}
+        missing = required - set(model_inputs)
+        if missing:
+            raise ValueError(
+                "enabled Stage-2 evidence-window loss requires model input(s): "
+                + ", ".join(sorted(missing))
+            )
+        if (sample_indices is None) != (plan_types is None):
+            raise ValueError(
+                "Stage-2 plan types and sample indices must be provided together"
+            )
+        if requires_sample_indices and sample_indices is None:
+            raise ValueError(
+                "fixed-reference Stage-2 requires deterministic ew_sample_indices"
+            )
+        layout = extract_stage2_layout(
+            model_inputs["input_ids"],
+            model_inputs["attention_mask"],
+            model_inputs["labels"],
+            token_ids,
+        )
+        if plan_types is not None:
+            validate_plan_types(layout, plan_types, sample_indices)
+        # Selection is repeated by the engine/provider, but doing its cheap
+        # validation here prevents one rank from failing after peers proceed.
+        select_stage2_edges(layout, max_evidence_edges_per_window)
+        _validate_deterministic_auxiliary_dropout(model)
+    except Exception as exc:
+        local_exception = exc
+        local_error = f"{type(exc).__name__}: {exc}"
+
+    if distributed.is_available() and distributed.is_initialized():
+        failed = torch.tensor(
+            int(local_error is not None),
+            dtype=torch.long,
+            device=collective_device,
+        )
+        distributed.all_reduce(failed, op=distributed.ReduceOp.MAX)
+        if failed.item():
+            errors: list[str | None] = [None] * distributed.get_world_size()
+            distributed.all_gather_object(errors, local_error)
+            detail = "; ".join(
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(errors)
+                if error is not None
+            )
+            raise RuntimeError(
+                f"distributed Stage-2 auxiliary preflight failed: {detail}"
+            )
+    elif local_exception is not None:
+        raise local_exception
+
+    assert layout is not None
+    return layout
+
+
+def _validate_deterministic_auxiliary_dropout(model) -> None:
+    """Reject active stochastic dropout in matched full/LOO training forwards."""
+    if not getattr(model, "training", False):
+        return
+
+    violations: set[str] = set()
+    for name, module in model.named_modules():
+        qualified = name or "<root>"
+        if (
+            isinstance(module, nn.Dropout)
+            and module.training
+            and float(module.p) > 0.0
+        ):
+            violations.add(f"{qualified}.dropout={float(module.p)}")
+        attention_dropout = getattr(module, "attention_dropout", None)
+        if (
+            not isinstance(attention_dropout, bool)
+            and isinstance(attention_dropout, (int, float))
+            and math.isfinite(float(attention_dropout))
+            and float(attention_dropout) > 0.0
+        ):
+            violations.add(
+                f"{qualified}.attention_dropout={float(attention_dropout)}"
+            )
+
+    config = getattr(model, "config", None)
+    for name, candidate in (
+        ("config", config),
+        ("config.text_config", getattr(config, "text_config", None)),
+    ):
+        attention_dropout = getattr(candidate, "attention_dropout", None)
+        if (
+            not isinstance(attention_dropout, bool)
+            and isinstance(attention_dropout, (int, float))
+            and math.isfinite(float(attention_dropout))
+            and float(attention_dropout) > 0.0
+        ):
+            violations.add(f"{name}.attention_dropout={float(attention_dropout)}")
+
+    if violations:
+        raise ValueError(
+            "active Stage-2 evidence-window matched replay requires zero dropout: "
+            + ", ".join(sorted(violations))
+        )
 
 
 def _coordinated_reference_lookup(

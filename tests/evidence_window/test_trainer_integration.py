@@ -505,7 +505,7 @@ def test_auxiliary_scores_normalize_labels_dependent_logits_to_float32(
     }
 
 
-def test_main_wires_disabled_config_and_rejects_enabled_v1_launcher_config(
+def test_main_wires_disabled_and_enabled_v1_stage1_configurations(
     monkeypatch,
     tmp_path,
 ):
@@ -640,5 +640,6 @@ def test_main_wires_disabled_config_and_rejects_enabled_v1_launcher_config(
         lambda path: loaded_config,
     )
 
-    with pytest.raises(ValueError, match="Stage 1.*disabled version-1"):
-        main_module.main_train()
+    main_module.main_train()
+
+    assert FakeTrainer.captured["evidence_window_config"] is loaded_config
