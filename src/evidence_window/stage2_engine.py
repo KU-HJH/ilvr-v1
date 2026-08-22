@@ -13,6 +13,7 @@ from .artifacts import ReferenceBatchTargets
 from .losses import (
     stage2_ew_dpo_loss,
     stage2_ew_preference_loss,
+    stage2_hidden_residual_loss,
     stage2_relation_jsd,
 )
 from .metrics import global_outer_coefficient, softmax_contribution_summaries
@@ -80,16 +81,20 @@ class Stage2EvidenceWindowEngine:
 
         ew_weight = self.config.effective_weight("ew", progress)
         relation_weight = self.config.effective_weight("relation", progress)
+        residual_weight = self.config.effective_weight("residual", progress)
         active_weights = {
             name: weight
             for name, weight in (
                 ("ew_pref", ew_weight),
                 ("relation", relation_weight),
+                ("residual", residual_weight),
             )
             if weight > 0.0
         }
         if not active_weights:
             return self._empty_result(layout)
+        if residual_weight > 0.0:
+            _prevalidate_hidden_reference(reference_targets, layout)
         edges = select_stage2_edges(
             layout,
             self.config.loo.max_evidence_edges_per_window,
@@ -109,7 +114,7 @@ class Stage2EvidenceWindowEngine:
         # forwards, so every rank must execute the same number before any
         # backward. Reusing a prior output would not enter those collectives.
         graph_zeros: list[torch.Tensor] = []
-        need_hidden = "hidden_states" in self.config.required_outputs
+        need_hidden = residual_weight > 0.0
 
         def coordinated_forward(block_mask, request_hidden):
             output = policy_forward(block_mask, request_hidden)
@@ -160,7 +165,11 @@ class Stage2EvidenceWindowEngine:
         objective_values = contributions
         reference = None
         if reference_targets is not None:
-            _validate_reference_targets(reference_targets, effects)
+            _validate_reference_targets(
+                reference_targets,
+                effects,
+                require_hidden_residuals=residual_weight > 0.0,
+            )
             reference = reference_targets.contributions.to(
                 device=contributions.device,
                 dtype=contributions.dtype,
@@ -190,6 +199,22 @@ class Stage2EvidenceWindowEngine:
             losses["relation"] = relation_loss
             weighted_objectives["relation"] = relation_loss * relation_weight
             auxiliary_loss = auxiliary_loss + weighted_objectives["relation"]
+        if residual_weight > 0.0:
+            assert reference_targets is not None
+            assert effects.hidden_residuals is not None
+            assert reference_targets.hidden_residuals is not None
+            reference_hidden = reference_targets.hidden_residuals.to(
+                device=effects.hidden_residuals.device,
+            ).detach()
+            residual_loss = stage2_hidden_residual_loss(
+                effects.hidden_residuals,
+                reference_hidden,
+                valid,
+                self.config.residual.huber_delta,
+            )
+            losses["residual"] = residual_loss
+            weighted_objectives["residual"] = residual_loss * residual_weight
+            auxiliary_loss = auxiliary_loss + weighted_objectives["residual"]
 
         metric_sums = _edge_metrics(
             contributions,
@@ -219,6 +244,28 @@ class Stage2EvidenceWindowEngine:
             )
             metric_sums["schedule/relation_weight"] = (
                 contributions.new_tensor(relation_weight),
+                contributions.new_tensor(1.0),
+            )
+        if residual_weight > 0.0:
+            assert effects.hidden_residuals is not None
+            residual_count = valid.sum().to(dtype=contributions.dtype)
+            policy_norms = effects.hidden_residuals.detach().to(dtype=torch.float32).norm(
+                dim=-1
+            )
+            metric_sums["loss/residual"] = (
+                losses["residual"].detach() * residual_count,
+                residual_count,
+            )
+            metric_sums["residual/valid_edge_count"] = (
+                residual_count,
+                contributions.new_tensor(1.0),
+            )
+            metric_sums["residual/policy_effect_norm"] = (
+                policy_norms.masked_select(valid).sum(),
+                residual_count,
+            )
+            metric_sums["schedule/residual_weight"] = (
+                contributions.new_tensor(residual_weight),
                 contributions.new_tensor(1.0),
             )
         return Stage2EvidenceWindowResult(
@@ -346,6 +393,8 @@ def _count_tensor(value: int, like: torch.Tensor) -> torch.Tensor:
 def _validate_reference_targets(
     targets: ReferenceBatchTargets,
     effects: Stage2EvidenceEffects,
+    *,
+    require_hidden_residuals: bool = False,
 ) -> None:
     if not isinstance(targets, ReferenceBatchTargets):
         raise TypeError("reference_targets must be ReferenceBatchTargets")
@@ -365,6 +414,42 @@ def _validate_reference_targets(
         pair_mask = pair_mask.to(device=effects.pair_mask.device)
     if not torch.equal(pair_mask, effects.pair_mask):
         raise ValueError("reference pair_mask does not match selected policy edges")
+    if require_hidden_residuals:
+        hidden = targets.hidden_residuals
+        policy_hidden = effects.hidden_residuals
+        if policy_hidden is None:
+            raise ValueError("policy hidden residuals are required")
+        if (
+            not torch.is_tensor(hidden)
+            or hidden.shape != policy_hidden.shape
+            or not hidden.is_floating_point()
+            or not torch.isfinite(hidden).all()
+        ):
+            raise ValueError(
+                "reference hidden residuals must be finite and match policy hidden width"
+            )
+
+
+def _prevalidate_hidden_reference(
+    targets: ReferenceBatchTargets | None,
+    layout: Stage2InterleavedLayout,
+) -> None:
+    """Reject an absent/malformed residual artifact before policy replay begins."""
+    if not isinstance(targets, ReferenceBatchTargets):
+        raise ValueError("fixed-reference residual objective requires reference targets")
+    hidden = targets.hidden_residuals
+    expected_prefix = layout.causal_pair_mask.shape
+    if (
+        not torch.is_tensor(hidden)
+        or hidden.ndim != 4
+        or hidden.shape[:3] != expected_prefix
+        or hidden.shape[-1] <= 0
+        or not hidden.is_floating_point()
+        or not torch.isfinite(hidden).all()
+    ):
+        raise ValueError(
+            "hidden residual reference targets are required with shape [B, J, K, H]"
+        )
 
 
 def _distributed_edge_counts(

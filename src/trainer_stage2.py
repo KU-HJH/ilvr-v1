@@ -221,7 +221,7 @@ class CustomTrainerStage2(SFTTrainer):
                 self._stage2_reference_provider,
                 sample_indices,
                 layout,
-                require_hidden_residuals=self.evidence_window_config._residual_enabled(),
+                require_hidden_residuals="residual" in active_reference_objectives,
                 model_inputs=(
                     auxiliary_inputs
                     if isinstance(

@@ -103,6 +103,58 @@ def stage2_ew_dpo_loss(
     return evidence_window_preference_loss(margins, pair_mask, beta)
 
 
+def stage2_hidden_residual_loss(
+    policy_hidden_effects: torch.Tensor,
+    reference_hidden_effects: torch.Tensor,
+    pair_mask: torch.Tensor,
+    delta: float,
+) -> torch.Tensor:
+    """FP32 elementwise Huber, averaged over hidden width and valid edges."""
+    if (
+        not torch.is_tensor(policy_hidden_effects)
+        or policy_hidden_effects.ndim != 4
+        or not policy_hidden_effects.is_floating_point()
+    ):
+        raise ValueError(
+            "policy_hidden_effects must be floating point with shape [B, J, K, H]"
+        )
+    if (
+        not torch.is_tensor(reference_hidden_effects)
+        or reference_hidden_effects.shape != policy_hidden_effects.shape
+        or not reference_hidden_effects.is_floating_point()
+    ):
+        raise ValueError("policy and reference hidden effects must have the same shape")
+    if reference_hidden_effects.device != policy_hidden_effects.device:
+        raise ValueError("policy and reference hidden effects must share a device")
+    if (
+        not torch.is_tensor(pair_mask)
+        or pair_mask.dtype is not torch.bool
+        or pair_mask.shape != policy_hidden_effects.shape[:3]
+    ):
+        raise ValueError("pair_mask must be boolean with shape [B, J, K]")
+    if pair_mask.device != policy_hidden_effects.device:
+        raise ValueError("pair_mask and hidden effects must share a device")
+    if not torch.isfinite(policy_hidden_effects).all() or not torch.isfinite(
+        reference_hidden_effects
+    ).all():
+        raise ValueError("hidden effects must be finite")
+    delta_value = _validate_positive_finite(delta, "delta")
+
+    policy_fp32 = policy_hidden_effects.to(dtype=torch.float32)
+    reference_fp32 = reference_hidden_effects.detach().to(dtype=torch.float32)
+    if not torch.isfinite(policy_fp32).all() or not torch.isfinite(reference_fp32).all():
+        raise ValueError("hidden effects must be representable in FP32")
+    if not pair_mask.any():
+        return policy_fp32.sum() * 0.0
+    edge_losses = F.huber_loss(
+        policy_fp32,
+        reference_fp32,
+        delta=delta_value,
+        reduction="none",
+    ).mean(dim=-1)
+    return edge_losses.masked_select(pair_mask).mean()
+
+
 def stage2_relation_distribution(
     contributions: torch.Tensor,
     pair_mask: torch.Tensor,

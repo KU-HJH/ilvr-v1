@@ -104,14 +104,8 @@ def compute_stage2_effects(
         if hidden_residuals is not None:
             assert full.final_hidden_state is not None
             assert loo.final_hidden_state is not None
-            full_hidden = _mean_window_hidden(
+            hidden_effect = pooled_hidden_effect(
                 full.final_hidden_state[batch_index : batch_index + 1],
-                prediction_query_mask[
-                    batch_index : batch_index + 1,
-                    window_index : window_index + 1,
-                ],
-            )[0, 0]
-            loo_hidden = _mean_window_hidden(
                 loo.final_hidden_state[batch_index : batch_index + 1],
                 prediction_query_mask[
                     batch_index : batch_index + 1,
@@ -120,7 +114,7 @@ def compute_stage2_effects(
             )[0, 0]
             hidden_residuals = hidden_residuals + selector.unsqueeze(-1).to(
                 hidden_residuals.dtype
-            ) * (full_hidden - loo_hidden)
+            ) * hidden_effect
 
     return Stage2EvidenceEffects(
         contributions=contributions,
@@ -130,14 +124,49 @@ def compute_stage2_effects(
     )
 
 
-def _mean_window_hidden(
-    hidden_state: torch.Tensor,
+def pooled_hidden_effect(
+    full_hidden_state: torch.Tensor,
+    loo_hidden_state: torch.Tensor,
     window_token_mask: torch.Tensor,
 ) -> torch.Tensor:
-    mask = window_token_mask.to(dtype=hidden_state.dtype).unsqueeze(-1)
-    sums = (hidden_state.unsqueeze(1) * mask).sum(dim=2)
-    counts = window_token_mask.sum(dim=-1).clamp_min(1).to(dtype=hidden_state.dtype)
-    return sums / counts.unsqueeze(-1)
+    """Mean ``full - LOO`` effect over caller-selected predictor-query rows."""
+    if (
+        not torch.is_tensor(full_hidden_state)
+        or full_hidden_state.ndim != 3
+        or not full_hidden_state.is_floating_point()
+    ):
+        raise ValueError("full_hidden_state must be floating point with shape [B, T, H]")
+    if (
+        not torch.is_tensor(loo_hidden_state)
+        or loo_hidden_state.shape != full_hidden_state.shape
+        or not loo_hidden_state.is_floating_point()
+    ):
+        raise ValueError("full and LOO hidden states must have the same [B, T, H] shape")
+    if loo_hidden_state.device != full_hidden_state.device:
+        raise ValueError("full and LOO hidden states must share a device")
+    if loo_hidden_state.dtype != full_hidden_state.dtype:
+        raise ValueError("full and LOO hidden states must share a dtype")
+    if (
+        not torch.is_tensor(window_token_mask)
+        or window_token_mask.dtype is not torch.bool
+        or window_token_mask.ndim not in {2, 3}
+    ):
+        raise ValueError("window_token_mask must be boolean with shape [B, T] or [B, K, T]")
+    if window_token_mask.shape[0] != full_hidden_state.shape[0] or (
+        window_token_mask.shape[-1] != full_hidden_state.shape[1]
+    ):
+        raise ValueError("window_token_mask must match hidden-state batch and token axes")
+    if window_token_mask.device != full_hidden_state.device:
+        raise ValueError("window mask and hidden states must share a device")
+
+    squeeze_window = window_token_mask.ndim == 2
+    mask = window_token_mask.unsqueeze(1) if squeeze_window else window_token_mask
+    mask_float = mask.to(dtype=full_hidden_state.dtype).unsqueeze(-1)
+    effect = full_hidden_state - loo_hidden_state
+    sums = (effect.unsqueeze(1) * mask_float).sum(dim=2)
+    counts = mask.sum(dim=-1).clamp_min(1).to(dtype=full_hidden_state.dtype)
+    pooled = sums / counts.unsqueeze(-1)
+    return pooled[:, 0] if squeeze_window else pooled
 
 
 def _validate_layout(layout: Stage2InterleavedLayout) -> None:
