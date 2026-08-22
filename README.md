@@ -318,7 +318,7 @@ accelerate launch --num_processes="${NUM_PROCESSES}" src/main.py \
   --cache_dir /path/to/cache \
   --lora_dropout 0 \
   --ew_config configs/evidence_window/frozen_reference_zero1.json \
-  --deepspeed_config /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/.worktrees/ours-trial1/configs/config_stage1.json
+  --deepspeed_config configs/config_stage1.json
 ```
 
 The explicit frozen-reference ZeRO-2 variant uses optimizer-state and policy-

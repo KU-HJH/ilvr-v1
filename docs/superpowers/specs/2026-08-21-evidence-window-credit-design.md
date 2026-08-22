@@ -22,7 +22,7 @@ The first implementation uses **zero-latent replacement**, not token deletion or
 
 The design is based on the current ILVR implementation rather than a generic DPO trainer:
 
-- `src/main.py` creates `Qwen2_5_VLForConditionalGeneration`, freezes the visual encoder, optionally adds LoRA, uses `trl.SFTTrainer` through `CustomTrainerStage1`, and currently hard-codes `configs/config_stage3.json`.
+- `src/main.py` creates `Qwen2_5_VLForConditionalGeneration`, freezes the visual encoder, optionally adds LoRA, uses `trl.SFTTrainer` through `CustomTrainerStage1`, and passes `args.deepspeed_config` into the training configuration. `src/utils_deepseed.py` defines `--deepspeed_config` with the backward-compatible default `configs/config_stage3.json`.
 - `src/trainer.py` creates a full EMA copy of the policy, selects sparse helper-image features, injects the selected features as `latent_hidden_states`, computes the original causal CE loss, and adds cosine similarity supervision at latent positions.
 - `src/main.py::collate_fn_stage1` converts assistant images into latent delimiters, replaces each delimiter's original image-token expansion with a fixed number of latent pad tokens, and builds `image_out_mask`.
 - `transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py` injects either helper-image features or supplied `latent_hidden_states` into positions identified by the configured latent token ID. It preserves token count and multimodal positions.
