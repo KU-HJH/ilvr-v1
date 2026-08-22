@@ -129,7 +129,222 @@ bash run_training.sh
 - Gradient Accumulation Steps: 8
 - Latent Size: 8
 
-### Evidence-window diagnostics and training objectives
+### Stage-2 evidence-window credit (version 2)
+
+The new training path gives the two ILVR stages deliberately different jobs:
+
+- Stage 1 remains the original node-grounding path. Its EMA teacher,
+  helper-image teacher forcing, CE/similarity objective, masks, and mixed-
+  precision behavior are unchanged.
+- Stage 2 starts from an explicit Stage-1 checkpoint, generates its own latent
+  states, and uses assistant CE plus optional evidence-to-window edge losses.
+  It does not reuse Stage-1 helper-image supervision or its EMA teacher.
+
+With no `--ew_config`, or with
+`configs/evidence_window/stage2/baseline.json`, Stage 2 performs exactly one
+ordinary CE forward and creates no evidence-window engine or reference. All
+version-2 coefficients default to zero. Version-1 configs under
+`configs/evidence_window/` remain historical Stage-1 ablations and are not
+accepted as enabled Stage-2 configs.
+
+#### Exact spans and intervention
+
+For Stage 2, `Z_j` is the complete marker-inclusive token range
+`<|latent_start|> <|latent_pad|>... <|latent_end|>`. It is valid evidence only
+when at least one latent-pad token lies between the markers. `R_k` is one
+assistant-only supervised text window between latent ranges. Padding,
+user/system text, latent markers/pads, assistant termination, special tokens,
+and every `labels == -100` position are excluded. Preserved `sequence_plan`
+types are checked against token parsing.
+
+The likelihood target at token row `t` is predicted by decoder query row
+`t-1`. Therefore a selected edge `(Z_j, R_k)` blocks exactly the Cartesian
+product
+
+```text
+predictor queries {t - 1 : t in R_k}  x  marker-inclusive keys in Z_j
+```
+
+and no other query-key entries. It does not delete or zero tokens, change
+positions, remove another visual span, or recompute earlier reasoning under a
+different intervention. Ordinary CE stays on FlashAttention2. Both the full
+and LOO auxiliary branches use the same model weights and the same explicit
+SDPA backend, so backend differences cannot masquerade as contribution.
+
+The default window score is mean target log-probability (`sum` is an explicit
+config alternative):
+
+```text
+ell_M(R_k | H) = mean_{t in R_k} log p_M(y_t | H, y_<t)
+C^M_jk = ell_M(R_k | full) - ell_M(R_k | block R_k -> Z_j)
+```
+
+This fixed-history LOO value estimates a conditional/direct re-reference
+dependency while retaining previous reasoning and every other evidence span.
+It is not the total causal effect of removing evidence and regenerating the
+downstream trajectory.
+
+#### Stage-2 objective and variants
+
+The implemented objective is
+
+```text
+L_stage2 = L_CE
+         + lambda_ew(r)  * mean_edges[-log sigmoid(beta * M_jk)]
+         + lambda_rel(r) * mean_windows JSD(q_ref(.|k), q_policy(.|k))
+         + lambda_res(r) * mean_edges,hidden Huber(delta_h_policy, stop(delta_h_ref))
+```
+
+For reference-free EW, `M_jk = C_policy_jk`. With a fixed reference,
+`M_jk = C_policy_jk - stop(C_ref_jk)`. Relation distributions normalize only
+over valid predecessor evidence for the current window. Hidden residuals are
+mean-pooled on the same causal predictor-query rows and use
+`delta_h = h_full - h_LOO`; they are effects to match, never representations
+to subtract from normal reasoning.
+
+Every loss has an independent configurable CE-only warmup and linear ramp.
+Before warmup its effective weight is zero; it grows linearly during the ramp
+and stays at the configured coefficient afterward. A zero ramp switches at
+the boundary. Zero effective weights cause no auxiliary replay, reference
+lookup, or hidden-state collection.
+
+The source-edit-free version-2 experiment matrix is:
+
+| Config | Only enabled objective | Reference |
+| --- | --- | --- |
+| `configs/evidence_window/stage2/baseline.json` | none | none |
+| `configs/evidence_window/stage2/ew_reference_free.json` | EW preference | none |
+| `configs/evidence_window/stage2/ew_precomputed_dpo.json` | EW-DPO | precomputed |
+| `configs/evidence_window/stage2/relation_kd.json` | relation JSD | precomputed |
+| `configs/evidence_window/stage2/hidden_residual_kd.json` | hidden residual Huber | precomputed |
+| `configs/evidence_window/stage2/online_frozen_zero1.json` | EW-DPO | online frozen, ZeRO-1 only |
+| `configs/evidence_window/stage2/online_frozen_zero2.json` | EW-DPO | online frozen, ZeRO-2 only |
+
+Artifact/checkpoint entries in the template configs are intentionally explicit
+absolute-path placeholders. Copy the selected JSON into the run directory and
+replace only those path values; switching objectives never requires a source
+edit. The online files do not select a DeepSpeed stage: pair them explicitly
+with `configs/config_stage1.json` (ZeRO-1) or `configs/config_stage2.json`
+(ZeRO-2). `config_stage*.json` names describe DeepSpeed ZeRO, not ILVR Stage 1
+or Stage 2.
+
+#### Launch and reference artifacts
+
+All examples below assume this repository root and the required environment:
+
+```bash
+cd /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/.worktrees/ours-trial1
+source /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/venv/ilvr-venv/bin/activate
+```
+
+Reference-free Stage 2 can run under ZeRO-3 because it owns no second policy:
+
+```bash
+accelerate launch src/main.py \
+  --stage stage2 \
+  --model /absolute/path/to/Qwen2.5-VL-7B-Instruct \
+  --load_model_path /absolute/path/to/stage1-checkpoint \
+  --task zebra-cot \
+  --data_path /absolute/path/to/TRAIN.jsonl \
+  --save_model_path /absolute/path/to/stage2-output \
+  --log_file /absolute/path/to/stage2.log \
+  --cache_dir /absolute/path/to/cache \
+  --ew_config configs/evidence_window/stage2/ew_reference_free.json \
+  --deepspeed_config configs/config_stage3.json
+```
+
+Under Stage 2, `--load_model_path` supplies the model and processor
+initialization; `--model` remains a Stage-1 launcher argument. The checkpoint
+must exist. Relative image paths in the current dataset loader still resolve
+through `task_deepseed.TRAIN_IMAGE_ROOT`; use absolute image paths in data or
+set that repository constant for the environment before launching.
+
+Produce immutable reference targets once with Stage-2 self-generated latent
+semantics. Add `--include-hidden-residuals` only for the hidden-residual config:
+
+```bash
+/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/venv/ilvr-venv/bin/python \
+  src/precompute_stage2_reference.py \
+  --data-path /absolute/path/to/TRAIN.jsonl \
+  --reference-checkpoint /absolute/path/to/stage1-checkpoint \
+  --reference-checkpoint-id stage1-approved \
+  --reference-checkpoint-witness /absolute/or-authenticated-checkpoint-witness \
+  --artifact-dir /absolute/path/to/stage2-reference-artifact \
+  --tokenizer-id /absolute/path/to/stage1-checkpoint \
+  --model-config-id qwen2.5-vl-stage2-self-latent-v1 \
+  --contribution-reduction mean
+```
+
+The producer hashes the dataset once unless
+`--dataset-sha256-witness` supplies an authenticated digest. It never hashes
+checkpoint weights. Training reconstructs and verifies the manifest identity,
+so precomputed runs must also pass matching
+`--reference_dataset_sha256`, `--reference_checkpoint_id`,
+`--reference_checkpoint_witness`, `--reference_tokenizer_id`,
+`--reference_parser_version`, and `--reference_model_config_id` arguments.
+Artifacts are keyed by deterministic source-row index, exact special tokens,
+parser/reduction/intervention/backend semantics, edge cap, and model identity.
+
+Online frozen EW loads the exact same Stage-1 checkpoint independently and
+runs it under Stage-2 self-generated-latent semantics with `eval()` and
+`torch.no_grad()`. It is not the Stage-1 EMA teacher and is never optimized.
+ZeRO-1 and ZeRO-2 replicate this full frozen model on every rank; they do not
+partition its parameters. Expect approximately one extra full parameter copy
+per rank plus transient reference activations. ZeRO-3 is rejected before
+reference construction; use reference-free or precomputed mode instead.
+
+#### Cost, smoke harness, and interpretation limits
+
+For `E` selected local evidence-window edges, a policy step performs one normal
+CE forward plus `1 + E` matched auxiliary forwards. This is
+`O(1 + E_local)` auxiliary work. Distributed ranks pad to the global maximum
+edge count with all-false same-policy slots so collective-bearing schedules
+remain identical; the effective schedule is `O(1 + E_global_max)` per role.
+Online fixed reference repeats that schedule under no-grad. Residual mode alone
+requests final hidden states.
+
+The CPU config/optimizer smoke is:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:transformers/src \
+  /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/venv/ilvr-venv/bin/python \
+  -m pytest \
+  tests/evidence_window/test_stage2_experiment_configs.py \
+  tests/evidence_window/test_stage2_smoke.py -q
+```
+
+The callable B200 harness performs exactly one optimizer step per requested
+case and writes small JSON witnesses for finite losses, edges/forwards,
+policy gradients, fixed-model gradients, dtype, and device:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:transformers/src \
+  /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/venv/ilvr-venv/bin/python \
+  .superpowers/sdd/2026-08-22-ilvr-stage2-evidence-window-credit/stage2_large_model_smoke.py \
+  --case all-single-gpu \
+  --model /absolute/path/to/Qwen2.5-VL-7B-Instruct \
+  --stage1-checkpoint /absolute/path/to/stage1-checkpoint \
+  --data /absolute/path/to/TRAIN.jsonl \
+  --image-root /absolute/path/to/image-root \
+  --sample-index 920 \
+  --deepspeed-config configs/config_stage3.json \
+  --reference-artifact-dir /absolute/path/to/stage2-reference-artifact-with-hidden-residuals \
+  --output-dir /absolute/path/to/stage2-smoke-results
+```
+
+Do not treat a high relation entropy, dense attention, or positive LOO score as
+proof of correct evidence use. Sparse dependency can be correct. The local
+loss intentionally differs from a global preference loss to prevent one edge
+from saturating every other edge's outer gradient. Single-evidence LOO cannot
+resolve synergy or redundancy, and no group/Shapley attribution or automatic
+task-required edge labeler is implemented.
+
+### Historical Stage-1 zero-latent evidence-window ablations (version 1)
+
+The following section documents the retained version-1 research branch. It
+uses Stage-1 EMA/helper-image semantics and zero-latent interventions. It is
+not the exact Stage-2 `window_attention_block` implementation described above,
+and its configs must not be used to claim Stage-2 results.
 
 Evidence-window training asks a local question: when one generated visual
 evidence span is replaced by a zero latent while the token history stays fixed,

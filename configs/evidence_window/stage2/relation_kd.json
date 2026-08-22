@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "reference": {
+    "mode": "precomputed",
+    "artifact": "/absolute/path/to/stage2-reference-artifact"
+  },
+  "preference": {
+    "enabled": false,
+    "lambda_ew": 0.0,
+    "beta": 0.1,
+    "contribution_reduction": "mean"
+  },
+  "relation": {
+    "enabled": true,
+    "lambda_rel": 1.0,
+    "temperature": 1.0
+  },
+  "residual": {
+    "enabled": false,
+    "lambda_res": 0.0,
+    "huber_delta": 1.0
+  },
+  "loo": {
+    "intervention": "window_attention_block",
+    "max_evidence_edges_per_window": 0
+  },
+  "schedule": {
+    "relation_warmup_ratio": 0.1,
+    "relation_ramp_ratio": 0.2
+  }
+}
