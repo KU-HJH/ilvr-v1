@@ -1,6 +1,7 @@
 """Configuration and runtime helpers for evidence-window training."""
 
 from .config import EvidenceWindowConfig
+from .stage2_config import Stage2EvidenceWindowConfig, read_deepspeed_zero_stage
 from .engine import (
     Condition,
     ConditionForward,
@@ -41,6 +42,8 @@ from .reference import (
 
 __all__ = [
     "EvidenceWindowConfig",
+    "Stage2EvidenceWindowConfig",
+    "read_deepspeed_zero_stage",
     "Condition",
     "ConditionForward",
     "EvidenceWindowEngine",
