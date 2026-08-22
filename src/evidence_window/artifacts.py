@@ -354,26 +354,7 @@ class PrecomputedReferenceProvider:
         contributions = torch.zeros(
             (batch_size, evidence_count, window_count), dtype=torch.float32, device=device
         )
-        hidden_size: int | None = None
-        for sample_index in requested:
-            residual = self._targets[sample_index].hidden_residuals
-            if residual is not None:
-                if hidden_size is None:
-                    hidden_size = residual.shape[-1]
-                elif hidden_size != residual.shape[-1]:
-                    raise ValueError("reference hidden residual width differs across samples")
-            elif require_hidden_residuals:
-                raise ValueError(f"hidden residual missing for sample {sample_index}")
-        hidden = None
-        if hidden_size is not None:
-            if any(self._targets[index].hidden_residuals is None for index in requested):
-                raise ValueError("reference batch mixes present and absent hidden residuals")
-            hidden = torch.zeros(
-                (batch_size, evidence_count, window_count, hidden_size),
-                dtype=torch.float32,
-                device=device,
-            )
-
+        rows = []
         for batch_index, sample_index in enumerate(requested):
             target = self._targets[sample_index]
             current_evidence = int(layout.evidence_valid[batch_index].sum().item())
@@ -392,7 +373,64 @@ class PrecomputedReferenceProvider:
             contributions[
                 batch_index, :current_evidence, :current_windows
             ] = target.contributions.to(device=device, dtype=torch.float32)
+            rows.append(
+                (
+                    batch_index,
+                    sample_index,
+                    target,
+                    current_evidence,
+                    current_windows,
+                    bool(current_pair.any().item()),
+                )
+            )
+
+        hidden_size: int | None = None
+        if require_hidden_residuals:
+            for _, sample_index, target, _, _, has_edges in rows:
+                if not has_edges:
+                    continue
+                residual = target.hidden_residuals
+                if residual is None:
+                    raise ValueError(f"hidden residual missing for sample {sample_index}")
+                if hidden_size is None:
+                    hidden_size = residual.shape[-1]
+                elif hidden_size != residual.shape[-1]:
+                    raise ValueError(
+                        "reference hidden residual width differs across edge-bearing samples"
+                    )
+        else:
+            for _, _, target, _, _, _ in rows:
+                residual = target.hidden_residuals
+                if residual is not None:
+                    if hidden_size is None:
+                        hidden_size = residual.shape[-1]
+                    elif hidden_size != residual.shape[-1]:
+                        raise ValueError(
+                            "reference hidden residual width differs across samples"
+                        )
+            if hidden_size is not None and any(
+                target.hidden_residuals is None for _, _, target, _, _, _ in rows
+            ):
+                raise ValueError("reference batch mixes present and absent hidden residuals")
+
+        hidden = None
+        if hidden_size is not None:
+            hidden = torch.zeros(
+                (batch_size, evidence_count, window_count, hidden_size),
+                dtype=torch.float32,
+                device=device,
+            )
+        for (
+            batch_index,
+            _,
+            target,
+            current_evidence,
+            current_windows,
+            has_edges,
+        ) in rows:
             if hidden is not None:
+                if require_hidden_residuals and not has_edges:
+                    continue
                 assert target.hidden_residuals is not None
                 hidden[
                     batch_index, :current_evidence, :current_windows

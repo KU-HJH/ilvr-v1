@@ -8,7 +8,14 @@ import torch
 import torch.nn.functional as F
 
 import trainer_stage2 as trainer_stage2_module
-from evidence_window.artifacts import ReferenceBatchTargets
+from evidence_window.artifacts import (
+    ArtifactIdentity,
+    PrecomputedReferenceProvider,
+    ReferenceBatchTargets,
+    ReferenceSampleTargets,
+    publish_reference_manifest,
+    write_reference_shard,
+)
 from evidence_window.stage2_config import (
     Stage2EvidenceWindowConfig,
     Stage2ReferenceConfig,
@@ -166,6 +173,23 @@ def _residual_config(**changes) -> Stage2EvidenceWindowConfig:
         ),
     )
     return replace(base, **changes)
+
+
+def _artifact_identity() -> ArtifactIdentity:
+    return ArtifactIdentity(
+        format_version=1,
+        dataset_sha256="a" * 64,
+        checkpoint_id="stage1",
+        checkpoint_witness="approved-stage1",
+        tokenizer_id="qwen-tokenizer",
+        tokenizer_special_tokens=(0, 90, 91, 92, 99),
+        parser_version="stage2-marker-v1",
+        contribution_reduction="mean",
+        intervention="window_attention_block",
+        attention_backend="sdpa",
+        max_evidence_edges_per_window=0,
+        model_config_id="tiny-stage2",
+    )
 
 
 def test_pooled_hidden_effect_is_masked_mean_full_minus_loo():
@@ -490,6 +514,38 @@ def test_online_residual_with_globally_no_edges_returns_finite_ce_without_aux_re
     assert torch.isfinite(loss)
     assert len(policy.calls) == 1
     assert reference.calls == []
+
+
+def test_precomputed_residual_with_globally_no_edges_returns_finite_ce_without_aux_replay(
+    monkeypatch, tmp_path
+):
+    """An edge-free artifact row may omit hidden effects during active residual KD."""
+    identity = _artifact_identity()
+    metadata = write_reference_shard(
+        tmp_path,
+        identity,
+        {
+            17: ReferenceSampleTargets(
+                contributions=torch.zeros((0, 1)),
+                pair_mask=torch.zeros((0, 1), dtype=torch.bool),
+                hidden_residuals=None,
+            )
+        },
+        publish_manifest=False,
+    )
+    publish_reference_manifest(tmp_path, identity, [metadata])
+    provider = PrecomputedReferenceProvider(tmp_path, identity)
+    trainer, policy = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        _residual_config(),
+        provider,
+    )
+
+    loss = trainer.compute_loss(policy, _no_edge_trainer_batch())
+
+    assert torch.isfinite(loss)
+    assert len(policy.calls) == 1
 
 
 def _asymmetric_hidden_target_worker(rank, init_file, result_dir):

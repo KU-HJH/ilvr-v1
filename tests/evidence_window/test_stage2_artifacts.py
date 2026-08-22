@@ -218,6 +218,62 @@ def test_optional_residual_absence_is_explicit(tmp_path):
         provider.get_batch([7], _layout(), require_hidden_residuals=True)
 
 
+def test_mixed_batch_requires_hidden_only_for_rows_with_selected_edges(tmp_path):
+    """Edge-free rows may omit hidden targets without creating fake residual edges."""
+    identity = _identity()
+    edge_hidden = torch.tensor([[[1.0, 2.0, 3.0]], [[4.0, 5.0, 6.0]]])
+    edge_shard = write_reference_shard(
+        tmp_path,
+        identity,
+        {7: _sample(hidden_residuals=edge_hidden)},
+        rank=0,
+        publish_manifest=False,
+    )
+    empty_shard = write_reference_shard(
+        tmp_path,
+        identity,
+        {
+            8: ReferenceSampleTargets(
+                contributions=torch.zeros((0, 1)),
+                pair_mask=torch.zeros((0, 1), dtype=torch.bool),
+                hidden_residuals=None,
+            )
+        },
+        rank=1,
+        publish_manifest=False,
+    )
+    publish_reference_manifest(tmp_path, identity, [edge_shard, empty_shard])
+    provider = PrecomputedReferenceProvider(tmp_path, identity)
+    layout = Stage2InterleavedLayout(
+        evidence_token_mask=torch.tensor(
+            [
+                [[1, 0, 0, 0], [0, 1, 0, 0]],
+                [[0, 0, 0, 0], [0, 0, 0, 0]],
+            ],
+            dtype=torch.bool,
+        ),
+        window_token_mask=torch.tensor(
+            [[[0, 0, 1, 1]], [[0, 0, 1, 1]]], dtype=torch.bool
+        ),
+        evidence_valid=torch.tensor([[True, True], [False, False]]),
+        window_valid=torch.tensor([[True], [True]]),
+        causal_pair_mask=torch.tensor(
+            [[[True], [True]], [[False], [False]]], dtype=torch.bool
+        ),
+    )
+
+    batch = provider.get_batch(
+        [7, 8], layout, require_hidden_residuals=True
+    )
+
+    assert batch.hidden_residuals is not None
+    assert batch.hidden_residuals.shape == (2, 2, 1, 3)
+    torch.testing.assert_close(batch.hidden_residuals[0], edge_hidden)
+    assert torch.count_nonzero(batch.hidden_residuals[1]).item() == 0
+    assert torch.equal(batch.pair_mask, layout.causal_pair_mask)
+    assert not batch.pair_mask[1].any()
+
+
 def test_manifest_missing_or_malformed_shard_is_rejected(tmp_path):
     """The manifest must not authorize absent or structurally altered shard payloads."""
     identity = _identity()
