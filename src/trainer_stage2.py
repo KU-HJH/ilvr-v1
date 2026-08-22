@@ -18,7 +18,10 @@ from evidence_window.stage2_config import Stage2EvidenceWindowConfig
 from evidence_window.stage2_effects import Stage2ConditionOutput
 from evidence_window.stage2_engine import Stage2EvidenceWindowEngine, Stage2EvidenceWindowResult
 from evidence_window.stage2_layout import extract_stage2_layout, validate_plan_types
-from evidence_window.stage2_reference import build_stage2_reference_provider
+from evidence_window.stage2_reference import (
+    OnlineFrozenStage2Reference,
+    build_stage2_reference_provider,
+)
 
 
 class CustomTrainerStage2(SFTTrainer):
@@ -31,6 +34,8 @@ class CustomTrainerStage2(SFTTrainer):
         latent_token_ids: Mapping[str, Any] | TokenIds | None = None,
         reference_provider=None,
         reference_identity: ArtifactIdentity | None = None,
+        reference_model_factory=None,
+        deepspeed_zero_stage: int | None = None,
         **kwargs,
     ):
         config = (
@@ -41,6 +46,24 @@ class CustomTrainerStage2(SFTTrainer):
         if not isinstance(config, Stage2EvidenceWindowConfig):
             raise TypeError("evidence_window_config must be a Stage2EvidenceWindowConfig")
         config.validate()
+        online_enabled = (
+            not config.is_disabled and config.reference.mode == "online_frozen"
+        )
+        if online_enabled:
+            if deepspeed_zero_stage is None:
+                raise ValueError("online frozen Stage-2 reference requires a ZeRO stage")
+            config.validate_runtime(deepspeed_zero_stage)
+            if not callable(reference_model_factory):
+                raise TypeError("online frozen Stage-2 reference requires a model factory")
+            if reference_provider is not None or reference_identity is not None:
+                raise ValueError(
+                    "online frozen Stage-2 reference does not accept an artifact "
+                    "provider or identity"
+                )
+        elif reference_model_factory is not None or deepspeed_zero_stage is not None:
+            raise ValueError(
+                "online reference construction inputs require enabled online_frozen mode"
+            )
         self.evidence_window_config = config
         super().__init__(*args, **kwargs)
 
@@ -60,6 +83,13 @@ class CustomTrainerStage2(SFTTrainer):
                     "reference-free Stage 2 does not accept a reference provider or identity"
                 )
             self._stage2_reference_provider = None
+        elif config.reference.mode == "online_frozen":
+            self._stage2_reference_provider = build_stage2_reference_provider(
+                config,
+                model_factory=reference_model_factory,
+                accelerator=self.accelerator,
+                zero_stage=deepspeed_zero_stage,
+            )
         else:
             self._stage2_reference_provider = (
                 build_stage2_reference_provider(
@@ -86,6 +116,12 @@ class CustomTrainerStage2(SFTTrainer):
             config.preference.lambda_ew,
             config.preference.beta,
         )
+        if config.reference.mode == "online_frozen":
+            logging.info(
+                "Stage-2 online reference owns one additional frozen full model per "
+                "rank under ZeRO-%s; precomputed targets use less training memory",
+                deepspeed_zero_stage,
+            )
 
     def compute_loss(
         self,
@@ -161,6 +197,21 @@ class CustomTrainerStage2(SFTTrainer):
                 sample_indices,
                 layout,
                 require_hidden_residuals=self.evidence_window_config._residual_enabled(),
+                model_inputs=(
+                    auxiliary_inputs
+                    if isinstance(
+                        self._stage2_reference_provider,
+                        OnlineFrozenStage2Reference,
+                    )
+                    else None
+                ),
+                labels=labels,
+                contribution_reduction=(
+                    self.evidence_window_config.preference.contribution_reduction
+                ),
+                max_evidence_edges_per_window=(
+                    self.evidence_window_config.loo.max_evidence_edges_per_window
+                ),
             )
         auxiliary = self._ew_engine.compute(
             layout,
@@ -318,16 +369,31 @@ def _coordinated_reference_lookup(
     layout: Stage2InterleavedLayout,
     *,
     require_hidden_residuals: bool,
+    model_inputs=None,
+    labels=None,
+    contribution_reduction: str = "mean",
+    max_evidence_edges_per_window: int = 0,
 ):
     """Make sample-specific artifact failures collective before model replays."""
     targets = None
     local_error = None
     try:
-        targets = provider.get_batch(
-            sample_indices,
-            layout,
-            require_hidden_residuals=require_hidden_residuals,
-        )
+        if isinstance(provider, OnlineFrozenStage2Reference):
+            targets = provider.get_batch(
+                sample_indices,
+                layout,
+                model_inputs=model_inputs,
+                labels=labels,
+                contribution_reduction=contribution_reduction,
+                max_evidence_edges_per_window=max_evidence_edges_per_window,
+                require_hidden_residuals=require_hidden_residuals,
+            )
+        else:
+            targets = provider.get_batch(
+                sample_indices,
+                layout,
+                require_hidden_residuals=require_hidden_residuals,
+            )
         if not isinstance(targets, ReferenceBatchTargets):
             raise TypeError("reference provider must return ReferenceBatchTargets")
         requested = (

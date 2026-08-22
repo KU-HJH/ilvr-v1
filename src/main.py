@@ -24,7 +24,10 @@ from utils_deepseed import *
 from task_deepseed import *
 from trainer import CustomTrainerStage1
 from evidence_window.config import EvidenceWindowConfig
-from evidence_window.stage2_config import Stage2EvidenceWindowConfig
+from evidence_window.stage2_config import (
+    Stage2EvidenceWindowConfig,
+    read_deepspeed_zero_stage,
+)
 from evidence_window.artifacts import ArtifactIdentity
 from stage2_data import build_stage2_record, collate_fn_stage2
 from trainer_stage2 import CustomTrainerStage2
@@ -186,6 +189,47 @@ def resolve_stage2_reference_identity(
     )
 
 
+def load_stage2_online_reference_model(
+    args,
+    ew_config,
+    *,
+    tokenizer_size,
+    latent_token_ids,
+):
+    """Independently load the fixed checkpoint under Stage-2 model semantics.
+
+    The returned model is intentionally not derived from the policy object.
+    ``OnlineFrozenStage2Reference.create`` freezes and prepares it for ZeRO-1/2.
+    """
+    if not isinstance(ew_config, Stage2EvidenceWindowConfig):
+        raise TypeError("ew_config must be a Stage2EvidenceWindowConfig")
+    if ew_config.reference.mode != "online_frozen" or ew_config.is_disabled:
+        raise ValueError("online reference loading requires enabled online_frozen mode")
+    checkpoint = ew_config.reference.checkpoint
+    assert checkpoint is not None
+    reference_config = Qwen2_5_VLConfig.from_pretrained(
+        checkpoint,
+        cache_dir=args.cache_dir,
+        trust_remote_code=True,
+    )
+    reference_config.compress_strategy = args.compress_strategy
+    reference_config.latent_size = args.latent_size
+    reference_config.stage = "stage2"
+    reference_config.latent_token_id = int(latent_token_ids["pad"])
+    reference_config.latent_start_id = int(latent_token_ids["start"])
+    reference_config.latent_end_id = int(latent_token_ids["end"])
+    reference_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        checkpoint,
+        config=reference_config,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        cache_dir=args.cache_dir,
+        trust_remote_code=True,
+    )
+    reference_model.resize_token_embeddings(tokenizer_size)
+    return reference_model
+
+
 def prepare_training_dataset(args, raw_rows):
     """Apply the stage-specific preprocessing contract to raw training rows."""
     if args.stage == "stage1":
@@ -209,6 +253,11 @@ def main_train():
     CustomTrainer, collate_fn_raw = select_stage_components(args.stage)
     model_path = resolve_policy_model_path(args)
     ew_config = resolve_evidence_window_config(args)
+    stage2_zero_stage = None
+    if args.stage == "stage2":
+        stage2_zero_stage = read_deepspeed_zero_stage(args.deepspeed_config)
+        # This runs before processor, policy, or optional reference allocation.
+        ew_config.validate_runtime(stage2_zero_stage)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -265,6 +314,21 @@ def main_train():
     config.latent_token_id = int(latent_token_idx)
     config.latent_start_id = int(latent_start_idx)
     config.latent_end_id   = int(latent_end_idx)
+
+    # Materialize the independent fixed checkpoint before SFTTrainer can apply
+    # PEFT or other policy mutations. ZeRO compatibility was checked above.
+    online_reference_model = None
+    if (
+        args.stage == "stage2"
+        and not ew_config.is_disabled
+        and ew_config.reference.mode == "online_frozen"
+    ):
+        online_reference_model = load_stage2_online_reference_model(
+            args,
+            ew_config,
+            tokenizer_size=len(processor.tokenizer),
+            latent_token_ids=latent_token_ids,
+        )
 
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
@@ -355,6 +419,11 @@ def main_train():
         trainer_kwargs["latent_token_ids"] = latent_token_ids
         if reference_identity is not None:
             trainer_kwargs["reference_identity"] = reference_identity
+        if online_reference_model is not None:
+            trainer_kwargs["reference_model_factory"] = (
+                lambda model=online_reference_model: model
+            )
+            trainer_kwargs["deepspeed_zero_stage"] = stage2_zero_stage
     trainer = CustomTrainer(**trainer_kwargs)
     
 
@@ -368,7 +437,12 @@ def main_train():
     else:
         logging.info("no checkpoint，train from start。")
 
-    logging.info("start training (DeepSpeed ZeRO-3 Mode)...")
+    configured_zero_stage = (
+        stage2_zero_stage
+        if stage2_zero_stage is not None
+        else read_deepspeed_zero_stage(args.deepspeed_config)
+    )
+    logging.info("start training (DeepSpeed ZeRO-%s Mode)...", configured_zero_stage)
     trainer.train(resume_from_checkpoint=last_checkpoint)
 
     final_model_path = training_args.output_dir
