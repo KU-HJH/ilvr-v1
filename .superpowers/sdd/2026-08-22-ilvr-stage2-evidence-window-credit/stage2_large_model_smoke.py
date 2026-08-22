@@ -574,20 +574,94 @@ def _initialize_distributed_from_environment(
     import torch
     import torch.distributed as distributed
 
-    try:
-        rank = int(os.environ.get("RANK", "0"))
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    except ValueError as exc:
-        raise RuntimeError("distributed launcher rank environment is invalid") from exc
-    if world_size <= 0 or rank < 0 or rank >= world_size or local_rank < 0:
-        raise RuntimeError("distributed launcher rank environment is out of range")
+    required_names = (
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    )
+    launcher_names = required_names + ("LOCAL_WORLD_SIZE",)
+    launcher_environment = any(name in os.environ for name in launcher_names)
+    if not launcher_environment:
+        if distributed.is_available() and distributed.is_initialized():
+            if distributed.get_world_size() > 1:
+                raise RuntimeError(
+                    "a multi-rank initialized process group requires the complete "
+                    "distributed launcher environment"
+                )
+            rank, world_size, local_rank = 0, 1, 0
+        else:
+            return 0, 1
+    else:
+        missing = [name for name in required_names if name not in os.environ]
+        if missing:
+            raise RuntimeError(
+                "distributed launcher environment is incomplete; requires "
+                + ", ".join(required_names)
+                + "; missing "
+                + ", ".join(missing)
+            )
+        try:
+            rank = int(os.environ["RANK"])
+            world_size = int(os.environ["WORLD_SIZE"])
+            local_rank = int(os.environ["LOCAL_RANK"])
+            master_port = int(os.environ["MASTER_PORT"])
+            local_world_size = (
+                int(os.environ["LOCAL_WORLD_SIZE"])
+                if "LOCAL_WORLD_SIZE" in os.environ
+                else None
+            )
+        except ValueError as exc:
+            raise RuntimeError("distributed launcher rank environment is invalid") from exc
+        if (
+            world_size <= 0
+            or rank < 0
+            or rank >= world_size
+            or local_rank < 0
+            or local_rank >= world_size
+        ):
+            raise RuntimeError("distributed launcher rank environment is out of range")
+        if not os.environ["MASTER_ADDR"].strip():
+            raise RuntimeError("distributed launcher MASTER_ADDR is invalid")
+        if master_port < 1 or master_port > 65535:
+            raise RuntimeError("distributed launcher MASTER_PORT is out of range")
+        if local_world_size is not None and (
+            local_world_size <= 0
+            or local_world_size > world_size
+            or local_rank >= local_world_size
+        ):
+            raise RuntimeError(
+                "distributed launcher LOCAL_RANK is out of LOCAL_WORLD_SIZE range"
+            )
+
+    cuda_target = bool(torch.cuda.is_available())
+    selected_backend = "nccl" if cuda_target else "gloo"
+    if backend is not None and str(backend).lower() != selected_backend:
+        raise RuntimeError(
+            f"requested distributed backend {backend!r} does not match "
+            f"the {selected_backend!r} device target"
+        )
+    if cuda_target:
+        device_count = int(torch.cuda.device_count())
+        if device_count <= 0 or local_rank >= device_count:
+            raise RuntimeError(
+                f"LOCAL_RANK {local_rank} does not identify an available CUDA device "
+                f"among {device_count} visible devices"
+            )
+        torch.cuda.set_device(local_rank)
 
     if distributed.is_available() and distributed.is_initialized():
         actual = (distributed.get_rank(), distributed.get_world_size())
         if actual != (rank, world_size):
             raise RuntimeError(
                 "initialized process group does not match launcher rank/world size"
+            )
+        actual_backend = str(distributed.get_backend()).lower().split(".")[-1]
+        if actual_backend != selected_backend:
+            raise RuntimeError(
+                f"initialized process group backend {actual_backend!r} does not match "
+                f"requested backend {selected_backend!r}"
             )
         return actual
     if world_size == 1:
@@ -597,13 +671,6 @@ def _initialize_distributed_from_environment(
             "WORLD_SIZE>1 requires torch.distributed before smoke preflight"
         )
 
-    selected_backend = backend
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        if selected_backend is None:
-            selected_backend = "nccl"
-    elif selected_backend is None:
-        selected_backend = "gloo"
     try:
         distributed.init_process_group(
             backend=selected_backend,

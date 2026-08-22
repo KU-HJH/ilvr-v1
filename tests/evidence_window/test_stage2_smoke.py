@@ -178,10 +178,219 @@ def _load_large_smoke_module():
     return module
 
 
-def _free_local_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
+_DISTRIBUTED_ENVIRONMENT = (
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "LOCAL_WORLD_SIZE",
+)
+
+
+def _set_distributed_environment(monkeypatch, **overrides):
+    values = {
+        "RANK": "0",
+        "WORLD_SIZE": "2",
+        "LOCAL_RANK": "0",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "29501",
+    }
+    values.update(overrides)
+    for name in _DISTRIBUTED_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in values.items():
+        if value is not None:
+            monkeypatch.setenv(name, value)
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    ["RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"],
+)
+def test_distributed_environment_requires_every_rendezvous_field(
+    monkeypatch, missing_name
+):
+    """Dropping any launcher field must fail rather than invent rank state."""
+    module = _load_large_smoke_module()
+    _set_distributed_environment(monkeypatch, **{missing_name: None})
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rendezvous must not start for an incomplete environment")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete|requires"):
+        module._initialize_distributed_from_environment()
+
+
+def test_one_distributed_environment_field_cannot_enable_launcher_defaults(monkeypatch):
+    """A stray launcher field must not silently become a local rank-zero run."""
+    module = _load_large_smoke_module()
+    for name in _DISTRIBUTED_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rendezvous must not start for an incomplete environment")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete|requires"):
+        module._initialize_distributed_from_environment()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"RANK": "rank-zero"},
+        {"WORLD_SIZE": "0"},
+        {"RANK": "2"},
+        {"LOCAL_RANK": "-1"},
+        {"LOCAL_RANK": "2"},
+        {"MASTER_ADDR": ""},
+        {"MASTER_PORT": "not-a-port"},
+        {"MASTER_PORT": "0"},
+        {"MASTER_PORT": "65536"},
+        {"LOCAL_RANK": "2", "LOCAL_WORLD_SIZE": "2"},
+        {"LOCAL_WORLD_SIZE": "3"},
+    ],
+)
+def test_distributed_environment_rejects_malformed_or_out_of_range_values(
+    monkeypatch, overrides
+):
+    """Invalid rank, local topology, address, and port values fail before rendezvous."""
+    module = _load_large_smoke_module()
+    _set_distributed_environment(monkeypatch, **overrides)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rendezvous must not start for invalid launcher values")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid|range|address|port|local"):
+        module._initialize_distributed_from_environment()
+
+
+def test_single_process_without_launcher_environment_remains_supported(monkeypatch):
+    """An ordinary local invocation does not need rendezvous variables."""
+    module = _load_large_smoke_module()
+    for name in _DISTRIBUTED_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+
+    assert module._initialize_distributed_from_environment() == (0, 1)
+
+
+def test_preinitialized_single_process_without_launcher_env_selects_cuda(monkeypatch):
+    """Even a rank-one group reuse must select and validate its CUDA target first."""
+    module = _load_large_smoke_module()
+    for name in _DISTRIBUTED_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    selected = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", selected.append)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "nccl")
+
+    assert module._initialize_distributed_from_environment() == (0, 1)
+    assert selected == [0]
+
+
+def test_local_cuda_rank_is_validated_before_device_selection(monkeypatch):
+    """An unavailable local CUDA ordinal must fail before set_device or rendezvous."""
+    module = _load_large_smoke_module()
+    _set_distributed_environment(monkeypatch, LOCAL_RANK="1")
+    selected = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", selected.append)
+
+    with pytest.raises(RuntimeError, match="LOCAL_RANK|device"):
+        module._initialize_distributed_from_environment()
+    assert selected == []
+
+
+def test_matching_preinitialized_cuda_group_still_selects_local_device(monkeypatch):
+    """Early reuse must not skip the local CUDA selection required by the model."""
+    module = _load_large_smoke_module()
+    _set_distributed_environment(monkeypatch, RANK="1", LOCAL_RANK="1")
+    selected = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "set_device", selected.append)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "nccl")
+
+    assert module._initialize_distributed_from_environment() == (1, 2)
+    assert selected == [1]
+
+
+def test_preinitialized_group_rejects_backend_for_wrong_device_target(monkeypatch):
+    """A CPU run cannot silently reuse a NCCL process group."""
+    module = _load_large_smoke_module()
+    _set_distributed_environment(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "nccl")
+
+    with pytest.raises(RuntimeError, match="backend"):
+        module._initialize_distributed_from_environment()
+
+
+def test_preinitialized_group_rejects_launcher_rank_mismatch(monkeypatch):
+    """A process group from a different launch must fail before model work."""
+    module = _load_large_smoke_module()
+    _set_distributed_environment(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "gloo")
+
+    with pytest.raises(RuntimeError, match="rank/world"):
+        module._initialize_distributed_from_environment()
+
+
+def _reserve_local_ports(count: int) -> list[tuple[socket.socket, int]]:
+    reservations = []
+    try:
+        for _ in range(count):
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind(("127.0.0.1", 0))
+            reservations.append((listener, int(listener.getsockname()[1])))
+    except BaseException:
+        for listener, _port in reservations:
+            listener.close()
+        raise
+    assert len({port for _listener, port in reservations}) == count
+    return reservations
+
+
+def test_concurrent_rendezvous_ports_are_distinct_while_reserved():
+    """Two launch groups must never be assigned the same released port candidate."""
+    reservations = _reserve_local_ports(2)
+    try:
+        ports = [port for _listener, port in reservations]
+        assert len(set(ports)) == 2
+        for listener, port in reservations:
+            assert listener.getsockname()[1] == port
+    finally:
+        for listener, _port in reservations:
+            listener.close()
 
 
 def _distributed_attempt_worker(
@@ -282,30 +491,40 @@ def _run_spawned_attempts(tmp_path, launches):
     start_gate = context.Barrier(world_size * len(launches))
     processes = []
     result_paths = []
-    for launch_name, attempt_id, output_dir, asymmetric_failure in launches:
-        port = _free_local_port()
-        for rank in range(world_size):
-            result_path = tmp_path / f"worker-{launch_name}-{rank}.json"
-            result_paths.append(result_path)
-            process = context.Process(
-                target=_distributed_attempt_worker,
-                args=(
-                    rank,
-                    world_size,
-                    port,
-                    launch_name,
-                    attempt_id,
-                    output_dir,
-                    checkpoint,
-                    data,
-                    image_root,
-                    result_path,
-                    asymmetric_failure,
-                    start_gate,
-                ),
-            )
-            process.start()
-            processes.append(process)
+    reservations = _reserve_local_ports(len(launches))
+    try:
+        for (
+            launch_name,
+            attempt_id,
+            output_dir,
+            asymmetric_failure,
+        ), (_listener, port) in zip(launches, reservations, strict=True):
+            for rank in range(world_size):
+                result_path = tmp_path / f"worker-{launch_name}-{rank}.json"
+                result_paths.append(result_path)
+                process = context.Process(
+                    target=_distributed_attempt_worker,
+                    args=(
+                        rank,
+                        world_size,
+                        port,
+                        launch_name,
+                        attempt_id,
+                        output_dir,
+                        checkpoint,
+                        data,
+                        image_root,
+                        result_path,
+                        asymmetric_failure,
+                        start_gate,
+                    ),
+                )
+                processes.append(process)
+    finally:
+        for listener, _port in reservations:
+            listener.close()
+    for process in processes:
+        process.start()
     for process in processes:
         process.join(timeout=30)
         assert process.exitcode == 0

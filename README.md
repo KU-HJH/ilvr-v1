@@ -320,16 +320,21 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:transformers/src \
 The callable B200 harness performs exactly one optimizer step per requested
 case and writes small JSON witnesses for finite losses, edges/forwards,
 policy gradients, fixed-model gradients, dtype, and device. `--output-dir`
-must name a nonexistent attempt directory. For `WORLD_SIZE>1`, the harness
-first initializes the launcher-provided `env://` process group (selecting the
-local CUDA device and NCCL on the GPU target, or Gloo when CUDA is unavailable)
-before any ownership or preflight work. Initialization failure stops before
-processor/model loading. Rank 0 then exclusively claims the directory, all
-ranks collectively agree on claim success, and only then does every rank
-validate the claim and run preflight. A concurrent launcher or retry using the
-same path therefore loses collectively without loading a model. `--attempt-id`
-is a path-safe identifier bound into the claim, every rank filename, rank JSON,
-and completion manifest:
+must name a nonexistent attempt directory. An ordinary single-process call may
+omit launcher variables. If any distributed launcher variable is present, the
+harness requires valid `RANK`, `WORLD_SIZE`, `LOCAL_RANK`, `MASTER_ADDR`, and
+`MASTER_PORT` together; it never invents missing rank state. It validates
+optional `LOCAL_WORLD_SIZE`, the master-port range, and the local rank against
+visible CUDA devices before device selection or rendezvous. It then initializes
+the launcher-provided `env://` process group with NCCL on the CUDA target or
+Gloo on CPU before ownership or preflight. A preinitialized group is reused
+only when its rank, world size, backend, and selected local device match that
+same contract. Initialization or validation failure stops before processor/model
+loading. Rank 0 then exclusively claims the directory, all ranks collectively
+agree on claim success, and only then does every rank validate the claim and run
+preflight. A concurrent launcher or retry using the same path therefore loses
+collectively without loading a model. `--attempt-id` is a path-safe identifier
+bound into the claim, every rank filename, rank JSON, and completion manifest:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:transformers/src \
