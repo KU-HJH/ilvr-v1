@@ -57,6 +57,18 @@ def _no_edge_layout() -> Stage2InterleavedLayout:
     )
 
 
+def _two_edge_layout() -> Stage2InterleavedLayout:
+    return Stage2InterleavedLayout(
+        evidence_token_mask=torch.tensor(
+            [[[1, 0, 0, 0, 0], [0, 1, 0, 0, 0]]], dtype=torch.bool
+        ),
+        window_token_mask=torch.tensor([[[0, 0, 0, 1, 1]]], dtype=torch.bool),
+        evidence_valid=torch.tensor([[True, True]]),
+        window_valid=torch.tensor([[True]]),
+        causal_pair_mask=torch.tensor([[[True], [True]]]),
+    )
+
+
 def test_stage2_engine_module_and_public_interface_exist():
     """A missing engine leaves Stage 2 unable to compose exact edge effects."""
     module = importlib.import_module("evidence_window.stage2_engine")
@@ -156,6 +168,83 @@ def test_engine_applies_schedule_and_keeps_global_margin_diagnostic_only():
     result.auxiliary_loss.backward()
     assert full_scale.grad is not None
     assert loo_scale.grad is not None
+
+
+def test_heterogeneous_ranks_execute_identical_model_forward_slots_before_backward():
+    """Unequal forward counts can desynchronize ZeRO parameter gathers and DDP buffers."""
+    from evidence_window.stage2_engine import Stage2EvidenceWindowEngine
+
+    rank_calls = [[], []]
+    rank_scales = [
+        torch.tensor(1.0, requires_grad=True),
+        torch.tensor(1.0, requires_grad=True),
+    ]
+
+    def run_rank(rank, layout, local_count):
+        def coordinator(count, device):
+            assert count == local_count
+            assert device == layout.evidence_token_mask.device
+            assert rank_calls[rank] == []
+            return 2, 2
+
+        engine = Stage2EvidenceWindowEngine(
+            _config(), edge_count_coordinator=coordinator
+        )
+
+        def policy_forward(block_mask, need_hidden):
+            assert need_hidden is False
+            rank_calls[rank].append(block_mask)
+            value = rank_scales[rank] * torch.ones(
+                (1, layout.window_token_mask.shape[-1])
+            )
+            return Stage2ConditionOutput(value, None)
+
+        return engine.compute(layout, policy_forward, progress=1.0)
+
+    with_edges = run_rank(0, _two_edge_layout(), local_count=2)
+    without_edges = run_rank(1, _no_edge_layout(), local_count=0)
+
+    assert [len(calls) for calls in rank_calls] == [3, 3]
+    assert with_edges.effects.forward_count == 3
+    assert without_edges.effects.forward_count == 3
+    assert rank_calls[1][0] is None
+    assert all(
+        torch.is_tensor(mask) and mask.dtype is torch.bool and not mask.any()
+        for mask in rank_calls[1][1:]
+    )
+    assert not without_edges.effects.pair_mask.any()
+    assert without_edges.metric_sums == {}
+    assert without_edges.losses == {}
+    without_edges.auxiliary_loss.backward()
+    assert rank_scales[1].grad is not None
+    assert rank_scales[1].grad.item() == 0.0
+
+
+def test_two_edge_engine_uses_mean_of_independent_losses_not_global_aggregate():
+    """The engine objective must differ from the saturating sequence sigmoid."""
+    from evidence_window.stage2_engine import Stage2EvidenceWindowEngine
+
+    full = torch.tensor([[0.0, 0.0, 0.0, 20.0, 20.0]], requires_grad=True)
+    loo_values = iter(
+        (
+            torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0]], requires_grad=True),
+            torch.tensor([[0.0, 0.0, 0.0, 20.0, 20.0]], requires_grad=True),
+        )
+    )
+
+    def policy_forward(block_mask, need_hidden):
+        assert need_hidden is False
+        return Stage2ConditionOutput(full if block_mask is None else next(loo_values), None)
+
+    result = Stage2EvidenceWindowEngine(_config()).compute(
+        _two_edge_layout(), policy_forward, progress=1.0
+    )
+    contributions = result.effects.contributions[result.effects.pair_mask]
+    local = -F.logsigmoid(0.3 * contributions).mean()
+    global_loss = -F.logsigmoid(0.3 * contributions.sum())
+
+    torch.testing.assert_close(result.losses["ew_pref"], local)
+    assert abs((result.losses["ew_pref"] - global_loss).item()) > 0.1
 
 
 def test_softmax_concentration_and_raw_threshold_statistics_are_finite():
