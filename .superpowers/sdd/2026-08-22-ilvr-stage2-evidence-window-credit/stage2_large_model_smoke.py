@@ -12,6 +12,7 @@ import argparse
 from dataclasses import replace
 import gc
 import json
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,45 @@ CASE_CONFIGS = {
     "hidden-residual-kd": "hidden_residual_kd.json",
     "online-frozen-zero1": "online_frozen_zero1.json",
     "online-frozen-zero2": "online_frozen_zero2.json",
+}
+CASE_SIGNATURES = {
+    "baseline": (frozenset(), "none", frozenset(), "window_attention_block"),
+    "ew-reference-free": (
+        frozenset({"ew"}),
+        "none",
+        frozenset({"token_logps"}),
+        "window_attention_block",
+    ),
+    "ew-precomputed-dpo": (
+        frozenset({"ew"}),
+        "precomputed",
+        frozenset({"token_logps"}),
+        "window_attention_block",
+    ),
+    "relation-kd": (
+        frozenset({"relation"}),
+        "precomputed",
+        frozenset({"token_logps"}),
+        "window_attention_block",
+    ),
+    "hidden-residual-kd": (
+        frozenset({"residual"}),
+        "precomputed",
+        frozenset({"token_logps", "hidden_states"}),
+        "window_attention_block",
+    ),
+    "online-frozen-zero1": (
+        frozenset({"ew"}),
+        "online_frozen",
+        frozenset({"token_logps"}),
+        "window_attention_block",
+    ),
+    "online-frozen-zero2": (
+        frozenset({"ew"}),
+        "online_frozen",
+        frozenset({"token_logps"}),
+        "window_attention_block",
+    ),
 }
 SINGLE_GPU_CASES = (
     "stage1-baseline",
@@ -56,14 +96,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ew-config")
     parser.add_argument("--deepspeed-config")
     parser.add_argument("--reference-artifact-dir")
+    parser.add_argument("--reference-dataset-sha256")
+    parser.add_argument("--reference-checkpoint-id")
+    parser.add_argument("--reference-checkpoint-witness")
+    parser.add_argument("--reference-tokenizer-id")
+    parser.add_argument("--reference-parser-version", default="stage2-marker-v1")
+    parser.add_argument("--reference-model-config-id")
     parser.add_argument("--output-dir", required=True)
     return parser
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.sample_index < 0:
         raise ValueError("sample index must be nonnegative")
+    if args.case == "all-single-gpu" and args.ew_config is not None:
+        parser.error("--ew-config cannot override the all-single-gpu named matrix")
     return args
 
 
@@ -162,12 +211,39 @@ def _token_ids(processor, marker_ids):
     )
 
 
-def _read_manifest_identity(artifact_dir: str):
-    from evidence_window.artifacts import ArtifactIdentity
+def _stage2_config_signature(config) -> tuple[frozenset[str], str, frozenset[str], str]:
+    active = frozenset(
+        objective
+        for objective in ("ew", "relation", "residual")
+        if config.effective_weight(objective, 1.0) > 0.0
+    )
+    return (
+        active,
+        config.reference.mode,
+        config.required_outputs,
+        config.loo.intervention,
+    )
 
-    with (Path(artifact_dir) / "manifest.json").open(encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    return ArtifactIdentity.from_dict(manifest["identity"])
+
+def _validate_case_config(case: str, config) -> None:
+    expected = CASE_SIGNATURES.get(case)
+    if expected is None:
+        raise ValueError(f"unsupported Stage-2 smoke case: {case}")
+    actual = _stage2_config_signature(config)
+    if actual != expected:
+        raise ValueError(
+            f"case {case!r} configuration signature mismatch: "
+            f"expected {expected}, found {actual}"
+        )
+
+
+def _validate_case_zero_stage(case: str, zero_stage: int) -> None:
+    expected = {
+        "online-frozen-zero1": 1,
+        "online-frozen-zero2": 2,
+    }.get(case)
+    if expected is not None and zero_stage != expected:
+        raise ValueError(f"case {case!r} requires DeepSpeed ZeRO-{expected}")
 
 
 def _resolve_stage2_config(args: argparse.Namespace, case: str):
@@ -178,6 +254,7 @@ def _resolve_stage2_config(args: argparse.Namespace, case: str):
 
     path = Path(args.ew_config) if args.ew_config else STAGE2_CONFIG_ROOT / CASE_CONFIGS[case]
     config = Stage2EvidenceWindowConfig.from_json(path)
+    _validate_case_config(case, config)
     # A one-step smoke must exercise the named objective instead of remaining
     # inside a production warmup interval.
     config = replace(config, schedule=Stage2ScheduleConfig())
@@ -194,6 +271,49 @@ def _resolve_stage2_config(args: argparse.Namespace, case: str):
             reference=replace(config.reference, checkpoint=args.stage1_checkpoint),
         )
     return config
+
+
+def _build_expected_reference_identity(args, config, tokenizer_special_tokens):
+    """Reconstruct the consumer expectation without reading artifact metadata."""
+    from evidence_window.artifacts import ArtifactIdentity
+
+    values = {
+        "dataset_sha256": getattr(args, "reference_dataset_sha256", None),
+        "checkpoint_id": getattr(args, "reference_checkpoint_id", None),
+        "checkpoint_witness": getattr(args, "reference_checkpoint_witness", None),
+        "tokenizer_id": getattr(args, "reference_tokenizer_id", None),
+        "parser_version": getattr(args, "reference_parser_version", None),
+        "model_config_id": getattr(args, "reference_model_config_id", None),
+    }
+    missing = sorted(name for name, value in values.items() if not value)
+    if missing:
+        raise ValueError(
+            "precomputed smoke requires authenticated identity argument(s): "
+            + ", ".join(missing)
+        )
+    identity = ArtifactIdentity(
+        format_version=1,
+        dataset_sha256=values["dataset_sha256"],
+        checkpoint_id=values["checkpoint_id"],
+        checkpoint_witness=values["checkpoint_witness"],
+        tokenizer_id=values["tokenizer_id"],
+        tokenizer_special_tokens=tuple(int(value) for value in tokenizer_special_tokens),
+        parser_version=values["parser_version"],
+        contribution_reduction=config.preference.contribution_reduction,
+        intervention=config.loo.intervention,
+        attention_backend="sdpa",
+        max_evidence_edges_per_window=config.loo.max_evidence_edges_per_window,
+        model_config_id=values["model_config_id"],
+    )
+    # Reuse the artifact schema's strict primitive/range validation without
+    # consulting the producer manifest.
+    return ArtifactIdentity.from_dict(identity.to_dict())
+
+
+def _build_precomputed_provider(artifact_dir, expected_identity):
+    from evidence_window.artifacts import PrecomputedReferenceProvider
+
+    return PrecomputedReferenceProvider(artifact_dir, expected_identity)
 
 
 def _training_arguments(output_dir: Path, deepspeed_config: str | None):
@@ -245,6 +365,48 @@ def _forward_witness(model) -> tuple[dict[str, int], Any]:
     return witness, model.register_forward_pre_hook(observe, with_kwargs=True)
 
 
+def _parameter_update_tracker(model):
+    import torch
+
+    selected = [
+        (parameter, parameter.detach().cpu().clone())
+        for parameter in model.parameters()
+        if parameter.requires_grad and parameter.numel() > 0
+    ]
+    if not selected:
+        raise RuntimeError("smoke policy exposes no trainable parameter")
+
+    def finish() -> dict[str, Any]:
+        after = [parameter.detach().cpu() for parameter, _before in selected]
+        changed = sum(
+            not torch.equal(current, before)
+            for current, (_parameter, before) in zip(after, selected, strict=True)
+        )
+        return {
+            "changed": changed > 0,
+            "finite": all(bool(current.isfinite().all().item()) for current in after),
+            "changed_parameter_count": changed,
+        }
+
+    return finish
+
+
+def _distributed_max_int(value: int) -> int:
+    import torch
+    import torch.distributed as distributed
+
+    if not distributed.is_available() or not distributed.is_initialized():
+        return value
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if distributed.get_backend() == "nccl"
+        else torch.device("cpu")
+    )
+    tensor = torch.tensor(value, dtype=torch.long, device=device)
+    distributed.all_reduce(tensor, op=distributed.ReduceOp.MAX)
+    return int(tensor.item())
+
+
 def _loss_witness(log_history) -> dict[str, float]:
     result: dict[str, float] = {}
     for record in log_history:
@@ -261,7 +423,6 @@ def _loss_witness(log_history) -> dict[str, float]:
 
 def _run_stage2(args: argparse.Namespace, case: str, case_dir: Path) -> dict[str, Any]:
     import torch
-    from evidence_window.artifacts import PrecomputedReferenceProvider
     from evidence_window.stage2_config import read_deepspeed_zero_stage
     from evidence_window.stage2_layout import extract_stage2_layout, select_stage2_edges
     from evidence_window.stage2_reference import OnlineFrozenStage2Reference
@@ -276,6 +437,7 @@ def _run_stage2(args: argparse.Namespace, case: str, case_dir: Path) -> dict[str
         else 0
     )
     config = _resolve_stage2_config(args, case)
+    _validate_case_zero_stage(case, zero_stage)
     config.validate_runtime(zero_stage)
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     processor, model, marker_ids = _load_processor_and_model(
@@ -293,8 +455,16 @@ def _run_stage2(args: argparse.Namespace, case: str, case_dir: Path) -> dict[str
     layout = extract_stage2_layout(
         batch["input_ids"], batch["attention_mask"], batch["labels"], token_ids
     )
-    edge_count = len(
-        select_stage2_edges(layout, config.loo.max_evidence_edges_per_window)
+    selected_edges = select_stage2_edges(
+        layout, config.loo.max_evidence_edges_per_window
+    )
+    edge_count = len(selected_edges)
+    edge_counts_by_window: dict[tuple[int, int], int] = {}
+    for edge in selected_edges:
+        key = (edge.batch_index, edge.window_index)
+        edge_counts_by_window[key] = edge_counts_by_window.get(key, 0) + 1
+    eligible_window_count = sum(
+        count >= 2 for count in edge_counts_by_window.values()
     )
 
     reference_provider = None
@@ -302,9 +472,14 @@ def _run_stage2(args: argparse.Namespace, case: str, case_dir: Path) -> dict[str
     reference_model = None
     if config.reference.mode == "precomputed":
         assert args.reference_artifact_dir is not None
-        reference_identity = _read_manifest_identity(args.reference_artifact_dir)
-        reference_provider = PrecomputedReferenceProvider(
-            args.reference_artifact_dir, reference_identity
+        reference_identity = _build_expected_reference_identity(
+            args,
+            config,
+            processor.tokenizer.all_special_ids,
+        )
+        reference_provider = _build_precomputed_provider(
+            args.reference_artifact_dir,
+            reference_identity,
         )
     elif config.reference.mode == "online_frozen":
         _, reference_model, _ = _load_processor_and_model(
@@ -341,7 +516,9 @@ def _run_stage2(args: argparse.Namespace, case: str, case_dir: Path) -> dict[str
         )
     trainer = CustomTrainerStage2(**trainer_kwargs)
     policy_grad = _gradient_witness(trainer.model)
+    policy_update = _parameter_update_tracker(trainer.model)
     policy_forwards, policy_hook = _forward_witness(trainer.model)
+    global_max_edge_slots = _distributed_max_int(edge_count)
     fixed = getattr(trainer, "_stage2_reference_provider", None)
     reference_forwards = {"total": 0, "blocked": 0, "hidden": 0}
     reference_hook = None
@@ -357,20 +534,6 @@ def _run_stage2(args: argparse.Namespace, case: str, case_dir: Path) -> dict[str
         and hasattr(fixed, "parameters")
         and any(parameter.grad is not None for parameter in fixed.parameters())
     )
-    expected_policy_calls = 1 if config.is_disabled else 2 + edge_count
-    if policy_forwards["total"] != expected_policy_calls:
-        raise RuntimeError(
-            f"policy forward count mismatch: expected {expected_policy_calls}, "
-            f"got {policy_forwards['total']}"
-        )
-    if config.residual.enabled and config.residual.lambda_res > 0:
-        if policy_forwards["hidden"] != 1 + edge_count:
-            raise RuntimeError("hidden-state residual smoke did not collect exact auxiliary states")
-    elif policy_forwards["hidden"] != 0:
-        raise RuntimeError("non-residual smoke unexpectedly collected hidden states")
-    if reference_has_grad:
-        raise RuntimeError("fixed Stage-2 reference received gradients")
-
     result = {
         "case": case,
         "rank": int(os.environ.get("RANK", "0")),
@@ -380,9 +543,12 @@ def _run_stage2(args: argparse.Namespace, case: str, case_dir: Path) -> dict[str
         "zero_stage": zero_stage,
         "losses": _loss_witness(trainer.state.log_history),
         "edge_count": edge_count,
+        "eligible_window_count": eligible_window_count,
+        "global_max_edge_slots": global_max_edge_slots,
         "policy_forwards": policy_forwards,
         "reference_forwards": reference_forwards,
         "policy_gradient": policy_grad,
+        "policy_parameter_update": policy_update(),
         "reference_has_gradient": reference_has_grad,
         "disabled_auxiliary_forward_count": (
             max(policy_forwards["total"] - 1, 0) if config.is_disabled else None
@@ -423,6 +589,7 @@ def _run_stage1(args: argparse.Namespace, case_dir: Path) -> dict[str, Any]:
         evidence_window_config=EvidenceWindowConfig.disabled(),
     )
     policy_grad = _gradient_witness(trainer.model)
+    policy_update = _parameter_update_tracker(trainer.model)
     policy_forwards, policy_hook = _forward_witness(trainer.model)
     teacher_forwards, teacher_hook = _forward_witness(trainer._ema.teacher)
     teacher_grad = any(parameter.grad is not None for parameter in trainer._ema.teacher.parameters())
@@ -446,9 +613,15 @@ def _run_stage1(args: argparse.Namespace, case_dir: Path) -> dict[str, Any]:
         "dtype": str(next(trainer.model.parameters()).dtype),
         "losses": _loss_witness(trainer.state.log_history),
         "edge_count": 0,
+        "eligible_window_count": 0,
+        "global_max_edge_slots": 0,
+        "latent_evidence_count": sum(
+            step.get("type") == "latent" for step in row["sequence_plan"]
+        ),
         "policy_forwards": policy_forwards,
         "teacher_forwards": teacher_forwards,
         "policy_gradient": policy_grad,
+        "policy_parameter_update": policy_update(),
         "teacher_has_gradient": teacher_grad,
         "ema_update_count": trainer._ema_update_count,
         "disabled_auxiliary_forward_count": 0,
@@ -469,6 +642,162 @@ def _write_result(output_dir: Path, result: dict[str, Any]) -> Path:
     return destination
 
 
+CASE_LOSS_KEYS = {
+    "ew-reference-free": "loss/ew_pref",
+    "ew-precomputed-dpo": "loss/ew_pref",
+    "online-frozen-zero1": "loss/ew_pref",
+    "online-frozen-zero2": "loss/ew_pref",
+    "relation-kd": "loss/relation",
+    "hidden-residual-kd": "loss/residual",
+}
+
+
+def _finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _nonnegative_int(witness: dict[str, Any], key: str) -> int:
+    value = witness.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{key} must be a nonnegative integer")
+    return value
+
+
+def _validate_forward_ledger(
+    witness: dict[str, Any],
+    key: str,
+    *,
+    total: int,
+    blocked: int,
+    hidden: int,
+) -> None:
+    ledger = witness.get(key)
+    if not isinstance(ledger, dict):
+        raise ValueError(f"missing {key.replace('_', ' ')} ledger")
+    expected = {"total": total, "blocked": blocked, "hidden": hidden}
+    if any(ledger.get(name) != count for name, count in expected.items()):
+        raise ValueError(
+            f"{key.replace('_', ' ')} mismatch: expected {expected}, found {ledger}"
+        )
+
+
+def _validate_policy_learning_witness(witness: dict[str, Any]) -> None:
+    gradient = witness.get("policy_gradient")
+    gradient_valid = bool(
+        isinstance(gradient, dict)
+        and gradient.get("seen") is True
+        and gradient.get("finite") is True
+        and gradient.get("nonzero") is True
+    )
+    if gradient_valid:
+        return
+    update = witness.get("policy_parameter_update")
+    update_valid = bool(
+        isinstance(update, dict)
+        and update.get("changed") is True
+        and update.get("finite") is True
+    )
+    if witness.get("zero_stage") in {1, 2} and update_valid:
+        return
+    raise ValueError(
+        "policy gradient witness must be seen, finite, and nonzero; "
+        "a finite parameter update is accepted only for ZeRO-1/2 after gradient clearing"
+    )
+
+
+def _validate_case_witness(witness: dict[str, Any]) -> None:
+    """Authenticate the small smoke witness before it becomes a success artifact."""
+    case = witness.get("case")
+    if case not in {"stage1-baseline", *CASE_CONFIGS}:
+        raise ValueError(f"unsupported smoke witness case: {case!r}")
+    losses = witness.get("losses")
+    if not isinstance(losses, dict) or not losses:
+        raise ValueError("loss witness must be a nonempty mapping")
+    total_keys = [key for key in ("loss", "train_loss") if key in losses]
+    if not total_keys or any(not _finite_number(losses[key]) for key in total_keys):
+        raise ValueError("recorded total loss must be finite")
+    if any(not _finite_number(value) for value in losses.values()):
+        raise ValueError("all recorded losses must be finite")
+
+    named_loss = CASE_LOSS_KEYS.get(case)
+    if named_loss is not None and (
+        named_loss not in losses or not _finite_number(losses[named_loss])
+    ):
+        raise ValueError(f"named case requires finite {named_loss}")
+
+    edge_count = _nonnegative_int(witness, "edge_count")
+    global_max = _nonnegative_int(witness, "global_max_edge_slots")
+    eligible_windows = _nonnegative_int(witness, "eligible_window_count")
+    _validate_policy_learning_witness(witness)
+
+    if case == "stage1-baseline":
+        latent_count = _nonnegative_int(witness, "latent_evidence_count")
+        teacher_count = latent_count + int(latent_count > 0)
+        if edge_count != 0 or global_max != 0 or eligible_windows != 0:
+            raise ValueError("Stage-1 witness cannot contain Stage-2 evidence edges")
+        _validate_forward_ledger(
+            witness, "policy_forwards", total=1, blocked=0, hidden=0
+        )
+        _validate_forward_ledger(
+            witness,
+            "teacher_forwards",
+            total=teacher_count,
+            blocked=0,
+            hidden=teacher_count,
+        )
+        if witness.get("teacher_has_gradient") is not False:
+            raise ValueError("Stage-1 EMA teacher must have no gradients")
+        if witness.get("ema_update_count") != 1:
+            raise ValueError("Stage-1 smoke requires exactly one EMA update")
+        if witness.get("disabled_auxiliary_forward_count") != 0:
+            raise ValueError("Stage-1 smoke must not run Stage-2 auxiliary forwards")
+        return
+
+    _validate_case_zero_stage(case, witness.get("zero_stage"))
+    if witness.get("reference_has_gradient") is not False:
+        raise ValueError("frozen Stage-2 reference must have no gradients")
+    if global_max < edge_count:
+        raise ValueError("global maximum edge slots cannot be smaller than local edge count")
+
+    if named_loss is None:
+        _validate_forward_ledger(
+            witness, "policy_forwards", total=1, blocked=0, hidden=0
+        )
+        _validate_forward_ledger(
+            witness, "reference_forwards", total=0, blocked=0, hidden=0
+        )
+        if witness.get("disabled_auxiliary_forward_count") != 0:
+            raise ValueError("baseline smoke unexpectedly ran auxiliary forwards")
+        return
+
+    if edge_count <= 0 or global_max <= 0:
+        raise ValueError("named auxiliary case requires at least one selected evidence edge")
+    if case == "relation-kd" and eligible_windows <= 0:
+        raise ValueError("relation case requires an eligible window with multiple evidence edges")
+
+    hidden_calls = 1 + global_max if case == "hidden-residual-kd" else 0
+    _validate_forward_ledger(
+        witness,
+        "policy_forwards",
+        total=2 + global_max,
+        blocked=global_max,
+        hidden=hidden_calls,
+    )
+    online = case.startswith("online-frozen")
+    _validate_forward_ledger(
+        witness,
+        "reference_forwards",
+        total=1 + global_max if online else 0,
+        blocked=global_max if online else 0,
+        hidden=0,
+    )
+
+
+def _publish_validated_result(output_dir: Path, result: dict[str, Any]) -> Path:
+    _validate_case_witness(result)
+    return _write_result(output_dir, result)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     _require_inputs(args)
@@ -481,7 +810,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             if case == "stage1-baseline"
             else _run_stage2(args, case, case_dir)
         )
-        path = _write_result(output_dir, result)
+        path = _publish_validated_result(output_dir, result)
         if int(os.environ.get("RANK", "0")) == 0:
             print(path)
 

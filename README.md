@@ -226,7 +226,11 @@ replace only those path values; switching objectives never requires a source
 edit. The online files do not select a DeepSpeed stage: pair them explicitly
 with `configs/config_stage1.json` (ZeRO-1) or `configs/config_stage2.json`
 (ZeRO-2). `config_stage*.json` names describe DeepSpeed ZeRO, not ILVR Stage 1
-or Stage 2.
+or Stage 2. The smoke harness enforces those exact named-case pairings and
+rejects cross-pairing. A named case also validates the resolved objective,
+reference mode, required outputs, and intervention; `--ew-config` may replace
+a path only when its semantic signature still matches the case and is rejected
+for `all-single-gpu`.
 
 #### Launch and reference artifacts
 
@@ -329,8 +333,21 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:transformers/src \
   --sample-index 920 \
   --deepspeed-config configs/config_stage3.json \
   --reference-artifact-dir /absolute/path/to/stage2-reference-artifact-with-hidden-residuals \
+  --reference-dataset-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --reference-checkpoint-id stage1-approved \
+  --reference-checkpoint-witness /absolute/or-authenticated-checkpoint-witness \
+  --reference-tokenizer-id /absolute/path/to/stage1-checkpoint \
+  --reference-parser-version stage2-marker-v1 \
+  --reference-model-config-id qwen2.5-vl-stage2-self-latent-v1 \
   --output-dir /absolute/path/to/stage2-smoke-results
 ```
+
+The harness reconstructs the expected artifact identity from these explicit
+consumer-side witnesses. It never accepts the producer manifest itself as the
+expected identity and does not hash checkpoint weights. Before atomically
+publishing a result, it validates the named loss, finite total, eligible
+edges/windows, exact padded forward ledger, nonzero policy learning witness,
+and absence of reference/EMA gradients.
 
 Do not treat a high relation entropy, dense attention, or positive LOO score as
 proof of correct evidence use. Sparse dependency can be correct. The local
