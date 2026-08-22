@@ -272,6 +272,117 @@ def test_bounded_backward_matches_dense_student_gradients(metric):
     )
 
 
+@pytest.mark.parametrize("metric", ["huber", "cosine"])
+def test_bf16_autocast_uses_fp32_for_forward_and_backward_projections(
+    metric,
+    monkeypatch,
+):
+    """BF16 training autocast must not make forward and recomputation disagree."""
+    student = torch.tensor(
+        [[1.03125, -0.53125, 2.0625], [0.28125, 1.46875, -0.96875]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    teacher = torch.tensor(
+        [[0.46875, 1.03125, -0.21875], [1.0625, -0.46875, 0.71875]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    student_weight = torch.tensor(
+        [
+            [1.03125, 0.03125, 0.53125],
+            [0.03125, 1.03125, -0.46875],
+            [0.53125, -0.96875, 1.03125],
+            [-0.46875, 0.28125, 1.53125],
+            [1.03125, 0.96875, 0.03125],
+        ],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    teacher_weight = torch.tensor(
+        [
+            [0.53125, 0.03125, 0.96875],
+            [0.03125, 1.46875, -0.21875],
+            [1.03125, -0.46875, 0.78125],
+            [-0.21875, 0.53125, 1.03125],
+            [0.71875, 1.03125, 0.28125],
+        ],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    reference_student = student.detach().clone().requires_grad_()
+    reference_weight = student_weight.detach().clone().requires_grad_()
+    with torch.autocast(device_type="cpu", enabled=False):
+        reference_student_logits = (
+            reference_student.float() @ reference_weight.float().T
+        )
+        reference_teacher_logits = (
+            teacher.detach().float() @ teacher_weight.detach().float().T
+        )
+        if metric == "huber":
+            reference_loss = F.huber_loss(
+                reference_student_logits,
+                reference_teacher_logits,
+                delta=0.75,
+            )
+        else:
+            reference_loss = 1.0 - F.cosine_similarity(
+                reference_student_logits,
+                reference_teacher_logits,
+            ).mean()
+    reference_loss.backward()
+
+    original_matmul = torch.matmul
+    projection_observations: list[tuple[bool, torch.dtype]] = []
+
+    def traced_matmul(left, right, *args, **kwargs):
+        result = original_matmul(left, right, *args, **kwargs)
+        if (
+            left.shape == student.shape
+            and right.ndim == 2
+            and right.shape[0] == student.shape[1]
+            and right.shape[1] <= 2
+        ):
+            projection_observations.append((torch.is_grad_enabled(), result.dtype))
+        return result
+
+    monkeypatch.setattr(torch, "matmul", traced_matmul)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        bounded_loss = chunked_logit_residual_loss(
+            student,
+            teacher,
+            student_weight,
+            teacher_weight,
+            metric,
+            2,
+            0.75,
+        )
+    bounded_loss.backward()
+
+    forward_dtypes = {
+        dtype for grad_enabled, dtype in projection_observations if not grad_enabled
+    }
+    backward_dtypes = {
+        dtype for grad_enabled, dtype in projection_observations if grad_enabled
+    }
+    assert forward_dtypes == backward_dtypes == {torch.float32}
+    assert torch.allclose(bounded_loss, reference_loss, atol=1e-7, rtol=1e-7)
+    assert torch.allclose(
+        student.grad,
+        reference_student.grad,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert torch.allclose(
+        student_weight.grad,
+        reference_weight.grad,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert teacher.grad is None
+    assert teacher_weight.grad is None
+
+
 def test_student_hidden_and_head_receive_gradients_but_teacher_is_detached():
     """Residual KD trains both student factors without entering the EMA graph."""
     student = torch.tensor([[1.0, 2.0]], requires_grad=True)

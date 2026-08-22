@@ -278,8 +278,42 @@ class _BoundedLogitResidual(torch.autograd.Function):
         ctx.chunk_size = chunk_size
         ctx.delta = delta
 
-        if metric_code == 0:
-            total = student_values.new_zeros(())
+        with _autocast_disabled_for(student_values):
+            if metric_code == 0:
+                total = student_values.new_zeros(())
+                for start in range(0, student_weight.shape[0], chunk_size):
+                    stop = min(start + chunk_size, student_weight.shape[0])
+                    student_chunk = student_weight[start:stop].to(
+                        dtype=student_values.dtype
+                    )
+                    teacher_chunk = teacher_weight[start:stop].to(
+                        dtype=teacher_values.dtype
+                    )
+                    student_logits = torch.matmul(
+                        student_values,
+                        student_chunk.transpose(0, 1),
+                    )
+                    teacher_logits = torch.matmul(
+                        teacher_values,
+                        teacher_chunk.transpose(0, 1),
+                    )
+                    total = total + F.huber_loss(
+                        student_logits,
+                        teacher_logits,
+                        delta=delta,
+                        reduction="sum",
+                    )
+                ctx.save_for_backward(
+                    student_values,
+                    teacher_values,
+                    student_weight,
+                    teacher_weight,
+                )
+                return total / (student_values.shape[0] * student_weight.shape[0])
+
+            dots = student_values.new_zeros(student_values.shape[0])
+            student_norm_sq = torch.zeros_like(dots)
+            teacher_norm_sq = torch.zeros_like(dots)
             for start in range(0, student_weight.shape[0], chunk_size):
                 stop = min(start + chunk_size, student_weight.shape[0])
                 student_chunk = student_weight[start:stop].to(
@@ -296,56 +330,23 @@ class _BoundedLogitResidual(torch.autograd.Function):
                     teacher_values,
                     teacher_chunk.transpose(0, 1),
                 )
-                total = total + F.huber_loss(
-                    student_logits,
-                    teacher_logits,
-                    delta=delta,
-                    reduction="sum",
-                )
+                dots = dots + (student_logits * teacher_logits).sum(dim=-1)
+                student_norm_sq = student_norm_sq + student_logits.square().sum(dim=-1)
+                teacher_norm_sq = teacher_norm_sq + teacher_logits.square().sum(dim=-1)
             ctx.save_for_backward(
                 student_values,
                 teacher_values,
                 student_weight,
                 teacher_weight,
+                dots,
+                student_norm_sq,
+                teacher_norm_sq,
             )
-            return total / (student_values.shape[0] * student_weight.shape[0])
-
-        dots = student_values.new_zeros(student_values.shape[0])
-        student_norm_sq = torch.zeros_like(dots)
-        teacher_norm_sq = torch.zeros_like(dots)
-        for start in range(0, student_weight.shape[0], chunk_size):
-            stop = min(start + chunk_size, student_weight.shape[0])
-            student_chunk = student_weight[start:stop].to(
-                dtype=student_values.dtype
+            return _cosine_residual_from_statistics(
+                dots,
+                student_norm_sq,
+                teacher_norm_sq,
             )
-            teacher_chunk = teacher_weight[start:stop].to(
-                dtype=teacher_values.dtype
-            )
-            student_logits = torch.matmul(
-                student_values,
-                student_chunk.transpose(0, 1),
-            )
-            teacher_logits = torch.matmul(
-                teacher_values,
-                teacher_chunk.transpose(0, 1),
-            )
-            dots = dots + (student_logits * teacher_logits).sum(dim=-1)
-            student_norm_sq = student_norm_sq + student_logits.square().sum(dim=-1)
-            teacher_norm_sq = teacher_norm_sq + teacher_logits.square().sum(dim=-1)
-        ctx.save_for_backward(
-            student_values,
-            teacher_values,
-            student_weight,
-            teacher_weight,
-            dots,
-            student_norm_sq,
-            teacher_norm_sq,
-        )
-        return _cosine_residual_from_statistics(
-            dots,
-            student_norm_sq,
-            teacher_norm_sq,
-        )
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -367,7 +368,7 @@ class _BoundedLogitResidual(torch.autograd.Function):
 
         for start in range(0, student_weight.shape[0], ctx.chunk_size):
             stop = min(start + ctx.chunk_size, student_weight.shape[0])
-            with torch.enable_grad():
+            with torch.enable_grad(), _autocast_disabled_for(student_values):
                 local_student_values = student_values.detach().requires_grad_(
                     need_student_values
                 )
@@ -437,6 +438,11 @@ class _BoundedLogitResidual(torch.autograd.Function):
             None,
             None,
         )
+
+
+def _autocast_disabled_for(value: torch.Tensor):
+    """Disable autocast for the actual CPU/CUDA projection device."""
+    return torch.autocast(device_type=value.device.type, enabled=False)
 
 
 def _cosine_residual_from_statistics(
