@@ -2101,6 +2101,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         latent_hidden_states: Optional[torch.Tensor] = None, 
         attention_block_mask: Optional[torch.Tensor] = None,
         attention_backend_override: Optional[str] = None,
+        stage2_latent_prefix_steps: Optional[int] = None,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2118,7 +2119,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if self.config.stage == "stage2" and not generate_mode:
+        stage2_training_forward = self.config.stage == "stage2" and not generate_mode
+        stage2_latent_indices = None
+        local_stage2_latent_count = 0
+        if stage2_latent_prefix_steps is not None and not stage2_training_forward:
+            raise ValueError(
+                "stage2 latent prefix steps are only valid for a non-generation Stage-2 forward"
+            )
+        if stage2_training_forward:
+            if input_ids is None:
+                raise ValueError("Stage-2 latent replay requires input_ids")
             stage2_batch_size = (
                 input_ids.shape[0]
                 if input_ids is not None
@@ -2127,6 +2137,19 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             if stage2_batch_size != 1:
                 raise NotImplementedError(
                     "Stage-2 latent replay currently requires batch_size == 1."
+                )
+            stage2_latent_indices = (input_ids == self.config.latent_token_id).nonzero()
+            local_stage2_latent_count = int(stage2_latent_indices.shape[0])
+            if stage2_latent_prefix_steps is None:
+                stage2_latent_prefix_steps = local_stage2_latent_count
+            elif (
+                isinstance(stage2_latent_prefix_steps, bool)
+                or not isinstance(stage2_latent_prefix_steps, int)
+                or stage2_latent_prefix_steps < local_stage2_latent_count
+            ):
+                raise ValueError(
+                    "stage2 latent prefix steps must be an integer greater than or "
+                    "equal to the local latent count"
                 )
 
         # ===================================================================
@@ -2236,14 +2259,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
         all_hidden_states_seq = []
         
-        if self.config.stage == 'stage2' and not generate_mode:
+        if stage2_training_forward:
 
-            latent_indices = (input_ids == self.config.latent_token_id).nonzero()
+            latent_indices = stage2_latent_indices
+            assert latent_indices is not None
 
             latent_lists = [
                 [idx[1].item() for idx in latent_indices if idx[0] == i] for i in range(input_ids.shape[0])
             ]
             max_n_latents = max(len(lst) for lst in latent_lists) if latent_lists else 0
+            assert stage2_latent_prefix_steps is not None
 
 
             full_position_ids, full_rope_deltas = self.get_rope_index(
@@ -2365,6 +2390,34 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     
                 next_compute_range = (cur_end, next_latent_pos)
 
+            dummy_graph_zeros = []
+            for _ in range(stage2_latent_prefix_steps - max_n_latents):
+                # ZeRO-3 parameter gathers and backward hooks must observe the
+                # same number of decoder calls on every rank.  Dummy slots use
+                # the current full, unmodified trajectory and contribute only
+                # an autograd-connected exact zero to the final output.
+                dummy_inputs = curr_inputs_embeds
+                dummy_mask = attention_mask
+                dummy_pos_ids = full_position_ids
+                dummy_block_mask = attention_block_mask
+                if self.training:
+                    dummy_hidden = checkpoint(
+                        latent_step_forward,
+                        dummy_inputs,
+                        dummy_mask,
+                        dummy_pos_ids,
+                        dummy_block_mask,
+                        use_reentrant=False,
+                    )
+                else:
+                    dummy_hidden = latent_step_forward(
+                        dummy_inputs,
+                        dummy_mask,
+                        dummy_pos_ids,
+                        dummy_block_mask,
+                    )
+                dummy_graph_zeros.append(dummy_hidden.sum() * 0.0)
+
             slice_start, slice_end = next_compute_range
             if slice_start < input_ids.shape[1]:
 
@@ -2397,6 +2450,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             if hidden_states.shape[1] != input_ids.shape[1]:
 
                 hidden_states = hidden_full 
+
+            if dummy_graph_zeros:
+                hidden_states = hidden_states + torch.stack(dummy_graph_zeros).sum().to(
+                    dtype=hidden_states.dtype
+                )
 
         else:
 

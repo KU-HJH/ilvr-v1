@@ -1,6 +1,8 @@
 from dataclasses import replace
 import importlib
 import json
+import multiprocessing
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -283,6 +285,7 @@ class TinyStage2AuxModel(torch.nn.Module):
         output_hidden_states=False,
         return_dict=True,
         use_cache=None,
+        stage2_latent_prefix_steps=None,
     ):
         del return_dict
         self.calls.append(
@@ -291,6 +294,7 @@ class TinyStage2AuxModel(torch.nn.Module):
                 "backend": attention_backend_override,
                 "hidden": output_hidden_states,
                 "use_cache": use_cache,
+                "latent_prefix_steps": stage2_latent_prefix_steps,
             }
         )
         hidden = self.embedding(input_ids) * attention_mask.unsqueeze(-1)
@@ -352,6 +356,7 @@ def test_enabled_trainer_runs_ce_then_same_policy_matched_sdpa_and_keeps_metadat
         "backend": None,
         "hidden": False,
         "use_cache": None,
+        "latent_prefix_steps": None,
     }
     assert [call["backend"] for call in model.calls[1:]] == ["sdpa", "sdpa"]
     assert [call["blocked"] for call in model.calls[1:]] == [False, True]
@@ -360,6 +365,197 @@ def test_enabled_trainer_runs_ce_then_same_policy_matched_sdpa_and_keeps_metadat
     assert model.embedding.weight.grad is not None
     assert model.head.weight.grad is not None
     assert "ew_sample_indices" in caller_batch and "ew_plan_types" in caller_batch
+
+
+def test_zero3_trainer_coordinates_latent_steps_once_and_reuses_for_ce_and_auxiliary(
+    monkeypatch, tmp_path
+):
+    """Re-coordinating inside each replay can diverge or enter hidden collectives."""
+    coordinator_calls = []
+
+    def coordinator(local_count, device, local_error):
+        coordinator_calls.append((local_count, device, local_error))
+        return 3
+
+    def fake_sft_init(instance, *args, **kwargs):
+        del args
+        instance.model = kwargs["model"]
+        instance.args = SimpleNamespace(output_dir=str(tmp_path))
+        instance.state = SimpleNamespace(global_step=2, max_steps=10)
+        plugin = SimpleNamespace(zero_stage=3)
+        instance.accelerator = SimpleNamespace(
+            process_index=0,
+            state=SimpleNamespace(deepspeed_plugin=plugin),
+        )
+
+    monkeypatch.setattr(trainer_stage2_module.SFTTrainer, "__init__", fake_sft_init)
+    model = TinyStage2AuxModel()
+    trainer = CustomTrainerStage2(
+        model=model,
+        evidence_window_config=_config(),
+        latent_token_ids=TOKEN_IDS,
+        latent_prefix_step_coordinator=coordinator,
+    )
+
+    loss = trainer.compute_loss(model, _stage2_batch())
+
+    assert torch.isfinite(loss)
+    assert coordinator_calls == [(1, torch.device("cpu"), None)]
+    assert len(model.calls) == 3
+    assert [call["latent_prefix_steps"] for call in model.calls] == [3, 3, 3]
+
+
+def test_zero3_disabled_stage2_ce_still_receives_coordinated_latent_ledger(
+    monkeypatch, tmp_path
+):
+    """The CE-only baseline can hang before any optional EW replay begins."""
+    coordinator_calls = []
+
+    def coordinator(local_count, device, local_error):
+        coordinator_calls.append((local_count, device, local_error))
+        return 2
+
+    def fake_sft_init(instance, *args, **kwargs):
+        del args
+        instance.model = kwargs["model"]
+        instance.args = SimpleNamespace(output_dir=str(tmp_path))
+        instance.state = SimpleNamespace(global_step=0, max_steps=10)
+        instance.accelerator = SimpleNamespace(
+            process_index=0,
+            state=SimpleNamespace(
+                deepspeed_plugin=SimpleNamespace(zero_stage=3)
+            ),
+        )
+
+    monkeypatch.setattr(trainer_stage2_module.SFTTrainer, "__init__", fake_sft_init)
+    model = TinyStage2AuxModel()
+    trainer = CustomTrainerStage2(
+        model=model,
+        evidence_window_config=Stage2EvidenceWindowConfig.disabled(),
+        latent_token_ids=TOKEN_IDS,
+        latent_prefix_step_coordinator=coordinator,
+    )
+
+    loss = trainer.compute_loss(model, _stage2_batch())
+
+    assert torch.isfinite(loss)
+    assert coordinator_calls == [(1, torch.device("cpu"), None)]
+    assert len(model.calls) == 1
+    assert model.calls[0]["latent_prefix_steps"] == 2
+
+
+def test_zero2_trainer_does_not_coordinate_or_pass_latent_ledger(monkeypatch, tmp_path):
+    """ZeRO-1/2 and ordinary calls must retain their established model API path."""
+    def forbidden_coordinator(*_args):
+        raise AssertionError("ZeRO-2 entered the ZeRO-3 latent coordinator")
+
+    def fake_sft_init(instance, *args, **kwargs):
+        del args
+        instance.model = kwargs["model"]
+        instance.args = SimpleNamespace(output_dir=str(tmp_path))
+        instance.state = SimpleNamespace(global_step=0, max_steps=10)
+        instance.accelerator = SimpleNamespace(
+            process_index=0,
+            state=SimpleNamespace(
+                deepspeed_plugin=SimpleNamespace(zero_stage=2)
+            ),
+        )
+
+    monkeypatch.setattr(trainer_stage2_module.SFTTrainer, "__init__", fake_sft_init)
+    model = TinyStage2AuxModel()
+    trainer = CustomTrainerStage2(
+        model=model,
+        evidence_window_config=Stage2EvidenceWindowConfig.disabled(),
+        latent_token_ids=TOKEN_IDS,
+        latent_prefix_step_coordinator=forbidden_coordinator,
+    )
+
+    trainer.compute_loss(model, _stage2_batch())
+
+    assert model.calls[0]["latent_prefix_steps"] is None
+
+
+def test_invalid_coordinated_latent_count_rejects_before_policy_model_call(
+    monkeypatch, tmp_path
+):
+    """A bad coordinator result must not let one rank enter ZeRO model collectives."""
+    def fake_sft_init(instance, *args, **kwargs):
+        del args
+        instance.model = kwargs["model"]
+        instance.args = SimpleNamespace(output_dir=str(tmp_path))
+        instance.state = SimpleNamespace(global_step=0, max_steps=10)
+        instance.accelerator = SimpleNamespace(
+            process_index=0,
+            state=SimpleNamespace(
+                deepspeed_plugin=SimpleNamespace(zero_stage=3)
+            ),
+        )
+
+    monkeypatch.setattr(trainer_stage2_module.SFTTrainer, "__init__", fake_sft_init)
+    model = TinyStage2AuxModel()
+    trainer = CustomTrainerStage2(
+        model=model,
+        evidence_window_config=Stage2EvidenceWindowConfig.disabled(),
+        latent_token_ids=TOKEN_IDS,
+        latent_prefix_step_coordinator=lambda _count, _device, _error: 0,
+    )
+
+    with pytest.raises(ValueError, match="latent prefix steps"):
+        trainer.compute_loss(model, _stage2_batch())
+
+    assert model.calls == []
+
+
+def _latent_prefix_error_worker(rank, init_file, result_dir):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        trainer_stage2_module._distributed_latent_prefix_steps(
+            1 if rank == 0 else 0,
+            torch.device("cpu"),
+            None if rank == 0 else "ValueError: invalid local latent count",
+        )
+        outcome = "unexpected success"
+    except Exception as exc:
+        outcome = f"{type(exc).__name__}: {exc}"
+    finally:
+        Path(result_dir, f"rank-{rank}.txt").write_text(outcome, encoding="utf-8")
+        torch.distributed.destroy_process_group()
+
+
+def test_rank_local_latent_validation_error_reaches_consensus_before_model(tmp_path):
+    """A malformed rank must not strand a valid peer before the first model call."""
+    context = multiprocessing.get_context("spawn")
+    init_file = tmp_path / "gloo-init"
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    processes = [
+        context.Process(
+            target=_latent_prefix_error_worker,
+            args=(rank, str(init_file), str(result_dir)),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=15)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+
+    assert alive == []
+    outcomes = [
+        (result_dir / f"rank-{rank}.txt").read_text(encoding="utf-8")
+        for rank in range(2)
+    ]
+    assert all("distributed Stage-2 latent-prefix preflight failed" in value for value in outcomes)
+    assert all("invalid local latent count" in value for value in outcomes)
 
 
 def test_trainer_matrix_dump_is_interval_gated_detached_and_opaque(monkeypatch, tmp_path):

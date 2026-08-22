@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import logging
 import math
 from typing import Any
@@ -30,6 +30,9 @@ from evidence_window.stage2_reference import (
 )
 
 
+LatentPrefixStepCoordinator = Callable[[int, torch.device, str | None], int]
+
+
 class CustomTrainerStage2(SFTTrainer):
     """Train self-generated Stage-2 latents with CE and optional edge credit."""
 
@@ -43,6 +46,7 @@ class CustomTrainerStage2(SFTTrainer):
         reference_model_factory=None,
         deepspeed_zero_stage: int | None = None,
         policy_initialization_checkpoint: str | None = None,
+        latent_prefix_step_coordinator: LatentPrefixStepCoordinator | None = None,
         **kwargs,
     ):
         config = (
@@ -52,6 +56,10 @@ class CustomTrainerStage2(SFTTrainer):
         )
         if not isinstance(config, Stage2EvidenceWindowConfig):
             raise TypeError("evidence_window_config must be a Stage2EvidenceWindowConfig")
+        if latent_prefix_step_coordinator is not None and not callable(
+            latent_prefix_step_coordinator
+        ):
+            raise TypeError("latent_prefix_step_coordinator must be callable")
         config.validate()
         online_enabled = (
             not config.is_disabled and config.reference.mode == "online_frozen"
@@ -85,6 +93,25 @@ class CustomTrainerStage2(SFTTrainer):
             )
         self.evidence_window_config = config
         super().__init__(*args, **kwargs)
+        self._deepspeed_zero_stage = _accelerator_deepspeed_zero_stage(
+            getattr(self, "accelerator", None)
+        )
+        self._latent_prefix_step_coordinator = (
+            _distributed_latent_prefix_steps
+            if latent_prefix_step_coordinator is None
+            else latent_prefix_step_coordinator
+        )
+        if (
+            online_enabled
+            and self._deepspeed_zero_stage is not None
+            and self._deepspeed_zero_stage != deepspeed_zero_stage
+        ):
+            raise ValueError(
+                "configured online reference ZeRO stage does not match the active "
+                "Accelerator DeepSpeed stage"
+            )
+        if not config.is_disabled or self._deepspeed_zero_stage == 3:
+            self._token_ids = _resolve_token_ids(latent_token_ids)
 
         # Disabled Stage 2 deliberately has no auxiliary runtime objects. This
         # keeps its hot path identical to the established CE-only baseline.
@@ -94,7 +121,6 @@ class CustomTrainerStage2(SFTTrainer):
                     "disabled Stage 2 does not accept a reference provider or identity"
                 )
             return
-        self._token_ids = _resolve_token_ids(latent_token_ids)
         self._ew_engine = Stage2EvidenceWindowEngine(config)
         if config.reference.mode == "none":
             if reference_provider is not None or reference_identity is not None:
@@ -154,6 +180,15 @@ class CustomTrainerStage2(SFTTrainer):
         model_inputs = dict(inputs)
         sample_indices = model_inputs.pop("ew_sample_indices", None)
         plan_types = model_inputs.pop("ew_plan_types", None)
+        latent_prefix_steps = self._coordinated_latent_prefix_steps(
+            model, model_inputs
+        )
+        if latent_prefix_steps is not None:
+            if "stage2_latent_prefix_steps" in model_inputs:
+                raise ValueError(
+                    "stage2_latent_prefix_steps is reserved for Trainer coordination"
+                )
+            model_inputs["stage2_latent_prefix_steps"] = latent_prefix_steps
 
         # Disabled Stage 2 remains the direct CE baseline: no progress,
         # metadata, layout, or dropout validation is introduced on this path.
@@ -263,6 +298,50 @@ class CustomTrainerStage2(SFTTrainer):
         self._maybe_dump_evidence_window_matrices(auxiliary)
         loss = ce_loss + self._globally_scaled_auxiliary(ce_loss, auxiliary)
         return (loss, outputs) if return_outputs else loss
+
+    def _coordinated_latent_prefix_steps(
+        self,
+        model,
+        model_inputs: Mapping[str, Any],
+    ) -> int | None:
+        """Coordinate one inner decoder ledger for an actual ZeRO-3 batch."""
+        if self._deepspeed_zero_stage != 3:
+            return None
+
+        local_count = 0
+        local_exception: Exception | None = None
+        local_error: str | None = None
+        try:
+            input_ids = model_inputs.get("input_ids")
+            if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+                raise ValueError(
+                    "ZeRO-3 Stage-2 latent coordination requires input_ids with shape [B, T]"
+                )
+            if input_ids.shape[0] != 1:
+                raise ValueError(
+                    "ZeRO-3 Stage-2 latent coordination requires batch_size == 1"
+                )
+            local_count = int(input_ids.eq(self._token_ids.latent_pad).sum().item())
+        except Exception as exc:
+            local_exception = exc
+            local_error = f"{type(exc).__name__}: {exc}"
+
+        device = _auxiliary_preflight_collective_device(model, model_inputs)
+        requested = self._latent_prefix_step_coordinator(
+            local_count, device, local_error
+        )
+        if local_exception is not None:
+            raise local_exception
+        if (
+            isinstance(requested, bool)
+            or not isinstance(requested, int)
+            or requested < local_count
+        ):
+            raise ValueError(
+                "coordinated Stage-2 latent prefix steps must be an integer greater "
+                "than or equal to the local latent count"
+            )
+        return requested
 
     def _active_auxiliary_objectives(self, progress: float) -> frozenset[str]:
         """Return scheduled objectives that require work at this step.
@@ -544,6 +623,13 @@ def _auxiliary_preflight_collective_device(
     model_inputs: Mapping[str, Any],
 ) -> torch.device:
     """Choose a backend-compatible device without assuming any required input exists."""
+    if not distributed.is_available() or not distributed.is_initialized():
+        for value in model_inputs.values():
+            if torch.is_tensor(value):
+                return value.device
+        for parameter in model.parameters():
+            return parameter.device
+        return torch.device("cpu")
     backend = str(distributed.get_backend()).lower()
     if "nccl" not in backend:
         return torch.device("cpu")
@@ -560,6 +646,55 @@ def _auxiliary_preflight_collective_device(
     # execution. Returning CPU here lets the backend raise its own setup error
     # rather than introducing a rank-local preflight branch.
     return torch.device("cpu")
+
+
+def _accelerator_deepspeed_zero_stage(accelerator) -> int | None:
+    """Return the active Accelerator plugin's ZeRO stage, never a JSON guess."""
+    state = getattr(accelerator, "state", None)
+    plugin = getattr(state, "deepspeed_plugin", None)
+    if plugin is None:
+        return None
+    stage = getattr(plugin, "zero_stage", None)
+    if (
+        isinstance(stage, bool)
+        or not isinstance(stage, int)
+        or stage not in {0, 1, 2, 3}
+    ):
+        raise ValueError(
+            "Accelerator DeepSpeed plugin zero_stage must be an integer from 0 through 3"
+        )
+    return stage
+
+
+def _distributed_latent_prefix_steps(
+    local_count: int,
+    device: torch.device,
+    local_error: str | None,
+) -> int:
+    """Agree on one ZeRO-3 latent-step maximum before any model module runs."""
+    if not distributed.is_available() or not distributed.is_initialized():
+        if local_error is not None:
+            raise ValueError(local_error)
+        return local_count
+
+    status = torch.tensor(
+        (int(local_error is not None), local_count),
+        dtype=torch.long,
+        device=device,
+    )
+    distributed.all_reduce(status, op=distributed.ReduceOp.MAX)
+    if status[0].item():
+        errors: list[str | None] = [None] * distributed.get_world_size()
+        distributed.all_gather_object(errors, local_error)
+        detail = "; ".join(
+            f"rank {rank}: {error}"
+            for rank, error in enumerate(errors)
+            if error is not None
+        )
+        raise RuntimeError(
+            f"distributed Stage-2 latent-prefix preflight failed: {detail}"
+        )
+    return int(status[1].item())
 
 
 def _validate_deterministic_auxiliary_dropout(model) -> None:

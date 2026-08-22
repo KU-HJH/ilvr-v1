@@ -285,3 +285,113 @@ def test_stage2_model_rejects_batch_larger_than_one_before_latent_replay():
             use_cache=False,
             return_dict=True,
         )
+
+
+def _stage2_decoder_ledger(model, input_ids, *, requested_steps=None):
+    observed = []
+
+    def record_model_inputs(_module, args, kwargs):
+        del args
+        hidden = kwargs["inputs_embeds"]
+        observed.append(hidden.shape[1])
+
+    handle = model.model.register_forward_pre_hook(record_model_inputs, with_kwargs=True)
+    try:
+        output = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            labels=input_ids,
+            use_cache=False,
+            return_dict=True,
+            stage2_latent_prefix_steps=requested_steps,
+        )
+    finally:
+        handle.remove()
+    return output, observed
+
+
+def test_requested_stage2_prefix_steps_equalize_one_vs_three_latent_ledgers():
+    """A rank-local latent count must not change ZeRO-3 decoder-call slots."""
+    torch.manual_seed(303)
+    one_latent = Qwen2_5_VLForConditionalGeneration(_tiny_config(stage="stage2"))
+    three_latents = Qwen2_5_VLForConditionalGeneration(_tiny_config(stage="stage2"))
+    three_latents.load_state_dict(one_latent.state_dict())
+    one_ids = torch.tensor([[1, 9, 2, 3, 4, 5, 6]], dtype=torch.long)
+    three_ids = torch.tensor([[1, 9, 2, 9, 3, 9, 4]], dtype=torch.long)
+
+    one_output, one_ledger = _stage2_decoder_ledger(
+        one_latent, one_ids, requested_steps=3
+    )
+    three_output, three_ledger = _stage2_decoder_ledger(
+        three_latents, three_ids, requested_steps=3
+    )
+
+    assert len(one_ledger) == len(three_ledger) == 4
+    assert torch.isfinite(one_output.loss)
+    assert torch.isfinite(three_output.loss)
+
+
+def test_stage2_dummy_prefix_calls_are_zero_value_and_backward_connected():
+    """Removing the dummy graph must fail even when forward values still match."""
+    torch.manual_seed(404)
+    baseline = Qwen2_5_VLForConditionalGeneration(_tiny_config(stage="stage2"))
+    padded = Qwen2_5_VLForConditionalGeneration(_tiny_config(stage="stage2"))
+    padded.load_state_dict(baseline.state_dict())
+    input_ids = torch.tensor([[1, 9, 2, 3, 4, 5, 6]], dtype=torch.long)
+
+    baseline_output, baseline_ledger = _stage2_decoder_ledger(baseline, input_ids)
+    baseline_output.loss.backward()
+    baseline_grads = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in baseline.named_parameters()
+        if parameter.grad is not None
+    }
+
+    backward_slots = []
+
+    def retain_decoder_output(_module, _args, _kwargs, output):
+        output.last_hidden_state.register_hook(
+            lambda grad: backward_slots.append(torch.isfinite(grad).all().item())
+        )
+
+    handle = padded.model.register_forward_hook(retain_decoder_output, with_kwargs=True)
+    try:
+        padded_output, padded_ledger = _stage2_decoder_ledger(
+            padded, input_ids, requested_steps=3
+        )
+        padded_output.loss.backward()
+    finally:
+        handle.remove()
+
+    torch.testing.assert_close(padded_output.logits, baseline_output.logits)
+    torch.testing.assert_close(padded_output.loss, baseline_output.loss)
+    assert baseline_ledger == [1, 7]
+    assert len(padded_ledger) == 4
+    assert backward_slots == [True, True, True, True]
+    for name, parameter in padded.named_parameters():
+        if name in baseline_grads:
+            torch.testing.assert_close(parameter.grad, baseline_grads[name])
+
+
+@pytest.mark.parametrize("requested", [True, -1, 0, 2])
+def test_stage2_prefix_step_request_rejects_invalid_or_too_small_counts(requested):
+    """An invalid ledger must fail before any language decoder module call."""
+    model = Qwen2_5_VLForConditionalGeneration(_tiny_config(stage="stage2")).eval()
+    input_ids = torch.tensor([[1, 9, 2, 9, 3, 9, 4]], dtype=torch.long)
+    calls = []
+    handle = model.model.register_forward_pre_hook(
+        lambda _module, _args, _kwargs: calls.append(1), with_kwargs=True
+    )
+    try:
+        with pytest.raises(ValueError, match="latent prefix steps"):
+            model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                use_cache=False,
+                return_dict=True,
+                stage2_latent_prefix_steps=requested,
+            )
+    finally:
+        handle.remove()
+
+    assert calls == []
