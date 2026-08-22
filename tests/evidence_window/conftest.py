@@ -343,6 +343,7 @@ class _Stage2Processor:
     def __init__(self):
         self.tokenizer = _Stage2Tokenizer()
         self.image_inputs = None
+        self.text_inputs = None
 
     def apply_chat_template(self, conversation, tokenize):
         assert not tokenize
@@ -359,6 +360,7 @@ class _Stage2Processor:
     def __call__(self, *, text, images, return_tensors, padding):
         assert return_tensors == "pt"
         assert padding
+        self.text_inputs = text
         self.image_inputs = images
         return {
             "input_ids": torch.tensor([[93, 90, 100, 91, 94, 0]]),

@@ -1,4 +1,12 @@
+import pytest
+import torch
+
+from evidence_window.layout import TokenIds
+from evidence_window.stage2_layout import extract_stage2_layout, validate_plan_types
 from stage2_data import build_stage2_record, collate_fn_stage2
+
+
+TOKENS = TokenIds(90, 91, 92, 0, frozenset({0, 90, 91, 92, 99}))
 
 
 def test_record_preserves_plan_without_checking_helper(monkeypatch, raw_sample):
@@ -12,6 +20,39 @@ def test_record_preserves_plan_without_checking_helper(monkeypatch, raw_sample):
 
     assert record["ew_sample_index"] == 17
     assert record["ew_plan_types"] == ("text", "latent", "text")
+
+
+def test_record_collapses_adjacent_text_steps_to_token_semantic_window_runs():
+    """Separate source text steps without a latent boundary form one parsed R window."""
+    sample = {
+        "image_input": [],
+        "text_input": "question",
+        "sequence_plan": [
+            {"type": "text", "content": "before"},
+            {"type": "latent", "helper_image": "unused.png"},
+            {"type": "text", "content": "reasoning"},
+            {"type": "text", "content": "final answer"},
+        ],
+    }
+
+    record = build_stage2_record(sample, 920, validate_user_images=False)
+
+    assert record["ew_plan_types"] == ("text", "latent", "text")
+    ids = torch.tensor([[10, 90, 92, 91, 20, 21]])
+    layout = extract_stage2_layout(ids, torch.ones_like(ids), ids.clone(), TOKENS)
+    validate_plan_types(layout, (record["ew_plan_types"],), [920])
+
+
+def test_record_does_not_normalize_an_unknown_plan_type():
+    """Metadata normalization must not hide an invalid source sequence-plan step."""
+    sample = {
+        "image_input": [],
+        "text_input": "question",
+        "sequence_plan": [{"type": "audio", "content": "unsupported"}],
+    }
+
+    with pytest.raises(ValueError, match="Unknown step type: audio"):
+        build_stage2_record(sample, 1, validate_user_images=False)
 
 
 def test_collator_loads_only_user_images(
@@ -49,3 +90,23 @@ def test_collator_loads_only_user_images(
         assert forbidden not in batch
     assert batch["ew_sample_indices"].tolist() == [17]
     assert batch["ew_plan_types"] == (("text", "latent", "text"),)
+
+
+def test_collator_hides_latent_placeholders_from_qwen_image_expansion(
+    monkeypatch,
+    stage2_processor,
+    stage2_record,
+    stage2_args,
+):
+    """A latent placeholder must not consume a user-image grid row in Qwen processing."""
+    monkeypatch.setattr(
+        "stage2_data.process_vision_info",
+        lambda conversations: ([["decoded-user-image"]], None),
+    )
+
+    collate_fn_stage2([stage2_record], stage2_processor, stage2_args())
+
+    assert stage2_processor.text_inputs is not None
+    rendered = stage2_processor.text_inputs[0]
+    assert rendered.count("<|image_pad|>") == 1
+    assert "<|latent_start|><|latent_pad|><|latent_end|>" in rendered

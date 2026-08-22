@@ -71,6 +71,13 @@ def test_adjacent_spans_create_no_empty_window():
     assert layout.window_token_mask[0, 0].nonzero().flatten().tolist() == [6]
 
 
+def test_adjacent_latent_plan_steps_match_distinct_evidence_spans():
+    """Consecutive latent markers remain two evidence nodes despite having no R between them."""
+    layout = _layout([90, 92, 91, 90, 92, 91, 7])
+
+    validate_plan_types(layout, (("latent", "latent", "text"),), [17])
+
+
 def test_evidence_without_a_latent_pad_is_structural_but_not_eligible():
     """A marker pair with no latent-pad interior cannot form an intervention edge."""
     layout = _layout([90, 7, 91, 10])

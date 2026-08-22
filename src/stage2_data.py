@@ -21,10 +21,16 @@ def build_stage2_record(sample, row_index, *, validate_user_images: bool = True)
         validate_user_images=validate_user_images,
         validate_helper_images=False,
     )
+    plan_types = []
+    for step in sample["sequence_plan"]:
+        step_type = step["type"]
+        if step_type == "text" and plan_types and plan_types[-1] == "text":
+            continue
+        plan_types.append(step_type)
     return {
         "conversations": conversations,
         "ew_sample_index": row_index,
-        "ew_plan_types": tuple(step["type"] for step in sample["sequence_plan"]),
+        "ew_plan_types": tuple(plan_types),
     }
 
 
@@ -35,6 +41,13 @@ def collate_fn_stage2(records, processor, args):
     texts = [place_input_image(text) for text in texts]
     texts = [place_output_image(text) for text in texts]
     texts = replace_visual_spectial_tokens(texts)
+    texts = [
+        text.replace(
+            "<|latent_start|><|image_pad|><|latent_end|>",
+            "<|latent_start|><|latent_pad|><|latent_end|>",
+        )
+        for text in texts
+    ]
 
     user_conversations = remove_assistant_images(conversations)
     image_inputs, _ = process_vision_info(user_conversations)

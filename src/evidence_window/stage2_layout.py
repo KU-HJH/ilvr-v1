@@ -106,13 +106,13 @@ def validate_plan_types(
             layout.evidence_token_mask[batch_index].any(dim=-1).nonzero(as_tuple=False)
         )
         actual = tuple(row_plan)
-        valid_order = all(
-            step in {"text", "latent"} for step in actual
-        ) and all(left != right for left, right in zip(actual, actual[1:]))
+        valid_order = all(step in {"text", "latent"} for step in actual) and all(
+            not (left == right == "text") for left, right in zip(actual, actual[1:])
+        )
         if actual.count("latent") != evidence_count or not valid_order:
             raise ValueError(
                 f"sequence plan mismatch for row {row_id}: expected {evidence_count} latent "
-                f"steps in alternating order, got {actual}"
+                f"steps in token-semantic order, got {actual}"
             )
 
 
