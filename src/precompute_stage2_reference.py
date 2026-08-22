@@ -45,6 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Precompute immutable ILVR Stage-2 evidence-window reference targets."
     )
     parser.add_argument("--data-path", required=True)
+    parser.add_argument(
+        "--image-root",
+        required=True,
+        help="Root used to resolve relative user-image paths in the source dataset.",
+    )
+    parser.add_argument(
+        "--sample-index",
+        type=int,
+        help="Precompute only this zero-based source row while preserving its global ID.",
+    )
     parser.add_argument("--reference-checkpoint", required=True)
     parser.add_argument("--reference-checkpoint-id", required=True)
     parser.add_argument("--reference-checkpoint-witness", required=True)
@@ -73,6 +83,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError("batch size must be positive and workers nonnegative")
     if args.batch_size != 1:
         raise ValueError("Stage-2 reference precompute requires model batch size 1")
+    if args.sample_index is not None and args.sample_index < 0:
+        raise ValueError("sample index must be nonnegative")
     if args.dataset_sha256_witness is not None:
         _validate_sha256(args.dataset_sha256_witness)
     return args
@@ -219,6 +231,7 @@ def precompute(args: argparse.Namespace) -> None:
         "artifact precheck",
         lambda: _precheck_artifact(artifact_dir) if rank == 0 else None,
     )
+    run_distributed_phase("input precheck", lambda: _precheck_inputs(args))
     dataset_witness = _distributed_dataset_witness(args, rank)
     identity, _ = run_distributed_phase(
         "shard production",
@@ -252,6 +265,50 @@ def _precheck_artifact(artifact_dir: Path) -> None:
         )
 
 
+def _precheck_inputs(args: argparse.Namespace) -> None:
+    image_root = getattr(args, "image_root", None)
+    if not image_root or not Path(image_root).is_dir():
+        raise ValueError("image root must name an existing directory")
+
+
+def _selected_row_indices(
+    row_count: int,
+    *,
+    rank: int,
+    world_size: int,
+    sample_index: int | None = None,
+) -> tuple[int, ...]:
+    """Return stable global row IDs owned by this rank."""
+    if sample_index is not None:
+        if sample_index < 0 or sample_index >= row_count:
+            raise IndexError(
+                f"sample index {sample_index} is outside dataset with {row_count} rows"
+            )
+        return (sample_index,) if sample_index % world_size == rank else ()
+    return tuple(range(rank, row_count, world_size))
+
+
+def _load_rank_records(
+    args: argparse.Namespace, *, rank: int, world_size: int
+) -> list[dict]:
+    """Load rank-local records after installing the explicit image root."""
+    import task_deepseed
+    from stage2_data import build_stage2_record
+    from utils_deepseed import load_jsonl_dataset
+
+    task_deepseed.TRAIN_IMAGE_ROOT = str(Path(args.image_root).resolve())
+    raw = load_jsonl_dataset(args.data_path)
+    return [
+        build_stage2_record(raw[row_index], row_index)
+        for row_index in _selected_row_indices(
+            len(raw),
+            rank=rank,
+            world_size=world_size,
+            sample_index=args.sample_index,
+        )
+    ]
+
+
 def _produce_rank_shard(
     args: argparse.Namespace,
     *,
@@ -264,11 +321,12 @@ def _produce_rank_shard(
 
     # Heavy repository dependencies remain local so identity/schema utilities
     # can be tested and inspected on CPU-only hosts.
+    local_records = _load_rank_records(args, rank=rank, world_size=world_size)
+
     from torch.utils.data import DataLoader
     from transformers import AutoProcessor, Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
-    from stage2_data import build_stage2_record, collate_fn_stage2
-    from utils_deepseed import load_jsonl_dataset
+    from stage2_data import collate_fn_stage2
 
     checkpoint = args.reference_checkpoint
     processor = AutoProcessor.from_pretrained(
@@ -317,11 +375,6 @@ def _produce_rank_shard(
         tokenizer_special_tokens=processor.tokenizer.all_special_ids,
         dataset_sha256=dataset_witness,
     )
-    raw = load_jsonl_dataset(args.data_path)
-    local_records = [
-        build_stage2_record(raw[row_index], row_index)
-        for row_index in range(rank, len(raw), world_size)
-    ]
     loader = DataLoader(
         local_records,
         batch_size=args.batch_size,

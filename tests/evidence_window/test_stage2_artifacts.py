@@ -470,6 +470,8 @@ def test_precompute_identity_hashes_dataset_once_and_uses_explicit_checkpoint_wi
         [
             "--data-path",
             str(dataset),
+            "--image-root",
+            str(tmp_path),
             "--reference-checkpoint",
             str(tmp_path / "large-checkpoint-directory"),
             "--reference-checkpoint-id",
@@ -505,6 +507,8 @@ def test_precompute_identity_reuses_supplied_dataset_witness_without_rehash(
         [
             "--data-path",
             str(tmp_path / "unread.jsonl"),
+            "--image-root",
+            str(tmp_path),
             "--dataset-sha256-witness",
             "c" * 64,
             "--reference-checkpoint",
@@ -542,6 +546,7 @@ def test_precompute_cli_rejects_model_batch_larger_than_one():
         precompute_module.parse_args(
             [
                 "--data-path", "/data.jsonl",
+                "--image-root", "/images",
                 "--reference-checkpoint", "/checkpoint",
                 "--reference-checkpoint-id", "stage1",
                 "--reference-checkpoint-witness", "sealed",
@@ -551,6 +556,110 @@ def test_precompute_cli_rejects_model_batch_larger_than_one():
                 "--batch-size", "2",
             ]
         )
+
+
+def test_precompute_cli_requires_image_root_and_rejects_negative_sample_index():
+    """A missing image root or negative source row must fail during cheap CLI parsing."""
+    common = [
+        "--data-path", "/data.jsonl",
+        "--reference-checkpoint", "/checkpoint",
+        "--reference-checkpoint-id", "stage1",
+        "--reference-checkpoint-witness", "sealed",
+        "--artifact-dir", "/artifact",
+        "--tokenizer-id", "tokenizer",
+        "--model-config-id", "model",
+    ]
+    with pytest.raises(SystemExit):
+        precompute_module.parse_args(common)
+    with pytest.raises(ValueError, match="sample index must be nonnegative"):
+        precompute_module.parse_args(
+            [*common, "--image-root", "/images", "--sample-index", "-1"]
+        )
+
+
+def test_selected_sample_preserves_global_row_and_existing_distributed_sharding():
+    """Selected mode must write the original row ID on exactly its normal owner rank."""
+    assert precompute_module._selected_row_indices(10, rank=1, world_size=3) == (1, 4, 7)
+    assert precompute_module._selected_row_indices(
+        10, rank=1, world_size=3, sample_index=7
+    ) == (7,)
+    assert precompute_module._selected_row_indices(
+        10, rank=0, world_size=3, sample_index=7
+    ) == ()
+    with pytest.raises(IndexError, match="sample index 10.*10 rows"):
+        precompute_module._selected_row_indices(
+            10, rank=1, world_size=3, sample_index=10
+        )
+
+
+def test_rank_record_loading_sets_image_root_and_preserves_selected_global_id(
+    tmp_path, monkeypatch
+):
+    """Relative images must resolve under the CLI root before the selected row is built."""
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    (image_root / "selected.png").write_bytes(b"exists")
+    data_path = tmp_path / "rows.jsonl"
+    rows = [
+        {
+            "image_input": "unselected.png",
+            "text_input": "unselected",
+            "sequence_plan": [{"type": "text", "content": "first"}],
+        },
+        {
+            "image_input": "selected.png",
+            "text_input": "selected",
+            "sequence_plan": [{"type": "text", "content": "second"}],
+        },
+    ]
+    data_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    args = SimpleNamespace(
+        data_path=str(data_path), image_root=str(image_root), sample_index=1
+    )
+    monkeypatch.setattr("task_deepseed.TRAIN_IMAGE_ROOT", str(tmp_path / "wrong"))
+
+    records = precompute_module._load_rank_records(args, rank=0, world_size=1)
+
+    assert len(records) == 1
+    assert records[0]["ew_sample_index"] == 1
+    assert records[0]["conversations"][0]["content"][0]["image"] == str(
+        (image_root / "selected.png").resolve()
+    )
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_image_root_fails_before_dataset_hash_or_model_load(tmp_path, monkeypatch, missing):
+    """Missing or non-directory image roots must stop before expensive producer work."""
+    artifact_dir = tmp_path / "artifact"
+    invalid_root = tmp_path / "missing-images"
+    if not missing:
+        invalid_root.write_text("not a directory", encoding="utf-8")
+    args = SimpleNamespace(
+        artifact_dir=str(artifact_dir),
+        image_root=str(invalid_root),
+        dataset_sha256_witness=None,
+        data_path=str(tmp_path / "data.jsonl"),
+    )
+    work = []
+    monkeypatch.setattr(precompute_module, "_initialize_distributed_if_requested", lambda: None)
+    monkeypatch.setattr(precompute_module.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        precompute_module,
+        "sha256_file",
+        lambda path: work.append(("dataset", path)) or "c" * 64,
+    )
+    monkeypatch.setattr(
+        precompute_module,
+        "_produce_rank_shard",
+        lambda *args, **kwargs: work.append(("model", args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="input precheck.*image root.*directory"):
+        precompute_module.precompute(args)
+
+    assert work == []
 
 
 @pytest.mark.parametrize("entry_name", ["partial.pt", "shard-rank-00000.pt"])

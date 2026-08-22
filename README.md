@@ -270,6 +270,7 @@ semantics. Add `--include-hidden-residuals` only for the hidden-residual config:
 /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/venv/ilvr-venv/bin/python \
   src/precompute_stage2_reference.py \
   --data-path /absolute/path/to/TRAIN.jsonl \
+  --image-root /absolute/path/to/image-root \
   --reference-checkpoint /absolute/path/to/stage1-checkpoint \
   --reference-checkpoint-id stage1-approved \
   --reference-checkpoint-witness /absolute/or-authenticated-checkpoint-witness \
@@ -288,6 +289,10 @@ so precomputed runs must also pass matching
 `--reference_parser_version`, and `--reference_model_config_id` arguments.
 Artifacts are keyed by deterministic source-row index, exact special tokens,
 parser/reduction/intervention/backend semantics, edge cap, and model identity.
+For a one-row smoke artifact, add `--sample-index 920`; the artifact remains
+keyed by global source-row ID `920` rather than renumbering it to zero. In a
+distributed producer, only the rank that owns that row under the normal
+modulo sharding writes it.
 
 Online frozen EW loads the exact same Stage-1 checkpoint independently and
 runs it under Stage-2 self-generated-latent semantics with `eval()` and
