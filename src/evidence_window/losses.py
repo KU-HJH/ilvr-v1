@@ -77,6 +77,32 @@ def stage2_ew_preference_loss(
     return evidence_window_preference_loss(contributions, pair_mask, beta)
 
 
+def stage2_ew_dpo_loss(
+    policy_contributions: torch.Tensor,
+    reference_contributions: torch.Tensor,
+    pair_mask: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
+    """Independent edge DPO with immutable stopped reference targets."""
+    if not torch.is_tensor(reference_contributions):
+        raise TypeError("reference_contributions must be a tensor")
+    if reference_contributions.shape != policy_contributions.shape:
+        raise ValueError("reference_contributions must match policy_contributions shape")
+    if reference_contributions.device != policy_contributions.device:
+        raise ValueError("policy and reference contributions must share a device")
+    if not reference_contributions.is_floating_point():
+        raise ValueError("reference_contributions must be floating point")
+    if not torch.isfinite(reference_contributions).all():
+        raise ValueError("reference_contributions must be finite")
+    margins = policy_contributions - reference_contributions.detach().to(
+        dtype=policy_contributions.dtype
+    )
+    if margins.ndim == 1:
+        margins = margins.unsqueeze(0)
+        pair_mask = pair_mask.unsqueeze(0)
+    return evidence_window_preference_loss(margins, pair_mask, beta)
+
+
 def relation_matrix(
     full_window_sums: torch.Tensor,
     loo_window_sums: torch.Tensor,

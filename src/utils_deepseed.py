@@ -68,6 +68,14 @@ def get_args():
     parser.add_argument("--max_seq_length_train", type=int, default=8192,
         help="Stage-2")  # 改默认 8192
     parser.add_argument("--ew_config", type=str, default=None)
+    parser.add_argument("--reference_dataset_sha256", type=str, default=None)
+    parser.add_argument("--reference_checkpoint_id", type=str, default=None)
+    parser.add_argument("--reference_checkpoint_witness", type=str, default=None)
+    parser.add_argument("--reference_tokenizer_id", type=str, default=None)
+    parser.add_argument(
+        "--reference_parser_version", type=str, default="stage2-marker-v1"
+    )
+    parser.add_argument("--reference_model_config_id", type=str, default=None)
     parser.add_argument("--deepspeed_config", type=str, default="configs/config_stage3.json")
     # global_pad_to 已存在，保留
 # 其余不变

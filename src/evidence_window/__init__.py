@@ -22,7 +22,18 @@ from .losses import (
     evidence_window_preference_loss,
     global_preference_loss,
     stage2_ew_preference_loss,
+    stage2_ew_dpo_loss,
     window_preference_loss,
+)
+from .artifacts import (
+    ArtifactIdentity,
+    PrecomputedReferenceProvider,
+    ReferenceBatchTargets,
+    ReferenceSampleTargets,
+    ReferenceShardMetadata,
+    publish_reference_manifest,
+    read_reference_shard_metadata,
+    write_reference_shard,
 )
 from .metrics import (
     ContributionSummaries,
@@ -80,6 +91,7 @@ __all__ = [
     "window_preference_loss",
     "evidence_window_preference_loss",
     "stage2_ew_preference_loss",
+    "stage2_ew_dpo_loss",
     "MetricBatch",
     "ContributionSummaries",
     "contribution_summaries",
@@ -94,4 +106,12 @@ __all__ = [
     "ParameterWitness",
     "ReferenceProvider",
     "build_reference_provider",
+    "ArtifactIdentity",
+    "PrecomputedReferenceProvider",
+    "ReferenceBatchTargets",
+    "ReferenceSampleTargets",
+    "ReferenceShardMetadata",
+    "publish_reference_manifest",
+    "read_reference_shard_metadata",
+    "write_reference_shard",
 ]

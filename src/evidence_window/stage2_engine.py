@@ -1,4 +1,4 @@
-"""Reference-free edge-local credit objective for explicit ILVR Stage 2."""
+"""Reference-free or fixed-reference edge-local credit for ILVR Stage 2."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ import torch
 import torch.distributed as distributed
 import torch.nn.functional as F
 
-from .losses import stage2_ew_preference_loss
+from .artifacts import ReferenceBatchTargets
+from .losses import stage2_ew_dpo_loss, stage2_ew_preference_loss
 from .metrics import global_outer_coefficient, softmax_contribution_summaries
 from .stage2_config import Stage2EvidenceWindowConfig
 from .stage2_effects import (
@@ -35,7 +36,7 @@ class Stage2EvidenceWindowResult:
 
 
 class Stage2EvidenceWindowEngine:
-    """Compute the exact matched-SDPA reference-free Stage-2 objective."""
+    """Compute the exact matched-SDPA Stage-2 edge objective."""
 
     def __init__(
         self,
@@ -60,19 +61,17 @@ class Stage2EvidenceWindowEngine:
         layout: Stage2InterleavedLayout,
         policy_forward: ConditionForward,
         progress: float,
-        reference_targets=None,
+        reference_targets: ReferenceBatchTargets | None = None,
     ) -> Stage2EvidenceWindowResult:
         """Compute independent evidence-edge preference for the current policy."""
         if not isinstance(layout, Stage2InterleavedLayout):
             raise TypeError("layout must be a Stage2InterleavedLayout")
         if not callable(policy_forward):
             raise TypeError("policy_forward must be callable")
-        if self.config.reference.mode != "none":
-            raise NotImplementedError(
-                "fixed-reference Stage-2 modes require the reference integration"
-            )
-        if reference_targets is not None:
+        if self.config.reference.mode == "none" and reference_targets is not None:
             raise ValueError("reference-free Stage-2 does not accept reference targets")
+        if self.config.reference.mode != "none" and reference_targets is None:
+            raise ValueError("fixed-reference Stage-2 requires reference targets")
 
         effective_weight = self.config.effective_weight("ew", progress)
         if effective_weight == 0.0:
@@ -140,16 +139,29 @@ class Stage2EvidenceWindowEngine:
         contributions = effects.contributions
         valid = effects.pair_mask
         beta = self.config.preference.beta
-        raw_loss = stage2_ew_preference_loss(contributions, valid, beta)
+        objective_values = contributions
+        if reference_targets is None:
+            raw_loss = stage2_ew_preference_loss(contributions, valid, beta)
+        else:
+            _validate_reference_targets(reference_targets, effects)
+            reference = reference_targets.contributions.to(
+                device=contributions.device,
+                dtype=contributions.dtype,
+            )
+            objective_values = contributions - reference.detach()
+            raw_loss = stage2_ew_dpo_loss(contributions, reference, valid, beta)
         auxiliary_loss = raw_loss * effective_weight + graph_zero
-        metric_sums = _reference_free_metrics(
+        metric_sums = _edge_metrics(
             contributions,
             valid,
             beta=beta,
             temperature=self.config.relation.temperature,
             threshold=self.config.diagnostics.contribution_threshold,
+            preference_margins=(
+                None if reference_targets is None else objective_values
+            ),
         )
-        edge_losses = -F.logsigmoid(beta * contributions).masked_select(valid)
+        edge_losses = -F.logsigmoid(beta * objective_values).masked_select(valid)
         metric_sums["loss/ew_pref"] = (
             edge_losses.detach().sum(),
             _count_tensor(edge_losses.numel(), contributions),
@@ -190,13 +202,14 @@ class Stage2EvidenceWindowEngine:
         )
 
 
-def _reference_free_metrics(
+def _edge_metrics(
     contributions: torch.Tensor,
     valid: torch.Tensor,
     *,
     beta: float,
     temperature: float,
     threshold: float,
+    preference_margins: torch.Tensor | None = None,
 ) -> MetricSums:
     detached = contributions.detach()
     valid = valid.detach().to(dtype=torch.bool)
@@ -209,9 +222,20 @@ def _reference_free_metrics(
         "ew/num_edges": (edge_count, one),
     }
 
+    diagnostic_margins = (
+        detached
+        if preference_margins is None
+        else preference_margins.detach().to(device=detached.device, dtype=detached.dtype)
+    )
+    if diagnostic_margins.shape != detached.shape:
+        raise ValueError("preference margins must match contribution shape")
+    if preference_margins is not None:
+        margin_values = diagnostic_margins.masked_select(valid)
+        metrics["ew/mean_margin"] = (margin_values.sum(), edge_count)
+
     row_valid = valid.flatten(start_dim=1).any(dim=1)
     global_margin = (
-        detached * valid.to(dtype=detached.dtype)
+        diagnostic_margins * valid.to(dtype=detached.dtype)
     ).flatten(start_dim=1).sum(dim=1)
     selected_global = global_margin.masked_select(row_valid)
     global_count = _count_tensor(selected_global.numel(), detached)
@@ -257,6 +281,30 @@ def _reference_free_metrics(
 
 def _count_tensor(value: int, like: torch.Tensor) -> torch.Tensor:
     return like.new_tensor(float(value))
+
+
+def _validate_reference_targets(
+    targets: ReferenceBatchTargets,
+    effects: Stage2EvidenceEffects,
+) -> None:
+    if not isinstance(targets, ReferenceBatchTargets):
+        raise TypeError("reference_targets must be ReferenceBatchTargets")
+    contributions = targets.contributions
+    if not torch.is_tensor(contributions) or contributions.shape != effects.contributions.shape:
+        raise ValueError("reference contributions must match policy contribution layout")
+    if not contributions.is_floating_point() or not torch.isfinite(contributions).all():
+        raise ValueError("reference contributions must be finite floating-point values")
+    pair_mask = targets.pair_mask
+    if (
+        not torch.is_tensor(pair_mask)
+        or pair_mask.dtype is not torch.bool
+        or pair_mask.shape != effects.pair_mask.shape
+    ):
+        raise ValueError("reference pair_mask must match policy pair layout")
+    if pair_mask.device != effects.pair_mask.device:
+        pair_mask = pair_mask.to(device=effects.pair_mask.device)
+    if not torch.equal(pair_mask, effects.pair_mask):
+        raise ValueError("reference pair_mask does not match selected policy edges")
 
 
 def _distributed_edge_counts(

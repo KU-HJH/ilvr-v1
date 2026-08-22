@@ -11,12 +11,14 @@ import torch.distributed as distributed
 from trl import SFTTrainer
 
 from evidence_window.layout import TokenIds
+from evidence_window.artifacts import ArtifactIdentity, ReferenceBatchTargets
 from evidence_window.metrics import MatrixJsonlWriter, reduce_sufficient_statistics
 from evidence_window.scores import chunked_causal_target_logps
 from evidence_window.stage2_config import Stage2EvidenceWindowConfig
 from evidence_window.stage2_effects import Stage2ConditionOutput
 from evidence_window.stage2_engine import Stage2EvidenceWindowEngine, Stage2EvidenceWindowResult
 from evidence_window.stage2_layout import extract_stage2_layout, validate_plan_types
+from evidence_window.stage2_reference import build_stage2_reference_provider
 
 
 class CustomTrainerStage2(SFTTrainer):
@@ -27,6 +29,8 @@ class CustomTrainerStage2(SFTTrainer):
         *args,
         evidence_window_config: Stage2EvidenceWindowConfig | None = None,
         latent_token_ids: Mapping[str, Any] | TokenIds | None = None,
+        reference_provider=None,
+        reference_identity: ArtifactIdentity | None = None,
         **kwargs,
     ):
         config = (
@@ -43,9 +47,29 @@ class CustomTrainerStage2(SFTTrainer):
         # Disabled Stage 2 deliberately has no auxiliary runtime objects. This
         # keeps its hot path identical to the established CE-only baseline.
         if config.is_disabled:
+            if reference_provider is not None or reference_identity is not None:
+                raise ValueError(
+                    "disabled Stage 2 does not accept a reference provider or identity"
+                )
             return
         self._token_ids = _resolve_token_ids(latent_token_ids)
         self._ew_engine = Stage2EvidenceWindowEngine(config)
+        if config.reference.mode == "none":
+            if reference_provider is not None or reference_identity is not None:
+                raise ValueError(
+                    "reference-free Stage 2 does not accept a reference provider or identity"
+                )
+            self._stage2_reference_provider = None
+        else:
+            self._stage2_reference_provider = (
+                build_stage2_reference_provider(
+                    config, expected_identity=reference_identity
+                )
+                if reference_provider is None
+                else reference_provider
+            )
+            if not callable(getattr(self._stage2_reference_provider, "get_batch", None)):
+                raise TypeError("reference_provider must provide get_batch")
         self._ew_pending_metrics: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {
             "train": {},
             "eval": {},
@@ -125,10 +149,24 @@ class CustomTrainerStage2(SFTTrainer):
             hidden = _final_hidden_state(condition_outputs) if need_hidden else None
             return Stage2ConditionOutput(token_logps, hidden)
 
+        progress = self._training_progress()
+        reference_targets = None
+        if self._stage2_reference_provider is not None:
+            if sample_indices is None:
+                raise ValueError(
+                    "fixed-reference Stage-2 requires deterministic ew_sample_indices"
+                )
+            reference_targets = _coordinated_reference_lookup(
+                self._stage2_reference_provider,
+                sample_indices,
+                layout,
+                require_hidden_residuals=self.evidence_window_config._residual_enabled(),
+            )
         auxiliary = self._ew_engine.compute(
             layout,
             policy_forward,
-            progress=self._training_progress(),
+            progress=progress,
+            reference_targets=reference_targets,
         )
         split = "train" if model.training else "eval"
         batch_count = ce_loss.new_tensor(float(model_inputs["input_ids"].shape[0]))
@@ -272,6 +310,56 @@ def _final_hidden_state(outputs) -> torch.Tensor:
     if not torch.is_tensor(hidden):
         raise ValueError("Stage-2 residual output requires a final hidden-state tensor")
     return hidden
+
+
+def _coordinated_reference_lookup(
+    provider,
+    sample_indices,
+    layout: Stage2InterleavedLayout,
+    *,
+    require_hidden_residuals: bool,
+):
+    """Make sample-specific artifact failures collective before model replays."""
+    targets = None
+    local_error = None
+    try:
+        targets = provider.get_batch(
+            sample_indices,
+            layout,
+            require_hidden_residuals=require_hidden_residuals,
+        )
+        if not isinstance(targets, ReferenceBatchTargets):
+            raise TypeError("reference provider must return ReferenceBatchTargets")
+        requested = (
+            tuple(sample_indices.detach().cpu().tolist())
+            if torch.is_tensor(sample_indices)
+            else tuple(sample_indices)
+        )
+        if targets.sample_indices != requested:
+            raise ValueError(
+                "reference sample order mismatch: "
+                f"requested {requested}, received {targets.sample_indices}"
+            )
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+
+    if distributed.is_available() and distributed.is_initialized():
+        failed = torch.tensor(
+            int(local_error is not None),
+            dtype=torch.long,
+            device=layout.causal_pair_mask.device,
+        )
+        distributed.all_reduce(failed, op=distributed.ReduceOp.MAX)
+        if failed.item():
+            messages: list[str | None] = [None] * distributed.get_world_size()
+            distributed.all_gather_object(messages, local_error)
+            detail = "; ".join(message for message in messages if message)
+            raise RuntimeError(f"distributed reference target lookup failed: {detail}")
+    elif local_error is not None:
+        raise ValueError(f"reference target lookup failed: {local_error}")
+
+    assert targets is not None
+    return targets
 
 
 def _resolve_token_ids(configured: Mapping[str, Any] | TokenIds | None) -> TokenIds:

@@ -25,6 +25,7 @@ from task_deepseed import *
 from trainer import CustomTrainerStage1
 from evidence_window.config import EvidenceWindowConfig
 from evidence_window.stage2_config import Stage2EvidenceWindowConfig
+from evidence_window.artifacts import ArtifactIdentity
 from stage2_data import build_stage2_record, collate_fn_stage2
 from trainer_stage2 import CustomTrainerStage2
 
@@ -142,6 +143,49 @@ def resolve_evidence_window_config(args):
     raise ValueError("stage must be stage1 or stage2")
 
 
+def resolve_stage2_reference_identity(
+    args,
+    ew_config,
+    *,
+    tokenizer_special_tokens,
+):
+    """Build the training-side expectation for immutable reference targets."""
+    if not isinstance(ew_config, Stage2EvidenceWindowConfig):
+        return None
+    if ew_config.reference.mode != "precomputed" or ew_config.is_disabled:
+        return None
+    required = {
+        "reference_dataset_sha256": getattr(args, "reference_dataset_sha256", None),
+        "reference_checkpoint_id": getattr(args, "reference_checkpoint_id", None),
+        "reference_checkpoint_witness": getattr(
+            args, "reference_checkpoint_witness", None
+        ),
+        "reference_tokenizer_id": getattr(args, "reference_tokenizer_id", None),
+        "reference_parser_version": getattr(args, "reference_parser_version", None),
+        "reference_model_config_id": getattr(args, "reference_model_config_id", None),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise ValueError(
+            "precomputed reference requires explicit identity argument(s): "
+            + ", ".join(sorted(missing))
+        )
+    return ArtifactIdentity(
+        format_version=1,
+        dataset_sha256=required["reference_dataset_sha256"],
+        checkpoint_id=required["reference_checkpoint_id"],
+        checkpoint_witness=required["reference_checkpoint_witness"],
+        tokenizer_id=required["reference_tokenizer_id"],
+        tokenizer_special_tokens=tuple(int(value) for value in tokenizer_special_tokens),
+        parser_version=required["reference_parser_version"],
+        contribution_reduction=ew_config.preference.contribution_reduction,
+        intervention=ew_config.loo.intervention,
+        attention_backend="sdpa",
+        max_evidence_edges_per_window=ew_config.loo.max_evidence_edges_per_window,
+        model_config_id=required["reference_model_config_id"],
+    )
+
+
 def prepare_training_dataset(args, raw_rows):
     """Apply the stage-specific preprocessing contract to raw training rows."""
     if args.stage == "stage1":
@@ -213,6 +257,11 @@ def main_train():
         "special": tuple(int(x) for x in processor.tokenizer.all_special_ids),
         "assistant_termination": (int(assistant_termination_idx),),
     }
+    reference_identity = resolve_stage2_reference_identity(
+        args,
+        ew_config,
+        tokenizer_special_tokens=processor.tokenizer.all_special_ids,
+    )
     config.latent_token_id = int(latent_token_idx)
     config.latent_start_id = int(latent_start_idx)
     config.latent_end_id   = int(latent_end_idx)
@@ -304,6 +353,8 @@ def main_train():
     else:
         trainer_kwargs["processing_class"] = processor.tokenizer
         trainer_kwargs["latent_token_ids"] = latent_token_ids
+        if reference_identity is not None:
+            trainer_kwargs["reference_identity"] = reference_identity
     trainer = CustomTrainer(**trainer_kwargs)
     
 
