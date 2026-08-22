@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 import torch.distributed as distributed
 import torch.nn.functional as F
 
 from .artifacts import ReferenceBatchTargets
-from .losses import stage2_ew_dpo_loss, stage2_ew_preference_loss
+from .losses import (
+    stage2_ew_dpo_loss,
+    stage2_ew_preference_loss,
+    stage2_relation_jsd,
+)
 from .metrics import global_outer_coefficient, softmax_contribution_summaries
 from .stage2_config import Stage2EvidenceWindowConfig
 from .stage2_effects import (
@@ -33,6 +37,7 @@ class Stage2EvidenceWindowResult:
     losses: dict[str, torch.Tensor]
     metric_sums: MetricSums
     effects: Stage2EvidenceEffects
+    weighted_objectives: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 class Stage2EvidenceWindowEngine:
@@ -73,8 +78,17 @@ class Stage2EvidenceWindowEngine:
         if self.config.reference.mode != "none" and reference_targets is None:
             raise ValueError("fixed-reference Stage-2 requires reference targets")
 
-        effective_weight = self.config.effective_weight("ew", progress)
-        if effective_weight == 0.0:
+        ew_weight = self.config.effective_weight("ew", progress)
+        relation_weight = self.config.effective_weight("relation", progress)
+        active_weights = {
+            name: weight
+            for name, weight in (
+                ("ew_pref", ew_weight),
+                ("relation", relation_weight),
+            )
+            if weight > 0.0
+        }
+        if not active_weights:
             return self._empty_result(layout)
         edges = select_stage2_edges(
             layout,
@@ -89,7 +103,7 @@ class Stage2EvidenceWindowEngine:
             global_max=global_max_edges,
         )
         if global_edge_count == 0:
-            return self._empty_result(layout)
+            return self._empty_result(layout, active_objectives=active_weights)
 
         # ZeRO parameter gathers and DDP buffer broadcasts happen inside model
         # forwards, so every rank must execute the same number before any
@@ -129,28 +143,54 @@ class Stage2EvidenceWindowEngine:
         graph_zero = torch.stack(graph_zeros).sum()
 
         if not edges:
+            objective_zeros = {
+                name: effects.contributions.sum() * 0.0 for name in active_weights
+            }
             return Stage2EvidenceWindowResult(
                 auxiliary_loss=graph_zero,
                 losses={},
                 metric_sums={},
                 effects=effects,
+                weighted_objectives=objective_zeros,
             )
 
         contributions = effects.contributions
         valid = effects.pair_mask
         beta = self.config.preference.beta
         objective_values = contributions
-        if reference_targets is None:
-            raw_loss = stage2_ew_preference_loss(contributions, valid, beta)
-        else:
+        reference = None
+        if reference_targets is not None:
             _validate_reference_targets(reference_targets, effects)
             reference = reference_targets.contributions.to(
                 device=contributions.device,
                 dtype=contributions.dtype,
-            )
+            ).detach()
             objective_values = contributions - reference.detach()
-            raw_loss = stage2_ew_dpo_loss(contributions, reference, valid, beta)
-        auxiliary_loss = raw_loss * effective_weight + graph_zero
+
+        losses: dict[str, torch.Tensor] = {}
+        weighted_objectives: dict[str, torch.Tensor] = {}
+        auxiliary_loss = graph_zero
+        if ew_weight > 0.0:
+            if reference is None:
+                ew_loss = stage2_ew_preference_loss(contributions, valid, beta)
+            else:
+                ew_loss = stage2_ew_dpo_loss(contributions, reference, valid, beta)
+            losses["ew_pref"] = ew_loss
+            weighted_objectives["ew_pref"] = ew_loss * ew_weight
+            auxiliary_loss = auxiliary_loss + weighted_objectives["ew_pref"]
+        if relation_weight > 0.0:
+            if reference is None:
+                raise ValueError("relation objective requires fixed reference targets")
+            relation_loss = stage2_relation_jsd(
+                contributions,
+                reference,
+                valid,
+                self.config.relation.temperature,
+            )
+            losses["relation"] = relation_loss
+            weighted_objectives["relation"] = relation_loss * relation_weight
+            auxiliary_loss = auxiliary_loss + weighted_objectives["relation"]
+
         metric_sums = _edge_metrics(
             contributions,
             valid,
@@ -161,24 +201,39 @@ class Stage2EvidenceWindowEngine:
                 None if reference_targets is None else objective_values
             ),
         )
-        edge_losses = -F.logsigmoid(beta * objective_values).masked_select(valid)
-        metric_sums["loss/ew_pref"] = (
-            edge_losses.detach().sum(),
-            _count_tensor(edge_losses.numel(), contributions),
-        )
-        metric_sums["schedule/ew_weight"] = (
-            contributions.new_tensor(effective_weight),
-            contributions.new_tensor(1.0),
-        )
+        if ew_weight > 0.0:
+            edge_losses = -F.logsigmoid(beta * objective_values).masked_select(valid)
+            metric_sums["loss/ew_pref"] = (
+                edge_losses.detach().sum(),
+                _count_tensor(edge_losses.numel(), contributions),
+            )
+            metric_sums["schedule/ew_weight"] = (
+                contributions.new_tensor(ew_weight),
+                contributions.new_tensor(1.0),
+            )
+        if relation_weight > 0.0:
+            relation_count = (valid.sum(dim=1) >= 2).sum().to(dtype=contributions.dtype)
+            metric_sums["loss/relation"] = (
+                losses["relation"].detach() * relation_count,
+                relation_count,
+            )
+            metric_sums["schedule/relation_weight"] = (
+                contributions.new_tensor(relation_weight),
+                contributions.new_tensor(1.0),
+            )
         return Stage2EvidenceWindowResult(
             auxiliary_loss=auxiliary_loss,
-            losses={"ew_pref": raw_loss},
+            losses=losses,
             metric_sums=metric_sums,
             effects=effects,
+            weighted_objectives=weighted_objectives,
         )
 
     @staticmethod
-    def _empty_result(layout: Stage2InterleavedLayout) -> Stage2EvidenceWindowResult:
+    def _empty_result(
+        layout: Stage2InterleavedLayout,
+        active_objectives: dict[str, float] | None = None,
+    ) -> Stage2EvidenceWindowResult:
         batch_size, evidence_count, _ = layout.evidence_token_mask.shape
         window_count = layout.window_token_mask.shape[1]
         shape = (batch_size, evidence_count, window_count)
@@ -199,6 +254,11 @@ class Stage2EvidenceWindowEngine:
             losses={},
             metric_sums={},
             effects=effects,
+            weighted_objectives=(
+                {}
+                if active_objectives is None
+                else {name: zero for name in active_objectives}
+            ),
         )
 
 

@@ -103,6 +103,90 @@ def stage2_ew_dpo_loss(
     return evidence_window_preference_loss(margins, pair_mask, beta)
 
 
+def stage2_relation_distribution(
+    contributions: torch.Tensor,
+    pair_mask: torch.Tensor,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize each window over only its valid evidence candidates in FP32."""
+    if (
+        not torch.is_tensor(contributions)
+        or contributions.ndim != 3
+        or not contributions.is_floating_point()
+    ):
+        raise ValueError(
+            "contributions must be a floating-point tensor with shape [B, J, K]"
+        )
+    if (
+        not torch.is_tensor(pair_mask)
+        or pair_mask.dtype is not torch.bool
+        or pair_mask.shape != contributions.shape
+    ):
+        raise ValueError("pair_mask must be boolean with the same shape as contributions")
+    if pair_mask.device != contributions.device:
+        raise ValueError("pair_mask and contributions must be on the same device")
+    if not torch.isfinite(contributions).all():
+        raise ValueError("contributions must be finite")
+    temperature_value = _validate_positive_finite(temperature, "temperature")
+
+    valid_windows = pair_mask.any(dim=1)
+    logits = contributions.to(dtype=torch.float32) / temperature_value
+    masked_logits = logits.masked_fill(~pair_mask, -torch.inf)
+    # An all-masked softmax is undefined. Give those rows finite scratch logits,
+    # then erase their distribution exactly after normalization.
+    safe_logits = torch.where(
+        valid_windows.unsqueeze(1),
+        masked_logits,
+        torch.zeros_like(masked_logits),
+    )
+    distribution = F.softmax(safe_logits, dim=1)
+    distribution = distribution.masked_fill(~pair_mask, 0.0)
+    return distribution, valid_windows
+
+
+def stage2_relation_jsd(
+    policy_contributions: torch.Tensor,
+    reference_contributions: torch.Tensor,
+    pair_mask: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Mean symmetric JSD over windows with at least two evidence candidates."""
+    _validate_relation_loss_inputs(
+        policy_contributions, reference_contributions, pair_mask
+    )
+    policy_distribution, _ = stage2_relation_distribution(
+        policy_contributions, pair_mask, temperature
+    )
+    reference_distribution, _ = stage2_relation_distribution(
+        reference_contributions.detach(), pair_mask, temperature
+    )
+    eligible = pair_mask.sum(dim=1) >= 2
+    if not eligible.any():
+        return policy_contributions.to(dtype=torch.float32).sum() * 0.0
+
+    midpoint = 0.5 * (policy_distribution + reference_distribution)
+    policy_log = torch.where(
+        policy_distribution > 0,
+        policy_distribution.log(),
+        torch.zeros_like(policy_distribution),
+    )
+    reference_log = torch.where(
+        reference_distribution > 0,
+        reference_distribution.log(),
+        torch.zeros_like(reference_distribution),
+    )
+    midpoint_log = torch.where(
+        midpoint > 0,
+        midpoint.log(),
+        torch.zeros_like(midpoint),
+    )
+    window_jsd = 0.5 * (
+        (policy_distribution * (policy_log - midpoint_log)).sum(dim=1)
+        + (reference_distribution * (reference_log - midpoint_log)).sum(dim=1)
+    )
+    return _guard_jsd_roundoff(window_jsd.masked_select(eligible).mean())
+
+
 def relation_matrix(
     full_window_sums: torch.Tensor,
     loo_window_sums: torch.Tensor,

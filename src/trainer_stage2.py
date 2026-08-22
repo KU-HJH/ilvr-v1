@@ -302,6 +302,38 @@ class CustomTrainerStage2(SFTTrainer):
         ce_loss: torch.Tensor,
         auxiliary: Stage2EvidenceWindowResult,
     ) -> torch.Tensor:
+        if auxiliary.weighted_objectives:
+            weighted_sum = sum(auxiliary.weighted_objectives.values())
+            # Keep dummy forward graphs exactly once; objective terms below are
+            # replaced by their independently population-scaled counterparts.
+            scaled = auxiliary.auxiliary_loss - weighted_sum
+            world_size = 1
+            if distributed.is_available() and distributed.is_initialized():
+                world_size = distributed.get_world_size()
+            metric_names = {
+                "ew_pref": "loss/ew_pref",
+                "relation": "loss/relation",
+                "residual": "loss/residual",
+            }
+            for name in sorted(auxiliary.weighted_objectives):
+                statistics = auxiliary.metric_sums.get(metric_names[name])
+                local_count = (
+                    torch.zeros((), device=ce_loss.device, dtype=torch.float64)
+                    if statistics is None
+                    else statistics[1]
+                    .detach()
+                    .to(device=ce_loss.device, dtype=torch.float64)
+                )
+                global_count = local_count.clone()
+                if distributed.is_available() and distributed.is_initialized():
+                    distributed.all_reduce(global_count, op=distributed.ReduceOp.SUM)
+                if global_count.item() > 0:
+                    scale = (world_size * local_count / global_count).to(
+                        dtype=auxiliary.auxiliary_loss.dtype
+                    )
+                    scaled = scaled + auxiliary.weighted_objectives[name] * scale
+            return scaled
+
         statistics = auxiliary.metric_sums.get("loss/ew_pref")
         local_count = (
             torch.zeros((), device=ce_loss.device, dtype=torch.float64)
