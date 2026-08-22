@@ -2391,32 +2391,48 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 next_compute_range = (cur_end, next_latent_pos)
 
             dummy_graph_zeros = []
-            for _ in range(stage2_latent_prefix_steps - max_n_latents):
-                # ZeRO-3 parameter gathers and backward hooks must observe the
-                # same number of decoder calls on every rank.  Dummy slots use
-                # the current full, unmodified trajectory and contribute only
-                # an autograd-connected exact zero to the final output.
-                dummy_inputs = curr_inputs_embeds
-                dummy_mask = attention_mask
-                dummy_pos_ids = full_position_ids
-                dummy_block_mask = attention_block_mask
-                if self.training:
-                    dummy_hidden = checkpoint(
-                        latent_step_forward,
-                        dummy_inputs,
-                        dummy_mask,
-                        dummy_pos_ids,
-                        dummy_block_mask,
-                        use_reentrant=False,
-                    )
-                else:
-                    dummy_hidden = latent_step_forward(
-                        dummy_inputs,
-                        dummy_mask,
-                        dummy_pos_ids,
-                        dummy_block_mask,
-                    )
-                dummy_graph_zeros.append(dummy_hidden.sum() * 0.0)
+            dummy_slot_count = stage2_latent_prefix_steps - max_n_latents
+            if dummy_slot_count:
+                dummy_cuda_devices = []
+                if curr_inputs_embeds.device.type == "cuda":
+                    cuda_index = curr_inputs_embeds.device.index
+                    if cuda_index is None:
+                        cuda_index = torch.cuda.current_device()
+                    dummy_cuda_devices.append(cuda_index)
+                # Dummy collectives must not consume dropout RNG that belongs
+                # to the unchanged final CE call.  Checkpoint recomputation
+                # preserves each dummy call's forked state during backward.
+                with torch.random.fork_rng(devices=dummy_cuda_devices):
+                    for _ in range(dummy_slot_count):
+                        # ZeRO-3 parameter gathers and backward hooks must
+                        # observe the same decoder-call count on every rank.
+                        dummy_inputs = curr_inputs_embeds
+                        dummy_mask = attention_mask
+                        dummy_pos_ids = full_position_ids
+                        dummy_block_mask = attention_block_mask
+                        if self.training:
+                            dummy_hidden = checkpoint(
+                                latent_step_forward,
+                                dummy_inputs,
+                                dummy_mask,
+                                dummy_pos_ids,
+                                dummy_block_mask,
+                                use_reentrant=False,
+                            )
+                        else:
+                            dummy_hidden = latent_step_forward(
+                                dummy_inputs,
+                                dummy_mask,
+                                dummy_pos_ids,
+                                dummy_block_mask,
+                            )
+                        bounded_element = torch.nan_to_num(
+                            dummy_hidden.reshape(-1)[0].to(torch.float32),
+                            nan=0.0,
+                            posinf=1.0,
+                            neginf=-1.0,
+                        ).clamp(min=-1.0, max=1.0)
+                        dummy_graph_zeros.append(bounded_element * 0.0)
 
             slice_start, slice_end = next_compute_range
             if slice_start < input_ids.shape[1]:

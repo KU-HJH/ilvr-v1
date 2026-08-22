@@ -10,7 +10,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 
-def _tiny_config(*, stage=None):
+def _tiny_config(*, stage=None, attention_dropout=0.0):
     config = Qwen2_5_VLConfig(
         vocab_size=32,
         hidden_size=24,
@@ -19,7 +19,7 @@ def _tiny_config(*, stage=None):
         num_attention_heads=2,
         num_key_value_heads=1,
         max_position_embeddings=32,
-        attention_dropout=0.0,
+        attention_dropout=attention_dropout,
         use_cache=False,
         pad_token_id=0,
         latent_token_id=9,
@@ -371,6 +371,89 @@ def test_stage2_dummy_prefix_calls_are_zero_value_and_backward_connected():
     for name, parameter in padded.named_parameters():
         if name in baseline_grads:
             torch.testing.assert_close(parameter.grad, baseline_grads[name])
+
+
+def test_stage2_dummy_prefix_calls_preserve_training_dropout_rng_and_gradients():
+    """Dummy slots must not shift the final CE dropout masks on a shorter rank."""
+    torch.manual_seed(505)
+    baseline = Qwen2_5_VLForConditionalGeneration(
+        _tiny_config(stage="stage2", attention_dropout=0.25)
+    )
+    padded = Qwen2_5_VLForConditionalGeneration(
+        _tiny_config(stage="stage2", attention_dropout=0.25)
+    )
+    padded.load_state_dict(baseline.state_dict())
+    baseline.train()
+    padded.train()
+    input_ids = torch.tensor([[1, 9, 2, 3, 4, 5, 6]], dtype=torch.long)
+
+    torch.manual_seed(606)
+    baseline_output, _ = _stage2_decoder_ledger(baseline, input_ids)
+    baseline_output.loss.backward()
+    baseline_rng_witness = torch.rand(4)
+    baseline_grads = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in baseline.named_parameters()
+        if parameter.grad is not None
+    }
+
+    dummy_backward_slots = []
+
+    def retain_decoder_output(_module, _args, _kwargs, output):
+        output.last_hidden_state.register_hook(
+            lambda grad: dummy_backward_slots.append(
+                torch.isfinite(grad).all().item()
+            )
+        )
+
+    handle = padded.model.register_forward_hook(retain_decoder_output, with_kwargs=True)
+    try:
+        torch.manual_seed(606)
+        padded_output, padded_ledger = _stage2_decoder_ledger(
+            padded, input_ids, requested_steps=3
+        )
+        padded_output.loss.backward()
+        padded_rng_witness = torch.rand(4)
+    finally:
+        handle.remove()
+
+    torch.testing.assert_close(padded_output.logits, baseline_output.logits)
+    torch.testing.assert_close(padded_output.loss, baseline_output.loss)
+    torch.testing.assert_close(padded_rng_witness, baseline_rng_witness)
+    assert len(padded_ledger) == 4
+    assert dummy_backward_slots == [True, True, True, True]
+    for name, parameter in padded.named_parameters():
+        if name in baseline_grads:
+            torch.testing.assert_close(parameter.grad, baseline_grads[name])
+
+
+def test_stage2_dummy_graph_zero_is_bounded_against_extreme_hidden_values():
+    """A non-finite unused dummy activation must not turn the final CE into NaN."""
+    torch.manual_seed(707)
+    model = Qwen2_5_VLForConditionalGeneration(_tiny_config(stage="stage2")).eval()
+    input_ids = torch.tensor([[1, 9, 2, 3, 4, 5, 6]], dtype=torch.long)
+    call_index = 0
+
+    def make_dummy_extreme(_module, _args, _kwargs, output):
+        nonlocal call_index
+        call_index += 1
+        if call_index in {2, 3}:
+            hidden = output.last_hidden_state.clone()
+            hidden.reshape(-1)[0] = float("inf")
+            output.last_hidden_state = hidden
+        return output
+
+    handle = model.model.register_forward_hook(make_dummy_extreme, with_kwargs=True)
+    try:
+        output, ledger = _stage2_decoder_ledger(
+            model, input_ids, requested_steps=3
+        )
+    finally:
+        handle.remove()
+
+    assert len(ledger) == 4
+    assert torch.isfinite(output.logits).all()
+    assert torch.isfinite(output.loss)
 
 
 @pytest.mark.parametrize("requested", [True, -1, 0, 2])
