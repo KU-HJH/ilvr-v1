@@ -1,6 +1,6 @@
 # Evidence–Window Credit Learning for ILVR
 
-**Date:** 2026-08-21  
+**Date:** 2026-08-21
 **Status:** Fully implemented and verified (CPU/synthetic and 7B/B200 optimizer-smoke matrix)
 **Target branch/worktree:** `ours-trial1`
 

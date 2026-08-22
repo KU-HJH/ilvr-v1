@@ -66,4 +66,3 @@ def test_invalid_loss_shapes_raise_value_error():
         evidence_window_preference_loss(
             torch.zeros(1, 2, 3), torch.zeros(1, 2, 2, dtype=torch.bool), 1.0
         )
-
