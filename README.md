@@ -319,7 +319,9 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:transformers/src \
 
 The callable B200 harness performs exactly one optimizer step per requested
 case and writes small JSON witnesses for finite losses, edges/forwards,
-policy gradients, fixed-model gradients, dtype, and device:
+policy gradients, fixed-model gradients, dtype, and device. `--output-dir`
+must name a new or empty attempt directory; any stale result, completion file,
+or other prior-attempt content is rejected before processor/model loading:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:transformers/src \
@@ -345,9 +347,22 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:transformers/src \
 The harness reconstructs the expected artifact identity from these explicit
 consumer-side witnesses. It never accepts the producer manifest itself as the
 expected identity and does not hash checkpoint weights. Before atomically
-publishing a result, it validates the named loss, finite total, eligible
-edges/windows, exact padded forward ledger, nonzero policy learning witness,
-and absence of reference/EMA gradients.
+starting model work, it resolves every selected case (including the complete
+`all-single-gpu` matrix), validates config signatures and DeepSpeed pairings,
+checks obvious paths, parses the reference manifest, and compares every
+independent identity field. Exact tokenizer special-token identity is checked
+after processor construction.
+
+After training, every rank first validates all local named losses, finite
+totals, eligible edges/windows, exact padded forward ledgers, nonzero policy
+learning witnesses, and absence of reference/EMA gradients. Validation errors
+are aggregated collectively before any rank JSON is published. Rank JSON files
+are then atomically published and publication errors are collectively checked.
+Only after every expected rank file exists does rank 0 atomically write
+`completion.json`, followed by a final collective publication-status check.
+Consumers must treat `completion.json`, not an individual rank JSON, as the
+success witness. A failed attempt has no completion manifest; use a fresh
+attempt directory rather than reusing its partial files.
 
 Do not treat a high relation entropy, dense attention, or positive LOO score as
 proof of correct evidence use. Sparse dependency can be correct. The local

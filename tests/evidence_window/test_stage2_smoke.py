@@ -1,5 +1,6 @@
 import importlib.util
 from dataclasses import replace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -397,9 +398,16 @@ def test_invalid_witness_is_not_published(tmp_path):
     witness = _valid_witness("ew-reference-free")
     witness["policy_gradient"]["seen"] = False
     witness["policy_parameter_update"]["changed"] = False
+    witness.update(rank=0, world_size=1)
 
     with pytest.raises(ValueError, match="gradient|parameter update"):
-        module._publish_validated_result(tmp_path, witness)
+        module._finalize_attempt(
+            tmp_path,
+            [witness],
+            ("ew-reference-free",),
+            rank=0,
+            world_size=1,
+        )
     assert list(tmp_path.iterdir()) == []
 
 
@@ -461,3 +469,208 @@ def test_precomputed_expected_identity_comes_from_explicit_consumer_witnesses():
     assert module._build_expected_reference_identity(
         args, config, (0, 90, 91, 92, 99)
     ) == _identity()
+
+
+def _rank_witness(case: str, rank: int, world_size: int) -> dict:
+    witness = _valid_witness(case)
+    witness.update(rank=rank, world_size=world_size)
+    return witness
+
+
+def test_remote_validation_failure_prevents_rank0_completion(tmp_path):
+    """Publishing rank 0 before rank 1 validates would create a false success."""
+    module = _load_large_smoke_module()
+
+    def simulated_collective(name, operation):
+        result = operation()
+        if name == "witness validation":
+            raise RuntimeError("rank 1: invalid named loss")
+        return result
+
+    with pytest.raises(RuntimeError, match="rank 1"):
+        module._finalize_attempt(
+            tmp_path,
+            [_rank_witness("ew-reference-free", 0, 2)],
+            ("ew-reference-free",),
+            rank=0,
+            world_size=2,
+            collective_phase=simulated_collective,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "stale_name",
+    ["completion.json", "baseline-rank-00000.json"],
+)
+def test_stale_attempt_witness_rejects_retry_before_model_work(tmp_path, stale_name):
+    module = _load_large_smoke_module()
+    (tmp_path / stale_name).write_text("stale\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="fresh|nonempty|stale"):
+        module._require_fresh_attempt_destination(
+            tmp_path, ("baseline",), world_size=1
+        )
+
+
+def test_main_rejects_nonempty_attempt_before_model_load(tmp_path, monkeypatch):
+    module = _load_large_smoke_module()
+    argv = _preflight_cli(tmp_path, tmp_path / "unused", case="baseline")
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    (attempt / "baseline-rank-00000.json").write_text("stale\n", encoding="utf-8")
+    loads = 0
+
+    def count_load(*_args, **_kwargs):
+        nonlocal loads
+        loads += 1
+        raise AssertionError("model construction must not begin")
+
+    monkeypatch.setattr(module, "_load_processor_and_model", count_load)
+    with pytest.raises(FileExistsError, match="fresh|nonempty"):
+        module.main(argv)
+    assert loads == 0
+
+
+def test_completion_manifest_is_last_after_every_rank_result(tmp_path):
+    module = _load_large_smoke_module()
+    cases = ("ew-reference-free",)
+
+    module._finalize_attempt(
+        tmp_path,
+        [_rank_witness("ew-reference-free", 1, 2)],
+        cases,
+        rank=1,
+        world_size=2,
+    )
+    assert not (tmp_path / "completion.json").exists()
+
+    manifest_path = module._finalize_attempt(
+        tmp_path,
+        [_rank_witness("ew-reference-free", 0, 2)],
+        cases,
+        rank=0,
+        world_size=2,
+    )
+    assert manifest_path == tmp_path / "completion.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest == {
+        "format_version": 1,
+        "status": "complete",
+        "cases": ["ew-reference-free"],
+        "world_size": 2,
+        "result_files": [
+            {
+                "case": "ew-reference-free",
+                "rank": 0,
+                "filename": "ew-reference-free-rank-00000.json",
+            },
+            {
+                "case": "ew-reference-free",
+                "rank": 1,
+                "filename": "ew-reference-free-rank-00001.json",
+            },
+        ],
+    }
+
+
+def _preflight_cli(tmp_path, artifact_dir, *, case="ew-precomputed-dpo"):
+    checkpoint = tmp_path / "stage1-checkpoint"
+    checkpoint.mkdir(exist_ok=True)
+    image_root = tmp_path / "images"
+    image_root.mkdir(exist_ok=True)
+    data = tmp_path / "train.jsonl"
+    data.write_text("{}\n", encoding="utf-8")
+    return [
+        "--case", case,
+        "--model", str(checkpoint),
+        "--stage1-checkpoint", str(checkpoint),
+        "--data", str(data),
+        "--image-root", str(image_root),
+        "--sample-index", "0",
+        "--reference-artifact-dir", str(artifact_dir),
+        "--reference-dataset-sha256", "a" * 64,
+        "--reference-checkpoint-id", "stage1-approved",
+        "--reference-tokenizer-id", "qwen-tokenizer",
+        "--reference-model-config-id", "qwen-stage2",
+        "--output-dir", str(tmp_path / "attempt"),
+    ]
+
+
+def test_all_case_preflight_rejects_missing_identity_before_any_model_load(
+    tmp_path, monkeypatch
+):
+    """All-case execution must not run Stage 1 before checking later artifacts."""
+    module = _load_large_smoke_module()
+    artifact = tmp_path / "artifact"
+    write_reference_shard(
+        artifact,
+        _identity(),
+        {0: ReferenceSampleTargets(torch.tensor([[0.2]]), torch.tensor([[True]]))},
+    )
+    loads = 0
+
+    def count_load(*_args, **_kwargs):
+        nonlocal loads
+        loads += 1
+        raise AssertionError("model construction must not begin")
+
+    monkeypatch.setattr(module, "_load_processor_and_model", count_load)
+    with pytest.raises(ValueError, match="checkpoint_witness"):
+        module.main(_preflight_cli(tmp_path, artifact, case="all-single-gpu"))
+    assert loads == 0
+
+
+def test_preflight_rejects_manifest_identity_mismatch_before_model_load(
+    tmp_path, monkeypatch
+):
+    module = _load_large_smoke_module()
+    artifact = tmp_path / "artifact"
+    write_reference_shard(
+        artifact,
+        _identity(),
+        {0: ReferenceSampleTargets(torch.tensor([[0.2]]), torch.tensor([[True]]))},
+    )
+    argv = _preflight_cli(tmp_path, artifact)
+    argv.extend(["--reference-checkpoint-witness", "wrong-stage1"])
+    loads = 0
+
+    def count_load(*_args, **_kwargs):
+        nonlocal loads
+        loads += 1
+        raise AssertionError("model construction must not begin")
+
+    monkeypatch.setattr(module, "_load_processor_and_model", count_load)
+    with pytest.raises(ValueError, match="identity mismatch"):
+        module.main(argv)
+    assert loads == 0
+
+
+def test_preflight_rejects_malformed_reference_manifest_before_model_load(
+    tmp_path, monkeypatch
+):
+    module = _load_large_smoke_module()
+    artifact = tmp_path / "artifact"
+    write_reference_shard(
+        artifact,
+        _identity(),
+        {0: ReferenceSampleTargets(torch.tensor([[0.2]]), torch.tensor([[True]]))},
+    )
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["format"] = "wrong-format"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    argv = _preflight_cli(tmp_path, artifact)
+    argv.extend(["--reference-checkpoint-witness", "sealed-stage1"])
+    loads = 0
+
+    def count_load(*_args, **_kwargs):
+        nonlocal loads
+        loads += 1
+        raise AssertionError("model construction must not begin")
+
+    monkeypatch.setattr(module, "_load_processor_and_model", count_load)
+    with pytest.raises(ValueError, match="manifest format"):
+        module.main(argv)
+    assert loads == 0

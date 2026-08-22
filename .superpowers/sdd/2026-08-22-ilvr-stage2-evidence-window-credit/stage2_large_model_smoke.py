@@ -2,8 +2,9 @@
 """One-optimizer-step witness for ILVR Stage 1 and Stage-2 EW variants.
 
 The script deliberately performs no checkpoint hashing. Precomputed targets
-are authenticated by their already-published manifest, and the resulting JSON
-contains only small scalar/structural witnesses.
+are authenticated against independent consumer witnesses. Per-rank JSON files
+contain only small scalar/structural evidence; only the final completion
+manifest denotes a successful distributed attempt.
 """
 
 from __future__ import annotations
@@ -116,11 +117,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _require_inputs(args: argparse.Namespace) -> None:
+def _require_inputs(args: argparse.Namespace, cases: Sequence[str]) -> None:
     for name in ("stage1_checkpoint", "data", "image_root"):
         value = Path(getattr(args, name)).expanduser()
         if not value.exists():
             raise FileNotFoundError(f"--{name.replace('_', '-')} does not exist: {value}")
+    if not Path(args.data).is_file():
+        raise FileNotFoundError(f"--data is not a file: {args.data}")
+    if not Path(args.image_root).is_dir():
+        raise FileNotFoundError(f"--image-root is not a directory: {args.image_root}")
+    if "stage1-baseline" in cases and not Path(args.model).expanduser().exists():
+        raise FileNotFoundError(f"--model does not exist for Stage-1 smoke: {args.model}")
     if args.deepspeed_config is not None and not Path(args.deepspeed_config).is_file():
         raise FileNotFoundError(
             f"--deepspeed-config does not exist: {args.deepspeed_config}"
@@ -273,10 +280,7 @@ def _resolve_stage2_config(args: argparse.Namespace, case: str):
     return config
 
 
-def _build_expected_reference_identity(args, config, tokenizer_special_tokens):
-    """Reconstruct the consumer expectation without reading artifact metadata."""
-    from evidence_window.artifacts import ArtifactIdentity
-
+def _reference_identity_values(args) -> dict[str, str]:
     values = {
         "dataset_sha256": getattr(args, "reference_dataset_sha256", None),
         "checkpoint_id": getattr(args, "reference_checkpoint_id", None),
@@ -291,6 +295,14 @@ def _build_expected_reference_identity(args, config, tokenizer_special_tokens):
             "precomputed smoke requires authenticated identity argument(s): "
             + ", ".join(missing)
         )
+    return values
+
+
+def _build_expected_reference_identity(args, config, tokenizer_special_tokens):
+    """Reconstruct the consumer expectation without reading artifact metadata."""
+    from evidence_window.artifacts import ArtifactIdentity
+
+    values = _reference_identity_values(args)
     identity = ArtifactIdentity(
         format_version=1,
         dataset_sha256=values["dataset_sha256"],
@@ -310,10 +322,157 @@ def _build_expected_reference_identity(args, config, tokenizer_special_tokens):
     return ArtifactIdentity.from_dict(identity.to_dict())
 
 
+def _read_precomputed_manifest_identity(artifact_dir: str):
+    from evidence_window.artifacts import ArtifactIdentity, ReferenceShardMetadata
+
+    directory = Path(artifact_dir)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"reference artifact directory does not exist: {directory}")
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"reference artifact manifest does not exist: {manifest_path}")
+    with manifest_path.open(encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if type(manifest) is not dict or set(manifest) != {"format", "identity", "shards"}:
+        raise ValueError("reference artifact manifest schema mismatch")
+    if manifest["format"] != "ilvr-stage2-reference":
+        raise ValueError("reference artifact manifest format mismatch")
+    raw_shards = manifest["shards"]
+    if type(raw_shards) is not list or not raw_shards:
+        raise ValueError("reference artifact manifest shards must be a nonempty list")
+    shards = [ReferenceShardMetadata.from_dict(raw) for raw in raw_shards]
+    ranks = [shard.rank for shard in shards]
+    if ranks != sorted(ranks) or len(set(ranks)) != len(ranks):
+        raise ValueError("reference artifact manifest shard ranks are invalid")
+    filenames = [shard.filename for shard in shards]
+    if len(set(filenames)) != len(filenames):
+        raise ValueError("reference artifact manifest shard filenames are duplicated")
+    missing_shards = [name for name in filenames if not (directory / name).is_file()]
+    if missing_shards:
+        raise ValueError(
+            "reference artifact manifest names missing shard(s): "
+            + ", ".join(missing_shards)
+        )
+    return ArtifactIdentity.from_dict(manifest["identity"]), tuple(shards)
+
+
+def _validate_precomputed_preflight(args, config) -> None:
+    """Reject independent identity mismatches before loading a processor/model."""
+    values = _reference_identity_values(args)
+    actual, shards = _read_precomputed_manifest_identity(args.reference_artifact_dir)
+    expected = {
+        "dataset_sha256": values["dataset_sha256"],
+        "checkpoint_id": values["checkpoint_id"],
+        "checkpoint_witness": values["checkpoint_witness"],
+        "tokenizer_id": values["tokenizer_id"],
+        "parser_version": values["parser_version"],
+        "contribution_reduction": config.preference.contribution_reduction,
+        "intervention": config.loo.intervention,
+        "attention_backend": "sdpa",
+        "max_evidence_edges_per_window": config.loo.max_evidence_edges_per_window,
+        "model_config_id": values["model_config_id"],
+    }
+    mismatches = {
+        name: (value, getattr(actual, name))
+        for name, value in expected.items()
+        if getattr(actual, name) != value
+    }
+    if mismatches:
+        raise ValueError(f"reference artifact identity mismatch: {mismatches}")
+    if config.residual.enabled and config.residual.lambda_res > 0.0:
+        if any(not shard.has_hidden_residuals for shard in shards):
+            raise ValueError(
+                "hidden-residual smoke requires hidden residuals in every artifact shard"
+            )
+
+
 def _build_precomputed_provider(artifact_dir, expected_identity):
     from evidence_window.artifacts import PrecomputedReferenceProvider
 
     return PrecomputedReferenceProvider(artifact_dir, expected_identity)
+
+
+def _require_fresh_attempt_destination(
+    output_dir: Path,
+    cases: Sequence[str],
+    *,
+    world_size: int,
+) -> None:
+    if world_size <= 0:
+        raise ValueError("world size must be positive")
+    if not cases:
+        raise ValueError("smoke attempt must select at least one case")
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(
+            f"smoke attempt destination must be fresh and empty; found nonempty {output_dir}"
+        )
+
+
+def _prepare_attempt(
+    args: argparse.Namespace,
+    cases: Sequence[str],
+    output_dir: Path,
+    *,
+    world_size: int,
+) -> dict[str, Any]:
+    from evidence_window.stage2_config import read_deepspeed_zero_stage
+
+    _require_inputs(args, cases)
+    _require_fresh_attempt_destination(output_dir, cases, world_size=world_size)
+    _read_source_row(args.data, args.sample_index)
+    zero_stage = (
+        read_deepspeed_zero_stage(args.deepspeed_config)
+        if args.deepspeed_config
+        else 0
+    )
+    configs: dict[str, Any] = {}
+    for case in cases:
+        if case == "stage1-baseline":
+            continue
+        config = _resolve_stage2_config(args, case)
+        _validate_case_zero_stage(case, zero_stage)
+        config.validate_runtime(zero_stage)
+        if config.reference.mode == "precomputed":
+            _validate_precomputed_preflight(args, config)
+        configs[case] = config
+    return configs
+
+
+def _run_collective_phase(name: str, operation):
+    """Return local work only after every distributed rank reports success."""
+    import torch
+    import torch.distributed as distributed
+
+    result = None
+    local_error = None
+    local_exception = None
+    try:
+        result = operation()
+    except Exception as exc:
+        local_exception = exc
+        local_error = f"{type(exc).__name__}: {exc}"
+
+    if distributed.is_available() and distributed.is_initialized():
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if distributed.get_backend() == "nccl"
+            else torch.device("cpu")
+        )
+        failed = torch.tensor(int(local_error is not None), dtype=torch.long, device=device)
+        distributed.all_reduce(failed, op=distributed.ReduceOp.MAX)
+        if failed.item():
+            errors: list[str | None] = [None] * distributed.get_world_size()
+            distributed.all_gather_object(errors, local_error)
+            details = "; ".join(
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(errors)
+                if error is not None
+            )
+            raise RuntimeError(f"distributed {name} failed: {details}")
+    elif local_error is not None:
+        assert local_exception is not None
+        raise local_exception
+    return result
 
 
 def _training_arguments(output_dir: Path, deepspeed_config: str | None):
@@ -421,7 +580,12 @@ def _loss_witness(log_history) -> dict[str, float]:
     return result
 
 
-def _run_stage2(args: argparse.Namespace, case: str, case_dir: Path) -> dict[str, Any]:
+def _run_stage2(
+    args: argparse.Namespace,
+    case: str,
+    case_dir: Path,
+    config,
+) -> dict[str, Any]:
     import torch
     from evidence_window.stage2_config import read_deepspeed_zero_stage
     from evidence_window.stage2_layout import extract_stage2_layout, select_stage2_edges
@@ -436,7 +600,6 @@ def _run_stage2(args: argparse.Namespace, case: str, case_dir: Path) -> dict[str
         if args.deepspeed_config
         else 0
     )
-    config = _resolve_stage2_config(args, case)
     _validate_case_zero_stage(case, zero_stage)
     config.validate_runtime(zero_stage)
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
@@ -793,26 +956,128 @@ def _validate_case_witness(witness: dict[str, Any]) -> None:
     )
 
 
-def _publish_validated_result(output_dir: Path, result: dict[str, Any]) -> Path:
-    _validate_case_witness(result)
-    return _write_result(output_dir, result)
+def _expected_result_records(
+    cases: Sequence[str], world_size: int
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "case": case,
+            "rank": rank,
+            "filename": f"{case}-rank-{rank:05d}.json",
+        }
+        for case in cases
+        for rank in range(world_size)
+    ]
+
+
+def _validate_local_attempt_results(
+    results: Sequence[dict[str, Any]],
+    cases: Sequence[str],
+    *,
+    rank: int,
+    world_size: int,
+) -> None:
+    if tuple(result.get("case") for result in results) != tuple(cases):
+        raise ValueError("local result cases do not match the selected attempt cases")
+    for result in results:
+        if result.get("rank") != rank or result.get("world_size") != world_size:
+            raise ValueError("local result rank/world size does not match the attempt")
+        _validate_case_witness(result)
+
+
+def _write_completion_manifest(
+    output_dir: Path,
+    cases: Sequence[str],
+    world_size: int,
+) -> Path:
+    result_files = _expected_result_records(cases, world_size)
+    missing = [
+        record["filename"]
+        for record in result_files
+        if not (output_dir / record["filename"]).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "cannot publish completion manifest before every rank result exists: "
+            + ", ".join(missing)
+        )
+    manifest = {
+        "format_version": 1,
+        "status": "complete",
+        "cases": list(cases),
+        "world_size": world_size,
+        "result_files": result_files,
+    }
+    destination = output_dir / "completion.json"
+    temporary = destination.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, destination)
+    return destination
+
+
+def _finalize_attempt(
+    output_dir: Path,
+    results: Sequence[dict[str, Any]],
+    cases: Sequence[str],
+    *,
+    rank: int,
+    world_size: int,
+    collective_phase=None,
+) -> Path | None:
+    phase = _run_collective_phase if collective_phase is None else collective_phase
+    phase(
+        "witness validation",
+        lambda: _validate_local_attempt_results(
+            results, cases, rank=rank, world_size=world_size
+        ),
+    )
+    phase(
+        "rank result publication",
+        lambda: [_write_result(output_dir, result) for result in results],
+    )
+    manifest_path = phase(
+        "completion manifest publication",
+        lambda: (
+            _write_completion_manifest(output_dir, cases, world_size)
+            if rank == 0
+            else None
+        ),
+    )
+    return manifest_path if rank == 0 else None
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
-    _require_inputs(args)
     output_dir = Path(args.output_dir)
     cases = SINGLE_GPU_CASES if args.case == "all-single-gpu" else (args.case,)
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    configs = _run_collective_phase(
+        "attempt preflight",
+        lambda: _prepare_attempt(
+            args, cases, output_dir, world_size=world_size
+        ),
+    )
+    results = []
     for case in cases:
         case_dir = output_dir / case
         result = (
             _run_stage1(args, case_dir)
             if case == "stage1-baseline"
-            else _run_stage2(args, case, case_dir)
+            else _run_stage2(args, case, case_dir, configs[case])
         )
-        path = _publish_validated_result(output_dir, result)
-        if int(os.environ.get("RANK", "0")) == 0:
-            print(path)
+        results.append(result)
+    manifest_path = _finalize_attempt(
+        output_dir,
+        results,
+        cases,
+        rank=rank,
+        world_size=world_size,
+    )
+    if rank == 0:
+        print(manifest_path)
 
 
 if __name__ == "__main__":
