@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+from pathlib import Path
 from tqdm import tqdm
 from functools import partial
 
@@ -23,6 +24,9 @@ from utils_deepseed import *
 from task_deepseed import *
 from trainer import CustomTrainerStage1
 from evidence_window.config import EvidenceWindowConfig
+from evidence_window.stage2_config import Stage2EvidenceWindowConfig
+from stage2_data import build_stage2_record, collate_fn_stage2
+from trainer_stage2 import CustomTrainerStage2
 
 # ==============================================================
 # Collate Functions
@@ -91,6 +95,65 @@ def collate_fn_stage1(examples, processor, args):
     batch["image_out_mask"] = image_out_mask
     return batch
 
+
+def select_stage_components(stage):
+    """Return the trainer and collator belonging to one ILVR stage."""
+    if stage == "stage1":
+        return CustomTrainerStage1, collate_fn_stage1
+    if stage == "stage2":
+        return CustomTrainerStage2, collate_fn_stage2
+    raise ValueError("stage must be stage1 or stage2")
+
+
+def resolve_policy_model_path(args):
+    """Resolve the base model for Stage 1 or required Stage-1 checkpoint for Stage 2."""
+    if args.stage == "stage1":
+        return args.model
+    if args.stage != "stage2":
+        raise ValueError("stage must be stage1 or stage2")
+
+    checkpoint = getattr(args, "load_model_path", None)
+    if not checkpoint or not Path(checkpoint).exists():
+        raise ValueError(
+            "Stage 2 requires an existing Stage 1 checkpoint via --load_model_path"
+        )
+    return str(checkpoint)
+
+
+def resolve_evidence_window_config(args):
+    """Parse only the evidence-window configuration version valid for a stage."""
+    if args.stage == "stage1":
+        config = (
+            EvidenceWindowConfig.disabled()
+            if args.ew_config is None
+            else EvidenceWindowConfig.from_json(args.ew_config)
+        )
+        if not config.is_disabled:
+            raise ValueError(
+                "Stage 1 accepts only no EW config or a disabled version-1 EW config"
+            )
+        return config
+    if args.stage == "stage2":
+        return (
+            Stage2EvidenceWindowConfig.disabled()
+            if args.ew_config is None
+            else Stage2EvidenceWindowConfig.from_json(args.ew_config)
+        )
+    raise ValueError("stage must be stage1 or stage2")
+
+
+def prepare_training_dataset(args, raw_rows):
+    """Apply the stage-specific preprocessing contract to raw training rows."""
+    if args.stage == "stage1":
+        preprocess_function = task_preporcess_config[args.task]
+        return [preprocess_function(sample) for sample in raw_rows]
+    if args.stage == "stage2":
+        return [
+            build_stage2_record(sample, row_index)
+            for row_index, sample in enumerate(raw_rows)
+        ]
+    raise ValueError("stage must be stage1 or stage2")
+
     
 
 # ==============================================================
@@ -99,11 +162,9 @@ def collate_fn_stage1(examples, processor, args):
 def main_train():
     seed_everything(seed=42)
     args = get_args()
-    ew_config = (
-        EvidenceWindowConfig.disabled()
-        if args.ew_config is None
-        else EvidenceWindowConfig.from_json(args.ew_config)
-    )
+    CustomTrainer, collate_fn_raw = select_stage_components(args.stage)
+    model_path = resolve_policy_model_path(args)
+    ew_config = resolve_evidence_window_config(args)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -121,15 +182,14 @@ def main_train():
     cache_dir = args.cache_dir
     os.environ['HF_HOME'] = cache_dir
     
-    logging.info(f"Loading processor from: {args.model}")
-    processor = AutoProcessor.from_pretrained(args.model, cache_dir=cache_dir, trust_remote_code=True)
+    logging.info(f"Loading processor from: {model_path}")
+    processor = AutoProcessor.from_pretrained(model_path, cache_dir=cache_dir, trust_remote_code=True)
     
     new_tokens = ["<|latent_pad|>", "<|latent_start|>", "<|latent_end|>"]
     processor.tokenizer.add_tokens(new_tokens, special_tokens=True)
 
 
-    logging.info(f"Loading model (Stage 1) from: {args.model}")
-    model_path = args.model
+    logging.info(f"Loading model ({args.stage}) from: {model_path}")
     config = Qwen2_5_VLConfig.from_pretrained(model_path, cache_dir=cache_dir, trust_remote_code=True)
     grad_checkpointing = True
     
@@ -178,14 +238,8 @@ def main_train():
     logging.info(f"Moving model to CUDA device: {torch.cuda.current_device()} ...")
     
 
-    preprocess_function = task_preporcess_config[args.task]
-    train_dataset = load_jsonl_dataset(args.data_path)
-    train_dataset = [preprocess_function(sample) for sample in train_dataset]
-
-    
-    CustomTrainer = CustomTrainerStage1
-    collate_fn_raw = collate_fn_stage1
-    
+    raw_train_dataset = load_jsonl_dataset(args.data_path)
+    train_dataset = prepare_training_dataset(args, raw_train_dataset)
         
     collate_fn = partial(collate_fn_raw, processor=processor, args=args)
 
@@ -228,22 +282,28 @@ def main_train():
         ddp_find_unused_parameters=False if args.stage == 'stage2' else None,
     )
     
-    trainer = CustomTrainer(
+    trainer_kwargs = dict(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=collate_fn,
-        tokenizer=processor.tokenizer,
         peft_config=peft_config,
-        sim_weight=getattr(args, "sim_weight", 1.0),
-        ema_tau=getattr(args, "ema_tau", 0.999),
-        coverage_p=getattr(args, "coverage_p", 0.9),
-        image_pool_k=getattr(args, "image_pool_k", 8),
-        helper_group_L=getattr(args, "helper_group_L", 256),
-        ce_weight=getattr(args, "ce_weight", 1.0),
         evidence_window_config=ew_config,
-        latent_token_ids=latent_token_ids,
     )
+    if args.stage == "stage1":
+        trainer_kwargs.update(
+            tokenizer=processor.tokenizer,
+            sim_weight=getattr(args, "sim_weight", 1.0),
+            ema_tau=getattr(args, "ema_tau", 0.999),
+            coverage_p=getattr(args, "coverage_p", 0.9),
+            image_pool_k=getattr(args, "image_pool_k", 8),
+            helper_group_L=getattr(args, "helper_group_L", 256),
+            ce_weight=getattr(args, "ce_weight", 1.0),
+            latent_token_ids=latent_token_ids,
+        )
+    else:
+        trainer_kwargs["processing_class"] = processor.tokenizer
+    trainer = CustomTrainer(**trainer_kwargs)
     
 
     last_checkpoint = None

@@ -16,7 +16,12 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--evaluation_output_path", type=str, default="evaluation_results.json", help="Path to save evaluation results JSON file.")
     parser.add_argument("--model", type=str, default='Qwen/Qwen2.5-VL-7B-Instruct')
-    parser.add_argument("--stage", type=str, default="stage1")
+    parser.add_argument(
+        "--stage",
+        type=str,
+        default="stage1",
+        choices=["stage1", "stage2"],
+    )
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)
@@ -27,7 +32,12 @@ def get_args():
     parser.add_argument("--data_path", type=str, default='PathToJsonlData')
     parser.add_argument("--log_file", type=str, default='./log.txt')
     parser.add_argument("--save_model_path", type=str, default='./checkpoints/model_stage1')
-    parser.add_argument("--load_model_path", type=str, default='./checkpoints/model_stage1')
+    parser.add_argument(
+        "--load_model_path",
+        type=str,
+        default=None,
+        help="Required Stage-1 checkpoint path when --stage stage2 is selected.",
+    )
     parser.add_argument("--cache_dir", type=str, default='./cache')
     parser.add_argument("--ce_weight", type=float, default=1.0)
     parser.add_argument("--warm_up_steps", type=int, default=10)

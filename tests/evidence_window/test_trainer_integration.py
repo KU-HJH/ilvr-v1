@@ -505,7 +505,7 @@ def test_auxiliary_scores_normalize_labels_dependent_logits_to_float32(
     }
 
 
-def test_main_wires_loaded_config_and_resolved_token_ids_into_trainer(
+def test_main_wires_disabled_config_and_rejects_enabled_v1_launcher_config(
     monkeypatch,
     tmp_path,
 ):
@@ -640,14 +640,5 @@ def test_main_wires_loaded_config_and_resolved_token_ids_into_trainer(
         lambda path: loaded_config,
     )
 
-    main_module.main_train()
-
-    assert FakeTrainer.captured["evidence_window_config"] is loaded_config
-    assert FakeTrainer.captured["latent_token_ids"] == {
-        "start": 190,
-        "end": 191,
-        "pad": 192,
-        "padding": 0,
-        "special": (0, 190, 191, 192, 198, 199),
-        "assistant_termination": (198,),
-    }
+    with pytest.raises(ValueError, match="Stage 1.*disabled version-1"):
+        main_module.main_train()
