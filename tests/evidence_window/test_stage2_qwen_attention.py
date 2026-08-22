@@ -81,6 +81,61 @@ def test_block_leaves_prior_hidden_states_unchanged(tiny_qwen, text_batch, block
     assert not torch.allclose(full[:, 4], loo[:, 4], atol=1e-7, rtol=1e-7)
 
 
+def test_fully_blocked_predictor_row_cannot_leak_future_padding(tiny_qwen):
+    """Finite-min ties must not let an all-blocked predictor attend forbidden future keys."""
+    prefix = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    first_ids = torch.cat((prefix, torch.tensor([[4, 5, 6]])), dim=1)
+    changed_padding_ids = torch.cat((prefix, torch.tensor([[7, 8, 9]])), dim=1)
+    padding_mask = torch.tensor([[1, 1, 1, 0, 0, 0]], dtype=torch.long)
+    block_mask = torch.zeros((1, 6, 6), dtype=torch.bool)
+    block_mask[0, 2, :3] = True
+
+    with torch.no_grad():
+        first = tiny_qwen(
+            input_ids=first_ids,
+            attention_mask=padding_mask,
+            use_cache=False,
+            return_dict=True,
+            attention_backend_override="sdpa",
+            attention_block_mask=block_mask,
+        ).last_hidden_state
+        changed = tiny_qwen(
+            input_ids=changed_padding_ids,
+            attention_mask=padding_mask,
+            use_cache=False,
+            return_dict=True,
+            attention_backend_override="sdpa",
+            attention_block_mask=block_mask,
+        ).last_hidden_state
+
+    assert torch.isfinite(first[:, 2]).all()
+    assert torch.isfinite(changed[:, 2]).all()
+    torch.testing.assert_close(first[:, 2], changed[:, 2], atol=0.0, rtol=0.0)
+
+
+def test_fully_blocked_predictor_row_has_finite_backward(tiny_qwen):
+    """An exact no-key attention row must remain differentiable without NaN gradients."""
+    tiny_qwen.train()
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    padding_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.long)
+    block_mask = torch.zeros((1, 4, 4), dtype=torch.bool)
+    block_mask[0, 2, :3] = True
+
+    output = tiny_qwen(
+        input_ids=input_ids,
+        attention_mask=padding_mask,
+        use_cache=False,
+        return_dict=True,
+        attention_backend_override="sdpa",
+        attention_block_mask=block_mask,
+    ).last_hidden_state
+    output[:, 2].sum().backward()
+
+    assert torch.isfinite(output[:, 2]).all()
+    assert tiny_qwen.embed_tokens.weight.grad is not None
+    assert torch.isfinite(tiny_qwen.embed_tokens.weight.grad).all()
+
+
 def test_block_requires_explicit_sdpa_override(tiny_qwen, text_batch, block):
     """Sending an intervention through the configured backend would change its meaning."""
     with pytest.raises(ValueError, match="SDPA"):

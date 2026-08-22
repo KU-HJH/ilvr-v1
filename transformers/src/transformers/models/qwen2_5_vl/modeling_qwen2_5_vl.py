@@ -1565,10 +1565,16 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             past_key_values=None,
             apply_sliding_window=False,
         )
+        # Pair-local interventions can block every otherwise-causal key for a
+        # prediction query (for example the latent-end row that predicts the
+        # first reasoning token).  Keeping forbidden entries at finite
+        # ``finfo.min`` would make a fully blocked row a uniform softmax tie and
+        # leak future or padding values.  PyTorch SDPA treats an all-``-inf``
+        # row as zero attention with finite forward/backward behavior.
+        min_dtype = torch.finfo(input_tensor.dtype).min
+        causal_mask = causal_mask.masked_fill(causal_mask.eq(min_dtype), float("-inf"))
         if attention_block_mask is not None:
-            causal_mask = causal_mask.masked_fill(
-                attention_block_mask[:, None], torch.finfo(input_tensor.dtype).min
-            )
+            causal_mask = causal_mask.masked_fill(attention_block_mask[:, None], float("-inf"))
         return causal_mask
 
     def _update_causal_mask(
