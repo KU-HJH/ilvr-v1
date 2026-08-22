@@ -33,6 +33,25 @@ def test_padding_ignored_and_special_tokens_are_excluded():
     assert layout.window_token_mask[0, 0].nonzero().flatten().tolist() == [3]
 
 
+def test_final_window_stops_at_assistant_termination_not_other_special_tokens():
+    """Supervision after im_end belongs to later turns, not the final native window."""
+    tokens = TokenIds(
+        90,
+        91,
+        92,
+        0,
+        frozenset({0, 90, 91, 92, 98, 99}),
+        assistant_termination=frozenset({98}),
+    )
+    ids = torch.tensor([[90, 92, 91, 20, 99, 21, 98, 22, 0]])
+    labels = ids.clone()
+    labels[:, -1] = -100
+
+    layout = extract_interleaved_layout(ids, ids.ne(0), labels, ids.eq(92), tokens)
+
+    assert layout.window_token_mask[0, 0].nonzero().flatten().tolist() == [3, 5]
+
+
 def test_adjacent_spans_create_no_empty_window():
     """Creating a window for delimiter-adjacent spans is an invalid layout."""
     ids = torch.tensor([[90, 92, 91, 90, 92, 91, 7]])

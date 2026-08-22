@@ -170,7 +170,31 @@ class CustomTrainerStage1(SFTTrainer):
             ) from exc
         if any(isinstance(value, bool) or not isinstance(value, int) for value in special_values):
             raise ValueError("latent_token_ids.special must contain only integers")
-        return TokenIds(special=frozenset(int(value) for value in special_values), **scalar_values)
+        termination = configured.get("assistant_termination", ())
+        if isinstance(termination, (str, bytes)):
+            raise ValueError(
+                "latent_token_ids.assistant_termination must be an iterable of integers"
+            )
+        try:
+            termination_values = frozenset(termination)
+        except TypeError as exc:
+            raise ValueError(
+                "latent_token_ids.assistant_termination must be an iterable of integers"
+            ) from exc
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in termination_values
+        ):
+            raise ValueError(
+                "latent_token_ids.assistant_termination must contain only integers"
+            )
+        return TokenIds(
+            special=frozenset(int(value) for value in special_values),
+            assistant_termination=frozenset(
+                int(value) for value in termination_values
+            ),
+            **scalar_values,
+        )
 
     def _log_evidence_window_startup(self) -> None:
         config = self.evidence_window_config
@@ -264,6 +288,10 @@ class CustomTrainerStage1(SFTTrainer):
                 e = s + 1
                 while e < T and ids[e] != latent_end_id:
                     e += 1
+                if e >= T:
+                    raise ValueError(
+                        f"unmatched latent-start delimiter at token position {s}"
+                    )
                 pad_pos = [i for i in range(s, e+1) if ids[i] == latent_pad_id]
                 segments.append(pad_pos)
                 t = e + 1
@@ -720,6 +748,17 @@ class CustomTrainerStage1(SFTTrainer):
             ordinal_families.append("preference/window_margin")
         if config.preference.lambda_ew > 0:
             ordinal_families.append("preference/ew_margin")
+        if (
+            config.loo.max_spans_per_example > 0
+            and (
+                config.preference.lambda_ew > 0
+                or config.relation.lambda_jsd > 0
+                or config.relation.lambda_magnitude > 0
+                or config.residual.lambda_logit > 0
+                or config.diagnostics.matrix_dump_interval > 0
+            )
+        ):
+            ordinal_families.append("loo/selected_span")
         self._accumulate_evidence_window_metrics(
             metric_sums,
             ordinal_families=ordinal_families,
@@ -883,6 +922,17 @@ class CustomTrainerStage1(SFTTrainer):
             families.append("preference/window_margin")
         if config.preference.lambda_ew > 0:
             families.append("preference/ew_margin")
+        if (
+            config.loo.max_spans_per_example > 0
+            and (
+                config.preference.lambda_ew > 0
+                or config.relation.lambda_jsd > 0
+                or config.relation.lambda_magnitude > 0
+                or config.residual.lambda_logit > 0
+                or config.diagnostics.matrix_dump_interval > 0
+            )
+        ):
+            families.append("loo/selected_span")
         return tuple(families)
 
     def _expected_evidence_metric_keys(self) -> set[str]:
@@ -945,6 +995,7 @@ class CustomTrainerStage1(SFTTrainer):
             for prefix in (
                 "preference/window_margin/",
                 "preference/ew_margin/",
+                "loo/selected_span/",
             )
         )
 

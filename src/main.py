@@ -141,6 +141,9 @@ def main_train():
     latent_token_idx = processor.tokenizer("<|latent_pad|>", return_tensors="pt")["input_ids"][0,0].item()
     latent_start_idx = processor.tokenizer("<|latent_start|>", return_tensors="pt")["input_ids"][0,0].item()
     latent_end_idx   = processor.tokenizer("<|latent_end|>", return_tensors="pt")["input_ids"][0,0].item()
+    assistant_termination_idx = processor.tokenizer(
+        "<|im_end|>", return_tensors="pt"
+    )["input_ids"][0,0].item()
     pad_token_idx = processor.tokenizer("<|endoftext|>", return_tensors="pt")["input_ids"][0,0].item()
     latent_token_ids = {
         "start": int(latent_start_idx),
@@ -148,6 +151,7 @@ def main_train():
         "pad": int(latent_token_idx),
         "padding": int(pad_token_idx),
         "special": tuple(int(x) for x in processor.tokenizer.all_special_ids),
+        "assistant_termination": (int(assistant_termination_idx),),
     }
     config.latent_token_id = int(latent_token_idx)
     config.latent_start_id = int(latent_start_idx)

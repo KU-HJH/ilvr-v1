@@ -249,41 +249,201 @@ def chunked_logit_residual_loss(
     if student_dh.shape[0] == 0:
         return zero
 
-    if metric == "huber":
-        total = zero
-        count = 0
-        for start in range(0, student_weight.shape[0], chunk_size_value):
-            stop = min(start + chunk_size_value, student_weight.shape[0])
-            student_chunk = student_weight[start:stop].to(dtype=accumulation_dtype)
-            teacher_chunk = teacher_weight[start:stop].detach().to(
-                dtype=accumulation_dtype
-            )
-            student_logits = torch.matmul(student_values, student_chunk.transpose(0, 1))
-            teacher_logits = torch.matmul(teacher_values, teacher_chunk.transpose(0, 1))
-            total = total + F.huber_loss(
-                student_logits,
-                teacher_logits,
-                delta=delta_value,
-                reduction="sum",
-            )
-            count += student_logits.numel()
-        return total / count
+    return _BoundedLogitResidual.apply(
+        student_values,
+        teacher_values,
+        student_weight,
+        teacher_weight.detach(),
+        0 if metric == "huber" else 1,
+        chunk_size_value,
+        delta_value,
+    )
 
-    dots = student_values.new_zeros(student_values.shape[0])
-    student_norm_sq = torch.zeros_like(dots)
-    teacher_norm_sq = torch.zeros_like(dots)
-    for start in range(0, student_weight.shape[0], chunk_size_value):
-        stop = min(start + chunk_size_value, student_weight.shape[0])
-        student_chunk = student_weight[start:stop].to(dtype=accumulation_dtype)
-        teacher_chunk = teacher_weight[start:stop].detach().to(
-            dtype=accumulation_dtype
+
+class _BoundedLogitResidual(torch.autograd.Function):
+    """Recompute one vocabulary projection chunk at a time during backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        student_values: torch.Tensor,
+        teacher_values: torch.Tensor,
+        student_weight: torch.Tensor,
+        teacher_weight: torch.Tensor,
+        metric_code: int,
+        chunk_size: int,
+        delta: float,
+    ) -> torch.Tensor:
+        ctx.metric_code = metric_code
+        ctx.chunk_size = chunk_size
+        ctx.delta = delta
+
+        if metric_code == 0:
+            total = student_values.new_zeros(())
+            for start in range(0, student_weight.shape[0], chunk_size):
+                stop = min(start + chunk_size, student_weight.shape[0])
+                student_chunk = student_weight[start:stop].to(
+                    dtype=student_values.dtype
+                )
+                teacher_chunk = teacher_weight[start:stop].to(
+                    dtype=teacher_values.dtype
+                )
+                student_logits = torch.matmul(
+                    student_values,
+                    student_chunk.transpose(0, 1),
+                )
+                teacher_logits = torch.matmul(
+                    teacher_values,
+                    teacher_chunk.transpose(0, 1),
+                )
+                total = total + F.huber_loss(
+                    student_logits,
+                    teacher_logits,
+                    delta=delta,
+                    reduction="sum",
+                )
+            ctx.save_for_backward(
+                student_values,
+                teacher_values,
+                student_weight,
+                teacher_weight,
+            )
+            return total / (student_values.shape[0] * student_weight.shape[0])
+
+        dots = student_values.new_zeros(student_values.shape[0])
+        student_norm_sq = torch.zeros_like(dots)
+        teacher_norm_sq = torch.zeros_like(dots)
+        for start in range(0, student_weight.shape[0], chunk_size):
+            stop = min(start + chunk_size, student_weight.shape[0])
+            student_chunk = student_weight[start:stop].to(
+                dtype=student_values.dtype
+            )
+            teacher_chunk = teacher_weight[start:stop].to(
+                dtype=teacher_values.dtype
+            )
+            student_logits = torch.matmul(
+                student_values,
+                student_chunk.transpose(0, 1),
+            )
+            teacher_logits = torch.matmul(
+                teacher_values,
+                teacher_chunk.transpose(0, 1),
+            )
+            dots = dots + (student_logits * teacher_logits).sum(dim=-1)
+            student_norm_sq = student_norm_sq + student_logits.square().sum(dim=-1)
+            teacher_norm_sq = teacher_norm_sq + teacher_logits.square().sum(dim=-1)
+        ctx.save_for_backward(
+            student_values,
+            teacher_values,
+            student_weight,
+            teacher_weight,
+            dots,
+            student_norm_sq,
+            teacher_norm_sq,
         )
-        student_logits = torch.matmul(student_values, student_chunk.transpose(0, 1))
-        teacher_logits = torch.matmul(teacher_values, teacher_chunk.transpose(0, 1))
-        dots = dots + (student_logits * teacher_logits).sum(dim=-1)
-        student_norm_sq = student_norm_sq + student_logits.square().sum(dim=-1)
-        teacher_norm_sq = teacher_norm_sq + teacher_logits.square().sum(dim=-1)
+        return _cosine_residual_from_statistics(
+            dots,
+            student_norm_sq,
+            teacher_norm_sq,
+        )
 
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        saved = ctx.saved_tensors
+        student_values, teacher_values, student_weight, teacher_weight = saved[:4]
+        need_student_values = ctx.needs_input_grad[0]
+        need_student_weight = ctx.needs_input_grad[2]
+        if not need_student_values and not need_student_weight:
+            return (None,) * 7
+
+        student_values_grad = (
+            torch.zeros_like(student_values) if need_student_values else None
+        )
+        student_weight_grad = (
+            torch.zeros_like(student_weight) if need_student_weight else None
+        )
+        if ctx.metric_code == 1:
+            dots, student_norm_sq, teacher_norm_sq = saved[4:]
+
+        for start in range(0, student_weight.shape[0], ctx.chunk_size):
+            stop = min(start + ctx.chunk_size, student_weight.shape[0])
+            with torch.enable_grad():
+                local_student_values = student_values.detach().requires_grad_(
+                    need_student_values
+                )
+                local_student_weight = (
+                    student_weight[start:stop]
+                    .detach()
+                    .to(dtype=student_values.dtype)
+                    .requires_grad_(need_student_weight)
+                )
+                teacher_chunk = teacher_weight[start:stop].to(
+                    dtype=teacher_values.dtype
+                )
+                student_logits = torch.matmul(
+                    local_student_values,
+                    local_student_weight.transpose(0, 1),
+                )
+                teacher_logits = torch.matmul(
+                    teacher_values,
+                    teacher_chunk.transpose(0, 1),
+                )
+                if ctx.metric_code == 0:
+                    chunk_loss = F.huber_loss(
+                        student_logits,
+                        teacher_logits,
+                        delta=ctx.delta,
+                        reduction="sum",
+                    ) / (student_values.shape[0] * student_weight.shape[0])
+                else:
+                    local_dots = (student_logits * teacher_logits).sum(dim=-1)
+                    local_student_norm_sq = student_logits.square().sum(dim=-1)
+                    differentiable_dots = dots + local_dots - local_dots.detach()
+                    differentiable_student_norm_sq = (
+                        student_norm_sq
+                        + local_student_norm_sq
+                        - local_student_norm_sq.detach()
+                    )
+                    chunk_loss = _cosine_residual_from_statistics(
+                        differentiable_dots,
+                        differentiable_student_norm_sq,
+                        teacher_norm_sq,
+                    )
+
+                differentiable_inputs = []
+                if need_student_values:
+                    differentiable_inputs.append(local_student_values)
+                if need_student_weight:
+                    differentiable_inputs.append(local_student_weight)
+                gradients = torch.autograd.grad(
+                    chunk_loss,
+                    differentiable_inputs,
+                    grad_outputs=grad_output,
+                )
+
+            gradient_index = 0
+            if student_values_grad is not None:
+                student_values_grad.add_(gradients[gradient_index])
+                gradient_index += 1
+            if student_weight_grad is not None:
+                student_weight_grad[start:stop].copy_(gradients[gradient_index])
+
+        return (
+            student_values_grad,
+            None,
+            student_weight_grad,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def _cosine_residual_from_statistics(
+    dots: torch.Tensor,
+    student_norm_sq: torch.Tensor,
+    teacher_norm_sq: torch.Tensor,
+) -> torch.Tensor:
     epsilon = 1e-8
     denominator = (
         student_norm_sq.sqrt().clamp_min(epsilon)

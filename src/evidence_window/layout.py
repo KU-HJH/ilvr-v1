@@ -14,6 +14,7 @@ class TokenIds:
     latent_pad: int
     padding: int
     special: frozenset[int]
+    assistant_termination: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,7 @@ def _extract_row(
     excluded_ids.update(
         {token_ids.latent_start, token_ids.latent_end, token_ids.latent_pad, token_ids.padding}
     )
+    excluded_ids.update(token_ids.assistant_termination)
     positions = torch.arange(length, device=input_ids.device)
     excluded = torch.isin(input_ids, input_ids.new_tensor(tuple(excluded_ids)))
     reasoning = active_attention & labels.ne(-100) & ~excluded
@@ -181,10 +183,20 @@ def _extract_row(
 
     if open_start is not None:
         raise ValueError("unmatched latent delimiter")
+    final_stop = length
+    if token_ids.assistant_termination:
+        termination_ids = input_ids.new_tensor(tuple(token_ids.assistant_termination))
+        termination_positions = (
+            active_attention
+            & torch.isin(input_ids, termination_ids)
+            & positions.ge(text_start)
+        ).nonzero(as_tuple=False).flatten().tolist()
+        if termination_positions:
+            final_stop = termination_positions[0]
     _append_window_if_nonempty(
         windows, reasoning, positions,
         text_start,
-        length,
+        final_stop,
         len(evidence) - 1,
     )
     return evidence, windows

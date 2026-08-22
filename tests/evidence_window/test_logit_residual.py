@@ -111,6 +111,167 @@ def test_chunked_projection_never_allocates_the_full_residual_matrix(monkeypatch
     assert (4, 7) not in projected_shapes
 
 
+def test_low_precision_lm_head_casts_are_vocabulary_chunk_bounded(monkeypatch):
+    """FP32 accumulation must not first copy an entire low-precision LM head."""
+    original_to = torch.Tensor.to
+    converted_weight_shapes: list[tuple[int, ...]] = []
+
+    def traced_to(tensor, *args, **kwargs):
+        result = original_to(tensor, *args, **kwargs)
+        if (
+            tensor.ndim == 2
+            and tensor.shape[1] == 5
+            and tensor.dtype == torch.float16
+            and result.dtype == torch.float32
+        ):
+            converted_weight_shapes.append(tuple(tensor.shape))
+        return result
+
+    monkeypatch.setattr(torch.Tensor, "to", traced_to)
+    chunked_logit_residual_loss(
+        torch.randn((3, 5), dtype=torch.float16, requires_grad=True),
+        torch.randn((3, 5), dtype=torch.float16),
+        torch.randn((17, 5), dtype=torch.float16, requires_grad=True),
+        torch.randn((17, 5), dtype=torch.float16),
+        "huber",
+        4,
+        1.0,
+    )
+
+    assert converted_weight_shapes
+    assert all(shape[0] <= 4 for shape in converted_weight_shapes)
+
+
+@pytest.mark.parametrize("metric", ["huber", "cosine"])
+def test_backward_retains_only_one_projection_chunk_at_a_time(metric):
+    """Adding vocabulary chunks must not increase peak saved projection state."""
+    token_count = 3
+    hidden_size = 5
+    chunk_size = 4
+
+    def peak_saved_projection_elements(vocabulary_size: int) -> int:
+        generator = torch.Generator().manual_seed(1729 + vocabulary_size)
+        student = torch.randn(
+            (token_count, hidden_size), generator=generator, requires_grad=True
+        )
+        teacher = torch.randn((token_count, hidden_size), generator=generator)
+        student_weight = torch.randn(
+            (vocabulary_size, hidden_size), generator=generator, requires_grad=True
+        )
+        teacher_weight = torch.randn(
+            (vocabulary_size, hidden_size), generator=generator
+        )
+        live_projection_elements = 0
+        peak_projection_elements = 0
+
+        def pack(tensor):
+            nonlocal live_projection_elements, peak_projection_elements
+            is_projection = (
+                tensor.ndim == 2
+                and tensor.shape[0] == token_count
+                and 0 < tensor.shape[1] <= chunk_size
+            )
+            if is_projection:
+                live_projection_elements += tensor.numel()
+                peak_projection_elements = max(
+                    peak_projection_elements,
+                    live_projection_elements,
+                )
+            return tensor, is_projection
+
+        def unpack(payload):
+            nonlocal live_projection_elements
+            tensor, is_projection = payload
+            if is_projection:
+                live_projection_elements -= tensor.numel()
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            loss = chunked_logit_residual_loss(
+                student,
+                teacher,
+                student_weight,
+                teacher_weight,
+                metric,
+                chunk_size,
+                0.75,
+            )
+            loss.backward()
+
+        assert live_projection_elements == 0
+        return peak_projection_elements
+
+    one_chunk_peak = peak_saved_projection_elements(chunk_size)
+    many_chunk_peak = peak_saved_projection_elements(6 * chunk_size)
+
+    assert one_chunk_peak > 0
+    assert many_chunk_peak <= one_chunk_peak
+
+
+@pytest.mark.parametrize("metric", ["huber", "cosine"])
+def test_bounded_backward_matches_dense_student_gradients(metric):
+    """Recomputation must preserve gradients for both student projection factors."""
+    student = torch.tensor(
+        [[1.0, -0.5, 2.0], [0.25, 1.5, -1.0]], requires_grad=True
+    )
+    teacher = torch.tensor([[0.5, 1.0, -0.25], [1.0, -0.5, 0.75]])
+    student_weight = torch.tensor(
+        [
+            [1.0, 0.0, 0.5],
+            [0.0, 1.0, -0.5],
+            [0.5, -1.0, 1.0],
+            [-0.5, 0.25, 1.5],
+            [1.0, 1.0, 0.0],
+        ],
+        requires_grad=True,
+    )
+    teacher_weight = torch.tensor(
+        [
+            [0.5, 0.0, 1.0],
+            [0.0, 1.5, -0.25],
+            [1.0, -0.5, 0.75],
+            [-0.25, 0.5, 1.0],
+            [0.75, 1.0, 0.25],
+        ]
+    )
+    dense_student = student.detach().clone().requires_grad_()
+    dense_weight = student_weight.detach().clone().requires_grad_()
+    dense_student_logits = dense_student @ dense_weight.T
+    dense_teacher_logits = teacher @ teacher_weight.T
+    if metric == "huber":
+        dense_loss = F.huber_loss(
+            dense_student_logits,
+            dense_teacher_logits,
+            delta=0.75,
+        )
+    else:
+        dense_loss = 1.0 - F.cosine_similarity(
+            dense_student_logits,
+            dense_teacher_logits,
+        ).mean()
+    dense_loss.backward()
+
+    bounded_loss = chunked_logit_residual_loss(
+        student,
+        teacher,
+        student_weight,
+        teacher_weight,
+        metric,
+        2,
+        0.75,
+    )
+    bounded_loss.backward()
+
+    assert torch.allclose(bounded_loss, dense_loss)
+    assert torch.allclose(student.grad, dense_student.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(
+        student_weight.grad,
+        dense_weight.grad,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 def test_student_hidden_and_head_receive_gradients_but_teacher_is_detached():
     """Residual KD trains both student factors without entering the EMA graph."""
     student = torch.tensor([[1.0, 2.0]], requires_grad=True)

@@ -8,6 +8,7 @@ import torch
 
 from evidence_window.config import (
     EvidenceWindowConfig,
+    LOOConfig,
     PreferenceConfig,
     ReferenceConfig,
     RelationConfig,
@@ -81,6 +82,25 @@ def test_enabled_constructor_builds_native_runtime_after_parent_initialization(
     assert trainer._token_ids.latent_pad == 92
     assert trainer._token_ids.padding == 0
     assert trainer._token_ids.special == frozenset({0, 90, 91, 92, 99})
+    assert trainer._token_ids.assistant_termination == frozenset()
+
+
+def test_assistant_termination_mapping_requires_an_integer_iterable(
+    tiny_trainer_factory,
+):
+    token_ids = dict(TOKEN_IDS)
+    token_ids["assistant_termination"] = 98
+
+    with pytest.raises(
+        ValueError,
+        match="latent_token_ids.assistant_termination must be an iterable of integers",
+    ):
+        tiny_trainer_factory(
+            evidence_window_config=EvidenceWindowConfig(
+                relation=RelationConfig(lambda_magnitude=1.0)
+            ),
+            latent_token_ids=token_ids,
+        )
 
 
 def test_enabled_loss_composes_with_original_loss_and_preserves_fixed_models(
@@ -195,6 +215,84 @@ def test_three_spans_add_one_loo_forward_per_enabled_role(
     assert trainer._reference.model.loo_forward_count == 3
     assert trainer._ema.teacher.full_forward_count == 1
     assert trainer._ema.teacher.loo_forward_count == 3
+
+
+@pytest.mark.parametrize("objective", ["relation", "residual"])
+def test_capped_nonpreference_runs_log_selected_evidence_ordinals(
+    objective,
+    tiny_trainer_factory,
+    monkeypatch,
+):
+    """Capped relation/residual runs stay auditable without matrix dumps or EW-DPO."""
+    import trainer as trainer_module
+
+    config = EvidenceWindowConfig(
+        relation=RelationConfig(
+            lambda_magnitude=1.0 if objective == "relation" else 0.0
+        ),
+        residual=ResidualConfig(
+            lambda_logit=1.0 if objective == "residual" else 0.0,
+            vocab_chunk_size=31,
+        ),
+        loo=LOOConfig(max_spans_per_example=2),
+    )
+    trainer, model = tiny_trainer_factory(
+        evidence_window_config=config,
+        latent_token_ids=TOKEN_IDS,
+        sim_weight=0.0,
+    )
+    input_ids = torch.tensor(
+        [[5, 90, 92, 91, 7, 90, 92, 91, 8, 90, 92, 91, 9, 0]]
+    )
+    inputs = {
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+        "labels": torch.tensor(
+            [[-100, -100, -100, -100, 7, -100, -100, -100, 8,
+              -100, -100, -100, 9, -100]]
+        ),
+        "image_out_mask": input_ids.eq(92),
+    }
+    latent_values = torch.tensor(
+        [[[0.25, -0.5, 0.75, 1.0],
+          [-0.75, 0.5, 0.25, -0.25],
+          [0.6, 0.2, -0.4, 0.8]]]
+    )
+
+    def three_latents(_self, supplied_inputs, k, p):
+        del supplied_inputs, k, p
+        return latent_values.clone(), input_ids.eq(92)
+
+    trainer._teacher_build_latents = MethodType(three_latents, trainer)
+    captured = []
+    monkeypatch.setattr(
+        trainer_module.SFTTrainer,
+        "log",
+        lambda _self, logs, start_time=None: captured.append(dict(logs)),
+    )
+
+    trainer.compute_loss(model, inputs)
+    trainer.log({"loss": 99.0})
+
+    assert len(captured) == 1
+    assert captured[0]["loo/selected_span_count"] == 2.0
+    assert captured[0]["loo/selected_span/0"] == 1.0
+    assert captured[0]["loo/selected_span/1"] == 0.0
+    assert captured[0]["loo/selected_span/2"] == 1.0
+    assert trainer._ew_matrix_writer is None
+
+
+def test_unmatched_latent_start_fails_with_deliberate_value_error(
+    tiny_trainer_factory,
+):
+    """Malformed trainer input must fail before indexing beyond the token row."""
+    trainer, _ = tiny_trainer_factory(
+        evidence_window_config=EvidenceWindowConfig.disabled()
+    )
+    ids = torch.tensor([[5, 90, 92, 7]])
+
+    with pytest.raises(ValueError, match="unmatched latent-start delimiter"):
+        trainer._find_latent_segments(ids, 90, 91, 92)
 
 
 def test_condition_copy_is_local_and_preserves_fixed_token_history(
@@ -414,11 +512,12 @@ def test_main_wires_loaded_config_and_resolved_token_ids_into_trainer(
     import main as main_module
 
     class FakeTokenizer:
-        all_special_ids = [0, 190, 191, 192, 199]
+        all_special_ids = [0, 190, 191, 192, 198, 199]
         ids = {
             "<|latent_start|>": 190,
             "<|latent_end|>": 191,
             "<|latent_pad|>": 192,
+            "<|im_end|>": 198,
             "<|endoftext|>": 0,
         }
 
@@ -527,7 +626,8 @@ def test_main_wires_loaded_config_and_resolved_token_ids_into_trainer(
         "end": 191,
         "pad": 192,
         "padding": 0,
-        "special": (0, 190, 191, 192, 199),
+        "special": (0, 190, 191, 192, 198, 199),
+        "assistant_termination": (198,),
     }
 
     loaded_config = EvidenceWindowConfig(
@@ -548,5 +648,6 @@ def test_main_wires_loaded_config_and_resolved_token_ids_into_trainer(
         "end": 191,
         "pad": 192,
         "padding": 0,
-        "special": (0, 190, 191, 192, 199),
+        "special": (0, 190, 191, 192, 198, 199),
+        "assistant_termination": (198,),
     }

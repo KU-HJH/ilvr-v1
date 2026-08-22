@@ -702,6 +702,17 @@ class EvidenceWindowEngine:
                 selected_per_row.detach().sum(),
                 selected_per_row.detach().gt(0).sum(),
             )
+            if self.config.loo.max_spans_per_example > 0:
+                rows_with_selection = selected_per_row.gt(0)
+                for evidence_index in range(loo_selected.shape[1]):
+                    metric_sums[f"loo/selected_span/{evidence_index}"] = (
+                        self._masked_sum_and_count(
+                            loo_selected[:, evidence_index].to(
+                                dtype=policy_full.token_logps.dtype
+                            ),
+                            rows_with_selection,
+                        )
+                    )
 
         expected_keys = tuple(
             (request.role, request.condition.kind, request.condition.evidence_index)
