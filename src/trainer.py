@@ -222,9 +222,17 @@ class CustomTrainerStage1(SFTTrainer):
                 ",".join(witness.dtypes),
                 "none" if zero_stage is None else zero_stage,
             )
-            if config.reference.mode == "frozen_copy" and zero_stage == 2:
+            if config.reference.mode == "frozen_copy" and zero_stage in (1, 2):
+                partitioning = (
+                    "optimizer states only"
+                    if zero_stage == 1
+                    else "optimizer states and policy gradients"
+                )
                 logging.info(
-                    "Evidence-window frozen reference is rank-local replicated under ZeRO-2"
+                    "Evidence-window frozen reference is rank-local replicated under "
+                    "ZeRO-%d (partitioning: %s); configured stage is preserved",
+                    zero_stage,
+                    partitioning,
                 )
         nonzero_dropout = [
             f"{name}={module.p}"

@@ -147,6 +147,18 @@ EXPECTED_CONFIGS = {
             "ema": set(),
         },
     ),
+    "frozen_reference_zero1.json": (
+        _variant(
+            reference={"mode": "frozen_copy"},
+            preference={"lambda_ew": 1.0},
+            diagnostics={"global_saturation": True},
+        ),
+        {
+            "policy": {"full", "all_null", "loo"},
+            "reference": {"full", "all_null", "loo"},
+            "ema": set(),
+        },
+    ),
 }
 
 
@@ -682,6 +694,51 @@ def test_startup_log_states_complete_objective_and_diagnostic_switches(
         "matrix_dump_interval=7",
     ):
         assert expected in objective_log
+
+
+def test_startup_log_distinguishes_explicit_zero1_and_zero2_replication(
+    tiny_trainer_factory,
+    caplog,
+    monkeypatch,
+):
+    expected_partitioning = {
+        1: "optimizer states only",
+        2: "optimizer states and policy gradients",
+    }
+    for zero_stage, partitioning in expected_partitioning.items():
+        caplog.clear()
+        caplog.set_level("INFO")
+        monkeypatch.setattr(
+            trainer_module.CustomTrainerStage1,
+            "_deepspeed_zero_stage",
+            lambda _self, stage=zero_stage: stage,
+        )
+        tiny_trainer_factory(
+            evidence_window_config=EvidenceWindowConfig(
+                reference=ReferenceConfig(mode="frozen_copy"),
+                preference=PreferenceConfig(lambda_ew=1.0),
+            ),
+            latent_token_ids={
+                "start": 90,
+                "end": 91,
+                "pad": 92,
+                "padding": 0,
+                "special": (0, 90, 91, 92, 99),
+            },
+        )
+
+        replication_log = next(
+            (
+                record.getMessage()
+                for record in caplog.records
+                if "frozen reference is rank-local replicated" in record.getMessage()
+            ),
+            None,
+        )
+        assert replication_log is not None
+        assert f"ZeRO-{zero_stage}" in replication_log
+        assert partitioning in replication_log
+        assert "configured stage is preserved" in replication_log
 
 
 def test_baseline_does_not_add_logging_or_collectives(

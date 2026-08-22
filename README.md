@@ -255,13 +255,16 @@ Two fixed-reference modes are available:
   switches it to evaluation/no-grad mode, prepares it as an evaluation model,
   and excludes it from optimizer groups and policy checkpoints.
 
-ZeRO-2 does not partition frozen parameters. Consequently, a frozen 7B-class
-reference is replicated on every data-parallel rank while the existing full EMA
-teacher also remains resident. Expect roughly another 15–17 GB of BF16 weights
-per rank before activations, optimizer state, or gradients. Startup logging
-reports reference parameter count/bytes/dtypes, detected ZeRO stage, replication
-under ZeRO-2, EMA coexistence, the selected intervention/cap, all objective
-coefficients, diagnostics, and any active nonzero dropout.
+Neither ZeRO-1 nor ZeRO-2 partitions frozen model parameters. Consequently, a
+frozen 7B-class reference is replicated on every data-parallel rank while the
+existing full EMA teacher also remains resident. ZeRO-1 partitions optimizer
+state only; ZeRO-2 also partitions policy gradients. Expect roughly another
+15–17 GB of BF16 weights per rank before activations, optimizer state, or
+gradients. Startup logging reports reference parameter count/bytes/dtypes, the
+detected ZeRO stage, replication under ZeRO-1 or ZeRO-2, the stage-specific
+partitioning semantics, EMA coexistence, the selected intervention/cap, all
+objective coefficients, diagnostics, and any active nonzero dropout. The
+program preserves the explicitly selected stage and never silently switches it.
 
 #### Configurations and launch examples
 
@@ -283,7 +286,8 @@ The shipped variants are:
 | `relation_kd.json` | Relation JSD and magnitude KD |
 | `logit_residual.json` | Chunked EMA logit-residual KD |
 | `loo_relation_combined.json` | EW preference plus both relation losses |
-| `frozen_reference_zero2.json` | Frozen-reference EW preference plus global diagnostics |
+| `frozen_reference_zero1.json` | Frozen-reference EW preference plus global diagnostics for ZeRO-1 |
+| `frozen_reference_zero2.json` | Frozen-reference EW preference plus global diagnostics for ZeRO-2 |
 
 For a LoRA EW run, add the usual dataset/output arguments used by
 `run_training.sh`:
@@ -300,8 +304,25 @@ accelerate launch --num_processes="${NUM_PROCESSES}" src/main.py \
   --ew_config configs/evidence_window/loo_window_preference.json
 ```
 
-The explicit frozen-reference ZeRO-2 variant is launched with the stage-2
-configuration; the program never switches stages implicitly:
+The explicit frozen-reference ZeRO-1 variant uses optimizer-state partitioning
+while keeping policy gradients, policy parameters, EMA, and the frozen
+reference replicated:
+
+```bash
+source /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/venv/ilvr-venv/bin/activate
+accelerate launch --num_processes="${NUM_PROCESSES}" src/main.py \
+  --stage stage1 --task zebra-cot \
+  --data_path /path/to/TRAIN.jsonl \
+  --save_model_path /path/to/output \
+  --log_file /path/to/train.log \
+  --cache_dir /path/to/cache \
+  --lora_dropout 0 \
+  --ew_config configs/evidence_window/frozen_reference_zero1.json \
+  --deepspeed_config /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/.worktrees/ours-trial1/configs/config_stage1.json
+```
+
+The explicit frozen-reference ZeRO-2 variant uses optimizer-state and policy-
+gradient partitioning with the stage-2 configuration:
 
 ```bash
 source /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/venv/ilvr-venv/bin/activate
@@ -337,9 +358,9 @@ residual KD, group/pair ablation, Shapley attribution, or supervised evidence-
 window link selector. Adjacent-pair EW training can miss long-range requirements;
 single-evidence LOO cannot identify synergy or redundancy. The helper-image
 producer remains per-device batch size one. CPU/synthetic validation is
-complete, including previously recorded two-rank schedule/metric tests and a
-real two-rank ZeRO-2 frozen-reference smoke; the full 7B/B200 optimizer-smoke
-matrix still requires separately approved large-model validation.
+complete, including previously recorded two-rank schedule/metric tests and real
+two-rank ZeRO-1 and ZeRO-2 frozen-reference smokes; the approved 7B/B200
+optimizer-smoke matrix is pending completion.
 
 ---
 

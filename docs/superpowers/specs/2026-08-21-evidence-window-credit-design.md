@@ -14,7 +14,7 @@ The design preserves ILVR's existing trainer, EMA teacher, modified Qwen2.5-VL p
 2. scores full, all-null, and single-evidence leave-one-out conditions;
 3. measures global saturation and evidence–window relations;
 4. adds window, evidence–window, relation-distillation, and logit-residual losses behind zero-default coefficients; and
-5. supports either an adapter-disabled fixed reference or an explicit frozen-copy reference for ZeRO-2 experiments.
+5. supports either an adapter-disabled fixed reference or explicit frozen-copy references for ZeRO-1 and ZeRO-2 experiments.
 
 The first implementation uses **zero-latent replacement**, not token deletion or arbitrary attention blocking. Hidden-state residual KD remains a conditional Milestone 7 after logit-residual profiling.
 
@@ -160,14 +160,15 @@ Startup validation rejects this mode if trainable non-adapter parameters could m
 
 `reference.mode = "frozen_copy"` snapshots the initialized policy before optimizer updates, calls `eval()`, sets every parameter to `requires_grad=False`, and prepares it as an evaluation model through Accelerate/DeepSpeed. It is excluded from optimizer construction and checkpoint serialization.
 
-This mode supports full fine-tuning and is included in the first implementation for explicit ZeRO-2 experiments. ZeRO-2 does not partition frozen model parameters, so the copy is replicated on every data-parallel rank. Startup logs must report:
+This mode supports full fine-tuning and is included in the first implementation for explicit ZeRO-1 and ZeRO-2 experiments. Neither stage partitions frozen model parameters, so the copy is replicated on every data-parallel rank. ZeRO-1 partitions optimizer state only; ZeRO-2 partitions optimizer state and policy gradients. Startup logs must report:
 
 - parameter count and dtype-derived parameter bytes;
 - detected DeepSpeed ZeRO stage;
-- that frozen reference parameters are replicated under ZeRO-2; and
+- that frozen reference parameters are replicated under ZeRO-1 or ZeRO-2 without switching the configured stage;
+- the stage-specific optimizer/gradient partitioning distinction; and
 - the simultaneous existence of the replicated EMA teacher.
 
-The default launcher remains backward-compatible with the current ZeRO-3 config. `src/main.py` gains `--deepspeed_config`; frozen-reference examples select `configs/config_stage2.json` explicitly. The program does not silently switch ZeRO stages.
+The default launcher remains backward-compatible with the current ZeRO-3 config. `src/main.py` gains `--deepspeed_config`; frozen-reference examples select `configs/config_stage1.json` or `configs/config_stage2.json` explicitly. The program does not silently switch ZeRO stages.
 
 ## 8. Token Scores and Preference Losses
 
@@ -326,7 +327,8 @@ Shipped configs:
 - `loo_window_preference.json`;
 - `relation_kd.json`;
 - `logit_residual.json`;
-- `loo_relation_combined.json`; and
+- `loo_relation_combined.json`;
+- `frozen_reference_zero1.json`; and
 - `frozen_reference_zero2.json`.
 
 All new coefficients default to zero. Multiple losses may be combined only through explicitly nonzero coefficients, and startup logs print the complete active objective.
@@ -442,7 +444,8 @@ Required integration checks:
 - logit residual smoke;
 - explicit combined-config smoke;
 - LoRA adapter-disabled reference invariance;
-- frozen-copy reference invariance; and
+- frozen-copy reference invariance;
+- two-process tiny-model ZeRO-1 frozen-reference smoke; and
 - two-process tiny-model ZeRO-2 frozen-reference smoke.
 
 Reference and EMA parameters are snapshotted before an optimizer step and compared afterward. Policy and any active residual projection must receive gradients; reference and EMA parameters must not.
@@ -458,7 +461,7 @@ Before any completion claim, the workflow runs `superpowers:verification-before-
 - Adjacent-pair EW-DPO can miss genuine long-range evidence requirements; all-causal diagnostics expose them, while supervised or validated pair selection is future work.
 - Single-evidence LOO does not identify synergy or redundancy among evidence groups.
 - A positive LOO score is not proof of necessity, and negative scores are retained in raw relation logs even though positive-part mass is used for descriptive entropy/top-1 metrics.
-- Frozen-copy ZeRO-2 mode is intentionally memory-heavy and replicated.
+- Frozen-copy ZeRO-1 and ZeRO-2 modes are intentionally memory-heavy and replicated.
 - The existing full EMA copy and batch-size-one helper-image path remain architectural constraints.
 - Hidden-state residual KD, attention blocking, group ablation, and Shapley attribution are deferred.
 
@@ -468,7 +471,7 @@ The following decisions were explicitly approved during brainstorming:
 
 1. modular evidence-window engine with thin trainer integration;
 2. adjacent evidence–window pairs for EW-DPO training and all causal predecessor pairs for diagnostics;
-3. adapter-disabled LoRA reference plus an explicit ZeRO-2 frozen-copy reference in the first implementation;
+3. adapter-disabled LoRA reference plus explicit ZeRO-1 and ZeRO-2 frozen-copy references in the first implementation; both preserve the requested stage and replicate the frozen reference, while ZeRO-1 partitions optimizer state only and ZeRO-2 additionally partitions policy gradients;
 4. zero-latent replacement as the first LOO intervention, with attention blocking deferred;
 5. direct window-masked prefix cancellation;
 6. separate JSD and magnitude relation losses;
