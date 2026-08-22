@@ -129,18 +129,12 @@ def stage2_relation_distribution(
         raise ValueError("contributions must be finite")
     temperature_value = _validate_positive_finite(temperature, "temperature")
 
-    valid_windows = pair_mask.any(dim=1)
-    logits = contributions.to(dtype=torch.float32) / temperature_value
-    masked_logits = logits.masked_fill(~pair_mask, -torch.inf)
-    # An all-masked softmax is undefined. Give those rows finite scratch logits,
-    # then erase their distribution exactly after normalization.
-    safe_logits = torch.where(
-        valid_windows.unsqueeze(1),
-        masked_logits,
-        torch.zeros_like(masked_logits),
+    log_distribution, valid_windows = _stage2_relation_log_distribution(
+        contributions,
+        pair_mask,
+        temperature_value,
     )
-    distribution = F.softmax(safe_logits, dim=1)
-    distribution = distribution.masked_fill(~pair_mask, 0.0)
+    distribution = log_distribution.exp().masked_fill(~pair_mask, 0.0)
     return distribution, valid_windows
 
 
@@ -154,37 +148,59 @@ def stage2_relation_jsd(
     _validate_relation_loss_inputs(
         policy_contributions, reference_contributions, pair_mask
     )
-    policy_distribution, _ = stage2_relation_distribution(
-        policy_contributions, pair_mask, temperature
+    temperature_value = _validate_positive_finite(temperature, "temperature")
+    policy_log_distribution, _ = _stage2_relation_log_distribution(
+        policy_contributions, pair_mask, temperature_value
     )
-    reference_distribution, _ = stage2_relation_distribution(
-        reference_contributions.detach(), pair_mask, temperature
+    reference_log_distribution, _ = _stage2_relation_log_distribution(
+        reference_contributions.detach(), pair_mask, temperature_value
     )
     eligible = pair_mask.sum(dim=1) >= 2
     if not eligible.any():
-        return policy_contributions.to(dtype=torch.float32).sum() * 0.0
+        # One finite element is sufficient to retain the policy graph. Summing
+        # an extreme but finite tensor before multiplying by zero can overflow.
+        return policy_contributions.reshape(-1)[:1].to(dtype=torch.float32).sum() * 0.0
 
-    midpoint = 0.5 * (policy_distribution + reference_distribution)
-    policy_log = torch.where(
-        policy_distribution > 0,
-        policy_distribution.log(),
-        torch.zeros_like(policy_distribution),
-    )
-    reference_log = torch.where(
-        reference_distribution > 0,
-        reference_distribution.log(),
-        torch.zeros_like(reference_distribution),
-    )
-    midpoint_log = torch.where(
-        midpoint > 0,
-        midpoint.log(),
-        torch.zeros_like(midpoint),
-    )
+    # Never evaluate -inf - -inf on invalid entries. Mask those log values to
+    # the same finite constant before logaddexp; their resulting zero terms are
+    # excluded from both the value and the gradient by masked_fill.
+    policy_log = policy_log_distribution.masked_fill(~pair_mask, 0.0)
+    reference_log = reference_log_distribution.masked_fill(~pair_mask, 0.0)
+    midpoint_log = torch.logaddexp(policy_log, reference_log) - math.log(2.0)
+    policy_distribution = policy_log.exp().masked_fill(~pair_mask, 0.0)
+    reference_distribution = reference_log.exp().masked_fill(~pair_mask, 0.0)
     window_jsd = 0.5 * (
         (policy_distribution * (policy_log - midpoint_log)).sum(dim=1)
         + (reference_distribution * (reference_log - midpoint_log)).sum(dim=1)
     )
     return _guard_jsd_roundoff(window_jsd.masked_select(eligible).mean())
+
+
+def _stage2_relation_log_distribution(
+    contributions: torch.Tensor,
+    pair_mask: torch.Tensor,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return stable FP32 log-probabilities without overflowing scaled logits."""
+    valid_windows = pair_mask.any(dim=1)
+    if contributions.shape[1] == 0:
+        return contributions.to(dtype=torch.float32), valid_windows
+
+    # Center before temperature scaling. Float64 is only a temporary range
+    # extension; any negative overflow from an exceptionally tiny temperature
+    # is clamped before the values enter the FP32 log_softmax computation.
+    wide = contributions.to(dtype=torch.float64)
+    masked_wide = wide.masked_fill(~pair_mask, -torch.inf)
+    maximum = masked_wide.amax(dim=1, keepdim=True)
+    maximum = maximum.masked_fill(~valid_windows.unsqueeze(1), 0.0)
+    centered = (wide - maximum).masked_fill(~pair_mask, 0.0)
+    bounded = (centered / temperature).clamp(min=-1.0e30, max=0.0)
+    logits = bounded.to(dtype=torch.float32).masked_fill(~pair_mask, -torch.inf)
+
+    # An all-masked log_softmax is undefined. Its scratch row is erased below.
+    safe_logits = logits.masked_fill(~valid_windows.unsqueeze(1), 0.0)
+    log_distribution = F.log_softmax(safe_logits, dim=1)
+    return log_distribution.masked_fill(~pair_mask, -torch.inf), valid_windows
 
 
 def relation_matrix(

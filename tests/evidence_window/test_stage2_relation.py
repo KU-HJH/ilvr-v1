@@ -117,6 +117,71 @@ def test_relation_jsd_is_symmetric_finite_for_variable_candidate_sets_and_stops_
     assert teacher.grad is None
 
 
+@pytest.mark.parametrize(
+    ("dtype", "magnitude"),
+    [
+        (torch.float16, 65_000.0),
+        (torch.bfloat16, 65_000.0),
+        (torch.float32, torch.finfo(torch.float32).max * 0.75),
+    ],
+)
+def test_extreme_relation_logits_keep_distribution_loss_and_policy_gradient_finite(
+    dtype, magnitude
+):
+    """Overflow before softmax or probability-space log(0) must not poison gradients."""
+    from evidence_window.losses import (
+        stage2_relation_distribution,
+        stage2_relation_jsd,
+    )
+
+    policy = torch.tensor(
+        [[[magnitude], [-magnitude], [magnitude]]], dtype=dtype, requires_grad=True
+    )
+    reference = torch.tensor(
+        [[[-magnitude], [magnitude], [-magnitude]]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    mask = torch.tensor([[[True], [True], [False]]])
+
+    distribution, valid = stage2_relation_distribution(policy, mask, 1e-4)
+    loss = stage2_relation_jsd(policy, reference, mask, 1e-4)
+    reverse = stage2_relation_jsd(reference.detach(), policy.detach(), mask, 1e-4)
+
+    assert distribution.dtype is torch.float32
+    assert torch.isfinite(distribution).all()
+    assert distribution[0, 2, 0].item() == 0.0
+    torch.testing.assert_close(distribution.sum(dim=1), torch.ones((1, 1)))
+    assert valid.tolist() == [[True]]
+    assert torch.isfinite(loss)
+    assert 0.0 <= loss.item() <= 0.693148
+    torch.testing.assert_close(loss.detach(), reverse)
+
+    loss.backward()
+    assert policy.grad is not None and torch.isfinite(policy.grad).all()
+    assert reference.grad is None
+
+
+def test_extreme_single_candidate_keeps_exact_graph_connected_zero():
+    """Creating the degenerate zero must not sum huge policy values first."""
+    from evidence_window.losses import stage2_relation_jsd
+
+    magnitude = torch.finfo(torch.float32).max * 0.75
+    policy = torch.tensor(
+        [[[magnitude], [magnitude]]], dtype=torch.float32, requires_grad=True
+    )
+    reference = torch.tensor([[[-magnitude], [-magnitude]]], dtype=torch.float32)
+    mask = torch.tensor([[[True], [False]]])
+
+    loss = stage2_relation_jsd(policy, reference, mask, 1e-4)
+
+    assert loss.item() == 0.0
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert policy.grad is not None
+    assert torch.equal(policy.grad, torch.zeros_like(policy))
+
+
 def test_relation_only_engine_runs_policy_effects_uses_fixed_target_and_own_schedule():
     """Relation-only training must not be suppressed by a zero EW coefficient."""
     from evidence_window.losses import stage2_relation_jsd
