@@ -802,6 +802,84 @@ class Qwen2_5_VLAttention(nn.Module):
 
         return attn_output, attn_weights, past_key_value
 
+    def forward_sdpa(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Run SDPA with this module's existing projection weights."""
+        if output_attentions:
+            logger.warning_once(
+                "Qwen2_5_VLModel is using Qwen2_5_VLSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return Qwen2_5_VLAttention.forward(
+                self,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_multimodal_rotary_pos_emb(
+            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        )
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        causal_mask = attention_mask
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+        if query_states.device.type == "cuda" and attention_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        is_causal = causal_mask is None and q_len > 1
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
     
     
 class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
@@ -1121,76 +1199,16 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if output_attentions:
-            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
-            logger.warning_once(
-                "Qwen2_5_VLModel is using Qwen2_5_VLSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-            )
-            return super().forward(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-            )
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        return self.forward_sdpa(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
         )
-
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        causal_mask = attention_mask
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-
-        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-        # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type == "cuda" and attention_mask is not None:
-            query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
-
-        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-        # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-        is_causal = True if causal_mask is None and q_len > 1 else False
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=causal_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
-        )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output, None, past_key_value
 
 
 QWEN2_5_VL_ATTENTION_CLASSES = {
@@ -1228,6 +1246,7 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         generate_mode: Optional[bool] = False,
+        attention_backend_override: Optional[str] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1257,7 +1276,18 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        if generate_mode and self.attn_type == "flash_attention_2":
+        if attention_backend_override == "sdpa":
+            hidden_states, self_attn_weights, present_key_value = self.self_attn.forward_sdpa(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+        elif generate_mode and self.attn_type == "flash_attention_2":
         #generate, normal forward
             hidden_states, self_attn_weights, present_key_value = self.self_attn.forward_normal(
                 hidden_states=hidden_states,
@@ -1354,6 +1384,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         generate_mode: Optional[bool] = False,
+        attention_block_mask: Optional[torch.Tensor] = None,
+        attention_backend_override: Optional[str] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1380,6 +1412,14 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        self._validate_attention_override(
+            attention_backend_override=attention_backend_override,
+            attention_block_mask=attention_block_mask,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+        )
+
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -1392,9 +1432,17 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         elif position_ids.dim() == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
+        if attention_backend_override == "sdpa":
+            causal_mask = self._build_auxiliary_sdpa_mask(
+                attention_mask=attention_mask,
+                attention_block_mask=attention_block_mask,
+                input_tensor=inputs_embeds,
+                cache_position=cache_position,
+            )
+        else:
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            )
 
         hidden_states = inputs_embeds
 
@@ -1422,6 +1470,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     cache_position,
                     position_embeddings,
                     generate_mode,
+                    attention_backend_override,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1434,6 +1483,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     generate_mode=generate_mode,
+                    attention_backend_override=attention_backend_override,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1460,6 +1510,61 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+
+    @staticmethod
+    def _validate_attention_override(
+        *,
+        attention_backend_override: Optional[str],
+        attention_block_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        inputs_embeds: torch.Tensor,
+        use_cache: bool,
+    ) -> None:
+        if attention_backend_override not in (None, "sdpa"):
+            raise ValueError("attention_backend_override must be None or 'sdpa'")
+        if attention_block_mask is not None and attention_backend_override != "sdpa":
+            raise ValueError("attention_block_mask requires the explicit SDPA override")
+        if attention_backend_override != "sdpa":
+            return
+        if use_cache:
+            raise ValueError("the auxiliary SDPA override requires use_cache=False")
+        if attention_mask is not None and attention_mask.ndim != 2:
+            raise ValueError("the auxiliary SDPA override requires a 2D attention_mask")
+        if attention_block_mask is None:
+            return
+        batch_size, sequence_length = inputs_embeds.shape[:2]
+        if attention_block_mask.dtype is not torch.bool:
+            raise ValueError("attention_block_mask must be boolean")
+        if attention_block_mask.shape != (batch_size, sequence_length, sequence_length):
+            raise ValueError("attention_block_mask must have shape [B, T, T]")
+        if attention_block_mask.device != inputs_embeds.device:
+            raise ValueError("attention_block_mask must be on the input device")
+
+    def _build_auxiliary_sdpa_mask(
+        self,
+        *,
+        attention_mask: Optional[torch.Tensor],
+        attention_block_mask: Optional[torch.Tensor],
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+    ) -> torch.Tensor:
+        sequence_length = input_tensor.shape[1]
+        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask,
+            sequence_length=sequence_length,
+            target_length=sequence_length,
+            dtype=input_tensor.dtype,
+            device=input_tensor.device,
+            cache_position=cache_position,
+            batch_size=input_tensor.shape[0],
+            config=self.config,
+            past_key_values=None,
+        )
+        if attention_block_mask is not None:
+            causal_mask = causal_mask.masked_fill(
+                attention_block_mask[:, None], torch.finfo(input_tensor.dtype).min
+            )
+        return causal_mask
 
     def _update_causal_mask(
         self,
@@ -1982,6 +2087,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         image_out_mask: Optional[torch.Tensor] = None, 
         generate_mode: Optional[bool] = False,
         latent_hidden_states: Optional[torch.Tensor] = None, 
+        attention_block_mask: Optional[torch.Tensor] = None,
+        attention_backend_override: Optional[str] = None,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2096,6 +2203,14 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
 
+        self.model._validate_attention_override(
+            attention_backend_override=attention_backend_override,
+            attention_block_mask=attention_block_mask,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache is True,
+        )
+
         all_hidden_states_seq = []
         
         if self.config.stage == 'stage2' and not generate_mode:
@@ -2118,7 +2233,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             self.rope_deltas = full_rope_deltas
 
 
-            def latent_step_forward(step_embeds, step_mask, step_pos_ids):
+            def latent_step_forward(step_embeds, step_mask, step_pos_ids, step_block_mask):
 
 
                 is_gc_enabled = getattr(self.model, "gradient_checkpointing", False)
@@ -2134,7 +2249,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     use_cache=False, 
                     output_attentions=False,
                     output_hidden_states=False,
-                    return_dict=True
+                    return_dict=True,
+                    attention_block_mask=step_block_mask,
+                    attention_backend_override=attention_backend_override,
                 )
                 
 
@@ -2160,6 +2277,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 prefix_inputs = curr_inputs_embeds[:, :cur_end, :]
                 prefix_mask = attention_mask[:, :cur_end]
                 prefix_pos_ids = full_position_ids[:, :, :cur_end]
+                prefix_block_mask = (
+                    None
+                    if attention_block_mask is None
+                    else attention_block_mask[:, :cur_end, :cur_end]
+                )
 
 
                 if self.training:
@@ -2168,10 +2290,13 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         prefix_inputs,
                         prefix_mask,
                         prefix_pos_ids,
+                        prefix_block_mask,
                         use_reentrant=False 
                     )
                 else:
-                    hidden_full = latent_step_forward(prefix_inputs, prefix_mask, prefix_pos_ids)
+                    hidden_full = latent_step_forward(
+                        prefix_inputs, prefix_mask, prefix_pos_ids, prefix_block_mask
+                    )
 
 
                 hidden_new = hidden_full[:, slice_start:slice_end, :]
@@ -2223,11 +2348,21 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 prefix_inputs = curr_inputs_embeds 
                 prefix_mask = attention_mask
                 prefix_pos_ids = full_position_ids
+                prefix_block_mask = attention_block_mask
                 
                 if self.training:
-                     hidden_full = checkpoint(latent_step_forward, prefix_inputs, prefix_mask, prefix_pos_ids, use_reentrant=False)
+                     hidden_full = checkpoint(
+                         latent_step_forward,
+                         prefix_inputs,
+                         prefix_mask,
+                         prefix_pos_ids,
+                         prefix_block_mask,
+                         use_reentrant=False,
+                     )
                 else:
-                     hidden_full = latent_step_forward(prefix_inputs, prefix_mask, prefix_pos_ids)
+                     hidden_full = latent_step_forward(
+                         prefix_inputs, prefix_mask, prefix_pos_ids, prefix_block_mask
+                     )
                 
                 hidden_tail = hidden_full[:, slice_start:, :]
                 all_hidden_states_seq.append(hidden_tail)
@@ -2283,6 +2418,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 return_dict=return_dict,
                 cache_position=cache_position,
                 generate_mode=generate_mode,
+                attention_block_mask=attention_block_mask,
+                attention_backend_override=attention_backend_override,
             )
             hidden_states = outputs[0]
             
