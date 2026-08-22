@@ -580,6 +580,35 @@ def test_nonempty_artifact_destination_fails_before_model_load(
     assert loads == []
 
 
+def test_dangling_artifact_symlink_fails_before_model_load(tmp_path, monkeypatch):
+    """A dangling destination symlink must not bypass the cheap artifact gate."""
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.symlink_to(tmp_path / "missing-target", target_is_directory=True)
+    args = SimpleNamespace(
+        artifact_dir=str(artifact_dir),
+        dataset_sha256_witness=None,
+        data_path=str(tmp_path / "data.jsonl"),
+    )
+    loads = []
+    monkeypatch.setattr(precompute_module, "_initialize_distributed_if_requested", lambda: None)
+    monkeypatch.setattr(precompute_module.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        precompute_module,
+        "sha256_file",
+        lambda path: loads.append(("dataset", path)) or "c" * 64,
+    )
+    monkeypatch.setattr(
+        precompute_module,
+        "_produce_rank_shard",
+        lambda *args, **kwargs: loads.append(("model", args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="artifact precheck.*symlink"):
+        precompute_module.precompute(args)
+
+    assert loads == []
+
+
 @pytest.mark.parametrize(
     ("phase", "local_failure", "remote_failure"),
     [
@@ -926,10 +955,15 @@ def test_distributed_reference_lookup_replays_remote_failure_before_auxiliary_fo
     monkeypatch.setattr(trainer_stage2_module.SFTTrainer, "__init__", fake_init)
     monkeypatch.setattr(trainer_stage2_module.distributed, "is_available", lambda: True)
     monkeypatch.setattr(trainer_stage2_module.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(trainer_stage2_module.distributed, "get_backend", lambda: "gloo")
+
+    reductions = []
 
     def inject_remote_failure(value, op):
         del op
-        value.fill_(1)
+        reductions.append(value.item())
+        if len(reductions) == 2:
+            value.fill_(1)
 
     def remote_messages(output, local):
         assert local is None
@@ -976,6 +1010,7 @@ def test_distributed_reference_lookup_replays_remote_failure_before_auxiliary_fo
         trainer.compute_loss(model, batch)
 
     assert model.calls == 1
+    assert len(reductions) == 2
 
 
 def test_trainer_rejects_reference_batch_returned_in_wrong_sample_order(

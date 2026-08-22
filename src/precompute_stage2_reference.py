@@ -239,12 +239,16 @@ def precompute(args: argparse.Namespace) -> None:
 
 
 def _precheck_artifact(artifact_dir: Path) -> None:
-    if not artifact_dir.exists():
+    if not os.path.lexists(artifact_dir):
         return
-    if not artifact_dir.is_dir() or any(artifact_dir.iterdir()):
+    if (
+        artifact_dir.is_symlink()
+        or not artifact_dir.is_dir()
+        or any(artifact_dir.iterdir())
+    ):
         raise FileExistsError(
             "reference artifact destination must be an empty directory; "
-            "refusing a nonempty or non-directory destination"
+            "refusing a nonempty, non-directory, or symlink destination"
         )
 
 

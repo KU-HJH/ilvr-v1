@@ -116,7 +116,7 @@ def test_active_stage2_auxiliary_rejects_dropout_before_matched_replay(
     with pytest.raises(ValueError, match=name):
         trainer.compute_loss(model, _batch())
 
-    assert model.calls == 1
+    assert model.calls == 0
 
 
 def test_zero_dropout_allows_matched_full_and_loo_replay(monkeypatch, tmp_path):
@@ -143,7 +143,7 @@ def test_ce_only_warmup_does_not_enforce_auxiliary_dropout(monkeypatch, tmp_path
     assert model.calls == 1
 
 
-def _asymmetric_layout_preflight_worker(rank, init_file, result_dir):
+def _asymmetric_preflight_worker(rank, init_file, result_dir, failure_mode):
     torch.distributed.init_process_group(
         "gloo",
         init_method=f"file://{init_file}",
@@ -175,8 +175,11 @@ def _asymmetric_layout_preflight_worker(rank, init_file, result_dir):
     )
     engine = CountingEngine()
     trainer._ew_engine = engine
+    batch = _batch(malformed=rank == 1 and failure_mode == "malformed")
+    if rank == 1 and failure_mode in {"labels", "attention_mask"}:
+        batch.pop(failure_mode)
     try:
-        trainer.compute_loss(model, _batch(malformed=rank == 1))
+        trainer.compute_loss(model, batch)
         outcome = "unexpected success"
     except Exception as exc:
         outcome = (
@@ -188,16 +191,15 @@ def _asymmetric_layout_preflight_worker(rank, init_file, result_dir):
         torch.distributed.destroy_process_group()
 
 
-def test_two_rank_layout_failure_is_collective_before_any_auxiliary_callback(tmp_path):
-    """One malformed rank must make both peers exit before reference/edge collectives."""
+def _run_two_rank_preflight_failure(tmp_path, failure_mode):
     context = multiprocessing.get_context("spawn")
     init_file = tmp_path / "gloo-init"
     result_dir = tmp_path / "results"
     result_dir.mkdir()
     processes = [
         context.Process(
-            target=_asymmetric_layout_preflight_worker,
-            args=(rank, str(init_file), str(result_dir)),
+            target=_asymmetric_preflight_worker,
+            args=(rank, str(init_file), str(result_dir), failure_mode),
         )
         for rank in range(2)
     ]
@@ -217,6 +219,21 @@ def test_two_rank_layout_failure_is_collective_before_any_auxiliary_callback(tmp
     ]
     assert outcomes[0] == outcomes[1]
     assert "distributed Stage-2 auxiliary preflight failed" in outcomes[0]
-    assert "unmatched latent" in outcomes[0]
     assert "auxiliary_calls=0" in outcomes[0]
-    assert "model_calls=1" in outcomes[0]
+    assert "model_calls=0" in outcomes[0]
+    return outcomes[0]
+
+
+def test_two_rank_layout_failure_is_collective_before_ce_or_auxiliary(tmp_path):
+    """One malformed rank must make both peers exit before model or aux work."""
+    outcome = _run_two_rank_preflight_failure(tmp_path, "malformed")
+    assert "unmatched latent" in outcome
+
+
+@pytest.mark.parametrize("missing_key", ["labels", "attention_mask"])
+def test_two_rank_missing_required_input_is_collective_before_ce_or_auxiliary(
+    tmp_path, missing_key
+):
+    """A missing active-path tensor must be agreed before either rank calls CE."""
+    outcome = _run_two_rank_preflight_failure(tmp_path, missing_key)
+    assert f"input(s): {missing_key}" in outcome

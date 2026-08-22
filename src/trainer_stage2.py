@@ -155,16 +155,18 @@ class CustomTrainerStage2(SFTTrainer):
         sample_indices = model_inputs.pop("ew_sample_indices", None)
         plan_types = model_inputs.pop("ew_plan_types", None)
 
-        # Establish ordinary Stage-2 CE first. The disabled branch returns
-        # here without parsing or auxiliary replay.
-        outputs = model(**model_inputs)
-        ce_loss = outputs.loss
+        # Disabled Stage 2 remains the direct CE baseline: no progress,
+        # metadata, layout, or dropout validation is introduced on this path.
         if self.evidence_window_config.is_disabled:
+            outputs = model(**model_inputs)
+            ce_loss = outputs.loss
             return (ce_loss, outputs) if return_outputs else ce_loss
 
         progress = self._training_progress()
         active_objectives = self._active_auxiliary_objectives(progress)
         if not active_objectives:
+            outputs = model(**model_inputs)
+            ce_loss = outputs.loss
             self._record_ce_metric(ce_loss, model_inputs, model.training)
             return (ce_loss, outputs) if return_outputs else ce_loss
 
@@ -184,8 +186,13 @@ class CustomTrainerStage2(SFTTrainer):
                 self._stage2_reference_provider is not None
                 and bool(active_reference_objectives)
             ),
-            collective_device=ce_loss.device,
         )
+
+        # Active ranks have now collectively agreed that the CE inputs and all
+        # auxiliary metadata are valid, so no peer can fail before this call
+        # while another enters a later auxiliary collective.
+        outputs = model(**model_inputs)
+        ce_loss = outputs.loss
 
         labels = model_inputs["labels"]
         auxiliary_inputs = dict(model_inputs)
@@ -467,9 +474,8 @@ def _coordinated_auxiliary_preflight(
     token_ids: TokenIds,
     max_evidence_edges_per_window: int,
     requires_sample_indices: bool,
-    collective_device: torch.device,
 ) -> Stage2InterleavedLayout:
-    """Validate every rank before any reference or edge-replay collective."""
+    """Validate every active rank before CE or any auxiliary collective."""
     layout = None
     local_exception: Exception | None = None
     local_error: str | None = None
@@ -506,6 +512,9 @@ def _coordinated_auxiliary_preflight(
         local_error = f"{type(exc).__name__}: {exc}"
 
     if distributed.is_available() and distributed.is_initialized():
+        collective_device = _auxiliary_preflight_collective_device(
+            model, model_inputs
+        )
         failed = torch.tensor(
             int(local_error is not None),
             dtype=torch.long,
@@ -528,6 +537,29 @@ def _coordinated_auxiliary_preflight(
 
     assert layout is not None
     return layout
+
+
+def _auxiliary_preflight_collective_device(
+    model,
+    model_inputs: Mapping[str, Any],
+) -> torch.device:
+    """Choose a backend-compatible device without assuming any required input exists."""
+    backend = str(distributed.get_backend()).lower()
+    if "nccl" not in backend:
+        return torch.device("cpu")
+
+    for value in model_inputs.values():
+        if torch.is_tensor(value) and value.device.type == "cuda":
+            return value.device
+    for parameter in model.parameters():
+        if parameter.device.type == "cuda":
+            return parameter.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    # An initialized NCCL group necessarily has a CUDA device in supported
+    # execution. Returning CPU here lets the backend raise its own setup error
+    # rather than introducing a rank-local preflight branch.
+    return torch.device("cpu")
 
 
 def _validate_deterministic_auxiliary_dropout(model) -> None:
