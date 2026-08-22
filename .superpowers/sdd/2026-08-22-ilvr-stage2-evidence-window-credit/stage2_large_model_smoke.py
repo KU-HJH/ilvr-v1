@@ -386,6 +386,15 @@ def _validate_precomputed_preflight(args, config) -> None:
     }
     if mismatches:
         raise ValueError(f"reference artifact identity mismatch: {mismatches}")
+    requested_sample = args.sample_index
+    owner_count = sum(
+        requested_sample in shard.sample_indices for shard in shards
+    )
+    if owner_count != 1:
+        raise ValueError(
+            f"sample index {requested_sample} must appear in exactly one artifact shard; "
+            f"found {owner_count}"
+        )
     if config.residual.enabled and config.residual.lambda_res > 0.0:
         if any(
             shard.record_count > 0 and not shard.has_hidden_residuals

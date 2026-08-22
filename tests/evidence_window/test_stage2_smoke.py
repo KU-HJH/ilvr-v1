@@ -858,6 +858,7 @@ def test_residual_preflight_ignores_empty_nonowner_shard(tmp_path):
     publish_reference_manifest(tmp_path, identity, [empty, owner])
     args = SimpleNamespace(
         reference_artifact_dir=str(tmp_path),
+        sample_index=7,
         reference_dataset_sha256="a" * 64,
         reference_checkpoint_id="stage1-approved",
         reference_checkpoint_witness="sealed-stage1",
@@ -1304,6 +1305,60 @@ def test_preflight_rejects_manifest_identity_mismatch_before_model_load(
 
     monkeypatch.setattr(module, "_load_processor_and_model", count_load)
     with pytest.raises(ValueError, match="identity mismatch"):
+        module.main(argv)
+    assert loads == 0
+
+
+@pytest.mark.parametrize("ownership", ["missing", "duplicate"])
+def test_preflight_requires_exactly_one_shard_owner_for_requested_sample(
+    tmp_path, monkeypatch, ownership
+):
+    """Dataset identity alone must not authorize a missing or multiply-owned smoke row."""
+    module = _load_large_smoke_module()
+    artifact = tmp_path / "artifact"
+    identity = _identity()
+    if ownership == "missing":
+        write_reference_shard(
+            artifact,
+            identity,
+            {7: ReferenceSampleTargets(torch.tensor([[0.2]]), torch.tensor([[True]]))},
+        )
+    else:
+        first = write_reference_shard(
+            artifact,
+            identity,
+            {0: ReferenceSampleTargets(torch.tensor([[0.2]]), torch.tensor([[True]]))},
+            rank=0,
+            publish_manifest=False,
+        )
+        second = write_reference_shard(
+            artifact,
+            identity,
+            {0: ReferenceSampleTargets(torch.tensor([[0.3]]), torch.tensor([[True]]))},
+            rank=1,
+            publish_manifest=False,
+        )
+        (artifact / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "format": "ilvr-stage2-reference",
+                    "identity": identity.to_dict(),
+                    "shards": [first.to_dict(), second.to_dict()],
+                }
+            ),
+            encoding="utf-8",
+        )
+    argv = _preflight_cli(tmp_path, artifact)
+    argv.extend(["--reference-checkpoint-witness", "sealed-stage1"])
+    loads = 0
+
+    def count_load(*_args, **_kwargs):
+        nonlocal loads
+        loads += 1
+        raise AssertionError("model construction must not begin")
+
+    monkeypatch.setattr(module, "_load_processor_and_model", count_load)
+    with pytest.raises(ValueError, match="sample index 0.*exactly one.*shard"):
         module.main(argv)
     assert loads == 0
 
