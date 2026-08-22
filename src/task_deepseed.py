@@ -20,13 +20,19 @@ def _assert_exists(p: str):
         raise FileNotFoundError(f"Image path not found: {p}")
 
 
-def interleaved_latent_cot_preprocess_function(sample):
+def interleaved_latent_cot_preprocess_function(
+    sample,
+    *,
+    validate_user_images: bool = True,
+    validate_helper_images: bool = True,
+):
     
     # Process user content (Input images)
     user_content = []
     for image_rel in _to_list(sample.get('image_input', [])):
         full_image_path = _resolve_path(TRAIN_IMAGE_ROOT, image_rel)
-        _assert_exists(full_image_path)
+        if validate_user_images:
+            _assert_exists(full_image_path)
         user_content.append({"type": "image", "image": full_image_path})
     user_content.append({"type": "text", "text": sample.get("text_input", "")})
 
@@ -45,7 +51,8 @@ def interleaved_latent_cot_preprocess_function(sample):
             if not helper_rel:
                 raise ValueError(f"Latent step is missing 'helper_image': {step}")
             helper_path = _resolve_path(TRAIN_IMAGE_ROOT, helper_rel)
-            _assert_exists(helper_path)
+            if validate_helper_images:
+                _assert_exists(helper_path)
             assistant_content.append({"type": "image", "image": helper_path})
         else:
             raise ValueError(f"Unknown step type: {stype}")

@@ -310,3 +310,76 @@ def legacy_no_latent_case():
         "recorded_logits_sum": torch.tensor(-5.442888259887695),
         "recorded_legacy_forward_count": 1,
     }
+
+
+@pytest.fixture
+def raw_sample():
+    return {
+        "image_input": "input.png",
+        "text_input": "Where should the agent move?",
+        "sequence_plan": [
+            {"type": "text", "content": "Inspect the map."},
+            {"type": "latent", "helper_image": "missing-helper.png"},
+            {"type": "text", "content": "Move right."},
+        ],
+    }
+
+
+class _Stage2Tokenizer:
+    _ids = {
+        "<|latent_start|>": 90,
+        "<|latent_end|>": 91,
+        "<|latent_pad|>": 92,
+        "<|endoftext|>": 0,
+        "<|im_start|>assistant": 93,
+    }
+
+    def __call__(self, value, return_tensors):
+        assert return_tensors == "pt"
+        return {"input_ids": torch.tensor([[self._ids[value]]])}
+
+
+class _Stage2Processor:
+    def __init__(self):
+        self.tokenizer = _Stage2Tokenizer()
+        self.image_inputs = None
+
+    def apply_chat_template(self, conversation, tokenize):
+        assert not tokenize
+        rendered = []
+        for turn in conversation:
+            rendered.append(f"<|im_start|>{turn['role']}")
+            for item in turn["content"]:
+                if item["type"] == "image":
+                    rendered.append("<|vision_start|><|image_pad|><|vision_end|>")
+                else:
+                    rendered.append(item["text"])
+        return "".join(rendered)
+
+    def __call__(self, *, text, images, return_tensors, padding):
+        assert return_tensors == "pt"
+        assert padding
+        self.image_inputs = images
+        return {
+            "input_ids": torch.tensor([[93, 90, 100, 91, 94, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),
+            "pixel_values": torch.ones((1, 1)),
+            "image_grid_thw": torch.ones((1, 3), dtype=torch.long),
+        }
+
+
+@pytest.fixture
+def stage2_processor():
+    return _Stage2Processor()
+
+
+@pytest.fixture
+def stage2_args():
+    return lambda: SimpleNamespace(latent_size=2)
+
+
+@pytest.fixture
+def stage2_record(raw_sample):
+    from stage2_data import build_stage2_record
+
+    return build_stage2_record(raw_sample, 17, validate_user_images=False)
