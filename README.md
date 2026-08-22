@@ -353,6 +353,32 @@ reduced across ranks before means are emitted. Matrix dumps are off when
 `matrix_dump_dir` with only opaque rank/step/local-counter identifiers—never raw
 text, sample IDs, or image paths.
 
+#### 7B/B200 optimizer-smoke results
+
+The production Qwen2.5-VL 7B path, real interleaved sample, LoRA (`r=4`,
+`alpha=8`, dropout zero), compact latent producer, condition forwards, Trainer
+optimizer/callback lifecycle, and EMA update were validated for one optimizer
+step per case on NVIDIA B200 GPUs. Successful cases were not repeated.
+
+| Case | Ranks / ZeRO | Active auxiliary loss | Canonical evidence conditions per rank (`P/R/E`) | Peak allocated / reserved | Wall time |
+| --- | --- | --- | --- | --- | --- |
+| Baseline disabled | 1 / none | none | `F1/F0/F0` | 33.50 / 34.74 GiB | 27.65 s |
+| Global diagnostic | 1 / none | metrics only | `F1+A1/F1+A1/F0` | 33.88 / 34.74 GiB | 22.99 s |
+| Window preference | 1 / none | `0.69314718` | `F1+A1/F1+A1/F0` | 35.86 / 37.01 GiB | 22.65 s |
+| EW-DPO, adapter-disabled | 1 / none | `0.69314718` | `F1+L3/F1+L3/F0` | 38.12 / 39.05 GiB | 23.70 s |
+| EW-DPO, frozen copy | 2 / ZeRO-1 | `0.67923099` | `F1+A1+L3/F1+A1+L3/F0` | 51.81 / 56.59–56.64 GiB | 57.30 s |
+| EW-DPO, frozen copy | 2 / ZeRO-2 | `0.67923099` | `F1+A1+L3/F1+A1+L3/F0` | 51.81 / 54.70 GiB | 80.02 s |
+| Relation JSD | 1 / none | `0.0` at identical initialization | `F1+L3/F0/F1+L3` | 38.12 / 39.29 GiB | 23.55 s |
+| Relation magnitude | 1 / none | `0.0` at identical initialization | `F1+L3/F0/F1+L3` | 38.12 / 39.29 GiB | 23.25 s |
+| Logit residual | 1 / none | `3.784389e-6` | `F1+L3/F0/F1+L3` | 38.63 / 39.25 GiB | 28.10 s |
+| Explicit combined | 1 / none | EW `0.69314718`; JSD/magnitude `0.0` | `F1+L3/F1+L3/F1+L3` | 38.12 / 39.05 GiB | 23.92 s |
+
+`F`, `A`, and `L` denote full, all-null, and LOO conditions; `P`, `R`, and
+`E` denote policy, fixed reference, and EMA. Every case had finite ILVR and
+total loss, a student update, no fixed-reference or EMA gradients, and exactly
+one EMA update. Both frozen-copy runs preserved the requested stage and showed
+identical replicated-reference structural/scalar witnesses on both ranks.
+
 Current limitations: there is no arbitrary attention blocking, hidden-state
 residual KD, group/pair ablation, Shapley attribution, or supervised evidence-
 window link selector. Adjacent-pair EW training can miss long-range requirements;
@@ -360,7 +386,7 @@ single-evidence LOO cannot identify synergy or redundancy. The helper-image
 producer remains per-device batch size one. CPU/synthetic validation is
 complete, including previously recorded two-rank schedule/metric tests and real
 two-rank ZeRO-1 and ZeRO-2 frozen-reference smokes; the approved 7B/B200
-optimizer-smoke matrix is pending completion.
+optimizer-smoke matrix above is complete.
 
 ---
 

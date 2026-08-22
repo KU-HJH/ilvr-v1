@@ -1,7 +1,7 @@
 # Evidence–Window Credit Learning for ILVR
 
 **Date:** 2026-08-21  
-**Status:** Implemented and CPU/synthetic verified; 7B/B200 validation pending
+**Status:** Fully implemented and verified (CPU/synthetic and 7B/B200 optimizer-smoke matrix)
 **Target branch/worktree:** `ours-trial1`
 
 ## 1. Summary
@@ -360,7 +360,7 @@ The current end-to-end helper-image builder remains batch-size-one unless separa
 The existing ILVR process already holds a trainable policy and a full EMA teacher. Approximate BF16 parameter storage for the 7B-class VLM is 15–17 GB per full copy before optimizer states, gradients, or activations.
 
 - Adapter-disabled reference adds no full base copy.
-- Frozen-copy reference adds another approximately 15–17 GB per rank under ZeRO-2.
+- Frozen-copy reference adds another approximately 15–17 GB per rank under ZeRO-1 or ZeRO-2.
 - ZeRO-1 partitions optimizer state only; ZeRO-2 partitions optimizer state and gradients but not model parameters. Neither partitions a frozen reference's parameters.
 - Gradient checkpointing and the repository's mixed precision remain active.
 - Reference and EMA forwards run under `torch.no_grad()`.
@@ -450,7 +450,7 @@ Required integration checks:
 
 Reference and EMA parameters are snapshotted before an optimizer step and compared afterward. Policy and any active residual projection must receive gradients; reference and EMA parameters must not.
 
-Relevant vendored Qwen CPU tests and `python -m compileall src tests` are run because the current main branch has no ILVR lint/static-check configuration. A final 7B/B200 smoke is run once when needed and recorded. Equivalent successful evidence is reused; an additional validation expected to exceed five minutes or read more than 10 GB requires explicit approval.
+Relevant vendored Qwen CPU tests and `python -m compileall src tests` are run because the current main branch has no ILVR lint/static-check configuration. A final 7B/B200 smoke is run once when needed and recorded. Equivalent successful evidence is reused; an additional validation expected to exceed five minutes or read more than 10 GB requires explicit approval. The approved matrix completed with successful witnesses for the disabled baseline, global diagnostics, window preference, adapter-disabled EW-DPO, frozen-copy EW-DPO under explicit ZeRO-1 and ZeRO-2, relation JSD, relation magnitude, logit residual, and the explicit combined objective. Both frozen-copy runs preserved the configured stage and confirmed per-rank reference replication without hashing the checkpoint or full parameter trees.
 
 Before any completion claim, the workflow runs `superpowers:verification-before-completion` and reports exact commands and results, files changed, implemented objective, `V_j`/`R_k` definitions, LOO semantics, complexity, configs, limitations, and deviations.
 
