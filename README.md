@@ -320,11 +320,16 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:transformers/src \
 The callable B200 harness performs exactly one optimizer step per requested
 case and writes small JSON witnesses for finite losses, edges/forwards,
 policy gradients, fixed-model gradients, dtype, and device. `--output-dir`
-must name a nonexistent attempt directory. Rank 0 atomically claims that
-directory before processor/model loading; a concurrent launcher or retry using
-the same path loses the claim without loading a model. `--attempt-id` is a
-path-safe identifier bound into the claim, every rank filename, rank JSON, and
-completion manifest:
+must name a nonexistent attempt directory. For `WORLD_SIZE>1`, the harness
+first initializes the launcher-provided `env://` process group (selecting the
+local CUDA device and NCCL on the GPU target, or Gloo when CUDA is unavailable)
+before any ownership or preflight work. Initialization failure stops before
+processor/model loading. Rank 0 then exclusively claims the directory, all
+ranks collectively agree on claim success, and only then does every rank
+validate the claim and run preflight. A concurrent launcher or retry using the
+same path therefore loses collectively without loading a model. `--attempt-id`
+is a path-safe identifier bound into the claim, every rank filename, rank JSON,
+and completion manifest:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:transformers/src \
@@ -361,17 +366,23 @@ After training, every rank first validates all local named losses, finite
 totals, eligible edges/windows, exact padded forward ledgers, nonzero policy
 learning witnesses, and absence of reference/EMA gradients. Validation errors
 are aggregated collectively before any rank JSON is published. Rank JSON files
-are then durably published with same-directory temporary files, file/directory
-`fsync`, and atomic no-overwrite links; publication errors are collectively
-checked. Every rank next validates the complete expected file set and attempt
-identity in a final precommit collective. Only after that agreement does rank 0
-atomically publish `completion.json` with the same no-overwrite protocol.
-Nothing fallible or collective runs after this terminal commit point.
+are serialized to same-directory temporary files, flushed and file-`fsync`ed,
+then atomically exposed with no-overwrite hard links; pre-link/link publication
+errors are collectively checked. Every rank next validates the complete
+expected file set and attempt identity in a final precommit collective. Only
+after that agreement does rank 0 expose `completion.json` with the same
+protocol. The successful hard link is the logical terminal commit point.
+Temporary cleanup and directory `fsync` happen afterward on a best-effort,
+non-throwing basis: failure there does not retract a visible completion, though
+it means crash durability was not additionally confirmed by that directory
+`fsync`. Hard-link failure leaves no destination. No collective or other
+required success operation occurs after the terminal link.
 Consumers must treat `completion.json`, not an individual rank JSON, as the
-success witness. A rank-0 completion write failure leaves no completion and
-fails the launcher through rank 0; once published, completion remains valid
-even if a process later exits unexpectedly. Failed or partial attempts are
-immutable diagnostic state; retry with a new attempt ID and output path.
+success witness. A rank-0 failure before or at the completion link leaves no
+completion and fails that rank; once linked, completion remains logically
+committed even if best-effort cleanup/directory sync fails or a process later
+exits unexpectedly. Failed or partial attempts are immutable diagnostic state;
+retry with a new attempt ID and output path.
 
 Do not treat a high relation entropy, dense attention, or positive LOO score as
 proof of correct evidence use. Sparse dependency can be correct. The local

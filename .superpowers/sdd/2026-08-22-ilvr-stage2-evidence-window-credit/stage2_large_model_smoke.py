@@ -408,7 +408,12 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _atomic_publish_json_no_overwrite(destination: Path, value: Any) -> Path:
-    """Durably link a same-directory temporary file without replacing a name."""
+    """Atomically expose a prepared temporary file without replacing a name.
+
+    The successful hard link is the logical commit point. Cleanup and the
+    post-link directory fsync are best effort because reporting failure after
+    the destination is visible would make the attempt's state ambiguous.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=destination.parent,
@@ -423,10 +428,20 @@ def _atomic_publish_json_no_overwrite(destination: Path, value: Any) -> Path:
             handle.flush()
             os.fsync(handle.fileno())
         os.link(temporary, destination)
-        _fsync_directory(destination.parent)
-    finally:
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    try:
         temporary.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
         _fsync_directory(destination.parent)
+    except Exception:
+        pass
     return destination
 
 
@@ -550,6 +565,96 @@ def _run_collective_phase(name: str, operation):
         assert local_exception is not None
         raise local_exception
     return result
+
+
+def _initialize_distributed_from_environment(
+    *, backend: str | None = None
+) -> tuple[int, int]:
+    """Initialize launcher-provided distributed state before any attempt work."""
+    import torch
+    import torch.distributed as distributed
+
+    try:
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    except ValueError as exc:
+        raise RuntimeError("distributed launcher rank environment is invalid") from exc
+    if world_size <= 0 or rank < 0 or rank >= world_size or local_rank < 0:
+        raise RuntimeError("distributed launcher rank environment is out of range")
+
+    if distributed.is_available() and distributed.is_initialized():
+        actual = (distributed.get_rank(), distributed.get_world_size())
+        if actual != (rank, world_size):
+            raise RuntimeError(
+                "initialized process group does not match launcher rank/world size"
+            )
+        return actual
+    if world_size == 1:
+        return rank, world_size
+    if not distributed.is_available():
+        raise RuntimeError(
+            "WORLD_SIZE>1 requires torch.distributed before smoke preflight"
+        )
+
+    selected_backend = backend
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        if selected_backend is None:
+            selected_backend = "nccl"
+    elif selected_backend is None:
+        selected_backend = "gloo"
+    try:
+        distributed.init_process_group(
+            backend=selected_backend,
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "failed to initialize distributed coordination before smoke preflight"
+        ) from exc
+    return distributed.get_rank(), distributed.get_world_size()
+
+
+def _coordinate_attempt_start(
+    args: argparse.Namespace,
+    cases: Sequence[str],
+    output_dir: Path,
+    *,
+    collective_phase=None,
+) -> dict[str, Any]:
+    """Claim once, agree collectively, then preflight on every rank."""
+    import torch.distributed as distributed
+
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
+        if not distributed.is_available() or not distributed.is_initialized():
+            raise RuntimeError(
+                "distributed process group must be initialized before attempt coordination"
+            )
+        rank = distributed.get_rank()
+        world_size = distributed.get_world_size()
+    phase = _run_collective_phase if collective_phase is None else collective_phase
+    phase(
+        "attempt ownership claim",
+        lambda: (
+            _claim_attempt_destination(
+                output_dir,
+                args.attempt_id,
+                cases,
+                world_size=world_size,
+            )
+            if rank == 0
+            else None
+        ),
+    )
+    return phase(
+        "attempt preflight",
+        lambda: _prepare_attempt(args, cases, output_dir, world_size=world_size),
+    )
 
 
 def _training_arguments(output_dir: Path, deepspeed_config: str | None):
@@ -1181,27 +1286,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     output_dir = Path(args.output_dir)
     cases = SINGLE_GPU_CASES if args.case == "all-single-gpu" else (args.case,)
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    _run_collective_phase(
-        "attempt ownership claim",
-        lambda: (
-            _claim_attempt_destination(
-                output_dir,
-                args.attempt_id,
-                cases,
-                world_size=world_size,
-            )
-            if rank == 0
-            else None
-        ),
-    )
-    configs = _run_collective_phase(
-        "attempt preflight",
-        lambda: _prepare_attempt(
-            args, cases, output_dir, world_size=world_size
-        ),
-    )
+    rank, world_size = _initialize_distributed_from_environment()
+    configs = _coordinate_attempt_start(args, cases, output_dir)
     results = []
     for case in cases:
         case_dir = output_dir / case

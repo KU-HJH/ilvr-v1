@@ -1,7 +1,9 @@
 import importlib.util
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -174,6 +176,140 @@ def _load_large_smoke_module():
     spec.loader.exec_module(module)
     assert module.REPOSITORY_ROOT == REPOSITORY_ROOT
     return module
+
+
+def _free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _distributed_attempt_worker(
+    rank,
+    world_size,
+    port,
+    launch_name,
+    attempt_id,
+    output_dir,
+    checkpoint,
+    data,
+    image_root,
+    result_path,
+    asymmetric_failure,
+    start_gate,
+):
+    """Exercise real env:// Gloo coordination from an uninitialized child."""
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": str(rank),
+            "CUDA_VISIBLE_DEVICES": "",
+        }
+    )
+    module = _load_large_smoke_module()
+    phases = []
+    loads = 0
+    error = None
+    initialized_before = torch.distributed.is_initialized()
+    try:
+        start_gate.wait(timeout=20)
+        original_collective = module._run_collective_phase
+
+        def recording_collective(name, operation):
+            phases.append(name)
+            return original_collective(name, operation)
+
+        def run_counting_stage2(_args, case, _case_dir, _config):
+            nonlocal loads
+            loads += 1
+            witness = _valid_witness(case)
+            witness.update(rank=rank, world_size=world_size)
+            return witness
+
+        module._run_collective_phase = recording_collective
+        module._run_stage2 = run_counting_stage2
+        module.main(
+            [
+                "--case", "baseline",
+                "--model", str(checkpoint),
+                "--stage1-checkpoint", str(checkpoint),
+                "--data",
+                str(
+                    Path(data).with_name("missing.jsonl")
+                    if asymmetric_failure and rank == 1
+                    else data
+                ),
+                "--image-root", str(image_root),
+                "--sample-index", "0",
+                "--attempt-id", attempt_id,
+                "--output-dir", str(output_dir),
+            ]
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        initialized_after = torch.distributed.is_initialized()
+        if initialized_after:
+            torch.distributed.destroy_process_group()
+        Path(result_path).write_text(
+            json.dumps(
+                {
+                    "launch": launch_name,
+                    "rank": rank,
+                    "initialized_before": initialized_before,
+                    "initialized_after": initialized_after,
+                    "loads": loads,
+                    "phases": phases,
+                    "error": error,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+
+def _run_spawned_attempts(tmp_path, launches):
+    context = torch.multiprocessing.get_context("spawn")
+    world_size = 2
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir(exist_ok=True)
+    image_root = tmp_path / "images"
+    image_root.mkdir(exist_ok=True)
+    data = tmp_path / "train.jsonl"
+    data.write_text("{}\n", encoding="utf-8")
+    start_gate = context.Barrier(world_size * len(launches))
+    processes = []
+    result_paths = []
+    for launch_name, attempt_id, output_dir, asymmetric_failure in launches:
+        port = _free_local_port()
+        for rank in range(world_size):
+            result_path = tmp_path / f"worker-{launch_name}-{rank}.json"
+            result_paths.append(result_path)
+            process = context.Process(
+                target=_distributed_attempt_worker,
+                args=(
+                    rank,
+                    world_size,
+                    port,
+                    launch_name,
+                    attempt_id,
+                    output_dir,
+                    checkpoint,
+                    data,
+                    image_root,
+                    result_path,
+                    asymmetric_failure,
+                    start_gate,
+                ),
+            )
+            process.start()
+            processes.append(process)
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+    return [json.loads(path.read_text(encoding="utf-8")) for path in result_paths]
 
 
 def test_large_model_harness_exposes_the_documented_cli():
@@ -550,6 +686,93 @@ def test_main_rejects_nonempty_attempt_before_model_load(tmp_path, monkeypatch):
     assert claim["attempt_id"] == "winner"
 
 
+def test_two_rank_gloo_initializes_before_claim_and_preflight(tmp_path):
+    """Missing early init makes both ranks run claim/preflight as unrelated locals."""
+    output_dir = tmp_path / "attempt"
+    outcomes = _run_spawned_attempts(
+        tmp_path,
+        [("one", "attempt-a", output_dir, False)],
+    )
+
+    assert [outcome["rank"] for outcome in outcomes] == [0, 1]
+    assert all(outcome["initialized_before"] is False for outcome in outcomes)
+    assert all(outcome["initialized_after"] is True for outcome in outcomes)
+    assert all(outcome["loads"] == 1 for outcome in outcomes)
+    assert all(outcome["error"] is None for outcome in outcomes)
+    assert all(
+        outcome["phases"]
+        == [
+            "attempt ownership claim",
+            "attempt preflight",
+            "witness validation",
+            "rank result publication",
+            "completion precommit",
+        ]
+        for outcome in outcomes
+    )
+    assert json.loads((output_dir / "attempt.json").read_text(encoding="utf-8"))[
+        "world_size"
+    ] == 2
+    assert (output_dir / "completion.json").is_file()
+
+
+def test_two_rank_asymmetric_preflight_fails_collectively_before_load(tmp_path):
+    """One bad rank must stop its peer before either begins model construction."""
+    outcomes = _run_spawned_attempts(
+        tmp_path,
+        [("one", "attempt-a", tmp_path / "attempt", True)],
+    )
+
+    assert all(outcome["loads"] == 0 for outcome in outcomes)
+    assert all(
+        "distributed attempt preflight failed" in outcome["error"]
+        for outcome in outcomes
+    )
+    assert all(
+        outcome["phases"] == ["attempt ownership claim", "attempt preflight"]
+        for outcome in outcomes
+    )
+
+
+def test_two_concurrent_two_rank_launches_have_one_all_rank_winner(tmp_path):
+    """A losing rank zero must notify its own rank one before any model loads."""
+    output_dir = tmp_path / "attempt"
+    outcomes = _run_spawned_attempts(
+        tmp_path,
+        [
+            ("alpha", "attempt-alpha", output_dir, False),
+            ("beta", "attempt-beta", output_dir, False),
+        ],
+    )
+    by_launch = {
+        name: sorted(
+            (outcome for outcome in outcomes if outcome["launch"] == name),
+            key=lambda outcome: outcome["rank"],
+        )
+        for name in ("alpha", "beta")
+    }
+    winners = [
+        name
+        for name, launch in by_launch.items()
+        if all(outcome["loads"] == 1 and outcome["error"] is None for outcome in launch)
+    ]
+    losers = [name for name in by_launch if name not in winners]
+
+    assert len(winners) == 1
+    assert len(losers) == 1
+    assert all(outcome["loads"] == 0 for outcome in by_launch[losers[0]])
+    assert all(
+        "distributed attempt ownership claim failed" in outcome["error"]
+        for outcome in by_launch[losers[0]]
+    )
+    assert all(
+        outcome["phases"] == ["attempt ownership claim"]
+        for outcome in by_launch[losers[0]]
+    )
+    claim = json.loads((output_dir / "attempt.json").read_text(encoding="utf-8"))
+    assert claim["attempt_id"] == f"attempt-{winners[0]}"
+
+
 def test_completion_manifest_is_last_after_every_rank_result(tmp_path):
     module = _load_large_smoke_module()
     cases = ("ew-reference-free",)
@@ -677,6 +900,63 @@ def test_rank_and_completion_publication_never_overwrite(tmp_path):
     with pytest.raises(FileExistsError):
         module._write_completion_manifest(attempt, cases, 1, "attempt-a")
     assert completion_path.read_bytes() == original_completion
+
+
+def test_post_link_directory_fsync_failure_keeps_publication_committed(
+    tmp_path, monkeypatch
+):
+    """A visible completion must not be reported failed by best-effort durability work."""
+    module = _load_large_smoke_module()
+    destination = tmp_path / "completion.json"
+
+    def fail_fsync(_directory):
+        raise OSError("injected post-link directory fsync failure")
+
+    monkeypatch.setattr(module, "_fsync_directory", fail_fsync)
+    assert (
+        module._atomic_publish_json_no_overwrite(
+            destination, {"status": "complete"}
+        )
+        == destination
+    )
+    assert json.loads(destination.read_text(encoding="utf-8")) == {"status": "complete"}
+
+
+def test_post_link_temp_cleanup_failure_keeps_publication_committed(
+    tmp_path, monkeypatch
+):
+    """Temporary cleanup cannot turn an atomic visible commit into a false failure."""
+    module = _load_large_smoke_module()
+    destination = tmp_path / "completion.json"
+    original_unlink = Path.unlink
+
+    def fail_temp_cleanup(path, *args, **kwargs):
+        if path.name.startswith(".completion.json."):
+            raise OSError("injected post-link cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_temp_cleanup)
+    assert (
+        module._atomic_publish_json_no_overwrite(
+            destination, {"status": "complete"}
+        )
+        == destination
+    )
+    assert destination.is_file()
+
+
+def test_link_failure_leaves_no_publication_destination(tmp_path, monkeypatch):
+    """Before the hard-link commit point, failure must leave success invisible."""
+    module = _load_large_smoke_module()
+    destination = tmp_path / "completion.json"
+
+    def fail_link(_source, _destination):
+        raise OSError("injected link failure")
+
+    monkeypatch.setattr(module.os, "link", fail_link)
+    with pytest.raises(OSError, match="injected link failure"):
+        module._atomic_publish_json_no_overwrite(destination, {"status": "complete"})
+    assert not destination.exists()
 
 
 def test_precommit_rejects_rank_file_from_another_attempt(tmp_path):
