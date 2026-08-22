@@ -320,8 +320,11 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:transformers/src \
 The callable B200 harness performs exactly one optimizer step per requested
 case and writes small JSON witnesses for finite losses, edges/forwards,
 policy gradients, fixed-model gradients, dtype, and device. `--output-dir`
-must name a new or empty attempt directory; any stale result, completion file,
-or other prior-attempt content is rejected before processor/model loading:
+must name a nonexistent attempt directory. Rank 0 atomically claims that
+directory before processor/model loading; a concurrent launcher or retry using
+the same path loses the claim without loading a model. `--attempt-id` is a
+path-safe identifier bound into the claim, every rank filename, rank JSON, and
+completion manifest:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:transformers/src \
@@ -333,6 +336,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:transformers/src \
   --data /absolute/path/to/TRAIN.jsonl \
   --image-root /absolute/path/to/image-root \
   --sample-index 920 \
+  --attempt-id ew-v2-smoke-001 \
   --deepspeed-config configs/config_stage3.json \
   --reference-artifact-dir /absolute/path/to/stage2-reference-artifact-with-hidden-residuals \
   --reference-dataset-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -357,12 +361,17 @@ After training, every rank first validates all local named losses, finite
 totals, eligible edges/windows, exact padded forward ledgers, nonzero policy
 learning witnesses, and absence of reference/EMA gradients. Validation errors
 are aggregated collectively before any rank JSON is published. Rank JSON files
-are then atomically published and publication errors are collectively checked.
-Only after every expected rank file exists does rank 0 atomically write
-`completion.json`, followed by a final collective publication-status check.
+are then durably published with same-directory temporary files, file/directory
+`fsync`, and atomic no-overwrite links; publication errors are collectively
+checked. Every rank next validates the complete expected file set and attempt
+identity in a final precommit collective. Only after that agreement does rank 0
+atomically publish `completion.json` with the same no-overwrite protocol.
+Nothing fallible or collective runs after this terminal commit point.
 Consumers must treat `completion.json`, not an individual rank JSON, as the
-success witness. A failed attempt has no completion manifest; use a fresh
-attempt directory rather than reusing its partial files.
+success witness. A rank-0 completion write failure leaves no completion and
+fails the launcher through rank 0; once published, completion remains valid
+even if a process later exits unexpectedly. Failed or partial attempts are
+immutable diagnostic state; retry with a new attempt ID and output path.
 
 Do not treat a high relation entropy, dense attention, or positive LOO score as
 proof of correct evidence use. Sparse dependency can be correct. The local

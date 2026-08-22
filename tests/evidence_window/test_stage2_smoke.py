@@ -194,6 +194,8 @@ def test_large_model_harness_exposes_the_documented_cli():
             "/data",
             "--sample-index",
             "7",
+            "--attempt-id",
+            "attempt-a",
             "--ew-config",
             "/configs/baseline.json",
             "--deepspeed-config",
@@ -395,20 +397,26 @@ def test_stage1_witness_requires_exact_policy_teacher_and_ema_counts():
 
 def test_invalid_witness_is_not_published(tmp_path):
     module = _load_large_smoke_module()
+    attempt = tmp_path / "attempt"
+    module._claim_attempt_destination(
+        attempt, "attempt-a", ("ew-reference-free",), world_size=1
+    )
     witness = _valid_witness("ew-reference-free")
     witness["policy_gradient"]["seen"] = False
     witness["policy_parameter_update"]["changed"] = False
-    witness.update(rank=0, world_size=1)
+    witness.update(rank=0, world_size=1, attempt_id="attempt-a")
 
     with pytest.raises(ValueError, match="gradient|parameter update"):
         module._finalize_attempt(
-            tmp_path,
+            attempt,
             [witness],
             ("ew-reference-free",),
             rank=0,
             world_size=1,
+            attempt_id="attempt-a",
         )
-    assert list(tmp_path.iterdir()) == []
+    assert not (attempt / "completion.json").exists()
+    assert not list(attempt.glob("*rank-*.json"))
 
 
 def _identity(**changes) -> ArtifactIdentity:
@@ -473,13 +481,17 @@ def test_precomputed_expected_identity_comes_from_explicit_consumer_witnesses():
 
 def _rank_witness(case: str, rank: int, world_size: int) -> dict:
     witness = _valid_witness(case)
-    witness.update(rank=rank, world_size=world_size)
+    witness.update(rank=rank, world_size=world_size, attempt_id="attempt-a")
     return witness
 
 
 def test_remote_validation_failure_prevents_rank0_completion(tmp_path):
     """Publishing rank 0 before rank 1 validates would create a false success."""
     module = _load_large_smoke_module()
+    attempt = tmp_path / "attempt"
+    module._claim_attempt_destination(
+        attempt, "attempt-a", ("ew-reference-free",), world_size=2
+    )
 
     def simulated_collective(name, operation):
         result = operation()
@@ -489,28 +501,30 @@ def test_remote_validation_failure_prevents_rank0_completion(tmp_path):
 
     with pytest.raises(RuntimeError, match="rank 1"):
         module._finalize_attempt(
-            tmp_path,
+            attempt,
             [_rank_witness("ew-reference-free", 0, 2)],
             ("ew-reference-free",),
             rank=0,
             world_size=2,
+            attempt_id="attempt-a",
             collective_phase=simulated_collective,
         )
 
-    assert list(tmp_path.iterdir()) == []
+    assert not (attempt / "completion.json").exists()
+    assert not list(attempt.glob("*rank-*.json"))
 
 
 @pytest.mark.parametrize(
     "stale_name",
-    ["completion.json", "baseline-rank-00000.json"],
+    ["completion.json", "attempt-a-baseline-rank-00000.json"],
 )
 def test_stale_attempt_witness_rejects_retry_before_model_work(tmp_path, stale_name):
     module = _load_large_smoke_module()
     (tmp_path / stale_name).write_text("stale\n", encoding="utf-8")
 
-    with pytest.raises(FileExistsError, match="fresh|nonempty|stale"):
-        module._require_fresh_attempt_destination(
-            tmp_path, ("baseline",), world_size=1
+    with pytest.raises(FileExistsError, match="attempt|exist|claim"):
+        module._claim_attempt_destination(
+            tmp_path, "attempt-a", ("baseline",), world_size=1
         )
 
 
@@ -518,8 +532,9 @@ def test_main_rejects_nonempty_attempt_before_model_load(tmp_path, monkeypatch):
     module = _load_large_smoke_module()
     argv = _preflight_cli(tmp_path, tmp_path / "unused", case="baseline")
     attempt = tmp_path / "attempt"
-    attempt.mkdir()
-    (attempt / "baseline-rank-00000.json").write_text("stale\n", encoding="utf-8")
+    module._claim_attempt_destination(
+        attempt, "winner", ("baseline",), world_size=1
+    )
     loads = 0
 
     def count_load(*_args, **_kwargs):
@@ -528,51 +543,159 @@ def test_main_rejects_nonempty_attempt_before_model_load(tmp_path, monkeypatch):
         raise AssertionError("model construction must not begin")
 
     monkeypatch.setattr(module, "_load_processor_and_model", count_load)
-    with pytest.raises(FileExistsError, match="fresh|nonempty"):
+    with pytest.raises(FileExistsError, match="attempt|exist|claim"):
         module.main(argv)
     assert loads == 0
+    claim = json.loads((attempt / "attempt.json").read_text(encoding="utf-8"))
+    assert claim["attempt_id"] == "winner"
 
 
 def test_completion_manifest_is_last_after_every_rank_result(tmp_path):
     module = _load_large_smoke_module()
     cases = ("ew-reference-free",)
-
-    module._finalize_attempt(
-        tmp_path,
-        [_rank_witness("ew-reference-free", 1, 2)],
-        cases,
-        rank=1,
-        world_size=2,
+    attempt = tmp_path / "attempt"
+    module._claim_attempt_destination(
+        attempt, "attempt-a", cases, world_size=2
     )
-    assert not (tmp_path / "completion.json").exists()
+
+    module._write_result(
+        attempt, _rank_witness("ew-reference-free", 1, 2)
+    )
+    assert not (attempt / "completion.json").exists()
 
     manifest_path = module._finalize_attempt(
-        tmp_path,
+        attempt,
         [_rank_witness("ew-reference-free", 0, 2)],
         cases,
         rank=0,
         world_size=2,
+        attempt_id="attempt-a",
     )
-    assert manifest_path == tmp_path / "completion.json"
+    assert manifest_path == attempt / "completion.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest == {
         "format_version": 1,
         "status": "complete",
+        "attempt_id": "attempt-a",
         "cases": ["ew-reference-free"],
         "world_size": 2,
         "result_files": [
             {
                 "case": "ew-reference-free",
                 "rank": 0,
-                "filename": "ew-reference-free-rank-00000.json",
+                "attempt_id": "attempt-a",
+                "filename": "attempt-a-ew-reference-free-rank-00000.json",
             },
             {
                 "case": "ew-reference-free",
                 "rank": 1,
-                "filename": "ew-reference-free-rank-00001.json",
+                "attempt_id": "attempt-a",
+                "filename": "attempt-a-ew-reference-free-rank-00001.json",
             },
         ],
     }
+
+
+def test_remote_precommit_failure_leaves_no_completion(tmp_path):
+    module = _load_large_smoke_module()
+    cases = ("ew-reference-free",)
+    attempt = tmp_path / "attempt"
+    module._claim_attempt_destination(
+        attempt, "attempt-a", cases, world_size=1
+    )
+
+    def simulated_collective(name, operation):
+        result = operation()
+        if name == "completion precommit":
+            raise RuntimeError("rank 1: precommit failed")
+        return result
+
+    with pytest.raises(RuntimeError, match="precommit failed"):
+        module._finalize_attempt(
+            attempt,
+            [_rank_witness("ew-reference-free", 0, 1)],
+            cases,
+            rank=0,
+            world_size=1,
+            attempt_id="attempt-a",
+            collective_phase=simulated_collective,
+        )
+    assert not (attempt / "completion.json").exists()
+
+
+def test_completion_is_terminal_with_no_postpublish_collective(tmp_path):
+    module = _load_large_smoke_module()
+    cases = ("ew-reference-free",)
+    attempt = tmp_path / "attempt"
+    module._claim_attempt_destination(
+        attempt, "attempt-a", cases, world_size=1
+    )
+    phases = []
+
+    def simulated_collective(name, operation):
+        phases.append(name)
+        return operation()
+
+    module._finalize_attempt(
+        attempt,
+        [_rank_witness("ew-reference-free", 0, 1)],
+        cases,
+        rank=0,
+        world_size=1,
+        attempt_id="attempt-a",
+        collective_phase=simulated_collective,
+    )
+
+    assert phases == [
+        "witness validation",
+        "rank result publication",
+        "completion precommit",
+    ]
+    assert (attempt / "completion.json").is_file()
+
+
+def test_rank_and_completion_publication_never_overwrite(tmp_path):
+    module = _load_large_smoke_module()
+    cases = ("ew-reference-free",)
+    attempt = tmp_path / "attempt"
+    module._claim_attempt_destination(
+        attempt, "attempt-a", cases, world_size=1
+    )
+    witness = _rank_witness("ew-reference-free", 0, 1)
+    rank_path = module._write_result(attempt, witness)
+    original_rank = rank_path.read_bytes()
+
+    changed = dict(witness, losses={"loss": 99.0, "loss/ew_pref": 99.0})
+    with pytest.raises(FileExistsError):
+        module._write_result(attempt, changed)
+    assert rank_path.read_bytes() == original_rank
+
+    completion_path = module._write_completion_manifest(
+        attempt, cases, 1, "attempt-a"
+    )
+    original_completion = completion_path.read_bytes()
+    with pytest.raises(FileExistsError):
+        module._write_completion_manifest(attempt, cases, 1, "attempt-a")
+    assert completion_path.read_bytes() == original_completion
+
+
+def test_precommit_rejects_rank_file_from_another_attempt(tmp_path):
+    module = _load_large_smoke_module()
+    cases = ("ew-reference-free",)
+    attempt = tmp_path / "attempt"
+    module._claim_attempt_destination(
+        attempt, "attempt-a", cases, world_size=1
+    )
+    wrong = _rank_witness("ew-reference-free", 0, 1)
+    wrong["attempt_id"] = "attempt-b"
+    expected = attempt / "attempt-a-ew-reference-free-rank-00000.json"
+    expected.write_text(json.dumps(wrong), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="attempt"):
+        module._validate_completion_precommit(
+            attempt, cases, 1, "attempt-a"
+        )
+    assert not (attempt / "completion.json").exists()
 
 
 def _preflight_cli(tmp_path, artifact_dir, *, case="ew-precomputed-dpo"):
@@ -589,6 +712,7 @@ def _preflight_cli(tmp_path, artifact_dir, *, case="ew-precomputed-dpo"):
         "--data", str(data),
         "--image-root", str(image_root),
         "--sample-index", "0",
+        "--attempt-id", "attempt-a",
         "--reference-artifact-dir", str(artifact_dir),
         "--reference-dataset-sha256", "a" * 64,
         "--reference-checkpoint-id", "stage1-approved",

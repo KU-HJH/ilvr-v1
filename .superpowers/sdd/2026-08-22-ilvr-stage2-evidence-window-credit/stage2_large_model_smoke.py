@@ -16,6 +16,8 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import tempfile
 from types import SimpleNamespace
 from typing import Any, Sequence
 
@@ -94,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data", required=True)
     parser.add_argument("--image-root", required=True)
     parser.add_argument("--sample-index", required=True, type=int)
+    parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--ew-config")
     parser.add_argument("--deepspeed-config")
     parser.add_argument("--reference-artifact-dir")
@@ -112,6 +115,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.sample_index < 0:
         raise ValueError("sample index must be nonnegative")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", args.attempt_id) is None:
+        raise ValueError(
+            "attempt id must be 1-64 path-safe ASCII letters, digits, dot, underscore, or dash"
+        )
     if args.case == "all-single-gpu" and args.ew_config is not None:
         parser.error("--ew-config cannot override the all-single-gpu named matrix")
     return args
@@ -392,20 +399,90 @@ def _build_precomputed_provider(artifact_dir, expected_identity):
     return PrecomputedReferenceProvider(artifact_dir, expected_identity)
 
 
-def _require_fresh_attempt_destination(
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_publish_json_no_overwrite(destination: Path, value: Any) -> Path:
+    """Durably link a same-directory temporary file without replacing a name."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, destination)
+        _fsync_directory(destination.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+        _fsync_directory(destination.parent)
+    return destination
+
+
+def _attempt_claim_value(
+    attempt_id: str,
+    cases: Sequence[str],
+    world_size: int,
+) -> dict[str, Any]:
+    return {
+        "format_version": 1,
+        "attempt_id": attempt_id,
+        "cases": list(cases),
+        "world_size": world_size,
+    }
+
+
+def _claim_attempt_destination(
     output_dir: Path,
+    attempt_id: str,
     cases: Sequence[str],
     *,
     world_size: int,
-) -> None:
+) -> Path:
     if world_size <= 0:
         raise ValueError("world size must be positive")
     if not cases:
         raise ValueError("smoke attempt must select at least one case")
-    if output_dir.exists() and any(output_dir.iterdir()):
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", attempt_id) is None:
+        raise ValueError("invalid attempt id")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_dir.mkdir()
+    except FileExistsError as exc:
         raise FileExistsError(
-            f"smoke attempt destination must be fresh and empty; found nonempty {output_dir}"
-        )
+            f"smoke attempt destination already exists and cannot be claimed: {output_dir}"
+        ) from exc
+    _fsync_directory(output_dir.parent)
+    return _atomic_publish_json_no_overwrite(
+        output_dir / "attempt.json",
+        _attempt_claim_value(attempt_id, cases, world_size),
+    )
+
+
+def _validate_attempt_claim(
+    output_dir: Path,
+    attempt_id: str,
+    cases: Sequence[str],
+    world_size: int,
+) -> None:
+    claim_path = output_dir / "attempt.json"
+    if not claim_path.is_file():
+        raise ValueError("attempt ownership claim is missing")
+    with claim_path.open(encoding="utf-8") as handle:
+        claim = json.load(handle)
+    if claim != _attempt_claim_value(attempt_id, cases, world_size):
+        raise ValueError("attempt ownership claim does not match this launch")
 
 
 def _prepare_attempt(
@@ -418,7 +495,7 @@ def _prepare_attempt(
     from evidence_window.stage2_config import read_deepspeed_zero_stage
 
     _require_inputs(args, cases)
-    _require_fresh_attempt_destination(output_dir, cases, world_size=world_size)
+    _validate_attempt_claim(output_dir, args.attempt_id, cases, world_size)
     _read_source_row(args.data, args.sample_index)
     zero_stage = (
         read_deepspeed_zero_stage(args.deepspeed_config)
@@ -797,12 +874,13 @@ def _run_stage1(args: argparse.Namespace, case_dir: Path) -> dict[str, Any]:
 
 
 def _write_result(output_dir: Path, result: dict[str, Any]) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    destination = output_dir / f"{result['case']}-rank-{result['rank']:05d}.json"
-    temporary = destination.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, destination)
-    return destination
+    attempt_id = result.get("attempt_id")
+    if not isinstance(attempt_id, str):
+        raise ValueError("rank result requires an attempt id")
+    destination = output_dir / _result_filename(
+        attempt_id, result["case"], result["rank"]
+    )
+    return _atomic_publish_json_no_overwrite(destination, result)
 
 
 CASE_LOSS_KEYS = {
@@ -956,14 +1034,19 @@ def _validate_case_witness(witness: dict[str, Any]) -> None:
     )
 
 
+def _result_filename(attempt_id: str, case: str, rank: int) -> str:
+    return f"{attempt_id}-{case}-rank-{rank:05d}.json"
+
+
 def _expected_result_records(
-    cases: Sequence[str], world_size: int
+    cases: Sequence[str], world_size: int, attempt_id: str
 ) -> list[dict[str, Any]]:
     return [
         {
             "case": case,
             "rank": rank,
-            "filename": f"{case}-rank-{rank:05d}.json",
+            "attempt_id": attempt_id,
+            "filename": _result_filename(attempt_id, case, rank),
         }
         for case in cases
         for rank in range(world_size)
@@ -976,21 +1059,26 @@ def _validate_local_attempt_results(
     *,
     rank: int,
     world_size: int,
+    attempt_id: str,
 ) -> None:
     if tuple(result.get("case") for result in results) != tuple(cases):
         raise ValueError("local result cases do not match the selected attempt cases")
     for result in results:
         if result.get("rank") != rank or result.get("world_size") != world_size:
             raise ValueError("local result rank/world size does not match the attempt")
+        if result.get("attempt_id") != attempt_id:
+            raise ValueError("local result attempt id does not match the attempt")
         _validate_case_witness(result)
 
 
-def _write_completion_manifest(
+def _validate_completion_precommit(
     output_dir: Path,
     cases: Sequence[str],
     world_size: int,
-) -> Path:
-    result_files = _expected_result_records(cases, world_size)
+    attempt_id: str,
+) -> list[dict[str, Any]]:
+    _validate_attempt_claim(output_dir, attempt_id, cases, world_size)
+    result_files = _expected_result_records(cases, world_size, attempt_id)
     missing = [
         record["filename"]
         for record in result_files
@@ -1001,20 +1089,50 @@ def _write_completion_manifest(
             "cannot publish completion manifest before every rank result exists: "
             + ", ".join(missing)
         )
+    for record in result_files:
+        path = output_dir / record["filename"]
+        with path.open(encoding="utf-8") as handle:
+            result = json.load(handle)
+        if (
+            result.get("attempt_id") != attempt_id
+            or result.get("case") != record["case"]
+            or result.get("rank") != record["rank"]
+            or result.get("world_size") != world_size
+        ):
+            raise ValueError(
+                f"rank result metadata does not match attempt: {record['filename']}"
+            )
+        _validate_case_witness(result)
+    if (output_dir / "completion.json").exists():
+        raise FileExistsError("completion manifest already exists")
+    return result_files
+
+
+def _write_completion_manifest(
+    output_dir: Path,
+    cases: Sequence[str],
+    world_size: int,
+    attempt_id: str,
+    *,
+    validated_result_files: Sequence[dict[str, Any]] | None = None,
+) -> Path:
+    result_files = (
+        _validate_completion_precommit(output_dir, cases, world_size, attempt_id)
+        if validated_result_files is None
+        else list(validated_result_files)
+    )
+    if result_files != _expected_result_records(cases, world_size, attempt_id):
+        raise ValueError("validated result files do not match the completion attempt")
     manifest = {
         "format_version": 1,
         "status": "complete",
+        "attempt_id": attempt_id,
         "cases": list(cases),
         "world_size": world_size,
         "result_files": result_files,
     }
     destination = output_dir / "completion.json"
-    temporary = destination.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    os.replace(temporary, destination)
-    return destination
+    return _atomic_publish_json_no_overwrite(destination, manifest)
 
 
 def _finalize_attempt(
@@ -1024,28 +1142,39 @@ def _finalize_attempt(
     *,
     rank: int,
     world_size: int,
+    attempt_id: str,
     collective_phase=None,
 ) -> Path | None:
     phase = _run_collective_phase if collective_phase is None else collective_phase
     phase(
         "witness validation",
         lambda: _validate_local_attempt_results(
-            results, cases, rank=rank, world_size=world_size
+            results,
+            cases,
+            rank=rank,
+            world_size=world_size,
+            attempt_id=attempt_id,
         ),
     )
     phase(
         "rank result publication",
         lambda: [_write_result(output_dir, result) for result in results],
     )
-    manifest_path = phase(
-        "completion manifest publication",
-        lambda: (
-            _write_completion_manifest(output_dir, cases, world_size)
-            if rank == 0
-            else None
+    result_files = phase(
+        "completion precommit",
+        lambda: _validate_completion_precommit(
+            output_dir, cases, world_size, attempt_id
         ),
     )
-    return manifest_path if rank == 0 else None
+    if rank != 0:
+        return None
+    return _write_completion_manifest(
+        output_dir,
+        cases,
+        world_size,
+        attempt_id,
+        validated_result_files=result_files,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1054,6 +1183,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     cases = SINGLE_GPU_CASES if args.case == "all-single-gpu" else (args.case,)
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    _run_collective_phase(
+        "attempt ownership claim",
+        lambda: (
+            _claim_attempt_destination(
+                output_dir,
+                args.attempt_id,
+                cases,
+                world_size=world_size,
+            )
+            if rank == 0
+            else None
+        ),
+    )
     configs = _run_collective_phase(
         "attempt preflight",
         lambda: _prepare_attempt(
@@ -1068,6 +1210,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             if case == "stage1-baseline"
             else _run_stage2(args, case, case_dir, configs[case])
         )
+        result["attempt_id"] = args.attempt_id
         results.append(result)
     manifest_path = _finalize_attempt(
         output_dir,
@@ -1075,6 +1218,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         cases,
         rank=rank,
         world_size=world_size,
+        attempt_id=args.attempt_id,
     )
     if rank == 0:
         print(manifest_path)
