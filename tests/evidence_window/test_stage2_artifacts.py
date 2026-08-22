@@ -662,6 +662,48 @@ def test_image_root_fails_before_dataset_hash_or_model_load(tmp_path, monkeypatc
     assert work == []
 
 
+def test_remote_record_preparation_failure_stops_nonowner_before_model_load(
+    tmp_path, monkeypatch
+):
+    """A rank with no selected row must await owner record validation before model work."""
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    args = SimpleNamespace(
+        artifact_dir=str(tmp_path / "artifact"),
+        image_root=str(image_root),
+        dataset_sha256_witness="c" * 64,
+        data_path=str(tmp_path / "data.jsonl"),
+        sample_index=1,
+    )
+    phases = []
+    model_loads = []
+
+    def coordinated_phase(name, operation, **_kwargs):
+        phases.append(name)
+        if name == "record preparation":
+            raise RuntimeError(
+                "distributed record preparation failed: rank 1: missing selected image"
+            )
+        return operation()
+
+    monkeypatch.setattr(precompute_module, "_initialize_distributed_if_requested", lambda: None)
+    monkeypatch.setattr(precompute_module.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(precompute_module.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(precompute_module.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(precompute_module, "run_distributed_phase", coordinated_phase)
+    monkeypatch.setattr(
+        precompute_module,
+        "_produce_rank_shard",
+        lambda *args, **kwargs: model_loads.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="record preparation.*rank 1"):
+        precompute_module.precompute(args)
+
+    assert phases[-1] == "record preparation"
+    assert model_loads == []
+
+
 @pytest.mark.parametrize("entry_name", ["partial.pt", "shard-rank-00000.pt"])
 def test_nonempty_artifact_destination_fails_before_model_load(
     tmp_path, monkeypatch, entry_name

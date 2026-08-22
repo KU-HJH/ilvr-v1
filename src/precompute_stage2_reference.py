@@ -233,6 +233,10 @@ def precompute(args: argparse.Namespace) -> None:
     )
     run_distributed_phase("input precheck", lambda: _precheck_inputs(args))
     dataset_witness = _distributed_dataset_witness(args, rank)
+    local_records = run_distributed_phase(
+        "record preparation",
+        lambda: _load_rank_records(args, rank=rank, world_size=world_size),
+    )
     identity, _ = run_distributed_phase(
         "shard production",
         lambda: _produce_rank_shard(
@@ -241,6 +245,7 @@ def precompute(args: argparse.Namespace) -> None:
             world_size=world_size,
             artifact_dir=artifact_dir,
             dataset_witness=dataset_witness,
+            local_records=local_records,
         ),
     )
     run_distributed_phase(
@@ -316,13 +321,12 @@ def _produce_rank_shard(
     world_size: int,
     artifact_dir: Path,
     dataset_witness: str,
+    local_records: Sequence[dict],
 ) -> tuple[ArtifactIdentity, ReferenceShardMetadata]:
     """Load one fixed reference and seal this rank's deterministic rows."""
 
     # Heavy repository dependencies remain local so identity/schema utilities
     # can be tested and inspected on CPU-only hosts.
-    local_records = _load_rank_records(args, rank=rank, world_size=world_size)
-
     from torch.utils.data import DataLoader
     from transformers import AutoProcessor, Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 

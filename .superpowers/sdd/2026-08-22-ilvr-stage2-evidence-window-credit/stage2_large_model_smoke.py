@@ -387,9 +387,12 @@ def _validate_precomputed_preflight(args, config) -> None:
     if mismatches:
         raise ValueError(f"reference artifact identity mismatch: {mismatches}")
     if config.residual.enabled and config.residual.lambda_res > 0.0:
-        if any(not shard.has_hidden_residuals for shard in shards):
+        if any(
+            shard.record_count > 0 and not shard.has_hidden_residuals
+            for shard in shards
+        ):
             raise ValueError(
-                "hidden-residual smoke requires hidden residuals in every artifact shard"
+                "hidden-residual smoke requires hidden residuals in every nonempty artifact shard"
             )
 
 

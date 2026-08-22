@@ -13,6 +13,7 @@ from evidence_window.artifacts import (
     ArtifactIdentity,
     ReferenceBatchTargets,
     ReferenceSampleTargets,
+    publish_reference_manifest,
     write_reference_shard,
 )
 from evidence_window.stage2_config import Stage2EvidenceWindowConfig
@@ -832,6 +833,43 @@ def test_precomputed_expected_identity_comes_from_explicit_consumer_witnesses():
     assert module._build_expected_reference_identity(
         args, config, (0, 90, 91, 92, 99)
     ) == _identity()
+
+
+def test_residual_preflight_ignores_empty_nonowner_shard(tmp_path):
+    """Selected-sample distributed artifacts may have empty shards without residual rows."""
+    module = _load_large_smoke_module()
+    identity = _identity()
+    owner = write_reference_shard(
+        tmp_path,
+        identity,
+        {
+            7: ReferenceSampleTargets(
+                torch.tensor([[0.2]]),
+                torch.tensor([[True]]),
+                torch.tensor([[[0.1, -0.1]]]),
+            )
+        },
+        rank=1,
+        publish_manifest=False,
+    )
+    empty = write_reference_shard(
+        tmp_path, identity, {}, rank=0, publish_manifest=False
+    )
+    publish_reference_manifest(tmp_path, identity, [empty, owner])
+    args = SimpleNamespace(
+        reference_artifact_dir=str(tmp_path),
+        reference_dataset_sha256="a" * 64,
+        reference_checkpoint_id="stage1-approved",
+        reference_checkpoint_witness="sealed-stage1",
+        reference_tokenizer_id="qwen-tokenizer",
+        reference_parser_version="stage2-marker-v1",
+        reference_model_config_id="qwen-stage2",
+    )
+    config = Stage2EvidenceWindowConfig.from_json(
+        CONFIG_ROOT / "hidden_residual_kd.json"
+    )
+
+    module._validate_precomputed_preflight(args, config)
 
 
 def _rank_witness(case: str, rank: int, world_size: int) -> dict:
