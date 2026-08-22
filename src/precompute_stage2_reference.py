@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence, TypeVar
 
 import torch
 import torch.distributed as distributed
@@ -21,6 +21,7 @@ import torch.distributed as distributed
 from evidence_window.artifacts import (
     ArtifactIdentity,
     ReferenceSampleTargets,
+    ReferenceShardMetadata,
     publish_reference_manifest,
     read_reference_shard_metadata,
     write_reference_shard,
@@ -151,10 +152,51 @@ def reference_rows_from_effects(
     return result
 
 
+_T = TypeVar("_T")
+
+
+def run_distributed_phase(
+    name: str,
+    operation: Callable[[], _T],
+    *,
+    device: torch.device | None = None,
+) -> _T:
+    """Run local work, then collectively agree whether any rank may continue."""
+    result: _T | None = None
+    local_error: str | None = None
+    try:
+        result = operation()
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+
+    if distributed.is_available() and distributed.is_initialized():
+        collective_device = _collective_device() if device is None else device
+        failed = torch.tensor(
+            int(local_error is not None), dtype=torch.long, device=collective_device
+        )
+        distributed.all_reduce(failed, op=distributed.ReduceOp.MAX)
+        if failed.item():
+            errors: list[str | None] = [None] * distributed.get_world_size()
+            distributed.all_gather_object(errors, local_error)
+            details = "; ".join(
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(errors)
+                if error is not None
+            )
+            raise RuntimeError(f"distributed {name} failed: {details}")
+    elif local_error is not None:
+        raise RuntimeError(f"{name} failed: {local_error}")
+
+    return result  # type: ignore[return-value]
+
+
 def _distributed_dataset_witness(args: argparse.Namespace, rank: int) -> str:
     if args.dataset_sha256_witness is not None:
         return args.dataset_sha256_witness
-    witness = sha256_file(args.data_path) if rank == 0 else None
+    witness = run_distributed_phase(
+        "dataset witness",
+        lambda: sha256_file(args.data_path) if rank == 0 else None,
+    )
     if distributed.is_available() and distributed.is_initialized():
         values = [witness]
         distributed.broadcast_object_list(values, src=0)
@@ -171,9 +213,43 @@ def precompute(args: argparse.Namespace) -> None:
     rank = distributed.get_rank() if distributed.is_initialized() else 0
     world_size = distributed.get_world_size() if distributed.is_initialized() else 1
     artifact_dir = Path(args.artifact_dir)
-    if rank == 0 and (artifact_dir / "manifest.json").exists():
-        raise FileExistsError("reference artifact manifest already exists")
+    run_distributed_phase(
+        "artifact precheck",
+        lambda: _precheck_artifact(artifact_dir) if rank == 0 else None,
+    )
     dataset_witness = _distributed_dataset_witness(args, rank)
+    identity, _ = run_distributed_phase(
+        "shard production",
+        lambda: _produce_rank_shard(
+            args,
+            rank=rank,
+            world_size=world_size,
+            artifact_dir=artifact_dir,
+            dataset_witness=dataset_witness,
+        ),
+    )
+    run_distributed_phase(
+        "manifest publication",
+        lambda: _publish_rank_manifest(
+            artifact_dir, identity, world_size
+        ) if rank == 0 else None,
+    )
+
+
+def _precheck_artifact(artifact_dir: Path) -> None:
+    if (artifact_dir / "manifest.json").exists():
+        raise FileExistsError("reference artifact manifest already exists")
+
+
+def _produce_rank_shard(
+    args: argparse.Namespace,
+    *,
+    rank: int,
+    world_size: int,
+    artifact_dir: Path,
+    dataset_witness: str,
+) -> tuple[ArtifactIdentity, ReferenceShardMetadata]:
+    """Load one fixed reference and seal this rank's deterministic rows."""
 
     # Heavy repository dependencies remain local so identity/schema utilities
     # can be tested and inspected on CPU-only hosts.
@@ -292,25 +368,28 @@ def precompute(args: argparse.Namespace) -> None:
                 raise ValueError(f"duplicate precompute sample indices: {sorted(overlap)}")
             rank_targets.update(rows)
 
-    write_reference_shard(
+    metadata = write_reference_shard(
         artifact_dir,
         identity,
         rank_targets,
         rank=rank,
         publish_manifest=False,
     )
-    if distributed.is_initialized():
-        distributed.barrier()
-    if rank == 0:
-        metadata = [
-            read_reference_shard_metadata(
-                artifact_dir / f"shard-rank-{shard_rank:05d}.metadata.json"
-            )
-            for shard_rank in range(world_size)
-        ]
-        publish_reference_manifest(artifact_dir, identity, metadata)
-    if distributed.is_initialized():
-        distributed.barrier()
+    return identity, metadata
+
+
+def _publish_rank_manifest(
+    artifact_dir: Path,
+    identity: ArtifactIdentity,
+    world_size: int,
+) -> None:
+    metadata = [
+        read_reference_shard_metadata(
+            artifact_dir / f"shard-rank-{shard_rank:05d}.metadata.json"
+        )
+        for shard_rank in range(world_size)
+    ]
+    publish_reference_manifest(artifact_dir, identity, metadata)
 
 
 def _token_ids(processor, start, end, pad, padding, termination):
@@ -336,7 +415,15 @@ def _single_token_id(processor, text: str) -> int:
 def _initialize_distributed_if_requested() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size > 1 and not distributed.is_initialized():
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
         distributed.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+
+
+def _collective_device() -> torch.device:
+    if distributed.get_backend() == "nccl":
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
 
 
 def _validate_sha256(value: str) -> None:

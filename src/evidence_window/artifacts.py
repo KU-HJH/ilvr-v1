@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, fields
 import json
 import os
 from pathlib import Path
+import tempfile
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -40,7 +41,7 @@ class ArtifactIdentity:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ArtifactIdentity":
-        if not isinstance(raw, Mapping):
+        if type(raw) is not dict:
             raise ValueError("artifact identity must be an object")
         expected = {field.name for field in fields(cls)}
         if set(raw) != expected:
@@ -50,8 +51,8 @@ class ArtifactIdentity:
             raise ValueError(f"artifact identity schema mismatch: {detail}")
         values = dict(raw)
         special = values["tokenizer_special_tokens"]
-        if not isinstance(special, (list, tuple)):
-            raise ValueError("tokenizer_special_tokens must be a sequence")
+        if type(special) is not list:
+            raise ValueError("tokenizer_special_tokens must be a list")
         values["tokenizer_special_tokens"] = tuple(special)
         identity = cls(**values)
         _validate_identity(identity)
@@ -105,10 +106,10 @@ class ReferenceShardMetadata:
             "record_count",
             "has_hidden_residuals",
         }
-        if not isinstance(raw, Mapping) or set(raw) != expected:
+        if type(raw) is not dict or set(raw) != expected:
             raise ValueError("reference shard metadata schema mismatch")
         sample_indices = raw["sample_indices"]
-        if not isinstance(sample_indices, list):
+        if type(sample_indices) is not list:
             raise ValueError("reference shard sample_indices must be a list")
         metadata = cls(
             filename=raw["filename"],
@@ -154,8 +155,6 @@ def write_reference_shard(
     directory.mkdir(parents=True, exist_ok=True)
     filename = f"shard-rank-{rank:05d}.pt"
     destination = directory / filename
-    if destination.exists():
-        raise FileExistsError(f"reference shard already exists: {filename}")
     records = [
         {
             "sample_index": sample_index,
@@ -176,7 +175,7 @@ def write_reference_shard(
         "sample_indices": list(sample_indices),
         "records": records,
     }
-    torch.save(payload, destination)
+    _write_torch_exclusive(destination, payload)
     metadata = ReferenceShardMetadata(
         filename=filename,
         rank=rank,
@@ -202,10 +201,7 @@ def publish_reference_manifest(
         raise ValueError("at least one reference shard is required")
     for shard in normalized:
         _validate_shard_metadata(shard)
-    ranks = [shard.rank for shard in normalized]
-    filenames = [shard.filename for shard in normalized]
-    if len(set(ranks)) != len(ranks) or len(set(filenames)) != len(filenames):
-        raise ValueError("duplicate reference shard rank or filename")
+    _validate_manifest_shards(normalized)
     owner: dict[int, str] = {}
     for shard in normalized:
         for sample_index in shard.sample_indices:
@@ -249,16 +245,17 @@ class PrecomputedReferenceProvider:
                 manifest = json.load(handle)
         except FileNotFoundError as exc:
             raise ValueError("missing reference manifest") from exc
-        if not isinstance(manifest, dict) or set(manifest) != {"format", "identity", "shards"}:
+        if type(manifest) is not dict or set(manifest) != {"format", "identity", "shards"}:
             raise ValueError("reference manifest schema mismatch")
-        if manifest["format"] != _ARTIFACT_FORMAT:
+        if type(manifest["format"]) is not str or manifest["format"] != _ARTIFACT_FORMAT:
             raise ValueError("reference manifest format mismatch")
         actual_identity = ArtifactIdentity.from_dict(manifest["identity"])
         _require_matching_identity(actual_identity, expected_identity)
         raw_shards = manifest["shards"]
-        if not isinstance(raw_shards, list) or not raw_shards:
+        if type(raw_shards) is not list or not raw_shards:
             raise ValueError("reference manifest shards must be a nonempty list")
         metadata = [ReferenceShardMetadata.from_dict(raw) for raw in raw_shards]
+        _validate_manifest_shards(metadata)
         if [item.rank for item in metadata] != sorted(item.rank for item in metadata):
             raise ValueError("reference manifest shard order must be rank-sorted")
         self.identity = actual_identity
@@ -275,18 +272,23 @@ class PrecomputedReferenceProvider:
         except Exception as exc:
             raise ValueError(f"reference shard schema invalid: {metadata.filename}") from exc
         expected_keys = {"format", "identity", "rank", "sample_indices", "records"}
-        if not isinstance(payload, dict) or set(payload) != expected_keys:
+        if type(payload) is not dict or set(payload) != expected_keys:
             raise ValueError(f"reference shard schema invalid: {metadata.filename}")
-        if payload["format"] != _ARTIFACT_FORMAT:
+        if type(payload["format"]) is not str or payload["format"] != _ARTIFACT_FORMAT:
             raise ValueError(f"reference shard format mismatch: {metadata.filename}")
         shard_identity = ArtifactIdentity.from_dict(payload["identity"])
         _require_matching_identity(shard_identity, self.identity)
+        _require_nonnegative_int(payload["rank"], "reference shard rank")
         if payload["rank"] != metadata.rank:
             raise ValueError(f"reference shard rank mismatch: {metadata.filename}")
+        if type(payload["sample_indices"]) is not list:
+            raise ValueError(f"reference shard sample index layout mismatch: {metadata.filename}")
+        for sample_index in payload["sample_indices"]:
+            _require_nonnegative_int(sample_index, "sample index")
         if payload["sample_indices"] != list(metadata.sample_indices):
             raise ValueError(f"reference shard sample index layout mismatch: {metadata.filename}")
         records = payload["records"]
-        if not isinstance(records, list) or len(records) != metadata.record_count:
+        if type(records) is not list or len(records) != metadata.record_count:
             raise ValueError(f"reference shard record layout mismatch: {metadata.filename}")
         seen: list[int] = []
         residual_flags: set[bool] = set()
@@ -297,7 +299,7 @@ class PrecomputedReferenceProvider:
                 "pair_mask",
                 "hidden_residuals",
             }
-            if not isinstance(record, dict) or set(record) != expected_record_keys:
+            if type(record) is not dict or set(record) != expected_record_keys:
                 raise ValueError(f"reference shard record schema invalid: {metadata.filename}")
             sample_index = record["sample_index"]
             _require_nonnegative_int(sample_index, "sample index")
@@ -407,10 +409,10 @@ class PrecomputedReferenceProvider:
 def _validate_identity(identity: ArtifactIdentity) -> None:
     if not isinstance(identity, ArtifactIdentity):
         raise TypeError("identity must be an ArtifactIdentity")
-    if isinstance(identity.format_version, bool) or identity.format_version != 1:
-        raise ValueError("format_version must be 1")
+    if type(identity.format_version) is not int or identity.format_version != 1:
+        raise ValueError("format_version must be integer 1")
     if (
-        not isinstance(identity.dataset_sha256, str)
+        type(identity.dataset_sha256) is not str
         or len(identity.dataset_sha256) != 64
         or any(character not in "0123456789abcdef" for character in identity.dataset_sha256)
     ):
@@ -423,13 +425,13 @@ def _validate_identity(identity: ArtifactIdentity) -> None:
         "model_config_id",
     ):
         value = getattr(identity, name)
-        if not isinstance(value, str) or not value:
+        if type(value) is not str or not value:
             raise ValueError(f"{name} must be a nonempty string")
     special = identity.tokenizer_special_tokens
     if (
         not isinstance(special, tuple)
         or not special
-        or any(isinstance(value, bool) or not isinstance(value, int) for value in special)
+        or any(type(value) is not int for value in special)
         or len(set(special)) != len(special)
     ):
         raise ValueError("tokenizer_special_tokens must be unique integers")
@@ -499,12 +501,12 @@ def _validate_sample_targets(target: ReferenceSampleTargets) -> None:
 def _validate_shard_metadata(metadata: ReferenceShardMetadata) -> None:
     if not isinstance(metadata, ReferenceShardMetadata):
         raise TypeError("shards must contain ReferenceShardMetadata")
-    if not isinstance(metadata.filename, str) or not metadata.filename:
+    if type(metadata.filename) is not str or not metadata.filename:
         raise ValueError("reference shard filename must be nonempty")
     if Path(metadata.filename).name != metadata.filename:
         raise ValueError("reference shard filename must be local")
     _require_nonnegative_int(metadata.rank, "reference shard rank")
-    if not isinstance(metadata.sample_indices, tuple):
+    if type(metadata.sample_indices) is not tuple:
         raise ValueError("reference shard sample_indices must be a tuple")
     for index in metadata.sample_indices:
         _require_nonnegative_int(index, "sample index")
@@ -515,7 +517,7 @@ def _validate_shard_metadata(metadata: ReferenceShardMetadata) -> None:
     _require_nonnegative_int(metadata.record_count, "reference shard record_count")
     if metadata.record_count != len(metadata.sample_indices):
         raise ValueError("reference shard record count mismatch")
-    if not isinstance(metadata.has_hidden_residuals, bool):
+    if type(metadata.has_hidden_residuals) is not bool:
         raise ValueError("reference shard residual flag must be boolean")
 
 
@@ -524,21 +526,74 @@ def _sealed_cpu_tensor(value: torch.Tensor) -> torch.Tensor:
 
 
 def _require_nonnegative_int(value: Any, name: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
 
 
 def _write_json_exclusive(path: Path, value: Mapping[str, Any]) -> None:
+    encoded = (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    _write_bytes_exclusive(path, encoded)
+
+
+def _write_torch_exclusive(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    descriptor = os.open(path, flags, 0o644)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.tmp-", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
+        torch.save(dict(payload), temporary)
+        _fsync_file(temporary)
+        _publish_temp_no_replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_bytes_exclusive(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.tmp-", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _publish_temp_no_replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_temp_no_replace(temporary: Path, destination: Path) -> None:
+    """Atomically expose one complete file while refusing existing names."""
+    os.link(temporary, destination)
+    _fsync_directory(destination.parent)
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_manifest_shards(
+    shards: Sequence[ReferenceShardMetadata],
+) -> None:
+    ranks = [shard.rank for shard in shards]
+    filenames = [shard.filename for shard in shards]
+    if len(set(ranks)) != len(ranks) or len(set(filenames)) != len(filenames):
+        raise ValueError("duplicate reference shard rank or filename")
 
 
 __all__ = [

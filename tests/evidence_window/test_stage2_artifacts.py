@@ -1,4 +1,5 @@
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 import json
 
 import pytest
@@ -7,6 +8,7 @@ import torch.nn.functional as F
 
 import trainer_stage2 as trainer_stage2_module
 import precompute_stage2_reference as precompute_module
+import evidence_window.artifacts as artifacts_module
 from main import resolve_stage2_reference_identity
 from evidence_window.artifacts import (
     ArtifactIdentity,
@@ -233,6 +235,149 @@ def test_manifest_missing_or_malformed_shard_is_rejected(tmp_path):
         PrecomputedReferenceProvider(tmp_path, identity)
 
 
+def test_concurrent_shard_writers_have_one_immutable_winner(tmp_path):
+    """Concurrent producers must never overwrite a complete final shard."""
+    identity = _identity()
+    first = _sample(torch.tensor([[1.0], [1.5]]))
+    second = _sample(torch.tensor([[2.0], [2.5]]))
+
+    def write(value):
+        return write_reference_shard(
+            tmp_path,
+            identity,
+            {7: value},
+            rank=0,
+            publish_manifest=False,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(write, value) for value in (first, second)]
+    successes = [future.result() for future in futures if future.exception() is None]
+    failures = [future.exception() for future in futures if future.exception() is not None]
+
+    assert len(successes) == 1
+    assert len(failures) == 1 and isinstance(failures[0], FileExistsError)
+    payload = torch.load(
+        tmp_path / "shard-rank-00000.pt", map_location="cpu", weights_only=True
+    )
+    stored = payload["records"][0]["contributions"]
+    assert torch.equal(stored, first.contributions) or torch.equal(
+        stored, second.contributions
+    )
+    assert not list(tmp_path.glob(".*.tmp-*"))
+
+
+def test_atomic_publish_failure_exposes_no_partial_final_and_cleans_temp(
+    tmp_path, monkeypatch
+):
+    """Failure before the atomic link must leave the final name retryable."""
+    def fail_link(_source, _destination):
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(artifacts_module.os, "link", fail_link)
+
+    with pytest.raises(OSError, match="injected publish failure"):
+        write_reference_shard(
+            tmp_path,
+            _identity(),
+            {7: _sample()},
+            rank=0,
+            publish_manifest=False,
+        )
+
+    assert not (tmp_path / "shard-rank-00000.pt").exists()
+    assert not (tmp_path / "shard-rank-00000.metadata.json").exists()
+    assert not list(tmp_path.glob(".*.tmp-*"))
+
+
+def test_atomic_manifest_publish_never_overwrites_existing_final(tmp_path):
+    """A second publisher cannot replace an already sealed manifest."""
+    identity = _identity()
+    metadata = write_reference_shard(
+        tmp_path, identity, {7: _sample()}, rank=0, publish_manifest=False
+    )
+    publish_reference_manifest(tmp_path, identity, [metadata])
+    original = (tmp_path / "manifest.json").read_bytes()
+
+    with pytest.raises(FileExistsError, match="manifest.json"):
+        publish_reference_manifest(tmp_path, identity, [metadata])
+
+    assert (tmp_path / "manifest.json").read_bytes() == original
+    assert not list(tmp_path.glob(".*.tmp-*"))
+
+
+def test_provider_rejects_duplicate_manifest_rank_and_filename_entries(tmp_path):
+    """A malicious manifest must not make shard ownership iteration-dependent."""
+    identity = _identity()
+    metadata = write_reference_shard(
+        tmp_path, identity, {7: _sample()}, rank=0, publish_manifest=False
+    )
+    manifest_path = publish_reference_manifest(tmp_path, identity, [metadata])
+    manifest = json.loads(manifest_path.read_text())
+    manifest["shards"].append(dict(manifest["shards"][0]))
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="duplicate.*rank.*filename"):
+        PrecomputedReferenceProvider(tmp_path, identity)
+
+
+@pytest.mark.parametrize(
+    ("location", "field", "value", "message"),
+    [
+        ("identity", "format_version", 1.0, "format_version.*integer"),
+        ("metadata", "rank", 0.0, "rank.*integer"),
+        ("metadata", "record_count", 1.0, "record_count.*integer"),
+        ("metadata", "has_hidden_residuals", 0, "residual flag.*boolean"),
+    ],
+)
+def test_provider_rejects_equal_but_wrong_manifest_primitive_types(
+    tmp_path, location, field, value, message
+):
+    """Python equality must not let floats or ints impersonate schema primitives."""
+    identity = _identity()
+    metadata = write_reference_shard(
+        tmp_path, identity, {7: _sample()}, rank=0, publish_manifest=False
+    )
+    manifest_path = publish_reference_manifest(tmp_path, identity, [metadata])
+    manifest = json.loads(manifest_path.read_text())
+    target = manifest["identity"] if location == "identity" else manifest["shards"][0]
+    target[field] = value
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match=message):
+        PrecomputedReferenceProvider(tmp_path, identity)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("rank", 0.0, "rank.*integer"),
+        ("sample_indices", [7.0], "sample index.*integer"),
+        ("record_sample_index", 7.0, "sample index.*integer"),
+    ],
+)
+def test_provider_rejects_equal_but_wrong_shard_primitive_types(
+    tmp_path, field, value, message
+):
+    """Tensor-shard primitive schema is strict before equality comparisons."""
+    identity = _identity()
+    metadata = write_reference_shard(
+        tmp_path, identity, {7: _sample()}, rank=0, publish_manifest=False
+    )
+    publish_reference_manifest(tmp_path, identity, [metadata])
+    shard_path = tmp_path / metadata.filename
+    payload = torch.load(shard_path, map_location="cpu", weights_only=True)
+    if field == "record_sample_index":
+        payload["records"][0]["sample_index"] = value
+    else:
+        payload[field] = value
+    shard_path.unlink()
+    torch.save(payload, shard_path)
+
+    with pytest.raises(ValueError, match=message):
+        PrecomputedReferenceProvider(tmp_path, identity)
+
+
 def test_manifest_is_published_from_metadata_without_loading_shards(tmp_path, monkeypatch):
     """Rank zero must publish the small manifest without rereading tensor shards."""
     identity = _identity()
@@ -332,6 +477,94 @@ def test_precompute_identity_reuses_supplied_dataset_witness_without_rehash(
     )
 
     assert identity.dataset_sha256 == "c" * 64
+
+
+@pytest.mark.parametrize(
+    ("phase", "local_failure", "remote_failure"),
+    [
+        ("artifact precheck", "manifest already exists", None),
+        ("shard production", None, "rank 1: data decode failed"),
+        ("manifest publication", "rank 0 publish failed", None),
+    ],
+)
+def test_distributed_precompute_phase_propagates_local_or_remote_failure(
+    monkeypatch, phase, local_failure, remote_failure
+):
+    """Every rank must make the same next-collective decision after each phase."""
+    monkeypatch.setattr(precompute_module.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(precompute_module.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(precompute_module.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(precompute_module.distributed, "get_backend", lambda: "gloo")
+    collectives = []
+
+    def reduce_failure(value, op):
+        collectives.append(("reduce", op))
+        if remote_failure is not None:
+            value.fill_(1)
+
+    def gather_errors(output, local):
+        collectives.append(("gather", local))
+        output[:] = [local, remote_failure]
+
+    monkeypatch.setattr(precompute_module.distributed, "all_reduce", reduce_failure)
+    monkeypatch.setattr(
+        precompute_module.distributed, "all_gather_object", gather_errors
+    )
+    monkeypatch.setattr(
+        precompute_module.distributed,
+        "barrier",
+        lambda: (_ for _ in ()).throw(AssertionError("unsafe barrier")),
+    )
+
+    def operation():
+        if local_failure is not None:
+            raise OSError(local_failure)
+        return "completed"
+
+    expected = local_failure if local_failure is not None else remote_failure
+    with pytest.raises(RuntimeError, match=expected):
+        precompute_module.run_distributed_phase(
+            phase, operation, device=torch.device("cpu")
+        )
+
+    assert [name for name, _ in collectives] == ["reduce", "gather"]
+
+
+def test_dataset_hash_failure_is_coordinated_before_witness_broadcast(
+    tmp_path, monkeypatch
+):
+    """Rank-zero hash failure must not strand peers inside broadcast_object_list."""
+    args = type(
+        "Args",
+        (),
+        {"dataset_sha256_witness": None, "data_path": str(tmp_path / "missing")},
+    )()
+    monkeypatch.setattr(precompute_module.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(precompute_module.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(precompute_module.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(precompute_module.distributed, "get_backend", lambda: "gloo")
+    monkeypatch.setattr(
+        precompute_module.distributed,
+        "all_reduce",
+        lambda value, op: None,
+    )
+
+    def gather_errors(output, local):
+        output[:] = [local, None]
+
+    monkeypatch.setattr(
+        precompute_module.distributed, "all_gather_object", gather_errors
+    )
+    monkeypatch.setattr(
+        precompute_module.distributed,
+        "broadcast_object_list",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("broadcast entered after hash failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="dataset witness.*FileNotFoundError"):
+        precompute_module._distributed_dataset_witness(args, rank=0)
 
 
 def test_reference_effect_rows_are_unpadded_and_detached():
