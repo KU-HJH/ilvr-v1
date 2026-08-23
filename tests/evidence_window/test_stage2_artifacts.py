@@ -49,6 +49,27 @@ def _identity(**changes):
     return replace(value, **changes)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA BF16 regression")
+def test_precompute_normalizes_mixed_checkpoint_parameters_before_scoring():
+    """A mixed FP32-weight/BF16-bias checkpoint must not reach a frozen BF16 forward."""
+    device = torch.device("cuda", 0)
+    model = torch.nn.Linear(3, 2).to(device)
+    model.bias.data = model.bias.data.to(torch.bfloat16)
+    inputs = torch.ones((1, 3), device=device, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="self and mat2 must have the same dtype"):
+        model(inputs)
+
+    prepared = precompute_module._prepare_reference_model(model, device)
+
+    assert prepared is model
+    assert not prepared.training
+    assert {parameter.dtype for parameter in prepared.parameters()} == {
+        torch.bfloat16
+    }
+    assert all(not parameter.requires_grad for parameter in prepared.parameters())
+    assert torch.isfinite(prepared(inputs)).all()
+
+
 def _sample(contributions=None, pair_mask=None, hidden_residuals=None):
     if contributions is None:
         contributions = torch.tensor([[0.7], [0.2]], dtype=torch.float32)

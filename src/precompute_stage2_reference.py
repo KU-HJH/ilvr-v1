@@ -314,6 +314,16 @@ def _load_rank_records(
     ]
 
 
+def _prepare_reference_model(model, device: torch.device):
+    """Place the frozen scorer on one deterministic execution dtype."""
+    execution_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model.to(device=device, dtype=execution_dtype)
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
 def _produce_rank_shard(
     args: argparse.Namespace,
     *,
@@ -369,10 +379,7 @@ def _produce_rank_shard(
         trust_remote_code=True,
     )
     model.resize_token_embeddings(len(processor.tokenizer))
-    model.to(device)
-    model.eval()
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
+    _prepare_reference_model(model, device)
 
     identity = build_artifact_identity(
         args,
