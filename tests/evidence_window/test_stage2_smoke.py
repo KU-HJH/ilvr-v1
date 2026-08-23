@@ -759,6 +759,24 @@ def test_zero2_parameter_update_is_an_explicit_gradient_fallback():
     module._validate_case_witness(witness)
 
 
+def test_gradient_witness_hooks_the_runtime_wrapped_model():
+    """The hook must be installed after DeepSpeed replaces the Trainer model."""
+    module = _load_large_smoke_module()
+
+    class FakeTrainer:
+        def add_callback(self, callback):
+            self.callback = callback
+
+    trainer = FakeTrainer()
+    witness = module._gradient_witness(trainer)
+    runtime_model = torch.nn.Linear(2, 1, bias=False)
+
+    trainer.callback.on_train_begin(None, None, None, model=runtime_model)
+    runtime_model(torch.ones(1, 2)).sum().backward()
+
+    assert witness == {"seen": True, "finite": True, "nonzero": True}
+
+
 def test_parameter_update_witness_checks_all_trainable_smoke_parameters():
     """LoRA A can stay unchanged while a later LoRA B parameter updates."""
     module = _load_large_smoke_module()

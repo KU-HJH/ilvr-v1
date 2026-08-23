@@ -215,7 +215,7 @@ def main() -> None:
             torch.distributed.all_gather_object(records, record)
 
             assert {item[0] for item in records} == {1, 3}
-            assert len({item[1] for item in records}) == 1
+            assert {item[1] for item in records} == {8}
             assert all(item[2] == (3,) for item in records)
             assert all(item[3] for item in records)
             assert all(item[4] for item in records)
