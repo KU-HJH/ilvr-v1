@@ -193,6 +193,10 @@ def _load_processor_and_model(checkpoint: str, *, stage: str, device_dtype):
 def _apply_smoke_lora(model):
     from peft import LoraConfig, get_peft_model
 
+    # The production SFTTrainer installs this hook before wrapping a model
+    # with PEFT when reentrant gradient checkpointing is enabled.  The smoke
+    # harness wraps eagerly, so it must preserve the same input-gradient path.
+    model.enable_input_require_grads()
     return get_peft_model(
         model,
         LoraConfig(

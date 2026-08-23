@@ -179,6 +179,53 @@ def _load_large_smoke_module():
     return module
 
 
+def test_smoke_lora_preserves_reentrant_checkpoint_gradient_path():
+    """The harness must mirror SFTTrainer's input-grad setup before PEFT."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    module = _load_large_smoke_module()
+    base_model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            max_position_embeddings=16,
+            use_cache=False,
+        )
+    )
+    model = module._apply_smoke_lora(base_model)
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": True}
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+
+    embedding_output = model.get_input_embeddings()(input_ids)
+    assert embedding_output.requires_grad
+    assert not model.get_input_embeddings().weight.requires_grad
+    assert all(
+        not parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if "lora_" not in name
+    )
+
+    loss = model(input_ids=input_ids, labels=input_ids).loss
+    loss.backward()
+    lora_parameters = [
+        parameter for name, parameter in model.named_parameters() if "lora_" in name
+    ]
+    assert lora_parameters
+    assert all(parameter.requires_grad for parameter in lora_parameters)
+    assert any(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in lora_parameters
+    )
+
+
 _DISTRIBUTED_ENVIRONMENT = (
     "RANK",
     "WORLD_SIZE",
