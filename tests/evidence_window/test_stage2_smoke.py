@@ -759,22 +759,16 @@ def test_zero2_parameter_update_is_an_explicit_gradient_fallback():
     module._validate_case_witness(witness)
 
 
-def test_gradient_witness_hooks_the_runtime_wrapped_model():
-    """The hook must be installed after DeepSpeed replaces the Trainer model."""
+def test_gradient_witness_uses_the_pre_step_global_norm_logged_by_trainer():
+    """DeepSpeed's global norm remains available after optimizer gradient clearing."""
     module = _load_large_smoke_module()
+    history = [{"loss": 1.0}, {"grad_norm": 0.25}, {"train_loss": 1.0}]
 
-    class FakeTrainer:
-        def add_callback(self, callback):
-            self.callback = callback
-
-    trainer = FakeTrainer()
-    witness = module._gradient_witness(trainer)
-    runtime_model = torch.nn.Linear(2, 1, bias=False)
-
-    trainer.callback.on_train_begin(None, None, None, model=runtime_model)
-    runtime_model(torch.ones(1, 2)).sum().backward()
-
-    assert witness == {"seen": True, "finite": True, "nonzero": True}
+    assert module._gradient_witness(history) == {
+        "seen": True,
+        "finite": True,
+        "nonzero": True,
+    }
 
 
 def test_parameter_update_witness_checks_all_trainable_smoke_parameters():

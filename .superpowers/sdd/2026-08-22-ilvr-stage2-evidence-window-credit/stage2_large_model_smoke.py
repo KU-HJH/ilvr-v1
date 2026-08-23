@@ -763,34 +763,18 @@ def _training_arguments(output_dir: Path, deepspeed_config: str | None):
     )
 
 
-def _gradient_witness(trainer) -> dict[str, Any]:
-    from transformers import TrainerCallback
-
+def _gradient_witness(log_history) -> dict[str, Any]:
     witness = {"seen": False, "finite": True, "nonzero": False}
-
-    class RuntimeGradientWitness(TrainerCallback):
-        installed = False
-
-        def on_train_begin(self, _args, _state, _control, *, model, **_kwargs):
-            if self.installed:
-                return
-            self.installed = True
-
-            def observe(gradient):
-                witness["seen"] = True
-                witness["finite"] = witness["finite"] and bool(
-                    gradient.isfinite().all().item()
-                )
-                witness["nonzero"] = witness["nonzero"] or bool(
-                    gradient.count_nonzero().item()
-                )
-                return gradient
-
-            for parameter in model.parameters():
-                if parameter.requires_grad:
-                    parameter.register_hook(observe)
-
-    trainer.add_callback(RuntimeGradientWitness())
+    for record in log_history:
+        if "grad_norm" not in record:
+            continue
+        witness["seen"] = True
+        value = record["grad_norm"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            witness["finite"] = False
+            continue
+        witness["finite"] = witness["finite"] and math.isfinite(value)
+        witness["nonzero"] = witness["nonzero"] or value != 0.0
     return witness
 
 
@@ -959,7 +943,6 @@ def _run_stage2(
             policy_initialization_checkpoint=args.stage1_checkpoint,
         )
     trainer = CustomTrainerStage2(**trainer_kwargs)
-    policy_grad = _gradient_witness(trainer)
     policy_update = _parameter_update_tracker(trainer.model)
     policy_forwards, policy_hook = _forward_witness(trainer.model)
     global_max_edge_slots = _distributed_max_int(edge_count)
@@ -970,6 +953,7 @@ def _run_stage2(
         reference_forwards, reference_hook = _forward_witness(fixed.model)
 
     trainer.train()
+    policy_grad = _gradient_witness(trainer.state.log_history)
     policy_hook.remove()
     if reference_hook is not None:
         reference_hook.remove()
@@ -1032,12 +1016,12 @@ def _run_stage1(args: argparse.Namespace, case_dir: Path) -> dict[str, Any]:
         tokenizer=processor.tokenizer,
         evidence_window_config=EvidenceWindowConfig.disabled(),
     )
-    policy_grad = _gradient_witness(trainer)
     policy_update = _parameter_update_tracker(trainer.model)
     policy_forwards, policy_hook = _forward_witness(trainer.model)
     teacher_forwards, teacher_hook = _forward_witness(trainer._ema.teacher)
     teacher_grad = any(parameter.grad is not None for parameter in trainer._ema.teacher.parameters())
     trainer.train()
+    policy_grad = _gradient_witness(trainer.state.log_history)
     policy_hook.remove()
     teacher_hook.remove()
     teacher_grad = teacher_grad or any(
