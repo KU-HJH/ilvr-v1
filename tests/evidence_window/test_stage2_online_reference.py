@@ -51,6 +51,7 @@ class _Accelerator:
     def __init__(self):
         self.prepared = []
         self.process_index = 0
+        self.device = torch.device("cpu")
 
     def prepare_model(self, model, *, evaluation_mode=False):
         assert evaluation_mode is True
@@ -189,6 +190,26 @@ def test_independent_reference_is_stage2_frozen_eval_before_prepare(zero_stage):
     assert accelerator.prepared == [reference.model]
     assert reference.witness.trainable_parameter_count == 0
     assert all(not parameter.requires_grad for parameter in reference.parameters())
+
+
+def test_online_reference_normalizes_mixed_checkpoint_dtype_before_prepare():
+    """Direct frozen scoring cannot rely on autocast to repair mixed checkpoints."""
+    model = _TinyStage2Model()
+    model.head.to(dtype=torch.bfloat16)
+
+    reference = _create_online(lambda: model, _Accelerator(), zero_stage=1)
+    output = reference.model(
+        input_ids=torch.tensor([[1, 2]]),
+        attention_mask=torch.ones((1, 2), dtype=torch.long),
+    )
+
+    floating_dtypes = {
+        parameter.dtype
+        for parameter in reference.model.parameters()
+        if parameter.is_floating_point()
+    }
+    assert floating_dtypes == {torch.float32}
+    assert torch.isfinite(output.logits).all()
 
 
 def test_online_reference_uses_matched_sdpa_edges_and_dummy_slots_without_gradients():

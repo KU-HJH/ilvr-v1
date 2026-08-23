@@ -86,6 +86,21 @@ class OnlineFrozenStage2Reference:
         if config is None:
             raise ValueError("online reference model must expose config.stage")
         config.stage = "stage2"
+        first_parameter = next(model.parameters(), None)
+        fallback_device = (
+            torch.device("cpu")
+            if first_parameter is None
+            else first_parameter.device
+        )
+        execution_device = torch.device(
+            getattr(accelerator, "device", fallback_device)
+        )
+        execution_dtype = (
+            torch.bfloat16
+            if execution_device.type == "cuda"
+            else torch.float32
+        )
+        model.to(device=execution_device, dtype=execution_dtype)
         model.eval()
         for parameter in model.parameters():
             parameter.requires_grad_(False)
