@@ -7,6 +7,7 @@ import tempfile
 
 import deepspeed
 import torch
+from peft import LoraConfig
 from torch.utils.data import Dataset
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -114,12 +115,16 @@ def main() -> None:
         decoder_calls = []
         requested_steps = []
         observed_local_latents = []
+        observed_gradient_checkpointing = []
         backward_witness = []
 
         def record_outer(_module, _args, kwargs):
             requested_steps.append(kwargs.get("stage2_latent_prefix_steps"))
             observed_local_latents.append(
                 int(kwargs["input_ids"].eq(9).sum().item())
+            )
+            observed_gradient_checkpointing.append(
+                bool(policy.model.gradient_checkpointing)
             )
 
         def record_decoder(_module, _args, kwargs):
@@ -130,11 +135,6 @@ def main() -> None:
             backward_witness.append(
                 bool(tensors) and all(torch.isfinite(value).all().item() for value in tensors)
             )
-
-        model.register_forward_pre_hook(record_outer, with_kwargs=True)
-        model.model.register_forward_pre_hook(record_decoder, with_kwargs=True)
-        model.lm_head.register_full_backward_hook(record_backward)
-        initial_lm_head = model.lm_head.weight.detach().cpu().clone()
 
         with tempfile.TemporaryDirectory(prefix="stage2-zero3-ledger-") as output_dir:
             args = SFTConfig(
@@ -151,6 +151,7 @@ def main() -> None:
                 dataset_kwargs={"skip_prepare_dataset": True},
                 max_seq_length=7,
                 use_cpu=False,
+                gradient_checkpointing=True,
                 deepspeed=_zero3_config(),
                 ddp_find_unused_parameters=False,
             )
@@ -160,6 +161,14 @@ def main() -> None:
                 train_dataset=_Rows(),
                 data_collator=_collate,
                 processing_class=_tokenizer(),
+                peft_config=LoraConfig(
+                    r=4,
+                    lora_alpha=8,
+                    lora_dropout=0.0,
+                    target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                ),
                 evidence_window_config=Stage2EvidenceWindowConfig.disabled(),
                 latent_token_ids={
                     "start": 8,
@@ -170,23 +179,37 @@ def main() -> None:
                 },
             )
             assert trainer.accelerator.state.deepspeed_plugin.zero_stage == 3
+            assert trainer.args.gradient_checkpointing
+            unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+            policy = unwrapped.get_base_model()
+            unwrapped.register_forward_pre_hook(record_outer, with_kwargs=True)
+            policy.model.register_forward_pre_hook(record_decoder, with_kwargs=True)
+            policy.lm_head.register_full_backward_hook(record_backward)
+            lora_b = next(
+                parameter
+                for name, parameter in unwrapped.named_parameters()
+                if "lora_B" in name
+            )
+            with deepspeed.zero.GatheredParameters([lora_b], modifier_rank=None):
+                initial_lora_b = lora_b.detach().cpu().clone()
+
             result = trainer.train()
             assert math.isfinite(result.training_loss)
 
-            unwrapped = trainer.accelerator.unwrap_model(trainer.model)
             with deepspeed.zero.GatheredParameters(
-                [unwrapped.lm_head.weight], modifier_rank=None
+                [lora_b], modifier_rank=None
             ):
-                updated_lm_head = unwrapped.lm_head.weight.detach().cpu().clone()
+                updated_lora_b = lora_b.detach().cpu().clone()
 
             assert len(observed_local_latents) == 1
+            assert observed_gradient_checkpointing == [True]
             local_latents = observed_local_latents[0]
             record = (
                 local_latents,
                 len(decoder_calls),
                 tuple(requested_steps),
                 bool(backward_witness) and all(backward_witness),
-                not torch.equal(initial_lm_head, updated_lm_head),
+                not torch.equal(initial_lora_b, updated_lora_b),
             )
             records = [None] * trainer.accelerator.num_processes
             torch.distributed.all_gather_object(records, record)

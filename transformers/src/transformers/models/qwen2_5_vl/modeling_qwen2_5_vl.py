@@ -2317,6 +2317,21 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             if self.training and not curr_inputs_embeds.requires_grad:
                 curr_inputs_embeds.requires_grad_(True)
 
+            zero3_checkpoint = None
+            if any(hasattr(parameter, "ds_id") for parameter in self.model.parameters()):
+                import deepspeed
+
+                zero3_checkpoint = deepspeed.checkpointing.non_reentrant_checkpoint
+
+            def checkpoint_latent_step(*checkpoint_args):
+                if zero3_checkpoint is not None:
+                    return zero3_checkpoint(latent_step_forward, *checkpoint_args)
+                return checkpoint(
+                    latent_step_forward,
+                    *checkpoint_args,
+                    use_reentrant=False,
+                )
+
             for latent_i in range(max_n_latents):
                 slice_start, slice_end = next_compute_range
                 cur_end = slice_end
@@ -2333,13 +2348,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
 
                 if self.training:
-                    hidden_full = checkpoint(
-                        latent_step_forward,
+                    hidden_full = checkpoint_latent_step(
                         prefix_inputs,
                         prefix_mask,
                         prefix_pos_ids,
                         prefix_block_mask,
-                        use_reentrant=False 
                     )
                 else:
                     hidden_full = latent_step_forward(
@@ -2411,13 +2424,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         dummy_pos_ids = full_position_ids
                         dummy_block_mask = attention_block_mask
                         if self.training:
-                            dummy_hidden = checkpoint(
-                                latent_step_forward,
+                            dummy_hidden = checkpoint_latent_step(
                                 dummy_inputs,
                                 dummy_mask,
                                 dummy_pos_ids,
                                 dummy_block_mask,
-                                use_reentrant=False,
                             )
                         else:
                             dummy_hidden = latent_step_forward(
@@ -2443,13 +2454,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 prefix_block_mask = attention_block_mask
                 
                 if self.training:
-                     hidden_full = checkpoint(
-                         latent_step_forward,
+                     hidden_full = checkpoint_latent_step(
                          prefix_inputs,
                          prefix_mask,
                          prefix_pos_ids,
                          prefix_block_mask,
-                         use_reentrant=False,
                      )
                 else:
                      hidden_full = latent_step_forward(
