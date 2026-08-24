@@ -1,5 +1,6 @@
 """Model-specific, no-cache Stage 2 inference controller."""
 
+import math
 from dataclasses import dataclass
 from functools import partial
 
@@ -26,8 +27,8 @@ class Stage2GenerationConfig:
             raise ValueError("max_new_tokens must be non-negative")
         if self.max_sequence_length is not None and self.max_sequence_length <= 0:
             raise ValueError("max_sequence_length must be positive")
-        if self.temperature < 0:
-            raise ValueError("temperature must be non-negative")
+        if not math.isfinite(self.temperature) or self.temperature < 0:
+            raise ValueError("temperature must be finite and non-negative")
         if not 0 < self.top_p <= 1:
             raise ValueError("top_p must be in the interval (0, 1]")
 
