@@ -11,6 +11,62 @@ export TOKENIZERS_PARALLELISM=false
 : "${OUTPUT_DIR:?set OUTPUT_DIR}"
 : "${LOG_FILE:?set LOG_FILE}"
 
+LATENT_SIZE=${LATENT_SIZE:-8}
+SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
+LEARNING_RATE=${LEARNING_RATE:-1e-5}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-8}
+ATTENTION_IMPLEMENTATION=${ATTENTION_IMPLEMENTATION:-sdpa}
+GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
+MAX_SEQUENCE_LENGTH=${MAX_SEQUENCE_LENGTH:-8192}
+PER_DEVICE_TRAIN_BATCH_SIZE=1
+
+require_positive_integer() {
+  local name=$1
+  local value=$2
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s must be a positive integer\n' "$name" >&2
+    exit 2
+  fi
+}
+
+require_positive_integer LATENT_SIZE "$LATENT_SIZE"
+require_positive_integer GRADIENT_ACCUMULATION_STEPS "$GRADIENT_ACCUMULATION_STEPS"
+require_positive_integer MAX_SEQUENCE_LENGTH "$MAX_SEQUENCE_LENGTH"
+
+if [[ ! "$LEARNING_RATE" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$ ]] ||
+   [[ "$LEARNING_RATE" =~ ^0*([.]0*)?([eE][+-]?[0-9]+)?$ ]]; then
+  printf 'LEARNING_RATE must be a positive number\n' >&2
+  exit 2
+fi
+
+BOUNDARY_ARGS=()
+case "$SUPERVISE_LATENT_BOUNDARIES" in
+  true) BOUNDARY_ARGS+=(--supervise_latent_boundaries) ;;
+  false) BOUNDARY_ARGS+=(--no-supervise_latent_boundaries) ;;
+  *)
+    printf 'SUPERVISE_LATENT_BOUNDARIES must be true or false\n' >&2
+    exit 2
+    ;;
+esac
+
+CHECKPOINTING_ARGS=()
+case "$GRADIENT_CHECKPOINTING" in
+  true) CHECKPOINTING_ARGS+=(--gradient_checkpointing) ;;
+  false) CHECKPOINTING_ARGS+=(--no-gradient_checkpointing) ;;
+  *)
+    printf 'GRADIENT_CHECKPOINTING must be true or false\n' >&2
+    exit 2
+    ;;
+esac
+
+case "$ATTENTION_IMPLEMENTATION" in
+  eager|sdpa|flash_attention_2) ;;
+  *)
+    printf 'ATTENTION_IMPLEMENTATION must be eager, sdpa, or flash_attention_2\n' >&2
+    exit 2
+    ;;
+esac
+
 RESUME_ARGS=()
 if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
   RESUME_ARGS+=(--resume_from_checkpoint_path "$RESUME_CHECKPOINT")
@@ -30,7 +86,14 @@ COMMAND=(
   --image_root "$IMAGE_ROOT"
   --save_model_path "$OUTPUT_DIR"
   --log_file "$LOG_FILE"
-  --per_device_train_batch_size 1
+  --latent_size "$LATENT_SIZE"
+  "${BOUNDARY_ARGS[@]}"
+  --learning_rate "$LEARNING_RATE"
+  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
+  --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE"
+  --attention_implementation "$ATTENTION_IMPLEMENTATION"
+  "${CHECKPOINTING_ARGS[@]}"
+  --max_seq_length_train "$MAX_SEQUENCE_LENGTH"
   "${RESUME_ARGS[@]}"
   "${DEEPSPEED_ARGS[@]}"
   "$@"

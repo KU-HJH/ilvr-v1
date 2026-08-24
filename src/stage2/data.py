@@ -1,5 +1,6 @@
-"""CoMT data preparation, non-truncating collation, and length filtering."""
+"""CoMT data preparation, non-truncating collation, and length auditing."""
 
+import argparse
 from collections import Counter
 from dataclasses import asdict, dataclass
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
+from transformers import AutoProcessor
 
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
@@ -299,3 +301,44 @@ def filter_stage2_examples(*, examples, measure_length, max_length):
     )
     logger.info("Stage 2 length statistics: %s", asdict(stats))
     return kept, stats
+
+
+def build_audit_parser() -> argparse.ArgumentParser:
+    """Build the standalone CoMT Stage 2 length-audit interface."""
+    parser = argparse.ArgumentParser(description="Audit CoMT Stage 2 sequence lengths")
+    parser.add_argument("--data-path", type=Path, required=True)
+    parser.add_argument("--image-root", type=Path, required=True)
+    parser.add_argument("--processor-path", required=True)
+    parser.add_argument("--latent-size", type=int, required=True)
+    parser.add_argument("--max-sequence-length", type=int, required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Audit complete rendered samples once and emit a stable JSON summary."""
+    args = build_audit_parser().parse_args(argv)
+    if args.latent_size <= 0:
+        raise ValueError("latent_size must be positive")
+    if args.max_sequence_length <= 0:
+        raise ValueError("max_sequence_length must be positive")
+
+    processor = AutoProcessor.from_pretrained(args.processor_path)
+    examples = [
+        prepare_stage2_example(
+            sample,
+            image_root=args.image_root,
+            latent_size=args.latent_size,
+        )
+        for sample in load_jsonl_examples(args.data_path)
+    ]
+    _, stats = filter_stage2_examples(
+        examples=examples,
+        measure_length=build_prepared_example_length_measure(processor),
+        max_length=args.max_sequence_length,
+    )
+    print(json.dumps(asdict(stats), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

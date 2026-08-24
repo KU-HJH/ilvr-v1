@@ -131,14 +131,24 @@ bash run_training.sh
 
 ### Stage 2 training
 
-Evidence status: this Stage 2 path has passed a one-sample, one-optimizer-step
-smoke test. Full-scale CoMT training, evaluation, and reproduction of the
-paper's reported results have not been established.
+Stage 2 starts from a Stage 1 checkpoint and replaces CoMT helper-image steps
+with differentiable continuous-latent blocks. The original/user image remains
+a model input, but helper images are never loaded as Stage 2 visual inputs. The
+entire visual tower is frozen and is encoded once per rank-local batch.
 
 `run_stage2_training.sh` launches the Stage 2 path with this checkout's
 `./venv/ilvr-venv` Python and local `transformers/src` and `src` trees. It is
 safe to invoke from outside the repository because all runtime paths are
-resolved relative to the script.
+resolved relative to the script. The reproduction-oriented defaults are:
+
+- `LATENT_SIZE=8`;
+- `SUPERVISE_LATENT_BOUNDARIES=true` (start and end are always paired);
+- `LEARNING_RATE=1e-5`;
+- `GRADIENT_ACCUMULATION_STEPS=8`;
+- `ATTENTION_IMPLEMENTATION=sdpa`;
+- `GRADIENT_CHECKPOINTING=false`;
+- `MAX_SEQUENCE_LENGTH=8192`; and
+- rank-local/per-device batch size fixed at `1`.
 
 For a fresh Stage 2 run, provide an explicit Stage 1 checkpoint origin and do
 not set `RESUME_CHECKPOINT`:
@@ -149,8 +159,15 @@ DATA_PATH=/path/to/TRAIN.jsonl \
 IMAGE_ROOT=/path/to/data \
 OUTPUT_DIR=/path/to/stage2/output \
 LOG_FILE=/path/to/stage2.log \
-./run_stage2_training.sh \
-  --gradient_accumulation_steps 8
+LATENT_SIZE=8 \
+SUPERVISE_LATENT_BOUNDARIES=true \
+LEARNING_RATE=1e-5 \
+GRADIENT_ACCUMULATION_STEPS=8 \
+ATTENTION_IMPLEMENTATION=flash_attention_2 \
+GRADIENT_CHECKPOINTING=true \
+MAX_SEQUENCE_LENGTH=8192 \
+DEEPSPEED_CONFIG=configs/config_stage3.json \
+./run_stage2_training.sh
 ```
 
 Fresh training loads model and processor state from `STAGE1_CHECKPOINT`, then
@@ -175,18 +192,59 @@ source for model, processor, optimizer, scheduler, and trainer progress;
 `STAGE1_CHECKPOINT` remains a separate, explicit provenance input and is never
 reinterpreted as the resume path.
 
-Stage 2 currently requires a rank-local batch size of exactly `B=1`, which the
-launcher sets explicitly. The effective global batch is therefore
-`world_size × gradient_accumulation_steps`. Latent start/end boundary tokens
-are supervised by default; pass `--no-supervise_latent_boundaries` to disable
-that supervision.
+Stage 2 currently requires a rank-local batch size of exactly `B=1`; arbitrary
+local `B>1` latent scheduling is not implemented. Data-parallel ranks and
+gradient accumulation are supported, so the effective global batch is
+`world_size × 1 × GRADIENT_ACCUMULATION_STEPS`. Set
+`SUPERVISE_LATENT_BOUNDARIES=false` to mask both latent boundary tokens from CE;
+the latent slots themselves are always masked. Start-only or end-only boundary
+supervision is not a supported state.
 
 Stage 2 uses each sample's original input images only. `helper_image` entries
 mark latent reasoning steps in the data, but helper-image pixels/tensors are
-not collated or encoded. The recurrent latent update also requires
-`use_cache=False`; KV-cache training is not supported. Use
+not collated or encoded. The recurrent latent update runs with
+`use_cache=False`; no training or inference KV-cache optimization is
+implemented. Use
 `STAGE2_DRY_RUN=true` to print the shell-escaped environment and command without
 loading Python, a model, or data.
+
+#### CoMT length audit
+
+The audit renders every complete Stage 2 sample through the Stage 1 processor
+without destructive truncation, then filters only whole examples above the
+configured maximum:
+
+```bash
+PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+./venv/ilvr-venv/bin/python -m stage2.data \
+  --data-path ../../data/TRAIN.jsonl \
+  --image-root ../../data \
+  --processor-path ../../checkpoints/comt_ckpt \
+  --latent-size 8 \
+  --max-sequence-length 8192
+```
+
+The available CoMT training data was audited once with that command: 3,450
+total samples, 3,379 retained, and 71 filtered (2.057971%). Lengths had minimum
+131, median 724, p90 1,557.1, p95 2,691.6, p99 15,769.73, and maximum 16,698
+tokens. The latent-block distribution was 924/239/561/1,227/286/213 samples
+for one through six blocks, respectively.
+
+#### Verification status
+
+- **Implementation and smoke:** one real Stage 1 checkpoint/CoMT sample
+  completed one Stage 2 optimizer step with finite loss
+  (`0.00010741489677457139`).
+- **FlashAttention:** a tiny one-layer Stage 2 model passed eager versus
+  FlashAttention 2 latent/logit parity once on an NVIDIA B200 using bfloat16,
+  PyTorch 2.7.1+cu128, and FlashAttention 2.8.3.
+- **DeepSpeed:** a reviewed tiny-model two-B200 ZeRO-3 run passed consolidated
+  save/load and optimizer/scheduler resume from global step 1 to 2, with every
+  observed rank-local batch equal to 1.
+- **Paper-level reproduction:** full CoMT Stage 2 training, benchmark
+  evaluation, and reproduction of the paper's reported metrics were **not**
+  run. The evidence above establishes implementation, smoke, backend, and data
+  readiness only.
 
 ---
 
