@@ -4,6 +4,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
 import torch
 from PIL import Image
 
@@ -21,12 +22,12 @@ REQUIRED_ENV = {
 }
 
 
-def run_launcher(*, env_overrides=None):
+def run_launcher(*args, env_overrides=None):
     env = {"PATH": os.environ["PATH"], "STAGE2_DRY_RUN": "true", **REQUIRED_ENV}
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
-        ["bash", str(LAUNCHER)], env=env, capture_output=True, text=True
+        ["bash", str(LAUNCHER), *args], env=env, capture_output=True, text=True
     )
 
 
@@ -145,11 +146,84 @@ def test_stage2_launcher_rejects_non_positive_integer_settings():
 
 def test_stage2_launcher_rejects_invalid_learning_rate():
     """Catches a malformed or zero learning rate before training starts."""
-    for value in ("fast", "0"):
+    for value in ("fast", "0", "-1", "1e999", "1e-9999", "nan", "inf", "-inf"):
         result = run_launcher(env_overrides={"LEARNING_RATE": value})
 
         assert result.returncode == 2
         assert "LEARNING_RATE must be a positive number" in result.stderr
+
+
+MANAGED_OPTIONS = (
+    "--stage",
+    "--load_model_path",
+    "--data_path",
+    "--image_root",
+    "--save_model_path",
+    "--log_file",
+    "--latent_size",
+    "--supervise_latent_boundaries",
+    "--no-supervise_latent_boundaries",
+    "--learning_rate",
+    "--gradient_accumulation_steps",
+    "--per_device_train_batch_size",
+    "--attention_implementation",
+    "--gradient_checkpointing",
+    "--no-gradient_checkpointing",
+    "--max_seq_length_train",
+    "--deepspeed_config",
+    "--resume_from_checkpoint_path",
+)
+
+
+@pytest.mark.parametrize("option", MANAGED_OPTIONS)
+@pytest.mark.parametrize("syntax", ("separate", "equals"))
+def test_stage2_launcher_rejects_trailing_managed_options(option, syntax):
+    """Catches trailing argparse values replacing launcher-owned invariants."""
+    arguments = [option, "override"] if syntax == "separate" else [f"{option}=override"]
+
+    result = run_launcher(*arguments)
+
+    assert result.returncode == 2
+    assert f"launcher-owned option cannot be passed directly: {option}" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "arguments, abbreviated_option",
+    [
+        (["--sta", "stage1"], "--sta"),
+        (["--load_model_p=/wrong/model"], "--load_model_p"),
+        (["--per_device_train_b", "2"], "--per_device_train_b"),
+    ],
+)
+def test_stage2_launcher_rejects_argparse_abbreviations_of_managed_options(
+    arguments, abbreviated_option
+):
+    """Catches argparse long-option abbreviation bypassing invariant ownership."""
+    result = run_launcher(*arguments)
+
+    assert result.returncode == 2
+    assert (
+        f"launcher-owned option cannot be passed directly: {abbreviated_option}"
+        in result.stderr
+    )
+
+
+def test_stage2_launcher_preserves_unmanaged_passthrough_and_quoting():
+    """Catches invariant protection dropping or splitting genuine passthrough options."""
+    result = run_launcher(
+        "--max_steps",
+        "7",
+        "--evaluation_output_path",
+        "/reports/stage 2.json",
+    )
+
+    arguments = resolved_launcher_arguments(result)
+    assert arguments[-4:] == [
+        "--max_steps",
+        "7",
+        "--evaluation_output_path",
+        "/reports/stage 2.json",
+    ]
 
 
 class FakeProcessor:

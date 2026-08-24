@@ -40,8 +40,8 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
     result = run_launcher(
         "--max_steps",
         "1",
-        "--attention_implementation",
-        "sdpa",
+        "--evaluation_output_path",
+        "/reports/stage 2.json",
         cwd=tmp_path,
     )
 
@@ -82,8 +82,8 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "8192",
         "--max_steps",
         "1",
-        "--attention_implementation",
-        "sdpa",
+        "--evaluation_output_path",
+        "/reports/stage 2.json",
     ]
 
 

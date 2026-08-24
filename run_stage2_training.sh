@@ -20,6 +20,44 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 MAX_SEQUENCE_LENGTH=${MAX_SEQUENCE_LENGTH:-8192}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 
+MANAGED_OPTIONS=(
+  --stage
+  --load_model_path
+  --data_path
+  --image_root
+  --save_model_path
+  --log_file
+  --latent_size
+  --supervise_latent_boundaries
+  --no-supervise_latent_boundaries
+  --learning_rate
+  --gradient_accumulation_steps
+  --per_device_train_batch_size
+  --attention_implementation
+  --gradient_checkpointing
+  --no-gradient_checkpointing
+  --max_seq_length_train
+  --deepspeed_config
+  --resume_from_checkpoint_path
+)
+
+reject_managed_arguments() {
+  local argument
+  local managed_option
+  local option
+  for argument in "$@"; do
+    option=${argument%%=*}
+    for managed_option in "${MANAGED_OPTIONS[@]}"; do
+      if [[ "$managed_option" == "$option"* ]]; then
+        printf 'launcher-owned option cannot be passed directly: %s\n' "$option" >&2
+        exit 2
+      fi
+    done
+  done
+}
+
+reject_managed_arguments "$@"
+
 require_positive_integer() {
   local name=$1
   local value=$2
@@ -33,8 +71,17 @@ require_positive_integer LATENT_SIZE "$LATENT_SIZE"
 require_positive_integer GRADIENT_ACCUMULATION_STEPS "$GRADIENT_ACCUMULATION_STEPS"
 require_positive_integer MAX_SEQUENCE_LENGTH "$MAX_SEQUENCE_LENGTH"
 
-if [[ ! "$LEARNING_RATE" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$ ]] ||
-   [[ "$LEARNING_RATE" =~ ^0*([.]0*)?([eE][+-]?[0-9]+)?$ ]]; then
+if ! "$REPO_ROOT/venv/ilvr-venv/bin/python" - "$LEARNING_RATE" <<'PY'
+import math
+import sys
+
+try:
+    learning_rate = float(sys.argv[1])
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(learning_rate) and learning_rate > 0 else 1)
+PY
+then
   printf 'LEARNING_RATE must be a positive number\n' >&2
   exit 2
 fi

@@ -206,7 +206,11 @@ not collated or encoded. The recurrent latent update runs with
 `use_cache=False`; no training or inference KV-cache optimization is
 implemented. Use
 `STAGE2_DRY_RUN=true` to print the shell-escaped environment and command without
-loading Python, a model, or data.
+loading a model or data. Set the reproduction-critical options through the
+documented environment variables; passing a launcher-owned option such as
+`--stage`, `--latent_size`, or `--per_device_train_batch_size` directly is
+rejected. Unmanaged training options such as `--max_steps` remain available as
+trailing command-line arguments.
 
 #### CoMT length audit
 
