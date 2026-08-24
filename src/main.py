@@ -78,6 +78,16 @@ def configure_stage2_model_backend(model, *, gradient_checkpointing: bool) -> No
         model.gradient_checkpointing_disable()
 
 
+def validate_stage2_distributed_settings(
+    per_device_train_batch_size: int,
+) -> None:
+    """Enforce the rank-local batch contract used by latent rollout."""
+    if per_device_train_batch_size != 1:
+        raise ValueError(
+            "Stage 2 train_micro_batch_size_per_gpu must resolve to 1"
+        )
+
+
 def build_stage2_training_components(args) -> Stage2TrainingComponents:
     decision = resolve_stage2_load_decision(
         load_model_path=args.load_model_path,
@@ -138,6 +148,7 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
 
 
 def build_stage2_training_arguments(args) -> SFTConfig:
+    validate_stage2_distributed_settings(args.per_device_train_batch_size)
     return SFTConfig(
         output_dir=args.save_model_path,
         num_train_epochs=args.epochs,

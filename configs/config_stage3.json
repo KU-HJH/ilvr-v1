@@ -20,9 +20,9 @@
       "stage3_prefetch_bucket_size": 5e7,
       "stage3_param_persistence_threshold": 1e6,
       "sub_group_size": 1e9,
-      "stage3_max_live_parameters": 1e9
+      "stage3_max_live_parameters": 1e9,
+      "stage3_gather_16bit_weights_on_model_save": true
   },
-  "stage3_gather_16bit_weights_on_model_save": true,
   "gradient_clipping": 1.0,
   "steps_per_print": 10,
   "wall_clock_breakdown": false

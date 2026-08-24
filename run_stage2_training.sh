@@ -16,6 +16,11 @@ if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
   RESUME_ARGS+=(--resume_from_checkpoint_path "$RESUME_CHECKPOINT")
 fi
 
+DEEPSPEED_ARGS=()
+if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
+  DEEPSPEED_ARGS+=(--deepspeed_config "$DEEPSPEED_CONFIG")
+fi
+
 COMMAND=(
   "$REPO_ROOT/venv/ilvr-venv/bin/python"
   "$REPO_ROOT/src/main.py"
@@ -27,6 +32,7 @@ COMMAND=(
   --log_file "$LOG_FILE"
   --per_device_train_batch_size 1
   "${RESUME_ARGS[@]}"
+  "${DEEPSPEED_ARGS[@]}"
   "$@"
 )
 
