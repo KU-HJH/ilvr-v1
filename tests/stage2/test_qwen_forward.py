@@ -1,9 +1,50 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
 from .helpers import ToyCausalLanguageModel
+
+
+class OutputAwareToyCausalLanguageModel(ToyCausalLanguageModel):
+    """Toy decoder that mirrors Qwen's config-default output flags."""
+
+    def __init__(self, hidden_size, *, output_hidden_states=False, output_attentions=False):
+        super().__init__(hidden_size)
+        self.output_hidden_states = output_hidden_states
+        self.output_attentions = output_attentions
+
+    def forward(
+        self,
+        *,
+        inputs_embeds,
+        attention_mask,
+        position_ids,
+        use_cache,
+        return_dict,
+        generate_mode=False,
+        output_hidden_states=None,
+        output_attentions=None,
+    ):
+        outputs = super().forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=use_cache,
+            return_dict=return_dict,
+            generate_mode=generate_mode,
+        )
+        output_hidden_states = (
+            self.output_hidden_states if output_hidden_states is None else output_hidden_states
+        )
+        output_attentions = self.output_attentions if output_attentions is None else output_attentions
+        return SimpleNamespace(
+            last_hidden_state=outputs.last_hidden_state,
+            hidden_states=(inputs_embeds, outputs.last_hidden_state) if output_hidden_states else None,
+            attentions=(torch.zeros(1, device=inputs_embeds.device),) if output_attentions else None,
+        )
 
 
 def tiny_stage2_qwen():
@@ -48,7 +89,7 @@ def stage2_scaffold():
 
 def test_stage2_forward_slices_one_full_mrope_tensor(monkeypatch):
     model = tiny_stage2_qwen()
-    recorder = ToyCausalLanguageModel(8)
+    recorder = OutputAwareToyCausalLanguageModel(8)
     model.model = recorder
     input_ids, attention_mask, image_grid_thw = stage2_scaffold()
     expected_positions, _ = model.get_rope_index(
@@ -86,7 +127,7 @@ def test_stage2_forward_slices_one_full_mrope_tensor(monkeypatch):
 
 def test_stage2_outputs_do_not_retain_latents_or_diagnostic_graphs_by_default():
     model = tiny_stage2_qwen()
-    model.model = ToyCausalLanguageModel(8)
+    model.model = OutputAwareToyCausalLanguageModel(8)
     input_ids, attention_mask, image_grid_thw = stage2_scaffold()
 
     outputs = model(
@@ -100,6 +141,57 @@ def test_stage2_outputs_do_not_retain_latents_or_diagnostic_graphs_by_default():
     assert torch.equal(outputs.stage2_diagnostics["block_count"], torch.tensor(1))
     assert outputs.stage2_diagnostics["latent_l2_norms"].requires_grad is False
     assert outputs.stage2_diagnostics["adjacent_cosine_similarities"].requires_grad is False
+
+
+@pytest.mark.parametrize(
+    ("config_default", "call_override"),
+    [(False, True), (True, False)],
+)
+def test_stage2_forward_honors_per_call_output_overrides(config_default, call_override):
+    model = tiny_stage2_qwen()
+    model.model = OutputAwareToyCausalLanguageModel(
+        8,
+        output_hidden_states=config_default,
+        output_attentions=config_default,
+    )
+    input_ids, attention_mask, image_grid_thw = stage2_scaffold()
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        image_grid_thw=image_grid_thw,
+        output_hidden_states=call_override,
+        output_attentions=call_override,
+    )
+
+    assert (outputs.hidden_states is not None) is call_override
+    assert (outputs.attentions is not None) is call_override
+
+
+def test_stage2_return_dict_false_preserves_qwen_order_before_opt_in_extras():
+    model = tiny_stage2_qwen()
+    model.model = OutputAwareToyCausalLanguageModel(8)
+    input_ids, attention_mask, image_grid_thw = stage2_scaffold()
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        image_grid_thw=image_grid_thw,
+        labels=input_ids.masked_fill(input_ids == 90, -100),
+        output_hidden_states=True,
+        output_attentions=True,
+        return_dict=False,
+        return_stage2_latent_states=True,
+        collect_stage2_diagnostics=True,
+    )
+
+    loss, logits, hidden_states, attentions, latent_states, diagnostics = outputs
+    assert loss.ndim == 0
+    assert logits.shape == (1, input_ids.shape[1], model.config.vocab_size)
+    assert len(hidden_states) == model.config.num_hidden_layers + 1
+    assert len(attentions) == model.config.num_hidden_layers
+    assert len(latent_states) == model.config.latent_size
+    assert diagnostics["block_count"].item() == 1
 
 
 @pytest.mark.parametrize(

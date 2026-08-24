@@ -2000,6 +2000,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         labels: Optional[torch.LongTensor],
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.LongTensor],
+        output_attentions: bool,
+        output_hidden_states: bool,
         return_dict: bool,
         return_stage2_latent_states: bool,
         collect_stage2_diagnostics: bool,
@@ -2058,6 +2060,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             attention_mask=attention_mask,
             position_ids=full_position_ids,
             use_cache=False,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             return_dict=True,
         )
         logits = self.lm_head(final_outputs.last_hidden_state)
@@ -2069,10 +2073,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
             loss = CrossEntropyLoss()(shift_logits, shift_labels)
 
-        if not return_dict:
-            output = (logits,)
-            return (loss,) + output if loss is not None else output
-
         diagnostics = None
         if rollout.diagnostics is not None:
             diagnostics = {
@@ -2083,6 +2083,24 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 "latent_l2_norms": rollout.diagnostics.latent_l2_norms.detach(),
                 "adjacent_cosine_similarities": rollout.diagnostics.adjacent_cosine_similarities.detach(),
             }
+
+        if not return_dict:
+            decoder_outputs = tuple(
+                value
+                for value in (
+                    getattr(final_outputs, "hidden_states", None),
+                    getattr(final_outputs, "attentions", None),
+                )
+                if value is not None
+            )
+            stage2_outputs = ()
+            if return_stage2_latent_states:
+                stage2_outputs += (rollout.latent_states,)
+            if collect_stage2_diagnostics:
+                stage2_outputs += (diagnostics,)
+            output = (logits,) + decoder_outputs + stage2_outputs
+            return (loss,) + output if loss is not None else output
+
         return Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -2156,6 +2174,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 labels=labels,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
                 return_stage2_latent_states=return_stage2_latent_states,
                 collect_stage2_diagnostics=collect_stage2_diagnostics,
