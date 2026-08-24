@@ -13,11 +13,11 @@ from PIL import Image
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
     AutoProcessor,
-    LogitsProcessorList,
 )
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-from utils_deepseed import LatentTemplateLogitsProcessor
+from stage2.checkpointing import resolve_latent_token_ids
+from stage2.inference import Stage2GenerationConfig, Stage2InferenceController
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -334,14 +334,26 @@ def run_one_example(
         if isinstance(v, torch.Tensor)
     }
 
-    latent_pad_id = processor.tokenizer("<|latent_pad|>", return_tensors="pt")["input_ids"][0, 0].item()
-    latent_start_id = processor.tokenizer("<|latent_start|>", return_tensors="pt")["input_ids"][0, 0].item()
-    latent_end_id = processor.tokenizer("<|latent_end|>", return_tensors="pt")["input_ids"][0, 0].item()
-    latent_size = int(getattr(model.config, "latent_size", 8))
-    logits_processor = LogitsProcessorList([
-        LatentTemplateLogitsProcessor(latent_start_id, latent_end_id, latent_pad_id, latent_size)
-    ])
-
+    input_ids = inputs["input_ids"]
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise NotImplementedError("Stage 2 evaluation currently supports batch_size=1 only")
+    latent_size = getattr(model.config, "latent_size", None)
+    if not isinstance(latent_size, int) or isinstance(latent_size, bool) or latent_size <= 0:
+        raise ValueError("Stage 2 checkpoint config must contain a positive latent_size")
+    token_ids = resolve_latent_token_ids(processor.tokenizer, model.config)
+    do_sample = bool(gen_kwargs.get("do_sample", gen_kwargs.get("temperature", 0) > 0))
+    eos_token_id = gen_kwargs.get("eos_token_id")
+    if eos_token_id is None:
+        eos_token_id = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    if eos_token_id is None:
+        eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
+    generation_config = Stage2GenerationConfig(
+        max_new_tokens=int(gen_kwargs.get("max_new_tokens", 64)),
+        max_sequence_length=gen_kwargs.get("max_sequence_length"),
+        temperature=float(gen_kwargs.get("temperature", 0.0)) if do_sample else 0.0,
+        top_p=float(gen_kwargs.get("top_p", 1.0)),
+        eos_token_id=eos_token_id,
+    )
 
     # ---- Start inference timing (generation only) ----
     if torch.cuda.is_available():
@@ -349,12 +361,17 @@ def run_one_example(
     start_time = time.perf_counter()
 
     with torch.inference_mode():
-        out_ids = model.generate(
-            **inputs,
-            **gen_kwargs,
-            logits_processor=logits_processor,
-            tokenizer=processor.tokenizer,
+        generation_result = Stage2InferenceController().generate(
+            model=model,
+            input_ids=input_ids,
+            attention_mask=inputs["attention_mask"],
+            token_ids=token_ids,
+            generation_config=generation_config,
+            pixel_values=inputs.get("pixel_values"),
+            image_grid_thw=inputs.get("image_grid_thw"),
+            return_latent_states=False,
         )
+    out_ids = generation_result.sequences
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
