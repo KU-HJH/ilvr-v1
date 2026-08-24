@@ -12,7 +12,7 @@ from transformers import LogitsProcessor
 import torch
 
 
-def get_args():
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--evaluation_output_path", type=str, default="evaluation_results.json", help="Path to save evaluation results JSON file.")
     parser.add_argument("--model", type=str, default='Qwen/Qwen2.5-VL-7B-Instruct')
@@ -57,10 +57,43 @@ def get_args():
     )
     parser.add_argument("--max_seq_length_train", type=int, default=8192,
         help="Stage-2")  # 改默认 8192
+    parser.add_argument(
+        "--supervise_latent_boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--save_final_model", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--image_root", required=False)
+    parser.add_argument("--max_train_samples", type=int)
+    parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--attention_implementation",
+        choices=("eager", "sdpa", "flash_attention_2"),
+        default="sdpa",
+    )
+    parser.add_argument("--deepspeed_config")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     # global_pad_to 已存在，保留
 # 其余不变
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.stage == "stage2" and args.use_lora:
+        raise ValueError("Stage 2 does not support LoRA")
+    if args.stage == "stage2" and args.per_device_train_batch_size != 1:
+        raise ValueError("Stage 2 requires per_device_train_batch_size=1")
+    return args
+
+
+def get_args():
+    return parse_args()
 
 def seed_everything(seed: int = 42):
     random.seed(seed)

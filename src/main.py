@@ -2,6 +2,8 @@ import os
 import re
 import json
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 from tqdm import tqdm
 from functools import partial
 
@@ -10,6 +12,7 @@ from torch.nn import functional as F
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
     Qwen2_5_VLConfig,
+    AutoConfig,
     AutoProcessor,
 )
 from transformers.trainer_utils import get_last_checkpoint
@@ -22,6 +25,126 @@ from qwen_vl_utils import process_vision_info
 from utils_deepseed import *
 from task_deepseed import *
 from trainer import CustomTrainerStage1
+from stage2.checkpointing import (
+    configure_stage2_metadata,
+    resolve_latent_token_ids,
+    resolve_stage2_load_decision,
+)
+from stage2.data import (
+    Stage2DataCollator,
+    build_prepared_example_length_measure,
+    filter_stage2_examples,
+    load_jsonl_examples,
+    prepare_stage2_example,
+)
+from stage2.trainer import Stage2Trainer
+
+
+@dataclass(frozen=True)
+class TrainingPath:
+    trainer_class: type
+    collator_factory: object
+
+
+def select_training_path(stage: str) -> TrainingPath:
+    if stage == "stage1":
+        return TrainingPath(CustomTrainerStage1, collate_fn_stage1)
+    if stage == "stage2":
+        return TrainingPath(Stage2Trainer, Stage2DataCollator)
+    raise ValueError(f"Unsupported training stage: {stage}")
+
+
+@dataclass(frozen=True)
+class Stage2TrainingComponents:
+    model: object
+    processor: object
+    train_dataset: object
+    data_collator: Stage2DataCollator
+    trainer_class: type[Stage2Trainer]
+    trainer_resume_path: str | None
+
+
+def build_stage2_training_components(args) -> Stage2TrainingComponents:
+    decision = resolve_stage2_load_decision(
+        load_model_path=args.load_model_path,
+        resume_from_checkpoint_path=args.resume_from_checkpoint_path,
+        load_config=AutoConfig.from_pretrained,
+    )
+    processor = AutoProcessor.from_pretrained(decision.processor_source)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        decision.model_source,
+        attn_implementation=args.attention_implementation,
+    )
+    token_ids = resolve_latent_token_ids(processor.tokenizer, model.config)
+    configure_stage2_metadata(
+        model.config,
+        token_ids,
+        latent_size=args.latent_size,
+        supervise_latent_boundaries=args.supervise_latent_boundaries,
+    )
+    model.config.use_cache = False
+    model.visual.requires_grad_(False)
+
+    raw_examples = load_jsonl_examples(Path(args.data_path))
+    selected_examples = (
+        raw_examples
+        if args.max_train_samples is None
+        else raw_examples[: args.max_train_samples]
+    )
+    prepared = [
+        prepare_stage2_example(
+            item,
+            image_root=Path(args.image_root),
+            latent_size=args.latent_size,
+        )
+        for item in selected_examples
+    ]
+    kept, _length_stats = filter_stage2_examples(
+        examples=prepared,
+        measure_length=build_prepared_example_length_measure(processor),
+        max_length=args.max_seq_length_train,
+    )
+    collator = Stage2DataCollator(
+        processor,
+        token_ids,
+        args.latent_size,
+        args.supervise_latent_boundaries,
+    )
+    return Stage2TrainingComponents(
+        model=model,
+        processor=processor,
+        train_dataset=kept,
+        data_collator=collator,
+        trainer_class=Stage2Trainer,
+        trainer_resume_path=decision.trainer_resume_path,
+    )
+
+
+def build_stage2_training_arguments(args) -> SFTConfig:
+    return SFTConfig(
+        output_dir=args.save_model_path,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        warmup_steps=args.warm_up_steps,
+        learning_rate=args.learning_rate,
+        weight_decay=0.01,
+        logging_steps=20,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        save_total_limit=1,
+        optim="adamw_torch",
+        bf16=True,
+        report_to=[],
+        remove_unused_columns=False,
+        dataset_text_field="",
+        dataset_kwargs={"skip_prepare_dataset": True},
+        max_seq_length=args.max_seq_length_train,
+        max_steps=args.max_steps,
+        gradient_checkpointing=args.gradient_checkpointing,
+        deepspeed=args.deepspeed_config,
+        ddp_find_unused_parameters=False,
+    )
 
 # ==============================================================
 # Collate Functions
@@ -111,6 +234,21 @@ def main_train():
     logging.info('==' * 20)
     logging.info(args)
     logging.info('==' * 20)
+
+    if args.stage == "stage2":
+        components = build_stage2_training_components(args)
+        trainer = components.trainer_class(
+            model=components.model,
+            args=build_stage2_training_arguments(args),
+            train_dataset=components.train_dataset,
+            data_collator=components.data_collator,
+            processing_class=components.processor,
+        )
+        trainer.train(resume_from_checkpoint=components.trainer_resume_path)
+        if args.save_final_model:
+            trainer.save_model(args.save_model_path)
+            components.processor.save_pretrained(args.save_model_path)
+        return
 
     cache_dir = args.cache_dir
     os.environ['HF_HOME'] = cache_dir
