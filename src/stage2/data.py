@@ -1,13 +1,20 @@
-"""CoMT trajectory conversion and Stage 2 loss-label helpers."""
+"""CoMT data preparation, non-truncating collation, and length filtering."""
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass
 import json
+import logging
 from pathlib import Path
+
+import torch
 
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
     parse_latent_spans,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -135,3 +142,148 @@ def build_stage2_labels(
             labels[0, span.start_position] = -100
             labels[0, span.end_position] = -100
     return labels
+
+
+def find_unique_subsequence_end(sequence: torch.Tensor, pattern: torch.Tensor) -> int:
+    """Return the position immediately after one required assistant marker."""
+    matches = [
+        start + pattern.numel()
+        for start in range(sequence.numel() - pattern.numel() + 1)
+        if torch.equal(sequence[start : start + pattern.numel()], pattern)
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one assistant marker, found {len(matches)}")
+    return matches[0]
+
+
+class Stage2DataCollator:
+    """Tokenize exactly one complete CoMT sample without truncation."""
+
+    def __init__(self, processor, token_ids, latent_size, supervise_latent_boundaries):
+        self.processor = processor
+        self.token_ids = token_ids
+        self.latent_size = latent_size
+        self.supervise_latent_boundaries = supervise_latent_boundaries
+        self.assistant_pattern = processor.tokenizer(
+            "<|im_start|>assistant", add_special_tokens=False, return_tensors="pt"
+        )["input_ids"][0]
+
+    def __call__(self, examples: list[Stage2PreparedExample]) -> dict[str, torch.Tensor]:
+        if len(examples) != 1:
+            raise NotImplementedError("Stage 2 collator currently supports batch_size=1 only")
+
+        example = examples[0]
+        text = self.processor.apply_chat_template(
+            example.conversation, tokenize=False, add_generation_prompt=False
+        )
+        batch = self.processor(
+            text=[text],
+            images=[list(example.original_image_paths)],
+            padding=True,
+            truncation=False,
+            return_tensors="pt",
+        )
+        forbidden = {"pixel_values_latent", "image_grid_thw_latent"} & batch.keys()
+        if forbidden:
+            raise ValueError(f"helper-image tensors leaked into Stage 2: {sorted(forbidden)}")
+        if batch["input_ids"].shape[0] != 1:
+            raise NotImplementedError("Stage 2 collator currently supports batch_size=1 only")
+
+        parse_latent_spans(
+            batch["input_ids"][0], token_ids=self.token_ids, latent_size=self.latent_size
+        )
+        assistant_content_start = find_unique_subsequence_end(
+            batch["input_ids"][0], self.assistant_pattern
+        )
+        batch["labels"] = build_stage2_labels(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            assistant_content_start=assistant_content_start,
+            token_ids=self.token_ids,
+            latent_size=self.latent_size,
+            supervise_latent_boundaries=self.supervise_latent_boundaries,
+        )
+        return batch
+
+
+def build_prepared_example_length_measure(processor):
+    """Build a length measurement closure that never truncates a sample."""
+
+    def measure(example: Stage2PreparedExample) -> int:
+        rendered = processor.apply_chat_template(
+            example.conversation, tokenize=False, add_generation_prompt=False
+        )
+        encoded = processor(
+            text=[rendered],
+            images=[list(example.original_image_paths)],
+            padding=False,
+            truncation=False,
+            return_tensors="pt",
+        )
+        return int(encoded["input_ids"].shape[1])
+
+    return measure
+
+
+@dataclass(frozen=True)
+class Stage2LengthStats:
+    """Distribution of complete Stage 2 samples before length filtering."""
+
+    total: int
+    retained: int
+    filtered: int
+    filtered_percentage: float
+    minimum: int
+    median: float
+    p90: float
+    p95: float
+    p99: float
+    maximum: int
+    latent_block_distribution: dict[int, int]
+
+
+def filter_stage2_examples(*, examples, measure_length, max_length):
+    """Keep complete samples at or under ``max_length`` and summarize all samples."""
+    kept = []
+    lengths: list[int] = []
+    block_counts: Counter[int] = Counter()
+    for example in examples:
+        length = int(measure_length(example))
+        lengths.append(length)
+        block_count = (
+            example.latent_block_count
+            if isinstance(example, Stage2PreparedExample)
+            else int(
+                example.get(
+                    "latent_block_count",
+                    sum(
+                        step.get("type") == "latent"
+                        for step in example.get("sequence_plan", [])
+                    ),
+                )
+            )
+        )
+        block_counts[block_count] += 1
+        if length <= max_length:
+            kept.append(example)
+
+    if not lengths:
+        raise ValueError("cannot compute Stage 2 length statistics for an empty dataset")
+
+    values = torch.tensor(lengths, dtype=torch.float64)
+    filtered = len(lengths) - len(kept)
+    stats = Stage2LengthStats(
+        total=len(lengths),
+        retained=len(kept),
+        filtered=filtered,
+        filtered_percentage=100.0 * filtered / len(lengths),
+        minimum=min(lengths),
+        median=float(values.quantile(0.50)),
+        p90=float(values.quantile(0.90)),
+        p95=float(values.quantile(0.95)),
+        p99=float(values.quantile(0.99)),
+        maximum=max(lengths),
+        latent_block_distribution=dict(sorted(block_counts.items())),
+    )
+    logger.info("Stage 2 length statistics: %s", asdict(stats))
+    return kept, stats
