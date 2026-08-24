@@ -14,6 +14,7 @@ from stage2.data import (
     prepare_stage2_example,
 )
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds, LatentStructureError
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
 
 TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
@@ -52,6 +53,26 @@ class RecordingProcessor:
         }
 
 
+class QwenImageBoundaryProcessor(RecordingProcessor):
+    """Run supplied images through the real local Qwen image processor."""
+
+    def __init__(self):
+        super().__init__()
+        self.image_processor = Qwen2VLImageProcessor()
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        image_inputs = self.image_processor(
+            images=kwargs["images"], return_tensors=kwargs["return_tensors"]
+        )
+        return {
+            "input_ids": self.input_ids.clone(),
+            "attention_mask": torch.ones_like(self.input_ids),
+            "pixel_values": image_inputs["pixel_values"],
+            "image_grid_thw": image_inputs["image_grid_thw"],
+        }
+
+
 @pytest.fixture
 def prepared_example(valid_sample, tmp_path):
     valid_sample["sequence_plan"] = [
@@ -74,7 +95,7 @@ def make_collator(input_ids=None):
 
 @pytest.fixture
 def valid_sample(tmp_path):
-    Image.new("RGB", (2, 2)).save(tmp_path / "input.png")
+    Image.new("RGB", (56, 56)).save(tmp_path / "input.png")
     return {
         "image_input": "input.png",
         "text_input": "question",
@@ -206,9 +227,10 @@ def test_stage2_collator_emits_only_original_visual_tensors(prepared_example):
     assert "image_grid_thw_latent" not in batch
     assert batch["input_ids"].shape[0] == 1
     assert collator.processor.calls[-1]["truncation"] is False
-    assert collator.processor.calls[-1]["images"] == [
-        list(prepared_example.original_image_paths)
-    ]
+    images = collator.processor.calls[-1]["images"]
+    assert len(images) == 1
+    assert len(images[0]) == len(prepared_example.original_image_paths)
+    assert all(isinstance(image, Image.Image) for image in images[0])
     assert batch["labels"][0, :3].tolist() == [-100, -100, -100]
 
 
@@ -231,13 +253,48 @@ def test_prepared_length_measure_uses_original_images_without_truncation(prepare
     length = build_prepared_example_length_measure(processor)(prepared_example)
 
     assert length == 8
-    assert processor.calls == [{
-        "text": ["rendered CoMT conversation"],
-        "images": [list(prepared_example.original_image_paths)],
-        "padding": False,
-        "truncation": False,
-        "return_tensors": "pt",
-    }]
+    call = processor.calls[-1]
+    assert call["text"] == ["rendered CoMT conversation"]
+    assert call["padding"] is False
+    assert call["truncation"] is False
+    images = call["images"]
+    assert len(images) == 1
+    assert len(images[0]) == len(prepared_example.original_image_paths)
+    assert all(isinstance(image, Image.Image) for image in images[0])
+
+
+def test_stage2_collator_materializes_original_images_for_qwen_processor(prepared_example):
+    """Catches passing filesystem strings into Qwen's real image-processing boundary."""
+    processor = QwenImageBoundaryProcessor()
+    collator = Stage2DataCollator(
+        processor=processor,
+        token_ids=TOKENS,
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+
+    batch = collator([prepared_example])
+
+    assert isinstance(batch["pixel_values"], torch.Tensor)
+    assert batch["pixel_values"].numel() > 0
+    images = processor.calls[-1]["images"]
+    assert len(images) == 1
+    assert len(images[0]) == len(prepared_example.original_image_paths)
+    assert all(isinstance(image, Image.Image) for image in images[0])
+
+
+def test_prepared_length_measure_materializes_images_for_qwen_processor(prepared_example):
+    """Catches length measurement passing filesystem strings into Qwen image processing."""
+    processor = QwenImageBoundaryProcessor()
+
+    length = build_prepared_example_length_measure(processor)(prepared_example)
+
+    assert length == 8
+    assert processor.calls[-1]["truncation"] is False
+    images = processor.calls[-1]["images"]
+    assert len(images) == 1
+    assert len(images[0]) == len(prepared_example.original_image_paths)
+    assert all(isinstance(image, Image.Image) for image in images[0])
 
 
 def test_length_filter_drops_whole_samples_and_reports_distribution():

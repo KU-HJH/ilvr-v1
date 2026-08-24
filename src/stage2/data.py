@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 
 import torch
+from PIL import Image
 
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
@@ -156,6 +157,17 @@ def find_unique_subsequence_end(sequence: torch.Tensor, pattern: torch.Tensor) -
     return matches[0]
 
 
+def _load_original_images(paths: tuple[str, ...]) -> list[Image.Image]:
+    """Materialize original image files as detached RGB PIL images."""
+    images = []
+    for path in paths:
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+            image.load()
+        images.append(image)
+    return images
+
+
 class Stage2DataCollator:
     """Tokenize exactly one complete CoMT sample without truncation."""
 
@@ -178,7 +190,7 @@ class Stage2DataCollator:
         )
         batch = self.processor(
             text=[text],
-            images=[list(example.original_image_paths)],
+            images=[_load_original_images(example.original_image_paths)],
             padding=True,
             truncation=False,
             return_tensors="pt",
@@ -215,7 +227,7 @@ def build_prepared_example_length_measure(processor):
         )
         encoded = processor(
             text=[rendered],
-            images=[list(example.original_image_paths)],
+            images=[_load_original_images(example.original_image_paths)],
             padding=False,
             truncation=False,
             return_tensors="pt",
