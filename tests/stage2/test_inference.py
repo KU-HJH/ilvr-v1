@@ -127,6 +127,26 @@ def test_eos_is_checked_only_after_a_completed_latent_block():
     assert model.lm_head.calls == 2
 
 
+@pytest.mark.parametrize("emitted_eos", [3, 7])
+def test_inference_stops_on_either_member_of_multiple_eos_ids(emitted_eos):
+    """Comparing an emitted ID to an EOS list as a scalar must fail this test."""
+    model = scripted_model(latent_size=2, emitted_ids=[emitted_eos, 4])
+
+    result = Stage2InferenceController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=Stage2GenerationConfig(
+            max_new_tokens=2,
+            eos_token_id=[3, 7],
+        ),
+    )
+
+    assert result.sequences[0, -1].item() == emitted_eos
+    assert model.lm_head.calls == 1
+
+
 def test_latent_block_rejects_hard_sequence_cap_before_rollout():
     model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
 
@@ -188,6 +208,21 @@ def test_inference_rejects_batch_greater_than_one():
 def test_generation_config_rejects_invalid_values(kwargs):
     with pytest.raises(ValueError):
         Stage2GenerationConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "eos_token_id",
+    [[], [3, "7"], [3, True], [-1], "3", True, -1],
+)
+def test_generation_config_rejects_malformed_eos_ids(eos_token_id):
+    with pytest.raises(ValueError, match="eos_token_id"):
+        Stage2GenerationConfig(eos_token_id=eos_token_id)
+
+
+@pytest.mark.parametrize("max_sequence_length", [True, 1.5, "128"])
+def test_generation_config_rejects_non_integer_sequence_limits(max_sequence_length):
+    with pytest.raises(ValueError, match="max_sequence_length"):
+        Stage2GenerationConfig(max_sequence_length=max_sequence_length)
 
 
 def test_inference_rejects_non_positive_latent_size():

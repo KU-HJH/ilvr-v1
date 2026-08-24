@@ -20,17 +20,84 @@ class Stage2GenerationConfig:
     max_sequence_length: int | None = None
     temperature: float = 0.0
     top_p: float = 1.0
-    eos_token_id: int | None = None
+    eos_token_id: int | list[int] | tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
-        if self.max_sequence_length is not None and self.max_sequence_length <= 0:
-            raise ValueError("max_sequence_length must be positive")
+        if self.max_sequence_length is not None and (
+            isinstance(self.max_sequence_length, bool)
+            or not isinstance(self.max_sequence_length, int)
+            or self.max_sequence_length <= 0
+        ):
+            raise ValueError("max_sequence_length must be a positive integer")
         if not math.isfinite(self.temperature) or self.temperature < 0:
             raise ValueError("temperature must be finite and non-negative")
         if not 0 < self.top_p <= 1:
             raise ValueError("top_p must be in the interval (0, 1]")
+        eos_token_id = self.eos_token_id
+        if eos_token_id is None:
+            return
+        if isinstance(eos_token_id, bool):
+            raise ValueError("eos_token_id must be a non-negative integer or list")
+        if isinstance(eos_token_id, int):
+            if eos_token_id < 0:
+                raise ValueError("eos_token_id must be non-negative")
+            return
+        if not isinstance(eos_token_id, (list, tuple)) or not eos_token_id:
+            raise ValueError("eos_token_id must be a non-empty integer list")
+        if any(
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or token_id < 0
+            for token_id in eos_token_id
+        ):
+            raise ValueError("eos_token_id entries must be non-negative integers")
+        object.__setattr__(self, "eos_token_id", tuple(eos_token_id))
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]:
+        if self.eos_token_id is None:
+            return ()
+        if isinstance(self.eos_token_id, int):
+            return (self.eos_token_id,)
+        return self.eos_token_id
+
+
+def build_stage2_generation_config(
+    *,
+    model_config,
+    model_generation_config,
+    tokenizer,
+    generation_kwargs,
+) -> Stage2GenerationConfig:
+    """Translate evaluation generation settings into the Stage 2 contract."""
+    do_sample = bool(
+        generation_kwargs.get(
+            "do_sample",
+            generation_kwargs.get("temperature", 0) > 0,
+        )
+    )
+    if "eos_token_id" in generation_kwargs:
+        eos_token_id = generation_kwargs["eos_token_id"]
+    else:
+        eos_token_id = getattr(model_generation_config, "eos_token_id", None)
+        if eos_token_id is None:
+            eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+    max_sequence_length = generation_kwargs.get("max_sequence_length")
+    if max_sequence_length is None:
+        max_sequence_length = getattr(model_config, "max_position_embeddings", None)
+
+    return Stage2GenerationConfig(
+        max_new_tokens=int(generation_kwargs.get("max_new_tokens", 64)),
+        max_sequence_length=max_sequence_length,
+        temperature=(
+            float(generation_kwargs.get("temperature", 0.0)) if do_sample else 0.0
+        ),
+        top_p=float(generation_kwargs.get("top_p", 1.0)),
+        eos_token_id=eos_token_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -157,10 +224,7 @@ class Stage2InferenceController:
                 generated += model.config.latent_size + 1
                 continue
 
-            if (
-                generation_config.eos_token_id is not None
-                and next_token_id == generation_config.eos_token_id
-            ):
+            if next_token_id in generation_config.eos_token_ids:
                 break
 
         return Stage2GenerationResult(

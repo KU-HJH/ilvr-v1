@@ -4,6 +4,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from PIL import Image
+from torch import nn
+
+from helpers import ToyCausalLanguageModel
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentRolloutEngine
 
 
 MODULE_NAMES = ("eval", "evaluate_deepseed")
@@ -28,8 +32,10 @@ class FakeTokenizer:
 
 
 class FakeProcessor:
-    def __init__(self):
+    def __init__(self, *, include_attention_mask=True, include_visual_inputs=True):
         self.tokenizer = FakeTokenizer()
+        self.include_attention_mask = include_attention_mask
+        self.include_visual_inputs = include_visual_inputs
         self.images = None
         self.decoded_ids = None
         self.input_ids = torch.tensor([[10, 11]])
@@ -51,12 +57,13 @@ class FakeProcessor:
         assert return_tensors == "pt"
         assert padding is True
         self.images = images
-        return {
-            "input_ids": self.input_ids,
-            "attention_mask": self.attention_mask,
-            "pixel_values": self.pixel_values,
-            "image_grid_thw": self.image_grid_thw,
-        }
+        result = {"input_ids": self.input_ids}
+        if self.include_attention_mask:
+            result["attention_mask"] = self.attention_mask
+        if self.include_visual_inputs:
+            result["pixel_values"] = self.pixel_values
+            result["image_grid_thw"] = self.image_grid_thw
+        return result
 
     def batch_decode(self, ids, *, skip_special_tokens):
         assert skip_special_tokens is False
@@ -76,6 +83,7 @@ class ModelWhoseGenerateRaises:
             latent_pad_token_id=90,
             latent_start_token_id=start_token_id,
             latent_end_token_id=92,
+            max_position_embeddings=128,
         )
         self.generation_config = SimpleNamespace(eos_token_id=3)
         self.batch_size = batch_size
@@ -92,6 +100,42 @@ class RecordingController:
     def generate(self, **kwargs):
         self.calls.append(kwargs)
         return SimpleNamespace(sequences=self.sequences)
+
+
+class DeepSpeedShapedWrapper:
+    device = torch.device("cpu")
+
+    def __init__(self, module):
+        self.module = module
+
+
+class StartTokenHead(nn.Module):
+    def forward(self, hidden):
+        logits = hidden.new_full((hidden.shape[0], 128), -1e9)
+        logits[:, LATENT_TOKEN_IDS["<|latent_start|>"]] = 0
+        return logits
+
+
+class RealControllerCapModel(ModelWhoseGenerateRaises):
+    def __init__(self):
+        super().__init__()
+        self.config.max_position_embeddings = 5
+        self.model = ToyCausalLanguageModel(4)
+        self.lm_head = StartTokenHead()
+        self.stage2_rollout_engine = LatentRolloutEngine()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def prepare_stage2_base_inputs_embeds(
+        self, *, input_ids, pixel_values, image_grid_thw
+    ):
+        return self.get_input_embeddings()(input_ids)
+
+    def get_rope_index(self, input_ids, image_grid_thw=None, attention_mask=None):
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+        positions = positions.view(1, 1, -1).expand(3, input_ids.shape[0], -1)
+        return positions, torch.zeros(input_ids.shape[0], 1, device=input_ids.device)
 
 
 def _import_entry_point(module_name, monkeypatch):
@@ -131,6 +175,7 @@ def test_eval_uses_controller_with_original_visual_inputs_and_preserves_decoding
             "top_p": 0.75,
             "do_sample": True,
             "eos_token_id": 8,
+            "max_sequence_length": 64,
         },
     )
 
@@ -148,6 +193,7 @@ def test_eval_uses_controller_with_original_visual_inputs_and_preserves_decoding
     assert call["generation_config"].temperature == 0.7
     assert call["generation_config"].top_p == 0.75
     assert call["generation_config"].eos_token_id == 8
+    assert call["generation_config"].max_sequence_length == 64
     assert call["return_latent_states"] is False
     assert len(processor.images) == 1
     assert processor.images[0].mode == "RGB"
@@ -187,6 +233,91 @@ def test_eval_maps_explicit_greedy_settings_to_controller(module_name, monkeypat
     assert config.temperature == 0.0
     assert config.top_p == 0.6
     assert config.eos_token_id == 3
+    assert config.max_sequence_length == 128
+
+
+def test_deepspeed_eval_unwraps_model_for_controller_and_uses_wrapper_device(
+    monkeypatch,
+):
+    """Passing wrapper instead of its Stage 2 module must fail this test."""
+    module = _import_entry_point("evaluate_deepseed", monkeypatch)
+    controller = RecordingController()
+    monkeypatch.setattr(module, "Stage2InferenceController", lambda: controller)
+    bare_model = ModelWhoseGenerateRaises()
+
+    module.run_one_example(
+        DeepSpeedShapedWrapper(bare_model),
+        FakeProcessor(),
+        {"text_input": "question"},
+        {"max_new_tokens": 1, "temperature": 0.0, "top_p": 1.0},
+    )
+
+    assert controller.calls[0]["model"] is bare_model
+    assert controller.calls[0]["input_ids"].device == torch.device("cpu")
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("source", ["explicit", "model_fallback"])
+def test_eval_preserves_multiple_eos_ids(module_name, source, monkeypatch):
+    """Narrowing an HF EOS list to scalar or leaving it mutable must fail."""
+    module = _import_entry_point(module_name, monkeypatch)
+    controller = RecordingController()
+    monkeypatch.setattr(module, "Stage2InferenceController", lambda: controller)
+    model = ModelWhoseGenerateRaises()
+    kwargs = {"max_new_tokens": 2, "temperature": 0.0, "top_p": 1.0}
+    if source == "explicit":
+        kwargs["eos_token_id"] = [8, 9]
+        expected = (8, 9)
+    else:
+        model.generation_config.eos_token_id = [3, 4]
+        expected = (3, 4)
+
+    module.run_one_example(
+        model,
+        FakeProcessor(),
+        {"text_input": "question"},
+        kwargs,
+    )
+
+    assert controller.calls[0]["generation_config"].eos_token_id == expected
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_derives_model_sequence_cap_for_real_controller(module_name, monkeypatch):
+    """Dropping the model-derived cap would let this latent block overflow."""
+    module = _import_entry_point(module_name, monkeypatch)
+
+    with pytest.raises(ValueError, match="latent block would exceed"):
+        module.run_one_example(
+            RealControllerCapModel(),
+            FakeProcessor(include_visual_inputs=False),
+            {"text_input": "question"},
+            {"max_new_tokens": 1, "temperature": 0.0, "top_p": 1.0},
+        )
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_text_only_eval_defaults_missing_attention_mask(module_name, monkeypatch):
+    """Indexing optional processor fields or forwarding visual placeholders must fail."""
+    module = _import_entry_point(module_name, monkeypatch)
+    controller = RecordingController()
+    monkeypatch.setattr(module, "Stage2InferenceController", lambda: controller)
+    processor = FakeProcessor(
+        include_attention_mask=False,
+        include_visual_inputs=False,
+    )
+
+    module.run_one_example(
+        ModelWhoseGenerateRaises(),
+        processor,
+        {"text_input": "question"},
+        {"max_new_tokens": 1, "temperature": 0.0, "top_p": 1.0},
+    )
+
+    call = controller.calls[0]
+    assert torch.equal(call["attention_mask"], torch.ones_like(processor.input_ids))
+    assert call["pixel_values"] is None
+    assert call["image_grid_thw"] is None
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
