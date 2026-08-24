@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
+from PIL import Image
 from torch.utils.data import Dataset
 from transformers import (
     Qwen2_5_VLConfig,
@@ -18,23 +19,14 @@ from transformers import (
 )
 
 from main import build_stage2_training_arguments
+from stage2.data import Stage2DataCollator, prepare_stage2_example
 from stage2.trainer import Stage2Trainer
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 
 class TinyStage2Dataset(Dataset):
-    def __init__(self, size: int = 8):
-        input_ids = torch.tensor([81, 80, 1, 91, 90, 90, 92, 2, 3])
-        labels = input_ids.clone()
-        labels[:3] = -100
-        labels[input_ids == 90] = -100
-        self.sample = {
-            "input_ids": input_ids,
-            "attention_mask": torch.ones_like(input_ids),
-            "labels": labels,
-            "pixel_values": torch.arange(12, dtype=torch.float32).reshape(1, 12)
-            / 12.0,
-            "image_grid_thw": torch.tensor([[1, 1, 1]]),
-        }
+    def __init__(self, prepared_example, size: int = 8):
+        self.sample = prepared_example
         self.size = size
 
     def __len__(self):
@@ -42,31 +34,97 @@ class TinyStage2Dataset(Dataset):
 
     def __getitem__(self, index):
         del index
-        return {key: value.clone() for key, value in self.sample.items()}
+        return self.sample
+
+
+class TinyStage2Tokenizer:
+    def __call__(self, text, *, add_special_tokens, return_tensors):
+        assert text == "<|im_start|>assistant"
+        assert add_special_tokens is False
+        assert return_tensors == "pt"
+        return {"input_ids": torch.tensor([[31, 32]])}
+
+
+class TinyStage2Processor:
+    """Deterministic processor boundary used by the production collator."""
+
+    def __init__(self):
+        self.tokenizer = TinyStage2Tokenizer()
+        self.calls = []
+
+    def apply_chat_template(self, conversation, *, tokenize, add_generation_prompt):
+        assert tokenize is False
+        assert add_generation_prompt is False
+        assistant_text = conversation[1]["content"][0]["text"]
+        assert assistant_text == (
+            "A<|latent_start|><|latent_pad|><|latent_pad|><|latent_end|>B"
+        )
+        return "rendered tiny Stage 2 conversation"
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        assert kwargs["text"] == ["rendered tiny Stage 2 conversation"]
+        assert kwargs["padding"] is True
+        assert kwargs["truncation"] is False
+        assert kwargs["return_tensors"] == "pt"
+        images = kwargs["images"]
+        assert len(images) == 1 and len(images[0]) == 1
+        assert isinstance(images[0][0], Image.Image)
+        input_ids = torch.tensor(
+            [[81, 80, 1, 31, 32, 91, 90, 90, 92, 2, 3]]
+        )
+        return {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "pixel_values": torch.arange(12, dtype=torch.float32).reshape(1, 12)
+            / 12.0,
+            "image_grid_thw": torch.tensor([[1, 1, 1]]),
+        }
+
+
+def build_tiny_prepared_example(image_root: Path):
+    image_root.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (2, 2), color=(17, 31, 47)).save(image_root / "input.png")
+    return prepare_stage2_example(
+        {
+            "image_input": "input.png",
+            "text_input": "question",
+            "sequence_plan": [
+                {"type": "text", "content": "A"},
+                {"type": "latent", "helper_image": "helper-not-loaded.png"},
+                {"type": "text", "content": "B"},
+            ],
+        },
+        image_root=image_root,
+        latent_size=2,
+    )
 
 
 class RecordingStage2Collator:
-    """Record and enforce the rank-local B=1 contract at the last data boundary."""
+    """Record local size while delegating the production Stage 2 collator."""
 
-    def __init__(self):
+    def __init__(self, delegate: Stage2DataCollator):
+        self.delegate = delegate
         self.local_batch_sizes: list[int] = []
 
     def __call__(self, features):
-        local_batch_size = len(features)
-        self.local_batch_sizes.append(local_batch_size)
-        if local_batch_size != 1:
-            raise ValueError(
-                "Stage 2 collator requires rank-local batch size 1, "
-                f"got {local_batch_size}"
-            )
-        item = features[0]
-        return {
-            "input_ids": item["input_ids"].unsqueeze(0),
-            "attention_mask": item["attention_mask"].unsqueeze(0),
-            "labels": item["labels"].unsqueeze(0),
-            "pixel_values": item["pixel_values"],
-            "image_grid_thw": item["image_grid_thw"],
-        }
+        self.local_batch_sizes.append(len(features))
+        return self.delegate(features)
+
+
+def _recording_production_collator() -> RecordingStage2Collator:
+    return RecordingStage2Collator(
+        Stage2DataCollator(
+            processor=TinyStage2Processor(),
+            token_ids=LatentTokenIds(
+                pad_token_id=90,
+                start_token_id=91,
+                end_token_id=92,
+            ),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+        )
+    )
 
 
 def _scalar_step(value) -> int | None:
@@ -196,9 +254,11 @@ def _assert_contract(witness):
 def run_harness(*, output_dir: Path, witness_path: Path, deepspeed: str | None):
     torch.manual_seed(23)
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset = TinyStage2Dataset()
+    dataset = TinyStage2Dataset(
+        build_tiny_prepared_example(output_dir / "tiny-data")
+    )
 
-    first_collator = RecordingStage2Collator()
+    first_collator = _recording_production_collator()
     first_recorder = ResumeStateRecorder()
     first_trainer = Stage2Trainer(
         model=_tiny_model(),
@@ -213,7 +273,7 @@ def run_harness(*, output_dir: Path, witness_path: Path, deepspeed: str | None):
     if not checkpoint.is_dir():
         raise AssertionError(f"first Stage 2 checkpoint was not saved: {checkpoint}")
 
-    resumed_collator = RecordingStage2Collator()
+    resumed_collator = _recording_production_collator()
     resumed_recorder = ResumeStateRecorder()
     resumed_trainer = Stage2Trainer(
         model=Qwen2_5_VLForConditionalGeneration.from_pretrained(checkpoint),

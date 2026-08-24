@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import math
 import os
@@ -7,14 +8,30 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from main import (
     build_stage2_training_arguments,
     validate_stage2_distributed_settings,
 )
+from stage2.data import Stage2DataCollator
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
+    LatentTokenIds,
+    parse_latent_spans,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+HARNESS_PATH = REPO_ROOT / "tests/stage2/integration/tiny_stage2_train.py"
+TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
+
+
+def _load_harness_module():
+    spec = importlib.util.spec_from_file_location("tiny_stage2_train", HARNESS_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def _stage2_args(**overrides):
@@ -109,6 +126,66 @@ def test_stage2_launcher_passes_optional_deepspeed_selection_by_behavior():
     with_deepspeed = _dry_run_launcher(deepspeed_config=config)
     assert with_deepspeed.returncode == 0, with_deepspeed.stderr
     assert f"--deepspeed_config {config}" in with_deepspeed.stdout
+
+
+def test_recording_collator_delegates_production_stage2_batch_contract(tmp_path):
+    """Catches the distributed harness replacing production Stage 2 collation."""
+    harness = _load_harness_module()
+    prepared = harness.build_tiny_prepared_example(tmp_path)
+    processor = harness.TinyStage2Processor()
+    production_collator = Stage2DataCollator(
+        processor=processor,
+        token_ids=TOKENS,
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    recorder = harness.RecordingStage2Collator(production_collator)
+
+    batch = recorder([prepared])
+
+    assert recorder.delegate is production_collator
+    assert recorder.local_batch_sizes == [1]
+    assert processor.calls
+    assert set(batch) == {
+        "input_ids",
+        "attention_mask",
+        "labels",
+        "pixel_values",
+        "image_grid_thw",
+    }
+    assert batch["input_ids"].shape == batch["attention_mask"].shape == (1, 11)
+    assert batch["labels"].shape == (1, 11)
+    assert batch["pixel_values"].shape == (1, 12)
+    assert batch["image_grid_thw"].shape == (1, 3)
+    assert len(
+        parse_latent_spans(batch["input_ids"][0], token_ids=TOKENS, latent_size=2)
+    ) == 1
+    assert batch["labels"][0, 6:8].tolist() == [-100, -100]
+    assert batch["labels"][0, [5, 8]].tolist() == [91, 92]
+    images = processor.calls[-1]["images"]
+    assert len(images) == 1 and len(images[0]) == 1
+    assert isinstance(images[0][0], Image.Image)
+    assert "pixel_values_latent" not in batch
+    assert "image_grid_thw_latent" not in batch
+
+
+def test_recording_collator_uses_production_b_greater_than_one_failure(tmp_path):
+    """Catches the harness recording B=1 without delegating B>1 validation."""
+    harness = _load_harness_module()
+    prepared = harness.build_tiny_prepared_example(tmp_path)
+    recorder = harness.RecordingStage2Collator(
+        Stage2DataCollator(
+            processor=harness.TinyStage2Processor(),
+            token_ids=TOKENS,
+            latent_size=2,
+            supervise_latent_boundaries=True,
+        )
+    )
+
+    with pytest.raises(NotImplementedError, match="batch_size=1"):
+        recorder([prepared, prepared])
+
+    assert recorder.local_batch_sizes == [2]
 
 
 @pytest.mark.skipif(
