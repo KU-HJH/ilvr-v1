@@ -23,6 +23,13 @@ class LatentSpan:
     end_position: int
 
 
+@dataclass(frozen=True)
+class LatentRolloutDiagnostics:
+    block_count: int
+    latent_l2_norms: torch.Tensor
+    adjacent_cosine_similarities: torch.Tensor
+
+
 def parse_latent_spans(
     input_ids: torch.LongTensor,
     *,
@@ -75,7 +82,7 @@ class LatentRolloutResult:
     final_inputs_embeds: torch.Tensor
     latent_states: tuple[torch.Tensor, ...]
     prefix_lengths: tuple[int, ...]
-    diagnostics: "LatentRolloutDiagnostics | None" = None
+    diagnostics: LatentRolloutDiagnostics | None = None
 
 
 def _replace_embedding(embeds: torch.Tensor, position: int, value: torch.Tensor) -> torch.Tensor:
@@ -83,6 +90,25 @@ def _replace_embedding(embeds: torch.Tensor, position: int, value: torch.Tensor)
         (embeds[:, :position], value.unsqueeze(1), embeds[:, position + 1 :]),
         dim=1,
     )
+
+
+def _build_diagnostics(
+    states: list[torch.Tensor],
+    block_count: int,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> LatentRolloutDiagnostics:
+    if not states:
+        empty = torch.empty((batch_size, 0), dtype=torch.float32, device=device)
+        return LatentRolloutDiagnostics(block_count, empty, empty.clone())
+
+    stacked = torch.stack(states, dim=1)
+    norms = torch.linalg.vector_norm(stacked.float(), dim=-1).detach()
+    adjacent = torch.nn.functional.cosine_similarity(
+        stacked[:, :-1].float(), stacked[:, 1:].float(), dim=-1
+    ).detach()
+    return LatentRolloutDiagnostics(block_count, norms, adjacent)
 
 
 class LatentRolloutEngine:
@@ -127,4 +153,12 @@ class LatentRolloutEngine:
                 states.append(latent)
                 prefix_lengths.append(position)
                 current = _replace_embedding(current, position, latent)
-        return LatentRolloutResult(current, tuple(states), tuple(prefix_lengths))
+        diagnostics = None
+        if collect_diagnostics:
+            diagnostics = _build_diagnostics(
+                states,
+                len(latent_spans),
+                batch_size=base_inputs_embeds.shape[0],
+                device=base_inputs_embeds.device,
+            )
+        return LatentRolloutResult(current, tuple(states), tuple(prefix_lengths), diagnostics)
