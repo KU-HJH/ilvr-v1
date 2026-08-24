@@ -129,6 +129,61 @@ bash run_training.sh
 - Gradient Accumulation Steps: 8
 - Latent Size: 8
 
+### Stage 2 training
+
+`run_stage2_training.sh` launches the Stage 2 path with this checkout's
+`./venv/ilvr-venv` Python and local `transformers/src` and `src` trees. It is
+safe to invoke from outside the repository because all runtime paths are
+resolved relative to the script.
+
+For a fresh Stage 2 run, provide an explicit Stage 1 checkpoint origin and do
+not set `RESUME_CHECKPOINT`:
+
+```bash
+STAGE1_CHECKPOINT=/path/to/stage1/checkpoint \
+DATA_PATH=/path/to/TRAIN.jsonl \
+IMAGE_ROOT=/path/to/data \
+OUTPUT_DIR=/path/to/stage2/output \
+LOG_FILE=/path/to/stage2.log \
+./run_stage2_training.sh \
+  --gradient_accumulation_steps 8
+```
+
+Fresh training loads model and processor state from `STAGE1_CHECKPOINT`, then
+creates new optimizer and scheduler state. It does not discover or inherit a
+nearby trainer checkpoint automatically.
+
+To resume, keep the Stage 1 origin explicit and independently name the exact
+Stage 2 checkpoint:
+
+```bash
+STAGE1_CHECKPOINT=/path/to/stage1/checkpoint \
+RESUME_CHECKPOINT=/path/to/stage2/output/checkpoint-100 \
+DATA_PATH=/path/to/TRAIN.jsonl \
+IMAGE_ROOT=/path/to/data \
+OUTPUT_DIR=/path/to/stage2/output \
+LOG_FILE=/path/to/stage2.log \
+./run_stage2_training.sh
+```
+
+The resume checkpoint must be a Stage 2 checkpoint. On resume it is the single
+source for model, processor, optimizer, scheduler, and trainer progress;
+`STAGE1_CHECKPOINT` remains a separate, explicit provenance input and is never
+reinterpreted as the resume path.
+
+Stage 2 currently requires a rank-local batch size of exactly `B=1`, which the
+launcher sets explicitly. The effective global batch is therefore
+`world_size × gradient_accumulation_steps`. Latent start/end boundary tokens
+are supervised by default; pass `--no-supervise_latent_boundaries` to disable
+that supervision.
+
+Stage 2 uses each sample's original input images only. `helper_image` entries
+mark latent reasoning steps in the data, but helper-image pixels/tensors are
+not collated or encoded. The recurrent latent update also requires
+`use_cache=False`; KV-cache training is not supported. Use
+`STAGE2_DRY_RUN=true` to print the shell-escaped environment and command without
+loading Python, a model, or data.
+
 ---
 
 ## 📝 Citation
@@ -149,4 +204,3 @@ This codebase is built upon [Qwen-VL](https://github.com/QwenLM/Qwen-VL) 、 [Tr
 
 ## 📄 License
 This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
-
