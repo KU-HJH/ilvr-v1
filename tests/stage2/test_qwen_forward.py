@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
@@ -47,6 +48,52 @@ class OutputAwareToyCausalLanguageModel(ToyCausalLanguageModel):
         )
 
 
+class CountingVisual(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size), requires_grad=False)
+        self.calls = 0
+        self.grad_enabled = []
+
+    @property
+    def dtype(self):
+        return self.weight.dtype
+
+    def forward(self, pixel_values, grid_thw):
+        self.calls += 1
+        self.grad_enabled.append(torch.is_grad_enabled())
+        return self.weight.unsqueeze(0).expand(grid_thw.shape[0], -1)
+
+
+class PixelFreeToyCausalLanguageModel(ToyCausalLanguageModel):
+    """Records only kwargs the Stage 2 wrapper sends to the decoder."""
+
+    def __init__(self, hidden_size):
+        super().__init__(hidden_size)
+        self.extra_kwargs = []
+
+    def forward(
+        self,
+        *,
+        inputs_embeds,
+        attention_mask,
+        position_ids,
+        use_cache,
+        return_dict,
+        generate_mode=False,
+        **kwargs,
+    ):
+        self.extra_kwargs.append(kwargs)
+        return super().forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=use_cache,
+            return_dict=return_dict,
+            generate_mode=generate_mode,
+        )
+
+
 def tiny_stage2_qwen():
     config = Qwen2_5_VLConfig(
         vocab_size=128,
@@ -85,6 +132,59 @@ def stage2_scaffold():
     attention_mask = torch.ones_like(input_ids)
     image_grid_thw = torch.tensor([[1, 2, 2]])
     return input_ids, attention_mask, image_grid_thw
+
+
+def test_stage2_freezes_full_visual_module_at_composition():
+    model = tiny_stage2_qwen()
+
+    assert all(not parameter.requires_grad for parameter in model.visual.parameters())
+
+
+def test_stage2_encodes_frozen_visual_once_and_backpropagates_through_lm():
+    model = tiny_stage2_qwen()
+    model.model = PixelFreeToyCausalLanguageModel(8)
+    model.visual = CountingVisual(8)
+    model.visual.requires_grad_(False)
+    input_ids = torch.tensor([[81, 80, 1, 91, 90, 90, 92, 2]])
+    labels = input_ids.clone()
+    labels[:, :3] = -100
+    labels[input_ids == 90] = -100
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        pixel_values=torch.ones(1, 3),
+        image_grid_thw=torch.tensor([[1, 1, 1]]),
+    )
+    outputs.loss.backward()
+
+    assert model.visual.calls == 1
+    assert model.visual.grad_enabled == [False]
+    assert all(not parameter.requires_grad and parameter.grad is None for parameter in model.visual.parameters())
+    assert model.model.scale.grad is not None
+    expected_loss = torch.nn.functional.cross_entropy(
+        outputs.logits[..., :-1, :].contiguous().view(-1, model.config.vocab_size),
+        labels[..., 1:].contiguous().view(-1),
+    )
+    assert torch.allclose(outputs.loss, expected_loss)
+    assert all(
+        not {"pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"}.intersection(kwargs)
+        for kwargs in model.model.extra_kwargs
+    )
+
+
+def test_stage2_rejects_image_token_feature_count_mismatch():
+    model = tiny_stage2_qwen()
+    model.visual = CountingVisual(8)
+
+    with pytest.raises(ValueError, match="Stage 2 image token/feature count mismatch"):
+        model(
+            input_ids=torch.tensor([[81, 80, 80, 1, 91, 90, 90, 92, 2]]),
+            attention_mask=torch.ones(1, 9, dtype=torch.long),
+            pixel_values=torch.ones(1, 3),
+            image_grid_thw=torch.tensor([[1, 1, 1]]),
+        )
 
 
 def test_stage2_forward_slices_one_full_mrope_tensor(monkeypatch):
@@ -207,7 +307,7 @@ def test_stage2_forward_rejects_legacy_helper_inputs(name, value):
     model = tiny_stage2_qwen()
     input_ids, attention_mask, image_grid_thw = stage2_scaffold()
 
-    with pytest.raises(ValueError, match="helper inputs"):
+    with pytest.raises(ValueError, match=name):
         model(
             input_ids=input_ids,
             attention_mask=attention_mask,

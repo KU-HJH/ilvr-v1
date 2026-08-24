@@ -1762,7 +1762,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
         # Initialize weights and apply final processing
         self.post_init()
-        
+
+        if getattr(self.config, "stage", None) == "stage2":
+            self.visual.requires_grad_(False)
+
         self.latent_model = False
 
     def get_input_embeddings(self):
@@ -1972,22 +1975,12 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         if pixel_values is None:
             return inputs_embeds
 
-        pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
-        n_image_features = image_embeds.shape[0]
-        if n_image_tokens != n_image_features:
-            if n_image_tokens >= n_image_features:
-                raise ValueError("Image features must cover every image token")
-            batch_size = input_ids.shape[0]
-            hidden_size = image_embeds.shape[-1]
-            if n_image_tokens % batch_size != 0:
-                raise ValueError("Image tokens must be evenly distributed across the batch")
-            image_embeds = image_embeds.view(batch_size, -1, hidden_size)
-            image_embeds = image_embeds[:, : n_image_tokens // batch_size, :].contiguous()
-            image_embeds = image_embeds.view(-1, hidden_size)
-
+        with torch.no_grad():
+            image_embeds = self.visual(pixel_values.to(dtype=self.visual.dtype), grid_thw=image_grid_thw)
         image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        if int(image_mask[..., 0].sum()) != image_embeds.shape[0]:
+            raise ValueError("Stage 2 image token/feature count mismatch")
+
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         return inputs_embeds.masked_scatter(image_mask.to(inputs_embeds.device), image_embeds)
 
@@ -2160,11 +2153,14 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if getattr(self.config, "stage", None) == "stage2":
-            if any(
-                value is not None
-                for value in (pixel_values_latent, image_grid_thw_latent, image_out_mask, latent_hidden_states)
+            for name, value in (
+                ("pixel_values_latent", pixel_values_latent),
+                ("image_grid_thw_latent", image_grid_thw_latent),
+                ("image_out_mask", image_out_mask),
+                ("latent_hidden_states", latent_hidden_states),
             ):
-                raise ValueError("Stage 2 helper inputs are not supported")
+                if value is not None:
+                    raise ValueError(f"Stage 2 helper input `{name}` is not supported")
             if inputs_embeds is not None:
                 raise ValueError("Stage 2 forward requires input_ids rather than inputs_embeds")
             return self._forward_stage2(
