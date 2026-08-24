@@ -99,6 +99,10 @@ def _build_diagnostics(
     batch_size: int,
     device: torch.device,
 ) -> LatentRolloutDiagnostics:
+    if not states:
+        empty = torch.empty((batch_size, 0), dtype=torch.float32, device=device)
+        return LatentRolloutDiagnostics(block_count, empty, empty.clone())
+
     stacked = torch.stack(states, dim=1)
     norms = torch.linalg.vector_norm(stacked.float(), dim=-1).detach()
     adjacent = torch.nn.functional.cosine_similarity(

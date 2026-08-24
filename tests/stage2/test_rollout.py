@@ -200,3 +200,17 @@ def test_diagnostics_are_observability_only():
     assert result.diagnostics.latent_l2_norms.requires_grad is False
     assert result.diagnostics.adjacent_cosine_similarities.requires_grad is False
 
+
+def test_zero_state_diagnostics_have_empty_metrics():
+    base_inputs_embeds = torch.arange(16, dtype=torch.float32).view(1, 4, 4)
+    result = LatentRolloutEngine().rollout(
+        language_model=ToyCausalLanguageModel(4),
+        base_inputs_embeds=base_inputs_embeds,
+        attention_mask=torch.ones(1, 4, dtype=torch.long),
+        full_position_ids=torch.arange(4).view(1, 1, 4).expand(3, 1, 4),
+        latent_spans=(),
+        collect_diagnostics=True,
+    )
+
+    assert result.diagnostics.latent_l2_norms.shape == (1, 0)
+    assert result.diagnostics.adjacent_cosine_similarities.shape == (1, 0)
