@@ -131,6 +131,10 @@ bash run_training.sh
 
 ### Stage 2 training
 
+Evidence status: this Stage 2 path has passed a one-sample, one-optimizer-step
+smoke test. Full-scale CoMT training, evaluation, and reproduction of the
+paper's reported results have not been established.
+
 `run_stage2_training.sh` launches the Stage 2 path with this checkout's
 `./venv/ilvr-venv` Python and local `transformers/src` and `src` trees. It is
 safe to invoke from outside the repository because all runtime paths are
