@@ -1,9 +1,11 @@
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
+from main import configure_stage2_model_backend
 from helpers import ToyCausalLanguageModel, tiny_stage2_qwen
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentRolloutEngine
 
@@ -130,6 +132,86 @@ def test_stage2_training_uses_model_owned_rollout_engine():
     )
 
     assert engine.calls == 1
+
+
+def _run_tiny_stage2_train_step(model):
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
+    labels = input_ids.masked_fill(input_ids == 90, -100)
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        return_stage2_latent_states=True,
+        retain_stage2_latent_grads=True,
+    )
+    outputs.loss.backward()
+    return outputs
+
+
+def test_stage2_gradient_checkpointing_preserves_loss_latents_and_gradients():
+    """Catches checkpointing that detaches or numerically changes the latent recurrence."""
+    torch.manual_seed(7)
+    plain = tiny_stage2_qwen().train()
+    checkpointed = deepcopy(plain).train()
+    plain.config.use_cache = False
+    checkpointed.config.use_cache = False
+    checkpointed.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+
+    plain_outputs = _run_tiny_stage2_train_step(plain)
+    checkpointed_outputs = _run_tiny_stage2_train_step(checkpointed)
+
+    assert torch.isfinite(plain_outputs.loss)
+    assert torch.isfinite(checkpointed_outputs.loss)
+    assert torch.allclose(
+        plain_outputs.loss,
+        checkpointed_outputs.loss,
+        atol=1e-6,
+        rtol=1e-5,
+    )
+    assert len(plain_outputs.stage2_latent_states) == len(
+        checkpointed_outputs.stage2_latent_states
+    ) == 2
+    for plain_state, checkpointed_state in zip(
+        plain_outputs.stage2_latent_states,
+        checkpointed_outputs.stage2_latent_states,
+        strict=True,
+    ):
+        assert torch.allclose(plain_state, checkpointed_state, atol=1e-6, rtol=1e-5)
+        assert plain_state.grad is not None and torch.isfinite(plain_state.grad).all()
+        assert checkpointed_state.grad is not None and torch.isfinite(
+            checkpointed_state.grad
+        ).all()
+
+    plain_grad = plain.model.layers[0].self_attn.q_proj.weight.grad
+    checkpointed_grad = checkpointed.model.layers[0].self_attn.q_proj.weight.grad
+    assert plain_grad is not None and torch.isfinite(plain_grad).all()
+    assert checkpointed_grad is not None and torch.isfinite(checkpointed_grad).all()
+    assert plain_grad.abs().sum() > 0
+    assert checkpointed_grad.abs().sum() > 0
+    assert torch.allclose(plain_grad, checkpointed_grad, atol=1e-6, rtol=1e-5)
+    assert plain_outputs.past_key_values is None
+    assert checkpointed_outputs.past_key_values is None
+
+
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+def test_stage2_backend_configuration_controls_cache_and_checkpointing(
+    gradient_checkpointing,
+):
+    """Catches cache activation or checkpointing that ignores the Stage 2 flag."""
+    model = tiny_stage2_qwen()
+    model.config.use_cache = True
+    if not gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    configure_stage2_model_backend(
+        model,
+        gradient_checkpointing=gradient_checkpointing,
+    )
+
+    assert model.config.use_cache is False
+    assert model.is_gradient_checkpointing is gradient_checkpointing
 
 
 def test_stage2_encodes_frozen_visual_once_and_backpropagates_through_lm():

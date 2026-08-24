@@ -64,6 +64,15 @@ class Stage2TrainingComponents:
     trainer_resume_path: str | None
 
 
+def configure_stage2_model_backend(model, *, gradient_checkpointing: bool) -> None:
+    """Apply Stage 2 cache/checkpoint settings outside the latent recurrence."""
+    model.config.use_cache = False
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    else:
+        model.gradient_checkpointing_disable()
+
+
 def build_stage2_training_components(args) -> Stage2TrainingComponents:
     decision = resolve_stage2_load_decision(
         load_model_path=args.load_model_path,
@@ -82,7 +91,10 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
         latent_size=args.latent_size,
         supervise_latent_boundaries=args.supervise_latent_boundaries,
     )
-    model.config.use_cache = False
+    configure_stage2_model_backend(
+        model,
+        gradient_checkpointing=args.gradient_checkpointing,
+    )
     model.visual.requires_grad_(False)
 
     raw_examples = load_jsonl_examples(Path(args.data_path))

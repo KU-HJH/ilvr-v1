@@ -186,6 +186,19 @@ class RecordingVisual:
         self.requires_grad = value
 
 
+class RecordingStage2Model:
+    def __init__(self):
+        self.config = SimpleNamespace()
+        self.visual = RecordingVisual()
+        self.is_gradient_checkpointing = False
+
+    def gradient_checkpointing_enable(self):
+        self.is_gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        self.is_gradient_checkpointing = False
+
+
 class CompositionTokenizer:
     def __call__(self, text, *, add_special_tokens, return_tensors):
         assert text == "<|im_start|>assistant"
@@ -230,7 +243,7 @@ def test_stage2_components_use_one_source_and_filter_complete_samples(
     """Catches model/processor source drift, unbounded samples, or unfrozen vision."""
     calls = SimpleNamespace(prepared=[], filtered=None)
     processor = CompositionProcessor()
-    model = SimpleNamespace(config=SimpleNamespace(), visual=RecordingVisual())
+    model = RecordingStage2Model()
     decision = SimpleNamespace(
         model_source="selected/model",
         processor_source="selected/processor",
@@ -283,6 +296,7 @@ def test_stage2_components_use_one_source_and_filter_complete_samples(
     assert components.data_collator.token_ids == token_ids
     assert model.config.stage == "stage2"
     assert model.config.use_cache is False
+    assert model.is_gradient_checkpointing is True
     assert model.visual.requires_grad is False
 
 

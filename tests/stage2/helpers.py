@@ -33,7 +33,7 @@ class ToyCausalLanguageModel(nn.Module):
         return SimpleNamespace(last_hidden_state=hidden)
 
 
-def tiny_stage2_qwen():
+def tiny_stage2_qwen(*, attn_implementation="eager"):
     config = Qwen2_5_VLConfig(
         vocab_size=128,
         hidden_size=8,
@@ -61,6 +61,7 @@ def tiny_stage2_qwen():
         latent_pad_token_id=90,
         latent_start_token_id=91,
         latent_end_token_id=92,
-        attn_implementation="eager",
+        attn_implementation=attn_implementation,
+        rope_scaling={"type": "mrope", "mrope_section": [1, 1, 0]},
     )
     return Qwen2_5_VLForConditionalGeneration(config)
