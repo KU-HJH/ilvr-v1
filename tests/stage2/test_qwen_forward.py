@@ -134,6 +134,34 @@ def test_stage2_training_uses_model_owned_rollout_engine():
     assert engine.calls == 1
 
 
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"latent_size": 0}, "latent_size must be a positive integer"),
+        ({"latent_size": True}, "latent_size must be a positive integer"),
+        ({"latent_start_token_id": None}, "latent_start_token_id.*integer"),
+        ({"latent_start_token_id": "91"}, "latent_start_token_id.*integer"),
+        (
+            {"latent_start_token_id": 90},
+            "latent pad/start/end token IDs must be distinct",
+        ),
+        (
+            {"latent_start_id": 99},
+            "latent_start_token_id.*latent_start_id.*disagree",
+        ),
+    ],
+)
+def test_stage2_direct_forward_rejects_malformed_config(updates, message):
+    """Catches malformed external Stage 2 configs bypassing composition checks."""
+    model = tiny_stage2_qwen()
+    for name, value in updates.items():
+        setattr(model.config, name, value)
+
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2]])
+    with pytest.raises(ValueError, match=message):
+        model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
+
+
 def _run_tiny_stage2_train_step(model):
     input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
     labels = input_ids.masked_fill(input_ids == 90, -100)

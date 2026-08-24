@@ -2,11 +2,37 @@ import inspect
 
 import pytest
 import torch
+from torch import nn
 
 from helpers import tiny_stage2_qwen
 from transformers import GPT2Config, GPT2LMHeadModel
 from transformers.cache_utils import DynamicCache
 from transformers.generation.utils import GenerateDecoderOnlyOutput, GenerationMixin
+
+
+def tiny_ordinary_qwen():
+    model = tiny_stage2_qwen()
+    model.config.stage = None
+    model.config.use_cache = True
+    model.generation_config.eos_token_id = None
+    model.generation_config.pad_token_id = 0
+    model.eval()
+    return model
+
+
+class DeterministicVisualStub(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.register_buffer("feature", torch.arange(hidden_size, dtype=torch.float32))
+        self.calls = 0
+
+    @property
+    def dtype(self):
+        return self.feature.dtype
+
+    def forward(self, pixel_values, grid_thw):
+        self.calls += 1
+        return self.feature.unsqueeze(0).expand(grid_thw.shape[0], -1)
 
 
 def test_generic_sample_exposes_only_the_standard_sampling_contract():
@@ -51,6 +77,95 @@ def test_tiny_text_model_generates_with_standard_arguments_and_output(return_dic
     else:
         assert type(output) is torch.Tensor
         assert output.shape == (1, 4)
+
+
+def test_local_qwen_ordinary_greedy_generate_returns_tensor():
+    """Catches local Qwen bypassing or breaking the generic greedy sampler."""
+    torch.manual_seed(31)
+    model = tiny_ordinary_qwen()
+
+    output = model.generate(
+        torch.tensor([[1, 2]]),
+        attention_mask=torch.ones(1, 2, dtype=torch.long),
+        max_new_tokens=2,
+        do_sample=False,
+        return_dict_in_generate=False,
+    )
+
+    assert type(output) is torch.Tensor
+    assert output.shape == (1, 4)
+
+
+def test_local_qwen_ordinary_seeded_sampling_returns_structured_output():
+    """Catches local Qwen stochastic sampling or structured output regressions."""
+    torch.manual_seed(37)
+    model = tiny_ordinary_qwen()
+    inputs = torch.tensor([[1, 2]])
+    attention_mask = torch.ones_like(inputs)
+
+    torch.manual_seed(41)
+    first = model.generate(
+        inputs,
+        attention_mask=attention_mask,
+        max_new_tokens=2,
+        do_sample=True,
+        return_dict_in_generate=True,
+        output_scores=True,
+    )
+    model.rope_deltas = None
+    torch.manual_seed(41)
+    second = model.generate(
+        inputs,
+        attention_mask=attention_mask,
+        max_new_tokens=2,
+        do_sample=True,
+        return_dict_in_generate=True,
+        output_scores=True,
+    )
+
+    assert isinstance(first, GenerateDecoderOnlyOutput)
+    assert first.sequences.shape == (1, 4)
+    assert len(first.scores) == 2
+    assert torch.equal(first.sequences, second.sequences)
+
+
+def test_local_qwen_multimodal_prefill_uses_cached_decode_without_reencoding_visual():
+    """Catches cached local-Qwen decode replaying multimodal pixels or losing cache."""
+    torch.manual_seed(43)
+    model = tiny_ordinary_qwen()
+    visual = DeterministicVisualStub(model.config.hidden_size)
+    model.visual = visual
+    calls = []
+    original_forward = model.forward
+
+    def recording_forward(*args, **kwargs):
+        past = kwargs.get("past_key_values")
+        calls.append(
+            {
+                "cache_length": None if past is None else past.get_seq_length(),
+                "has_pixels": kwargs.get("pixel_values") is not None,
+            }
+        )
+        return original_forward(*args, **kwargs)
+
+    model.forward = recording_forward
+    input_ids = torch.tensor([[model.config.vision_start_token_id, model.config.image_token_id, 2]])
+
+    output = model.generate(
+        input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        pixel_values=torch.ones(1, 3),
+        image_grid_thw=torch.tensor([[1, 1, 1]]),
+        max_new_tokens=2,
+        do_sample=False,
+        return_dict_in_generate=True,
+    )
+
+    assert isinstance(output, GenerateDecoderOnlyOutput)
+    assert output.sequences.shape == (1, 5)
+    assert visual.calls == 1
+    assert calls[0] == {"cache_length": 0, "has_pixels": True}
+    assert any(call["cache_length"] > 0 and not call["has_pixels"] for call in calls[1:])
 
 
 def test_qwen_generation_preparation_preserves_prefill_multimodal_inputs():

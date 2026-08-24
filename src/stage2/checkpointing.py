@@ -2,7 +2,10 @@
 
 from dataclasses import dataclass
 
-from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
+    LatentTokenIds,
+    validate_stage2_config,
+)
 
 
 LATENT_TOKEN_STRINGS = {
@@ -38,6 +41,16 @@ def resolve_latent_token_ids(tokenizer, config) -> LatentTokenIds:
             raise ValueError(f"tokenizer does not contain {token}")
 
         tokenizer_id = int(tokenizer_id)
+        resolved[result_field] = tokenizer_id
+
+    tokenizer_ids = LatentTokenIds(**resolved)
+    validate_stage2_config(
+        config,
+        fallback_token_ids=tokenizer_ids,
+        require_canonical_ids=False,
+        require_latent_size=False,
+    )
+    for result_field, tokenizer_id in resolved.items():
         canonical_field = LATENT_CONFIG_FIELDS[result_field][0]
         for config_field in LATENT_CONFIG_FIELDS[result_field]:
             config_id = getattr(config, config_field, None)
@@ -47,9 +60,8 @@ def resolve_latent_token_ids(tokenizer, config) -> LatentTokenIds:
                     f"{canonical_field} mismatch{alias}: "
                     f"tokenizer={tokenizer_id}, config={config_id}"
                 )
-        resolved[result_field] = tokenizer_id
 
-    return LatentTokenIds(**resolved)
+    return tokenizer_ids
 
 
 def configure_stage2_metadata(
@@ -75,6 +87,8 @@ class Stage2LoadDecision:
     model_source: str
     processor_source: str
     trainer_resume_path: str | None
+    latent_size: int
+    supervise_latent_boundaries: bool
 
 
 def resolve_stage2_load_decision(
@@ -82,6 +96,8 @@ def resolve_stage2_load_decision(
     load_model_path,
     resume_from_checkpoint_path,
     load_config,
+    latent_size: int,
+    supervise_latent_boundaries: bool,
 ) -> Stage2LoadDecision:
     """Choose fresh Stage 2 initialization or a complete Stage 2 resume.
 
@@ -93,12 +109,31 @@ def resolve_stage2_load_decision(
     if resume_from_checkpoint_path is None:
         if getattr(load_config(load_model_path), "stage", None) != "stage1":
             raise ValueError("fresh Stage 2 requires a stage1 checkpoint")
-        return Stage2LoadDecision(load_model_path, load_model_path, None)
+        return Stage2LoadDecision(
+            load_model_path,
+            load_model_path,
+            None,
+            latent_size,
+            supervise_latent_boundaries,
+        )
 
-    if getattr(load_config(resume_from_checkpoint_path), "stage", None) != "stage2":
+    resume_config = load_config(resume_from_checkpoint_path)
+    if getattr(resume_config, "stage", None) != "stage2":
         raise ValueError("expected stage2 checkpoint for resume")
+    for field, requested in (
+        ("latent_size", latent_size),
+        ("supervise_latent_boundaries", supervise_latent_boundaries),
+    ):
+        checkpoint_value = getattr(resume_config, field, None)
+        if checkpoint_value != requested:
+            raise ValueError(
+                f"cannot resume Stage 2 with changed {field}: "
+                f"checkpoint={checkpoint_value}, requested={requested}"
+            )
     return Stage2LoadDecision(
         resume_from_checkpoint_path,
         resume_from_checkpoint_path,
         resume_from_checkpoint_path,
+        resume_config.latent_size,
+        resume_config.supervise_latent_boundaries,
     )

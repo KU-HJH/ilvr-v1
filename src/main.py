@@ -93,6 +93,8 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
         load_model_path=args.load_model_path,
         resume_from_checkpoint_path=args.resume_from_checkpoint_path,
         load_config=AutoConfig.from_pretrained,
+        latent_size=args.latent_size,
+        supervise_latent_boundaries=args.supervise_latent_boundaries,
     )
     processor = AutoProcessor.from_pretrained(decision.processor_source)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -103,8 +105,8 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
     configure_stage2_metadata(
         model.config,
         token_ids,
-        latent_size=args.latent_size,
-        supervise_latent_boundaries=args.supervise_latent_boundaries,
+        latent_size=decision.latent_size,
+        supervise_latent_boundaries=decision.supervise_latent_boundaries,
     )
     configure_stage2_model_backend(
         model,
@@ -122,7 +124,7 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
         prepare_stage2_example(
             item,
             image_root=Path(args.image_root),
-            latent_size=args.latent_size,
+            latent_size=decision.latent_size,
         )
         for item in selected_examples
     ]
@@ -134,8 +136,8 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
     collator = Stage2DataCollator(
         processor,
         token_ids,
-        args.latent_size,
-        args.supervise_latent_boundaries,
+        decision.latent_size,
+        decision.supervise_latent_boundaries,
     )
     return Stage2TrainingComponents(
         model=model,
@@ -280,7 +282,8 @@ def main_train():
         trainer.train(resume_from_checkpoint=components.trainer_resume_path)
         if args.save_final_model:
             trainer.save_model(args.save_model_path)
-            components.processor.save_pretrained(args.save_model_path)
+            if trainer.is_world_process_zero():
+                components.processor.save_pretrained(args.save_model_path)
         return
 
     cache_dir = args.cache_dir

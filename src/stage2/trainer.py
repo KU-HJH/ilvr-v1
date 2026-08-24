@@ -17,3 +17,25 @@ class Stage2Trainer(Trainer):
         outputs = model(**inputs, collect_stage2_diagnostics=True)
         self._latest_stage2_diagnostics = outputs.stage2_diagnostics
         return (outputs.loss, outputs) if return_outputs else outputs.loss
+
+    def log(self, logs, start_time=None):
+        diagnostics = getattr(self, "_latest_stage2_diagnostics", None)
+        self._latest_stage2_diagnostics = None
+        if diagnostics is not None:
+            logs = dict(logs)
+            logs["stage2/latent_block_count"] = float(
+                diagnostics["block_count"].item()
+            )
+            norms = diagnostics["latent_l2_norms"]
+            if norms.numel():
+                logs.update(
+                    {
+                        "stage2/latent_l2_norm_mean": float(norms.mean().item()),
+                        "stage2/latent_l2_norm_min": float(norms.min().item()),
+                        "stage2/latent_l2_norm_max": float(norms.max().item()),
+                    }
+                )
+            adjacent = diagnostics["adjacent_cosine_similarities"]
+            if adjacent.numel():
+                logs["stage2/adjacent_cosine_mean"] = float(adjacent.mean().item())
+        super().log(logs, start_time=start_time)

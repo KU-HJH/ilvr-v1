@@ -40,22 +40,32 @@ def test_fresh_stage2_resets_trainer_state():
         load_model_path="stage1/model",
         resume_from_checkpoint_path=None,
         load_config=lambda _: SimpleNamespace(stage="stage1"),
+        latent_size=4,
+        supervise_latent_boundaries=False,
     )
     assert decision.model_source == "stage1/model"
     assert decision.processor_source == "stage1/model"
     assert decision.trainer_resume_path is None
+    assert decision.latent_size == 4
+    assert decision.supervise_latent_boundaries is False
 
 
 def test_resume_requires_stage2_and_uses_single_source_for_all_state():
     decision = resolve_stage2_load_decision(
         load_model_path="stage1/model",
         resume_from_checkpoint_path="stage2/checkpoint-10",
-        load_config=lambda _: SimpleNamespace(stage="stage2"),
+        load_config=lambda _: SimpleNamespace(
+            stage="stage2", latent_size=4, supervise_latent_boundaries=False
+        ),
+        latent_size=4,
+        supervise_latent_boundaries=False,
     )
     assert decision == Stage2LoadDecision(
         model_source="stage2/checkpoint-10",
         processor_source="stage2/checkpoint-10",
         trainer_resume_path="stage2/checkpoint-10",
+        latent_size=4,
+        supervise_latent_boundaries=False,
     )
 
 
@@ -65,6 +75,38 @@ def test_resume_rejects_stage1_source():
             load_model_path="stage1/model",
             resume_from_checkpoint_path="stage1/checkpoint-10",
             load_config=lambda _: SimpleNamespace(stage="stage1"),
+            latent_size=4,
+            supervise_latent_boundaries=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_values", "requested_values", "message"),
+    [
+        (
+            {"latent_size": 2, "supervise_latent_boundaries": True},
+            {"latent_size": 4, "supervise_latent_boundaries": True},
+            "latent_size.*checkpoint=2.*requested=4",
+        ),
+        (
+            {"latent_size": 4, "supervise_latent_boundaries": False},
+            {"latent_size": 4, "supervise_latent_boundaries": True},
+            "supervise_latent_boundaries.*checkpoint=False.*requested=True",
+        ),
+    ],
+)
+def test_resume_rejects_semantic_setting_changes(
+    checkpoint_values, requested_values, message
+):
+    """Catches resuming optimizer/global state under a changed recurrence or loss."""
+    config = SimpleNamespace(stage="stage2", **checkpoint_values)
+
+    with pytest.raises(ValueError, match=message):
+        resolve_stage2_load_decision(
+            load_model_path="stage1/model",
+            resume_from_checkpoint_path="stage2/checkpoint-10",
+            load_config=lambda _: config,
+            **requested_values,
         )
 
 

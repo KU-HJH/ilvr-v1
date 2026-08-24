@@ -16,6 +16,64 @@ class LatentTokenIds:
     end_token_id: int
 
 
+_LATENT_CONFIG_FIELDS = {
+    "pad_token_id": ("latent_pad_token_id", "latent_token_id"),
+    "start_token_id": ("latent_start_token_id", "latent_start_id"),
+    "end_token_id": ("latent_end_token_id", "latent_end_id"),
+}
+
+
+def validate_stage2_config(
+    config,
+    *,
+    fallback_token_ids: LatentTokenIds | None = None,
+    require_canonical_ids: bool = True,
+    require_latent_size: bool = True,
+) -> tuple[LatentTokenIds, int | None]:
+    """Validate Stage 2 structural metadata without requiring a tokenizer."""
+    resolved = {}
+    for result_field, (canonical_field, legacy_field) in _LATENT_CONFIG_FIELDS.items():
+        canonical_value = getattr(config, canonical_field, None)
+        legacy_value = getattr(config, legacy_field, None)
+        if require_canonical_ids and (
+            not isinstance(canonical_value, int) or isinstance(canonical_value, bool)
+        ):
+            raise ValueError(f"{canonical_field} must be present as an integer")
+        for field, value in (
+            (canonical_field, canonical_value),
+            (legacy_field, legacy_value),
+        ):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool)
+            ):
+                raise ValueError(f"{field} must be an integer")
+        if canonical_value is not None and legacy_value is not None:
+            if canonical_value != legacy_value:
+                raise ValueError(
+                    f"{canonical_field} and {legacy_field} disagree: "
+                    f"{canonical_value} != {legacy_value}"
+                )
+        value = canonical_value if canonical_value is not None else legacy_value
+        if value is None and fallback_token_ids is not None:
+            value = getattr(fallback_token_ids, result_field)
+        if value is None:
+            raise ValueError(f"{canonical_field} must be present as an integer")
+        resolved[result_field] = value
+
+    token_ids = LatentTokenIds(**resolved)
+    if len(set(resolved.values())) != 3:
+        raise ValueError("latent pad/start/end token IDs must be distinct")
+
+    latent_size = getattr(config, "latent_size", None)
+    if require_latent_size and (
+        not isinstance(latent_size, int)
+        or isinstance(latent_size, bool)
+        or latent_size <= 0
+    ):
+        raise ValueError("latent_size must be a positive integer")
+    return token_ids, latent_size
+
+
 @dataclass(frozen=True)
 class LatentSpan:
     start_position: int

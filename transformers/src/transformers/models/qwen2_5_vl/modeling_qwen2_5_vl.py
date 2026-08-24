@@ -50,7 +50,7 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
-from .stage2_latent_rollout import LatentRolloutEngine, LatentTokenIds, parse_latent_spans
+from .stage2_latent_rollout import LatentRolloutEngine, parse_latent_spans, validate_stage2_config
 
 
 if is_flash_attn_2_available():
@@ -2028,15 +2028,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 full_position_ids = full_position_ids.unsqueeze(0).expand(3, -1, -1)
         full_position_ids = full_position_ids.to(base_inputs_embeds.device)
 
-        token_ids = LatentTokenIds(
-            pad_token_id=self.config.latent_pad_token_id,
-            start_token_id=self.config.latent_start_token_id,
-            end_token_id=self.config.latent_end_token_id,
-        )
+        token_ids, latent_size = validate_stage2_config(self.config)
         latent_spans = parse_latent_spans(
             input_ids[0],
             token_ids=token_ids,
-            latent_size=self.config.latent_size,
+            latent_size=latent_size,
         )
         language_model = partial(self.model, generate_mode=True)
         rollout = self.stage2_rollout_engine.rollout(

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 import main
@@ -43,6 +44,54 @@ def test_stage2_trainer_uses_model_ce_without_teacher():
     assert trainer._latest_stage2_diagnostics == {"latent_blocks": 1}
     assert "pixel_values_latent" not in trainer.model.last_inputs
     assert trainer.model.last_inputs["collect_stage2_diagnostics"] is True
+
+
+@pytest.mark.parametrize(
+    ("diagnostics", "expected"),
+    [
+        (
+            {
+                "block_count": torch.tensor(2),
+                "latent_l2_norms": torch.tensor([[3.0, 4.0]]),
+                "adjacent_cosine_similarities": torch.tensor([[0.5]]),
+            },
+            {
+                "stage2/latent_block_count": 2.0,
+                "stage2/latent_l2_norm_mean": 3.5,
+                "stage2/latent_l2_norm_min": 3.0,
+                "stage2/latent_l2_norm_max": 4.0,
+                "stage2/adjacent_cosine_mean": 0.5,
+            },
+        ),
+        (
+            {
+                "block_count": torch.tensor(0),
+                "latent_l2_norms": torch.empty(1, 0),
+                "adjacent_cosine_similarities": torch.empty(1, 0),
+            },
+            {"stage2/latent_block_count": 0.0},
+        ),
+    ],
+)
+def test_stage2_trainer_logs_each_diagnostic_snapshot_once(
+    monkeypatch, diagnostics, expected
+):
+    """Catches detached Stage 2 diagnostics being dropped or replayed forever."""
+    emitted = []
+    monkeypatch.setattr(
+        Trainer,
+        "log",
+        lambda self, logs, start_time=None: emitted.append((dict(logs), start_time)),
+    )
+    trainer = object.__new__(Stage2Trainer)
+    trainer._latest_stage2_diagnostics = diagnostics
+
+    trainer.log({"loss": 1.25}, start_time=7.0)
+    trainer.log({"loss": 1.0})
+
+    assert emitted[0] == ({"loss": 1.25, **expected}, 7.0)
+    assert emitted[1] == ({"loss": 1.0}, None)
+    assert trainer._latest_stage2_diagnostics is None
 
 
 def test_stage_routing_selects_independent_trainers():
@@ -251,6 +300,8 @@ def test_stage2_components_use_one_source_and_filter_complete_samples(
         model_source="selected/model",
         processor_source="selected/processor",
         trainer_resume_path="selected/checkpoint",
+        latent_size=2,
+        supervise_latent_boundaries=False,
     )
     monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
     monkeypatch.setattr(
@@ -289,7 +340,7 @@ def test_stage2_components_use_one_source_and_filter_complete_samples(
     )
 
     assert [item for item, _, _ in calls.prepared] == expected
-    assert all(str(root) == "images" and size == 4 for _, root, size in calls.prepared)
+    assert all(str(root) == "images" and size == 2 for _, root, size in calls.prepared)
     assert calls.filtered == (expected, "measure", 8192)
     assert components.model is model
     assert components.processor is processor
@@ -297,7 +348,11 @@ def test_stage2_components_use_one_source_and_filter_complete_samples(
     assert components.trainer_class is Stage2Trainer
     assert components.trainer_resume_path == "selected/checkpoint"
     assert components.data_collator.token_ids == token_ids
+    assert components.data_collator.latent_size == 2
+    assert components.data_collator.supervise_latent_boundaries is False
     assert model.config.stage == "stage2"
+    assert model.config.latent_size == 2
+    assert model.config.supervise_latent_boundaries is False
     assert model.config.use_cache is False
     assert model.is_gradient_checkpointing is True
     assert model.gradient_checkpointing_kwargs == {"use_reentrant": False}
@@ -334,6 +389,7 @@ def test_stage2_training_arguments_omit_checkpoint_kwargs_when_disabled():
 
 class RecordingTrainer:
     instance = None
+    world_process_zero = True
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -347,6 +403,9 @@ class RecordingTrainer:
     def save_model(self, path):
         self.saved_path = path
 
+    def is_world_process_zero(self):
+        return self.world_process_zero
+
 
 class RecordingSavedProcessor:
     def __init__(self):
@@ -356,7 +415,13 @@ class RecordingSavedProcessor:
         self.saved_path = path
 
 
-def test_main_stage2_uses_only_stage2_components_and_validated_resume(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("world_process_zero", "expected_processor_path"),
+    [(True, "out"), (False, None)],
+)
+def test_main_stage2_uses_only_stage2_components_and_validated_resume(
+    monkeypatch, tmp_path, world_process_zero, expected_processor_path
+):
     """Catches Stage 2 falling through the Stage 1 trainer or auto-resume path."""
     args = stage2_args(
         stage="stage2",
@@ -377,6 +442,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(monkeypatc
         trainer_resume_path="stage2/checkpoint-4",
     )
     training_args = object()
+    RecordingTrainer.world_process_zero = world_process_zero
     monkeypatch.setattr(main, "get_args", lambda: args)
     monkeypatch.setattr(main, "seed_everything", lambda seed: None)
     monkeypatch.setattr(main, "build_stage2_training_components", lambda selected: components)
@@ -399,4 +465,4 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(monkeypatc
     }
     assert trainer.resume_path == "stage2/checkpoint-4"
     assert trainer.saved_path == "out"
-    assert processor.saved_path == "out"
+    assert processor.saved_path == expected_processor_path
