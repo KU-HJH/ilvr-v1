@@ -102,4 +102,3 @@ def resolve_stage2_load_decision(
         resume_from_checkpoint_path,
         resume_from_checkpoint_path,
     )
-
