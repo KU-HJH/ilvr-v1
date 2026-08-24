@@ -7,6 +7,7 @@ from torch import nn
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
 from helpers import ToyCausalLanguageModel
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentRolloutEngine
 
 
 class OutputAwareToyCausalLanguageModel(ToyCausalLanguageModel):
@@ -134,10 +135,36 @@ def stage2_scaffold():
     return input_ids, attention_mask, image_grid_thw
 
 
+class RecordingRolloutEngine:
+    def __init__(self):
+        self.delegate = LatentRolloutEngine()
+        self.calls = 0
+
+    def rollout(self, **kwargs):
+        self.calls += 1
+        return self.delegate.rollout(**kwargs)
+
+
 def test_stage2_freezes_full_visual_module_at_composition():
     model = tiny_stage2_qwen()
 
     assert all(not parameter.requires_grad for parameter in model.visual.parameters())
+
+
+def test_stage2_training_uses_model_owned_rollout_engine():
+    model = tiny_stage2_qwen()
+    model.model = OutputAwareToyCausalLanguageModel(8)
+    engine = RecordingRolloutEngine()
+    model.stage2_rollout_engine = engine
+    input_ids, attention_mask, image_grid_thw = stage2_scaffold()
+
+    model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        image_grid_thw=image_grid_thw,
+    )
+
+    assert engine.calls == 1
 
 
 def test_stage2_encodes_frozen_visual_once_and_backpropagates_through_lm():

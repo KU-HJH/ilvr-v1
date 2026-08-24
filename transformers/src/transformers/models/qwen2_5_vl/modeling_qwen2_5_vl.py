@@ -1766,6 +1766,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         if getattr(self.config, "stage", None) == "stage2":
             self.visual.requires_grad_(False)
 
+        self.stage2_rollout_engine = LatentRolloutEngine()
         self.latent_model = False
 
     def get_input_embeddings(self):
@@ -2038,7 +2039,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             latent_size=self.config.latent_size,
         )
         language_model = partial(self.model, generate_mode=True)
-        rollout = LatentRolloutEngine().rollout(
+        rollout = self.stage2_rollout_engine.rollout(
             language_model=language_model,
             base_inputs_embeds=base_inputs_embeds,
             attention_mask=attention_mask,
