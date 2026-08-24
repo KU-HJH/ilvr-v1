@@ -6,7 +6,7 @@ from torch import nn
 
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
-from .helpers import ToyCausalLanguageModel
+from helpers import ToyCausalLanguageModel
 
 
 class OutputAwareToyCausalLanguageModel(ToyCausalLanguageModel):

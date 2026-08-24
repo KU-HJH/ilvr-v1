@@ -3,7 +3,7 @@ import torch
 from types import SimpleNamespace
 from torch import nn
 
-from tests.stage2.helpers import ToyCausalLanguageModel
+from helpers import ToyCausalLanguageModel
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentRolloutEngine,
     LatentSpan,

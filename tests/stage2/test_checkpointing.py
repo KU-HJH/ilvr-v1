@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.stage2.checkpointing import (
+from stage2.checkpointing import (
     Stage2LoadDecision,
     configure_stage2_metadata,
     resolve_latent_token_ids,
