@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -97,6 +98,25 @@ def build_tiny_prepared_example(image_root: Path):
         },
         image_root=image_root,
         latent_size=2,
+    )
+
+
+def resolve_launcher_rank(environ=None) -> int:
+    environment = os.environ if environ is None else environ
+    raw_rank = environment.get("RANK", "0")
+    try:
+        rank = int(raw_rank)
+    except (TypeError, ValueError) as error:
+        raise ValueError("RANK must be a non-negative integer") from error
+    if rank < 0:
+        raise ValueError("RANK must be a non-negative integer")
+    return rank
+
+
+def build_rank_local_tiny_prepared_example(output_dir: Path, *, environ=None):
+    rank = resolve_launcher_rank(environ)
+    return build_tiny_prepared_example(
+        output_dir / "tiny-data" / f"rank-{rank}"
     )
 
 
@@ -254,9 +274,7 @@ def _assert_contract(witness):
 def run_harness(*, output_dir: Path, witness_path: Path, deepspeed: str | None):
     torch.manual_seed(23)
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset = TinyStage2Dataset(
-        build_tiny_prepared_example(output_dir / "tiny-data")
-    )
+    dataset = TinyStage2Dataset(build_rank_local_tiny_prepared_example(output_dir))
 
     first_collator = _recording_production_collator()
     first_recorder = ResumeStateRecorder()

@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 from PIL import Image
 
 from main import (
@@ -186,6 +187,59 @@ def test_recording_collator_uses_production_b_greater_than_one_failure(tmp_path)
         recorder([prepared, prepared])
 
     assert recorder.local_batch_sizes == [2]
+
+
+def test_rank_local_fixtures_have_distinct_valid_production_batches(tmp_path):
+    """Catches launched ranks concurrently truncating the same original image."""
+    harness = _load_harness_module()
+    examples = [
+        harness.build_rank_local_tiny_prepared_example(
+            tmp_path, environ={"RANK": str(rank)}
+        )
+        for rank in (0, 1)
+    ]
+
+    image_paths = [Path(example.original_image_paths[0]) for example in examples]
+    assert image_paths == [
+        tmp_path / "tiny-data" / "rank-0" / "input.png",
+        tmp_path / "tiny-data" / "rank-1" / "input.png",
+    ]
+    assert image_paths[0] != image_paths[1]
+
+    batches = []
+    for image_path, example in zip(image_paths, examples, strict=True):
+        with Image.open(image_path) as image:
+            image.verify()
+        batch = Stage2DataCollator(
+            processor=harness.TinyStage2Processor(),
+            token_ids=TOKENS,
+            latent_size=2,
+            supervise_latent_boundaries=True,
+        )([example])
+        assert batch["input_ids"].shape == batch["attention_mask"].shape == (1, 11)
+        assert batch["labels"].shape == (1, 11)
+        assert batch["pixel_values"].shape == (1, 12)
+        assert batch["image_grid_thw"].shape == (1, 3)
+        assert len(
+            parse_latent_spans(
+                batch["input_ids"][0], token_ids=TOKENS, latent_size=2
+            )
+        ) == 1
+        batches.append(batch)
+
+    for key in batches[0]:
+        assert torch.equal(batches[0][key], batches[1][key])
+
+
+@pytest.mark.parametrize("raw_rank", ["", "worker-1", "-1"])
+def test_rank_local_fixture_rejects_malformed_launcher_rank(tmp_path, raw_rank):
+    """Catches malformed launcher state silently collapsing ranks to one path."""
+    harness = _load_harness_module()
+
+    with pytest.raises(ValueError, match="RANK must be a non-negative integer"):
+        harness.build_rank_local_tiny_prepared_example(
+            tmp_path, environ={"RANK": raw_rank}
+        )
 
 
 @pytest.mark.skipif(
