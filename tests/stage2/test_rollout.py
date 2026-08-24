@@ -47,6 +47,39 @@ def test_rollout_rejects_local_batch_larger_than_one():
         )
 
 
+def test_rollout_rejects_mismatched_attention_mask():
+    with pytest.raises(ValueError, match="attention_mask"):
+        LatentRolloutEngine().rollout(
+            language_model=ToyCausalLanguageModel(2),
+            base_inputs_embeds=torch.zeros(1, 4, 2),
+            attention_mask=torch.ones(1, 3),
+            full_position_ids=torch.zeros(3, 1, 4, dtype=torch.long),
+            latent_spans=(),
+        )
+
+
+def test_rollout_rejects_malformed_full_position_ids():
+    with pytest.raises(ValueError, match="full_position_ids"):
+        LatentRolloutEngine().rollout(
+            language_model=ToyCausalLanguageModel(2),
+            base_inputs_embeds=torch.zeros(1, 4, 2),
+            attention_mask=torch.ones(1, 4),
+            full_position_ids=torch.zeros(1, 4, dtype=torch.long),
+            latent_spans=(),
+        )
+
+
+def test_rollout_rejects_mismatched_full_position_ids():
+    with pytest.raises(ValueError, match="full_position_ids"):
+        LatentRolloutEngine().rollout(
+            language_model=ToyCausalLanguageModel(2),
+            base_inputs_embeds=torch.zeros(1, 4, 2),
+            attention_mask=torch.ones(1, 4),
+            full_position_ids=torch.zeros(3, 1, 3, dtype=torch.long),
+            latent_spans=(),
+        )
+
+
 def test_second_block_keeps_first_block_context():
     ids = torch.tensor([1, 91, 90, 90, 92, 2, 91, 90, 90, 92, 3])
     spans = parse_latent_spans(ids, token_ids=TOKENS, latent_size=2)
@@ -54,19 +87,29 @@ def test_second_block_keeps_first_block_context():
     base = torch.arange(ids.numel() * 2, dtype=torch.float32).view(1, -1, 2)
     changed = base.clone()
     changed[:, 0] += 100
+    first_lm = ToyCausalLanguageModel(2)
+    second_lm = ToyCausalLanguageModel(2)
     first = LatentRolloutEngine().rollout(
-        language_model=ToyCausalLanguageModel(2),
+        language_model=first_lm,
         base_inputs_embeds=base,
         attention_mask=torch.ones(1, ids.numel()),
         full_position_ids=positions,
         latent_spans=spans,
     )
     second = LatentRolloutEngine().rollout(
-        language_model=ToyCausalLanguageModel(2),
+        language_model=second_lm,
         base_inputs_embeds=changed,
         attention_mask=torch.ones(1, ids.numel()),
         full_position_ids=positions,
         latent_spans=spans,
     )
 
+    assert first.prefix_lengths == (2, 3, 7, 8)
+    assert len(first.latent_states) == 4
+    assert len(first_lm.calls) == 4
+    assert [call[0].shape[1] for call in first_lm.calls] == [2, 3, 7, 8]
+    assert torch.allclose(
+        torch.cat(first.latent_states),
+        torch.tensor([[2.0, 3.0], [4.0, 5.5], [25.0, 28.75], [38.5, 44.125]]),
+    )
     assert not torch.allclose(first.latent_states[2], second.latent_states[2])
