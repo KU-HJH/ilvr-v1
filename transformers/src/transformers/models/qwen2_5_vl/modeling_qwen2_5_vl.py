@@ -2384,6 +2384,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
 
         model_inputs["position_ids"] = None
+        model_inputs["generate_mode"] = True
 
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None
