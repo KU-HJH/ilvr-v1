@@ -68,3 +68,63 @@ def parse_latent_spans(
     if open_start is not None:
         raise LatentStructureError("missing latent_end")
     return tuple(spans)
+
+
+@dataclass(frozen=True)
+class LatentRolloutResult:
+    final_inputs_embeds: torch.Tensor
+    latent_states: tuple[torch.Tensor, ...]
+    prefix_lengths: tuple[int, ...]
+    diagnostics: "LatentRolloutDiagnostics | None" = None
+
+
+def _replace_embedding(embeds: torch.Tensor, position: int, value: torch.Tensor) -> torch.Tensor:
+    return torch.cat(
+        (embeds[:, :position], value.unsqueeze(1), embeds[:, position + 1 :]),
+        dim=1,
+    )
+
+
+class LatentRolloutEngine:
+    """Run the differentiable, no-cache continuous latent recurrence."""
+
+    def rollout(
+        self,
+        *,
+        language_model,
+        base_inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        full_position_ids: torch.Tensor,
+        latent_spans: tuple[LatentSpan, ...],
+        retain_latent_grads: bool = False,
+        collect_diagnostics: bool = False,
+    ) -> LatentRolloutResult:
+        if base_inputs_embeds.ndim != 3:
+            raise ValueError("base_inputs_embeds must have shape [batch, sequence, hidden]")
+        if base_inputs_embeds.shape[0] != 1:
+            raise NotImplementedError("Stage 2 rollout currently supports batch_size=1 only")
+        sequence_shape = base_inputs_embeds.shape[:2]
+        if attention_mask.shape != sequence_shape:
+            raise ValueError("attention_mask must match the embedding batch and sequence dimensions")
+        if full_position_ids.ndim != 3 or full_position_ids.shape[-2:] != sequence_shape:
+            raise ValueError("full_position_ids must match the embedding batch and sequence dimensions")
+
+        current = base_inputs_embeds
+        states = []
+        prefix_lengths = []
+        for span in latent_spans:
+            for position in span.latent_positions:
+                outputs = language_model(
+                    inputs_embeds=current[:, :position],
+                    attention_mask=attention_mask[:, :position],
+                    position_ids=full_position_ids[..., :position],
+                    use_cache=False,
+                    return_dict=True,
+                )
+                latent = outputs.last_hidden_state[:, -1, :]
+                if retain_latent_grads:
+                    latent.retain_grad()
+                states.append(latent)
+                prefix_lengths.append(position)
+                current = _replace_embedding(current, position, latent)
+        return LatentRolloutResult(current, tuple(states), tuple(prefix_lengths))
