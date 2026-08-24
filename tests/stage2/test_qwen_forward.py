@@ -154,9 +154,9 @@ def test_stage2_gradient_checkpointing_preserves_loss_latents_and_gradients():
     plain = tiny_stage2_qwen().train()
     checkpointed = deepcopy(plain).train()
     plain.config.use_cache = False
-    checkpointed.config.use_cache = False
-    checkpointed.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
+    configure_stage2_model_backend(
+        checkpointed,
+        gradient_checkpointing=True,
     )
 
     plain_outputs = _run_tiny_stage2_train_step(plain)
@@ -212,6 +212,10 @@ def test_stage2_backend_configuration_controls_cache_and_checkpointing(
 
     assert model.config.use_cache is False
     assert model.is_gradient_checkpointing is gradient_checkpointing
+    if gradient_checkpointing:
+        assert model.model._gradient_checkpointing_func.keywords == {
+            "use_reentrant": False
+        }
 
 
 def test_stage2_encodes_frozen_visual_once_and_backpropagates_through_lm():

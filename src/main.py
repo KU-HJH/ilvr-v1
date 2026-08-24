@@ -40,6 +40,9 @@ from stage2.data import (
 from stage2.trainer import Stage2Trainer
 
 
+_STAGE2_GRADIENT_CHECKPOINTING_KWARGS = {"use_reentrant": False}
+
+
 @dataclass(frozen=True)
 class TrainingPath:
     trainer_class: type
@@ -68,7 +71,9 @@ def configure_stage2_model_backend(model, *, gradient_checkpointing: bool) -> No
     """Apply Stage 2 cache/checkpoint settings outside the latent recurrence."""
     model.config.use_cache = False
     if gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs=dict(_STAGE2_GRADIENT_CHECKPOINTING_KWARGS)
+        )
     else:
         model.gradient_checkpointing_disable()
 
@@ -154,6 +159,11 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         max_seq_length=args.max_seq_length_train,
         max_steps=args.max_steps,
         gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing_kwargs=(
+            dict(_STAGE2_GRADIENT_CHECKPOINTING_KWARGS)
+            if args.gradient_checkpointing
+            else None
+        ),
         deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False,
     )

@@ -191,12 +191,15 @@ class RecordingStage2Model:
         self.config = SimpleNamespace()
         self.visual = RecordingVisual()
         self.is_gradient_checkpointing = False
+        self.gradient_checkpointing_kwargs = None
 
-    def gradient_checkpointing_enable(self):
+    def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs=None):
         self.is_gradient_checkpointing = True
+        self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
 
     def gradient_checkpointing_disable(self):
         self.is_gradient_checkpointing = False
+        self.gradient_checkpointing_kwargs = None
 
 
 class CompositionTokenizer:
@@ -297,6 +300,7 @@ def test_stage2_components_use_one_source_and_filter_complete_samples(
     assert model.config.stage == "stage2"
     assert model.config.use_cache is False
     assert model.is_gradient_checkpointing is True
+    assert model.gradient_checkpointing_kwargs == {"use_reentrant": False}
     assert model.visual.requires_grad is False
 
 
@@ -315,6 +319,17 @@ def test_stage2_training_arguments_create_fresh_optimizer_configuration():
     assert training_args.max_seq_length == 8192
     assert training_args.max_steps == 13
     assert training_args.gradient_checkpointing is True
+    assert training_args.gradient_checkpointing_kwargs == {"use_reentrant": False}
+
+
+def test_stage2_training_arguments_omit_checkpoint_kwargs_when_disabled():
+    """Catches inactive checkpointing carrying mode-specific runtime kwargs."""
+    training_args = build_stage2_training_arguments(
+        stage2_args(gradient_checkpointing=False)
+    )
+
+    assert training_args.gradient_checkpointing is False
+    assert training_args.gradient_checkpointing_kwargs is None
 
 
 class RecordingTrainer:
