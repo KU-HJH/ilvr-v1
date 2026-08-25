@@ -1,11 +1,325 @@
 """Validate Stage 2 token metadata and checkpoint transitions."""
 
-from dataclasses import dataclass
+import json
+import logging
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
 
+import peft
+from peft import PeftConfig
+from safetensors import safe_open
+from torch import nn
+
+from .peft import Stage2TuningConfig, resolve_stage2_qwen_model
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
     validate_stage2_config,
 )
+
+
+STAGE2_PEFT_METADATA_FILENAME = "stage2_peft_metadata.json"
+STAGE2_PEFT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class Stage2PeftMetadata:
+    """Portable provenance and structural contract for a Stage 2 adapter."""
+
+    schema_version: int
+    stage: str
+    tuning_method: str
+    base_model_reference: str
+    latent_size: int
+    latent_start_token_id: int
+    latent_pad_token_id: int
+    latent_end_token_id: int
+    supervise_latent_boundaries: bool
+    lora_r: int
+    lora_alpha: int
+    lora_dropout: float
+    requested_target_modules: tuple[str, ...]
+    resolved_target_module_names: tuple[str, ...]
+    peft_version: str
+
+    def to_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["requested_target_modules"] = list(self.requested_target_modules)
+        payload["resolved_target_module_names"] = list(
+            self.resolved_target_module_names
+        )
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "Stage2PeftMetadata":
+        if not isinstance(payload, Mapping):
+            raise ValueError("Stage 2 PEFT metadata must be a JSON object")
+        expected = {field.name for field in fields(cls)}
+        actual = set(payload)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            unknown = sorted(actual - expected)
+            raise ValueError(
+                "invalid Stage 2 PEFT metadata fields: "
+                f"missing={missing}, unknown={unknown}"
+            )
+        if payload["schema_version"] != STAGE2_PEFT_SCHEMA_VERSION:
+            raise ValueError("unsupported Stage 2 PEFT metadata schema")
+        if payload["stage"] != "stage2":
+            raise ValueError("Stage 2 PEFT metadata must describe stage2")
+        if payload["tuning_method"] not in ("lora", "dora"):
+            raise ValueError("Stage 2 PEFT metadata requires LoRA or DoRA")
+
+        integer_fields = (
+            "schema_version",
+            "latent_size",
+            "latent_start_token_id",
+            "latent_pad_token_id",
+            "latent_end_token_id",
+            "lora_r",
+            "lora_alpha",
+        )
+        if any(type(payload[name]) is not int for name in integer_fields):
+            raise ValueError("Stage 2 PEFT integer metadata has an invalid type")
+        if type(payload["supervise_latent_boundaries"]) is not bool:
+            raise ValueError("supervise_latent_boundaries must be a boolean")
+        if type(payload["lora_dropout"]) not in (int, float):
+            raise ValueError("lora_dropout must be numeric")
+        string_fields = (
+            "stage",
+            "tuning_method",
+            "base_model_reference",
+            "peft_version",
+        )
+        if any(
+            not isinstance(payload[name], str) or not payload[name]
+            for name in string_fields
+        ):
+            raise ValueError("Stage 2 PEFT string metadata must be non-empty")
+
+        sequence_fields = (
+            "requested_target_modules",
+            "resolved_target_module_names",
+        )
+        converted: dict[str, tuple[str, ...]] = {}
+        for name in sequence_fields:
+            value = payload[name]
+            if (
+                not isinstance(value, list)
+                or not value
+                or any(not isinstance(item, str) or not item for item in value)
+            ):
+                raise ValueError(f"{name} must be a non-empty JSON string list")
+            converted[name] = tuple(value)
+
+        tuning = Stage2TuningConfig(
+            method=payload["tuning_method"],
+            r=payload["lora_r"],
+            alpha=payload["lora_alpha"],
+            dropout=float(payload["lora_dropout"]),
+            target_modules=converted["requested_target_modules"],
+        )
+        if payload["latent_size"] <= 0:
+            raise ValueError("latent_size must be positive")
+        if any(payload[name] < 0 for name in integer_fields[2:5]):
+            raise ValueError("latent token IDs must be non-negative")
+        if len(set(converted["resolved_target_module_names"])) != len(
+            converted["resolved_target_module_names"]
+        ):
+            raise ValueError("resolved target module names must be unique")
+
+        return cls(
+            schema_version=STAGE2_PEFT_SCHEMA_VERSION,
+            stage="stage2",
+            tuning_method=tuning.method,
+            base_model_reference=payload["base_model_reference"],
+            latent_size=payload["latent_size"],
+            latent_start_token_id=payload["latent_start_token_id"],
+            latent_pad_token_id=payload["latent_pad_token_id"],
+            latent_end_token_id=payload["latent_end_token_id"],
+            supervise_latent_boundaries=payload["supervise_latent_boundaries"],
+            lora_r=tuning.r,
+            lora_alpha=tuning.alpha,
+            lora_dropout=tuning.dropout,
+            requested_target_modules=tuning.target_modules,
+            resolved_target_module_names=converted["resolved_target_module_names"],
+            peft_version=payload["peft_version"],
+        )
+
+
+def build_stage2_peft_metadata(
+    *,
+    tuning: Stage2TuningConfig,
+    base_model_reference: str,
+    model_config,
+    token_ids: LatentTokenIds,
+    resolved_target_names: Sequence[str],
+) -> Stage2PeftMetadata:
+    """Build the sidecar for a fresh Stage 2 PEFT run."""
+    if not tuning.is_peft:
+        raise ValueError("Stage 2 PEFT metadata requires LoRA or DoRA tuning")
+    return Stage2PeftMetadata.from_dict(
+        {
+            "schema_version": STAGE2_PEFT_SCHEMA_VERSION,
+            "stage": "stage2",
+            "tuning_method": tuning.method,
+            "base_model_reference": str(base_model_reference),
+            "latent_size": getattr(model_config, "latent_size", None),
+            "latent_start_token_id": token_ids.start_token_id,
+            "latent_pad_token_id": token_ids.pad_token_id,
+            "latent_end_token_id": token_ids.end_token_id,
+            "supervise_latent_boundaries": getattr(
+                model_config, "supervise_latent_boundaries", None
+            ),
+            "lora_r": tuning.r,
+            "lora_alpha": tuning.alpha,
+            "lora_dropout": tuning.dropout,
+            "requested_target_modules": list(tuning.target_modules),
+            "resolved_target_module_names": list(resolved_target_names),
+            "peft_version": peft.__version__,
+        }
+    )
+
+
+def save_stage2_peft_metadata(
+    directory: str | Path, metadata: Stage2PeftMetadata
+) -> None:
+    """Atomically publish one validated Stage 2 adapter sidecar."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / STAGE2_PEFT_METADATA_FILENAME
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.write_text(
+        json.dumps(metadata.to_dict(), sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary.replace(destination)
+
+
+def load_stage2_peft_metadata(directory: str | Path) -> Stage2PeftMetadata:
+    """Load and fail closed on a missing or malformed adapter sidecar."""
+    source = Path(directory) / STAGE2_PEFT_METADATA_FILENAME
+    if not source.is_file():
+        raise ValueError(f"missing Stage 2 PEFT metadata: {source}")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid Stage 2 PEFT metadata: {source}") from error
+    return Stage2PeftMetadata.from_dict(payload)
+
+
+def validate_stage2_peft_compatibility(
+    base_model,
+    tokenizer,
+    metadata: Stage2PeftMetadata,
+    adapter_config,
+    adapter_path: str | Path,
+) -> None:
+    """Validate a relocated base against adapter metadata without reading weights."""
+    qwen = resolve_stage2_qwen_model(base_model)
+    config = qwen.config
+    token_ids = resolve_latent_token_ids(tokenizer, config)
+    for field, actual in (
+        ("latent_pad_token_id", token_ids.pad_token_id),
+        ("latent_start_token_id", token_ids.start_token_id),
+        ("latent_end_token_id", token_ids.end_token_id),
+    ):
+        expected = getattr(metadata, field)
+        if actual != expected:
+            raise ValueError(
+                f"{field} mismatch: checkpoint={expected}, base={actual}"
+            )
+    for field in ("latent_size", "supervise_latent_boundaries"):
+        actual = getattr(config, field, None)
+        expected = getattr(metadata, field)
+        if actual != expected:
+            raise ValueError(f"{field} mismatch: checkpoint={expected}, base={actual}")
+
+    source = getattr(config, "_name_or_path", "")
+    if source and source != metadata.base_model_reference:
+        logging.getLogger(__name__).warning(
+            "validating relocated Stage 1 base %s (recorded source: %s)",
+            source,
+            metadata.base_model_reference,
+        )
+
+    expected_use_dora = metadata.tuning_method == "dora"
+    actual_use_dora = getattr(adapter_config, "use_dora", None)
+    if actual_use_dora is not expected_use_dora:
+        raise ValueError(
+            "adapter method mismatch: "
+            f"use_dora mismatch (checkpoint={expected_use_dora}, "
+            f"adapter={actual_use_dora})"
+        )
+    peft_type = getattr(adapter_config, "peft_type", None)
+    peft_type_value = getattr(peft_type, "value", peft_type)
+    if peft_type_value != "LORA":
+        raise ValueError(f"adapter method mismatch: unsupported peft_type={peft_type}")
+
+    for label, attribute, expected in (
+        ("rank", "r", metadata.lora_r),
+        ("alpha", "lora_alpha", metadata.lora_alpha),
+        ("dropout", "lora_dropout", metadata.lora_dropout),
+    ):
+        actual = getattr(adapter_config, attribute, None)
+        if actual != expected:
+            raise ValueError(
+                f"adapter {label} mismatch: checkpoint={expected}, adapter={actual}"
+            )
+    if getattr(adapter_config, "modules_to_save", None) is not None:
+        raise ValueError("adapter must not contain modules_to_save")
+
+    modules = dict(qwen.named_modules())
+    for target in metadata.resolved_target_module_names:
+        if target not in modules:
+            raise ValueError(f"missing resolved target: {target}")
+        if not isinstance(modules[target], nn.Linear):
+            raise ValueError(f"resolved target is not linear: {target}")
+    target_modules = tuple(getattr(adapter_config, "target_modules", ()) or ())
+    if set(target_modules) != set(metadata.resolved_target_module_names):
+        raise ValueError("adapter resolved targets do not match metadata")
+    suffixes = tuple(
+        dict.fromkeys(name.rsplit(".", 1)[-1] for name in target_modules)
+    )
+    if set(suffixes) != set(metadata.requested_target_modules):
+        raise ValueError("adapter requested targets do not match metadata")
+
+    hidden_size = getattr(config, "hidden_size", None)
+    for target in metadata.resolved_target_module_names:
+        if modules[target].in_features != hidden_size:
+            raise ValueError(
+                f"hidden size mismatch at {target}: "
+                f"config={hidden_size}, target={modules[target].in_features}"
+            )
+
+    tensor_path = Path(adapter_path) / "adapter_model.safetensors"
+    if not tensor_path.is_file():
+        raise ValueError(f"missing adapter safetensors: {tensor_path}")
+    with safe_open(tensor_path, framework="pt", device="cpu") as tensors:
+        keys = tuple(tensors.keys())
+        for target in metadata.resolved_target_module_names:
+            module = modules[target]
+            expected_shapes = {
+                "lora_A": [metadata.lora_r, module.in_features],
+                "lora_B": [module.out_features, metadata.lora_r],
+            }
+            if expected_use_dora:
+                expected_shapes["lora_magnitude_vector"] = [module.out_features]
+            for tensor_name, expected_shape in expected_shapes.items():
+                parameter_suffix = (
+                    "" if tensor_name == "lora_magnitude_vector" else ".weight"
+                )
+                suffix = f".{target}.{tensor_name}{parameter_suffix}"
+                matches = [key for key in keys if key.endswith(suffix)]
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"adapter tensor mismatch for {target}: expected {tensor_name}"
+                    )
+                actual_shape = tensors.get_slice(matches[0]).get_shape()
+                if actual_shape != expected_shape:
+                    raise ValueError(
+                        f"target shape mismatch at {target}: "
+                        f"adapter={actual_shape}, expected={expected_shape}"
+                    )
 
 
 LATENT_TOKEN_STRINGS = {
@@ -84,56 +398,150 @@ def configure_stage2_metadata(
 class Stage2LoadDecision:
     """The model, processor, and trainer sources for one Stage 2 run."""
 
-    model_source: str
+    base_model_source: str
     processor_source: str
+    adapter_source: str | None
     trainer_resume_path: str | None
+    tuning: Stage2TuningConfig
     latent_size: int
     supervise_latent_boundaries: bool
+    peft_metadata: Stage2PeftMetadata | None = None
+
+    @property
+    def model_source(self) -> str:
+        """Backward-compatible name used by the full-checkpoint loader."""
+        return self.base_model_source
 
 
 def resolve_stage2_load_decision(
     *,
-    load_model_path,
-    resume_from_checkpoint_path,
+    load_model_path: str,
+    resume_from_checkpoint_path: str | None,
     load_config,
+    load_peft_metadata=load_stage2_peft_metadata,
     latent_size: int,
     supervise_latent_boundaries: bool,
+    tuning_method: str | None = None,
+    tuning_method_explicit: bool = False,
+    lora_r: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.0,
+    lora_target_modules: str | Sequence[str] = ("q_proj",),
 ) -> Stage2LoadDecision:
-    """Choose fresh Stage 2 initialization or a complete Stage 2 resume.
+    """Choose fresh/full/adapter Stage 2 initialization and resume sources.
 
     A fresh run reads model and processor artifacts from a Stage 1 source but
     intentionally returns no trainer resume path, so optimizer/scheduler/global
-    state starts new. A resume uses only the Stage 2 checkpoint source for all
-    three consumers.
+    state starts new. Full resume remains single-source. Adapter resume keeps an
+    explicit, structurally validated Stage 1 base separate from adapter/trainer
+    state and preserves the checkpoint sidecar as the provenance authority.
     """
-    if resume_from_checkpoint_path is None:
-        if getattr(load_config(load_model_path), "stage", None) != "stage1":
+    requested_method = tuning_method or "full"
+    requested_tuning = Stage2TuningConfig(
+        method=requested_method,
+        r=lora_r,
+        alpha=lora_alpha,
+        dropout=lora_dropout,
+        target_modules=tuple(
+            item.strip() for item in lora_target_modules.split(",")
+        )
+        if isinstance(lora_target_modules, str)
+        else tuple(lora_target_modules),
+    )
+
+    def require_full_stage1(source: str):
+        config = load_config(source)
+        if getattr(config, "stage", None) != "stage1":
             raise ValueError("fresh Stage 2 requires a stage1 checkpoint")
+        adapter_config_file = Path(source) / "adapter_config.json"
+        if adapter_config_file.is_file():
+            PeftConfig.from_pretrained(source)
+        if (
+            adapter_config_file.is_file()
+            or getattr(config, "peft_type", None) is not None
+        ):
+            raise ValueError("Stage 1 PEFT-only base is not supported")
+        return config
+
+    if resume_from_checkpoint_path is None:
+        require_full_stage1(load_model_path)
         return Stage2LoadDecision(
             load_model_path,
             load_model_path,
             None,
+            None,
+            requested_tuning,
             latent_size,
             supervise_latent_boundaries,
         )
 
-    resume_config = load_config(resume_from_checkpoint_path)
-    if getattr(resume_config, "stage", None) != "stage2":
-        raise ValueError("expected stage2 checkpoint for resume")
+    try:
+        metadata = load_peft_metadata(resume_from_checkpoint_path)
+    except FileNotFoundError:
+        metadata = None
+    except ValueError as error:
+        if not str(error).startswith("missing Stage 2 PEFT metadata"):
+            raise
+        metadata = None
+
+    if metadata is None:
+        resume_config = load_config(resume_from_checkpoint_path)
+        if getattr(resume_config, "stage", None) != "stage2":
+            raise ValueError("expected stage2 checkpoint for resume")
+        if requested_tuning.is_peft:
+            raise ValueError("requested PEFT resume is missing Stage 2 PEFT metadata")
+        for field, requested in (
+            ("latent_size", latent_size),
+            ("supervise_latent_boundaries", supervise_latent_boundaries),
+        ):
+            checkpoint_value = getattr(resume_config, field, None)
+            if checkpoint_value != requested:
+                raise ValueError(
+                    f"cannot resume Stage 2 with changed {field}: "
+                    f"checkpoint={checkpoint_value}, requested={requested}"
+                )
+        return Stage2LoadDecision(
+            resume_from_checkpoint_path,
+            resume_from_checkpoint_path,
+            None,
+            resume_from_checkpoint_path,
+            requested_tuning,
+            resume_config.latent_size,
+            resume_config.supervise_latent_boundaries,
+        )
+
+    if tuning_method_explicit and requested_method == "full":
+        raise ValueError("cannot request full tuning against a PEFT checkpoint")
+    if tuning_method_explicit and requested_method != metadata.tuning_method:
+        raise ValueError(
+            "cannot switch Stage 2 PEFT method from "
+            f"{metadata.tuning_method} to {requested_method}"
+        )
     for field, requested in (
         ("latent_size", latent_size),
         ("supervise_latent_boundaries", supervise_latent_boundaries),
     ):
-        checkpoint_value = getattr(resume_config, field, None)
+        checkpoint_value = getattr(metadata, field)
         if checkpoint_value != requested:
             raise ValueError(
                 f"cannot resume Stage 2 with changed {field}: "
                 f"checkpoint={checkpoint_value}, requested={requested}"
             )
+    require_full_stage1(load_model_path)
+    metadata_tuning = Stage2TuningConfig(
+        method=metadata.tuning_method,
+        r=metadata.lora_r,
+        alpha=metadata.lora_alpha,
+        dropout=metadata.lora_dropout,
+        target_modules=metadata.requested_target_modules,
+    )
     return Stage2LoadDecision(
+        load_model_path,
         resume_from_checkpoint_path,
         resume_from_checkpoint_path,
         resume_from_checkpoint_path,
-        resume_config.latent_size,
-        resume_config.supervise_latent_boundaries,
+        metadata_tuning,
+        metadata.latent_size,
+        metadata.supervise_latent_boundaries,
+        metadata,
     )

@@ -61,9 +61,11 @@ def test_resume_requires_stage2_and_uses_single_source_for_all_state():
         supervise_latent_boundaries=False,
     )
     assert decision == Stage2LoadDecision(
-        model_source="stage2/checkpoint-10",
+        base_model_source="stage2/checkpoint-10",
         processor_source="stage2/checkpoint-10",
+        adapter_source=None,
         trainer_resume_path="stage2/checkpoint-10",
+        tuning=decision.tuning,
         latent_size=4,
         supervise_latent_boundaries=False,
     )
