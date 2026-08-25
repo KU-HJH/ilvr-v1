@@ -11,7 +11,7 @@ from PIL import Image
 from torch import nn
 from transformers import PretrainedConfig
 
-from helpers import (
+from .helpers import (
     ToyCausalLanguageModel,
     activate_stage2_adapter_deltas,
     tiny_stage2_qwen,

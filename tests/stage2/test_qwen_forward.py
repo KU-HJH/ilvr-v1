@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from main import configure_stage2_model_backend
-from helpers import (
+from .helpers import (
     ToyCausalLanguageModel,
     activate_stage2_adapter_deltas,
     tiny_stage2_qwen,

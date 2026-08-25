@@ -8,7 +8,7 @@ from transformers import Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 import main
-from helpers import tiny_stage2_qwen
+from .helpers import tiny_stage2_qwen
 from main import (
     CustomTrainerStage1,
     Stage2DataCollator,

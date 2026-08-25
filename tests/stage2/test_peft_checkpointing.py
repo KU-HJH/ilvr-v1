@@ -12,7 +12,7 @@ from torch import nn
 from transformers import TrainingArguments, default_data_collator
 from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
-from helpers import tiny_stage2_qwen
+from .helpers import tiny_stage2_qwen
 from src.peft_common import capture_qwen2_5_vl_architecture
 from stage2.checkpointing import (
     STAGE2_PEFT_METADATA_FILENAME,

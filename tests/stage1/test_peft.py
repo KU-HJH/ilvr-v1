@@ -27,6 +27,7 @@ def latent_token_ids() -> tuple[int, int, int]:
 @pytest.fixture
 def tiny_qwen() -> Qwen2_5_VLForConditionalGeneration:
     """Return the real local Qwen fork at a CPU-testable scale."""
+    torch.manual_seed(17)
     config = Qwen2_5_VLConfig(
         vocab_size=128,
         hidden_size=8,
@@ -67,6 +68,16 @@ def tuning(method: str, *, targets=None) -> Stage1TuningConfig:
         target_suffixes=targets
         or ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     )
+
+
+def assert_finite_nonzero_tensor(value: torch.Tensor) -> None:
+    assert torch.isfinite(value).all()
+    assert value.abs().sum() > 0
+
+
+def assert_finite_nonzero_gradient(parameter: nn.Parameter) -> None:
+    assert parameter.grad is not None
+    assert_finite_nonzero_tensor(parameter.grad)
 
 
 def test_dora_targets_decoder_and_exact_latent_rows(tiny_qwen, latent_token_ids):
@@ -137,6 +148,35 @@ def test_full_freezes_visual_but_trains_all_language(tiny_qwen, latent_token_ids
     assert report.categories["latent_output_rows"] == 3
 
 
+def test_full_ce_backward_reaches_language_but_not_visual(
+    tiny_qwen, latent_token_ids
+):
+    """Catches full-mode language gradients being detached or leaking to vision."""
+    model = build_stage1_tuned_model(
+        tiny_qwen, tuning("full"), latent_token_ids
+    )
+    qwen = resolve_qwen2_5_vl_model(model)
+    input_ids = torch.tensor([[1, 125, 4, 126, 5, 127, 6]])
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=input_ids,
+    )
+    outputs.loss.backward()
+
+    expected_language_parameters = (
+        qwen.model.embed_tokens.weight,
+        qwen.model.layers[0].self_attn.q_proj.weight,
+        qwen.model.layers[0].mlp.down_proj.weight,
+        qwen.model.norm.weight,
+        qwen.lm_head.weight,
+    )
+    for parameter in expected_language_parameters:
+        assert_finite_nonzero_gradient(parameter)
+    assert all(parameter.grad is None for parameter in qwen.visual.parameters())
+
+
 def test_legacy_lora_remains_lora_and_keeps_exact_latent_rows(
     tiny_qwen, latent_token_ids
 ):
@@ -158,20 +198,23 @@ def test_legacy_lora_remains_lora_and_keeps_exact_latent_rows(
     assert report.categories["latent_output_rows"] == 3
 
 
-def test_latent_ce_backward_reaches_only_selective_input_rows(
+def test_dora_ce_backward_reaches_every_adapter_and_latent_row_only(
     tiny_qwen, latent_token_ids
 ):
-    """Catches detached selective embeddings or gradients leaking to ordinary rows."""
+    """Catches missing DoRA/token-row gradients or leakage into frozen Qwen state."""
     model = build_stage1_tuned_model(
         tiny_qwen, tuning("dora"), latent_token_ids
     )
     qwen = resolve_qwen2_5_vl_model(model)
     token_adapter = qwen.model.embed_tokens.token_adapter
-    selective = token_adapter.trainable_tokens_delta["default"]
+    input_delta = token_adapter.trainable_tokens_delta["default"]
+    output_delta = qwen.lm_head.output_delta
     base_embedding = token_adapter.base_layer.weight
-    ordinary_before = base_embedding[7].detach().clone()
     with torch.no_grad():
-        selective.add_(0.05)
+        input_delta.add_(0.05)
+        for name, parameter in model.named_parameters():
+            if "lora_B" in name.split("."):
+                parameter.fill_(0.05)
     input_ids = torch.tensor([[1, 125, 4, 126, 5, 127, 6]])
 
     outputs = model(
@@ -181,13 +224,43 @@ def test_latent_ce_backward_reaches_only_selective_input_rows(
     )
     outputs.loss.backward()
 
-    assert selective.grad is not None
-    assert torch.isfinite(selective.grad).all()
-    assert selective.grad.abs().sum() > 0
+    adapter_parameters = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if {"lora_A", "lora_B", "lora_magnitude_vector"}
+        & set(name.split("."))
+    }
+    for component in ("lora_A", "lora_B", "lora_magnitude_vector"):
+        selected = [
+            parameter
+            for name, parameter in adapter_parameters.items()
+            if component in name.split(".")
+        ]
+        assert selected
+        for parameter in selected:
+            assert_finite_nonzero_gradient(parameter)
+
     assert token_adapter.token_indices["default"] == list(latent_token_ids)
+    assert tuple(qwen.lm_head.token_ids.tolist()) == latent_token_ids
+    assert input_delta.grad is not None
+    assert output_delta.grad is not None
+    for row in range(3):
+        assert_finite_nonzero_tensor(input_delta.grad[row])
+        assert_finite_nonzero_tensor(output_delta.grad[row])
+
+    adapter_ids = {id(parameter) for parameter in adapter_parameters.values()}
+    frozen_decoder = [
+        parameter
+        for parameter in qwen.model.parameters()
+        if id(parameter) not in adapter_ids | {id(input_delta)}
+    ]
+    assert frozen_decoder
+    assert all(parameter.grad is None for parameter in frozen_decoder)
     assert base_embedding.requires_grad is False
     assert base_embedding.grad is None
-    torch.testing.assert_close(base_embedding[7], ordinary_before)
+    assert qwen.lm_head.base_head.weight.requires_grad is False
+    assert qwen.lm_head.base_head.weight.grad is None
+    assert all(parameter.grad is None for parameter in qwen.visual.parameters())
 
 
 def test_parameter_report_uses_zero3_logical_sparse_row_shapes(
@@ -309,6 +382,20 @@ def test_build_rejects_non_linear_decoder_target(tiny_qwen, latent_token_ids):
     tiny_qwen.model.layers[0].self_attn.q_proj = nn.Identity()
 
     with pytest.raises(ValueError, match="linear decoder modules"):
+        build_stage1_tuned_model(
+            tiny_qwen,
+            tuning("dora", targets=("q_proj",)),
+            latent_token_ids,
+        )
+
+
+def test_build_rejects_suffix_match_outside_canonical_decoder_layer(
+    tiny_qwen, latent_token_ids
+):
+    """Catches unrelated qwen.model descendants being accepted by suffix alone."""
+    tiny_qwen.model.norm.q_proj = nn.Linear(8, 8)
+
+    with pytest.raises(ValueError, match="canonical decoder-layer projection"):
         build_stage1_tuned_model(
             tiny_qwen,
             tuning("dora", targets=("q_proj",)),

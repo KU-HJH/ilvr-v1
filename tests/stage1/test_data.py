@@ -4,7 +4,7 @@ from dataclasses import replace
 from PIL import Image
 import pytest
 
-from helpers import (
+from .helpers import (
     PlaceholderConsumingStage1Processor,
     TOKENS,
     make_stage1_collator,

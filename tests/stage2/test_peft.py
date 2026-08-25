@@ -5,7 +5,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from torch import nn
 
-from helpers import activate_stage2_adapter_deltas, tiny_stage2_qwen
+from .helpers import activate_stage2_adapter_deltas, tiny_stage2_qwen
 from src.peft_common import resolve_qwen_decoder_target_names
 from stage2.data import build_stage2_labels
 from stage2.peft import (

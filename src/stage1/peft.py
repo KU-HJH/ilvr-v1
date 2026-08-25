@@ -20,6 +20,8 @@ from stage1.types import Stage1TuningConfig
 
 _ADAPTER_NAME = "default"
 _EMBEDDING_TARGET = "model.embed_tokens"
+_ATTENTION_TARGET_SUFFIXES = frozenset({"q_proj", "k_proj", "v_proj", "o_proj"})
+_MLP_TARGET_SUFFIXES = frozenset({"gate_proj", "up_proj", "down_proj"})
 
 
 @dataclass(frozen=True)
@@ -99,9 +101,40 @@ def _resolve_linear_decoder_targets(
 ) -> tuple[str, ...]:
     resolved = resolve_qwen_decoder_target_names(qwen, requested_suffixes)
     modules = dict(qwen.named_modules())
+    canonical: list[str] = []
+    missing: list[str] = []
+    for suffix in requested_suffixes:
+        if suffix in _ATTENTION_TARGET_SUFFIXES:
+            owner_name = "self_attn"
+        elif suffix in _MLP_TARGET_SUFFIXES:
+            owner_name = "mlp"
+        else:  # The shared normalizer normally rejects this before resolution.
+            raise ValueError(f"Unsupported decoder target suffix: {suffix}")
+        suffix_matches: list[str] = []
+        for layer_index, layer in enumerate(qwen.model.layers):
+            owner = getattr(layer, owner_name, None)
+            projection = getattr(owner, suffix, None)
+            path = f"model.layers.{layer_index}.{owner_name}.{suffix}"
+            if projection is not None and modules.get(path) is projection:
+                suffix_matches.append(path)
+        if not suffix_matches:
+            missing.append(suffix)
+        canonical.extend(suffix_matches)
+
+    canonical_set = set(canonical)
+    unrelated = [name for name in resolved if name not in canonical_set]
+    if unrelated:
+        raise ValueError(
+            "Stage 1 PEFT targets must be canonical decoder-layer projections: "
+            + ", ".join(unrelated)
+        )
+    if missing:
+        raise ValueError(
+            f"Requested canonical decoder targets did not match: {missing}"
+        )
     invalid = [
         name
-        for name in resolved
+        for name in canonical
         if not isinstance(getattr(modules[name], "base_layer", modules[name]), nn.Linear)
     ]
     if invalid:
@@ -109,7 +142,7 @@ def _resolve_linear_decoder_targets(
             "Stage 1 PEFT targets must be linear decoder modules: "
             + ", ".join(invalid)
         )
-    return resolved
+    return tuple(canonical)
 
 
 def _peft_model(model: nn.Module) -> PeftModel:

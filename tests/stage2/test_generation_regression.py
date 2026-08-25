@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from helpers import tiny_stage2_qwen
+from .helpers import tiny_stage2_qwen
 from transformers import GPT2Config, GPT2LMHeadModel
 from transformers.cache_utils import DynamicCache
 from transformers.generation.utils import GenerateDecoderOnlyOutput, GenerationMixin
