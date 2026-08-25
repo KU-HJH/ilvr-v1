@@ -112,3 +112,87 @@ All commands used the repository virtual environment at `./venv/ilvr-venv`.
   explicit local checkpoint directories. Non-local model identifiers rely on
   the supplied config loader exposing `peft_type`; no remote probing is added to
   the load-decision path.
+
+## Review fix round 1
+
+### Verification and root causes
+
+Applied `superpowers:receiving-code-review` and
+`superpowers:systematic-debugging` before production changes. Focused probes
+confirmed all four Important findings:
+
+- The general Stage 2 resolver rejected the required unmodified `stage1` base
+  before structural checks.
+- The blanket `in_features == hidden_size` rule rejected `down_proj`, whose
+  expected input is `intermediate_size`.
+- Explicit PEFT resumes ignored rank, alpha, dropout, and target differences.
+- `use_rslora=True` and other unsupported adapter variants passed validation.
+
+The probes also confirmed that direct invalid metadata could be serialized,
+and code inspection confirmed that current-base target topology was not
+recomputed. The four negative-coverage claims identified by review described
+existing rejection branches but lacked tests.
+
+### RED evidence
+
+Command:
+
+`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" ./venv/ilvr-venv/bin/pytest tests/stage2/test_peft_checkpointing.py -q`
+
+Result: `28 failed, 14 passed in 5.81s`. Failures covered invalid direct
+serialization, four explicit tuning conflicts, genuine Stage 1 relocation,
+the full default projection set, five unsupported LoRA variants, added decoder
+topology, and the previously masked compatibility matrix.
+
+Focused RED confirmation for the default projection set produced
+`ValueError: hidden size mismatch ... down_proj: config=8, target=16`.
+
+### GREEN evidence
+
+- Genuine unmodified Stage 1 relocation: `1 passed in 4.93s`.
+- All default projection shapes including `down_proj`: `1 passed in 5.07s`.
+- Explicit rank/alpha/dropout/target conflicts: `4 passed in 4.59s`.
+- Unsupported rsLoRA/pattern/task/bias variants: `5 passed in 4.71s`.
+- Added decoder topology rejection: `1 passed in 4.76s`.
+- Invalid direct `to_dict`/save rejection: `2 passed in 4.81s`.
+- Complete PEFT checkpointing file: `42 passed in 5.33s`.
+- Final combined checkpoint suites:
+  `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" ./venv/ilvr-venv/bin/pytest tests/stage2/test_checkpointing.py tests/stage2/test_peft_checkpointing.py -q`
+  produced `50 passed in 5.37s`.
+
+### Changes
+
+- `src/stage2/checkpointing.py`
+  - Requires an unmodified, non-PEFT Stage 1 Qwen base at the pre-configuration
+    compatibility boundary.
+  - Uses Qwen projection-specific architectural shapes for q/k/v/o and MLP
+    gate/up/down projections, then checks adapter A/B header shapes.
+  - Rejects explicit tuning-setting conflicts and unsupported rsLoRA,
+    rank/alpha patterns, non-causal task types, and non-`none` bias.
+  - Recomputes exact resolved target topology on the relocated base.
+  - Validates direct metadata instances before `to_dict` or atomic save.
+- `tests/stage2/test_peft_checkpointing.py`
+  - Uses a real `stage1` relocation fixture and covers all findings plus latent
+    boundary, nonlinear target, requested-target, and resolved-target failures.
+
+### Commit
+
+- `f0288cc fix: harden stage2 adapter compatibility`
+
+### Self-review
+
+- Rechecked every reviewer finding against the fixed data flow and regression
+  tests.
+- Confirmed Stage 1 validation occurs before `configure_stage2_metadata`; the
+  Stage 2 runtime resolver remains unchanged.
+- Confirmed full Stage 2 checkpoint behavior is unchanged.
+- Confirmed compatibility reads only the small adapter safetensors header and
+  performs no base-weight traversal, hashing, stacking, or merge.
+- Confirmed exact requested/resolved topology and public serialization now fail
+  closed.
+- `git diff --check` was clean before the fix commit.
+
+### Review-round concerns
+
+No additional concerns beyond the non-local Stage 1 adapter identifier note
+above.
