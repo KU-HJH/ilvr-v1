@@ -356,6 +356,12 @@ def test_peft_eval_requires_base_before_loading_or_iterating(
             ValueError,
             "Flash Attention adapter is not compatible with the base model",
         ),
+        (ValueError, "adapter config package flash_attn version mismatch"),
+        (
+            ValueError,
+            "Flash Attention 2 adapter only supports torch.float16 metadata",
+        ),
+        (ValueError, "Flash Attention 2 adapter backend initialization failed"),
     ],
     ids=(
         "missing-path",
@@ -366,6 +372,9 @@ def test_peft_eval_requires_base_before_loading_or_iterating(
         "malformed-config",
         "adapter-dtype-metadata",
         "adapter-base-incompatible",
+        "package-version-metadata",
+        "adapter-dtype-support",
+        "invented-backend-initialization",
     ),
 )
 def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
@@ -387,6 +396,45 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
     )
 
     with pytest.raises(error_type, match=error_message) as raised:
+        module.load_model("model", "cache")
+    assert raised.value is original_error
+    assert calls == ["flash_attention_2"]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("nested", [False, True], ids=("direct", "nested"))
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "No module named 'flash_attn_extra'",
+        "cannot import my_flash_attn extension",
+    ],
+    ids=("suffix", "prefix"),
+)
+def test_near_flash_attn_module_name_does_not_retry_eager(
+    module_name, nested, error_message, monkeypatch
+):
+    """Substring package-name matching must fail this actual-loader test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    calls = []
+    near_name_error = ImportError(error_message)
+    if nested:
+        original_error = RuntimeError("attention model load failed")
+        original_error.__cause__ = near_name_error
+    else:
+        original_error = near_name_error
+
+    def fail_load(_source, **kwargs):
+        calls.append(kwargs["attn_implementation"])
+        raise original_error
+
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        fail_load,
+    )
+
+    with pytest.raises(type(original_error)) as raised:
         module.load_model("model", "cache")
     assert raised.value is original_error
     assert calls == ["flash_attention_2"]
@@ -433,6 +481,74 @@ def test_flash_attn_module_import_error_retries_with_eager(
         original_error.__cause__ = package_error
     else:
         original_error = package_error
+
+    def load(_source, **kwargs):
+        calls.append(kwargs["attn_implementation"])
+        if kwargs["attn_implementation"] == "flash_attention_2":
+            raise original_error
+        return model
+
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        load,
+    )
+
+    assert module.load_model("model", "cache") is model
+    assert calls == ["flash_attention_2", "eager"]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        (
+            "FlashAttention2 has been toggled on, but it cannot be used due to "
+            "the following error: Flash Attention 2 is not available on CPU. "
+            "Please make sure torch can access a CUDA device."
+        ),
+        (
+            "Qwen2_5_VLForConditionalGeneration does not support Flash Attention "
+            "2.0 yet. Please request to add support where the model is hosted, on "
+            "its model hub page: https://huggingface.co/tiny/discussions/new or in "
+            "the Transformers GitHub repo: "
+            "https://github.com/huggingface/transformers/issues/new"
+        ),
+        (
+            "Flash Attention 2 and BetterTransformer API are not compatible. "
+            "Please make sure to disable BetterTransformers by doing "
+            "model.reverse_bettertransformer()"
+        ),
+        (
+            "You are attempting to use Flash Attention 2.0 with a model not "
+            "initialized on GPU and with no GPU available. This is not supported "
+            "yet. Please make sure to have access to a GPU and either initialise "
+            "the model on a GPU by passing a device_map or initialising the model "
+            "on CPU and then moving it to GPU."
+        ),
+        (
+            "You are attempting to use Flash Attention 2.0 with a model dispatched "
+            "on CPU or disk. This is not supported. Please make sure to initialise "
+            "the model on a GPU by passing a device_map that contains only GPU "
+            "devices as keys."
+        ),
+    ],
+    ids=(
+        "toggled-unavailable",
+        "unsupported-model",
+        "bettertransformer",
+        "no-gpu",
+        "cpu-disk-dispatch",
+    ),
+)
+def test_local_transformers_flash_attention_errors_retry_eager(
+    module_name, error_message, monkeypatch
+):
+    """Removing any locally raised ValueError family must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    model = tiny_stage2_qwen()
+    calls = []
+    original_error = ValueError(error_message)
 
     def load(_source, **kwargs):
         calls.append(kwargs["attn_implementation"])

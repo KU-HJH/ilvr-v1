@@ -64,53 +64,30 @@ def load_processor(model_dir: str, cache_dir: str):
         return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
 
 def _is_flash_attention_initialization_error(error: Exception) -> bool:
+    flash_attn_module = re.compile(
+        r"(?<![a-z0-9_])flash_attn(?![a-z0-9_])"
+    )
+    unsupported_model = re.compile(
+        r"^[a-z_][a-z0-9_.]* does not support flash attention 2\.0 yet\."
+    )
+    concrete_prefixes = (
+        "flashattention2 has been toggled on, but it cannot be used due to the following error:",
+        "flash attention 2 and bettertransformer api are not compatible.",
+        "you are attempting to use flash attention 2.0 with a model not initialized on gpu and with no gpu available.",
+        "you are attempting to use flash attention 2.0 with a model dispatched on cpu or disk.",
+    )
     current = error
     while current is not None:
-        message = str(current).lower()
-        names = (
-            "flashattention2",
-            "flash attention 2",
-            "flash_attention_2",
-            "flash-attention 2",
+        message = " ".join(str(current).split()).casefold()
+        package_import = isinstance(current, ImportError) and flash_attn_module.search(
+            message
         )
-        names_backend = any(name in message for name in names)
-        package_import = (
-            isinstance(current, ImportError)
-            and "flash_attn" in message
+        concrete_backend_error = not isinstance(current, ImportError) and (
+            any(message.startswith(prefix) for prefix in concrete_prefixes)
+            or unsupported_model.match(message)
+            or message == "flash attention 2 is unavailable"
         )
-        package_failure = any(
-            package in message
-            for package in ("package flash_attn", "flash_attn package")
-        ) and any(
-            failure in message
-            for failure in ("not installed", "not supported", "version")
-        )
-        backend_failure = names_backend and (
-            "has been toggled on" in message
-            or "does not support flash attention 2" in message
-            or "is not available" in message
-            or "is unavailable" in message
-            or "flash attention 2 and bettertransformer" in message
-            or (
-                "attempting to use flash attention 2" in message
-                and any(
-                    detail in message
-                    for detail in (
-                        "torch dtype",
-                        "not initialized on gpu",
-                        "no gpu available",
-                        "dispatched on cpu",
-                        "dispatched on disk",
-                    )
-                )
-            )
-            or "only supports torch.float16" in message
-            or "backend initialization failed" in message
-            or "backend initialisation failed" in message
-            or "failed to initialize flash attention 2" in message
-            or "failed to initialise flash attention 2" in message
-        )
-        if package_import or package_failure or backend_failure:
+        if package_import or concrete_backend_error:
             return True
         current = current.__cause__ or current.__context__
     return False

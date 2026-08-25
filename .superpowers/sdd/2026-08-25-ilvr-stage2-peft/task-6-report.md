@@ -473,3 +473,116 @@ Result:
   unchanged.
 - No broader suite was run, per the focused-validation instruction and
   repository verification policy.
+
+## Review Fix Round 3: Exact Local Exception Allowlist
+
+### Correction to Round 2 and Root Cause
+
+The round-2 report again overstated the boundary. Its per-exception logic was
+an improvement, but each exception was still classified through broad
+substring combinations. In particular, package/version prose, dtype-warning
+prose, invented backend-initialization prose, and near package names could
+authorize eager fallback.
+
+The local source at
+`transformers/src/transformers/modeling_utils.py:2226-2271,2293-2306` shows
+that dtype messages are warnings, not raised exceptions, and that the raised
+non-import errors belong to five concrete message families. A read-only
+actual-loader probe reproduced an unwanted call sequence of
+`["flash_attention_2", "eager"]` in both entry points for all of:
+
+```text
+ValueError: adapter config package flash_attn version mismatch
+ValueError: Flash Attention 2 adapter only supports torch.float16 metadata
+ValueError: Flash Attention 2 adapter backend initialization failed
+ImportError: No module named 'flash_attn_extra'
+ImportError: cannot import my_flash_attn extension
+```
+
+### RED
+
+Loader-level tests were added for both entry points. Negative cases assert the
+original exception object and exactly one load; direct and nested near-name
+imports are both covered. Positive cases copy one full representative message
+from every locally raised non-import family and retain the direct/nested exact
+`flash_attn` import cases and the exact synthetic spaced availability case.
+
+Command:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" \
+  ./venv/ilvr-venv/bin/pytest tests/stage2/test_eval_integration.py -q \
+  -k 'non_backend_model_error or near_flash_attn_module_name or \
+nested_non_backend_error or local_transformers_flash_attention_errors or \
+flash_attn_module_import_error or flash_attn_import_error or \
+flash_backend_initialization_error'
+```
+
+Result before production changes:
+
+```text
+14 failed, 36 passed, 31 deselected in 4.37s
+```
+
+All 14 failures were the new false-positive negatives performing an eager
+retry. The concrete positive families already retried.
+
+### Minimal Classifier Change
+
+Both entry points now use the same classifier and still inspect each exception
+in its cause/context chain independently:
+
+- `ImportError` (including `ModuleNotFoundError`) qualifies only when its own
+  normalized message contains the exact `flash_attn` module token, bounded so
+  `flash_attn_extra` and `my_flash_attn` do not match.
+- Non-import exceptions qualify only through anchored prefixes copied from the
+  five locally raised Transformers families: toggled-on failure, model-class
+  unsupported, BetterTransformer incompatibility, no-GPU initialization, and
+  CPU/disk dispatch.
+- The plan's synthetic `Flash Attention 2 is unavailable` case is retained
+  only as an exact normalized whole message.
+- Package/version combinations, dtype-warning text, generic availability or
+  support language, and invented backend-initialization phrases were deleted.
+
+No adapter, artifact, controller, catch-boundary, or loading semantics changed.
+
+### GREEN and Focused Final Verification
+
+The same classifier selection after the production change:
+
+```text
+50 passed, 31 deselected in 3.99s
+```
+
+Per controller direction, the only full test file run was:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" \
+  ./venv/ilvr-venv/bin/pytest tests/stage2/test_eval_integration.py -q
+```
+
+Result:
+
+```text
+81 passed, 6 warnings in 4.31s
+```
+
+The six warnings are the existing PEFT vocabulary warnings. `git diff --check`
+also passed.
+
+### Round-3 Self-Review
+
+- Negative metadata/config/import-near-name failures preserve exception
+  identity and perform exactly one model load in both entry points.
+- Direct and nested exact `flash_attn` import failures retry eager; near module
+  names do not.
+- Every accepted non-import family is anchored to text actually raised by the
+  checked-in Transformers source, apart from the explicitly retained synthetic
+  exact whole-message case.
+- Dtype warnings are deliberately excluded because local Transformers logs
+  rather than raises them.
+- Cause/context traversal does not combine evidence between exceptions.
+- The implementation is identical in both entry points, and no broader suite
+  was run.
