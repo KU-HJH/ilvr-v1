@@ -22,6 +22,37 @@ DEFAULT_STAGE1_TARGET_SUFFIXES = (
 
 
 @dataclass(frozen=True)
+class Stage1LatentSpan:
+    """One complete latent block in a sample's padded batch row."""
+
+    start: int
+    end: int
+    latent_positions: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class Stage1SampleMetadata:
+    """Sample-local ownership after processor outputs have been flattened."""
+
+    source_index: int
+    source_id: str | None
+    original_grid_range: tuple[int, int]
+    helper_grid_range: tuple[int, int]
+    latent_spans: tuple[Stage1LatentSpan, ...]
+    helper_to_block: tuple[int, ...]
+    unpadded_length: int
+
+
+@dataclass(frozen=True)
+class Stage1BatchMetadata:
+    """Trainer-only ownership metadata for one collated Stage 1 batch."""
+
+    samples: tuple[Stage1SampleMetadata, ...]
+    batch_size: int
+    sequence_length: int
+
+
+@dataclass(frozen=True)
 class Stage1TuningConfig:
     method: Stage1TuningMethod
     rank: int = 32

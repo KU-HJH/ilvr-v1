@@ -293,6 +293,99 @@ def replace_subsequent_image_parts_1d(
     new_seq = torch.cat(new_seq_pieces, dim=0)
     return new_seq
 
+
+def normalize_stage1_latent_blocks_1d(
+    seq: torch.Tensor,
+    *,
+    start_token: int,
+    end_token: int,
+    latent_pad_token: int,
+    latent_size: int,
+    source_index: int,
+) -> torch.Tensor:
+    """Replace visual block interiors while preserving prebuilt latent scaffolds.
+
+    A real processor expands assistant image placeholders between latent boundary
+    tokens. Tests and already-tokenized inputs may instead contain latent-pad
+    tokens, which are kept so the Stage 1 parser can validate their exact count.
+    """
+    if seq.ndim != 1:
+        raise ValueError(
+            f"source_index={source_index}: observed tensor rank {seq.ndim}; "
+            "expected a one-dimensional token row"
+        )
+    if latent_size <= 0:
+        raise ValueError(
+            f"source_index={source_index}: observed latent_size={latent_size}; "
+            "expected a positive latent_size"
+        )
+
+    pieces = []
+    cursor = 0
+    open_start = None
+    values = seq.tolist()
+    for position, raw_token in enumerate(values):
+        token = int(raw_token)
+        if open_start is None:
+            if token == start_token:
+                open_start = position
+            elif token == end_token:
+                raise ValueError(
+                    f"source_index={source_index}: observed latent_end at position "
+                    f"{position} without latent_start; expected ordered complete boundaries"
+                )
+            elif token == latent_pad_token:
+                raise ValueError(
+                    f"source_index={source_index}: observed latent_pad at position "
+                    f"{position} outside a latent block; expected pads only inside a block"
+                )
+            continue
+
+        if token == start_token:
+            raise ValueError(
+                f"source_index={source_index}: observed nested latent_start at position "
+                f"{position}; expected ordered, nonnested latent boundaries"
+            )
+        if token != end_token:
+            continue
+
+        interior = seq[open_start + 1 : position]
+        interior_is_latent = bool(interior.numel()) and bool(
+            torch.all(interior == latent_pad_token)
+        )
+        interior_has_latent = bool(
+            interior.numel() and torch.any(interior == latent_pad_token)
+        )
+        if interior_has_latent and not interior_is_latent:
+            observed = interior.tolist()
+            raise ValueError(
+                f"source_index={source_index}: observed mixed latent/visual block "
+                f"tokens {observed}; expected either a visual placeholder or only "
+                "latent_pad slots"
+            )
+
+        pieces.append(seq[cursor : open_start + 1])
+        if interior_is_latent:
+            pieces.append(interior)
+        else:
+            pieces.append(
+                seq.new_full((latent_size,), fill_value=int(latent_pad_token))
+            )
+        pieces.append(seq[position : position + 1])
+        cursor = position + 1
+        open_start = None
+
+    if open_start is not None:
+        raise ValueError(
+            f"source_index={source_index}: observed incomplete latent block starting "
+            f"at position {open_start}; expected a complete latent_start/latent_end pair"
+        )
+
+    if not pieces:
+        return seq.clone()
+    pieces.append(seq[cursor:])
+    return torch.cat(pieces)
+
 def process_batch(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
