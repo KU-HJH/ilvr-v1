@@ -305,7 +305,9 @@ def _build_tuned_model(
         if adapter_path is None:
             base.visual.requires_grad_(False)
             return base
-        return Qwen2_5_VLForConditionalGeneration.from_pretrained(adapter_path)
+        loaded = Qwen2_5_VLForConditionalGeneration.from_pretrained(adapter_path)
+        loaded.visual.requires_grad_(False)
+        return loaded
     return build_stage2_tuned_model(
         base,
         tuning,
@@ -346,19 +348,19 @@ def _snapshot_trainable_parameters(model) -> dict[str, torch.Tensor]:
 def _parameter_boundary(model) -> tuple[int, int]:
     qwen = resolve_stage2_qwen_model(model)
     visual_ids = {id(parameter) for parameter in qwen.visual.parameters()}
-    visual_trainable = sum(
-        parameter.numel()
-        for parameter in qwen.visual.parameters()
+    visual_trainable_names = tuple(
+        name
+        for name, parameter in qwen.visual.named_parameters()
         if parameter.requires_grad
     )
-    base_trainable = sum(
-        parameter.numel()
+    base_trainable_names = tuple(
+        name
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
         and id(parameter) not in visual_ids
         and "lora_" not in name
     )
-    return visual_trainable, base_trainable
+    return len(visual_trainable_names), len(base_trainable_names)
 
 
 def _git_commit() -> str:
@@ -392,6 +394,19 @@ def _assert_contract(witness):
         witness["resumed_loss"]
     ):
         raise AssertionError(f"non-finite training loss: {witness}")
+    if not witness["processor_present"]:
+        raise AssertionError(f"processor artifact was not saved: {witness}")
+    if witness["visual_trainable_parameters"] != 0:
+        raise AssertionError(f"visual parameters became trainable: {witness}")
+    if witness["tuning_method"] == "full":
+        if (
+            witness["adapter_checkpoint_present"]
+            or witness["sidecar_present"]
+            or witness["full_model_weights_absent"]
+        ):
+            raise AssertionError(f"full checkpoint contract failed: {witness}")
+        if witness["base_trainable_parameters"] <= 0:
+            raise AssertionError(f"full language model is frozen: {witness}")
     if witness["tuning_method"] in ("lora", "dora"):
         required_true = (
             "adapter_parameters_changed",
@@ -402,8 +417,6 @@ def _assert_contract(witness):
         )
         if any(not witness[field] for field in required_true):
             raise AssertionError(f"PEFT checkpoint contract failed: {witness}")
-        if witness["visual_trainable_parameters"] != 0:
-            raise AssertionError(f"visual parameters became trainable: {witness}")
         if witness["base_trainable_parameters"] != 0:
             raise AssertionError(f"base parameters became trainable: {witness}")
 

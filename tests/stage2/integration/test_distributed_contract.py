@@ -260,13 +260,56 @@ def test_harness_rehomes_buffers_for_partially_zero_initialized_resume():
     assert next(model.parameters()).device.type == "cpu"
 
 
+def test_full_harness_reload_refreezes_visual_parameters(tmp_path, monkeypatch):
+    """Catches full-checkpoint reload restoring visual parameters as trainable."""
+    harness = _load_harness_module()
+    tuning = harness._tuning_config("full")
+    source = harness._build_tuned_model(tuning)
+    source.save_pretrained(tmp_path)
+    loader_result = harness._tiny_model()
+    loader_result.visual.requires_grad_(True)
+
+    def load_trainable_visual(checkpoint):
+        assert Path(checkpoint) == tmp_path
+        return loader_result
+
+    monkeypatch.setattr(
+        harness.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        load_trainable_visual,
+    )
+
+    resumed = harness._build_tuned_model(tuning, adapter_path=tmp_path)
+
+    assert resumed is loader_result
+    assert not any(parameter.requires_grad for parameter in resumed.visual.parameters())
+
+
+def test_boundary_counts_zero_sized_zero3_parameter_names():
+    """Catches ZeRO-empty tensors hiding trainable visual or base violations."""
+    harness = _load_harness_module()
+    model = harness._build_tuned_model(harness._tuning_config("lora"))
+    qwen = harness.resolve_stage2_qwen_model(model)
+    visual = next(qwen.visual.parameters())
+    base = next(qwen.model.embed_tokens.parameters())
+    for parameter in (visual, base):
+        parameter.requires_grad_(True)
+        parameter.data = torch.empty(0, dtype=parameter.dtype)
+        parameter.ds_numel = 0
+
+    visual_violations, base_violations = harness._parameter_boundary(model)
+
+    assert visual_violations == 1
+    assert base_violations == 1
+
+
 @pytest.mark.skipif(
     os.environ.get("RUN_STAGE2_TINY_TRAIN") != "1",
     reason="set RUN_STAGE2_TINY_TRAIN=1 for the save/resume witness",
 )
-@pytest.mark.parametrize("method", ["lora", "dora"])
+@pytest.mark.parametrize("method", ["full", "lora", "dora"])
 def test_tiny_stage2_harness_restores_full_training_state(tmp_path, method):
-    """Catches PEFT resume losing adapter, frozen-boundary, or Trainer state."""
+    """Catches resume losing model artifacts, frozen vision, or Trainer state."""
     witness_path = tmp_path / "witness.json"
     result = subprocess.run(
         [
@@ -295,13 +338,20 @@ def test_tiny_stage2_harness_restores_full_training_state(tmp_path, method):
     assert witness["scheduler_state_restored"] is True
     assert witness["optimizer_step_at_resume"] == 1
     assert witness["scheduler_step_at_resume"] == 1
-    assert witness["adapter_parameters_changed"] is True
-    assert witness["adapter_checkpoint_present"] is True
-    assert witness["sidecar_present"] is True
     assert witness["processor_present"] is True
-    assert witness["full_model_weights_absent"] is True
     assert witness["visual_trainable_parameters"] == 0
-    assert witness["base_trainable_parameters"] == 0
+    if method == "full":
+        assert witness["adapter_parameters_changed"] is False
+        assert witness["adapter_checkpoint_present"] is False
+        assert witness["sidecar_present"] is False
+        assert witness["full_model_weights_absent"] is False
+        assert witness["base_trainable_parameters"] > 0
+    else:
+        assert witness["adapter_parameters_changed"] is True
+        assert witness["adapter_checkpoint_present"] is True
+        assert witness["sidecar_present"] is True
+        assert witness["full_model_weights_absent"] is True
+        assert witness["base_trainable_parameters"] == 0
     assert witness["observed_local_batch_sizes"]
     assert set(witness["observed_local_batch_sizes"]) == {1}
     assert math.isfinite(witness["first_loss"])
