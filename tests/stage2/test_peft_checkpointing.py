@@ -204,6 +204,23 @@ def test_full_resume_keeps_the_complete_stage2_checkpoint_as_every_source():
     assert decision.tuning.method == "full"
 
 
+def test_adapter_shaped_resume_without_sidecar_fails_before_full_config_load(tmp_path):
+    (tmp_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+
+    def reject_full_config_load(_):
+        raise AssertionError("adapter-shaped resume must not load a full config")
+
+    with pytest.raises(ValueError, match="missing Stage 2 PEFT metadata"):
+        resolve_stage2_load_decision(
+            load_model_path="stage1",
+            resume_from_checkpoint_path=str(tmp_path),
+            load_config=reject_full_config_load,
+            tuning_method=None,
+            tuning_method_explicit=False,
+            **semantic_args(),
+        )
+
+
 @pytest.mark.parametrize(
     ("tuning_method", "tuning_method_explicit", "metadata_loader", "message"),
     [
@@ -303,6 +320,24 @@ def test_fresh_training_rejects_a_real_stage1_peft_config_directory(tmp_path):
             load_model_path=str(tmp_path),
             resume_from_checkpoint_path=None,
             load_config=lambda _: SimpleNamespace(stage="stage1"),
+            load_peft_metadata=fake_metadata_loader,
+            tuning_method="lora",
+            tuning_method_explicit=True,
+            **semantic_args(),
+        )
+
+
+def test_fresh_local_peft_only_stage1_fails_before_full_config_load(tmp_path):
+    (tmp_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+
+    def reject_full_config_load(_):
+        raise AssertionError("PEFT-only Stage 1 source must not load a full config")
+
+    with pytest.raises(ValueError, match="Stage 1 PEFT-only base is not supported"):
+        resolve_stage2_load_decision(
+            load_model_path=str(tmp_path),
+            resume_from_checkpoint_path=None,
+            load_config=reject_full_config_load,
             load_peft_metadata=fake_metadata_loader,
             tuning_method="lora",
             tuning_method_explicit=True,

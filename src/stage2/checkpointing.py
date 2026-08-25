@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import peft
-from peft import PeftConfig, PeftModel
+from peft import PeftModel
 from safetensors import safe_open
 from torch import nn
 
@@ -514,16 +514,13 @@ def resolve_stage2_load_decision(
     )
 
     def require_full_stage1(source: str):
+        adapter_config_file = Path(source) / "adapter_config.json"
+        if adapter_config_file.is_file():
+            raise ValueError("Stage 1 PEFT-only base is not supported")
         config = load_config(source)
         if getattr(config, "stage", None) != "stage1":
             raise ValueError("fresh Stage 2 requires a stage1 checkpoint")
-        adapter_config_file = Path(source) / "adapter_config.json"
-        if adapter_config_file.is_file():
-            PeftConfig.from_pretrained(source)
-        if (
-            adapter_config_file.is_file()
-            or getattr(config, "peft_type", None) is not None
-        ):
+        if getattr(config, "peft_type", None) is not None:
             raise ValueError("Stage 1 PEFT-only base is not supported")
         return config
 
@@ -549,6 +546,11 @@ def resolve_stage2_load_decision(
         metadata = None
 
     if metadata is None:
+        if (Path(resume_from_checkpoint_path) / "adapter_config.json").is_file():
+            raise ValueError(
+                "missing Stage 2 PEFT metadata: "
+                f"{Path(resume_from_checkpoint_path) / STAGE2_PEFT_METADATA_FILENAME}"
+            )
         resume_config = load_config(resume_from_checkpoint_path)
         if getattr(resume_config, "stage", None) != "stage2":
             raise ValueError("expected stage2 checkpoint for resume")
