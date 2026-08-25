@@ -10,6 +10,7 @@ import sys
 from datasets import Dataset
 from transformers import LogitsProcessor
 from stage2.peft import normalize_stage2_target_modules
+from peft_common import normalize_decoder_target_suffixes
 
 from transformers import LogitsProcessor
 import torch
@@ -44,12 +45,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lora_alpha", type=int, default=64)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target_modules", type=str,
-        default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj")
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     parser.add_argument(
         "--tuning_method",
         choices=("full", "lora", "dora"),
         default=None,
     )
+    parser.add_argument("--stage1_adapter_path", type=str, default=None)
     
     parser.add_argument(
         "--resume_from_checkpoint_path",
@@ -72,6 +74,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--save_final_model", action=argparse.BooleanOptionalAction, default=True
     )
+    parser.add_argument(
+        "--save_strategy", choices=("no", "steps", "epoch"), default="steps"
+    )
+    parser.add_argument("--final_save", action="store_true", default=True)
+    parser.add_argument("--no_final_save", action="store_false", dest="final_save")
     parser.add_argument("--image_root", required=False)
     parser.add_argument("--max_train_samples", type=int)
     parser.add_argument("--max_steps", type=int, default=-1)
@@ -88,6 +95,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--deepspeed_config")
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
     # global_pad_to 已存在，保留
 # 其余不变
 
@@ -97,22 +105,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         item == "--tuning_method" or item.startswith("--tuning_method=")
         for item in raw_argv
     )
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        raise ValueError("Learning rate must be finite and positive")
+    if args.lora_r <= 0 or args.lora_alpha <= 0:
+        raise ValueError("LoRA rank and alpha must be positive")
+    if not math.isfinite(args.lora_dropout) or not 0.0 <= args.lora_dropout < 1.0:
+        raise ValueError("LoRA dropout must be finite and in [0, 1)")
+    if args.per_device_train_batch_size < 1:
+        raise ValueError("per_device_train_batch_size must be at least 1")
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
     if args.stage == "stage2":
         if args.use_lora:
             raise ValueError(
                 "Stage 2 does not accept --use_lora; use --tuning_method lora"
             )
+        if args.stage1_adapter_path and args.resume_from_checkpoint_path:
+            raise ValueError(
+                "--stage1_adapter_path and --resume_from_checkpoint_path are mutually exclusive"
+            )
         if args.tuning_method is None and args.resume_from_checkpoint_path is None:
             args.tuning_method = "full"
-        if args.lora_r <= 0 or args.lora_alpha <= 0:
-            raise ValueError("LoRA rank and alpha must be positive")
-        if not math.isfinite(args.lora_dropout) or not 0.0 <= args.lora_dropout < 1.0:
-            raise ValueError("LoRA dropout must be finite and in [0, 1)")
         normalize_stage2_target_modules(args.lora_target_modules)
         if args.per_device_train_batch_size != 1:
             raise ValueError("Stage 2 requires per_device_train_batch_size=1")
+    elif args.stage == "stage1":
+        if args.use_lora and args.tuning_method_explicit:
+            raise ValueError("--use_lora and --tuning_method cannot be combined")
+        if args.tuning_method_explicit and args.tuning_method not in ("full", "dora"):
+            raise ValueError("Stage 1 --tuning_method accepts only full or dora")
+        normalize_decoder_target_suffixes(
+            args.lora_target_modules, stage_label="Stage 1 PEFT target modules"
+        )
     elif args.tuning_method_explicit:
-        raise ValueError("--tuning_method is only valid for Stage 2")
+        raise ValueError("--tuning_method is only valid for Stage 1 or Stage 2")
     return args
 
 
