@@ -261,10 +261,13 @@ def _write_fake_peft(directory, metadata, *, weight="adapter_model.safetensors")
     _write_metadata(directory, metadata)
 
 
-def _write_full_checkpoint(directory):
+def _write_full_checkpoint(directory, *, complete=True):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "model.safetensors").write_bytes(b"fixture")
-    (directory / "trainer_state.json").write_text("{}\n", encoding="utf-8")
+    if complete:
+        _write_standard_trainer_state(directory)
+    else:
+        (directory / "trainer_state.json").write_text("{}\n", encoding="utf-8")
 
 
 def _write_full_index(directory, *, binary=False, shard_names=None, weight_map=None):
@@ -306,18 +309,29 @@ def _write_standard_trainer_state(directory, *, rank_count=None):
             (directory / f"rng_state_{rank}.pth").write_bytes(b"fixture")
 
 
-def _write_deepspeed_trainer_state(directory):
+def _write_deepspeed_trainer_state(directory, *, step, replicated_model=False):
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "trainer_state.json").write_text("{}\n", encoding="utf-8")
+    (directory / "trainer_state.json").write_text(
+        json.dumps({"global_step": step}) + "\n", encoding="utf-8"
+    )
     (directory / "rng_state_0.pth").write_bytes(b"fixture")
     (directory / "rng_state_1.pth").write_bytes(b"fixture")
-    (directory / "latest").write_text("global_step1\n", encoding="utf-8")
-    tag = directory / "global_step1"
-    tag.mkdir()
-    (tag / "zero_pp_rank_0_mp_rank_00_model_states.pt").write_bytes(b"fixture")
-    (tag / "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt").write_bytes(
-        b"fixture"
+    (directory / "latest").write_text(
+        f"global_step{step}", encoding="utf-8"
     )
+    tag = directory / f"global_step{step}"
+    tag.mkdir()
+    if replicated_model:
+        (tag / "mp_rank_00_model_states.pt").write_bytes(b"fixture")
+    else:
+        for rank in (0, 1):
+            (tag / f"zero_pp_rank_{rank}_mp_rank_00_model_states.pt").write_bytes(
+                b"fixture"
+            )
+    for rank in (0, 1):
+        (tag / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt").write_bytes(
+            b"fixture"
+        )
 
 
 def test_metadata_schema_v1_round_trips_exact_fields(tmp_path):
@@ -535,6 +549,25 @@ def test_classifier_accepts_exactly_one_standalone_full_family(tmp_path, filenam
     (tmp_path / filename).write_bytes(b"fixture")
 
     assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.FULL
+
+
+@pytest.mark.parametrize("filename", ["model.safetensors", "pytorch_model.bin"])
+@pytest.mark.parametrize("target_location", ["inside", "outside"])
+def test_classifier_rejects_symlink_standalone_full_weight(
+    tmp_path, filename, target_location
+):
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    target = (
+        artifact / "payload"
+        if target_location == "inside"
+        else tmp_path / "outside-payload"
+    )
+    target.write_bytes(b"fixture")
+    (artifact / filename).symlink_to(target)
+
+    with pytest.raises(ValueError, match="full|standalone|symlink|regular"):
+        classify_stage1_artifact(artifact)
 
 
 @pytest.mark.parametrize("binary", [False, True])
@@ -835,6 +868,18 @@ def test_resolve_explicit_numbered_resume_wins(tmp_path):
     assert decision.explicit is True
 
 
+def test_explicit_full_resume_precedence_rejects_incomplete_selected_path(
+    tmp_path,
+):
+    output = tmp_path / "output"
+    explicit = tmp_path / "other" / "checkpoint-2"
+    _write_full_checkpoint(output / "checkpoint-10")
+    _write_full_checkpoint(explicit, complete=False)
+
+    with pytest.raises(ValueError, match="complete|optimizer|scheduler|RNG"):
+        resolve_stage1_resume(output, explicit)
+
+
 def test_explicit_full_resume_retains_normal_trainer_path_semantics(tmp_path):
     explicit = tmp_path / "named-full-trainer-save"
     _write_full_checkpoint(explicit)
@@ -863,6 +908,17 @@ def test_auto_resume_selects_latest_valid_immediate_numbered_checkpoint_only(
 
     assert decision.checkpoint_path == output / "checkpoint-11"
     assert decision.explicit is False
+
+
+def test_auto_resume_skips_incomplete_full_checkpoint(tmp_path):
+    output = tmp_path / "output"
+    valid = output / "checkpoint-2"
+    _write_full_checkpoint(valid)
+    _write_full_checkpoint(output / "checkpoint-11", complete=False)
+
+    decision = resolve_stage1_resume(output, None)
+
+    assert decision.checkpoint_path == valid
 
 
 def test_auto_resume_never_selects_final_adapter_directory(
@@ -938,7 +994,22 @@ def test_peft_resume_accepts_explicitly_validated_deepspeed_layout(
 ):
     output = tmp_path / "output"
     checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 6)
-    _write_deepspeed_trainer_state(checkpoint)
+    _write_deepspeed_trainer_state(checkpoint, step=6)
+
+    decision = resolve_stage1_resume(output, checkpoint)
+
+    assert decision.checkpoint_path == checkpoint
+    assert decision.artifact_kind is Stage1ArtifactKind.PEFT
+
+
+def test_peft_resume_accepts_mp_replicated_deepspeed_layout(
+    tmp_path, saved_dora_artifact
+):
+    output = tmp_path / "output"
+    checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 6)
+    _write_deepspeed_trainer_state(
+        checkpoint, step=6, replicated_model=True
+    )
 
     decision = resolve_stage1_resume(output, checkpoint)
 
@@ -947,25 +1018,60 @@ def test_peft_resume_accepts_explicitly_validated_deepspeed_layout(
 
 
 @pytest.mark.parametrize(
-    "mutation", ["missing_model", "missing_optimizer", "missing_tag", "escaping_tag"]
+    "mutation",
+    [
+        "rank0_only",
+        "missing_model",
+        "missing_optimizer",
+        "extra_dp_rank",
+        "extra_mp_rank",
+        "gapped_rng",
+        "tag_step_mismatch",
+        "mixed_standard",
+        "missing_tag",
+        "escaping_tag",
+    ],
 )
 def test_peft_resume_rejects_incomplete_deepspeed_layout(
     tmp_path, saved_dora_artifact, mutation
 ):
     output = tmp_path / "output"
     checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 7)
-    _write_deepspeed_trainer_state(checkpoint)
-    tag = checkpoint / "global_step1"
-    if mutation == "missing_model":
-        (tag / "zero_pp_rank_0_mp_rank_00_model_states.pt").unlink()
+    _write_deepspeed_trainer_state(checkpoint, step=7)
+    tag = checkpoint / "global_step7"
+    if mutation == "rank0_only":
+        (tag / "zero_pp_rank_1_mp_rank_00_model_states.pt").unlink()
+        (tag / "bf16_zero_pp_rank_1_mp_rank_00_optim_states.pt").unlink()
+    elif mutation == "missing_model":
+        (tag / "zero_pp_rank_1_mp_rank_00_model_states.pt").unlink()
     elif mutation == "missing_optimizer":
-        (tag / "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt").unlink()
+        (tag / "bf16_zero_pp_rank_1_mp_rank_00_optim_states.pt").unlink()
+    elif mutation == "extra_dp_rank":
+        (tag / "zero_pp_rank_2_mp_rank_00_model_states.pt").write_bytes(b"fixture")
+        (tag / "bf16_zero_pp_rank_2_mp_rank_00_optim_states.pt").write_bytes(
+            b"fixture"
+        )
+    elif mutation == "extra_mp_rank":
+        (tag / "zero_pp_rank_0_mp_rank_01_model_states.pt").write_bytes(b"fixture")
+        (tag / "bf16_zero_pp_rank_0_mp_rank_01_optim_states.pt").write_bytes(
+            b"fixture"
+        )
+    elif mutation == "gapped_rng":
+        (checkpoint / "rng_state_1.pth").unlink()
+        (checkpoint / "rng_state_2.pth").write_bytes(b"fixture")
+    elif mutation == "tag_step_mismatch":
+        (checkpoint / "trainer_state.json").write_text(
+            '{"global_step":8}\n', encoding="utf-8"
+        )
+    elif mutation == "mixed_standard":
+        (checkpoint / "optimizer.pt").write_bytes(b"fixture")
+        (checkpoint / "scheduler.pt").write_bytes(b"fixture")
     elif mutation == "missing_tag":
         shutil.rmtree(tag)
     else:
         (checkpoint / "latest").write_text("../outside\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="DeepSpeed|complete"):
+    with pytest.raises(ValueError, match="DeepSpeed|complete|mixed"):
         resolve_stage1_resume(output, checkpoint)
 
 

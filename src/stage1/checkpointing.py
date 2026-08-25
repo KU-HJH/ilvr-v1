@@ -98,15 +98,19 @@ _FULL_BINARY_SHARD = re.compile(
 )
 _RANK_RNG_STATE = re.compile(r"rng_state_(0|[1-9][0-9]*)\.pth\Z")
 _NUMBERED_CHECKPOINT = re.compile(r"checkpoint-(\d+)\Z")
-_DEEPSPEED_TAG = re.compile(r"global_step[0-9]+\Z")
-_DEEPSPEED_MODEL_STATE = re.compile(
-    r"(?:zero_pp_rank_[0-9]+_)?mp_rank_([0-9]{2})_model_states\.pt\Z"
+_DEEPSPEED_TAG = re.compile(r"global_step(0|[1-9][0-9]*)\Z")
+_DEEPSPEED_ZERO3_MODEL_STATE = re.compile(
+    r"zero_pp_rank_(0|[1-9][0-9]*)_mp_rank_([0-9]{2,})_model_states\.pt\Z"
+)
+_DEEPSPEED_REPLICATED_MODEL_STATE = re.compile(
+    r"mp_rank_([0-9]{2,})_model_states\.pt\Z"
 )
 _DEEPSPEED_OPTIMIZER_STATE = re.compile(
-    r"(?:bf16_)?zero_pp_rank_[0-9]+_mp_rank_([0-9]{2})_optim_states\.pt\Z"
+    r"(bf16_)?zero_pp_rank_(0|[1-9][0-9]*)_mp_rank_([0-9]{2,})_optim_states\.pt\Z"
 )
 _MAX_FULL_INDEX_BYTES = 4 * 1024 * 1024
 _MAX_DEEPSPEED_LATEST_BYTES = 1024
+_MAX_TRAINER_STATE_BYTES = 4 * 1024 * 1024
 
 
 class Stage1ArtifactKind(str, Enum):
@@ -214,10 +218,20 @@ def _validate_full_serialization(directory: Path, names: set[str]) -> None:
     if safe_single:
         if safe_index or safe_shards:
             raise ValueError("mixed standalone and sharded full serialization")
+        weight = directory / "model.safetensors"
+        if weight.is_symlink() or not weight.is_file():
+            raise ValueError(
+                f"standalone full-model weight must be a regular file: {weight}"
+            )
         return
     if binary_single:
         if binary_index or binary_shards:
             raise ValueError("mixed standalone and sharded full serialization")
+        weight = directory / "pytorch_model.bin"
+        if weight.is_symlink() or not weight.is_file():
+            raise ValueError(
+                f"standalone full-model weight must be a regular file: {weight}"
+            )
         return
     if safe_index:
         _validate_full_shard_index(
@@ -1032,7 +1046,7 @@ def _is_regular_file(path: Path) -> bool:
     return path.is_file() and not path.is_symlink()
 
 
-def _has_complete_rng_layout(path: Path) -> bool:
+def _validated_rng_world_size(path: Path) -> int | None:
     single = path / "rng_state.pth"
     rank_files = {
         int(match.group(1)): entry
@@ -1041,51 +1055,179 @@ def _has_complete_rng_layout(path: Path) -> bool:
         and (match := _RANK_RNG_STATE.fullmatch(entry.name))
     }
     if _is_regular_file(single):
-        return not rank_files
+        return 1 if not rank_files else None
     if single.exists() or not rank_files:
-        return False
-    return sorted(rank_files) == list(range(len(rank_files))) and all(
+        return None
+    if sorted(rank_files) != list(range(len(rank_files))) or not all(
         _is_regular_file(rank_file) for rank_file in rank_files.values()
-    )
+    ):
+        return None
+    return len(rank_files)
 
 
 def _has_complete_standard_trainer_state(path: Path) -> bool:
     return all(
         _is_regular_file(path / filename)
-        for filename in ("trainer_state.json", "optimizer.pt", "scheduler.pt")
-    ) and _has_complete_rng_layout(path)
+        for filename in ("optimizer.pt", "scheduler.pt")
+    )
 
 
-def _has_complete_deepspeed_trainer_state(path: Path) -> bool:
+def _load_trainer_global_step(path: Path) -> int | None:
+    trainer_state = path / "trainer_state.json"
+    try:
+        if trainer_state.stat().st_size > _MAX_TRAINER_STATE_BYTES:
+            return None
+        payload = json.loads(trainer_state.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    global_step = payload.get("global_step")
+    if type(global_step) is not int or global_step < 0:
+        return None
+    return global_step
+
+
+def _canonical_mp_rank(value: str) -> int | None:
+    rank = int(value)
+    return rank if value == f"{rank:02d}" else None
+
+
+def _has_complete_deepspeed_trainer_state(
+    path: Path, *, rng_world_size: int
+) -> bool:
     latest = path / "latest"
     if not _is_regular_file(latest):
         return False
     try:
         if latest.stat().st_size > _MAX_DEEPSPEED_LATEST_BYTES:
             return False
-        tag_name = latest.read_text(encoding="utf-8").strip()
+        tag_name = latest.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return False
-    if _DEEPSPEED_TAG.fullmatch(tag_name) is None:
+    tag_match = _DEEPSPEED_TAG.fullmatch(tag_name)
+    if tag_match is None:
+        return False
+    tag_step = int(tag_match.group(1))
+    if _load_trainer_global_step(path) != tag_step:
         return False
     tag = path / tag_name
     if tag.is_symlink() or not tag.is_dir() or tag.resolve().parent != path.resolve():
         return False
 
-    model_mp_ranks: set[int] = set()
-    optimizer_mp_ranks: set[int] = set()
+    zero3_model_pairs: list[tuple[int, int]] = []
+    replicated_model_ranks: list[int] = []
+    optimizer_pairs: list[tuple[int, int]] = []
+    optimizer_bf16: set[bool] = set()
     for entry in tag.iterdir():
         if entry.is_symlink():
             return False
-        model_match = _DEEPSPEED_MODEL_STATE.fullmatch(entry.name)
+        zero3_match = _DEEPSPEED_ZERO3_MODEL_STATE.fullmatch(entry.name)
+        replicated_match = _DEEPSPEED_REPLICATED_MODEL_STATE.fullmatch(
+            entry.name
+        )
         optimizer_match = _DEEPSPEED_OPTIMIZER_STATE.fullmatch(entry.name)
-        if model_match is not None and entry.is_file():
-            model_mp_ranks.add(int(model_match.group(1)))
+        if zero3_match is not None and entry.is_file():
+            mp_rank = _canonical_mp_rank(zero3_match.group(2))
+            if mp_rank is None:
+                return False
+            zero3_model_pairs.append((int(zero3_match.group(1)), mp_rank))
+        elif replicated_match is not None and entry.is_file():
+            mp_rank = _canonical_mp_rank(replicated_match.group(1))
+            if mp_rank is None:
+                return False
+            replicated_model_ranks.append(mp_rank)
         elif optimizer_match is not None and entry.is_file():
-            optimizer_mp_ranks.add(int(optimizer_match.group(1)))
+            mp_rank = _canonical_mp_rank(optimizer_match.group(3))
+            if mp_rank is None:
+                return False
+            optimizer_pairs.append((int(optimizer_match.group(2)), mp_rank))
+            optimizer_bf16.add(optimizer_match.group(1) is not None)
         elif entry.name.endswith("_states.pt"):
             return False
-    return bool(model_mp_ranks) and model_mp_ranks == optimizer_mp_ranks
+    if (
+        not optimizer_pairs
+        or len(set(optimizer_pairs)) != len(optimizer_pairs)
+        or len(optimizer_bf16) != 1
+    ):
+        return False
+    mp_ranks = sorted({mp_rank for _, mp_rank in optimizer_pairs})
+    if mp_ranks != list(range(len(mp_ranks))):
+        return False
+    dp_ranks_by_mp = {
+        mp_rank: sorted(
+            dp_rank
+            for dp_rank, candidate_mp_rank in optimizer_pairs
+            if candidate_mp_rank == mp_rank
+        )
+        for mp_rank in mp_ranks
+    }
+    expected_dp_ranks = list(range(len(dp_ranks_by_mp[0])))
+    if not expected_dp_ranks or any(
+        dp_ranks != expected_dp_ranks
+        for dp_ranks in dp_ranks_by_mp.values()
+    ):
+        return False
+    expected_pairs = {
+        (dp_rank, mp_rank)
+        for mp_rank in mp_ranks
+        for dp_rank in expected_dp_ranks
+    }
+    if set(optimizer_pairs) != expected_pairs:
+        return False
+    if len(expected_pairs) != rng_world_size:
+        return False
+
+    has_zero3 = bool(zero3_model_pairs)
+    has_replicated = bool(replicated_model_ranks)
+    if has_zero3 == has_replicated:
+        return False
+    if has_zero3:
+        return (
+            len(set(zero3_model_pairs)) == len(zero3_model_pairs)
+            and set(zero3_model_pairs) == expected_pairs
+        )
+    return (
+        len(set(replicated_model_ranks)) == len(replicated_model_ranks)
+        and set(replicated_model_ranks) == set(mp_ranks)
+    )
+
+
+def _validate_complete_trainer_state(path: Path) -> None:
+    if not _is_regular_file(path / "trainer_state.json"):
+        raise ValueError(
+            f"Stage 1 resume requires complete trainer_state.json: {path}"
+        )
+    rng_world_size = _validated_rng_world_size(path)
+    if rng_world_size is None:
+        raise ValueError(f"Stage 1 resume has incomplete RNG state: {path}")
+
+    standard_markers = {
+        filename
+        for filename in ("optimizer.pt", "scheduler.pt")
+        if (path / filename).exists() or (path / filename).is_symlink()
+    }
+    deepspeed_markers = (path / "latest").exists() or (path / "latest").is_symlink()
+    deepspeed_markers = deepspeed_markers or any(
+        _DEEPSPEED_TAG.fullmatch(entry.name)
+        and (entry.is_dir() or entry.is_symlink())
+        for entry in path.iterdir()
+    )
+    if standard_markers and deepspeed_markers:
+        raise ValueError(f"Stage 1 resume has mixed Trainer state layouts: {path}")
+    if standard_markers:
+        if not _has_complete_standard_trainer_state(path):
+            raise ValueError(
+                f"Stage 1 resume has incomplete optimizer/scheduler state: {path}"
+            )
+        return
+    if deepspeed_markers and _has_complete_deepspeed_trainer_state(
+        path, rng_world_size=rng_world_size
+    ):
+        return
+    raise ValueError(
+        f"Stage 1 resume requires complete standard or DeepSpeed state: {path}"
+    )
 
 
 def _validate_peft_resume_location(output_dir: Path, checkpoint: Path) -> None:
@@ -1111,25 +1253,7 @@ def _validated_resume_checkpoint(
                 f"Stage 1 adapter resume requires a numbered checkpoint: {path}"
             )
         _validate_peft_resume_location(output_dir, path)
-        if not _is_regular_file(path / "trainer_state.json"):
-            raise ValueError(
-                "Stage 1 adapter resume requires complete Trainer state; "
-                f"missing trainer_state.json: {path}"
-            )
-        if not _has_complete_rng_layout(path):
-            raise ValueError(
-                f"Stage 1 adapter resume has incomplete RNG state: {path}"
-            )
-        if not (
-            _has_complete_standard_trainer_state(path)
-            or _has_complete_deepspeed_trainer_state(path)
-        ):
-            raise ValueError(
-                "Stage 1 adapter resume requires complete optimizer/scheduler "
-                f"state or a complete DeepSpeed checkpoint: {path}"
-            )
-    elif not _is_regular_file(path / "trainer_state.json"):
-        raise ValueError(f"Stage 1 resume is missing trainer_state.json: {path}")
+    _validate_complete_trainer_state(path)
     return kind
 
 
