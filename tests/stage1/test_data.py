@@ -1,10 +1,16 @@
 import json
+from dataclasses import replace
 
 from PIL import Image
 import pytest
 
-from helpers import make_stage1_collator, prepared_example
-from stage1.data import prepare_stage1_comt_examples
+from helpers import (
+    PlaceholderConsumingStage1Processor,
+    TOKENS,
+    make_stage1_collator,
+    prepared_example,
+)
+from stage1.data import Stage1DataCollator, prepare_stage1_comt_examples
 
 
 @pytest.fixture
@@ -40,6 +46,31 @@ def test_collator_records_per_sample_ownership_and_row_identity(stage1_collator)
     assert batch["image_out_mask"].shape == batch["input_ids"].shape
     assert batch["pixel_values_latent"].shape[0] == 3
     assert batch["image_grid_thw_latent"].shape[0] == 3
+
+
+def test_collator_tokenizes_all_placeholders_but_publishes_role_owned_pixels():
+    """Catches starving full Qwen tokenization of helper image-grid rows."""
+    processor = PlaceholderConsumingStage1Processor()
+    collator = Stage1DataCollator(processor, TOKENS, latent_size=3)
+    example = prepared_example(
+        source_index=17,
+        original_images=2,
+        helper_images=2,
+        blocks=2,
+    )
+
+    batch = collator([example])
+
+    assert processor.calls == [
+        {"placeholder_count": 4, "image_values": [[10, 11, 200, 201]]},
+        {"placeholder_count": 2, "image_values": [[10, 11]]},
+        {"placeholder_count": 2, "image_values": [[200, 201]]},
+    ]
+    assert batch["pixel_values"].squeeze(1).tolist() == [10.0, 11.0]
+    assert batch["pixel_values_latent"].squeeze(1).tolist() == [200.0, 201.0]
+    assert batch["image_grid_thw"].shape[0] == 2
+    assert batch["image_grid_thw_latent"].shape[0] == 2
+    assert len(batch["stage1_batch_metadata"].samples[0].latent_spans) == 2
 
 
 def test_collator_repads_replaced_rows_and_records_unpadded_lengths(stage1_collator):
@@ -163,6 +194,92 @@ def test_prepare_examples_uses_row_index_as_unique_identity_and_raw_id_as_proven
     assert examples[0].conversation[1]["content"][0]["image"] == str(
         tmp_path / "helper-a.png"
     )
+
+
+@pytest.mark.parametrize(
+    ("sequence_plan", "detail"),
+    [
+        ("not-a-list", "Missing or non-list"),
+        ([{"type": "latent"}], "missing 'helper_image'"),
+    ],
+)
+def test_prepare_errors_include_source_index_and_observed_expected(
+    tmp_path, sequence_plan, detail
+):
+    """Catches raw CoMT conversion errors escaping without row provenance."""
+    data_path = tmp_path / "bad.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {
+                "image_input": [],
+                "text_input": "question",
+                "sequence_plan": sequence_plan,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=detail) as error:
+        prepare_stage1_comt_examples(data_path, tmp_path)
+
+    message = str(error.value)
+    assert "source_index=0" in message
+    assert "observed" in message
+    assert "expected" in message
+    assert error.value.__cause__ is not None
+
+
+def test_prepare_missing_image_error_includes_source_index_and_expected_path(tmp_path):
+    """Catches missing source images losing their JSONL row identity."""
+    data_path = tmp_path / "missing.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {
+                "image_input": "missing.png",
+                "text_input": "question",
+                "sequence_plan": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileNotFoundError) as error:
+        prepare_stage1_comt_examples(data_path, tmp_path)
+
+    message = str(error.value)
+    assert "source_index=0" in message
+    assert "observed" in message
+    assert "expected" in message
+    assert error.value.__cause__ is not None
+
+
+@pytest.mark.parametrize("role", ["original", "helper"])
+def test_collator_corrupt_image_error_includes_source_index_and_role(tmp_path, role):
+    """Catches unreadable image materialization escaping without sample ownership."""
+    corrupt_path = tmp_path / f"corrupt-{role}.png"
+    corrupt_path.write_text("not an image", encoding="utf-8")
+    example = prepared_example(
+        source_index=41,
+        original_images=1,
+        helper_images=1,
+        blocks=1,
+    )
+    if role == "original":
+        example = replace(example, original_image_paths=(str(corrupt_path),))
+    else:
+        example = replace(example, helper_image_paths=(str(corrupt_path),))
+
+    with pytest.raises(ValueError) as error:
+        make_stage1_collator()([example])
+
+    message = str(error.value)
+    assert "source_index=41" in message
+    assert role in message
+    assert "observed" in message
+    assert "expected" in message
+    assert error.value.__cause__ is not None
 
 
 @pytest.mark.parametrize(

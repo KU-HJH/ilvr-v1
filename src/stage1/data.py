@@ -20,6 +20,8 @@ from utils_deepseed import (
     normalize_stage1_latent_blocks_1d,
     place_input_image,
     place_output_image,
+    remove_assistant_images,
+    remove_user_images,
     replace_visual_spectial_tokens,
 )
 
@@ -44,9 +46,19 @@ def prepare_stage1_comt_examples(
 
     prepared = []
     for source_index, sample in enumerate(rows):
-        conversation = interleaved_latent_cot_preprocess_function(
-            sample, image_root=Path(image_root)
-        )
+        try:
+            conversation = interleaved_latent_cot_preprocess_function(
+                sample, image_root=Path(image_root)
+            )
+        except (FileNotFoundError, ValueError) as error:
+            message = (
+                f"source_index={source_index}: observed CoMT preparation failure "
+                f"({error}); expected a valid sequence_plan with resolvable "
+                "original and helper image paths"
+            )
+            if isinstance(error, FileNotFoundError):
+                raise FileNotFoundError(message) from error
+            raise ValueError(message) from error
         original_paths = tuple(
             item["image"]
             for turn in conversation
@@ -74,13 +86,26 @@ def prepare_stage1_comt_examples(
     return prepared
 
 
-def _materialize_image(image_reference: object) -> Image.Image:
-    if isinstance(image_reference, Image.Image):
-        return image_reference.convert("RGB")
-    with Image.open(Path(image_reference)) as source:
-        image = source.convert("RGB")
-        image.load()
-    return image
+def _materialize_image(
+    image_reference: object,
+    *,
+    source_index: int,
+    role: str,
+    image_index: int,
+) -> Image.Image:
+    try:
+        if isinstance(image_reference, Image.Image):
+            return image_reference.convert("RGB")
+        with Image.open(Path(image_reference)) as source:
+            image = source.convert("RGB")
+            image.load()
+        return image
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"source_index={source_index}: observed unreadable {role} image "
+            f"at index {image_index} ({image_reference!s}: {error}); expected a "
+            "readable RGB-compatible image"
+        ) from error
 
 
 def _find_subsequence_starts(sequence: torch.Tensor, pattern: torch.Tensor) -> list[int]:
@@ -120,24 +145,27 @@ class Stage1DataCollator:
             raise ValueError("Stage 1 collator requires at least one example")
         self._validate_source_indices(examples)
 
+        batch = self._process_full_conversations(examples)
         original = self._process_original_images(examples)
         helper = self._process_helper_images(examples)
+        batch["pixel_values"] = original["pixel_values"]
+        batch["image_grid_thw"] = original["image_grid_thw"]
         input_ids, attention_mask, latent_spans, unpadded_lengths = (
-            self._replace_helper_tokens_with_latent_blocks(examples, original)
+            self._replace_helper_tokens_with_latent_blocks(examples, batch)
         )
-        original["input_ids"] = input_ids
-        original["attention_mask"] = attention_mask
+        batch["input_ids"] = input_ids
+        batch["attention_mask"] = attention_mask
         labels = self._build_labels(examples, input_ids, attention_mask)
         latent_mask = torch.zeros_like(input_ids)
         for row_index, row_spans in enumerate(latent_spans):
             for span in row_spans:
                 latent_mask[row_index, list(span.latent_positions)] = 1
-        original["labels"] = labels
-        original["image_out_mask"] = latent_mask
+        batch["labels"] = labels
+        batch["image_out_mask"] = latent_mask
 
         metadata = self._build_metadata(
             examples,
-            original,
+            batch,
             helper,
             latent_spans,
             unpadded_lengths,
@@ -146,7 +174,7 @@ class Stage1DataCollator:
             examples, metadata, input_ids, attention_mask, labels, latent_mask
         )
         return {
-            **original,
+            **batch,
             "pixel_values_latent": helper["pixel_values"],
             "image_grid_thw_latent": helper["image_grid_thw"],
             "stage1_batch_metadata": metadata,
@@ -163,23 +191,73 @@ class Stage1DataCollator:
                 )
             seen.add(example.source_index)
 
-    def _process_original_images(
-        self, examples: Sequence[PreparedStage1Example]
-    ) -> dict[str, torch.Tensor]:
+    def _render_conversations(self, conversations: Sequence[list[dict]]) -> list[str]:
         texts = []
-        images = []
-        for example in examples:
+        for conversation in conversations:
             rendered = self.processor.apply_chat_template(
-                example.conversation,
+                conversation,
                 tokenize=False,
                 add_generation_prompt=False,
             )
             rendered = place_input_image(rendered)
             rendered = place_output_image(rendered)
             texts.append(replace_visual_spectial_tokens([rendered])[0])
-            images.append(
-                [_materialize_image(item) for item in example.original_image_paths]
+        return texts
+
+    def _materialize_role_images(self, examples, role):
+        attribute = f"{role}_image_paths"
+        return [
+            [
+                _materialize_image(
+                    image_reference,
+                    source_index=example.source_index,
+                    role=role,
+                    image_index=image_index,
+                )
+                for image_index, image_reference in enumerate(
+                    getattr(example, attribute)
+                )
+            ]
+            for example in examples
+        ]
+
+    def _process_full_conversations(
+        self, examples: Sequence[PreparedStage1Example]
+    ) -> dict[str, torch.Tensor]:
+        texts = self._render_conversations(
+            [example.conversation for example in examples]
+        )
+        original_images = self._materialize_role_images(examples, "original")
+        helper_images = self._materialize_role_images(examples, "helper")
+        images = [
+            originals + helpers
+            for originals, helpers in zip(original_images, helper_images)
+        ]
+        batch = dict(
+            self.processor(
+                text=texts,
+                images=images,
+                padding=True,
+                truncation=False,
+                return_tensors="pt",
             )
+        )
+        self._require_processor_keys(examples[0], batch, "full")
+        counts = tuple(
+            len(example.original_image_paths) + len(example.helper_image_paths)
+            for example in examples
+        )
+        self._validate_grid_rows(examples, batch["image_grid_thw"], counts, "full")
+        return batch
+
+    def _process_original_images(
+        self, examples: Sequence[PreparedStage1Example]
+    ) -> dict[str, torch.Tensor]:
+        conversations = remove_assistant_images(
+            [example.conversation for example in examples]
+        )
+        texts = self._render_conversations(conversations)
+        images = self._materialize_role_images(examples, "original")
         batch = dict(
             self.processor(
                 text=texts,
@@ -195,14 +273,21 @@ class Stage1DataCollator:
     def _process_helper_images(
         self, examples: Sequence[PreparedStage1Example]
     ) -> dict[str, torch.Tensor]:
-        images = [
-            _materialize_image(item)
-            for example in examples
-            for item in example.helper_image_paths
-        ]
-        if images:
+        helper_count = sum(len(example.helper_image_paths) for example in examples)
+        if helper_count:
+            conversations = remove_user_images(
+                [example.conversation for example in examples]
+            )
+            texts = self._render_conversations(conversations)
+            images = self._materialize_role_images(examples, "helper")
             batch = dict(
-                self.processor.image_processor(images=images, return_tensors="pt")
+                self.processor(
+                    text=texts,
+                    images=images,
+                    padding=True,
+                    truncation=False,
+                    return_tensors="pt",
+                )
             )
         else:
             batch = {
@@ -215,7 +300,7 @@ class Stage1DataCollator:
     @staticmethod
     def _require_processor_keys(example, batch, kind):
         required = {"pixel_values", "image_grid_thw"}
-        if kind == "original":
+        if kind in {"full", "original"}:
             required.update(("input_ids", "attention_mask"))
         missing = sorted(required - batch.keys())
         if missing:
