@@ -96,6 +96,47 @@ def _attached_token_ids(rows: SparseOutputTokenRows) -> tuple[int, int, int]:
     return _validate_exact_latent_token_ids(values, rows.out_features)
 
 
+def initialize_frozen_output_token_rows(
+    model: nn.Module, token_ids: Sequence[int]
+) -> None:
+    """Deterministically initialize appended frozen output rows for adapters."""
+
+    qwen = resolve_qwen2_5_vl_model(model)
+    head = qwen.lm_head
+    embedding = qwen.model.embed_tokens
+    if not isinstance(head, nn.Linear):
+        raise TypeError("Qwen2.5-VL lm_head must be a torch.nn.Linear")
+    if not isinstance(embedding, nn.Embedding):
+        raise TypeError("Qwen2.5-VL input embedding must be a torch.nn.Embedding")
+    ids = _validate_exact_latent_token_ids(token_ids, head.out_features)
+    base_vocab_size = head.out_features - len(ids)
+    if base_vocab_size <= 0 or ids != tuple(
+        range(base_vocab_size, head.out_features)
+    ):
+        raise ValueError(
+            "latent token IDs must be the exact appended output rows"
+        )
+    if (
+        bool(getattr(qwen.config, "tie_word_embeddings", False))
+        or head.weight is embedding.weight
+    ):
+        raise ValueError(
+            "tied input/output embeddings are unsupported for sparse output rows"
+        )
+    if embedding.num_embeddings != head.out_features:
+        raise ValueError("input and output vocabulary sizes must match")
+
+    with torch.no_grad():
+        ordinary_mean = head.weight[:base_vocab_size].float().mean(
+            dim=0, keepdim=True
+        )
+        head.weight.index_copy_(
+            0,
+            torch.tensor(ids, dtype=torch.long, device=head.weight.device),
+            ordinary_mean.to(dtype=head.weight.dtype).expand(len(ids), -1),
+        )
+
+
 def attach_sparse_output_token_rows(
     model: nn.Module, token_ids: Sequence[int]
 ) -> SparseOutputTokenRows:
@@ -279,6 +320,7 @@ __all__ = [
     "SparseOutputTokenRows",
     "attach_sparse_output_token_rows",
     "find_sparse_output_token_rows",
+    "initialize_frozen_output_token_rows",
     "load_sparse_token_rows",
     "save_sparse_token_rows",
 ]

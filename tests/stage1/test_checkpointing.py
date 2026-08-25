@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import random
 import shutil
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import numpy as np
 import peft
 import pytest
 import torch
@@ -12,7 +16,12 @@ from peft import PeftModel
 from safetensors.torch import load_file, save_file
 from torch import nn
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
-from transformers import Trainer, TrainingArguments, default_data_collator
+from transformers import (
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+    default_data_collator,
+)
 
 from peft_common import capture_qwen2_5_vl_architecture, resolve_qwen2_5_vl_model
 from stage1.checkpointing import (
@@ -258,6 +267,59 @@ def _write_full_checkpoint(directory):
     (directory / "trainer_state.json").write_text("{}\n", encoding="utf-8")
 
 
+def _write_full_index(directory, *, binary=False, shard_names=None, weight_map=None):
+    directory.mkdir(parents=True, exist_ok=True)
+    if shard_names is None:
+        stem = "pytorch_model" if binary else "model"
+        suffix = "bin" if binary else "safetensors"
+        shard_names = [
+            f"{stem}-00001-of-00002.{suffix}",
+            f"{stem}-00002-of-00002.{suffix}",
+        ]
+    for name in shard_names:
+        (directory / name).write_bytes(b"fixture")
+    if weight_map is None:
+        weight_map = {
+            "model.embed_tokens.weight": shard_names[0],
+            "lm_head.weight": shard_names[-1],
+        }
+    index_name = (
+        "pytorch_model.bin.index.json"
+        if binary
+        else "model.safetensors.index.json"
+    )
+    (directory / index_name).write_text(
+        json.dumps({"metadata": {"total_size": 14}, "weight_map": weight_map})
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_standard_trainer_state(directory, *, rank_count=None):
+    directory.mkdir(parents=True, exist_ok=True)
+    for filename in ("trainer_state.json", "optimizer.pt", "scheduler.pt"):
+        (directory / filename).write_bytes(b"fixture")
+    if rank_count is None:
+        (directory / "rng_state.pth").write_bytes(b"fixture")
+    else:
+        for rank in range(rank_count):
+            (directory / f"rng_state_{rank}.pth").write_bytes(b"fixture")
+
+
+def _write_deepspeed_trainer_state(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "trainer_state.json").write_text("{}\n", encoding="utf-8")
+    (directory / "rng_state_0.pth").write_bytes(b"fixture")
+    (directory / "rng_state_1.pth").write_bytes(b"fixture")
+    (directory / "latest").write_text("global_step1\n", encoding="utf-8")
+    tag = directory / "global_step1"
+    tag.mkdir()
+    (tag / "zero_pp_rank_0_mp_rank_00_model_states.pt").write_bytes(b"fixture")
+    (tag / "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt").write_bytes(
+        b"fixture"
+    )
+
+
 def test_metadata_schema_v1_round_trips_exact_fields(tmp_path):
     metadata = sample_metadata()
 
@@ -314,6 +376,44 @@ def test_metadata_rejects_full_tuning_as_an_adapter_schema():
     payload["tuning_method"] = "full"
 
     with pytest.raises(ValueError, match="LoRA or DoRA"):
+        Stage1PeftMetadata.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", True),
+        ("stage", True),
+        ("base_model_architecture", True),
+        ("base_vocab_size", True),
+        ("resized_vocab_size", False),
+        ("latent_size", False),
+        ("image_pool_k", True),
+        ("rank", False),
+        ("alpha", True),
+        ("repository_format_version", False),
+        ("ce_weight", True),
+        ("sim_weight", False),
+        ("coverage_p", True),
+        ("dropout", False),
+        ("base_model_reference", 1),
+        ("latent_token_ids", [125, 126, True]),
+        ("latent_token_strings", ["<|latent_pad|>", True, "<|latent_end|>"]),
+        ("tuning_method", True),
+        ("requested_target_suffixes", ["q_proj", True]),
+        ("resolved_target_names", ["model.layers.0.self_attn.q_proj", True]),
+        ("input_row_format", True),
+        ("output_row_format", False),
+        ("output_row_shape", [3, True]),
+        ("peft_version", 1),
+        ("latent_token_ids", (125, 126, 127)),
+    ],
+)
+def test_metadata_rejects_json_scalar_type_confusion(field, value):
+    payload = sample_metadata().to_dict()
+    payload[field] = value
+
+    with pytest.raises(ValueError):
         Stage1PeftMetadata.from_dict(payload)
 
 
@@ -395,15 +495,95 @@ def test_classifier_rejects_unknown_model_weight_marker(tmp_path):
         classify_stage1_artifact(tmp_path)
 
 
+def test_classifier_accepts_exact_rank_qualified_rng_state_marker(tmp_path):
+    _write_full_checkpoint(tmp_path)
+    (tmp_path / "rng_state_7.pth").write_bytes(b"fixture")
+
+    assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.FULL
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "rng_state_.pth",
+        "rng_state_-1.pth",
+        "rng_state_01.pth",
+        "rng_state_1_copy.pth",
+        "prefix_rng_state_1.pth",
+    ],
+)
+def test_classifier_rejects_inexact_rank_rng_state_marker(tmp_path, filename):
+    _write_full_checkpoint(tmp_path)
+    (tmp_path / filename).write_bytes(b"fixture")
+
+    with pytest.raises(ValueError, match="unknown.*weight"):
+        classify_stage1_artifact(tmp_path)
+
+
 def test_classifier_accepts_full_final_and_numbered_checkpoint(tmp_path):
     final = tmp_path / "final"
     numbered = tmp_path / "checkpoint-7"
-    (final).mkdir()
-    (final / "model.safetensors.index.json").write_text("{}\n")
+    _write_full_index(final)
     _write_full_checkpoint(numbered)
 
     assert classify_stage1_artifact(final) is Stage1ArtifactKind.FULL
     assert classify_stage1_artifact(numbered) is Stage1ArtifactKind.FULL
+
+
+@pytest.mark.parametrize("filename", ["model.safetensors", "pytorch_model.bin"])
+def test_classifier_accepts_exactly_one_standalone_full_family(tmp_path, filename):
+    (tmp_path / filename).write_bytes(b"fixture")
+
+    assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.FULL
+
+
+@pytest.mark.parametrize("binary", [False, True])
+def test_classifier_accepts_one_complete_sharded_full_family(tmp_path, binary):
+    _write_full_index(tmp_path, binary=binary)
+
+    assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.FULL
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "empty_index",
+        "malformed_index",
+        "missing_shard",
+        "orphan_shard",
+        "escaping_reference",
+        "empty_reference",
+        "mixed_standalone",
+        "mixed_binary_family",
+    ],
+)
+def test_classifier_rejects_incoherent_full_serialization_family(
+    tmp_path, mutation
+):
+    _write_full_index(tmp_path)
+    index = tmp_path / "model.safetensors.index.json"
+    if mutation == "empty_index":
+        index.write_text("{}\n", encoding="utf-8")
+    elif mutation == "malformed_index":
+        index.write_text("{\n", encoding="utf-8")
+    elif mutation == "missing_shard":
+        (tmp_path / "model-00002-of-00002.safetensors").unlink()
+    elif mutation == "orphan_shard":
+        (tmp_path / "model-00003-of-00003.safetensors").write_bytes(b"fixture")
+    elif mutation == "escaping_reference":
+        _write_full_index(
+            tmp_path,
+            weight_map={"lm_head.weight": "../model-00001-of-00002.safetensors"},
+        )
+    elif mutation == "empty_reference":
+        _write_full_index(tmp_path, weight_map={"lm_head.weight": ""})
+    elif mutation == "mixed_standalone":
+        (tmp_path / "model.safetensors").write_bytes(b"fixture")
+    else:
+        (tmp_path / "pytorch_model.bin").write_bytes(b"fixture")
+
+    with pytest.raises(ValueError, match="full|index|shard|serialization|mixed"):
+        classify_stage1_artifact(tmp_path)
 
 
 def test_classifier_accepts_peft_final_and_numbered_checkpoint(
@@ -582,6 +762,55 @@ def test_processor_and_adapter_rows_round_trip_without_reassigning_tokens(
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_adapter_restore_preserves_effective_latent_output_rows_across_resize_rng(
+    tmp_path,
+):
+    source_base = tiny_original_qwen()
+    metadata = sample_metadata(source_base)
+    torch.manual_seed(101)
+    source_base.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    source_base.config.latent_token_id = LATENT_TOKEN_IDS[0]
+    source_base.config.latent_start_id = LATENT_TOKEN_IDS[1]
+    source_base.config.latent_end_id = LATENT_TOKEN_IDS[2]
+    torch.manual_seed(303)
+    source = build_stage1_tuned_model(
+        source_base, stage1_tuning(), LATENT_TOKEN_IDS
+    )
+    source_rows = find_sparse_output_token_rows(source)
+    assert torch.count_nonzero(source_rows.output_delta) == 0
+    save_stage1_peft_artifact(
+        source, TinyStage1Processor(), tmp_path, metadata
+    )
+
+    restore_base = tiny_original_qwen()
+    torch.manual_seed(202)
+    restored = load_stage1_peft_artifact(
+        restore_base,
+        TinyStage1Processor.from_pretrained(tmp_path),
+        tmp_path,
+        is_trainable=True,
+    )
+    restored_rows = find_sparse_output_token_rows(restored)
+    token_index = torch.tensor(LATENT_TOKEN_IDS)
+    source_base_rows = source_rows.base_head.weight[token_index]
+    restored_base_rows = restored_rows.base_head.weight[token_index]
+    source_effective = source_base_rows + source_rows.output_delta
+    restored_effective = restored_base_rows + restored_rows.output_delta
+    hidden = torch.tensor(
+        [[0.5, -0.25, 1.0, 0.75, -1.0, 0.125, 0.25, -0.5]]
+    )
+
+    torch.testing.assert_close(source_base_rows, restored_base_rows, rtol=0, atol=0)
+    torch.testing.assert_close(source_effective, restored_effective, rtol=0, atol=0)
+    torch.testing.assert_close(
+        source_rows(hidden)[..., token_index],
+        restored_rows(hidden)[..., token_index],
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
 def test_load_honors_is_trainable_false(saved_dora_artifact):
     restored = load_stage1_peft_artifact(
         tiny_original_qwen(),
@@ -652,6 +881,138 @@ def test_explicit_peft_resume_requires_a_numbered_trainer_checkpoint(
         resolve_stage1_resume(saved_dora_artifact.parent, saved_dora_artifact)
 
 
+def _copy_numbered_peft(saved_artifact, output, step):
+    checkpoint = output / f"checkpoint-{step}"
+    shutil.copytree(saved_artifact, checkpoint)
+    return checkpoint
+
+
+def test_explicit_peft_resume_accepts_complete_standard_state(
+    tmp_path, saved_dora_artifact
+):
+    output = tmp_path / "output"
+    checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 3)
+    _write_standard_trainer_state(checkpoint, rank_count=2)
+
+    decision = resolve_stage1_resume(output, checkpoint)
+
+    assert decision.checkpoint_path == checkpoint
+    assert decision.artifact_kind is Stage1ArtifactKind.PEFT
+
+
+@pytest.mark.parametrize(
+    "missing", ["trainer_state.json", "optimizer.pt", "scheduler.pt", "rng_state.pth"]
+)
+def test_peft_resume_rejects_incomplete_standard_trainer_state(
+    tmp_path, saved_dora_artifact, missing
+):
+    output = tmp_path / "output"
+    checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 4)
+    _write_standard_trainer_state(checkpoint)
+    (checkpoint / missing).unlink()
+
+    with pytest.raises(ValueError, match="complete|optimizer|scheduler|RNG"):
+        resolve_stage1_resume(output, checkpoint)
+
+
+@pytest.mark.parametrize("layout", ["mixed", "rank_gap"])
+def test_peft_resume_rejects_ambiguous_or_incomplete_rng_layout(
+    tmp_path, saved_dora_artifact, layout
+):
+    output = tmp_path / "output"
+    checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 5)
+    _write_standard_trainer_state(checkpoint)
+    if layout == "mixed":
+        (checkpoint / "rng_state_0.pth").write_bytes(b"fixture")
+    else:
+        (checkpoint / "rng_state.pth").unlink()
+        (checkpoint / "rng_state_0.pth").write_bytes(b"fixture")
+        (checkpoint / "rng_state_2.pth").write_bytes(b"fixture")
+
+    with pytest.raises(ValueError, match="RNG|complete"):
+        resolve_stage1_resume(output, checkpoint)
+
+
+def test_peft_resume_accepts_explicitly_validated_deepspeed_layout(
+    tmp_path, saved_dora_artifact
+):
+    output = tmp_path / "output"
+    checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 6)
+    _write_deepspeed_trainer_state(checkpoint)
+
+    decision = resolve_stage1_resume(output, checkpoint)
+
+    assert decision.checkpoint_path == checkpoint
+    assert decision.artifact_kind is Stage1ArtifactKind.PEFT
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing_model", "missing_optimizer", "missing_tag", "escaping_tag"]
+)
+def test_peft_resume_rejects_incomplete_deepspeed_layout(
+    tmp_path, saved_dora_artifact, mutation
+):
+    output = tmp_path / "output"
+    checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 7)
+    _write_deepspeed_trainer_state(checkpoint)
+    tag = checkpoint / "global_step1"
+    if mutation == "missing_model":
+        (tag / "zero_pp_rank_0_mp_rank_00_model_states.pt").unlink()
+    elif mutation == "missing_optimizer":
+        (tag / "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt").unlink()
+    elif mutation == "missing_tag":
+        shutil.rmtree(tag)
+    else:
+        (checkpoint / "latest").write_text("../outside\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="DeepSpeed|complete"):
+        resolve_stage1_resume(output, checkpoint)
+
+
+@pytest.mark.parametrize("location", ["sibling", "nested"])
+def test_explicit_peft_resume_requires_immediate_same_output_checkpoint(
+    tmp_path, saved_dora_artifact, location
+):
+    output = tmp_path / "output"
+    if location == "sibling":
+        checkpoint = _copy_numbered_peft(saved_dora_artifact, tmp_path / "other", 8)
+    else:
+        checkpoint = _copy_numbered_peft(saved_dora_artifact, output / "nested", 8)
+    _write_standard_trainer_state(checkpoint)
+
+    with pytest.raises(ValueError, match="same output|immediate|outside"):
+        resolve_stage1_resume(output, checkpoint)
+
+
+def test_peft_resume_rejects_symlink_checkpoint_escape(
+    tmp_path, saved_dora_artifact
+):
+    output = tmp_path / "output"
+    output.mkdir()
+    target = _copy_numbered_peft(saved_dora_artifact, tmp_path / "outside", 9)
+    _write_standard_trainer_state(target)
+    link = output / "checkpoint-9"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink|same output|outside"):
+        resolve_stage1_resume(output, link)
+
+
+def test_auto_resume_skips_symlink_checkpoint_escape(
+    tmp_path, saved_dora_artifact
+):
+    output = tmp_path / "output"
+    valid = _copy_numbered_peft(saved_dora_artifact, output, 2)
+    _write_standard_trainer_state(valid)
+    target = _copy_numbered_peft(saved_dora_artifact, tmp_path / "outside", 10)
+    _write_standard_trainer_state(target)
+    (output / "checkpoint-10").symlink_to(target, target_is_directory=True)
+
+    decision = resolve_stage1_resume(output, None)
+
+    assert decision.checkpoint_path == valid
+
+
 class CheckpointLifecycleTrainer(CustomTrainerStage1):
     """Use the real Stage 1 save override with ordinary Trainer state ownership."""
 
@@ -683,6 +1044,85 @@ class CheckpointLifecycleTrainer(CustomTrainerStage1):
         return (outputs.loss, outputs) if return_outputs else outputs.loss
 
 
+class StopAfterFirstStep(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        del args, kwargs
+        if state.global_step == 1:
+            control.should_training_stop = True
+        return control
+
+
+def _capture_rng_state():
+    numpy_state = np.random.get_state()
+    return (
+        random.getstate(),
+        (
+            numpy_state[0],
+            numpy_state[1].copy(),
+            numpy_state[2],
+            numpy_state[3],
+            numpy_state[4],
+        ),
+        torch.random.get_rng_state().clone(),
+    )
+
+
+def _assert_rng_state_equal(actual, expected):
+    assert actual[0] == expected[0]
+    assert actual[1][0] == expected[1][0]
+    assert np.array_equal(actual[1][1], expected[1][1])
+    assert actual[1][2:] == expected[1][2:]
+    assert torch.equal(actual[2], expected[2])
+
+
+def _assert_nested_state_equal(actual, expected):
+    if isinstance(expected, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    elif isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_nested_state_equal(actual[key], expected[key])
+    elif isinstance(expected, (list, tuple)):
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_nested_state_equal(actual_item, expected_item)
+    else:
+        assert actual == expected
+
+
+def _capture_trainable_state(model):
+    return {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+
+def _capture_logits(model):
+    model.eval()
+    batch = _tiny_trainer_batch()
+    with torch.no_grad():
+        return model(
+            input_ids=batch["input_ids"].unsqueeze(0),
+            attention_mask=batch["attention_mask"].unsqueeze(0),
+        ).logits.detach().cpu()
+
+
+def _trainer_args(output_dir, *, save_strategy):
+    return TrainingArguments(
+        output_dir=str(output_dir),
+        max_steps=2,
+        per_device_train_batch_size=1,
+        save_strategy=save_strategy,
+        save_steps=1,
+        report_to=[],
+        disable_tqdm=True,
+        use_cpu=True,
+        seed=47,
+        data_seed=47,
+    )
+
+
 def _tiny_trainer_batch():
     return {
         "input_ids": torch.tensor([1, 125, 4, 126, 5, 127, 6]),
@@ -707,6 +1147,35 @@ def test_stage1_trainer_final_peft_save_is_adapter_only(
     assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.PEFT
     assert (tmp_path / "tokenizer.json").is_file()
     assert not (tmp_path / "model.safetensors").exists()
+
+
+def test_stage1_peft_save_uses_logical_zero_shape_before_collective(
+    tmp_path, stage1_dora_bundle, monkeypatch
+):
+    rows = find_sparse_output_token_rows(stage1_dora_bundle.model)
+    rows.output_delta.ds_id = 17
+    rows.output_delta.ds_shape = torch.Size((3, rows.in_features))
+    rows.output_delta.data = torch.empty(0)
+    gathered = []
+
+    @contextmanager
+    def collective_boundary(parameter):
+        gathered.append(parameter)
+        raise RuntimeError("collective boundary reached")
+        yield
+
+    monkeypatch.setattr(
+        "stage1.token_rows._gathered_output_delta", collective_boundary
+    )
+
+    with pytest.raises(RuntimeError, match="collective boundary reached"):
+        save_stage1_peft_artifact(
+            stage1_dora_bundle.model,
+            stage1_dora_bundle.processor,
+            tmp_path,
+            stage1_dora_bundle.metadata,
+        )
+    assert gathered == [rows.output_delta]
 
 
 @pytest.mark.parametrize(
@@ -739,27 +1208,38 @@ def test_stage1_trainer_rejects_mismatched_semantic_metadata_before_save(
 def test_stage1_trainer_numbered_peft_checkpoint_keeps_resume_state(
     tmp_path, stage1_dora_bundle
 ):
-    trainer = CheckpointLifecycleTrainer(
-        model=stage1_dora_bundle.model,
-        args=TrainingArguments(
-            output_dir=str(tmp_path),
-            max_steps=1,
-            per_device_train_batch_size=1,
-            save_strategy="steps",
-            save_steps=1,
-            report_to=[],
-            disable_tqdm=True,
-            use_cpu=True,
-        ),
+    initial = stage1_dora_bundle.model
+    uninterrupted = CheckpointLifecycleTrainer(
+        model=deepcopy(initial),
+        args=_trainer_args(tmp_path / "uninterrupted", save_strategy="no"),
         train_dataset=[_tiny_trainer_batch()],
         data_collator=default_data_collator,
         processing_class=stage1_dora_bundle.processor,
         stage1_peft_metadata=stage1_dora_bundle.metadata,
     )
+    uninterrupted.train()
+    expected_model = _capture_trainable_state(uninterrupted.model)
+    expected_optimizer = deepcopy(uninterrupted.optimizer.state_dict())
+    expected_scheduler = deepcopy(uninterrupted.lr_scheduler.state_dict())
+    expected_rng = _capture_rng_state()
+    expected_logits = _capture_logits(uninterrupted.model)
 
-    trainer.train()
+    output = tmp_path / "resumed"
+    interrupted = CheckpointLifecycleTrainer(
+        model=deepcopy(initial),
+        args=_trainer_args(output, save_strategy="steps"),
+        train_dataset=[_tiny_trainer_batch()],
+        data_collator=default_data_collator,
+        processing_class=stage1_dora_bundle.processor,
+        stage1_peft_metadata=stage1_dora_bundle.metadata,
+        callbacks=[StopAfterFirstStep()],
+    )
+    interrupted.train()
 
-    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint = output / "checkpoint-1"
+    decision = resolve_stage1_resume(output, None)
+    assert decision.checkpoint_path == checkpoint
+    assert decision.artifact_kind is Stage1ArtifactKind.PEFT
     for filename in (
         "adapter_config.json",
         "adapter_model.safetensors",
@@ -781,15 +1261,7 @@ def test_stage1_trainer_numbered_peft_checkpoint_keeps_resume_state(
     )
     resumed = CheckpointLifecycleTrainer(
         model=restored,
-        args=TrainingArguments(
-            output_dir=str(tmp_path),
-            max_steps=2,
-            per_device_train_batch_size=1,
-            save_strategy="no",
-            report_to=[],
-            disable_tqdm=True,
-            use_cpu=True,
-        ),
+        args=_trainer_args(output, save_strategy="no"),
         train_dataset=[_tiny_trainer_batch()],
         data_collator=default_data_collator,
         processing_class=TinyStage1Processor.from_pretrained(checkpoint),
@@ -799,6 +1271,13 @@ def test_stage1_trainer_numbered_peft_checkpoint_keeps_resume_state(
     resumed.train(resume_from_checkpoint=str(checkpoint))
 
     assert resumed.state.global_step == 2
+    _assert_nested_state_equal(_capture_trainable_state(resumed.model), expected_model)
+    _assert_nested_state_equal(resumed.optimizer.state_dict(), expected_optimizer)
+    _assert_nested_state_equal(resumed.lr_scheduler.state_dict(), expected_scheduler)
+    _assert_rng_state_equal(_capture_rng_state(), expected_rng)
+    torch.testing.assert_close(
+        _capture_logits(resumed.model), expected_logits, rtol=0, atol=0
+    )
 
 
 def test_stage1_trainer_full_save_retains_normal_trainer_behavior(tmp_path):
@@ -816,6 +1295,72 @@ def test_stage1_trainer_full_save_retains_normal_trainer_behavior(tmp_path):
     assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.FULL
     assert (tmp_path / "model.safetensors").is_file()
     assert not (tmp_path / STAGE1_PEFT_METADATA_FILENAME).exists()
+
+
+def test_stage1_trainer_full_numbered_checkpoint_resume_matches_uninterrupted(
+    tmp_path,
+):
+    base = tiny_original_qwen()
+    base.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    initial = build_stage1_tuned_model(
+        base, stage1_tuning("full"), LATENT_TOKEN_IDS
+    )
+    processor = TinyStage1Processor()
+    dataset = [_tiny_trainer_batch()]
+    uninterrupted = CheckpointLifecycleTrainer(
+        model=deepcopy(initial),
+        args=_trainer_args(tmp_path / "full-uninterrupted", save_strategy="no"),
+        train_dataset=dataset,
+        data_collator=default_data_collator,
+        processing_class=processor,
+    )
+    uninterrupted.train()
+    expected_model = _capture_trainable_state(uninterrupted.model)
+    expected_optimizer = deepcopy(uninterrupted.optimizer.state_dict())
+    expected_scheduler = deepcopy(uninterrupted.lr_scheduler.state_dict())
+    expected_rng = _capture_rng_state()
+    expected_logits = _capture_logits(uninterrupted.model)
+
+    output = tmp_path / "full-resumed"
+    interrupted = CheckpointLifecycleTrainer(
+        model=deepcopy(initial),
+        args=_trainer_args(output, save_strategy="steps"),
+        train_dataset=dataset,
+        data_collator=default_data_collator,
+        processing_class=processor,
+        callbacks=[StopAfterFirstStep()],
+    )
+    interrupted.train()
+    checkpoint = output / "checkpoint-1"
+    decision = resolve_stage1_resume(output, None)
+    assert decision.checkpoint_path == checkpoint
+    assert decision.artifact_kind is Stage1ArtifactKind.FULL
+    for filename in (
+        "model.safetensors",
+        "trainer_state.json",
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state.pth",
+    ):
+        assert (checkpoint / filename).is_file(), filename
+
+    resumed = CheckpointLifecycleTrainer(
+        model=deepcopy(initial),
+        args=_trainer_args(output, save_strategy="no"),
+        train_dataset=dataset,
+        data_collator=default_data_collator,
+        processing_class=processor,
+    )
+    resumed.train(resume_from_checkpoint=str(checkpoint))
+
+    assert resumed.state.global_step == 2
+    _assert_nested_state_equal(_capture_trainable_state(resumed.model), expected_model)
+    _assert_nested_state_equal(resumed.optimizer.state_dict(), expected_optimizer)
+    _assert_nested_state_equal(resumed.lr_scheduler.state_dict(), expected_scheduler)
+    _assert_rng_state_equal(_capture_rng_state(), expected_rng)
+    torch.testing.assert_close(
+        _capture_logits(resumed.model), expected_logits, rtol=0, atol=0
+    )
 
 
 def test_stage1_trainer_keeps_trainer_checkpoint_ownership():

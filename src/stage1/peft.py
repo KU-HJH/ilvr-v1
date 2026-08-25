@@ -14,6 +14,7 @@ from peft_common import resolve_qwen2_5_vl_model, resolve_qwen_decoder_target_na
 from stage1.token_rows import (
     SparseOutputTokenRows,
     attach_sparse_output_token_rows,
+    initialize_frozen_output_token_rows,
 )
 from stage1.types import Stage1TuningConfig
 
@@ -503,6 +504,7 @@ def build_stage1_tuned_model(
         validate_stage1_trainable_boundary(base_model, tuning, ids)
         return base_model
 
+    initialize_frozen_output_token_rows(qwen, ids)
     qwen.visual.requires_grad_(False)
     resolved = _resolve_linear_decoder_targets(qwen, tuning.target_suffixes)
     config = LoraConfig(

@@ -408,3 +408,16 @@ def test_build_rejects_invalid_latent_token_ids(tiny_qwen, bad_ids):
     """Catches malformed selective rows before adapter training can begin."""
     with pytest.raises(ValueError, match="latent token IDs"):
         build_stage1_tuned_model(tiny_qwen, tuning("dora"), bad_ids)
+
+
+def test_adapter_build_rejects_tied_latent_output_topology(
+    tiny_qwen, latent_token_ids
+):
+    tiny_qwen.config.tie_word_embeddings = True
+    tiny_qwen.tie_weights()
+    assert tiny_qwen.lm_head.weight is tiny_qwen.model.embed_tokens.weight
+
+    with pytest.raises(ValueError, match="tied.*output"):
+        build_stage1_tuned_model(
+            tiny_qwen, tuning("dora"), latent_token_ids
+        )

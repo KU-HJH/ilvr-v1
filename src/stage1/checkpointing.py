@@ -25,6 +25,7 @@ from peft_common import (
     normalize_qwen2_5_vl_architecture,
     resolve_qwen2_5_vl_model,
 )
+from stage1.ema import _parameter_shape
 from stage1.peft import (
     _resolve_linear_decoder_targets,
     validate_stage1_trainable_boundary,
@@ -33,6 +34,7 @@ from stage1.token_rows import (
     SPARSE_TOKEN_ROWS_FILENAME,
     attach_sparse_output_token_rows,
     find_sparse_output_token_rows,
+    initialize_frozen_output_token_rows,
     load_sparse_token_rows,
     save_sparse_token_rows,
 )
@@ -88,9 +90,23 @@ _NON_MODEL_BINARY_FILES = frozenset(
         "training_args.bin",
     }
 )
-_FULL_SAFE_SHARD = re.compile(r"model-\d{5}-of-\d{5}\.safetensors\Z")
-_FULL_BINARY_SHARD = re.compile(r"pytorch_model-\d{5}-of-\d{5}\.bin\Z")
+_FULL_SAFE_SHARD = re.compile(
+    r"model-(\d{5})-of-(\d{5})\.safetensors\Z"
+)
+_FULL_BINARY_SHARD = re.compile(
+    r"pytorch_model-(\d{5})-of-(\d{5})\.bin\Z"
+)
+_RANK_RNG_STATE = re.compile(r"rng_state_(0|[1-9][0-9]*)\.pth\Z")
 _NUMBERED_CHECKPOINT = re.compile(r"checkpoint-(\d+)\Z")
+_DEEPSPEED_TAG = re.compile(r"global_step[0-9]+\Z")
+_DEEPSPEED_MODEL_STATE = re.compile(
+    r"(?:zero_pp_rank_[0-9]+_)?mp_rank_([0-9]{2})_model_states\.pt\Z"
+)
+_DEEPSPEED_OPTIMIZER_STATE = re.compile(
+    r"(?:bf16_)?zero_pp_rank_[0-9]+_mp_rank_([0-9]{2})_optim_states\.pt\Z"
+)
+_MAX_FULL_INDEX_BYTES = 4 * 1024 * 1024
+_MAX_DEEPSPEED_LATEST_BYTES = 1024
 
 
 class Stage1ArtifactKind(str, Enum):
@@ -113,6 +129,113 @@ def _claims_weight_format(name: str) -> bool:
         name.endswith((".safetensors", ".bin", ".pt", ".pth"))
         or name.endswith((".safetensors.index.json", ".bin.index.json"))
     )
+
+
+def _validate_full_shard_index(
+    directory: Path,
+    *,
+    index_name: str,
+    shard_pattern: re.Pattern[str],
+    actual_shards: set[str],
+) -> None:
+    index_path = directory / index_name
+    if index_path.is_symlink() or not index_path.is_file():
+        raise ValueError(f"invalid full-model shard index: {index_path}")
+    try:
+        if index_path.stat().st_size > _MAX_FULL_INDEX_BYTES:
+            raise ValueError(f"full-model shard index is too large: {index_path}")
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid full-model shard index: {index_path}") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("full-model shard index must be a JSON object")
+    weight_map = payload.get("weight_map")
+    if (
+        not isinstance(weight_map, Mapping)
+        or not weight_map
+        or any(not isinstance(key, str) or not key for key in weight_map)
+    ):
+        raise ValueError("full-model shard index requires a non-empty weight_map")
+
+    references: set[str] = set()
+    for reference in weight_map.values():
+        if (
+            not isinstance(reference, str)
+            or not reference
+            or Path(reference).name != reference
+            or shard_pattern.fullmatch(reference) is None
+        ):
+            raise ValueError(
+                f"invalid full-model shard reference: {reference!r}"
+            )
+        references.add(reference)
+    if references != actual_shards:
+        raise ValueError(
+            "full-model shard set does not match index: "
+            f"missing={sorted(references - actual_shards)}, "
+            f"orphan={sorted(actual_shards - references)}"
+        )
+    if any(
+        (directory / shard).is_symlink()
+        or not (directory / shard).is_file()
+        for shard in references
+    ):
+        raise ValueError("full-model shard index references an invalid file")
+
+    positions = []
+    totals = set()
+    for shard in references:
+        match = shard_pattern.fullmatch(shard)
+        if match is None:
+            raise ValueError(f"invalid full-model shard name: {shard}")
+        positions.append(int(match.group(1)))
+        totals.add(int(match.group(2)))
+    if (
+        len(totals) != 1
+        or next(iter(totals)) != len(references)
+        or sorted(positions) != list(range(1, len(references) + 1))
+    ):
+        raise ValueError("full-model shard numbering is inconsistent")
+
+
+def _validate_full_serialization(directory: Path, names: set[str]) -> None:
+    safe_single = "model.safetensors" in names
+    binary_single = "pytorch_model.bin" in names
+    safe_index = "model.safetensors.index.json" in names
+    binary_index = "pytorch_model.bin.index.json" in names
+    safe_shards = {name for name in names if _FULL_SAFE_SHARD.fullmatch(name)}
+    binary_shards = {
+        name for name in names if _FULL_BINARY_SHARD.fullmatch(name)
+    }
+    has_safe = safe_single or safe_index or bool(safe_shards)
+    has_binary = binary_single or binary_index or bool(binary_shards)
+    if has_safe and has_binary:
+        raise ValueError("mixed full-model serialization families")
+    if safe_single:
+        if safe_index or safe_shards:
+            raise ValueError("mixed standalone and sharded full serialization")
+        return
+    if binary_single:
+        if binary_index or binary_shards:
+            raise ValueError("mixed standalone and sharded full serialization")
+        return
+    if safe_index:
+        _validate_full_shard_index(
+            directory,
+            index_name="model.safetensors.index.json",
+            shard_pattern=_FULL_SAFE_SHARD,
+            actual_shards=safe_shards,
+        )
+        return
+    if binary_index:
+        _validate_full_shard_index(
+            directory,
+            index_name="pytorch_model.bin.index.json",
+            shard_pattern=_FULL_BINARY_SHARD,
+            actual_shards=binary_shards,
+        )
+        return
+    raise ValueError("full-model shards require their matching parsed index")
 
 
 def classify_stage1_artifact(path: Path) -> Stage1ArtifactKind:
@@ -142,6 +265,7 @@ def classify_stage1_artifact(path: Path) -> Stage1ArtifactKind:
         | (names & {_ADAPTER_SAFE_FILENAME, _ADAPTER_BINARY_FILENAME})
         | ({SPARSE_TOKEN_ROWS_FILENAME} if SPARSE_TOKEN_ROWS_FILENAME in names else set())
         | (names & _NON_MODEL_BINARY_FILES)
+        | {name for name in names if _RANK_RNG_STATE.fullmatch(name)}
     )
     unknown_weights = sorted(
         name
@@ -177,6 +301,7 @@ def classify_stage1_artifact(path: Path) -> Stage1ArtifactKind:
         return Stage1ArtifactKind.PEFT
 
     if present_full:
+        _validate_full_serialization(directory, names)
         return Stage1ArtifactKind.FULL
     raise ValueError(
         f"unrecognized local Stage 1 artifact (missing model weights): {directory}"
@@ -263,7 +388,10 @@ class Stage1PeftMetadata:
     def from_dict(cls, payload: Mapping[str, object]) -> "Stage1PeftMetadata":
         if not isinstance(payload, Mapping):
             raise ValueError("Stage 1 PEFT metadata must be a JSON object")
-        if payload.get("schema_version") != STAGE1_PEFT_SCHEMA_VERSION:
+        if (
+            type(payload.get("schema_version")) is not int
+            or payload["schema_version"] != STAGE1_PEFT_SCHEMA_VERSION
+        ):
             raise ValueError(
                 "unsupported Stage 1 PEFT metadata schema: "
                 f"expected={STAGE1_PEFT_SCHEMA_VERSION}, "
@@ -783,7 +911,7 @@ def _validate_stage1_peft_runtime(
     rows = find_sparse_output_token_rows(candidate)
     if tuple(rows.token_ids.detach().cpu().tolist()) != validated.latent_token_ids:
         raise ValueError("sparse output-row latent token ID mismatch")
-    if tuple(rows.output_delta.shape) != validated.output_row_shape:
+    if tuple(_parameter_shape(rows.output_delta)) != validated.output_row_shape:
         raise ValueError("sparse output-row shape mismatch")
     validate_stage1_trainable_boundary(
         candidate, _metadata_tuning(validated), validated.latent_token_ids
@@ -869,6 +997,7 @@ def load_stage1_peft_artifact(
         )
 
     candidate.resize_token_embeddings(metadata.resized_vocab_size)
+    initialize_frozen_output_token_rows(candidate, metadata.latent_token_ids)
     _configure_latent_config(candidate.config, metadata)
     restored = PeftModel.from_pretrained(
         candidate, artifact, is_trainable=is_trainable
@@ -899,16 +1028,107 @@ class Stage1ResumeDecision:
     explicit: bool
 
 
-def _validated_resume_checkpoint(path: Path) -> Stage1ArtifactKind:
-    kind = classify_stage1_artifact(path)
-    if (
-        kind is Stage1ArtifactKind.PEFT
-        and _NUMBERED_CHECKPOINT.fullmatch(path.name) is None
-    ):
+def _is_regular_file(path: Path) -> bool:
+    return path.is_file() and not path.is_symlink()
+
+
+def _has_complete_rng_layout(path: Path) -> bool:
+    single = path / "rng_state.pth"
+    rank_files = {
+        int(match.group(1)): entry
+        for entry in path.iterdir()
+        if entry.is_file()
+        and (match := _RANK_RNG_STATE.fullmatch(entry.name))
+    }
+    if _is_regular_file(single):
+        return not rank_files
+    if single.exists() or not rank_files:
+        return False
+    return sorted(rank_files) == list(range(len(rank_files))) and all(
+        _is_regular_file(rank_file) for rank_file in rank_files.values()
+    )
+
+
+def _has_complete_standard_trainer_state(path: Path) -> bool:
+    return all(
+        _is_regular_file(path / filename)
+        for filename in ("trainer_state.json", "optimizer.pt", "scheduler.pt")
+    ) and _has_complete_rng_layout(path)
+
+
+def _has_complete_deepspeed_trainer_state(path: Path) -> bool:
+    latest = path / "latest"
+    if not _is_regular_file(latest):
+        return False
+    try:
+        if latest.stat().st_size > _MAX_DEEPSPEED_LATEST_BYTES:
+            return False
+        tag_name = latest.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return False
+    if _DEEPSPEED_TAG.fullmatch(tag_name) is None:
+        return False
+    tag = path / tag_name
+    if tag.is_symlink() or not tag.is_dir() or tag.resolve().parent != path.resolve():
+        return False
+
+    model_mp_ranks: set[int] = set()
+    optimizer_mp_ranks: set[int] = set()
+    for entry in tag.iterdir():
+        if entry.is_symlink():
+            return False
+        model_match = _DEEPSPEED_MODEL_STATE.fullmatch(entry.name)
+        optimizer_match = _DEEPSPEED_OPTIMIZER_STATE.fullmatch(entry.name)
+        if model_match is not None and entry.is_file():
+            model_mp_ranks.add(int(model_match.group(1)))
+        elif optimizer_match is not None and entry.is_file():
+            optimizer_mp_ranks.add(int(optimizer_match.group(1)))
+        elif entry.name.endswith("_states.pt"):
+            return False
+    return bool(model_mp_ranks) and model_mp_ranks == optimizer_mp_ranks
+
+
+def _validate_peft_resume_location(output_dir: Path, checkpoint: Path) -> None:
+    if checkpoint.is_symlink():
         raise ValueError(
-            f"Stage 1 adapter resume requires a numbered checkpoint: {path}"
+            f"Stage 1 adapter resume rejects symlink checkpoints: {checkpoint}"
         )
-    if not (path / "trainer_state.json").is_file():
+    output = output_dir.resolve()
+    if checkpoint.parent.resolve() != output or checkpoint.resolve().parent != output:
+        raise ValueError(
+            "Stage 1 adapter resume requires an immediate checkpoint in the "
+            f"same output directory: output={output_dir}, checkpoint={checkpoint}"
+        )
+
+
+def _validated_resume_checkpoint(
+    path: Path, *, output_dir: Path
+) -> Stage1ArtifactKind:
+    kind = classify_stage1_artifact(path)
+    if kind is Stage1ArtifactKind.PEFT:
+        if _NUMBERED_CHECKPOINT.fullmatch(path.name) is None:
+            raise ValueError(
+                f"Stage 1 adapter resume requires a numbered checkpoint: {path}"
+            )
+        _validate_peft_resume_location(output_dir, path)
+        if not _is_regular_file(path / "trainer_state.json"):
+            raise ValueError(
+                "Stage 1 adapter resume requires complete Trainer state; "
+                f"missing trainer_state.json: {path}"
+            )
+        if not _has_complete_rng_layout(path):
+            raise ValueError(
+                f"Stage 1 adapter resume has incomplete RNG state: {path}"
+            )
+        if not (
+            _has_complete_standard_trainer_state(path)
+            or _has_complete_deepspeed_trainer_state(path)
+        ):
+            raise ValueError(
+                "Stage 1 adapter resume requires complete optimizer/scheduler "
+                f"state or a complete DeepSpeed checkpoint: {path}"
+            )
+    elif not _is_regular_file(path / "trainer_state.json"):
         raise ValueError(f"Stage 1 resume is missing trainer_state.json: {path}")
     return kind
 
@@ -922,20 +1142,20 @@ def resolve_stage1_resume(
     output = Path(output_dir)
     if explicit_resume is not None:
         checkpoint = Path(explicit_resume)
-        kind = _validated_resume_checkpoint(checkpoint)
+        kind = _validated_resume_checkpoint(checkpoint, output_dir=output)
         return Stage1ResumeDecision(checkpoint, kind, True)
 
     if not output.is_dir():
         return Stage1ResumeDecision(None, None, False)
     candidates: list[tuple[int, Path, Stage1ArtifactKind]] = []
     for child in output.iterdir():
-        if not child.is_dir():
+        if child.is_symlink() or not child.is_dir():
             continue
         match = _NUMBERED_CHECKPOINT.fullmatch(child.name)
         if match is None:
             continue
         try:
-            kind = _validated_resume_checkpoint(child)
+            kind = _validated_resume_checkpoint(child, output_dir=output)
         except (OSError, ValueError):
             continue
         candidates.append((int(match.group(1)), child, kind))
