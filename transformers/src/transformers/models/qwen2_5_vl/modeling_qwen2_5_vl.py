@@ -2261,13 +2261,45 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 latent_image_embeds = latent_image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, latent_image_embeds)
             
-            # --- 处理 Latent Hidden States (Stage 2 Teacher Forcing) ---
+            # --- 处理预先计算的 Latent Hidden States ---
             elif latent_hidden_states is not None and not generate_mode:
-                latent_mask_2d = (input_ids == self.config.latent_token_id)
-                if image_out_mask is not None:
-                    latent_mask_2d = latent_mask_2d & image_out_mask.to(device=input_ids.device, dtype=torch.bool)
-                latent_mask = latent_mask_2d.unsqueeze(-1).expand_as(inputs_embeds)
-                inputs_embeds = inputs_embeds.masked_scatter(latent_mask, latent_hidden_states)
+                if image_out_mask is None:
+                    raise ValueError("image_out_mask must have shape [B, T]")
+                if not isinstance(image_out_mask, torch.Tensor):
+                    raise TypeError("image_out_mask must be a BoolTensor")
+                if tuple(image_out_mask.shape) != tuple(input_ids.shape):
+                    raise ValueError("image_out_mask must have shape [B, T]")
+                if image_out_mask.dtype != torch.bool:
+                    raise TypeError("image_out_mask must be a BoolTensor")
+                if not isinstance(latent_hidden_states, torch.Tensor):
+                    raise TypeError("latent_hidden_states must be a tensor")
+                if not latent_hidden_states.is_floating_point():
+                    raise TypeError(
+                        "latent_hidden_states must use a floating-point dtype"
+                    )
+                if latent_hidden_states.ndim != 2:
+                    raise ValueError(
+                        "latent_hidden_states must have shape [N, H]"
+                    )
+                expected = int(image_out_mask.sum().item())
+                if latent_hidden_states.shape[0] != expected:
+                    raise ValueError(
+                        f"latent_hidden_states rows ({latent_hidden_states.shape[0]}) "
+                        f"must equal true image_out_mask entries ({expected})"
+                    )
+                if latent_hidden_states.shape[1] != inputs_embeds.shape[-1]:
+                    raise ValueError(
+                        "latent_hidden_states hidden width must match input embeddings"
+                    )
+                latent_mask = image_out_mask.to(
+                    device=inputs_embeds.device
+                ).unsqueeze(-1)
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    latent_mask,
+                    latent_hidden_states.to(
+                        device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                    ),
+                )
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
