@@ -110,7 +110,7 @@ def resolve_stage2_qwen_model(model: nn.Module) -> nn.Module:
 
 
 def _stage2_adapter_target_names(
-    model: nn.Module, qwen: nn.Module
+    model: nn.Module, qwen: nn.Module, tuning: Stage2TuningConfig
 ) -> tuple[str, ...]:
     if not isinstance(model, PeftModel):
         raise ValueError("Stage 2 PEFT tuning requires a PeftModel")
@@ -118,6 +118,22 @@ def _stage2_adapter_target_names(
     config = model.peft_config["default"]
     target_names = tuple(config.target_modules)
     modules = dict(qwen.named_modules())
+    unapproved = sorted(
+        name
+        for name in target_names
+        if name.rsplit(".", 1)[-1] not in ALLOWED_STAGE2_TARGET_SUFFIXES
+    )
+    if unapproved:
+        raise ValueError(f"unapproved Stage 2 decoder targets: {unapproved}")
+
+    requested = normalize_stage2_target_modules(tuning.target_modules)
+    expected_targets = {
+        name
+        for name, module in modules.items()
+        if name.startswith("model.layers.")
+        and name.rsplit(".", 1)[-1] in requested
+        and isinstance(getattr(module, "base_layer", module), torch.nn.Linear)
+    }
     if (
         not target_names
         or config.modules_to_save is not None
@@ -125,6 +141,8 @@ def _stage2_adapter_target_names(
         or any(name not in modules or not hasattr(modules[name], "lora_A") for name in target_names)
     ):
         raise ValueError("Stage 2 PEFT adapter targets must be decoder LoRA modules")
+    if set(target_names) != expected_targets:
+        raise ValueError("loaded adapter targets do not match Stage 2 tuning")
     return target_names
 
 
@@ -146,7 +164,7 @@ def validate_stage2_parameter_boundary(
                 raise ValueError(f"{label} parameter is trainable: {name}")
 
     if tuning.is_peft:
-        resolved_target_names = _stage2_adapter_target_names(model, qwen)
+        resolved_target_names = _stage2_adapter_target_names(model, qwen, tuning)
         config = model.peft_config["default"]
         if config.use_dora is not tuning.use_dora:
             raise ValueError("Stage 2 PEFT adapter method does not match tuning")
@@ -212,6 +230,8 @@ def build_stage2_tuned_model(
         wrapped = PeftModel.from_pretrained(
             model, str(adapter_path), is_trainable=is_trainable
         )
+    if not is_trainable:
+        wrapped.requires_grad_(False)
     validate_stage2_parameter_boundary(
         wrapped, tuning, expect_trainable=is_trainable
     )

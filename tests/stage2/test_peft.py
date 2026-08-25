@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from peft import LoraConfig, get_peft_model
 from torch import nn
 
 from helpers import tiny_stage2_qwen
@@ -134,15 +135,11 @@ def test_parameter_boundary_fails_if_visual_is_reenabled():
         validate_stage2_parameter_boundary(wrapped, lora_settings())
 
 
-def test_inference_boundary_requires_frozen_adapter_parameters():
-    """Catches inference validation accepting a trainable adapter or no topology."""
-    loaded = build_stage2_tuned_model(tiny_stage2_qwen(), lora_settings())
-    with pytest.raises(ValueError, match="inference model has trainable parameters"):
-        validate_stage2_parameter_boundary(
-            loaded, lora_settings(), expect_trainable=False
-        )
-
-    loaded.requires_grad_(False)
+def test_fresh_inference_adapter_is_constructed_with_frozen_parameters():
+    """Catches fresh inference construction leaving LoRA parameters trainable."""
+    loaded = build_stage2_tuned_model(
+        tiny_stage2_qwen(), lora_settings(), is_trainable=False
+    )
     report = validate_stage2_parameter_boundary(
         loaded, lora_settings(), expect_trainable=False
     )
@@ -150,6 +147,82 @@ def test_inference_boundary_requires_frozen_adapter_parameters():
     assert report.trainable_parameters == 0
     assert report.resolved_target_names
     assert all(name.startswith("model.layers.") for name in report.resolved_target_names)
+
+
+def test_loaded_inference_adapter_is_frozen_and_matches_tuning(tmp_path):
+    """Catches loading that bypasses inference freezing or target validation."""
+    trained = build_stage2_tuned_model(tiny_stage2_qwen(), lora_settings())
+    with pytest.warns(UserWarning, match="Could not find a config file"):
+        trained.save_pretrained(tmp_path)
+
+    loaded = build_stage2_tuned_model(
+        tiny_stage2_qwen(),
+        lora_settings(),
+        adapter_path=tmp_path,
+        is_trainable=False,
+    )
+    report = validate_stage2_parameter_boundary(
+        loaded, lora_settings(), expect_trainable=False
+    )
+
+    assert report.trainable_parameters == 0
+    assert report.resolved_target_names == tuple(
+        loaded.peft_config["default"].target_modules
+    )
+
+
+def test_loaded_adapter_rejects_unapproved_decoder_linear_target(tmp_path):
+    """Catches a loaded adapter targeting a non-approved decoder projection."""
+    target_name = "model.layers.0.unapproved_proj"
+    source = tiny_stage2_qwen()
+    source.model.layers[0].add_module("unapproved_proj", nn.Linear(8, 8))
+    adapter = get_peft_model(
+        source,
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            target_modules=[target_name],
+            bias="none",
+            task_type="CAUSAL_LM",
+        ),
+    )
+    with pytest.warns(UserWarning, match="Could not find a config file"):
+        adapter.save_pretrained(tmp_path)
+
+    base = tiny_stage2_qwen()
+    base.model.layers[0].add_module("unapproved_proj", nn.Linear(8, 8))
+    with pytest.raises(ValueError, match="unapproved Stage 2 decoder targets"):
+        build_stage2_tuned_model(
+            base,
+            lora_settings(),
+            adapter_path=tmp_path,
+            is_trainable=False,
+        )
+
+
+def test_loaded_adapter_rejects_targets_that_do_not_match_tuning(tmp_path):
+    """Catches a loaded adapter whose approved targets differ from the request."""
+    source = tiny_stage2_qwen()
+    adapter = get_peft_model(
+        source,
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            target_modules=["model.layers.0.self_attn.q_proj"],
+            bias="none",
+            task_type="CAUSAL_LM",
+        ),
+    )
+    with pytest.warns(UserWarning, match="Could not find a config file"):
+        adapter.save_pretrained(tmp_path)
+
+    with pytest.raises(ValueError, match="do not match Stage 2 tuning"):
+        build_stage2_tuned_model(
+            tiny_stage2_qwen(),
+            lora_settings(),
+            adapter_path=tmp_path,
+            is_trainable=False,
+        )
 
 
 def test_full_tuning_keeps_the_vision_tower_frozen_but_trains_language():
