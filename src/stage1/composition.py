@@ -378,9 +378,13 @@ def build_stage1_training_components(
     )
     checkpoint = decision.checkpoint_path
     metadata = None
-    metadata_snapshot = None
+    metadata_snapshot = decision.peft_metadata_snapshot
     if decision.artifact_kind is Stage1ArtifactKind.PEFT:
-        metadata_snapshot = dependencies.load_peft_metadata(checkpoint)
+        if metadata_snapshot is None:
+            raise ValueError(
+                "Stage 1 PEFT resume decision is missing its classified "
+                "metadata snapshot"
+            )
         metadata = dependencies.decode_peft_metadata(metadata_snapshot)
     _validate_resume_tuning(decision, tuning, metadata) if checkpoint else None
     if metadata is not None:

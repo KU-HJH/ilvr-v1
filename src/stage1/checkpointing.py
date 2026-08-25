@@ -266,8 +266,12 @@ def _validate_full_serialization(directory: Path, names: set[str]) -> None:
 def _classify_stage1_artifact_with_metadata(
     path: Path,
     *,
-    metadata: Stage1PeftMetadata | None = None,
-) -> tuple[Stage1ArtifactKind, Stage1PeftMetadata | None]:
+    metadata_snapshot: Stage1PeftMetadataSnapshot | None = None,
+) -> tuple[
+    Stage1ArtifactKind,
+    Stage1PeftMetadata | None,
+    Stage1PeftMetadataSnapshot | None,
+]:
     """Classify one local artifact from filenames and a strict PEFT sidecar.
 
     Classification deliberately performs no model/config ``from_pretrained``
@@ -326,18 +330,28 @@ def _classify_stage1_artifact_with_metadata(
             raise ValueError(
                 "incomplete Stage 1 PEFT artifact: missing " + ", ".join(labels)
             )
-        validated_metadata = (
-            load_stage1_peft_metadata(directory)
-            if metadata is None
-            else Stage1PeftMetadata.from_dict(metadata.to_dict())
+        artifact = _canonical_artifact_dir(directory)
+        if metadata_snapshot is None:
+            metadata_snapshot = read_stage1_peft_metadata_snapshot(artifact)
+        elif not isinstance(metadata_snapshot, Stage1PeftMetadataSnapshot):
+            raise TypeError(
+                "metadata_snapshot must be a Stage1PeftMetadataSnapshot"
+            )
+        if metadata_snapshot.artifact_dir != artifact:
+            raise ValueError(
+                "Stage 1 PEFT metadata snapshot artifact mismatch: "
+                f"snapshot={metadata_snapshot.artifact_dir}, requested={artifact}"
+            )
+        validated_metadata = decode_stage1_peft_metadata_snapshot(
+            metadata_snapshot
         )
-        return Stage1ArtifactKind.PEFT, validated_metadata
+        return Stage1ArtifactKind.PEFT, validated_metadata, metadata_snapshot
 
     if present_full:
         _validate_full_serialization(directory, names)
-        if metadata is not None:
+        if metadata_snapshot is not None:
             raise ValueError("full Stage 1 artifact cannot use PEFT metadata")
-        return Stage1ArtifactKind.FULL, None
+        return Stage1ArtifactKind.FULL, None, None
     raise ValueError(
         f"unrecognized local Stage 1 artifact (missing model weights): {directory}"
     )
@@ -583,6 +597,19 @@ class Stage1PeftMetadataSnapshot:
 
     artifact_dir: Path
     metadata_json: bytes
+
+
+@dataclass(frozen=True)
+class Stage1ArtifactInspection:
+    """One classified artifact with any already-read immutable PEFT sidecar."""
+
+    artifact_kind: Stage1ArtifactKind
+    peft_metadata_snapshot: Stage1PeftMetadataSnapshot | None
+
+
+def _inspect_stage1_artifact(path: Path) -> Stage1ArtifactInspection:
+    kind, _, metadata_snapshot = _classify_stage1_artifact_with_metadata(path)
+    return Stage1ArtifactInspection(kind, metadata_snapshot)
 
 
 def _canonical_artifact_dir(directory: Path) -> Path:
@@ -1157,12 +1184,13 @@ def preflight_stage1_peft_artifact(
             "Stage 1 PEFT metadata snapshot artifact mismatch: "
             f"snapshot={metadata_snapshot.artifact_dir}, requested={artifact}"
         )
-    validated_metadata = decode_stage1_peft_metadata_snapshot(metadata_snapshot)
-    kind, validated = _classify_stage1_artifact_with_metadata(
-        artifact, metadata=validated_metadata
+    kind, validated, classified_snapshot = _classify_stage1_artifact_with_metadata(
+        artifact, metadata_snapshot=metadata_snapshot
     )
     if kind is not Stage1ArtifactKind.PEFT or validated is None:
         raise ValueError("Stage 1 PEFT preflight requires a PEFT artifact")
+    if classified_snapshot is not metadata_snapshot:
+        raise ValueError("Stage 1 PEFT preflight did not retain metadata snapshot")
     if validated.peft_version != peft.__version__:
         raise ValueError(
             "Stage 1 PEFT version mismatch: "
@@ -1312,6 +1340,7 @@ class Stage1ResumeDecision:
     checkpoint_path: Path | None
     artifact_kind: Stage1ArtifactKind | None
     explicit: bool
+    peft_metadata_snapshot: Stage1PeftMetadataSnapshot | None = None
 
 
 def _is_regular_file(path: Path) -> bool:
@@ -1526,16 +1555,16 @@ def _validate_peft_resume_location(output_dir: Path, checkpoint: Path) -> None:
 
 def _validated_resume_checkpoint(
     path: Path, *, output_dir: Path
-) -> Stage1ArtifactKind:
-    kind = classify_stage1_artifact(path)
-    if kind is Stage1ArtifactKind.PEFT:
+) -> Stage1ArtifactInspection:
+    inspection = _inspect_stage1_artifact(path)
+    if inspection.artifact_kind is Stage1ArtifactKind.PEFT:
         if _NUMBERED_CHECKPOINT.fullmatch(path.name) is None:
             raise ValueError(
                 f"Stage 1 adapter resume requires a numbered checkpoint: {path}"
             )
         _validate_peft_resume_location(output_dir, path)
     _validate_complete_trainer_state(path)
-    return kind
+    return inspection
 
 
 def resolve_stage1_resume(
@@ -1547,12 +1576,17 @@ def resolve_stage1_resume(
     output = Path(output_dir)
     if explicit_resume is not None:
         checkpoint = Path(explicit_resume)
-        kind = _validated_resume_checkpoint(checkpoint, output_dir=output)
-        return Stage1ResumeDecision(checkpoint, kind, True)
+        inspection = _validated_resume_checkpoint(checkpoint, output_dir=output)
+        return Stage1ResumeDecision(
+            checkpoint,
+            inspection.artifact_kind,
+            True,
+            inspection.peft_metadata_snapshot,
+        )
 
     if not output.is_dir():
         return Stage1ResumeDecision(None, None, False)
-    candidates: list[tuple[int, Path, Stage1ArtifactKind]] = []
+    candidates: list[tuple[int, Path, Stage1ArtifactInspection]] = []
     for child in output.iterdir():
         if child.is_symlink() or not child.is_dir():
             continue
@@ -1560,14 +1594,19 @@ def resolve_stage1_resume(
         if match is None:
             continue
         try:
-            kind = _validated_resume_checkpoint(child, output_dir=output)
+            inspection = _validated_resume_checkpoint(child, output_dir=output)
         except (OSError, ValueError):
             continue
-        candidates.append((int(match.group(1)), child, kind))
+        candidates.append((int(match.group(1)), child, inspection))
     if not candidates:
         return Stage1ResumeDecision(None, None, False)
-    _, checkpoint, kind = max(candidates, key=lambda item: item[0])
-    return Stage1ResumeDecision(checkpoint, kind, False)
+    _, checkpoint, inspection = max(candidates, key=lambda item: item[0])
+    return Stage1ResumeDecision(
+        checkpoint,
+        inspection.artifact_kind,
+        False,
+        inspection.peft_metadata_snapshot,
+    )
 
 
 __all__ = [

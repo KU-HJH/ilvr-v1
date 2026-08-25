@@ -3,11 +3,26 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
+import peft
 import pytest
 import torch
 from torch import nn
+from transformers import Qwen2_5_VLConfig
 
-from stage1.checkpointing import Stage1ArtifactKind, Stage1ResumeDecision
+from peft_common import capture_qwen2_5_vl_architecture
+from stage1.checkpointing import (
+    STAGE1_PEFT_METADATA_FILENAME,
+    STAGE1_PEFT_SCHEMA_VERSION,
+    STAGE1_REPOSITORY_FORMAT_VERSION,
+    Stage1ArtifactKind,
+    Stage1PeftMetadata,
+    Stage1PeftMetadataSnapshot,
+    Stage1ResumeDecision,
+    decode_stage1_peft_metadata_snapshot,
+    read_stage1_peft_metadata_snapshot,
+    resolve_stage1_resume,
+    save_stage1_peft_metadata,
+)
 from stage1.composition import (
     DEFAULT_STAGE1_DEPENDENCIES,
     LATENT_TOKEN_STRINGS,
@@ -120,6 +135,107 @@ def stage1_args(tmp_path, *extra, method="dora"):
     )
 
 
+def _write_peft_resume_checkpoint(args, *, step=9):
+    checkpoint = Path(args.save_model_path) / f"checkpoint-{step}"
+    checkpoint.mkdir(parents=True)
+    architecture_config = Qwen2_5_VLConfig(
+        vocab_size=12,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vision_config={
+            "depth": 1,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_heads": 2,
+            "patch_size": 2,
+            "spatial_merge_size": 1,
+            "temporal_patch_size": 1,
+            "window_size": 2,
+            "out_hidden_size": 8,
+            "fullatt_block_indexes": [0],
+        },
+        image_token_id=5,
+        vision_start_token_id=6,
+        vision_end_token_id=7,
+        video_token_id=8,
+        rope_scaling={"type": "mrope", "mrope_section": [1, 1, 0]},
+    )
+    target_suffixes = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
+    owners = {
+        "q_proj": "self_attn",
+        "k_proj": "self_attn",
+        "v_proj": "self_attn",
+        "o_proj": "self_attn",
+        "gate_proj": "mlp",
+        "up_proj": "mlp",
+        "down_proj": "mlp",
+    }
+    metadata = Stage1PeftMetadata(
+        schema_version=STAGE1_PEFT_SCHEMA_VERSION,
+        stage="stage1",
+        base_model_reference=args.model,
+        base_model_architecture=capture_qwen2_5_vl_architecture(
+            architecture_config
+        ),
+        base_vocab_size=12,
+        resized_vocab_size=15,
+        latent_token_ids=(12, 13, 14),
+        latent_token_strings=LATENT_TOKEN_STRINGS,
+        latent_size=args.latent_size,
+        ce_weight=args.ce_weight,
+        sim_weight=args.sim_weight,
+        coverage_p=args.coverage_p,
+        image_pool_k=args.image_pool_k,
+        tuning_method="dora",
+        rank=32,
+        alpha=64,
+        dropout=0.05,
+        requested_target_suffixes=target_suffixes,
+        resolved_target_names=tuple(
+            f"model.layers.0.{owners[suffix]}.{suffix}"
+            for suffix in target_suffixes
+        ),
+        input_row_format="peft_trainable_tokens_v1",
+        output_row_format="ilvr_sparse_output_rows_v1",
+        output_row_shape=(3, 8),
+        peft_version=peft.__version__,
+        repository_format_version=STAGE1_REPOSITORY_FORMAT_VERSION,
+    )
+    for filename in (
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors",
+        "trainer_state.json",
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state.pth",
+    ):
+        (checkpoint / filename).write_bytes(b"fixture")
+    save_stage1_peft_metadata(checkpoint, metadata)
+    processor = RecordingProcessor(RecordingTokenizer(size=12))
+    for token, token_id in zip(LATENT_TOKEN_STRINGS, (12, 13, 14)):
+        processor.tokenizer.vocab[token] = token_id
+    return checkpoint, metadata, processor
+
+
+def _fake_metadata_snapshot(checkpoint):
+    return Stage1PeftMetadataSnapshot(
+        artifact_dir=Path(checkpoint).resolve(),
+        metadata_json=b"test-owned immutable metadata",
+    )
+
+
 def fake_dependencies(events, *, decision=None, processor=None, metadata=None):
     decision = decision or Stage1ResumeDecision(None, None, False)
     processor = processor or RecordingProcessor()
@@ -213,6 +329,86 @@ def fake_dependencies(events, *, decision=None, processor=None, metadata=None):
     ), processor, model, parameter_report
 
 
+@pytest.mark.parametrize("explicit", [True, False])
+def test_real_peft_resume_reuses_classification_metadata_snapshot_through_preflight(
+    tmp_path, monkeypatch, explicit
+):
+    """Catches composition reopening the selected PEFT metadata after resolve."""
+    args = stage1_args(tmp_path)
+    checkpoint, metadata, processor = _write_peft_resume_checkpoint(args)
+    if explicit:
+        args.resume_from_checkpoint_path = str(checkpoint)
+    metadata_path = checkpoint / STAGE1_PEFT_METADATA_FILENAME
+    witnessed_bytes = metadata_path.read_bytes()
+    metadata_reads = []
+    real_read_bytes = Path.read_bytes
+
+    def count_metadata_read(path):
+        if path == metadata_path:
+            metadata_reads.append(path)
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", count_metadata_read)
+    events = []
+    deps, _, _, _ = fake_dependencies(
+        events, processor=processor, metadata=metadata
+    )
+    real_load_processor = deps.load_processor
+    real_preflight = deps.preflight_peft
+    preflight_snapshots = []
+
+    def mutate_metadata_after_resolve(source, **kwargs):
+        metadata_path.write_bytes(b'{"schema_version":999}\n')
+        return real_load_processor(source, **kwargs)
+
+    def inspect_preflight(selected_processor, selected_config, path, **kwargs):
+        snapshot = kwargs["metadata_snapshot"]
+        preflight_snapshots.append(snapshot)
+        assert snapshot.metadata_json == witnessed_bytes
+        assert decode_stage1_peft_metadata_snapshot(snapshot) == metadata
+        return real_preflight(
+            selected_processor, selected_config, path, **kwargs
+        )
+
+    deps = replace(
+        deps,
+        resolve_resume=resolve_stage1_resume,
+        load_processor=mutate_metadata_after_resolve,
+        load_peft_metadata=read_stage1_peft_metadata_snapshot,
+        decode_peft_metadata=decode_stage1_peft_metadata_snapshot,
+        preflight_peft=inspect_preflight,
+    )
+
+    bundle = build_stage1_training_components(args, dependencies=deps)
+
+    assert metadata_reads == [metadata_path]
+    assert bundle.resume_decision.peft_metadata_snapshot is preflight_snapshots[0]
+    assert preflight_snapshots[0].artifact_dir == checkpoint.resolve()
+    assert bundle.trainer.kwargs["stage1_peft_metadata"] == metadata
+
+
+def test_real_explicit_resume_rejects_malformed_metadata_before_large_load(
+    tmp_path,
+):
+    """Catches malformed PEFT metadata surviving classification into loading."""
+    args = stage1_args(tmp_path)
+    checkpoint, metadata, processor = _write_peft_resume_checkpoint(args)
+    args.resume_from_checkpoint_path = str(checkpoint)
+    (checkpoint / STAGE1_PEFT_METADATA_FILENAME).write_bytes(
+        b'{"schema_version":999}\n'
+    )
+    events = []
+    deps, _, _, _ = fake_dependencies(
+        events, processor=processor, metadata=metadata
+    )
+    deps = replace(deps, resolve_resume=resolve_stage1_resume)
+
+    with pytest.raises(ValueError, match="schema|fields"):
+        build_stage1_training_components(args, dependencies=deps)
+
+    assert not any(event[0] in {"processor", "model"} for event in events)
+
+
 def test_fresh_dora_composition_adds_tokens_once_and_propagates_runtime_args(tmp_path):
     """Catches repeated token remapping and hidden Stage 1 Trainer constants."""
     events = []
@@ -267,7 +463,14 @@ def test_resume_composition_preserves_checkpoint_token_ids_without_readding(
 ):
     """Catches Stage 1 resume re-adding or remapping latent vocabulary rows."""
     checkpoint = tmp_path / "output" / "checkpoint-9"
-    decision = Stage1ResumeDecision(checkpoint, kind, True)
+    decision = Stage1ResumeDecision(
+        checkpoint,
+        kind,
+        True,
+        _fake_metadata_snapshot(checkpoint)
+        if kind is Stage1ArtifactKind.PEFT
+        else None,
+    )
     processor = RecordingProcessor(RecordingTokenizer(size=12))
     for token, token_id in zip(LATENT_TOKEN_STRINGS, (12, 13, 14)):
         processor.tokenizer.vocab[token] = token_id
@@ -347,7 +550,10 @@ def test_peft_resume_rejects_semantic_mismatch_before_any_large_load(
     """Catches checkpoint-owned loss/model semantics changing on resume."""
     checkpoint = tmp_path / "output" / "checkpoint-9"
     decision = Stage1ResumeDecision(
-        checkpoint, Stage1ArtifactKind.PEFT, True
+        checkpoint,
+        Stage1ArtifactKind.PEFT,
+        True,
+        _fake_metadata_snapshot(checkpoint),
     )
     metadata_values = {
         "base_model_reference": "Qwen/Qwen2.5-VL-3B-Instruct",
@@ -396,7 +602,10 @@ def test_peft_artifact_preflight_failure_prevents_large_model_load(
     """Catches composition loading base weights before artifact validation."""
     checkpoint = tmp_path / "output" / "checkpoint-9"
     decision = Stage1ResumeDecision(
-        checkpoint, Stage1ArtifactKind.PEFT, True
+        checkpoint,
+        Stage1ArtifactKind.PEFT,
+        True,
+        _fake_metadata_snapshot(checkpoint),
     )
     processor = RecordingProcessor(RecordingTokenizer(size=12))
     for token, token_id in zip(LATENT_TOKEN_STRINGS, (12, 13, 14)):
