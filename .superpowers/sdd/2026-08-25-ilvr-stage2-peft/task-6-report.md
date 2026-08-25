@@ -224,3 +224,108 @@ already owns the correct continuous-latent recurrence.
   fixtures and does not affect the 77 passing assertions.
 - The repository tracks several `.pyc` files under `src/__pycache__`; they were
   preserved unchanged and are unrelated to Task 6.
+
+## Review Fix Round 1: Narrow FlashAttention Fallback Classification
+
+### Review Finding and Root Cause
+
+The reviewer reported that both evaluation classifiers treated any exception
+chain containing a FlashAttention spelling as a backend-initialization error.
+A direct probe reproduced the false positives in both modules:
+
+```text
+True  No such checkpoint: /checkpoints/flashattention-experiment/missing
+True  Malformed config: attn_implementation=flash_attention_2
+True  Flash Attention 2 is unavailable
+```
+
+The classifier had only one condition: a FlashAttention identifier. It had no
+independent signal that the exception described availability, import/install,
+support, device, dtype, or backend initialization. Consequently unrelated
+errors triggered a second potentially expensive eager model load.
+
+### RED
+
+The existing behavioral test was parameterized across both entry points and
+six false-positive families: missing checkpoint path, unknown model ID,
+metadata mismatch, latent-token mismatch, adapter mismatch, and malformed
+configuration. Every message deliberately includes a FlashAttention spelling.
+The test requires the original exception object to propagate and the external
+model loader to be called exactly once.
+
+Command:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" \
+  ./venv/ilvr-venv/bin/pytest tests/stage2/test_eval_integration.py -q \
+  -k 'non_backend_model_error or flash_backend_initialization_error'
+```
+
+Result before the production change:
+
+```text
+12 failed, 2 passed, 31 deselected in 4.24s
+```
+
+All 12 failures showed the unwanted call sequence:
+
+```text
+['flash_attention_2', 'eager']
+```
+
+The two real positive cases, using `Flash Attention 2 is unavailable`, already
+passed and remained the preservation boundary.
+
+### Minimal GREEN
+
+Both classifiers now require two independently detected conditions while
+walking the exception chain:
+
+1. a recognized FlashAttention identifier, including the spaced spelling;
+2. recognized initialization-failure language covering availability,
+   import/install, support/compatibility, CUDA/GPU placement, dtype, or backend
+   initialization.
+
+The surrounding broad catch, re-raise behavior, eager retry, model load
+arguments, and all adapter-loading semantics were left unchanged.
+
+Focused RED-selection result after the change:
+
+```text
+14 passed, 31 deselected in 4.37s
+```
+
+### Focused Final Verification
+
+Per controller direction, only the focused evaluation integration file was run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" \
+  ./venv/ilvr-venv/bin/pytest tests/stage2/test_eval_integration.py -q
+```
+
+Result:
+
+```text
+45 passed, 6 warnings in 4.65s
+```
+
+`git diff --check` also passed.
+
+### Review-Fix Self-Review
+
+- A FlashAttention spelling alone can no longer authorize eager fallback.
+- Missing paths/model IDs and metadata/token/adapter/config mismatches propagate
+  by object identity after exactly one load attempt.
+- The real positive `Flash Attention 2 is unavailable` spelling still retries
+  eager in both entry points.
+- Local Transformers initialization messages for unsupported models, missing
+  installs/imports, unavailable CUDA, unsupported dtype, and CPU/disk dispatch
+  are covered by the recognized second-signal vocabulary.
+- The change is identical in both entry points and does not modify their catch
+  boundaries, Qwen loading arguments, PEFT validation order, adapter attachment,
+  controller resolution, or inference recurrence.
+- No broad suite was rerun, in accordance with the focused-validation request
+  and the repository's stop-redundant-verification policy.

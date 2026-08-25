@@ -339,16 +339,39 @@ def test_peft_eval_requires_base_before_loading_or_iterating(
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize(
+    "error_type,error_message",
+    [
+        (
+            FileNotFoundError,
+            "checkpoint /checkpoints/flashattention-experiment/missing does not exist",
+        ),
+        (ValueError, "unknown model ID flash_attention_2-experiment"),
+        (ValueError, "FlashAttention metadata mismatch"),
+        (ValueError, "Flash Attention latent token mismatch"),
+        (ValueError, "flash-attention adapter mismatch"),
+        (ValueError, "malformed config: attn_implementation=flash_attention_2"),
+    ],
+    ids=(
+        "missing-path",
+        "model-id",
+        "metadata",
+        "token",
+        "adapter",
+        "malformed-config",
+    ),
+)
 def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
-    module_name, monkeypatch
+    module_name, error_type, error_message, monkeypatch
 ):
     """Retrying metadata/config errors as eager attention must fail this test."""
     module = _import_entry_point(module_name, monkeypatch)
     calls = []
+    original_error = error_type(error_message)
 
     def fail_load(_source, **kwargs):
         calls.append(kwargs["attn_implementation"])
-        raise ValueError("adapter metadata mismatch")
+        raise original_error
 
     monkeypatch.setattr(
         module.Qwen2_5_VLForConditionalGeneration,
@@ -356,8 +379,9 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
         fail_load,
     )
 
-    with pytest.raises(ValueError, match="adapter metadata mismatch"):
+    with pytest.raises(error_type, match=error_message) as raised:
         module.load_model("model", "cache")
+    assert raised.value is original_error
     assert calls == ["flash_attention_2"]
 
 

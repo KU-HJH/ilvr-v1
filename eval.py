@@ -87,10 +87,12 @@ def load_processor(model_dir: str, cache_dir: str):
 
 
 def _is_flash_attention_initialization_error(error: Exception) -> bool:
+    has_flash_attention_identifier = False
+    has_initialization_failure = False
     current = error
     while current is not None:
         message = str(current).lower()
-        if any(
+        has_flash_attention_identifier |= any(
             marker in message
             for marker in (
                 "flashattention",
@@ -98,7 +100,38 @@ def _is_flash_attention_initialization_error(error: Exception) -> bool:
                 "flash_attention",
                 "flash-attention",
             )
-        ):
+        )
+        has_initialization_failure |= any(
+            marker in message
+            for marker in (
+                "unavailable",
+                "not available",
+                "cannot be used",
+                "cannot import",
+                "failed to import",
+                "no module named",
+                "not installed",
+                "please install",
+                "does not support",
+                "not supported",
+                "only supports",
+                "not compatible",
+                "cuda device",
+                "not initialized on gpu",
+                "not initialized on cuda",
+                "dispatched on cpu",
+                "dispatched on disk",
+                "torch dtype",
+                "dtype",
+                "backend initialization",
+                "backend initialisation",
+                "initialization failed",
+                "initialisation failed",
+                "failed to initialize",
+                "failed to initialise",
+            )
+        )
+        if has_flash_attention_identifier and has_initialization_failure:
             return True
         current = current.__cause__ or current.__context__
     return False
