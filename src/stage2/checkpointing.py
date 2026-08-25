@@ -7,11 +7,11 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import peft
-from peft import PeftConfig
+from peft import PeftConfig, PeftModel
 from safetensors import safe_open
 from torch import nn
 
-from .peft import Stage2TuningConfig, resolve_stage2_qwen_model
+from .peft import Stage2TuningConfig, resolve_stage2_target_module_names
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
     validate_stage2_config,
@@ -48,6 +48,7 @@ class Stage2PeftMetadata:
         payload["resolved_target_module_names"] = list(
             self.resolved_target_module_names
         )
+        type(self).from_dict(payload)
         return payload
 
     @classmethod
@@ -207,6 +208,45 @@ def load_stage2_peft_metadata(directory: str | Path) -> Stage2PeftMetadata:
     return Stage2PeftMetadata.from_dict(payload)
 
 
+def _resolve_stage1_qwen_base(base_model):
+    """Require the unmodified full Stage 1 Qwen base used before PEFT loading."""
+    candidate = getattr(base_model, "module", base_model)
+    if isinstance(candidate, PeftModel):
+        raise ValueError("Stage 1 PEFT-only base is not supported")
+    required = (
+        "prepare_stage2_base_inputs_embeds",
+        "get_rope_index",
+        "stage2_rollout_engine",
+        "model",
+        "lm_head",
+    )
+    if (
+        any(not hasattr(candidate, attribute) for attribute in required)
+        or getattr(getattr(candidate, "config", None), "stage", None) != "stage1"
+    ):
+        raise TypeError("model does not satisfy the Stage 1 Qwen interface")
+    return candidate
+
+
+def _expected_qwen_projection_weight_shape(config, suffix: str) -> tuple[int, int]:
+    hidden_size = int(config.hidden_size)
+    intermediate_size = int(config.intermediate_size)
+    attention_heads = int(config.num_attention_heads)
+    key_value_heads = int(config.num_key_value_heads)
+    head_dim = getattr(config, "head_dim", None) or hidden_size // attention_heads
+    attention_width = attention_heads * int(head_dim)
+    key_value_width = key_value_heads * int(head_dim)
+    return {
+        "q_proj": (attention_width, hidden_size),
+        "k_proj": (key_value_width, hidden_size),
+        "v_proj": (key_value_width, hidden_size),
+        "o_proj": (hidden_size, attention_width),
+        "gate_proj": (intermediate_size, hidden_size),
+        "up_proj": (intermediate_size, hidden_size),
+        "down_proj": (hidden_size, intermediate_size),
+    }[suffix]
+
+
 def validate_stage2_peft_compatibility(
     base_model,
     tokenizer,
@@ -215,7 +255,7 @@ def validate_stage2_peft_compatibility(
     adapter_path: str | Path,
 ) -> None:
     """Validate a relocated base against adapter metadata without reading weights."""
-    qwen = resolve_stage2_qwen_model(base_model)
+    qwen = _resolve_stage1_qwen_base(base_model)
     config = qwen.config
     token_ids = resolve_latent_token_ids(tokenizer, config)
     for field, actual in (
@@ -254,6 +294,19 @@ def validate_stage2_peft_compatibility(
     peft_type_value = getattr(peft_type, "value", peft_type)
     if peft_type_value != "LORA":
         raise ValueError(f"adapter method mismatch: unsupported peft_type={peft_type}")
+    if getattr(adapter_config, "use_rslora", None) is not False:
+        raise ValueError("Stage 2 adapters require use_rslora=False")
+    for pattern_name in ("rank_pattern", "alpha_pattern"):
+        if getattr(adapter_config, pattern_name, None):
+            raise ValueError(f"Stage 2 adapters do not support {pattern_name}")
+    task_type = getattr(adapter_config, "task_type", None)
+    task_type_value = getattr(task_type, "value", task_type)
+    if task_type_value != "CAUSAL_LM":
+        raise ValueError(
+            f"Stage 2 adapters require task_type=CAUSAL_LM, got {task_type}"
+        )
+    if getattr(adapter_config, "bias", None) != "none":
+        raise ValueError("Stage 2 adapters require bias=none")
 
     for label, attribute, expected in (
         ("rank", "r", metadata.lora_r),
@@ -282,13 +335,24 @@ def validate_stage2_peft_compatibility(
     )
     if set(suffixes) != set(metadata.requested_target_modules):
         raise ValueError("adapter requested targets do not match metadata")
+    current_resolved_targets = resolve_stage2_target_module_names(
+        qwen, metadata.requested_target_modules
+    )
+    if current_resolved_targets != metadata.resolved_target_module_names:
+        raise ValueError(
+            "resolved target topology mismatch: "
+            f"checkpoint={metadata.resolved_target_module_names}, "
+            f"base={current_resolved_targets}"
+        )
 
-    hidden_size = getattr(config, "hidden_size", None)
     for target in metadata.resolved_target_module_names:
-        if modules[target].in_features != hidden_size:
+        suffix = target.rsplit(".", 1)[-1]
+        expected_shape = _expected_qwen_projection_weight_shape(config, suffix)
+        actual_shape = tuple(modules[target].weight.shape)
+        if actual_shape != expected_shape:
             raise ValueError(
-                f"hidden size mismatch at {target}: "
-                f"config={hidden_size}, target={modules[target].in_features}"
+                f"hidden size or target shape mismatch at {target}: "
+                f"architecture={expected_shape}, target={actual_shape}"
             )
 
     tensor_path = Path(adapter_path) / "adapter_model.safetensors"
@@ -517,6 +581,22 @@ def resolve_stage2_load_decision(
             "cannot switch Stage 2 PEFT method from "
             f"{metadata.tuning_method} to {requested_method}"
         )
+    if tuning_method_explicit:
+        for label, checkpoint_value, requested_value in (
+            ("rank", metadata.lora_r, requested_tuning.r),
+            ("alpha", metadata.lora_alpha, requested_tuning.alpha),
+            ("dropout", metadata.lora_dropout, requested_tuning.dropout),
+            (
+                "target_modules",
+                metadata.requested_target_modules,
+                requested_tuning.target_modules,
+            ),
+        ):
+            if checkpoint_value != requested_value:
+                raise ValueError(
+                    f"cannot resume Stage 2 with changed {label}: "
+                    f"checkpoint={checkpoint_value}, requested={requested_value}"
+                )
     for field, requested in (
         ("latent_size", latent_size),
         ("supervise_latent_boundaries", supervise_latent_boundaries),

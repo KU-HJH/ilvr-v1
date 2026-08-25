@@ -1,5 +1,6 @@
 import json
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -76,6 +77,19 @@ def test_stage2_peft_metadata_fails_closed(tmp_path, mutation):
 
     with pytest.raises(ValueError):
         load_stage2_peft_metadata(tmp_path)
+
+
+@pytest.mark.parametrize("operation", ["to_dict", "save"])
+def test_invalid_direct_metadata_cannot_be_serialized(tmp_path, operation):
+    invalid = replace(sample_metadata(), schema_version=999)
+
+    with pytest.raises(ValueError, match="unsupported.*schema"):
+        if operation == "to_dict":
+            invalid.to_dict()
+        else:
+            save_stage2_peft_metadata(tmp_path, invalid)
+
+    assert not (tmp_path / STAGE2_PEFT_METADATA_FILENAME).exists()
 
 
 def semantic_args():
@@ -212,6 +226,31 @@ def test_resume_rejects_incompatible_checkpoint_selection(
         )
 
 
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"lora_r": 4}, "rank.*checkpoint=16.*requested=4"),
+        ({"lora_alpha": 7}, "alpha.*checkpoint=32.*requested=7"),
+        ({"lora_dropout": 0.25}, "dropout.*checkpoint=0.05.*requested=0.25"),
+        ({"lora_target_modules": "q_proj"}, "target_modules.*checkpoint"),
+    ],
+)
+def test_explicit_peft_resume_rejects_changed_adapter_settings(override, message):
+    values = semantic_args()
+    values.update(override)
+
+    with pytest.raises(ValueError, match=message):
+        resolve_stage2_load_decision(
+            load_model_path="stage1",
+            resume_from_checkpoint_path="stage2/checkpoint-9",
+            load_config=fake_stage_config,
+            load_peft_metadata=lambda _: lora_metadata(),
+            tuning_method="lora",
+            tuning_method_explicit=True,
+            **values,
+        )
+
+
 def test_peft_resume_rejects_changed_latent_settings():
     values = semantic_args()
     values["latent_size"] = 4
@@ -280,13 +319,15 @@ class TinyTokenizer:
         return self.ids.get(token, self.unk_token_id)
 
 
-def write_tiny_adapter(directory, *, method="lora"):
+def write_tiny_adapter(
+    directory, *, method="lora", target_modules=("q_proj", "v_proj")
+):
     tuning = Stage2TuningConfig(
         method=method,
         r=4,
         alpha=8,
         dropout=0.0,
-        target_modules=("q_proj", "v_proj"),
+        target_modules=target_modules,
     )
     source = tiny_stage2_qwen()
     source.config.supervise_latent_boundaries = True
@@ -307,6 +348,7 @@ def write_tiny_adapter(directory, *, method="lora"):
 def relocated_base():
     base = tiny_stage2_qwen()
     base.config.supervise_latent_boundaries = True
+    base.config.stage = "stage1"
     base.config._name_or_path = "/relocated/stage1"
     return base
 
@@ -335,18 +377,76 @@ def test_relocated_stage1_base_accepts_dora_magnitude_tensor_naming(tmp_path):
     )
 
 
+def test_relocated_stage1_base_accepts_all_default_projection_shapes(tmp_path):
+    metadata, adapter_config = write_tiny_adapter(
+        tmp_path,
+        target_modules=(
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "up_proj",
+            "down_proj",
+            "gate_proj",
+        ),
+    )
+
+    validate_stage2_peft_compatibility(
+        relocated_base(), TinyTokenizer(), metadata, adapter_config, tmp_path
+    )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    [
+        ("use_rslora", True, "use_rslora"),
+        ("rank_pattern", {"model.layers.0.self_attn.q_proj": 2}, "rank_pattern"),
+        ("alpha_pattern", {"model.layers.0.self_attn.q_proj": 4}, "alpha_pattern"),
+        ("task_type", "SEQ_CLS", "task_type"),
+        ("bias", "all", "bias"),
+    ],
+)
+def test_stage2_peft_compatibility_rejects_unsupported_lora_variants(
+    tmp_path, attribute, value, message
+):
+    metadata, original_adapter_config = write_tiny_adapter(tmp_path)
+    adapter_config = deepcopy(original_adapter_config)
+    setattr(adapter_config, attribute, value)
+
+    with pytest.raises(ValueError, match=message):
+        validate_stage2_peft_compatibility(
+            relocated_base(), TinyTokenizer(), metadata, adapter_config, tmp_path
+        )
+
+
+def test_stage2_peft_compatibility_rejects_added_decoder_target_topology(tmp_path):
+    metadata, adapter_config = write_tiny_adapter(tmp_path)
+    base = relocated_base()
+    base.model.layers.append(deepcopy(base.model.layers[0]))
+    base.config.num_hidden_layers = 2
+
+    with pytest.raises(ValueError, match="resolved target topology"):
+        validate_stage2_peft_compatibility(
+            base, TinyTokenizer(), metadata, adapter_config, tmp_path
+        )
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
         ("token_id", "latent_start_token_id mismatch"),
+        ("latent_boundaries", "supervise_latent_boundaries mismatch"),
         ("hidden_size", "hidden size"),
         ("missing_target", "missing resolved target"),
+        ("nonlinear_target", "resolved target is not linear"),
         ("target_shape", "target shape mismatch"),
         ("method", "method.*mismatch"),
         ("rank", "rank.*mismatch"),
         ("alpha", "alpha.*mismatch"),
         ("dropout", "dropout.*mismatch"),
         ("use_dora", "use_dora.*mismatch"),
+        ("requested_targets", "requested targets"),
+        ("resolved_targets", "resolved targets"),
     ],
 )
 def test_stage2_peft_compatibility_fails_closed(
@@ -359,10 +459,14 @@ def test_stage2_peft_compatibility_fails_closed(
 
     if mutation == "token_id":
         tokenizer = TinyTokenizer(start_token_id=99)
+    elif mutation == "latent_boundaries":
+        base.config.supervise_latent_boundaries = False
     elif mutation == "hidden_size":
         base.config.hidden_size += 1
     elif mutation == "missing_target":
         delattr(base.model.layers[0].self_attn, "q_proj")
+    elif mutation == "nonlinear_target":
+        base.model.layers[0].self_attn.q_proj = nn.ReLU()
     elif mutation == "target_shape":
         base.model.layers[0].self_attn.q_proj = nn.Linear(8, 7)
     elif mutation == "method":
@@ -377,6 +481,16 @@ def test_stage2_peft_compatibility_fails_closed(
         adapter_config.lora_dropout = 0.25
     elif mutation == "use_dora":
         adapter_config.use_dora = True
+    elif mutation == "requested_targets":
+        values = metadata.to_dict()
+        values["requested_target_modules"] = ["q_proj"]
+        metadata = Stage2PeftMetadata.from_dict(values)
+    elif mutation == "resolved_targets":
+        values = metadata.to_dict()
+        values["resolved_target_module_names"] = [
+            "model.layers.0.self_attn.q_proj"
+        ]
+        metadata = Stage2PeftMetadata.from_dict(values)
 
     with pytest.raises(ValueError, match=message):
         validate_stage2_peft_compatibility(
