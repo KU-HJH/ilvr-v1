@@ -6,6 +6,12 @@ import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import nn
 
+from peft_common import (
+    normalize_decoder_target_suffixes,
+    resolve_qwen2_5_vl_model,
+    resolve_qwen_decoder_target_names,
+)
+
 TuningMethod = Literal["full", "lora", "dora"]
 ALLOWED_STAGE2_TARGET_SUFFIXES = (
     "q_proj",
@@ -21,16 +27,9 @@ ALLOWED_STAGE2_TARGET_SUFFIXES = (
 def normalize_stage2_target_modules(
     value: str | Sequence[str],
 ) -> tuple[str, ...]:
-    raw = value.split(",") if isinstance(value, str) else list(value)
-    targets = tuple(item.strip() for item in raw if item.strip())
-    if not targets:
-        raise ValueError("Stage 2 PEFT target modules must not be empty")
-    if len(set(targets)) != len(targets):
-        raise ValueError("Stage 2 PEFT target modules must be unique")
-    invalid = sorted(set(targets) - set(ALLOWED_STAGE2_TARGET_SUFFIXES))
-    if invalid:
-        raise ValueError(f"unsupported Stage 2 PEFT target modules: {invalid}")
-    return targets
+    return normalize_decoder_target_suffixes(
+        value, stage_label="Stage 2 PEFT target modules"
+    )
 
 
 @dataclass(frozen=True)
@@ -72,13 +71,24 @@ def resolve_stage2_target_module_names(
 ) -> tuple[str, ...]:
     """Return full decoder projection paths, excluding matching visual layers."""
     requested = normalize_stage2_target_modules(requested)
+    try:
+        resolved = resolve_qwen_decoder_target_names(model, requested)
+    except ValueError as error:
+        if str(error).startswith(
+            ("Requested decoder targets did not match", "Requested targets must be decoder-owned")
+        ):
+            missing = str(error).split(": ", 1)[1]
+            raise ValueError(
+                f"Stage 2 decoder targets matched no modules: {missing}"
+            ) from error
+        raise
+    modules = dict(model.named_modules())
     matches = {
         suffix: tuple(
             name
-            for name, module in model.named_modules()
-            if name.startswith("model.layers.")
-            and name.rsplit(".", 1)[-1] == suffix
-            and isinstance(module, torch.nn.Linear)
+            for name in resolved
+            if name.endswith(f".{suffix}")
+            and isinstance(modules[name], torch.nn.Linear)
         )
         for suffix in requested
     }
@@ -90,10 +100,10 @@ def resolve_stage2_target_module_names(
 
 def resolve_stage2_qwen_model(model: nn.Module) -> nn.Module:
     """Unwrap one engine wrapper and a PEFT model to the Stage 2 Qwen base."""
-    candidate = getattr(model, "module", model)
-    if isinstance(candidate, PeftModel):
-        candidate = candidate.get_base_model()
-
+    try:
+        candidate = resolve_qwen2_5_vl_model(model)
+    except TypeError as error:
+        raise TypeError("model does not satisfy the Stage 2 Qwen interface") from error
     required = (
         "prepare_stage2_base_inputs_embeds",
         "get_rope_index",

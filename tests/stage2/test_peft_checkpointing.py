@@ -13,9 +13,11 @@ from transformers import TrainingArguments, default_data_collator
 from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from helpers import tiny_stage2_qwen
+from src.peft_common import capture_qwen2_5_vl_architecture
 from stage2.checkpointing import (
     STAGE2_PEFT_METADATA_FILENAME,
     Stage2PeftMetadata,
+    _capture_base_model_architecture as capture_stage2_base_model_architecture,
     build_stage2_peft_metadata,
     load_stage2_peft_metadata,
     resolve_stage2_load_decision,
@@ -125,6 +127,65 @@ def test_stage2_peft_metadata_round_trips(tmp_path):
     assert (tmp_path / STAGE2_PEFT_METADATA_FILENAME).read_text(
         encoding="utf-8"
     ).endswith("\n")
+
+
+def test_stage2_architecture_snapshot_is_unchanged():
+    """Catches a shared Qwen snapshot drifting from Stage 2's artifact contract."""
+    config = tiny_stage2_qwen().config
+    expected = {
+        "architectures": [],
+        "decoder": {
+            "attention_dropout": 0.0,
+            "head_dim": 4,
+            "hidden_act": "silu",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "max_position_embeddings": 32768,
+            "max_window_layers": 80,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 1,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-05,
+            "rope_scaling": {
+                "mrope_section": [1, 1, 0],
+                "rope_type": "default",
+                "type": "default",
+            },
+            "rope_theta": 1000000.0,
+            "sliding_window": 4096,
+            "tie_word_embeddings": False,
+            "use_sliding_window": False,
+            "vocab_size": 128,
+        },
+        "model_type": "qwen2_5_vl",
+        "multimodal_token_ids": {
+            "image_token_id": 80,
+            "video_token_id": 82,
+            "vision_end_token_id": None,
+            "vision_start_token_id": 81,
+        },
+        "vision": {
+            "depth": 1,
+            "fullatt_block_indexes": [0],
+            "hidden_act": "silu",
+            "hidden_size": 8,
+            "in_channels": 3,
+            "intermediate_size": 16,
+            "num_heads": 2,
+            "out_hidden_size": 8,
+            "patch_size": 2,
+            "spatial_merge_size": 1,
+            "temporal_patch_size": 1,
+            "tokens_per_second": 4,
+            "window_size": 2,
+        },
+    }
+
+    shared = capture_qwen2_5_vl_architecture(config)
+    legacy = capture_stage2_base_model_architecture(config)
+
+    assert shared == expected
+    assert shared == legacy
 
 
 @pytest.mark.parametrize(

@@ -6,6 +6,7 @@ from peft import LoraConfig, get_peft_model
 from torch import nn
 
 from helpers import activate_stage2_adapter_deltas, tiny_stage2_qwen
+from src.peft_common import resolve_qwen_decoder_target_names
 from stage2.data import build_stage2_labels
 from stage2.peft import (
     ALLOWED_STAGE2_TARGET_SUFFIXES,
@@ -114,6 +115,28 @@ def test_stage2_tuning_config_rejects_invalid_hyperparameters(overrides, message
 
     with pytest.raises(ValueError, match=message):
         Stage2TuningConfig(**config)
+
+
+def test_shared_target_resolution_preserves_stage2_contract():
+    """Catches shared decoder resolution changing Stage 2 target paths or order."""
+    requested = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+    assert resolve_qwen_decoder_target_names(tiny_stage2_qwen(), requested) == (
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.v_proj",
+        "model.layers.0.self_attn.o_proj",
+    )
+
+
+def test_shared_target_resolution_rejects_visual_projection():
+    """Catches a visual-only suffix being accepted as a decoder PEFT target."""
+    model = tiny_stage2_qwen()
+    delattr(model.model.layers[0].self_attn, "q_proj")
+    model.visual.q_proj = nn.Linear(8, 8)
+
+    with pytest.raises(ValueError, match="decoder-owned"):
+        resolve_qwen_decoder_target_names(model, ("q_proj",))
 
 
 @pytest.mark.parametrize("method,use_dora", [("lora", False), ("dora", True)])
