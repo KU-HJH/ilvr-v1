@@ -698,6 +698,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
     """Catches Stage 2 falling through the Stage 1 trainer or auto-resume path."""
     args = stage2_args(
         stage="stage2",
+        seed=99,
         log_file=str(tmp_path / "train.log"),
         cache_dir=str(tmp_path / "cache"),
         save_final_model=True,
@@ -718,7 +719,6 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
     training_args = object()
     RecordingTrainer.world_process_zero = world_process_zero
     monkeypatch.setattr(main, "get_args", lambda: args)
-    monkeypatch.setattr(main, "seed_everything", lambda seed: None)
     monkeypatch.setattr(main, "build_stage2_training_components", lambda selected: components)
     monkeypatch.setattr(main, "build_stage2_training_arguments", lambda selected: training_args)
     monkeypatch.setattr(
@@ -741,3 +741,20 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
     assert trainer.resume_path == "stage2/checkpoint-4"
     assert trainer.saved_path == "out"
     assert processor.saved_path == expected_processor_path
+    assert torch.initial_seed() == 42
+
+
+def test_main_stage1_uses_requested_global_seed(monkeypatch, tmp_path):
+    """Catches the Stage 2 compatibility seed leaking into Stage 1."""
+    args = stage2_args(
+        stage="stage1",
+        seed=73,
+        log_file=str(tmp_path / "stage1.log"),
+    )
+    monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(main, "route_training", lambda selected: "stage1-result")
+
+    result = main_train()
+
+    assert result == "stage1-result"
+    assert torch.initial_seed() == 73

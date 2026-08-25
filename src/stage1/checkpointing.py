@@ -6,7 +6,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
@@ -15,9 +15,13 @@ from typing import Literal
 
 import peft
 import torch
+from accelerate import init_empty_weights
 from peft import PeftConfig, PeftModel
 from safetensors import SafetensorError, safe_open
 from torch import nn
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+)
 
 from peft_common import (
     capture_qwen2_5_vl_architecture,
@@ -252,7 +256,11 @@ def _validate_full_serialization(directory: Path, names: set[str]) -> None:
     raise ValueError("full-model shards require their matching parsed index")
 
 
-def classify_stage1_artifact(path: Path) -> Stage1ArtifactKind:
+def _classify_stage1_artifact_with_metadata(
+    path: Path,
+    *,
+    metadata: Stage1PeftMetadata | None = None,
+) -> tuple[Stage1ArtifactKind, Stage1PeftMetadata | None]:
     """Classify one local artifact from filenames and a strict PEFT sidecar.
 
     Classification deliberately performs no model/config ``from_pretrained``
@@ -311,15 +319,27 @@ def classify_stage1_artifact(path: Path) -> Stage1ArtifactKind:
             raise ValueError(
                 "incomplete Stage 1 PEFT artifact: missing " + ", ".join(labels)
             )
-        load_stage1_peft_metadata(directory)
-        return Stage1ArtifactKind.PEFT
+        validated_metadata = (
+            load_stage1_peft_metadata(directory)
+            if metadata is None
+            else Stage1PeftMetadata.from_dict(metadata.to_dict())
+        )
+        return Stage1ArtifactKind.PEFT, validated_metadata
 
     if present_full:
         _validate_full_serialization(directory, names)
-        return Stage1ArtifactKind.FULL
+        if metadata is not None:
+            raise ValueError("full Stage 1 artifact cannot use PEFT metadata")
+        return Stage1ArtifactKind.FULL, None
     raise ValueError(
         f"unrecognized local Stage 1 artifact (missing model weights): {directory}"
     )
+
+
+def classify_stage1_artifact(path: Path) -> Stage1ArtifactKind:
+    """Classify one local artifact without loading model weights."""
+
+    return _classify_stage1_artifact_with_metadata(path)[0]
 
 
 def _require_exact_string_list(
@@ -966,40 +986,97 @@ def save_stage1_peft_artifact(
     classify_stage1_artifact(destination)
 
 
+@dataclass(frozen=True)
+class Stage1PeftPreflightWitness:
+    """Validated small-artifact state reusable by the weight-loading phase."""
+
+    artifact_dir: Path
+    metadata: Stage1PeftMetadata
+    adapter_config: PeftConfig
+
+
+def _build_meta_stage1_base(config) -> nn.Module:
+    with init_empty_weights():
+        return Qwen2_5_VLForConditionalGeneration(config)
+
+
+def preflight_stage1_peft_artifact(
+    processor,
+    base_config,
+    artifact_dir: Path,
+    *,
+    metadata: Stage1PeftMetadata | None = None,
+    model_factory: Callable[[object], nn.Module] = _build_meta_stage1_base,
+) -> Stage1PeftPreflightWitness:
+    """Validate a PEFT artifact completely without loading base weights."""
+
+    artifact = Path(artifact_dir)
+    kind, validated = _classify_stage1_artifact_with_metadata(
+        artifact, metadata=metadata
+    )
+    if kind is not Stage1ArtifactKind.PEFT or validated is None:
+        raise ValueError("Stage 1 PEFT preflight requires a PEFT artifact")
+    if validated.peft_version != peft.__version__:
+        raise ValueError(
+            "Stage 1 PEFT version mismatch: "
+            f"metadata={validated.peft_version}, installed={peft.__version__}"
+        )
+    _validate_processor(processor, validated)
+    _validate_latent_config(base_config, validated)
+    structural_model = model_factory(deepcopy(base_config))
+    qwen = resolve_qwen2_5_vl_model(structural_model)
+    _validate_architecture(qwen, validated, resized=False)
+    adapter_config = PeftConfig.from_pretrained(artifact)
+    _validate_adapter_config(qwen, adapter_config, validated)
+    _validate_adapter_tensors(qwen, artifact, validated)
+    _validate_sparse_artifact(artifact, validated)
+    return Stage1PeftPreflightWitness(
+        artifact_dir=artifact.resolve(),
+        metadata=validated,
+        adapter_config=adapter_config,
+    )
+
+
 def load_stage1_peft_artifact(
     base_model: nn.Module,
     processor,
     artifact_dir: Path,
     *,
     is_trainable: bool,
+    preflight: Stage1PeftPreflightWitness | None = None,
 ) -> nn.Module:
     """Validate, resize, and restore one Stage 1 PEFT artifact in strict order."""
 
     if type(is_trainable) is not bool:
         raise TypeError("is_trainable must be boolean")
     artifact = Path(artifact_dir)
-    kind = classify_stage1_artifact(artifact)
-    if kind is not Stage1ArtifactKind.PEFT:
-        raise ValueError("Stage 1 PEFT loader requires a PEFT artifact")
-    metadata = load_stage1_peft_metadata(artifact)
-    if metadata.peft_version != peft.__version__:
-        raise ValueError(
-            "Stage 1 PEFT version mismatch: "
-            f"metadata={metadata.peft_version}, installed={peft.__version__}"
-        )
-
     candidate = getattr(base_model, "module", base_model)
     if isinstance(candidate, PeftModel):
         raise ValueError("Stage 1 PEFT loader requires an unmodified full base")
     qwen = resolve_qwen2_5_vl_model(candidate)
+    if preflight is None:
+        preflight = preflight_stage1_peft_artifact(
+            processor,
+            qwen.config,
+            artifact,
+            model_factory=lambda config: candidate,
+        )
+    elif not isinstance(preflight, Stage1PeftPreflightWitness):
+        raise TypeError("preflight must be a Stage1PeftPreflightWitness")
+    if preflight.artifact_dir != artifact.resolve():
+        raise ValueError(
+            "Stage 1 PEFT preflight artifact mismatch: "
+            f"witness={preflight.artifact_dir}, requested={artifact.resolve()}"
+        )
+    metadata = preflight.metadata
+    adapter_config = preflight.adapter_config
+
+    # The small artifact was already fully validated. Recheck only the actual
+    # runtime objects constructed after preflight, before mutating the base.
     _validate_processor(processor, metadata)
     _validate_latent_config(qwen.config, metadata)
     _validate_architecture(qwen, metadata, resized=False)
-
-    adapter_config = PeftConfig.from_pretrained(artifact)
     _validate_adapter_config(qwen, adapter_config, metadata)
-    _validate_adapter_tensors(qwen, artifact, metadata)
-    _validate_sparse_artifact(artifact, metadata)
 
     recorded_source = metadata.base_model_reference
     current_source = getattr(qwen.config, "_name_or_path", "")
@@ -1014,7 +1091,10 @@ def load_stage1_peft_artifact(
     initialize_frozen_output_token_rows(candidate, metadata.latent_token_ids)
     _configure_latent_config(candidate.config, metadata)
     restored = PeftModel.from_pretrained(
-        candidate, artifact, is_trainable=is_trainable
+        candidate,
+        artifact,
+        is_trainable=is_trainable,
+        config=adapter_config,
     )
     if not is_trainable:
         # PEFT 0.17.1 leaves TrainableTokensModel's selective delta enabled
@@ -1304,10 +1384,12 @@ __all__ = [
     "STAGE1_REPOSITORY_FORMAT_VERSION",
     "Stage1ArtifactKind",
     "Stage1PeftMetadata",
+    "Stage1PeftPreflightWitness",
     "Stage1ResumeDecision",
     "classify_stage1_artifact",
     "load_stage1_peft_artifact",
     "load_stage1_peft_metadata",
+    "preflight_stage1_peft_artifact",
     "resolve_stage1_resume",
     "save_stage1_peft_artifact",
     "save_stage1_peft_metadata",

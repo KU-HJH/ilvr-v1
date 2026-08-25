@@ -338,7 +338,7 @@ def route_training(args, *, stage1_handler=None, stage2_handler=None):
 # ==============================================================
 def main_train():
     args = get_args()
-    seed_everything(seed=args.seed)
+    seed_everything(seed=42 if args.stage == "stage2" else args.seed)
 
     logging.basicConfig(
         level=logging.INFO,

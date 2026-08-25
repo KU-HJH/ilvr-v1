@@ -148,6 +148,26 @@ def fake_dependencies(events, *, decision=None, processor=None, metadata=None):
         assert kwargs["config"] is config
         return model
 
+    preflight_witness = object()
+
+    def preflight_peft(selected_processor, selected_config, path, **kwargs):
+        events.append(
+            (
+                "preflight",
+                selected_processor,
+                selected_config,
+                Path(path),
+                kwargs,
+                preflight_witness,
+            )
+        )
+        return preflight_witness
+
+    def load_peft_model(base, selected_processor, path, **kwargs):
+        events.append(("peft", base, selected_processor, Path(path), kwargs))
+        assert kwargs["preflight"] is preflight_witness
+        return model
+
     def build_tuned(base, tuning, latent_ids):
         events.append(("topology", tuning.method, tuple(latent_ids)))
         return base
@@ -174,6 +194,7 @@ def fake_dependencies(events, *, decision=None, processor=None, metadata=None):
         load_processor=load_processor,
         load_config=load_config,
         load_model=load_model,
+        preflight_peft=preflight_peft,
         build_tuned_model=build_tuned,
         validate_boundary=validate_boundary,
         prepare_dataset=prepare_dataset,
@@ -187,7 +208,7 @@ def fake_dependencies(events, *, decision=None, processor=None, metadata=None):
             f"model.layers.0.{suffix}" for suffix in suffixes
         ),
         load_peft_metadata=lambda path: metadata,
-        load_peft_model=lambda *args, **kwargs: model,
+        load_peft_model=load_peft_model,
     ), processor, model, parameter_report
 
 
@@ -255,6 +276,10 @@ def test_resume_composition_preserves_checkpoint_token_ids_without_readding(
         resized_vocab_size=15,
         latent_token_ids=(12, 13, 14),
         latent_size=8,
+        ce_weight=1.0,
+        sim_weight=1.0,
+        coverage_p=0.9,
+        image_pool_k=8,
         tuning_method="dora",
         rank=32,
         alpha=64,
@@ -293,8 +318,129 @@ def test_resume_composition_preserves_checkpoint_token_ids_without_readding(
     if kind is Stage1ArtifactKind.PEFT:
         assert any(event[0] == "processor" and event[1] == str(checkpoint) for event in events)
         assert not any(event[0] == "topology" for event in events)
+        event_names = [event[0] for event in events]
+        assert event_names.index("preflight") < event_names.index("model")
+        peft_event = next(event for event in events if event[0] == "peft")
+        assert peft_event[3] == checkpoint
     else:
         assert any(event[0] == "model" and event[1] == str(checkpoint) for event in events)
+
+
+@pytest.mark.parametrize(
+    ("field", "checkpoint_value"),
+    [
+        ("latent_size", 7),
+        ("ce_weight", 2.0),
+        ("sim_weight", 2.0),
+        ("coverage_p", 0.8),
+        ("image_pool_k", 4),
+    ],
+)
+def test_peft_resume_rejects_semantic_mismatch_before_any_large_load(
+    tmp_path, field, checkpoint_value
+):
+    """Catches checkpoint-owned loss/model semantics changing on resume."""
+    checkpoint = tmp_path / "output" / "checkpoint-9"
+    decision = Stage1ResumeDecision(
+        checkpoint, Stage1ArtifactKind.PEFT, True
+    )
+    metadata_values = {
+        "base_model_reference": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "base_vocab_size": 12,
+        "resized_vocab_size": 15,
+        "latent_token_ids": (12, 13, 14),
+        "latent_size": 8,
+        "ce_weight": 1.0,
+        "sim_weight": 1.0,
+        "coverage_p": 0.9,
+        "image_pool_k": 8,
+        "tuning_method": "dora",
+        "rank": 32,
+        "alpha": 64,
+        "dropout": 0.05,
+        "requested_target_suffixes": (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ),
+    }
+    metadata_values[field] = checkpoint_value
+    events = []
+    deps, _, _, _ = fake_dependencies(
+        events,
+        decision=decision,
+        metadata=SimpleNamespace(**metadata_values),
+    )
+
+    with pytest.raises(ValueError, match="resume semantic mismatch"):
+        build_stage1_training_components(stage1_args(tmp_path), dependencies=deps)
+
+    assert [event for event in events if event[0] in {"processor", "model"}] == []
+
+
+@pytest.mark.parametrize(
+    "corruption", ["architecture", "adapter tensor", "sparse rows"]
+)
+def test_peft_artifact_preflight_failure_prevents_large_model_load(
+    tmp_path, corruption
+):
+    """Catches composition loading base weights before artifact validation."""
+    checkpoint = tmp_path / "output" / "checkpoint-9"
+    decision = Stage1ResumeDecision(
+        checkpoint, Stage1ArtifactKind.PEFT, True
+    )
+    processor = RecordingProcessor(RecordingTokenizer(size=12))
+    for token, token_id in zip(LATENT_TOKEN_STRINGS, (12, 13, 14)):
+        processor.tokenizer.vocab[token] = token_id
+    metadata = SimpleNamespace(
+        base_model_reference="Qwen/Qwen2.5-VL-3B-Instruct",
+        base_vocab_size=12,
+        resized_vocab_size=15,
+        latent_token_ids=(12, 13, 14),
+        latent_size=8,
+        ce_weight=1.0,
+        sim_weight=1.0,
+        coverage_p=0.9,
+        image_pool_k=8,
+        tuning_method="dora",
+        rank=32,
+        alpha=64,
+        dropout=0.05,
+        requested_target_suffixes=(
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ),
+    )
+    events = []
+    deps, _, model, _ = fake_dependencies(
+        events,
+        decision=decision,
+        processor=processor,
+        metadata=metadata,
+    )
+    model.config.latent_size = 8
+
+    def reject_preflight(*args, **kwargs):
+        raise ValueError(f"corrupt {corruption}")
+
+    deps = replace(
+        deps,
+        preflight_peft=reject_preflight,
+    )
+
+    with pytest.raises(ValueError, match=f"corrupt {corruption}"):
+        build_stage1_training_components(stage1_args(tmp_path), dependencies=deps)
+
+    assert not any(event[0] == "model" for event in events)
 
 
 def test_full_resume_rejects_latent_ids_that_are_not_appended_rows(tmp_path):

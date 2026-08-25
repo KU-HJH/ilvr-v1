@@ -29,10 +29,12 @@ from stage1.checkpointing import (
     STAGE1_PEFT_SCHEMA_VERSION,
     STAGE1_REPOSITORY_FORMAT_VERSION,
     Stage1ArtifactKind,
+    Stage1PeftPreflightWitness,
     Stage1PeftMetadata,
     classify_stage1_artifact,
     load_stage1_peft_artifact,
     load_stage1_peft_metadata,
+    preflight_stage1_peft_artifact,
     resolve_stage1_resume,
     save_stage1_peft_artifact,
 )
@@ -744,6 +746,106 @@ def test_load_rejects_extra_adapter_tensor_before_peft(
             is_trainable=True,
         )
     assert calls == 0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("architecture", "architecture mismatch.*hidden_act"),
+        ("adapter_tensor", "adapter target shape mismatch"),
+        ("sparse_rows", "sparse output_delta shape mismatch"),
+    ],
+)
+def test_preflight_rejects_corrupt_artifact_before_any_large_model_load(
+    saved_dora_artifact, mutation, message, monkeypatch
+):
+    """Catches malformed small artifacts reaching base-weight loading."""
+    if mutation == "architecture":
+        payload = load_stage1_peft_metadata(saved_dora_artifact).to_dict()
+        payload["base_model_architecture"]["decoder"]["hidden_act"] = "gelu"
+        (saved_dora_artifact / STAGE1_PEFT_METADATA_FILENAME).write_text(
+            json.dumps(payload) + "\n", encoding="utf-8"
+        )
+    elif mutation == "adapter_tensor":
+        path = saved_dora_artifact / "adapter_model.safetensors"
+        tensors = load_file(path)
+        key = next(name for name in tensors if name.endswith("lora_A.weight"))
+        tensors[key] = tensors[key][:, :-1].contiguous()
+        save_file(tensors, path)
+    else:
+        save_file(
+            {
+                "token_ids": torch.tensor(LATENT_TOKEN_IDS, dtype=torch.int64),
+                "output_delta": torch.zeros((3, 7), dtype=torch.float32),
+            },
+            saved_dora_artifact / "ilvr_token_rows.safetensors",
+            metadata={"format_version": "1", "training_dtype": "float32"},
+        )
+
+    large_loads = 0
+
+    def reject_large_load(*args, **kwargs):
+        nonlocal large_loads
+        large_loads += 1
+        raise AssertionError("large base weights must not load during preflight")
+
+    monkeypatch.setattr(
+        Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        reject_large_load,
+    )
+    base_config = deepcopy(tiny_original_qwen().config)
+
+    with pytest.raises(ValueError, match=message):
+        preflight_stage1_peft_artifact(
+            TinyStage1Processor.from_pretrained(saved_dora_artifact),
+            base_config,
+            saved_dora_artifact,
+        )
+
+    assert large_loads == 0
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_peft_loader_reuses_preflight_witness_without_revalidating_files(
+    saved_dora_artifact, monkeypatch
+):
+    """Catches the loader discarding its completed small-artifact witness."""
+    processor = TinyStage1Processor.from_pretrained(saved_dora_artifact)
+    base = tiny_original_qwen()
+    witness = preflight_stage1_peft_artifact(
+        processor,
+        deepcopy(base.config),
+        saved_dora_artifact,
+    )
+
+    assert isinstance(witness, Stage1PeftPreflightWitness)
+    monkeypatch.setattr(
+        "stage1.checkpointing.classify_stage1_artifact",
+        lambda *args, **kwargs: pytest.fail("artifact was reclassified"),
+    )
+    monkeypatch.setattr(
+        "stage1.checkpointing.load_stage1_peft_metadata",
+        lambda *args, **kwargs: pytest.fail("metadata was reread"),
+    )
+    monkeypatch.setattr(
+        "stage1.checkpointing._validate_adapter_tensors",
+        lambda *args, **kwargs: pytest.fail("adapter tensors were revalidated"),
+    )
+    monkeypatch.setattr(
+        "stage1.checkpointing._validate_sparse_artifact",
+        lambda *args, **kwargs: pytest.fail("sparse rows were revalidated"),
+    )
+
+    restored = load_stage1_peft_artifact(
+        base,
+        processor,
+        saved_dora_artifact,
+        is_trainable=True,
+        preflight=witness,
+    )
+
+    assert isinstance(restored, PeftModel)
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")

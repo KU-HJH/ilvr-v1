@@ -96,17 +96,35 @@ for integer_name in micro_batch gradient_accumulation seed; do
     fi
 done
 
-if [[ -d $output_dir ]] && find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-    if [[ -z $resume_path ]]; then
-        printf 'error: output directory is nonempty; pass --resume explicitly: %s\n' "$output_dir" >&2
+is_positive_finite() {
+    local value=$1
+    [[ $value =~ ^\+?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))([eE][+-]?[0-9]+)?$ ]] || return 1
+    awk -v value="$value" \
+        'BEGIN { number = value + 0; exit !(number > 0 && number <= 1.7976931348623157e308) }'
+}
+
+for scalar_name in epochs learning_rate; do
+    value=${!scalar_name}
+    if ! is_positive_finite "$value"; then
+        printf 'error: %s must be a positive finite number\n' "$scalar_name" >&2
         exit 2
     fi
-elif [[ -e $output_dir && ! -d $output_dir ]]; then
-    printf 'error: output path exists and is not a directory: %s\n' "$output_dir" >&2
-    exit 2
-fi
+done
 
 if [[ $dry_run != true ]]; then
+    if [[ -L $output_dir ]]; then
+        printf 'error: output path must not be a symlink: %s\n' "$output_dir" >&2
+        exit 2
+    fi
+    if [[ -d $output_dir ]] && find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        if [[ -z $resume_path ]]; then
+            printf 'error: output directory is nonempty; pass --resume explicitly: %s\n' "$output_dir" >&2
+            exit 2
+        fi
+    elif [[ -e $output_dir && ! -d $output_dir ]]; then
+        printf 'error: output path exists and is not a directory: %s\n' "$output_dir" >&2
+        exit 2
+    fi
     [[ -f $data_path ]] || { printf 'error: data path is not a file: %s\n' "$data_path" >&2; exit 2; }
     [[ -d $image_root ]] || { printf 'error: image root is not a directory: %s\n' "$image_root" >&2; exit 2; }
     [[ -f $deepspeed_config ]] || { printf 'error: DeepSpeed config is not a file: %s\n' "$deepspeed_config" >&2; exit 2; }
