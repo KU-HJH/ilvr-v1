@@ -3,6 +3,7 @@
 from transformers import Trainer
 
 from .checkpointing import save_stage2_peft_metadata
+from stage1.token_rows import save_sparse_token_rows
 
 
 class Stage2Trainer(Trainer):
@@ -55,4 +56,6 @@ class Stage2Trainer(Trainer):
         super().save_model(output_dir, _internal_call=_internal_call)
         target = output_dir or self.args.output_dir
         if self.stage2_peft_metadata is not None and self.args.should_save:
+            if self.stage2_peft_metadata.token_row_source == "sparse_adapter":
+                save_sparse_token_rows(self.model, target)
             save_stage2_peft_metadata(target, self.stage2_peft_metadata)

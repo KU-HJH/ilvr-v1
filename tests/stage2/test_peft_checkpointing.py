@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from accelerate.state import AcceleratorState, GradientState
 from peft import LoraConfig
 from torch import nn
@@ -19,7 +20,9 @@ from stage2.checkpointing import (
     Stage2PeftMetadata,
     _capture_base_model_architecture as capture_stage2_base_model_architecture,
     build_stage2_peft_metadata,
+    classify_stage2_artifact,
     load_stage2_peft_metadata,
+    migrate_stage2_metadata,
     resolve_stage2_load_decision,
     save_stage2_peft_metadata,
     validate_stage2_peft_compatibility,
@@ -35,7 +38,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 def sample_metadata() -> Stage2PeftMetadata:
     return Stage2PeftMetadata(
-        schema_version=2,
+        schema_version=3,
         stage="stage2",
         tuning_method="dora",
         base_model_reference="/models/stage1",
@@ -101,7 +104,122 @@ def sample_metadata() -> Stage2PeftMetadata:
             "model.layers.0.self_attn.v_proj",
         ),
         peft_version="0.17.1",
+        token_row_source="base",
+        stage1_adapter_reference=None,
     )
+
+
+def complete_v2_metadata() -> dict[str, object]:
+    payload = sample_metadata().to_dict()
+    payload["schema_version"] = 2
+    payload.pop("token_row_source", None)
+    payload.pop("stage1_adapter_reference", None)
+    return payload
+
+
+def test_complete_v2_metadata_migrates_in_memory_to_base_rows():
+    """Catches removing strict compatibility for complete unreleased v2 artifacts."""
+    metadata = migrate_stage2_metadata(complete_v2_metadata())
+
+    assert metadata.schema_version == 3
+    assert metadata.token_row_source == "base"
+    assert metadata.stage1_adapter_reference is None
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("v1", "schema v1"),
+        ("partial", "complete v2"),
+        ("extra", "complete v2"),
+        ("bool_schema", "schema_version"),
+    ],
+)
+def test_inexact_legacy_stage2_metadata_fails_closed(mutation, message):
+    """Catches permissive migration of v1, partial, extra, or type-invalid v2."""
+    payload = complete_v2_metadata()
+    if mutation == "v1":
+        payload = {"schema_version": 1}
+    elif mutation == "partial":
+        payload.pop("base_model_architecture")
+    elif mutation == "extra":
+        payload["token_row_source"] = "base"
+    elif mutation == "bool_schema":
+        payload["schema_version"] = True
+
+    with pytest.raises(ValueError, match=message):
+        migrate_stage2_metadata(payload)
+
+
+def test_new_stage2_metadata_writes_schema_v3_base_provenance_fields(tmp_path):
+    """Catches newly saved Stage 2 sidecars silently remaining on schema v2."""
+    metadata = sample_metadata()
+    save_stage2_peft_metadata(tmp_path, metadata)
+    payload = json.loads(
+        (tmp_path / STAGE2_PEFT_METADATA_FILENAME).read_text(encoding="utf-8")
+    )
+
+    assert payload["schema_version"] == 3
+    assert payload["token_row_source"] == "base"
+    assert payload["stage1_adapter_reference"] is None
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_sparse_stage2_artifact_requires_its_own_exact_token_rows(tmp_path, missing):
+    """Catches sparse Stage 2 checkpoints depending on the Stage 1 directory."""
+    payload = sample_metadata().to_dict()
+    payload.update(
+        token_row_source="sparse_adapter",
+        stage1_adapter_reference="/deleted/stage1/provenance-only",
+    )
+    (tmp_path / STAGE2_PEFT_METADATA_FILENAME).write_text(
+        json.dumps(payload) + "\n", encoding="utf-8"
+    )
+    (tmp_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "adapter_model.safetensors").touch()
+    if not missing:
+        save_file(
+            {
+                "token_ids": torch.tensor([90, 91, 92], dtype=torch.int64),
+                "output_delta": torch.zeros((3, 8), dtype=torch.float32),
+            },
+            tmp_path / "ilvr_token_rows.safetensors",
+            metadata={"format_version": "1", "training_dtype": "float32"},
+        )
+
+    if missing:
+        with pytest.raises(ValueError, match="token-row"):
+            classify_stage2_artifact(tmp_path)
+    else:
+        assert classify_stage2_artifact(tmp_path).value == "peft"
+
+
+@pytest.mark.parametrize("mutation", ["token_ids", "output_shape"])
+def test_sparse_stage2_artifact_rejects_mismatched_payload(tmp_path, mutation):
+    """Catches structurally present but incompatible sparse row payloads."""
+    payload = sample_metadata().to_dict()
+    payload.update(
+        token_row_source="sparse_adapter",
+        stage1_adapter_reference="/provenance-only/stage1",
+    )
+    (tmp_path / STAGE2_PEFT_METADATA_FILENAME).write_text(
+        json.dumps(payload) + "\n", encoding="utf-8"
+    )
+    (tmp_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "adapter_model.safetensors").touch()
+    token_ids = [90, 99, 92] if mutation == "token_ids" else [90, 91, 92]
+    output_shape = (3, 7) if mutation == "output_shape" else (3, 8)
+    save_file(
+        {
+            "token_ids": torch.tensor(token_ids, dtype=torch.int64),
+            "output_delta": torch.zeros(output_shape, dtype=torch.float32),
+        },
+        tmp_path / "ilvr_token_rows.safetensors",
+        metadata={"format_version": "1", "training_dtype": "float32"},
+    )
+
+    with pytest.raises(ValueError, match="sparse.*(token|shape)"):
+        classify_stage2_artifact(tmp_path)
 
 
 def write_mutated_metadata(directory, metadata, mutation):

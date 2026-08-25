@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 import peft
 from peft import PeftModel
@@ -17,6 +18,16 @@ from peft_common import (
     first_architecture_difference,
     normalize_qwen2_5_vl_architecture,
 )
+from stage1.token_rows import (
+    SPARSE_TOKEN_ROWS_FILENAME,
+    decode_sparse_token_rows_state,
+    initialize_frozen_output_token_rows,
+)
+from stage1.checkpointing import (
+    Stage1PeftMetadataSnapshot,
+    decode_stage1_peft_metadata_snapshot,
+    read_stage1_peft_metadata_snapshot,
+)
 from .peft import Stage2TuningConfig, resolve_stage2_target_module_names
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
@@ -25,7 +36,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 
 
 STAGE2_PEFT_METADATA_FILENAME = "stage2_peft_metadata.json"
-STAGE2_PEFT_SCHEMA_VERSION = 2
+STAGE2_PEFT_SCHEMA_VERSION = 3
 
 
 class Stage2ArtifactKind(str, Enum):
@@ -47,6 +58,7 @@ _OTHER_PEFT_MARKERS = frozenset(
         "adapter_model.bin",
         "adapter_model.bin.index.json",
         "adapter_model.safetensors.index.json",
+        SPARSE_TOKEN_ROWS_FILENAME,
     }
 )
 _FULL_MODEL_MARKERS = frozenset(
@@ -81,15 +93,63 @@ def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
             "mixed Stage 2 full and PEFT artifact markers: "
             f"peft={sorted(present_peft)}, full={sorted(present_full)}"
         )
-    if present_peft and present_peft != _REQUIRED_PEFT_MARKERS:
+    required_present = present_peft & _REQUIRED_PEFT_MARKERS
+    unsupported_present = present_peft & (
+        _OTHER_PEFT_MARKERS - {SPARSE_TOKEN_ROWS_FILENAME}
+    )
+    if present_peft and (
+        required_present != _REQUIRED_PEFT_MARKERS or unsupported_present
+    ):
         missing = sorted(_REQUIRED_PEFT_MARKERS - present_peft)
-        unsupported = sorted(present_peft & _OTHER_PEFT_MARKERS)
+        unsupported = sorted(unsupported_present)
         raise ValueError(
             "incomplete Stage 2 PEFT artifact: "
             f"missing={missing}, unsupported={unsupported}; "
             "adapter_model.safetensors is required"
         )
     if present_peft:
+        metadata = load_stage2_peft_metadata(path)
+        has_sparse_rows = SPARSE_TOKEN_ROWS_FILENAME in names
+        expects_sparse_rows = metadata.token_row_source == "sparse_adapter"
+        if expects_sparse_rows and not has_sparse_rows:
+            raise ValueError(
+                "incomplete Stage 2 PEFT token-row layout: "
+                f"missing={SPARSE_TOKEN_ROWS_FILENAME}"
+            )
+        if has_sparse_rows and not expects_sparse_rows:
+            raise ValueError(
+                "mixed Stage 2 PEFT token-row layout: "
+                "token_row_source=base but sparse token rows are present"
+            )
+        if expects_sparse_rows:
+            sparse_path = path / SPARSE_TOKEN_ROWS_FILENAME
+            try:
+                stored_ids, output_delta = decode_sparse_token_rows_state(
+                    sparse_path.read_bytes()
+                )
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"invalid sparse Stage 2 token-row artifact: {sparse_path}"
+                ) from error
+            expected_ids = (
+                metadata.latent_pad_token_id,
+                metadata.latent_start_token_id,
+                metadata.latent_end_token_id,
+            )
+            if tuple(stored_ids.tolist()) != expected_ids:
+                raise ValueError(
+                    "sparse Stage 2 token IDs do not match metadata: "
+                    f"stored={tuple(stored_ids.tolist())}, expected={expected_ids}"
+                )
+            expected_shape = (
+                3,
+                metadata.base_model_architecture["decoder"]["hidden_size"],
+            )
+            if tuple(output_delta.shape) != expected_shape:
+                raise ValueError(
+                    "sparse Stage 2 output shape does not match metadata: "
+                    f"stored={tuple(output_delta.shape)}, expected={expected_shape}"
+                )
         return Stage2ArtifactKind.PEFT
     if present_full:
         return Stage2ArtifactKind.FULL
@@ -131,6 +191,8 @@ class Stage2PeftMetadata:
     requested_target_modules: tuple[str, ...]
     resolved_target_module_names: tuple[str, ...]
     peft_version: str
+    token_row_source: Literal["base", "sparse_adapter"]
+    stage1_adapter_reference: str | None
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -143,107 +205,167 @@ class Stage2PeftMetadata:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "Stage2PeftMetadata":
-        if not isinstance(payload, Mapping):
-            raise ValueError("Stage 2 PEFT metadata must be a JSON object")
-        if payload.get("schema_version") != STAGE2_PEFT_SCHEMA_VERSION:
-            raise ValueError(
-                "unsupported Stage 2 PEFT metadata schema: "
-                f"expected={STAGE2_PEFT_SCHEMA_VERSION}, "
-                f"actual={payload.get('schema_version')}; "
-                "pre-v2 sidecars lack required base architecture provenance"
-            )
-        expected = {field.name for field in fields(cls)}
+        return migrate_stage2_metadata(payload)
+
+
+_V3_STAGE2_PEFT_FIELDS = {field.name for field in fields(Stage2PeftMetadata)}
+_V2_STAGE2_PEFT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "stage",
+        "tuning_method",
+        "base_model_reference",
+        "base_model_architecture",
+        "latent_size",
+        "latent_start_token_id",
+        "latent_pad_token_id",
+        "latent_end_token_id",
+        "supervise_latent_boundaries",
+        "lora_r",
+        "lora_alpha",
+        "lora_dropout",
+        "requested_target_modules",
+        "resolved_target_module_names",
+        "peft_version",
+    }
+)
+
+
+def _parse_stage2_metadata_v3(
+    payload: Mapping[str, object],
+) -> Stage2PeftMetadata:
+    if set(payload) != _V3_STAGE2_PEFT_FIELDS:
         actual = set(payload)
-        if actual != expected:
-            missing = sorted(expected - actual)
-            unknown = sorted(actual - expected)
+        raise ValueError(
+            "invalid Stage 2 PEFT metadata fields: "
+            f"missing={sorted(_V3_STAGE2_PEFT_FIELDS - actual)}, "
+            f"unknown={sorted(actual - _V3_STAGE2_PEFT_FIELDS)}"
+        )
+    if payload["stage"] != "stage2":
+        raise ValueError("Stage 2 PEFT metadata must describe stage2")
+    if payload["tuning_method"] not in ("lora", "dora"):
+        raise ValueError("Stage 2 PEFT metadata requires LoRA or DoRA")
+    if payload["token_row_source"] not in ("base", "sparse_adapter"):
+        raise ValueError("token_row_source must be base or sparse_adapter")
+    adapter_reference = payload["stage1_adapter_reference"]
+    if adapter_reference is not None and (
+        not isinstance(adapter_reference, str) or not adapter_reference
+    ):
+        raise ValueError(
+            "stage1_adapter_reference must be a non-empty string or null"
+        )
+
+    integer_fields = (
+        "schema_version",
+        "latent_size",
+        "latent_start_token_id",
+        "latent_pad_token_id",
+        "latent_end_token_id",
+        "lora_r",
+        "lora_alpha",
+    )
+    if any(type(payload[name]) is not int for name in integer_fields):
+        raise ValueError("Stage 2 PEFT integer metadata has an invalid type")
+    if type(payload["supervise_latent_boundaries"]) is not bool:
+        raise ValueError("supervise_latent_boundaries must be a boolean")
+    if type(payload["lora_dropout"]) not in (int, float):
+        raise ValueError("lora_dropout must be numeric")
+    string_fields = (
+        "stage",
+        "tuning_method",
+        "base_model_reference",
+        "peft_version",
+    )
+    if any(
+        not isinstance(payload[name], str) or not payload[name]
+        for name in string_fields
+    ):
+        raise ValueError("Stage 2 PEFT string metadata must be non-empty")
+
+    converted: dict[str, tuple[str, ...]] = {}
+    for name in ("requested_target_modules", "resolved_target_module_names"):
+        value = payload[name]
+        if (
+            not isinstance(value, list)
+            or not value
+            or any(not isinstance(item, str) or not item for item in value)
+        ):
+            raise ValueError(f"{name} must be a non-empty JSON string list")
+        converted[name] = tuple(value)
+
+    tuning = Stage2TuningConfig(
+        method=payload["tuning_method"],
+        r=payload["lora_r"],
+        alpha=payload["lora_alpha"],
+        dropout=float(payload["lora_dropout"]),
+        target_modules=converted["requested_target_modules"],
+    )
+    if payload["latent_size"] <= 0:
+        raise ValueError("latent_size must be positive")
+    if any(payload[name] < 0 for name in integer_fields[2:5]):
+        raise ValueError("latent token IDs must be non-negative")
+    if len(set(converted["resolved_target_module_names"])) != len(
+        converted["resolved_target_module_names"]
+    ):
+        raise ValueError("resolved target module names must be unique")
+
+    return Stage2PeftMetadata(
+        schema_version=STAGE2_PEFT_SCHEMA_VERSION,
+        stage="stage2",
+        tuning_method=tuning.method,
+        base_model_reference=payload["base_model_reference"],
+        base_model_architecture=_normalize_base_model_architecture(
+            payload["base_model_architecture"]
+        ),
+        latent_size=payload["latent_size"],
+        latent_start_token_id=payload["latent_start_token_id"],
+        latent_pad_token_id=payload["latent_pad_token_id"],
+        latent_end_token_id=payload["latent_end_token_id"],
+        supervise_latent_boundaries=payload["supervise_latent_boundaries"],
+        lora_r=tuning.r,
+        lora_alpha=tuning.alpha,
+        lora_dropout=tuning.dropout,
+        requested_target_modules=tuning.target_modules,
+        resolved_target_module_names=converted["resolved_target_module_names"],
+        peft_version=payload["peft_version"],
+        token_row_source=payload["token_row_source"],
+        stage1_adapter_reference=adapter_reference,
+    )
+
+
+def migrate_stage2_metadata(raw: Mapping[str, object]) -> Stage2PeftMetadata:
+    """Strictly parse v3 or migrate one exact complete v2 payload in memory."""
+    if not isinstance(raw, Mapping):
+        raise ValueError("Stage 2 PEFT metadata must be a JSON object")
+    schema_version = raw.get("schema_version")
+    if type(schema_version) is not int:
+        raise ValueError("Stage 2 PEFT schema_version must be an integer")
+    if schema_version == 1:
+        raise ValueError(
+            "unsupported Stage 2 PEFT metadata schema v1 because it lacks "
+            "base architecture provenance"
+        )
+    if schema_version == 2:
+        actual = set(raw)
+        if actual != _V2_STAGE2_PEFT_FIELDS:
             raise ValueError(
-                "invalid Stage 2 PEFT metadata fields: "
-                f"missing={missing}, unknown={unknown}"
+                "Stage 2 PEFT migration requires an exact complete v2 payload: "
+                f"missing={sorted(_V2_STAGE2_PEFT_FIELDS - actual)}, "
+                f"unknown={sorted(actual - _V2_STAGE2_PEFT_FIELDS)}"
             )
-        if payload["stage"] != "stage2":
-            raise ValueError("Stage 2 PEFT metadata must describe stage2")
-        if payload["tuning_method"] not in ("lora", "dora"):
-            raise ValueError("Stage 2 PEFT metadata requires LoRA or DoRA")
-
-        integer_fields = (
-            "schema_version",
-            "latent_size",
-            "latent_start_token_id",
-            "latent_pad_token_id",
-            "latent_end_token_id",
-            "lora_r",
-            "lora_alpha",
-        )
-        if any(type(payload[name]) is not int for name in integer_fields):
-            raise ValueError("Stage 2 PEFT integer metadata has an invalid type")
-        if type(payload["supervise_latent_boundaries"]) is not bool:
-            raise ValueError("supervise_latent_boundaries must be a boolean")
-        if type(payload["lora_dropout"]) not in (int, float):
-            raise ValueError("lora_dropout must be numeric")
-        string_fields = (
-            "stage",
-            "tuning_method",
-            "base_model_reference",
-            "peft_version",
-        )
-        if any(
-            not isinstance(payload[name], str) or not payload[name]
-            for name in string_fields
-        ):
-            raise ValueError("Stage 2 PEFT string metadata must be non-empty")
-
-        sequence_fields = (
-            "requested_target_modules",
-            "resolved_target_module_names",
-        )
-        converted: dict[str, tuple[str, ...]] = {}
-        for name in sequence_fields:
-            value = payload[name]
-            if (
-                not isinstance(value, list)
-                or not value
-                or any(not isinstance(item, str) or not item for item in value)
-            ):
-                raise ValueError(f"{name} must be a non-empty JSON string list")
-            converted[name] = tuple(value)
-
-        tuning = Stage2TuningConfig(
-            method=payload["tuning_method"],
-            r=payload["lora_r"],
-            alpha=payload["lora_alpha"],
-            dropout=float(payload["lora_dropout"]),
-            target_modules=converted["requested_target_modules"],
-        )
-        if payload["latent_size"] <= 0:
-            raise ValueError("latent_size must be positive")
-        if any(payload[name] < 0 for name in integer_fields[2:5]):
-            raise ValueError("latent token IDs must be non-negative")
-        if len(set(converted["resolved_target_module_names"])) != len(
-            converted["resolved_target_module_names"]
-        ):
-            raise ValueError("resolved target module names must be unique")
-
-        return cls(
+        migrated = dict(raw)
+        migrated.update(
             schema_version=STAGE2_PEFT_SCHEMA_VERSION,
-            stage="stage2",
-            tuning_method=tuning.method,
-            base_model_reference=payload["base_model_reference"],
-            base_model_architecture=_normalize_base_model_architecture(
-                payload["base_model_architecture"]
-            ),
-            latent_size=payload["latent_size"],
-            latent_start_token_id=payload["latent_start_token_id"],
-            latent_pad_token_id=payload["latent_pad_token_id"],
-            latent_end_token_id=payload["latent_end_token_id"],
-            supervise_latent_boundaries=payload["supervise_latent_boundaries"],
-            lora_r=tuning.r,
-            lora_alpha=tuning.alpha,
-            lora_dropout=tuning.dropout,
-            requested_target_modules=tuning.target_modules,
-            resolved_target_module_names=converted["resolved_target_module_names"],
-            peft_version=payload["peft_version"],
+            token_row_source="base",
+            stage1_adapter_reference=None,
         )
+        return _parse_stage2_metadata_v3(migrated)
+    if schema_version == STAGE2_PEFT_SCHEMA_VERSION:
+        return _parse_stage2_metadata_v3(raw)
+    raise ValueError(
+        "unsupported Stage 2 PEFT metadata schema: "
+        f"expected={STAGE2_PEFT_SCHEMA_VERSION}, actual={schema_version}"
+    )
 
 
 def build_stage2_peft_metadata(
@@ -253,6 +375,8 @@ def build_stage2_peft_metadata(
     model_config,
     token_ids: LatentTokenIds,
     resolved_target_names: Sequence[str],
+    token_row_source: str = "base",
+    stage1_adapter_reference: str | None = None,
 ) -> Stage2PeftMetadata:
     """Build the sidecar for a fresh Stage 2 PEFT run."""
     if not tuning.is_peft:
@@ -277,6 +401,8 @@ def build_stage2_peft_metadata(
             "requested_target_modules": list(tuning.target_modules),
             "resolved_target_module_names": list(resolved_target_names),
             "peft_version": peft.__version__,
+            "token_row_source": token_row_source,
+            "stage1_adapter_reference": stage1_adapter_reference,
         }
     )
 
@@ -307,7 +433,7 @@ def load_stage2_peft_metadata(directory: str | Path) -> Stage2PeftMetadata:
     return Stage2PeftMetadata.from_dict(payload)
 
 
-def _resolve_stage1_qwen_base(base_model):
+def _resolve_stage1_qwen_base(base_model, *, expected_stage: str = "stage1"):
     """Require the unmodified full Stage 1 Qwen base used before PEFT loading."""
     candidate = getattr(base_model, "module", base_model)
     if isinstance(candidate, PeftModel):
@@ -321,7 +447,8 @@ def _resolve_stage1_qwen_base(base_model):
     )
     if (
         any(not hasattr(candidate, attribute) for attribute in required)
-        or getattr(getattr(candidate, "config", None), "stage", None) != "stage1"
+        or getattr(getattr(candidate, "config", None), "stage", None)
+        != expected_stage
     ):
         raise TypeError("model does not satisfy the Stage 1 Qwen interface")
     return candidate
@@ -354,7 +481,12 @@ def validate_stage2_peft_compatibility(
     adapter_path: str | Path,
 ) -> None:
     """Validate a relocated base against adapter metadata without reading weights."""
-    qwen = _resolve_stage1_qwen_base(base_model)
+    qwen = _resolve_stage1_qwen_base(
+        base_model,
+        expected_stage=(
+            "stage2" if metadata.token_row_source == "sparse_adapter" else "stage1"
+        ),
+    )
     config = qwen.config
     current_architecture = _capture_base_model_architecture(config)
     architecture_difference = _first_architecture_difference(
@@ -429,6 +561,28 @@ def validate_stage2_peft_compatibility(
             )
     if getattr(adapter_config, "modules_to_save", None) is not None:
         raise ValueError("adapter must not contain modules_to_save")
+    trainable_token_indices = getattr(
+        adapter_config, "trainable_token_indices", None
+    )
+    expected_sparse_ids = (
+        metadata.latent_pad_token_id,
+        metadata.latent_start_token_id,
+        metadata.latent_end_token_id,
+    )
+    if metadata.token_row_source == "sparse_adapter":
+        if (
+            not isinstance(trainable_token_indices, dict)
+            or set(trainable_token_indices) != {"model.embed_tokens"}
+            or tuple(trainable_token_indices["model.embed_tokens"])
+            != expected_sparse_ids
+        ):
+            raise ValueError(
+                "sparse Stage 2 adapter selective input token IDs do not match metadata"
+            )
+    elif trainable_token_indices is not None:
+        raise ValueError(
+            "base Stage 2 token rows must not contain selective input token rows"
+        )
 
     modules = dict(qwen.named_modules())
     for target in metadata.resolved_target_module_names:
@@ -508,6 +662,56 @@ LATENT_CONFIG_FIELDS = {
 }
 
 
+def prepare_stage2_sparse_token_base(
+    base_model,
+    tokenizer,
+    metadata: Stage2PeftMetadata,
+) -> LatentTokenIds:
+    """Resize an original compatible base for one self-contained sparse adapter."""
+
+    if metadata.token_row_source != "sparse_adapter":
+        raise ValueError("sparse base preparation requires sparse_adapter metadata")
+    qwen = _resolve_stage1_qwen_base(base_model)
+    current_vocab_size = int(qwen.config.vocab_size)
+    expected_vocab_size = int(
+        metadata.base_model_architecture["decoder"]["vocab_size"]
+    )
+    if expected_vocab_size != current_vocab_size + 3:
+        raise ValueError(
+            "sparse Stage 2 base vocabulary mismatch: "
+            f"base={current_vocab_size}, checkpoint={expected_vocab_size}"
+        )
+    if len(tokenizer) != expected_vocab_size:
+        raise ValueError(
+            "sparse Stage 2 processor vocabulary mismatch: "
+            f"processor={len(tokenizer)}, checkpoint={expected_vocab_size}"
+        )
+    token_ids = resolve_latent_token_ids(tokenizer, qwen.config)
+    ordered_ids = (
+        token_ids.pad_token_id,
+        token_ids.start_token_id,
+        token_ids.end_token_id,
+    )
+    expected_ids = tuple(range(current_vocab_size, expected_vocab_size))
+    if ordered_ids != expected_ids or ordered_ids != (
+        metadata.latent_pad_token_id,
+        metadata.latent_start_token_id,
+        metadata.latent_end_token_id,
+    ):
+        raise ValueError(
+            "sparse Stage 2 latent token IDs must be the exact appended rows"
+        )
+    base_model.resize_token_embeddings(expected_vocab_size)
+    initialize_frozen_output_token_rows(base_model, ordered_ids)
+    configure_stage2_metadata(
+        qwen.config,
+        token_ids,
+        latent_size=metadata.latent_size,
+        supervise_latent_boundaries=metadata.supervise_latent_boundaries,
+    )
+    return token_ids
+
+
 def resolve_latent_token_ids(tokenizer, config) -> LatentTokenIds:
     """Resolve latent IDs without modifying the tokenizer or its vocabulary.
 
@@ -579,6 +783,8 @@ class Stage2LoadDecision:
     latent_size: int
     supervise_latent_boundaries: bool
     peft_metadata: Stage2PeftMetadata | None = None
+    stage1_adapter_source: str | None = None
+    stage1_metadata_snapshot: Stage1PeftMetadataSnapshot | None = None
 
     @property
     def model_source(self) -> str:
@@ -589,9 +795,11 @@ class Stage2LoadDecision:
 def resolve_stage2_load_decision(
     *,
     load_model_path: str,
+    stage1_adapter_path: str | None = None,
     resume_from_checkpoint_path: str | None,
     load_config,
     load_peft_metadata=load_stage2_peft_metadata,
+    load_stage1_metadata_snapshot=read_stage1_peft_metadata_snapshot,
     latent_size: int,
     supervise_latent_boundaries: bool,
     tuning_method: str | None = None,
@@ -621,6 +829,57 @@ def resolve_stage2_load_decision(
         if isinstance(lora_target_modules, str)
         else tuple(lora_target_modules),
     )
+
+    if stage1_adapter_path is not None and resume_from_checkpoint_path is not None:
+        raise ValueError(
+            "Stage 1 adapter initialization and Stage 2 resume are mutually exclusive"
+        )
+
+    if stage1_adapter_path is not None:
+        if requested_tuning.method == "full":
+            raise ValueError("Stage 1 DoRA cannot initialize Stage 2 full tuning")
+        if requested_tuning.method == "lora":
+            raise ValueError("Stage 1 DoRA cannot initialize a new Stage 2 LoRA adapter")
+        metadata_snapshot = load_stage1_metadata_snapshot(
+            Path(stage1_adapter_path)
+        )
+        metadata = decode_stage1_peft_metadata_snapshot(metadata_snapshot)
+        if metadata.tuning_method != "dora":
+            raise ValueError(
+                "fresh Stage 2 continuation requires a Stage 1 DoRA adapter"
+            )
+        for label, stage1_value, stage2_value in (
+            ("latent_size", metadata.latent_size, latent_size),
+            ("rank", metadata.rank, requested_tuning.r),
+            ("alpha", metadata.alpha, requested_tuning.alpha),
+            ("dropout", metadata.dropout, requested_tuning.dropout),
+            (
+                "requested target modules",
+                metadata.requested_target_suffixes,
+                requested_tuning.target_modules,
+            ),
+        ):
+            if stage1_value != stage2_value:
+                raise ValueError(
+                    f"Stage 1/Stage 2 {label} mismatch: "
+                    f"stage1={stage1_value}, stage2={stage2_value}"
+                )
+        if (Path(load_model_path) / "adapter_config.json").is_file():
+            raise ValueError(
+                "Stage 1 DoRA continuation requires the original full base model"
+            )
+        load_config(load_model_path)
+        return Stage2LoadDecision(
+            base_model_source=load_model_path,
+            processor_source=stage1_adapter_path,
+            adapter_source=None,
+            trainer_resume_path=None,
+            tuning=requested_tuning,
+            latent_size=latent_size,
+            supervise_latent_boundaries=supervise_latent_boundaries,
+            stage1_adapter_source=stage1_adapter_path,
+            stage1_metadata_snapshot=metadata_snapshot,
+        )
 
     def require_full_stage1(source: str):
         adapter_config_file = Path(source) / "adapter_config.json"

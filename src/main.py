@@ -15,10 +15,15 @@ from qwen_vl_utils import process_vision_info
 
 from utils_deepseed import *
 from task_deepseed import *
+from stage1.checkpointing import (
+    decode_stage1_peft_metadata_snapshot,
+    preflight_stage1_peft_artifact,
+)
 from stage2.checkpointing import (
     Stage2PeftMetadata,
     build_stage2_peft_metadata,
     configure_stage2_metadata,
+    prepare_stage2_sparse_token_base,
     resolve_latent_token_ids,
     resolve_stage2_load_decision,
     validate_stage2_peft_compatibility,
@@ -33,6 +38,7 @@ from stage2.data import (
 from stage2.trainer import Stage2Trainer
 from stage2.peft import (
     build_stage2_tuned_model,
+    load_stage1_dora_for_fresh_stage2,
     resolve_stage2_target_module_names,
     validate_stage2_parameter_boundary,
 )
@@ -92,6 +98,7 @@ def validate_stage2_distributed_settings(
 def build_stage2_training_components(args) -> Stage2TrainingComponents:
     decision = resolve_stage2_load_decision(
         load_model_path=args.load_model_path,
+        stage1_adapter_path=getattr(args, "stage1_adapter_path", None),
         resume_from_checkpoint_path=args.resume_from_checkpoint_path,
         load_config=AutoConfig.from_pretrained,
         latent_size=args.latent_size,
@@ -104,11 +111,43 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
         lora_target_modules=args.lora_target_modules,
     )
     processor = AutoProcessor.from_pretrained(decision.processor_source)
+    stage1_preflight = None
+    stage1_metadata = None
+    if decision.stage1_adapter_source is not None:
+        base_config = AutoConfig.from_pretrained(decision.base_model_source)
+        stage1_preflight = preflight_stage1_peft_artifact(
+            processor,
+            base_config,
+            Path(decision.stage1_adapter_source),
+            metadata_snapshot=decision.stage1_metadata_snapshot,
+        )
+        stage1_metadata = decode_stage1_peft_metadata_snapshot(
+            decision.stage1_metadata_snapshot
+        )
     base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         decision.base_model_source,
         attn_implementation=args.attention_implementation,
     )
-    token_ids = resolve_latent_token_ids(processor.tokenizer, base_model.config)
+    if decision.stage1_adapter_source is not None:
+        model = load_stage1_dora_for_fresh_stage2(
+            base_model,
+            processor,
+            decision.stage1_adapter_source,
+            decision.tuning,
+            preflight=stage1_preflight,
+        )
+        token_ids = resolve_latent_token_ids(processor.tokenizer, base_model.config)
+    elif (
+        decision.peft_metadata is not None
+        and decision.peft_metadata.token_row_source == "sparse_adapter"
+    ):
+        token_ids = prepare_stage2_sparse_token_base(
+            base_model,
+            processor.tokenizer,
+            decision.peft_metadata,
+        )
+    else:
+        token_ids = resolve_latent_token_ids(processor.tokenizer, base_model.config)
     if decision.peft_metadata is not None:
         adapter_config = PeftConfig.from_pretrained(decision.adapter_source)
         validate_stage2_peft_compatibility(
@@ -130,19 +169,50 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
     )
     base_model.visual.requires_grad_(False)
     fresh_resolved_target_names = (
-        resolve_stage2_target_module_names(
-            base_model, decision.tuning.target_modules
+        stage1_metadata.resolved_target_names
+        if stage1_metadata is not None
+        else (
+            resolve_stage2_target_module_names(
+                base_model, decision.tuning.target_modules
+            )
+            if decision.peft_metadata is None and decision.tuning.is_peft
+            else None
         )
-        if decision.peft_metadata is None and decision.tuning.is_peft
-        else None
     )
-    model = build_stage2_tuned_model(
-        base_model,
+    if decision.stage1_adapter_source is None:
+        if (
+            decision.peft_metadata is not None
+            and decision.peft_metadata.token_row_source == "sparse_adapter"
+        ):
+            model = build_stage2_tuned_model(
+                base_model,
+                decision.tuning,
+                adapter_path=decision.adapter_source,
+                is_trainable=True,
+                token_row_source="sparse_adapter",
+                latent_token_ids=(
+                    token_ids.pad_token_id,
+                    token_ids.start_token_id,
+                    token_ids.end_token_id,
+                ),
+            )
+        else:
+            model = build_stage2_tuned_model(
+                base_model,
+                decision.tuning,
+                adapter_path=decision.adapter_source,
+                is_trainable=True,
+            )
+    sparse_continuation = (
+        decision.stage1_adapter_source is not None
+        or decision.peft_metadata is not None
+        and decision.peft_metadata.token_row_source == "sparse_adapter"
+    )
+    parameter_report = validate_stage2_parameter_boundary(
+        model,
         decision.tuning,
-        adapter_path=decision.adapter_source,
-        is_trainable=True,
+        allow_sparse_token_rows=sparse_continuation,
     )
-    parameter_report = validate_stage2_parameter_boundary(model, decision.tuning)
     logging.info(
         "Stage 2 parameters: total=%d trainable=%d resolved_targets=%s",
         parameter_report.total_parameters,
@@ -157,6 +227,14 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
             model_config=base_model.config,
             token_ids=token_ids,
             resolved_target_names=fresh_resolved_target_names,
+            token_row_source=(
+                "sparse_adapter" if stage1_metadata is not None else "base"
+            ),
+            stage1_adapter_reference=(
+                str(stage1_preflight.artifact_dir)
+                if stage1_preflight is not None
+                else None
+            ),
         )
 
     raw_examples = load_jsonl_examples(Path(args.data_path))
