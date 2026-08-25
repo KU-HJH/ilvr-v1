@@ -1,30 +1,20 @@
-import os
-import re
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from tqdm import tqdm
-from functools import partial
 
 import torch
-from torch.nn import functional as F
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
-    Qwen2_5_VLConfig,
     AutoConfig,
     AutoProcessor,
 )
-from transformers.trainer_utils import get_last_checkpoint
-from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig, PeftConfig, get_peft_model
-from datasets import load_dataset
+from trl import SFTConfig
+from peft import PeftConfig
 
 from qwen_vl_utils import process_vision_info
 
 from utils_deepseed import *
 from task_deepseed import *
-from trainer import CustomTrainerStage1
 from stage2.checkpointing import (
     Stage2PeftMetadata,
     build_stage2_peft_metadata,
@@ -59,6 +49,8 @@ class TrainingPath:
 
 def select_training_path(stage: str) -> TrainingPath:
     if stage == "stage1":
+        from stage1.trainer import CustomTrainerStage1
+
         return TrainingPath(CustomTrainerStage1, collate_fn_stage1)
     if stage == "stage2":
         return TrainingPath(Stage2Trainer, Stage2DataCollator)
@@ -304,12 +296,49 @@ def collate_fn_stage1(examples, processor, args):
 
     
 
+def run_stage1(args):
+    """Load the Stage 1 runtime only after Stage 1 was selected."""
+
+    from stage1.composition import run_stage1 as run_composed_stage1
+
+    return run_composed_stage1(args)
+
+
+def run_stage2(args):
+    """Run the existing Stage 2 path without importing Stage 1 Trainer code."""
+
+    components = build_stage2_training_components(args)
+    trainer = components.trainer_class(
+        model=components.model,
+        args=build_stage2_training_arguments(args),
+        train_dataset=components.train_dataset,
+        data_collator=components.data_collator,
+        processing_class=components.processor,
+        stage2_peft_metadata=components.peft_metadata,
+    )
+    trainer.train(resume_from_checkpoint=components.trainer_resume_path)
+    if args.save_final_model:
+        trainer.save_model(args.save_model_path)
+        if trainer.is_world_process_zero():
+            components.processor.save_pretrained(args.save_model_path)
+
+
+def route_training(args, *, stage1_handler=None, stage2_handler=None):
+    """Select exactly one public stage handler and return its observable result."""
+
+    if args.stage == "stage1":
+        return (stage1_handler or run_stage1)(args)
+    if args.stage == "stage2":
+        return (stage2_handler or run_stage2)(args)
+    raise ValueError(f"Unsupported stage: {args.stage}")
+
+
 # ==============================================================
 # Main Training Function
 # ==============================================================
 def main_train():
-    seed_everything(seed=42)
     args = get_args()
+    seed_everything(seed=args.seed)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -324,162 +353,17 @@ def main_train():
     logging.info(args)
     logging.info('==' * 20)
 
-    if args.stage == "stage2":
-        components = build_stage2_training_components(args)
-        trainer = components.trainer_class(
-            model=components.model,
-            args=build_stage2_training_arguments(args),
-            train_dataset=components.train_dataset,
-            data_collator=components.data_collator,
-            processing_class=components.processor,
-            stage2_peft_metadata=components.peft_metadata,
-        )
-        trainer.train(resume_from_checkpoint=components.trainer_resume_path)
-        if args.save_final_model:
-            trainer.save_model(args.save_model_path)
-            if trainer.is_world_process_zero():
-                components.processor.save_pretrained(args.save_model_path)
-        return
-
-    cache_dir = args.cache_dir
-    os.environ['HF_HOME'] = cache_dir
-    
-    logging.info(f"Loading processor from: {args.model}")
-    processor = AutoProcessor.from_pretrained(args.model, cache_dir=cache_dir, trust_remote_code=True)
-    
-    new_tokens = ["<|latent_pad|>", "<|latent_start|>", "<|latent_end|>"]
-    processor.tokenizer.add_tokens(new_tokens, special_tokens=True)
+    return route_training(args)
 
 
-    logging.info(f"Loading model (Stage 1) from: {args.model}")
-    model_path = args.model
-    config = Qwen2_5_VLConfig.from_pretrained(model_path, cache_dir=cache_dir, trust_remote_code=True)
-    grad_checkpointing = True
-    
-    
-    config.compress_strategy = args.compress_strategy
-    config.latent_size = args.latent_size
-    config.stage = args.stage
+def __getattr__(name):
+    """Retain the historical public trainer import without eager Stage 1 load."""
 
-    latent_token_idx = processor.tokenizer("<|latent_pad|>", return_tensors="pt")["input_ids"][0,0].item()
-    latent_start_idx = processor.tokenizer("<|latent_start|>", return_tensors="pt")["input_ids"][0,0].item()
-    latent_end_idx   = processor.tokenizer("<|latent_end|>", return_tensors="pt")["input_ids"][0,0].item()
-    config.latent_token_id = int(latent_token_idx)
-    config.latent_start_id = int(latent_start_idx)
-    config.latent_end_id   = int(latent_end_idx)
+    if name == "CustomTrainerStage1":
+        from stage1.trainer import CustomTrainerStage1
 
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_path,
-        config=config,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        cache_dir=cache_dir if args.stage == 'stage1' else None,
-        trust_remote_code=True
-    )
-    
-    model.resize_token_embeddings(len(processor.tokenizer))
-
-    for param in model.visual.parameters():
-        param.requires_grad = False
-    
-    if torch.cuda.is_available():
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-            
-    logging.info(f"Moving model to CUDA device: {torch.cuda.current_device()} ...")
-    
-
-    preprocess_function = task_preporcess_config[args.task]
-    train_dataset = load_jsonl_dataset(args.data_path)
-    train_dataset = [preprocess_function(sample) for sample in train_dataset]
-
-    
-    CustomTrainer = CustomTrainerStage1
-    collate_fn_raw = collate_fn_stage1
-    
-        
-    collate_fn = partial(collate_fn_raw, processor=processor, args=args)
-
-    peft_config = None
-    if getattr(args, "use_lora", False):
-        logging.info("Enabling LoRA...")
-        peft_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=args.lora_target_modules.split(","),
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-
-    training_args = SFTConfig(
-        output_dir=args.save_model_path,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warm_up_steps,
-        learning_rate=1e-5,
-        weight_decay=0.01,
-        logging_steps=20,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=1,
-        optim="adamw_torch_fused" if args.stage == 'stage1' else "adamw_torch",
-        bf16=True,
-        push_to_hub=False,
-        remove_unused_columns=False,
-        gradient_checkpointing=grad_checkpointing,
-        dataset_text_field="",
-        dataset_kwargs={"skip_prepare_dataset": True},
-        report_to=[],
-        logging_dir='./logs/',
-        logging_strategy='steps',
-        max_seq_length=32768 if args.stage == 'stage1' else args.max_seq_length_train,
-        deepspeed="configs/config_stage3.json",
-        ddp_find_unused_parameters=False if args.stage == 'stage2' else None,
-    )
-    
-    trainer = CustomTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        data_collator=collate_fn,
-        tokenizer=processor.tokenizer,
-        peft_config=peft_config,
-        sim_weight=getattr(args, "sim_weight", 1.0),
-        ema_tau=getattr(args, "ema_tau", 0.999),
-        coverage_p=getattr(args, "coverage_p", 0.9),
-        image_pool_k=getattr(args, "image_pool_k", 8),
-        helper_group_L=getattr(args, "helper_group_L", 256),
-        ce_weight=getattr(args, "ce_weight", 1.0),
-    )
-    
-
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir):
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is not None:
-            logging.info(f"last checkpoint: {last_checkpoint}，continue。")
-        else:
-            logging.info(f"output log {training_args.output_dir} exists but no checkpoint， train from start。")
-    else:
-        logging.info("no checkpoint，train from start。")
-
-    logging.info("start training (DeepSpeed ZeRO-3 Mode)...")
-    trainer.train(resume_from_checkpoint=last_checkpoint)
-
-    final_model_path = training_args.output_dir
-
-    if trainer.is_world_process_zero():
-        logging.info(f"training finish，save model: {final_model_path}")
-        processor.save_pretrained(final_model_path)
-
-    trainer.save_model(final_model_path)
-
-    if trainer.is_world_process_zero():
-        logging.info("all saved。")
-        
-    logging.info("finish。")
+        return CustomTrainerStage1
+    raise AttributeError(name)
 
 if __name__ == "__main__":
     main_train()

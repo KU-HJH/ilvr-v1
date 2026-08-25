@@ -1,4 +1,7 @@
 import logging
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +21,7 @@ from main import (
     collate_fn_stage1,
     main_train,
     parse_args,
+    route_training,
     select_training_path,
 )
 from stage2.checkpointing import (
@@ -141,6 +145,52 @@ def test_stage_routing_selects_independent_trainers():
     assert select_training_path("stage1").collator_factory is collate_fn_stage1
     assert select_training_path("stage2").trainer_class is Stage2Trainer
     assert select_training_path("stage2").collator_factory is Stage2DataCollator
+
+
+def test_stage2_route_returns_the_selected_handler_result():
+    """Catches Stage 2 dispatch entering the Stage 1 route or falling through."""
+    args = SimpleNamespace(stage="stage2")
+    observed = []
+
+    result = route_training(
+        args,
+        stage1_handler=lambda selected: pytest.fail("Stage 1 route was selected"),
+        stage2_handler=lambda selected: observed.append(selected) or "stage2-result",
+    )
+
+    assert result == "stage2-result"
+    assert observed == [args]
+
+
+def test_stage2_route_does_not_import_stage1_trainer_in_a_fresh_process():
+    """Catches Stage 2 startup paying the Stage 1 Trainer import/construction cost."""
+    repo = Path(__file__).resolve().parents[2]
+    program = """
+import sys
+from types import SimpleNamespace
+import main
+result = main.route_training(
+    SimpleNamespace(stage='stage2'),
+    stage2_handler=lambda args: 'stage2-result',
+)
+assert result == 'stage2-result'
+assert 'stage1.trainer' not in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_route_rejects_unsupported_stage():
+    """Catches unknown stages silently falling into Stage 1."""
+    with pytest.raises(ValueError, match="Unsupported stage: stage3"):
+        route_training(SimpleNamespace(stage="stage3"))
 
 
 def test_boundary_supervision_is_one_default_true_boolean():
@@ -347,6 +397,7 @@ def stage2_args(**overrides):
         max_steps=13,
         gradient_checkpointing=True,
         deepspeed_config=None,
+        seed=42,
         tuning_method="full",
         tuning_method_explicit=False,
         lora_r=4,
