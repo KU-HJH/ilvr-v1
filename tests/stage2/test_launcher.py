@@ -35,6 +35,10 @@ def dry_run_tokens(result):
     return shlex.split(result.stdout.strip())
 
 
+def option_value(tokens: list[str], option: str) -> str:
+    return tokens[tokens.index(option) + 1]
+
+
 def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path):
     """Catches cwd-dependent paths, wrong Stage 2 bindings, or lost CLI arguments."""
     result = run_launcher(
@@ -80,11 +84,44 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "--no-gradient_checkpointing",
         "--max_seq_length_train",
         "8192",
+        "--tuning_method",
+        "full",
+        "--lora_r",
+        "32",
+        "--lora_alpha",
+        "64",
+        "--lora_dropout",
+        "0.05",
+        "--lora_target_modules",
+        "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
         "--max_steps",
         "1",
         "--evaluation_output_path",
         "/reports/stage 2.json",
     ]
+
+
+def test_stage2_launcher_propagates_explicit_dora_settings():
+    """Catches PEFT environment settings being defaulted or reordered incorrectly."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "TUNING_METHOD": "dora",
+                "LORA_R": "16",
+                "LORA_ALPHA": "32",
+                "LORA_DROPOUT": "0.1",
+                "LORA_TARGET_MODULES": "q_proj,v_proj,down_proj",
+            }
+        )
+    )
+
+    assert option_value(tokens, "--tuning_method") == "dora"
+    assert option_value(tokens, "--lora_r") == "16"
+    assert option_value(tokens, "--lora_alpha") == "32"
+    assert option_value(tokens, "--lora_dropout") == "0.1"
+    assert option_value(tokens, "--lora_target_modules") == (
+        "q_proj,v_proj,down_proj"
+    )
 
 
 def test_stage2_launcher_maps_resume_without_reinterpreting_stage1_origin():
@@ -96,6 +133,93 @@ def test_stage2_launcher_maps_resume_without_reinterpreting_stage1_origin():
     resume_index = tokens.index("--resume_from_checkpoint_path")
     assert tokens[load_index + 1] == REQUIRED_ENV["STAGE1_CHECKPOINT"]
     assert tokens[resume_index + 1] == "/resume/checkpoint 10"
+
+
+def test_stage2_launcher_resume_without_explicit_method_omits_all_tuning_options():
+    """Catches environment defaults or stray LoRA values overriding the sidecar."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "RESUME_CHECKPOINT": "/resume/checkpoint 10",
+                "LORA_R": "16",
+                "LORA_ALPHA": "32",
+                "LORA_DROPOUT": "0.1",
+                "LORA_TARGET_MODULES": "q_proj,v_proj",
+            }
+        )
+    )
+
+    for option in (
+        "--tuning_method",
+        "--lora_r",
+        "--lora_alpha",
+        "--lora_dropout",
+        "--lora_target_modules",
+    ):
+        assert option not in tokens
+
+
+def test_stage2_launcher_resume_with_explicit_method_forwards_complete_settings():
+    """Catches an intentional resume override bypassing compatibility validation."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "RESUME_CHECKPOINT": "/resume/checkpoint 10",
+                "TUNING_METHOD": "lora",
+                "LORA_R": "16",
+                "LORA_ALPHA": "32",
+                "LORA_DROPOUT": "0.1",
+                "LORA_TARGET_MODULES": "q_proj,v_proj",
+            }
+        )
+    )
+
+    assert option_value(tokens, "--tuning_method") == "lora"
+    assert option_value(tokens, "--lora_r") == "16"
+    assert option_value(tokens, "--lora_alpha") == "32"
+    assert option_value(tokens, "--lora_dropout") == "0.1"
+    assert option_value(tokens, "--lora_target_modules") == "q_proj,v_proj"
+
+
+@pytest.mark.parametrize("method", ("qlora", "adapter", "FULL", ""))
+def test_stage2_launcher_rejects_unknown_tuning_method(method):
+    """Catches unsupported tuning methods reaching model construction."""
+    result = run_launcher(env_overrides={"TUNING_METHOD": method})
+
+    assert result.returncode == 2
+    assert "TUNING_METHOD must be full, lora, or dora" in result.stderr
+
+
+@pytest.mark.parametrize("name", ("LORA_R", "LORA_ALPHA"))
+@pytest.mark.parametrize("value", ("0", "-1", "1.5", "rank"))
+def test_stage2_launcher_rejects_invalid_positive_lora_integers(name, value):
+    """Catches malformed adapter dimensions before model startup."""
+    result = run_launcher(env_overrides={name: value})
+
+    assert result.returncode == 2
+    assert f"{name} must be a positive integer" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "value", ("nan", "inf", "-inf", "-0.1", "1", "1.1", "dropout")
+)
+def test_stage2_launcher_rejects_invalid_lora_dropout(value):
+    """Catches non-finite or out-of-range adapter dropout before model startup."""
+    result = run_launcher(env_overrides={"LORA_DROPOUT": value})
+
+    assert result.returncode == 2
+    assert "LORA_DROPOUT must be a finite number in [0, 1)" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "value", ("", ",", "visual.q_proj", "rotary_emb", "q_proj,embed_tokens")
+)
+def test_stage2_launcher_rejects_invalid_lora_targets(value):
+    """Catches empty, visual, or out-of-scope adapter targets before startup."""
+    result = run_launcher(env_overrides={"LORA_TARGET_MODULES": value})
+
+    assert result.returncode == 2
+    assert "LORA_TARGET_MODULES must contain only approved decoder targets" in result.stderr
 
 
 def test_stage2_launcher_omits_resume_for_fresh_training():

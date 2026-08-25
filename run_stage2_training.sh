@@ -11,6 +11,16 @@ export TOKENIZERS_PARALLELISM=false
 : "${OUTPUT_DIR:?set OUTPUT_DIR}"
 : "${LOG_FILE:?set LOG_FILE}"
 
+if [[ -v TUNING_METHOD ]]; then
+  TUNING_METHOD_EXPLICIT=true
+else
+  TUNING_METHOD_EXPLICIT=false
+fi
+TUNING_METHOD=${TUNING_METHOD-full}
+LORA_R=${LORA_R-32}
+LORA_ALPHA=${LORA_ALPHA-64}
+LORA_DROPOUT=${LORA_DROPOUT-0.05}
+LORA_TARGET_MODULES=${LORA_TARGET_MODULES-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
 LATENT_SIZE=${LATENT_SIZE:-8}
 SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
@@ -39,6 +49,11 @@ MANAGED_OPTIONS=(
   --max_seq_length_train
   --deepspeed_config
   --resume_from_checkpoint_path
+  --tuning_method
+  --lora_r
+  --lora_alpha
+  --lora_dropout
+  --lora_target_modules
 )
 
 reject_managed_arguments() {
@@ -70,6 +85,53 @@ require_positive_integer() {
 require_positive_integer LATENT_SIZE "$LATENT_SIZE"
 require_positive_integer GRADIENT_ACCUMULATION_STEPS "$GRADIENT_ACCUMULATION_STEPS"
 require_positive_integer MAX_SEQUENCE_LENGTH "$MAX_SEQUENCE_LENGTH"
+require_positive_integer LORA_R "$LORA_R"
+require_positive_integer LORA_ALPHA "$LORA_ALPHA"
+
+case "$TUNING_METHOD" in
+  full|lora|dora) ;;
+  *)
+    printf 'TUNING_METHOD must be full, lora, or dora\n' >&2
+    exit 2
+    ;;
+esac
+
+if ! "$REPO_ROOT/venv/ilvr-venv/bin/python" - "$LORA_DROPOUT" <<'PY'
+import math
+import sys
+
+try:
+    dropout = float(sys.argv[1])
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(dropout) and 0 <= dropout < 1 else 1)
+PY
+then
+  printf 'LORA_DROPOUT must be a finite number in [0, 1)\n' >&2
+  exit 2
+fi
+
+remaining_targets=$LORA_TARGET_MODULES
+while true; do
+  if [[ "$remaining_targets" == *,* ]]; then
+    target=${remaining_targets%%,*}
+    remaining_targets=${remaining_targets#*,}
+    has_more_targets=true
+  else
+    target=$remaining_targets
+    has_more_targets=false
+  fi
+  case "$target" in
+    q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj) ;;
+    *)
+      printf 'LORA_TARGET_MODULES must contain only approved decoder targets\n' >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$has_more_targets" == false ]]; then
+    break
+  fi
+done
 
 if ! "$REPO_ROOT/venv/ilvr-venv/bin/python" - "$LEARNING_RATE" <<'PY'
 import math
@@ -119,6 +181,17 @@ if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
   RESUME_ARGS+=(--resume_from_checkpoint_path "$RESUME_CHECKPOINT")
 fi
 
+TUNING_ARGS=()
+if [[ -z "${RESUME_CHECKPOINT:-}" || "$TUNING_METHOD_EXPLICIT" == true ]]; then
+  TUNING_ARGS+=(
+    --tuning_method "$TUNING_METHOD"
+    --lora_r "$LORA_R"
+    --lora_alpha "$LORA_ALPHA"
+    --lora_dropout "$LORA_DROPOUT"
+    --lora_target_modules "$LORA_TARGET_MODULES"
+  )
+fi
+
 DEEPSPEED_ARGS=()
 if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
   DEEPSPEED_ARGS+=(--deepspeed_config "$DEEPSPEED_CONFIG")
@@ -141,6 +214,7 @@ COMMAND=(
   --attention_implementation "$ATTENTION_IMPLEMENTATION"
   "${CHECKPOINTING_ARGS[@]}"
   --max_seq_length_train "$MAX_SEQUENCE_LENGTH"
+  "${TUNING_ARGS[@]}"
   "${RESUME_ARGS[@]}"
   "${DEEPSPEED_ARGS[@]}"
   "$@"

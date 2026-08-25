@@ -147,11 +147,15 @@ resolved relative to the script. The reproduction-oriented defaults are:
 - `GRADIENT_ACCUMULATION_STEPS=8`;
 - `ATTENTION_IMPLEMENTATION=sdpa`;
 - `GRADIENT_CHECKPOINTING=false`;
-- `MAX_SEQUENCE_LENGTH=8192`; and
+- `MAX_SEQUENCE_LENGTH=8192`;
+- `TUNING_METHOD=full`;
+- `LORA_R=32`, `LORA_ALPHA=64`, and `LORA_DROPOUT=0.05`;
+- `LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj`;
+  and
 - rank-local/per-device batch size fixed at `1`.
 
-For a fresh Stage 2 run, provide an explicit Stage 1 checkpoint origin and do
-not set `RESUME_CHECKPOINT`:
+For fresh full tuning, provide a complete Stage 1 checkpoint and do not set
+`RESUME_CHECKPOINT`:
 
 ```bash
 STAGE1_CHECKPOINT=/path/to/stage1/checkpoint \
@@ -159,6 +163,7 @@ DATA_PATH=/path/to/TRAIN.jsonl \
 IMAGE_ROOT=/path/to/data \
 OUTPUT_DIR=/path/to/stage2/output \
 LOG_FILE=/path/to/stage2.log \
+TUNING_METHOD=full \
 LATENT_SIZE=8 \
 SUPERVISE_LATENT_BOUNDARIES=true \
 LEARNING_RATE=1e-5 \
@@ -170,27 +175,111 @@ DEEPSPEED_CONFIG=configs/config_stage3.json \
 ./run_stage2_training.sh
 ```
 
-Fresh training loads model and processor state from `STAGE1_CHECKPOINT`, then
-creates new optimizer and scheduler state. It does not discover or inherit a
-nearby trainer checkpoint automatically.
-
-To resume, keep the Stage 1 origin explicit and independently name the exact
-Stage 2 checkpoint:
+Fresh LoRA training uses the same Stage 1 base but trains adapters only:
 
 ```bash
 STAGE1_CHECKPOINT=/path/to/stage1/checkpoint \
-RESUME_CHECKPOINT=/path/to/stage2/output/checkpoint-100 \
 DATA_PATH=/path/to/TRAIN.jsonl \
 IMAGE_ROOT=/path/to/data \
-OUTPUT_DIR=/path/to/stage2/output \
-LOG_FILE=/path/to/stage2.log \
+OUTPUT_DIR=/path/to/stage2-lora/output \
+LOG_FILE=/path/to/stage2-lora.log \
+TUNING_METHOD=lora \
+LORA_R=32 \
+LORA_ALPHA=64 \
+LORA_DROPOUT=0.05 \
+LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+DEEPSPEED_CONFIG=configs/config_stage3.json \
 ./run_stage2_training.sh
 ```
 
-The resume checkpoint must be a Stage 2 checkpoint. On resume it is the single
-source for model, processor, optimizer, scheduler, and trainer progress;
-`STAGE1_CHECKPOINT` remains a separate, explicit provenance input and is never
-reinterpreted as the resume path.
+DoRA has the same target and hyperparameter contract, with
+`TUNING_METHOD=dora`:
+
+```bash
+STAGE1_CHECKPOINT=/path/to/stage1/checkpoint \
+DATA_PATH=/path/to/TRAIN.jsonl \
+IMAGE_ROOT=/path/to/data \
+OUTPUT_DIR=/path/to/stage2-dora/output \
+LOG_FILE=/path/to/stage2-dora.log \
+TUNING_METHOD=dora \
+LORA_R=32 \
+LORA_ALPHA=64 \
+LORA_DROPOUT=0.05 \
+LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+DEEPSPEED_CONFIG=configs/config_stage3.json \
+./run_stage2_training.sh
+```
+
+All fresh modes load model and processor state from `STAGE1_CHECKPOINT`, then
+create new optimizer and scheduler state. The Stage 1 source must contain full
+base-model weights; a Stage 1 PEFT-only artifact is rejected because adapter
+stacking and implicit merging are not supported.
+
+To resume PEFT training, keep the compatible Stage 1 base explicit and name
+the exact Stage 2 adapter checkpoint independently. Supplying all tuning
+settings makes the requested topology explicit so compatibility validation can
+reject a mismatch:
+
+```bash
+STAGE1_CHECKPOINT=/path/to/stage1/checkpoint \
+RESUME_CHECKPOINT=/path/to/stage2-lora/output/checkpoint-100 \
+DATA_PATH=/path/to/TRAIN.jsonl \
+IMAGE_ROOT=/path/to/data \
+OUTPUT_DIR=/path/to/stage2-lora/output \
+LOG_FILE=/path/to/stage2-lora.log \
+TUNING_METHOD=lora \
+LORA_R=32 \
+LORA_ALPHA=64 \
+LORA_DROPOUT=0.05 \
+LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+./run_stage2_training.sh
+```
+
+Alternatively, omit `TUNING_METHOD` on resume to inherit the method and all
+four adapter settings from `stage2_peft_metadata.json`. In that mode the
+launcher deliberately forwards none of the five tuning arguments, even if
+valid `LORA_*` variables happen to be present. An explicit `TUNING_METHOD`
+always forwards the complete setting set for compatibility validation.
+
+Every PEFT checkpoint and final adapter artifact contains:
+
+```text
+adapter_config.json
+adapter_model.safetensors
+stage2_peft_metadata.json
+```
+
+A numbered Trainer checkpoint additionally contains the ordinary resume state:
+
+```text
+trainer_state.json
+optimizer.pt, scheduler.pt, RNG state, and other Trainer resume files
+```
+
+It does not contain a merged copy of the Stage 1 base. Resume restores the
+adapter plus Trainer progress from `RESUME_CHECKPOINT`; `STAGE1_CHECKPOINT`
+remains the separate base source. Moving the base and adapter directories is
+supported: compatibility is checked structurally through latent-token IDs,
+model configuration, target modules, and parameter shapes rather than by
+requiring the original absolute path or hashing the full model weights.
+
+Evaluate a full Stage 2 artifact with `--model_dir` alone. Evaluate a PEFT
+artifact by supplying the adapter as `--model_dir` and its compatible Stage 1
+base separately:
+
+```bash
+PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+./venv/ilvr-venv/bin/python eval.py \
+  --model_dir /path/to/stage2-lora/output/checkpoint-100 \
+  --base_model_dir /path/to/stage1/checkpoint \
+  --test_data_path /path/to/TEST.jsonl \
+  --task_name comt \
+  --output_json_path /path/to/lora-evaluation.jsonl
+```
+
+Adapter evaluation loads the base plus adapter without merging them. Adapter
+merge/export, adapter stacking/fusion, QLoRA, and alternate PEFT methods are
+not implemented.
 
 Stage 2 currently requires a rank-local batch size of exactly `B=1`; arbitrary
 local `B>1` latent scheduling is not implemented. Data-parallel ranks and
@@ -199,6 +288,11 @@ gradient accumulation are supported, so the effective global batch is
 `SUPERVISE_LATENT_BOUNDARIES=false` to mask both latent boundary tokens from CE;
 the latent slots themselves are always masked. Start-only or end-only boundary
 supervision is not a supported state.
+
+In all three modes the visual encoder remains frozen. In LoRA and DoRA modes,
+the base decoder, token embeddings, and LM head are also frozen; only adapters
+on the exact decoder projection allowlist above are trainable. Visual or
+out-of-scope target names are rejected before model loading.
 
 Stage 2 uses each sample's original input images only. `helper_image` entries
 mark latent reasoning steps in the data, but helper-image pixels/tensors are
@@ -244,7 +338,13 @@ for one through six blocks, respectively.
   PyTorch 2.7.1+cu128, and FlashAttention 2.8.3.
 - **DeepSpeed:** a reviewed tiny-model two-B200 ZeRO-3 run passed consolidated
   save/load and optimizer/scheduler resume from global step 1 to 2, with every
-  observed rank-local batch equal to 1.
+  observed rank-local batch equal to 1 for the pre-PEFT full-tuning path.
+- **LoRA ZeRO-3:** launcher, construction, checkpoint, resume-routing, and
+  base-plus-adapter evaluation support are implemented; the dedicated two-GPU
+  LoRA save/resume validation has not run yet.
+- **DoRA ZeRO-3:** launcher, construction, checkpoint, resume-routing, and
+  base-plus-adapter evaluation support are implemented; the dedicated two-GPU
+  DoRA save/resume validation has not run yet.
 - **Paper-level reproduction:** full CoMT Stage 2 training, benchmark
   evaluation, and reproduction of the paper's reported metrics were **not**
   run. The evidence above establishes implementation, smoke, backend, and data

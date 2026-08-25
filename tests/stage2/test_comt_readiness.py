@@ -68,6 +68,16 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         "--no-gradient_checkpointing",
         "--max_seq_length_train",
         "8192",
+        "--tuning_method",
+        "full",
+        "--lora_r",
+        "32",
+        "--lora_alpha",
+        "64",
+        "--lora_dropout",
+        "0.05",
+        "--lora_target_modules",
+        "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     ]
 
 
@@ -172,6 +182,11 @@ MANAGED_OPTIONS = (
     "--max_seq_length_train",
     "--deepspeed_config",
     "--resume_from_checkpoint_path",
+    "--tuning_method",
+    "--lora_r",
+    "--lora_alpha",
+    "--lora_dropout",
+    "--lora_target_modules",
 )
 
 
