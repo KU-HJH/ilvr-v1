@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 from importlib import metadata as importlib_metadata
+from pathlib import Path
+import tempfile
 import weakref
 from typing import Callable, Mapping
 
@@ -118,9 +120,11 @@ class CustomTrainerStage1(SFTTrainer):
         ema_method: str | None = None,
         target_builder: Stage1TeacherTargetBuilder | None = None,
         ema_teacher: Stage1EmaTeacher | None = None,
+        stage1_peft_metadata=None,
         collect_stage1_diagnostics: bool = False,
         **kwargs,
     ) -> None:
+        self.stage1_peft_metadata = stage1_peft_metadata
         # Preserve the repository's legacy constructor spelling across the
         # tokenizer -> processing_class Trainer API migration.
         if "tokenizer" in kwargs and "processing_class" not in kwargs:
@@ -628,6 +632,53 @@ class CustomTrainerStage1(SFTTrainer):
                 if isinstance(value, torch.Tensor) and value.numel() == 1:
                     logs[f"stage1/{name}"] = float(value.item())
         super().log(logs, start_time=start_time)
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Extend ordinary Trainer saves with strict Stage 1 PEFT sidecars."""
+
+        metadata = self.stage1_peft_metadata
+        if metadata is None:
+            return super().save_model(output_dir, _internal_call=_internal_call)
+
+        from stage1.checkpointing import (
+            _save_stage1_peft_supplements,
+            _validate_stage1_peft_runtime,
+            classify_stage1_artifact,
+        )
+
+        if not self.args.save_safetensors:
+            raise ValueError("Stage 1 PEFT checkpoints require safetensors")
+        processor = getattr(self, "processing_class", None)
+        if processor is None:
+            raise ValueError("Stage 1 PEFT checkpoint requires a processor")
+        _validate_stage1_peft_runtime(self.model, processor, metadata)
+        for field in ("ce_weight", "sim_weight", "coverage_p", "image_pool_k"):
+            runtime_value = getattr(self, field, None)
+            metadata_value = getattr(metadata, field)
+            if runtime_value != metadata_value:
+                raise ValueError(
+                    f"Stage 1 {field} metadata mismatch: "
+                    f"runtime={runtime_value}, metadata={metadata_value}"
+                )
+
+        super().save_model(output_dir, _internal_call=_internal_call)
+        target = Path(output_dir or self.args.output_dir)
+        if self.is_deepspeed_enabled:
+            # The sparse ZeRO gather is collective. Non-writing ranks use a
+            # private temporary destination while rank zero publishes.
+            if self.args.should_save:
+                _save_stage1_peft_supplements(self.model, target, metadata)
+            else:
+                with tempfile.TemporaryDirectory(
+                    prefix="stage1-token-rows-"
+                ) as temporary:
+                    _save_stage1_peft_supplements(
+                        self.model, Path(temporary), metadata
+                    )
+        elif self.args.should_save:
+            _save_stage1_peft_supplements(self.model, target, metadata)
+        if self.args.should_save:
+            classify_stage1_artifact(target)
 
 
 __all__ = ["CustomTrainerStage1"]

@@ -1,0 +1,822 @@
+from __future__ import annotations
+
+import json
+import shutil
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import peft
+import pytest
+import torch
+from peft import PeftModel
+from safetensors.torch import load_file, save_file
+from torch import nn
+from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
+from transformers import Trainer, TrainingArguments, default_data_collator
+
+from peft_common import capture_qwen2_5_vl_architecture, resolve_qwen2_5_vl_model
+from stage1.checkpointing import (
+    STAGE1_PEFT_METADATA_FILENAME,
+    STAGE1_PEFT_SCHEMA_VERSION,
+    STAGE1_REPOSITORY_FORMAT_VERSION,
+    Stage1ArtifactKind,
+    Stage1PeftMetadata,
+    classify_stage1_artifact,
+    load_stage1_peft_artifact,
+    load_stage1_peft_metadata,
+    resolve_stage1_resume,
+    save_stage1_peft_artifact,
+)
+from stage1.peft import build_stage1_tuned_model
+from stage1.token_rows import find_sparse_output_token_rows
+from stage1.trainer import CustomTrainerStage1
+from stage1.types import Stage1TuningConfig
+
+
+BASE_VOCAB_SIZE = 125
+RESIZED_VOCAB_SIZE = 128
+LATENT_TOKEN_STRINGS = (
+    "<|latent_pad|>",
+    "<|latent_start|>",
+    "<|latent_end|>",
+)
+LATENT_TOKEN_IDS = (125, 126, 127)
+
+
+class TinyStage1Tokenizer:
+    unk_token = "<unk>"
+    unk_token_id = 0
+
+    def __init__(self, token_ids=LATENT_TOKEN_IDS, *, size=RESIZED_VOCAB_SIZE):
+        self._ids = dict(zip(LATENT_TOKEN_STRINGS, token_ids))
+        self._tokens = {value: key for key, value in self._ids.items()}
+        self._size = size
+
+    def __len__(self):
+        return self._size
+
+    def convert_tokens_to_ids(self, token):
+        return self._ids.get(token, self.unk_token_id)
+
+    def convert_ids_to_tokens(self, token_id):
+        return self._tokens.get(int(token_id), self.unk_token)
+
+    def save_pretrained(self, directory):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "tokenizer.json").write_text(
+            json.dumps({"ids": self._ids, "size": self._size}, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def from_pretrained(cls, directory):
+        payload = json.loads(
+            (Path(directory) / "tokenizer.json").read_text(encoding="utf-8")
+        )
+        token_ids = tuple(payload["ids"][token] for token in LATENT_TOKEN_STRINGS)
+        return cls(token_ids, size=payload["size"])
+
+
+class TinyStage1Processor:
+    model_input_names = ["input_ids"]
+
+    def __init__(self, tokenizer=None):
+        self.tokenizer = tokenizer or TinyStage1Tokenizer()
+
+    def save_pretrained(self, directory):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "preprocessor_config.json").write_text(
+            '{"processor_class":"TinyStage1Processor"}\n', encoding="utf-8"
+        )
+        self.tokenizer.save_pretrained(directory)
+
+    @classmethod
+    def from_pretrained(cls, directory):
+        return cls(TinyStage1Tokenizer.from_pretrained(directory))
+
+
+def stage1_tuning(method="dora"):
+    return Stage1TuningConfig(
+        method=method,
+        rank=4,
+        alpha=8,
+        dropout=0.0,
+        target_suffixes=(
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ),
+    )
+
+
+def tiny_original_qwen():
+    torch.manual_seed(29)
+    config = Qwen2_5_VLConfig(
+        vocab_size=BASE_VOCAB_SIZE,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vision_config={
+            "depth": 1,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_heads": 2,
+            "patch_size": 2,
+            "spatial_merge_size": 1,
+            "temporal_patch_size": 1,
+            "window_size": 2,
+            "out_hidden_size": 8,
+            "fullatt_block_indexes": [0],
+        },
+        image_token_id=80,
+        vision_start_token_id=81,
+        video_token_id=82,
+        stage="stage1",
+        latent_size=2,
+        attn_implementation="eager",
+        rope_scaling={"type": "mrope", "mrope_section": [1, 1, 0]},
+    )
+    config._name_or_path = "tiny/original-qwen"
+    return Qwen2_5_VLForConditionalGeneration(config)
+
+
+def _resolved_names(tuning):
+    owners = {
+        "q_proj": "self_attn",
+        "k_proj": "self_attn",
+        "v_proj": "self_attn",
+        "o_proj": "self_attn",
+        "gate_proj": "mlp",
+        "up_proj": "mlp",
+        "down_proj": "mlp",
+    }
+    return tuple(
+        f"model.layers.0.{owners[suffix]}.{suffix}"
+        for suffix in tuning.target_suffixes
+    )
+
+
+def sample_metadata(base_model=None, tuning=None):
+    base_model = base_model or tiny_original_qwen()
+    tuning = tuning or stage1_tuning()
+    return Stage1PeftMetadata(
+        schema_version=STAGE1_PEFT_SCHEMA_VERSION,
+        stage="stage1",
+        base_model_reference="tiny/original-qwen",
+        base_model_architecture=capture_qwen2_5_vl_architecture(base_model.config),
+        base_vocab_size=BASE_VOCAB_SIZE,
+        resized_vocab_size=RESIZED_VOCAB_SIZE,
+        latent_token_ids=LATENT_TOKEN_IDS,
+        latent_token_strings=LATENT_TOKEN_STRINGS,
+        latent_size=2,
+        ce_weight=1.0,
+        sim_weight=0.5,
+        coverage_p=0.9,
+        image_pool_k=8,
+        tuning_method=tuning.method,
+        rank=tuning.rank,
+        alpha=tuning.alpha,
+        dropout=tuning.dropout,
+        requested_target_suffixes=tuning.target_suffixes,
+        resolved_target_names=_resolved_names(tuning),
+        input_row_format="peft_trainable_tokens_v1",
+        output_row_format="ilvr_sparse_output_rows_v1",
+        output_row_shape=(3, 8),
+        peft_version=peft.__version__,
+        repository_format_version=STAGE1_REPOSITORY_FORMAT_VERSION,
+    )
+
+
+@dataclass(frozen=True)
+class Stage1DoraBundle:
+    model: nn.Module
+    processor: TinyStage1Processor
+    metadata: Stage1PeftMetadata
+
+
+@pytest.fixture
+def stage1_dora_bundle():
+    base = tiny_original_qwen()
+    metadata = sample_metadata(base)
+    base.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    base.config.latent_token_id = LATENT_TOKEN_IDS[0]
+    base.config.latent_start_id = LATENT_TOKEN_IDS[1]
+    base.config.latent_end_id = LATENT_TOKEN_IDS[2]
+    model = build_stage1_tuned_model(base, stage1_tuning(), LATENT_TOKEN_IDS)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if parameter.requires_grad:
+                parameter.fill_(0.01 * (len(name) % 7 + 1))
+    return Stage1DoraBundle(
+        model=model,
+        processor=TinyStage1Processor(),
+        metadata=metadata,
+    )
+
+
+@pytest.fixture
+def saved_dora_artifact(tmp_path, stage1_dora_bundle):
+    save_stage1_peft_artifact(
+        stage1_dora_bundle.model,
+        stage1_dora_bundle.processor,
+        tmp_path,
+        stage1_dora_bundle.metadata,
+    )
+    return tmp_path
+
+
+def _write_metadata(directory, metadata):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / STAGE1_PEFT_METADATA_FILENAME).write_text(
+        json.dumps(metadata.to_dict(), sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _write_fake_peft(directory, metadata, *, weight="adapter_model.safetensors"):
+    directory.mkdir(parents=True, exist_ok=True)
+    for filename in (
+        "adapter_config.json",
+        weight,
+        "ilvr_token_rows.safetensors",
+    ):
+        (directory / filename).write_bytes(b"fixture")
+    _write_metadata(directory, metadata)
+
+
+def _write_full_checkpoint(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "model.safetensors").write_bytes(b"fixture")
+    (directory / "trainer_state.json").write_text("{}\n", encoding="utf-8")
+
+
+def test_metadata_schema_v1_round_trips_exact_fields(tmp_path):
+    metadata = sample_metadata()
+
+    _write_metadata(tmp_path, metadata)
+
+    assert load_stage1_peft_metadata(tmp_path) == metadata
+    assert set(metadata.to_dict()) == {
+        "schema_version",
+        "stage",
+        "base_model_reference",
+        "base_model_architecture",
+        "base_vocab_size",
+        "resized_vocab_size",
+        "latent_token_ids",
+        "latent_token_strings",
+        "latent_size",
+        "ce_weight",
+        "sim_weight",
+        "coverage_p",
+        "image_pool_k",
+        "tuning_method",
+        "rank",
+        "alpha",
+        "dropout",
+        "requested_target_suffixes",
+        "resolved_target_names",
+        "input_row_format",
+        "output_row_format",
+        "output_row_shape",
+        "peft_version",
+        "repository_format_version",
+    }
+
+
+@pytest.mark.parametrize("mutation", ["schema", "missing", "extra"])
+def test_metadata_fails_closed_on_unknown_or_partial_schema(tmp_path, mutation):
+    payload = sample_metadata().to_dict()
+    if mutation == "schema":
+        payload["schema_version"] = 999
+    elif mutation == "missing":
+        payload.pop("coverage_p")
+    else:
+        payload["future_field"] = True
+    (tmp_path / STAGE1_PEFT_METADATA_FILENAME).write_text(
+        json.dumps(payload) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="schema|fields"):
+        load_stage1_peft_metadata(tmp_path)
+
+
+def test_metadata_rejects_full_tuning_as_an_adapter_schema():
+    payload = sample_metadata().to_dict()
+    payload["tuning_method"] = "full"
+
+    with pytest.raises(ValueError, match="LoRA or DoRA"):
+        Stage1PeftMetadata.from_dict(payload)
+
+
+def test_dora_artifact_is_adapter_only_and_complete(
+    tmp_path, stage1_dora_bundle
+):
+    save_stage1_peft_artifact(
+        stage1_dora_bundle.model,
+        stage1_dora_bundle.processor,
+        tmp_path,
+        stage1_dora_bundle.metadata,
+    )
+
+    assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.PEFT
+    assert (tmp_path / "adapter_config.json").is_file()
+    assert (tmp_path / "adapter_model.safetensors").is_file()
+    assert (tmp_path / "ilvr_token_rows.safetensors").is_file()
+    assert (tmp_path / STAGE1_PEFT_METADATA_FILENAME).is_file()
+    assert (tmp_path / "tokenizer.json").is_file()
+    assert (tmp_path / "preprocessor_config.json").is_file()
+    assert not (tmp_path / "model.safetensors").exists()
+    assert not (tmp_path / "pytorch_model.bin").exists()
+
+
+@pytest.mark.parametrize(
+    ("missing", "message"),
+    [
+        ("adapter_model.safetensors", "incomplete"),
+        ("ilvr_token_rows.safetensors", "token-row"),
+        (STAGE1_PEFT_METADATA_FILENAME, "metadata"),
+    ],
+)
+def test_incomplete_adapter_fails_before_peft_load(
+    saved_dora_artifact, missing, message, monkeypatch
+):
+    (saved_dora_artifact / missing).unlink()
+    calls = 0
+
+    def reject_load(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("large/base adapter load must not run")
+
+    monkeypatch.setattr(PeftModel, "from_pretrained", reject_load)
+    base = tiny_original_qwen()
+    with pytest.raises(ValueError, match=message):
+        load_stage1_peft_artifact(
+            base,
+            TinyStage1Processor.from_pretrained(saved_dora_artifact),
+            saved_dora_artifact,
+            is_trainable=True,
+        )
+    assert calls == 0
+    assert base.get_input_embeddings().num_embeddings == BASE_VOCAB_SIZE
+
+
+def test_classifier_rejects_mixed_full_and_peft_markers_before_metadata(
+    tmp_path,
+):
+    _write_fake_peft(tmp_path, sample_metadata())
+    (tmp_path / "model.safetensors").write_bytes(b"fixture")
+
+    with pytest.raises(ValueError, match="mixed.*full.*PEFT"):
+        classify_stage1_artifact(tmp_path)
+
+
+def test_classifier_rejects_legacy_binary_adapter(tmp_path):
+    _write_fake_peft(tmp_path, sample_metadata(), weight="adapter_model.bin")
+
+    with pytest.raises(ValueError, match="legacy binary.*safetensors"):
+        classify_stage1_artifact(tmp_path)
+
+
+def test_classifier_rejects_unknown_model_weight_marker(tmp_path):
+    _write_fake_peft(tmp_path, sample_metadata())
+    (tmp_path / "unowned_weights.safetensors").write_bytes(b"fixture")
+
+    with pytest.raises(ValueError, match="unknown.*weight"):
+        classify_stage1_artifact(tmp_path)
+
+
+def test_classifier_accepts_full_final_and_numbered_checkpoint(tmp_path):
+    final = tmp_path / "final"
+    numbered = tmp_path / "checkpoint-7"
+    (final).mkdir()
+    (final / "model.safetensors.index.json").write_text("{}\n")
+    _write_full_checkpoint(numbered)
+
+    assert classify_stage1_artifact(final) is Stage1ArtifactKind.FULL
+    assert classify_stage1_artifact(numbered) is Stage1ArtifactKind.FULL
+
+
+def test_classifier_accepts_peft_final_and_numbered_checkpoint(
+    saved_dora_artifact, tmp_path
+):
+    numbered = tmp_path / "numbered" / "checkpoint-4"
+    shutil.copytree(saved_dora_artifact, numbered)
+    (numbered / "trainer_state.json").write_text("{}\n", encoding="utf-8")
+
+    assert classify_stage1_artifact(saved_dora_artifact) is Stage1ArtifactKind.PEFT
+    assert classify_stage1_artifact(numbered) is Stage1ArtifactKind.PEFT
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("architecture", "architecture mismatch.*hidden_act"),
+        ("token_id", "latent token.*mismatch"),
+        ("rank", "rank mismatch"),
+        ("resolved_order", "resolved target.*mismatch"),
+        ("output_shape", "output_row_shape"),
+        ("row_format", "output_row_format"),
+        ("repository_schema", "repository format"),
+        ("peft_version", "PEFT version"),
+    ],
+)
+def test_load_validates_architecture_token_shape_tuning_and_schema_before_peft(
+    saved_dora_artifact, mutation, message, monkeypatch
+):
+    base = tiny_original_qwen()
+    processor = TinyStage1Processor.from_pretrained(saved_dora_artifact)
+    payload = load_stage1_peft_metadata(saved_dora_artifact).to_dict()
+    if mutation == "architecture":
+        base.config.hidden_act = "gelu"
+    elif mutation == "token_id":
+        processor = TinyStage1Processor(
+            TinyStage1Tokenizer((124, 126, 127), size=RESIZED_VOCAB_SIZE)
+        )
+    elif mutation == "rank":
+        payload["rank"] = 5
+    elif mutation == "resolved_order":
+        payload["resolved_target_names"] = list(
+            reversed(payload["resolved_target_names"])
+        )
+    elif mutation == "output_shape":
+        payload["output_row_shape"] = [3, 9]
+    elif mutation == "row_format":
+        payload["output_row_format"] = "future_rows_v2"
+    elif mutation == "repository_schema":
+        payload["repository_format_version"] = 999
+    else:
+        payload["peft_version"] = "0.0.0"
+    if mutation not in ("architecture", "token_id"):
+        (saved_dora_artifact / STAGE1_PEFT_METADATA_FILENAME).write_text(
+            json.dumps(payload) + "\n", encoding="utf-8"
+        )
+
+    calls = 0
+
+    def reject_load(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("PEFT load must not run")
+
+    monkeypatch.setattr(PeftModel, "from_pretrained", reject_load)
+    with pytest.raises(ValueError, match=message):
+        load_stage1_peft_artifact(
+            base,
+            processor,
+            saved_dora_artifact,
+            is_trainable=True,
+        )
+    assert calls == 0
+    assert base.get_input_embeddings().num_embeddings == BASE_VOCAB_SIZE
+
+
+def test_load_rejects_sparse_row_tensor_shape_before_peft(
+    saved_dora_artifact, monkeypatch
+):
+    save_file(
+        {
+            "token_ids": torch.tensor(LATENT_TOKEN_IDS, dtype=torch.int64),
+            "output_delta": torch.zeros((3, 7), dtype=torch.float32),
+        },
+        saved_dora_artifact / "ilvr_token_rows.safetensors",
+        metadata={"format_version": "1", "training_dtype": "float32"},
+    )
+    calls = 0
+
+    def reject_load(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("PEFT load must not run")
+
+    monkeypatch.setattr(PeftModel, "from_pretrained", reject_load)
+    with pytest.raises(ValueError, match="sparse output_delta shape mismatch"):
+        load_stage1_peft_artifact(
+            tiny_original_qwen(),
+            TinyStage1Processor.from_pretrained(saved_dora_artifact),
+            saved_dora_artifact,
+            is_trainable=True,
+        )
+    assert calls == 0
+
+
+def test_load_rejects_extra_adapter_tensor_before_peft(
+    saved_dora_artifact, monkeypatch
+):
+    tensors = load_file(saved_dora_artifact / "adapter_model.safetensors")
+    tensors["base_model.model.rogue.weight"] = torch.ones(1)
+    save_file(tensors, saved_dora_artifact / "adapter_model.safetensors")
+    calls = 0
+
+    def reject_load(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("PEFT load must not run")
+
+    monkeypatch.setattr(PeftModel, "from_pretrained", reject_load)
+    with pytest.raises(ValueError, match="unexpected adapter tensor"):
+        load_stage1_peft_artifact(
+            tiny_original_qwen(),
+            TinyStage1Processor.from_pretrained(saved_dora_artifact),
+            saved_dora_artifact,
+            is_trainable=True,
+        )
+    assert calls == 0
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_processor_and_adapter_rows_round_trip_without_reassigning_tokens(
+    saved_dora_artifact, stage1_dora_bundle
+):
+    restored_processor = TinyStage1Processor.from_pretrained(saved_dora_artifact)
+    before_ids = tuple(
+        restored_processor.tokenizer.convert_tokens_to_ids(token)
+        for token in LATENT_TOKEN_STRINGS
+    )
+
+    restored = load_stage1_peft_artifact(
+        tiny_original_qwen(),
+        restored_processor,
+        saved_dora_artifact,
+        is_trainable=True,
+    )
+
+    assert before_ids == LATENT_TOKEN_IDS
+    assert tuple(
+        restored_processor.tokenizer.convert_tokens_to_ids(token)
+        for token in LATENT_TOKEN_STRINGS
+    ) == LATENT_TOKEN_IDS
+    source_state = {
+        name: value.detach().cpu()
+        for name, value in stage1_dora_bundle.model.state_dict().items()
+        if "lora_" in name or "trainable_tokens_delta" in name
+    }
+    restored_state = {
+        name: value.detach().cpu()
+        for name, value in restored.state_dict().items()
+        if "lora_" in name or "trainable_tokens_delta" in name
+    }
+    assert restored_state.keys() == source_state.keys()
+    for name in source_state:
+        assert torch.equal(restored_state[name], source_state[name]), name
+    assert torch.equal(
+        find_sparse_output_token_rows(restored).output_delta.detach().cpu(),
+        find_sparse_output_token_rows(
+            stage1_dora_bundle.model
+        ).output_delta.detach().cpu(),
+    )
+    assert resolve_qwen2_5_vl_model(
+        restored
+    ).model.embed_tokens.token_adapter.token_indices["default"] == list(
+        LATENT_TOKEN_IDS
+    )
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_load_honors_is_trainable_false(saved_dora_artifact):
+    restored = load_stage1_peft_artifact(
+        tiny_original_qwen(),
+        TinyStage1Processor.from_pretrained(saved_dora_artifact),
+        saved_dora_artifact,
+        is_trainable=False,
+    )
+
+    assert not any(parameter.requires_grad for parameter in restored.parameters())
+
+
+def test_resolve_explicit_numbered_resume_wins(tmp_path):
+    output = tmp_path / "output"
+    explicit = tmp_path / "other" / "checkpoint-2"
+    _write_full_checkpoint(output / "checkpoint-10")
+    _write_full_checkpoint(explicit)
+
+    decision = resolve_stage1_resume(output, explicit)
+
+    assert decision.checkpoint_path == explicit
+    assert decision.artifact_kind is Stage1ArtifactKind.FULL
+    assert decision.explicit is True
+
+
+def test_explicit_full_resume_retains_normal_trainer_path_semantics(tmp_path):
+    explicit = tmp_path / "named-full-trainer-save"
+    _write_full_checkpoint(explicit)
+
+    decision = resolve_stage1_resume(tmp_path / "output", explicit)
+
+    assert decision.checkpoint_path == explicit
+    assert decision.artifact_kind is Stage1ArtifactKind.FULL
+    assert decision.explicit is True
+
+
+def test_auto_resume_selects_latest_valid_immediate_numbered_checkpoint_only(
+    tmp_path,
+):
+    output = tmp_path / "output"
+    _write_full_checkpoint(output / "checkpoint-2")
+    _write_full_checkpoint(output / "checkpoint-11")
+    _write_full_checkpoint(output / "checkpoint-not-a-number")
+    _write_full_checkpoint(output / "nested" / "checkpoint-99")
+    _write_full_checkpoint(tmp_path / "sibling" / "checkpoint-100")
+    invalid_latest = output / "checkpoint-12"
+    invalid_latest.mkdir(parents=True)
+    (invalid_latest / "adapter_config.json").write_text("{}\n")
+
+    decision = resolve_stage1_resume(output, None)
+
+    assert decision.checkpoint_path == output / "checkpoint-11"
+    assert decision.explicit is False
+
+
+def test_auto_resume_never_selects_final_adapter_directory(
+    saved_dora_artifact,
+):
+    decision = resolve_stage1_resume(saved_dora_artifact, None)
+
+    assert decision.checkpoint_path is None
+    assert decision.artifact_kind is None
+
+
+def test_explicit_peft_resume_requires_a_numbered_trainer_checkpoint(
+    saved_dora_artifact,
+):
+    with pytest.raises(ValueError, match="numbered.*checkpoint"):
+        resolve_stage1_resume(saved_dora_artifact.parent, saved_dora_artifact)
+
+
+class CheckpointLifecycleTrainer(CustomTrainerStage1):
+    """Use the real Stage 1 save override with ordinary Trainer state ownership."""
+
+    log = Trainer.log
+
+    def __init__(
+        self,
+        *,
+        stage1_peft_metadata=None,
+        stage1_runtime_metadata=None,
+        **kwargs,
+    ):
+        self.stage1_peft_metadata = stage1_peft_metadata
+        runtime = stage1_runtime_metadata or stage1_peft_metadata
+        if runtime is not None:
+            self.ce_weight = runtime.ce_weight
+            self.sim_weight = runtime.sim_weight
+            self.coverage_p = runtime.coverage_p
+            self.image_pool_k = runtime.image_pool_k
+        self.collect_stage1_diagnostics = False
+        self._latest_stage1_diagnostics = None
+        Trainer.__init__(self, **kwargs)
+
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
+        del num_items_in_batch
+        outputs = model(**inputs)
+        return (outputs.loss, outputs) if return_outputs else outputs.loss
+
+
+def _tiny_trainer_batch():
+    return {
+        "input_ids": torch.tensor([1, 125, 4, 126, 5, 127, 6]),
+        "attention_mask": torch.ones(7, dtype=torch.long),
+        "labels": torch.tensor([1, 125, 4, 126, 5, 127, 6]),
+    }
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_stage1_trainer_final_peft_save_is_adapter_only(
+    tmp_path, stage1_dora_bundle
+):
+    trainer = CheckpointLifecycleTrainer(
+        model=stage1_dora_bundle.model,
+        args=TrainingArguments(output_dir=str(tmp_path), report_to=[], use_cpu=True),
+        processing_class=stage1_dora_bundle.processor,
+        stage1_peft_metadata=stage1_dora_bundle.metadata,
+    )
+
+    trainer.save_model(tmp_path)
+
+    assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.PEFT
+    assert (tmp_path / "tokenizer.json").is_file()
+    assert not (tmp_path / "model.safetensors").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ce_weight", 2.0),
+        ("sim_weight", 2.0),
+        ("coverage_p", 0.5),
+        ("image_pool_k", 4),
+    ],
+)
+def test_stage1_trainer_rejects_mismatched_semantic_metadata_before_save(
+    tmp_path, stage1_dora_bundle, field, value
+):
+    mismatched = replace(stage1_dora_bundle.metadata, **{field: value})
+    trainer = CheckpointLifecycleTrainer(
+        model=stage1_dora_bundle.model,
+        args=TrainingArguments(output_dir=str(tmp_path), report_to=[], use_cpu=True),
+        processing_class=stage1_dora_bundle.processor,
+        stage1_peft_metadata=mismatched,
+        stage1_runtime_metadata=stage1_dora_bundle.metadata,
+    )
+
+    with pytest.raises(ValueError, match=field):
+        trainer.save_model(tmp_path)
+    assert not (tmp_path / "adapter_model.safetensors").exists()
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_stage1_trainer_numbered_peft_checkpoint_keeps_resume_state(
+    tmp_path, stage1_dora_bundle
+):
+    trainer = CheckpointLifecycleTrainer(
+        model=stage1_dora_bundle.model,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            max_steps=1,
+            per_device_train_batch_size=1,
+            save_strategy="steps",
+            save_steps=1,
+            report_to=[],
+            disable_tqdm=True,
+            use_cpu=True,
+        ),
+        train_dataset=[_tiny_trainer_batch()],
+        data_collator=default_data_collator,
+        processing_class=stage1_dora_bundle.processor,
+        stage1_peft_metadata=stage1_dora_bundle.metadata,
+    )
+
+    trainer.train()
+
+    checkpoint = tmp_path / "checkpoint-1"
+    for filename in (
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors",
+        STAGE1_PEFT_METADATA_FILENAME,
+        "trainer_state.json",
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state.pth",
+    ):
+        assert (checkpoint / filename).is_file(), filename
+    assert not (checkpoint / "model.safetensors").exists()
+
+    restored = load_stage1_peft_artifact(
+        tiny_original_qwen(),
+        TinyStage1Processor.from_pretrained(checkpoint),
+        checkpoint,
+        is_trainable=True,
+    )
+    resumed = CheckpointLifecycleTrainer(
+        model=restored,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            max_steps=2,
+            per_device_train_batch_size=1,
+            save_strategy="no",
+            report_to=[],
+            disable_tqdm=True,
+            use_cpu=True,
+        ),
+        train_dataset=[_tiny_trainer_batch()],
+        data_collator=default_data_collator,
+        processing_class=TinyStage1Processor.from_pretrained(checkpoint),
+        stage1_peft_metadata=stage1_dora_bundle.metadata,
+    )
+
+    resumed.train(resume_from_checkpoint=str(checkpoint))
+
+    assert resumed.state.global_step == 2
+
+
+def test_stage1_trainer_full_save_retains_normal_trainer_behavior(tmp_path):
+    base = tiny_original_qwen()
+    base.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    model = build_stage1_tuned_model(base, stage1_tuning("full"), LATENT_TOKEN_IDS)
+    trainer = CheckpointLifecycleTrainer(
+        model=model,
+        args=TrainingArguments(output_dir=str(tmp_path), report_to=[], use_cpu=True),
+        processing_class=TinyStage1Processor(),
+    )
+
+    trainer.save_model(tmp_path)
+
+    assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.FULL
+    assert (tmp_path / "model.safetensors").is_file()
+    assert not (tmp_path / STAGE1_PEFT_METADATA_FILENAME).exists()
+
+
+def test_stage1_trainer_keeps_trainer_checkpoint_ownership():
+    assert CustomTrainerStage1._save_checkpoint is Trainer._save_checkpoint
