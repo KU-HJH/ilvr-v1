@@ -16,8 +16,14 @@ from typing import Literal
 import peft
 import torch
 from accelerate import init_empty_weights
-from peft import PeftConfig, PeftModel
+from peft import (
+    PeftConfig,
+    PeftModel,
+    get_peft_model,
+    set_peft_model_state_dict,
+)
 from safetensors import SafetensorError, safe_open
+from safetensors.torch import load as load_safetensors
 from torch import nn
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
@@ -36,10 +42,11 @@ from stage1.peft import (
 )
 from stage1.token_rows import (
     SPARSE_TOKEN_ROWS_FILENAME,
+    apply_sparse_token_rows_state,
     attach_sparse_output_token_rows,
+    decode_sparse_token_rows_state,
     find_sparse_output_token_rows,
     initialize_frozen_output_token_rows,
-    load_sparse_token_rows,
     save_sparse_token_rows,
 )
 from stage1.types import Stage1TuningConfig
@@ -570,6 +577,67 @@ class Stage1PeftMetadata:
         )
 
 
+@dataclass(frozen=True)
+class Stage1PeftMetadataSnapshot:
+    """One path-bound immutable read of the strict metadata sidecar."""
+
+    artifact_dir: Path
+    metadata_json: bytes
+
+
+def _canonical_artifact_dir(directory: Path) -> Path:
+    candidate = Path(directory)
+    if candidate.is_symlink():
+        raise ValueError(
+            f"Stage 1 artifact directory must not be a symlink: {candidate}"
+        )
+    try:
+        canonical = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"Stage 1 artifact does not exist: {candidate}") from error
+    if not canonical.is_dir():
+        raise ValueError(f"Stage 1 artifact is not a directory: {candidate}")
+    return canonical
+
+
+def _read_regular_payload(path: Path, *, label: str) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"invalid {label} payload file: {path}")
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"invalid {label} payload file: {path}") from error
+
+
+def read_stage1_peft_metadata_snapshot(
+    directory: Path,
+) -> Stage1PeftMetadataSnapshot:
+    """Read the metadata payload once while binding its canonical directory."""
+
+    artifact = _canonical_artifact_dir(directory)
+    source = artifact / STAGE1_PEFT_METADATA_FILENAME
+    if not source.is_file():
+        raise ValueError(f"missing Stage 1 PEFT metadata: {source}")
+    return Stage1PeftMetadataSnapshot(
+        artifact_dir=artifact,
+        metadata_json=_read_regular_payload(source, label="Stage 1 PEFT metadata"),
+    )
+
+
+def decode_stage1_peft_metadata_snapshot(
+    snapshot: Stage1PeftMetadataSnapshot,
+) -> Stage1PeftMetadata:
+    """Reconstruct strict metadata only from immutable witnessed JSON bytes."""
+
+    if not isinstance(snapshot, Stage1PeftMetadataSnapshot):
+        raise TypeError("snapshot must be a Stage1PeftMetadataSnapshot")
+    try:
+        payload = json.loads(snapshot.metadata_json.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid Stage 1 PEFT metadata bytes") from error
+    return Stage1PeftMetadata.from_dict(payload)
+
+
 def save_stage1_peft_metadata(
     directory: Path, metadata: Stage1PeftMetadata
 ) -> None:
@@ -588,14 +656,9 @@ def save_stage1_peft_metadata(
 def load_stage1_peft_metadata(directory: Path) -> Stage1PeftMetadata:
     """Read the strict schema-v1 Stage 1 sidecar."""
 
-    source = Path(directory) / STAGE1_PEFT_METADATA_FILENAME
-    if not source.is_file():
-        raise ValueError(f"missing Stage 1 PEFT metadata: {source}")
-    try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid Stage 1 PEFT metadata: {source}") from error
-    return Stage1PeftMetadata.from_dict(payload)
+    return decode_stage1_peft_metadata_snapshot(
+        read_stage1_peft_metadata_snapshot(directory)
+    )
 
 
 def _peft_model(model: nn.Module) -> PeftModel:
@@ -742,6 +805,24 @@ def _adapter_value(config, name: str):
     return getattr(value, "value", value)
 
 
+def _decode_adapter_config(payload: bytes) -> PeftConfig:
+    if type(payload) is not bytes:
+        raise TypeError("Stage 1 adapter config payload must be bytes")
+    try:
+        values = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid Stage 1 adapter config bytes") from error
+    if not isinstance(values, Mapping):
+        raise ValueError("Stage 1 adapter config must be a JSON object")
+    values = dict(values)
+    values.pop("runtime_config", None)
+    try:
+        checked = PeftConfig.check_kwargs(**values)
+        return PeftConfig.from_peft_type(**checked)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid Stage 1 adapter config values") from error
+
+
 def _validate_adapter_config(
     qwen: nn.Module,
     config,
@@ -812,91 +893,71 @@ def _linear_base(module: nn.Module, target: str) -> nn.Linear:
 
 def _validate_adapter_tensors(
     qwen: nn.Module,
-    artifact_dir: Path,
+    payload: bytes,
     metadata: Stage1PeftMetadata,
 ) -> None:
-    tensor_path = Path(artifact_dir) / _ADAPTER_SAFE_FILENAME
     modules = dict(qwen.named_modules())
     matched: set[str] = set()
     try:
-        with safe_open(tensor_path, framework="pt", device="cpu") as stored:
-            keys = tuple(stored.keys())
-
-            input_matches = [
-                key
-                for key in keys
-                if key.endswith(
-                    ".model.embed_tokens.token_adapter.trainable_tokens_delta"
-                )
-            ]
-            if len(input_matches) != 1:
-                raise ValueError(
-                    "Stage 1 adapter must contain exactly one selective input-row tensor"
-                )
-            input_key = input_matches[0]
-            matched.add(input_key)
-            input_shape = stored.get_slice(input_key).get_shape()
-            if input_shape != list(metadata.output_row_shape):
-                raise ValueError(
-                    "Stage 1 selective input-row shape mismatch: "
-                    f"adapter={input_shape}, expected={list(metadata.output_row_shape)}"
-                )
-
-            for target in metadata.resolved_target_names:
-                if target not in modules:
-                    raise ValueError(f"missing Stage 1 resolved target: {target}")
-                module = _linear_base(modules[target], target)
-                expected_shapes = {
-                    "lora_A.weight": [metadata.rank, module.in_features],
-                    "lora_B.weight": [module.out_features, metadata.rank],
-                }
-                if metadata.tuning_method == "dora":
-                    expected_shapes["lora_magnitude_vector"] = [module.out_features]
-                for component, expected_shape in expected_shapes.items():
-                    suffix = f".{target}.{component}"
-                    component_matches = [key for key in keys if key.endswith(suffix)]
-                    if len(component_matches) != 1:
-                        raise ValueError(
-                            f"Stage 1 adapter tensor mismatch at {target}: {component}"
-                        )
-                    key = component_matches[0]
-                    matched.add(key)
-                    actual_shape = stored.get_slice(key).get_shape()
-                    if actual_shape != expected_shape:
-                        raise ValueError(
-                            f"Stage 1 adapter target shape mismatch at {target}: "
-                            f"adapter={actual_shape}, expected={expected_shape}"
-                        )
-            unexpected = sorted(set(keys) - matched)
-            if unexpected:
-                raise ValueError(
-                    f"unexpected adapter tensor fields: {unexpected}"
-                )
+        tensors = load_safetensors(payload)
     except SafetensorError as error:
-        raise ValueError(f"invalid Stage 1 adapter safetensors: {tensor_path}") from error
+        raise ValueError("invalid Stage 1 adapter safetensors bytes") from error
+    keys = tuple(tensors)
+
+    input_matches = [
+        key
+        for key in keys
+        if key.endswith(
+            ".model.embed_tokens.token_adapter.trainable_tokens_delta"
+        )
+    ]
+    if len(input_matches) != 1:
+        raise ValueError(
+            "Stage 1 adapter must contain exactly one selective input-row tensor"
+        )
+    input_key = input_matches[0]
+    matched.add(input_key)
+    input_shape = list(tensors[input_key].shape)
+    if input_shape != list(metadata.output_row_shape):
+        raise ValueError(
+            "Stage 1 selective input-row shape mismatch: "
+            f"adapter={input_shape}, expected={list(metadata.output_row_shape)}"
+        )
+
+    for target in metadata.resolved_target_names:
+        if target not in modules:
+            raise ValueError(f"missing Stage 1 resolved target: {target}")
+        module = _linear_base(modules[target], target)
+        expected_shapes = {
+            "lora_A.weight": [metadata.rank, module.in_features],
+            "lora_B.weight": [module.out_features, metadata.rank],
+        }
+        if metadata.tuning_method == "dora":
+            expected_shapes["lora_magnitude_vector"] = [module.out_features]
+        for component, expected_shape in expected_shapes.items():
+            suffix = f".{target}.{component}"
+            component_matches = [key for key in keys if key.endswith(suffix)]
+            if len(component_matches) != 1:
+                raise ValueError(
+                    f"Stage 1 adapter tensor mismatch at {target}: {component}"
+                )
+            key = component_matches[0]
+            matched.add(key)
+            actual_shape = list(tensors[key].shape)
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"Stage 1 adapter target shape mismatch at {target}: "
+                    f"adapter={actual_shape}, expected={expected_shape}"
+                )
+    unexpected = sorted(set(keys) - matched)
+    if unexpected:
+        raise ValueError(f"unexpected adapter tensor fields: {unexpected}")
 
 
 def _validate_sparse_artifact(
-    artifact_dir: Path, metadata: Stage1PeftMetadata
+    payload: bytes, metadata: Stage1PeftMetadata
 ) -> None:
-    path = Path(artifact_dir) / SPARSE_TOKEN_ROWS_FILENAME
-    try:
-        with safe_open(path, framework="pt", device="cpu") as stored:
-            if set(stored.keys()) != {"token_ids", "output_delta"}:
-                raise ValueError("invalid sparse token-row tensor fields")
-            sparse_metadata = stored.metadata()
-            if (
-                sparse_metadata is None
-                or set(sparse_metadata) != {"format_version", "training_dtype"}
-                or sparse_metadata["format_version"] != "1"
-                or sparse_metadata["training_dtype"]
-                not in {"float16", "bfloat16", "float32", "float64"}
-            ):
-                raise ValueError("invalid sparse token-row metadata")
-            token_ids = stored.get_tensor("token_ids")
-            output_delta = stored.get_tensor("output_delta")
-    except SafetensorError as error:
-        raise ValueError(f"invalid sparse token-row artifact: {path}") from error
+    token_ids, output_delta = decode_sparse_token_rows_state(payload)
     if token_ids.dtype != torch.int64 or token_ids.shape != torch.Size((3,)):
         raise ValueError("sparse token_ids must be an int64 tensor with shape (3,)")
     if tuple(token_ids.tolist()) != metadata.latent_token_ids:
@@ -988,11 +1049,24 @@ def save_stage1_peft_artifact(
 
 @dataclass(frozen=True)
 class Stage1PeftPreflightWitness:
-    """Validated small-artifact state reusable by the weight-loading phase."""
+    """Immutable path-bound payloads and scalar provenance for restoration."""
 
     artifact_dir: Path
-    metadata: Stage1PeftMetadata
-    adapter_config: PeftConfig
+    metadata_json: bytes
+    adapter_config_json: bytes
+    adapter_safetensors: bytes
+    sparse_safetensors: bytes
+    base_model_reference: str
+    base_architecture_json: bytes
+    base_vocab_size: int
+    resized_vocab_size: int
+    processor_vocab_size: int
+    processor_contract: tuple[tuple[str, int], ...]
+    latent_size: int
+    tuning_method: str
+    rank: int
+    alpha: int
+    dropout: float
 
 
 def _build_meta_stage1_base(config) -> nn.Module:
@@ -1000,19 +1074,92 @@ def _build_meta_stage1_base(config) -> nn.Module:
         return Qwen2_5_VLForConditionalGeneration(config)
 
 
+def _architecture_json(architecture: Mapping[str, object]) -> bytes:
+    try:
+        return json.dumps(
+            architecture,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Stage 1 base architecture is not canonical JSON"
+        ) from error
+
+
+def _validate_base_source(config, expected: str) -> None:
+    actual = getattr(config, "_name_or_path", None)
+    if actual != expected:
+        raise ValueError(
+            "Stage 1 PEFT base source mismatch: "
+            f"metadata={expected!r}, runtime={actual!r}"
+        )
+
+
+def _decode_preflight_witness(
+    witness: Stage1PeftPreflightWitness,
+) -> tuple[Stage1PeftMetadata, PeftConfig]:
+    metadata = decode_stage1_peft_metadata_snapshot(
+        Stage1PeftMetadataSnapshot(
+            artifact_dir=witness.artifact_dir,
+            metadata_json=witness.metadata_json,
+        )
+    )
+    scalar_provenance = (
+        metadata.base_model_reference,
+        _architecture_json(metadata.base_model_architecture),
+        metadata.base_vocab_size,
+        metadata.resized_vocab_size,
+        metadata.resized_vocab_size,
+        tuple(zip(metadata.latent_token_strings, metadata.latent_token_ids)),
+        metadata.latent_size,
+        metadata.tuning_method,
+        metadata.rank,
+        metadata.alpha,
+        metadata.dropout,
+    )
+    witnessed_provenance = (
+        witness.base_model_reference,
+        witness.base_architecture_json,
+        witness.base_vocab_size,
+        witness.resized_vocab_size,
+        witness.processor_vocab_size,
+        witness.processor_contract,
+        witness.latent_size,
+        witness.tuning_method,
+        witness.rank,
+        witness.alpha,
+        witness.dropout,
+    )
+    if scalar_provenance != witnessed_provenance:
+        raise ValueError("Stage 1 PEFT witness scalar provenance mismatch")
+    return metadata, _decode_adapter_config(witness.adapter_config_json)
+
+
 def preflight_stage1_peft_artifact(
     processor,
     base_config,
     artifact_dir: Path,
     *,
-    metadata: Stage1PeftMetadata | None = None,
+    metadata_snapshot: Stage1PeftMetadataSnapshot | None = None,
     model_factory: Callable[[object], nn.Module] = _build_meta_stage1_base,
 ) -> Stage1PeftPreflightWitness:
     """Validate a PEFT artifact completely without loading base weights."""
 
-    artifact = Path(artifact_dir)
+    artifact = _canonical_artifact_dir(artifact_dir)
+    if metadata_snapshot is None:
+        metadata_snapshot = read_stage1_peft_metadata_snapshot(artifact)
+    elif not isinstance(metadata_snapshot, Stage1PeftMetadataSnapshot):
+        raise TypeError("metadata_snapshot must be a Stage1PeftMetadataSnapshot")
+    if metadata_snapshot.artifact_dir != artifact:
+        raise ValueError(
+            "Stage 1 PEFT metadata snapshot artifact mismatch: "
+            f"snapshot={metadata_snapshot.artifact_dir}, requested={artifact}"
+        )
+    validated_metadata = decode_stage1_peft_metadata_snapshot(metadata_snapshot)
     kind, validated = _classify_stage1_artifact_with_metadata(
-        artifact, metadata=metadata
+        artifact, metadata=validated_metadata
     )
     if kind is not Stage1ArtifactKind.PEFT or validated is None:
         raise ValueError("Stage 1 PEFT preflight requires a PEFT artifact")
@@ -1021,19 +1168,49 @@ def preflight_stage1_peft_artifact(
             "Stage 1 PEFT version mismatch: "
             f"metadata={validated.peft_version}, installed={peft.__version__}"
         )
-    _validate_processor(processor, validated)
+    tokenizer = _validate_processor(processor, validated)
     _validate_latent_config(base_config, validated)
+    _validate_base_source(base_config, validated.base_model_reference)
     structural_model = model_factory(deepcopy(base_config))
     qwen = resolve_qwen2_5_vl_model(structural_model)
     _validate_architecture(qwen, validated, resized=False)
-    adapter_config = PeftConfig.from_pretrained(artifact)
+    adapter_config_json = _read_regular_payload(
+        artifact / _ADAPTER_CONFIG_FILENAME,
+        label="Stage 1 adapter config",
+    )
+    adapter_safetensors = _read_regular_payload(
+        artifact / _ADAPTER_SAFE_FILENAME,
+        label="Stage 1 adapter safetensors",
+    )
+    sparse_safetensors = _read_regular_payload(
+        artifact / SPARSE_TOKEN_ROWS_FILENAME,
+        label="Stage 1 sparse token rows",
+    )
+    adapter_config = _decode_adapter_config(adapter_config_json)
     _validate_adapter_config(qwen, adapter_config, validated)
-    _validate_adapter_tensors(qwen, artifact, validated)
-    _validate_sparse_artifact(artifact, validated)
+    _validate_adapter_tensors(qwen, adapter_safetensors, validated)
+    _validate_sparse_artifact(sparse_safetensors, validated)
     return Stage1PeftPreflightWitness(
-        artifact_dir=artifact.resolve(),
-        metadata=validated,
-        adapter_config=adapter_config,
+        artifact_dir=artifact,
+        metadata_json=metadata_snapshot.metadata_json,
+        adapter_config_json=adapter_config_json,
+        adapter_safetensors=adapter_safetensors,
+        sparse_safetensors=sparse_safetensors,
+        base_model_reference=validated.base_model_reference,
+        base_architecture_json=_architecture_json(
+            validated.base_model_architecture
+        ),
+        base_vocab_size=validated.base_vocab_size,
+        resized_vocab_size=validated.resized_vocab_size,
+        processor_vocab_size=len(tokenizer),
+        processor_contract=tuple(
+            zip(validated.latent_token_strings, validated.latent_token_ids)
+        ),
+        latent_size=validated.latent_size,
+        tuning_method=validated.tuning_method,
+        rank=validated.rank,
+        alpha=validated.alpha,
+        dropout=validated.dropout,
     )
 
 
@@ -1063,39 +1240,50 @@ def load_stage1_peft_artifact(
         )
     elif not isinstance(preflight, Stage1PeftPreflightWitness):
         raise TypeError("preflight must be a Stage1PeftPreflightWitness")
-    if preflight.artifact_dir != artifact.resolve():
+    requested_artifact = artifact.resolve()
+    if preflight.artifact_dir != requested_artifact:
         raise ValueError(
             "Stage 1 PEFT preflight artifact mismatch: "
-            f"witness={preflight.artifact_dir}, requested={artifact.resolve()}"
+            f"witness={preflight.artifact_dir}, requested={requested_artifact}"
         )
-    metadata = preflight.metadata
-    adapter_config = preflight.adapter_config
+    metadata, adapter_config = _decode_preflight_witness(preflight)
 
     # The small artifact was already fully validated. Recheck only the actual
     # runtime objects constructed after preflight, before mutating the base.
     _validate_processor(processor, metadata)
     _validate_latent_config(qwen.config, metadata)
     _validate_architecture(qwen, metadata, resized=False)
+    _validate_base_source(qwen.config, preflight.base_model_reference)
+    actual_architecture_json = _architecture_json(
+        capture_qwen2_5_vl_architecture(qwen.config)
+    )
+    if actual_architecture_json != preflight.base_architecture_json:
+        raise ValueError("Stage 1 PEFT runtime architecture witness mismatch")
     _validate_adapter_config(qwen, adapter_config, metadata)
-
-    recorded_source = metadata.base_model_reference
-    current_source = getattr(qwen.config, "_name_or_path", "")
-    if current_source and current_source != recorded_source:
-        logging.getLogger(__name__).warning(
-            "loading relocated Stage 1 base %s (recorded source: %s)",
-            current_source,
-            recorded_source,
-        )
 
     candidate.resize_token_embeddings(metadata.resized_vocab_size)
     initialize_frozen_output_token_rows(candidate, metadata.latent_token_ids)
     _configure_latent_config(candidate.config, metadata)
-    restored = PeftModel.from_pretrained(
+    adapter_config.inference_mode = not is_trainable
+    restored = get_peft_model(
         candidate,
-        artifact,
-        is_trainable=is_trainable,
-        config=adapter_config,
+        adapter_config,
+        adapter_name=_ADAPTER_NAME,
     )
+    try:
+        adapter_state = load_safetensors(preflight.adapter_safetensors)
+    except SafetensorError as error:
+        raise ValueError("invalid witnessed Stage 1 adapter bytes") from error
+    load_result = set_peft_model_state_dict(
+        restored,
+        adapter_state,
+        adapter_name=_ADAPTER_NAME,
+    )
+    if load_result.unexpected_keys:
+        raise ValueError(
+            "unexpected Stage 1 adapter state keys after application: "
+            f"{sorted(load_result.unexpected_keys)}"
+        )
     if not is_trainable:
         # PEFT 0.17.1 leaves TrainableTokensModel's selective delta enabled
         # even when the adapter itself is loaded for inference.
@@ -1103,7 +1291,11 @@ def load_stage1_peft_artifact(
     # PEFT restoration never creates the repository-owned output-row wrapper.
     rows = attach_sparse_output_token_rows(restored, metadata.latent_token_ids)
     rows.output_delta.requires_grad_(is_trainable)
-    load_sparse_token_rows(restored, artifact, metadata.latent_token_ids)
+    apply_sparse_token_rows_state(
+        restored,
+        preflight.sparse_safetensors,
+        metadata.latent_token_ids,
+    )
     if is_trainable:
         validate_stage1_trainable_boundary(
             restored, _metadata_tuning(metadata), metadata.latent_token_ids
@@ -1384,12 +1576,15 @@ __all__ = [
     "STAGE1_REPOSITORY_FORMAT_VERSION",
     "Stage1ArtifactKind",
     "Stage1PeftMetadata",
+    "Stage1PeftMetadataSnapshot",
     "Stage1PeftPreflightWitness",
     "Stage1ResumeDecision",
     "classify_stage1_artifact",
+    "decode_stage1_peft_metadata_snapshot",
     "load_stage1_peft_artifact",
     "load_stage1_peft_metadata",
     "preflight_stage1_peft_artifact",
+    "read_stage1_peft_metadata_snapshot",
     "resolve_stage1_resume",
     "save_stage1_peft_artifact",
     "save_stage1_peft_metadata",

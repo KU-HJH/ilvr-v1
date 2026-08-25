@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
+import json
 from pathlib import Path
+import struct
 from typing import Iterator
 
 import torch
 import torch.nn.functional as F
 from safetensors import SafetensorError, safe_open
-from safetensors.torch import save_file
+from safetensors.torch import load as load_safetensors, save_file
 from torch import nn
 
 from peft_common import resolve_qwen2_5_vl_model
@@ -249,12 +251,69 @@ def _validate_metadata(metadata: dict[str, str] | None) -> None:
         raise ValueError("invalid sparse token-row metadata training_dtype")
 
 
-def load_sparse_token_rows(
+def _safetensors_metadata(payload: bytes) -> dict[str, str] | None:
+    try:
+        if len(payload) < 8:
+            raise ValueError("safetensors payload has no header")
+        header_size = struct.unpack("<Q", payload[:8])[0]
+        header_end = 8 + header_size
+        if header_end > len(payload):
+            raise ValueError("safetensors header exceeds payload")
+        header = json.loads(payload[8:header_end])
+    except (UnicodeError, json.JSONDecodeError, struct.error) as error:
+        raise ValueError("invalid safetensors metadata header") from error
+    metadata = header.get("__metadata__")
+    if metadata is not None and (
+        not isinstance(metadata, dict)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in metadata.items()
+        )
+    ):
+        raise ValueError("invalid safetensors metadata values")
+    return metadata
+
+
+def decode_sparse_token_rows_state(
+    payload: bytes,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode and validate one sparse-row safetensors byte payload."""
+
+    if type(payload) is not bytes:
+        raise TypeError("sparse token-row payload must be bytes")
+    try:
+        tensors = load_safetensors(payload)
+    except SafetensorError as error:
+        raise ValueError("invalid sparse token-row artifact bytes") from error
+    keys = set(tensors)
+    if keys != _TENSOR_KEYS:
+        raise ValueError(
+            "invalid sparse token-row tensor fields: "
+            f"expected={sorted(_TENSOR_KEYS)}, actual={sorted(keys)}"
+        )
+    _validate_metadata(_safetensors_metadata(payload))
+    stored_ids = tensors["token_ids"]
+    output_delta = tensors["output_delta"]
+    if stored_ids.dtype != torch.int64:
+        raise ValueError("sparse token_ids tensor must have int64 dtype")
+    if stored_ids.shape != torch.Size((3,)):
+        raise ValueError(
+            "sparse token_ids shape mismatch: expected (3,), "
+            f"got {tuple(stored_ids.shape)}"
+        )
+    if output_delta.dtype != torch.float32:
+        raise ValueError("sparse output_delta tensor must have float32 dtype")
+    if not torch.isfinite(output_delta).all():
+        raise ValueError("sparse output_delta must contain only finite values")
+    return stored_ids, output_delta
+
+
+def apply_sparse_token_rows_state(
     model: nn.Module,
-    artifact_dir: Path,
+    payload: bytes,
     expected_token_ids: Sequence[int],
 ) -> None:
-    """Validate and restore a sparse-row artifact without touching the base head."""
+    """Restore validated sparse rows directly from immutable artifact bytes."""
 
     rows = find_sparse_output_token_rows(model)
     expected = _validate_exact_latent_token_ids(
@@ -267,47 +326,19 @@ def load_sparse_token_rows(
             f"attached={attached}, expected={expected}"
         )
 
-    artifact = Path(artifact_dir) / SPARSE_TOKEN_ROWS_FILENAME
-    if not artifact.is_file():
-        raise FileNotFoundError(f"missing sparse token-row artifact: {artifact}")
-    try:
-        with safe_open(artifact, framework="pt", device="cpu") as stored:
-            keys = set(stored.keys())
-            if keys != _TENSOR_KEYS:
-                raise ValueError(
-                    "invalid sparse token-row tensor fields: "
-                    f"expected={sorted(_TENSOR_KEYS)}, actual={sorted(keys)}"
-                )
-            _validate_metadata(stored.metadata())
-            stored_ids = stored.get_tensor("token_ids")
-            output_delta = stored.get_tensor("output_delta")
-    except SafetensorError as error:
-        raise ValueError(f"invalid sparse token-row artifact: {artifact}") from error
-
-    if stored_ids.dtype != torch.int64:
-        raise ValueError("sparse token_ids tensor must have int64 dtype")
-    if stored_ids.shape != torch.Size((3,)):
-        raise ValueError(
-            "sparse token_ids shape mismatch: expected (3,), "
-            f"got {tuple(stored_ids.shape)}"
-        )
+    stored_ids, output_delta = decode_sparse_token_rows_state(payload)
     stored_tuple = tuple(stored_ids.tolist())
     if stored_tuple != expected:
         raise ValueError(
             "stored token IDs do not match expected token IDs: "
             f"stored={stored_tuple}, expected={expected}"
         )
-    if output_delta.dtype != torch.float32:
-        raise ValueError("sparse output_delta tensor must have float32 dtype")
     expected_shape = torch.Size((3, rows.in_features))
     if output_delta.shape != expected_shape:
         raise ValueError(
             "sparse output_delta shape mismatch: "
             f"expected {tuple(expected_shape)}, got {tuple(output_delta.shape)}"
         )
-    if not torch.isfinite(output_delta).all():
-        raise ValueError("sparse output_delta must contain only finite values")
-
     with torch.no_grad():
         rows.output_delta.copy_(
             output_delta.to(
@@ -316,10 +347,36 @@ def load_sparse_token_rows(
         )
 
 
+def load_sparse_token_rows(
+    model: nn.Module,
+    artifact_dir: Path,
+    expected_token_ids: Sequence[int],
+) -> None:
+    """Validate and restore a sparse-row artifact without touching the base head."""
+
+    artifact = Path(artifact_dir) / SPARSE_TOKEN_ROWS_FILENAME
+    if not artifact.is_file():
+        raise FileNotFoundError(f"missing sparse token-row artifact: {artifact}")
+    try:
+        payload = artifact.read_bytes()
+    except OSError as error:
+        raise ValueError(f"invalid sparse token-row artifact: {artifact}") from error
+    try:
+        apply_sparse_token_rows_state(model, payload, expected_token_ids)
+    except ValueError as error:
+        if "artifact bytes" in str(error):
+            raise ValueError(
+                f"invalid sparse token-row artifact: {artifact}"
+            ) from error
+        raise
+
+
 __all__ = [
     "SparseOutputTokenRows",
+    "apply_sparse_token_rows_state",
     "attach_sparse_output_token_rows",
     "find_sparse_output_token_rows",
+    "decode_sparse_token_rows_state",
     "initialize_frozen_output_token_rows",
     "load_sparse_token_rows",
     "save_sparse_token_rows",

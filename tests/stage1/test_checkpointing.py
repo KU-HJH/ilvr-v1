@@ -806,11 +806,57 @@ def test_preflight_rejects_corrupt_artifact_before_any_large_model_load(
     assert large_loads == 0
 
 
-@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
-def test_peft_loader_reuses_preflight_witness_without_revalidating_files(
+def test_preflight_reads_each_small_payload_once_and_retains_immutable_bytes(
     saved_dora_artifact, monkeypatch
 ):
-    """Catches the loader discarding its completed small-artifact witness."""
+    """Catches witness construction rereading files or retaining parsed state."""
+    names = (
+        STAGE1_PEFT_METADATA_FILENAME,
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors",
+    )
+    payload_paths = {saved_dora_artifact / name for name in names}
+    reads = {path: 0 for path in payload_paths}
+    original_read_bytes = Path.read_bytes
+
+    def counted_read_bytes(path):
+        if path in reads:
+            reads[path] += 1
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+
+    witness = preflight_stage1_peft_artifact(
+        TinyStage1Processor.from_pretrained(saved_dora_artifact),
+        deepcopy(tiny_original_qwen().config),
+        saved_dora_artifact,
+    )
+
+    assert reads == {path: 1 for path in payload_paths}
+    assert witness.artifact_dir == saved_dora_artifact.resolve()
+    assert isinstance(witness.metadata_json, bytes)
+    assert isinstance(witness.adapter_config_json, bytes)
+    assert isinstance(witness.adapter_safetensors, bytes)
+    assert isinstance(witness.sparse_safetensors, bytes)
+    assert witness.base_model_reference == "tiny/original-qwen"
+    assert witness.base_vocab_size == BASE_VOCAB_SIZE
+    assert witness.processor_contract == tuple(
+        zip(LATENT_TOKEN_STRINGS, LATENT_TOKEN_IDS)
+    )
+
+
+@pytest.mark.parametrize("payload_mutation", ["delete", "replace"])
+@pytest.mark.parametrize("is_trainable", [True, False])
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_peft_loader_reuses_preflight_witness_without_revalidating_files(
+    saved_dora_artifact,
+    stage1_dora_bundle,
+    monkeypatch,
+    is_trainable,
+    payload_mutation,
+):
+    """Catches restore reopening payload paths instead of consuming witness bytes."""
     processor = TinyStage1Processor.from_pretrained(saved_dora_artifact)
     base = tiny_original_qwen()
     witness = preflight_stage1_peft_artifact(
@@ -820,32 +866,157 @@ def test_peft_loader_reuses_preflight_witness_without_revalidating_files(
     )
 
     assert isinstance(witness, Stage1PeftPreflightWitness)
+    hidden = torch.tensor(
+        [[0.5, -0.25, 1.0, 0.75, -1.0, 0.125, 0.25, -0.5]]
+    )
+    source_logits = resolve_qwen2_5_vl_model(stage1_dora_bundle.model).lm_head(
+        hidden
+    ).detach()
+    source_state = {
+        name: value.detach().cpu()
+        for name, value in stage1_dora_bundle.model.state_dict().items()
+        if "lora_" in name or "trainable_tokens_delta" in name
+    }
+    for name in (
+        STAGE1_PEFT_METADATA_FILENAME,
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors",
+    ):
+        path = saved_dora_artifact / name
+        if payload_mutation == "delete":
+            path.unlink()
+        else:
+            path.write_bytes(b"changed after preflight")
+
     monkeypatch.setattr(
-        "stage1.checkpointing.classify_stage1_artifact",
-        lambda *args, **kwargs: pytest.fail("artifact was reclassified"),
+        Path,
+        "read_bytes",
+        lambda *args, **kwargs: pytest.fail("artifact payload was reopened"),
     )
     monkeypatch.setattr(
-        "stage1.checkpointing.load_stage1_peft_metadata",
-        lambda *args, **kwargs: pytest.fail("metadata was reread"),
+        Path,
+        "open",
+        lambda *args, **kwargs: pytest.fail("artifact payload was reopened"),
     )
     monkeypatch.setattr(
-        "stage1.checkpointing._validate_adapter_tensors",
-        lambda *args, **kwargs: pytest.fail("adapter tensors were revalidated"),
+        "stage1.checkpointing.safe_open",
+        lambda *args, **kwargs: pytest.fail("adapter payload was reopened"),
     )
     monkeypatch.setattr(
-        "stage1.checkpointing._validate_sparse_artifact",
-        lambda *args, **kwargs: pytest.fail("sparse rows were revalidated"),
+        "stage1.token_rows.safe_open",
+        lambda *args, **kwargs: pytest.fail("sparse payload was reopened"),
+    )
+    monkeypatch.setattr(
+        PeftModel,
+        "from_pretrained",
+        lambda *args, **kwargs: pytest.fail("path-based PEFT restore was used"),
     )
 
     restored = load_stage1_peft_artifact(
         base,
         processor,
         saved_dora_artifact,
-        is_trainable=True,
+        is_trainable=is_trainable,
         preflight=witness,
     )
 
     assert isinstance(restored, PeftModel)
+    restored_state = {
+        name: value.detach().cpu()
+        for name, value in restored.state_dict().items()
+        if "lora_" in name or "trainable_tokens_delta" in name
+    }
+    assert restored_state.keys() == source_state.keys()
+    for name in source_state:
+        assert torch.equal(restored_state[name], source_state[name]), name
+    torch.testing.assert_close(
+        resolve_qwen2_5_vl_model(restored).lm_head(hidden),
+        source_logits,
+        rtol=0,
+        atol=0,
+    )
+    if is_trainable:
+        assert any(parameter.requires_grad for parameter in restored.parameters())
+    else:
+        assert not any(parameter.requires_grad for parameter in restored.parameters())
+
+
+def test_preflight_rejects_base_config_source_identity_mismatch(
+    saved_dora_artifact
+):
+    """Catches architecture-compatible replacement bases passing provenance."""
+    config = deepcopy(tiny_original_qwen().config)
+    config._name_or_path = "tiny/different-qwen"
+
+    with pytest.raises(ValueError, match="base source mismatch"):
+        preflight_stage1_peft_artifact(
+            TinyStage1Processor.from_pretrained(saved_dora_artifact),
+            config,
+            saved_dora_artifact,
+        )
+
+
+def test_preflight_rejects_base_config_architecture_mismatch(
+    saved_dora_artifact
+):
+    """Catches a mismatched config being witnessed before model construction."""
+    config = deepcopy(tiny_original_qwen().config)
+    config.hidden_act = "gelu"
+
+    with pytest.raises(ValueError, match="architecture mismatch.*hidden_act"):
+        preflight_stage1_peft_artifact(
+            TinyStage1Processor.from_pretrained(saved_dora_artifact),
+            config,
+            saved_dora_artifact,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("processor_vocab", "vocabulary mismatch"),
+        ("processor_tokens", "latent token ID mismatch"),
+        ("base_source", "base source mismatch"),
+        ("model_architecture", "architecture mismatch.*hidden_act"),
+        ("artifact_path", "preflight artifact mismatch"),
+    ],
+)
+def test_peft_restore_binds_runtime_objects_to_witness(
+    saved_dora_artifact, tmp_path, mutation, message
+):
+    """Catches a valid witness being replayed against different runtime inputs."""
+    processor = TinyStage1Processor.from_pretrained(saved_dora_artifact)
+    witness = preflight_stage1_peft_artifact(
+        processor,
+        deepcopy(tiny_original_qwen().config),
+        saved_dora_artifact,
+    )
+    base = tiny_original_qwen()
+    artifact = saved_dora_artifact
+    if mutation == "processor_vocab":
+        processor = TinyStage1Processor(
+            TinyStage1Tokenizer(size=RESIZED_VOCAB_SIZE + 1)
+        )
+    elif mutation == "processor_tokens":
+        processor = TinyStage1Processor(
+            TinyStage1Tokenizer((124, 126, 127), size=RESIZED_VOCAB_SIZE)
+        )
+    elif mutation == "base_source":
+        base.config._name_or_path = "tiny/different-qwen"
+    elif mutation == "model_architecture":
+        base.config.hidden_act = "gelu"
+    else:
+        artifact = tmp_path / "different-artifact"
+
+    with pytest.raises(ValueError, match=message):
+        load_stage1_peft_artifact(
+            base,
+            processor,
+            artifact,
+            is_trainable=True,
+            preflight=witness,
+        )
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")

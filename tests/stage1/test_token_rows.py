@@ -12,6 +12,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 
+import stage1.token_rows as token_rows
 from stage1.token_rows import (
     SparseOutputTokenRows,
     attach_sparse_output_token_rows,
@@ -237,6 +238,34 @@ def test_sparse_rows_round_trip_through_fp32_container_from_bfloat16(tmp_path):
     )
     assert torch.equal(
         find_sparse_output_token_rows(restored).base_head.weight, restored_base
+    )
+
+
+def test_sparse_rows_restore_from_validated_bytes_without_reopening_path(
+    tmp_path, monkeypatch
+):
+    """Catches in-memory checkpoint restore falling back to artifact paths."""
+    original = wrapped_tiny_head(dtype=torch.bfloat16, token_ids=(4, 5, 6))
+    artifact = save_sparse_token_rows(original, tmp_path)
+    payload = artifact.read_bytes()
+    artifact.unlink()
+    restored = TinyQwen(dtype=torch.bfloat16)
+    attach_sparse_output_token_rows(restored, (4, 5, 6))
+    monkeypatch.setattr(
+        token_rows,
+        "safe_open",
+        lambda *args, **kwargs: pytest.fail("sparse artifact path was reopened"),
+    )
+
+    token_rows.apply_sparse_token_rows_state(
+        restored, payload, expected_token_ids=(4, 5, 6)
+    )
+
+    torch.testing.assert_close(
+        find_sparse_output_token_rows(restored).output_delta,
+        find_sparse_output_token_rows(original).output_delta,
+        rtol=0,
+        atol=0,
     )
 
 

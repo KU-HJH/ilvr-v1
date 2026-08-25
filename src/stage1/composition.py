@@ -25,9 +25,10 @@ from stage1.checkpointing import (
     Stage1ArtifactKind,
     Stage1PeftMetadata,
     Stage1ResumeDecision,
+    decode_stage1_peft_metadata_snapshot,
     load_stage1_peft_artifact,
-    load_stage1_peft_metadata,
     preflight_stage1_peft_artifact,
+    read_stage1_peft_metadata_snapshot,
     resolve_stage1_resume,
 )
 from stage1.data import Stage1DataCollator, prepare_stage1_comt_examples
@@ -71,6 +72,7 @@ class Stage1CompositionDependencies:
     load_config: Callable
     load_model: Callable
     load_peft_metadata: Callable
+    decode_peft_metadata: Callable
     preflight_peft: Callable
     load_peft_model: Callable
     build_tuned_model: Callable
@@ -128,7 +130,8 @@ DEFAULT_STAGE1_DEPENDENCIES = Stage1CompositionDependencies(
     load_processor=AutoProcessor.from_pretrained,
     load_config=Qwen2_5_VLConfig.from_pretrained,
     load_model=Qwen2_5_VLForConditionalGeneration.from_pretrained,
-    load_peft_metadata=load_stage1_peft_metadata,
+    load_peft_metadata=read_stage1_peft_metadata_snapshot,
+    decode_peft_metadata=decode_stage1_peft_metadata_snapshot,
     preflight_peft=preflight_stage1_peft_artifact,
     load_peft_model=load_stage1_peft_artifact,
     build_tuned_model=build_stage1_tuned_model,
@@ -375,8 +378,10 @@ def build_stage1_training_components(
     )
     checkpoint = decision.checkpoint_path
     metadata = None
+    metadata_snapshot = None
     if decision.artifact_kind is Stage1ArtifactKind.PEFT:
-        metadata = dependencies.load_peft_metadata(checkpoint)
+        metadata_snapshot = dependencies.load_peft_metadata(checkpoint)
+        metadata = dependencies.decode_peft_metadata(metadata_snapshot)
     _validate_resume_tuning(decision, tuning, metadata) if checkpoint else None
     if metadata is not None:
         _validate_resume_semantics(args, metadata)
@@ -469,7 +474,7 @@ def build_stage1_training_components(
             processor,
             config,
             checkpoint,
-            metadata=metadata,
+            metadata_snapshot=metadata_snapshot,
         )
         base_model = dependencies.load_model(
             metadata.base_model_reference,

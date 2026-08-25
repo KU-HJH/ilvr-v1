@@ -207,7 +207,8 @@ def fake_dependencies(events, *, decision=None, processor=None, metadata=None):
         resolve_target_names=lambda model, suffixes: tuple(
             f"model.layers.0.{suffix}" for suffix in suffixes
         ),
-        load_peft_metadata=lambda path: metadata,
+        load_peft_metadata=lambda path: object(),
+        decode_peft_metadata=lambda snapshot: metadata,
         load_peft_model=load_peft_model,
     ), processor, model, parameter_report
 
@@ -320,6 +321,10 @@ def test_resume_composition_preserves_checkpoint_token_ids_without_readding(
         assert not any(event[0] == "topology" for event in events)
         event_names = [event[0] for event in events]
         assert event_names.index("preflight") < event_names.index("model")
+        preflight_event = next(
+            event for event in events if event[0] == "preflight"
+        )
+        assert set(preflight_event[4]) == {"metadata_snapshot"}
         peft_event = next(event for event in events if event[0] == "peft")
         assert peft_event[3] == checkpoint
     else:
