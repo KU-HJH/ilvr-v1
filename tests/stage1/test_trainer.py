@@ -70,12 +70,18 @@ class CountingTargetBuilder:
 
 
 class CountingStudent(nn.Module):
-    def __init__(self, hidden_size=1):
+    def __init__(self, hidden_size=1, prediction_matrix=None):
         super().__init__()
         self.language_scale = nn.Parameter(torch.tensor(2.0))
         self.visual = nn.Linear(1, hidden_size, bias=False)
         self.visual.requires_grad_(False)
         self.hidden_size = hidden_size
+        if prediction_matrix is None:
+            prediction_matrix = -torch.eye(hidden_size)
+        prediction_matrix = torch.as_tensor(prediction_matrix, dtype=torch.float32)
+        if tuple(prediction_matrix.shape) != (hidden_size, hidden_size):
+            raise ValueError("prediction_matrix must have shape [H, H]")
+        self.register_buffer("prediction_matrix", prediction_matrix)
         self.student_forward_count = 0
         self.last_forward_kwargs = None
         self.last_inputs_embeds = None
@@ -108,7 +114,9 @@ class CountingStudent(nn.Module):
         hidden_states = torch.zeros_like(inputs_embeds) + self.language_scale * 0.0
         for row, column in mask.nonzero(as_tuple=False).tolist():
             if column:
-                hidden_states[row, column - 1] = -inputs_embeds[row, column]
+                hidden_states[row, column - 1] = (
+                    inputs_embeds[row, column] @ self.prediction_matrix
+                )
         self.last_inputs_embeds = inputs_embeds
         logits = torch.zeros(
             (*input_ids.shape, 4),
@@ -334,11 +342,15 @@ def test_b1_ce_alignment_and_total_loss_match_legacy_golden():
     teacher_values = torch.tensor(
         [[2.0, 1.0], [1.0, 3.0]], requires_grad=True
     )
+    prediction_matrix = torch.tensor([[0.0, -1.0], [1.0, 0.0]])
     builder = CountingTargetBuilder(
         teacher_values, mask, ((2,),)
     )
     trainer = make_trainer(
-        CountingStudent(hidden_size=2),
+        CountingStudent(
+            hidden_size=2,
+            prediction_matrix=prediction_matrix,
+        ),
         builder,
         sim_weight=0.25,
         ce_weight=1.5,
@@ -349,21 +361,29 @@ def test_b1_ce_alignment_and_total_loss_match_legacy_golden():
     expected_target = teacher_values.detach() + 0.01 * torch.randn_like(
         teacher_values.detach()
     )
-    expected_predicted = -teacher_values.detach()
-    expected_alignment = 1.0 - F.cosine_similarity(
+    expected_predicted = teacher_values.detach() @ prediction_matrix
+    noisy_alignment = 1.0 - F.cosine_similarity(
         expected_target, expected_predicted, dim=-1
     ).mean()
-    expected_loss = 1.5 * torch.tensor(4.0) + 0.25 * expected_alignment
+    no_noise_alignment = 1.0 - F.cosine_similarity(
+        teacher_values.detach(), expected_predicted, dim=-1
+    ).mean()
+    noisy_loss = 1.5 * torch.tensor(4.0) + 0.25 * noisy_alignment
+    no_noise_loss = 1.5 * torch.tensor(4.0) + 0.25 * no_noise_alignment
+    assert abs((noisy_alignment - no_noise_alignment).item()) > 5e-4
+    assert abs((noisy_loss - no_noise_loss).item()) > 1e-4
 
     torch.manual_seed(seed)
     loss = trainer.compute_loss(trainer.model, batch)
     loss.backward()
 
-    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(loss, noisy_loss, rtol=0.0, atol=1e-7)
     assert trainer._latest_stage1_diagnostics["ce_loss"].item() == pytest.approx(4.0)
     torch.testing.assert_close(
         trainer._latest_stage1_diagnostics["alignment_loss"],
-        expected_alignment,
+        noisy_alignment,
+        rtol=0.0,
+        atol=1e-7,
     )
     assert trainer._latest_stage1_diagnostics["latent_count"].item() == 2
     assert teacher_values.grad is None
