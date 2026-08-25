@@ -5,8 +5,11 @@ import json
 import random
 import os
 import argparse
+import math
+import sys
 from datasets import Dataset
 from transformers import LogitsProcessor
+from stage2.peft import normalize_stage2_target_modules
 
 from transformers import LogitsProcessor
 import torch
@@ -40,9 +43,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lora_r", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=64)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    
     parser.add_argument("--lora_target_modules", type=str,
         default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj")
+    parser.add_argument(
+        "--tuning_method",
+        choices=("full", "lora", "dora"),
+        default=None,
+    )
     
     parser.add_argument(
         "--resume_from_checkpoint_path",
@@ -84,11 +91,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # global_pad_to 已存在，保留
 # 其余不变
 
-    args = parser.parse_args(argv)
-    if args.stage == "stage2" and args.use_lora:
-        raise ValueError("Stage 2 does not support LoRA")
-    if args.stage == "stage2" and args.per_device_train_batch_size != 1:
-        raise ValueError("Stage 2 requires per_device_train_batch_size=1")
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    args.tuning_method_explicit = any(
+        item == "--tuning_method" or item.startswith("--tuning_method=")
+        for item in raw_argv
+    )
+    if args.stage == "stage2":
+        if args.use_lora:
+            raise ValueError(
+                "Stage 2 does not accept --use_lora; use --tuning_method lora"
+            )
+        if args.tuning_method is None and args.resume_from_checkpoint_path is None:
+            args.tuning_method = "full"
+        if args.lora_r <= 0 or args.lora_alpha <= 0:
+            raise ValueError("LoRA rank and alpha must be positive")
+        if not math.isfinite(args.lora_dropout) or not 0.0 <= args.lora_dropout < 1.0:
+            raise ValueError("LoRA dropout must be finite and in [0, 1)")
+        normalize_stage2_target_modules(args.lora_target_modules)
+        if args.per_device_train_batch_size != 1:
+            raise ValueError("Stage 2 requires per_device_train_batch_size=1")
+    elif args.tuning_method_explicit:
+        raise ValueError("--tuning_method is only valid for Stage 2")
     return args
 
 

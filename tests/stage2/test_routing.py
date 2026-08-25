@@ -129,20 +129,71 @@ def test_stage2_trainer_rejects_helper_tensors_before_model_call():
     assert model.last_inputs is None
 
 
+def test_fresh_stage2_tuning_defaults_to_full():
+    """Catches fresh Stage 2 runs defaulting to a PEFT method."""
+    args = parse_args(["--stage", "stage2"])
+
+    assert args.tuning_method == "full"
+    assert args.tuning_method_explicit is False
+
+
+@pytest.mark.parametrize("method", ["lora", "dora"])
+def test_stage2_accepts_explicit_peft_methods(method):
+    """Catches Stage 2 rejecting its explicit LoRA/DoRA selectors."""
+    args = parse_args(["--stage", "stage2", "--tuning_method", method])
+
+    assert args.tuning_method == method
+    assert args.tuning_method_explicit is True
+
+
+def test_stage2_resume_leaves_omitted_method_for_sidecar_resolution():
+    """Catches resume parsing overwriting the checkpoint-sidecar selector."""
+    args = parse_args(
+        [
+            "--stage",
+            "stage2",
+            "--resume_from_checkpoint_path",
+            "checkpoint-7",
+        ]
+    )
+
+    assert args.tuning_method is None
+    assert args.tuning_method_explicit is False
+
+
+def test_stage2_rejects_legacy_use_lora():
+    """Catches legacy Stage 1 LoRA mode leaking into Stage 2."""
+    with pytest.raises(ValueError, match="--tuning_method lora"):
+        parse_args(["--stage", "stage2", "--use_lora"])
+
+
+def test_stage1_cli_contract_does_not_gain_stage2_tuning():
+    """Catches the Stage 2 selector changing the Stage 1 CLI contract."""
+    args = parse_args(["--stage", "stage1", "--use_lora"])
+
+    assert args.use_lora is True
+    assert args.tuning_method is None
+
+
+def test_stage2_rejects_multi_sample_local_batches():
+    """Catches Stage 2 training violating its local B==1 requirement."""
+    with pytest.raises(ValueError, match="requires per_device_train_batch_size=1"):
+        parse_args(["--stage", "stage2", "--per_device_train_batch_size", "2"])
+
+
 @pytest.mark.parametrize(
-    "argv, message",
+    ("argv", "message"),
     [
-        (["--stage", "stage2", "--use_lora"], "does not support LoRA"),
-        (
-            ["--stage", "stage2", "--per_device_train_batch_size", "2"],
-            "requires per_device_train_batch_size=1",
-        ),
+        (["--lora_r", "0"], "LoRA rank and alpha must be positive"),
+        (["--lora_alpha", "0"], "LoRA rank and alpha must be positive"),
+        (["--lora_dropout", "nan"], "LoRA dropout must be finite"),
+        (["--lora_dropout", "1"], "LoRA dropout must be finite"),
     ],
 )
-def test_stage2_cli_rejects_unsupported_training_modes(argv, message):
-    """Catches unsupported Stage 2 LoRA or multi-sample local batches."""
+def test_stage2_rejects_invalid_peft_hyperparameters_during_parsing(argv, message):
+    """Catches invalid PEFT settings reaching Stage 2 model construction."""
     with pytest.raises(ValueError, match=message):
-        parse_args(argv)
+        parse_args(["--stage", "stage2", *argv])
 
 
 def test_stage1_cli_defaults_are_preserved():
