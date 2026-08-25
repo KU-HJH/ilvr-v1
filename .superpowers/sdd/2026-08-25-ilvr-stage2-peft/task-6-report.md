@@ -586,3 +586,149 @@ also passed.
 - Cause/context traversal does not combine evidence between exceptions.
 - The implementation is identical in both entry points, and no broader suite
   was run.
+
+## Review Fix Round 4: Shared Provenance Classifier
+
+### Architectural Correction
+
+The round-3 claim that anchored local exception text was a robust boundary was
+incorrect. Even a full local prefix is still prose that arbitrary adapter,
+configuration, or test code can reproduce. After three lexical revisions, the
+user approved replacing message classification with a single shared predicate
+that authenticates exception provenance.
+
+The implementation now lives in `src/stage2/backend_fallback.py`. Both
+`eval.py` and `src/evaluate_deepseed.py` import that predicate; their duplicate
+lexical classifiers were deleted. The loader catch boundaries and eager retry
+calls remain in their original locations.
+
+### Systematic-Debugging Evidence
+
+A controlled probe called the checked-in Qwen/`PreTrainedModel` FlashAttention
+initialization check for two real failure paths:
+
+1. an unsupported model class, producing the local `ValueError`;
+2. an unavailable backend with `flash_attn` absent, producing the local
+   `ImportError`.
+
+Both captured exceptions retained this traceback frame:
+
+```text
+transformers.modeling_utils._check_and_enable_flash_attn_2
+```
+
+Representative captured frame evidence was:
+
+```text
+ValueError  ... modeling_utils._check_and_enable_flash_attn_2:2227
+ImportError ... modeling_utils._check_and_enable_flash_attn_2:2244
+```
+
+Re-raising the captured exception added the fake-loader frame without removing
+the Transformers frame. Therefore the real local package failure does not lose
+backend provenance, and no message fallback or broader
+`modeling_flash_attention_utils`/`flash_attn` provenance rule was needed.
+
+### RED Cycle 1: Identical Text, Different Origin
+
+The old synthetic positive tests were replaced with exceptions captured from
+the real local initialization method. For both entry points, both unsupported
+model and missing-package errors were tested directly and wrapped through an
+explicit cause. Negative tests cloned the exact type and text but originated
+only in ordinary test loader code. Exact arbitrary `flash_attn` import prose
+and the former synthetic availability message were also made negative.
+
+Command:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" \
+  ./venv/ilvr-venv/bin/pytest tests/stage2/test_eval_integration.py -q \
+  -k 'real_transformers_flash_attention_error or \
+identical_flash_attention_text_without_transformers_provenance or \
+non_backend_model_error or near_flash_attn_module_name or \
+nested_non_backend_error'
+```
+
+Result against the round-3 lexical classifiers:
+
+```text
+12 failed, 40 passed, 31 deselected in 4.57s
+```
+
+All failures were unwanted eager retries for exceptions lacking Transformers
+backend provenance. The real captured direct/wrapped errors retried as
+expected.
+
+After adding the shared provenance predicate and switching both entry points,
+the same selection passed:
+
+```text
+52 passed, 31 deselected in 4.26s
+```
+
+### RED Cycle 2: Implicit Context Traversal
+
+Checklist review found that implicit exception context needed its own TDD
+witness. With context traversal deliberately absent, direct/cause/context
+tests produced:
+
+```text
+4 failed, 20 passed, 67 deselected in 5.20s
+```
+
+Only the four real context-nested cases failed. Restoring the single required
+context branch produced:
+
+```text
+24 passed, 67 deselected in 4.60s
+```
+
+### Implementation Boundary
+
+The shared predicate traverses the supplied exception, explicit causes,
+implicit contexts, and every associated traceback. It returns true only when a
+frame has both:
+
+- the exact code object of the loaded
+  `PreTrainedModel._check_and_enable_flash_attn_2` method; and
+- module provenance `transformers.modeling_utils`.
+
+It does not inspect exception classes or messages. Thus identical local text,
+exact `flash_attn` text, fabricated suffixes, near module names, and future
+adapter/config prose cannot authorize fallback without the real loaded
+Transformers boundary frame. A visited set prevents malformed exception-chain
+cycles from looping.
+
+### Focused Final Verification
+
+Per controller direction, the only full test file run was:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" \
+  ./venv/ilvr-venv/bin/pytest tests/stage2/test_eval_integration.py -q
+```
+
+Result:
+
+```text
+91 passed, 6 warnings in 4.49s
+```
+
+The warnings are the existing PEFT vocabulary warnings.
+
+### Round-4 Self-Review
+
+- There is one shared classifier and no lexical classifier in either entry
+  point.
+- Real unsupported-model and missing-package errors captured from local
+  Transformers retry in direct, cause, and context shapes for both loaders.
+- Byte-for-byte identical error text without that provenance preserves the
+  original exception identity and performs exactly one model load.
+- No additional module provenance was admitted because focused reproduction
+  proved the principal initialization boundary covers the real local package
+  failure.
+- Artifact discrimination, Stage 1 validation, PEFT loading, controller
+  resolution, device handling, and recurrence semantics were not changed.
+- No broader suite was run.

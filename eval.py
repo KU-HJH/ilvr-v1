@@ -22,6 +22,7 @@ from stage2.checkpointing import (
     load_stage2_peft_metadata,
     resolve_latent_token_ids,
 )
+from stage2.backend_fallback import is_flash_attention_initialization_error
 from stage2.inference import (
     Stage2InferenceController,
     build_stage2_generation_config,
@@ -86,36 +87,6 @@ def load_processor(model_dir: str, cache_dir: str):
         return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
 
 
-def _is_flash_attention_initialization_error(error: Exception) -> bool:
-    flash_attn_module = re.compile(
-        r"(?<![a-z0-9_])flash_attn(?![a-z0-9_])"
-    )
-    unsupported_model = re.compile(
-        r"^[a-z_][a-z0-9_.]* does not support flash attention 2\.0 yet\."
-    )
-    concrete_prefixes = (
-        "flashattention2 has been toggled on, but it cannot be used due to the following error:",
-        "flash attention 2 and bettertransformer api are not compatible.",
-        "you are attempting to use flash attention 2.0 with a model not initialized on gpu and with no gpu available.",
-        "you are attempting to use flash attention 2.0 with a model dispatched on cpu or disk.",
-    )
-    current = error
-    while current is not None:
-        message = " ".join(str(current).split()).casefold()
-        package_import = isinstance(current, ImportError) and flash_attn_module.search(
-            message
-        )
-        concrete_backend_error = not isinstance(current, ImportError) and (
-            any(message.startswith(prefix) for prefix in concrete_prefixes)
-            or unsupported_model.match(message)
-            or message == "flash attention 2 is unavailable"
-        )
-        if package_import or concrete_backend_error:
-            return True
-        current = current.__cause__ or current.__context__
-    return False
-
-
 def load_model(model_dir: str, cache_dir: str):
     """
     Prefer flash_attention_2 for efficiency; automatically fall back
@@ -130,7 +101,7 @@ def load_model(model_dir: str, cache_dir: str):
             attn_implementation="flash_attention_2",
         )
     except Exception as e:
-        if not _is_flash_attention_initialization_error(e):
+        if not is_flash_attention_initialization_error(e):
             raise
         logging.warning(
             f"flash_attention_2 initialization failed ({e}); "
