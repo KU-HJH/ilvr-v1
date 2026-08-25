@@ -246,8 +246,9 @@ def test_rank_local_fixture_rejects_malformed_launcher_rank(tmp_path, raw_rank):
     os.environ.get("RUN_STAGE2_TINY_TRAIN") != "1",
     reason="set RUN_STAGE2_TINY_TRAIN=1 for the save/resume witness",
 )
-def test_tiny_stage2_harness_restores_full_training_state(tmp_path):
-    """Catches resume restarting optimizer, scheduler, or global step from zero."""
+@pytest.mark.parametrize("method", ["lora", "dora"])
+def test_tiny_stage2_harness_restores_full_training_state(tmp_path, method):
+    """Catches PEFT resume losing adapter, frozen-boundary, or Trainer state."""
     witness_path = tmp_path / "witness.json"
     result = subprocess.run(
         [
@@ -257,6 +258,8 @@ def test_tiny_stage2_harness_restores_full_training_state(tmp_path):
             str(tmp_path / "train"),
             "--witness-path",
             str(witness_path),
+            "--tuning-method",
+            method,
         ],
         cwd=REPO_ROOT,
         env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
@@ -267,12 +270,20 @@ def test_tiny_stage2_harness_restores_full_training_state(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
     witness = json.loads(witness_path.read_text())
+    assert witness["tuning_method"] == method
     assert witness["first_global_step"] == 1
     assert witness["resumed_global_step"] == 2
     assert witness["optimizer_state_restored"] is True
     assert witness["scheduler_state_restored"] is True
     assert witness["optimizer_step_at_resume"] == 1
     assert witness["scheduler_step_at_resume"] == 1
+    assert witness["adapter_parameters_changed"] is True
+    assert witness["adapter_checkpoint_present"] is True
+    assert witness["sidecar_present"] is True
+    assert witness["processor_present"] is True
+    assert witness["full_model_weights_absent"] is True
+    assert witness["visual_trainable_parameters"] == 0
+    assert witness["base_trainable_parameters"] == 0
     assert witness["observed_local_batch_sizes"]
     assert set(witness["observed_local_batch_sizes"]) == {1}
     assert math.isfinite(witness["first_loss"])

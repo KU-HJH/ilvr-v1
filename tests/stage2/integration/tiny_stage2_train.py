@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import math
 import os
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
+import peft
 import torch
 import torch.distributed as dist
+import transformers
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import (
@@ -20,7 +24,14 @@ from transformers import (
 )
 
 from main import build_stage2_training_arguments
+from stage2.checkpointing import build_stage2_peft_metadata
 from stage2.data import Stage2DataCollator, prepare_stage2_example
+from stage2.peft import (
+    ALLOWED_STAGE2_TARGET_SUFFIXES,
+    Stage2TuningConfig,
+    build_stage2_tuned_model,
+    resolve_stage2_qwen_model,
+)
 from stage2.trainer import Stage2Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
@@ -52,6 +63,24 @@ class TinyStage2Processor:
     def __init__(self):
         self.tokenizer = TinyStage2Tokenizer()
         self.calls = []
+
+    model_input_names = ["input_ids"]
+
+    def save_pretrained(self, directory):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "tiny_stage2_processor.json").write_text(
+            json.dumps(
+                {
+                    "latent_pad_token_id": 90,
+                    "latent_start_token_id": 91,
+                    "latent_end_token_id": 92,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def apply_chat_template(self, conversation, *, tokenize, add_generation_prompt):
         assert tokenize is False
@@ -132,10 +161,12 @@ class RecordingStage2Collator:
         return self.delegate(features)
 
 
-def _recording_production_collator() -> RecordingStage2Collator:
+def _recording_production_collator(
+    processor: TinyStage2Processor | None = None,
+) -> RecordingStage2Collator:
     return RecordingStage2Collator(
         Stage2DataCollator(
-            processor=TinyStage2Processor(),
+            processor=processor or TinyStage2Processor(),
             token_ids=LatentTokenIds(
                 pad_token_id=90,
                 start_token_id=91,
@@ -254,6 +285,90 @@ def _is_world_process_zero() -> bool:
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
 
+def _tuning_config(method: str) -> Stage2TuningConfig:
+    return Stage2TuningConfig(
+        method=method,
+        r=2,
+        alpha=4,
+        dropout=0.0,
+        target_modules=ALLOWED_STAGE2_TARGET_SUFFIXES,
+    )
+
+
+def _build_tuned_model(
+    tuning: Stage2TuningConfig, *, adapter_path: Path | None = None
+):
+    # Re-seeding makes fresh base B byte-identical to fresh base A.
+    torch.manual_seed(23)
+    base = _tiny_model()
+    if tuning.method == "full":
+        if adapter_path is None:
+            base.visual.requires_grad_(False)
+            return base
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(adapter_path)
+    return build_stage2_tuned_model(
+        base,
+        tuning,
+        adapter_path=adapter_path,
+        is_trainable=True,
+    )
+
+
+def _gathered_parameters(parameters):
+    if not any(hasattr(parameter, "ds_id") for parameter in parameters):
+        return nullcontext()
+    from deepspeed import zero
+
+    return zero.GatheredParameters(parameters, modifier_rank=None)
+
+
+def _snapshot_trainable_parameters(model) -> dict[str, torch.Tensor]:
+    named = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    with _gathered_parameters([parameter for _, parameter in named]):
+        return {
+            name: parameter.detach().cpu().clone()
+            for name, parameter in named
+        }
+
+
+def _parameter_boundary(model) -> tuple[int, int]:
+    qwen = resolve_stage2_qwen_model(model)
+    visual_ids = {id(parameter) for parameter in qwen.visual.parameters()}
+    visual_trainable = sum(
+        parameter.numel()
+        for parameter in qwen.visual.parameters()
+        if parameter.requires_grad
+    )
+    base_trainable = sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+        and id(parameter) not in visual_ids
+        and "lora_" not in name
+    )
+    return visual_trainable, base_trainable
+
+
+def _git_commit() -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parents[3],
+        text=True,
+    ).strip()
+
+
+def _deepspeed_identity(deepspeed: str | None) -> tuple[str | None, int | None]:
+    if deepspeed is None:
+        return None, None
+    path = Path(deepspeed).resolve()
+    config = json.loads(path.read_text(encoding="utf-8"))
+    return str(path), int(config["zero_optimization"]["stage"])
+
+
 def _assert_contract(witness):
     if witness["first_global_step"] != 1 or witness["resumed_global_step"] != 2:
         raise AssertionError(f"global step was not restored: {witness}")
@@ -269,38 +384,100 @@ def _assert_contract(witness):
         witness["resumed_loss"]
     ):
         raise AssertionError(f"non-finite training loss: {witness}")
+    if witness["tuning_method"] in ("lora", "dora"):
+        required_true = (
+            "adapter_parameters_changed",
+            "adapter_checkpoint_present",
+            "sidecar_present",
+            "processor_present",
+            "full_model_weights_absent",
+        )
+        if any(not witness[field] for field in required_true):
+            raise AssertionError(f"PEFT checkpoint contract failed: {witness}")
+        if witness["visual_trainable_parameters"] != 0:
+            raise AssertionError(f"visual parameters became trainable: {witness}")
+        if witness["base_trainable_parameters"] != 0:
+            raise AssertionError(f"base parameters became trainable: {witness}")
 
 
-def run_harness(*, output_dir: Path, witness_path: Path, deepspeed: str | None):
-    torch.manual_seed(23)
+def run_harness(
+    *,
+    output_dir: Path,
+    witness_path: Path,
+    deepspeed: str | None,
+    tuning_method: str,
+):
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset = TinyStage2Dataset(build_rank_local_tiny_prepared_example(output_dir))
+    tuning = _tuning_config(tuning_method)
+    first_model = _build_tuned_model(tuning)
+    initial_trainable = _snapshot_trainable_parameters(first_model)
+    metadata = None
+    if tuning.is_peft:
+        qwen = resolve_stage2_qwen_model(first_model)
+        metadata = build_stage2_peft_metadata(
+            tuning=tuning,
+            base_model_reference="tiny-stage1-base",
+            model_config=qwen.config,
+            token_ids=LatentTokenIds(90, 91, 92),
+            resolved_target_names=tuple(
+                first_model.peft_config["default"].target_modules
+            ),
+        )
 
-    first_collator = _recording_production_collator()
+    first_processor = TinyStage2Processor()
+    first_collator = _recording_production_collator(first_processor)
     first_recorder = ResumeStateRecorder()
     first_trainer = Stage2Trainer(
-        model=_tiny_model(),
+        model=first_model,
         args=_training_args(output_dir, max_steps=1, deepspeed=deepspeed),
         train_dataset=dataset,
         data_collator=first_collator,
         callbacks=[first_recorder],
+        processing_class=first_processor,
+        stage2_peft_metadata=metadata,
     )
     first_result = first_trainer.train()
     first_global_step = int(first_trainer.state.global_step)
     checkpoint = output_dir / "checkpoint-1"
     if not checkpoint.is_dir():
         raise AssertionError(f"first Stage 2 checkpoint was not saved: {checkpoint}")
+    adapter_checkpoint_present = all(
+        (checkpoint / filename).is_file()
+        for filename in ("adapter_config.json", "adapter_model.safetensors")
+    )
+    sidecar_present = (checkpoint / "stage2_peft_metadata.json").is_file()
+    processor_present = (checkpoint / "tiny_stage2_processor.json").is_file()
+    full_model_weights_absent = not any(
+        (checkpoint / filename).exists()
+        for filename in ("model.safetensors", "pytorch_model.bin")
+    )
 
-    resumed_collator = _recording_production_collator()
+    resumed_model = _build_tuned_model(tuning, adapter_path=checkpoint)
+    resumed_processor = TinyStage2Processor()
+    resumed_collator = _recording_production_collator(resumed_processor)
     resumed_recorder = ResumeStateRecorder()
     resumed_trainer = Stage2Trainer(
-        model=Qwen2_5_VLForConditionalGeneration.from_pretrained(checkpoint),
+        model=resumed_model,
         args=_training_args(output_dir, max_steps=2, deepspeed=deepspeed),
         train_dataset=dataset,
         data_collator=resumed_collator,
         callbacks=[resumed_recorder],
+        processing_class=resumed_processor,
+        stage2_peft_metadata=metadata,
     )
     resumed_result = resumed_trainer.train(resume_from_checkpoint=str(checkpoint))
+
+    final_trainable = _snapshot_trainable_parameters(resumed_model)
+    adapter_parameters_changed = (
+        tuning.is_peft
+        and final_trainable.keys() == initial_trainable.keys()
+        and any(
+            not torch.equal(initial_trainable[name], final_trainable[name])
+            for name in initial_trainable
+        )
+    )
+    visual_trainable, base_trainable = _parameter_boundary(resumed_model)
 
     rank_records = _collect_rank_records(
         {
@@ -308,6 +485,9 @@ def run_harness(*, output_dir: Path, witness_path: Path, deepspeed: str | None):
             "resumed_batches": resumed_collator.local_batch_sizes,
             "optimizer_step_at_resume": resumed_recorder.optimizer_step,
             "scheduler_step_at_resume": resumed_recorder.scheduler_step,
+            "adapter_parameters_changed": adapter_parameters_changed,
+            "visual_trainable_parameters": visual_trainable,
+            "base_trainable_parameters": base_trainable,
         }
     )
     observed_batch_sizes = [
@@ -318,7 +498,16 @@ def run_harness(*, output_dir: Path, witness_path: Path, deepspeed: str | None):
     ]
     optimizer_steps = {record["optimizer_step_at_resume"] for record in rank_records}
     scheduler_steps = {record["scheduler_step_at_resume"] for record in rank_records}
+    adapter_changes = {record["adapter_parameters_changed"] for record in rank_records}
+    visual_trainable_counts = {
+        record["visual_trainable_parameters"] for record in rank_records
+    }
+    base_trainable_counts = {
+        record["base_trainable_parameters"] for record in rank_records
+    }
+    deepspeed_config, deepspeed_zero_stage = _deepspeed_identity(deepspeed)
     witness = {
+        "tuning_method": tuning.method,
         "first_global_step": first_global_step,
         "resumed_global_step": int(resumed_trainer.state.global_step),
         "optimizer_state_restored": optimizer_steps == {1},
@@ -334,6 +523,24 @@ def run_harness(*, output_dir: Path, witness_path: Path, deepspeed: str | None):
         "first_loss": float(first_result.training_loss),
         "resumed_loss": float(resumed_result.training_loss),
         "deepspeed": deepspeed is not None,
+        "deepspeed_config": deepspeed_config,
+        "deepspeed_zero_stage": deepspeed_zero_stage,
+        "adapter_parameters_changed": adapter_changes == {True},
+        "adapter_checkpoint_present": adapter_checkpoint_present,
+        "sidecar_present": sidecar_present,
+        "processor_present": processor_present,
+        "full_model_weights_absent": full_model_weights_absent,
+        "visual_trainable_parameters": next(iter(visual_trainable_counts))
+        if len(visual_trainable_counts) == 1
+        else None,
+        "base_trainable_parameters": next(iter(base_trainable_counts))
+        if len(base_trainable_counts) == 1
+        else None,
+        "git_commit": _git_commit(),
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+        "peft_version": peft.__version__,
+        "harness_path": str(Path(__file__).resolve()),
         "checkpoint": str(checkpoint),
     }
     _assert_contract(witness)
@@ -348,6 +555,9 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--witness-path", type=Path)
     parser.add_argument("--deepspeed")
+    parser.add_argument(
+        "--tuning-method", choices=("full", "lora", "dora"), default="full"
+    )
     return parser.parse_args()
 
 
@@ -358,6 +568,7 @@ def main():
         output_dir=args.output_dir.resolve(),
         witness_path=witness_path.resolve(),
         deepspeed=args.deepspeed,
+        tuning_method=args.tuning_method,
     )
 
 
