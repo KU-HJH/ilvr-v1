@@ -257,17 +257,19 @@ stage2_peft_metadata.json
 
 A numbered checkpoint also contains `trainer_state.json`, RNG state, and the
 optimizer/scheduler state required by its training backend. The concrete
-optimizer layout is backend-specific:
+layout depends on both the backend and who owns the scheduler:
 
-```text
-ordinary Trainer:  optimizer.pt, scheduler.pt
-DeepSpeed ZeRO-3:  DeepSpeed-owned global_step*/ rank-specific state
-```
+| Backend/configuration | Model and optimizer state | Scheduler state |
+| --- | --- | --- |
+| Ordinary non-DeepSpeed Trainer | root `optimizer.pt` | root `scheduler.pt` |
+| Current `configs/config_stage3.json` | DeepSpeed `global_step*/` rank model and optimizer state | root `scheduler.pt` (HF-owned) |
+| DeepSpeed with a configured DeepSpeed scheduler | DeepSpeed `global_step*/` rank model and optimizer state | backend-owned |
 
-DeepSpeed state includes rank files such as `*_model_states.pt` and
-`*_optim_states.pt`; a ZeRO-3 checkpoint is not expected to expose root-level
-`optimizer.pt` and `scheduler.pt`. Resume the complete numbered checkpoint
-directory rather than selecting individual state files.
+The current ZeRO-3 config has no DeepSpeed `scheduler` section, so only its
+optimizer/model state is backend-owned; the vendored Trainer saves the
+HF-owned scheduler at the numbered checkpoint root. Always resume the complete
+numbered checkpoint with the same backend and configuration. Individual
+filenames are not the compatibility contract and may vary with configuration.
 
 It does not contain a merged copy of the Stage 1 base. Resume restores the
 adapter plus Trainer progress from `RESUME_CHECKPOINT`; `STAGE1_CHECKPOINT`
