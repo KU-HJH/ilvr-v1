@@ -4,8 +4,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import torch
+from accelerate.state import AcceleratorState, GradientState
 from peft import LoraConfig
 from torch import nn
+from transformers import TrainingArguments, default_data_collator
+from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from helpers import tiny_stage2_qwen
 from stage2.checkpointing import (
@@ -22,6 +26,7 @@ from stage2.peft import (
     build_stage2_tuned_model,
     resolve_stage2_target_module_names,
 )
+from stage2.trainer import Stage2Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 
@@ -496,3 +501,122 @@ def test_stage2_peft_compatibility_fails_closed(
         validate_stage2_peft_compatibility(
             base, tokenizer, metadata, adapter_config, tmp_path
         )
+
+
+def tiny_trainer_metadata(model, tuning):
+    model.config.supervise_latent_boundaries = True
+    return build_stage2_peft_metadata(
+        tuning=tuning,
+        base_model_reference="stage1/tiny-base",
+        model_config=model.config,
+        token_ids=LatentTokenIds(90, 91, 92),
+        resolved_target_names=resolve_stage2_target_module_names(
+            model, tuning.target_modules
+        ),
+    )
+
+
+def tiny_trainer_batch():
+    return {
+        "input_ids": torch.tensor([1, 91, 90, 90, 92, 2]),
+        "attention_mask": torch.ones(6, dtype=torch.long),
+        "labels": torch.tensor([-100, 91, -100, -100, 92, 2]),
+    }
+
+
+@pytest.fixture
+def isolated_trainer_deepspeed_state(monkeypatch):
+    monkeypatch.delenv("ACCELERATE_USE_DEEPSPEED", raising=False)
+    unset_hf_deepspeed_config()
+    AcceleratorState._reset_state(reset_partial_state=True)
+    GradientState._reset_state()
+    yield
+    unset_hf_deepspeed_config()
+    AcceleratorState._reset_state(reset_partial_state=True)
+    GradientState._reset_state()
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_stage2_trainer_final_peft_save_is_adapter_only_with_sidecar(
+    tmp_path, isolated_trainer_deepspeed_state
+):
+    """Catches final PEFT saving dropping metadata or copying full base weights."""
+    tuning = Stage2TuningConfig(
+        method="lora", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+    )
+    base = tiny_stage2_qwen()
+    metadata = tiny_trainer_metadata(base, tuning)
+    model = build_stage2_tuned_model(base, tuning)
+    trainer = Stage2Trainer(
+        model=model,
+        args=TrainingArguments(output_dir=str(tmp_path), report_to=[], use_cpu=True),
+        stage2_peft_metadata=metadata,
+    )
+
+    trainer.save_model(tmp_path)
+
+    assert (tmp_path / "adapter_config.json").is_file()
+    assert (tmp_path / "adapter_model.safetensors").is_file()
+    assert (tmp_path / STAGE2_PEFT_METADATA_FILENAME).is_file()
+    assert not (tmp_path / "model.safetensors").exists()
+    assert not (tmp_path / "pytorch_model.bin").exists()
+    assert load_stage2_peft_metadata(tmp_path) == metadata
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_stage2_trainer_numbered_peft_checkpoint_keeps_resume_state(
+    tmp_path, isolated_trainer_deepspeed_state
+):
+    """Catches sidecar saving replacing Trainer's ordinary checkpoint machinery."""
+    tuning = Stage2TuningConfig(
+        method="lora", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+    )
+    base = tiny_stage2_qwen()
+    metadata = tiny_trainer_metadata(base, tuning)
+    model = build_stage2_tuned_model(base, tuning)
+    trainer = Stage2Trainer(
+        model=model,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            max_steps=1,
+            per_device_train_batch_size=1,
+            save_strategy="steps",
+            save_steps=1,
+            report_to=[],
+            disable_tqdm=True,
+            use_cpu=True,
+        ),
+        train_dataset=[tiny_trainer_batch()],
+        data_collator=default_data_collator,
+        stage2_peft_metadata=metadata,
+    )
+
+    trainer.train()
+
+    checkpoint = tmp_path / "checkpoint-1"
+    for filename in (
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        STAGE2_PEFT_METADATA_FILENAME,
+        "trainer_state.json",
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state.pth",
+    ):
+        assert (checkpoint / filename).is_file(), filename
+    assert not (checkpoint / "model.safetensors").exists()
+    assert not (checkpoint / "pytorch_model.bin").exists()
+
+
+def test_stage2_trainer_full_save_writes_no_peft_sidecar(
+    tmp_path, isolated_trainer_deepspeed_state
+):
+    """Catches full tuning being mislabeled as an adapter checkpoint."""
+    trainer = Stage2Trainer(
+        model=tiny_stage2_qwen(),
+        args=TrainingArguments(output_dir=str(tmp_path), report_to=[], use_cpu=True),
+    )
+
+    trainer.save_model(tmp_path)
+
+    assert not (tmp_path / STAGE2_PEFT_METADATA_FILENAME).exists()

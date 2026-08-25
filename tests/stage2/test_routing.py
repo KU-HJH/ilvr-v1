@@ -2,10 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from peft import PeftModel
 from transformers import Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 import main
+from helpers import tiny_stage2_qwen
 from main import (
     CustomTrainerStage1,
     Stage2DataCollator,
@@ -17,81 +19,24 @@ from main import (
     parse_args,
     select_training_path,
 )
-
-
-class FakeStage2Model:
-    def __init__(self, loss):
-        self.loss = loss
-        self.last_inputs = None
-
-    def __call__(self, **inputs):
-        self.last_inputs = inputs
-        return SimpleNamespace(loss=self.loss, stage2_diagnostics={"latent_blocks": 1})
-
-
-def test_stage2_trainer_uses_model_ce_without_teacher():
-    """Catches Stage 2 reintroducing a teacher, EMA, or altered model loss."""
-    trainer = object.__new__(Stage2Trainer)
-    trainer.model = FakeStage2Model(loss=torch.tensor(2.0, requires_grad=True))
-
-    loss, outputs = trainer.compute_loss(
-        trainer.model, {"input_ids": torch.ones(1, 3)}, return_outputs=True
-    )
-
-    assert loss.item() == 2.0
-    assert outputs.loss is loss
-    assert not hasattr(trainer, "_ema")
-    assert trainer._latest_stage2_diagnostics == {"latent_blocks": 1}
-    assert "pixel_values_latent" not in trainer.model.last_inputs
-    assert trainer.model.last_inputs["collect_stage2_diagnostics"] is True
-
-
-@pytest.mark.parametrize(
-    ("diagnostics", "expected"),
-    [
-        (
-            {
-                "block_count": torch.tensor(2),
-                "latent_l2_norms": torch.tensor([[3.0, 4.0]]),
-                "adjacent_cosine_similarities": torch.tensor([[0.5]]),
-            },
-            {
-                "stage2/latent_block_count": 2.0,
-                "stage2/latent_l2_norm_mean": 3.5,
-                "stage2/latent_l2_norm_min": 3.0,
-                "stage2/latent_l2_norm_max": 4.0,
-                "stage2/adjacent_cosine_mean": 0.5,
-            },
-        ),
-        (
-            {
-                "block_count": torch.tensor(0),
-                "latent_l2_norms": torch.empty(1, 0),
-                "adjacent_cosine_similarities": torch.empty(1, 0),
-            },
-            {"stage2/latent_block_count": 0.0},
-        ),
-    ],
+from stage2.checkpointing import (
+    Stage2LoadDecision,
+    build_stage2_peft_metadata,
+    configure_stage2_metadata,
+    validate_stage2_peft_compatibility,
 )
-def test_stage2_trainer_logs_each_diagnostic_snapshot_once(
-    monkeypatch, diagnostics, expected
-):
-    """Catches detached Stage 2 diagnostics being dropped or replayed forever."""
-    emitted = []
-    monkeypatch.setattr(
-        Trainer,
-        "log",
-        lambda self, logs, start_time=None: emitted.append((dict(logs), start_time)),
-    )
-    trainer = object.__new__(Stage2Trainer)
-    trainer._latest_stage2_diagnostics = diagnostics
+from stage2.peft import (
+    Stage2TuningConfig,
+    build_stage2_tuned_model,
+    resolve_stage2_target_module_names,
+)
 
-    trainer.log({"loss": 1.25}, start_time=7.0)
-    trainer.log({"loss": 1.0})
 
-    assert emitted[0] == ({"loss": 1.25, **expected}, 7.0)
-    assert emitted[1] == ({"loss": 1.0}, None)
-    assert trainer._latest_stage2_diagnostics is None
+def test_stage2_trainer_keeps_loss_checkpointing_and_logging_model_owned():
+    """Catches adapter plumbing taking ownership of Trainer/model behavior."""
+    assert Stage2Trainer.compute_loss is Trainer.compute_loss
+    assert Stage2Trainer._save_checkpoint is Trainer._save_checkpoint
+    assert Stage2Trainer.log is Trainer.log
 
 
 def test_stage_routing_selects_independent_trainers():
@@ -110,23 +55,6 @@ def test_boundary_supervision_is_one_default_true_boolean():
         .supervise_latent_boundaries
         is False
     )
-
-
-def test_stage2_trainer_rejects_helper_tensors_before_model_call():
-    """Catches Stage 1 helper-image tensors leaking into the Stage 2 model."""
-    trainer = object.__new__(Stage2Trainer)
-    model = FakeStage2Model(loss=torch.tensor(1.0))
-
-    with pytest.raises(ValueError, match="helper-image tensors leaked"):
-        trainer.compute_loss(
-            model,
-            {
-                "input_ids": torch.ones(1, 3),
-                "image_grid_thw_latent": torch.ones(1, 3),
-            },
-        )
-
-    assert model.last_inputs is None
 
 
 def test_fresh_stage2_tuning_defaults_to_full():
@@ -278,34 +206,23 @@ def test_stage1_collator_contract_is_unchanged(monkeypatch):
     )
 
 
-class RecordingVisual:
-    def __init__(self):
-        self.requires_grad = None
-
-    def requires_grad_(self, value):
-        self.requires_grad = value
-
-
-class RecordingStage2Model:
-    def __init__(self):
-        self.config = SimpleNamespace()
-        self.visual = RecordingVisual()
-        self.is_gradient_checkpointing = False
-        self.gradient_checkpointing_kwargs = None
-
-    def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs=None):
-        self.is_gradient_checkpointing = True
-        self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
-
-    def gradient_checkpointing_disable(self):
-        self.is_gradient_checkpointing = False
-        self.gradient_checkpointing_kwargs = None
-
-
 class CompositionTokenizer:
+    unk_token_id = 0
+    unk_token = "<unk>"
+
+    def __init__(self):
+        self.ids = {
+            "<|latent_pad|>": 90,
+            "<|latent_start|>": 91,
+            "<|latent_end|>": 92,
+        }
+
     def __call__(self, text, *, add_special_tokens, return_tensors):
         assert text == "<|im_start|>assistant"
         return {"input_ids": torch.tensor([[31, 32]])}
+
+    def convert_tokens_to_ids(self, token):
+        return self.ids.get(token, self.unk_token_id)
 
 
 class CompositionProcessor:
@@ -334,41 +251,18 @@ def stage2_args(**overrides):
         max_steps=13,
         gradient_checkpointing=True,
         deepspeed_config=None,
+        tuning_method="full",
+        tuning_method_explicit=False,
+        lora_r=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+        lora_target_modules="q_proj,v_proj",
     )
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
-@pytest.mark.parametrize("sample_limit, expected", [(None, [1, 2, 3]), (2, [1, 2])])
-def test_stage2_components_use_one_source_and_filter_complete_samples(
-    monkeypatch, sample_limit, expected
-):
-    """Catches model/processor source drift, unbounded samples, or unfrozen vision."""
-    calls = SimpleNamespace(prepared=[], filtered=None)
-    processor = CompositionProcessor()
-    model = RecordingStage2Model()
-    decision = SimpleNamespace(
-        model_source="selected/model",
-        processor_source="selected/processor",
-        trainer_resume_path="selected/checkpoint",
-        latent_size=2,
-        supervise_latent_boundaries=False,
-    )
-    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
-    monkeypatch.setattr(
-        main.AutoProcessor,
-        "from_pretrained",
-        lambda source: processor if source == "selected/processor" else None,
-    )
-    monkeypatch.setattr(
-        main.Qwen2_5_VLForConditionalGeneration,
-        "from_pretrained",
-        lambda source, **kwargs: model
-        if (source, kwargs) == ("selected/model", {"attn_implementation": "sdpa"})
-        else None,
-    )
-    token_ids = LatentTokenIds(90, 91, 92)
-    monkeypatch.setattr(main, "resolve_latent_token_ids", lambda tokenizer, config: token_ids)
+def _stub_stage2_data_pipeline(monkeypatch, calls):
     monkeypatch.setattr(main, "load_jsonl_examples", lambda path: [1, 2, 3])
 
     def prepare(item, *, image_root, latent_size):
@@ -386,28 +280,205 @@ def test_stage2_components_use_one_source_and_filter_complete_samples(
 
     monkeypatch.setattr(main, "filter_stage2_examples", filter_examples)
 
+
+@pytest.mark.parametrize(
+    ("method", "expected_peft", "sample_limit", "expected_examples"),
+    [
+        ("full", False, None, [1, 2, 3]),
+        ("lora", True, 2, [1, 2]),
+        ("dora", True, None, [1, 2, 3]),
+    ],
+)
+def test_stage2_components_compose_full_or_adapter_models_from_decision(
+    monkeypatch, method, expected_peft, sample_limit, expected_examples
+):
+    """Catches source drift, late metadata setup, wrong wrapping, or provenance loss."""
+    calls = SimpleNamespace(prepared=[], filtered=None, sources=[], wrap_states=[])
+    processor = CompositionProcessor()
+    tokenizer_ids_before = dict(processor.tokenizer.ids)
+    model = tiny_stage2_qwen()
+    model.config.stage = "stage1"
+    model.config.supervise_latent_boundaries = True
+    tuning = Stage2TuningConfig(
+        method=method,
+        r=4,
+        alpha=8,
+        dropout=0.0,
+        target_modules=("q_proj", "v_proj"),
+    )
+    decision = Stage2LoadDecision(
+        base_model_source=f"stage1/{method}-base",
+        processor_source=f"stage1/{method}-processor",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=tuning,
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
+
+    def load_processor(source):
+        calls.sources.append(("processor", source))
+        return processor
+
+    def load_model(source, **kwargs):
+        calls.sources.append(("base", source, kwargs))
+        return model
+
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", load_processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration, "from_pretrained", load_model
+    )
+    real_build = build_stage2_tuned_model
+
+    def record_build(base, selected_tuning, *, adapter_path, is_trainable):
+        calls.wrap_states.append(
+            (
+                base.config.stage,
+                all(not parameter.requires_grad for parameter in base.visual.parameters()),
+                adapter_path,
+                is_trainable,
+            )
+        )
+        return real_build(
+            base,
+            selected_tuning,
+            adapter_path=adapter_path,
+            is_trainable=is_trainable,
+        )
+
+    monkeypatch.setattr(main, "build_stage2_tuned_model", record_build, raising=False)
+    _stub_stage2_data_pipeline(monkeypatch, calls)
+
     components = build_stage2_training_components(
-        stage2_args(max_train_samples=sample_limit)
+        stage2_args(tuning_method=method, max_train_samples=sample_limit)
     )
 
-    assert [item for item, _, _ in calls.prepared] == expected
+    assert calls.sources == [
+        ("processor", f"stage1/{method}-processor"),
+        ("base", f"stage1/{method}-base", {"attn_implementation": "sdpa"}),
+    ]
+    assert calls.wrap_states == [("stage2", True, None, True)]
+    assert isinstance(components.model, PeftModel) is expected_peft
+    assert processor.tokenizer.ids == tokenizer_ids_before
+    assert [item for item, _, _ in calls.prepared] == expected_examples
     assert all(str(root) == "images" and size == 2 for _, root, size in calls.prepared)
-    assert calls.filtered == (expected, "measure", 8192)
-    assert components.model is model
+    assert calls.filtered == (expected_examples, "measure", 8192)
     assert components.processor is processor
-    assert components.train_dataset == expected
+    assert components.train_dataset == expected_examples
     assert components.trainer_class is Stage2Trainer
-    assert components.trainer_resume_path == "selected/checkpoint"
-    assert components.data_collator.token_ids == token_ids
+    assert components.trainer_resume_path is None
+    assert components.data_collator.token_ids == LatentTokenIds(90, 91, 92)
     assert components.data_collator.latent_size == 2
-    assert components.data_collator.supervise_latent_boundaries is False
+    assert components.data_collator.supervise_latent_boundaries is True
     assert model.config.stage == "stage2"
     assert model.config.latent_size == 2
-    assert model.config.supervise_latent_boundaries is False
+    assert model.config.supervise_latent_boundaries is True
     assert model.config.use_cache is False
     assert model.is_gradient_checkpointing is True
-    assert model.gradient_checkpointing_kwargs == {"use_reentrant": False}
-    assert model.visual.requires_grad is False
+    assert model.model._gradient_checkpointing_func.keywords == {
+        "use_reentrant": False
+    }
+    assert all(not parameter.requires_grad for parameter in model.visual.parameters())
+    if method == "full":
+        assert components.peft_metadata is None
+    else:
+        assert components.peft_metadata.base_model_reference == f"stage1/{method}-base"
+        assert components.peft_metadata.tuning_method == method
+        assert components.peft_metadata.requested_target_modules == (
+            "q_proj",
+            "v_proj",
+        )
+        assert components.peft_metadata.resolved_target_module_names == (
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.v_proj",
+        )
+
+
+def test_stage2_peft_resume_validates_stage1_before_mutation_and_preserves_sidecar(
+    monkeypatch, tmp_path
+):
+    """Catches compatibility validation being hidden by Stage 2 mutation or relocation."""
+    processor = CompositionProcessor()
+    tokenizer_ids_before = dict(processor.tokenizer.ids)
+    tuning = Stage2TuningConfig(
+        method="lora",
+        r=4,
+        alpha=8,
+        dropout=0.0,
+        target_modules=("q_proj", "v_proj"),
+    )
+    adapter_base = tiny_stage2_qwen()
+    adapter_base.config.supervise_latent_boundaries = True
+    resolved = resolve_stage2_target_module_names(adapter_base, tuning.target_modules)
+    adapter = build_stage2_tuned_model(adapter_base, tuning)
+    with pytest.warns(UserWarning, match="Could not find a config file"):
+        adapter.save_pretrained(tmp_path)
+    metadata = build_stage2_peft_metadata(
+        tuning=tuning,
+        base_model_reference="original/stage1-base",
+        model_config=adapter_base.config,
+        token_ids=LatentTokenIds(90, 91, 92),
+        resolved_target_names=resolved,
+    )
+    decision = Stage2LoadDecision(
+        base_model_source="relocated/stage1-base",
+        processor_source="adapter/checkpoint-7",
+        adapter_source=str(tmp_path),
+        trainer_resume_path=str(tmp_path),
+        tuning=tuning,
+        latent_size=2,
+        supervise_latent_boundaries=True,
+        peft_metadata=metadata,
+    )
+    resumed_base = tiny_stage2_qwen()
+    resumed_base.config.stage = "stage1"
+    resumed_base.config.supervise_latent_boundaries = True
+    events = []
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", lambda source: processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **kwargs: resumed_base,
+    )
+    real_validate = validate_stage2_peft_compatibility
+    real_configure = configure_stage2_metadata
+
+    def record_validate(base, tokenizer, selected_metadata, adapter_config, adapter_path):
+        events.append(("validate", base.config.stage, selected_metadata, adapter_path))
+        return real_validate(
+            base, tokenizer, selected_metadata, adapter_config, adapter_path
+        )
+
+    def record_configure(config, token_ids, **kwargs):
+        events.append(("configure", config.stage))
+        return real_configure(config, token_ids, **kwargs)
+
+    monkeypatch.setattr(
+        main, "validate_stage2_peft_compatibility", record_validate, raising=False
+    )
+    monkeypatch.setattr(main, "configure_stage2_metadata", record_configure)
+    calls = SimpleNamespace(prepared=[], filtered=None)
+    _stub_stage2_data_pipeline(monkeypatch, calls)
+
+    components = build_stage2_training_components(
+        stage2_args(
+            load_model_path="relocated/stage1-base",
+            resume_from_checkpoint_path=str(tmp_path),
+            tuning_method=None,
+        )
+    )
+
+    assert events == [
+        ("validate", "stage1", metadata, str(tmp_path)),
+        ("configure", "stage1"),
+    ]
+    assert isinstance(components.model, PeftModel)
+    assert components.peft_metadata is metadata
+    assert components.peft_metadata.base_model_reference == "original/stage1-base"
+    assert processor.tokenizer.ids == tokenizer_ids_before
+    assert components.trainer_resume_path == str(tmp_path)
 
 
 def test_stage2_training_arguments_create_fresh_optimizer_configuration():
@@ -491,6 +562,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         data_collator=collator,
         trainer_class=RecordingTrainer,
         trainer_resume_path="stage2/checkpoint-4",
+        peft_metadata="preserved-sidecar",
     )
     training_args = object()
     RecordingTrainer.world_process_zero = world_process_zero
@@ -513,6 +585,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         "train_dataset": dataset,
         "data_collator": collator,
         "processing_class": processor,
+        "stage2_peft_metadata": "preserved-sidecar",
     }
     assert trainer.resume_path == "stage2/checkpoint-4"
     assert trainer.saved_path == "out"

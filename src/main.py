@@ -17,7 +17,7 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint
 from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftConfig, get_peft_model
 from datasets import load_dataset
 
 from qwen_vl_utils import process_vision_info
@@ -26,9 +26,12 @@ from utils_deepseed import *
 from task_deepseed import *
 from trainer import CustomTrainerStage1
 from stage2.checkpointing import (
+    Stage2PeftMetadata,
+    build_stage2_peft_metadata,
     configure_stage2_metadata,
     resolve_latent_token_ids,
     resolve_stage2_load_decision,
+    validate_stage2_peft_compatibility,
 )
 from stage2.data import (
     Stage2DataCollator,
@@ -38,6 +41,11 @@ from stage2.data import (
     prepare_stage2_example,
 )
 from stage2.trainer import Stage2Trainer
+from stage2.peft import (
+    build_stage2_tuned_model,
+    resolve_stage2_target_module_names,
+    validate_stage2_parameter_boundary,
+)
 
 
 _STAGE2_GRADIENT_CHECKPOINTING_KWARGS = {"use_reentrant": False}
@@ -65,6 +73,7 @@ class Stage2TrainingComponents:
     data_collator: Stage2DataCollator
     trainer_class: type[Stage2Trainer]
     trainer_resume_path: str | None
+    peft_metadata: Stage2PeftMetadata | None
 
 
 def configure_stage2_model_backend(model, *, gradient_checkpointing: bool) -> None:
@@ -95,24 +104,67 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
         load_config=AutoConfig.from_pretrained,
         latent_size=args.latent_size,
         supervise_latent_boundaries=args.supervise_latent_boundaries,
+        tuning_method=args.tuning_method,
+        tuning_method_explicit=args.tuning_method_explicit,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=args.lora_target_modules,
     )
     processor = AutoProcessor.from_pretrained(decision.processor_source)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        decision.model_source,
+    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        decision.base_model_source,
         attn_implementation=args.attention_implementation,
     )
-    token_ids = resolve_latent_token_ids(processor.tokenizer, model.config)
+    token_ids = resolve_latent_token_ids(processor.tokenizer, base_model.config)
+    if decision.peft_metadata is not None:
+        adapter_config = PeftConfig.from_pretrained(decision.adapter_source)
+        validate_stage2_peft_compatibility(
+            base_model,
+            processor.tokenizer,
+            decision.peft_metadata,
+            adapter_config,
+            decision.adapter_source,
+        )
     configure_stage2_metadata(
-        model.config,
+        base_model.config,
         token_ids,
         latent_size=decision.latent_size,
         supervise_latent_boundaries=decision.supervise_latent_boundaries,
     )
     configure_stage2_model_backend(
-        model,
+        base_model,
         gradient_checkpointing=args.gradient_checkpointing,
     )
-    model.visual.requires_grad_(False)
+    base_model.visual.requires_grad_(False)
+    fresh_resolved_target_names = (
+        resolve_stage2_target_module_names(
+            base_model, decision.tuning.target_modules
+        )
+        if decision.peft_metadata is None and decision.tuning.is_peft
+        else None
+    )
+    model = build_stage2_tuned_model(
+        base_model,
+        decision.tuning,
+        adapter_path=decision.adapter_source,
+        is_trainable=True,
+    )
+    parameter_report = validate_stage2_parameter_boundary(model, decision.tuning)
+    logging.info(
+        "Stage 2 parameters: total=%d trainable=%d",
+        parameter_report.total_parameters,
+        parameter_report.trainable_parameters,
+    )
+    peft_metadata = decision.peft_metadata
+    if peft_metadata is None and decision.tuning.is_peft:
+        peft_metadata = build_stage2_peft_metadata(
+            tuning=decision.tuning,
+            base_model_reference=decision.base_model_source,
+            model_config=base_model.config,
+            token_ids=token_ids,
+            resolved_target_names=fresh_resolved_target_names,
+        )
 
     raw_examples = load_jsonl_examples(Path(args.data_path))
     selected_examples = (
@@ -146,6 +198,7 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
         data_collator=collator,
         trainer_class=Stage2Trainer,
         trainer_resume_path=decision.trainer_resume_path,
+        peft_metadata=peft_metadata,
     )
 
 
@@ -278,6 +331,7 @@ def main_train():
             train_dataset=components.train_dataset,
             data_collator=components.data_collator,
             processing_class=components.processor,
+            stage2_peft_metadata=components.peft_metadata,
         )
         trainer.train(resume_from_checkpoint=components.trainer_resume_path)
         if args.save_final_model:
