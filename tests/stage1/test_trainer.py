@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+import torch.nn.functional as F
 
+from accelerate.utils import DeepSpeedEngineWrapper, DistributedType
 from peft_common import resolve_qwen2_5_vl_model
 from stage1.peft import build_stage1_tuned_model
 from stage1.types import (
@@ -23,6 +25,7 @@ from tests.stage1.test_peft import (
     tuning,
 )
 from trainer import CustomTrainerStage1
+from stage1.trainer import _Stage1OptimizerCallback
 
 
 class CountingTargetBuilder:
@@ -121,25 +124,66 @@ class CountingStudent(nn.Module):
 
 
 class RecordingEma:
-    def __init__(self, model=None):
+    def __init__(self, model=None, events=None):
         self.model = model if model is not None else nn.Identity()
+        self.events = events
         self.update_count = 0
         self.values_at_update = []
 
     def update(self, student):
+        if self.events is not None:
+            self.events.append("ema.update")
         self.update_count += 1
         parameter = next(parameter for parameter in student.parameters() if parameter.requires_grad)
         self.values_at_update.append(parameter.detach().clone())
 
 
-class GlobalGradientNormWrapper(nn.Module):
-    def __init__(self, module, norm):
+class FakeZero3Optimizer:
+    """Small ZeRO-3 norm witness matching DeepSpeed 0.18's step prelude."""
+
+    def __init__(self, norm_groups, events, *, loss_scale=2.0):
+        self.norm_groups = norm_groups
+        self.events = events
+        self.loss_scale = loss_scale
+
+    def _get_norm_groups(self):
+        self.events.append("optimizer.norm_groups")
+        return self.norm_groups
+
+
+class FakeDeepSpeedEngine(nn.Module):
+    """Engine call order consumed by Accelerate 1.10's wrapper."""
+
+    def __init__(self, module, *, norm_groups, step_applied=True):
         super().__init__()
         self.module = module
-        self.norm = norm
+        self.events = []
+        self.optimizer = FakeZero3Optimizer(norm_groups, self.events)
+        self._boundary = False
+        self._step_applied = False
+        self.next_step_applied = step_applied
+        self.mutation_count = 0
 
-    def get_global_grad_norm(self):
-        return self.norm
+    def set_gradient_accumulation_boundary(self, is_boundary):
+        self._boundary = bool(is_boundary)
+        self.events.append(f"engine.boundary:{self._boundary}")
+
+    def backward(self, loss, **kwargs):
+        del loss, kwargs
+        self.events.append("engine.backward")
+
+    def is_gradient_accumulation_boundary(self):
+        return self._boundary
+
+    def step(self):
+        self.events.append("engine.step")
+        self._step_applied = bool(self.next_step_applied)
+        if self._step_applied:
+            self.mutation_count += 1
+
+    def was_step_applied(self):
+        self.events.append("engine.was_step_applied")
+        return self._step_applied
 
 
 def metadata_for(mask):
@@ -201,7 +245,14 @@ def make_trainer(model, target_builder, *, sim_weight=1.0, ce_weight=1.0, diagno
     trainer.collect_stage1_diagnostics = diagnostics
     trainer._latest_stage1_diagnostics = None
     trainer._successful_optimizer_steps = 0
-    trainer.accelerator = SimpleNamespace(optimizer_step_was_skipped=False)
+    trainer._ema_execution_device = None
+    trainer._deepspeed_step_adapter = None
+    trainer.model_wrapped = model
+    trainer.accelerator = SimpleNamespace(
+        optimizer_step_was_skipped=False,
+        distributed_type=DistributedType.NO,
+        device=model.device,
+    )
     return trainer
 
 
@@ -277,23 +328,45 @@ def test_missing_teacher_target_is_not_a_fallback(stage1_trainer, batch_b2):
 
 
 def test_b1_ce_alignment_and_total_loss_match_legacy_golden():
-    """Catches drift in the B=1 shifted alignment and weighted objective."""
+    """Catches B=1 noise/detach drift with non-collinear 2-D targets."""
     mask = torch.tensor([[False, True, False, True, False]])
     batch = make_batch(mask)
+    teacher_values = torch.tensor(
+        [[2.0, 1.0], [1.0, 3.0]], requires_grad=True
+    )
     builder = CountingTargetBuilder(
-        torch.tensor([[2.0], [3.0]]), mask, ((2,),)
+        teacher_values, mask, ((2,),)
     )
     trainer = make_trainer(
-        CountingStudent(), builder, sim_weight=0.25, ce_weight=1.5, diagnostics=True
+        CountingStudent(hidden_size=2),
+        builder,
+        sim_weight=0.25,
+        ce_weight=1.5,
+        diagnostics=True,
     )
-    torch.manual_seed(123)
+    seed = 123
+    torch.manual_seed(seed)
+    expected_target = teacher_values.detach() + 0.01 * torch.randn_like(
+        teacher_values.detach()
+    )
+    expected_predicted = -teacher_values.detach()
+    expected_alignment = 1.0 - F.cosine_similarity(
+        expected_target, expected_predicted, dim=-1
+    ).mean()
+    expected_loss = 1.5 * torch.tensor(4.0) + 0.25 * expected_alignment
 
+    torch.manual_seed(seed)
     loss = trainer.compute_loss(trainer.model, batch)
+    loss.backward()
 
-    torch.testing.assert_close(loss, torch.tensor(6.5))
+    torch.testing.assert_close(loss, expected_loss)
     assert trainer._latest_stage1_diagnostics["ce_loss"].item() == pytest.approx(4.0)
-    assert trainer._latest_stage1_diagnostics["alignment_loss"].item() == pytest.approx(2.0)
+    torch.testing.assert_close(
+        trainer._latest_stage1_diagnostics["alignment_loss"],
+        expected_alignment,
+    )
     assert trainer._latest_stage1_diagnostics["latent_count"].item() == 2
+    assert teacher_values.grad is None
 
 
 def make_qwen_trainer(method):
@@ -439,24 +512,155 @@ def test_nonfinite_gradient_prevents_optimizer_and_ema_step():
     assert trainer.ema_teacher.update_count == 0
 
 
-def test_zero3_wrapper_gradient_norm_is_used_when_local_grads_are_unavailable():
-    """Catches treating absent local ZeRO shards as missing gradient evidence."""
+def make_deepspeed_trainer(*, norm_groups, step_applied=True):
     mask = torch.tensor([[False, True, False]])
     trainer = make_trainer(
         CountingStudent(),
         CountingTargetBuilder(torch.tensor([[1.0]]), mask, ((1,),)),
         diagnostics=True,
     )
-    trainer.model_wrapped = GlobalGradientNormWrapper(
-        trainer.model, torch.tensor(3.5)
+    engine = FakeDeepSpeedEngine(
+        trainer.model,
+        norm_groups=norm_groups,
+        step_applied=step_applied,
+    )
+    trainer.ema_teacher = RecordingEma(events=engine.events)
+    trainer._attach_deepspeed_step_adapter(engine)
+    return trainer, engine, DeepSpeedEngineWrapper(engine)
+
+
+def test_deepspeed_delayed_prepare_places_ema_on_rank_execution_device():
+    """Models Trainer's CPU __init__ followed by post-prepare placement."""
+    mask = torch.tensor([[False, True, False]])
+    trainer = make_trainer(
+        CountingStudent(),
+        CountingTargetBuilder(torch.tensor([[1.0]]), mask, ((1,),)),
+    )
+    trainer.ema_teacher = RecordingEma(nn.Linear(1, 1))
+    assert next(trainer.ema_teacher.model.parameters()).device.type == "cpu"
+    trainer.model_wrapped = SimpleNamespace(device=torch.device("meta"))
+    trainer.accelerator.device = torch.device("meta")
+
+    _Stage1OptimizerCallback(trainer).on_train_begin(
+        None, None, SimpleNamespace()
     )
 
-    norm = trainer._validate_gradient_norm(trainer.model)
+    assert next(trainer.ema_teacher.model.parameters()).device.type == "meta"
+    assert trainer._ema_execution_device == torch.device("meta")
 
-    torch.testing.assert_close(norm, torch.tensor(3.5))
+
+def test_teacher_device_mismatch_fails_before_target_construction():
+    """Catches silently building CPU EMA targets for a prepared rank batch."""
+    mask = torch.tensor([[False, True, False]])
+    builder = CountingTargetBuilder(torch.tensor([[1.0]]), mask, ((1,),))
+    trainer = make_trainer(CountingStudent(), builder)
+    trainer.ema_teacher = RecordingEma(nn.Linear(1, 1))
+    batch = make_batch(mask)
+    batch["input_ids"] = batch["input_ids"].to("meta")
+
+    with pytest.raises(RuntimeError, match="EMA teacher.*device"):
+        trainer.compute_loss(trainer.model, batch)
+
+    assert builder.teacher_language_calls == 0
+
+
+def test_accelerate_deepspeed_nonboundary_microstep_does_not_validate_or_step():
+    trainer, engine, wrapper = make_deepspeed_trainer(
+        norm_groups=[torch.tensor(3.0)]
+    )
+
+    wrapper.backward(torch.tensor(1.0), sync_gradients=False)
+
+    assert engine.events == ["engine.boundary:False", "engine.backward"]
+    assert engine.mutation_count == 0
+    assert trainer.ema_teacher.update_count == 0
+
+
+def test_accelerate_deepspeed_boundary_validates_before_step_and_updates_once():
+    trainer, engine, wrapper = make_deepspeed_trainer(
+        norm_groups=[torch.tensor(3.0), torch.tensor(4.0)]
+    )
+
+    wrapper.backward(torch.tensor(1.0), sync_gradients=True)
+
+    assert engine.events == [
+        "engine.boundary:True",
+        "engine.backward",
+        "optimizer.norm_groups",
+        "engine.step",
+        "engine.was_step_applied",
+        "ema.update",
+    ]
+    assert engine.mutation_count == 1
+    assert trainer._successful_optimizer_steps == 1
+    assert trainer.ema_teacher.update_count == 1
     torch.testing.assert_close(
-        trainer._latest_stage1_diagnostics["gradient_norm"], torch.tensor(3.5)
+        trainer._latest_stage1_diagnostics["gradient_norm"],
+        torch.tensor(2.5),
     )
+
+    callback = _Stage1OptimizerCallback(trainer)
+    control = SimpleNamespace()
+    callback.on_pre_optimizer_step(None, None, control, model=trainer.model)
+    callback.on_optimizer_step(None, None, control, model=trainer.model)
+    assert trainer.ema_teacher.update_count == 1
+
+
+def test_accelerate_deepspeed_overflow_witness_prevents_ema_update():
+    trainer, engine, wrapper = make_deepspeed_trainer(
+        norm_groups=[torch.tensor(2.0)], step_applied=False
+    )
+
+    wrapper.backward(torch.tensor(1.0), sync_gradients=True)
+
+    assert engine.events[-2:] == ["engine.step", "engine.was_step_applied"]
+    assert engine.mutation_count == 0
+    assert trainer._successful_optimizer_steps == 0
+    assert trainer.ema_teacher.update_count == 0
+
+
+@pytest.mark.parametrize(
+    "norm_groups",
+    [[], [torch.tensor(-1.0)], [torch.tensor(float("nan"))]],
+    ids=["missing", "deepspeed-nonfinite-sentinel", "nan"],
+)
+def test_accelerate_deepspeed_invalid_gradient_evidence_prevents_engine_step(
+    norm_groups,
+):
+    trainer, engine, wrapper = make_deepspeed_trainer(norm_groups=norm_groups)
+
+    with pytest.raises(FloatingPointError, match="gradient"):
+        wrapper.backward(torch.tensor(1.0), sync_gradients=True)
+
+    assert "engine.step" not in engine.events
+    assert engine.mutation_count == 0
+    assert trainer.ema_teacher.update_count == 0
+
+
+def test_accelerate_deepspeed_missing_loss_scale_prevents_engine_step():
+    trainer, engine, wrapper = make_deepspeed_trainer(
+        norm_groups=[torch.tensor(2.0)]
+    )
+    engine.optimizer.loss_scale = None
+
+    with pytest.raises(FloatingPointError, match="loss scale"):
+        wrapper.backward(torch.tensor(1.0), sync_gradients=True)
+
+    assert "engine.step" not in engine.events
+    assert trainer.ema_teacher.update_count == 0
+
+
+def test_unsupported_deepspeed_prepare_lifecycle_fails_closed():
+    mask = torch.tensor([[False, True, False]])
+    trainer = make_trainer(
+        CountingStudent(),
+        CountingTargetBuilder(torch.tensor([[1.0]]), mask, ((1,),)),
+    )
+    trainer.accelerator.distributed_type = DistributedType.DEEPSPEED
+    trainer.accelerator.deepspeed_engine_wrapped = SimpleNamespace(engine=object())
+
+    with pytest.raises(RuntimeError, match="unsupported DeepSpeed"):
+        trainer._install_deepspeed_step_adapter()
 
 
 def test_nonfinite_loss_raises_before_backward_or_step():

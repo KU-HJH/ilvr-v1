@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from importlib import metadata as importlib_metadata
 import weakref
-from typing import Mapping
+from typing import Callable, Mapping
 
 import torch
 from torch import nn
@@ -20,6 +21,47 @@ from .types import Stage1BatchMetadata, Stage1TeacherTargets
 _HELPER_INPUTS = frozenset(
     {"pixel_values_latent", "image_grid_thw_latent"}
 )
+_SUPPORTED_ACCELERATE_VERSION = "1.10.1"
+_SUPPORTED_DEEPSPEED_VERSION = "0.18.0"
+
+
+class _DeepSpeedStepAdapter:
+    """Guard the real DeepSpeed mutation boundary and finish EMA there."""
+
+    def __init__(
+        self,
+        trainer: "CustomTrainerStage1",
+        engine,
+        original_step: Callable,
+    ) -> None:
+        self._trainer = weakref.ref(trainer)
+        self.engine = engine
+        self.original_step = original_step
+
+    def __call__(self, *args, **kwargs):
+        trainer = self._trainer()
+        if trainer is None:
+            raise RuntimeError("Stage 1 trainer disappeared before DeepSpeed step")
+
+        boundary = self.engine.is_gradient_accumulation_boundary()
+        if type(boundary) is not bool:
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: accumulation "
+                "boundary witness is not boolean"
+            )
+        if not boundary:
+            return self.original_step(*args, **kwargs)
+
+        trainer._validate_deepspeed_gradient_norm(self.engine)
+        result = self.original_step(*args, **kwargs)
+        applied = self.engine.was_step_applied()
+        if type(applied) is not bool:
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: applied-step "
+                "witness is not boolean"
+            )
+        trainer._finish_optimizer_step(self.engine, successful=applied)
+        return result
 
 
 class _Stage1OptimizerCallback(TrainerCallback):
@@ -28,17 +70,30 @@ class _Stage1OptimizerCallback(TrainerCallback):
     def __init__(self, trainer: "CustomTrainerStage1") -> None:
         self._trainer = weakref.ref(trainer)
 
+    def on_train_begin(self, args, state, control, **kwargs):
+        del args, state, kwargs
+        trainer = self._trainer()
+        if trainer is not None:
+            # Trainer invokes this only after Accelerator/DeepSpeed prepare.
+            trainer._prepare_ema_teacher_for_training()
+            trainer._install_deepspeed_step_adapter()
+        return control
+
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
         del args, state
         trainer = self._trainer()
-        if trainer is not None:
+        if trainer is not None and getattr(
+            trainer, "_deepspeed_step_adapter", None
+        ) is None:
             trainer._validate_gradient_norm(kwargs.get("model"))
         return control
 
     def on_optimizer_step(self, args, state, control, **kwargs):
         del args, state
         trainer = self._trainer()
-        if trainer is not None:
+        if trainer is not None and getattr(
+            trainer, "_deepspeed_step_adapter", None
+        ) is None:
             skipped = bool(
                 getattr(trainer.accelerator, "optimizer_step_was_skipped", False)
             )
@@ -80,6 +135,8 @@ class CustomTrainerStage1(SFTTrainer):
         self.collect_stage1_diagnostics = bool(collect_stage1_diagnostics)
         self._latest_stage1_diagnostics = None
         self._successful_optimizer_steps = 0
+        self._ema_execution_device: torch.device | None = None
+        self._deepspeed_step_adapter: _DeepSpeedStepAdapter | None = None
 
         if target_builder is None:
             tokenizer = getattr(self, "processing_class", None)
@@ -142,6 +199,7 @@ class CustomTrainerStage1(SFTTrainer):
                 "stage1_batch_metadata must be a Stage1BatchMetadata instance"
             )
 
+        self._validate_ema_teacher_device(working_inputs)
         targets = self.target_builder.build(
             self.ema_teacher.model, working_inputs, metadata
         )
@@ -151,7 +209,7 @@ class CustomTrainerStage1(SFTTrainer):
             for key, value in working_inputs.items()
             if key not in _HELPER_INPUTS
         }
-        model_inputs["latent_hidden_states"] = targets.latent_values
+        model_inputs["latent_hidden_states"] = targets.latent_values.detach()
         model_inputs["image_out_mask"] = targets.latent_mask
 
         outputs = model(**model_inputs)
@@ -337,6 +395,202 @@ class CustomTrainerStage1(SFTTrainer):
             if self._latest_stage1_diagnostics is None:
                 self._latest_stage1_diagnostics = {}
             self._latest_stage1_diagnostics["gradient_norm"] = norm.detach()
+
+    @staticmethod
+    def _module_devices(module: nn.Module) -> set[torch.device]:
+        return {
+            tensor.device
+            for tensor in (*tuple(module.parameters()), *tuple(module.buffers()))
+        }
+
+    def _execution_device(self) -> torch.device:
+        wrapped_device = getattr(getattr(self, "model_wrapped", None), "device", None)
+        accelerator_device = getattr(getattr(self, "accelerator", None), "device", None)
+        if wrapped_device is not None:
+            wrapped_device = torch.device(wrapped_device)
+        if accelerator_device is not None:
+            accelerator_device = torch.device(accelerator_device)
+        if (
+            wrapped_device is not None
+            and accelerator_device is not None
+            and wrapped_device != accelerator_device
+        ):
+            raise RuntimeError(
+                "Stage 1 prepared model and accelerator execution devices disagree"
+            )
+        device = wrapped_device or accelerator_device
+        if device is None:
+            raise RuntimeError("Stage 1 prepared execution device is unavailable")
+        return device
+
+    def _prepare_ema_teacher_for_training(self) -> None:
+        device = self._execution_device()
+        teacher = self.ema_teacher.model
+        if not isinstance(teacher, nn.Module):
+            raise TypeError("Stage 1 EMA teacher model must be a torch.nn.Module")
+        teacher.to(device=device)
+        teacher.eval()
+        devices = self._module_devices(teacher)
+        if devices and devices != {device}:
+            actual = ", ".join(sorted(str(item) for item in devices))
+            raise RuntimeError(
+                "Stage 1 EMA teacher placement failed: expected device "
+                f"{device}, found {actual}"
+            )
+        self._ema_execution_device = device
+
+    def _validate_ema_teacher_device(
+        self, model_inputs: Mapping[str, object]
+    ) -> None:
+        input_ids = model_inputs.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor):
+            raise TypeError("Stage 1 input_ids must be a tensor")
+        teacher = self.ema_teacher.model
+        if not isinstance(teacher, nn.Module):
+            raise TypeError("Stage 1 EMA teacher model must be a torch.nn.Module")
+        devices = self._module_devices(teacher)
+        if len(devices) > 1:
+            actual = ", ".join(sorted(str(item) for item in devices))
+            raise RuntimeError(
+                f"Stage 1 EMA teacher spans multiple devices: {actual}"
+            )
+        teacher_device = next(iter(devices), self._ema_execution_device)
+        if (
+            teacher_device is not None
+            and self._ema_execution_device is not None
+            and teacher_device != self._ema_execution_device
+        ):
+            raise RuntimeError(
+                "Stage 1 EMA teacher left its prepared execution device: "
+                f"expected {self._ema_execution_device}, found {teacher_device}"
+            )
+        if teacher_device is not None and teacher_device != input_ids.device:
+            raise RuntimeError(
+                "Stage 1 EMA teacher and batch must share a device before target "
+                f"construction: teacher={teacher_device}, batch={input_ids.device}"
+            )
+
+    def _validate_deepspeed_gradient_norm(self, engine) -> torch.Tensor:
+        optimizer = getattr(engine, "optimizer", None)
+        get_norm_groups = getattr(optimizer, "_get_norm_groups", None)
+        if not callable(get_norm_groups):
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: ZeRO-3 norm witness "
+                "is unavailable"
+            )
+        norm_groups = get_norm_groups()
+        if not isinstance(norm_groups, (tuple, list)) or not norm_groups:
+            raise FloatingPointError(
+                "Stage 1 representative DeepSpeed gradient evidence is missing"
+            )
+
+        scalar_norms: list[torch.Tensor] = []
+        for raw_norm in norm_groups:
+            norm = torch.as_tensor(raw_norm).detach().float()
+            if norm.numel() != 1:
+                raise FloatingPointError(
+                    "Stage 1 DeepSpeed gradient norm must be scalar"
+                )
+            if not bool(torch.isfinite(norm).all().item()) or bool((norm < 0).item()):
+                raise FloatingPointError(
+                    "Stage 1 DeepSpeed gradient norm is nonfinite"
+                )
+            scalar_norms.append(norm.reshape(()))
+
+        reference_device = scalar_norms[0].device
+        stacked = torch.stack(
+            [norm.to(device=reference_device) for norm in scalar_norms]
+        )
+        raw_loss_scale = getattr(optimizer, "loss_scale", None)
+        if raw_loss_scale is None:
+            raise FloatingPointError(
+                "Stage 1 DeepSpeed gradient loss scale is missing"
+            )
+        loss_scale = torch.as_tensor(
+            raw_loss_scale,
+            dtype=torch.float32,
+            device=reference_device,
+        )
+        if (
+            loss_scale.numel() != 1
+            or not bool(torch.isfinite(loss_scale).all().item())
+            or not bool((loss_scale > 0).item())
+        ):
+            raise FloatingPointError(
+                "Stage 1 DeepSpeed gradient loss scale is invalid"
+            )
+        norm = torch.linalg.vector_norm(stacked) / loss_scale
+        if not bool(torch.isfinite(norm).all().item()):
+            raise FloatingPointError("Stage 1 DeepSpeed gradient norm is nonfinite")
+        self._record_gradient_diagnostic(norm)
+        return norm
+
+    def _attach_deepspeed_step_adapter(self, engine) -> None:
+        existing = self._deepspeed_step_adapter
+        if existing is not None:
+            if existing.engine is not engine:
+                raise RuntimeError(
+                    "unsupported DeepSpeed Stage 1 lifecycle: engine changed "
+                    "after step adapter installation"
+                )
+            return
+        required = (
+            "step",
+            "is_gradient_accumulation_boundary",
+            "was_step_applied",
+        )
+        if any(not callable(getattr(engine, name, None)) for name in required):
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: required engine "
+                "step witnesses are unavailable"
+            )
+        adapter = _DeepSpeedStepAdapter(self, engine, engine.step)
+        engine.step = adapter
+        self._deepspeed_step_adapter = adapter
+
+    def _install_deepspeed_step_adapter(self) -> None:
+        from accelerate.utils import DeepSpeedEngineWrapper, DistributedType
+
+        if getattr(self.accelerator, "distributed_type", None) != DistributedType.DEEPSPEED:
+            return
+        accelerate_version = importlib_metadata.version("accelerate")
+        deepspeed_version = importlib_metadata.version("deepspeed")
+        if (
+            accelerate_version != _SUPPORTED_ACCELERATE_VERSION
+            or deepspeed_version != _SUPPORTED_DEEPSPEED_VERSION
+        ):
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: expected "
+                f"accelerate {_SUPPORTED_ACCELERATE_VERSION} and deepspeed "
+                f"{_SUPPORTED_DEEPSPEED_VERSION}, found accelerate "
+                f"{accelerate_version} and deepspeed {deepspeed_version}"
+            )
+
+        wrapper = getattr(self.accelerator, "deepspeed_engine_wrapped", None)
+        if not isinstance(wrapper, DeepSpeedEngineWrapper):
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: Accelerate engine "
+                "wrapper is unavailable after prepare"
+            )
+        from deepspeed.runtime.engine import DeepSpeedEngine
+        from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
+
+        engine = wrapper.engine
+        if not isinstance(engine, DeepSpeedEngine):
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: prepared engine type"
+            )
+        if getattr(self, "model_wrapped", None) is not engine:
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: Trainer and "
+                "Accelerate prepared different engines"
+            )
+        if not isinstance(getattr(engine, "optimizer", None), DeepSpeedZeroOptimizer_Stage3):
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: only the pinned "
+                "ZeRO-3 optimizer exposes the pre-step gradient witness"
+            )
+        self._attach_deepspeed_step_adapter(engine)
 
     def _finish_optimizer_step(
         self, model: nn.Module | None = None, *, successful: bool
