@@ -4,7 +4,9 @@ import argparse
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Mapping
+
+import torch
 
 from peft_common import normalize_decoder_target_suffixes
 
@@ -50,6 +52,16 @@ class Stage1BatchMetadata:
     samples: tuple[Stage1SampleMetadata, ...]
     batch_size: int
     sequence_length: int
+
+
+@dataclass(frozen=True)
+class Stage1TeacherTargets:
+    """Packed, row-major EMA-teacher targets for one Stage 1 batch."""
+
+    latent_values: torch.Tensor
+    latent_mask: torch.Tensor
+    selected_counts: tuple[tuple[int, ...], ...]
+    diagnostics: Mapping[str, torch.Tensor]
 
 
 @dataclass(frozen=True)
