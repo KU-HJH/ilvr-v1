@@ -35,7 +35,7 @@ class Stage1TeacherTargetBuilder:
         self.coverage_p = float(coverage_p)
         self.image_pool_k = int(image_pool_k)
         self.helper_group_L = (
-            None if helper_group_L is None else int(helper_group_L)
+            self.image_pool_k if helper_group_L is None else int(helper_group_L)
         )
         self._assistant_patterns = self._token_patterns(
             ("<|im_start|>assistant", "<|im_start|>assistant\n")

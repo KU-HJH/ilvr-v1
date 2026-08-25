@@ -413,3 +413,24 @@ def test_builder_consumes_helper_only_tensors_before_student_boundary(target_bui
 
     assert "pixel_values_latent" not in case.inputs
     assert "image_grid_thw_latent" not in case.inputs
+
+
+def test_none_helper_group_uses_legacy_image_pool_k():
+    """Catches None disabling the legacy image-pool-sized helper grouping."""
+    builder = Stage1TeacherTargetBuilder(
+        tokenizer=LiteralTokenizer(),
+        coverage_p=0.6,
+        image_pool_k=2,
+        helper_group_L=None,
+    )
+    case = make_case((GOLDEN_MULTIBLOCK,))
+
+    result = builder.build(case.teacher, case.inputs, case.metadata)
+
+    assert result.selected_counts == ((1, 1),)
+    torch.testing.assert_close(
+        result.latent_values,
+        torch.tensor([[20.0, 0.0], [2.0, 0.0]]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
