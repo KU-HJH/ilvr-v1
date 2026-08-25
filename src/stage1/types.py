@@ -10,6 +10,15 @@ from peft_common import normalize_decoder_target_suffixes
 
 
 Stage1TuningMethod = Literal["full", "lora", "dora"]
+DEFAULT_STAGE1_TARGET_SUFFIXES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
 
 
 @dataclass(frozen=True)
@@ -18,15 +27,7 @@ class Stage1TuningConfig:
     rank: int = 32
     alpha: int = 64
     dropout: float = 0.05
-    target_suffixes: tuple[str, ...] = (
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    )
+    target_suffixes: tuple[str, ...] = DEFAULT_STAGE1_TARGET_SUFFIXES
 
     def __post_init__(self) -> None:
         if self.method not in ("full", "lora", "dora"):
@@ -66,12 +67,17 @@ def resolve_stage1_tuning_config(args: argparse.Namespace) -> Stage1TuningConfig
     else:
         method = args.tuning_method or "full"
 
+    target_suffixes = (
+        normalize_decoder_target_suffixes(
+            args.lora_target_modules, stage_label="Stage 1 PEFT target modules"
+        )
+        if args.lora_target_modules_explicit
+        else DEFAULT_STAGE1_TARGET_SUFFIXES
+    )
     return Stage1TuningConfig(
         method=method,
         rank=args.lora_r,
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
-        target_suffixes=normalize_decoder_target_suffixes(
-            args.lora_target_modules, stage_label="Stage 1 PEFT target modules"
-        ),
+        target_suffixes=target_suffixes,
     )

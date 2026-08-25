@@ -45,7 +45,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lora_alpha", type=int, default=64)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target_modules", type=str,
-        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
+        default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj")
     parser.add_argument(
         "--tuning_method",
         choices=("full", "lora", "dora"),
@@ -103,6 +103,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(raw_argv)
     args.tuning_method_explicit = any(
         item == "--tuning_method" or item.startswith("--tuning_method=")
+        for item in raw_argv
+    )
+    args.lora_target_modules_explicit = any(
+        item == "--lora_target_modules"
+        or item.startswith("--lora_target_modules=")
         for item in raw_argv
     )
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
