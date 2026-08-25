@@ -329,3 +329,147 @@ Result:
   controller resolution, or inference recurrence.
 - No broad suite was rerun, in accordance with the focused-validation request
   and the repository's stop-redundant-verification policy.
+
+## Review Fix Round 2: Per-Exception Concrete Backend Patterns
+
+### Correction to Round 1
+
+The round-1 report overstated the classifier boundary. Although it added a
+second vocabulary gate, generic standalone markers such as `dtype` and `not
+compatible` still authorized fallback. It also accumulated the identifier and
+failure flags across different exceptions in a cause/context chain, and it did
+not recognize the real package spelling `flash_attn`.
+
+A read-only probe reproduced all three defects in both entry points:
+
+```text
+True   FlashAttention adapter dtype metadata mismatch
+True   Flash Attention adapter is not compatible with the base model
+True   outer: FlashAttention adapter load failed
+       cause: adapter dtype config mismatch
+False  ModuleNotFoundError: No module named 'flash_attn'
+```
+
+### RED Cycle 1: Direct/Nested Negatives and Package Positives
+
+Actual `load_model` tests were added for both entry points. The negative cases
+require the original exception object to propagate and exactly one
+`flash_attention_2` load. The positives require an eager retry and successful
+model return.
+
+The new coverage includes:
+
+- direct adapter dtype-metadata and base-compatibility errors containing a
+  FlashAttention spelling;
+- an outer FlashAttention adapter error whose inner config error contains the
+  generic `dtype` term;
+- direct and nested `ModuleNotFoundError("No module named 'flash_attn'")`;
+- the existing spaced `Flash Attention 2 is unavailable` positive.
+
+Command:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" \
+  ./venv/ilvr-venv/bin/pytest tests/stage2/test_eval_integration.py -q \
+  -k 'non_backend_model_error or nested_non_backend_error or \
+flash_attn_module_import_error or flash_backend_initialization_error'
+```
+
+RED result:
+
+```text
+10 failed, 14 passed, 31 deselected in 4.91s
+```
+
+The six negative failures showed an unwanted eager retry. The four package
+positive failures propagated the missing-package exception without retry.
+
+After replacing accumulated generic flags with per-exception concrete pattern
+matching:
+
+```text
+24 passed, 31 deselected in 4.64s
+```
+
+### RED Cycle 2: General ImportError Contract
+
+Requirement review found that the first minimal implementation recognized the
+exact `ModuleNotFoundError` form but not every `ImportError` naming
+`flash_attn`. An additional actual-loader test used:
+
+```text
+ImportError: cannot import flash_attn CUDA extension
+```
+
+RED:
+
+```text
+2 failed, 55 deselected in 4.53s
+```
+
+The package-import predicate was then changed to require exactly the conjunction
+of `isinstance(error, ImportError)` and `flash_attn` in that same exception's
+message.
+
+Combined classifier GREEN:
+
+```text
+26 passed, 31 deselected in 4.30s
+```
+
+### Implementation Boundary
+
+Each exception in the cause/context chain is now classified independently. No
+state is carried from an outer exception to an inner exception. An individual
+exception qualifies only through one of these concrete local-Transformers
+families:
+
+- an `ImportError`/`ModuleNotFoundError` naming `flash_attn`;
+- `package flash_attn` install, support, or version failure text;
+- `FlashAttention2 has been toggled on`;
+- a model that `does not support Flash Attention 2`;
+- `Flash Attention 2 is not available` or `is unavailable`;
+- `Flash Attention 2 and BetterTransformer` incompatibility;
+- `attempting to use Flash Attention 2` with the local dtype/GPU/CPU/disk
+  initialization details;
+- `Flash Attention ... only supports torch.float16`;
+- an explicit Flash Attention 2 backend initialization failure.
+
+Standalone `dtype`, `not compatible`, `support`, device, and initialization
+terms are no longer classifiers.
+
+### Focused Final Verification
+
+Per controller direction, only the focused evaluation integration file was run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage2" \
+  ./venv/ilvr-venv/bin/pytest tests/stage2/test_eval_integration.py -q
+```
+
+Result:
+
+```text
+57 passed, 6 warnings in 4.69s
+```
+
+`git diff --check` passed before commit.
+
+### Round-2 Self-Review
+
+- Direct and nested negative errors preserve object identity and perform one
+  model load in both entry points.
+- Direct and nested missing-`flash_attn` errors retry eager in both entry
+  points, as does the retained spaced availability error.
+- Generic adapter/config metadata, dtype, and compatibility language cannot be
+  combined with a FlashAttention identifier in the same or another exception.
+- Concrete patterns are grounded in local
+  `transformers/modeling_utils.py:2226-2305`; no broad standalone vocabulary
+  markers remain.
+- The broad catch location, original re-raise, eager call arguments, adapter
+  compatibility/loading, controller resolution, and recurrence remain
+  unchanged.
+- No broader suite was run, per the focused-validation instruction and
+  repository verification policy.

@@ -351,6 +351,11 @@ def test_peft_eval_requires_base_before_loading_or_iterating(
         (ValueError, "Flash Attention latent token mismatch"),
         (ValueError, "flash-attention adapter mismatch"),
         (ValueError, "malformed config: attn_implementation=flash_attention_2"),
+        (ValueError, "FlashAttention adapter dtype metadata mismatch"),
+        (
+            ValueError,
+            "Flash Attention adapter is not compatible with the base model",
+        ),
     ],
     ids=(
         "missing-path",
@@ -359,6 +364,8 @@ def test_peft_eval_requires_base_before_loading_or_iterating(
         "token",
         "adapter",
         "malformed-config",
+        "adapter-dtype-metadata",
+        "adapter-base-incompatible",
     ),
 )
 def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
@@ -383,6 +390,88 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
         module.load_model("model", "cache")
     assert raised.value is original_error
     assert calls == ["flash_attention_2"]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_nested_non_backend_error_does_not_combine_classifier_signals(
+    module_name, monkeypatch
+):
+    """Combining classifier signals across exceptions must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    calls = []
+    original_error = RuntimeError("FlashAttention adapter load failed")
+    original_error.__cause__ = ValueError("adapter dtype config mismatch")
+
+    def fail_load(_source, **kwargs):
+        calls.append(kwargs["attn_implementation"])
+        raise original_error
+
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        fail_load,
+    )
+
+    with pytest.raises(RuntimeError, match="adapter load failed") as raised:
+        module.load_model("model", "cache")
+    assert raised.value is original_error
+    assert calls == ["flash_attention_2"]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("nested", [False, True], ids=("direct", "nested"))
+def test_flash_attn_module_import_error_retries_with_eager(
+    module_name, nested, monkeypatch
+):
+    """Missing the real flash_attn package spelling must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    model = tiny_stage2_qwen()
+    calls = []
+    package_error = ModuleNotFoundError("No module named 'flash_attn'")
+    if nested:
+        original_error = RuntimeError("attention backend initialization failed")
+        original_error.__cause__ = package_error
+    else:
+        original_error = package_error
+
+    def load(_source, **kwargs):
+        calls.append(kwargs["attn_implementation"])
+        if kwargs["attn_implementation"] == "flash_attention_2":
+            raise original_error
+        return model
+
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        load,
+    )
+
+    assert module.load_model("model", "cache") is model
+    assert calls == ["flash_attention_2", "eager"]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_flash_attn_import_error_retries_with_eager(module_name, monkeypatch):
+    """An ImportError naming flash_attn must trigger the backend fallback."""
+    module = _import_entry_point(module_name, monkeypatch)
+    model = tiny_stage2_qwen()
+    calls = []
+    original_error = ImportError("cannot import flash_attn CUDA extension")
+
+    def load(_source, **kwargs):
+        calls.append(kwargs["attn_implementation"])
+        if kwargs["attn_implementation"] == "flash_attention_2":
+            raise original_error
+        return model
+
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        load,
+    )
+
+    assert module.load_model("model", "cache") is model
+    assert calls == ["flash_attention_2", "eager"]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

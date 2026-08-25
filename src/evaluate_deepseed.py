@@ -64,51 +64,53 @@ def load_processor(model_dir: str, cache_dir: str):
         return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
 
 def _is_flash_attention_initialization_error(error: Exception) -> bool:
-    has_flash_attention_identifier = False
-    has_initialization_failure = False
     current = error
     while current is not None:
         message = str(current).lower()
-        has_flash_attention_identifier |= any(
-            marker in message
-            for marker in (
-                "flashattention",
-                "flash attention",
-                "flash_attention",
-                "flash-attention",
-            )
+        names = (
+            "flashattention2",
+            "flash attention 2",
+            "flash_attention_2",
+            "flash-attention 2",
         )
-        has_initialization_failure |= any(
-            marker in message
-            for marker in (
-                "unavailable",
-                "not available",
-                "cannot be used",
-                "cannot import",
-                "failed to import",
-                "no module named",
-                "not installed",
-                "please install",
-                "does not support",
-                "not supported",
-                "only supports",
-                "not compatible",
-                "cuda device",
-                "not initialized on gpu",
-                "not initialized on cuda",
-                "dispatched on cpu",
-                "dispatched on disk",
-                "torch dtype",
-                "dtype",
-                "backend initialization",
-                "backend initialisation",
-                "initialization failed",
-                "initialisation failed",
-                "failed to initialize",
-                "failed to initialise",
-            )
+        names_backend = any(name in message for name in names)
+        package_import = (
+            isinstance(current, ImportError)
+            and "flash_attn" in message
         )
-        if has_flash_attention_identifier and has_initialization_failure:
+        package_failure = any(
+            package in message
+            for package in ("package flash_attn", "flash_attn package")
+        ) and any(
+            failure in message
+            for failure in ("not installed", "not supported", "version")
+        )
+        backend_failure = names_backend and (
+            "has been toggled on" in message
+            or "does not support flash attention 2" in message
+            or "is not available" in message
+            or "is unavailable" in message
+            or "flash attention 2 and bettertransformer" in message
+            or (
+                "attempting to use flash attention 2" in message
+                and any(
+                    detail in message
+                    for detail in (
+                        "torch dtype",
+                        "not initialized on gpu",
+                        "no gpu available",
+                        "dispatched on cpu",
+                        "dispatched on disk",
+                    )
+                )
+            )
+            or "only supports torch.float16" in message
+            or "backend initialization failed" in message
+            or "backend initialisation failed" in message
+            or "failed to initialize flash attention 2" in message
+            or "failed to initialise flash attention 2" in message
+        )
+        if package_import or package_failure or backend_failure:
             return True
         current = current.__cause__ or current.__context__
     return False
