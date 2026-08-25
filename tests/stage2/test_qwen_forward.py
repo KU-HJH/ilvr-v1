@@ -6,7 +6,11 @@ import torch
 from torch import nn
 
 from main import configure_stage2_model_backend
-from helpers import ToyCausalLanguageModel, tiny_stage2_qwen
+from helpers import (
+    ToyCausalLanguageModel,
+    activate_stage2_adapter_deltas,
+    tiny_stage2_qwen,
+)
 from stage2.peft import (
     ALLOWED_STAGE2_TARGET_SUFFIXES,
     Stage2TuningConfig,
@@ -348,30 +352,41 @@ def test_stage2_forward_slices_one_full_mrope_tensor(monkeypatch):
 
 
 @pytest.mark.parametrize("method", ["lora", "dora"])
-def test_peft_stage2_multiblock_rollout_ignores_latent_pad_embeddings(
-    method, monkeypatch
-):
+def test_peft_stage2_multiblock_rollout_ignores_latent_pad_embeddings(method):
     """Catches PEFT recurrence using discrete latent-pad vectors in either block."""
     wrapped = build_stage2_tuned_model(tiny_stage2_qwen(), settings(method)).eval()
+    inactive = deepcopy(wrapped).eval()
+    activate_stage2_adapter_deltas(wrapped)
     qwen = resolve_stage2_qwen_model(wrapped)
     input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 91, 90, 90, 92, 3]])
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.masked_fill(input_ids == 90, -100)
-    rope_calls = 0
-    original_get_rope_index = qwen.get_rope_index
+    inactive_outputs = inactive(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        return_stage2_latent_states=True,
+    )
+    projection_calls = []
+    decoder_inputs = []
 
-    def record_get_rope_index(*args, **kwargs):
-        nonlocal rope_calls
-        rope_calls += 1
-        return original_get_rope_index(*args, **kwargs)
+    def record_decoder_inputs(_module, _args, kwargs):
+        decoder_inputs.append(kwargs["inputs_embeds"].detach().clone())
 
-    monkeypatch.setattr(qwen, "get_rope_index", record_get_rope_index)
+    projection_handle = qwen.model.layers[0].self_attn.q_proj.register_forward_hook(
+        lambda *unused: projection_calls.append(1)
+    )
+    decoder_handle = qwen.model.register_forward_pre_hook(
+        record_decoder_inputs, with_kwargs=True
+    )
     reference = wrapped(
         input_ids=input_ids,
         attention_mask=attention_mask,
         labels=labels,
         return_stage2_latent_states=True,
     )
+    projection_handle.remove()
+    decoder_handle.remove()
     with torch.no_grad():
         qwen.get_input_embeddings().weight[90].fill_(10_000)
     modified = wrapped(
@@ -381,12 +396,27 @@ def test_peft_stage2_multiblock_rollout_ignores_latent_pad_embeddings(
         return_stage2_latent_states=True,
     )
 
-    assert rope_calls == 2
     assert reference.loss.isfinite()
     assert modified.loss.isfinite()
+    assert len(projection_calls) == 5
+    assert [value.shape[1] for value in decoder_inputs] == [2, 3, 7, 8, 11]
     assert len(reference.stage2_latent_states) == len(
         modified.stage2_latent_states
     ) == 4
+    assert any(
+        not torch.allclose(inactive_state, active_state)
+        for inactive_state, active_state in zip(
+            inactive_outputs.stage2_latent_states,
+            reference.stage2_latent_states,
+            strict=True,
+        )
+    )
+    torch.testing.assert_close(
+        decoder_inputs[2][:, 2], reference.stage2_latent_states[0]
+    )
+    torch.testing.assert_close(
+        decoder_inputs[2][:, 3], reference.stage2_latent_states[1]
+    )
     for reference_state, modified_state in zip(
         reference.stage2_latent_states,
         modified.stage2_latent_states,

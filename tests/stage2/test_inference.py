@@ -5,7 +5,11 @@ import pytest
 import torch
 from torch import nn
 
-from helpers import ToyCausalLanguageModel, tiny_stage2_qwen
+from helpers import (
+    ToyCausalLanguageModel,
+    activate_stage2_adapter_deltas,
+    tiny_stage2_qwen,
+)
 from stage2.inference import (
     Stage2GenerationConfig,
     Stage2InferenceController,
@@ -252,36 +256,89 @@ def test_inference_rejects_non_positive_latent_size():
 
 @pytest.mark.parametrize("method", ["lora", "dora"])
 def test_peft_training_and_inference_share_latent_states_and_full_mrope_positions(
-    method,
+    method, monkeypatch
 ):
     """Catches inference using an unadapted decoder instead of the PEFT Qwen base."""
     training_wrapper = build_stage2_tuned_model(
         tiny_stage2_qwen(), settings(method)
     ).eval()
+    activate_stage2_adapter_deltas(training_wrapper)
     training_model = resolve_stage2_qwen_model(training_wrapper).eval()
-    with torch.no_grad():
-        for name, parameter in training_wrapper.named_parameters():
-            if "lora_B" in name:
-                parameter.fill_(0.01)
     training_model.lm_head = ScriptedHead([TOKENS.start_token_id])
     inference_model = copy.deepcopy(training_model).eval()
-    scaffold = torch.tensor([[1, 91, 90, 90, 92]])
+    context = torch.tensor([[1, 81, 80, 80, 80, 80, 2]])
+    scaffold = torch.tensor(
+        [[1, 81, 80, 80, 80, 80, 2, 91, 90, 90, 92]]
+    )
     mask = torch.ones_like(scaffold)
-    image_grid_thw = torch.tensor([[1, 1, 1]])
+    image_grid_thw = torch.tensor([[1, 2, 2]])
+    pixel_values = torch.ones((4, 12))
+    full_positions, _ = training_model.get_rope_index(
+        scaffold,
+        image_grid_thw=image_grid_thw,
+        attention_mask=mask,
+    )
+    training_rope_inputs = []
+    training_decoder_inputs = []
+    inference_rope_inputs = []
+    original_training_rope_index = training_model.get_rope_index
+    original_inference_rope_index = inference_model.get_rope_index
+
+    def record_training_rope_index(
+        input_ids, image_grid_thw=None, attention_mask=None
+    ):
+        training_rope_inputs.append(
+            (input_ids.clone(), image_grid_thw.clone(), attention_mask.clone())
+        )
+        return original_training_rope_index(
+            input_ids,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+        )
+
+    def record_inference_rope_index(
+        input_ids, image_grid_thw=None, attention_mask=None
+    ):
+        inference_rope_inputs.append(
+            (input_ids.clone(), image_grid_thw.clone(), attention_mask.clone())
+        )
+        return original_inference_rope_index(
+            input_ids,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+        )
+
+    def record_training_decoder_inputs(_module, _args, kwargs):
+        training_decoder_inputs.append(
+            (kwargs["position_ids"].clone(), kwargs["attention_mask"].clone())
+        )
+
+    monkeypatch.setattr(
+        training_model, "get_rope_index", record_training_rope_index
+    )
+    monkeypatch.setattr(
+        inference_model, "get_rope_index", record_inference_rope_index
+    )
+    handle = training_model.model.register_forward_pre_hook(
+        record_training_decoder_inputs, with_kwargs=True
+    )
     training = training_wrapper(
         input_ids=scaffold,
         attention_mask=mask,
         image_grid_thw=image_grid_thw,
+        pixel_values=pixel_values,
         return_stage2_latent_states=True,
     )
+    handle.remove()
 
     inference = Stage2InferenceController().generate(
         model=inference_model,
-        input_ids=torch.tensor([[1]]),
-        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        input_ids=context,
+        attention_mask=torch.ones_like(context),
         token_ids=TOKENS,
         generation_config=Stage2GenerationConfig(max_new_tokens=1),
         image_grid_thw=image_grid_thw,
+        pixel_values=pixel_values,
         return_latent_states=True,
     )
 
@@ -294,6 +351,20 @@ def test_peft_training_and_inference_share_latent_states_and_full_mrope_position
         strict=True,
     ):
         torch.testing.assert_close(train_state, inference_state)
+    assert len(training_rope_inputs) == 1
+    assert torch.equal(training_rope_inputs[0][0], scaffold)
+    assert torch.equal(training_rope_inputs[0][1], image_grid_thw)
+    assert torch.equal(training_rope_inputs[0][2], mask)
+    assert len(training_decoder_inputs) == 3
+    for (position_ids, attention_mask), prefix_length in zip(
+        training_decoder_inputs, (8, 9, 11), strict=True
+    ):
+        assert torch.equal(position_ids, full_positions[..., :prefix_length])
+        assert torch.equal(attention_mask, mask[:, :prefix_length])
+    assert len(inference_rope_inputs) == 2
+    assert torch.equal(inference_rope_inputs[-1][0], scaffold)
+    assert torch.equal(inference_rope_inputs[-1][1], image_grid_thw)
+    assert torch.equal(inference_rope_inputs[-1][2], mask)
 
 
 def test_latent_states_are_returned_only_when_requested():

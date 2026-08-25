@@ -65,3 +65,16 @@ def tiny_stage2_qwen(*, attn_implementation="eager"):
         rope_scaling={"type": "mrope", "mrope_section": [1, 1, 0]},
     )
     return Qwen2_5_VLForConditionalGeneration(config)
+
+
+def activate_stage2_adapter_deltas(model, value: float = 0.05) -> tuple[str, ...]:
+    """Make freshly initialized LoRA/DoRA adapters observably affect a tiny model."""
+    changed = []
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "lora_B" in name:
+                parameter.fill_(value)
+                changed.append(name)
+    if not changed:
+        raise AssertionError("expected PEFT model to expose LoRA-B parameters")
+    return tuple(changed)

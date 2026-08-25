@@ -5,7 +5,8 @@ import torch
 from peft import LoraConfig, get_peft_model
 from torch import nn
 
-from helpers import tiny_stage2_qwen
+from helpers import activate_stage2_adapter_deltas, tiny_stage2_qwen
+from stage2.data import build_stage2_labels
 from stage2.peft import (
     ALLOWED_STAGE2_TARGET_SUFFIXES,
     Stage2TuningConfig,
@@ -14,6 +15,7 @@ from stage2.peft import (
     resolve_stage2_qwen_model,
     validate_stage2_parameter_boundary,
 )
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 
 def settings(method: str) -> Stage2TuningConfig:
@@ -36,6 +38,28 @@ def one_block_stage2_batch() -> dict[str, torch.Tensor]:
         "input_ids": input_ids,
         "attention_mask": torch.ones_like(input_ids),
         "labels": torch.tensor([[-100, 91, -100, -100, 92, 2]]),
+    }
+
+
+def original_image_stage2_batch(*, supervise_latent_boundaries: bool):
+    input_ids = torch.tensor(
+        [[1, 81, 80, 80, 80, 80, 2, 91, 90, 90, 92, 3]]
+    )
+    attention_mask = torch.ones_like(input_ids)
+    labels = build_stage2_labels(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        assistant_content_start=7,
+        token_ids=LatentTokenIds(90, 91, 92),
+        latent_size=2,
+        supervise_latent_boundaries=supervise_latent_boundaries,
+    )
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+        "pixel_values": torch.ones((4, 12)),
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
     }
 
 
@@ -140,6 +164,7 @@ def test_only_adapter_parameters_are_trainable(method):
 def test_adapter_executes_in_every_recurrent_prefix_and_final_forward(method):
     """Catches Stage 2 recurrence bypassing decoder adapters during PEFT training."""
     wrapped = build_stage2_tuned_model(tiny_stage2_qwen(), settings(method))
+    activate_stage2_adapter_deltas(wrapped)
     qwen = resolve_stage2_qwen_model(wrapped)
     calls = []
     handle = qwen.model.layers[0].self_attn.q_proj.register_forward_hook(
@@ -159,6 +184,7 @@ def test_adapter_executes_in_every_recurrent_prefix_and_final_forward(method):
 def test_adapter_latents_and_only_adapter_parameters_receive_ce_gradients(method):
     """Catches detached Stage 2 latent states or gradients leaking into frozen modules."""
     wrapped = build_stage2_tuned_model(tiny_stage2_qwen(), settings(method))
+    activate_stage2_adapter_deltas(wrapped)
     qwen = resolve_stage2_qwen_model(wrapped)
     outputs = wrapped(**one_block_stage2_batch(), return_stage2_latent_states=True)
     for state in outputs.stage2_latent_states:
@@ -186,6 +212,42 @@ def test_adapter_latents_and_only_adapter_parameters_receive_ce_gradients(method
     assert all(parameter.grad is None for parameter in qwen.model.embed_tokens.parameters())
     assert all(parameter.grad is None for parameter in qwen.lm_head.parameters())
     assert all(parameter.grad is None for parameter in qwen.visual.parameters())
+
+
+@pytest.mark.parametrize("method", ["lora", "dora"])
+@pytest.mark.parametrize(
+    ("supervise_latent_boundaries", "expected_boundaries"),
+    [(True, [91, 92]), (False, [-100, -100])],
+)
+def test_peft_original_image_forward_keeps_visual_frozen_and_pairs_boundary_labels(
+    method, supervise_latent_boundaries, expected_boundaries
+):
+    """Catches PEFT paths that re-encode vision or ignore paired label policy."""
+    wrapped = build_stage2_tuned_model(tiny_stage2_qwen(), settings(method))
+    activate_stage2_adapter_deltas(wrapped)
+    qwen = resolve_stage2_qwen_model(wrapped)
+    batch = original_image_stage2_batch(
+        supervise_latent_boundaries=supervise_latent_boundaries
+    )
+    visual_grad_modes = []
+    handle = qwen.visual.register_forward_hook(
+        lambda *unused: visual_grad_modes.append(torch.is_grad_enabled())
+    )
+    try:
+        outputs = wrapped(**batch, return_stage2_latent_states=True)
+        outputs.loss.backward()
+    finally:
+        handle.remove()
+
+    assert batch["labels"][0, 8:10].tolist() == [-100, -100]
+    assert [batch["labels"][0, 7].item(), batch["labels"][0, 10].item()] == expected_boundaries
+    assert visual_grad_modes == [False]
+    assert all(parameter.grad is None for parameter in qwen.visual.parameters())
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0
+        for name, parameter in wrapped.named_parameters()
+        if "lora_" in name
+    )
 
 
 def test_parameter_boundary_fails_if_visual_is_reenabled():
