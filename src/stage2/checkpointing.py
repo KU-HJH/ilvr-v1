@@ -111,10 +111,14 @@ _DECODER_ARCHITECTURE_KEYS = frozenset(
         "num_attention_heads",
         "num_key_value_heads",
         "head_dim",
+        "hidden_act",
         "vocab_size",
         "max_position_embeddings",
         "rope_theta",
+        "rms_norm_eps",
         "rope_scaling",
+        "attention_dropout",
+        "tie_word_embeddings",
         "use_sliding_window",
         "sliding_window",
         "max_window_layers",
@@ -142,6 +146,7 @@ _VISION_ARCHITECTURE_KEYS = frozenset(
         "out_hidden_size",
         "tokens_per_second",
         "fullatt_block_indexes",
+        "hidden_act",
     }
 )
 
@@ -170,6 +175,18 @@ def _optional_int(value, *, path: str, minimum: int = 1) -> int | None:
     if value is None:
         return None
     return _require_int(value, path=path, minimum=minimum)
+
+
+def _require_nonempty_string(value, *, path: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{path} must be a non-empty string")
+    return value
+
+
+def _require_finite_number(value, *, path: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError(f"{path} must be a finite number")
+    return float(value)
 
 
 def _normalize_json_value(value, *, path: str):
@@ -231,16 +248,41 @@ def _normalize_base_model_architecture(value) -> dict[str, object]:
             "max_position_embeddings",
         )
     }
-    rope_theta = decoder["rope_theta"]
-    if (
-        type(rope_theta) not in (int, float)
-        or not math.isfinite(rope_theta)
-        or rope_theta <= 0
-    ):
+    normalized_decoder["hidden_act"] = _require_nonempty_string(
+        decoder["hidden_act"], path="base_model_architecture.decoder.hidden_act"
+    )
+    rope_theta = _require_finite_number(
+        decoder["rope_theta"], path="base_model_architecture.decoder.rope_theta"
+    )
+    if rope_theta <= 0:
         raise ValueError(
             "base_model_architecture.decoder.rope_theta must be finite and positive"
         )
-    normalized_decoder["rope_theta"] = float(rope_theta)
+    normalized_decoder["rope_theta"] = rope_theta
+    rms_norm_eps = _require_finite_number(
+        decoder["rms_norm_eps"],
+        path="base_model_architecture.decoder.rms_norm_eps",
+    )
+    if rms_norm_eps <= 0:
+        raise ValueError(
+            "base_model_architecture.decoder.rms_norm_eps must be finite and positive"
+        )
+    normalized_decoder["rms_norm_eps"] = rms_norm_eps
+    attention_dropout = _require_finite_number(
+        decoder["attention_dropout"],
+        path="base_model_architecture.decoder.attention_dropout",
+    )
+    if not 0.0 <= attention_dropout < 1.0:
+        raise ValueError(
+            "base_model_architecture.decoder.attention_dropout must be finite "
+            "and in [0, 1)"
+        )
+    normalized_decoder["attention_dropout"] = attention_dropout
+    if type(decoder["tie_word_embeddings"]) is not bool:
+        raise ValueError(
+            "base_model_architecture.decoder.tie_word_embeddings must be boolean"
+        )
+    normalized_decoder["tie_word_embeddings"] = decoder["tie_word_embeddings"]
     rope_scaling = decoder["rope_scaling"]
     if rope_scaling is not None and not isinstance(rope_scaling, Mapping):
         raise ValueError(
@@ -288,8 +330,12 @@ def _normalize_base_model_architecture(value) -> dict[str, object]:
         name: _require_int(
             vision[name], path=f"base_model_architecture.vision.{name}"
         )
-        for name in _VISION_ARCHITECTURE_KEYS - {"fullatt_block_indexes"}
+        for name in _VISION_ARCHITECTURE_KEYS
+        - {"fullatt_block_indexes", "hidden_act"}
     }
+    normalized_vision["hidden_act"] = _require_nonempty_string(
+        vision["hidden_act"], path="base_model_architecture.vision.hidden_act"
+    )
     fullatt_indexes = vision["fullatt_block_indexes"]
     if not isinstance(fullatt_indexes, list):
         raise ValueError(
@@ -341,12 +387,16 @@ def _capture_base_model_architecture(config) -> dict[str, object]:
             "num_attention_heads": attention_heads,
             "num_key_value_heads": int(getattr(config, "num_key_value_heads")),
             "head_dim": int(head_dim),
+            "hidden_act": getattr(config, "hidden_act", None),
             "vocab_size": int(getattr(config, "vocab_size")),
             "max_position_embeddings": int(
                 getattr(config, "max_position_embeddings")
             ),
             "rope_theta": float(getattr(config, "rope_theta")),
+            "rms_norm_eps": getattr(config, "rms_norm_eps", None),
             "rope_scaling": getattr(config, "rope_scaling", None),
+            "attention_dropout": getattr(config, "attention_dropout", None),
+            "tie_word_embeddings": getattr(config, "tie_word_embeddings", None),
             "use_sliding_window": getattr(config, "use_sliding_window", False),
             "sliding_window": getattr(config, "sliding_window", None),
             "max_window_layers": getattr(config, "max_window_layers", None),
@@ -372,6 +422,7 @@ def _capture_base_model_architecture(config) -> dict[str, object]:
             "fullatt_block_indexes": list(
                 getattr(vision, "fullatt_block_indexes", ())
             ),
+            "hidden_act": getattr(vision, "hidden_act", None),
         },
     }
     return _normalize_base_model_architecture(snapshot)

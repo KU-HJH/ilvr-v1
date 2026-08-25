@@ -40,7 +40,9 @@ def sample_metadata() -> Stage2PeftMetadata:
         base_model_architecture={
             "architectures": [],
             "decoder": {
+                "attention_dropout": 0.0,
                 "head_dim": 4,
+                "hidden_act": "silu",
                 "hidden_size": 8,
                 "intermediate_size": 16,
                 "max_position_embeddings": 32768,
@@ -54,7 +56,9 @@ def sample_metadata() -> Stage2PeftMetadata:
                     "type": "default",
                 },
                 "rope_theta": 1000000.0,
+                "rms_norm_eps": 1e-05,
                 "sliding_window": 4096,
+                "tie_word_embeddings": False,
                 "use_sliding_window": False,
                 "vocab_size": 128,
             },
@@ -68,6 +72,7 @@ def sample_metadata() -> Stage2PeftMetadata:
             "vision": {
                 "depth": 1,
                 "fullatt_block_indexes": [0],
+                "hidden_act": "silu",
                 "hidden_size": 8,
                 "in_channels": 3,
                 "intermediate_size": 16,
@@ -150,6 +155,56 @@ def test_architecture_snapshot_rejects_non_json_rope_number():
     payload["base_model_architecture"]["decoder"]["rope_theta"] = float("nan")
 
     with pytest.raises(ValueError, match="rope_theta.*finite"):
+        Stage2PeftMetadata.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    [
+        ("decoder", "hidden_act", False, "hidden_act.*non-empty string"),
+        ("decoder", "rms_norm_eps", float("inf"), "rms_norm_eps.*finite"),
+        ("decoder", "rms_norm_eps", True, "rms_norm_eps.*finite"),
+        (
+            "decoder",
+            "attention_dropout",
+            float("nan"),
+            "attention_dropout.*finite",
+        ),
+        ("decoder", "attention_dropout", False, "attention_dropout.*finite"),
+        (
+            "decoder",
+            "tie_word_embeddings",
+            0,
+            "tie_word_embeddings.*boolean",
+        ),
+        ("vision", "hidden_act", 1, "hidden_act.*non-empty string"),
+    ],
+)
+def test_architecture_snapshot_strictly_validates_semantic_fields(
+    section, field, value, message
+):
+    source = tiny_stage2_qwen()
+    source.config.supervise_latent_boundaries = True
+    tuning = Stage2TuningConfig(
+        method="lora",
+        r=4,
+        alpha=8,
+        dropout=0.0,
+        target_modules=("q_proj",),
+    )
+    metadata = build_stage2_peft_metadata(
+        tuning=tuning,
+        base_model_reference="stage1",
+        model_config=source.config,
+        token_ids=LatentTokenIds(90, 91, 92),
+        resolved_target_names=resolve_stage2_target_module_names(
+            source, tuning.target_modules
+        ),
+    )
+    payload = metadata.to_dict()
+    payload["base_model_architecture"][section][field] = value
+
+    with pytest.raises(ValueError, match=message):
         Stage2PeftMetadata.from_dict(payload)
 
 
@@ -506,9 +561,26 @@ def test_relocated_stage1_base_with_identical_structure_is_compatible(
     ("mutate", "field"),
     [
         (lambda config: setattr(config, "rope_theta", 500000.0), "rope_theta"),
+        (lambda config: setattr(config, "hidden_act", "gelu"), "hidden_act"),
+        (
+            lambda config: setattr(config, "rms_norm_eps", 1e-6),
+            "rms_norm_eps",
+        ),
+        (
+            lambda config: setattr(config, "attention_dropout", 0.25),
+            "attention_dropout",
+        ),
+        (
+            lambda config: setattr(config, "tie_word_embeddings", True),
+            "tie_word_embeddings",
+        ),
         (
             lambda config: setattr(config.vision_config, "window_size", 4),
             "vision.window_size",
+        ),
+        (
+            lambda config: setattr(config.vision_config, "hidden_act", "gelu"),
+            "vision.hidden_act",
         ),
     ],
 )
