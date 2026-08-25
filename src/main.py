@@ -152,9 +152,10 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
     )
     parameter_report = validate_stage2_parameter_boundary(model, decision.tuning)
     logging.info(
-        "Stage 2 parameters: total=%d trainable=%d",
+        "Stage 2 parameters: total=%d trainable=%d resolved_targets=%s",
         parameter_report.total_parameters,
         parameter_report.trainable_parameters,
+        parameter_report.resolved_target_names,
     )
     peft_metadata = decision.peft_metadata
     if peft_metadata is None and decision.tuning.is_peft:

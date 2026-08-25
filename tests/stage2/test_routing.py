@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -32,11 +33,106 @@ from stage2.peft import (
 )
 
 
-def test_stage2_trainer_keeps_loss_checkpointing_and_logging_model_owned():
-    """Catches adapter plumbing taking ownership of Trainer/model behavior."""
-    assert Stage2Trainer.compute_loss is Trainer.compute_loss
+class DiagnosticStage2Model:
+    def __init__(self):
+        self.last_inputs = None
+
+    def __call__(self, **inputs):
+        self.last_inputs = inputs
+        return SimpleNamespace(
+            loss=torch.tensor(2.0, requires_grad=True),
+            stage2_diagnostics={
+                "block_count": torch.tensor(2),
+                "latent_l2_norms": torch.tensor(
+                    [[3.0, 4.0]], requires_grad=True
+                ),
+                "adjacent_cosine_similarities": torch.tensor(
+                    [[0.5]], requires_grad=True
+                ),
+            },
+        )
+
+
+def test_stage2_trainer_collects_detached_model_native_diagnostics():
+    """Catches generic Trainer calls silently disabling Stage 2 observability."""
+    trainer = object.__new__(Stage2Trainer)
+    model = DiagnosticStage2Model()
+
+    loss, outputs = trainer.compute_loss(
+        model, {"input_ids": torch.ones(1, 3)}, return_outputs=True
+    )
+
+    assert loss.item() == 2.0
+    assert outputs.loss is loss
+    assert model.last_inputs["collect_stage2_diagnostics"] is True
+    assert set(trainer._latest_stage2_diagnostics) == {
+        "block_count",
+        "latent_l2_norms",
+        "adjacent_cosine_similarities",
+    }
+    assert all(
+        not value.requires_grad
+        for value in trainer._latest_stage2_diagnostics.values()
+    )
+
+
+def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(
+    monkeypatch,
+):
+    """Catches detached Stage 2 diagnostics being dropped or replayed."""
+    emitted = []
+    monkeypatch.setattr(
+        Trainer,
+        "log",
+        lambda self, logs, start_time=None: emitted.append((dict(logs), start_time)),
+    )
+    trainer = object.__new__(Stage2Trainer)
+    trainer._latest_stage2_diagnostics = {
+        "block_count": torch.tensor(2),
+        "latent_l2_norms": torch.tensor([[3.0, 4.0]]),
+        "adjacent_cosine_similarities": torch.tensor([[0.5]]),
+    }
+
+    trainer.log({"loss": 1.25}, start_time=7.0)
+    trainer.log({"loss": 1.0})
+
+    assert emitted == [
+        (
+            {
+                "loss": 1.25,
+                "stage2/latent_block_count": 2.0,
+                "stage2/latent_l2_norm_mean": 3.5,
+                "stage2/latent_l2_norm_min": 3.0,
+                "stage2/latent_l2_norm_max": 4.0,
+                "stage2/adjacent_cosine_mean": 0.5,
+            },
+            7.0,
+        ),
+        ({"loss": 1.0}, None),
+    ]
+    assert trainer._latest_stage2_diagnostics is None
+
+
+def test_stage2_trainer_rejects_helper_image_tensors_before_model_call():
+    """Catches Stage 1 helper-image tensors leaking past the Trainer boundary."""
+    trainer = object.__new__(Stage2Trainer)
+    model = DiagnosticStage2Model()
+
+    with pytest.raises(ValueError, match="helper-image tensors leaked"):
+        trainer.compute_loss(
+            model,
+            {
+                "input_ids": torch.ones(1, 3),
+                "pixel_values_latent": torch.ones(1, 3),
+            },
+        )
+
+    assert model.last_inputs is None
+
+
+def test_stage2_trainer_keeps_checkpointing_model_owned():
+    """Catches observability plumbing replacing Trainer checkpoint behavior."""
     assert Stage2Trainer._save_checkpoint is Trainer._save_checkpoint
-    assert Stage2Trainer.log is Trainer.log
 
 
 def test_stage_routing_selects_independent_trainers():
@@ -290,7 +386,7 @@ def _stub_stage2_data_pipeline(monkeypatch, calls):
     ],
 )
 def test_stage2_components_compose_full_or_adapter_models_from_decision(
-    monkeypatch, method, expected_peft, sample_limit, expected_examples
+    monkeypatch, caplog, method, expected_peft, sample_limit, expected_examples
 ):
     """Catches source drift, late metadata setup, wrong wrapping, or provenance loss."""
     calls = SimpleNamespace(prepared=[], filtered=None, sources=[], wrap_states=[])
@@ -350,9 +446,10 @@ def test_stage2_components_compose_full_or_adapter_models_from_decision(
     monkeypatch.setattr(main, "build_stage2_tuned_model", record_build, raising=False)
     _stub_stage2_data_pipeline(monkeypatch, calls)
 
-    components = build_stage2_training_components(
-        stage2_args(tuning_method=method, max_train_samples=sample_limit)
-    )
+    with caplog.at_level(logging.INFO):
+        components = build_stage2_training_components(
+            stage2_args(tuning_method=method, max_train_samples=sample_limit)
+        )
 
     assert calls.sources == [
         ("processor", f"stage1/{method}-processor"),
@@ -380,6 +477,9 @@ def test_stage2_components_compose_full_or_adapter_models_from_decision(
         "use_reentrant": False
     }
     assert all(not parameter.requires_grad for parameter in model.visual.parameters())
+    assert "resolved_targets=" in caplog.text
+    assert "model.layers.0.self_attn.q_proj" in caplog.text
+    assert "model.layers.0.self_attn.v_proj" in caplog.text
     if method == "full":
         assert components.peft_metadata is None
     else:

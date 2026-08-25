@@ -1,6 +1,7 @@
 import json
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -524,6 +525,18 @@ def tiny_trainer_batch():
     }
 
 
+class TinySavingProcessor:
+    model_input_names = ["input_ids"]
+
+    def save_pretrained(self, directory):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "tiny_processor.txt").write_text(
+            "latent_pad=90\nlatent_start=91\nlatent_end=92\n",
+            encoding="utf-8",
+        )
+
+
 @pytest.fixture
 def isolated_trainer_deepspeed_state(monkeypatch):
     monkeypatch.delenv("ACCELERATE_USE_DEEPSPEED", raising=False)
@@ -588,6 +601,7 @@ def test_stage2_trainer_numbered_peft_checkpoint_keeps_resume_state(
         ),
         train_dataset=[tiny_trainer_batch()],
         data_collator=default_data_collator,
+        processing_class=TinySavingProcessor(),
         stage2_peft_metadata=metadata,
     )
 
@@ -606,6 +620,40 @@ def test_stage2_trainer_numbered_peft_checkpoint_keeps_resume_state(
         assert (checkpoint / filename).is_file(), filename
     assert not (checkpoint / "model.safetensors").exists()
     assert not (checkpoint / "pytorch_model.bin").exists()
+    assert (checkpoint / "tiny_processor.txt").read_text(encoding="utf-8") == (
+        "latent_pad=90\nlatent_start=91\nlatent_end=92\n"
+    )
+
+    resumed_model = build_stage2_tuned_model(
+        tiny_stage2_qwen(),
+        tuning,
+        adapter_path=checkpoint,
+        is_trainable=True,
+    )
+    resumed_trainer = Stage2Trainer(
+        model=resumed_model,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            max_steps=2,
+            per_device_train_batch_size=1,
+            save_strategy="steps",
+            save_steps=1,
+            report_to=[],
+            disable_tqdm=True,
+            use_cpu=True,
+        ),
+        train_dataset=[tiny_trainer_batch()],
+        data_collator=default_data_collator,
+        processing_class=TinySavingProcessor(),
+        stage2_peft_metadata=metadata,
+    )
+
+    resumed_trainer.train(resume_from_checkpoint=str(checkpoint))
+
+    assert resumed_trainer.state.global_step == 2
+    resumed_checkpoint = tmp_path / "checkpoint-2"
+    assert (resumed_checkpoint / "tiny_processor.txt").is_file()
+    assert (resumed_checkpoint / STAGE2_PEFT_METADATA_FILENAME).is_file()
 
 
 def test_stage2_trainer_full_save_writes_no_peft_sidecar(
