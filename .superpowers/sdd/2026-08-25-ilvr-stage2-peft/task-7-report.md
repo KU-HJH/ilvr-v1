@@ -237,3 +237,56 @@ Result:
 - Documentation now matches the Transformers DeepSpeed save branch inspected
   in this repository and does not promise root optimizer/scheduler files for
   ZeRO-3.
+
+## Review Fix Round 2
+
+Precision-fix commit: `abff291c7baa99ee879a6033759ef259af4f9302`
+
+### Verification and correction
+
+- `configs/config_stage3.json` contains ZeRO-3 settings but no DeepSpeed
+  `scheduler` section.
+- Vendored `deepspeed_optim_sched` therefore constructs an HF scheduler. In
+  `Trainer._save_optimizer_and_scheduler`, DeepSpeed owns the
+  `global_step*/` rank model/optimizer state, while the non-
+  `DeepSpeedSchedulerWrapper` branch saves root `scheduler.pt`.
+- A configuration that declares a DeepSpeed scheduler instead uses backend-
+  owned scheduler state.
+
+The README checkpoint table now distinguishes exactly these cases:
+
+- ordinary non-DeepSpeed Trainer: root `optimizer.pt` and `scheduler.pt`;
+- current `configs/config_stage3.json`: DeepSpeed rank model/optimizer state
+  plus root `scheduler.pt` because the scheduler is HF-owned;
+- configured DeepSpeed scheduler: backend-owned scheduler state.
+
+It also states that callers must resume the complete numbered checkpoint with
+the matching backend/configuration and that individual filenames are not the
+compatibility contract.
+
+No README prose test was added. The repository has no documentation-consumer
+test pattern, and a full-paragraph source assertion would be brittle rather
+than behavioral.
+
+### Verification evidence
+
+Command:
+
+```bash
+set -e
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+  ./venv/ilvr-venv/bin/pytest \
+  tests/stage2/test_launcher.py tests/stage2/test_comt_readiness.py -q
+bash -n run_stage2_training.sh
+git diff --check
+```
+
+Result:
+
+```text
+96 passed in 8.01s
+```
+
+`bash -n` and `git diff --check` exited 0 without output. No GPU, DeepSpeed,
+training, or evaluation job ran for this documentation-only correction.
