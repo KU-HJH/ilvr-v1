@@ -322,6 +322,14 @@ def _gathered_parameters(parameters):
     return zero.GatheredParameters(parameters, modifier_rank=None)
 
 
+def _move_registered_buffers_to_device(model, device: torch.device) -> None:
+    """Place buffers without moving parameters already owned by ZeRO-3."""
+    for module in model.modules():
+        for name, buffer in module.named_buffers(recurse=False):
+            if buffer is not None and buffer.device != device:
+                setattr(module, name, buffer.to(device))
+
+
 def _snapshot_trainable_parameters(model) -> dict[str, torch.Tensor]:
     named = [
         (name, parameter)
@@ -454,6 +462,10 @@ def run_harness(
     )
 
     resumed_model = _build_tuned_model(tuning, adapter_path=checkpoint)
+    if deepspeed is not None:
+        _move_registered_buffers_to_device(
+            resumed_model, first_trainer.accelerator.device
+        )
     resumed_processor = TinyStage2Processor()
     resumed_collator = _recording_production_collator(resumed_processor)
     resumed_recorder = ResumeStateRecorder()

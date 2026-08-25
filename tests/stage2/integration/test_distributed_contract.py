@@ -242,6 +242,24 @@ def test_rank_local_fixture_rejects_malformed_launcher_rank(tmp_path, raw_rank):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_harness_rehomes_buffers_for_partially_zero_initialized_resume():
+    """Catches ZeRO-3 skipping device placement for nonpersistent RoPE buffers."""
+    harness = _load_harness_module()
+    model = harness._tiny_model()
+    next(model.parameters()).ds_id = 0
+    qwen = model
+    target = torch.device("cuda", 0)
+
+    assert qwen.model.rotary_emb.inv_freq.device.type == "cpu"
+    assert next(model.parameters()).device.type == "cpu"
+
+    harness._move_registered_buffers_to_device(model, target)
+
+    assert qwen.model.rotary_emb.inv_freq.device == target
+    assert next(model.parameters()).device.type == "cpu"
+
+
 @pytest.mark.skipif(
     os.environ.get("RUN_STAGE2_TINY_TRAIN") != "1",
     reason="set RUN_STAGE2_TINY_TRAIN=1 for the save/resume witness",
