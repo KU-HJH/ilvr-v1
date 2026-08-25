@@ -1,13 +1,34 @@
+import copy
 import importlib
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+from peft import PeftModel
 from PIL import Image
 from torch import nn
 
-from helpers import ToyCausalLanguageModel
-from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentRolloutEngine
+from helpers import (
+    ToyCausalLanguageModel,
+    activate_stage2_adapter_deltas,
+    tiny_stage2_qwen,
+)
+from stage2.checkpointing import (
+    build_stage2_peft_metadata,
+    save_stage2_peft_metadata,
+)
+from stage2.peft import (
+    ALLOWED_STAGE2_TARGET_SUFFIXES,
+    Stage2TuningConfig,
+    build_stage2_tuned_model,
+    resolve_stage2_qwen_model,
+    resolve_stage2_target_module_names,
+)
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
+    LatentRolloutEngine,
+    LatentTokenIds,
+)
 
 
 MODULE_NAMES = ("eval", "evaluate_deepseed")
@@ -79,6 +100,7 @@ class ModelWhoseGenerateRaises:
 
     def __init__(self, *, start_token_id=91, batch_size=1):
         self.config = SimpleNamespace(
+            stage="stage2",
             latent_size=2,
             latent_pad_token_id=90,
             latent_start_token_id=start_token_id,
@@ -87,6 +109,19 @@ class ModelWhoseGenerateRaises:
         )
         self.generation_config = SimpleNamespace(eos_token_id=3)
         self.batch_size = batch_size
+        self.model = ToyCausalLanguageModel(4)
+        self.lm_head = nn.Linear(4, 128, bias=False)
+        self.stage2_rollout_engine = LatentRolloutEngine()
+
+    def prepare_stage2_base_inputs_embeds(
+        self, *, input_ids, pixel_values, image_grid_thw
+    ):
+        return self.model.embed_tokens(input_ids)
+
+    def get_rope_index(self, input_ids, image_grid_thw=None, attention_mask=None):
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+        positions = positions.view(1, 1, -1).expand(3, input_ids.shape[0], -1)
+        return positions, torch.zeros(input_ids.shape[0], 1, device=input_ids.device)
 
     def generate(self, **kwargs):
         raise AssertionError("legacy model.generate was called")
@@ -142,6 +177,250 @@ def _import_entry_point(module_name, monkeypatch):
     module = importlib.import_module(module_name)
     monkeypatch.setattr(module.torch.cuda, "is_available", lambda: False)
     return module
+
+
+def _saved_adapter_artifact(tmp_path, method="lora"):
+    tuning = Stage2TuningConfig(
+        method=method,
+        r=4,
+        alpha=8,
+        dropout=0.0,
+        target_modules=ALLOWED_STAGE2_TARGET_SUFFIXES,
+    )
+    source_base = tiny_stage2_qwen()
+    source_base.config.supervise_latent_boundaries = True
+    fresh_base = copy.deepcopy(source_base)
+    targets = resolve_stage2_target_module_names(source_base, tuning.target_modules)
+    source = build_stage2_tuned_model(source_base, tuning).eval()
+    activate_stage2_adapter_deltas(source)
+    artifact_dir = tmp_path / "adapter"
+    source.save_pretrained(artifact_dir)
+    save_stage2_peft_metadata(
+        artifact_dir,
+        build_stage2_peft_metadata(
+            tuning=tuning,
+            base_model_reference="tiny-stage1",
+            model_config=resolve_stage2_qwen_model(source).config,
+            token_ids=LatentTokenIds(
+                pad_token_id=90,
+                start_token_id=91,
+                end_token_id=92,
+            ),
+            resolved_target_names=targets,
+        ),
+    )
+    fresh_base.config.stage = "stage1"
+    return artifact_dir, fresh_base
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_cli_accepts_explicit_stage1_base(module_name, monkeypatch):
+    """Omitting the base-model CLI route must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            module_name,
+            "--model_dir",
+            "adapter",
+            "--base_model_dir",
+            "stage1",
+            "--test_data_path",
+            "test.jsonl",
+            "--task_name",
+            "task",
+        ],
+    )
+
+    assert module.get_eval_args().base_model_dir == "stage1"
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
+    module_name, monkeypatch, tmp_path
+):
+    """Loading the adapter directory as a full model must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    artifact_dir, fresh_base = _saved_adapter_artifact(tmp_path)
+    base_dir = tmp_path / "stage1"
+    processor = FakeProcessor()
+    processor_sources = []
+    model_sources = []
+
+    def load_processor(source, **_kwargs):
+        processor_sources.append(source)
+        return processor
+
+    def load_model(source, **_kwargs):
+        model_sources.append(source)
+        return fresh_base
+
+    monkeypatch.setattr(module.AutoProcessor, "from_pretrained", load_processor)
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        load_model,
+    )
+
+    model, loaded_processor = module.load_evaluation_artifacts(
+        model_dir=str(artifact_dir),
+        base_model_dir=str(base_dir),
+        cache_dir="cache",
+    )
+
+    assert isinstance(model, PeftModel)
+    assert loaded_processor is processor
+    assert processor_sources == [str(artifact_dir)]
+    assert model_sources == [str(base_dir)]
+    assert resolve_stage2_qwen_model(model).config.stage == "stage2"
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_full_eval_uses_model_dir_only_and_rejects_stray_base(
+    module_name, monkeypatch, tmp_path
+):
+    """Treating a full artifact as base-plus-adapter must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    full_dir = tmp_path / "full"
+    full_dir.mkdir()
+    full_model = tiny_stage2_qwen()
+    processor = FakeProcessor()
+    model_sources = []
+    monkeypatch.setattr(
+        module.AutoProcessor,
+        "from_pretrained",
+        lambda source, **_kwargs: processor,
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **_kwargs: model_sources.append(source) or full_model,
+    )
+
+    loaded_model, loaded_processor = module.load_evaluation_artifacts(
+        model_dir=str(full_dir), base_model_dir=None, cache_dir="cache"
+    )
+
+    assert loaded_model is full_model
+    assert loaded_processor is processor
+    assert model_sources == [str(full_dir)]
+    with pytest.raises(ValueError, match="base_model_dir.*full"):
+        module.load_evaluation_artifacts(
+            model_dir=str(full_dir),
+            base_model_dir="stray-stage1",
+            cache_dir="cache",
+        )
+    assert model_sources == [str(full_dir)]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_peft_eval_requires_base_before_loading_or_iterating(
+    module_name, monkeypatch, tmp_path
+):
+    """A missing Stage 1 base must fail before any model or processor load."""
+    module = _import_entry_point(module_name, monkeypatch)
+    artifact_dir, _fresh_base = _saved_adapter_artifact(tmp_path)
+    monkeypatch.setattr(
+        module.AutoProcessor,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("processor load must not start"),
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
+
+    with pytest.raises(ValueError, match="base_model_dir.*required"):
+        module.load_evaluation_artifacts(
+            model_dir=str(artifact_dir), base_model_dir=None, cache_dir="cache"
+        )
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
+    module_name, monkeypatch
+):
+    """Retrying metadata/config errors as eager attention must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    calls = []
+
+    def fail_load(_source, **kwargs):
+        calls.append(kwargs["attn_implementation"])
+        raise ValueError("adapter metadata mismatch")
+
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        fail_load,
+    )
+
+    with pytest.raises(ValueError, match="adapter metadata mismatch"):
+        module.load_model("model", "cache")
+    assert calls == ["flash_attention_2"]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_flash_backend_initialization_error_retries_with_eager(
+    module_name, monkeypatch
+):
+    """Removing the intended backend-only fallback must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    model = tiny_stage2_qwen()
+    calls = []
+
+    def load(_source, **kwargs):
+        calls.append(kwargs["attn_implementation"])
+        if kwargs["attn_implementation"] == "flash_attention_2":
+            raise RuntimeError("Flash Attention 2 is unavailable")
+        return model
+
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        load,
+    )
+
+    assert module.load_model("model", "cache") is model
+    assert calls == ["flash_attention_2", "eager"]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_peft_eval_token_mismatch_fails_during_artifact_loading(
+    module_name, monkeypatch, tmp_path
+):
+    """Deferring token validation until sample iteration must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    artifact_dir, fresh_base = _saved_adapter_artifact(tmp_path)
+    processor = FakeProcessor()
+
+    class MismatchedTokenizer(FakeTokenizer):
+        def convert_tokens_to_ids(self, token):
+            if token == "<|latent_start|>":
+                return 999
+            return super().convert_tokens_to_ids(token)
+
+    processor.tokenizer = MismatchedTokenizer()
+    model_calls = []
+    monkeypatch.setattr(
+        module.AutoProcessor,
+        "from_pretrained",
+        lambda _source, **_kwargs: processor,
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **_kwargs: model_calls.append(source) or fresh_base,
+    )
+
+    with pytest.raises(ValueError, match="latent_start_token_id mismatch"):
+        module.load_evaluation_artifacts(
+            model_dir=str(artifact_dir),
+            base_model_dir=str(tmp_path / "stage1"),
+            cache_dir="cache",
+        )
+    assert model_calls == [str(tmp_path / "stage1")]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
@@ -239,21 +518,60 @@ def test_eval_maps_explicit_greedy_settings_to_controller(module_name, monkeypat
 def test_deepspeed_eval_unwraps_model_for_controller_and_uses_wrapper_device(
     monkeypatch,
 ):
-    """Passing wrapper instead of its Stage 2 module must fail this test."""
+    """Stopping at DeepSpeed's PeftModel wrapper must fail this test."""
     module = _import_entry_point("evaluate_deepseed", monkeypatch)
     controller = RecordingController()
     monkeypatch.setattr(module, "Stage2InferenceController", lambda: controller)
-    bare_model = ModelWhoseGenerateRaises()
+    tuning = Stage2TuningConfig(
+        method="lora",
+        r=4,
+        alpha=8,
+        dropout=0.0,
+        target_modules=ALLOWED_STAGE2_TARGET_SUFFIXES,
+    )
+    adapter_model = build_stage2_tuned_model(tiny_stage2_qwen(), tuning).eval()
+    activate_stage2_adapter_deltas(adapter_model)
+    wrapper = DeepSpeedShapedWrapper(adapter_model)
 
     module.run_one_example(
-        DeepSpeedShapedWrapper(bare_model),
+        wrapper,
         FakeProcessor(),
         {"text_input": "question"},
         {"max_new_tokens": 1, "temperature": 0.0, "top_p": 1.0},
     )
 
-    assert controller.calls[0]["model"] is bare_model
+    resolved = wrapper.module.get_base_model()
+    assert controller.calls[0]["model"] is resolved
+    assert any(hasattr(module, "lora_A") for module in resolved.modules())
     assert controller.calls[0]["input_ids"].device == torch.device("cpu")
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_resolves_direct_peft_wrapper_for_controller(module_name, monkeypatch):
+    """Passing a direct PeftModel to the controller must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    controller = RecordingController()
+    monkeypatch.setattr(module, "Stage2InferenceController", lambda: controller)
+    tuning = Stage2TuningConfig(
+        method="lora",
+        r=4,
+        alpha=8,
+        dropout=0.0,
+        target_modules=ALLOWED_STAGE2_TARGET_SUFFIXES,
+    )
+    adapter_model = build_stage2_tuned_model(tiny_stage2_qwen(), tuning).eval()
+    activate_stage2_adapter_deltas(adapter_model)
+
+    module.run_one_example(
+        adapter_model,
+        FakeProcessor(),
+        {"text_input": "question"},
+        {"max_new_tokens": 1, "temperature": 0.0, "top_p": 1.0},
+    )
+
+    resolved = adapter_model.get_base_model()
+    assert controller.calls[0]["model"] is resolved
+    assert any(hasattr(child, "lora_A") for child in resolved.modules())
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

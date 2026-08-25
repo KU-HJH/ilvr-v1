@@ -4,16 +4,25 @@ import re
 import json
 import argparse
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, Union
 
 import torch
 from PIL import Image
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-from stage2.checkpointing import resolve_latent_token_ids
+from stage2.checkpointing import (
+    STAGE2_PEFT_METADATA_FILENAME,
+    load_stage2_peft_metadata,
+    resolve_latent_token_ids,
+)
 from stage2.inference import (
     Stage2InferenceController,
     build_stage2_generation_config,
+)
+from stage2.peft import (
+    load_stage2_model_for_inference,
+    resolve_stage2_qwen_model,
 )
 
 try:
@@ -35,6 +44,7 @@ BASE_DATASET_DIR = ''
 def get_eval_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", type=str, required=True, help="Path to the trained model directory.")
+    parser.add_argument("--base_model_dir", type=str, help="Stage 1 base directory for a Stage 2 PEFT artifact.")
     parser.add_argument("--test_data_path", type=str, required=True, help="Path to the test data jsonl file.")
     parser.add_argument("--task_name", type=str, required=True, help="Task name for bookkeeping.")
     parser.add_argument("--output_json_path", type=str, default="evaluation_results.jsonl", help="Where to save per-sample results.")
@@ -53,6 +63,24 @@ def load_processor(model_dir: str, cache_dir: str):
         logging.warning("Failed to load processor from model_dir, falling back to base model id.")
         return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
 
+def _is_flash_attention_initialization_error(error: Exception) -> bool:
+    current = error
+    while current is not None:
+        message = str(current).lower()
+        if any(
+            marker in message
+            for marker in (
+                "flashattention",
+                "flash attention",
+                "flash_attention",
+                "flash-attention",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def load_model(model_dir: str, cache_dir: str):
 
     try:
@@ -64,6 +92,8 @@ def load_model(model_dir: str, cache_dir: str):
             attn_implementation="flash_attention_2"
         )
     except Exception as e:
+        if not _is_flash_attention_initialization_error(e):
+            raise
         logging.warning(f"flash_attention_2 initialization failed ({e}), falling back to eager.")
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_dir,
@@ -78,6 +108,30 @@ def load_model(model_dir: str, cache_dir: str):
     except Exception:
         pass
     return model
+
+
+def load_evaluation_artifacts(
+    *, model_dir: str, base_model_dir: str | None, cache_dir: str
+):
+    """Load either one full Stage 2 artifact or a Stage 1 base plus adapter."""
+    sidecar = Path(model_dir) / STAGE2_PEFT_METADATA_FILENAME
+    if not sidecar.exists():
+        if base_model_dir is not None:
+            raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
+        return load_model(model_dir, cache_dir), load_processor(model_dir, cache_dir)
+
+    metadata = load_stage2_peft_metadata(model_dir)
+    if base_model_dir is None:
+        raise ValueError("base_model_dir is required for a Stage 2 PEFT artifact")
+    processor = AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
+    base_model = load_model(base_model_dir, cache_dir)
+    model = load_stage2_model_for_inference(
+        base_model=base_model,
+        adapter_path=model_dir,
+        metadata=metadata,
+        tokenizer=processor.tokenizer,
+    )
+    return model, processor
 
 def _resolve_image_paths(image_input: Union[str, List[str]]) -> List[str]:
 
@@ -229,7 +283,7 @@ def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[s
         padding=True
     )
 
-    stage2_model = getattr(model, "module", model)
+    stage2_model = resolve_stage2_qwen_model(model)
     effective_device = getattr(model, "device", None)
     if effective_device is None:
         effective_device = getattr(stage2_model, "device", None)
@@ -284,8 +338,11 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
     logging.info(f"Loading model: {args.model_dir}")
-    model = load_model(args.model_dir, args.cache_dir)
-    processor = load_processor(args.model_dir, args.cache_dir)
+    model, processor = load_evaluation_artifacts(
+        model_dir=args.model_dir,
+        base_model_dir=args.base_model_dir,
+        cache_dir=args.cache_dir,
+    )
 
 
     data = []

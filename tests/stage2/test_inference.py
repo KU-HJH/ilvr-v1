@@ -10,6 +10,12 @@ from helpers import (
     activate_stage2_adapter_deltas,
     tiny_stage2_qwen,
 )
+from peft import PeftModel
+from stage2.checkpointing import (
+    build_stage2_peft_metadata,
+    load_stage2_peft_metadata,
+    save_stage2_peft_metadata,
+)
 from stage2.inference import (
     Stage2GenerationConfig,
     Stage2InferenceController,
@@ -18,7 +24,9 @@ from stage2.peft import (
     ALLOWED_STAGE2_TARGET_SUFFIXES,
     Stage2TuningConfig,
     build_stage2_tuned_model,
+    load_stage2_model_for_inference,
     resolve_stage2_qwen_model,
+    resolve_stage2_target_module_names,
 )
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentRolloutEngine,
@@ -31,6 +39,29 @@ TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
 
 
 def settings(method: str) -> Stage2TuningConfig:
+    return Stage2TuningConfig(
+        method=method,
+        r=4,
+        alpha=8,
+        dropout=0.0,
+        target_modules=ALLOWED_STAGE2_TARGET_SUFFIXES,
+    )
+
+
+class TinyLatentTokenizer:
+    unk_token_id = 0
+    unk_token = "<unk>"
+    ids = {
+        "<|latent_pad|>": 90,
+        "<|latent_start|>": 91,
+        "<|latent_end|>": 92,
+    }
+
+    def convert_tokens_to_ids(self, token):
+        return self.ids.get(token, self.unk_token_id)
+
+
+def inference_settings(method: str) -> Stage2TuningConfig:
     return Stage2TuningConfig(
         method=method,
         r=4,
@@ -252,6 +283,74 @@ def test_inference_rejects_non_positive_latent_size():
             token_ids=TOKENS,
             generation_config=Stage2GenerationConfig(max_new_tokens=1),
         )
+
+
+@pytest.mark.parametrize("method", ["lora", "dora"])
+def test_saved_stage2_adapter_reload_preserves_logits_and_latent_states(
+    method, tmp_path
+):
+    """Skipping adapter reload or loading zero deltas must break parity."""
+    tuning = inference_settings(method)
+    artifact_dir = tmp_path / method
+    source_base = tiny_stage2_qwen()
+    source_base.config.supervise_latent_boundaries = True
+    fresh_base = copy.deepcopy(source_base)
+    resolved_targets = resolve_stage2_target_module_names(
+        source_base, tuning.target_modules
+    )
+    source = build_stage2_tuned_model(source_base, tuning).eval()
+    changed = activate_stage2_adapter_deltas(source)
+    assert changed
+    source_parameters = dict(source.named_parameters())
+    assert all(torch.count_nonzero(source_parameters[name]) for name in changed)
+    source.save_pretrained(artifact_dir)
+    metadata = build_stage2_peft_metadata(
+        tuning=tuning,
+        base_model_reference="tiny-stage1",
+        model_config=resolve_stage2_qwen_model(source).config,
+        token_ids=TOKENS,
+        resolved_target_names=resolved_targets,
+    )
+    save_stage2_peft_metadata(artifact_dir, metadata)
+
+    # Compatibility must see the truly unmodified Stage 1 boundary.
+    fresh_base.config.stage = "stage1"
+    reloaded = load_stage2_model_for_inference(
+        base_model=fresh_base,
+        adapter_path=artifact_dir,
+        metadata=load_stage2_peft_metadata(artifact_dir),
+        tokenizer=TinyLatentTokenizer(),
+    )
+
+    assert isinstance(reloaded, PeftModel)
+    assert reloaded.training is False
+    assert resolve_stage2_qwen_model(reloaded).config.stage == "stage2"
+    assert not any(parameter.requires_grad for parameter in reloaded.parameters())
+
+    scaffold = torch.tensor([[1, 91, 90, 90, 92, 2]])
+    mask = torch.ones_like(scaffold)
+    with torch.inference_mode():
+        source_output = source(
+            input_ids=scaffold,
+            attention_mask=mask,
+            return_stage2_latent_states=True,
+        )
+        reload_output = reloaded(
+            input_ids=scaffold,
+            attention_mask=mask,
+            return_stage2_latent_states=True,
+        )
+
+    torch.testing.assert_close(source_output.logits, reload_output.logits)
+    assert len(source_output.stage2_latent_states) == len(
+        reload_output.stage2_latent_states
+    ) == 2
+    for source_state, reload_state in zip(
+        source_output.stage2_latent_states,
+        reload_output.stage2_latent_states,
+        strict=True,
+    ):
+        torch.testing.assert_close(source_state, reload_state)
 
 
 @pytest.mark.parametrize("method", ["lora", "dora"])

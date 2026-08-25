@@ -236,3 +236,54 @@ def build_stage2_tuned_model(
         wrapped, tuning, expect_trainable=is_trainable
     )
     return wrapped
+
+
+def load_stage2_model_for_inference(
+    base_model: nn.Module,
+    adapter_path: str | Path,
+    metadata,
+    tokenizer,
+) -> PeftModel:
+    """Validate a Stage 1 base, then attach one frozen Stage 2 adapter."""
+    from peft import PeftConfig
+
+    from .checkpointing import (
+        configure_stage2_metadata,
+        resolve_latent_token_ids,
+        validate_stage2_peft_compatibility,
+    )
+
+    adapter_config = PeftConfig.from_pretrained(str(adapter_path))
+    validate_stage2_peft_compatibility(
+        base_model,
+        tokenizer,
+        metadata,
+        adapter_config,
+        adapter_path,
+    )
+    token_ids = resolve_latent_token_ids(tokenizer, base_model.config)
+    configure_stage2_metadata(
+        base_model.config,
+        token_ids,
+        latent_size=metadata.latent_size,
+        supervise_latent_boundaries=metadata.supervise_latent_boundaries,
+    )
+    tuning = Stage2TuningConfig(
+        method=metadata.tuning_method,
+        r=metadata.lora_r,
+        alpha=metadata.lora_alpha,
+        dropout=metadata.lora_dropout,
+        target_modules=metadata.requested_target_modules,
+    )
+    wrapped = PeftModel.from_pretrained(
+        base_model,
+        str(adapter_path),
+        is_trainable=False,
+    )
+    wrapped.eval()
+    validate_stage2_parameter_boundary(
+        wrapped,
+        tuning,
+        expect_trainable=False,
+    )
+    return wrapped

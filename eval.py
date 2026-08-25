@@ -6,6 +6,7 @@ import argparse
 import logging
 import time
 import sys
+from pathlib import Path
 from typing import List, Dict, Any, Union
 
 import torch
@@ -16,10 +17,18 @@ from transformers import (
 )
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-from stage2.checkpointing import resolve_latent_token_ids
+from stage2.checkpointing import (
+    STAGE2_PEFT_METADATA_FILENAME,
+    load_stage2_peft_metadata,
+    resolve_latent_token_ids,
+)
 from stage2.inference import (
     Stage2InferenceController,
     build_stage2_generation_config,
+)
+from stage2.peft import (
+    load_stage2_model_for_inference,
+    resolve_stage2_qwen_model,
 )
 
 try:
@@ -43,6 +52,8 @@ def get_eval_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", type=str, required=True,
                         help="Path to the trained model directory.")
+    parser.add_argument("--base_model_dir", type=str,
+                        help="Stage 1 base directory for a Stage 2 PEFT artifact.")
     parser.add_argument("--test_data_path", type=str, required=True,
                         help="Path to the test data JSONL file.")
     parser.add_argument("--task_name", type=str, required=True,
@@ -75,6 +86,24 @@ def load_processor(model_dir: str, cache_dir: str):
         return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
 
 
+def _is_flash_attention_initialization_error(error: Exception) -> bool:
+    current = error
+    while current is not None:
+        message = str(current).lower()
+        if any(
+            marker in message
+            for marker in (
+                "flashattention",
+                "flash attention",
+                "flash_attention",
+                "flash-attention",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def load_model(model_dir: str, cache_dir: str):
     """
     Prefer flash_attention_2 for efficiency; automatically fall back
@@ -89,6 +118,8 @@ def load_model(model_dir: str, cache_dir: str):
             attn_implementation="flash_attention_2",
         )
     except Exception as e:
+        if not _is_flash_attention_initialization_error(e):
+            raise
         logging.warning(
             f"flash_attention_2 initialization failed ({e}); "
             f"falling back to eager attention."
@@ -107,6 +138,30 @@ def load_model(model_dir: str, cache_dir: str):
     except Exception:
         pass
     return model
+
+
+def load_evaluation_artifacts(
+    *, model_dir: str, base_model_dir: str | None, cache_dir: str
+):
+    """Load either one full Stage 2 artifact or a Stage 1 base plus adapter."""
+    sidecar = Path(model_dir) / STAGE2_PEFT_METADATA_FILENAME
+    if not sidecar.exists():
+        if base_model_dir is not None:
+            raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
+        return load_model(model_dir, cache_dir), load_processor(model_dir, cache_dir)
+
+    metadata = load_stage2_peft_metadata(model_dir)
+    if base_model_dir is None:
+        raise ValueError("base_model_dir is required for a Stage 2 PEFT artifact")
+    processor = AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
+    base_model = load_model(base_model_dir, cache_dir)
+    model = load_stage2_model_for_inference(
+        base_model=base_model,
+        adapter_path=model_dir,
+        metadata=metadata,
+        tokenizer=processor.tokenizer,
+    )
+    return model, processor
 
 
 def _resolve_image_paths(image_input: Union[str, List[str]]) -> List[str]:
@@ -330,9 +385,16 @@ def run_one_example(
         padding=True,
     )
 
-    # Move tensor inputs to the model device
+    stage2_model = resolve_stage2_qwen_model(model)
+    effective_device = getattr(model, "device", None)
+    if effective_device is None:
+        effective_device = getattr(stage2_model, "device", None)
+    if effective_device is None:
+        raise ValueError("Unable to determine the Stage 2 evaluation device")
+
+    # Move tensor inputs to the outer runtime wrapper's device when available.
     inputs = {
-        k: v.to(model.device)
+        k: v.to(effective_device)
         for k, v in inputs.items()
         if isinstance(v, torch.Tensor)
     }
@@ -343,13 +405,13 @@ def run_one_example(
     attention_mask = inputs.get("attention_mask")
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
-    latent_size = getattr(model.config, "latent_size", None)
+    latent_size = getattr(stage2_model.config, "latent_size", None)
     if not isinstance(latent_size, int) or isinstance(latent_size, bool) or latent_size <= 0:
         raise ValueError("Stage 2 checkpoint config must contain a positive latent_size")
-    token_ids = resolve_latent_token_ids(processor.tokenizer, model.config)
+    token_ids = resolve_latent_token_ids(processor.tokenizer, stage2_model.config)
     generation_config = build_stage2_generation_config(
-        model_config=model.config,
-        model_generation_config=getattr(model, "generation_config", None),
+        model_config=stage2_model.config,
+        model_generation_config=getattr(stage2_model, "generation_config", None),
         tokenizer=processor.tokenizer,
         generation_kwargs=gen_kwargs,
     )
@@ -361,7 +423,7 @@ def run_one_example(
 
     with torch.inference_mode():
         generation_result = Stage2InferenceController().generate(
-            model=model,
+            model=stage2_model,
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_ids=token_ids,
@@ -403,8 +465,11 @@ def main():
     )
 
     logging.info(f"Loading model from: {args.model_dir}")
-    model = load_model(args.model_dir, args.cache_dir)
-    processor = load_processor(args.model_dir, args.cache_dir)
+    model, processor = load_evaluation_artifacts(
+        model_dir=args.model_dir,
+        base_model_dir=args.base_model_dir,
+        cache_dir=args.cache_dir,
+    )
 
     # Load test data
     data = []
