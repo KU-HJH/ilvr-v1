@@ -310,6 +310,7 @@ def test_full_eval_uses_model_dir_only_and_rejects_stray_base(
     module = _import_entry_point(module_name, monkeypatch)
     full_dir = tmp_path / "full"
     full_dir.mkdir()
+    (full_dir / "model.safetensors").touch()
     full_model = tiny_stage2_qwen()
     processor = FakeProcessor()
     model_sources = []
@@ -338,6 +339,108 @@ def test_full_eval_uses_model_dir_only_and_rejects_stray_base(
             cache_dir="cache",
         )
     assert model_sources == [str(full_dir)]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize(
+    "markers",
+    [
+        ("stage2_peft_metadata.json",),
+        ("adapter_config.json",),
+        ("adapter_model.safetensors",),
+        ("adapter_model.bin",),
+    ],
+    ids=(
+        "sidecar-only",
+        "config-only",
+        "safe-weights-only",
+        "unsupported-bin-weights",
+    ),
+)
+def test_eval_rejects_incomplete_peft_artifact_before_loading(
+    module_name, markers, monkeypatch, tmp_path
+):
+    module = _import_entry_point(module_name, monkeypatch)
+    artifact_dir = tmp_path / "incomplete"
+    artifact_dir.mkdir()
+    for marker in markers:
+        (artifact_dir / marker).touch()
+    monkeypatch.setattr(
+        module.AutoProcessor,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("processor load must not start"),
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
+
+    with pytest.raises(ValueError, match="incomplete Stage 2 PEFT artifact"):
+        module.load_evaluation_artifacts(
+            model_dir=str(artifact_dir),
+            base_model_dir="stage1",
+            cache_dir="cache",
+        )
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_rejects_saved_adapter_after_sidecar_is_removed(
+    module_name, monkeypatch, tmp_path
+):
+    module = _import_entry_point(module_name, monkeypatch)
+    artifact_dir, _fresh_base = _saved_adapter_artifact(tmp_path)
+    (artifact_dir / "stage2_peft_metadata.json").unlink()
+    monkeypatch.setattr(
+        module.AutoProcessor,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("processor load must not start"),
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
+
+    with pytest.raises(ValueError, match="incomplete Stage 2 PEFT artifact"):
+        module.load_evaluation_artifacts(
+            model_dir=str(artifact_dir),
+            base_model_dir="stage1",
+            cache_dir="cache",
+        )
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_rejects_mixed_full_and_peft_artifact_before_loading(
+    module_name, monkeypatch, tmp_path
+):
+    module = _import_entry_point(module_name, monkeypatch)
+    artifact_dir = tmp_path / "mixed"
+    artifact_dir.mkdir()
+    for marker in (
+        "stage2_peft_metadata.json",
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "model.safetensors",
+    ):
+        (artifact_dir / marker).touch()
+    monkeypatch.setattr(
+        module.AutoProcessor,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("processor load must not start"),
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
+
+    with pytest.raises(ValueError, match="mixed Stage 2 full and PEFT artifact"):
+        module.load_evaluation_artifacts(
+            model_dir=str(artifact_dir),
+            base_model_dir="stage1",
+            cache_dir="cache",
+        )
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

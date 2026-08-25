@@ -33,10 +33,53 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 def sample_metadata() -> Stage2PeftMetadata:
     return Stage2PeftMetadata(
-        schema_version=1,
+        schema_version=2,
         stage="stage2",
         tuning_method="dora",
         base_model_reference="/models/stage1",
+        base_model_architecture={
+            "architectures": [],
+            "decoder": {
+                "head_dim": 4,
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "max_position_embeddings": 32768,
+                "max_window_layers": 80,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 1,
+                "rope_scaling": {
+                    "mrope_section": [1, 1, 0],
+                    "rope_type": "default",
+                    "type": "default",
+                },
+                "rope_theta": 1000000.0,
+                "sliding_window": 4096,
+                "use_sliding_window": False,
+                "vocab_size": 128,
+            },
+            "model_type": "qwen2_5_vl",
+            "multimodal_token_ids": {
+                "image_token_id": 80,
+                "video_token_id": 82,
+                "vision_end_token_id": None,
+                "vision_start_token_id": 81,
+            },
+            "vision": {
+                "depth": 1,
+                "fullatt_block_indexes": [0],
+                "hidden_size": 8,
+                "in_channels": 3,
+                "intermediate_size": 16,
+                "num_heads": 2,
+                "out_hidden_size": 8,
+                "patch_size": 2,
+                "spatial_merge_size": 1,
+                "temporal_patch_size": 1,
+                "tokens_per_second": 4,
+                "window_size": 2,
+            },
+        },
         latent_size=8,
         latent_start_token_id=91,
         latent_pad_token_id=90,
@@ -62,6 +105,8 @@ def write_mutated_metadata(directory, metadata, mutation):
         payload["stage"] = "stage1"
     elif mutation == "missing_field":
         payload.pop("latent_size")
+    elif mutation == "unknown_architecture_field":
+        payload["base_model_architecture"]["decoder"]["unknown"] = 1
     directory.mkdir(parents=True, exist_ok=True)
     (directory / STAGE2_PEFT_METADATA_FILENAME).write_text(
         json.dumps(payload) + "\n", encoding="utf-8"
@@ -77,12 +122,35 @@ def test_stage2_peft_metadata_round_trips(tmp_path):
     ).endswith("\n")
 
 
-@pytest.mark.parametrize("mutation", ["bad_schema", "bad_stage", "missing_field"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["bad_schema", "bad_stage", "missing_field", "unknown_architecture_field"],
+)
 def test_stage2_peft_metadata_fails_closed(tmp_path, mutation):
     write_mutated_metadata(tmp_path, sample_metadata(), mutation)
 
     with pytest.raises(ValueError):
         load_stage2_peft_metadata(tmp_path)
+
+
+def test_unreleased_schema_v1_without_architecture_snapshot_fails_closed(tmp_path):
+    payload = sample_metadata().to_dict()
+    payload["schema_version"] = 1
+    payload.pop("base_model_architecture")
+    (tmp_path / STAGE2_PEFT_METADATA_FILENAME).write_text(
+        json.dumps(payload) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="unsupported.*schema"):
+        load_stage2_peft_metadata(tmp_path)
+
+
+def test_architecture_snapshot_rejects_non_json_rope_number():
+    payload = sample_metadata().to_dict()
+    payload["base_model_architecture"]["decoder"]["rope_theta"] = float("nan")
+
+    with pytest.raises(ValueError, match="rope_theta.*finite"):
+        Stage2PeftMetadata.from_dict(payload)
 
 
 @pytest.mark.parametrize("operation", ["to_dict", "save"])
@@ -204,17 +272,41 @@ def test_full_resume_keeps_the_complete_stage2_checkpoint_as_every_source():
     assert decision.tuning.method == "full"
 
 
-def test_adapter_shaped_resume_without_sidecar_fails_before_full_config_load(tmp_path):
+def test_incomplete_adapter_resume_fails_before_full_config_load(tmp_path):
     (tmp_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
 
     def reject_full_config_load(_):
         raise AssertionError("adapter-shaped resume must not load a full config")
 
-    with pytest.raises(ValueError, match="missing Stage 2 PEFT metadata"):
+    with pytest.raises(ValueError, match="incomplete Stage 2 PEFT artifact"):
         resolve_stage2_load_decision(
             load_model_path="stage1",
             resume_from_checkpoint_path=str(tmp_path),
             load_config=reject_full_config_load,
+            tuning_method=None,
+            tuning_method_explicit=False,
+            **semantic_args(),
+        )
+
+
+def test_mixed_full_and_peft_resume_fails_before_metadata_or_config_load(tmp_path):
+    for marker in (
+        STAGE2_PEFT_METADATA_FILENAME,
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "model.safetensors",
+    ):
+        (tmp_path / marker).touch()
+
+    def reject_load(_):
+        raise AssertionError("mixed artifact must fail before parsing")
+
+    with pytest.raises(ValueError, match="mixed Stage 2 full and PEFT artifact"):
+        resolve_stage2_load_decision(
+            load_model_path="stage1",
+            resume_from_checkpoint_path=str(tmp_path),
+            load_config=reject_load,
+            load_peft_metadata=reject_load,
             tuning_method=None,
             tuning_method_explicit=False,
             **semantic_args(),
@@ -410,6 +502,29 @@ def test_relocated_stage1_base_with_identical_structure_is_compatible(
     assert "relocated" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("mutate", "field"),
+    [
+        (lambda config: setattr(config, "rope_theta", 500000.0), "rope_theta"),
+        (
+            lambda config: setattr(config.vision_config, "window_size", 4),
+            "vision.window_size",
+        ),
+    ],
+)
+def test_relocated_same_shape_base_rejects_semantic_architecture_change(
+    tmp_path, mutate, field
+):
+    metadata, adapter_config = write_tiny_adapter(tmp_path)
+    base = relocated_base()
+    mutate(base.config)
+
+    with pytest.raises(ValueError, match=rf"base architecture mismatch.*{field}"):
+        validate_stage2_peft_compatibility(
+            base, TinyTokenizer(), metadata, adapter_config, tmp_path
+        )
+
+
 def test_relocated_stage1_base_accepts_dora_magnitude_tensor_naming(tmp_path):
     metadata, adapter_config = write_tiny_adapter(tmp_path, method="dora")
 
@@ -466,7 +581,9 @@ def test_stage2_peft_compatibility_rejects_added_decoder_target_topology(tmp_pat
     base.model.layers.append(deepcopy(base.model.layers[0]))
     base.config.num_hidden_layers = 2
 
-    with pytest.raises(ValueError, match="resolved target topology"):
+    with pytest.raises(
+        ValueError, match="base architecture mismatch.*num_hidden_layers"
+    ):
         validate_stage2_peft_compatibility(
             base, TinyTokenizer(), metadata, adapter_config, tmp_path
         )
@@ -477,7 +594,7 @@ def test_stage2_peft_compatibility_rejects_added_decoder_target_topology(tmp_pat
     [
         ("token_id", "latent_start_token_id mismatch"),
         ("latent_boundaries", "supervise_latent_boundaries mismatch"),
-        ("hidden_size", "hidden size"),
+        ("hidden_size", "base architecture mismatch.*hidden_size"),
         ("missing_target", "missing resolved target"),
         ("nonlinear_target", "resolved target is not linear"),
         ("target_shape", "target shape mismatch"),
@@ -503,7 +620,8 @@ def test_stage2_peft_compatibility_fails_closed(
     elif mutation == "latent_boundaries":
         base.config.supervise_latent_boundaries = False
     elif mutation == "hidden_size":
-        base.config.hidden_size += 1
+        base.config.hidden_size *= 2
+        base.config.num_attention_heads *= 2
     elif mutation == "missing_target":
         delattr(base.model.layers[0].self_attn, "q_proj")
     elif mutation == "nonlinear_target":

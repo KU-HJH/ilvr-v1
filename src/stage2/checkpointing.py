@@ -2,8 +2,10 @@
 
 import json
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
+from enum import Enum
 from pathlib import Path
 
 import peft
@@ -19,7 +21,386 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 
 
 STAGE2_PEFT_METADATA_FILENAME = "stage2_peft_metadata.json"
-STAGE2_PEFT_SCHEMA_VERSION = 1
+STAGE2_PEFT_SCHEMA_VERSION = 2
+
+
+class Stage2ArtifactKind(str, Enum):
+    """Supported local Stage 2 artifact layouts."""
+
+    FULL = "full"
+    PEFT = "peft"
+
+
+_REQUIRED_PEFT_MARKERS = frozenset(
+    {
+        STAGE2_PEFT_METADATA_FILENAME,
+        "adapter_config.json",
+        "adapter_model.safetensors",
+    }
+)
+_OTHER_PEFT_MARKERS = frozenset(
+    {
+        "adapter_model.bin",
+        "adapter_model.bin.index.json",
+        "adapter_model.safetensors.index.json",
+    }
+)
+_FULL_MODEL_MARKERS = frozenset(
+    {
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    }
+)
+
+
+def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
+    """Classify a local artifact from small filenames, failing closed on mixtures.
+
+    Non-local references are left to ``from_pretrained`` and classified as full
+    because their remote files cannot be inspected here. This repository's PEFT
+    publication contract is the unsharded safetensors marker set above.
+    """
+    path = Path(directory)
+    if not path.exists():
+        return Stage2ArtifactKind.FULL
+    if not path.is_dir():
+        raise ValueError(f"Stage 2 artifact is not a directory: {path}")
+
+    names = {entry.name for entry in path.iterdir() if entry.is_file()}
+    present_peft = names & (_REQUIRED_PEFT_MARKERS | _OTHER_PEFT_MARKERS)
+    present_full = names & _FULL_MODEL_MARKERS
+
+    if present_peft and present_full:
+        raise ValueError(
+            "mixed Stage 2 full and PEFT artifact markers: "
+            f"peft={sorted(present_peft)}, full={sorted(present_full)}"
+        )
+    if present_peft and present_peft != _REQUIRED_PEFT_MARKERS:
+        missing = sorted(_REQUIRED_PEFT_MARKERS - present_peft)
+        unsupported = sorted(present_peft & _OTHER_PEFT_MARKERS)
+        raise ValueError(
+            "incomplete Stage 2 PEFT artifact: "
+            f"missing={missing}, unsupported={unsupported}; "
+            "adapter_model.safetensors is required"
+        )
+    if present_peft:
+        return Stage2ArtifactKind.PEFT
+    if present_full:
+        return Stage2ArtifactKind.FULL
+    raise ValueError(
+        f"unrecognized local Stage 2 artifact (missing model weights): {path}"
+    )
+
+
+_ARCHITECTURE_KEYS = frozenset(
+    {
+        "model_type",
+        "architectures",
+        "decoder",
+        "multimodal_token_ids",
+        "vision",
+    }
+)
+_DECODER_ARCHITECTURE_KEYS = frozenset(
+    {
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "vocab_size",
+        "max_position_embeddings",
+        "rope_theta",
+        "rope_scaling",
+        "use_sliding_window",
+        "sliding_window",
+        "max_window_layers",
+    }
+)
+_MULTIMODAL_TOKEN_KEYS = frozenset(
+    {
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+    }
+)
+_VISION_ARCHITECTURE_KEYS = frozenset(
+    {
+        "depth",
+        "hidden_size",
+        "intermediate_size",
+        "num_heads",
+        "in_channels",
+        "patch_size",
+        "temporal_patch_size",
+        "spatial_merge_size",
+        "window_size",
+        "out_hidden_size",
+        "tokens_per_second",
+        "fullatt_block_indexes",
+    }
+)
+
+
+def _require_exact_object(value, *, path: str, keys: frozenset[str]) -> Mapping:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be a JSON object")
+    if any(not isinstance(key, str) or not key for key in value):
+        raise ValueError(f"{path} must contain non-empty string keys")
+    actual = set(value)
+    if actual != keys:
+        raise ValueError(
+            f"invalid {path} fields: "
+            f"missing={sorted(keys - actual)}, unknown={sorted(actual - keys)}"
+        )
+    return value
+
+
+def _require_int(value, *, path: str, minimum: int = 1) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{path} must be an integer >= {minimum}")
+    return value
+
+
+def _optional_int(value, *, path: str, minimum: int = 1) -> int | None:
+    if value is None:
+        return None
+    return _require_int(value, path=path, minimum=minimum)
+
+
+def _normalize_json_value(value, *, path: str):
+    if value is None or type(value) in (bool, str, int):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain only finite JSON numbers")
+        return value
+    if isinstance(value, list):
+        return [
+            _normalize_json_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) or not key for key in value):
+            raise ValueError(f"{path} must contain non-empty string keys")
+        return {
+            key: _normalize_json_value(value[key], path=f"{path}.{key}")
+            for key in sorted(value)
+        }
+    raise ValueError(f"{path} contains a non-JSON value: {type(value).__name__}")
+
+
+def _normalize_base_model_architecture(value) -> dict[str, object]:
+    root = _require_exact_object(
+        value, path="base_model_architecture", keys=_ARCHITECTURE_KEYS
+    )
+    model_type = root["model_type"]
+    if model_type != "qwen2_5_vl":
+        raise ValueError(
+            "base_model_architecture.model_type must be supported qwen2_5_vl"
+        )
+    architectures = root["architectures"]
+    if not isinstance(architectures, list) or any(
+        not isinstance(item, str) or not item for item in architectures
+    ):
+        raise ValueError(
+            "base_model_architecture.architectures must be a JSON string list"
+        )
+
+    decoder = _require_exact_object(
+        root["decoder"],
+        path="base_model_architecture.decoder",
+        keys=_DECODER_ARCHITECTURE_KEYS,
+    )
+    normalized_decoder = {
+        name: _require_int(
+            decoder[name], path=f"base_model_architecture.decoder.{name}"
+        )
+        for name in (
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "vocab_size",
+            "max_position_embeddings",
+        )
+    }
+    rope_theta = decoder["rope_theta"]
+    if (
+        type(rope_theta) not in (int, float)
+        or not math.isfinite(rope_theta)
+        or rope_theta <= 0
+    ):
+        raise ValueError(
+            "base_model_architecture.decoder.rope_theta must be finite and positive"
+        )
+    normalized_decoder["rope_theta"] = float(rope_theta)
+    rope_scaling = decoder["rope_scaling"]
+    if rope_scaling is not None and not isinstance(rope_scaling, Mapping):
+        raise ValueError(
+            "base_model_architecture.decoder.rope_scaling must be a JSON object or null"
+        )
+    normalized_decoder["rope_scaling"] = _normalize_json_value(
+        rope_scaling, path="base_model_architecture.decoder.rope_scaling"
+    )
+    if type(decoder["use_sliding_window"]) is not bool:
+        raise ValueError(
+            "base_model_architecture.decoder.use_sliding_window must be boolean"
+        )
+    normalized_decoder["use_sliding_window"] = decoder["use_sliding_window"]
+    for name in ("sliding_window", "max_window_layers"):
+        normalized_decoder[name] = _optional_int(
+            decoder[name], path=f"base_model_architecture.decoder.{name}"
+        )
+
+    token_ids = _require_exact_object(
+        root["multimodal_token_ids"],
+        path="base_model_architecture.multimodal_token_ids",
+        keys=_MULTIMODAL_TOKEN_KEYS,
+    )
+    normalized_token_ids = {
+        name: _require_int(
+            token_ids[name],
+            path=f"base_model_architecture.multimodal_token_ids.{name}",
+            minimum=0,
+        )
+        for name in ("image_token_id", "video_token_id")
+    }
+    for name in ("vision_start_token_id", "vision_end_token_id"):
+        normalized_token_ids[name] = _optional_int(
+            token_ids[name],
+            path=f"base_model_architecture.multimodal_token_ids.{name}",
+            minimum=0,
+        )
+
+    vision = _require_exact_object(
+        root["vision"],
+        path="base_model_architecture.vision",
+        keys=_VISION_ARCHITECTURE_KEYS,
+    )
+    normalized_vision = {
+        name: _require_int(
+            vision[name], path=f"base_model_architecture.vision.{name}"
+        )
+        for name in _VISION_ARCHITECTURE_KEYS - {"fullatt_block_indexes"}
+    }
+    fullatt_indexes = vision["fullatt_block_indexes"]
+    if not isinstance(fullatt_indexes, list):
+        raise ValueError(
+            "base_model_architecture.vision.fullatt_block_indexes must be a JSON list"
+        )
+    normalized_vision["fullatt_block_indexes"] = [
+        _require_int(
+            item,
+            path=(
+                "base_model_architecture.vision.fullatt_block_indexes"
+                f"[{index}]"
+            ),
+            minimum=0,
+        )
+        for index, item in enumerate(fullatt_indexes)
+    ]
+    return {
+        "architectures": list(architectures),
+        "decoder": {key: normalized_decoder[key] for key in sorted(normalized_decoder)},
+        "model_type": model_type,
+        "multimodal_token_ids": {
+            key: normalized_token_ids[key] for key in sorted(normalized_token_ids)
+        },
+        "vision": {key: normalized_vision[key] for key in sorted(normalized_vision)},
+    }
+
+
+def _capture_base_model_architecture(config) -> dict[str, object]:
+    hidden_size = int(getattr(config, "hidden_size"))
+    attention_heads = int(getattr(config, "num_attention_heads"))
+    head_dim = getattr(config, "head_dim", None)
+    if head_dim is None:
+        if hidden_size % attention_heads:
+            raise ValueError("Qwen hidden_size must be divisible by num_attention_heads")
+        head_dim = hidden_size // attention_heads
+    architectures = getattr(config, "architectures", None) or []
+    if isinstance(architectures, str) or not isinstance(architectures, Sequence):
+        raise ValueError("Qwen architectures must be a sequence of class names")
+    vision = getattr(config, "vision_config", None)
+    if vision is None:
+        raise ValueError("Qwen2.5-VL config is missing vision_config")
+    snapshot = {
+        "model_type": getattr(config, "model_type", None),
+        "architectures": list(architectures),
+        "decoder": {
+            "hidden_size": hidden_size,
+            "intermediate_size": int(getattr(config, "intermediate_size")),
+            "num_hidden_layers": int(getattr(config, "num_hidden_layers")),
+            "num_attention_heads": attention_heads,
+            "num_key_value_heads": int(getattr(config, "num_key_value_heads")),
+            "head_dim": int(head_dim),
+            "vocab_size": int(getattr(config, "vocab_size")),
+            "max_position_embeddings": int(
+                getattr(config, "max_position_embeddings")
+            ),
+            "rope_theta": float(getattr(config, "rope_theta")),
+            "rope_scaling": getattr(config, "rope_scaling", None),
+            "use_sliding_window": getattr(config, "use_sliding_window", False),
+            "sliding_window": getattr(config, "sliding_window", None),
+            "max_window_layers": getattr(config, "max_window_layers", None),
+        },
+        "multimodal_token_ids": {
+            "image_token_id": getattr(config, "image_token_id", None),
+            "video_token_id": getattr(config, "video_token_id", None),
+            "vision_start_token_id": getattr(config, "vision_start_token_id", None),
+            "vision_end_token_id": getattr(config, "vision_end_token_id", None),
+        },
+        "vision": {
+            "depth": getattr(vision, "depth", None),
+            "hidden_size": getattr(vision, "hidden_size", None),
+            "intermediate_size": getattr(vision, "intermediate_size", None),
+            "num_heads": getattr(vision, "num_heads", None),
+            "in_channels": getattr(vision, "in_channels", None),
+            "patch_size": getattr(vision, "patch_size", None),
+            "temporal_patch_size": getattr(vision, "temporal_patch_size", None),
+            "spatial_merge_size": getattr(vision, "spatial_merge_size", None),
+            "window_size": getattr(vision, "window_size", None),
+            "out_hidden_size": getattr(vision, "out_hidden_size", None),
+            "tokens_per_second": getattr(vision, "tokens_per_second", None),
+            "fullatt_block_indexes": list(
+                getattr(vision, "fullatt_block_indexes", ())
+            ),
+        },
+    }
+    return _normalize_base_model_architecture(snapshot)
+
+
+def _first_architecture_difference(expected, actual, path=""):
+    if type(expected) is not type(actual):
+        return path, expected, actual
+    if isinstance(expected, dict):
+        for key in sorted(expected):
+            result = _first_architecture_difference(
+                expected[key], actual[key], f"{path}.{key}" if path else key
+            )
+            if result is not None:
+                return result
+        return None
+    if isinstance(expected, list):
+        if len(expected) != len(actual):
+            return path, expected, actual
+        for index, (expected_item, actual_item) in enumerate(zip(expected, actual)):
+            result = _first_architecture_difference(
+                expected_item, actual_item, f"{path}[{index}]"
+            )
+            if result is not None:
+                return result
+        return None
+    if expected != actual:
+        return path, expected, actual
+    return None
 
 
 @dataclass(frozen=True)
@@ -30,6 +411,7 @@ class Stage2PeftMetadata:
     stage: str
     tuning_method: str
     base_model_reference: str
+    base_model_architecture: dict[str, object]
     latent_size: int
     latent_start_token_id: int
     latent_pad_token_id: int
@@ -55,6 +437,13 @@ class Stage2PeftMetadata:
     def from_dict(cls, payload: Mapping[str, object]) -> "Stage2PeftMetadata":
         if not isinstance(payload, Mapping):
             raise ValueError("Stage 2 PEFT metadata must be a JSON object")
+        if payload.get("schema_version") != STAGE2_PEFT_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported Stage 2 PEFT metadata schema: "
+                f"expected={STAGE2_PEFT_SCHEMA_VERSION}, "
+                f"actual={payload.get('schema_version')}; "
+                "pre-v2 sidecars lack required base architecture provenance"
+            )
         expected = {field.name for field in fields(cls)}
         actual = set(payload)
         if actual != expected:
@@ -64,8 +453,6 @@ class Stage2PeftMetadata:
                 "invalid Stage 2 PEFT metadata fields: "
                 f"missing={missing}, unknown={unknown}"
             )
-        if payload["schema_version"] != STAGE2_PEFT_SCHEMA_VERSION:
-            raise ValueError("unsupported Stage 2 PEFT metadata schema")
         if payload["stage"] != "stage2":
             raise ValueError("Stage 2 PEFT metadata must describe stage2")
         if payload["tuning_method"] not in ("lora", "dora"):
@@ -134,6 +521,9 @@ class Stage2PeftMetadata:
             stage="stage2",
             tuning_method=tuning.method,
             base_model_reference=payload["base_model_reference"],
+            base_model_architecture=_normalize_base_model_architecture(
+                payload["base_model_architecture"]
+            ),
             latent_size=payload["latent_size"],
             latent_start_token_id=payload["latent_start_token_id"],
             latent_pad_token_id=payload["latent_pad_token_id"],
@@ -165,6 +555,7 @@ def build_stage2_peft_metadata(
             "stage": "stage2",
             "tuning_method": tuning.method,
             "base_model_reference": str(base_model_reference),
+            "base_model_architecture": _capture_base_model_architecture(model_config),
             "latent_size": getattr(model_config, "latent_size", None),
             "latent_start_token_id": token_ids.start_token_id,
             "latent_pad_token_id": token_ids.pad_token_id,
@@ -257,6 +648,16 @@ def validate_stage2_peft_compatibility(
     """Validate a relocated base against adapter metadata without reading weights."""
     qwen = _resolve_stage1_qwen_base(base_model)
     config = qwen.config
+    current_architecture = _capture_base_model_architecture(config)
+    architecture_difference = _first_architecture_difference(
+        metadata.base_model_architecture, current_architecture
+    )
+    if architecture_difference is not None:
+        path, expected, actual = architecture_difference
+        raise ValueError(
+            f"base architecture mismatch at {path}: "
+            f"checkpoint={expected!r}, base={actual!r}"
+        )
     token_ids = resolve_latent_token_ids(tokenizer, config)
     for field, actual in (
         ("latent_pad_token_id", token_ids.pad_token_id),
@@ -536,14 +937,21 @@ def resolve_stage2_load_decision(
             supervise_latent_boundaries,
         )
 
-    try:
-        metadata = load_peft_metadata(resume_from_checkpoint_path)
-    except FileNotFoundError:
+    resume_path = Path(resume_from_checkpoint_path)
+    local_artifact_kind = (
+        classify_stage2_artifact(resume_path) if resume_path.is_dir() else None
+    )
+    if local_artifact_kind is Stage2ArtifactKind.FULL:
         metadata = None
-    except ValueError as error:
-        if not str(error).startswith("missing Stage 2 PEFT metadata"):
-            raise
-        metadata = None
+    else:
+        try:
+            metadata = load_peft_metadata(resume_from_checkpoint_path)
+        except FileNotFoundError:
+            metadata = None
+        except ValueError as error:
+            if not str(error).startswith("missing Stage 2 PEFT metadata"):
+                raise
+            metadata = None
 
     if metadata is None:
         if (Path(resume_from_checkpoint_path) / "adapter_config.json").is_file():

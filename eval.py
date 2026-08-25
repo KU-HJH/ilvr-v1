@@ -6,7 +6,6 @@ import argparse
 import logging
 import time
 import sys
-from pathlib import Path
 from typing import List, Dict, Any, Union
 
 import torch
@@ -18,7 +17,8 @@ from transformers import (
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 from stage2.checkpointing import (
-    STAGE2_PEFT_METADATA_FILENAME,
+    Stage2ArtifactKind,
+    classify_stage2_artifact,
     load_stage2_peft_metadata,
     resolve_latent_token_ids,
 )
@@ -127,8 +127,8 @@ def load_evaluation_artifacts(
     *, model_dir: str, base_model_dir: str | None, cache_dir: str
 ):
     """Load either one full Stage 2 artifact or a Stage 1 base plus adapter."""
-    sidecar = Path(model_dir) / STAGE2_PEFT_METADATA_FILENAME
-    if not sidecar.exists():
+    artifact_kind = classify_stage2_artifact(model_dir)
+    if artifact_kind is Stage2ArtifactKind.FULL:
         if base_model_dir is not None:
             raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
         return load_model(model_dir, cache_dir), load_processor(model_dir, cache_dir)

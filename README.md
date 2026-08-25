@@ -255,6 +255,12 @@ adapter_model.safetensors
 stage2_peft_metadata.json
 ```
 
+The sidecar uses the unreleased schema v2 and records a compact Qwen2.5-VL
+text/vision architecture snapshot in addition to the adapter and latent-token
+contract. Pre-v2 sidecars are rejected because they do not carry enough origin
+architecture provenance for safe base relocation. Since no Stage 2 PEFT format
+has been released from this branch, there is no legacy migration path.
+
 A numbered checkpoint also contains `trainer_state.json`, RNG state, and the
 optimizer/scheduler state required by its training backend. The concrete
 layout depends on both the backend and who owns the scheduler:
@@ -269,7 +275,8 @@ The current ZeRO-3 config has no DeepSpeed `scheduler` section, so only its
 optimizer/model state is backend-owned; the vendored Trainer saves the
 HF-owned scheduler at the numbered checkpoint root. Always resume the complete
 numbered checkpoint with the same backend and configuration. Individual
-filenames are not the compatibility contract and may vary with configuration.
+backend-owned Trainer-state filenames are not the compatibility contract and
+may vary with configuration.
 
 It does not contain a merged copy of the Stage 1 base. Resume restores the
 adapter plus Trainer progress from `RESUME_CHECKPOINT`; `STAGE1_CHECKPOINT`
@@ -277,6 +284,12 @@ remains the separate base source. Moving the base and adapter directories is
 supported: compatibility is checked structurally through latent-token IDs,
 model configuration, target modules, and parameter shapes rather than by
 requiring the original absolute path or hashing the full model weights.
+
+For local evaluation/resume directories, the three PEFT files above must be
+present together and must not coexist with full-model weight files. Incomplete,
+legacy binary-adapter, and mixed full-plus-PEFT layouts fail before any model
+weights are loaded. This repository publishes and accepts PEFT weights as the
+single unsharded `adapter_model.safetensors` file.
 
 Evaluate a full Stage 2 artifact with `--model_dir` alone. Evaluate a PEFT
 artifact by supplying the adapter as `--model_dir` and its compatible Stage 1
