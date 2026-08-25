@@ -7,6 +7,12 @@ from torch import nn
 
 from main import configure_stage2_model_backend
 from helpers import ToyCausalLanguageModel, tiny_stage2_qwen
+from stage2.peft import (
+    ALLOWED_STAGE2_TARGET_SUFFIXES,
+    Stage2TuningConfig,
+    build_stage2_tuned_model,
+    resolve_stage2_qwen_model,
+)
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentRolloutEngine
 
 
@@ -100,6 +106,16 @@ def stage2_scaffold():
     attention_mask = torch.ones_like(input_ids)
     image_grid_thw = torch.tensor([[1, 2, 2]])
     return input_ids, attention_mask, image_grid_thw
+
+
+def settings(method: str) -> Stage2TuningConfig:
+    return Stage2TuningConfig(
+        method=method,
+        r=4,
+        alpha=8,
+        dropout=0.0,
+        target_modules=ALLOWED_STAGE2_TARGET_SUFFIXES,
+    )
 
 
 class RecordingRolloutEngine:
@@ -329,6 +345,54 @@ def test_stage2_forward_slices_one_full_mrope_tensor(monkeypatch):
     assert torch.equal(recorder.calls[2][2], expected_positions)
     assert outputs.logits.shape == (1, input_ids.shape[1], model.config.vocab_size)
     assert outputs.loss.ndim == 0
+
+
+@pytest.mark.parametrize("method", ["lora", "dora"])
+def test_peft_stage2_multiblock_rollout_ignores_latent_pad_embeddings(
+    method, monkeypatch
+):
+    """Catches PEFT recurrence using discrete latent-pad vectors in either block."""
+    wrapped = build_stage2_tuned_model(tiny_stage2_qwen(), settings(method)).eval()
+    qwen = resolve_stage2_qwen_model(wrapped)
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 91, 90, 90, 92, 3]])
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.masked_fill(input_ids == 90, -100)
+    rope_calls = 0
+    original_get_rope_index = qwen.get_rope_index
+
+    def record_get_rope_index(*args, **kwargs):
+        nonlocal rope_calls
+        rope_calls += 1
+        return original_get_rope_index(*args, **kwargs)
+
+    monkeypatch.setattr(qwen, "get_rope_index", record_get_rope_index)
+    reference = wrapped(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        return_stage2_latent_states=True,
+    )
+    with torch.no_grad():
+        qwen.get_input_embeddings().weight[90].fill_(10_000)
+    modified = wrapped(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        return_stage2_latent_states=True,
+    )
+
+    assert rope_calls == 2
+    assert reference.loss.isfinite()
+    assert modified.loss.isfinite()
+    assert len(reference.stage2_latent_states) == len(
+        modified.stage2_latent_states
+    ) == 4
+    for reference_state, modified_state in zip(
+        reference.stage2_latent_states,
+        modified.stage2_latent_states,
+        strict=True,
+    ):
+        torch.testing.assert_close(reference_state, modified_state)
 
 
 def test_stage2_outputs_do_not_retain_latents_or_diagnostic_graphs_by_default():

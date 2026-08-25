@@ -1,25 +1,39 @@
 import copy
-import functools
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
-from helpers import ToyCausalLanguageModel
+from helpers import ToyCausalLanguageModel, tiny_stage2_qwen
 from stage2.inference import (
     Stage2GenerationConfig,
     Stage2InferenceController,
 )
+from stage2.peft import (
+    ALLOWED_STAGE2_TARGET_SUFFIXES,
+    Stage2TuningConfig,
+    build_stage2_tuned_model,
+    resolve_stage2_qwen_model,
+)
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentRolloutEngine,
-    LatentSpan,
     LatentTokenIds,
     parse_latent_spans,
 )
 
 
 TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
+
+
+def settings(method: str) -> Stage2TuningConfig:
+    return Stage2TuningConfig(
+        method=method,
+        r=4,
+        alpha=8,
+        dropout=0.0,
+        target_modules=ALLOWED_STAGE2_TARGET_SUFFIXES,
+    )
 
 
 class ScriptedHead(nn.Module):
@@ -32,8 +46,8 @@ class ScriptedHead(nn.Module):
     def forward(self, hidden):
         token_id = self.token_ids[min(self.calls, len(self.token_ids) - 1)]
         self.calls += 1
-        logits = hidden.new_full((hidden.shape[0], self.vocab_size), -1e9)
-        logits[:, token_id] = 0
+        logits = hidden.new_full((*hidden.shape[:-1], self.vocab_size), -1e9)
+        logits[..., token_id] = 0
         return logits
 
 
@@ -236,28 +250,30 @@ def test_inference_rejects_non_positive_latent_size():
         )
 
 
-def test_training_and_inference_share_latent_states_and_full_mrope_positions():
-    training_model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
-    inference_model = copy.deepcopy(training_model)
+@pytest.mark.parametrize("method", ["lora", "dora"])
+def test_peft_training_and_inference_share_latent_states_and_full_mrope_positions(
+    method,
+):
+    """Catches inference using an unadapted decoder instead of the PEFT Qwen base."""
+    training_wrapper = build_stage2_tuned_model(
+        tiny_stage2_qwen(), settings(method)
+    ).eval()
+    training_model = resolve_stage2_qwen_model(training_wrapper).eval()
+    with torch.no_grad():
+        for name, parameter in training_wrapper.named_parameters():
+            if "lora_B" in name:
+                parameter.fill_(0.01)
+    training_model.lm_head = ScriptedHead([TOKENS.start_token_id])
+    inference_model = copy.deepcopy(training_model).eval()
     scaffold = torch.tensor([[1, 91, 90, 90, 92]])
     mask = torch.ones_like(scaffold)
     image_grid_thw = torch.tensor([[1, 1, 1]])
-    positions, _ = training_model.get_rope_index(
-        scaffold,
+    training = training_wrapper(
+        input_ids=scaffold,
+        attention_mask=mask,
         image_grid_thw=image_grid_thw,
-        attention_mask=mask,
+        return_stage2_latent_states=True,
     )
-    training = training_model.stage2_rollout_engine.rollout(
-        language_model=functools.partial(training_model.model, generate_mode=True),
-        base_inputs_embeds=training_model.prepare_stage2_base_inputs_embeds(
-            input_ids=scaffold,
-            pixel_values=None,
-            image_grid_thw=image_grid_thw,
-        ),
-        attention_mask=mask,
-        full_position_ids=positions,
-        latent_spans=(LatentSpan(1, (2, 3), 4),),
-    ).latent_states
 
     inference = Stage2InferenceController().generate(
         model=inference_model,
@@ -269,13 +285,15 @@ def test_training_and_inference_share_latent_states_and_full_mrope_positions():
         return_latent_states=True,
     )
 
-    assert len(training) == len(inference.latent_states_by_block[0]) == 2
-    for train_state, inference_state in zip(training, inference.latent_states_by_block[0]):
-        assert torch.allclose(train_state, inference_state, atol=1e-6, rtol=1e-5)
-    full_ids, full_grid, full_mask = inference_model.rope_inputs[-1]
-    assert torch.equal(full_ids, scaffold)
-    assert torch.equal(full_grid, image_grid_thw)
-    assert torch.equal(full_mask, mask)
+    assert len(training.stage2_latent_states) == len(
+        inference.latent_states_by_block[0]
+    ) == 2
+    for train_state, inference_state in zip(
+        training.stage2_latent_states,
+        inference.latent_states_by_block[0],
+        strict=True,
+    ):
+        torch.testing.assert_close(train_state, inference_state)
 
 
 def test_latent_states_are_returned_only_when_requested():

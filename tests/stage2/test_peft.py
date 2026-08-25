@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 from peft import LoraConfig, get_peft_model
 from torch import nn
 
@@ -27,6 +28,15 @@ def settings(method: str) -> Stage2TuningConfig:
 
 def lora_settings() -> Stage2TuningConfig:
     return settings("lora")
+
+
+def one_block_stage2_batch() -> dict[str, torch.Tensor]:
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2]])
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "labels": torch.tensor([[-100, 91, -100, -100, 92, 2]]),
+    }
 
 
 def test_stage2_tuning_config_normalizes_the_approved_decoder_targets():
@@ -124,6 +134,58 @@ def test_only_adapter_parameters_are_trainable(method):
     assert all("lora_" in name for name in trainable)
     assert not any("visual" in name for name in trainable)
     assert not any("embed_tokens" in name or "lm_head" in name for name in trainable)
+
+
+@pytest.mark.parametrize("method", ["lora", "dora"])
+def test_adapter_executes_in_every_recurrent_prefix_and_final_forward(method):
+    """Catches Stage 2 recurrence bypassing decoder adapters during PEFT training."""
+    wrapped = build_stage2_tuned_model(tiny_stage2_qwen(), settings(method))
+    qwen = resolve_stage2_qwen_model(wrapped)
+    calls = []
+    handle = qwen.model.layers[0].self_attn.q_proj.register_forward_hook(
+        lambda *unused: calls.append(1)
+    )
+    try:
+        outputs = wrapped(**one_block_stage2_batch(), return_stage2_latent_states=True)
+    finally:
+        handle.remove()
+
+    assert outputs.loss.isfinite()
+    assert len(outputs.stage2_latent_states) == 2
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("method", ["lora", "dora"])
+def test_adapter_latents_and_only_adapter_parameters_receive_ce_gradients(method):
+    """Catches detached Stage 2 latent states or gradients leaking into frozen modules."""
+    wrapped = build_stage2_tuned_model(tiny_stage2_qwen(), settings(method))
+    qwen = resolve_stage2_qwen_model(wrapped)
+    outputs = wrapped(**one_block_stage2_batch(), return_stage2_latent_states=True)
+    for state in outputs.stage2_latent_states:
+        state.retain_grad()
+
+    outputs.loss.backward()
+
+    assert all(
+        state.grad is not None and torch.isfinite(state.grad).all()
+        for state in outputs.stage2_latent_states
+    )
+    assert all(state.grad.abs().sum() > 0 for state in outputs.stage2_latent_states)
+    assert any(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and parameter.grad.abs().sum() > 0
+        for name, parameter in wrapped.named_parameters()
+        if "lora_" in name
+    )
+    assert all(
+        parameter.grad is None
+        for name, parameter in qwen.model.named_parameters()
+        if "lora_" not in name
+    )
+    assert all(parameter.grad is None for parameter in qwen.model.embed_tokens.parameters())
+    assert all(parameter.grad is None for parameter in qwen.lm_head.parameters())
+    assert all(parameter.grad is None for parameter in qwen.visual.parameters())
 
 
 def test_parameter_boundary_fails_if_visual_is_reenabled():
