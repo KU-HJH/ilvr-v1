@@ -59,6 +59,30 @@ class SingleParameterStudent(nn.Module):
         self.model = nn.Linear(2, 2, bias=False)
 
 
+class TwoParameterStudent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.first = nn.Parameter(torch.tensor([2.0]))
+        self.model.second = nn.Parameter(torch.tensor([3.0]))
+
+
+class CanonicalPeftStudent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.proj = nn.Module()
+        self.model.proj.lora_A = nn.ModuleDict(
+            {"default": nn.Linear(2, 1, bias=False)}
+        )
+        self.model.proj.lora_B = nn.ModuleDict(
+            {"default": nn.Linear(1, 2, bias=False)}
+        )
+        self.model.proj.lora_magnitude_vector = nn.ParameterDict(
+            {"default": nn.Parameter(torch.ones(2))}
+        )
+
+
 @pytest.fixture
 def full_student() -> ToyStudent:
     torch.manual_seed(7)
@@ -195,6 +219,36 @@ def test_peft_ema_rejects_unclassified_trainable_parameter(dora_student):
         Stage1EmaTeacher(dora_student, decay=0.9, method="dora")
 
 
+def test_peft_ema_accepts_canonical_direction_and_magnitude_components():
+    ema = Stage1EmaTeacher(
+        CanonicalPeftStudent(), decay=0.9, method="dora"
+    )
+
+    assert ema.parameter_names == (
+        "model.proj.lora_A.default.weight",
+        "model.proj.lora_B.default.weight",
+        "model.proj.lora_magnitude_vector.default",
+    )
+
+
+@pytest.mark.parametrize(
+    "deceptive_name",
+    [
+        "not_an_adapter_lora_backup",
+        "lora_A_backup",
+        "trainable_tokens_delta_backup",
+        "my_output_delta_shadow",
+    ],
+)
+def test_peft_ema_rejects_deceptive_embedded_component_names(deceptive_name):
+    student = nn.Module()
+    student.model = nn.Module()
+    student.model.register_parameter(deceptive_name, nn.Parameter(torch.ones(1)))
+
+    with pytest.raises(RuntimeError, match=r"unsupported trainable"):
+        Stage1EmaTeacher(student, decay=0.9, method="dora")
+
+
 def test_parameter_map_rejects_duplicate_parameter_aliases():
     student = SingleParameterStudent()
     student.alias = student.model.weight
@@ -255,14 +309,42 @@ def test_zero3_gathers_only_current_source_and_partitioned_target(
 
     ema.update(ModuleWrapper(student))
 
-    assert len(RecordingGather.calls) == 1
-    gathered, modifier_rank = RecordingGather.calls[0]
+    assert len(RecordingGather.calls) == 2
     expected_ids = [id(source)]
     if partition_teacher:
         expected_ids.append(id(target))
-    assert [id(parameter) for parameter in gathered] == expected_ids
-    assert modifier_rank == (0 if partition_teacher else None)
+    for gathered, modifier_rank in RecordingGather.calls:
+        assert [id(parameter) for parameter in gathered] == expected_ids
+        assert modifier_rank == (0 if partition_teacher else None)
     torch.testing.assert_close(target, initial_target + 1.0)
+
+
+def test_gathered_shape_preflight_prevents_partial_ema_update(monkeypatch):
+    student = TwoParameterStudent()
+    ema = Stage1EmaTeacher(student, decay=0.5, method="full")
+    before = clone_named_parameters(ema.model)
+    first = student.model.first
+    second = student.model.second
+    with torch.no_grad():
+        first.add_(2.0)
+    for ds_id, parameter in enumerate((first, second), start=1):
+        parameter.ds_id = ds_id
+        parameter.ds_status = "NOT_AVAILABLE"
+        parameter.ds_shape = torch.Size((1,))
+
+    RecordingGather.calls = []
+    RecordingGather.replacement_by_id = {id(second): torch.zeros(2)}
+    fake_deepspeed = SimpleNamespace(
+        zero=SimpleNamespace(GatheredParameters=RecordingGather)
+    )
+    monkeypatch.setitem(sys.modules, "deepspeed", fake_deepspeed)
+
+    with pytest.raises(
+        RuntimeError, match=r"gathered source shape.*model.second"
+    ):
+        ema.update(student)
+
+    assert_named_parameters_equal(ema.model, before)
 
 
 def test_zero_sized_unpartitioned_source_is_rejected():

@@ -13,10 +13,16 @@ from torch import nn
 
 
 Stage1EmaMethod = Literal["full", "lora", "dora"]
-_PEFT_PARAMETER_MARKERS = (
-    "lora_",
-    "trainable_tokens_delta",
-    "output_delta",
+_PEFT_PARAMETER_COMPONENTS = frozenset(
+    {
+        "lora_A",
+        "lora_B",
+        "lora_embedding_A",
+        "lora_embedding_B",
+        "lora_magnitude_vector",
+        "trainable_tokens_delta",
+        "output_delta",
+    }
 )
 
 
@@ -61,7 +67,10 @@ def _is_visual_parameter(name: str) -> bool:
 
 
 def _is_peft_parameter(name: str) -> bool:
-    return any(marker in name for marker in _PEFT_PARAMETER_MARKERS)
+    return any(
+        component in _PEFT_PARAMETER_COMPONENTS
+        for component in name.split(".")
+    )
 
 
 def _selected_parameters(
@@ -302,6 +311,11 @@ class Stage1EmaTeacher:
                         f"{pair.name} is {tuple(target.shape)}, expected "
                         f"{tuple(pair.shape)}"
                     )
+
+        for pair in self._pairs:
+            source = student_named[pair.name]
+            target = teacher_named[pair.name]
+            with _gathered_parameter_pair(source, target):
                 source_value = source.detach().to(
                     device=target.device, dtype=target.dtype
                 )
