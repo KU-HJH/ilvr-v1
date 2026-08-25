@@ -222,6 +222,28 @@ def test_stage2_launcher_rejects_invalid_lora_targets(value):
     assert "LORA_TARGET_MODULES must contain only approved decoder targets" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "env_overrides",
+    (
+        {
+            "TUNING_METHOD": "lora",
+            "LORA_TARGET_MODULES": "q_proj,q_proj",
+        },
+        {
+            "RESUME_CHECKPOINT": "/resume/checkpoint 10",
+            "LORA_TARGET_MODULES": "q_proj,q_proj",
+        },
+    ),
+    ids=("fresh-explicit", "resume-inherited"),
+)
+def test_stage2_launcher_rejects_duplicate_lora_targets(env_overrides):
+    """Catches duplicate targets reaching Python or being ignored on resume."""
+    result = run_launcher(env_overrides=env_overrides)
+
+    assert result.returncode == 2
+    assert "LORA_TARGET_MODULES must not contain duplicate targets" in result.stderr
+
+
 def test_stage2_launcher_omits_resume_for_fresh_training():
     """Catches an empty resume value being forwarded as a real checkpoint."""
     tokens = dry_run_tokens(run_launcher())

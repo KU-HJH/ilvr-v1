@@ -232,8 +232,14 @@ LORA_R=32 \
 LORA_ALPHA=64 \
 LORA_DROPOUT=0.05 \
 LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+DEEPSPEED_CONFIG=configs/config_stage3.json \
 ./run_stage2_training.sh
 ```
+
+Resume with the same training backend and configuration used to create the
+checkpoint. In particular, a run started with the ZeRO-3 config
+above must keep `DEEPSPEED_CONFIG=configs/config_stage3.json`; removing or
+changing the backend cannot restore its optimizer and scheduler state.
 
 Alternatively, omit `TUNING_METHOD` on resume to inherit the method and all
 four adapter settings from `stage2_peft_metadata.json`. In that mode the
@@ -249,12 +255,19 @@ adapter_model.safetensors
 stage2_peft_metadata.json
 ```
 
-A numbered Trainer checkpoint additionally contains the ordinary resume state:
+A numbered checkpoint also contains `trainer_state.json`, RNG state, and the
+optimizer/scheduler state required by its training backend. The concrete
+optimizer layout is backend-specific:
 
 ```text
-trainer_state.json
-optimizer.pt, scheduler.pt, RNG state, and other Trainer resume files
+ordinary Trainer:  optimizer.pt, scheduler.pt
+DeepSpeed ZeRO-3:  DeepSpeed-owned global_step*/ rank-specific state
 ```
+
+DeepSpeed state includes rank files such as `*_model_states.pt` and
+`*_optim_states.pt`; a ZeRO-3 checkpoint is not expected to expose root-level
+`optimizer.pt` and `scheduler.pt`. Resume the complete numbered checkpoint
+directory rather than selecting individual state files.
 
 It does not contain a merged copy of the Stage 1 base. Resume restores the
 adapter plus Trainer progress from `RESUME_CHECKPOINT`; `STAGE1_CHECKPOINT`

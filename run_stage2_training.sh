@@ -111,6 +111,7 @@ then
   exit 2
 fi
 
+declare -A seen_lora_targets=()
 remaining_targets=$LORA_TARGET_MODULES
 while true; do
   if [[ "$remaining_targets" == *,* ]]; then
@@ -128,6 +129,11 @@ while true; do
       exit 2
       ;;
   esac
+  if [[ -n "${seen_lora_targets[$target]+present}" ]]; then
+    printf 'LORA_TARGET_MODULES must not contain duplicate targets\n' >&2
+    exit 2
+  fi
+  seen_lora_targets["$target"]=true
   if [[ "$has_more_targets" == false ]]; then
     break
   fi
