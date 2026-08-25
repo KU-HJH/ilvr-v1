@@ -144,3 +144,96 @@ tracked file was removed.
   malformed values still fail the launcher's global early validation. This
   preserves sidecar authority without allowing malformed environment input to
   pass silently.
+
+## Review Fix Round 1
+
+Review-fix commit: `61b3ea0c075b3a1ceac086164ab39b1cec09a5d3`
+
+### Findings and root causes
+
+- The launcher target loop checked every token against the decoder allowlist
+  but did not retain a seen-set. Consequently `q_proj,q_proj` passed fresh
+  launcher validation and, on inherited-method resume, was silently omitted
+  with the rest of the tuning arguments instead of failing global validation.
+- The documented LoRA/DoRA fresh commands enabled ZeRO-3, while the PEFT resume
+  example omitted `DEEPSPEED_CONFIG`. That would construct a different Trainer
+  backend and could not restore DeepSpeed optimizer/scheduler state.
+- The checkpoint layout described ordinary Trainer root files as universal.
+  Transformers delegates optimizer/scheduler saving to
+  `DeepSpeedEngine.save_checkpoint` when DeepSpeed is enabled, producing
+  backend-owned `global_step*` rank state instead.
+
+### RED
+
+Added a parameterized regression that executes the real launcher for both a
+fresh explicit LoRA run and a resume with `TUNING_METHOD` absent:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+  ./venv/ilvr-venv/bin/pytest \
+  tests/stage2/test_launcher.py::test_stage2_launcher_rejects_duplicate_lora_targets \
+  -q
+```
+
+Result before the fix:
+
+```text
+2 failed in 0.10s
+```
+
+Both failures returned exit code 0 and demonstrated the exact missing
+uniqueness guard.
+
+### GREEN and final verification
+
+The focused duplicate regression passed first:
+
+```text
+2 passed in 0.05s
+```
+
+Final focused command:
+
+```bash
+set -e
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+  ./venv/ilvr-venv/bin/pytest \
+  tests/stage2/test_launcher.py tests/stage2/test_comt_readiness.py -q
+bash -n run_stage2_training.sh
+git diff --check
+```
+
+Result:
+
+```text
+96 passed in 4.77s
+```
+
+`bash -n` and `git diff --check` exited 0 without output.
+
+### Corrections
+
+- Added an associative seen-set after exact allowlist validation. Duplicate
+  targets now fail with a clear launcher error while the original target order
+  remains unchanged.
+- Added the same `DEEPSPEED_CONFIG=configs/config_stage3.json` to the documented
+  PEFT resume command and require the resume backend/configuration to match the
+  checkpoint-producing run.
+- Distinguished ordinary Trainer `optimizer.pt`/`scheduler.pt` files from
+  DeepSpeed-owned `global_step*`, `*_model_states.pt`, and
+  `*_optim_states.pt` layout, and instruct users to resume the complete
+  numbered checkpoint directory.
+- No GPU, DeepSpeed, training, or evaluation job was run for this correction.
+
+### Self-review
+
+- Both duplicate cases exercise launcher behavior rather than source text.
+- Removing the seen-set or moving it behind tuning-argument omission makes the
+  inherited-resume regression fail.
+- Existing safe subsets still preserve caller order, and allowlist/error
+  behavior is unchanged for empty, visual, and out-of-scope targets.
+- Documentation now matches the Transformers DeepSpeed save branch inspected
+  in this repository and does not promise root optimizer/scheduler files for
+  ZeRO-3.
