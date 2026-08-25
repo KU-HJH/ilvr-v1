@@ -354,12 +354,16 @@ for one through six blocks, respectively.
 - **DeepSpeed:** a reviewed tiny-model two-B200 ZeRO-3 run passed consolidated
   save/load and optimizer/scheduler resume from global step 1 to 2, with every
   observed rank-local batch equal to 1 for the pre-PEFT full-tuning path.
-- **LoRA ZeRO-3:** launcher, construction, checkpoint, resume-routing, and
-  base-plus-adapter evaluation support are implemented; the dedicated two-GPU
-  LoRA save/resume validation has not run yet.
-- **DoRA ZeRO-3:** launcher, construction, checkpoint, resume-routing, and
-  base-plus-adapter evaluation support are implemented; the dedicated two-GPU
-  DoRA save/resume validation has not run yet.
+- **LoRA/DoRA CPU:** the production-based tiny harness passed adapter-only
+  save, fresh-base trainable reload, and Trainer resume from global step 1 to 2
+  for both methods, including optimizer/scheduler and frozen-boundary checks.
+- **LoRA ZeRO-3:** the dedicated two-GPU tiny harness passed adapter-only
+  checkpoint/sidecar/processor saving and resume from global step 1 to 2, with
+  adapter updates, restored optimizer/scheduler state, frozen visual/base
+  parameters, and every observed rank-local batch equal to 1.
+- **DoRA ZeRO-3:** the same dedicated two-GPU ZeRO-3 save/resume contract
+  passed for DoRA, including adapter updates, restored optimizer/scheduler
+  state, frozen visual/base parameters, and rank-local batch size 1.
 - **Paper-level reproduction:** full CoMT Stage 2 training, benchmark
   evaluation, and reproduction of the paper's reported metrics were **not**
   run. The evidence above establishes implementation, smoke, backend, and data
