@@ -1202,28 +1202,37 @@ def _validate_complete_trainer_state(path: Path) -> None:
     if rng_world_size is None:
         raise ValueError(f"Stage 1 resume has incomplete RNG state: {path}")
 
-    standard_markers = {
-        filename
-        for filename in ("optimizer.pt", "scheduler.pt")
-        if (path / filename).exists() or (path / filename).is_symlink()
-    }
+    optimizer = path / "optimizer.pt"
+    scheduler = path / "scheduler.pt"
+    optimizer_marker = optimizer.exists() or optimizer.is_symlink()
+    scheduler_marker = scheduler.exists() or scheduler.is_symlink()
     deepspeed_markers = (path / "latest").exists() or (path / "latest").is_symlink()
     deepspeed_markers = deepspeed_markers or any(
         _DEEPSPEED_TAG.fullmatch(entry.name)
         and (entry.is_dir() or entry.is_symlink())
         for entry in path.iterdir()
     )
-    if standard_markers and deepspeed_markers:
-        raise ValueError(f"Stage 1 resume has mixed Trainer state layouts: {path}")
-    if standard_markers:
+    if deepspeed_markers:
+        if optimizer_marker:
+            raise ValueError(
+                f"Stage 1 resume has mixed Trainer optimizer layouts: {path}"
+            )
+        if scheduler_marker and not _is_regular_file(scheduler):
+            raise ValueError(
+                f"Stage 1 resume has unsafe external scheduler state: {scheduler}"
+            )
+        if _has_complete_deepspeed_trainer_state(
+            path, rng_world_size=rng_world_size
+        ):
+            return
+        raise ValueError(
+            f"Stage 1 resume requires complete DeepSpeed state: {path}"
+        )
+    if optimizer_marker or scheduler_marker:
         if not _has_complete_standard_trainer_state(path):
             raise ValueError(
                 f"Stage 1 resume has incomplete optimizer/scheduler state: {path}"
             )
-        return
-    if deepspeed_markers and _has_complete_deepspeed_trainer_state(
-        path, rng_world_size=rng_world_size
-    ):
         return
     raise ValueError(
         f"Stage 1 resume requires complete standard or DeepSpeed state: {path}"

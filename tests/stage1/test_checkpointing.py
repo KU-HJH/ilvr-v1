@@ -1017,6 +1017,63 @@ def test_peft_resume_accepts_mp_replicated_deepspeed_layout(
     assert decision.artifact_kind is Stage1ArtifactKind.PEFT
 
 
+def test_peft_resume_accepts_zero3_deepspeed_with_external_scheduler(
+    tmp_path, saved_dora_artifact
+):
+    output = tmp_path / "output"
+    checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 6)
+    _write_deepspeed_trainer_state(checkpoint, step=6)
+    (checkpoint / "scheduler.pt").write_bytes(b"fixture")
+
+    decision = resolve_stage1_resume(output, checkpoint)
+
+    assert decision.checkpoint_path == checkpoint
+    assert decision.artifact_kind is Stage1ArtifactKind.PEFT
+
+
+def test_full_resume_accepts_mp_replicated_deepspeed_with_external_scheduler(
+    tmp_path,
+):
+    output = tmp_path / "output"
+    checkpoint = output / "checkpoint-6"
+    _write_full_checkpoint(checkpoint, complete=False)
+    _write_deepspeed_trainer_state(
+        checkpoint, step=6, replicated_model=True
+    )
+    (checkpoint / "scheduler.pt").write_bytes(b"fixture")
+
+    decision = resolve_stage1_resume(output, checkpoint)
+
+    assert decision.checkpoint_path == checkpoint
+    assert decision.artifact_kind is Stage1ArtifactKind.FULL
+
+
+@pytest.mark.parametrize(
+    ("artifact_kind", "scheduler_entry"),
+    [("peft", "symlink"), ("full", "directory")],
+)
+def test_deepspeed_resume_rejects_unsafe_external_scheduler(
+    tmp_path, saved_dora_artifact, artifact_kind, scheduler_entry
+):
+    output = tmp_path / "output"
+    if artifact_kind == "peft":
+        checkpoint = _copy_numbered_peft(saved_dora_artifact, output, 6)
+    else:
+        checkpoint = output / "checkpoint-6"
+        _write_full_checkpoint(checkpoint, complete=False)
+    _write_deepspeed_trainer_state(checkpoint, step=6)
+    scheduler = checkpoint / "scheduler.pt"
+    if scheduler_entry == "symlink":
+        target = checkpoint / "scheduler-payload"
+        target.write_bytes(b"fixture")
+        scheduler.symlink_to(target)
+    else:
+        scheduler.mkdir()
+
+    with pytest.raises(ValueError, match="scheduler|complete|mixed|DeepSpeed"):
+        resolve_stage1_resume(output, checkpoint)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -1027,7 +1084,7 @@ def test_peft_resume_accepts_mp_replicated_deepspeed_layout(
         "extra_mp_rank",
         "gapped_rng",
         "tag_step_mismatch",
-        "mixed_standard",
+        "mixed_optimizer",
         "missing_tag",
         "escaping_tag",
     ],
@@ -1063,9 +1120,8 @@ def test_peft_resume_rejects_incomplete_deepspeed_layout(
         (checkpoint / "trainer_state.json").write_text(
             '{"global_step":8}\n', encoding="utf-8"
         )
-    elif mutation == "mixed_standard":
+    elif mutation == "mixed_optimizer":
         (checkpoint / "optimizer.pt").write_bytes(b"fixture")
-        (checkpoint / "scheduler.pt").write_bytes(b"fixture")
     elif mutation == "missing_tag":
         shutil.rmtree(tag)
     else:
