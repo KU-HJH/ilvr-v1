@@ -103,6 +103,76 @@ def fake_accelerate_environment(tmp_path):
     return env, log_path, wrong_log, copied_launcher
 
 
+def live_import_worker_environment(tmp_path):
+    """Build a harmless live launcher boundary around the repository Python."""
+
+    copied_repo = tmp_path / "copied repository"
+    copied_repo.mkdir()
+    copied_launcher = copied_repo / LAUNCHER.name
+    copied_launcher.write_bytes(LAUNCHER.read_bytes())
+    copied_launcher.chmod(0o755)
+    config_dir = copied_repo / "configs"
+    config_dir.mkdir()
+    (config_dir / "config_stage3.json").write_bytes(
+        (REPO_ROOT / "configs/config_stage3.json").read_bytes()
+    )
+    (copied_repo / "transformers").symlink_to(
+        REPO_ROOT / "transformers", target_is_directory=True
+    )
+
+    source_dir = copied_repo / "src"
+    source_dir.mkdir()
+    (source_dir / "main.py").write_text(
+        """import json
+import os
+from pathlib import Path
+
+import qwen_vl_utils
+import transformers
+import transformers.models.qwen2_5_vl.stage2_latent_rollout as rollout
+
+Path(os.environ["WORKER_IMPORT_LOG"]).write_text(json.dumps({
+    "pythonpath": os.environ.get("PYTHONPATH"),
+    "transformers": transformers.__file__,
+    "rollout": rollout.__file__,
+    "qwen_vl_utils": qwen_vl_utils.__file__,
+}))
+""",
+        encoding="utf-8",
+    )
+
+    bin_dir = copied_repo / "venv/ilvr-venv/bin"
+    bin_dir.mkdir(parents=True)
+    repository_python = bin_dir / "python"
+    repository_python.write_text(
+        "#!/usr/bin/env bash\n"
+        f"exec {shlex.quote(str(REPO_ROOT / 'venv/ilvr-venv/bin/python'))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    repository_python.chmod(0o755)
+    repository_accelerate = bin_dir / "accelerate"
+    repository_accelerate.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "\"$PYTHON_EXEC\" src/main.py\n",
+        encoding="utf-8",
+    )
+    repository_accelerate.chmod(0o755)
+
+    hostile = tmp_path / "hostile pythonpath"
+    hostile_transformers = hostile / "transformers"
+    hostile_transformers.mkdir(parents=True)
+    (hostile_transformers / "__init__.py").write_text(
+        "raise RuntimeError('hostile inherited transformers imported')\n",
+        encoding="utf-8",
+    )
+    worker_log = tmp_path / "worker imports.json"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(hostile)
+    environment["WORKER_IMPORT_LOG"] = str(worker_log)
+    return environment, worker_log, copied_launcher, copied_repo
+
+
 def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_path):
     """Catches wrong experiment defaults, shell evaluation, and dry-run writes."""
     output = tmp_path / "output with spaces;$(touch SHOULD_NOT_EXIST)"
@@ -326,6 +396,35 @@ def test_live_launcher_allows_nonempty_output_only_with_explicit_resume(tmp_path
     resumed_command = shlex.split(accelerate_log.read_text(encoding="utf-8"))
     index = resumed_command.index("--resume_from_checkpoint_path")
     assert resumed_command[index + 1] == str(checkpoint)
+
+
+def test_live_worker_imports_local_transformers_before_hostile_pythonpath(tmp_path):
+    """Catches Accelerate workers resolving the venv's stale editable fork."""
+
+    environment, worker_log, launcher, copied_repo = live_import_worker_environment(
+        tmp_path
+    )
+    completed = run_launcher(
+        launcher,
+        *live_args(tmp_path, tmp_path / "worker output", method="full"),
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(worker_log.read_text(encoding="utf-8"))
+    assert payload["pythonpath"] == os.pathsep.join(
+        (str(copied_repo / "transformers/src"), str(copied_repo / "src"))
+    )
+    assert Path(payload["transformers"]).resolve() == (
+        REPO_ROOT / "transformers/src/transformers/__init__.py"
+    ).resolve()
+    assert Path(payload["rollout"]).resolve() == (
+        REPO_ROOT
+        / "transformers/src/transformers/models/qwen2_5_vl/stage2_latent_rollout.py"
+    ).resolve()
+    assert Path(payload["qwen_vl_utils"]).resolve().is_relative_to(
+        (REPO_ROOT / "venv/ilvr-venv").resolve()
+    )
 
 
 @pytest.mark.parametrize("target_location", ["inside", "outside"])

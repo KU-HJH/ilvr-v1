@@ -292,5 +292,6 @@ fi
 
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTHONPATH="$script_dir/transformers/src:$script_dir/src"
 export PYTHON_EXEC="$repository_python"
 "${command[@]}"
