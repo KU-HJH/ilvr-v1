@@ -37,6 +37,7 @@ from stage1.checkpointing import (
     preflight_stage1_peft_artifact,
     resolve_stage1_resume,
     save_stage1_peft_artifact,
+    validate_stage1_vocab_alignment,
 )
 from stage1.peft import build_stage1_tuned_model
 from stage1.token_rows import find_sparse_output_token_rows
@@ -945,6 +946,79 @@ def test_padded_pretrained_vocabulary_preflights_and_restores_with_one_resize(
         RESIZED_VOCAB_SIZE
     )
     assert qwen.lm_head.out_features == RESIZED_VOCAB_SIZE
+
+
+@pytest.mark.parametrize("pretrained_vocab_size", [BASE_VOCAB_SIZE, 132])
+def test_public_vocab_validator_accepts_exact_post_resize_alignment(
+    pretrained_vocab_size,
+):
+    model = tiny_original_qwen(pretrained_vocab_size=pretrained_vocab_size)
+    model.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+
+    validate_stage1_vocab_alignment(model, RESIZED_VOCAB_SIZE)
+
+
+@pytest.mark.parametrize("corruption", ["config", "input", "output"])
+def test_public_vocab_validator_rejects_each_malformed_post_resize_surface(corruption):
+    model = tiny_original_qwen(pretrained_vocab_size=132)
+    model.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    qwen = resolve_qwen2_5_vl_model(model)
+    if corruption == "config":
+        qwen.config.vocab_size += 1
+    elif corruption == "input":
+        qwen.model.embed_tokens = nn.Embedding(RESIZED_VOCAB_SIZE + 1, 8)
+    else:
+        qwen.lm_head = nn.Linear(8, RESIZED_VOCAB_SIZE + 1, bias=False)
+
+    with pytest.raises(ValueError, match="post-resize vocabulary mismatch"):
+        validate_stage1_vocab_alignment(model, RESIZED_VOCAB_SIZE)
+
+
+@pytest.mark.parametrize("corruption", ["config", "input", "output"])
+def test_peft_restore_rejects_malformed_resize_before_adapter_attach(
+    saved_dora_artifact, monkeypatch, corruption
+):
+    import stage1.checkpointing as checkpointing
+
+    processor = TinyStage1Processor.from_pretrained(saved_dora_artifact)
+    fresh = tiny_original_qwen()
+    witness = preflight_stage1_peft_artifact(
+        processor, deepcopy(fresh.config), saved_dora_artifact
+    )
+    original_resize = fresh.resize_token_embeddings
+    resize_calls = []
+
+    def malformed_resize(size):
+        resize_calls.append(size)
+        result = original_resize(size)
+        qwen = resolve_qwen2_5_vl_model(fresh)
+        if corruption == "config":
+            qwen.config.vocab_size += 1
+        elif corruption == "input":
+            qwen.model.embed_tokens = nn.Embedding(size + 1, 8)
+        else:
+            qwen.lm_head = nn.Linear(8, size + 1, bias=False)
+        return result
+
+    attach_calls = []
+    fresh.resize_token_embeddings = malformed_resize
+    monkeypatch.setattr(
+        checkpointing,
+        "get_peft_model",
+        lambda *args, **kwargs: attach_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="vocabulary mismatch"):
+        load_stage1_peft_artifact(
+            fresh,
+            processor,
+            saved_dora_artifact,
+            is_trainable=True,
+            preflight=witness,
+        )
+
+    assert resize_calls == [RESIZED_VOCAB_SIZE]
+    assert attach_calls == []
 
 
 @pytest.mark.parametrize("payload_mutation", ["delete", "replace"])

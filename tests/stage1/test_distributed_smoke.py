@@ -10,6 +10,12 @@ from stage1.benchmark import run_or_load_distributed_witness
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+SELECTED_METHOD = os.environ.get("ILVR_DISTRIBUTED_METHOD") or None
+if SELECTED_METHOD not in {None, "full", "dora"}:
+    raise pytest.UsageError(
+        "invalid ILVR_DISTRIBUTED_METHOD: expected full or dora, "
+        f"got {SELECTED_METHOD!r}"
+    )
 
 
 @pytest.fixture
@@ -33,7 +39,7 @@ def test_two_rank_zero3_b2_save_resume_witness(
 ):
     if os.environ.get("ILVR_REAL_GPU_TESTS") != "1":
         pytest.skip("set ILVR_REAL_GPU_TESTS=1 to run the real two-rank witness")
-    selected_method = os.environ.get("ILVR_DISTRIBUTED_METHOD")
+    selected_method = SELECTED_METHOD
     if selected_method not in {None, method}:
         pytest.skip(f"this invocation selected {selected_method}, not {method}")
 

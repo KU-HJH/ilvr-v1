@@ -33,6 +33,7 @@ from stage1.checkpointing import (
     preflight_stage1_peft_artifact,
     read_stage1_peft_metadata_snapshot,
     resolve_stage1_resume,
+    validate_stage1_vocab_alignment,
 )
 from stage1.data import Stage1DataCollator, prepare_stage1_comt_examples
 from stage1.peft import (
@@ -86,6 +87,7 @@ class Stage1CompositionDependencies:
     build_peft_metadata: Callable
     capture_architecture: Callable
     resolve_target_names: Callable
+    validate_vocab_alignment: Callable
 
 
 def _build_stage1_peft_metadata(
@@ -147,6 +149,7 @@ DEFAULT_STAGE1_DEPENDENCIES = Stage1CompositionDependencies(
     build_peft_metadata=_build_stage1_peft_metadata,
     capture_architecture=capture_qwen2_5_vl_architecture,
     resolve_target_names=_resolve_linear_decoder_targets,
+    validate_vocab_alignment=validate_stage1_vocab_alignment,
 )
 
 
@@ -433,12 +436,7 @@ def build_stage1_training_components(
             trust_remote_code=True,
         )
         base_model.resize_token_embeddings(resized_vocab_size)
-        if int(base_model.config.vocab_size) != resized_vocab_size:
-            raise ValueError(
-                "fresh Stage 1 model config vocabulary did not match the "
-                f"resized tokenizer: model={base_model.config.vocab_size}, "
-                f"tokenizer={resized_vocab_size}"
-            )
+        dependencies.validate_vocab_alignment(base_model, resized_vocab_size)
         if tuning.method != "full":
             resolved_target_names = tuple(
                 dependencies.resolve_target_names(base_model, tuning.target_suffixes)

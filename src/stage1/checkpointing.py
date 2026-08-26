@@ -804,6 +804,29 @@ def _configure_latent_config(config, metadata: Stage1PeftMetadata) -> None:
     config.latent_end_id = config.latent_end_token_id = end_id
 
 
+def validate_stage1_vocab_alignment(
+    model: nn.Module, expected_vocab_size: int
+) -> None:
+    """Require config, input embedding, and output head to share one vocab."""
+
+    if type(expected_vocab_size) is not int or expected_vocab_size <= 0:
+        raise ValueError("expected_vocab_size must be a positive integer")
+    qwen = resolve_qwen2_5_vl_model(model)
+    config_vocab = capture_qwen2_5_vl_architecture(qwen.config)["decoder"][
+        "vocab_size"
+    ]
+    embedding = _base_embedding(qwen)
+    head = _base_head(qwen)
+    actual = (config_vocab, embedding.num_embeddings, head.out_features)
+    expected = (expected_vocab_size,) * 3
+    if actual != expected:
+        raise ValueError(
+            "Stage 1 post-resize vocabulary mismatch: "
+            f"expected={expected_vocab_size}, config={config_vocab}, "
+            f"input={embedding.num_embeddings}, output={head.out_features}"
+        )
+
+
 def _validate_architecture(
     qwen: nn.Module,
     metadata: Stage1PeftMetadata,
@@ -836,17 +859,7 @@ def _validate_architecture(
             f"metadata={expected!r}, model={actual!r}"
         )
 
-    embedding = _base_embedding(qwen)
-    head = _base_head(qwen)
-    if (
-        embedding.num_embeddings != expected_vocab
-        or head.out_features != expected_vocab
-    ):
-        raise ValueError(
-            "input/output vocabulary mismatch: "
-            f"expected={expected_vocab}, input={embedding.num_embeddings}, "
-            f"output={head.out_features}"
-        )
+    validate_stage1_vocab_alignment(qwen, expected_vocab)
 
 
 def _adapter_value(config, name: str):
@@ -1316,6 +1329,7 @@ def load_stage1_peft_artifact(
     _validate_adapter_config(qwen, adapter_config, metadata)
 
     candidate.resize_token_embeddings(metadata.resized_vocab_size)
+    _validate_architecture(qwen, metadata, resized=True)
     initialize_frozen_output_token_rows(candidate, metadata.latent_token_ids)
     _configure_latent_config(candidate.config, metadata)
     adapter_config.inference_mode = not is_trainable
@@ -1653,4 +1667,5 @@ __all__ = [
     "resolve_stage1_resume",
     "save_stage1_peft_artifact",
     "save_stage1_peft_metadata",
+    "validate_stage1_vocab_alignment",
 ]

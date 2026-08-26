@@ -17,6 +17,7 @@ from .helpers import tiny_stage2_qwen
 from src.peft_common import capture_qwen2_5_vl_architecture
 from stage2.checkpointing import (
     STAGE2_PEFT_METADATA_FILENAME,
+    STAGE2_PEFT_SCHEMA_VERSION,
     Stage2PeftMetadata,
     _capture_base_model_architecture as capture_stage2_base_model_architecture,
     build_stage2_peft_metadata,
@@ -38,7 +39,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 def sample_metadata() -> Stage2PeftMetadata:
     return Stage2PeftMetadata(
-        schema_version=3,
+        schema_version=STAGE2_PEFT_SCHEMA_VERSION,
         stage="stage2",
         tuning_method="dora",
         base_model_reference="/models/stage1",
@@ -90,6 +91,9 @@ def sample_metadata() -> Stage2PeftMetadata:
                 "window_size": 2,
             },
         },
+        tokenizer_base_vocab_size=125,
+        pretrained_model_vocab_size=125,
+        resized_vocab_size=128,
         latent_size=8,
         latent_start_token_id=91,
         latent_pad_token_id=90,
@@ -110,10 +114,19 @@ def sample_metadata() -> Stage2PeftMetadata:
 
 
 def complete_v2_metadata() -> dict[str, object]:
-    payload = sample_metadata().to_dict()
+    payload = complete_v3_metadata()
     payload["schema_version"] = 2
     payload.pop("token_row_source", None)
     payload.pop("stage1_adapter_reference", None)
+    return payload
+
+
+def complete_v3_metadata() -> dict[str, object]:
+    payload = sample_metadata().to_dict()
+    payload["schema_version"] = 3
+    payload.pop("tokenizer_base_vocab_size")
+    payload.pop("pretrained_model_vocab_size")
+    payload.pop("resized_vocab_size")
     return payload
 
 
@@ -121,7 +134,7 @@ def test_complete_v2_metadata_migrates_in_memory_to_base_rows():
     """Catches removing strict compatibility for complete unreleased v2 artifacts."""
     metadata = migrate_stage2_metadata(complete_v2_metadata())
 
-    assert metadata.schema_version == 3
+    assert metadata.schema_version == STAGE2_PEFT_SCHEMA_VERSION == 4
     assert metadata.token_row_source == "base"
     assert metadata.stage1_adapter_reference is None
 
@@ -151,17 +164,86 @@ def test_inexact_legacy_stage2_metadata_fails_closed(mutation, message):
         migrate_stage2_metadata(payload)
 
 
-def test_new_stage2_metadata_writes_schema_v3_base_provenance_fields(tmp_path):
-    """Catches newly saved Stage 2 sidecars silently remaining on schema v2."""
+def test_complete_v3_metadata_migrates_with_explicit_unpadded_provenance():
+    metadata = migrate_stage2_metadata(complete_v3_metadata())
+
+    assert metadata.schema_version == 4
+    assert metadata.tokenizer_base_vocab_size == 125
+    assert metadata.pretrained_model_vocab_size == 125
+    assert metadata.resized_vocab_size == 128
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_inexact_legacy_stage2_v3_metadata_fails_closed(mutation):
+    payload = complete_v3_metadata()
+    if mutation == "missing":
+        payload.pop("base_model_architecture")
+    else:
+        payload["pretrained_model_vocab_size"] = 132
+
+    with pytest.raises(ValueError, match="complete v3"):
+        migrate_stage2_metadata(payload)
+
+
+@pytest.mark.parametrize("pretrained_vocab_size", [125, 132])
+def test_schema_v4_accepts_exact_or_padded_pretrained_vocab(pretrained_vocab_size):
+    payload = sample_metadata().to_dict()
+    payload["pretrained_model_vocab_size"] = pretrained_vocab_size
+
+    metadata = Stage2PeftMetadata.from_dict(payload)
+
+    assert metadata.tokenizer_base_vocab_size == 125
+    assert metadata.pretrained_model_vocab_size == pretrained_vocab_size
+    assert metadata.resized_vocab_size == 128
+
+
+def test_schema_v4_rejects_pretrained_vocab_smaller_than_tokenizer_base():
+    payload = sample_metadata().to_dict()
+    payload["pretrained_model_vocab_size"] = 124
+
+    with pytest.raises(ValueError, match="pretrained_model_vocab_size.*base"):
+        Stage2PeftMetadata.from_dict(payload)
+
+
+def test_sparse_metadata_builder_requires_complete_stage1_vocab_provenance():
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    tuning = Stage2TuningConfig(
+        method="dora",
+        r=2,
+        alpha=4,
+        dropout=0.0,
+        target_modules=("q_proj", "v_proj"),
+    )
+
+    with pytest.raises(ValueError, match="complete Stage 1 vocabulary provenance"):
+        build_stage2_peft_metadata(
+            tuning=tuning,
+            base_model_reference="stage1/tiny",
+            model_config=model.config,
+            token_ids=LatentTokenIds(90, 91, 92),
+            resolved_target_names=resolve_stage2_target_module_names(
+                model, tuning.target_modules
+            ),
+            token_row_source="sparse_adapter",
+            stage1_adapter_reference="stage1/adapter",
+        )
+
+
+def test_new_stage2_metadata_writes_schema_v4_vocab_provenance_fields(tmp_path):
+    """Catches new Stage 2 sidecars losing padded original provenance."""
     metadata = sample_metadata()
     save_stage2_peft_metadata(tmp_path, metadata)
     payload = json.loads(
         (tmp_path / STAGE2_PEFT_METADATA_FILENAME).read_text(encoding="utf-8")
     )
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["token_row_source"] == "base"
     assert payload["stage1_adapter_reference"] is None
+    assert payload["tokenizer_base_vocab_size"] == 125
+    assert payload["pretrained_model_vocab_size"] == 125
+    assert payload["resized_vocab_size"] == 128
 
 
 @pytest.mark.parametrize("missing", [True, False])
@@ -171,6 +253,9 @@ def test_sparse_stage2_artifact_requires_its_own_exact_token_rows(tmp_path, miss
     payload.update(
         token_row_source="sparse_adapter",
         stage1_adapter_reference="/deleted/stage1/provenance-only",
+        latent_pad_token_id=125,
+        latent_start_token_id=126,
+        latent_end_token_id=127,
     )
     (tmp_path / STAGE2_PEFT_METADATA_FILENAME).write_text(
         json.dumps(payload) + "\n", encoding="utf-8"
@@ -180,7 +265,7 @@ def test_sparse_stage2_artifact_requires_its_own_exact_token_rows(tmp_path, miss
     if not missing:
         save_file(
             {
-                "token_ids": torch.tensor([90, 91, 92], dtype=torch.int64),
+                "token_ids": torch.tensor([125, 126, 127], dtype=torch.int64),
                 "output_delta": torch.zeros((3, 8), dtype=torch.float32),
             },
             tmp_path / "ilvr_token_rows.safetensors",
@@ -201,13 +286,20 @@ def test_sparse_stage2_artifact_rejects_mismatched_payload(tmp_path, mutation):
     payload.update(
         token_row_source="sparse_adapter",
         stage1_adapter_reference="/provenance-only/stage1",
+        latent_pad_token_id=125,
+        latent_start_token_id=126,
+        latent_end_token_id=127,
     )
     (tmp_path / STAGE2_PEFT_METADATA_FILENAME).write_text(
         json.dumps(payload) + "\n", encoding="utf-8"
     )
     (tmp_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
     (tmp_path / "adapter_model.safetensors").touch()
-    token_ids = [90, 99, 92] if mutation == "token_ids" else [90, 91, 92]
+    token_ids = (
+        [125, 99, 127]
+        if mutation == "token_ids"
+        else [125, 126, 127]
+    )
     output_shape = (3, 7) if mutation == "output_shape" else (3, 8)
     save_file(
         {
@@ -227,6 +319,9 @@ def _write_structural_stage2_peft(directory, *, sparse=True):
     metadata = replace(
         sample_metadata(),
         token_row_source="sparse_adapter" if sparse else "base",
+        latent_pad_token_id=125 if sparse else 90,
+        latent_start_token_id=126 if sparse else 91,
+        latent_end_token_id=127 if sparse else 92,
         stage1_adapter_reference=(
             "/deleted/stage1/provenance-only" if sparse else None
         ),
@@ -237,7 +332,7 @@ def _write_structural_stage2_peft(directory, *, sparse=True):
     if sparse:
         save_file(
             {
-                "token_ids": torch.tensor([90, 91, 92], dtype=torch.int64),
+                "token_ids": torch.tensor([125, 126, 127], dtype=torch.int64),
                 "output_delta": torch.zeros((3, 8), dtype=torch.float32),
             },
             directory / "ilvr_token_rows.safetensors",
@@ -1188,6 +1283,9 @@ def test_stage2_sparse_deepspeed_save_has_all_rank_collective_participation(
         sample_metadata(),
         token_row_source="sparse_adapter",
         stage1_adapter_reference="/deleted/stage1/provenance-only",
+        latent_pad_token_id=125,
+        latent_start_token_id=126,
+        latent_end_token_id=127,
     )
     events = []
     temporary_targets = []

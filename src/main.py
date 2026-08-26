@@ -295,6 +295,21 @@ def build_stage2_training_components(
                 if stage1_preflight is not None
                 else None
             ),
+            tokenizer_base_vocab_size=(
+                stage1_metadata.base_vocab_size
+                if stage1_metadata is not None
+                else None
+            ),
+            pretrained_model_vocab_size=(
+                stage1_metadata.pretrained_model_vocab_size
+                if stage1_metadata is not None
+                else None
+            ),
+            resized_vocab_size=(
+                stage1_metadata.resized_vocab_size
+                if stage1_metadata is not None
+                else None
+            ),
         )
 
     raw_examples = load_jsonl_examples(Path(args.data_path))

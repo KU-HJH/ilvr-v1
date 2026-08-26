@@ -445,6 +445,9 @@ def fake_dependencies(
         resolve_target_names=lambda model, suffixes: tuple(
             f"model.layers.0.{suffix}" for suffix in suffixes
         ),
+        validate_vocab_alignment=lambda selected_model, expected_size: events.append(
+            ("vocab", selected_model, expected_size)
+        ),
         load_peft_metadata=lambda path: object(),
         decode_peft_metadata=lambda snapshot: metadata,
         load_peft_model=load_peft_model,
@@ -603,6 +606,9 @@ def test_fresh_stage1_accepts_exact_or_padded_pretrained_vocabulary_and_shrinks_
     assert processor.tokenizer.add_calls == [LATENT_TOKEN_STRINGS]
     assert model.resize_calls == [15]
     assert model.config.vocab_size == 15
+    assert [event[0] for event in events].index("vocab") < [
+        event[0] for event in events
+    ].index("topology")
     if method == "dora":
         assert len(metadata_calls) == 1
         assert metadata_calls[0]["base_vocab_size"] == 12

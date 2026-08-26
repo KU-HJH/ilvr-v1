@@ -648,9 +648,7 @@ def _preflight_stage2_inference_artifact(
         source_config = load_config(str(base_model_path), **source_kwargs)
         validate_stage2_sparse_original_base_config(source_config, metadata)
         preflight_config = deepcopy(source_config)
-        preflight_config.vocab_size = int(
-            metadata.base_model_architecture["decoder"]["vocab_size"]
-        )
+        preflight_config.vocab_size = metadata.resized_vocab_size
         configure_stage2_metadata(
             preflight_config,
             token_ids,

@@ -438,6 +438,43 @@ def load_verified_evidence(
 
 
 _SMOKE_MARKER_FILENAME = "checkpoint-topology.json"
+_FAILED_ATTEMPT_ARCHIVE_NAMESPACE = ".failed-attempts"
+
+
+def archive_failed_distributed_attempt(evidence_dir: str | Path) -> Path:
+    """Atomically archive one whole failed smoke directory exactly once."""
+
+    source = Path(evidence_dir)
+    if source.is_symlink():
+        raise ValueError("failed smoke evidence directory must not be a symlink")
+    if not source.is_dir():
+        raise FileNotFoundError(f"failed smoke evidence directory is missing: {source}")
+    resolved_source = source.resolve(strict=True)
+    parent = source.parent.resolve(strict=True)
+    if resolved_source.parent != parent or resolved_source.name not in {"full", "dora"}:
+        raise ValueError(
+            "failed smoke evidence directory must be a canonical full/dora child"
+        )
+    for protected_name in ("evidence.json", _SMOKE_MARKER_FILENAME):
+        protected = resolved_source / protected_name
+        if protected.exists() or protected.is_symlink():
+            raise ValueError(
+                "refusing to archive smoke directory containing success "
+                f"evidence/marker: {protected}"
+            )
+    archive_root = parent / _FAILED_ATTEMPT_ARCHIVE_NAMESPACE
+    if archive_root.is_symlink():
+        raise ValueError("failed smoke archive namespace must not be a symlink")
+    if archive_root.exists() and not archive_root.is_dir():
+        raise ValueError("failed smoke archive namespace must be a directory")
+    archive_root.mkdir(mode=0o750, exist_ok=True)
+    if archive_root.resolve(strict=True).parent != parent:
+        raise ValueError("failed smoke archive namespace escaped its parent")
+    target = archive_root / f"{resolved_source.name}-attempt-1"
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"failed smoke archive target already exists: {target}")
+    resolved_source.rename(target)
+    return target
 
 
 def _checkpoint_file_topology(checkpoint: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -3603,6 +3640,9 @@ def _build_parser() -> argparse.ArgumentParser:
     check.add_argument("--micro-batch", type=int, required=True)
     check.add_argument("--world-size", type=int, required=True)
 
+    archive = subparsers.add_parser("archive-failed-attempt")
+    archive.add_argument("--evidence-dir", required=True)
+
     require = subparsers.add_parser("require-evidence")
     require.add_argument("paths", nargs="+")
 
@@ -3687,6 +3727,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("confirmed-candidate")
     elif command == "check-evidence":
         print(_check_evidence(args))
+    elif command == "archive-failed-attempt":
+        print(archive_failed_distributed_attempt(args.evidence_dir))
     elif command == "require-evidence":
         _require_evidence(args.paths)
         print("reusable-success")
@@ -3719,6 +3761,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "Stage1BenchmarkEvidence",
+    "archive_failed_distributed_attempt",
     "capacity_candidates",
     "config_digest",
     "fallback_candidates_after_initial_failure",

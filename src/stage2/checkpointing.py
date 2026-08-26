@@ -36,6 +36,7 @@ from stage1.checkpointing import (
     Stage1PeftMetadataSnapshot,
     decode_stage1_peft_metadata_snapshot,
     read_stage1_peft_metadata_snapshot,
+    validate_stage1_vocab_alignment,
 )
 from .peft import Stage2TuningConfig, resolve_stage2_target_module_names
 from transformers.utils.peft_utils import find_adapter_config_file
@@ -46,7 +47,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 
 
 STAGE2_PEFT_METADATA_FILENAME = "stage2_peft_metadata.json"
-STAGE2_PEFT_SCHEMA_VERSION = 3
+STAGE2_PEFT_SCHEMA_VERSION = 4
 
 
 class Stage2ArtifactKind(str, Enum):
@@ -282,6 +283,9 @@ class Stage2PeftMetadata:
     tuning_method: str
     base_model_reference: str
     base_model_architecture: dict[str, object]
+    tokenizer_base_vocab_size: int
+    pretrained_model_vocab_size: int
+    resized_vocab_size: int
     latent_size: int
     latent_start_token_id: int
     latent_pad_token_id: int
@@ -310,7 +314,15 @@ class Stage2PeftMetadata:
         return migrate_stage2_metadata(payload)
 
 
-_V3_STAGE2_PEFT_FIELDS = {field.name for field in fields(Stage2PeftMetadata)}
+_V4_STAGE2_PEFT_FIELDS = {field.name for field in fields(Stage2PeftMetadata)}
+_V3_STAGE2_PEFT_FIELDS = frozenset(
+    _V4_STAGE2_PEFT_FIELDS
+    - {
+        "tokenizer_base_vocab_size",
+        "pretrained_model_vocab_size",
+        "resized_vocab_size",
+    }
+)
 _V2_STAGE2_PEFT_FIELDS = frozenset(
     {
         "schema_version",
@@ -333,15 +345,15 @@ _V2_STAGE2_PEFT_FIELDS = frozenset(
 )
 
 
-def _parse_stage2_metadata_v3(
+def _parse_stage2_metadata_v4(
     payload: Mapping[str, object],
 ) -> Stage2PeftMetadata:
-    if set(payload) != _V3_STAGE2_PEFT_FIELDS:
+    if set(payload) != _V4_STAGE2_PEFT_FIELDS:
         actual = set(payload)
         raise ValueError(
             "invalid Stage 2 PEFT metadata fields: "
-            f"missing={sorted(_V3_STAGE2_PEFT_FIELDS - actual)}, "
-            f"unknown={sorted(actual - _V3_STAGE2_PEFT_FIELDS)}"
+            f"missing={sorted(_V4_STAGE2_PEFT_FIELDS - actual)}, "
+            f"unknown={sorted(actual - _V4_STAGE2_PEFT_FIELDS)}"
         )
     if payload["stage"] != "stage2":
         raise ValueError("Stage 2 PEFT metadata must describe stage2")
@@ -359,6 +371,9 @@ def _parse_stage2_metadata_v3(
 
     integer_fields = (
         "schema_version",
+        "tokenizer_base_vocab_size",
+        "pretrained_model_vocab_size",
+        "resized_vocab_size",
         "latent_size",
         "latent_start_token_id",
         "latent_pad_token_id",
@@ -404,21 +419,63 @@ def _parse_stage2_metadata_v3(
     )
     if payload["latent_size"] <= 0:
         raise ValueError("latent_size must be positive")
-    if any(payload[name] < 0 for name in integer_fields[2:5]):
+    if any(
+        payload[name] <= 0
+        for name in (
+            "tokenizer_base_vocab_size",
+            "pretrained_model_vocab_size",
+            "resized_vocab_size",
+        )
+    ):
+        raise ValueError("Stage 2 vocabulary sizes must be positive")
+    if any(
+        payload[name] < 0
+        for name in (
+            "latent_start_token_id",
+            "latent_pad_token_id",
+            "latent_end_token_id",
+        )
+    ):
         raise ValueError("latent token IDs must be non-negative")
     if len(set(converted["resolved_target_module_names"])) != len(
         converted["resolved_target_module_names"]
     ):
         raise ValueError("resolved target module names must be unique")
 
+    architecture = _normalize_base_model_architecture(
+        payload["base_model_architecture"]
+    )
+    tokenizer_base_vocab_size = payload["tokenizer_base_vocab_size"]
+    pretrained_model_vocab_size = payload["pretrained_model_vocab_size"]
+    resized_vocab_size = payload["resized_vocab_size"]
+    if resized_vocab_size != tokenizer_base_vocab_size + 3:
+        raise ValueError("resized_vocab_size must add exactly three latent tokens")
+    if pretrained_model_vocab_size < tokenizer_base_vocab_size:
+        raise ValueError(
+            "pretrained_model_vocab_size must be at least tokenizer_base_vocab_size"
+        )
+    if architecture["decoder"]["vocab_size"] != resized_vocab_size:
+        raise ValueError(
+            "Stage 2 architecture vocab_size must equal resized_vocab_size"
+        )
+    if payload["token_row_source"] == "sparse_adapter" and (
+        payload["latent_pad_token_id"],
+        payload["latent_start_token_id"],
+        payload["latent_end_token_id"],
+    ) != tuple(range(tokenizer_base_vocab_size, resized_vocab_size)):
+        raise ValueError(
+            "sparse Stage 2 latent IDs must be the exact appended tokenizer rows"
+        )
+
     return Stage2PeftMetadata(
         schema_version=STAGE2_PEFT_SCHEMA_VERSION,
         stage="stage2",
         tuning_method=tuning.method,
         base_model_reference=payload["base_model_reference"],
-        base_model_architecture=_normalize_base_model_architecture(
-            payload["base_model_architecture"]
-        ),
+        base_model_architecture=architecture,
+        tokenizer_base_vocab_size=tokenizer_base_vocab_size,
+        pretrained_model_vocab_size=pretrained_model_vocab_size,
+        resized_vocab_size=resized_vocab_size,
         latent_size=payload["latent_size"],
         latent_start_token_id=payload["latent_start_token_id"],
         latent_pad_token_id=payload["latent_pad_token_id"],
@@ -436,7 +493,7 @@ def _parse_stage2_metadata_v3(
 
 
 def migrate_stage2_metadata(raw: Mapping[str, object]) -> Stage2PeftMetadata:
-    """Strictly parse v3 or migrate one exact complete v2 payload in memory."""
+    """Strictly parse v4 or migrate exact complete v2/v3 payloads."""
     if not isinstance(raw, Mapping):
         raise ValueError("Stage 2 PEFT metadata must be a JSON object")
     schema_version = raw.get("schema_version")
@@ -457,13 +514,35 @@ def migrate_stage2_metadata(raw: Mapping[str, object]) -> Stage2PeftMetadata:
             )
         migrated = dict(raw)
         migrated.update(
-            schema_version=STAGE2_PEFT_SCHEMA_VERSION,
+            schema_version=3,
             token_row_source="base",
             stage1_adapter_reference=None,
         )
-        return _parse_stage2_metadata_v3(migrated)
+        raw = migrated
+        schema_version = 3
+    if schema_version == 3:
+        actual = set(raw)
+        if actual != _V3_STAGE2_PEFT_FIELDS:
+            raise ValueError(
+                "Stage 2 PEFT migration requires an exact complete v3 payload: "
+                f"missing={sorted(_V3_STAGE2_PEFT_FIELDS - actual)}, "
+                f"unknown={sorted(actual - _V3_STAGE2_PEFT_FIELDS)}"
+            )
+        migrated = dict(raw)
+        architecture = _normalize_base_model_architecture(
+            migrated["base_model_architecture"]
+        )
+        resized_vocab_size = int(architecture["decoder"]["vocab_size"])
+        tokenizer_base_vocab_size = resized_vocab_size - 3
+        migrated.update(
+            schema_version=STAGE2_PEFT_SCHEMA_VERSION,
+            tokenizer_base_vocab_size=tokenizer_base_vocab_size,
+            pretrained_model_vocab_size=tokenizer_base_vocab_size,
+            resized_vocab_size=resized_vocab_size,
+        )
+        return _parse_stage2_metadata_v4(migrated)
     if schema_version == STAGE2_PEFT_SCHEMA_VERSION:
-        return _parse_stage2_metadata_v3(raw)
+        return _parse_stage2_metadata_v4(raw)
     raise ValueError(
         "unsupported Stage 2 PEFT metadata schema: "
         f"expected={STAGE2_PEFT_SCHEMA_VERSION}, actual={schema_version}"
@@ -479,17 +558,55 @@ def build_stage2_peft_metadata(
     resolved_target_names: Sequence[str],
     token_row_source: str = "base",
     stage1_adapter_reference: str | None = None,
+    tokenizer_base_vocab_size: int | None = None,
+    pretrained_model_vocab_size: int | None = None,
+    resized_vocab_size: int | None = None,
 ) -> Stage2PeftMetadata:
     """Build the sidecar for a fresh Stage 2 PEFT run."""
     if not tuning.is_peft:
         raise ValueError("Stage 2 PEFT metadata requires LoRA or DoRA tuning")
+    vocab_provenance = (
+        tokenizer_base_vocab_size,
+        pretrained_model_vocab_size,
+        resized_vocab_size,
+    )
+    if token_row_source == "sparse_adapter" and any(
+        value is None for value in vocab_provenance
+    ):
+        raise ValueError(
+            "sparse Stage 2 metadata requires complete Stage 1 vocabulary provenance"
+        )
+    if token_row_source != "sparse_adapter" and any(
+        value is not None for value in vocab_provenance
+    ) and any(value is None for value in vocab_provenance):
+        raise ValueError("Stage 2 vocabulary provenance must be provided all-or-none")
+    architecture = _capture_base_model_architecture(model_config)
+    architecture_vocab_size = int(architecture["decoder"]["vocab_size"])
+    resized_vocab_size = (
+        architecture_vocab_size
+        if resized_vocab_size is None
+        else resized_vocab_size
+    )
+    tokenizer_base_vocab_size = (
+        resized_vocab_size - 3
+        if tokenizer_base_vocab_size is None
+        else tokenizer_base_vocab_size
+    )
+    pretrained_model_vocab_size = (
+        tokenizer_base_vocab_size
+        if pretrained_model_vocab_size is None
+        else pretrained_model_vocab_size
+    )
     return Stage2PeftMetadata.from_dict(
         {
             "schema_version": STAGE2_PEFT_SCHEMA_VERSION,
             "stage": "stage2",
             "tuning_method": tuning.method,
             "base_model_reference": str(base_model_reference),
-            "base_model_architecture": _capture_base_model_architecture(model_config),
+            "base_model_architecture": architecture,
+            "tokenizer_base_vocab_size": tokenizer_base_vocab_size,
+            "pretrained_model_vocab_size": pretrained_model_vocab_size,
+            "resized_vocab_size": resized_vocab_size,
             "latent_size": getattr(model_config, "latent_size", None),
             "latent_start_token_id": token_ids.start_token_id,
             "latent_pad_token_id": token_ids.pad_token_id,
@@ -942,15 +1059,14 @@ def prepare_stage2_sparse_token_base(
     qwen = _resolve_stage1_qwen_base(base_model, expected_stage=None)
     validate_stage2_sparse_original_base_config(qwen.config, metadata)
     token_ids = validate_stage2_sparse_processor(tokenizer, metadata)
-    expected_vocab_size = int(
-        metadata.base_model_architecture["decoder"]["vocab_size"]
-    )
+    expected_vocab_size = metadata.resized_vocab_size
     ordered_ids = (
         token_ids.pad_token_id,
         token_ids.start_token_id,
         token_ids.end_token_id,
     )
     base_model.resize_token_embeddings(expected_vocab_size)
+    validate_stage1_vocab_alignment(base_model, expected_vocab_size)
     initialize_frozen_output_token_rows(base_model, ordered_ids)
     configure_stage2_metadata(
         qwen.config,
@@ -986,8 +1102,9 @@ def validate_stage2_sparse_original_base_config(
             f"{peft_metadata_fields}"
         )
     expected_architecture = deepcopy(metadata.base_model_architecture)
-    resized_vocab_size = int(expected_architecture["decoder"]["vocab_size"])
-    expected_architecture["decoder"]["vocab_size"] = resized_vocab_size - 3
+    expected_architecture["decoder"]["vocab_size"] = (
+        metadata.pretrained_model_vocab_size
+    )
     actual_architecture = _capture_base_model_architecture(config)
     architecture_difference = _first_architecture_difference(
         expected_architecture, actual_architecture
@@ -1007,9 +1124,7 @@ def validate_stage2_sparse_processor(
 
     if metadata.token_row_source != "sparse_adapter":
         raise ValueError("sparse processor validation requires sparse_adapter metadata")
-    expected_vocab_size = int(
-        metadata.base_model_architecture["decoder"]["vocab_size"]
-    )
+    expected_vocab_size = metadata.resized_vocab_size
     if len(tokenizer) != expected_vocab_size:
         raise ValueError(
             "sparse Stage 2 processor vocabulary mismatch: "
@@ -1021,7 +1136,9 @@ def validate_stage2_sparse_processor(
         token_ids.start_token_id,
         token_ids.end_token_id,
     )
-    expected_ids = tuple(range(expected_vocab_size - 3, expected_vocab_size))
+    expected_ids = tuple(
+        range(metadata.tokenizer_base_vocab_size, expected_vocab_size)
+    )
     if ordered_ids != expected_ids or ordered_ids != (
         metadata.latent_pad_token_id,
         metadata.latent_start_token_id,

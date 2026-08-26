@@ -14,6 +14,7 @@ import pytest
 
 from stage1.benchmark import (
     Stage1BenchmarkEvidence,
+    archive_failed_distributed_attempt,
     capacity_candidates,
     fallback_candidates_after_initial_failure,
     load_verified_evidence,
@@ -1401,3 +1402,123 @@ def test_distributed_smoke_reuse_rejects_a_tampered_small_checkpoint_marker(tmp_
 
     with pytest.raises(ValueError, match="checkpoint topology.*digest"):
         benchmark.run_or_load_distributed_witness(**kwargs)
+
+
+def test_failed_smoke_must_be_archived_whole_before_lightweight_retry(tmp_path):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    failed_log = evidence_dir / "initial.log"
+    failed_log.parent.mkdir(parents=True)
+    failed_log.write_bytes(b"original failed attempt\n")
+    before = failed_log.stat()
+    kwargs = dict(
+        method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path, image_root=image_root, micro_batch=2,
+        gradient_accumulation_steps=2, world_size=2, initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir, launcher_path=launcher,
+    )
+
+    with pytest.raises(FileExistsError, match="incomplete or stale"):
+        benchmark.run_or_load_distributed_witness(**kwargs)
+
+    archived = archive_failed_distributed_attempt(evidence_dir)
+    archived_log = archived / "initial.log"
+    after = archived_log.stat()
+    assert archived == evidence_dir.parent / ".failed-attempts" / "full-attempt-1"
+    assert not evidence_dir.exists()
+    assert archived_log.read_bytes() == b"original failed attempt\n"
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino, before.st_size, before.st_mtime_ns
+    )
+    with pytest.raises(FileNotFoundError, match="missing"):
+        archive_failed_distributed_attempt(evidence_dir)
+
+    observed = benchmark.run_or_load_distributed_witness(**kwargs)
+    assert observed.resume_final_step == 4
+    assert len(list(records.iterdir())) == 2
+
+    with pytest.raises((FileExistsError, ValueError), match="archive|evidence|marker"):
+        archive_failed_distributed_attempt(evidence_dir)
+
+
+@pytest.mark.parametrize("corruption", ["source_symlink", "archive_symlink", "target"])
+def test_failed_smoke_archive_rejects_unsafe_or_reused_paths(tmp_path, corruption):
+    evidence_dir = tmp_path / "evidence" / "full"
+    real_source = tmp_path / "real-failure"
+    real_source.mkdir(parents=True)
+    (real_source / "initial.log").write_bytes(b"failure")
+    evidence_dir.parent.mkdir(parents=True)
+    if corruption == "source_symlink":
+        evidence_dir.symlink_to(real_source, target_is_directory=True)
+    else:
+        real_source.rename(evidence_dir)
+        archive_root = evidence_dir.parent / ".failed-attempts"
+        if corruption == "archive_symlink":
+            archive_root.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+        else:
+            archive_root.mkdir()
+            (archive_root / "full-attempt-1").mkdir()
+
+    with pytest.raises((ValueError, FileExistsError), match="symlink|archive|target"):
+        archive_failed_distributed_attempt(evidence_dir)
+
+    assert evidence_dir.exists()
+
+
+def test_archive_failed_attempt_cli_moves_only_the_complete_directory(tmp_path):
+    evidence_dir = tmp_path / "evidence" / "dora"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "initial.log").write_bytes(b"failed dora")
+
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+            "-m",
+            "src.stage1.benchmark",
+            "archive-failed-attempt",
+            "--evidence-dir",
+            str(evidence_dir),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    target = evidence_dir.parent / ".failed-attempts" / "dora-attempt-1"
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(target)
+    assert (target / "initial.log").read_bytes() == b"failed dora"
+    assert not evidence_dir.exists()
+
+
+def test_invalid_distributed_method_environment_fails_collection_without_cuda(tmp_path):
+    environment = dict(os.environ)
+    environment.update(
+        ILVR_DISTRIBUTED_METHOD="invalid-method",
+        PYTHONDONTWRITEBYTECODE="1",
+        PYTHONPATH=os.pathsep.join(
+            (str(REPO_ROOT), str(REPO_ROOT / "transformers/src"), str(REPO_ROOT / "src"))
+        ),
+    )
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "venv/ilvr-venv/bin/pytest"),
+            "tests/stage1/test_distributed_smoke.py",
+            "--collect-only",
+            "-q",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "invalid ILVR_DISTRIBUTED_METHOD" in completed.stderr + completed.stdout
+    assert "cuda_initialized=True" not in completed.stderr + completed.stdout

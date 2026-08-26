@@ -35,6 +35,7 @@ from stage2.peft import (
     Stage2TuningConfig,
     build_stage2_tuned_model,
     load_stage1_dora_for_fresh_stage2,
+    load_stage2_model_for_inference,
     validate_stage2_parameter_boundary,
 )
 from stage2.trainer import Stage2Trainer
@@ -75,8 +76,14 @@ def stage2_dora_tuning(**overrides) -> Stage2TuningConfig:
     return Stage2TuningConfig(**values)
 
 
-def write_stage1_dora_artifact(directory):
-    base = tiny_original_qwen()
+def write_stage1_dora_artifact(directory, *, pretrained_vocab_size=None):
+    base = tiny_original_qwen(
+        **(
+            {}
+            if pretrained_vocab_size is None
+            else {"pretrained_vocab_size": pretrained_vocab_size}
+        )
+    )
     metadata = sample_metadata(base)
     base.resize_token_embeddings(RESIZED_VOCAB_SIZE)
     base.config.latent_token_id = LATENT_TOKEN_IDS[0]
@@ -118,12 +125,104 @@ def test_fresh_stage2_handoff_accepts_complete_legacy_stage1_v1_metadata(tmp_pat
     )
 
 
-def tiny_tag_free_original_qwen():
+def tiny_tag_free_original_qwen(*, pretrained_vocab_size=None):
     """Return the actual sparse-resume base shape without Stage 1 ILVR tags."""
-    model = tiny_original_qwen()
+    model = tiny_original_qwen(
+        **(
+            {}
+            if pretrained_vocab_size is None
+            else {"pretrained_vocab_size": pretrained_vocab_size}
+        )
+    )
     model.config.__dict__.pop("stage", None)
     model.config.__dict__.pop("latent_size", None)
     return model
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_padded_stage1_v2_to_self_contained_stage2_direct_and_inference_parity(
+    tmp_path,
+):
+    pretrained_vocab_size = 132
+    stage1_dir = tmp_path / "stage1"
+    stage2_dir = tmp_path / "stage2"
+    processor, stage1_metadata = write_stage1_dora_artifact(
+        stage1_dir,
+        pretrained_vocab_size=pretrained_vocab_size,
+    )
+    tuning = stage2_dora_tuning()
+    continued = load_stage1_dora_for_fresh_stage2(
+        tiny_original_qwen(pretrained_vocab_size=pretrained_vocab_size),
+        processor,
+        stage1_dir,
+        tuning,
+    )
+    qwen = resolve_qwen2_5_vl_model(continued)
+    configure_stage2_metadata(
+        qwen.config,
+        LatentTokenIds(*LATENT_TOKEN_IDS),
+        latent_size=stage1_metadata.latent_size,
+        supervise_latent_boundaries=True,
+    )
+    metadata = build_stage2_peft_metadata(
+        tuning=tuning,
+        base_model_reference=stage1_metadata.base_model_reference,
+        model_config=qwen.config,
+        token_ids=LatentTokenIds(*LATENT_TOKEN_IDS),
+        resolved_target_names=stage1_metadata.resolved_target_names,
+        token_row_source="sparse_adapter",
+        stage1_adapter_reference=str(stage1_dir.resolve()),
+        tokenizer_base_vocab_size=stage1_metadata.base_vocab_size,
+        pretrained_model_vocab_size=stage1_metadata.pretrained_model_vocab_size,
+        resized_vocab_size=stage1_metadata.resized_vocab_size,
+    )
+    Stage2Trainer(
+        model=continued,
+        args=TrainingArguments(
+            output_dir=str(stage2_dir), report_to=[], use_cpu=True
+        ),
+        stage2_peft_metadata=metadata,
+    ).save_model(stage2_dir)
+    processor.save_pretrained(stage2_dir)
+    fixed_hidden = torch.linspace(-0.4, 0.9, 16).reshape(2, 8)
+    expected_logits = qwen.lm_head(fixed_hidden).detach()
+    shutil.rmtree(stage1_dir)
+
+    direct_base = tiny_tag_free_original_qwen(
+        pretrained_vocab_size=pretrained_vocab_size
+    )
+    prepare_stage2_sparse_token_base(
+        direct_base, processor.tokenizer, load_stage2_peft_metadata(stage2_dir)
+    )
+    direct = build_stage2_tuned_model(
+        direct_base,
+        tuning,
+        adapter_path=stage2_dir,
+        is_trainable=True,
+        token_row_source="sparse_adapter",
+        latent_token_ids=LATENT_TOKEN_IDS,
+    )
+    torch.testing.assert_close(
+        resolve_qwen2_5_vl_model(direct).lm_head(fixed_hidden), expected_logits
+    )
+
+    inference = load_stage2_model_for_inference(
+        "tiny/original-qwen",
+        stage2_dir,
+        processor,
+        discover_adapter_config=lambda unused, **unused_kwargs: None,
+        load_config=lambda unused, **unused_kwargs: deepcopy(
+            tiny_tag_free_original_qwen(
+                pretrained_vocab_size=pretrained_vocab_size
+            ).config
+        ),
+        load_model=lambda unused, **unused_kwargs: tiny_tag_free_original_qwen(
+            pretrained_vocab_size=pretrained_vocab_size
+        ),
+    )
+    torch.testing.assert_close(
+        resolve_qwen2_5_vl_model(inference).lm_head(fixed_hidden), expected_logits
+    )
 
 
 def active_stage1_state(model) -> dict[str, torch.Tensor]:
@@ -164,6 +263,9 @@ def write_sparse_stage2_artifact(stage1_dir, stage2_dir):
         resolved_target_names=stage1_metadata.resolved_target_names,
         token_row_source="sparse_adapter",
         stage1_adapter_reference=str(stage1_dir.resolve()),
+        tokenizer_base_vocab_size=stage1_metadata.base_vocab_size,
+        pretrained_model_vocab_size=stage1_metadata.pretrained_model_vocab_size,
+        resized_vocab_size=stage1_metadata.resized_vocab_size,
     )
     Stage2Trainer(
         model=continued,
@@ -367,7 +469,9 @@ def test_main_handoff_consumes_preflight_before_large_base_load(
     tmp_path, monkeypatch
 ):
     """Catches reopening Stage 1 payloads or validating them after base weights."""
-    processor, _ = write_stage1_dora_artifact(tmp_path)
+    processor, _ = write_stage1_dora_artifact(
+        tmp_path, pretrained_vocab_size=132
+    )
     args = stage2_args(
         stage1_adapter_path=str(tmp_path),
         load_model_path="tiny/original-qwen",
@@ -394,7 +498,7 @@ def test_main_handoff_consumes_preflight_before_large_base_load(
         assert source == "tiny/original-qwen"
         assert calls.preflight is True
         calls.model_loads += 1
-        return tiny_original_qwen()
+        return tiny_original_qwen(pretrained_vocab_size=132)
 
     monkeypatch.setattr(
         main.AutoProcessor, "from_pretrained", lambda source: processor
@@ -402,7 +506,7 @@ def test_main_handoff_consumes_preflight_before_large_base_load(
     monkeypatch.setattr(
         main.AutoConfig,
         "from_pretrained",
-        lambda source: tiny_original_qwen().config,
+        lambda source: tiny_original_qwen(pretrained_vocab_size=132).config,
     )
     monkeypatch.setattr(
         main,
@@ -423,6 +527,9 @@ def test_main_handoff_consumes_preflight_before_large_base_load(
     assert components.trainer_resume_path is None
     assert components.peft_metadata.token_row_source == "sparse_adapter"
     assert components.peft_metadata.stage1_adapter_reference == str(tmp_path.resolve())
+    assert components.peft_metadata.tokenizer_base_vocab_size == 125
+    assert components.peft_metadata.pretrained_model_vocab_size == 132
+    assert components.peft_metadata.resized_vocab_size == 128
     assert resolve_qwen2_5_vl_model(components.model).config.stage == "stage2"
 
 
@@ -540,6 +647,9 @@ def test_saved_sparse_stage2_adapter_reloads_after_stage1_source_is_deleted(tmp_
         resolved_target_names=stage1_metadata.resolved_target_names,
         token_row_source="sparse_adapter",
         stage1_adapter_reference=str(stage1_dir.resolve()),
+        tokenizer_base_vocab_size=stage1_metadata.base_vocab_size,
+        pretrained_model_vocab_size=stage1_metadata.pretrained_model_vocab_size,
+        resized_vocab_size=stage1_metadata.resized_vocab_size,
     )
     expected_state = active_stage1_state(continued)
     fixed_hidden = torch.linspace(-0.4, 0.9, 16).reshape(2, 8)
@@ -596,7 +706,7 @@ def test_saved_sparse_stage2_adapter_reloads_after_stage1_source_is_deleted(tmp_
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
 def test_sparse_stage2_resume_decision_uses_tag_free_original_base(tmp_path):
-    """Catches sparse v3 resume being routed through legacy Stage 1 tag checks."""
+    """Catches sparse v4 resume being routed through legacy Stage 1 tag checks."""
     stage1_dir = tmp_path / "stage1"
     stage2_dir = tmp_path / "checkpoint-1"
     _, tuning, metadata, _ = write_sparse_stage2_artifact(
@@ -1252,6 +1362,9 @@ def test_sparse_stage2_numbered_resume_matches_uninterrupted_training(tmp_path):
         resolved_target_names=stage1_metadata.resolved_target_names,
         token_row_source="sparse_adapter",
         stage1_adapter_reference=str(stage1_dir.resolve()),
+        tokenizer_base_vocab_size=stage1_metadata.base_vocab_size,
+        pretrained_model_vocab_size=stage1_metadata.pretrained_model_vocab_size,
+        resized_vocab_size=stage1_metadata.resized_vocab_size,
     )
     dataset = [_stage2_sparse_batch()]
 
