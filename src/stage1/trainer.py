@@ -13,6 +13,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from transformers import TrainerCallback
+from transformers.trainer import TRAINING_ARGS_NAME
 from trl import SFTTrainer
 
 from .ema import Stage1EmaTeacher
@@ -647,6 +648,26 @@ class CustomTrainerStage1(SFTTrainer):
                 if isinstance(value, torch.Tensor) and value.numel() == 1:
                     logs[f"stage1/{name}"] = float(value.item())
         super().log(logs, start_time=start_time)
+
+    def _save(self, output_dir=None, state_dict=None):
+        """Keep Trainer's gathered state while writing canonical PEFT weights."""
+
+        if self.stage1_peft_metadata is None:
+            return super()._save(output_dir, state_dict=state_dict)
+
+        from stage1.checkpointing import _save_stage1_peft_weights
+
+        target = Path(output_dir or self.args.output_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        _save_stage1_peft_weights(
+            self.model,
+            target,
+            state_dict=state_dict,
+            safe_serialization=self.args.save_safetensors,
+        )
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(target)
+        torch.save(self.args, target / TRAINING_ARGS_NAME)
 
     def save_model(self, output_dir=None, _internal_call=False):
         """Extend ordinary Trainer saves with strict Stage 1 PEFT sidecars."""

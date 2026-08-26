@@ -250,6 +250,42 @@ def saved_dora_artifact(tmp_path, stage1_dora_bundle):
     return tmp_path
 
 
+def _bind_resized_bundle_to_local_base_source(stage1_dora_bundle, directory):
+    """Expose PEFT's resized-vocabulary auto-save branch with a real config."""
+
+    original = tiny_original_qwen()
+    original.config.save_pretrained(directory)
+    source = str(directory)
+    stage1_dora_bundle.model.peft_config[
+        "default"
+    ].base_model_name_or_path = source
+    return replace(
+        stage1_dora_bundle,
+        metadata=replace(
+            stage1_dora_bundle.metadata,
+            base_model_reference=source,
+        ),
+    )
+
+
+def _assert_tiny_dora_adapter_excludes_full_embedding_layers(directory):
+    tensors = load_file(Path(directory) / "adapter_model.safetensors")
+    keys = set(tensors)
+
+    assert len(keys) == 22
+    assert sum(key.endswith("lora_A.weight") for key in keys) == 7
+    assert sum(key.endswith("lora_B.weight") for key in keys) == 7
+    assert sum(key.endswith("lora_magnitude_vector") for key in keys) == 7
+    assert sum(
+        key.endswith(
+            ".model.embed_tokens.token_adapter.trainable_tokens_delta"
+        )
+        for key in keys
+    ) == 1
+    assert not any(".lm_head." in key for key in keys)
+    assert not any(key.endswith("token_adapter.base_layer.weight") for key in keys)
+
+
 def _write_metadata(directory, metadata):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / STAGE1_PEFT_METADATA_FILENAME).write_text(
@@ -508,6 +544,31 @@ def test_dora_artifact_is_adapter_only_and_complete(
     assert (tmp_path / "preprocessor_config.json").is_file()
     assert not (tmp_path / "model.safetensors").exists()
     assert not (tmp_path / "pytorch_model.bin").exists()
+
+
+def test_direct_resized_peft_save_excludes_full_embedding_layers(
+    tmp_path, stage1_dora_bundle
+):
+    base_source = tmp_path / "base"
+    artifact = tmp_path / "adapter"
+    bundle = _bind_resized_bundle_to_local_base_source(
+        stage1_dora_bundle, base_source
+    )
+
+    save_stage1_peft_artifact(
+        bundle.model,
+        bundle.processor,
+        artifact,
+        bundle.metadata,
+    )
+
+    _assert_tiny_dora_adapter_excludes_full_embedding_layers(artifact)
+    preflight_stage1_peft_artifact(
+        bundle.processor,
+        deepcopy(tiny_original_qwen().config),
+        artifact,
+        requested_base_model_reference=str(base_source),
+    )
 
 
 @pytest.mark.parametrize(
@@ -2107,6 +2168,77 @@ def test_stage1_trainer_final_peft_save_is_adapter_only(
     assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.PEFT
     assert (tmp_path / "tokenizer.json").is_file()
     assert not (tmp_path / "model.safetensors").exists()
+
+
+def test_stage1_trainer_resized_peft_save_excludes_full_embedding_layers(
+    tmp_path, stage1_dora_bundle
+):
+    base_source = tmp_path / "base"
+    artifact = tmp_path / "adapter"
+    bundle = _bind_resized_bundle_to_local_base_source(
+        stage1_dora_bundle, base_source
+    )
+    trainer = CheckpointLifecycleTrainer(
+        model=bundle.model,
+        args=TrainingArguments(
+            output_dir=str(artifact), report_to=[], use_cpu=True
+        ),
+        processing_class=bundle.processor,
+        stage1_peft_metadata=bundle.metadata,
+    )
+
+    trainer.save_model(artifact)
+
+    _assert_tiny_dora_adapter_excludes_full_embedding_layers(artifact)
+    assert (artifact / "ilvr_token_rows.safetensors").is_file()
+    preflight_stage1_peft_artifact(
+        bundle.processor,
+        deepcopy(tiny_original_qwen().config),
+        artifact,
+        requested_base_model_reference=str(base_source),
+    )
+
+
+def test_stage1_trainer_peft_writer_preserves_gathered_state_dict(
+    tmp_path, stage1_dora_bundle
+):
+    base_source = tmp_path / "base"
+    artifact = tmp_path / "adapter"
+    bundle = _bind_resized_bundle_to_local_base_source(
+        stage1_dora_bundle, base_source
+    )
+    trainer = CheckpointLifecycleTrainer(
+        model=bundle.model,
+        args=TrainingArguments(
+            output_dir=str(artifact), report_to=[], use_cpu=True
+        ),
+        processing_class=bundle.processor,
+        stage1_peft_metadata=bundle.metadata,
+    )
+    gathered = {
+        name: tensor.detach().clone()
+        for name, tensor in bundle.model.state_dict().items()
+    }
+    gathered_name = next(
+        name
+        for name in gathered
+        if name.endswith("self_attn.q_proj.lora_A.default.weight")
+    )
+    gathered[gathered_name].fill_(0.375)
+
+    trainer._save(artifact, state_dict=gathered)
+
+    tensors = load_file(artifact / "adapter_model.safetensors")
+    saved_name = gathered_name.replace(".default", "")
+    torch.testing.assert_close(
+        tensors[saved_name],
+        torch.full_like(tensors[saved_name], 0.375),
+        rtol=0,
+        atol=0,
+    )
+    _assert_tiny_dora_adapter_excludes_full_embedding_layers(artifact)
+    assert (artifact / "training_args.bin").is_file()
+    assert (artifact / "tokenizer.json").is_file()
 
 
 def test_stage1_peft_save_uses_logical_zero_shape_before_collective(

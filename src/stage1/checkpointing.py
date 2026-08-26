@@ -1105,6 +1105,24 @@ def _save_stage1_peft_supplements(
     save_stage1_peft_metadata(Path(output_dir), metadata)
 
 
+def _save_stage1_peft_weights(
+    model: nn.Module,
+    output_dir: Path,
+    *,
+    state_dict: Mapping[str, torch.Tensor] | None = None,
+    safe_serialization: bool = True,
+) -> None:
+    """Write only the repository-owned PEFT and selective input-row state."""
+
+    candidate = _peft_model(model)
+    candidate.save_pretrained(
+        Path(output_dir),
+        state_dict=state_dict,
+        safe_serialization=safe_serialization,
+        save_embedding_layers=False,
+    )
+
+
 def save_stage1_peft_artifact(
     model: nn.Module,
     processor,
@@ -1123,7 +1141,7 @@ def save_stage1_peft_artifact(
                 f"refusing to mix Stage 1 PEFT with full weights: {full_markers}"
             )
     destination.mkdir(parents=True, exist_ok=True)
-    candidate.save_pretrained(destination, safe_serialization=True)
+    _save_stage1_peft_weights(candidate, destination)
     _save_stage1_peft_supplements(candidate, destination, metadata)
     processor.save_pretrained(destination)
     classify_stage1_artifact(destination)
