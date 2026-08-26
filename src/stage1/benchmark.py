@@ -2646,10 +2646,21 @@ def _load_probe_attempt(path: Path) -> dict[str, object]:
     return payload
 
 
-def _probe_data_argv_matches_materialized_input(
+_PROBE_REPOSITORY_RELATIVE_ARGV_FLAGS = frozenset(
+    {
+        "--data-path",
+        "--output-dir",
+        "--log-file",
+        "--benchmark-run-config",
+        "--producer-evidence",
+    }
+)
+
+
+def _probe_argv_path_matches_sealed_absolute(
     value: str, expected: str
 ) -> bool:
-    """Accept the current absolute spelling or the producer's legacy repo-relative one."""
+    """Accept an absolute seal or its exact legacy repository-relative spelling."""
 
     if value == expected:
         return True
@@ -2715,11 +2726,13 @@ def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
             if flag == "--learning-rate":
                 if float(value) != float(expected):
                     raise ValueError(f"probe argv value mismatch for {flag}")
-            elif flag == "--data-path":
-                if not _probe_data_argv_matches_materialized_input(value, expected):
-                    raise ValueError(
-                        "probe --data-path must equal the materialized audited probe input"
-                    )
+            elif flag in _PROBE_REPOSITORY_RELATIVE_ARGV_FLAGS:
+                if not _probe_argv_path_matches_sealed_absolute(value, expected):
+                    if flag == "--data-path":
+                        raise ValueError(
+                            "probe --data-path must equal the materialized audited probe input"
+                        )
+                    raise ValueError(f"probe argv value mismatch for {flag}")
             elif value != expected:
                 raise ValueError(f"probe argv value mismatch for {flag}")
         seen.add(flag)

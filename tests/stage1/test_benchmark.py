@@ -729,10 +729,11 @@ def test_attempt_rejects_data_argv_not_equal_to_materialized_audit_subset(tmp_pa
         benchmark._load_probe_attempt(attempt_path)
 
 
-def _rewrite_probe_attempt_data_argv(attempt_path, value):
+def _rewrite_probe_attempt_argv(attempt_path, replacements):
     payload = json.loads(attempt_path.read_text())
     for command in (payload["command"], payload["launch_config"]["command"]):
-        command[command.index("--data-path") + 1] = value
+        for flag, value in replacements.items():
+            command[command.index(flag) + 1] = value
     payload["config_digest"] = config_digest(payload["launch_config"])
     payload["attempt_digest"] = config_digest(
         {key: item for key, item in payload.items() if key != "attempt_digest"}
@@ -741,10 +742,24 @@ def _rewrite_probe_attempt_data_argv(attempt_path, value):
     return payload
 
 
-def test_pre_fix_repository_relative_probe_argv_can_be_classified(
-    tmp_path, monkeypatch
-):
-    """Catches the producer's sealed relative argv becoming self-incompatible."""
+def _probe_output_path_expectations(payload):
+    output_dir = Path(payload["output_dir"])
+    return {
+        "--data-path": payload["launch_config"]["train_data_path"],
+        "--output-dir": payload["output_dir"],
+        "--log-file": payload["stdout_path"].replace("stdout.log", "train.log"),
+        "--benchmark-run-config": str(
+            output_dir.parent / "evidence" / "run-config.json"
+        ),
+        "--producer-evidence": str(
+            output_dir.parent / "evidence" / "producer-evidence.json"
+        ),
+    }
+
+
+@pytest.fixture
+def pre_fix_preserved_relative_probe_attempt(tmp_path, monkeypatch):
+    """Materialize the exact relative-path shape of the retained old attempt."""
 
     completed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert completed.returncode == 42
@@ -753,15 +768,42 @@ def test_pre_fix_repository_relative_probe_argv_can_be_classified(
     import stage1.benchmark as benchmark
 
     monkeypatch.setattr(benchmark, "_REPOSITORY_ROOT", tmp_path, raising=False)
-    expected = json.loads(attempt_path.read_text())["launch_config"]["train_data_path"]
-    relative = str(Path(expected).relative_to(tmp_path))
-    _rewrite_probe_attempt_data_argv(attempt_path, relative)
+    payload = json.loads(attempt_path.read_text())
+    expected_paths = _probe_output_path_expectations(payload)
+    relative_paths = {
+        flag: str(Path(expected).relative_to(tmp_path))
+        for flag, expected in expected_paths.items()
+    }
+    assert set(relative_paths) == {
+        "--data-path",
+        "--output-dir",
+        "--log-file",
+        "--benchmark-run-config",
+        "--producer-evidence",
+    }
+    _rewrite_probe_attempt_argv(attempt_path, relative_paths)
+    return attempt_path, relative_paths
+
+
+def test_pre_fix_all_repository_relative_probe_paths_can_be_classified(
+    pre_fix_preserved_relative_probe_attempt,
+):
+    """Catches the producer's complete old relative argv becoming incompatible."""
+
+    attempt_path, relative_paths = pre_fix_preserved_relative_probe_attempt
+    import stage1.benchmark as benchmark
+
     original_attempt = attempt_path.read_bytes()
 
     loaded = benchmark._load_probe_attempt(attempt_path)
     benchmark._classify_failure(attempt_path, "integration_failure")
 
-    assert loaded["command"][loaded["command"].index("--data-path") + 1] == relative
+    for flag, value in relative_paths.items():
+        assert loaded["command"][loaded["command"].index(flag) + 1] == value
+    for flag in ("--source-data-path", "--image-root", "--deepspeed-config"):
+        value = loaded["command"][loaded["command"].index(flag) + 1]
+        assert Path(value).is_absolute()
+    assert Path(loaded["command"][0]).is_absolute()
     assert attempt_path.read_bytes() == original_attempt
     assert benchmark._failure_classification(attempt_path) == "integration_failure"
 
@@ -796,7 +838,7 @@ def test_pre_fix_probe_argv_compatibility_rejects_noncanonical_aliases(
         else:
             os.link(expected, alias_path)
         alias = alias_path.name
-    _rewrite_probe_attempt_data_argv(attempt_path, alias)
+    _rewrite_probe_attempt_argv(attempt_path, {"--data-path": alias})
 
     with pytest.raises(ValueError, match="materialized audited probe"):
         benchmark._load_probe_attempt(attempt_path)
@@ -812,9 +854,37 @@ def test_probe_argv_compatibility_rejects_relative_expected_outside_repository(
     expected = tmp_path / "outside" / "probe-input.jsonl"
     monkeypatch.setattr(benchmark, "_REPOSITORY_ROOT", repository_root)
 
-    assert not benchmark._probe_data_argv_matches_materialized_input(
+    assert not benchmark._probe_argv_path_matches_sealed_absolute(
         "../outside/probe-input.jsonl", str(expected)
     )
+
+
+@pytest.mark.parametrize(
+    ("flag", "sealed_field"),
+    [
+        ("--source-data-path", "data_path"),
+        ("--image-root", "image_root"),
+        ("--deepspeed-config", "deepspeed_config"),
+    ],
+)
+def test_probe_argv_relative_compatibility_excludes_input_authorities(
+    tmp_path, monkeypatch, flag, sealed_field
+):
+    completed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    assert completed.returncode == 42
+    attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    payload = json.loads(attempt_path.read_text())
+
+    import stage1.benchmark as benchmark
+
+    expected = Path(payload["launch_config"][sealed_field])
+    repository_root = REPO_ROOT if flag == "--deepspeed-config" else tmp_path
+    monkeypatch.setattr(benchmark, "_REPOSITORY_ROOT", repository_root)
+    relative = str(expected.relative_to(repository_root))
+    _rewrite_probe_attempt_argv(attempt_path, {flag: relative})
+
+    with pytest.raises(ValueError, match=f"value mismatch for {flag}"):
+        benchmark._load_probe_attempt(attempt_path)
 
 
 def test_public_verified_loader_accepts_the_authoritative_producer_envelope(tmp_path):
