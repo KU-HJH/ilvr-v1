@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 import hashlib
@@ -1437,6 +1438,16 @@ def test_failed_smoke_must_be_archived_whole_before_lightweight_retry(tmp_path):
     with pytest.raises(FileNotFoundError, match="missing"):
         archive_failed_distributed_attempt(evidence_dir)
 
+    evidence_dir.mkdir()
+    (evidence_dir / "initial.log").write_bytes(b"second failed attempt\n")
+    second_archived = archive_failed_distributed_attempt(evidence_dir)
+    assert second_archived == (
+        evidence_dir.parent / ".failed-attempts" / "full-attempt-2"
+    )
+    assert (second_archived / "initial.log").read_bytes() == (
+        b"second failed attempt\n"
+    )
+
     observed = benchmark.run_or_load_distributed_witness(**kwargs)
     assert observed.resume_final_step == 4
     assert len(list(records.iterdir())) == 2
@@ -1445,8 +1456,17 @@ def test_failed_smoke_must_be_archived_whole_before_lightweight_retry(tmp_path):
         archive_failed_distributed_attempt(evidence_dir)
 
 
-@pytest.mark.parametrize("corruption", ["source_symlink", "archive_symlink", "target"])
-def test_failed_smoke_archive_rejects_unsafe_or_reused_paths(tmp_path, corruption):
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "source_symlink",
+        "archive_symlink",
+        "attempt_symlink",
+        "attempt_file",
+        "noncanonical",
+    ],
+)
+def test_failed_smoke_archive_rejects_unsafe_paths(tmp_path, corruption):
     evidence_dir = tmp_path / "evidence" / "full"
     real_source = tmp_path / "real-failure"
     real_source.mkdir(parents=True)
@@ -1459,14 +1479,114 @@ def test_failed_smoke_archive_rejects_unsafe_or_reused_paths(tmp_path, corruptio
         archive_root = evidence_dir.parent / ".failed-attempts"
         if corruption == "archive_symlink":
             archive_root.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+        elif corruption == "attempt_symlink":
+            archive_root.mkdir()
+            (archive_root / "full-attempt-1").symlink_to(
+                real_source, target_is_directory=True
+            )
+        elif corruption == "attempt_file":
+            archive_root.mkdir()
+            (archive_root / "full-attempt-1").write_bytes(b"not a directory")
         else:
             archive_root.mkdir()
-            (archive_root / "full-attempt-1").mkdir()
+            (archive_root / "full-attempt-zero").mkdir()
 
     with pytest.raises((ValueError, FileExistsError), match="symlink|archive|target"):
         archive_failed_distributed_attempt(evidence_dir)
 
     assert evidence_dir.exists()
+
+
+def test_failed_smoke_archive_allocates_monotonic_unique_attempts(tmp_path):
+    evidence_dir = tmp_path / "evidence" / "full"
+    evidence_dir.mkdir(parents=True)
+    first_log = evidence_dir / "initial.log"
+    first_log.write_bytes(b"first failure")
+    first_before = first_log.stat()
+
+    first = archive_failed_distributed_attempt(evidence_dir)
+    evidence_dir.mkdir()
+    (evidence_dir / "initial.log").write_bytes(b"second failure")
+    second = archive_failed_distributed_attempt(evidence_dir)
+    evidence_dir.mkdir()
+    (evidence_dir / "initial.log").write_bytes(b"third failure")
+    third = archive_failed_distributed_attempt(evidence_dir)
+
+    archive_root = evidence_dir.parent / ".failed-attempts"
+    assert first == archive_root / "full-attempt-1"
+    assert second == archive_root / "full-attempt-2"
+    assert third == archive_root / "full-attempt-3"
+    first_after = (first / "initial.log").stat()
+    assert (first / "initial.log").read_bytes() == b"first failure"
+    assert (
+        first_after.st_ino,
+        first_after.st_size,
+        first_after.st_mtime_ns,
+    ) == (
+        first_before.st_ino,
+        first_before.st_size,
+        first_before.st_mtime_ns,
+    )
+    assert (second / "initial.log").read_bytes() == b"second failure"
+    assert (third / "initial.log").read_bytes() == b"third failure"
+
+
+def test_failed_smoke_archive_uses_maximum_attempt_across_gaps(tmp_path):
+    evidence_dir = tmp_path / "evidence" / "full"
+    archive_root = evidence_dir.parent / ".failed-attempts"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "initial.log").write_bytes(b"new failure")
+    (archive_root / "full-attempt-1").mkdir(parents=True)
+    (archive_root / "full-attempt-3").mkdir()
+
+    archived = archive_failed_distributed_attempt(evidence_dir)
+
+    assert archived == archive_root / "full-attempt-4"
+    assert (archived / "initial.log").read_bytes() == b"new failure"
+
+
+def test_concurrent_full_and_dora_archives_use_independent_namespaces(tmp_path):
+    evidence_root = tmp_path / "evidence"
+    for method in ("full", "dora"):
+        directory = evidence_root / method
+        directory.mkdir(parents=True)
+        (directory / "initial.log").write_bytes(method.encode())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        full_future = executor.submit(
+            archive_failed_distributed_attempt, evidence_root / "full"
+        )
+        dora_future = executor.submit(
+            archive_failed_distributed_attempt, evidence_root / "dora"
+        )
+        full = full_future.result()
+        dora = dora_future.result()
+
+    assert full.name == "full-attempt-1"
+    assert dora.name == "dora-attempt-1"
+
+
+def test_failed_smoke_archive_lock_contention_leaves_source_unchanged(tmp_path):
+    evidence_dir = tmp_path / "evidence" / "full"
+    evidence_dir.mkdir(parents=True)
+    log = evidence_dir / "initial.log"
+    log.write_bytes(b"failure")
+    before = log.stat()
+    archive_root = evidence_dir.parent / ".failed-attempts"
+    archive_root.mkdir()
+    (archive_root / ".full-archive.lock").write_bytes(b"busy")
+
+    with pytest.raises(FileExistsError, match="archive lock"):
+        archive_failed_distributed_attempt(evidence_dir)
+
+    after = log.stat()
+    assert log.read_bytes() == b"failure"
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    assert not (archive_root / "full-attempt-1").exists()
 
 
 def test_archive_failed_attempt_cli_moves_only_the_complete_directory(tmp_path):
@@ -1494,6 +1614,37 @@ def test_archive_failed_attempt_cli_moves_only_the_complete_directory(tmp_path):
     assert completed.stdout.strip() == str(target)
     assert (target / "initial.log").read_bytes() == b"failed dora"
     assert not evidence_dir.exists()
+
+
+def test_archive_failed_attempt_cli_prints_next_unique_path(tmp_path):
+    evidence_dir = tmp_path / "evidence" / "full"
+    archive_root = evidence_dir.parent / ".failed-attempts"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "initial.log").write_bytes(b"second full")
+    first = archive_root / "full-attempt-1"
+    first.mkdir(parents=True)
+    (first / "initial.log").write_bytes(b"first full")
+
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+            "-m",
+            "src.stage1.benchmark",
+            "archive-failed-attempt",
+            "--evidence-dir",
+            str(evidence_dir),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    target = archive_root / "full-attempt-2"
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(target)
+    assert (first / "initial.log").read_bytes() == b"first full"
+    assert (target / "initial.log").read_bytes() == b"second full"
 
 
 def test_invalid_distributed_method_environment_fails_collection_without_cuda(tmp_path):

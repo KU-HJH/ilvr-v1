@@ -442,7 +442,7 @@ _FAILED_ATTEMPT_ARCHIVE_NAMESPACE = ".failed-attempts"
 
 
 def archive_failed_distributed_attempt(evidence_dir: str | Path) -> Path:
-    """Atomically archive one whole failed smoke directory exactly once."""
+    """Atomically archive one whole failed smoke directory to a unique path."""
 
     source = Path(evidence_dir)
     if source.is_symlink():
@@ -470,11 +470,55 @@ def archive_failed_distributed_attempt(evidence_dir: str | Path) -> Path:
     archive_root.mkdir(mode=0o750, exist_ok=True)
     if archive_root.resolve(strict=True).parent != parent:
         raise ValueError("failed smoke archive namespace escaped its parent")
-    target = archive_root / f"{resolved_source.name}-attempt-1"
-    if target.exists() or target.is_symlink():
-        raise FileExistsError(f"failed smoke archive target already exists: {target}")
-    resolved_source.rename(target)
-    return target
+
+    method = resolved_source.name
+    lock_path = archive_root / f".{method}-archive.lock"
+    try:
+        lock_fd = os.open(
+            lock_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except FileExistsError as error:
+        raise FileExistsError(
+            f"failed smoke archive lock is already held: {lock_path}"
+        ) from error
+    try:
+        prefix = f"{method}-attempt-"
+        attempt_numbers = []
+        for entry in archive_root.iterdir():
+            if not entry.name.startswith(prefix):
+                continue
+            suffix = entry.name.removeprefix(prefix)
+            if (
+                not suffix.isdigit()
+                or int(suffix) <= 0
+                or str(int(suffix)) != suffix
+            ):
+                raise ValueError(
+                    f"noncanonical failed smoke archive collision: {entry}"
+                )
+            if entry.is_symlink() or not entry.is_dir():
+                raise ValueError(
+                    "failed smoke archive attempts must be regular "
+                    f"non-symlink directories: {entry}"
+                )
+            resolved_entry = entry.resolve(strict=True)
+            if resolved_entry.parent != archive_root.resolve(strict=True):
+                raise ValueError(f"failed smoke archive attempt escaped: {entry}")
+            attempt_numbers.append(int(suffix))
+
+        next_attempt = max(attempt_numbers, default=0) + 1
+        target = archive_root / f"{prefix}{next_attempt}"
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(
+                f"failed smoke archive target already exists: {target}"
+            )
+        os.rename(resolved_source, target)
+        return target
+    finally:
+        os.close(lock_fd)
+        lock_path.unlink(missing_ok=True)
 
 
 def _checkpoint_file_topology(checkpoint: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
