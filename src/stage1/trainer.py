@@ -144,13 +144,19 @@ class CustomTrainerStage1(SFTTrainer):
         self._deepspeed_step_adapter: _DeepSpeedStepAdapter | None = None
 
         if target_builder is None:
-            tokenizer = getattr(self, "processing_class", None)
-            if tokenizer is None:
-                tokenizer = getattr(self, "tokenizer", None)
-            if tokenizer is None:
+            processing_class = getattr(self, "processing_class", None)
+            if processing_class is None:
+                processing_class = getattr(self, "tokenizer", None)
+            if processing_class is None:
                 raise ValueError(
                     "Stage 1 trainer requires a tokenizer/processing_class "
                     "or an explicit target_builder"
+                )
+            tokenizer = getattr(processing_class, "tokenizer", processing_class)
+            if not callable(tokenizer):
+                raise ValueError(
+                    "Stage 1 processing_class must be a tokenizer or expose "
+                    "a callable .tokenizer for text-only teacher targets"
                 )
             target_builder = Stage1TeacherTargetBuilder(
                 tokenizer,

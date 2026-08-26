@@ -75,6 +75,7 @@ class TinyIntegrationTokenizer:
 
     def __init__(self, *, include_latent_tokens: bool = False):
         self.vocab = {f"token-{index}": index for index in range(BASE_VOCAB_SIZE)}
+        self.text_calls = []
         if include_latent_tokens:
             for token in LATENT_TOKEN_STRINGS:
                 self.vocab[token] = len(self.vocab)
@@ -105,6 +106,7 @@ class TinyIntegrationTokenizer:
 
     def __call__(self, text, *, return_tensors):
         assert return_tensors == "pt"
+        self.text_calls.append(text)
         marker_ids = {
             "<|im_start|>assistant": 1,
             "<|im_start|>assistant\n": 1,
@@ -138,8 +140,10 @@ class TinyIntegrationProcessor:
     def __init__(self, tokenizer=None):
         self.tokenizer = tokenizer or TinyIntegrationTokenizer()
 
-    def __call__(self, text, *, return_tensors):
-        return self.tokenizer(text, return_tensors=return_tensors)
+    def __call__(self, *args, **kwargs):
+        raise AssertionError(
+            "multimodal processor must not receive Stage 1 text-only target calls"
+        )
 
     def save_pretrained(self, directory):
         directory = Path(directory)
@@ -398,6 +402,19 @@ def tiny_stage1_run(
     )
     assert type(components.trainer) is CustomTrainerStage1
     assert type(components.trainer.target_builder) is Stage1TeacherTargetBuilder
+    assert (
+        components.trainer.target_builder.tokenizer
+        is components.processor.tokenizer
+    )
+    assert components.processor.tokenizer.text_calls == [
+        "<|im_start|>assistant",
+        "<|im_start|>assistant\n",
+        "<|latent_pad|>",
+        "<|latent_start|>",
+        "<|latent_end|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+    ]
     components.trainer.args.save_total_limit = 2
     result = components.trainer.train()
     visual = resolve_qwen2_5_vl_model(components.model).visual
