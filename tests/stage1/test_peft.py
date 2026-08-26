@@ -176,6 +176,34 @@ def test_adapter_boundary_rejects_inexact_injected_target_witness(
         )
 
 
+@pytest.mark.parametrize(
+    "selector_modifiers",
+    [
+        {"exclude_modules": {"q_proj"}},
+        {"exclude_modules": "q_proj"},
+        {"layers_to_transform": [0]},
+        {"layers_to_transform": 0},
+        {"layers_to_transform": [0], "layers_pattern": ["layers"]},
+        {"layers_to_transform": [0], "layers_pattern": "layers"},
+    ],
+)
+def test_adapter_boundary_rejects_target_selector_modifiers(
+    tiny_qwen, latent_token_ids, selector_modifiers
+):
+    configured = tuning("dora")
+    model = build_stage1_tuned_model(
+        tiny_qwen, configured, latent_token_ids
+    )
+    adapter_config = model.peft_config["default"]
+    for name, value in selector_modifiers.items():
+        setattr(adapter_config, name, value)
+
+    with pytest.raises(ValueError, match="target selector modifiers"):
+        validate_stage1_trainable_boundary(
+            model, configured, latent_token_ids
+        )
+
+
 def test_full_freezes_visual_but_trains_all_language(tiny_qwen, latent_token_ids):
     """Catches full tuning freezing language or installing unnecessary row wrappers."""
     tiny_qwen.model.norm.weight.requires_grad_(False)

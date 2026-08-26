@@ -862,6 +862,77 @@ def test_preflight_rejects_corrupt_artifact_before_any_large_model_load(
     assert large_loads == 0
 
 
+@pytest.mark.parametrize(
+    "selector_modifiers",
+    [
+        {"exclude_modules": ["q_proj"]},
+        {"exclude_modules": "q_proj"},
+        {"layers_to_transform": [0]},
+        {"layers_to_transform": 0},
+        {"layers_to_transform": [0], "layers_pattern": ["layers"]},
+        {"layers_to_transform": [0], "layers_pattern": "layers"},
+    ],
+)
+def test_preflight_rejects_peft_target_selector_modifiers_before_large_load(
+    tmp_path, monkeypatch, selector_modifiers
+):
+    config = deepcopy(tiny_original_qwen().config)
+    config.num_hidden_layers = 4
+    config.tie_word_embeddings = True
+    source = Qwen2_5_VLForConditionalGeneration(config)
+    source.tie_weights()
+    source.config._name_or_path = "tiny/original-qwen"
+    base_config = deepcopy(source.config)
+    owners = {
+        "q_proj": "self_attn",
+        "k_proj": "self_attn",
+        "v_proj": "self_attn",
+        "o_proj": "self_attn",
+        "gate_proj": "mlp",
+        "up_proj": "mlp",
+        "down_proj": "mlp",
+    }
+    resolved = tuple(
+        f"model.layers.{layer}.{owners[suffix]}.{suffix}"
+        for suffix in stage1_tuning().target_suffixes
+        for layer in range(config.num_hidden_layers)
+    )
+    metadata = replace(sample_metadata(source), resolved_target_names=resolved)
+    source.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    source.config.latent_token_id = LATENT_TOKEN_IDS[0]
+    source.config.latent_start_id = LATENT_TOKEN_IDS[1]
+    source.config.latent_end_id = LATENT_TOKEN_IDS[2]
+    tuned = build_stage1_tuned_model(source, stage1_tuning(), LATENT_TOKEN_IDS)
+    processor = TinyStage1Processor()
+    save_stage1_peft_artifact(tuned, processor, tmp_path, metadata)
+
+    path = tmp_path / "adapter_config.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.update(selector_modifiers)
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    large_loads = 0
+
+    def reject_large_load(*args, **kwargs):
+        nonlocal large_loads
+        large_loads += 1
+        raise AssertionError("large base weights must not load during preflight")
+
+    monkeypatch.setattr(
+        Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        reject_large_load,
+    )
+
+    with pytest.raises(ValueError, match="target selector modifiers"):
+        preflight_stage1_peft_artifact(
+            processor,
+            base_config,
+            tmp_path,
+        )
+
+    assert large_loads == 0
+
+
 def test_preflight_reads_each_small_payload_once_and_retains_immutable_bytes(
     saved_dora_artifact, monkeypatch
 ):

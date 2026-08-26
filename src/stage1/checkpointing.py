@@ -39,6 +39,7 @@ from stage1.ema import _parameter_shape
 from stage1.peft import (
     _configured_target_patterns_match,
     _resolve_linear_decoder_targets,
+    _validate_target_selector_modifiers_absent,
     validate_stage1_trainable_boundary,
 )
 from stage1.token_rows import (
@@ -911,6 +912,7 @@ def _validate_adapter_config(
         raise ValueError("Stage 1 adapter requires bias=none")
     if getattr(config, "modules_to_save", None) is not None:
         raise ValueError("Stage 1 adapter must not contain modules_to_save")
+    _validate_target_selector_modifiers_absent(config)
     for label, attribute, expected in (
         ("rank", "r", metadata.rank),
         ("alpha", "lora_alpha", metadata.alpha),

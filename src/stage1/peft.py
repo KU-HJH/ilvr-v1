@@ -175,6 +175,25 @@ def _configured_target_patterns_match(
     return matched == set(expected_targets)
 
 
+def _validate_target_selector_modifiers_absent(config) -> None:
+    """Reject PEFT selectors that can narrow the configured target patterns."""
+
+    modifiers = {
+        name: getattr(config, name, None)
+        for name in (
+            "exclude_modules",
+            "layers_to_transform",
+            "layers_pattern",
+        )
+        if getattr(config, name, None) is not None
+    }
+    if modifiers:
+        raise ValueError(
+            "Stage 1 PEFT target selector modifiers are unsupported: "
+            + ", ".join(sorted(modifiers))
+        )
+
+
 def _peft_model(model: nn.Module) -> PeftModel:
     candidate = getattr(model, "module", model)
     if not isinstance(candidate, PeftModel):
@@ -421,6 +440,7 @@ def _validate_adapter_boundary(
         raise ValueError("Stage 1 PEFT adapter method does not match tuning")
     if config.bias != "none" or config.modules_to_save is not None:
         raise ValueError("Stage 1 PEFT adapter has unsupported saved base parameters")
+    _validate_target_selector_modifiers_absent(config)
 
     expected_targets = _resolve_linear_decoder_targets(qwen, tuning.target_suffixes)
     configured_targets = config.target_modules
