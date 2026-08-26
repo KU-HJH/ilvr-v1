@@ -158,13 +158,18 @@ Each invocation allocates a new append-only
 `outputs/stage1-smoke/<method>/attempts/attempt-N/` directory. A failed attempt
 is retained in place and the next invocation uses the next monotonic number;
 do not delete, move, or overwrite its logs. Legacy flat failure files under the
-method directory are also retained and reserve attempt 1. On success, the
-wrapper publishes exactly one small canonical
+method directory are also retained and reserve attempt 1. A persistent
+mode-`0600` `.execution.lock` uses a kernel `flock` lease across allocation,
+both launches, checkpoint sealing, and success publication. A concurrent
+invocation fails with an explicit in-progress/retry message and cannot allocate
+or launch; process exit releases the lease without deleting the lock inode. On
+success, the wrapper publishes exactly one small canonical
 `outputs/stage1-smoke/<method>/evidence.json` with exclusive-create semantics.
-That evidence embeds the authenticated producer envelope and refers to the
-sealed attempt checkpoint marker by a contained relative path. Reuse reads
-only the canonical evidence and that small marker, not the attempt's checkpoint
-tree or attempt-local evidence file. The legacy `archive-failed-attempt` command
+That evidence embeds both the authenticated producer envelope and the sealed
+checkpoint marker while retaining their contained relative provenance paths.
+Reuse reads only this canonical regular, non-aliased evidence inode; it does not
+require the source data, images, attempt directory, checkpoint tree, or
+attempt-local evidence file. The legacy `archive-failed-attempt` command
 is fail-closed where the filesystem lacks atomic no-replace rename support and
 is not a retry prerequisite.
 

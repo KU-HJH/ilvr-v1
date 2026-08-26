@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -417,32 +419,31 @@ def load_verified_evidence(
 ) -> Stage1BenchmarkEvidence | None:
     """Load and strictly validate a small evidence file once per unchanged stat witness."""
 
-    path = Path(path)
+    path = Path(os.path.abspath(path))
     _require_digest("expected_config_digest", expected_config_digest)
-    if not path.is_file():
+    payload = _read_canonical_evidence_json(path, missing_ok=True)
+    if payload is None:
         return None
-    resolved = path.resolve(strict=True)
+    resolved = path
     witness = _file_witness(resolved)
     cached = _VERIFIED_PRODUCER_EVIDENCE_CACHE.get(resolved)
     if cached is not None and cached[0] == witness:
         evidence = cached[1]
     else:
-        payload = _read_json_once(resolved)
         if type(payload) is not dict:
             raise ValueError("official evidence must be a Stage 1 producer envelope")
         if payload.get("kind") == _SMOKE_REGISTRY_KIND:
-            evidence, seal, marker_path = _validate_smoke_registry_payload(
+            evidence, seal, marker = _validate_smoke_registry_payload(
                 payload, resolved
             )
         elif payload.get("kind") == "stage1-producer-evidence":
             evidence, seal = _validate_producer_evidence_payload(payload)
-            marker_path = None
+            marker = None
         else:
             raise ValueError("official evidence must be a Stage 1 producer envelope")
         if seal["run_config"]["kind"] == "stage1-smoke-run-manifest":
-            _validate_smoke_marker_for_evidence(
-                resolved, seal, marker_path=marker_path
-            )
+            if marker is None:
+                _validate_smoke_marker_for_evidence(resolved, seal)
         else:
             _VERIFIED_PRODUCER_EVIDENCE_CACHE[resolved] = (witness, evidence)
     if evidence.config_digest != expected_config_digest:
@@ -452,7 +453,8 @@ def load_verified_evidence(
 
 _SMOKE_MARKER_FILENAME = "checkpoint-topology.json"
 _SMOKE_REGISTRY_KIND = "stage1-smoke-registry-evidence"
-_SMOKE_ATTEMPT_LOCK = ".attempt-allocation.lock"
+_SMOKE_REGISTRY_SCHEMA_VERSION = 2
+_SMOKE_EXECUTION_LOCK = ".execution.lock"
 _SMOKE_ATTEMPTS_DIRECTORY = "attempts"
 _FAILED_ATTEMPT_ARCHIVE_NAMESPACE = ".failed-attempts"
 _RENAME_NOREPLACE = 1
@@ -842,6 +844,29 @@ def load_stage1_smoke_resume_witness(
 
     marker_path = Path(marker_path).resolve(strict=True)
     marker = _read_json_once(marker_path)
+    return _validate_stage1_smoke_marker_payload(
+        marker,
+        marker_path=marker_path,
+        method=method,
+        checkpoint_path=Path(checkpoint_path).resolve(),
+        micro_batch=micro_batch,
+        initial_max_steps=initial_max_steps,
+        resumed_max_steps=resumed_max_steps,
+    )
+
+
+def _validate_stage1_smoke_marker_payload(
+    marker: object,
+    *,
+    marker_path: Path,
+    method: str,
+    checkpoint_path: Path,
+    micro_batch: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+) -> Stage1SmokeResumeSnapshot:
+    """Validate immutable marker bytes without reopening checkpoint artifacts."""
+
     _require_exact_keys(
         marker,
         {
@@ -868,7 +893,8 @@ def load_stage1_smoke_resume_witness(
     if (
         marker.get("method") != _validated_method(method)
         or marker.get("artifact_kind") != expected_kind
-        or marker.get("checkpoint_path") != str(Path(checkpoint_path).resolve())
+        or not Path(checkpoint_path).is_absolute()
+        or marker.get("checkpoint_path") != str(Path(checkpoint_path))
         or marker.get("initial_final_step") != initial_max_steps
         or marker.get("resumed_max_steps") != resumed_max_steps
         or marker.get("micro_batch") != micro_batch
@@ -890,7 +916,7 @@ def load_stage1_smoke_resume_witness(
             names.add(name)
             _require_int(f"{field_name}[{index}].size", entry.get("size"), positive=True)
     canonical = _canonical_json_bytes(marker)
-    return Stage1SmokeResumeSnapshot(marker_path, canonical, claimed)
+    return Stage1SmokeResumeSnapshot(Path(marker_path), canonical, claimed)
 
 
 def _validate_smoke_marker_for_evidence(
@@ -908,6 +934,29 @@ def _validate_smoke_marker_for_evidence(
             if marker_path is None
             else marker_path
         ),
+        method=config["method"],
+        checkpoint_path=checkpoint,
+        micro_batch=config["micro_batch"],
+        initial_max_steps=summary["initial_final_step"],
+        resumed_max_steps=summary["resume_final_step"],
+    )
+    if snapshot.marker_digest != summary["resume_artifact_digest"]:
+        raise ValueError("smoke checkpoint topology digest does not match evidence")
+    return snapshot
+
+
+def _validate_embedded_smoke_marker(
+    marker: object,
+    *,
+    marker_path: Path,
+    seal: Mapping[str, object],
+) -> Stage1SmokeResumeSnapshot:
+    config = seal["run_config"]
+    summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
+    checkpoint = Path(config["output_dir"]) / f"checkpoint-{summary['initial_final_step']}"
+    snapshot = _validate_stage1_smoke_marker_payload(
+        marker,
+        marker_path=marker_path,
         method=config["method"],
         checkpoint_path=checkpoint,
         micro_batch=config["micro_batch"],
@@ -966,32 +1015,184 @@ def _exclusive_write_json(path: Path, payload: object) -> None:
         os.close(parent_fd)
 
 
-def _allocate_smoke_attempt(evidence_directory: Path) -> Path:
-    """Allocate a monotonic append-only attempt directory using mkdir no-replace."""
+def _read_canonical_evidence_json(
+    path: Path, *, missing_ok: bool = False
+) -> object | None:
+    """Read one canonical regular evidence inode once without following aliases."""
 
-    evidence_directory = Path(evidence_directory)
-    evidence_directory.mkdir(parents=True, exist_ok=True)
-    method_fd = os.open(evidence_directory, _DIRECTORY_OPEN_FLAGS)
-    lock_fd: int | None = None
-    attempts_fd: int | None = None
-    lock_identity: os.stat_result | None = None
+    path = Path(os.path.abspath(path))
+    try:
+        parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise
     try:
         try:
+            named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        if not stat_module.S_ISREG(named.st_mode):
+            raise ValueError("canonical evidence must be a regular file")
+        if named.st_nlink != 1:
+            raise ValueError("canonical evidence must not be a filesystem alias")
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat_module.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or not _same_file_identity(named, opened)
+            ):
+                raise ValueError("canonical evidence changed before read")
+            if opened.st_size > 16 * 1024 * 1024:
+                raise ValueError("canonical evidence is unexpectedly large")
+            chunks: list[bytes] = []
+            remaining = opened.st_size + 1
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            after = os.fstat(descriptor)
+            if (
+                not _same_file_identity(opened, after)
+                or after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or len(data) != opened.st_size
+            ):
+                raise ValueError("canonical evidence changed during read")
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"malformed canonical evidence at {path}: {error}") from error
+
+
+@dataclass(frozen=True)
+class _SmokeExecutionLease:
+    directory: Path
+    directory_fd: int
+    lock_fd: int
+
+
+def _validate_smoke_execution_lease(lease: _SmokeExecutionLease) -> None:
+    opened = os.fstat(lease.lock_fd)
+    try:
+        named = os.stat(
+            _SMOKE_EXECUTION_LOCK,
+            dir_fd=lease.directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise ValueError("smoke execution lock changed while held") from error
+    if (
+        not stat_module.S_ISREG(named.st_mode)
+        or named.st_nlink != 1
+        or opened.st_nlink != 1
+        or stat_module.S_IMODE(named.st_mode) != 0o600
+        or not _same_file_identity(named, opened)
+    ):
+        raise ValueError("smoke execution lock changed while held")
+
+
+@contextmanager
+def _smoke_execution_lease(evidence_directory: Path):
+    """Hold one method's persistent kernel execution lease until fd close."""
+
+    directory = Path(os.path.abspath(evidence_directory))
+    _validated_method(directory.name)
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    parent_fd = os.open(directory.parent, _DIRECTORY_OPEN_FLAGS)
+    directory_fd: int | None = None
+    lock_fd: int | None = None
+    try:
+        try:
+            os.mkdir(directory.name, 0o750, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        try:
+            directory_fd = os.open(
+                directory.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd
+            )
+        except OSError as error:
+            raise ValueError("smoke method registry must be a real directory") from error
+        try:
             lock_fd = os.open(
-                _SMOKE_ATTEMPT_LOCK,
-                os.O_WRONLY
+                _SMOKE_EXECUTION_LOCK,
+                os.O_RDWR
                 | os.O_CREAT
-                | os.O_EXCL
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_CLOEXEC", 0),
                 0o600,
-                dir_fd=method_fd,
+                dir_fd=directory_fd,
             )
-        except FileExistsError as error:
-            raise FileExistsError(
-                f"smoke attempt allocation lock is already held: {evidence_directory}"
+        except OSError as error:
+            raise ValueError("smoke execution lock must be a regular file") from error
+        opened = os.fstat(lock_fd)
+        if (
+            not stat_module.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or stat_module.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise ValueError("smoke execution lock must be a unique mode-0600 file")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"distributed smoke execution is in progress; retry later: {directory}"
             ) from error
-        lock_identity = os.fstat(lock_fd)
+        _require_named_fd_identity(
+            directory_fd=parent_fd,
+            name=directory.name,
+            opened_fd=directory_fd,
+            label="method registry",
+            require_directory=True,
+        )
+        lease = _SmokeExecutionLease(directory, directory_fd, lock_fd)
+        _validate_smoke_execution_lease(lease)
+        yield lease
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+        os.close(parent_fd)
+
+
+def _allocate_smoke_attempt(
+    evidence_directory: Path,
+    *,
+    lease: _SmokeExecutionLease | None = None,
+) -> Path:
+    """Allocate a monotonic append-only attempt directory using mkdir no-replace."""
+
+    evidence_directory = Path(os.path.abspath(evidence_directory))
+    if lease is None:
+        with _smoke_execution_lease(evidence_directory) as acquired:
+            return _allocate_smoke_attempt(
+                evidence_directory,
+                lease=acquired,
+            )
+    if lease.directory != evidence_directory:
+        raise ValueError("smoke execution lease belongs to a different method")
+    _validate_smoke_execution_lease(lease)
+    method_fd = lease.directory_fd
+    attempts_fd: int | None = None
+    try:
         try:
             os.mkdir(_SMOKE_ATTEMPTS_DIRECTORY, 0o750, dir_fd=method_fd)
         except FileExistsError:
@@ -1009,7 +1210,7 @@ def _allocate_smoke_attempt(evidence_directory: Path) -> Path:
 
         allowed_root_entries = {
             _SMOKE_ATTEMPTS_DIRECTORY,
-            _SMOKE_ATTEMPT_LOCK,
+            _SMOKE_EXECUTION_LOCK,
             "evidence.json",
         }
         legacy_failure = any(
@@ -1029,22 +1230,6 @@ def _allocate_smoke_attempt(evidence_directory: Path) -> Path:
     finally:
         if attempts_fd is not None:
             os.close(attempts_fd)
-        if lock_fd is not None:
-            os.close(lock_fd)
-        if lock_identity is not None:
-            try:
-                named = os.stat(
-                    _SMOKE_ATTEMPT_LOCK,
-                    dir_fd=method_fd,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                pass
-            else:
-                if _same_file_identity(lock_identity, named):
-                    os.unlink(_SMOKE_ATTEMPT_LOCK, dir_fd=method_fd)
-                    os.fsync(method_fd)
-        os.close(method_fd)
 
 
 _FULL_WEIGHT_NAMES = {
@@ -1622,23 +1807,22 @@ def write_stage1_producer_evidence(
 
 
 def _load_producer_evidence(path: Path) -> tuple[Stage1BenchmarkEvidence, dict[str, object]]:
-    path = Path(path).resolve(strict=True)
-    raw = _read_json_once(path)
+    path = Path(os.path.abspath(path))
+    raw = _read_canonical_evidence_json(path)
     if type(raw) is dict and raw.get("kind") == _SMOKE_REGISTRY_KIND:
-        evidence, payload, marker_path = _validate_smoke_registry_payload(raw, path)
+        evidence, payload, marker = _validate_smoke_registry_payload(raw, path)
     else:
         evidence, payload = _validate_producer_evidence_payload(raw)
-        marker_path = None
+        marker = None
     if payload["run_config"]["kind"] == "stage1-smoke-run-manifest":
-        _validate_smoke_marker_for_evidence(
-            path, payload, marker_path=marker_path
-        )
+        if marker is None:
+            _validate_smoke_marker_for_evidence(path, payload)
     return evidence, payload
 
 
 def _validate_smoke_registry_payload(
     payload: object, evidence_path: Path
-) -> tuple[Stage1BenchmarkEvidence, dict[str, object], Path]:
+) -> tuple[Stage1BenchmarkEvidence, dict[str, object], dict[str, object]]:
     if type(payload) is not dict:
         raise TypeError("Stage 1 smoke registry evidence must be an object")
     _require_exact_keys(
@@ -1651,13 +1835,14 @@ def _validate_smoke_registry_payload(
             "attempt_evidence_digest",
             "marker_path",
             "marker_digest",
+            "checkpoint_marker",
             "producer_evidence",
             "registry_digest",
         },
         "Stage 1 smoke registry evidence",
     )
     if (
-        payload.get("schema_version") != _SCHEMA_VERSION
+        payload.get("schema_version") != _SMOKE_REGISTRY_SCHEMA_VERSION
         or payload.get("kind") != _SMOKE_REGISTRY_KIND
     ):
         raise ValueError("invalid Stage 1 smoke registry evidence schema")
@@ -1680,7 +1865,8 @@ def _validate_smoke_registry_payload(
         raise ValueError("invalid Stage 1 smoke registry marker path")
 
     evidence, producer = _validate_producer_evidence_payload(
-        payload.get("producer_evidence")
+        payload.get("producer_evidence"),
+        validate_external_inputs=False,
     )
     if producer["run_config"]["kind"] != "stage1-smoke-run-manifest":
         raise ValueError("registry evidence must contain smoke producer evidence")
@@ -1693,26 +1879,28 @@ def _validate_smoke_registry_payload(
     summary = _validate_smoke_resume_witness(producer["smoke_resume_witness"])
     if marker_digest != summary["resume_artifact_digest"]:
         raise ValueError("registry marker digest does not match producer evidence")
-
-    root = Path(evidence_path).resolve(strict=True).parent
-    attempts = root / _SMOKE_ATTEMPTS_DIRECTORY
-    attempt = attempts / parts[1]
-    for directory, label in ((attempts, "attempts"), (attempt, "attempt")):
-        info = directory.lstat()
-        if not stat_module.S_ISDIR(info.st_mode) or directory.is_symlink():
-            raise ValueError(f"smoke registry {label} path must be a real directory")
-    expected_output = (attempt / "run").resolve()
+    marker = payload.get("checkpoint_marker")
+    expected_output = Path(
+        os.path.abspath(Path(evidence_path).parent / attempt_path / "run")
+    )
     if Path(producer["run_config"]["output_dir"]) != expected_output:
         raise ValueError("registry producer output directory does not match attempt")
-    marker = attempt / _SMOKE_MARKER_FILENAME
-    marker_info = marker.lstat()
-    if not stat_module.S_ISREG(marker_info.st_mode) or marker.is_symlink():
-        raise ValueError("smoke registry marker must be a regular file")
+    snapshot = _validate_embedded_smoke_marker(
+        marker,
+        marker_path=Path(evidence_path).parent / expected_marker,
+        seal=producer,
+    )
+    if snapshot.marker_digest != marker_digest:
+        raise ValueError("embedded registry marker digest mismatch")
     return evidence, producer, marker
 
 
 def _smoke_registry_payload(
-    *, attempt: Path, evidence_directory: Path, producer: Mapping[str, object]
+    *,
+    attempt: Path,
+    evidence_directory: Path,
+    producer: Mapping[str, object],
+    checkpoint_marker: Mapping[str, object],
 ) -> dict[str, object]:
     evidence_directory = Path(evidence_directory).resolve(strict=True)
     attempt = Path(attempt).resolve(strict=True)
@@ -1723,14 +1911,22 @@ def _smoke_registry_payload(
     marker_digest = _validate_smoke_resume_witness(
         producer["smoke_resume_witness"]
     )["resume_artifact_digest"]
+    marker_path = attempt / _SMOKE_MARKER_FILENAME
+    marker = dict(checkpoint_marker)
+    _validate_embedded_smoke_marker(
+        marker,
+        marker_path=marker_path,
+        seal=producer,
+    )
     payload = {
-        "schema_version": _SCHEMA_VERSION,
+        "schema_version": _SMOKE_REGISTRY_SCHEMA_VERSION,
         "kind": _SMOKE_REGISTRY_KIND,
         "attempt_path": relative,
         "attempt_evidence_path": f"{relative}/evidence.json",
         "attempt_evidence_digest": producer["producer_digest"],
         "marker_path": f"{relative}/{_SMOKE_MARKER_FILENAME}",
         "marker_digest": marker_digest,
+        "checkpoint_marker": marker,
         "producer_evidence": dict(producer),
     }
     payload["registry_digest"] = config_digest(payload)
@@ -1739,6 +1935,8 @@ def _smoke_registry_payload(
 
 def _validate_producer_evidence_payload(
     payload: object,
+    *,
+    validate_external_inputs: bool = True,
 ) -> tuple[Stage1BenchmarkEvidence, dict[str, object]]:
     if type(payload) is not dict:
         raise TypeError("producer evidence must be an object")
@@ -1889,12 +2087,13 @@ def _validate_producer_evidence_payload(
         raise ValueError("no-save producer artifact cannot contain weight serialization")
     if artifact.get("checkpoint_bytes") != evidence.checkpoint_bytes:
         raise ValueError("producer artifact byte count mismatch")
-    source = Path(config["source_data_path"])
-    if not source.is_file() or _stat_payload(source) != config["data_stat"]:
-        raise ValueError("producer evidence source data stat witness is stale")
-    image_root = Path(config["image_root"])
-    if not image_root.is_dir() or image_root.resolve(strict=True) != image_root:
-        raise ValueError("producer evidence image root witness is stale")
+    if validate_external_inputs:
+        source = Path(config["source_data_path"])
+        if not source.is_file() or _stat_payload(source) != config["data_stat"]:
+            raise ValueError("producer evidence source data stat witness is stale")
+        image_root = Path(config["image_root"])
+        if not image_root.is_dir() or image_root.resolve(strict=True) != image_root:
+            raise ValueError("producer evidence image root witness is stale")
     return evidence, payload
 
 
@@ -3021,6 +3220,55 @@ def _distributed_smoke_result(
     )
 
 
+def _load_canonical_smoke_evidence(
+    evidence_path: Path,
+) -> tuple[Stage1BenchmarkEvidence, dict[str, object]] | None:
+    raw = _read_canonical_evidence_json(evidence_path, missing_ok=True)
+    if raw is None:
+        return None
+    if type(raw) is not dict or raw.get("kind") != _SMOKE_REGISTRY_KIND:
+        raise ValueError("canonical smoke evidence must be a registry envelope")
+    evidence, seal, _ = _validate_smoke_registry_payload(raw, evidence_path)
+    return evidence, seal
+
+
+def _matching_canonical_smoke_result(
+    evidence_path: Path,
+    *,
+    method: str,
+    model: str,
+    micro_batch: int,
+    gradient_accumulation_steps: int,
+    world_size: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+) -> DistributedSmokeWitness | None:
+    loaded = _load_canonical_smoke_evidence(evidence_path)
+    if loaded is None:
+        return None
+    evidence, seal = loaded
+    config = seal["run_config"]
+    summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
+    if (
+        evidence.status != "success"
+        or evidence.method != method
+        or evidence.micro_batch != micro_batch
+        or evidence.world_size != world_size
+        or config["method"] != method
+        or config["model"] != model
+        or config["micro_batch"] != micro_batch
+        or config["gradient_accumulation_steps"]
+        != gradient_accumulation_steps
+        or config["world_size"] != world_size
+        or summary["initial_final_step"] != initial_max_steps
+        or summary["resume_final_step"] != resumed_max_steps
+    ):
+        raise FileExistsError(
+            "canonical smoke evidence belongs to a different semantic request"
+        )
+    return _distributed_smoke_result(evidence, seal)
+
+
 def run_or_load_distributed_witness(
     *,
     method: str,
@@ -3064,31 +3312,56 @@ def run_or_load_distributed_witness(
             "distributed smoke requires micro-batch 2, accumulation 2, "
             "world-size 2, and exact 3-to-4 steps"
         )
-    repository = Path(__file__).resolve().parents[2]
-    data = Path(data_path).resolve(strict=True)
-    images = Path(image_root).resolve(strict=True)
-    deepspeed = Path(deepspeed_config)
-    if not deepspeed.is_absolute():
-        deepspeed = repository / deepspeed
-    deepspeed = deepspeed.resolve(strict=True)
-    evidence_directory = Path(evidence_dir).resolve()
-    audit_path = evidence_directory.parent / "high-cost-rows.json"
-    select_high_cost_probe_rows(data, 64, audit_path, image_root=images)
+    evidence_directory = Path(os.path.abspath(evidence_dir))
     evidence_path = evidence_directory / "evidence.json"
+    expected_scalars = {
+        "method": method,
+        "model": model,
+        "micro_batch": micro_batch,
+        "gradient_accumulation_steps": accumulation,
+        "world_size": world_size,
+        "initial_max_steps": initial_max_steps,
+        "resumed_max_steps": resumed_max_steps,
+    }
+    if (
+        reused := _matching_canonical_smoke_result(
+            evidence_path, **expected_scalars
+        )
+    ) is not None:
+        return reused
 
-    def reusable_result() -> DistributedSmokeWitness | None:
-        if not evidence_path.exists() and not evidence_path.is_symlink():
-            return None
-        if evidence_path.is_symlink() or not evidence_path.is_file():
-            raise ValueError("canonical smoke evidence must be a regular file")
-        existing, seal = _load_producer_evidence(evidence_path)
-        existing_config = seal["run_config"]
-        expected = _smoke_run_config(
+    with _smoke_execution_lease(evidence_directory) as execution_lease:
+        if (
+            reused := _matching_canonical_smoke_result(
+                evidence_path, **expected_scalars
+            )
+        ) is not None:
+            return reused
+
+        repository = Path(__file__).resolve().parents[2]
+        data = Path(data_path).resolve(strict=True)
+        images = Path(image_root).resolve(strict=True)
+        deepspeed = Path(deepspeed_config)
+        if not deepspeed.is_absolute():
+            deepspeed = repository / deepspeed
+        deepspeed = deepspeed.resolve(strict=True)
+        audit_path = evidence_directory.parent / "high-cost-rows.json"
+        select_high_cost_probe_rows(data, 64, audit_path, image_root=images)
+
+        attempt = _allocate_smoke_attempt(
+            evidence_directory, lease=execution_lease
+        )
+        run_dir = attempt / "run"
+        checkpoint = run_dir / f"checkpoint-{initial_max_steps}"
+        marker_path = attempt / _SMOKE_MARKER_FILENAME
+        run_config_path = attempt / "run-config.json"
+        attempt_evidence_path = attempt / "evidence.json"
+        config = _smoke_run_config(
             method=method,
             model=model,
             data_path=data,
             image_root=images,
-            output_dir=Path(existing_config["output_dir"]),
+            output_dir=run_dir,
             micro_batch=micro_batch,
             gradient_accumulation_steps=accumulation,
             world_size=world_size,
@@ -3096,108 +3369,86 @@ def run_or_load_distributed_witness(
             deepspeed_config=deepspeed,
             audit_path=audit_path,
         )
-        reusable = load_verified_evidence(evidence_path, expected["config_digest"])
-        if reusable is None:
-            raise FileExistsError(
-                "canonical smoke evidence belongs to a different request"
+        launcher = (
+            repository / "run_stage1_training.sh"
+            if launcher_path is None
+            else Path(launcher_path)
+        ).resolve(strict=True)
+        common = [
+            "--method", method,
+            "--model", model,
+            "--data-path", str(data),
+            "--image-root", str(images),
+            "--output-dir", str(run_dir),
+            "--micro-batch", str(micro_batch),
+            "--epochs", "3",
+            "--learning-rate", "1e-5",
+            "--gradient-accumulation", str(accumulation),
+            "--seed", "42",
+            "--deepspeed-config", str(deepspeed),
+            "--attention-implementation", "flash_attention_2",
+        ]
+        _run_smoke_launcher(
+            launcher,
+            [
+                *common,
+                "--save-strategy", "steps",
+                "--save-steps", str(initial_max_steps),
+                "--max-steps", str(initial_max_steps),
+                "--no-final-save",
+            ],
+            log_path=attempt / "initial.log",
+        )
+        _validate_smoke_execution_lease(execution_lease)
+        checkpoint_snapshot = seal_stage1_smoke_checkpoint(
+            checkpoint,
+            method=method,
+            micro_batch=micro_batch,
+            world_size=world_size,
+            initial_max_steps=initial_max_steps,
+            resumed_max_steps=resumed_max_steps,
+            marker_path=marker_path,
+        )
+        _atomic_write_json(run_config_path, config)
+        _validate_smoke_execution_lease(execution_lease)
+        _run_smoke_launcher(
+            launcher,
+            [
+                *common,
+                "--source-data-path", str(data),
+                "--save-strategy", "no",
+                "--save-steps", "612",
+                "--resume", str(checkpoint),
+                "--max-steps", str(resumed_max_steps),
+                "--benchmark-run-config", str(run_config_path),
+                "--producer-evidence", str(attempt_evidence_path),
+                "--smoke-resume-witness", str(marker_path),
+                "--no-final-save",
+            ],
+            log_path=attempt / "resume.log",
+        )
+        _validate_smoke_execution_lease(execution_lease)
+        produced, seal = _load_producer_evidence(attempt_evidence_path)
+        if produced.config_digest != config["config_digest"]:
+            raise RuntimeError("distributed smoke did not publish matching evidence")
+        registry = _smoke_registry_payload(
+            attempt=attempt,
+            evidence_directory=evidence_directory,
+            producer=seal,
+            checkpoint_marker=checkpoint_snapshot.payload(),
+        )
+        _validate_smoke_registry_payload(registry, evidence_path)
+        _validate_smoke_execution_lease(execution_lease)
+        try:
+            _exclusive_write_json(evidence_path, registry)
+        except FileExistsError:
+            reused = _matching_canonical_smoke_result(
+                evidence_path, **expected_scalars
             )
-        return _distributed_smoke_result(existing, seal)
-
-    if (reused := reusable_result()) is not None:
-        return reused
-
-    attempt = _allocate_smoke_attempt(evidence_directory)
-    run_dir = attempt / "run"
-    checkpoint = run_dir / f"checkpoint-{initial_max_steps}"
-    marker_path = attempt / _SMOKE_MARKER_FILENAME
-    run_config_path = attempt / "run-config.json"
-    attempt_evidence_path = attempt / "evidence.json"
-    config = _smoke_run_config(
-        method=method,
-        model=model,
-        data_path=data,
-        image_root=images,
-        output_dir=run_dir,
-        micro_batch=micro_batch,
-        gradient_accumulation_steps=accumulation,
-        world_size=world_size,
-        resumed_max_steps=resumed_max_steps,
-        deepspeed_config=deepspeed,
-        audit_path=audit_path,
-    )
-    launcher = (
-        repository / "run_stage1_training.sh"
-        if launcher_path is None
-        else Path(launcher_path)
-    ).resolve(strict=True)
-    common = [
-        "--method", method,
-        "--model", model,
-        "--data-path", str(data),
-        "--image-root", str(images),
-        "--output-dir", str(run_dir),
-        "--micro-batch", str(micro_batch),
-        "--epochs", "3",
-        "--learning-rate", "1e-5",
-        "--gradient-accumulation", str(accumulation),
-        "--seed", "42",
-        "--deepspeed-config", str(deepspeed),
-        "--attention-implementation", "flash_attention_2",
-    ]
-    _run_smoke_launcher(
-        launcher,
-        [
-            *common,
-            "--save-strategy", "steps",
-            "--save-steps", str(initial_max_steps),
-            "--max-steps", str(initial_max_steps),
-            "--no-final-save",
-        ],
-        log_path=attempt / "initial.log",
-    )
-    seal_stage1_smoke_checkpoint(
-        checkpoint,
-        method=method,
-        micro_batch=micro_batch,
-        world_size=world_size,
-        initial_max_steps=initial_max_steps,
-        resumed_max_steps=resumed_max_steps,
-        marker_path=marker_path,
-    )
-    _atomic_write_json(run_config_path, config)
-    _run_smoke_launcher(
-        launcher,
-        [
-            *common,
-            "--source-data-path", str(data),
-            "--save-strategy", "no",
-            "--save-steps", "612",
-            "--resume", str(checkpoint),
-            "--max-steps", str(resumed_max_steps),
-            "--benchmark-run-config", str(run_config_path),
-            "--producer-evidence", str(attempt_evidence_path),
-            "--smoke-resume-witness", str(marker_path),
-            "--no-final-save",
-        ],
-        log_path=attempt / "resume.log",
-    )
-    produced = load_verified_evidence(attempt_evidence_path, config["config_digest"])
-    if produced is None:
-        raise RuntimeError("distributed smoke did not publish matching evidence")
-    _, seal = _load_producer_evidence(attempt_evidence_path)
-    registry = _smoke_registry_payload(
-        attempt=attempt,
-        evidence_directory=evidence_directory,
-        producer=seal,
-    )
-    try:
-        _exclusive_write_json(evidence_path, registry)
-    except FileExistsError:
-        pass
-    reused = reusable_result()
-    if reused is None:  # pragma: no cover - exclusive publication just succeeded.
-        raise RuntimeError("distributed smoke did not publish canonical evidence")
-    return reused
+            if reused is None:  # pragma: no cover - colliding inode must exist.
+                raise RuntimeError("canonical smoke evidence disappeared")
+            return reused
+        return _distributed_smoke_result(produced, seal)
 
 
 def _load_evidence_without_expected(path: Path) -> Stage1BenchmarkEvidence:
@@ -3209,9 +3460,10 @@ def _load_evidence_without_expected(path: Path) -> Stage1BenchmarkEvidence:
 
 def _check_evidence(args: argparse.Namespace) -> str:
     path = Path(args.evidence_dir) / "evidence.json"
-    if not path.is_file():
+    loaded = _load_canonical_smoke_evidence(path)
+    if loaded is None:
         return "missing"
-    evidence, seal = _load_producer_evidence(path)
+    evidence, seal = loaded
     if seal["run_config"]["kind"] != "stage1-smoke-run-manifest":
         raise ValueError("check-evidence accepts only Task 15 smoke evidence")
     _validate_smoke_resume_witness(seal["smoke_resume_witness"])

@@ -8,9 +8,11 @@ import hashlib
 import math
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1243,7 +1245,12 @@ def test_timed_comparison_is_a_standalone_canonical_prerequisite_seal(
         benchmark._load_run_comparison(output)
 
 
-def _write_smoke_subprocess_launcher(path: Path, record_dir: Path) -> None:
+def _write_smoke_subprocess_launcher(
+    path: Path,
+    record_dir: Path,
+    *,
+    initial_gate: Path | None = None,
+) -> None:
     python = REPO_ROOT / "venv/ilvr-venv/bin/python"
     path.write_text(
         f"""#!{python}
@@ -1271,6 +1278,11 @@ record.write_text(json.dumps({{
 output = Path(value("--output-dir"))
 output.mkdir(parents=True, exist_ok=True)
 max_steps = int(value("--max-steps"))
+initial_gate = {str(initial_gate) if initial_gate is not None else None!r}
+if max_steps == 3 and initial_gate is not None:
+    import time
+    while not Path(initial_gate).exists():
+        time.sleep(0.01)
 if max_steps == 3:
     checkpoint = output / "checkpoint-3"
     checkpoint.mkdir()
@@ -1368,7 +1380,7 @@ raise SystemExit(19)
 
 
 def test_distributed_smoke_uses_two_real_processes_then_reuses_only_small_seals(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     """Catches in-process resume, rerun-on-reuse, or checkpoint-tree rereads."""
     import shutil
@@ -1398,6 +1410,9 @@ def test_distributed_smoke_uses_two_real_processes_then_reuses_only_small_seals(
     attempt = attempts[0]
     canonical = json.loads((evidence_dir / "evidence.json").read_text())
     assert canonical["kind"] == "stage1-smoke-registry-evidence"
+    assert canonical["checkpoint_marker"]["kind"] == (
+        "stage1-smoke-checkpoint-topology"
+    )
     assert canonical["attempt_path"] == "attempts/attempt-1"
     assert canonical["attempt_evidence_path"] == (
         "attempts/attempt-1/evidence.json"
@@ -1431,10 +1446,19 @@ def test_distributed_smoke_uses_two_real_processes_then_reuses_only_small_seals(
     assert observed.resume_final_step == 4
 
     canonical_before = (evidence_dir / "evidence.json").stat()
-    shutil.rmtree(attempt / "run")
-    (attempt / "evidence.json").unlink()
-    (attempt / "run-config.json").unlink()
+    shutil.rmtree(attempt)
+    data_path.unlink()
+    shutil.rmtree(image_root)
     launcher.unlink()
+
+    def reject_external_resolve(*args, **kwargs):
+        raise AssertionError("successful canonical reuse resolved an external path")
+
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        reject_external_resolve,
+    )
     reused = benchmark.run_or_load_distributed_witness(**kwargs)
     canonical_after = (evidence_dir / "evidence.json").stat()
     assert reused == observed
@@ -1460,13 +1484,237 @@ def test_distributed_smoke_reuse_rejects_a_tampered_small_checkpoint_marker(tmp_
         evidence_dir=evidence_dir, launcher_path=launcher,
     )
     benchmark.run_or_load_distributed_witness(**kwargs)
-    marker = evidence_dir / "attempts" / "attempt-1" / "checkpoint-topology.json"
-    payload = json.loads(marker.read_text())
-    payload["checkpoint_files"][0]["size"] += 1
-    marker.write_text(json.dumps(payload))
+    canonical_path = evidence_dir / "evidence.json"
+    payload = json.loads(canonical_path.read_text())
+    payload["checkpoint_marker"]["checkpoint_files"][0]["size"] += 1
+    payload["registry_digest"] = benchmark.config_digest(
+        {key: value for key, value in payload.items() if key != "registry_digest"}
+    )
+    canonical_path.write_text(json.dumps(payload))
 
     with pytest.raises(ValueError, match="checkpoint topology.*digest"):
         benchmark.run_or_load_distributed_witness(**kwargs)
+
+
+def test_smoke_execution_lease_releases_on_close_and_is_method_scoped(tmp_path):
+    import stage1.benchmark as benchmark
+
+    full = tmp_path / "evidence" / "full"
+    dora = tmp_path / "evidence" / "dora"
+    with benchmark._smoke_execution_lease(full):
+        with pytest.raises(RuntimeError, match="in progress"):
+            with benchmark._smoke_execution_lease(full):
+                raise AssertionError("contender acquired the full lease")
+        with benchmark._smoke_execution_lease(dora):
+            pass
+
+    lock = full / ".execution.lock"
+    before = lock.stat()
+    with pytest.raises(RuntimeError, match="simulated process failure"):
+        with benchmark._smoke_execution_lease(full):
+            raise RuntimeError("simulated process failure")
+    with benchmark._smoke_execution_lease(full):
+        pass
+    after = lock.stat()
+    assert stat.S_IMODE(after.st_mode) == 0o600
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+
+
+def test_smoke_execution_lease_rejects_symlink_and_replaced_lock(
+    tmp_path, monkeypatch
+):
+    import stage1.benchmark as benchmark
+
+    registry = tmp_path / "evidence" / "full"
+    registry.mkdir(parents=True)
+    target = tmp_path / "foreign-lock"
+    target.write_bytes(b"")
+    lock = registry / ".execution.lock"
+    lock.symlink_to(target)
+    with pytest.raises(ValueError, match="execution lock"):
+        with benchmark._smoke_execution_lease(registry):
+            raise AssertionError("symlink lock was accepted")
+
+    lock.unlink()
+    os.mkfifo(lock)
+    with pytest.raises(ValueError, match="execution lock"):
+        with benchmark._smoke_execution_lease(registry):
+            raise AssertionError("FIFO lock was accepted")
+
+    lock.unlink()
+    original = benchmark.fcntl.flock
+
+    def replace_after_acquire(fd, operation):
+        original(fd, operation)
+        lock.unlink()
+        lock.write_bytes(b"replacement")
+        lock.chmod(0o600)
+
+    monkeypatch.setattr(benchmark.fcntl, "flock", replace_after_acquire)
+    with pytest.raises(ValueError, match="execution lock changed"):
+        with benchmark._smoke_execution_lease(registry):
+            raise AssertionError("replaced lock was accepted")
+
+
+def test_smoke_execution_lease_is_released_when_holder_process_is_killed(tmp_path):
+    import stage1.benchmark as benchmark
+
+    registry = tmp_path / "evidence" / "full"
+    ready = tmp_path / "holder-ready"
+    code = """
+import sys
+import time
+from pathlib import Path
+from stage1.benchmark import _smoke_execution_lease
+with _smoke_execution_lease(Path(sys.argv[1])):
+    Path(sys.argv[2]).write_text('ready', encoding='utf-8')
+    time.sleep(60)
+"""
+    holder = subprocess.Popen(
+        [sys.executable, "-c", code, str(registry), str(ready)],
+        cwd=REPO_ROOT,
+    )
+    try:
+        for _ in range(500):
+            if ready.is_file():
+                break
+            if holder.poll() is not None:
+                raise AssertionError(f"lease holder exited early: {holder.returncode}")
+            time.sleep(0.01)
+        else:
+            raise AssertionError("lease holder did not acquire the lock")
+        with pytest.raises(RuntimeError, match="in progress"):
+            with benchmark._smoke_execution_lease(registry):
+                raise AssertionError("contender acquired a live process lease")
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+    with benchmark._smoke_execution_lease(registry):
+        pass
+
+
+def test_concurrent_smoke_wrapper_never_launches_after_winner_publishes_success(
+    tmp_path,
+):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, _ = _smoke_fixture(tmp_path)
+    gate = tmp_path / "release-initial"
+    launcher = tmp_path / "blocking-smoke-launcher"
+    _write_smoke_subprocess_launcher(
+        launcher, records, initial_gate=gate
+    )
+    evidence_dir = tmp_path / "evidence" / "full"
+    kwargs = dict(
+        method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path, image_root=image_root, micro_batch=2,
+        gradient_accumulation_steps=2, world_size=2, initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir, launcher_path=launcher,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        winner = executor.submit(benchmark.run_or_load_distributed_witness, **kwargs)
+        for _ in range(500):
+            if list(records.iterdir()):
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("winner did not reach its first subprocess")
+
+        with pytest.raises(RuntimeError, match="in progress"):
+            benchmark.run_or_load_distributed_witness(**kwargs)
+        assert len(list(records.iterdir())) == 1
+        assert [path.name for path in (evidence_dir / "attempts").iterdir()] == [
+            "attempt-1"
+        ]
+        gate.write_text("release", encoding="utf-8")
+        observed = winner.result(timeout=20)
+
+    assert observed.resume_final_step == 4
+    assert len(list(records.iterdir())) == 2
+    assert benchmark.run_or_load_distributed_witness(**kwargs) == observed
+    assert len(list(records.iterdir())) == 2
+
+
+def test_smoke_wrapper_detects_execution_lock_replacement_between_launches(
+    tmp_path, monkeypatch
+):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    lock = evidence_dir / ".execution.lock"
+    original = benchmark._run_smoke_launcher
+    calls = 0
+
+    def replace_lock_after_first_launch(*args, **kwargs):
+        nonlocal calls
+        original(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            lock.unlink()
+            lock.write_bytes(b"replacement")
+            lock.chmod(0o600)
+
+    monkeypatch.setattr(
+        benchmark, "_run_smoke_launcher", replace_lock_after_first_launch
+    )
+    with pytest.raises(ValueError, match="execution lock changed"):
+        benchmark.run_or_load_distributed_witness(
+            method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+            data_path=data_path, image_root=image_root, micro_batch=2,
+            gradient_accumulation_steps=2, world_size=2,
+            initial_max_steps=3, resumed_max_steps=4,
+            deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+            evidence_dir=evidence_dir, launcher_path=launcher,
+        )
+
+    assert len(list(records.iterdir())) == 1
+    assert not (evidence_dir / "evidence.json").exists()
+
+
+def test_check_evidence_rejects_every_noncanonical_file_topology(tmp_path):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, _, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    kwargs = dict(
+        method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path, image_root=image_root, micro_batch=2,
+        gradient_accumulation_steps=2, world_size=2, initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir, launcher_path=launcher,
+    )
+    benchmark.run_or_load_distributed_witness(**kwargs)
+    canonical = evidence_dir / "evidence.json"
+    backing = evidence_dir / "backing.json"
+    canonical.rename(backing)
+    args = SimpleNamespace(
+        evidence_dir=str(evidence_dir), method="full", micro_batch=2, world_size=2
+    )
+
+    canonical.symlink_to(backing.name)
+    with pytest.raises(ValueError, match="canonical.*regular"):
+        benchmark._check_evidence(args)
+    canonical.unlink()
+
+    os.link(backing, canonical)
+    with pytest.raises(ValueError, match="canonical.*alias"):
+        benchmark._check_evidence(args)
+    canonical.unlink()
+
+    canonical.mkdir()
+    with pytest.raises(ValueError, match="canonical.*regular"):
+        benchmark._check_evidence(args)
+    canonical.rmdir()
+
+    os.mkfifo(canonical)
+    with pytest.raises(ValueError, match="canonical.*regular"):
+        benchmark._check_evidence(args)
 
 
 def test_legacy_flat_failure_is_retained_while_registry_retry_uses_attempt_2(
@@ -1554,8 +1802,8 @@ def test_concurrent_smoke_attempt_allocators_never_share_or_replace_a_target(
     def allocate_once():
         try:
             return benchmark._allocate_smoke_attempt(registry)
-        except FileExistsError as error:
-            assert "allocation lock" in str(error)
+        except RuntimeError as error:
+            assert "execution is in progress" in str(error)
             return None
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1618,7 +1866,7 @@ def test_malicious_canonical_smoke_evidence_is_never_overwritten_or_launched(
     canonical.write_bytes(b"{}\n")
     before = canonical.stat()
 
-    with pytest.raises(ValueError, match="producer evidence"):
+    with pytest.raises(ValueError, match="registry envelope"):
         benchmark.run_or_load_distributed_witness(
             method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
             data_path=data_path, image_root=image_root, micro_batch=2,
