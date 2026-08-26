@@ -8,10 +8,8 @@ an artifact tree.
 from __future__ import annotations
 
 import argparse
-import ctypes
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
-import errno
 import fcntl
 import hashlib
 import json
@@ -24,7 +22,6 @@ import sys
 import tempfile
 import time
 from typing import Any, Literal, Mapping, Sequence
-import warnings
 
 
 _SCHEMA_VERSION = 1
@@ -456,8 +453,6 @@ _SMOKE_REGISTRY_KIND = "stage1-smoke-registry-evidence"
 _SMOKE_REGISTRY_SCHEMA_VERSION = 3
 _SMOKE_EXECUTION_LOCK = ".execution.lock"
 _SMOKE_ATTEMPTS_DIRECTORY = "attempts"
-_FAILED_ATTEMPT_ARCHIVE_NAMESPACE = ".failed-attempts"
-_RENAME_NOREPLACE = 1
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY
     | os.O_DIRECTORY
@@ -506,18 +501,6 @@ def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
-def _require_no_smoke_success_markers(source_fd: int) -> None:
-    for protected_name in ("evidence.json", _SMOKE_MARKER_FILENAME):
-        try:
-            os.stat(protected_name, dir_fd=source_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        raise ValueError(
-            "refusing to archive smoke directory containing success "
-            f"evidence/marker: {protected_name}"
-        )
-
-
 def _require_named_fd_identity(
     *,
     directory_fd: int,
@@ -529,260 +512,20 @@ def _require_named_fd_identity(
     try:
         named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError as error:
-        raise ValueError(f"failed smoke {label} changed before archive commit") from error
+        raise ValueError(f"failed smoke {label} changed while pinned") from error
     opened = os.fstat(opened_fd)
     expected_type = stat_module.S_ISDIR if require_directory else stat_module.S_ISREG
     if not expected_type(named.st_mode) or not _same_file_identity(named, opened):
-        raise ValueError(f"failed smoke {label} changed before archive commit")
-
-
-def _revalidate_failed_archive_commit(
-    *,
-    parent_fd: int,
-    source_fd: int,
-    archive_fd: int,
-    method: str,
-    lock_fd: int,
-    lock_name: str,
-) -> None:
-    """Revalidate every pinned name and success invariant under the lock."""
-
-    _require_named_fd_identity(
-        directory_fd=parent_fd,
-        name=method,
-        opened_fd=source_fd,
-        label="source directory",
-        require_directory=True,
-    )
-    _require_named_fd_identity(
-        directory_fd=parent_fd,
-        name=_FAILED_ATTEMPT_ARCHIVE_NAMESPACE,
-        opened_fd=archive_fd,
-        label="archive directory",
-        require_directory=True,
-    )
-    _require_named_fd_identity(
-        directory_fd=archive_fd,
-        name=lock_name,
-        opened_fd=lock_fd,
-        label="archive lock",
-        require_directory=False,
-    )
-    _require_no_smoke_success_markers(source_fd)
-
-
-def _renameat2_noreplace(
-    source_fd: int,
-    source_name: str,
-    archive_fd: int,
-    target_name: str,
-) -> None:
-    """Commit one directory rename atomically without replacing a target."""
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise OSError(errno.ENOSYS, "renameat2(RENAME_NOREPLACE) is unavailable")
-    renameat2.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
-    result = renameat2(
-        source_fd,
-        os.fsencode(source_name),
-        archive_fd,
-        os.fsencode(target_name),
-        _RENAME_NOREPLACE,
-    )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(
-            error_number,
-            os.strerror(error_number),
-            target_name,
-        )
-
-
-def _cleanup_owned_archive_lock(
-    *, archive_fd: int, lock_fd: int, lock_name: str
-) -> bool:
-    """Remove only the still-named inode owned by ``lock_fd``."""
-
-    try:
-        named = os.stat(lock_name, dir_fd=archive_fd, follow_symlinks=False)
-        owned = os.fstat(lock_fd)
-        if not stat_module.S_ISREG(named.st_mode) or not _same_file_identity(
-            named, owned
-        ):
-            return False
-        os.unlink(lock_name, dir_fd=archive_fd)
-        return True
-    except OSError:
-        return False
-
-
-def _archive_failed_distributed_attempt_locked(evidence_dir: str | Path) -> Path:
-    """Atomically archive one whole failed smoke directory to a unique path."""
-
-    source = Path(evidence_dir)
-    method = source.name
-    if method not in {"full", "dora"}:
-        raise ValueError(
-            "failed smoke evidence directory must be a canonical full/dora child"
-        )
-    try:
-        parent_fd = os.open(source.parent, _DIRECTORY_OPEN_FLAGS)
-    except OSError as error:
-        raise ValueError(
-            f"failed smoke evidence parent must be a real directory: {source.parent}"
-        ) from error
-    try:
-        try:
-            source_fd = os.open(method, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
-        except FileNotFoundError as error:
-            raise FileNotFoundError(
-                f"failed smoke evidence directory is missing: {source}"
-            ) from error
-        except OSError as error:
-            raise ValueError(
-                "failed smoke evidence directory must be a regular "
-                "non-symlink directory"
-            ) from error
-        try:
-            _require_named_fd_identity(
-                directory_fd=parent_fd,
-                name=method,
-                opened_fd=source_fd,
-                label="source directory",
-                require_directory=True,
-            )
-            _require_no_smoke_success_markers(source_fd)
-            try:
-                os.mkdir(
-                    _FAILED_ATTEMPT_ARCHIVE_NAMESPACE,
-                    mode=0o750,
-                    dir_fd=parent_fd,
-                )
-            except FileExistsError:
-                pass
-            try:
-                archive_fd = os.open(
-                    _FAILED_ATTEMPT_ARCHIVE_NAMESPACE,
-                    _DIRECTORY_OPEN_FLAGS,
-                    dir_fd=parent_fd,
-                )
-            except OSError as error:
-                raise ValueError(
-                    "failed smoke archive namespace must be a regular "
-                    "non-symlink directory"
-                ) from error
-            try:
-                _require_named_fd_identity(
-                    directory_fd=parent_fd,
-                    name=_FAILED_ATTEMPT_ARCHIVE_NAMESPACE,
-                    opened_fd=archive_fd,
-                    label="archive directory",
-                    require_directory=True,
-                )
-                lock_name = f".{method}-archive.lock"
-                try:
-                    lock_fd = os.open(
-                        lock_name,
-                        os.O_WRONLY
-                        | os.O_CREAT
-                        | os.O_EXCL
-                        | getattr(os, "O_NOFOLLOW", 0)
-                        | getattr(os, "O_CLOEXEC", 0),
-                        0o600,
-                        dir_fd=archive_fd,
-                    )
-                except FileExistsError as error:
-                    raise FileExistsError(
-                        "failed smoke archive lock is already held: "
-                        f"{source.parent / _FAILED_ATTEMPT_ARCHIVE_NAMESPACE / lock_name}"
-                    ) from error
-                committed = False
-                lock_cleaned = False
-                try:
-                    prefix = f"{method}-attempt-"
-                    attempt_numbers = []
-                    for name in os.listdir(archive_fd):
-                        if not name.startswith(prefix):
-                            continue
-                        suffix = name.removeprefix(prefix)
-                        if (
-                            not suffix.isdigit()
-                            or int(suffix) <= 0
-                            or str(int(suffix)) != suffix
-                        ):
-                            raise ValueError(
-                                "noncanonical failed smoke archive collision: "
-                                f"{name}"
-                            )
-                        entry = os.stat(
-                            name, dir_fd=archive_fd, follow_symlinks=False
-                        )
-                        if not stat_module.S_ISDIR(entry.st_mode):
-                            raise ValueError(
-                                "failed smoke archive attempts must be regular "
-                                f"non-symlink directories: {name}"
-                            )
-                        attempt_numbers.append(int(suffix))
-
-                    next_attempt = max(attempt_numbers, default=0) + 1
-                    target_name = f"{prefix}{next_attempt}"
-                    _revalidate_failed_archive_commit(
-                        parent_fd=parent_fd,
-                        source_fd=source_fd,
-                        archive_fd=archive_fd,
-                        method=method,
-                        lock_fd=lock_fd,
-                        lock_name=lock_name,
-                    )
-                    _renameat2_noreplace(
-                        parent_fd,
-                        method,
-                        archive_fd,
-                        target_name,
-                    )
-                    committed = True
-                finally:
-                    lock_cleaned = _cleanup_owned_archive_lock(
-                        archive_fd=archive_fd,
-                        lock_fd=lock_fd,
-                        lock_name=lock_name,
-                    )
-                    os.close(lock_fd)
-                if committed and not lock_cleaned:
-                    warnings.warn(
-                        "archive committed but owned lock cleanup could not be "
-                        "verified; stale lock remains fail-closed",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                return (
-                    source.parent
-                    / _FAILED_ATTEMPT_ARCHIVE_NAMESPACE
-                    / target_name
-                )
-            finally:
-                os.close(archive_fd)
-        finally:
-            os.close(source_fd)
-    finally:
-        os.close(parent_fd)
+        raise ValueError(f"failed smoke {label} changed while pinned")
 
 
 def archive_failed_distributed_attempt(evidence_dir: str | Path) -> Path:
-    """Archive only while holding the same method-wide execution authority."""
+    """Reject obsolete mutation; append-only attempts retain failures in place."""
 
-    source = Path(evidence_dir)
-    with _smoke_execution_lease(source, create=False):
-        return _archive_failed_distributed_attempt_locked(source)
+    os.fspath(evidence_dir)
+    raise RuntimeError(
+        "unsupported/deprecated: append-only attempts preserve failures in place"
+    )
 
 
 def _checkpoint_file_topology(checkpoint: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -1222,7 +965,7 @@ def _validate_smoke_execution_lease(lease: _SmokeExecutionLease) -> None:
 
 
 @contextmanager
-def _smoke_execution_lease(evidence_directory: Path, *, create: bool = True):
+def _smoke_execution_lease(evidence_directory: Path):
     """Hold one method's persistent kernel execution lease until fd close."""
 
     directory = Path(os.path.abspath(evidence_directory))
@@ -1232,11 +975,10 @@ def _smoke_execution_lease(evidence_directory: Path, *, create: bool = True):
     directory_fd: int | None = None
     lock_fd: int | None = None
     try:
-        if create:
-            try:
-                os.mkdir(directory.name, 0o750, dir_fd=parent_fd)
-            except FileExistsError:
-                pass
+        try:
+            os.mkdir(directory.name, 0o750, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
         try:
             directory_fd = os.open(
                 directory.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd
@@ -4669,7 +4411,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
     command = args.command_name
     if command == "capacity-candidates":
         print(" ".join(map(str, capacity_candidates(args.start, args.max_per_gpu))))
@@ -4710,7 +4453,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif command == "check-evidence":
         print(_check_evidence(args))
     elif command == "archive-failed-attempt":
-        print(archive_failed_distributed_attempt(args.evidence_dir))
+        try:
+            archive_failed_distributed_attempt(args.evidence_dir)
+        except RuntimeError as error:
+            parser.error(str(error))
     elif command == "require-evidence":
         _require_evidence(args.paths)
         print("reusable-success")
