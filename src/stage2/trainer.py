@@ -1,5 +1,8 @@
 """Thin Hugging Face Trainer adapter for Stage 2 model-native loss."""
 
+import tempfile
+from pathlib import Path
+
 from transformers import Trainer
 
 from .checkpointing import save_stage2_peft_metadata
@@ -54,8 +57,22 @@ class Stage2Trainer(Trainer):
 
     def save_model(self, output_dir=None, _internal_call=False):
         super().save_model(output_dir, _internal_call=_internal_call)
-        target = output_dir or self.args.output_dir
-        if self.stage2_peft_metadata is not None and self.args.should_save:
-            if self.stage2_peft_metadata.token_row_source == "sparse_adapter":
+        metadata = self.stage2_peft_metadata
+        if metadata is None:
+            return
+        target = Path(output_dir or self.args.output_dir)
+        if metadata.token_row_source == "sparse_adapter":
+            if self.is_deepspeed_enabled:
+                # The sparse ZeRO gather is collective. Non-writing ranks use a
+                # private temporary destination while rank zero publishes.
+                if self.args.should_save:
+                    save_sparse_token_rows(self.model, target)
+                else:
+                    with tempfile.TemporaryDirectory(
+                        prefix="stage2-token-rows-"
+                    ) as temporary:
+                        save_sparse_token_rows(self.model, Path(temporary))
+            elif self.args.should_save:
                 save_sparse_token_rows(self.model, target)
-            save_stage2_peft_metadata(target, self.stage2_peft_metadata)
+        if self.args.should_save:
+            save_stage2_peft_metadata(target, metadata)

@@ -24,6 +24,11 @@ from stage1.token_rows import (
     initialize_frozen_output_token_rows,
 )
 from stage1.checkpointing import (
+    _NON_MODEL_BINARY_FILES,
+    _RANK_RNG_STATE,
+    _claims_weight_format,
+    _is_full_weight_filename,
+    _validate_full_serialization,
     Stage1PeftMetadataSnapshot,
     decode_stage1_peft_metadata_snapshot,
     read_stage1_peft_metadata_snapshot,
@@ -61,22 +66,13 @@ _OTHER_PEFT_MARKERS = frozenset(
         SPARSE_TOKEN_ROWS_FILENAME,
     }
 )
-_FULL_MODEL_MARKERS = frozenset(
-    {
-        "model.safetensors",
-        "model.safetensors.index.json",
-        "pytorch_model.bin",
-        "pytorch_model.bin.index.json",
-    }
-)
-
-
 def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
-    """Classify a local artifact from small filenames, failing closed on mixtures.
+    """Classify a local artifact from filenames, failing closed on mixtures.
 
     Non-local references are left to ``from_pretrained`` and classified as full
-    because their remote files cannot be inspected here. This repository's PEFT
-    publication contract is the unsharded safetensors marker set above.
+    because their remote files cannot be inspected here. Local full artifacts
+    follow Task 9's standalone/indexed-family contract; this repository's PEFT
+    publication contract remains the unsharded safetensors marker set above.
     """
     path = Path(directory)
     if not path.exists():
@@ -84,15 +80,32 @@ def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
     if not path.is_dir():
         raise ValueError(f"Stage 2 artifact is not a directory: {path}")
 
-    names = {entry.name for entry in path.iterdir() if entry.is_file()}
+    names = {entry.name for entry in path.iterdir()}
     present_peft = names & (_REQUIRED_PEFT_MARKERS | _OTHER_PEFT_MARKERS)
-    present_full = names & _FULL_MODEL_MARKERS
+    present_full = {name for name in names if _is_full_weight_filename(name)}
 
     if present_peft and present_full:
         raise ValueError(
             "mixed Stage 2 full and PEFT artifact markers: "
             f"peft={sorted(present_peft)}, full={sorted(present_full)}"
         )
+
+    recognized_weights = (
+        present_full
+        | (names & (_REQUIRED_PEFT_MARKERS | _OTHER_PEFT_MARKERS))
+        | (names & _NON_MODEL_BINARY_FILES)
+        | {name for name in names if _RANK_RNG_STATE.fullmatch(name)}
+    )
+    unknown_weights = sorted(
+        name
+        for name in names
+        if _claims_weight_format(name) and name not in recognized_weights
+    )
+    if unknown_weights:
+        raise ValueError(
+            f"unknown Stage 2 model weight markers: {unknown_weights}"
+        )
+
     required_present = present_peft & _REQUIRED_PEFT_MARKERS
     unsupported_present = present_peft & (
         _OTHER_PEFT_MARKERS - {SPARSE_TOKEN_ROWS_FILENAME}
@@ -108,6 +121,19 @@ def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
             "adapter_model.safetensors is required"
         )
     if present_peft:
+        payload_names = set(_REQUIRED_PEFT_MARKERS)
+        if SPARSE_TOKEN_ROWS_FILENAME in names:
+            payload_names.add(SPARSE_TOKEN_ROWS_FILENAME)
+        invalid_files = sorted(
+            name
+            for name in payload_names
+            if (path / name).is_symlink() or not (path / name).is_file()
+        )
+        if invalid_files:
+            raise ValueError(
+                "Stage 2 PEFT payloads must be regular non-symlink files: "
+                f"{invalid_files}"
+            )
         metadata = load_stage2_peft_metadata(path)
         has_sparse_rows = SPARSE_TOKEN_ROWS_FILENAME in names
         expects_sparse_rows = metadata.token_row_source == "sparse_adapter"
@@ -152,6 +178,7 @@ def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
                 )
         return Stage2ArtifactKind.PEFT
     if present_full:
+        _validate_full_serialization(path, names)
         return Stage2ArtifactKind.FULL
     raise ValueError(
         f"unrecognized local Stage 2 artifact (missing model weights): {path}"

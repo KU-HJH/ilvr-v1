@@ -222,6 +222,187 @@ def test_sparse_stage2_artifact_rejects_mismatched_payload(tmp_path, mutation):
         classify_stage2_artifact(tmp_path)
 
 
+def _write_structural_stage2_peft(directory, *, sparse=True):
+    directory.mkdir(parents=True, exist_ok=True)
+    metadata = replace(
+        sample_metadata(),
+        token_row_source="sparse_adapter" if sparse else "base",
+        stage1_adapter_reference=(
+            "/deleted/stage1/provenance-only" if sparse else None
+        ),
+    )
+    save_stage2_peft_metadata(directory, metadata)
+    (directory / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (directory / "adapter_model.safetensors").write_bytes(b"adapter")
+    if sparse:
+        save_file(
+            {
+                "token_ids": torch.tensor([90, 91, 92], dtype=torch.int64),
+                "output_delta": torch.zeros((3, 8), dtype=torch.float32),
+            },
+            directory / "ilvr_token_rows.safetensors",
+            metadata={"format_version": "1", "training_dtype": "float32"},
+        )
+    return metadata
+
+
+def _write_stage2_full_index(directory, *, binary=False):
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = "pytorch_model" if binary else "model"
+    suffix = "bin" if binary else "safetensors"
+    shards = [
+        f"{stem}-00001-of-00002.{suffix}",
+        f"{stem}-00002-of-00002.{suffix}",
+    ]
+    for shard in shards:
+        (directory / shard).write_bytes(b"weight")
+    index_name = (
+        "pytorch_model.bin.index.json"
+        if binary
+        else "model.safetensors.index.json"
+    )
+    (directory / index_name).write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 12},
+                "weight_map": {
+                    "model.embed_tokens.weight": shards[0],
+                    "lm_head.weight": shards[1],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return index_name, shards
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        STAGE2_PEFT_METADATA_FILENAME,
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors",
+    ],
+)
+@pytest.mark.parametrize("target_location", ["inside", "outside"])
+def test_stage2_classifier_rejects_symlinked_required_peft_file(
+    tmp_path, filename, target_location
+):
+    """Catches a required PEFT payload escaping regular-file ownership."""
+    artifact = tmp_path / "artifact"
+    _write_structural_stage2_peft(artifact)
+    payload_dir = (
+        artifact / "payloads"
+        if target_location == "inside"
+        else tmp_path / "outside-payloads"
+    )
+    payload_dir.mkdir()
+    source = artifact / filename
+    target = payload_dir / filename
+    source.replace(target)
+    source.symlink_to(target)
+
+    with pytest.raises(ValueError, match="regular|symlink|invalid"):
+        classify_stage2_artifact(artifact)
+
+
+@pytest.mark.parametrize("filename", ["model.safetensors", "pytorch_model.bin"])
+def test_stage2_classifier_accepts_one_standalone_full_family(tmp_path, filename):
+    """Catches the strict classifier accidentally dropping valid full saves."""
+    (tmp_path / filename).write_bytes(b"weight")
+
+    assert classify_stage2_artifact(tmp_path).value == "full"
+
+
+@pytest.mark.parametrize("binary", [False, True])
+def test_stage2_classifier_accepts_one_complete_sharded_full_family(
+    tmp_path, binary
+):
+    """Catches a complete indexed full checkpoint being treated as incomplete."""
+    _write_stage2_full_index(tmp_path, binary=binary)
+
+    assert classify_stage2_artifact(tmp_path).value == "full"
+
+
+@pytest.mark.parametrize("target_location", ["inside", "outside"])
+@pytest.mark.parametrize("component", ["standalone", "index", "shard"])
+def test_stage2_classifier_rejects_symlinked_full_weight_family(
+    tmp_path, target_location, component
+):
+    """Catches full-model files being accepted through symlink indirection."""
+    artifact = tmp_path / "artifact"
+    if component == "standalone":
+        artifact.mkdir()
+        filename = "model.safetensors"
+        (artifact / filename).write_bytes(b"weight")
+    else:
+        index_name, shards = _write_stage2_full_index(artifact)
+        filename = index_name if component == "index" else shards[0]
+    payload_dir = (
+        artifact / "payloads"
+        if target_location == "inside"
+        else tmp_path / "outside-payloads"
+    )
+    payload_dir.mkdir()
+    source = artifact / filename
+    target = payload_dir / filename
+    source.replace(target)
+    source.symlink_to(target)
+
+    with pytest.raises(ValueError, match="full|regular|symlink|invalid"):
+        classify_stage2_artifact(artifact)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "malformed_index",
+        "missing_shard",
+        "orphan_shard",
+        "mixed_standalone",
+        "mixed_binary_family",
+    ],
+)
+def test_stage2_classifier_rejects_incoherent_full_serialization(
+    tmp_path, mutation
+):
+    """Catches incomplete or mixed sharded weight families reaching loading."""
+    index_name, shards = _write_stage2_full_index(tmp_path)
+    if mutation == "malformed_index":
+        (tmp_path / index_name).write_text("{\n", encoding="utf-8")
+    elif mutation == "missing_shard":
+        (tmp_path / shards[-1]).unlink()
+    elif mutation == "orphan_shard":
+        (tmp_path / "model-00003-of-00003.safetensors").write_bytes(b"weight")
+    elif mutation == "mixed_standalone":
+        (tmp_path / "model.safetensors").write_bytes(b"weight")
+    else:
+        (tmp_path / "pytorch_model.bin").write_bytes(b"weight")
+
+    with pytest.raises(ValueError, match="full|shard|serialization|index"):
+        classify_stage2_artifact(tmp_path)
+
+
+def test_stage2_classifier_rejects_orphan_full_shard_beside_peft(tmp_path):
+    """Catches an orphan full shard evading PEFT/full mixed-layout detection."""
+    _write_structural_stage2_peft(tmp_path)
+    (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"weight")
+
+    with pytest.raises(ValueError, match="mixed.*full.*PEFT|mixed.*PEFT.*full"):
+        classify_stage2_artifact(tmp_path)
+
+
+def test_stage2_classifier_rejects_unknown_weight_like_filename(tmp_path):
+    """Catches unowned model bytes being silently ignored during classification."""
+    (tmp_path / "model.safetensors").write_bytes(b"weight")
+    (tmp_path / "unowned_weights.safetensors").write_bytes(b"weight")
+
+    with pytest.raises(ValueError, match="unknown.*weight"):
+        classify_stage2_artifact(tmp_path)
+
+
 def write_mutated_metadata(directory, metadata, mutation):
     payload = metadata.to_dict()
     if mutation == "bad_schema":
@@ -978,6 +1159,76 @@ def test_stage2_trainer_final_peft_save_is_adapter_only_with_sidecar(
     assert not (tmp_path / "model.safetensors").exists()
     assert not (tmp_path / "pytorch_model.bin").exists()
     assert load_stage2_peft_metadata(tmp_path) == metadata
+
+
+@pytest.mark.parametrize("explicit_output", [False, True])
+def test_stage2_sparse_deepspeed_save_has_all_rank_collective_participation(
+    tmp_path, monkeypatch, explicit_output
+):
+    """Catches a non-writing ZeRO rank skipping the sparse-row collective."""
+    final_output = tmp_path / "final"
+    actual_output = tmp_path / "checkpoint-1" if explicit_output else final_output
+    metadata = replace(
+        sample_metadata(),
+        token_row_source="sparse_adapter",
+        stage1_adapter_reference="/deleted/stage1/provenance-only",
+    )
+    events = []
+    temporary_targets = []
+    active_rank = None
+
+    def framework_save(trainer, output_dir=None, _internal_call=False):
+        target = Path(output_dir or trainer.args.output_dir)
+        events.append((active_rank, "framework", target))
+        if trainer.args.should_save:
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "processor.json").write_text("{}\n", encoding="utf-8")
+
+    def sparse_save(model, output_dir):
+        target = Path(output_dir)
+        events.append((active_rank, "sparse", target))
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "ilvr_token_rows.safetensors").write_bytes(b"rows")
+        if active_rank == 1:
+            temporary_targets.append(target)
+
+    def metadata_save(output_dir, saved_metadata):
+        target = Path(output_dir)
+        events.append((active_rank, "metadata", target))
+        assert saved_metadata == metadata
+        target.mkdir(parents=True, exist_ok=True)
+        (target / STAGE2_PEFT_METADATA_FILENAME).write_text(
+            "{}\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr("stage2.trainer.Trainer.save_model", framework_save)
+    monkeypatch.setattr("stage2.trainer.save_sparse_token_rows", sparse_save)
+    monkeypatch.setattr("stage2.trainer.save_stage2_peft_metadata", metadata_save)
+
+    trainer = object.__new__(Stage2Trainer)
+    trainer.model = object()
+    trainer.stage2_peft_metadata = metadata
+    trainer.is_deepspeed_enabled = True
+    for rank, should_save in ((1, False), (0, True)):
+        active_rank = rank
+        trainer.args = SimpleNamespace(
+            output_dir=str(final_output), should_save=should_save
+        )
+        trainer.save_model(actual_output if explicit_output else None)
+
+    assert [(rank, action) for rank, action, _ in events] == [
+        (1, "framework"),
+        (1, "sparse"),
+        (0, "framework"),
+        (0, "sparse"),
+        (0, "metadata"),
+    ]
+    assert temporary_targets
+    assert all(target != actual_output for target in temporary_targets)
+    assert all(not target.exists() for target in temporary_targets)
+    assert (actual_output / "ilvr_token_rows.safetensors").is_file()
+    assert (actual_output / STAGE2_PEFT_METADATA_FILENAME).is_file()
+    assert (actual_output / "processor.json").is_file()
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")

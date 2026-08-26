@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import random
 import shutil
+from copy import deepcopy
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from accelerate.state import AcceleratorState, GradientState
-from transformers import TrainingArguments
+from transformers import TrainerCallback, TrainingArguments, default_data_collator
 from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 import main
@@ -22,6 +25,7 @@ from stage2.checkpointing import (
     classify_stage2_artifact,
     configure_stage2_metadata,
     load_stage2_peft_metadata,
+    prepare_stage2_sparse_token_base,
     resolve_stage2_load_decision,
 )
 from stage2.peft import (
@@ -100,6 +104,85 @@ def active_stage1_state(model) -> dict[str, torch.Tensor]:
             )
         )
     }
+
+
+class StopStage2AfterFirstStep(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == 1:
+            control.should_training_stop = True
+        return control
+
+
+def _stage2_resume_training_args(output_dir, *, save_strategy):
+    return TrainingArguments(
+        output_dir=str(output_dir),
+        max_steps=2,
+        per_device_train_batch_size=1,
+        save_strategy=save_strategy,
+        save_steps=1,
+        report_to=[],
+        disable_tqdm=True,
+        use_cpu=True,
+        seed=47,
+        data_seed=47,
+    )
+
+
+def _stage2_sparse_batch():
+    return {
+        "input_ids": torch.tensor([1, 126, 125, 125, 127, 2]),
+        "attention_mask": torch.ones(6, dtype=torch.long),
+        "labels": torch.tensor([-100, 126, -100, -100, 127, 2]),
+    }
+
+
+def _capture_rng_state():
+    return (
+        random.getstate(),
+        np.random.get_state(),
+        torch.random.get_rng_state().clone(),
+    )
+
+
+def _assert_rng_state_equal(actual, expected):
+    assert actual[0] == expected[0]
+    assert actual[1][0] == expected[1][0]
+    assert np.array_equal(actual[1][1], expected[1][1])
+    assert actual[1][2:] == expected[1][2:]
+    assert torch.equal(actual[2], expected[2])
+
+
+def _assert_nested_state_equal(actual, expected):
+    if isinstance(expected, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    elif isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_nested_state_equal(actual[key], expected[key])
+    elif isinstance(expected, (list, tuple)):
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_nested_state_equal(actual_item, expected_item)
+    else:
+        assert actual == expected
+
+
+def _capture_trainable_state(model):
+    return {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+
+def _capture_logits(model):
+    model.eval()
+    batch = _stage2_sparse_batch()
+    with torch.no_grad():
+        return model(
+            input_ids=batch["input_ids"].unsqueeze(0),
+            attention_mask=batch["attention_mask"].unsqueeze(0),
+        ).logits.detach().cpu()
 
 
 def test_stage1_dora_handoff_preserves_same_adapter_rows_and_logits(tmp_path):
@@ -501,4 +584,123 @@ def test_main_sparse_stage2_resume_is_independent_of_stage1_source(
     assert components.peft_metadata == metadata
     validate_stage2_parameter_boundary(
         components.model, tuning, allow_sparse_token_rows=True
+    )
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_sparse_stage2_numbered_resume_matches_uninterrupted_training(tmp_path):
+    """Catches Stage 2 resume dropping any Trainer-owned or sparse adapter state."""
+    stage1_dir = tmp_path / "stage1"
+    processor, stage1_metadata = write_stage1_dora_artifact(stage1_dir)
+    tuning = stage2_dora_tuning()
+    initial = load_stage1_dora_for_fresh_stage2(
+        tiny_original_qwen(), processor, stage1_dir, tuning
+    )
+    qwen = resolve_qwen2_5_vl_model(initial)
+    configure_stage2_metadata(
+        qwen.config,
+        LatentTokenIds(*LATENT_TOKEN_IDS),
+        latent_size=stage1_metadata.latent_size,
+        supervise_latent_boundaries=True,
+    )
+    metadata = build_stage2_peft_metadata(
+        tuning=tuning,
+        base_model_reference=stage1_metadata.base_model_reference,
+        model_config=qwen.config,
+        token_ids=LatentTokenIds(*LATENT_TOKEN_IDS),
+        resolved_target_names=stage1_metadata.resolved_target_names,
+        token_row_source="sparse_adapter",
+        stage1_adapter_reference=str(stage1_dir.resolve()),
+    )
+    dataset = [_stage2_sparse_batch()]
+
+    uninterrupted = Stage2Trainer(
+        model=deepcopy(initial),
+        args=_stage2_resume_training_args(
+            tmp_path / "uninterrupted", save_strategy="no"
+        ),
+        train_dataset=dataset,
+        data_collator=default_data_collator,
+        processing_class=processor,
+        stage2_peft_metadata=metadata,
+    )
+    uninterrupted.train()
+    expected_model = _capture_trainable_state(uninterrupted.model)
+    expected_optimizer = deepcopy(uninterrupted.optimizer.state_dict())
+    expected_scheduler = deepcopy(uninterrupted.lr_scheduler.state_dict())
+    expected_rng = _capture_rng_state()
+    expected_logits = _capture_logits(uninterrupted.model)
+
+    output = tmp_path / "resumed"
+    interrupted = Stage2Trainer(
+        model=deepcopy(initial),
+        args=_stage2_resume_training_args(output, save_strategy="steps"),
+        train_dataset=dataset,
+        data_collator=default_data_collator,
+        processing_class=processor,
+        stage2_peft_metadata=metadata,
+        callbacks=[StopStage2AfterFirstStep()],
+    )
+    interrupted.train()
+
+    checkpoint = output / "checkpoint-1"
+    for filename in (
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors",
+        "stage2_peft_metadata.json",
+        "trainer_state.json",
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state.pth",
+        "tokenizer.json",
+        "preprocessor_config.json",
+    ):
+        assert (checkpoint / filename).is_file(), filename
+    assert classify_stage2_artifact(checkpoint).value == "peft"
+
+    shutil.rmtree(stage1_dir)
+    assert not stage1_dir.exists()
+    resumed_processor = TinyStage1Processor.from_pretrained(checkpoint)
+    resumed_metadata = load_stage2_peft_metadata(checkpoint)
+    assert resumed_metadata.stage1_adapter_reference == str(stage1_dir.resolve())
+    resumed_base = tiny_original_qwen()
+    prepare_stage2_sparse_token_base(
+        resumed_base, resumed_processor.tokenizer, resumed_metadata
+    )
+    resumed_model = build_stage2_tuned_model(
+        resumed_base,
+        tuning,
+        adapter_path=checkpoint,
+        is_trainable=True,
+        token_row_source="sparse_adapter",
+        latent_token_ids=LATENT_TOKEN_IDS,
+    )
+    resumed = Stage2Trainer(
+        model=resumed_model,
+        args=_stage2_resume_training_args(output, save_strategy="no"),
+        train_dataset=dataset,
+        data_collator=default_data_collator,
+        processing_class=resumed_processor,
+        stage2_peft_metadata=resumed_metadata,
+    )
+
+    resumed.train(resume_from_checkpoint=str(checkpoint))
+
+    assert resumed.state.global_step == 2
+    trainable_names = set(_capture_trainable_state(resumed.model))
+    for component in (
+        "lora_A",
+        "lora_B",
+        "lora_magnitude_vector",
+        "trainable_tokens_delta",
+        "output_delta",
+    ):
+        assert any(component in name for name in trainable_names), component
+    _assert_nested_state_equal(_capture_trainable_state(resumed.model), expected_model)
+    _assert_nested_state_equal(resumed.optimizer.state_dict(), expected_optimizer)
+    _assert_nested_state_equal(resumed.lr_scheduler.state_dict(), expected_scheduler)
+    _assert_rng_state_equal(_capture_rng_state(), expected_rng)
+    torch.testing.assert_close(
+        _capture_logits(resumed.model), expected_logits, rtol=0, atol=0
     )
