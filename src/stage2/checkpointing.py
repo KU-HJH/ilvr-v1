@@ -3,6 +3,7 @@
 import json
 import logging
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from pathlib import Path
@@ -460,8 +461,10 @@ def load_stage2_peft_metadata(directory: str | Path) -> Stage2PeftMetadata:
     return Stage2PeftMetadata.from_dict(payload)
 
 
-def _resolve_stage1_qwen_base(base_model, *, expected_stage: str = "stage1"):
-    """Require the unmodified full Stage 1 Qwen base used before PEFT loading."""
+def _resolve_stage1_qwen_base(
+    base_model, *, expected_stage: str | None = "stage1"
+):
+    """Require an unmodified full Qwen base with the requested stage tag."""
     candidate = getattr(base_model, "module", base_model)
     if isinstance(candidate, PeftModel):
         raise ValueError("Stage 1 PEFT-only base is not supported")
@@ -698,36 +701,17 @@ def prepare_stage2_sparse_token_base(
 
     if metadata.token_row_source != "sparse_adapter":
         raise ValueError("sparse base preparation requires sparse_adapter metadata")
-    qwen = _resolve_stage1_qwen_base(base_model)
-    current_vocab_size = int(qwen.config.vocab_size)
+    qwen = _resolve_stage1_qwen_base(base_model, expected_stage=None)
+    validate_stage2_sparse_original_base_config(qwen.config, metadata)
+    token_ids = validate_stage2_sparse_processor(tokenizer, metadata)
     expected_vocab_size = int(
         metadata.base_model_architecture["decoder"]["vocab_size"]
     )
-    if expected_vocab_size != current_vocab_size + 3:
-        raise ValueError(
-            "sparse Stage 2 base vocabulary mismatch: "
-            f"base={current_vocab_size}, checkpoint={expected_vocab_size}"
-        )
-    if len(tokenizer) != expected_vocab_size:
-        raise ValueError(
-            "sparse Stage 2 processor vocabulary mismatch: "
-            f"processor={len(tokenizer)}, checkpoint={expected_vocab_size}"
-        )
-    token_ids = resolve_latent_token_ids(tokenizer, qwen.config)
     ordered_ids = (
         token_ids.pad_token_id,
         token_ids.start_token_id,
         token_ids.end_token_id,
     )
-    expected_ids = tuple(range(current_vocab_size, expected_vocab_size))
-    if ordered_ids != expected_ids or ordered_ids != (
-        metadata.latent_pad_token_id,
-        metadata.latent_start_token_id,
-        metadata.latent_end_token_id,
-    ):
-        raise ValueError(
-            "sparse Stage 2 latent token IDs must be the exact appended rows"
-        )
     base_model.resize_token_embeddings(expected_vocab_size)
     initialize_frozen_output_token_rows(base_model, ordered_ids)
     configure_stage2_metadata(
@@ -739,12 +723,70 @@ def prepare_stage2_sparse_token_base(
     return token_ids
 
 
-def resolve_latent_token_ids(tokenizer, config) -> LatentTokenIds:
-    """Resolve latent IDs without modifying the tokenizer or its vocabulary.
+def validate_stage2_sparse_original_base_config(
+    config, metadata: Stage2PeftMetadata
+) -> None:
+    """Validate the tag-free, pre-resize Qwen config for sparse resume."""
 
-    Every latent token must be present in the tokenizer. Any canonical or legacy
-    config alias that is present must agree with the tokenizer's ID.
-    """
+    if metadata.token_row_source != "sparse_adapter":
+        raise ValueError("sparse base validation requires sparse_adapter metadata")
+    if getattr(config, "stage", None) is not None:
+        raise ValueError("sparse Stage 2 resume requires a tag-free original base")
+    expected_architecture = deepcopy(metadata.base_model_architecture)
+    resized_vocab_size = int(expected_architecture["decoder"]["vocab_size"])
+    expected_architecture["decoder"]["vocab_size"] = resized_vocab_size - 3
+    actual_architecture = _capture_base_model_architecture(config)
+    architecture_difference = _first_architecture_difference(
+        expected_architecture, actual_architecture
+    )
+    if architecture_difference is not None:
+        path, expected, actual = architecture_difference
+        raise ValueError(
+            f"original base architecture mismatch at {path}: "
+            f"checkpoint={expected!r}, base={actual!r}"
+        )
+
+
+def validate_stage2_sparse_processor(
+    tokenizer, metadata: Stage2PeftMetadata
+) -> LatentTokenIds:
+    """Validate exact appended sparse token strings, IDs, and vocabulary."""
+
+    if metadata.token_row_source != "sparse_adapter":
+        raise ValueError("sparse processor validation requires sparse_adapter metadata")
+    expected_vocab_size = int(
+        metadata.base_model_architecture["decoder"]["vocab_size"]
+    )
+    if len(tokenizer) != expected_vocab_size:
+        raise ValueError(
+            "sparse Stage 2 processor vocabulary mismatch: "
+            f"processor={len(tokenizer)}, checkpoint={expected_vocab_size}"
+        )
+    token_ids = _resolve_tokenizer_latent_ids(tokenizer)
+    ordered_ids = (
+        token_ids.pad_token_id,
+        token_ids.start_token_id,
+        token_ids.end_token_id,
+    )
+    expected_ids = tuple(range(expected_vocab_size - 3, expected_vocab_size))
+    if ordered_ids != expected_ids or ordered_ids != (
+        metadata.latent_pad_token_id,
+        metadata.latent_start_token_id,
+        metadata.latent_end_token_id,
+    ):
+        raise ValueError(
+            "sparse Stage 2 latent token IDs must be the exact appended rows"
+        )
+    for token, token_id in zip(LATENT_TOKEN_STRINGS.values(), ordered_ids):
+        if tokenizer.convert_ids_to_tokens(token_id) != token:
+            raise ValueError(
+                "sparse Stage 2 latent token string round-trip mismatch: "
+                f"token={token}, id={token_id}"
+            )
+    return token_ids
+
+
+def _resolve_tokenizer_latent_ids(tokenizer) -> LatentTokenIds:
     resolved: dict[str, int] = {}
     unknown_id = getattr(tokenizer, "unk_token_id", None)
     unknown_token = getattr(tokenizer, "unk_token", None)
@@ -761,14 +803,28 @@ def resolve_latent_token_ids(tokenizer, config) -> LatentTokenIds:
         tokenizer_id = int(tokenizer_id)
         resolved[result_field] = tokenizer_id
 
-    tokenizer_ids = LatentTokenIds(**resolved)
+    return LatentTokenIds(**resolved)
+
+
+def resolve_latent_token_ids(tokenizer, config) -> LatentTokenIds:
+    """Resolve latent IDs without modifying the tokenizer or its vocabulary.
+
+    Every latent token must be present in the tokenizer. Any canonical or legacy
+    config alias that is present must agree with the tokenizer's ID.
+    """
+    tokenizer_ids = _resolve_tokenizer_latent_ids(tokenizer)
+
     validate_stage2_config(
         config,
         fallback_token_ids=tokenizer_ids,
         require_canonical_ids=False,
         require_latent_size=False,
     )
-    for result_field, tokenizer_id in resolved.items():
+    for result_field, tokenizer_id in (
+        ("pad_token_id", tokenizer_ids.pad_token_id),
+        ("start_token_id", tokenizer_ids.start_token_id),
+        ("end_token_id", tokenizer_ids.end_token_id),
+    ):
         canonical_field = LATENT_CONFIG_FIELDS[result_field][0]
         for config_field in LATENT_CONFIG_FIELDS[result_field]:
             config_id = getattr(config, config_field, None)
@@ -1011,7 +1067,16 @@ def resolve_stage2_load_decision(
                 f"cannot resume Stage 2 with changed {field}: "
                 f"checkpoint={checkpoint_value}, requested={requested}"
             )
-    require_full_stage1(load_model_path)
+    if metadata.token_row_source == "sparse_adapter":
+        if (Path(load_model_path) / "adapter_config.json").is_file():
+            raise ValueError(
+                "sparse Stage 2 resume requires the original full base model"
+            )
+        validate_stage2_sparse_original_base_config(
+            load_config(load_model_path), metadata
+        )
+    else:
+        require_full_stage1(load_model_path)
     metadata_tuning = Stage2TuningConfig(
         method=metadata.tuning_method,
         r=metadata.lora_r,

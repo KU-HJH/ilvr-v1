@@ -89,6 +89,14 @@ def write_stage1_dora_artifact(directory):
     return processor, metadata
 
 
+def tiny_tag_free_original_qwen():
+    """Return the actual sparse-resume base shape without Stage 1 ILVR tags."""
+    model = tiny_original_qwen()
+    model.config.__dict__.pop("stage", None)
+    model.config.__dict__.pop("latent_size", None)
+    return model
+
+
 def active_stage1_state(model) -> dict[str, torch.Tensor]:
     return {
         name: tensor.detach().cpu()
@@ -104,6 +112,39 @@ def active_stage1_state(model) -> dict[str, torch.Tensor]:
             )
         )
     }
+
+
+def write_sparse_stage2_artifact(stage1_dir, stage2_dir):
+    processor, stage1_metadata = write_stage1_dora_artifact(stage1_dir)
+    tuning = stage2_dora_tuning()
+    continued = load_stage1_dora_for_fresh_stage2(
+        tiny_original_qwen(), processor, stage1_dir, tuning
+    )
+    qwen = resolve_qwen2_5_vl_model(continued)
+    configure_stage2_metadata(
+        qwen.config,
+        LatentTokenIds(*LATENT_TOKEN_IDS),
+        latent_size=stage1_metadata.latent_size,
+        supervise_latent_boundaries=True,
+    )
+    metadata = build_stage2_peft_metadata(
+        tuning=tuning,
+        base_model_reference=stage1_metadata.base_model_reference,
+        model_config=qwen.config,
+        token_ids=LatentTokenIds(*LATENT_TOKEN_IDS),
+        resolved_target_names=stage1_metadata.resolved_target_names,
+        token_row_source="sparse_adapter",
+        stage1_adapter_reference=str(stage1_dir.resolve()),
+    )
+    Stage2Trainer(
+        model=continued,
+        args=TrainingArguments(
+            output_dir=str(stage2_dir), report_to=[], use_cpu=True
+        ),
+        stage2_peft_metadata=metadata,
+    ).save_model(stage2_dir)
+    processor.save_pretrained(stage2_dir)
+    return processor, tuning, metadata, continued
 
 
 class StopStage2AfterFirstStep(TrainerCallback):
@@ -514,41 +555,54 @@ def test_saved_sparse_stage2_adapter_reloads_after_stage1_source_is_deleted(tmp_
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_sparse_stage2_resume_decision_uses_tag_free_original_base(tmp_path):
+    """Catches sparse v3 resume being routed through legacy Stage 1 tag checks."""
+    stage1_dir = tmp_path / "stage1"
+    stage2_dir = tmp_path / "checkpoint-1"
+    _, tuning, metadata, _ = write_sparse_stage2_artifact(
+        stage1_dir, stage2_dir
+    )
+    shutil.rmtree(stage1_dir)
+    config_sources = []
+
+    decision = resolve_stage2_load_decision(
+        load_model_path="tiny/original-qwen",
+        resume_from_checkpoint_path=str(stage2_dir),
+        load_config=lambda source: config_sources.append(source)
+        or tiny_tag_free_original_qwen().config,
+        latent_size=metadata.latent_size,
+        supervise_latent_boundaries=metadata.supervise_latent_boundaries,
+        tuning_method=None,
+        tuning_method_explicit=False,
+        lora_r=tuning.r,
+        lora_alpha=tuning.alpha,
+        lora_dropout=tuning.dropout,
+        lora_target_modules=tuning.target_modules,
+    )
+
+    assert config_sources == ["tiny/original-qwen"]
+    assert decision.base_model_source == "tiny/original-qwen"
+    assert decision.processor_source == str(stage2_dir)
+    assert decision.adapter_source == str(stage2_dir)
+    assert decision.trainer_resume_path == str(stage2_dir)
+    assert decision.peft_metadata == metadata
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
 def test_main_sparse_stage2_resume_is_independent_of_stage1_source(
     tmp_path, monkeypatch
 ):
     """Catches normal Stage 2 resume reopening its provenance-only Stage 1 path."""
     stage1_dir = tmp_path / "stage1"
     stage2_dir = tmp_path / "stage2-checkpoint"
-    processor, stage1_metadata = write_stage1_dora_artifact(stage1_dir)
-    tuning = stage2_dora_tuning()
-    continued = load_stage1_dora_for_fresh_stage2(
-        tiny_original_qwen(), processor, stage1_dir, tuning
+    processor, tuning, metadata, continued = write_sparse_stage2_artifact(
+        stage1_dir, stage2_dir
     )
-    qwen = resolve_qwen2_5_vl_model(continued)
-    configure_stage2_metadata(
-        qwen.config,
-        LatentTokenIds(*LATENT_TOKEN_IDS),
-        latent_size=2,
-        supervise_latent_boundaries=True,
-    )
-    metadata = build_stage2_peft_metadata(
-        tuning=tuning,
-        base_model_reference=stage1_metadata.base_model_reference,
-        model_config=qwen.config,
-        token_ids=LatentTokenIds(*LATENT_TOKEN_IDS),
-        resolved_target_names=stage1_metadata.resolved_target_names,
-        token_row_source="sparse_adapter",
-        stage1_adapter_reference=str(stage1_dir.resolve()),
-    )
-    Stage2Trainer(
-        model=continued,
-        args=TrainingArguments(
-            output_dir=str(stage2_dir), report_to=[], use_cpu=True
-        ),
-        stage2_peft_metadata=metadata,
-    ).save_model(stage2_dir)
-    processor.save_pretrained(stage2_dir)
+    expected_state = active_stage1_state(continued)
+    fixed_hidden = torch.linspace(-0.4, 0.9, 16).reshape(2, 8)
+    expected_logits = resolve_qwen2_5_vl_model(continued).lm_head(
+        fixed_hidden
+    ).detach()
     shutil.rmtree(stage1_dir)
     args = stage2_args(
         stage1_adapter_path=None,
@@ -560,6 +614,8 @@ def test_main_sparse_stage2_resume_is_independent_of_stage1_source(
         gradient_checkpointing=False,
     )
     processor_sources = []
+    config_sources = []
+    model_sources = []
     monkeypatch.setattr(
         main.AutoProcessor,
         "from_pretrained",
@@ -568,23 +624,117 @@ def test_main_sparse_stage2_resume_is_independent_of_stage1_source(
     monkeypatch.setattr(
         main.AutoConfig,
         "from_pretrained",
-        lambda source: tiny_original_qwen().config,
+        lambda source: config_sources.append(source)
+        or tiny_tag_free_original_qwen().config,
     )
     monkeypatch.setattr(
         main.Qwen2_5_VLForConditionalGeneration,
         "from_pretrained",
-        lambda source, **unused: tiny_original_qwen(),
+        lambda source, **unused: model_sources.append(source)
+        or tiny_tag_free_original_qwen(),
     )
     _stub_empty_stage2_data(monkeypatch)
 
     components = main.build_stage2_training_components(args)
 
     assert processor_sources == [str(stage2_dir)]
+    assert config_sources == ["tiny/original-qwen"]
+    assert model_sources == ["tiny/original-qwen"]
     assert components.trainer_resume_path == str(stage2_dir)
     assert components.peft_metadata == metadata
     validate_stage2_parameter_boundary(
         components.model, tuning, allow_sparse_token_rows=True
     )
+    restored_state = active_stage1_state(components.model)
+    assert set(restored_state) == set(expected_state)
+    for name, expected in expected_state.items():
+        torch.testing.assert_close(restored_state[name], expected)
+    torch.testing.assert_close(
+        resolve_qwen2_5_vl_model(components.model).lm_head(fixed_hidden),
+        expected_logits,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("architecture", "original base architecture mismatch.*hidden_act"),
+        ("base_vocab", "original base architecture mismatch.*vocab_size"),
+        ("processor_vocab", "processor vocabulary mismatch"),
+        ("token_ids", "latent token IDs"),
+        ("token_strings", "latent token string round-trip"),
+    ],
+)
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_sparse_stage2_resume_rejects_wrong_original_sources_before_attach(
+    tmp_path, monkeypatch, mutation, message
+):
+    """Catches incompatible sources reaching PEFT attachment or Trainer."""
+    stage1_dir = tmp_path / "stage1"
+    stage2_dir = tmp_path / "stage2-checkpoint"
+    processor, _, _, _ = write_sparse_stage2_artifact(stage1_dir, stage2_dir)
+    shutil.rmtree(stage1_dir)
+    config = tiny_tag_free_original_qwen().config
+    if mutation == "architecture":
+        config.hidden_act = "gelu"
+    elif mutation == "base_vocab":
+        config.vocab_size = RESIZED_VOCAB_SIZE - 4
+    elif mutation == "processor_vocab":
+        processor.tokenizer._size = RESIZED_VOCAB_SIZE - 1
+    elif mutation == "token_ids":
+        processor.tokenizer._ids["<|latent_start|>"] = LATENT_TOKEN_IDS[0] - 1
+    else:
+        processor.tokenizer._tokens[LATENT_TOKEN_IDS[1]] = "<|wrong_latent|>"
+
+    args = stage2_args(
+        stage1_adapter_path=None,
+        load_model_path="tiny/original-qwen",
+        resume_from_checkpoint_path=str(stage2_dir),
+        latent_size=2,
+        tuning_method=None,
+        tuning_method_explicit=False,
+        gradient_checkpointing=False,
+    )
+    calls = SimpleNamespace(model_loads=0, adapter_attaches=0, trainers=0)
+    monkeypatch.setattr(
+        main.AutoProcessor, "from_pretrained", lambda unused: processor
+    )
+    monkeypatch.setattr(
+        main.AutoConfig, "from_pretrained", lambda unused: config
+    )
+
+    def load_large_base(*unused, **unused_keywords):
+        calls.model_loads += 1
+        model = tiny_tag_free_original_qwen()
+        if mutation == "architecture":
+            model.config.hidden_act = "gelu"
+        elif mutation == "base_vocab":
+            model.config.vocab_size = RESIZED_VOCAB_SIZE - 4
+        return model
+
+    def reject_adapter_attach(*unused, **unused_keywords):
+        calls.adapter_attaches += 1
+        raise AssertionError("adapter attach must not run")
+
+    def reject_trainer(*unused, **unused_keywords):
+        calls.trainers += 1
+        raise AssertionError("Trainer must not run")
+
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        load_large_base,
+    )
+    monkeypatch.setattr(main, "build_stage2_tuned_model", reject_adapter_attach)
+    monkeypatch.setattr(main, "Stage2Trainer", reject_trainer)
+    _stub_empty_stage2_data(monkeypatch)
+
+    with pytest.raises(ValueError, match=message):
+        main.build_stage2_training_components(args)
+
+    assert calls.model_loads == 0
+    assert calls.adapter_attaches == 0
+    assert calls.trainers == 0
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
@@ -664,7 +814,7 @@ def test_sparse_stage2_numbered_resume_matches_uninterrupted_training(tmp_path):
     resumed_processor = TinyStage1Processor.from_pretrained(checkpoint)
     resumed_metadata = load_stage2_peft_metadata(checkpoint)
     assert resumed_metadata.stage1_adapter_reference == str(stage1_dir.resolve())
-    resumed_base = tiny_original_qwen()
+    resumed_base = tiny_tag_free_original_qwen()
     prepare_stage2_sparse_token_base(
         resumed_base, resumed_processor.tokenizer, resumed_metadata
     )

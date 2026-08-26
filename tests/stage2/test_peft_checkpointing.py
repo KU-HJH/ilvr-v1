@@ -647,6 +647,22 @@ def test_peft_resume_keeps_explicit_base_and_loads_adapter_checkpoint():
     assert decision.peft_metadata == lora_metadata()
 
 
+def test_base_token_row_resume_still_requires_tagged_full_stage1():
+    """Catches the sparse original-base exception leaking into v2/base resumes."""
+    migrated_v2 = migrate_stage2_metadata(complete_v2_metadata())
+
+    with pytest.raises(ValueError, match="requires a stage1 checkpoint"):
+        resolve_stage2_load_decision(
+            load_model_path="tag-free/original-qwen",
+            resume_from_checkpoint_path="stage2/checkpoint-9",
+            load_config=lambda unused: SimpleNamespace(stage=None),
+            load_peft_metadata=lambda unused: migrated_v2,
+            tuning_method=None,
+            tuning_method_explicit=False,
+            **semantic_args(),
+        )
+
+
 def test_peft_sidecar_classifies_resume_without_loading_adapter_as_full_config():
     def load_only_explicit_base(path):
         if path != "relocated-stage1":

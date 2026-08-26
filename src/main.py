@@ -27,6 +27,7 @@ from stage2.checkpointing import (
     resolve_latent_token_ids,
     resolve_stage2_load_decision,
     validate_stage2_peft_compatibility,
+    validate_stage2_sparse_processor,
 )
 from stage2.data import (
     Stage2DataCollator,
@@ -111,6 +112,13 @@ def build_stage2_training_components(args) -> Stage2TrainingComponents:
         lora_target_modules=args.lora_target_modules,
     )
     processor = AutoProcessor.from_pretrained(decision.processor_source)
+    if (
+        decision.peft_metadata is not None
+        and decision.peft_metadata.token_row_source == "sparse_adapter"
+    ):
+        validate_stage2_sparse_processor(
+            processor.tokenizer, decision.peft_metadata
+        )
     stage1_preflight = None
     stage1_metadata = None
     if decision.stage1_adapter_source is not None:
