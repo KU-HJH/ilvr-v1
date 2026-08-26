@@ -1,5 +1,8 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
+from copy import deepcopy
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Sequence
 
 import torch
@@ -100,6 +103,7 @@ def resolve_stage2_target_module_names(
 
 def resolve_stage2_qwen_model(model: nn.Module) -> nn.Module:
     """Unwrap one engine wrapper and a PEFT model to the Stage 2 Qwen base."""
+    wrapped = getattr(model, "module", model)
     try:
         candidate = resolve_qwen2_5_vl_model(model)
     except TypeError as error:
@@ -116,6 +120,56 @@ def resolve_stage2_qwen_model(model: nn.Module) -> nn.Module:
         or getattr(getattr(candidate, "config", None), "stage", None) != "stage2"
     ):
         raise TypeError("model does not satisfy the Stage 2 Qwen interface")
+    from stage1.token_rows import SparseOutputTokenRows
+
+    sparse_rows = (
+        tuple(
+            module
+            for module in candidate.modules()
+            if isinstance(module, SparseOutputTokenRows)
+        )
+        if isinstance(candidate, nn.Module)
+        else ()
+    )
+    if sparse_rows:
+        if len(sparse_rows) != 1 or candidate.lm_head is not sparse_rows[0]:
+            raise ValueError(
+                "Stage 2 inference requires exactly one sparse output-token row wrapper"
+            )
+        if not isinstance(wrapped, PeftModel):
+            raise ValueError(
+                "sparse Stage 2 inference requires exactly one active Stage 2 adapter"
+            )
+        adapter_names = tuple(wrapped.peft_config)
+        active_adapters = getattr(wrapped, "active_adapters", None)
+        if active_adapters is None:
+            active_adapters = getattr(wrapped, "active_adapter", None)
+        if isinstance(active_adapters, str):
+            active_adapters = (active_adapters,)
+        else:
+            active_adapters = tuple(active_adapters or ())
+        if (
+            len(adapter_names) != 1
+            or len(active_adapters) != 1
+            or active_adapters[0] != adapter_names[0]
+        ):
+            raise ValueError(
+                "sparse Stage 2 inference requires exactly one active Stage 2 adapter"
+            )
+        rows = sparse_rows[0]
+        token_ids = tuple(rows.token_ids.detach().cpu().tolist())
+        if len(token_ids) != 3:
+            raise ValueError("latent token IDs must contain exactly three values")
+        if len(set(token_ids)) != 3:
+            raise ValueError("latent token IDs must be unique")
+        if any(
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or token_id < 0
+            or token_id >= rows.out_features
+            for token_id in token_ids
+        ):
+            raise ValueError("latent token IDs must be valid vocabulary integers")
     return candidate
 
 
@@ -166,26 +220,26 @@ def validate_stage2_parameter_boundary(
     """Validate that Stage 2 training owns only the permitted parameters."""
     qwen = resolve_stage2_qwen_model(model)
     if allow_sparse_token_rows:
-        if tuning.method != "dora" or not expect_trainable:
-            raise ValueError(
-                "sparse Stage 2 token rows require trainable DoRA continuation"
-            )
-        from stage1.peft import validate_stage1_trainable_boundary
+        if tuning.method != "dora":
+            raise ValueError("sparse Stage 2 token rows require DoRA")
         from stage1.token_rows import find_sparse_output_token_rows
-        from stage1.types import Stage1TuningConfig
 
         rows = find_sparse_output_token_rows(model)
-        validate_stage1_trainable_boundary(
-            model,
-            Stage1TuningConfig(
-                method="dora",
-                rank=tuning.r,
-                alpha=tuning.alpha,
-                dropout=tuning.dropout,
-                target_suffixes=tuning.target_modules,
-            ),
-            tuple(rows.token_ids.detach().cpu().tolist()),
-        )
+        if expect_trainable:
+            from stage1.peft import validate_stage1_trainable_boundary
+            from stage1.types import Stage1TuningConfig
+
+            validate_stage1_trainable_boundary(
+                model,
+                Stage1TuningConfig(
+                    method="dora",
+                    rank=tuning.r,
+                    alpha=tuning.alpha,
+                    dropout=tuning.dropout,
+                    target_suffixes=tuning.target_modules,
+                ),
+                tuple(rows.token_ids.detach().cpu().tolist()),
+            )
     for label, module in (
         ("visual", qwen.visual),
         ("embedding", qwen.model.embed_tokens),
@@ -392,35 +446,143 @@ def build_stage2_tuned_model(
 
 
 def load_stage2_model_for_inference(
-    base_model: nn.Module,
-    adapter_path: str | Path,
-    metadata,
-    tokenizer,
+    base_model_path: str | Path,
+    stage2_artifact_path: str | Path,
+    processor,
+    *,
+    source_provenance_kwargs: Mapping[str, object] | None = None,
+    model_load_kwargs: Mapping[str, object] | None = None,
+    discover_adapter_config=None,
+    load_config=None,
+    load_model=None,
 ) -> PeftModel:
-    """Validate a Stage 1 base, then attach one frozen Stage 2 adapter."""
+    """Load one frozen Stage 2 adapter from its validated original base."""
     from peft import PeftConfig
+    from accelerate import init_empty_weights
+    from safetensors import SafetensorError
+    from transformers import AutoConfig, Qwen2_5_VLForConditionalGeneration
+    from transformers.utils.peft_utils import find_adapter_config_file
 
+    from stage1.token_rows import (
+        SPARSE_TOKEN_ROWS_FILENAME,
+        apply_sparse_token_rows_state,
+        attach_sparse_output_token_rows,
+        decode_sparse_token_rows_state,
+    )
     from .checkpointing import (
+        Stage2ArtifactKind,
+        classify_stage2_artifact,
         configure_stage2_metadata,
+        load_stage2_peft_metadata,
+        prepare_stage2_sparse_token_base,
         resolve_latent_token_ids,
         validate_stage2_peft_compatibility,
+        validate_stage2_sparse_original_base_config,
+        validate_stage2_sparse_processor,
     )
 
-    adapter_config = PeftConfig.from_pretrained(str(adapter_path))
-    validate_stage2_peft_compatibility(
-        base_model,
-        tokenizer,
-        metadata,
-        adapter_config,
-        adapter_path,
+    artifact_path = Path(stage2_artifact_path)
+    if classify_stage2_artifact(artifact_path) is not Stage2ArtifactKind.PEFT:
+        raise ValueError("Stage 2 inference adapter path must be a PEFT artifact")
+    metadata = load_stage2_peft_metadata(artifact_path)
+    tokenizer = processor.tokenizer
+    allowed_source_selectors = frozenset(
+        {"cache_dir", "revision", "token", "local_files_only"}
     )
-    token_ids = resolve_latent_token_ids(tokenizer, base_model.config)
-    configure_stage2_metadata(
-        base_model.config,
-        token_ids,
-        latent_size=metadata.latent_size,
-        supervise_latent_boundaries=metadata.supervise_latent_boundaries,
+    unknown_source_selectors = sorted(
+        set(source_provenance_kwargs or {}) - allowed_source_selectors
     )
+    if unknown_source_selectors:
+        raise ValueError(
+            "unsupported Stage 2 source provenance selectors: "
+            f"{unknown_source_selectors}"
+        )
+    source_kwargs = MappingProxyType(dict(source_provenance_kwargs or {}))
+    model_kwargs = MappingProxyType(dict(model_load_kwargs or {}))
+    overlapping_model_selectors = sorted(set(source_kwargs) & set(model_kwargs))
+    if overlapping_model_selectors:
+        raise ValueError(
+            "Stage 2 model options duplicate source provenance selectors: "
+            f"{overlapping_model_selectors}"
+        )
+    discover_adapter_config = discover_adapter_config or find_adapter_config_file
+    load_config = load_config or AutoConfig.from_pretrained
+    load_model = load_model or Qwen2_5_VLForConditionalGeneration.from_pretrained
+
+    sparse_payload = None
+    if metadata.token_row_source == "sparse_adapter":
+        validate_stage2_sparse_processor(tokenizer, metadata)
+        discovered = discover_adapter_config(
+            str(base_model_path), **source_kwargs
+        )
+        if discovered is not None:
+            raise ValueError(
+                "sparse Stage 2 inference requires an adapter-free original "
+                f"base model; discovered adapter config at {discovered}"
+            )
+        source_config = load_config(str(base_model_path), **source_kwargs)
+        validate_stage2_sparse_original_base_config(source_config, metadata)
+        sparse_path = artifact_path / SPARSE_TOKEN_ROWS_FILENAME
+        sparse_payload = sparse_path.read_bytes()
+        decode_sparse_token_rows_state(sparse_payload)
+    else:
+        source_config = load_config(str(base_model_path), **source_kwargs)
+
+    adapter_config = PeftConfig.from_pretrained(str(artifact_path))
+    preflight_config = deepcopy(source_config)
+    if metadata.token_row_source == "sparse_adapter":
+        preflight_config.vocab_size = int(
+            metadata.base_model_architecture["decoder"]["vocab_size"]
+        )
+        configure_stage2_metadata(
+            preflight_config,
+            validate_stage2_sparse_processor(tokenizer, metadata),
+            latent_size=metadata.latent_size,
+            supervise_latent_boundaries=metadata.supervise_latent_boundaries,
+        )
+    with init_empty_weights():
+        preflight_model = Qwen2_5_VLForConditionalGeneration(preflight_config)
+    try:
+        validate_stage2_peft_compatibility(
+            preflight_model,
+            tokenizer,
+            metadata,
+            adapter_config,
+            artifact_path,
+        )
+    except (OSError, SafetensorError) as error:
+        raise ValueError(
+            f"invalid Stage 2 adapter safetensors: {artifact_path}"
+        ) from error
+    base_model = load_model(
+        str(base_model_path), **source_kwargs, **model_kwargs
+    )
+    if metadata.token_row_source == "sparse_adapter":
+        token_ids = prepare_stage2_sparse_token_base(
+            base_model, tokenizer, metadata
+        )
+        validate_stage2_peft_compatibility(
+            base_model,
+            tokenizer,
+            metadata,
+            adapter_config,
+            artifact_path,
+        )
+    else:
+        token_ids = resolve_latent_token_ids(tokenizer, base_model.config)
+        validate_stage2_peft_compatibility(
+            base_model,
+            tokenizer,
+            metadata,
+            adapter_config,
+            artifact_path,
+        )
+        configure_stage2_metadata(
+            base_model.config,
+            token_ids,
+            latent_size=metadata.latent_size,
+            supervise_latent_boundaries=metadata.supervise_latent_boundaries,
+        )
     tuning = Stage2TuningConfig(
         method=metadata.tuning_method,
         r=metadata.lora_r,
@@ -430,13 +592,23 @@ def load_stage2_model_for_inference(
     )
     wrapped = PeftModel.from_pretrained(
         base_model,
-        str(adapter_path),
+        str(artifact_path),
         is_trainable=False,
     )
+    if metadata.token_row_source == "sparse_adapter":
+        ordered_ids = (
+            token_ids.pad_token_id,
+            token_ids.start_token_id,
+            token_ids.end_token_id,
+        )
+        attach_sparse_output_token_rows(wrapped, ordered_ids)
+        apply_sparse_token_rows_state(wrapped, sparse_payload, ordered_ids)
+    wrapped.requires_grad_(False)
     wrapped.eval()
     validate_stage2_parameter_boundary(
         wrapped,
         tuning,
         expect_trainable=False,
+        allow_sparse_token_rows=metadata.token_row_source == "sparse_adapter",
     )
     return wrapped

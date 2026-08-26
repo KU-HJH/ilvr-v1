@@ -1,4 +1,5 @@
 import copy
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,6 @@ from .helpers import (
 from peft import PeftModel
 from stage2.checkpointing import (
     build_stage2_peft_metadata,
-    load_stage2_peft_metadata,
     save_stage2_peft_metadata,
 )
 from stage2.inference import (
@@ -315,11 +315,19 @@ def test_saved_stage2_adapter_reload_preserves_logits_and_latent_states(
 
     # Compatibility must see the truly unmodified Stage 1 boundary.
     fresh_base.config.stage = "stage1"
+    expected_architectures = list(fresh_base.config.architectures or [])
+    base_dir = tmp_path / f"base-{method}"
+    fresh_base.save_pretrained(base_dir)
+    config_path = base_dir / "config.json"
+    config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    config_payload["architectures"] = expected_architectures
+    config_path.write_text(
+        json.dumps(config_payload, sort_keys=True) + "\n", encoding="utf-8"
+    )
     reloaded = load_stage2_model_for_inference(
-        base_model=fresh_base,
-        adapter_path=artifact_dir,
-        metadata=load_stage2_peft_metadata(artifact_dir),
-        tokenizer=TinyLatentTokenizer(),
+        base_dir,
+        artifact_dir,
+        SimpleNamespace(tokenizer=TinyLatentTokenizer()),
     )
 
     assert isinstance(reloaded, PeftModel)

@@ -1,5 +1,6 @@
 import copy
 import importlib
+import json
 import sys
 from types import SimpleNamespace
 
@@ -239,6 +240,18 @@ def _saved_adapter_artifact(tmp_path, method="lora"):
     return artifact_dir, fresh_base
 
 
+def _save_exact_base_source(model, directory):
+    expected_architectures = list(model.config.architectures or [])
+    model.save_pretrained(directory)
+    model.config.architectures = expected_architectures
+    config_path = directory / "config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["architectures"] = expected_architectures
+    config_path.write_text(
+        json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
 def test_eval_cli_accepts_explicit_stage1_base(module_name, monkeypatch):
     """Omitting the base-model CLI route must fail this test."""
@@ -270,6 +283,7 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
     module = _import_entry_point(module_name, monkeypatch)
     artifact_dir, fresh_base = _saved_adapter_artifact(tmp_path)
     base_dir = tmp_path / "stage1"
+    _save_exact_base_source(fresh_base, base_dir)
     processor = FakeProcessor()
     processor_sources = []
     model_sources = []
@@ -686,6 +700,8 @@ def test_peft_eval_token_mismatch_fails_during_artifact_loading(
     """Deferring token validation until sample iteration must fail this test."""
     module = _import_entry_point(module_name, monkeypatch)
     artifact_dir, fresh_base = _saved_adapter_artifact(tmp_path)
+    base_dir = tmp_path / "stage1"
+    _save_exact_base_source(fresh_base, base_dir)
     processor = FakeProcessor()
 
     class MismatchedTokenizer(FakeTokenizer):
@@ -710,10 +726,10 @@ def test_peft_eval_token_mismatch_fails_during_artifact_loading(
     with pytest.raises(ValueError, match="latent_start_token_id mismatch"):
         module.load_evaluation_artifacts(
             model_dir=str(artifact_dir),
-            base_model_dir=str(tmp_path / "stage1"),
+            base_model_dir=str(base_dir),
             cache_dir="cache",
         )
-    assert model_calls == [str(tmp_path / "stage1")]
+    assert model_calls == []
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

@@ -19,7 +19,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 from stage2.checkpointing import (
     Stage2ArtifactKind,
     classify_stage2_artifact,
-    load_stage2_peft_metadata,
     resolve_latent_token_ids,
 )
 from stage2.backend_fallback import is_flash_attention_initialization_error
@@ -133,16 +132,17 @@ def load_evaluation_artifacts(
             raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
         return load_model(model_dir, cache_dir), load_processor(model_dir, cache_dir)
 
-    metadata = load_stage2_peft_metadata(model_dir)
     if base_model_dir is None:
         raise ValueError("base_model_dir is required for a Stage 2 PEFT artifact")
     processor = AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
-    base_model = load_model(base_model_dir, cache_dir)
     model = load_stage2_model_for_inference(
-        base_model=base_model,
-        adapter_path=model_dir,
-        metadata=metadata,
-        tokenizer=processor.tokenizer,
+        base_model_dir,
+        model_dir,
+        processor,
+        source_provenance_kwargs={"cache_dir": cache_dir},
+        load_model=lambda source, **selectors: load_model(
+            source, selectors["cache_dir"]
+        ),
     )
     return model, processor
 
