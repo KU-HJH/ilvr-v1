@@ -18,7 +18,7 @@ from stage1.benchmark import (
     fallback_candidates_after_initial_failure,
     load_verified_evidence,
     select_high_cost_probe_rows,
-    write_benchmark_evidence,
+    _write_legacy_benchmark_evidence,
     config_digest,
 )
 
@@ -126,29 +126,15 @@ def test_evidence_rejects_wrong_types_nonfinite_values_and_invariants(
         evidence(**{field: bad_value})
 
 
-def test_evidence_write_is_atomic_and_verified_reads_are_reused(tmp_path, monkeypatch):
-    """Catches partial JSON, stale digests, and repeated immutable-file reads."""
+def test_official_verified_loader_rejects_raw_metrics_without_producer_seals(tmp_path):
+    """Catches Task 15 reuse that bypasses artifact and resume producer seals."""
     path = tmp_path / "nested" / "evidence.json"
     expected = evidence()
-    write_benchmark_evidence(path, expected)
+    _write_legacy_benchmark_evidence(path, expected)
     assert not list(path.parent.glob("*.tmp"))
 
-    import stage1.benchmark as benchmark
-
-    benchmark._VERIFIED_EVIDENCE_CACHE.clear()
-    reads = 0
-    original = benchmark._read_json_once
-
-    def counted(selected):
-        nonlocal reads
-        reads += 1
-        return original(selected)
-
-    monkeypatch.setattr(benchmark, "_read_json_once", counted)
-    assert load_verified_evidence(path, "b" * 64) is None
-    assert load_verified_evidence(path, expected.config_digest) == expected
-    assert load_verified_evidence(path, expected.config_digest) is not None
-    assert reads == 1
+    with pytest.raises(ValueError, match="producer envelope"):
+        load_verified_evidence(path, expected.config_digest)
 
 
 def _touch(path: Path) -> str:
@@ -599,13 +585,182 @@ def test_capacity_chain_rejects_duplicate_and_success_after_first_failure():
         )
 
 
+def _maximum_probe_launch_config(*, max_steps=3):
+    return {
+        "method": "full",
+        "micro_batch": 8,
+        "world_size": 2,
+        "gradient_accumulation_steps": 2,
+        "effective_global_batch": 32,
+        "learning_rate": 1e-5,
+        "seed": 42,
+        "max_steps": max_steps,
+        "final_save": False,
+        "model": "model",
+        "tuning_config": None,
+        "data_path": "/source/TRAIN.jsonl",
+        "train_data_path": "/probe/probe-input.jsonl",
+        "data_stat": {"device": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+        "image_root": "/source/images",
+        "deepspeed_config": "/repo/configs/config_stage3.json",
+        "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2",
+        "probe_rows": "/probe/high-cost.json",
+        "probe_row_indices": [7, 3],
+        "audit_digest": "a" * 64,
+        "run_config_digest": ("c" if max_steps == 3 else "b") * 64,
+        "prerequisite_chain_digest": "f" * 64,
+        "prerequisite_chain": "/smoke/prerequisite-chain.json",
+        "command": ["launcher"],
+    }
+
+
+def _sealed_maximum_fixture(tmp_path, monkeypatch):
+    import stage1.benchmark as benchmark
+
+    probe_root = tmp_path / "probe"
+    selected_path = (
+        probe_root
+        / "attempts/full/micro-batch-8/attempt-selected/evidence/attempt.json"
+    )
+    long_path = (
+        probe_root
+        / "long-smoke/full/micro-batch-8/attempt-long/evidence/attempt.json"
+    )
+    selected_launch = _maximum_probe_launch_config(max_steps=3)
+    long_launch = _maximum_probe_launch_config(max_steps=10)
+    selected = {
+        "method": "full", "micro_batch": 8, "world_size": 2,
+        "gradient_accumulation_steps": 2, "effective_global_batch": 32,
+        "max_steps": 3, "final_save": False, "exit_code": 0,
+        "recorded_at_ns": 1, "attempt_digest": "1" * 64,
+        "audit_digest": "a" * 64, "data_stat": selected_launch["data_stat"],
+        "probe_row_indices": [7, 3], "prerequisite_chain_digest": "f" * 64,
+        "launch_config": selected_launch,
+    }
+    long_attempt = {
+        **selected,
+        "max_steps": 10,
+        "recorded_at_ns": 2,
+        "attempt_digest": "2" * 64,
+        "output_dir": str((long_path.parents[1] / "output").resolve()),
+        "launch_config": long_launch,
+    }
+    producer_config = {
+        "schema_version": 1, "kind": "stage1-probe-run-manifest",
+        "method": "full", "tuning_config": None, "model": "model",
+        "source_data_path": long_launch["data_path"],
+        "data_path": long_launch["train_data_path"],
+        "data_stat": long_launch["data_stat"],
+        "image_root": long_launch["image_root"],
+        "output_dir": long_attempt["output_dir"],
+        "micro_batch": 8, "world_size": 2,
+        "gradient_accumulation_steps": 2, "effective_global_batch": 32,
+        "epochs": 3, "learning_rate": 1e-5, "seed": 42,
+        "max_steps": 10, "final_save": False,
+        "deepspeed_config": long_launch["deepspeed_config"],
+        "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2", "save_strategy": "no",
+        "audit_digest": "a" * 64, "probe_rows": long_launch["probe_rows"],
+        "probe_row_indices": [7, 3], "maximum_config_digest": None,
+        "prerequisite_chain": long_launch["prerequisite_chain"],
+        "prerequisite_chain_digest": "f" * 64,
+    }
+    producer_config["config_digest"] = "b" * 64
+    long_evidence = evidence(
+        optimizer_steps=10,
+        samples_seen=320,
+        config_digest=producer_config["config_digest"],
+        checkpoint_bytes=0,
+    )
+    producer_seal = {
+        "producer_digest": "9" * 64,
+        "run_config": producer_config,
+        "benchmark_evidence": benchmark._evidence_to_dict(long_evidence),
+    }
+    maximum = {
+        "schema_version": 1,
+        "kind": "stage1-capacity-maximum",
+        "status": "success",
+        "method": "full",
+        "selected_micro_batch": 8,
+        "world_size": 2,
+        "gradient_accumulation_steps": 2,
+        "effective_global_batch": 32,
+        "long_smoke_steps": 10,
+        "long_smoke_attempt": str(long_path),
+        "selected_attempt": str(selected_path),
+        "first_failure": None,
+        "launch_config": dict(selected_launch),
+        "attempt_chain_digest": config_digest({"attempt_digests": ["1" * 64]}),
+        "audit_digest": "a" * 64,
+        "data_stat": selected_launch["data_stat"],
+        "probe_row_indices": [7, 3],
+        "prerequisite_chain_digest": "f" * 64,
+        "long_smoke_producer_digest": "9" * 64,
+        "rank_peak_allocated_bytes": [10, 11],
+        "rank_peak_reserved_bytes": [12, 13],
+    }
+    maximum["config_digest"] = config_digest(maximum)
+    maximum_path = tmp_path / "maximum.json"
+    maximum_path.write_text(json.dumps(maximum))
+
+    def load_attempt(path):
+        return long_attempt if Path(path) == long_path else selected
+
+    monkeypatch.setattr(benchmark, "_load_probe_attempt", load_attempt)
+    monkeypatch.setattr(
+        benchmark, "_attempt_files", lambda probe_dir, method=None: [selected_path]
+    )
+    monkeypatch.setattr(
+        benchmark, "_load_producer_evidence",
+        lambda path: (long_evidence, producer_seal),
+    )
+    return maximum_path, maximum, selected, long_attempt, producer_seal
+
+
+def test_maximum_rejects_resealed_launch_config_not_equal_to_selected_attempt(
+    tmp_path, monkeypatch,
+):
+    """Catches a maximum relabeling the selected attempt after the probe."""
+    import stage1.benchmark as benchmark
+
+    maximum_path, maximum, _, _, _ = _sealed_maximum_fixture(tmp_path, monkeypatch)
+    maximum["launch_config"] = dict(maximum["launch_config"])
+    maximum["launch_config"]["model"] = "forged-model"
+    maximum["config_digest"] = config_digest(
+        {key: value for key, value in maximum.items() if key != "config_digest"}
+    )
+    maximum_path.write_text(json.dumps(maximum))
+
+    with pytest.raises(ValueError, match="selected attempt launch config"):
+        benchmark._load_maximum(maximum_path)
+
+
+def test_maximum_rejects_resealed_long_producer_not_bound_to_long_attempt(
+    tmp_path, monkeypatch,
+):
+    """Catches unrelated ten-step producer evidence attached to a maximum."""
+    import stage1.benchmark as benchmark
+
+    maximum_path, _, _, _, producer = _sealed_maximum_fixture(tmp_path, monkeypatch)
+    producer["run_config"] = dict(producer["run_config"])
+    producer["run_config"]["source_data_path"] = "/forged/TRAIN.jsonl"
+    producer["run_config"]["config_digest"] = "e" * 64
+    producer["benchmark_evidence"] = dict(producer["benchmark_evidence"])
+    producer["benchmark_evidence"]["config_digest"] = "e" * 64
+
+    with pytest.raises(ValueError, match="long-smoke producer.*attempt"):
+        benchmark._load_maximum(maximum_path)
+
+
 def test_timed_validation_rejects_artifactless_and_plain_metric_evidence(tmp_path):
     """Catches sealing a successful metrics blob without final model topology."""
     import stage1.benchmark as benchmark
 
     plain = evidence(config_digest="c" * 64, checkpoint_bytes=0)
     plain_path = tmp_path / "plain.json"
-    write_benchmark_evidence(plain_path, plain)
+    _write_legacy_benchmark_evidence(plain_path, plain)
     with pytest.raises((TypeError, ValueError), match="producer evidence"):
         benchmark._load_evidence_without_expected(plain_path)
 
@@ -858,3 +1013,60 @@ def test_final_report_rejects_a_maximum_from_another_smoke_chain(tmp_path, monke
                 output=str(tmp_path / "final.json"),
             )
         )
+
+
+def test_timed_comparison_is_a_standalone_canonical_prerequisite_seal(
+    tmp_path, monkeypatch,
+):
+    """Catches a write-only comparison with no chain identity or tamper seal."""
+    import stage1.benchmark as benchmark
+
+    shared = {
+        "schema_version": 1, "kind": "stage1-timed-launch-manifest",
+        "model": "model", "source_data_path": "/data/TRAIN.jsonl",
+        "data_path": "/data/TRAIN.jsonl",
+        "data_stat": {"device": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+        "image_root": "/data/images", "micro_batch": 8, "world_size": 2,
+        "gradient_accumulation_steps": 2, "effective_global_batch": 32,
+        "epochs": 3, "learning_rate": 1e-5, "seed": 42, "max_steps": 0,
+        "final_save": True, "deepspeed_config": "/repo/zero3.json",
+        "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2", "save_strategy": "no",
+        "audit_digest": "a" * 64, "probe_rows": "/probe/high-cost.json",
+        "probe_row_indices": [7, 3], "prerequisite_chain": "/smoke/chain.json",
+        "prerequisite_chain_digest": "f" * 64,
+    }
+    loaded = {}
+    for method in ("full", "dora"):
+        run_config = {
+            **shared,
+            "method": method,
+            "tuning_config": None if method == "full" else {
+                "use_dora": True, "rank": 32, "alpha": 64, "dropout": 0.05,
+                "target_modules": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+            },
+            "output_dir": f"/timed/{method}",
+            "maximum_config_digest": ("1" if method == "full" else "2") * 64,
+        }
+        run_config["config_digest"] = config_digest(run_config)
+        metrics = evidence(method=method, config_digest=run_config["config_digest"])
+        loaded[f"{method}.json"] = (
+            metrics,
+            {"producer_digest": ("3" if method == "full" else "4") * 64,
+             "run_config": run_config},
+        )
+    monkeypatch.setattr(
+        benchmark, "_load_producer_evidence", lambda path: loaded[path.name]
+    )
+    output = tmp_path / "comparison.json"
+    compared = benchmark._compare_runs(["full.json", "dora.json"], output)
+
+    assert compared["prerequisite_chain_digest"] == "f" * 64
+    assert len(compared["comparison_digest"]) == 64
+    assert benchmark._load_run_comparison(output) == compared
+
+    tampered = json.loads(output.read_text())
+    tampered["methods"]["full"]["final_loss"] = 0.25
+    output.write_text(json.dumps(tampered))
+    with pytest.raises(ValueError, match="comparison digest"):
+        benchmark._load_run_comparison(output)

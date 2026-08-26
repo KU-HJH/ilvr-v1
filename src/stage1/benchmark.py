@@ -261,7 +261,10 @@ class Stage1BenchmarkEvidence:
 
 
 _EVIDENCE_FIELDS = {field.name for field in fields(Stage1BenchmarkEvidence)}
-_VERIFIED_EVIDENCE_CACHE: dict[
+_LEGACY_RAW_EVIDENCE_CACHE: dict[
+    Path, tuple[tuple[int, int, int, int], Stage1BenchmarkEvidence]
+] = {}
+_VERIFIED_PRODUCER_EVIDENCE_CACHE: dict[
     Path, tuple[tuple[int, int, int, int], Stage1BenchmarkEvidence]
 ] = {}
 
@@ -349,24 +352,26 @@ def _file_witness(path: Path) -> tuple[int, int, int, int]:
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
-def write_benchmark_evidence(path: Path, evidence: Stage1BenchmarkEvidence) -> None:
-    """Atomically publish evidence, refusing to replace a different sealed result."""
+def _write_legacy_benchmark_evidence(
+    path: Path, evidence: Stage1BenchmarkEvidence
+) -> None:
+    """Write the pre-envelope raw test fixture; never use for official reuse."""
 
     path = Path(path)
     if path.exists():
         resolved = path.resolve(strict=True)
         witness = _file_witness(resolved)
-        cached = _VERIFIED_EVIDENCE_CACHE.get(resolved)
+        cached = _LEGACY_RAW_EVIDENCE_CACHE.get(resolved)
         if cached is not None and cached[0] == witness:
             existing = cached[1]
         else:
             existing = _evidence_from_dict(_read_json_once(resolved))
-            _VERIFIED_EVIDENCE_CACHE[resolved] = (witness, existing)
+            _LEGACY_RAW_EVIDENCE_CACHE[resolved] = (witness, existing)
         if existing == evidence:
             return
         raise FileExistsError(f"refusing to replace existing benchmark evidence: {path}")
     _atomic_write_json(path, _evidence_to_dict(evidence))
-    _VERIFIED_EVIDENCE_CACHE[path.resolve()] = (_file_witness(path), evidence)
+    _LEGACY_RAW_EVIDENCE_CACHE[path.resolve()] = (_file_witness(path), evidence)
 
 
 def load_verified_evidence(
@@ -380,18 +385,15 @@ def load_verified_evidence(
         return None
     resolved = path.resolve(strict=True)
     witness = _file_witness(resolved)
-    cached = _VERIFIED_EVIDENCE_CACHE.get(resolved)
+    cached = _VERIFIED_PRODUCER_EVIDENCE_CACHE.get(resolved)
     if cached is not None and cached[0] == witness:
         evidence = cached[1]
     else:
         payload = _read_json_once(resolved)
-        if type(payload) is dict and payload.get("kind") == "stage1-producer-evidence":
-            evidence, _ = _validate_producer_evidence_payload(payload)
-        else:
-            # Compatibility for Task 13's original public pure-metrics writer.
-            # Official CLI/runtime evidence always uses the producer envelope.
-            evidence = _evidence_from_dict(payload)
-        _VERIFIED_EVIDENCE_CACHE[resolved] = (witness, evidence)
+        if type(payload) is not dict or payload.get("kind") != "stage1-producer-evidence":
+            raise ValueError("official evidence must be a Stage 1 producer envelope")
+        evidence, _ = _validate_producer_evidence_payload(payload)
+        _VERIFIED_PRODUCER_EVIDENCE_CACHE[resolved] = (witness, evidence)
     if evidence.config_digest != expected_config_digest:
         return None
     return evidence
@@ -2315,6 +2317,8 @@ def _load_maximum(path: Path) -> dict[str, object]:
     selected_path = Path(payload["selected_attempt"])
     selected = _load_probe_attempt(selected_path)
     long_attempt = _load_probe_attempt(Path(payload["long_smoke_attempt"]))
+    if payload["launch_config"] != selected["launch_config"]:
+        raise ValueError("maximum selected attempt launch config mismatch")
     if len(selected_path.parents) < 6 or selected_path.parents[4].name != "attempts":
         raise ValueError("maximum selected attempt is outside a probe attempt tree")
     probe_root = selected_path.parents[5]
@@ -2359,6 +2363,39 @@ def _load_maximum(path: Path) -> dict[str, object]:
     _, producer = _load_producer_evidence(producer_path)
     if producer["producer_digest"] != payload["long_smoke_producer_digest"]:
         raise ValueError("maximum long-smoke producer digest mismatch")
+    producer_config = producer["run_config"]
+    long_launch = long_attempt["launch_config"]
+    expected_producer_bindings = {
+        "config_digest": long_launch["run_config_digest"],
+        "method": long_attempt["method"],
+        "micro_batch": long_attempt["micro_batch"],
+        "world_size": long_attempt["world_size"],
+        "gradient_accumulation_steps": long_attempt[
+            "gradient_accumulation_steps"
+        ],
+        "effective_global_batch": long_attempt["effective_global_batch"],
+        "max_steps": long_attempt["max_steps"],
+        "final_save": False,
+        "model": long_launch["model"],
+        "source_data_path": long_launch["data_path"],
+        "data_path": long_launch["train_data_path"],
+        "data_stat": long_attempt["data_stat"],
+        "image_root": long_launch["image_root"],
+        "output_dir": long_attempt["output_dir"],
+        "deepspeed_config": long_launch["deepspeed_config"],
+        "deepspeed_config_digest": long_launch["deepspeed_config_digest"],
+        "audit_digest": long_attempt["audit_digest"],
+        "probe_row_indices": long_attempt["probe_row_indices"],
+        "prerequisite_chain_digest": long_attempt[
+            "prerequisite_chain_digest"
+        ],
+        "prerequisite_chain": long_launch["prerequisite_chain"],
+    }
+    for name, value in expected_producer_bindings.items():
+        if producer_config.get(name) != value:
+            raise ValueError(
+                f"maximum long-smoke producer is not bound to attempt field: {name}"
+            )
     evidence = _evidence_from_dict(producer["benchmark_evidence"])
     if (
         list(evidence.rank_peak_allocated_bytes) != payload["rank_peak_allocated_bytes"]
@@ -2742,6 +2779,45 @@ def _validate_timed_run(run_dir: Path) -> str:
     return str(evidence_path)
 
 
+def _validate_run_comparison_payload(payload: object) -> dict[str, object]:
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version", "kind", "paper_level_reproduction",
+            "common_batch_control", "prerequisite_chain_digest", "methods",
+            "comparison_digest",
+        },
+        "Stage 1 timed comparison",
+    )
+    if (
+        payload.get("schema_version") != _SCHEMA_VERSION
+        or payload.get("kind") != "stage1-maximum-throughput-comparison"
+        or payload.get("paper_level_reproduction") is not False
+        or payload.get("common_batch_control") is not False
+    ):
+        raise ValueError("invalid Stage 1 timed comparison identity")
+    _require_digest(
+        "prerequisite_chain_digest", payload.get("prerequisite_chain_digest")
+    )
+    claimed = payload.get("comparison_digest")
+    _require_digest("comparison_digest", claimed)
+    digest_input = dict(payload)
+    digest_input.pop("comparison_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("Stage 1 timed comparison digest mismatch")
+    methods = payload.get("methods")
+    _require_exact_keys(methods, {"full", "dora"}, "timed comparison methods")
+    for method, raw_evidence in methods.items():
+        evidence = _evidence_from_dict(raw_evidence)
+        if evidence.method != method or evidence.status != "success":
+            raise ValueError("timed comparison method evidence mismatch")
+    return dict(payload)
+
+
+def _load_run_comparison(path: Path) -> dict[str, object]:
+    return _validate_run_comparison_payload(_read_json_once(path))
+
+
 def _compare_runs(paths: Sequence[str], output: Path) -> dict[str, object]:
     loaded = [_load_producer_evidence(Path(path)) for path in paths]
     evidences = [item[0] for item in loaded]
@@ -2764,10 +2840,13 @@ def _compare_runs(paths: Sequence[str], output: Path) -> dict[str, object]:
         "kind": "stage1-maximum-throughput-comparison",
         "paper_level_reproduction": False,
         "common_batch_control": False,
+        "prerequisite_chain_digest": configs[0]["prerequisite_chain_digest"],
         "methods": {
             item.method: _evidence_to_dict(item) for item in evidences
         },
     }
+    payload["comparison_digest"] = config_digest(payload)
+    _validate_run_comparison_payload(payload)
     _atomic_write_json(output, payload)
     return payload
 
@@ -3046,5 +3125,4 @@ __all__ = [
     "load_verified_evidence",
     "main",
     "select_high_cost_probe_rows",
-    "write_benchmark_evidence",
 ]

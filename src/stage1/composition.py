@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
+import json
 import logging
 import math
 from pathlib import Path
@@ -548,33 +549,59 @@ def run_stage1(
         getattr(args, "benchmark_run_config", None)
         or getattr(args, "benchmark_evidence_path", None)
     )
-    if producing and not (
-        getattr(args, "benchmark_run_config", None)
-        and getattr(args, "benchmark_evidence_path", None)
-    ):
-        raise ValueError("benchmark run config and evidence path are required together")
     run_config_witness = None
+    config = None
     if producing:
         from stage1.benchmark import (
+            config_digest,
             load_stage1_run_config_witness,
             validate_stage1_runtime_args,
         )
 
-        run_config_witness = load_stage1_run_config_witness(
-            Path(args.benchmark_run_config)
-        )
+        try:
+            if not (
+                getattr(args, "benchmark_run_config", None)
+                and getattr(args, "benchmark_evidence_path", None)
+            ):
+                raise ValueError(
+                    "benchmark run config and evidence path are required together"
+                )
+            run_config_witness = load_stage1_run_config_witness(
+                Path(args.benchmark_run_config)
+            )
+            config = validate_stage1_runtime_args(run_config_witness, args)
+            local_preflight = {
+                "status": "success",
+                "config_digest": run_config_witness.config_digest,
+                "runtime_digest": config_digest(
+                    {
+                        "config_digest": run_config_witness.config_digest,
+                        "validated_runtime": config,
+                    }
+                ),
+                "error_type": None,
+                "error_message": None,
+            }
+        except Exception as error:
+            local_preflight = {
+                "status": "error",
+                "config_digest": (
+                    None
+                    if run_config_witness is None
+                    else run_config_witness.config_digest
+                ),
+                "runtime_digest": None,
+                "error_type": type(error).__name__,
+                "error_message": str(error).replace("\0", "\\0")[:4096],
+            }
         digest_provider = (
-            rank_config_digest_provider or _default_rank_config_digests
+            rank_config_digest_provider or _default_rank_preflight_results
         )
-        rank_digests = tuple(
-            digest_provider(run_config_witness.config_digest, 2)
+        rank_preflights = tuple(
+            digest_provider(local_preflight, 2)
         )
-        if (
-            len(rank_digests) != 2
-            or any(item != run_config_witness.config_digest for item in rank_digests)
-        ):
-            raise ValueError("Stage 1 rank config digest collective mismatch")
-        config = validate_stage1_runtime_args(run_config_witness, args)
+        _require_distributed_preflight_agreement(rank_preflights, world_size=2)
+        assert run_config_witness is not None and config is not None
     total_start = monotonic() if producing else None
     components = component_builder(args)
     model_load_seconds = monotonic() - total_start if producing else 0.0
@@ -677,7 +704,60 @@ def run_stage1(
     )
 
 
-def _default_rank_config_digests(digest: str, world_size: int) -> tuple[str, ...]:
+def _require_distributed_preflight_agreement(
+    results: tuple[object, ...], *, world_size: int
+) -> None:
+    expected_fields = {
+        "status", "config_digest", "runtime_digest", "error_type", "error_message"
+    }
+    if len(results) != world_size:
+        raise ValueError("Stage 1 distributed preflight rank count mismatch")
+    for index, result in enumerate(results):
+        if type(result) is not dict or set(result) != expected_fields:
+            raise ValueError(
+                f"Stage 1 distributed preflight payload mismatch at rank {index}"
+            )
+        if result["status"] not in {"success", "error"}:
+            raise ValueError(
+                f"Stage 1 distributed preflight status mismatch at rank {index}"
+            )
+        if result["status"] == "success":
+            for name in ("config_digest", "runtime_digest"):
+                value = result[name]
+                if (
+                    type(value) is not str
+                    or len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value)
+                ):
+                    raise ValueError(
+                        f"Stage 1 distributed preflight {name} mismatch at rank {index}"
+                    )
+            if result["error_type"] is not None or result["error_message"] is not None:
+                raise ValueError(
+                    f"Stage 1 distributed preflight success payload mismatch at rank {index}"
+                )
+        elif (
+            result["runtime_digest"] is not None
+            or type(result["error_type"]) is not str
+            or type(result["error_message"]) is not str
+        ):
+            raise ValueError(
+                f"Stage 1 distributed preflight error payload mismatch at rank {index}"
+            )
+    if any(result["status"] == "error" for result in results):
+        raise ValueError(
+            "Stage 1 distributed preflight failed: "
+            + json.dumps(results, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        )
+    if len({result["config_digest"] for result in results}) != 1:
+        raise ValueError("Stage 1 distributed preflight config digest mismatch")
+    if len({result["runtime_digest"] for result in results}) != 1:
+        raise ValueError("Stage 1 distributed preflight runtime digest mismatch")
+
+
+def _default_rank_preflight_results(
+    local_result: dict[str, object], world_size: int
+) -> tuple[object, ...]:
     if not torch.distributed.is_initialized():
         from accelerate import PartialState
 
@@ -685,8 +765,8 @@ def _default_rank_config_digests(digest: str, world_size: int) -> tuple[str, ...
         if state.num_processes != world_size:
             raise ValueError("sealed world size does not match Accelerate rank count")
     gathered: list[object] = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(gathered, digest)
-    return tuple(str(item) for item in gathered)
+    torch.distributed.all_gather_object(gathered, local_result)
+    return tuple(gathered)
 
 
 def _default_stage1_observability(args) -> dict[str, object]:

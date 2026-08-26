@@ -173,6 +173,54 @@ def _write_benchmark_audit(tmp_path, args, indices=(7, 3)):
     return path, payload
 
 
+def _write_probe_run_config(tmp_path, args):
+    audit_path, audit = _write_benchmark_audit(tmp_path, args)
+    source = Path(args.data_path).resolve()
+    stat = source.stat()
+    config = {
+        "schema_version": 1,
+        "kind": "stage1-probe-run-manifest",
+        "method": "full",
+        "tuning_config": None,
+        "model": args.model,
+        "source_data_path": str(source),
+        "data_path": str(source),
+        "data_stat": {
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        },
+        "image_root": str(Path(args.image_root).resolve()),
+        "output_dir": str(Path(args.save_model_path).resolve()),
+        "micro_batch": 8,
+        "world_size": 2,
+        "gradient_accumulation_steps": 2,
+        "effective_global_batch": 32,
+        "epochs": 3,
+        "learning_rate": 1e-5,
+        "seed": 42,
+        "max_steps": 3,
+        "final_save": False,
+        "deepspeed_config": str(Path(args.deepspeed_config).resolve()),
+        "deepspeed_config_digest": hashlib.sha256(
+            Path(args.deepspeed_config).read_bytes()
+        ).hexdigest(),
+        "attention_implementation": "flash_attention_2",
+        "save_strategy": "no",
+        "audit_digest": audit["audit_digest"],
+        "probe_rows": str(audit_path),
+        "probe_row_indices": [7, 3],
+        "maximum_config_digest": None,
+        "prerequisite_chain": str(tmp_path / "prerequisite-chain.json"),
+        "prerequisite_chain_digest": "f" * 64,
+    }
+    config["config_digest"] = config_digest(config)
+    path = tmp_path / "run-config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path, config
+
+
 def _write_peft_resume_checkpoint(args, *, step=9):
     checkpoint = Path(args.save_model_path) / f"checkpoint-{step}"
     checkpoint.mkdir(parents=True)
@@ -940,10 +988,15 @@ def test_run_stage1_rejects_runtime_or_rank_config_mismatch_before_build(tmp_pat
     assert builds == 0
 
     args.per_device_train_batch_size = 8
-    with pytest.raises(ValueError, match="rank.*digest"):
+    def config_mismatch(local_result, world_size):
+        remote = dict(local_result)
+        remote["config_digest"] = "f" * 64
+        return (local_result, remote)
+
+    with pytest.raises(ValueError, match="config digest"):
         run_stage1(
             args, component_builder=builder,
-            rank_config_digest_provider=lambda digest, world_size: (digest, "f" * 64),
+            rank_config_digest_provider=config_mismatch,
         )
     assert builds == 0
 
@@ -959,3 +1012,96 @@ def test_run_stage1_rejects_runtime_or_rank_config_mismatch_before_build(tmp_pat
             rank_config_digest_provider=lambda digest, world_size: (digest, digest),
         )
     assert builds == 0
+
+
+def test_distributed_preflight_collects_one_rank_runtime_error_before_uniform_failure(
+    tmp_path,
+):
+    """Catches one rank exiting local validation while its peer hangs in gather."""
+    args = stage1_args(tmp_path, "--max_steps", "3", "--no_final_save", method="full")
+    config_path, config = _write_probe_run_config(tmp_path, args)
+    args.benchmark_run_config = str(config_path)
+    args.benchmark_evidence_path = str(tmp_path / "evidence.json")
+    args.benchmark_source_data_path = config["source_data_path"]
+    args.per_device_train_batch_size = 16
+    gathered = []
+    builds = 0
+
+    def collective(local_result, world_size):
+        gathered.append(local_result)
+        if type(local_result) is not dict:
+            return (local_result, local_result)
+        remote_success = {
+            "status": "success",
+            "config_digest": config["config_digest"],
+            "runtime_digest": "d" * 64,
+            "error_type": None,
+            "error_message": None,
+        }
+        return (local_result, remote_success)
+
+    def builder(selected):
+        nonlocal builds
+        builds += 1
+        raise AssertionError("builder must not run")
+
+    with pytest.raises(ValueError, match="distributed preflight"):
+        run_stage1(
+            args,
+            component_builder=builder,
+            rank_config_digest_provider=collective,
+        )
+    assert len(gathered) == 1
+    assert gathered[0]["status"] == "error"
+    assert "micro_batch" in gathered[0]["error_message"]
+    assert builds == 0
+
+
+def test_distributed_preflight_collects_manifest_read_error_before_uniform_failure(
+    tmp_path,
+):
+    """Catches a rank-local manifest read error bypassing the collective."""
+    args = stage1_args(tmp_path, "--max_steps", "3", "--no_final_save", method="full")
+    args.benchmark_run_config = str(tmp_path / "missing-run-config.json")
+    args.benchmark_evidence_path = str(tmp_path / "evidence.json")
+    args.benchmark_source_data_path = str(Path(args.data_path).resolve())
+    gathered = []
+
+    def collective(local_result, world_size):
+        gathered.append(local_result)
+        return (local_result, local_result)
+
+    with pytest.raises(ValueError, match="distributed preflight"):
+        run_stage1(
+            args,
+            component_builder=lambda selected: pytest.fail("builder must not run"),
+            rank_config_digest_provider=collective,
+        )
+    assert len(gathered) == 1
+    assert gathered[0]["status"] == "error"
+    assert gathered[0]["error_type"] == "FileNotFoundError"
+
+
+def test_distributed_preflight_rejects_successful_ranks_with_runtime_digest_mismatch(
+    tmp_path,
+):
+    """Catches config-equal ranks proceeding with different validated runtime state."""
+    args = stage1_args(tmp_path, "--max_steps", "3", "--no_final_save", method="full")
+    config_path, config = _write_probe_run_config(tmp_path, args)
+    args.benchmark_run_config = str(config_path)
+    args.benchmark_evidence_path = str(tmp_path / "evidence.json")
+    args.benchmark_source_data_path = config["source_data_path"]
+
+    def collective(local_result, world_size):
+        if type(local_result) is not dict:
+            return (local_result, "e" * 64)
+        remote = dict(local_result)
+        remote["runtime_digest"] = "e" * 64
+        return (local_result, remote)
+
+    with pytest.raises(ValueError, match="runtime digest"):
+        run_stage1(
+            args,
+            component_builder=lambda selected: pytest.fail("builder must not run"),
+            rank_config_digest_provider=collective,
+        )
