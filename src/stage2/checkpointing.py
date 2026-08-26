@@ -927,7 +927,7 @@ def resolve_stage2_load_decision(
     resume_from_checkpoint_path: str | None,
     load_config,
     discover_adapter_config=find_adapter_config_file,
-    adapter_discovery_kwargs: Mapping[str, object] | None = None,
+    source_provenance_kwargs: Mapping[str, object] | None = None,
     load_peft_metadata=load_stage2_peft_metadata,
     load_stage1_metadata_snapshot=read_stage1_peft_metadata_snapshot,
     latent_size: int,
@@ -1115,8 +1115,10 @@ def resolve_stage2_load_decision(
                 f"checkpoint={checkpoint_value}, requested={requested}"
             )
     if metadata.token_row_source == "sparse_adapter":
+        if source_provenance_kwargs is None:
+            source_provenance_kwargs = {}
         discovered_adapter_config = discover_adapter_config(
-            load_model_path, **dict(adapter_discovery_kwargs or {})
+            load_model_path, **source_provenance_kwargs
         )
         if discovered_adapter_config is not None:
             raise ValueError(
@@ -1124,7 +1126,7 @@ def resolve_stage2_load_decision(
                 f"model; discovered adapter config at {discovered_adapter_config}"
             )
         validate_stage2_sparse_original_base_config(
-            load_config(load_model_path), metadata
+            load_config(load_model_path, **source_provenance_kwargs), metadata
         )
     else:
         require_full_stage1(load_model_path)

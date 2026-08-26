@@ -324,6 +324,17 @@ def _stub_empty_stage2_data(monkeypatch):
     monkeypatch.setattr(main, "Stage2DataCollator", lambda *unused: object())
 
 
+def _injected_stage2_source_dependencies(find_adapter_config):
+    """Bundle installed source seams; finder-only injection is forbidden."""
+
+    return main.Stage2SourceDependencies(
+        find_adapter_config=find_adapter_config,
+        load_config=main.AutoConfig.from_pretrained,
+        load_processor=main.AutoProcessor.from_pretrained,
+        load_model=main.Qwen2_5_VLForConditionalGeneration.from_pretrained,
+    )
+
+
 def test_main_handoff_consumes_preflight_before_large_base_load(
     tmp_path, monkeypatch
 ):
@@ -638,7 +649,10 @@ def test_main_sparse_stage2_resume_is_independent_of_stage1_source(
     _stub_empty_stage2_data(monkeypatch)
 
     components = main.build_stage2_training_components(
-        args, discover_adapter_config=lambda unused, **unused_kwargs: None
+        args,
+        source_dependencies=_injected_stage2_source_dependencies(
+            lambda unused, **unused_kwargs: None
+        ),
     )
 
     assert processor_sources == [str(stage2_dir)]
@@ -657,6 +671,192 @@ def test_main_sparse_stage2_resume_is_independent_of_stage1_source(
         resolve_qwen2_5_vl_model(components.model).lm_head(fixed_hidden),
         expected_logits,
     )
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_sparse_resume_default_loaders_share_one_source_provenance(
+    tmp_path, monkeypatch
+):
+    """Catches Hub source selectors diverging between discovery and loading."""
+    stage1_dir = tmp_path / "stage1"
+    stage2_dir = tmp_path / "stage2-checkpoint"
+    original_base = tmp_path / "clean-original-base"
+    original_base.mkdir()
+    processor, _, metadata, _ = write_sparse_stage2_artifact(
+        stage1_dir, stage2_dir
+    )
+    shutil.rmtree(stage1_dir)
+    token = "".join(("private", "-token"))
+    args = stage2_args(
+        stage1_adapter_path=None,
+        load_model_path=str(original_base),
+        resume_from_checkpoint_path=str(stage2_dir),
+        latent_size=metadata.latent_size,
+        tuning_method=None,
+        tuning_method_explicit=False,
+        gradient_checkpointing=False,
+        cache_dir=str(tmp_path / "hub-cache"),
+        revision="tested-revision",
+        token=token,
+        local_files_only=True,
+    )
+    expected_source_kwargs = {
+        name: getattr(args, name)
+        for name in ("cache_dir", "revision", "token", "local_files_only")
+    }
+    calls = []
+    real_finder = find_adapter_config_file
+
+    def record_finder(source, **kwargs):
+        calls.append(("finder", source, kwargs))
+        return real_finder(source, **kwargs)
+
+    def record_config(source, **kwargs):
+        calls.append(("config", source, kwargs))
+        return tiny_tag_free_original_qwen().config
+
+    def record_processor(source, **kwargs):
+        calls.append(("processor", source, kwargs))
+        return processor
+
+    def record_model(source, **kwargs):
+        calls.append(("model", source, kwargs))
+        return tiny_tag_free_original_qwen()
+
+    monkeypatch.setattr(main, "find_adapter_config_file", record_finder)
+    monkeypatch.setattr(main.AutoConfig, "from_pretrained", record_config)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", record_processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        record_model,
+    )
+    _stub_empty_stage2_data(monkeypatch)
+
+    components = main.build_stage2_training_components(args)
+
+    assert [name for name, _, _ in calls] == [
+        "finder",
+        "config",
+        "processor",
+        "model",
+    ]
+    assert calls[0][1] == calls[1][1] == calls[3][1] == str(original_base)
+    assert calls[2][1] == str(stage2_dir)
+    for name, _, kwargs in calls:
+        source_kwargs = {
+            key: kwargs[key] for key in expected_source_kwargs
+        }
+        assert source_kwargs == expected_source_kwargs, name
+        assert all(
+            source_kwargs[key] is expected
+            for key, expected in expected_source_kwargs.items()
+        ), name
+    assert calls[0][2] == expected_source_kwargs
+    assert calls[1][2] == expected_source_kwargs
+    assert calls[2][2] == expected_source_kwargs
+    assert calls[3][2] == {
+        **expected_source_kwargs,
+        "attn_implementation": "sdpa",
+    }
+    assert components.trainer_resume_path == str(stage2_dir)
+
+
+def test_stage2_source_provenance_is_immutable_and_excludes_model_options():
+    """Catches later loader layers mutating selectors or adding model-only args."""
+    args = stage2_args(
+        cache_dir="/cache/models",
+        revision="tested-revision",
+        token="tested-token",
+        local_files_only=False,
+        torch_dtype="bfloat16",
+    )
+
+    source_kwargs = main.build_stage2_source_provenance_kwargs(args)
+
+    assert dict(source_kwargs) == {
+        "cache_dir": "/cache/models",
+        "revision": "tested-revision",
+        "token": "tested-token",
+        "local_files_only": False,
+    }
+    with pytest.raises(TypeError):
+        source_kwargs["revision"] = "mutated"
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_sparse_resume_injected_source_dependencies_share_provenance(
+    tmp_path, monkeypatch
+):
+    """Catches dependency injection restoring a finder-only bypass."""
+    stage1_dir = tmp_path / "stage1"
+    stage2_dir = tmp_path / "stage2-checkpoint"
+    processor, _, metadata, _ = write_sparse_stage2_artifact(
+        stage1_dir, stage2_dir
+    )
+    shutil.rmtree(stage1_dir)
+    args = stage2_args(
+        stage1_adapter_path=None,
+        load_model_path="org/clean-original-base",
+        resume_from_checkpoint_path=str(stage2_dir),
+        latent_size=metadata.latent_size,
+        tuning_method=None,
+        tuning_method_explicit=False,
+        gradient_checkpointing=False,
+        cache_dir="/cache/models",
+        revision="immutable-revision",
+        token="immutable-token",
+        local_files_only=True,
+    )
+    expected_source_kwargs = {
+        name: getattr(args, name)
+        for name in ("cache_dir", "revision", "token", "local_files_only")
+    }
+    observed = []
+
+    def finder(source, **kwargs):
+        observed.append(("finder", kwargs))
+        return None
+
+    def config(source, **kwargs):
+        observed.append(("config", kwargs))
+        return tiny_tag_free_original_qwen().config
+
+    def processor_loader(source, **kwargs):
+        observed.append(("processor", kwargs))
+        return processor
+
+    def model_loader(source, **kwargs):
+        observed.append(("model", kwargs))
+        return tiny_tag_free_original_qwen()
+
+    source_dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=finder,
+        load_config=config,
+        load_processor=processor_loader,
+        load_model=model_loader,
+    )
+    _stub_empty_stage2_data(monkeypatch)
+
+    main.build_stage2_training_components(
+        args, source_dependencies=source_dependencies
+    )
+
+    assert [name for name, _ in observed] == [
+        "finder",
+        "config",
+        "processor",
+        "model",
+    ]
+    for name, kwargs in observed[:-1]:
+        assert kwargs == expected_source_kwargs, name
+        assert all(
+            kwargs[key] is expected for key, expected in expected_source_kwargs.items()
+        ), name
+    assert observed[-1][1] == {
+        **expected_source_kwargs,
+        "attn_implementation": "sdpa",
+    }
 
 
 @pytest.mark.parametrize("source_kind", ("local", "remote"))
@@ -737,7 +937,10 @@ def test_sparse_stage2_resume_discovers_adapter_bearing_original_source_before_l
 
     with pytest.raises(ValueError, match="original.*base.*adapter|adapter.*original.*base"):
         main.build_stage2_training_components(
-            args, discover_adapter_config=discover_adapter
+            args,
+            source_dependencies=_injected_stage2_source_dependencies(
+                discover_adapter
+            ),
         )
 
     assert discovery_calls == [
@@ -822,7 +1025,10 @@ def test_sparse_stage2_resume_rejects_peft_metadata_in_original_config_before_lo
 
     with pytest.raises(ValueError, match=f"PEFT.*{marker}|{marker}.*PEFT"):
         main.build_stage2_training_components(
-            args, discover_adapter_config=lambda unused, **unused_kwargs: None
+            args,
+            source_dependencies=_injected_stage2_source_dependencies(
+                lambda unused, **unused_kwargs: None
+            ),
         )
 
     assert vars(calls) == {
@@ -895,7 +1101,10 @@ def test_sparse_stage2_resume_rejects_adapter_bearing_loaded_base_before_resize(
         match="adapter-free original base.*adapter-bearing|adapter-bearing.*original base",
     ):
         main.build_stage2_training_components(
-            args, discover_adapter_config=lambda unused, **unused_kwargs: None
+            args,
+            source_dependencies=_injected_stage2_source_dependencies(
+                lambda unused, **unused_kwargs: None
+            ),
         )
 
     assert calls.model_loads == 1
@@ -980,7 +1189,10 @@ def test_sparse_stage2_resume_rejects_wrong_original_sources_before_attach(
 
     with pytest.raises(ValueError, match=message):
         main.build_stage2_training_components(
-            args, discover_adapter_config=lambda unused, **unused_kwargs: None
+            args,
+            source_dependencies=_injected_stage2_source_dependencies(
+                lambda unused, **unused_kwargs: None
+            ),
         )
 
     assert calls.model_loads == 0

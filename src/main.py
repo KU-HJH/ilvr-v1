@@ -1,6 +1,8 @@
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 from transformers import (
@@ -76,6 +78,39 @@ class Stage2TrainingComponents:
     peft_metadata: Stage2PeftMetadata | None
 
 
+@dataclass(frozen=True)
+class Stage2SourceDependencies:
+    """All source-sensitive Stage 2 loaders, injected as one safe bundle."""
+
+    find_adapter_config: object
+    load_config: object
+    load_processor: object
+    load_model: object
+
+
+def _default_stage2_source_dependencies() -> Stage2SourceDependencies:
+    """Bind production loaders at call time so tests can replace boundaries."""
+
+    return Stage2SourceDependencies(
+        find_adapter_config=find_adapter_config_file,
+        load_config=AutoConfig.from_pretrained,
+        load_processor=AutoProcessor.from_pretrained,
+        load_model=Qwen2_5_VLForConditionalGeneration.from_pretrained,
+    )
+
+
+def build_stage2_source_provenance_kwargs(args) -> Mapping[str, object]:
+    """Return one immutable set of Hub selectors for sparse source loading."""
+
+    return MappingProxyType(
+        {
+            name: getattr(args, name)
+            for name in ("cache_dir", "revision", "token", "local_files_only")
+            if hasattr(args, name) and getattr(args, name) is not None
+        }
+    )
+
+
 def configure_stage2_model_backend(model, *, gradient_checkpointing: bool) -> None:
     """Apply Stage 2 cache/checkpoint settings outside the latent recurrence."""
     model.config.use_cache = False
@@ -98,20 +133,19 @@ def validate_stage2_distributed_settings(
 
 
 def build_stage2_training_components(
-    args, *, discover_adapter_config=find_adapter_config_file
+    args, *, source_dependencies: Stage2SourceDependencies | None = None
 ) -> Stage2TrainingComponents:
-    adapter_discovery_kwargs = {
-        name: getattr(args, name)
-        for name in ("cache_dir", "revision", "token", "local_files_only")
-        if hasattr(args, name) and getattr(args, name) is not None
-    }
+    source_dependencies = (
+        source_dependencies or _default_stage2_source_dependencies()
+    )
+    source_provenance_kwargs = build_stage2_source_provenance_kwargs(args)
     decision = resolve_stage2_load_decision(
         load_model_path=args.load_model_path,
         stage1_adapter_path=getattr(args, "stage1_adapter_path", None),
         resume_from_checkpoint_path=args.resume_from_checkpoint_path,
-        load_config=AutoConfig.from_pretrained,
-        discover_adapter_config=discover_adapter_config,
-        adapter_discovery_kwargs=adapter_discovery_kwargs,
+        load_config=source_dependencies.load_config,
+        discover_adapter_config=source_dependencies.find_adapter_config,
+        source_provenance_kwargs=source_provenance_kwargs,
         latent_size=args.latent_size,
         supervise_latent_boundaries=args.supervise_latent_boundaries,
         tuning_method=args.tuning_method,
@@ -121,18 +155,22 @@ def build_stage2_training_components(
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
     )
-    processor = AutoProcessor.from_pretrained(decision.processor_source)
-    if (
+    sparse_resume = (
         decision.peft_metadata is not None
         and decision.peft_metadata.token_row_source == "sparse_adapter"
-    ):
+    )
+    sparse_source_kwargs = source_provenance_kwargs if sparse_resume else {}
+    processor = source_dependencies.load_processor(
+        decision.processor_source, **sparse_source_kwargs
+    )
+    if sparse_resume:
         validate_stage2_sparse_processor(
             processor.tokenizer, decision.peft_metadata
         )
     stage1_preflight = None
     stage1_metadata = None
     if decision.stage1_adapter_source is not None:
-        base_config = AutoConfig.from_pretrained(decision.base_model_source)
+        base_config = source_dependencies.load_config(decision.base_model_source)
         stage1_preflight = preflight_stage1_peft_artifact(
             processor,
             base_config,
@@ -142,9 +180,13 @@ def build_stage2_training_components(
         stage1_metadata = decode_stage1_peft_metadata_snapshot(
             decision.stage1_metadata_snapshot
         )
-    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model_only_kwargs = {
+        "attn_implementation": args.attention_implementation,
+    }
+    base_model = source_dependencies.load_model(
         decision.base_model_source,
-        attn_implementation=args.attention_implementation,
+        **sparse_source_kwargs,
+        **model_only_kwargs,
     )
     if decision.stage1_adapter_source is not None:
         model = load_stage1_dora_for_fresh_stage2(
