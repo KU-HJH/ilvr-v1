@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import errno
 import json
 import hashlib
 import math
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +29,16 @@ from stage1.benchmark import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROBE = REPO_ROOT / "run_stage1_batch_probe.sh"
+
+
+@pytest.fixture
+def archive_tmp_path():
+    """Exercise Linux no-replace rename on the host's supported overlay fs."""
+
+    with tempfile.TemporaryDirectory(
+        prefix="ilvr-stage1-archive-", dir="/var/tmp"
+    ) as directory:
+        yield Path(directory)
 
 
 def evidence(**overrides):
@@ -1334,6 +1346,27 @@ def _smoke_fixture(tmp_path: Path):
     return data_path, image_root, records, launcher
 
 
+def _write_failing_smoke_launcher(path: Path, record_dir: Path) -> None:
+    python = REPO_ROOT / "venv/ilvr-venv/bin/python"
+    path.write_text(
+        f"""#!{python}
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+output = Path(args[args.index("--output-dir") + 1])
+output.mkdir(parents=True, exist_ok=True)
+record = Path({str(record_dir)!r}) / f"{{os.getpid()}}.json"
+record.write_text(json.dumps({{"pid": os.getpid(), "output": str(output)}}))
+raise SystemExit(19)
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def test_distributed_smoke_uses_two_real_processes_then_reuses_only_small_seals(
     tmp_path,
 ):
@@ -1360,6 +1393,29 @@ def test_distributed_smoke_uses_two_real_processes_then_reuses_only_small_seals(
 
     observed = benchmark.run_or_load_distributed_witness(**kwargs)
 
+    attempts = sorted((evidence_dir / "attempts").iterdir())
+    assert [attempt.name for attempt in attempts] == ["attempt-1"]
+    attempt = attempts[0]
+    canonical = json.loads((evidence_dir / "evidence.json").read_text())
+    assert canonical["kind"] == "stage1-smoke-registry-evidence"
+    assert canonical["attempt_path"] == "attempts/attempt-1"
+    assert canonical["attempt_evidence_path"] == (
+        "attempts/attempt-1/evidence.json"
+    )
+    assert canonical["marker_path"] == (
+        "attempts/attempt-1/checkpoint-topology.json"
+    )
+    assert benchmark._check_evidence(
+        SimpleNamespace(
+            evidence_dir=str(evidence_dir),
+            method="full",
+            micro_batch=2,
+            world_size=2,
+        )
+    ) == "reusable-success"
+    assert benchmark._summaries([str(evidence_dir / "evidence.json")])[0][
+        "optimizer_steps"
+    ] == 4
     process_records = [json.loads(path.read_text()) for path in records.iterdir()]
     assert len(process_records) == 2
     assert len({item["pid"] for item in process_records}) == 2
@@ -1374,11 +1430,19 @@ def test_distributed_smoke_uses_two_real_processes_then_reuses_only_small_seals(
     assert observed.resume_initial_step == 3
     assert observed.resume_final_step == 4
 
-    shutil.rmtree(evidence_dir / "run")
+    canonical_before = (evidence_dir / "evidence.json").stat()
+    shutil.rmtree(attempt / "run")
+    (attempt / "evidence.json").unlink()
+    (attempt / "run-config.json").unlink()
     launcher.unlink()
     reused = benchmark.run_or_load_distributed_witness(**kwargs)
+    canonical_after = (evidence_dir / "evidence.json").stat()
     assert reused == observed
     assert len(list(records.iterdir())) == 2
+    assert (canonical_after.st_ino, canonical_after.st_mtime_ns) == (
+        canonical_before.st_ino,
+        canonical_before.st_mtime_ns,
+    )
 
 
 def test_distributed_smoke_reuse_rejects_a_tampered_small_checkpoint_marker(tmp_path):
@@ -1396,7 +1460,7 @@ def test_distributed_smoke_reuse_rejects_a_tampered_small_checkpoint_marker(tmp_
         evidence_dir=evidence_dir, launcher_path=launcher,
     )
     benchmark.run_or_load_distributed_witness(**kwargs)
-    marker = evidence_dir / "checkpoint-topology.json"
+    marker = evidence_dir / "attempts" / "attempt-1" / "checkpoint-topology.json"
     payload = json.loads(marker.read_text())
     payload["checkpoint_files"][0]["size"] += 1
     marker.write_text(json.dumps(payload))
@@ -1405,7 +1469,9 @@ def test_distributed_smoke_reuse_rejects_a_tampered_small_checkpoint_marker(tmp_
         benchmark.run_or_load_distributed_witness(**kwargs)
 
 
-def test_failed_smoke_must_be_archived_whole_before_lightweight_retry(tmp_path):
+def test_legacy_flat_failure_is_retained_while_registry_retry_uses_attempt_2(
+    tmp_path,
+):
     import stage1.benchmark as benchmark
 
     data_path, image_root, records, launcher = _smoke_fixture(tmp_path)
@@ -1423,37 +1489,153 @@ def test_failed_smoke_must_be_archived_whole_before_lightweight_retry(tmp_path):
         evidence_dir=evidence_dir, launcher_path=launcher,
     )
 
-    with pytest.raises(FileExistsError, match="incomplete or stale"):
-        benchmark.run_or_load_distributed_witness(**kwargs)
+    observed = benchmark.run_or_load_distributed_witness(**kwargs)
 
-    archived = archive_failed_distributed_attempt(evidence_dir)
-    archived_log = archived / "initial.log"
-    after = archived_log.stat()
-    assert archived == evidence_dir.parent / ".failed-attempts" / "full-attempt-1"
-    assert not evidence_dir.exists()
-    assert archived_log.read_bytes() == b"original failed attempt\n"
+    after = failed_log.stat()
+    assert observed.resume_final_step == 4
+    assert failed_log.read_bytes() == b"original failed attempt\n"
     assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
         before.st_ino, before.st_size, before.st_mtime_ns
     )
-    with pytest.raises(FileNotFoundError, match="missing"):
-        archive_failed_distributed_attempt(evidence_dir)
-
-    evidence_dir.mkdir()
-    (evidence_dir / "initial.log").write_bytes(b"second failed attempt\n")
-    second_archived = archive_failed_distributed_attempt(evidence_dir)
-    assert second_archived == (
-        evidence_dir.parent / ".failed-attempts" / "full-attempt-2"
-    )
-    assert (second_archived / "initial.log").read_bytes() == (
-        b"second failed attempt\n"
-    )
-
-    observed = benchmark.run_or_load_distributed_witness(**kwargs)
-    assert observed.resume_final_step == 4
+    attempts = sorted((evidence_dir / "attempts").iterdir())
+    assert [attempt.name for attempt in attempts] == ["attempt-2"]
+    assert (attempts[0] / "initial.log").is_file()
+    assert (attempts[0] / "resume.log").is_file()
     assert len(list(records.iterdir())) == 2
 
-    with pytest.raises((FileExistsError, ValueError), match="archive|evidence|marker"):
-        archive_failed_distributed_attempt(evidence_dir)
+
+def test_two_failed_smoke_runs_append_distinct_attempts_without_overwrite(tmp_path):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, _ = _smoke_fixture(tmp_path)
+    launcher = tmp_path / "failing-smoke-launcher"
+    _write_failing_smoke_launcher(launcher, records)
+    evidence_dir = tmp_path / "evidence" / "full"
+    kwargs = dict(
+        method="full",
+        model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path,
+        image_root=image_root,
+        micro_batch=2,
+        gradient_accumulation_steps=2,
+        world_size=2,
+        initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir,
+        launcher_path=launcher,
+    )
+
+    for _ in range(2):
+        with pytest.raises(subprocess.CalledProcessError):
+            benchmark.run_or_load_distributed_witness(**kwargs)
+
+    attempts = sorted((evidence_dir / "attempts").iterdir())
+    assert [attempt.name for attempt in attempts] == ["attempt-1", "attempt-2"]
+    logs = [attempt / "initial.log" for attempt in attempts]
+    assert all(log.is_file() for log in logs)
+    assert logs[0].stat().st_ino != logs[1].stat().st_ino
+    process_records = [json.loads(path.read_text()) for path in records.iterdir()]
+    assert len(process_records) == 2
+    assert len({record["pid"] for record in process_records}) == 2
+    assert {Path(record["output"]).parent.name for record in process_records} == {
+        "attempt-1",
+        "attempt-2",
+    }
+
+
+def test_concurrent_smoke_attempt_allocators_never_share_or_replace_a_target(
+    tmp_path,
+):
+    import stage1.benchmark as benchmark
+
+    registry = tmp_path / "evidence" / "full"
+
+    def allocate_once():
+        try:
+            return benchmark._allocate_smoke_attempt(registry)
+        except FileExistsError as error:
+            assert "allocation lock" in str(error)
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: allocate_once(), range(2)))
+    attempts = [attempt for attempt in results if attempt is not None]
+    while len(attempts) < 2:
+        attempts.append(benchmark._allocate_smoke_attempt(registry))
+
+    assert {attempt.name for attempt in attempts} == {"attempt-1", "attempt-2"}
+    assert len({attempt.stat().st_ino for attempt in attempts}) == 2
+
+
+def test_smoke_attempt_allocator_never_overwrites_precreated_entries(tmp_path):
+    import stage1.benchmark as benchmark
+
+    registry = tmp_path / "evidence" / "full"
+    prior = registry / "attempts" / "attempt-1"
+    prior.mkdir(parents=True)
+    sentinel = prior / "initial.log"
+    sentinel.write_bytes(b"untrusted prior attempt")
+    before = sentinel.stat()
+
+    allocated = benchmark._allocate_smoke_attempt(registry)
+
+    after = sentinel.stat()
+    assert allocated.name == "attempt-2"
+    assert sentinel.read_bytes() == b"untrusted prior attempt"
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+@pytest.mark.parametrize("bad_name", ["attempt-0", "attempt-01", "foreign"])
+def test_smoke_attempt_allocator_rejects_noncanonical_registry_entries(
+    tmp_path, bad_name
+):
+    import stage1.benchmark as benchmark
+
+    attempts = tmp_path / "evidence" / "full" / "attempts"
+    attempts.mkdir(parents=True)
+    (attempts / bad_name).mkdir()
+
+    with pytest.raises(ValueError, match="noncanonical"):
+        benchmark._allocate_smoke_attempt(attempts.parent)
+
+    assert not (attempts / "attempt-1").exists()
+
+
+def test_malicious_canonical_smoke_evidence_is_never_overwritten_or_launched(
+    tmp_path,
+):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    evidence_dir.mkdir(parents=True)
+    canonical = evidence_dir / "evidence.json"
+    canonical.write_bytes(b"{}\n")
+    before = canonical.stat()
+
+    with pytest.raises(ValueError, match="producer evidence"):
+        benchmark.run_or_load_distributed_witness(
+            method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+            data_path=data_path, image_root=image_root, micro_batch=2,
+            gradient_accumulation_steps=2, world_size=2,
+            initial_max_steps=3, resumed_max_steps=4,
+            deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+            evidence_dir=evidence_dir, launcher_path=launcher,
+        )
+
+    after = canonical.stat()
+    assert canonical.read_bytes() == b"{}\n"
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    assert list(records.iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -1466,9 +1648,9 @@ def test_failed_smoke_must_be_archived_whole_before_lightweight_retry(tmp_path):
         "noncanonical",
     ],
 )
-def test_failed_smoke_archive_rejects_unsafe_paths(tmp_path, corruption):
-    evidence_dir = tmp_path / "evidence" / "full"
-    real_source = tmp_path / "real-failure"
+def test_failed_smoke_archive_rejects_unsafe_paths(archive_tmp_path, corruption):
+    evidence_dir = archive_tmp_path / "evidence" / "full"
+    real_source = archive_tmp_path / "real-failure"
     real_source.mkdir(parents=True)
     (real_source / "initial.log").write_bytes(b"failure")
     evidence_dir.parent.mkdir(parents=True)
@@ -1478,7 +1660,9 @@ def test_failed_smoke_archive_rejects_unsafe_paths(tmp_path, corruption):
         real_source.rename(evidence_dir)
         archive_root = evidence_dir.parent / ".failed-attempts"
         if corruption == "archive_symlink":
-            archive_root.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+            archive_root.symlink_to(
+                archive_tmp_path / "elsewhere", target_is_directory=True
+            )
         elif corruption == "attempt_symlink":
             archive_root.mkdir()
             (archive_root / "full-attempt-1").symlink_to(
@@ -1497,8 +1681,8 @@ def test_failed_smoke_archive_rejects_unsafe_paths(tmp_path, corruption):
     assert evidence_dir.exists()
 
 
-def test_failed_smoke_archive_allocates_monotonic_unique_attempts(tmp_path):
-    evidence_dir = tmp_path / "evidence" / "full"
+def test_failed_smoke_archive_allocates_monotonic_unique_attempts(archive_tmp_path):
+    evidence_dir = archive_tmp_path / "evidence" / "full"
     evidence_dir.mkdir(parents=True)
     first_log = evidence_dir / "initial.log"
     first_log.write_bytes(b"first failure")
@@ -1531,8 +1715,8 @@ def test_failed_smoke_archive_allocates_monotonic_unique_attempts(tmp_path):
     assert (third / "initial.log").read_bytes() == b"third failure"
 
 
-def test_failed_smoke_archive_uses_maximum_attempt_across_gaps(tmp_path):
-    evidence_dir = tmp_path / "evidence" / "full"
+def test_failed_smoke_archive_uses_maximum_attempt_across_gaps(archive_tmp_path):
+    evidence_dir = archive_tmp_path / "evidence" / "full"
     archive_root = evidence_dir.parent / ".failed-attempts"
     evidence_dir.mkdir(parents=True)
     (evidence_dir / "initial.log").write_bytes(b"new failure")
@@ -1545,8 +1729,10 @@ def test_failed_smoke_archive_uses_maximum_attempt_across_gaps(tmp_path):
     assert (archived / "initial.log").read_bytes() == b"new failure"
 
 
-def test_concurrent_full_and_dora_archives_use_independent_namespaces(tmp_path):
-    evidence_root = tmp_path / "evidence"
+def test_concurrent_full_and_dora_archives_use_independent_namespaces(
+    archive_tmp_path,
+):
+    evidence_root = archive_tmp_path / "evidence"
     for method in ("full", "dora"):
         directory = evidence_root / method
         directory.mkdir(parents=True)
@@ -1566,8 +1752,10 @@ def test_concurrent_full_and_dora_archives_use_independent_namespaces(tmp_path):
     assert dora.name == "dora-attempt-1"
 
 
-def test_failed_smoke_archive_lock_contention_leaves_source_unchanged(tmp_path):
-    evidence_dir = tmp_path / "evidence" / "full"
+def test_failed_smoke_archive_lock_contention_leaves_source_unchanged(
+    archive_tmp_path,
+):
+    evidence_dir = archive_tmp_path / "evidence" / "full"
     evidence_dir.mkdir(parents=True)
     log = evidence_dir / "initial.log"
     log.write_bytes(b"failure")
@@ -1589,8 +1777,188 @@ def test_failed_smoke_archive_lock_contention_leaves_source_unchanged(tmp_path):
     assert not (archive_root / "full-attempt-1").exists()
 
 
-def test_archive_failed_attempt_cli_moves_only_the_complete_directory(tmp_path):
-    evidence_dir = tmp_path / "evidence" / "dora"
+def test_failed_smoke_archive_concurrent_target_is_never_replaced(
+    archive_tmp_path, monkeypatch
+):
+    import stage1.benchmark as benchmark
+
+    evidence_dir = archive_tmp_path / "evidence" / "full"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "initial.log").write_bytes(b"source failure")
+    original = getattr(benchmark, "_renameat2_noreplace", None)
+
+    def inject_target(source_fd, source_name, archive_fd, target_name):
+        os.mkdir(target_name, dir_fd=archive_fd)
+        (archive_tmp_path / "injected").write_text(target_name)
+        return original(source_fd, source_name, archive_fd, target_name)
+
+    monkeypatch.setattr(
+        benchmark, "_renameat2_noreplace", inject_target, raising=False
+    )
+
+    with pytest.raises(FileExistsError):
+        archive_failed_distributed_attempt(evidence_dir)
+
+    target_name = (archive_tmp_path / "injected").read_text()
+    target = evidence_dir.parent / ".failed-attempts" / target_name
+    assert evidence_dir.is_dir()
+    assert (evidence_dir / "initial.log").read_bytes() == b"source failure"
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("evidence", "success evidence"),
+        ("source_swap", "source.*changed"),
+        ("archive_swap", "archive.*changed"),
+        ("lock_swap", "lock.*changed"),
+    ],
+)
+def test_failed_smoke_archive_revalidates_pinned_topology_before_commit(
+    archive_tmp_path, monkeypatch, mutation, message
+):
+    import stage1.benchmark as benchmark
+
+    evidence_root = archive_tmp_path / "evidence"
+    evidence_dir = evidence_root / "full"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "initial.log").write_bytes(b"source failure")
+    original = getattr(benchmark, "_revalidate_failed_archive_commit", None)
+
+    def mutate_then_validate(**kwargs):
+        parent_fd = kwargs["parent_fd"]
+        source_fd = kwargs["source_fd"]
+        archive_fd = kwargs["archive_fd"]
+        method = kwargs["method"]
+        lock_name = kwargs["lock_name"]
+        if mutation == "evidence":
+            marker_fd = os.open(
+                "evidence.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=source_fd,
+            )
+            os.close(marker_fd)
+        elif mutation == "source_swap":
+            os.rename(
+                method,
+                f"{method}-displaced",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.mkdir(method, dir_fd=parent_fd)
+        elif mutation == "archive_swap":
+            os.mkdir("attacker-archive", dir_fd=parent_fd)
+            os.rename(
+                ".failed-attempts",
+                ".failed-attempts-displaced",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.symlink(
+                "attacker-archive",
+                ".failed-attempts",
+                target_is_directory=True,
+                dir_fd=parent_fd,
+            )
+        else:
+            os.unlink(lock_name, dir_fd=archive_fd)
+            replacement = os.open(
+                lock_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=archive_fd,
+            )
+            os.close(replacement)
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        benchmark,
+        "_revalidate_failed_archive_commit",
+        mutate_then_validate,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        archive_failed_distributed_attempt(evidence_dir)
+
+    archive_attempts = list(evidence_root.rglob("full-attempt-*"))
+    assert archive_attempts == []
+    if mutation == "source_swap":
+        assert (evidence_root / "full-displaced" / "initial.log").read_bytes() == (
+            b"source failure"
+        )
+        assert evidence_dir.is_dir()
+    else:
+        assert (evidence_dir / "initial.log").read_bytes() == b"source failure"
+
+
+def test_failed_smoke_archive_fails_closed_without_renameat2(
+    archive_tmp_path, monkeypatch
+):
+    import stage1.benchmark as benchmark
+
+    evidence_dir = archive_tmp_path / "evidence" / "full"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "initial.log").write_bytes(b"source failure")
+
+    def unavailable(*args):
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+
+    monkeypatch.setattr(
+        benchmark, "_renameat2_noreplace", unavailable, raising=False
+    )
+
+    with pytest.raises(OSError, match="renameat2 unavailable"):
+        archive_failed_distributed_attempt(evidence_dir)
+
+    assert (evidence_dir / "initial.log").read_bytes() == b"source failure"
+
+
+def test_committed_archive_does_not_unlink_replaced_lock(
+    archive_tmp_path, monkeypatch
+):
+    import stage1.benchmark as benchmark
+
+    evidence_dir = archive_tmp_path / "evidence" / "full"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "initial.log").write_bytes(b"source failure")
+    original = getattr(benchmark, "_renameat2_noreplace", None)
+
+    def commit_then_replace_lock(source_fd, source_name, archive_fd, target_name):
+        original(source_fd, source_name, archive_fd, target_name)
+        os.unlink(".full-archive.lock", dir_fd=archive_fd)
+        replacement = os.open(
+            ".full-archive.lock",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=archive_fd,
+        )
+        os.write(replacement, b"replacement")
+        os.close(replacement)
+
+    monkeypatch.setattr(
+        benchmark,
+        "_renameat2_noreplace",
+        commit_then_replace_lock,
+        raising=False,
+    )
+
+    with pytest.warns(RuntimeWarning, match="lock cleanup"):
+        archived = archive_failed_distributed_attempt(evidence_dir)
+
+    assert (archived / "initial.log").read_bytes() == b"source failure"
+    assert (
+        archived.parent / ".full-archive.lock"
+    ).read_bytes() == b"replacement"
+
+
+def test_archive_failed_attempt_cli_moves_only_the_complete_directory(
+    archive_tmp_path,
+):
+    evidence_dir = archive_tmp_path / "evidence" / "dora"
     evidence_dir.mkdir(parents=True)
     (evidence_dir / "initial.log").write_bytes(b"failed dora")
 
@@ -1616,8 +1984,8 @@ def test_archive_failed_attempt_cli_moves_only_the_complete_directory(tmp_path):
     assert not evidence_dir.exists()
 
 
-def test_archive_failed_attempt_cli_prints_next_unique_path(tmp_path):
-    evidence_dir = tmp_path / "evidence" / "full"
+def test_archive_failed_attempt_cli_prints_next_unique_path(archive_tmp_path):
+    evidence_dir = archive_tmp_path / "evidence" / "full"
     archive_root = evidence_dir.parent / ".failed-attempts"
     evidence_dir.mkdir(parents=True)
     (evidence_dir / "initial.log").write_bytes(b"second full")

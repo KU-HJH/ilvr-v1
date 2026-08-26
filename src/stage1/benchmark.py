@@ -8,7 +8,9 @@ an artifact tree.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import asdict, dataclass, fields
+import errno
 import hashlib
 import json
 import math
@@ -20,6 +22,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Literal, Mapping, Sequence
+import warnings
 
 
 _SCHEMA_VERSION = 1
@@ -425,11 +428,21 @@ def load_verified_evidence(
         evidence = cached[1]
     else:
         payload = _read_json_once(resolved)
-        if type(payload) is not dict or payload.get("kind") != "stage1-producer-evidence":
+        if type(payload) is not dict:
             raise ValueError("official evidence must be a Stage 1 producer envelope")
-        evidence, seal = _validate_producer_evidence_payload(payload)
+        if payload.get("kind") == _SMOKE_REGISTRY_KIND:
+            evidence, seal, marker_path = _validate_smoke_registry_payload(
+                payload, resolved
+            )
+        elif payload.get("kind") == "stage1-producer-evidence":
+            evidence, seal = _validate_producer_evidence_payload(payload)
+            marker_path = None
+        else:
+            raise ValueError("official evidence must be a Stage 1 producer envelope")
         if seal["run_config"]["kind"] == "stage1-smoke-run-manifest":
-            _validate_smoke_marker_for_evidence(resolved, seal)
+            _validate_smoke_marker_for_evidence(
+                resolved, seal, marker_path=marker_path
+            )
         else:
             _VERIFIED_PRODUCER_EVIDENCE_CACHE[resolved] = (witness, evidence)
     if evidence.config_digest != expected_config_digest:
@@ -438,87 +451,292 @@ def load_verified_evidence(
 
 
 _SMOKE_MARKER_FILENAME = "checkpoint-topology.json"
+_SMOKE_REGISTRY_KIND = "stage1-smoke-registry-evidence"
+_SMOKE_ATTEMPT_LOCK = ".attempt-allocation.lock"
+_SMOKE_ATTEMPTS_DIRECTORY = "attempts"
 _FAILED_ATTEMPT_ARCHIVE_NAMESPACE = ".failed-attempts"
+_RENAME_NOREPLACE = 1
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | os.O_DIRECTORY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _require_no_smoke_success_markers(source_fd: int) -> None:
+    for protected_name in ("evidence.json", _SMOKE_MARKER_FILENAME):
+        try:
+            os.stat(protected_name, dir_fd=source_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise ValueError(
+            "refusing to archive smoke directory containing success "
+            f"evidence/marker: {protected_name}"
+        )
+
+
+def _require_named_fd_identity(
+    *,
+    directory_fd: int,
+    name: str,
+    opened_fd: int,
+    label: str,
+    require_directory: bool,
+) -> None:
+    try:
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise ValueError(f"failed smoke {label} changed before archive commit") from error
+    opened = os.fstat(opened_fd)
+    expected_type = stat_module.S_ISDIR if require_directory else stat_module.S_ISREG
+    if not expected_type(named.st_mode) or not _same_file_identity(named, opened):
+        raise ValueError(f"failed smoke {label} changed before archive commit")
+
+
+def _revalidate_failed_archive_commit(
+    *,
+    parent_fd: int,
+    source_fd: int,
+    archive_fd: int,
+    method: str,
+    lock_fd: int,
+    lock_name: str,
+) -> None:
+    """Revalidate every pinned name and success invariant under the lock."""
+
+    _require_named_fd_identity(
+        directory_fd=parent_fd,
+        name=method,
+        opened_fd=source_fd,
+        label="source directory",
+        require_directory=True,
+    )
+    _require_named_fd_identity(
+        directory_fd=parent_fd,
+        name=_FAILED_ATTEMPT_ARCHIVE_NAMESPACE,
+        opened_fd=archive_fd,
+        label="archive directory",
+        require_directory=True,
+    )
+    _require_named_fd_identity(
+        directory_fd=archive_fd,
+        name=lock_name,
+        opened_fd=lock_fd,
+        label="archive lock",
+        require_directory=False,
+    )
+    _require_no_smoke_success_markers(source_fd)
+
+
+def _renameat2_noreplace(
+    source_fd: int,
+    source_name: str,
+    archive_fd: int,
+    target_name: str,
+) -> None:
+    """Commit one directory rename atomically without replacing a target."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2(RENAME_NOREPLACE) is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_fd,
+        os.fsencode(source_name),
+        archive_fd,
+        os.fsencode(target_name),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            target_name,
+        )
+
+
+def _cleanup_owned_archive_lock(
+    *, archive_fd: int, lock_fd: int, lock_name: str
+) -> bool:
+    """Remove only the still-named inode owned by ``lock_fd``."""
+
+    try:
+        named = os.stat(lock_name, dir_fd=archive_fd, follow_symlinks=False)
+        owned = os.fstat(lock_fd)
+        if not stat_module.S_ISREG(named.st_mode) or not _same_file_identity(
+            named, owned
+        ):
+            return False
+        os.unlink(lock_name, dir_fd=archive_fd)
+        return True
+    except OSError:
+        return False
 
 
 def archive_failed_distributed_attempt(evidence_dir: str | Path) -> Path:
     """Atomically archive one whole failed smoke directory to a unique path."""
 
     source = Path(evidence_dir)
-    if source.is_symlink():
-        raise ValueError("failed smoke evidence directory must not be a symlink")
-    if not source.is_dir():
-        raise FileNotFoundError(f"failed smoke evidence directory is missing: {source}")
-    resolved_source = source.resolve(strict=True)
-    parent = source.parent.resolve(strict=True)
-    if resolved_source.parent != parent or resolved_source.name not in {"full", "dora"}:
+    method = source.name
+    if method not in {"full", "dora"}:
         raise ValueError(
             "failed smoke evidence directory must be a canonical full/dora child"
         )
-    for protected_name in ("evidence.json", _SMOKE_MARKER_FILENAME):
-        protected = resolved_source / protected_name
-        if protected.exists() or protected.is_symlink():
-            raise ValueError(
-                "refusing to archive smoke directory containing success "
-                f"evidence/marker: {protected}"
-            )
-    archive_root = parent / _FAILED_ATTEMPT_ARCHIVE_NAMESPACE
-    if archive_root.is_symlink():
-        raise ValueError("failed smoke archive namespace must not be a symlink")
-    if archive_root.exists() and not archive_root.is_dir():
-        raise ValueError("failed smoke archive namespace must be a directory")
-    archive_root.mkdir(mode=0o750, exist_ok=True)
-    if archive_root.resolve(strict=True).parent != parent:
-        raise ValueError("failed smoke archive namespace escaped its parent")
-
-    method = resolved_source.name
-    lock_path = archive_root / f".{method}-archive.lock"
     try:
-        lock_fd = os.open(
-            lock_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-    except FileExistsError as error:
-        raise FileExistsError(
-            f"failed smoke archive lock is already held: {lock_path}"
+        parent_fd = os.open(source.parent, _DIRECTORY_OPEN_FLAGS)
+    except OSError as error:
+        raise ValueError(
+            f"failed smoke evidence parent must be a real directory: {source.parent}"
         ) from error
     try:
-        prefix = f"{method}-attempt-"
-        attempt_numbers = []
-        for entry in archive_root.iterdir():
-            if not entry.name.startswith(prefix):
-                continue
-            suffix = entry.name.removeprefix(prefix)
-            if (
-                not suffix.isdigit()
-                or int(suffix) <= 0
-                or str(int(suffix)) != suffix
-            ):
-                raise ValueError(
-                    f"noncanonical failed smoke archive collision: {entry}"
-                )
-            if entry.is_symlink() or not entry.is_dir():
-                raise ValueError(
-                    "failed smoke archive attempts must be regular "
-                    f"non-symlink directories: {entry}"
-                )
-            resolved_entry = entry.resolve(strict=True)
-            if resolved_entry.parent != archive_root.resolve(strict=True):
-                raise ValueError(f"failed smoke archive attempt escaped: {entry}")
-            attempt_numbers.append(int(suffix))
-
-        next_attempt = max(attempt_numbers, default=0) + 1
-        target = archive_root / f"{prefix}{next_attempt}"
-        if target.exists() or target.is_symlink():
-            raise FileExistsError(
-                f"failed smoke archive target already exists: {target}"
+        try:
+            source_fd = os.open(method, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        except FileNotFoundError as error:
+            raise FileNotFoundError(
+                f"failed smoke evidence directory is missing: {source}"
+            ) from error
+        except OSError as error:
+            raise ValueError(
+                "failed smoke evidence directory must be a regular "
+                "non-symlink directory"
+            ) from error
+        try:
+            _require_named_fd_identity(
+                directory_fd=parent_fd,
+                name=method,
+                opened_fd=source_fd,
+                label="source directory",
+                require_directory=True,
             )
-        os.rename(resolved_source, target)
-        return target
+            _require_no_smoke_success_markers(source_fd)
+            try:
+                os.mkdir(
+                    _FAILED_ATTEMPT_ARCHIVE_NAMESPACE,
+                    mode=0o750,
+                    dir_fd=parent_fd,
+                )
+            except FileExistsError:
+                pass
+            try:
+                archive_fd = os.open(
+                    _FAILED_ATTEMPT_ARCHIVE_NAMESPACE,
+                    _DIRECTORY_OPEN_FLAGS,
+                    dir_fd=parent_fd,
+                )
+            except OSError as error:
+                raise ValueError(
+                    "failed smoke archive namespace must be a regular "
+                    "non-symlink directory"
+                ) from error
+            try:
+                _require_named_fd_identity(
+                    directory_fd=parent_fd,
+                    name=_FAILED_ATTEMPT_ARCHIVE_NAMESPACE,
+                    opened_fd=archive_fd,
+                    label="archive directory",
+                    require_directory=True,
+                )
+                lock_name = f".{method}-archive.lock"
+                try:
+                    lock_fd = os.open(
+                        lock_name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                        dir_fd=archive_fd,
+                    )
+                except FileExistsError as error:
+                    raise FileExistsError(
+                        "failed smoke archive lock is already held: "
+                        f"{source.parent / _FAILED_ATTEMPT_ARCHIVE_NAMESPACE / lock_name}"
+                    ) from error
+                committed = False
+                lock_cleaned = False
+                try:
+                    prefix = f"{method}-attempt-"
+                    attempt_numbers = []
+                    for name in os.listdir(archive_fd):
+                        if not name.startswith(prefix):
+                            continue
+                        suffix = name.removeprefix(prefix)
+                        if (
+                            not suffix.isdigit()
+                            or int(suffix) <= 0
+                            or str(int(suffix)) != suffix
+                        ):
+                            raise ValueError(
+                                "noncanonical failed smoke archive collision: "
+                                f"{name}"
+                            )
+                        entry = os.stat(
+                            name, dir_fd=archive_fd, follow_symlinks=False
+                        )
+                        if not stat_module.S_ISDIR(entry.st_mode):
+                            raise ValueError(
+                                "failed smoke archive attempts must be regular "
+                                f"non-symlink directories: {name}"
+                            )
+                        attempt_numbers.append(int(suffix))
+
+                    next_attempt = max(attempt_numbers, default=0) + 1
+                    target_name = f"{prefix}{next_attempt}"
+                    _revalidate_failed_archive_commit(
+                        parent_fd=parent_fd,
+                        source_fd=source_fd,
+                        archive_fd=archive_fd,
+                        method=method,
+                        lock_fd=lock_fd,
+                        lock_name=lock_name,
+                    )
+                    _renameat2_noreplace(
+                        parent_fd,
+                        method,
+                        archive_fd,
+                        target_name,
+                    )
+                    committed = True
+                finally:
+                    lock_cleaned = _cleanup_owned_archive_lock(
+                        archive_fd=archive_fd,
+                        lock_fd=lock_fd,
+                        lock_name=lock_name,
+                    )
+                    os.close(lock_fd)
+                if committed and not lock_cleaned:
+                    warnings.warn(
+                        "archive committed but owned lock cleanup could not be "
+                        "verified; stale lock remains fail-closed",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                return (
+                    source.parent
+                    / _FAILED_ATTEMPT_ARCHIVE_NAMESPACE
+                    / target_name
+                )
+            finally:
+                os.close(archive_fd)
+        finally:
+            os.close(source_fd)
     finally:
-        os.close(lock_fd)
-        lock_path.unlink(missing_ok=True)
+        os.close(parent_fd)
 
 
 def _checkpoint_file_topology(checkpoint: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -676,13 +894,20 @@ def load_stage1_smoke_resume_witness(
 
 
 def _validate_smoke_marker_for_evidence(
-    evidence_path: Path, seal: Mapping[str, object]
+    evidence_path: Path,
+    seal: Mapping[str, object],
+    *,
+    marker_path: Path | None = None,
 ) -> Stage1SmokeResumeSnapshot:
     config = seal["run_config"]
     summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
     checkpoint = Path(config["output_dir"]) / f"checkpoint-{summary['initial_final_step']}"
     snapshot = load_stage1_smoke_resume_witness(
-        Path(evidence_path).parent / _SMOKE_MARKER_FILENAME,
+        (
+            Path(evidence_path).parent / _SMOKE_MARKER_FILENAME
+            if marker_path is None
+            else marker_path
+        ),
         method=config["method"],
         checkpoint_path=checkpoint,
         micro_batch=config["micro_batch"],
@@ -692,6 +917,134 @@ def _validate_smoke_marker_for_evidence(
     if snapshot.marker_digest != summary["resume_artifact_digest"]:
         raise ValueError("smoke checkpoint topology digest does not match evidence")
     return snapshot
+
+
+def _smoke_attempt_number(name: str) -> int:
+    prefix = "attempt-"
+    if not name.startswith(prefix):
+        raise ValueError(f"noncanonical smoke attempt entry: {name}")
+    suffix = name[len(prefix):]
+    if not suffix.isascii() or not suffix.isdigit() or suffix.startswith("0"):
+        raise ValueError(f"noncanonical smoke attempt entry: {name}")
+    number = int(suffix)
+    if number <= 0 or name != f"{prefix}{number}":
+        raise ValueError(f"noncanonical smoke attempt entry: {name}")
+    return number
+
+
+def _exclusive_write_json(path: Path, payload: object) -> None:
+    """Publish one small immutable JSON object without replacing any inode."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8") + b"\n"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(path, flags, 0o640)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+    parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _allocate_smoke_attempt(evidence_directory: Path) -> Path:
+    """Allocate a monotonic append-only attempt directory using mkdir no-replace."""
+
+    evidence_directory = Path(evidence_directory)
+    evidence_directory.mkdir(parents=True, exist_ok=True)
+    method_fd = os.open(evidence_directory, _DIRECTORY_OPEN_FLAGS)
+    lock_fd: int | None = None
+    attempts_fd: int | None = None
+    lock_identity: os.stat_result | None = None
+    try:
+        try:
+            lock_fd = os.open(
+                _SMOKE_ATTEMPT_LOCK,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=method_fd,
+            )
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"smoke attempt allocation lock is already held: {evidence_directory}"
+            ) from error
+        lock_identity = os.fstat(lock_fd)
+        try:
+            os.mkdir(_SMOKE_ATTEMPTS_DIRECTORY, 0o750, dir_fd=method_fd)
+        except FileExistsError:
+            pass
+        attempts_fd = os.open(
+            _SMOKE_ATTEMPTS_DIRECTORY, _DIRECTORY_OPEN_FLAGS, dir_fd=method_fd
+        )
+        numbers: list[int] = []
+        for name in os.listdir(attempts_fd):
+            number = _smoke_attempt_number(name)
+            entry = os.stat(name, dir_fd=attempts_fd, follow_symlinks=False)
+            if not stat_module.S_ISDIR(entry.st_mode):
+                raise ValueError(f"smoke attempt entry is not a directory: {name}")
+            numbers.append(number)
+
+        allowed_root_entries = {
+            _SMOKE_ATTEMPTS_DIRECTORY,
+            _SMOKE_ATTEMPT_LOCK,
+            "evidence.json",
+        }
+        legacy_failure = any(
+            name not in allowed_root_entries for name in os.listdir(method_fd)
+        )
+        reserved = 1 if legacy_failure else 0
+        next_number = max((*numbers, reserved)) + 1
+        target_name = f"attempt-{next_number}"
+        try:
+            os.mkdir(target_name, 0o750, dir_fd=attempts_fd)
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"smoke attempt was concurrently allocated: {target_name}"
+            ) from error
+        os.fsync(attempts_fd)
+        return evidence_directory / _SMOKE_ATTEMPTS_DIRECTORY / target_name
+    finally:
+        if attempts_fd is not None:
+            os.close(attempts_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if lock_identity is not None:
+            try:
+                named = os.stat(
+                    _SMOKE_ATTEMPT_LOCK,
+                    dir_fd=method_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                if _same_file_identity(lock_identity, named):
+                    os.unlink(_SMOKE_ATTEMPT_LOCK, dir_fd=method_fd)
+                    os.fsync(method_fd)
+        os.close(method_fd)
 
 
 _FULL_WEIGHT_NAMES = {
@@ -1269,10 +1622,119 @@ def write_stage1_producer_evidence(
 
 
 def _load_producer_evidence(path: Path) -> tuple[Stage1BenchmarkEvidence, dict[str, object]]:
-    evidence, payload = _validate_producer_evidence_payload(_read_json_once(path))
+    path = Path(path).resolve(strict=True)
+    raw = _read_json_once(path)
+    if type(raw) is dict and raw.get("kind") == _SMOKE_REGISTRY_KIND:
+        evidence, payload, marker_path = _validate_smoke_registry_payload(raw, path)
+    else:
+        evidence, payload = _validate_producer_evidence_payload(raw)
+        marker_path = None
     if payload["run_config"]["kind"] == "stage1-smoke-run-manifest":
-        _validate_smoke_marker_for_evidence(Path(path).resolve(strict=True), payload)
+        _validate_smoke_marker_for_evidence(
+            path, payload, marker_path=marker_path
+        )
     return evidence, payload
+
+
+def _validate_smoke_registry_payload(
+    payload: object, evidence_path: Path
+) -> tuple[Stage1BenchmarkEvidence, dict[str, object], Path]:
+    if type(payload) is not dict:
+        raise TypeError("Stage 1 smoke registry evidence must be an object")
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "kind",
+            "attempt_path",
+            "attempt_evidence_path",
+            "attempt_evidence_digest",
+            "marker_path",
+            "marker_digest",
+            "producer_evidence",
+            "registry_digest",
+        },
+        "Stage 1 smoke registry evidence",
+    )
+    if (
+        payload.get("schema_version") != _SCHEMA_VERSION
+        or payload.get("kind") != _SMOKE_REGISTRY_KIND
+    ):
+        raise ValueError("invalid Stage 1 smoke registry evidence schema")
+    claimed = _require_digest("registry_digest", payload.get("registry_digest"))
+    digest_input = dict(payload)
+    digest_input.pop("registry_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("Stage 1 smoke registry evidence digest mismatch")
+
+    attempt_path = _require_string("attempt_path", payload.get("attempt_path"))
+    parts = Path(attempt_path).parts
+    if len(parts) != 2 or parts[0] != _SMOKE_ATTEMPTS_DIRECTORY:
+        raise ValueError("invalid Stage 1 smoke registry attempt path")
+    _smoke_attempt_number(parts[1])
+    expected_attempt_evidence = f"{attempt_path}/evidence.json"
+    expected_marker = f"{attempt_path}/{_SMOKE_MARKER_FILENAME}"
+    if payload.get("attempt_evidence_path") != expected_attempt_evidence:
+        raise ValueError("invalid Stage 1 smoke registry attempt evidence path")
+    if payload.get("marker_path") != expected_marker:
+        raise ValueError("invalid Stage 1 smoke registry marker path")
+
+    evidence, producer = _validate_producer_evidence_payload(
+        payload.get("producer_evidence")
+    )
+    if producer["run_config"]["kind"] != "stage1-smoke-run-manifest":
+        raise ValueError("registry evidence must contain smoke producer evidence")
+    producer_digest = _require_digest(
+        "attempt_evidence_digest", payload.get("attempt_evidence_digest")
+    )
+    if producer_digest != producer["producer_digest"]:
+        raise ValueError("registry attempt evidence digest mismatch")
+    marker_digest = _require_digest("marker_digest", payload.get("marker_digest"))
+    summary = _validate_smoke_resume_witness(producer["smoke_resume_witness"])
+    if marker_digest != summary["resume_artifact_digest"]:
+        raise ValueError("registry marker digest does not match producer evidence")
+
+    root = Path(evidence_path).resolve(strict=True).parent
+    attempts = root / _SMOKE_ATTEMPTS_DIRECTORY
+    attempt = attempts / parts[1]
+    for directory, label in ((attempts, "attempts"), (attempt, "attempt")):
+        info = directory.lstat()
+        if not stat_module.S_ISDIR(info.st_mode) or directory.is_symlink():
+            raise ValueError(f"smoke registry {label} path must be a real directory")
+    expected_output = (attempt / "run").resolve()
+    if Path(producer["run_config"]["output_dir"]) != expected_output:
+        raise ValueError("registry producer output directory does not match attempt")
+    marker = attempt / _SMOKE_MARKER_FILENAME
+    marker_info = marker.lstat()
+    if not stat_module.S_ISREG(marker_info.st_mode) or marker.is_symlink():
+        raise ValueError("smoke registry marker must be a regular file")
+    return evidence, producer, marker
+
+
+def _smoke_registry_payload(
+    *, attempt: Path, evidence_directory: Path, producer: Mapping[str, object]
+) -> dict[str, object]:
+    evidence_directory = Path(evidence_directory).resolve(strict=True)
+    attempt = Path(attempt).resolve(strict=True)
+    try:
+        relative = attempt.relative_to(evidence_directory).as_posix()
+    except ValueError as error:
+        raise ValueError("smoke attempt is outside its registry") from error
+    marker_digest = _validate_smoke_resume_witness(
+        producer["smoke_resume_witness"]
+    )["resume_artifact_digest"]
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": _SMOKE_REGISTRY_KIND,
+        "attempt_path": relative,
+        "attempt_evidence_path": f"{relative}/evidence.json",
+        "attempt_evidence_digest": producer["producer_digest"],
+        "marker_path": f"{relative}/{_SMOKE_MARKER_FILENAME}",
+        "marker_digest": marker_digest,
+        "producer_evidence": dict(producer),
+    }
+    payload["registry_digest"] = config_digest(payload)
+    return payload
 
 
 def _validate_producer_evidence_payload(
@@ -2612,11 +3074,44 @@ def run_or_load_distributed_witness(
     evidence_directory = Path(evidence_dir).resolve()
     audit_path = evidence_directory.parent / "high-cost-rows.json"
     select_high_cost_probe_rows(data, 64, audit_path, image_root=images)
-    run_dir = evidence_directory / "run"
-    checkpoint = run_dir / f"checkpoint-{initial_max_steps}"
-    marker_path = evidence_directory / _SMOKE_MARKER_FILENAME
-    run_config_path = evidence_directory / "run-config.json"
     evidence_path = evidence_directory / "evidence.json"
+
+    def reusable_result() -> DistributedSmokeWitness | None:
+        if not evidence_path.exists() and not evidence_path.is_symlink():
+            return None
+        if evidence_path.is_symlink() or not evidence_path.is_file():
+            raise ValueError("canonical smoke evidence must be a regular file")
+        existing, seal = _load_producer_evidence(evidence_path)
+        existing_config = seal["run_config"]
+        expected = _smoke_run_config(
+            method=method,
+            model=model,
+            data_path=data,
+            image_root=images,
+            output_dir=Path(existing_config["output_dir"]),
+            micro_batch=micro_batch,
+            gradient_accumulation_steps=accumulation,
+            world_size=world_size,
+            resumed_max_steps=resumed_max_steps,
+            deepspeed_config=deepspeed,
+            audit_path=audit_path,
+        )
+        reusable = load_verified_evidence(evidence_path, expected["config_digest"])
+        if reusable is None:
+            raise FileExistsError(
+                "canonical smoke evidence belongs to a different request"
+            )
+        return _distributed_smoke_result(existing, seal)
+
+    if (reused := reusable_result()) is not None:
+        return reused
+
+    attempt = _allocate_smoke_attempt(evidence_directory)
+    run_dir = attempt / "run"
+    checkpoint = run_dir / f"checkpoint-{initial_max_steps}"
+    marker_path = attempt / _SMOKE_MARKER_FILENAME
+    run_config_path = attempt / "run-config.json"
+    attempt_evidence_path = attempt / "evidence.json"
     config = _smoke_run_config(
         method=method,
         model=model,
@@ -2630,17 +3125,6 @@ def run_or_load_distributed_witness(
         deepspeed_config=deepspeed,
         audit_path=audit_path,
     )
-    reusable = load_verified_evidence(evidence_path, config["config_digest"])
-    if reusable is not None:
-        _, seal = _load_producer_evidence(evidence_path)
-        return _distributed_smoke_result(reusable, seal)
-    if evidence_path.exists() or evidence_directory.exists() and any(
-        evidence_directory.iterdir()
-    ):
-        raise FileExistsError(
-            f"refusing to rerun an incomplete or stale distributed smoke: {evidence_directory}"
-        )
-    evidence_directory.mkdir(parents=True, exist_ok=True)
     launcher = (
         repository / "run_stage1_training.sh"
         if launcher_path is None
@@ -2669,7 +3153,7 @@ def run_or_load_distributed_witness(
             "--max-steps", str(initial_max_steps),
             "--no-final-save",
         ],
-        log_path=evidence_directory / "initial.log",
+        log_path=attempt / "initial.log",
     )
     seal_stage1_smoke_checkpoint(
         checkpoint,
@@ -2691,17 +3175,29 @@ def run_or_load_distributed_witness(
             "--resume", str(checkpoint),
             "--max-steps", str(resumed_max_steps),
             "--benchmark-run-config", str(run_config_path),
-            "--producer-evidence", str(evidence_path),
+            "--producer-evidence", str(attempt_evidence_path),
             "--smoke-resume-witness", str(marker_path),
             "--no-final-save",
         ],
-        log_path=evidence_directory / "resume.log",
+        log_path=attempt / "resume.log",
     )
-    produced = load_verified_evidence(evidence_path, config["config_digest"])
+    produced = load_verified_evidence(attempt_evidence_path, config["config_digest"])
     if produced is None:
         raise RuntimeError("distributed smoke did not publish matching evidence")
-    _, seal = _load_producer_evidence(evidence_path)
-    return _distributed_smoke_result(produced, seal)
+    _, seal = _load_producer_evidence(attempt_evidence_path)
+    registry = _smoke_registry_payload(
+        attempt=attempt,
+        evidence_directory=evidence_directory,
+        producer=seal,
+    )
+    try:
+        _exclusive_write_json(evidence_path, registry)
+    except FileExistsError:
+        pass
+    reused = reusable_result()
+    if reused is None:  # pragma: no cover - exclusive publication just succeeded.
+        raise RuntimeError("distributed smoke did not publish canonical evidence")
+    return reused
 
 
 def _load_evidence_without_expected(path: Path) -> Stage1BenchmarkEvidence:

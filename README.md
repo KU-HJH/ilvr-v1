@@ -154,6 +154,20 @@ save/resume witnesses. The checks read only the small evidence envelopes:
 
 Run only a case whose check printed `missing`; reuse `reusable-success`:
 
+Each invocation allocates a new append-only
+`outputs/stage1-smoke/<method>/attempts/attempt-N/` directory. A failed attempt
+is retained in place and the next invocation uses the next monotonic number;
+do not delete, move, or overwrite its logs. Legacy flat failure files under the
+method directory are also retained and reserve attempt 1. On success, the
+wrapper publishes exactly one small canonical
+`outputs/stage1-smoke/<method>/evidence.json` with exclusive-create semantics.
+That evidence embeds the authenticated producer envelope and refers to the
+sealed attempt checkpoint marker by a contained relative path. Reuse reads
+only the canonical evidence and that small marker, not the attempt's checkpoint
+tree or attempt-local evidence file. The legacy `archive-failed-attempt` command
+is fail-closed where the filesystem lacks atomic no-replace rename support and
+is not a retry prerequisite.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 ILVR_REAL_GPU_TESTS=1 ILVR_DISTRIBUTED_METHOD=full \
 PYTHONDONTWRITEBYTECODE=1 \
