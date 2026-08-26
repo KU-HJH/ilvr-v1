@@ -124,6 +124,97 @@ def test_dora_targets_decoder_and_exact_latent_rows(tiny_qwen, latent_token_ids)
     assert all("visual" not in name.split(".") for name in report.trainable_names)
 
 
+def test_dora_registers_exact_zero3_externals_on_magnitude_consumers(
+    tiny_qwen, latent_token_ids
+):
+    """Catches sibling weights being registered on the target or omitted."""
+
+    configured = tuning("dora")
+    model = build_stage1_tuned_model(
+        tiny_qwen, configured, latent_token_ids
+    )
+    qwen = resolve_qwen2_5_vl_model(model)
+    modules = dict(qwen.named_modules())
+
+    for target_name in model.base_model.targeted_module_names:
+        target = modules[target_name]
+        consumer = target.lora_magnitude_vector["default"]
+        base = target.get_base_layer()
+        expected = {
+            id(target.lora_A["default"].weight),
+            id(target.lora_B["default"].weight),
+            id(base.weight),
+        }
+        if base.bias is not None:
+            expected.add(id(base.bias))
+        actual = dict(consumer.ds_external_parameters())
+        assert set(actual) == expected
+        assert {id(parameter) for parameter in actual.values()} == expected
+
+    # Runtime and checkpoint validation can revisit this boundary; registration
+    # remains one exact identity-keyed set rather than accumulating duplicates.
+    validate_stage1_trainable_boundary(model, configured, latent_token_ids)
+    validate_stage1_trainable_boundary(model, configured, latent_token_ids)
+    external_counts = set()
+    for target_name in model.base_model.targeted_module_names:
+        target = modules[target_name]
+        consumer = target.lora_magnitude_vector["default"]
+        base = target.get_base_layer()
+        expected_count = 4 if base.bias is not None else 3
+        assert len(tuple(consumer.ds_external_parameters())) == expected_count
+        external_counts.add(expected_count)
+    assert external_counts == {3, 4}
+
+
+def test_lora_does_not_register_dora_zero3_externals(
+    tiny_qwen, latent_token_ids, monkeypatch
+):
+    """Catches the DoRA/ZeRO ownership contract leaking into legacy LoRA."""
+
+    import deepspeed
+
+    registrations = []
+    monkeypatch.setattr(
+        deepspeed.zero,
+        "register_external_parameter",
+        lambda module, parameter: registrations.append((module, parameter)),
+    )
+
+    model = build_stage1_tuned_model(
+        tiny_qwen, tuning("lora"), latent_token_ids
+    )
+
+    assert registrations == []
+    assert model.peft_config["default"].use_dora is False
+
+
+def test_malformed_dora_target_fails_before_new_zero3_registration(
+    tiny_qwen, latent_token_ids, monkeypatch
+):
+    """Catches invalid runtime topology acquiring new ownership metadata."""
+
+    import deepspeed
+
+    configured = tuning("dora")
+    model = build_stage1_tuned_model(
+        tiny_qwen, configured, latent_token_ids
+    )
+    model.base_model.targeted_module_names.pop()
+    registrations = []
+    monkeypatch.setattr(
+        deepspeed.zero,
+        "register_external_parameter",
+        lambda module, parameter: registrations.append((module, parameter)),
+    )
+
+    with pytest.raises(ValueError, match="adapter targets do not match"):
+        validate_stage1_trainable_boundary(
+            model, configured, latent_token_ids
+        )
+
+    assert registrations == []
+
+
 @pytest.mark.parametrize("method", ["lora", "dora"])
 def test_multilayer_qwen_validates_exact_injected_targets_after_peft_optimization(
     tiny_qwen, latent_token_ids, method

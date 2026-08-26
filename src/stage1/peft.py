@@ -263,6 +263,29 @@ def _adapter_parameter_ids(
     return allowed
 
 
+def _register_dora_zero3_external_parameters(
+    qwen: nn.Module, target_names: Sequence[str]
+) -> None:
+    """Bind PEFT DoRA's sibling/base weights to their actual consumer."""
+
+    import deepspeed
+
+    modules = dict(qwen.named_modules())
+    for target_name in target_names:
+        target = modules[target_name]
+        consumer = target.lora_magnitude_vector[_ADAPTER_NAME]
+        base = target.get_base_layer()
+        external_parameters = [
+            target.lora_A[_ADAPTER_NAME].weight,
+            target.lora_B[_ADAPTER_NAME].weight,
+            base.weight,
+        ]
+        if base.bias is not None:
+            external_parameters.append(base.bias)
+        for parameter in external_parameters:
+            deepspeed.zero.register_external_parameter(consumer, parameter)
+
+
 def _validate_selective_input_rows(
     qwen: nn.Module,
     config,
@@ -520,6 +543,8 @@ def _validate_adapter_boundary(
         for _, parameter in parameters
         if id(parameter) in adapter_ids
     )
+    if tuning.method == "dora":
+        _register_dora_zero3_external_parameters(qwen, expected_targets)
     return _report(
         model,
         categories={
