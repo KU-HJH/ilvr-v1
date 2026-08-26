@@ -53,7 +53,7 @@ from stage1.types import Stage1TuningConfig
 
 
 STAGE1_PEFT_METADATA_FILENAME = "stage1_peft_metadata.json"
-STAGE1_PEFT_SCHEMA_VERSION = 1
+STAGE1_PEFT_SCHEMA_VERSION = 2
 STAGE1_REPOSITORY_FORMAT_VERSION = 1
 
 _ADAPTER_CONFIG_FILENAME = "adapter_config.json"
@@ -399,13 +399,14 @@ def _require_finite_number(value: object, *, name: str) -> float:
 
 @dataclass(frozen=True)
 class Stage1PeftMetadata:
-    """Complete schema-v1 provenance for one Stage 1 adapter artifact."""
+    """Complete schema-v2 provenance for one Stage 1 adapter artifact."""
 
     schema_version: int
     stage: Literal["stage1"]
     base_model_reference: str
     base_model_architecture: dict[str, object]
     base_vocab_size: int
+    pretrained_model_vocab_size: int
     resized_vocab_size: int
     latent_token_ids: tuple[int, int, int]
     latent_token_strings: tuple[str, str, str]
@@ -443,16 +444,19 @@ class Stage1PeftMetadata:
     def from_dict(cls, payload: Mapping[str, object]) -> "Stage1PeftMetadata":
         if not isinstance(payload, Mapping):
             raise ValueError("Stage 1 PEFT metadata must be a JSON object")
-        if (
-            type(payload.get("schema_version")) is not int
-            or payload["schema_version"] != STAGE1_PEFT_SCHEMA_VERSION
+        schema_version = payload.get("schema_version")
+        if type(schema_version) is not int or schema_version not in (
+            1,
+            STAGE1_PEFT_SCHEMA_VERSION,
         ):
             raise ValueError(
                 "unsupported Stage 1 PEFT metadata schema: "
-                f"expected={STAGE1_PEFT_SCHEMA_VERSION}, "
-                f"actual={payload.get('schema_version')}"
+                f"expected=1 or {STAGE1_PEFT_SCHEMA_VERSION}, "
+                f"actual={schema_version}"
             )
         expected_fields = {field.name for field in fields(cls)}
+        if schema_version == 1:
+            expected_fields = expected_fields - {"pretrained_model_vocab_size"}
         actual_fields = set(payload)
         if actual_fields != expected_fields:
             raise ValueError(
@@ -460,6 +464,10 @@ class Stage1PeftMetadata:
                 f"missing={sorted(expected_fields - actual_fields)}, "
                 f"unknown={sorted(actual_fields - expected_fields)}"
             )
+        payload = dict(payload)
+        if schema_version == 1:
+            payload["schema_version"] = STAGE1_PEFT_SCHEMA_VERSION
+            payload["pretrained_model_vocab_size"] = payload["base_vocab_size"]
         if payload["stage"] != "stage1":
             raise ValueError("Stage 1 PEFT metadata must describe stage1")
         if (
@@ -470,6 +478,7 @@ class Stage1PeftMetadata:
 
         integer_fields = (
             "base_vocab_size",
+            "pretrained_model_vocab_size",
             "resized_vocab_size",
             "latent_size",
             "image_pool_k",
@@ -490,13 +499,21 @@ class Stage1PeftMetadata:
         architecture = normalize_qwen2_5_vl_architecture(
             payload["base_model_architecture"]
         )
-        if architecture["decoder"]["vocab_size"] != payload["base_vocab_size"]:
+        if (
+            architecture["decoder"]["vocab_size"]
+            != payload["pretrained_model_vocab_size"]
+        ):
             raise ValueError(
-                "base architecture vocab_size must equal base_vocab_size"
+                "base architecture vocab_size must equal "
+                "pretrained_model_vocab_size"
             )
         if payload["resized_vocab_size"] != payload["base_vocab_size"] + 3:
             raise ValueError(
                 "resized_vocab_size must add exactly three latent tokens"
+            )
+        if payload["pretrained_model_vocab_size"] < payload["base_vocab_size"]:
+            raise ValueError(
+                "pretrained_model_vocab_size must be at least base_vocab_size"
             )
 
         token_ids = _require_exact_int_list(
@@ -569,6 +586,7 @@ class Stage1PeftMetadata:
             base_model_reference=payload["base_model_reference"],
             base_model_architecture=architecture,
             base_vocab_size=payload["base_vocab_size"],
+            pretrained_model_vocab_size=payload["pretrained_model_vocab_size"],
             resized_vocab_size=payload["resized_vocab_size"],
             latent_token_ids=token_ids,
             latent_token_strings=token_strings,
@@ -681,7 +699,7 @@ def save_stage1_peft_metadata(
 
 
 def load_stage1_peft_metadata(directory: Path) -> Stage1PeftMetadata:
-    """Read the strict schema-v1 Stage 1 sidecar."""
+    """Read one strict Stage 1 sidecar for deferred validation/migration."""
 
     return decode_stage1_peft_metadata_snapshot(
         read_stage1_peft_metadata_snapshot(directory)
@@ -794,7 +812,9 @@ def _validate_architecture(
 ) -> None:
     current = capture_qwen2_5_vl_architecture(qwen.config)
     expected_vocab = (
-        metadata.resized_vocab_size if resized else metadata.base_vocab_size
+        metadata.resized_vocab_size
+        if resized
+        else metadata.pretrained_model_vocab_size
     )
     if current["decoder"]["vocab_size"] != expected_vocab:
         raise ValueError(
@@ -803,7 +823,9 @@ def _validate_architecture(
         )
     comparable = deepcopy(current)
     if resized:
-        comparable["decoder"]["vocab_size"] = metadata.base_vocab_size
+        comparable["decoder"]["vocab_size"] = (
+            metadata.pretrained_model_vocab_size
+        )
     difference = first_architecture_difference(
         metadata.base_model_architecture, comparable
     )
@@ -1086,6 +1108,7 @@ class Stage1PeftPreflightWitness:
     base_model_reference: str
     base_architecture_json: bytes
     base_vocab_size: int
+    pretrained_model_vocab_size: int
     resized_vocab_size: int
     processor_vocab_size: int
     processor_contract: tuple[tuple[str, int], ...]
@@ -1137,6 +1160,7 @@ def _decode_preflight_witness(
         metadata.base_model_reference,
         _architecture_json(metadata.base_model_architecture),
         metadata.base_vocab_size,
+        metadata.pretrained_model_vocab_size,
         metadata.resized_vocab_size,
         metadata.resized_vocab_size,
         tuple(zip(metadata.latent_token_strings, metadata.latent_token_ids)),
@@ -1150,6 +1174,7 @@ def _decode_preflight_witness(
         witness.base_model_reference,
         witness.base_architecture_json,
         witness.base_vocab_size,
+        witness.pretrained_model_vocab_size,
         witness.resized_vocab_size,
         witness.processor_vocab_size,
         witness.processor_contract,
@@ -1229,6 +1254,7 @@ def preflight_stage1_peft_artifact(
             validated.base_model_architecture
         ),
         base_vocab_size=validated.base_vocab_size,
+        pretrained_model_vocab_size=validated.pretrained_model_vocab_size,
         resized_vocab_size=validated.resized_vocab_size,
         processor_vocab_size=len(tokenizer),
         processor_contract=tuple(

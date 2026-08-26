@@ -127,10 +127,10 @@ def stage1_tuning(method="dora"):
     )
 
 
-def tiny_original_qwen():
+def tiny_original_qwen(*, pretrained_vocab_size=BASE_VOCAB_SIZE):
     torch.manual_seed(29)
     config = Qwen2_5_VLConfig(
-        vocab_size=BASE_VOCAB_SIZE,
+        vocab_size=pretrained_vocab_size,
         hidden_size=8,
         intermediate_size=16,
         num_hidden_layers=1,
@@ -185,6 +185,7 @@ def sample_metadata(base_model=None, tuning=None):
         base_model_reference="tiny/original-qwen",
         base_model_architecture=capture_qwen2_5_vl_architecture(base_model.config),
         base_vocab_size=BASE_VOCAB_SIZE,
+        pretrained_model_vocab_size=base_model.config.vocab_size,
         resized_vocab_size=RESIZED_VOCAB_SIZE,
         latent_token_ids=LATENT_TOKEN_IDS,
         latent_token_strings=LATENT_TOKEN_STRINGS,
@@ -336,7 +337,7 @@ def _write_deepspeed_trainer_state(directory, *, step, replicated_model=False):
         )
 
 
-def test_metadata_schema_v1_round_trips_exact_fields(tmp_path):
+def test_metadata_schema_v2_round_trips_exact_fields(tmp_path):
     metadata = sample_metadata()
 
     _write_metadata(tmp_path, metadata)
@@ -348,6 +349,7 @@ def test_metadata_schema_v1_round_trips_exact_fields(tmp_path):
         "base_model_reference",
         "base_model_architecture",
         "base_vocab_size",
+        "pretrained_model_vocab_size",
         "resized_vocab_size",
         "latent_token_ids",
         "latent_token_strings",
@@ -368,6 +370,28 @@ def test_metadata_schema_v1_round_trips_exact_fields(tmp_path):
         "peft_version",
         "repository_format_version",
     }
+
+
+def test_complete_legacy_schema_v1_migrates_only_unpadded_vocabulary_in_memory():
+    payload = sample_metadata().to_dict()
+    payload["schema_version"] = 1
+    payload.pop("pretrained_model_vocab_size")
+
+    migrated = Stage1PeftMetadata.from_dict(payload)
+
+    assert migrated.schema_version == STAGE1_PEFT_SCHEMA_VERSION == 2
+    assert migrated.pretrained_model_vocab_size == migrated.base_vocab_size
+    assert migrated.to_dict()["schema_version"] == 2
+
+
+def test_partial_legacy_schema_v1_still_fails_closed():
+    payload = sample_metadata().to_dict()
+    payload["schema_version"] = 1
+    payload.pop("pretrained_model_vocab_size")
+    payload.pop("coverage_p")
+
+    with pytest.raises(ValueError, match="fields"):
+        Stage1PeftMetadata.from_dict(payload)
 
 
 @pytest.mark.parametrize("mutation", ["schema", "missing", "extra"])
@@ -395,6 +419,33 @@ def test_metadata_rejects_full_tuning_as_an_adapter_schema():
         Stage1PeftMetadata.from_dict(payload)
 
 
+@pytest.mark.parametrize("pretrained_vocab_size", [BASE_VOCAB_SIZE, 132])
+def test_metadata_distinguishes_tokenizer_boundary_from_pretrained_padding(
+    pretrained_vocab_size,
+):
+    metadata = sample_metadata(
+        tiny_original_qwen(pretrained_vocab_size=pretrained_vocab_size)
+    )
+
+    restored = Stage1PeftMetadata.from_dict(metadata.to_dict())
+
+    assert restored.base_vocab_size == BASE_VOCAB_SIZE
+    assert restored.pretrained_model_vocab_size == pretrained_vocab_size
+    assert restored.resized_vocab_size == RESIZED_VOCAB_SIZE
+    assert restored.latent_token_ids == LATENT_TOKEN_IDS
+
+
+def test_metadata_rejects_pretrained_vocabulary_smaller_than_base_tokenizer():
+    payload = sample_metadata().to_dict()
+    payload["pretrained_model_vocab_size"] = BASE_VOCAB_SIZE - 1
+    payload["base_model_architecture"]["decoder"]["vocab_size"] = (
+        BASE_VOCAB_SIZE - 1
+    )
+
+    with pytest.raises(ValueError, match="pretrained_model_vocab_size.*base"):
+        Stage1PeftMetadata.from_dict(payload)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -402,6 +453,7 @@ def test_metadata_rejects_full_tuning_as_an_adapter_schema():
         ("stage", True),
         ("base_model_architecture", True),
         ("base_vocab_size", True),
+        ("pretrained_model_vocab_size", False),
         ("resized_vocab_size", False),
         ("latent_size", False),
         ("image_pool_k", True),
@@ -844,6 +896,55 @@ def test_preflight_reads_each_small_payload_once_and_retains_immutable_bytes(
     assert witness.processor_contract == tuple(
         zip(LATENT_TOKEN_STRINGS, LATENT_TOKEN_IDS)
     )
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_padded_pretrained_vocabulary_preflights_and_restores_with_one_resize(
+    tmp_path,
+):
+    pretrained_vocab_size = 132
+    source = tiny_original_qwen(pretrained_vocab_size=pretrained_vocab_size)
+    metadata = sample_metadata(source)
+    source.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    source.config.latent_token_id = LATENT_TOKEN_IDS[0]
+    source.config.latent_start_id = LATENT_TOKEN_IDS[1]
+    source.config.latent_end_id = LATENT_TOKEN_IDS[2]
+    tuned = build_stage1_tuned_model(source, stage1_tuning(), LATENT_TOKEN_IDS)
+    processor = TinyStage1Processor()
+    save_stage1_peft_artifact(tuned, processor, tmp_path, metadata)
+
+    fresh = tiny_original_qwen(pretrained_vocab_size=pretrained_vocab_size)
+    witness = preflight_stage1_peft_artifact(
+        processor,
+        deepcopy(fresh.config),
+        tmp_path,
+    )
+    resize_calls = []
+    original_resize = fresh.resize_token_embeddings
+
+    def record_resize(size):
+        resize_calls.append(size)
+        return original_resize(size)
+
+    fresh.resize_token_embeddings = record_resize
+    restored = load_stage1_peft_artifact(
+        fresh,
+        processor,
+        tmp_path,
+        is_trainable=True,
+        preflight=witness,
+    )
+    qwen = resolve_qwen2_5_vl_model(restored)
+
+    assert witness.base_vocab_size == BASE_VOCAB_SIZE
+    assert witness.pretrained_model_vocab_size == pretrained_vocab_size
+    assert witness.resized_vocab_size == RESIZED_VOCAB_SIZE
+    assert resize_calls == [RESIZED_VOCAB_SIZE]
+    assert qwen.config.vocab_size == RESIZED_VOCAB_SIZE
+    assert qwen.model.embed_tokens.token_adapter.base_layer.num_embeddings == (
+        RESIZED_VOCAB_SIZE
+    )
+    assert qwen.lm_head.out_features == RESIZED_VOCAB_SIZE
 
 
 @pytest.mark.parametrize("payload_mutation", ["delete", "replace"])

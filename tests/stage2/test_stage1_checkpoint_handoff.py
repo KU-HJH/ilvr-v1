@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import shutil
 from copy import deepcopy
@@ -16,6 +17,7 @@ from transformers.utils.peft_utils import find_adapter_config_file
 import main
 from peft_common import resolve_qwen2_5_vl_model
 from stage1.checkpointing import (
+    STAGE1_PEFT_METADATA_FILENAME,
     load_stage1_peft_artifact,
     save_stage1_peft_artifact,
 )
@@ -88,6 +90,32 @@ def write_stage1_dora_artifact(directory):
     processor = TinyStage1Processor()
     save_stage1_peft_artifact(model, processor, directory, metadata)
     return processor, metadata
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_fresh_stage2_handoff_accepts_complete_legacy_stage1_v1_metadata(tmp_path):
+    processor, metadata = write_stage1_dora_artifact(tmp_path)
+    metadata_path = tmp_path / STAGE1_PEFT_METADATA_FILENAME
+    legacy = metadata.to_dict()
+    legacy["schema_version"] = 1
+    legacy.pop("pretrained_model_vocab_size")
+    metadata_path.write_text(
+        json.dumps(legacy, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    continued = load_stage1_dora_for_fresh_stage2(
+        tiny_original_qwen(),
+        processor,
+        tmp_path,
+        stage2_dora_tuning(),
+    )
+
+    qwen = resolve_qwen2_5_vl_model(continued)
+    assert qwen.config.vocab_size == RESIZED_VOCAB_SIZE
+    assert qwen.model.embed_tokens.token_adapter.base_layer.num_embeddings == (
+        RESIZED_VOCAB_SIZE
+    )
 
 
 def tiny_tag_free_original_qwen():

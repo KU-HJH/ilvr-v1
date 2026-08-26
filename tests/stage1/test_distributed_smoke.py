@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from stage1.benchmark import run_or_load_distributed_witness
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture
+def real_comt_paths():
+    return SimpleNamespace(
+        train=REPO_ROOT.parent.parent / "data" / "TRAIN.jsonl",
+        root=REPO_ROOT.parent.parent / "data",
+    )
+
+
+@pytest.fixture
+def evidence_dir():
+    return REPO_ROOT / "outputs" / "stage1-smoke"
+
+
+@pytest.mark.gpu
+@pytest.mark.distributed
+@pytest.mark.parametrize("method", ["full", "dora"])
+def test_two_rank_zero3_b2_save_resume_witness(
+    method, real_comt_paths, evidence_dir
+):
+    if os.environ.get("ILVR_REAL_GPU_TESTS") != "1":
+        pytest.skip("set ILVR_REAL_GPU_TESTS=1 to run the real two-rank witness")
+    selected_method = os.environ.get("ILVR_DISTRIBUTED_METHOD")
+    if selected_method not in {None, method}:
+        pytest.skip(f"this invocation selected {selected_method}, not {method}")
+
+    evidence = run_or_load_distributed_witness(
+        method=method,
+        model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=real_comt_paths.train,
+        image_root=real_comt_paths.root,
+        micro_batch=2,
+        gradient_accumulation_steps=2,
+        world_size=2,
+        initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config="configs/config_stage3.json",
+        evidence_dir=evidence_dir / method,
+    )
+    assert evidence.initial_final_step == 3
+    assert evidence.resume_initial_step == 3
+    assert evidence.resume_final_step == 4
+    assert evidence.batch_size_observed == 2
+    assert evidence.finite_loss
+    assert evidence.checkpoint_validated

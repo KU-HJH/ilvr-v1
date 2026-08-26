@@ -260,6 +260,41 @@ class Stage1BenchmarkEvidence:
             _require_int(f"{name}[{index}]", value)
 
 
+@dataclass(frozen=True)
+class DistributedSmokeWitness:
+    initial_final_step: int
+    resume_initial_step: int
+    resume_final_step: int
+    batch_size_observed: int
+    finite_loss: bool
+    checkpoint_validated: bool
+
+
+@dataclass(frozen=True)
+class Stage1SmokeResumeSnapshot:
+    path: Path
+    canonical_payload: bytes
+    marker_digest: str
+
+    def payload(self) -> dict[str, object]:
+        payload = json.loads(self.canonical_payload)
+        if type(payload) is not dict:  # pragma: no cover - constructor invariant.
+            raise AssertionError("smoke checkpoint snapshot stopped being an object")
+        return payload
+
+    def summary(self) -> dict[str, object]:
+        marker = self.payload()
+        return {
+            "initial_final_step": marker["initial_final_step"],
+            "resume_initial_step": marker["initial_final_step"],
+            "resume_final_step": marker["resumed_max_steps"],
+            "batch_size_observed": marker["micro_batch"],
+            "finite_loss": True,
+            "checkpoint_validated": marker["checkpoint_validated"],
+            "resume_artifact_digest": marker["marker_digest"],
+        }
+
+
 _EVIDENCE_FIELDS = {field.name for field in fields(Stage1BenchmarkEvidence)}
 _LEGACY_RAW_EVIDENCE_CACHE: dict[
     Path, tuple[tuple[int, int, int, int], Stage1BenchmarkEvidence]
@@ -392,11 +427,190 @@ def load_verified_evidence(
         payload = _read_json_once(resolved)
         if type(payload) is not dict or payload.get("kind") != "stage1-producer-evidence":
             raise ValueError("official evidence must be a Stage 1 producer envelope")
-        evidence, _ = _validate_producer_evidence_payload(payload)
-        _VERIFIED_PRODUCER_EVIDENCE_CACHE[resolved] = (witness, evidence)
+        evidence, seal = _validate_producer_evidence_payload(payload)
+        if seal["run_config"]["kind"] == "stage1-smoke-run-manifest":
+            _validate_smoke_marker_for_evidence(resolved, seal)
+        else:
+            _VERIFIED_PRODUCER_EVIDENCE_CACHE[resolved] = (witness, evidence)
     if evidence.config_digest != expected_config_digest:
         return None
     return evidence
+
+
+_SMOKE_MARKER_FILENAME = "checkpoint-topology.json"
+
+
+def _checkpoint_file_topology(checkpoint: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    direct: list[dict[str, object]] = []
+    deepspeed: list[dict[str, object]] = []
+    for entry in sorted(checkpoint.iterdir(), key=lambda item: item.name):
+        if entry.is_symlink():
+            raise ValueError(f"smoke checkpoint rejects symlink topology: {entry}")
+        if entry.is_file():
+            direct.append({"name": entry.name, "size": entry.stat().st_size})
+            continue
+        if entry.is_dir() and entry.name.startswith("global_step"):
+            for state_file in sorted(entry.iterdir(), key=lambda item: item.name):
+                if state_file.is_symlink() or not state_file.is_file():
+                    raise ValueError(
+                        f"smoke DeepSpeed state must be a regular file: {state_file}"
+                    )
+                deepspeed.append(
+                    {
+                        "name": f"{entry.name}/{state_file.name}",
+                        "size": state_file.stat().st_size,
+                    }
+                )
+    return direct, deepspeed
+
+
+def seal_stage1_smoke_checkpoint(
+    checkpoint_path: Path,
+    *,
+    method: str,
+    micro_batch: int,
+    world_size: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+    marker_path: Path,
+) -> Stage1SmokeResumeSnapshot:
+    """Validate once and seal only small checkpoint topology metadata."""
+
+    method = _validated_method(method)
+    micro_batch = _require_int("micro_batch", micro_batch, positive=True)
+    world_size = _require_int("world_size", world_size, positive=True)
+    initial_max_steps = _require_int(
+        "initial_max_steps", initial_max_steps, positive=True
+    )
+    resumed_max_steps = _require_int(
+        "resumed_max_steps", resumed_max_steps, positive=True
+    )
+    if (micro_batch, world_size, initial_max_steps, resumed_max_steps) != (2, 2, 3, 4):
+        raise ValueError("distributed smoke requires B=2, world=2, and exact 3-to-4 steps")
+    checkpoint = Path(checkpoint_path).resolve(strict=True)
+    if checkpoint.name != f"checkpoint-{initial_max_steps}":
+        raise ValueError("smoke checkpoint name does not match initial final step")
+    from stage1.checkpointing import Stage1ArtifactKind, resolve_stage1_resume
+
+    decision = resolve_stage1_resume(checkpoint.parent, checkpoint)
+    expected_kind = (
+        Stage1ArtifactKind.FULL if method == "full" else Stage1ArtifactKind.PEFT
+    )
+    if decision.checkpoint_path != checkpoint or decision.artifact_kind is not expected_kind:
+        raise ValueError("smoke checkpoint method/topology validation failed")
+    trainer_state_path = checkpoint / "trainer_state.json"
+    trainer_state = _read_json_once(trainer_state_path)
+    if type(trainer_state) is not dict or trainer_state.get("global_step") != initial_max_steps:
+        raise ValueError("smoke checkpoint trainer state does not end at step 3")
+    direct, deepspeed = _checkpoint_file_topology(checkpoint)
+    marker = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-smoke-checkpoint-topology",
+        "method": method,
+        "artifact_kind": expected_kind.value,
+        "checkpoint_path": str(checkpoint),
+        "initial_final_step": initial_max_steps,
+        "resumed_max_steps": resumed_max_steps,
+        "micro_batch": micro_batch,
+        "world_size": world_size,
+        "checkpoint_validated": True,
+        "trainer_state_digest": config_digest(trainer_state),
+        "checkpoint_files": direct,
+        "deepspeed_state_files": deepspeed,
+    }
+    marker["marker_digest"] = config_digest(marker)
+    _atomic_write_json(Path(marker_path), marker)
+    return load_stage1_smoke_resume_witness(
+        marker_path,
+        method=method,
+        checkpoint_path=checkpoint,
+        micro_batch=micro_batch,
+        initial_max_steps=initial_max_steps,
+        resumed_max_steps=resumed_max_steps,
+    )
+
+
+def load_stage1_smoke_resume_witness(
+    marker_path: Path,
+    *,
+    method: str,
+    checkpoint_path: Path,
+    micro_batch: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+) -> Stage1SmokeResumeSnapshot:
+    """Read one immutable small marker without reopening its checkpoint tree."""
+
+    marker_path = Path(marker_path).resolve(strict=True)
+    marker = _read_json_once(marker_path)
+    _require_exact_keys(
+        marker,
+        {
+            "schema_version", "kind", "method", "artifact_kind",
+            "checkpoint_path", "initial_final_step", "resumed_max_steps",
+            "micro_batch", "world_size", "checkpoint_validated",
+            "trainer_state_digest", "checkpoint_files",
+            "deepspeed_state_files", "marker_digest",
+        },
+        "Stage 1 smoke checkpoint topology",
+    )
+    if (
+        marker.get("schema_version") != _SCHEMA_VERSION
+        or marker.get("kind") != "stage1-smoke-checkpoint-topology"
+    ):
+        raise ValueError("invalid Stage 1 smoke checkpoint topology schema")
+    claimed = marker.get("marker_digest")
+    _require_digest("marker_digest", claimed)
+    digest_input = dict(marker)
+    digest_input.pop("marker_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("smoke checkpoint topology marker digest mismatch")
+    expected_kind = "full" if method == "full" else "peft"
+    if (
+        marker.get("method") != _validated_method(method)
+        or marker.get("artifact_kind") != expected_kind
+        or marker.get("checkpoint_path") != str(Path(checkpoint_path).resolve())
+        or marker.get("initial_final_step") != initial_max_steps
+        or marker.get("resumed_max_steps") != resumed_max_steps
+        or marker.get("micro_batch") != micro_batch
+        or marker.get("world_size") != 2
+        or marker.get("checkpoint_validated") is not True
+    ):
+        raise ValueError("smoke checkpoint topology does not match requested resume")
+    _require_digest("trainer_state_digest", marker.get("trainer_state_digest"))
+    for field_name in ("checkpoint_files", "deepspeed_state_files"):
+        entries = marker.get(field_name)
+        if type(entries) is not list:
+            raise TypeError(f"{field_name} must be an array")
+        names: set[str] = set()
+        for index, entry in enumerate(entries):
+            _require_exact_keys(entry, {"name", "size"}, f"{field_name}[{index}]")
+            name = _require_string(f"{field_name}[{index}].name", entry.get("name"))
+            if name in names or Path(name).is_absolute() or ".." in Path(name).parts:
+                raise ValueError(f"{field_name} contains an unsafe/duplicate name")
+            names.add(name)
+            _require_int(f"{field_name}[{index}].size", entry.get("size"), positive=True)
+    canonical = _canonical_json_bytes(marker)
+    return Stage1SmokeResumeSnapshot(marker_path, canonical, claimed)
+
+
+def _validate_smoke_marker_for_evidence(
+    evidence_path: Path, seal: Mapping[str, object]
+) -> Stage1SmokeResumeSnapshot:
+    config = seal["run_config"]
+    summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
+    checkpoint = Path(config["output_dir"]) / f"checkpoint-{summary['initial_final_step']}"
+    snapshot = load_stage1_smoke_resume_witness(
+        Path(evidence_path).parent / _SMOKE_MARKER_FILENAME,
+        method=config["method"],
+        checkpoint_path=checkpoint,
+        micro_batch=config["micro_batch"],
+        initial_max_steps=summary["initial_final_step"],
+        resumed_max_steps=summary["resume_final_step"],
+    )
+    if snapshot.marker_digest != summary["resume_artifact_digest"]:
+        raise ValueError("smoke checkpoint topology digest does not match evidence")
+    return snapshot
 
 
 _FULL_WEIGHT_NAMES = {
@@ -757,6 +971,12 @@ def _validate_producer_run_config_payload(payload: object) -> dict[str, object]:
             raise ValueError("smoke evidence cannot depend on itself as a prerequisite")
         if payload.get("prerequisite_chain") is not None:
             raise ValueError("smoke evidence cannot name a prerequisite chain")
+        if (
+            payload["final_save"] is not False
+            or payload["max_steps"] != 4
+            or payload["micro_batch"] != 2
+        ):
+            raise ValueError("smoke run config requires B=2 and exact step-4 resume")
     else:
         _require_digest("prerequisite_chain_digest", prerequisite_digest)
         _require_string("prerequisite_chain", payload.get("prerequisite_chain"))
@@ -968,7 +1188,10 @@ def write_stage1_producer_evidence(
 
 
 def _load_producer_evidence(path: Path) -> tuple[Stage1BenchmarkEvidence, dict[str, object]]:
-    return _validate_producer_evidence_payload(_read_json_once(path))
+    evidence, payload = _validate_producer_evidence_payload(_read_json_once(path))
+    if payload["run_config"]["kind"] == "stage1-smoke-run-manifest":
+        _validate_smoke_marker_for_evidence(Path(path).resolve(strict=True), payload)
+    return evidence, payload
 
 
 def _validate_producer_evidence_payload(
@@ -1014,6 +1237,15 @@ def _validate_producer_evidence_payload(
         _require_digest("smoke_resume_witness_digest", smoke_digest)
         if config_digest(validated_smoke) != smoke_digest:
             raise ValueError("smoke resume witness digest mismatch")
+        if (
+            evidence.status != "success"
+            or evidence.optimizer_steps != validated_smoke["resume_final_step"]
+            or evidence.samples_seen
+            != evidence.effective_global_batch * validated_smoke["resume_final_step"]
+            or config["max_steps"] != validated_smoke["resume_final_step"]
+            or config["micro_batch"] != validated_smoke["batch_size_observed"]
+        ):
+            raise ValueError("smoke producer does not prove the exact resumed step")
     elif smoke_witness is not None or smoke_digest is not None:
         raise ValueError("non-smoke producer evidence contains a resume witness")
     artifact = payload["artifact_manifest"]
@@ -2121,6 +2353,274 @@ def _validated_method(value: object) -> str:
     if type(value) is not str or value not in {"full", "dora"}:
         raise ValueError("method must be full or dora")
     return value
+
+
+def _smoke_run_config(
+    *,
+    method: str,
+    model: str,
+    data_path: Path,
+    image_root: Path,
+    output_dir: Path,
+    micro_batch: int,
+    gradient_accumulation_steps: int,
+    world_size: int,
+    resumed_max_steps: int,
+    deepspeed_config: Path,
+    audit_path: Path,
+) -> dict[str, object]:
+    audit = _load_bound_audit(
+        audit_path, data_path=data_path, image_root=image_root, count=64
+    )
+    config = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-smoke-run-manifest",
+        "method": method,
+        "tuning_config": None if method == "full" else {
+            "use_dora": True,
+            "rank": 32,
+            "alpha": 64,
+            "dropout": 0.05,
+            "target_modules": (
+                "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+            ),
+        },
+        "model": model,
+        "source_data_path": str(data_path),
+        "data_path": str(data_path),
+        "data_stat": audit["input_stat"],
+        "image_root": str(image_root),
+        "output_dir": str(output_dir),
+        "micro_batch": micro_batch,
+        "world_size": world_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "effective_global_batch": (
+            micro_batch * world_size * gradient_accumulation_steps
+        ),
+        "epochs": 3,
+        "learning_rate": 1e-5,
+        "seed": 42,
+        "max_steps": resumed_max_steps,
+        "final_save": False,
+        "deepspeed_config": str(deepspeed_config),
+        "deepspeed_config_digest": _small_config_digest(deepspeed_config),
+        "attention_implementation": "flash_attention_2",
+        "save_strategy": "no",
+        "audit_digest": audit["audit_digest"],
+        "probe_rows": str(audit_path),
+        "probe_row_indices": [
+            row["source_row_index"] for row in audit["selected_rows"]
+        ],
+        "maximum_config_digest": None,
+        "prerequisite_chain_digest": None,
+        "prerequisite_chain": None,
+    }
+    config["config_digest"] = config_digest(config)
+    _validate_producer_run_config_payload(config)
+    return config
+
+
+def _run_smoke_launcher(
+    launcher: Path,
+    arguments: Sequence[str],
+    *,
+    log_path: Path,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    repository = Path(__file__).resolve().parents[2]
+    python_paths = (
+        str(repository),
+        str(repository / "transformers/src"),
+        str(repository / "src"),
+    )
+    existing = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (*python_paths, *((existing,) if existing else ()))
+    )
+    venv_bin = repository / "venv/ilvr-venv/bin"
+    environment["PATH"] = os.pathsep.join(
+        (str(venv_bin), environment.get("PATH", ""))
+    )
+    with log_path.open("wb") as log:
+        completed = subprocess.run(
+            [str(launcher), *arguments],
+            cwd=repository,
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode, [str(launcher), *arguments]
+        )
+
+
+def _distributed_smoke_result(
+    evidence: Stage1BenchmarkEvidence, seal: Mapping[str, object]
+) -> DistributedSmokeWitness:
+    summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
+    if (
+        evidence.status != "success"
+        or evidence.method != seal["run_config"]["method"]
+        or evidence.micro_batch != summary["batch_size_observed"]
+        or evidence.world_size != 2
+    ):
+        raise ValueError("distributed smoke evidence does not match its request")
+    return DistributedSmokeWitness(
+        initial_final_step=summary["initial_final_step"],
+        resume_initial_step=summary["resume_initial_step"],
+        resume_final_step=summary["resume_final_step"],
+        batch_size_observed=summary["batch_size_observed"],
+        finite_loss=summary["finite_loss"],
+        checkpoint_validated=summary["checkpoint_validated"],
+    )
+
+
+def run_or_load_distributed_witness(
+    *,
+    method: str,
+    model: str,
+    data_path: str | Path,
+    image_root: str | Path,
+    micro_batch: int,
+    gradient_accumulation_steps: int,
+    world_size: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+    deepspeed_config: str | Path,
+    evidence_dir: str | Path,
+    launcher_path: str | Path | None = None,
+) -> DistributedSmokeWitness:
+    """Run one exact 3->4 two-rank smoke, or reuse its sealed small witness."""
+
+    method = _validated_method(method)
+    model = _require_string("model", model)
+    micro_batch = _require_int("micro_batch", micro_batch, positive=True)
+    accumulation = _require_int(
+        "gradient_accumulation_steps",
+        gradient_accumulation_steps,
+        positive=True,
+    )
+    world_size = _require_int("world_size", world_size, positive=True)
+    initial_max_steps = _require_int(
+        "initial_max_steps", initial_max_steps, positive=True
+    )
+    resumed_max_steps = _require_int(
+        "resumed_max_steps", resumed_max_steps, positive=True
+    )
+    if (micro_batch, accumulation, world_size, initial_max_steps, resumed_max_steps) != (
+        2,
+        2,
+        2,
+        3,
+        4,
+    ):
+        raise ValueError(
+            "distributed smoke requires micro-batch 2, accumulation 2, "
+            "world-size 2, and exact 3-to-4 steps"
+        )
+    repository = Path(__file__).resolve().parents[2]
+    data = Path(data_path).resolve(strict=True)
+    images = Path(image_root).resolve(strict=True)
+    deepspeed = Path(deepspeed_config)
+    if not deepspeed.is_absolute():
+        deepspeed = repository / deepspeed
+    deepspeed = deepspeed.resolve(strict=True)
+    evidence_directory = Path(evidence_dir).resolve()
+    audit_path = evidence_directory.parent / "high-cost-rows.json"
+    select_high_cost_probe_rows(data, 64, audit_path, image_root=images)
+    run_dir = evidence_directory / "run"
+    checkpoint = run_dir / f"checkpoint-{initial_max_steps}"
+    marker_path = evidence_directory / _SMOKE_MARKER_FILENAME
+    run_config_path = evidence_directory / "run-config.json"
+    evidence_path = evidence_directory / "evidence.json"
+    config = _smoke_run_config(
+        method=method,
+        model=model,
+        data_path=data,
+        image_root=images,
+        output_dir=run_dir,
+        micro_batch=micro_batch,
+        gradient_accumulation_steps=accumulation,
+        world_size=world_size,
+        resumed_max_steps=resumed_max_steps,
+        deepspeed_config=deepspeed,
+        audit_path=audit_path,
+    )
+    reusable = load_verified_evidence(evidence_path, config["config_digest"])
+    if reusable is not None:
+        _, seal = _load_producer_evidence(evidence_path)
+        return _distributed_smoke_result(reusable, seal)
+    if evidence_path.exists() or evidence_directory.exists() and any(
+        evidence_directory.iterdir()
+    ):
+        raise FileExistsError(
+            f"refusing to rerun an incomplete or stale distributed smoke: {evidence_directory}"
+        )
+    evidence_directory.mkdir(parents=True, exist_ok=True)
+    launcher = (
+        repository / "run_stage1_training.sh"
+        if launcher_path is None
+        else Path(launcher_path)
+    ).resolve(strict=True)
+    common = [
+        "--method", method,
+        "--model", model,
+        "--data-path", str(data),
+        "--image-root", str(images),
+        "--output-dir", str(run_dir),
+        "--micro-batch", str(micro_batch),
+        "--epochs", "3",
+        "--learning-rate", "1e-5",
+        "--gradient-accumulation", str(accumulation),
+        "--seed", "42",
+        "--deepspeed-config", str(deepspeed),
+        "--attention-implementation", "flash_attention_2",
+    ]
+    _run_smoke_launcher(
+        launcher,
+        [
+            *common,
+            "--save-strategy", "steps",
+            "--save-steps", str(initial_max_steps),
+            "--max-steps", str(initial_max_steps),
+            "--no-final-save",
+        ],
+        log_path=evidence_directory / "initial.log",
+    )
+    seal_stage1_smoke_checkpoint(
+        checkpoint,
+        method=method,
+        micro_batch=micro_batch,
+        world_size=world_size,
+        initial_max_steps=initial_max_steps,
+        resumed_max_steps=resumed_max_steps,
+        marker_path=marker_path,
+    )
+    _atomic_write_json(run_config_path, config)
+    _run_smoke_launcher(
+        launcher,
+        [
+            *common,
+            "--source-data-path", str(data),
+            "--save-strategy", "no",
+            "--save-steps", "612",
+            "--resume", str(checkpoint),
+            "--max-steps", str(resumed_max_steps),
+            "--benchmark-run-config", str(run_config_path),
+            "--producer-evidence", str(evidence_path),
+            "--smoke-resume-witness", str(marker_path),
+            "--no-final-save",
+        ],
+        log_path=evidence_directory / "resume.log",
+    )
+    produced = load_verified_evidence(evidence_path, config["config_digest"])
+    if produced is None:
+        raise RuntimeError("distributed smoke did not publish matching evidence")
+    _, seal = _load_producer_evidence(evidence_path)
+    return _distributed_smoke_result(produced, seal)
 
 
 def _load_evidence_without_expected(path: Path) -> Stage1BenchmarkEvidence:

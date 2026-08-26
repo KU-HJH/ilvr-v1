@@ -103,6 +103,7 @@ class RecordingModel(nn.Module):
 
     def resize_token_embeddings(self, size):
         self.resize_calls.append(size)
+        self.config.vocab_size = size
 
 
 class RecordingTrainer:
@@ -296,6 +297,7 @@ def _write_peft_resume_checkpoint(args, *, step=9):
             architecture_config
         ),
         base_vocab_size=12,
+        pretrained_model_vocab_size=12,
         resized_vocab_size=15,
         latent_token_ids=(12, 13, 14),
         latent_token_strings=LATENT_TOKEN_STRINGS,
@@ -343,10 +345,23 @@ def _fake_metadata_snapshot(checkpoint):
     )
 
 
-def fake_dependencies(events, *, decision=None, processor=None, metadata=None):
+def fake_dependencies(
+    events,
+    *,
+    decision=None,
+    processor=None,
+    metadata=None,
+    pretrained_vocab_size=None,
+):
     decision = decision or Stage1ResumeDecision(None, None, False)
     processor = processor or RecordingProcessor()
-    config = SimpleNamespace(vocab_size=len(processor.tokenizer))
+    config = SimpleNamespace(
+        vocab_size=(
+            len(processor.tokenizer)
+            if pretrained_vocab_size is None
+            else pretrained_vocab_size
+        )
+    )
     model = RecordingModel(config)
     parameter_report = SimpleNamespace(
         trainable_parameters=7,
@@ -559,6 +574,69 @@ def test_fresh_dora_composition_adds_tokens_once_and_propagates_runtime_args(tmp
         event[0] for event in events
     ].index("trainer")
     assert all(not parameter.requires_grad for parameter in model.visual.parameters())
+
+
+@pytest.mark.parametrize("method", ["full", "dora"])
+@pytest.mark.parametrize("pretrained_vocab_size", [12, 18])
+def test_fresh_stage1_accepts_exact_or_padded_pretrained_vocabulary_and_shrinks_once(
+    tmp_path, pretrained_vocab_size, method
+):
+    events = []
+    metadata_calls = []
+    metadata = object()
+    deps, processor, model, _ = fake_dependencies(
+        events,
+        metadata=metadata,
+        pretrained_vocab_size=pretrained_vocab_size,
+    )
+    deps = replace(
+        deps,
+        build_peft_metadata=lambda **kwargs: (
+            metadata_calls.append(kwargs) or metadata
+        ),
+    )
+
+    build_stage1_training_components(
+        stage1_args(tmp_path, method=method), dependencies=deps
+    )
+
+    assert processor.tokenizer.add_calls == [LATENT_TOKEN_STRINGS]
+    assert model.resize_calls == [15]
+    assert model.config.vocab_size == 15
+    if method == "dora":
+        assert len(metadata_calls) == 1
+        assert metadata_calls[0]["base_vocab_size"] == 12
+        assert metadata_calls[0]["pretrained_model_vocab_size"] == (
+            pretrained_vocab_size
+        )
+        assert metadata_calls[0]["resized_vocab_size"] == 15
+        assert metadata_calls[0]["latent_token_ids"] == (12, 13, 14)
+        assert metadata_calls[0]["base_architecture"]["decoder"]["vocab_size"] == (
+            pretrained_vocab_size
+        )
+    else:
+        assert metadata_calls == []
+
+
+@pytest.mark.parametrize("method", ["full", "dora"])
+def test_fresh_stage1_rejects_pretrained_vocabulary_too_small_before_model_load(
+    tmp_path, method
+):
+    events = []
+    deps, processor, model, _ = fake_dependencies(
+        events,
+        metadata=object(),
+        pretrained_vocab_size=11,
+    )
+
+    with pytest.raises(ValueError, match="pretrained model vocabulary.*too small"):
+        build_stage1_training_components(
+            stage1_args(tmp_path, method=method), dependencies=deps
+        )
+
+    assert processor.tokenizer.add_calls == [LATENT_TOKEN_STRINGS]
+    assert model.resize_calls == []
+    assert not any(event[0] == "model" for event in events)
 
 
 @pytest.mark.parametrize(
@@ -1126,3 +1204,105 @@ def test_distributed_preflight_rejects_successful_ranks_with_runtime_digest_mism
             component_builder=lambda selected: pytest.fail("builder must not run"),
             rank_config_digest_provider=collective,
         )
+
+
+def test_run_stage1_prevalidates_smoke_marker_and_embeds_it_in_producer_evidence(
+    tmp_path,
+):
+    """Catches a resumed smoke publishing evidence without its immutable marker."""
+    args = stage1_args(tmp_path, "--max_steps", "4", "--no_final_save", method="full")
+    args.per_device_train_batch_size = 2
+    checkpoint = Path(args.save_model_path).resolve() / "checkpoint-3"
+    audit_path, audit = _write_benchmark_audit(tmp_path, args)
+    config = {
+        "schema_version": 1, "kind": "stage1-smoke-run-manifest",
+        "method": "full", "tuning_config": None, "model": args.model,
+        "source_data_path": str(Path(args.data_path).resolve()),
+        "data_path": str(Path(args.data_path).resolve()),
+        "data_stat": audit["input_stat"],
+        "image_root": str(Path(args.image_root).resolve()),
+        "output_dir": str(Path(args.save_model_path).resolve()),
+        "micro_batch": 2, "world_size": 2,
+        "gradient_accumulation_steps": 2, "effective_global_batch": 8,
+        "epochs": 3, "learning_rate": 1e-5, "seed": 42,
+        "max_steps": 4, "final_save": False,
+        "deepspeed_config": str(Path(args.deepspeed_config).resolve()),
+        "deepspeed_config_digest": hashlib.sha256(
+            Path(args.deepspeed_config).read_bytes()
+        ).hexdigest(),
+        "attention_implementation": "flash_attention_2", "save_strategy": "no",
+        "audit_digest": audit["audit_digest"], "probe_rows": str(audit_path),
+        "probe_row_indices": [7, 3], "maximum_config_digest": None,
+        "prerequisite_chain": None, "prerequisite_chain_digest": None,
+    }
+    config["config_digest"] = config_digest(config)
+    config_path = tmp_path / "smoke-run-config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    marker = {
+        "schema_version": 1, "kind": "stage1-smoke-checkpoint-topology",
+        "method": "full", "artifact_kind": "full",
+        "checkpoint_path": str(checkpoint), "initial_final_step": 3,
+        "resumed_max_steps": 4, "micro_batch": 2, "world_size": 2,
+        "checkpoint_validated": True, "trainer_state_digest": "a" * 64,
+        "checkpoint_files": [{"name": "trainer_state.json", "size": 10}],
+        "deepspeed_state_files": [],
+    }
+    marker["marker_digest"] = config_digest(marker)
+    marker_path = tmp_path / "checkpoint-topology.json"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    evidence_path = tmp_path / "evidence.json"
+    args.benchmark_run_config = str(config_path)
+    args.benchmark_evidence_path = str(evidence_path)
+    args.benchmark_source_data_path = config["source_data_path"]
+    args.benchmark_smoke_resume_witness = str(marker_path)
+    args.resume_from_checkpoint_path = str(checkpoint)
+
+    class SmokeTrainer(RecordingTrainer):
+        def __init__(self):
+            super().__init__(args=SimpleNamespace())
+            self.state = SimpleNamespace(global_step=4)
+            self._representative_gradient_norm = 0.25
+
+        def train(self, *, resume_from_checkpoint):
+            super().train(resume_from_checkpoint=resume_from_checkpoint)
+            return SimpleNamespace(
+                metrics={
+                    "train_samples_per_second": 1.0,
+                    "train_steps_per_second": 1.0,
+                    "train_loss": 0.5,
+                }
+            )
+
+    trainer = SmokeTrainer()
+    bundle = SimpleNamespace(
+        trainer=trainer,
+        processor=RecordingProcessor(),
+        dataset=[{}] * 8,
+        parameter_report=SimpleNamespace(
+            trainable_parameters=20, total_parameters=100
+        ),
+        resume_decision=Stage1ResumeDecision(
+            checkpoint, Stage1ArtifactKind.FULL, True
+        ),
+    )
+
+    run_stage1(
+        args,
+        component_builder=lambda selected: bundle,
+        monotonic=iter((1.0, 2.0, 3.0, 5.0, 6.0)).__next__,
+        observability_provider=lambda selected: {
+            "rank_peak_allocated_bytes": (10, 11),
+            "rank_peak_reserved_bytes": (12, 13),
+            "gpu_names": ("B200", "B200"),
+            "git_commit": "abc1234",
+            "dependency_versions": {"torch": "test"},
+        },
+        rank_config_digest_provider=lambda local, world_size: (local, local),
+    )
+
+    sealed = json.loads(evidence_path.read_text())
+    assert trainer.events == [("train", str(checkpoint))]
+    assert sealed["run_config"] == config
+    assert sealed["smoke_resume_witness"]["resume_artifact_digest"] == marker[
+        "marker_digest"
+    ]

@@ -93,6 +93,7 @@ def _build_stage1_peft_metadata(
     base_model_reference: str,
     base_architecture: dict[str, object],
     base_vocab_size: int,
+    pretrained_model_vocab_size: int,
     resized_vocab_size: int,
     latent_token_ids: tuple[int, int, int],
     latent_size: int,
@@ -106,6 +107,7 @@ def _build_stage1_peft_metadata(
         base_model_reference=base_model_reference,
         base_model_architecture=base_architecture,
         base_vocab_size=base_vocab_size,
+        pretrained_model_vocab_size=pretrained_model_vocab_size,
         resized_vocab_size=resized_vocab_size,
         latent_token_ids=latent_token_ids,
         latent_token_strings=LATENT_TOKEN_STRINGS,
@@ -409,11 +411,15 @@ def build_stage1_training_components(
             args.model, cache_dir=args.cache_dir, trust_remote_code=True
         )
         base_architecture = dependencies.capture_architecture(config)
-        if base_architecture["decoder"]["vocab_size"] != base_vocab_size:
+        resized_vocab_size = len(processor.tokenizer)
+        pretrained_model_vocab_size = base_architecture["decoder"]["vocab_size"]
+        if pretrained_model_vocab_size < base_vocab_size:
             raise ValueError(
-                "fresh Stage 1 base config/tokenizer vocabulary mismatch: "
-                f"config={base_architecture['decoder']['vocab_size']}, "
-                f"tokenizer={base_vocab_size}"
+                "fresh Stage 1 pretrained model vocabulary is too small for "
+                "the base tokenizer: "
+                f"model={pretrained_model_vocab_size}, "
+                f"tokenizer_base={base_vocab_size}, "
+                f"tokenizer_resized={resized_vocab_size}"
             )
         _configure_latent_model(config, latent_ids, latent_size=args.latent_size)
         config.compress_strategy = args.compress_strategy
@@ -426,7 +432,13 @@ def build_stage1_training_components(
             cache_dir=args.cache_dir,
             trust_remote_code=True,
         )
-        base_model.resize_token_embeddings(len(processor.tokenizer))
+        base_model.resize_token_embeddings(resized_vocab_size)
+        if int(base_model.config.vocab_size) != resized_vocab_size:
+            raise ValueError(
+                "fresh Stage 1 model config vocabulary did not match the "
+                f"resized tokenizer: model={base_model.config.vocab_size}, "
+                f"tokenizer={resized_vocab_size}"
+            )
         if tuning.method != "full":
             resolved_target_names = tuple(
                 dependencies.resolve_target_names(base_model, tuning.target_suffixes)
@@ -437,7 +449,8 @@ def build_stage1_training_components(
                 base_model_reference=args.model,
                 base_architecture=base_architecture,
                 base_vocab_size=base_vocab_size,
-                resized_vocab_size=len(processor.tokenizer),
+                pretrained_model_vocab_size=pretrained_model_vocab_size,
+                resized_vocab_size=resized_vocab_size,
                 latent_token_ids=latent_ids,
                 latent_size=args.latent_size,
                 args=args,
@@ -551,10 +564,12 @@ def run_stage1(
         or getattr(args, "benchmark_evidence_path", None)
     )
     run_config_witness = None
+    smoke_resume_snapshot = None
     config = None
     if producing:
         from stage1.benchmark import (
             config_digest,
+            load_stage1_smoke_resume_witness,
             load_stage1_run_config_witness,
             validate_stage1_runtime_args,
         )
@@ -571,6 +586,24 @@ def run_stage1(
                 Path(args.benchmark_run_config)
             )
             config = validate_stage1_runtime_args(run_config_witness, args)
+            smoke_path = getattr(args, "benchmark_smoke_resume_witness", None)
+            if config["kind"] == "stage1-smoke-run-manifest":
+                if not smoke_path or not getattr(args, "resume_from_checkpoint_path", None):
+                    raise ValueError(
+                        "smoke benchmark requires a resume checkpoint and witness"
+                    )
+                smoke_resume_snapshot = load_stage1_smoke_resume_witness(
+                    Path(smoke_path),
+                    method=config["method"],
+                    checkpoint_path=Path(args.resume_from_checkpoint_path),
+                    micro_batch=config["micro_batch"],
+                    initial_max_steps=3,
+                    resumed_max_steps=config["max_steps"],
+                )
+            elif smoke_path:
+                raise ValueError(
+                    "smoke resume witness is accepted only by a smoke run manifest"
+                )
             local_preflight = {
                 "status": "success",
                 "config_digest": run_config_witness.config_digest,
@@ -578,6 +611,11 @@ def run_stage1(
                     {
                         "config_digest": run_config_witness.config_digest,
                         "validated_runtime": config,
+                        "smoke_resume_marker_digest": (
+                            None
+                            if smoke_resume_snapshot is None
+                            else smoke_resume_snapshot.marker_digest
+                        ),
                     }
                 ),
                 "error_type": None,
@@ -603,6 +641,8 @@ def run_stage1(
         )
         _require_distributed_preflight_agreement(rank_preflights, world_size=2)
         assert run_config_witness is not None and config is not None
+        if config["kind"] == "stage1-smoke-run-manifest":
+            assert smoke_resume_snapshot is not None
     total_start = monotonic() if producing else None
     components = component_builder(args)
     model_load_seconds = monotonic() - total_start if producing else 0.0
@@ -701,6 +741,11 @@ def run_stage1(
         Path(args.benchmark_evidence_path),
         run_config_witness=run_config_witness,
         evidence=evidence,
+        smoke_resume_witness=(
+            None
+            if smoke_resume_snapshot is None
+            else smoke_resume_snapshot.summary()
+        ),
         artifact_manifest=artifact,
     )
 

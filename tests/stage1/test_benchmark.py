@@ -1227,3 +1227,177 @@ def test_timed_comparison_is_a_standalone_canonical_prerequisite_seal(
     output.write_text(json.dumps(tampered))
     with pytest.raises(ValueError, match="comparison digest"):
         benchmark._load_run_comparison(output)
+
+
+def _write_smoke_subprocess_launcher(path: Path, record_dir: Path) -> None:
+    python = REPO_ROOT / "venv/ilvr-venv/bin/python"
+    path.write_text(
+        f"""#!{python}
+import json
+import os
+from pathlib import Path
+import sys
+
+from stage1.benchmark import (
+    Stage1BenchmarkEvidence,
+    _build_artifact_manifest,
+    load_stage1_smoke_resume_witness,
+    load_stage1_run_config_witness,
+    write_stage1_producer_evidence,
+)
+
+args = sys.argv[1:]
+def value(flag):
+    return args[args.index(flag) + 1]
+
+record = Path({str(record_dir)!r}) / f"{{os.getpid()}}.json"
+record.write_text(json.dumps({{
+    "pid": os.getpid(), "argv": args, "path": os.environ["PATH"]
+}}))
+output = Path(value("--output-dir"))
+output.mkdir(parents=True, exist_ok=True)
+max_steps = int(value("--max-steps"))
+if max_steps == 3:
+    checkpoint = output / "checkpoint-3"
+    checkpoint.mkdir()
+    (checkpoint / "model.safetensors").write_bytes(b"full")
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({{"global_step": 3}})
+    )
+    for name in ("optimizer.pt", "scheduler.pt", "rng_state_0.pth", "rng_state_1.pth"):
+        (checkpoint / name).write_bytes(b"state")
+elif max_steps == 4:
+    config_path = Path(value("--benchmark-run-config"))
+    evidence_path = Path(value("--producer-evidence"))
+    marker_path = Path(value("--smoke-resume-witness"))
+    config_witness = load_stage1_run_config_witness(config_path)
+    config = config_witness.payload()
+    smoke = load_stage1_smoke_resume_witness(
+        marker_path,
+        method=config["method"],
+        checkpoint_path=Path(value("--resume")),
+        micro_batch=int(value("--micro-batch")),
+        initial_max_steps=3,
+        resumed_max_steps=4,
+    )
+    artifact = _build_artifact_manifest(
+        output, method=config["method"], final_save=False
+    )
+    metrics = Stage1BenchmarkEvidence(
+        status="success", method=config["method"],
+        micro_batch=config["micro_batch"], world_size=config["world_size"],
+        gradient_accumulation_steps=config["gradient_accumulation_steps"],
+        effective_global_batch=config["effective_global_batch"],
+        optimizer_steps=4, samples_seen=4 * config["effective_global_batch"],
+        model_load_seconds=1.0, trainer_seconds=2.0, total_seconds=3.0,
+        final_save_seconds=0.0, samples_per_second=1.0,
+        steps_per_second=1.0,
+        rank_peak_allocated_bytes=(10, 11),
+        rank_peak_reserved_bytes=(12, 13), trainable_parameters=20,
+        total_parameters=100, checkpoint_bytes=0, final_loss=0.5,
+        representative_gradient_norm=0.25, git_commit="abc1234",
+        dependency_versions={{"torch": "test"}}, gpu_names=("B200", "B200"),
+        config_digest=config["config_digest"],
+        probe_row_indices=tuple(config["probe_row_indices"]),
+    )
+    write_stage1_producer_evidence(
+        evidence_path, run_config_witness=config_witness, evidence=metrics,
+        smoke_resume_witness=smoke.summary(), artifact_manifest=artifact,
+    )
+else:
+    raise SystemExit(f"unexpected max steps: {{max_steps}}")
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _smoke_fixture(tmp_path: Path):
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    image = image_root / "original.bin"
+    image.write_bytes(b"metadata-only image reference")
+    data_path = tmp_path / "TRAIN.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {"image_input": str(image), "text_input": "hello", "sequence_plan": []}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    records = tmp_path / "records"
+    records.mkdir()
+    launcher = tmp_path / "smoke-launcher"
+    _write_smoke_subprocess_launcher(launcher, records)
+    return data_path, image_root, records, launcher
+
+
+def test_distributed_smoke_uses_two_real_processes_then_reuses_only_small_seals(
+    tmp_path,
+):
+    """Catches in-process resume, rerun-on-reuse, or checkpoint-tree rereads."""
+    import shutil
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    kwargs = dict(
+        method="full",
+        model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path,
+        image_root=image_root,
+        micro_batch=2,
+        gradient_accumulation_steps=2,
+        world_size=2,
+        initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir,
+        launcher_path=launcher,
+    )
+
+    observed = benchmark.run_or_load_distributed_witness(**kwargs)
+
+    process_records = [json.loads(path.read_text()) for path in records.iterdir()]
+    assert len(process_records) == 2
+    assert len({item["pid"] for item in process_records}) == 2
+    assert all(
+        item["path"].split(os.pathsep)[0]
+        == str(REPO_ROOT / "venv/ilvr-venv/bin")
+        for item in process_records
+    )
+    commands = {int(item["argv"][item["argv"].index("--max-steps") + 1]): item["argv"] for item in process_records}
+    assert commands[3][commands[3].index("--save-steps") + 1] == "3"
+    assert commands[4][commands[4].index("--resume") + 1].endswith("checkpoint-3")
+    assert observed.resume_initial_step == 3
+    assert observed.resume_final_step == 4
+
+    shutil.rmtree(evidence_dir / "run")
+    launcher.unlink()
+    reused = benchmark.run_or_load_distributed_witness(**kwargs)
+    assert reused == observed
+    assert len(list(records.iterdir())) == 2
+
+
+def test_distributed_smoke_reuse_rejects_a_tampered_small_checkpoint_marker(tmp_path):
+    """Catches evidence reuse that ignores its sealed checkpoint marker."""
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, _, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    kwargs = dict(
+        method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path, image_root=image_root, micro_batch=2,
+        gradient_accumulation_steps=2, world_size=2, initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir, launcher_path=launcher,
+    )
+    benchmark.run_or_load_distributed_witness(**kwargs)
+    marker = evidence_dir / "checkpoint-topology.json"
+    payload = json.loads(marker.read_text())
+    payload["checkpoint_files"][0]["size"] += 1
+    marker.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="checkpoint topology.*digest"):
+        benchmark.run_or_load_distributed_witness(**kwargs)

@@ -426,3 +426,64 @@ def test_legacy_launcher_forwards_use_lora_without_promoting_it_to_dora(tmp_path
     command = shlex.split(completed.stdout.strip())
     assert "--use_lora" in command
     assert "--tuning_method" not in command
+
+
+def test_smoke_launcher_forwards_exact_numbered_save_and_resume_witness(tmp_path):
+    """Catches a 3->4 smoke silently losing its checkpoint or sealed witness."""
+    marker = tmp_path / "checkpoint-topology.json"
+    checkpoint = tmp_path / "run" / "checkpoint-3"
+    completed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "run", method="full"),
+        "--save-strategy",
+        "steps",
+        "--save-steps",
+        "3",
+        "--max-steps",
+        "3",
+        "--no-final-save",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = shlex.split(completed.stdout)
+    assert command[command.index("--save_strategy") + 1] == "steps"
+    assert command[command.index("--save_steps") + 1] == "3"
+
+    resumed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "run", method="full"),
+        "--resume",
+        checkpoint,
+        "--max-steps",
+        "4",
+        "--source-data-path",
+        "/missing/CoMT train;literal/TRAIN.jsonl",
+        "--benchmark-run-config",
+        tmp_path / "run-config.json",
+        "--producer-evidence",
+        tmp_path / "evidence.json",
+        "--smoke-resume-witness",
+        marker,
+        "--no-final-save",
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    resumed_command = shlex.split(resumed.stdout)
+    assert resumed_command[resumed_command.index("--save_steps") + 1] == "612"
+    assert resumed_command[
+        resumed_command.index("--benchmark_smoke_resume_witness") + 1
+    ] == str(marker)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "3.5", "true"])
+def test_launcher_rejects_invalid_save_steps(tmp_path, value):
+    """Catches malformed checkpoint cadence reaching Trainer."""
+    completed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "output"),
+        "--save-steps",
+        value,
+    )
+
+    assert completed.returncode == 2
+    assert "save_steps" in completed.stderr

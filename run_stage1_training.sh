@@ -51,11 +51,13 @@ seed=${STAGE1_SEED:-42}
 deepspeed_config=${STAGE1_DEEPSPEED_CONFIG:-"$script_dir/configs/config_stage3.json"}
 attention_implementation=${STAGE1_ATTENTION_IMPLEMENTATION:-flash_attention_2}
 save_strategy=${STAGE1_SAVE_STRATEGY:-no}
+save_steps=${STAGE1_SAVE_STEPS:-612}
 resume_path=${STAGE1_RESUME_PATH:-}
 log_file=${STAGE1_LOG_FILE:-}
 max_steps=${STAGE1_MAX_STEPS:-}
 benchmark_run_config=${STAGE1_BENCHMARK_RUN_CONFIG:-}
 benchmark_evidence_path=${STAGE1_BENCHMARK_EVIDENCE_PATH:-}
+benchmark_smoke_resume_witness=${STAGE1_BENCHMARK_SMOKE_RESUME_WITNESS:-}
 dry_run=false
 final_save=true
 legacy_use_lora=false
@@ -89,11 +91,13 @@ while (( $# )); do
         --deepspeed-config) require_value "$@"; deepspeed_config=$2; shift 2 ;;
         --attention-implementation) require_value "$@"; attention_implementation=$2; shift 2 ;;
         --save-strategy) require_value "$@"; save_strategy=$2; shift 2 ;;
+        --save-steps) require_value "$@"; save_steps=$2; shift 2 ;;
         --resume) require_value "$@"; resume_path=$2; shift 2 ;;
         --log-file) require_value "$@"; log_file=$2; shift 2 ;;
         --max-steps) require_value "$@"; max_steps=$2; shift 2 ;;
         --benchmark-run-config) require_value "$@"; benchmark_run_config=$2; shift 2 ;;
         --producer-evidence) require_value "$@"; benchmark_evidence_path=$2; shift 2 ;;
+        --smoke-resume-witness) require_value "$@"; benchmark_smoke_resume_witness=$2; shift 2 ;;
         --final-save) final_save=true; shift ;;
         --no-final-save) final_save=false; shift ;;
         --use_lora) legacy_use_lora=true; shift ;;
@@ -129,7 +133,7 @@ case $attention_implementation in
     eager|sdpa|flash_attention_2) ;;
     *) printf 'error: unsupported attention implementation\n' >&2; exit 2 ;;
 esac
-for integer_name in micro_batch gradient_accumulation seed; do
+for integer_name in micro_batch gradient_accumulation seed save_steps; do
     value=${!integer_name}
     if [[ ! $value =~ ^[0-9]+$ ]] || [[ $integer_name != seed && $value -lt 1 ]]; then
         printf 'error: %s must be a valid integer\n' "$integer_name" >&2
@@ -221,6 +225,7 @@ command=(
     --deepspeed_config "$deepspeed_config"
     --attention_implementation "$attention_implementation"
     --save_strategy "$save_strategy"
+    --save_steps "$save_steps"
     --gradient_checkpointing
 )
 
@@ -260,6 +265,13 @@ if [[ -n $benchmark_run_config || -n $benchmark_evidence_path ]]; then
         --benchmark_run_config "$benchmark_run_config"
         --benchmark_evidence_path "$benchmark_evidence_path"
     )
+fi
+if [[ -n $benchmark_smoke_resume_witness ]]; then
+    if [[ -z $benchmark_run_config || -z $benchmark_evidence_path || -z $resume_path ]]; then
+        printf 'error: smoke resume witness requires benchmark config, evidence, and resume path\n' >&2
+        exit 2
+    fi
+    command+=(--benchmark_smoke_resume_witness "$benchmark_smoke_resume_witness")
 fi
 if [[ $final_save == true ]]; then
     command+=(--final_save)
