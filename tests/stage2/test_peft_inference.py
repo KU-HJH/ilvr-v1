@@ -86,7 +86,7 @@ def test_inference_inspection_is_bound_to_its_canonical_artifact_path(
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
-def test_v3_inference_loads_sparse_rows_without_stage1_directory(
+def test_v4_inference_loads_sparse_rows_without_stage1_directory(
     sparse_inference_artifact,
 ):
     """Dropping artifact-owned sparse rows must change the latent-token logits."""
@@ -104,7 +104,7 @@ def test_v3_inference_loads_sparse_rows_without_stage1_directory(
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
-def test_v3_reload_preserves_two_block_logits_and_latent_states_at_b1(
+def test_v4_reload_preserves_two_block_logits_and_latent_states_at_b1(
     sparse_inference_artifact,
 ):
     """Dropping adapter, row, or recurrence state must break reload parity."""
@@ -160,6 +160,46 @@ def test_inference_rejects_malformed_adapter_before_large_base_load(
         )
 
     assert model_loads == []
+
+
+@pytest.mark.parametrize(
+    "claimed_origin",
+    ["unpadded-stage1-origin", "padded-stage1-origin"],
+)
+def test_sparse_v3_inference_rejects_unknown_vocab_provenance_before_load(
+    sparse_inference_artifact,
+    tmp_path,
+    claimed_origin,
+):
+    """A legacy path string must not supply missing sparse vocab provenance."""
+
+    artifact_dir = tmp_path / claimed_origin
+    shutil.copytree(sparse_inference_artifact.stage2_dir, artifact_dir)
+    metadata_path = artifact_dir / "stage2_peft_metadata.json"
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 3
+    payload["base_model_reference"] = claimed_origin
+    payload.pop("tokenizer_base_vocab_size")
+    payload.pop("pretrained_model_vocab_size")
+    payload.pop("resized_vocab_size")
+    metadata_path.write_text(
+        json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    calls = []
+
+    with pytest.raises(ValueError, match="sparse.*v3.*provenance"):
+        load_stage2_model_for_inference(
+            claimed_origin,
+            artifact_dir,
+            sparse_inference_artifact.processor,
+            discover_adapter_config=lambda *args, **kwargs: calls.append(
+                "discover"
+            ),
+            load_config=lambda *args, **kwargs: calls.append("config"),
+            load_model=lambda *args, **kwargs: calls.append("model"),
+        )
+
+    assert calls == []
 
 
 def test_inference_source_provenance_rejects_model_only_selectors(
@@ -272,13 +312,13 @@ def test_inference_shares_source_selectors_and_resizes_original_base_once(
         ("adapter_name_corrupted", "canonical adapter tensor fields"),
     ],
 )
-def test_v3_adapter_tensor_topology_fails_before_large_base_load(
+def test_v4_adapter_tensor_topology_fails_before_large_base_load(
     sparse_inference_artifact,
     tmp_path,
     mutation,
     message,
 ):
-    """Missing, malformed, or extra v3 state must fail at small preflight."""
+    """Missing, malformed, or extra v4 state must fail at small preflight."""
 
     artifact_dir = tmp_path / mutation
     shutil.copytree(sparse_inference_artifact.stage2_dir, artifact_dir)

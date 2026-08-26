@@ -528,6 +528,12 @@ def migrate_stage2_metadata(raw: Mapping[str, object]) -> Stage2PeftMetadata:
                 f"missing={sorted(_V3_STAGE2_PEFT_FIELDS - actual)}, "
                 f"unknown={sorted(actual - _V3_STAGE2_PEFT_FIELDS)}"
             )
+        if raw["token_row_source"] == "sparse_adapter":
+            raise ValueError(
+                "Stage 2 sparse schema v3 lacks pretrained padded vocabulary "
+                "provenance; re-save it from authenticated Stage 1 schema v2 "
+                "as Stage 2 schema v4"
+            )
         migrated = dict(raw)
         architecture = _normalize_base_model_architecture(
             migrated["base_model_architecture"]

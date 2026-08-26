@@ -515,11 +515,22 @@ adapter_model.safetensors
 stage2_peft_metadata.json
 ```
 
-The sidecar uses schema v3 and records a compact Qwen2.5-VL
-text/vision architecture snapshot in addition to the adapter and latent-token
-contract. Strict complete v2 artifacts migrate as base-row sources; v1 and
-partial/unknown schemas are rejected because they lack enough origin
-architecture provenance for safe base relocation.
+The sidecar uses schema v4 and records a compact Qwen2.5-VL text/vision
+architecture snapshot in addition to the adapter and latent-token contract.
+Its vocabulary provenance keeps three distinct values: the tokenizer vocabulary
+before latent-token insertion, the pretrained model's possibly padded embedding
+vocabulary, and the final resized vocabulary after the three latent tokens are
+added.
+
+Strict complete v2 artifacts migrate according to their original base-row-only
+semantics. Strict complete v3 artifacts migrate only when
+`token_row_source=base`, where the legacy unpadded interpretation is
+unambiguous. A v3 `sparse_adapter` artifact is rejected even if its original
+model happened to be unpadded: v3 did not record the pretrained padded
+vocabulary, and the loader does not invent it from a path or from
+`resized_vocab_size - 3`. Re-save that artifact from its authenticated Stage 1
+schema-v2 source to produce a Stage 2 schema-v4 artifact. Do not manually add an
+inferred value. Schema v1 and partial or unknown v2/v3/v4 payloads are rejected.
 
 A numbered checkpoint also contains `trainer_state.json`, RNG state, and the
 optimizer/scheduler state required by its training backend. The concrete

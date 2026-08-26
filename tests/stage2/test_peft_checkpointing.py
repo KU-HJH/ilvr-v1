@@ -168,9 +168,33 @@ def test_complete_v3_metadata_migrates_with_explicit_unpadded_provenance():
     metadata = migrate_stage2_metadata(complete_v3_metadata())
 
     assert metadata.schema_version == 4
+    assert metadata.token_row_source == "base"
     assert metadata.tokenizer_base_vocab_size == 125
     assert metadata.pretrained_model_vocab_size == 125
     assert metadata.resized_vocab_size == 128
+
+
+@pytest.mark.parametrize(
+    "base_model_reference",
+    ["authenticated-unpadded-stage1", "authenticated-padded-stage1"],
+)
+def test_sparse_v3_metadata_without_vocab_provenance_fails_closed(
+    base_model_reference,
+):
+    """Catches inventing a pretrained vocabulary for a legacy sparse artifact."""
+
+    payload = complete_v3_metadata()
+    payload.update(
+        token_row_source="sparse_adapter",
+        stage1_adapter_reference="relocated-stage1-adapter",
+        base_model_reference=base_model_reference,
+        latent_pad_token_id=125,
+        latent_start_token_id=126,
+        latent_end_token_id=127,
+    )
+
+    with pytest.raises(ValueError, match="sparse.*v3.*provenance"):
+        migrate_stage2_metadata(payload)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra"])
@@ -756,6 +780,30 @@ def test_base_token_row_resume_still_requires_tagged_full_stage1():
             tuning_method_explicit=False,
             **semantic_args(),
         )
+
+
+@pytest.mark.parametrize(
+    "legacy_payload",
+    [complete_v2_metadata, complete_v3_metadata],
+    ids=["v2-base-rows", "v3-base-rows"],
+)
+def test_complete_legacy_base_row_metadata_resolves_resume(legacy_payload):
+    """Catches rejecting the unambiguous base-row v2/v3 compatibility path."""
+
+    migrated = migrate_stage2_metadata(legacy_payload())
+    decision = resolve_stage2_load_decision(
+        load_model_path="relocated-stage1",
+        resume_from_checkpoint_path="stage2/checkpoint-9",
+        load_config=lambda unused: SimpleNamespace(stage="stage1"),
+        load_peft_metadata=lambda unused: migrated,
+        tuning_method=None,
+        tuning_method_explicit=False,
+        **semantic_args(),
+    )
+
+    assert decision.base_model_source == "relocated-stage1"
+    assert decision.adapter_source == "stage2/checkpoint-9"
+    assert decision.peft_metadata.token_row_source == "base"
 
 
 def test_peft_sidecar_classifies_resume_without_loading_adapter_as_full_config():
