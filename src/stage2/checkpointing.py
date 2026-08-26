@@ -1344,6 +1344,12 @@ def resolve_stage2_load_decision(
             Path(stage1_adapter_path)
         )
         metadata = decode_stage1_peft_metadata_snapshot(metadata_snapshot)
+        if load_model_path != metadata.base_model_reference:
+            raise ValueError(
+                "Stage 1 PEFT base source mismatch: "
+                f"metadata={metadata.base_model_reference!r}, "
+                f"requested={load_model_path!r}"
+            )
         if metadata.tuning_method != "dora":
             raise ValueError(
                 "fresh Stage 2 continuation requires a Stage 1 DoRA adapter"

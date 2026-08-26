@@ -499,6 +499,58 @@ def test_stage1_adapter_source_routes_a_fresh_stage2_decision(tmp_path):
     assert decision.stage1_metadata_snapshot is not None
 
 
+def test_fresh_stage2_decision_rejects_malicious_metadata_base_before_external_load(
+    tmp_path,
+):
+    """Catches fresh handoff trusting a requested base unlike Stage 1 metadata."""
+    _, metadata = write_stage1_dora_artifact(tmp_path)
+    payload = metadata.to_dict()
+    payload["base_model_reference"] = "attacker/compatible-qwen"
+    (tmp_path / STAGE1_PEFT_METADATA_FILENAME).write_text(
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    calls = SimpleNamespace(configs=0, processors=0, models=0)
+
+    def reject_config(*unused, **unused_kwargs):
+        calls.configs += 1
+        raise AssertionError("config load must follow Stage 1 source validation")
+
+    def reject_processor(*unused, **unused_kwargs):
+        calls.processors += 1
+        raise AssertionError("processor load must follow Stage 1 source validation")
+
+    def reject_model(*unused, **unused_kwargs):
+        calls.models += 1
+        raise AssertionError("model load must follow Stage 1 source validation")
+
+    source_dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *unused, **unused_kwargs: None,
+        load_config=reject_config,
+        load_processor=reject_processor,
+        load_model=reject_model,
+    )
+    args = stage2_args(
+        stage1_adapter_path=str(tmp_path),
+        load_model_path="tiny/original-qwen",
+        latent_size=2,
+        tuning_method="dora",
+        tuning_method_explicit=True,
+        lora_r=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+        lora_target_modules=stage1_tuning().target_suffixes,
+    )
+
+    with pytest.raises(ValueError, match="base source mismatch"):
+        main.build_stage2_training_components(
+            args,
+            source_dependencies=source_dependencies,
+        )
+
+    assert vars(calls) == {"configs": 0, "processors": 0, "models": 0}
+
+
 def test_stage1_adapter_source_and_stage2_resume_fail_before_source_loading():
     """Catches ambiguous checkpoint precedence reaching either artifact loader."""
     calls = []

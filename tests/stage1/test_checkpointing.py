@@ -1343,6 +1343,87 @@ def test_preflight_rejects_explicit_base_source_identity_mismatch(
         )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("empty", ""),
+        ("missing", None),
+        ("wrong", "tiny/different-qwen"),
+    ],
+)
+def test_preflight_rejects_untrusted_adapter_base_reference_before_model_build(
+    saved_dora_artifact,
+    mutation,
+    value,
+):
+    """Catches empty/missing adapter provenance bypassing preflight."""
+    adapter_path = saved_dora_artifact / "adapter_config.json"
+    payload = json.loads(adapter_path.read_text(encoding="utf-8"))
+    if mutation == "missing":
+        payload.pop("base_model_name_or_path")
+    else:
+        payload["base_model_name_or_path"] = value
+    adapter_path.write_text(
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    model_builds = 0
+
+    def reject_model_build(config):
+        nonlocal model_builds
+        model_builds += 1
+        raise AssertionError("adapter provenance must precede model construction")
+
+    with pytest.raises(ValueError, match="adapter base reference"):
+        preflight_stage1_peft_artifact(
+            TinyStage1Processor.from_pretrained(saved_dora_artifact),
+            deepcopy(tiny_original_qwen().config),
+            saved_dora_artifact,
+            requested_base_model_reference="tiny/original-qwen",
+            model_factory=reject_model_build,
+        )
+
+    assert model_builds == 0
+
+
+@pytest.mark.parametrize("mutation", ("empty", "missing"))
+def test_runtime_restore_rejects_untrusted_witnessed_adapter_base_reference(
+    saved_dora_artifact,
+    mutation,
+):
+    """Catches a forged witnessed adapter source reaching base mutation."""
+    processor = TinyStage1Processor.from_pretrained(saved_dora_artifact)
+    witness = preflight_stage1_peft_artifact(
+        processor,
+        deepcopy(tiny_original_qwen().config),
+        saved_dora_artifact,
+        requested_base_model_reference="tiny/original-qwen",
+    )
+    payload = json.loads(witness.adapter_config_json.decode("utf-8"))
+    if mutation == "missing":
+        payload.pop("base_model_name_or_path")
+    else:
+        payload["base_model_name_or_path"] = ""
+    forged = replace(
+        witness,
+        adapter_config_json=json.dumps(payload, sort_keys=True).encode("utf-8"),
+    )
+    base = tiny_original_qwen()
+
+    with pytest.raises(ValueError, match="adapter base reference"):
+        load_stage1_peft_artifact(
+            base,
+            processor,
+            saved_dora_artifact,
+            requested_base_model_reference="tiny/original-qwen",
+            is_trainable=True,
+            preflight=forged,
+        )
+
+    assert base.config.vocab_size == BASE_VOCAB_SIZE
+    assert not hasattr(base.model.embed_tokens, "token_adapter")
+
+
 def test_preflight_accepts_serialized_config_without_mutable_name_when_request_matches(
     saved_dora_artifact,
     tmp_path,

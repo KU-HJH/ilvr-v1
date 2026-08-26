@@ -889,11 +889,28 @@ def _decode_adapter_config(payload: bytes) -> PeftConfig:
         raise ValueError("invalid Stage 1 adapter config values") from error
 
 
+def _validate_adapter_base_reference(
+    config,
+    metadata: Stage1PeftMetadata,
+) -> None:
+    source = getattr(config, "base_model_name_or_path", None)
+    if not isinstance(source, str) or not source:
+        raise ValueError(
+            "Stage 1 adapter base reference must be a non-empty string"
+        )
+    if source != metadata.base_model_reference:
+        raise ValueError(
+            "Stage 1 adapter base reference mismatch: "
+            f"metadata={metadata.base_model_reference}, adapter={source}"
+        )
+
+
 def _validate_adapter_config(
     qwen: nn.Module,
     config,
     metadata: Stage1PeftMetadata,
 ) -> None:
+    _validate_adapter_base_reference(config, metadata)
     if _adapter_value(config, "peft_type") != "LORA":
         raise ValueError("Stage 1 adapter requires peft_type=LORA")
     if _adapter_value(config, "task_type") != "CAUSAL_LM":
@@ -944,12 +961,6 @@ def _validate_adapter_config(
         raise ValueError(
             "Stage 1 resolved target topology mismatch: "
             f"metadata={metadata.resolved_target_names}, model={actual_resolved}"
-        )
-    source = getattr(config, "base_model_name_or_path", "")
-    if source and source != metadata.base_model_reference:
-        raise ValueError(
-            "Stage 1 adapter base reference mismatch: "
-            f"metadata={metadata.base_model_reference}, adapter={source}"
         )
 
 
@@ -1255,6 +1266,12 @@ def preflight_stage1_peft_artifact(
     _validate_base_source(
         requested_base_model_reference, validated.base_model_reference
     )
+    adapter_config_json = _read_regular_payload(
+        artifact / _ADAPTER_CONFIG_FILENAME,
+        label="Stage 1 adapter config",
+    )
+    adapter_config = _decode_adapter_config(adapter_config_json)
+    _validate_adapter_base_reference(adapter_config, validated)
     structural_model = model_factory(deepcopy(base_config))
     qwen = resolve_qwen2_5_vl_model(structural_model)
     _validate_architecture(qwen, validated, resized=False)
@@ -1268,10 +1285,6 @@ def preflight_stage1_peft_artifact(
     _validate_architecture(
         qwen, validated, resized=True, sparse_runtime=True
     )
-    adapter_config_json = _read_regular_payload(
-        artifact / _ADAPTER_CONFIG_FILENAME,
-        label="Stage 1 adapter config",
-    )
     adapter_safetensors = _read_regular_payload(
         artifact / _ADAPTER_SAFE_FILENAME,
         label="Stage 1 adapter safetensors",
@@ -1280,7 +1293,6 @@ def preflight_stage1_peft_artifact(
         artifact / SPARSE_TOKEN_ROWS_FILENAME,
         label="Stage 1 sparse token rows",
     )
-    adapter_config = _decode_adapter_config(adapter_config_json)
     _validate_adapter_config(qwen, adapter_config, validated)
     _validate_adapter_tensors(qwen, adapter_safetensors, validated)
     _validate_sparse_artifact(sparse_safetensors, validated)
