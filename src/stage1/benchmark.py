@@ -97,6 +97,7 @@ def _canonical_json_bytes(payload: object) -> bytes:
             for key, item in value.items():
                 if type(key) is not str:
                     raise TypeError(f"{location} contains a non-string key")
+                _require_string(f"{location} key", key, nonempty=False)
                 validate(item, f"{location}.{key}")
             return
         raise TypeError(f"{location} is not canonical JSON data: {type(value).__name__}")
@@ -383,7 +384,13 @@ def load_verified_evidence(
     if cached is not None and cached[0] == witness:
         evidence = cached[1]
     else:
-        evidence = _evidence_from_dict(_read_json_once(resolved))
+        payload = _read_json_once(resolved)
+        if type(payload) is dict and payload.get("kind") == "stage1-producer-evidence":
+            evidence, _ = _validate_producer_evidence_payload(payload)
+        else:
+            # Compatibility for Task 13's original public pure-metrics writer.
+            # Official CLI/runtime evidence always uses the producer envelope.
+            evidence = _evidence_from_dict(payload)
         _VERIFIED_EVIDENCE_CACHE[resolved] = (witness, evidence)
     if evidence.config_digest != expected_config_digest:
         return None
@@ -407,6 +414,22 @@ _PROCESSOR_REQUIRED_NAMES = {
     "tokenizer_config.json",
     "tokenizer.json",
 }
+_TOKENIZER_OPTIONAL_NAMES = {
+    "special_tokens_map.json", "added_tokens.json", "chat_template.json",
+    "merges.txt", "vocab.json", "generation_config.json",
+}
+_RUNTIME_OUTPUT_NAMES = {
+    "train.log", "launch-manifest.json", "producer-evidence.json", "evidence.json",
+}
+
+
+def _is_allowlisted_artifact_name(name: str, method: str) -> bool:
+    common = _PROCESSOR_REQUIRED_NAMES | _TOKENIZER_OPTIONAL_NAMES
+    if name in common or name.startswith("chat_template."):
+        return True
+    if method == "full":
+        return name == "config.json" or _is_full_weight_name(name)
+    return name in _DORA_REQUIRED_NAMES
 
 
 def _is_full_weight_name(name: str) -> bool:
@@ -427,14 +450,23 @@ def _build_artifact_manifest(
     if not final_save:
         entries: list[dict[str, object]] = []
         artifact_kind = "none"
+        weight_serialization = None
     else:
         if not output_dir.is_dir():
             raise FileNotFoundError(f"final Stage 1 artifact directory is missing: {output_dir}")
         entries = []
         for item in sorted(output_dir.iterdir(), key=lambda path: path.name):
-            if item.is_symlink() or not item.is_file():
+            if method == "dora" and _is_full_weight_name(item.name):
+                raise ValueError("DoRA final artifact must not contain full-model weights")
+            if method == "full" and item.name in _DORA_REQUIRED_NAMES:
+                raise ValueError("full final artifact unexpectedly contains DoRA weights")
+            if item.name in _RUNTIME_OUTPUT_NAMES or not _is_allowlisted_artifact_name(item.name, method):
                 continue
+            if item.is_symlink() or not item.is_file():
+                raise ValueError(f"artifact sidecar must be a regular non-symlink: {item}")
             item_stat = item.stat()
+            if item_stat.st_size <= 0:
+                raise ValueError(f"artifact file must have positive size: {item}")
             entries.append({"name": item.name, "size": item_stat.st_size})
         names = {item["name"] for item in entries}
         full_names = {name for name in names if _is_full_weight_name(name)}
@@ -451,6 +483,54 @@ def _build_artifact_manifest(
                 raise ValueError("full final artifact is missing config.json")
             if names & _DORA_REQUIRED_NAMES:
                 raise ValueError("full final artifact unexpectedly contains DoRA weights")
+            standalone = names & {"model.safetensors", "pytorch_model.bin"}
+            indexes = names & {
+                "model.safetensors.index.json", "pytorch_model.bin.index.json"
+            }
+            if len(standalone) + len(indexes) != 1:
+                raise ValueError("full artifact must have exactly one weight serialization")
+            if indexes:
+                index_name = next(iter(indexes))
+                index_path = output_dir / index_name
+                if index_path.stat().st_size > 4 * 1024 * 1024:
+                    raise ValueError("full shard index is unexpectedly large")
+                try:
+                    index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+                except (UnicodeError, json.JSONDecodeError) as error:
+                    raise ValueError("malformed full shard index") from error
+                if type(index_payload) is not dict or type(index_payload.get("weight_map")) is not dict or not index_payload["weight_map"]:
+                    raise ValueError("full shard index requires a nonempty weight_map")
+                references = set(index_payload["weight_map"].values())
+                expected_suffix = ".safetensors" if index_name.startswith("model") else ".bin"
+                expected_prefix = "model-" if index_name.startswith("model") else "pytorch_model-"
+                for reference in references:
+                    if (
+                        type(reference) is not str or "\0" in reference
+                        or Path(reference).name != reference
+                        or not reference.startswith(expected_prefix)
+                        or not reference.endswith(expected_suffix)
+                    ):
+                        raise ValueError(f"invalid full shard reference: {reference!r}")
+                    shard = output_dir / reference
+                    if shard.is_symlink() or not shard.is_file() or shard.stat().st_size <= 0:
+                        raise ValueError(f"referenced full shard is missing or invalid: {reference}")
+                actual_shards = {
+                    name for name in names
+                    if name.startswith(expected_prefix) and name.endswith(expected_suffix)
+                }
+                if actual_shards != references:
+                    raise ValueError("full shard set does not exactly match its index")
+                weight_serialization = {
+                    "kind": "indexed",
+                    "index": index_name,
+                    "shards": sorted(references),
+                }
+            else:
+                weight_serialization = {
+                    "kind": "standalone",
+                    "index": None,
+                    "shards": sorted(standalone),
+                }
             artifact_kind = "full"
         else:
             missing = _DORA_REQUIRED_NAMES - names
@@ -459,6 +539,7 @@ def _build_artifact_manifest(
             if full_names:
                 raise ValueError("DoRA final artifact must not contain full-model weights")
             artifact_kind = "dora"
+            weight_serialization = None
     payload = {
         "schema_version": _SCHEMA_VERSION,
         "kind": "stage1-artifact-topology-witness",
@@ -466,6 +547,7 @@ def _build_artifact_manifest(
         "artifact_kind": artifact_kind,
         "output_dir": str(output_dir),
         "final_save": final_save,
+        "weight_serialization": weight_serialization,
         "files": entries,
         "checkpoint_bytes": sum(item["size"] for item in entries),
     }
@@ -474,7 +556,107 @@ def _build_artifact_manifest(
 
 
 def _load_producer_run_config(path: Path) -> dict[str, object]:
-    return _validate_producer_run_config_payload(_read_json_once(path))
+    return load_stage1_run_config_witness(path).payload()
+
+
+@dataclass(frozen=True)
+class Stage1RunConfigWitness:
+    path: Path
+    file_witness: tuple[int, int, int, int]
+    canonical_payload: bytes
+    config_digest: str
+
+    def payload(self) -> dict[str, object]:
+        payload = json.loads(self.canonical_payload)
+        if type(payload) is not dict:  # pragma: no cover - constructor invariant.
+            raise AssertionError("run config witness payload stopped being an object")
+        return payload
+
+
+def load_stage1_run_config_witness(path: Path) -> Stage1RunConfigWitness:
+    """Read and validate a launch config exactly once into an immutable witness."""
+
+    resolved = Path(path).resolve(strict=True)
+    before = _file_witness(resolved)
+    payload = _validate_producer_run_config_payload(_read_json_once(resolved))
+    after = _file_witness(resolved)
+    if after != before:
+        raise RuntimeError("Stage 1 run config changed while it was read")
+    canonical = _canonical_json_bytes(payload)
+    return Stage1RunConfigWitness(
+        path=resolved,
+        file_witness=before,
+        canonical_payload=canonical,
+        config_digest=payload["config_digest"],
+    )
+
+
+def validate_stage1_runtime_args(
+    witness: Stage1RunConfigWitness, args: object
+) -> dict[str, object]:
+    config = witness.payload()
+    expected = {
+        "method": getattr(args, "tuning_method", None),
+        "model": getattr(args, "model", None),
+        "source_data_path": str(
+            Path(getattr(args, "benchmark_source_data_path", "")).resolve()
+        ),
+        "data_path": str(Path(getattr(args, "data_path", "")).resolve()),
+        "image_root": str(Path(getattr(args, "image_root", "")).resolve()),
+        "output_dir": str(Path(getattr(args, "save_model_path", "")).resolve()),
+        "micro_batch": getattr(args, "per_device_train_batch_size", None),
+        "gradient_accumulation_steps": getattr(
+            args, "gradient_accumulation_steps", None
+        ),
+        "epochs": getattr(args, "epochs", None),
+        "learning_rate": getattr(args, "learning_rate", None),
+        "seed": getattr(args, "seed", None),
+        "deepspeed_config": str(
+            Path(getattr(args, "deepspeed_config", "")).resolve()
+        ),
+        "attention_implementation": getattr(
+            args, "attention_implementation", None
+        ),
+        "save_strategy": getattr(args, "save_strategy", None),
+        "final_save": getattr(args, "final_save", None),
+        "max_steps": max(0, getattr(args, "max_steps", -1)),
+    }
+    for name, value in expected.items():
+        if config.get(name) != value:
+            raise ValueError(
+                f"Stage 1 runtime {name} does not match sealed run config"
+            )
+    if config["deepspeed_config_digest"] != _small_config_digest(
+        Path(expected["deepspeed_config"])
+    ):
+        raise ValueError("Stage 1 runtime DeepSpeed config digest mismatch")
+    if _stat_payload(Path(config["source_data_path"])) != config["data_stat"]:
+        raise ValueError("Stage 1 runtime source data stat witness is stale")
+    audit = _load_bound_audit(
+        Path(config["probe_rows"]),
+        data_path=Path(config["source_data_path"]),
+        image_root=Path(config["image_root"]),
+        count=64,
+    )
+    if (
+        audit["audit_digest"] != config["audit_digest"]
+        or audit["input_stat"] != config["data_stat"]
+        or [row["source_row_index"] for row in audit["selected_rows"]]
+        != config["probe_row_indices"]
+    ):
+        raise ValueError("Stage 1 runtime audit rows do not match sealed run config")
+    tuning = config["tuning_config"]
+    if config["method"] == "dora":
+        runtime_tuning = {
+            "use_dora": True,
+            "rank": getattr(args, "lora_r", None),
+            "alpha": getattr(args, "lora_alpha", None),
+            "dropout": getattr(args, "lora_dropout", None),
+            "target_modules": getattr(args, "lora_target_modules", None),
+        }
+        if tuning != runtime_tuning:
+            raise ValueError("Stage 1 runtime DoRA tuning does not match sealed config")
+    return config
 
 
 def _validate_producer_run_config_payload(payload: object) -> dict[str, object]:
@@ -491,12 +673,15 @@ def _validate_producer_run_config_payload(payload: object) -> dict[str, object]:
             "deepspeed_config", "deepspeed_config_digest",
             "attention_implementation", "save_strategy", "audit_digest",
             "probe_rows", "probe_row_indices", "maximum_config_digest",
+            "prerequisite_chain_digest",
+            "prerequisite_chain",
             "config_digest",
         },
         "Stage 1 producer run config",
     )
     if payload.get("schema_version") != _SCHEMA_VERSION or payload.get("kind") not in {
-        "stage1-probe-run-manifest", "stage1-timed-launch-manifest"
+        "stage1-probe-run-manifest", "stage1-timed-launch-manifest",
+        "stage1-smoke-run-manifest",
     }:
         raise ValueError("unsupported Stage 1 producer run config schema")
     claimed = payload.get("config_digest")
@@ -562,7 +747,79 @@ def _validate_producer_run_config_payload(payload: object) -> dict[str, object]:
     maximum_digest = payload.get("maximum_config_digest")
     if maximum_digest is not None:
         _require_digest("maximum_config_digest", maximum_digest)
+    prerequisite_digest = payload.get("prerequisite_chain_digest")
+    if payload["kind"] == "stage1-smoke-run-manifest":
+        if maximum_digest is not None:
+            raise ValueError("smoke evidence cannot depend on a capacity maximum")
+        if prerequisite_digest is not None:
+            raise ValueError("smoke evidence cannot depend on itself as a prerequisite")
+        if payload.get("prerequisite_chain") is not None:
+            raise ValueError("smoke evidence cannot name a prerequisite chain")
+    else:
+        _require_digest("prerequisite_chain_digest", prerequisite_digest)
+        _require_string("prerequisite_chain", payload.get("prerequisite_chain"))
+        if payload["kind"] == "stage1-probe-run-manifest":
+            if maximum_digest is not None or payload["final_save"] is not False or payload["max_steps"] == 0:
+                raise ValueError("probe run config has invalid maximum/save/step settings")
+        elif (
+            maximum_digest is None
+            or payload["final_save"] is not True
+            or payload["max_steps"] != 0
+        ):
+            raise ValueError("timed run config has invalid maximum/save/step settings")
     return payload
+
+
+def _load_prerequisite_chain(path: Path) -> dict[str, object]:
+    payload = _read_json_once(path)
+    _require_exact_keys(
+        payload,
+        {"schema_version", "kind", "shared_identity", "shared_identity_digest",
+         "producer_digests", "resume_witness_digests", "prerequisite_chain_digest"},
+        "Stage 1 smoke prerequisite chain",
+    )
+    if payload.get("schema_version") != _SCHEMA_VERSION or payload.get("kind") != "stage1-smoke-prerequisite-chain":
+        raise ValueError("invalid Stage 1 smoke prerequisite chain")
+    identity = payload.get("shared_identity")
+    if type(identity) is not dict:
+        raise TypeError("smoke shared identity must be an object")
+    _require_digest("shared_identity_digest", payload.get("shared_identity_digest"))
+    if config_digest(identity) != payload["shared_identity_digest"]:
+        raise ValueError("smoke shared identity digest mismatch")
+    for name in ("producer_digests", "resume_witness_digests"):
+        values = payload.get(name)
+        _require_exact_keys(values, {"full", "dora"}, f"smoke {name}")
+        for method, digest in values.items():
+            _require_digest(f"{name}.{method}", digest)
+    claimed = payload.get("prerequisite_chain_digest")
+    _require_digest("prerequisite_chain_digest", claimed)
+    digest_input = dict(payload)
+    digest_input.pop("prerequisite_chain_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("smoke prerequisite chain digest mismatch")
+    return payload
+
+
+_PREREQUISITE_CONTROL_FIELDS = (
+    "model", "source_data_path", "data_stat", "image_root", "world_size",
+    "gradient_accumulation_steps", "epochs", "learning_rate", "seed",
+    "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
+    "save_strategy",
+)
+
+
+def _validate_prerequisite_controls(
+    config: Mapping[str, object], prerequisite: Mapping[str, object]
+) -> None:
+    identity = prerequisite["shared_identity"]
+    for name in _PREREQUISITE_CONTROL_FIELDS:
+        source_name = (
+            "source_data_path"
+            if name == "source_data_path" and "source_data_path" in config
+            else "data_path" if name == "source_data_path" else name
+        )
+        if identity.get(name) != config.get(source_name):
+            raise ValueError(f"run changes smoke prerequisite field: {name}")
 
 
 def _small_config_digest(path: Path) -> str:
@@ -598,6 +855,7 @@ def _prepare_probe_run(args: argparse.Namespace) -> str:
     )
     max_steps = _require_int("max_steps", args.max_steps, positive=True)
     deepspeed = Path(args.deepspeed_config).resolve(strict=True)
+    prerequisite = _load_prerequisite_chain(Path(args.prerequisite_chain))
     config = {
         "schema_version": _SCHEMA_VERSION,
         "kind": "stage1-probe-run-manifest",
@@ -629,7 +887,10 @@ def _prepare_probe_run(args: argparse.Namespace) -> str:
         "probe_rows": str(Path(args.probe_rows).resolve()),
         "probe_row_indices": [row["source_row_index"] for row in audit["selected_rows"]],
         "maximum_config_digest": None,
+        "prerequisite_chain_digest": prerequisite["prerequisite_chain_digest"],
+        "prerequisite_chain": str(Path(args.prerequisite_chain).resolve(strict=True)),
     }
+    _validate_prerequisite_controls(config, prerequisite)
     config["config_digest"] = config_digest(config)
     path = Path(args.run_config)
     if path.exists():
@@ -643,12 +904,18 @@ def _prepare_probe_run(args: argparse.Namespace) -> str:
 def write_stage1_producer_evidence(
     path: Path,
     *,
-    run_config_path: Path,
+    run_config_path: Path | None = None,
+    run_config_witness: Stage1RunConfigWitness | None = None,
     evidence: Stage1BenchmarkEvidence,
+    smoke_resume_witness: Mapping[str, object] | None = None,
+    artifact_manifest: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Atomically publish metrics plus the producer-authenticated artifact witness."""
 
-    config = _load_producer_run_config(run_config_path)
+    if (run_config_path is None) == (run_config_witness is None):
+        raise ValueError("provide exactly one run config path or immutable witness")
+    witness = run_config_witness or load_stage1_run_config_witness(run_config_path)
+    config = witness.payload()
     source_path = Path(config["source_data_path"])
     if not source_path.is_file() or _stat_payload(source_path) != config["data_stat"]:
         raise ValueError("producer source data stat witness is stale")
@@ -659,8 +926,20 @@ def write_stage1_producer_evidence(
         raise ValueError("producer evidence is not bound to its run config")
     if evidence.method != config["method"]:
         raise ValueError("producer evidence method does not match run config")
-    artifact = _build_artifact_manifest(
-        Path(config["output_dir"]), method=evidence.method, final_save=config["final_save"]
+    smoke_digest = None
+    if config["kind"] == "stage1-smoke-run-manifest":
+        smoke_resume_witness = _validate_smoke_resume_witness(smoke_resume_witness)
+        smoke_digest = config_digest(smoke_resume_witness)
+    elif smoke_resume_witness is not None:
+        raise ValueError("resume witness is accepted only for smoke evidence")
+    artifact = (
+        _build_artifact_manifest(
+            Path(config["output_dir"]),
+            method=evidence.method,
+            final_save=config["final_save"],
+        )
+        if artifact_manifest is None
+        else dict(artifact_manifest)
     )
     if evidence.checkpoint_bytes != artifact["checkpoint_bytes"]:
         raise ValueError("producer checkpoint_bytes does not match artifact witness")
@@ -671,8 +950,11 @@ def write_stage1_producer_evidence(
         "benchmark_evidence": _evidence_to_dict(evidence),
         "artifact_manifest": artifact,
         "artifact_manifest_digest": artifact["artifact_manifest_digest"],
+        "smoke_resume_witness": smoke_resume_witness,
+        "smoke_resume_witness_digest": smoke_digest,
     }
     payload["producer_digest"] = config_digest(payload)
+    _validate_producer_evidence_payload(payload)
     path = Path(path)
     if path.exists():
         existing = _read_json_once(path)
@@ -684,13 +966,19 @@ def write_stage1_producer_evidence(
 
 
 def _load_producer_evidence(path: Path) -> tuple[Stage1BenchmarkEvidence, dict[str, object]]:
-    payload = _read_json_once(path)
+    return _validate_producer_evidence_payload(_read_json_once(path))
+
+
+def _validate_producer_evidence_payload(
+    payload: object,
+) -> tuple[Stage1BenchmarkEvidence, dict[str, object]]:
     if type(payload) is not dict:
         raise TypeError("producer evidence must be an object")
     _require_exact_keys(
         payload,
         {"schema_version", "kind", "run_config", "benchmark_evidence",
-         "artifact_manifest", "artifact_manifest_digest", "producer_digest"},
+         "artifact_manifest", "artifact_manifest_digest", "producer_digest",
+         "smoke_resume_witness", "smoke_resume_witness_digest"},
         "Stage 1 producer evidence",
     )
     if payload.get("schema_version") != _SCHEMA_VERSION or payload.get("kind") != "stage1-producer-evidence":
@@ -706,13 +994,34 @@ def _load_producer_evidence(path: Path) -> tuple[Stage1BenchmarkEvidence, dict[s
     evidence = _evidence_from_dict(payload["benchmark_evidence"])
     if evidence.config_digest != config_claimed:
         raise ValueError("producer metric/config digest mismatch")
+    metric_bindings = {
+        "method": evidence.method,
+        "micro_batch": evidence.micro_batch,
+        "world_size": evidence.world_size,
+        "gradient_accumulation_steps": evidence.gradient_accumulation_steps,
+        "effective_global_batch": evidence.effective_global_batch,
+        "probe_row_indices": list(evidence.probe_row_indices),
+    }
+    for name, value in metric_bindings.items():
+        if config.get(name) != value:
+            raise ValueError(f"producer metric/run config mismatch for {name}")
+    smoke_witness = payload.get("smoke_resume_witness")
+    smoke_digest = payload.get("smoke_resume_witness_digest")
+    if config["kind"] == "stage1-smoke-run-manifest":
+        validated_smoke = _validate_smoke_resume_witness(smoke_witness)
+        _require_digest("smoke_resume_witness_digest", smoke_digest)
+        if config_digest(validated_smoke) != smoke_digest:
+            raise ValueError("smoke resume witness digest mismatch")
+    elif smoke_witness is not None or smoke_digest is not None:
+        raise ValueError("non-smoke producer evidence contains a resume witness")
     artifact = payload["artifact_manifest"]
     if type(artifact) is not dict:
         raise TypeError("producer artifact manifest must be an object")
     _require_exact_keys(
         artifact,
         {"schema_version", "kind", "method", "artifact_kind", "output_dir",
-         "final_save", "files", "checkpoint_bytes", "artifact_manifest_digest"},
+         "final_save", "weight_serialization", "files", "checkpoint_bytes",
+         "artifact_manifest_digest"},
         "producer artifact manifest",
     )
     if (
@@ -743,19 +1052,64 @@ def _load_producer_evidence(path: Path) -> tuple[Stage1BenchmarkEvidence, dict[s
         if Path(name).name != name or name in names:
             raise ValueError("producer artifact filenames must be unique basenames")
         names.add(name)
-        byte_sum += _require_int(f"artifact file {index}.size", item.get("size"))
+        size = _require_int(f"artifact file {index}.size", item.get("size"))
+        if expected_kind != "none" and size == 0:
+            raise ValueError("producer artifact files must have positive size")
+        if expected_kind != "none" and not _is_allowlisted_artifact_name(name, evidence.method):
+            raise ValueError("producer artifact manifest contains a non-artifact file")
+        byte_sum += size
     if artifact.get("checkpoint_bytes") != byte_sum:
         raise ValueError("producer artifact file sizes do not sum to checkpoint_bytes")
     if expected_kind != "none" and not _PROCESSOR_REQUIRED_NAMES <= names:
         raise ValueError("producer artifact witness is missing processor/tokenizer files")
-    if expected_kind == "full" and (
-        "config.json" not in names
-        or not any(_is_full_weight_name(name) for name in names if type(name) is str)
-    ):
-        raise ValueError("producer full artifact witness has incomplete model topology")
+    serialization = artifact.get("weight_serialization")
+    if expected_kind == "full":
+        if "config.json" not in names:
+            raise ValueError("producer full artifact witness has incomplete model topology")
+        _require_exact_keys(
+            serialization, {"kind", "index", "shards"},
+            "producer full weight serialization",
+        )
+        serialization_kind = serialization.get("kind")
+        shards = serialization.get("shards")
+        if type(shards) is not list or not shards or shards != sorted(set(shards)):
+            raise ValueError("producer full weight shards must be a sorted unique array")
+        for index, name in enumerate(shards):
+            _require_string(f"producer full shard {index}", name)
+        if serialization_kind == "standalone":
+            if serialization.get("index") is not None or len(shards) != 1 or shards[0] not in {
+                "model.safetensors", "pytorch_model.bin"
+            }:
+                raise ValueError("producer standalone full weight witness is invalid")
+            expected_weights = set(shards)
+        elif serialization_kind == "indexed":
+            index_name = _require_string("producer full weight index", serialization.get("index"))
+            if index_name not in {
+                "model.safetensors.index.json", "pytorch_model.bin.index.json"
+            }:
+                raise ValueError("producer full weight index witness is invalid")
+            expected_prefix = "model-" if index_name.startswith("model") else "pytorch_model-"
+            expected_suffix = ".safetensors" if index_name.startswith("model") else ".bin"
+            if any(
+                Path(name).name != name
+                or not name.startswith(expected_prefix)
+                or not name.endswith(expected_suffix)
+                for name in shards
+            ):
+                raise ValueError("producer full shard witness is invalid")
+            expected_weights = {index_name, *shards}
+        else:
+            raise ValueError("producer full weight serialization kind is invalid")
+        actual_weights = {name for name in names if _is_full_weight_name(name)}
+        if actual_weights != expected_weights:
+            raise ValueError("producer full weight witness does not match artifact files")
     if expected_kind == "dora":
         if not _DORA_REQUIRED_NAMES <= names or any(_is_full_weight_name(name) for name in names if type(name) is str):
             raise ValueError("producer DoRA artifact topology is invalid")
+        if serialization is not None:
+            raise ValueError("producer DoRA artifact must not contain full weights")
+    if expected_kind == "none" and serialization is not None:
+        raise ValueError("no-save producer artifact cannot contain weight serialization")
     if artifact.get("checkpoint_bytes") != evidence.checkpoint_bytes:
         raise ValueError("producer artifact byte count mismatch")
     source = Path(config["source_data_path"])
@@ -765,6 +1119,32 @@ def _load_producer_evidence(path: Path) -> tuple[Stage1BenchmarkEvidence, dict[s
     if not image_root.is_dir() or image_root.resolve(strict=True) != image_root:
         raise ValueError("producer evidence image root witness is stale")
     return evidence, payload
+
+
+def _validate_smoke_resume_witness(payload: object) -> dict[str, object]:
+    _require_exact_keys(
+        payload,
+        {"initial_final_step", "resume_initial_step", "resume_final_step",
+         "batch_size_observed", "finite_loss", "checkpoint_validated",
+         "resume_artifact_digest"},
+        "Stage 1 smoke resume witness",
+    )
+    for name in (
+        "initial_final_step", "resume_initial_step", "resume_final_step",
+        "batch_size_observed",
+    ):
+        _require_int(name, payload.get(name), positive=True)
+    if (
+        payload["initial_final_step"] != 3
+        or payload["resume_initial_step"] != 3
+        or payload["resume_final_step"] != 4
+        or payload["batch_size_observed"] != 2
+        or payload.get("finite_loss") is not True
+        or payload.get("checkpoint_validated") is not True
+    ):
+        raise ValueError("smoke resume witness violates the approved 3-to-4 contract")
+    _require_digest("resume_artifact_digest", payload.get("resume_artifact_digest"))
+    return dict(payload)
 
 
 def _stat_payload(path: Path) -> dict[str, int]:
@@ -1209,6 +1589,8 @@ def _record_probe_attempt(args: argparse.Namespace) -> dict[str, object]:
         "probe_row_indices": probe_indices,
         "audit_digest": audit["audit_digest"],
         "run_config_digest": sealed_run["config_digest"],
+        "prerequisite_chain_digest": sealed_run["prerequisite_chain_digest"],
+        "prerequisite_chain": sealed_run["prerequisite_chain"],
         "command": command,
     }
     digest = config_digest(launch_config)
@@ -1235,6 +1617,7 @@ def _record_probe_attempt(args: argparse.Namespace) -> dict[str, object]:
         "probe_row_indices": probe_indices,
         "audit_digest": audit["audit_digest"],
         "data_stat": audit["input_stat"],
+        "prerequisite_chain_digest": sealed_run["prerequisite_chain_digest"],
         "command": command,
         "launch_config": launch_config,
         "config_digest": digest,
@@ -1290,6 +1673,7 @@ def _load_probe_attempt(path: Path) -> dict[str, object]:
             "probe_row_indices",
             "audit_digest",
             "data_stat",
+            "prerequisite_chain_digest",
             "command",
             "launch_config",
             "config_digest",
@@ -1364,6 +1748,7 @@ def _load_probe_attempt(path: Path) -> dict[str, object]:
         "method", "micro_batch", "world_size", "gradient_accumulation_steps",
         "effective_global_batch", "max_steps", "final_save", "command",
         "probe_row_indices", "audit_digest", "data_stat",
+        "prerequisite_chain_digest",
     ):
         if payload[name] != payload["launch_config"][name]:
             raise ValueError(f"probe attempt duplicate field mismatch: {name}")
@@ -1380,6 +1765,8 @@ def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
     flag_values = {
         "--method": str(attempt["method"]),
         "--model": str(attempt["launch_config"]["model"]),
+        "--source-data-path": str(attempt["launch_config"]["data_path"]),
+        "--data-path": str(attempt["launch_config"]["train_data_path"]),
         "--image-root": str(attempt["launch_config"]["image_root"]),
         "--output-dir": str(attempt["output_dir"]),
         "--micro-batch": str(attempt["micro_batch"]),
@@ -1399,7 +1786,7 @@ def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
             Path(str(attempt["output_dir"])).parent / "evidence" / "producer-evidence.json"
         ),
     }
-    allowed = set(flag_values) | {"--data-path", "--no-final-save"}
+    allowed = set(flag_values) | {"--no-final-save"}
     seen: set[str] = set()
     index = 1
     while index < len(command):
@@ -1422,6 +1809,10 @@ def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
                 if float(value) != float(expected):
                     raise ValueError(f"probe argv value mismatch for {flag}")
             elif value != expected:
+                if flag == "--data-path":
+                    raise ValueError(
+                        "probe --data-path must equal the materialized audited probe input"
+                    )
                 raise ValueError(f"probe argv value mismatch for {flag}")
         seen.add(flag)
         index += 2
@@ -1455,6 +1846,8 @@ def _validate_probe_launch_config(payload: object) -> None:
             "probe_row_indices",
             "audit_digest",
             "run_config_digest",
+            "prerequisite_chain_digest",
+            "prerequisite_chain",
             "command",
         },
         "probe launch config",
@@ -1485,8 +1878,12 @@ def _validate_probe_launch_config(payload: object) -> None:
         "probe_rows",
     ):
         _require_string(name, payload.get(name))
-    for name in ("audit_digest", "deepspeed_config_digest", "run_config_digest"):
+    for name in (
+        "audit_digest", "deepspeed_config_digest", "run_config_digest",
+        "prerequisite_chain_digest",
+    ):
         _require_digest(name, payload.get(name))
+    _require_string("prerequisite_chain", payload.get("prerequisite_chain"))
     tuning = payload.get("tuning_config")
     if payload["method"] == "full" and tuning is not None:
         raise ValueError("full probe config must not contain DoRA tuning")
@@ -1603,9 +2000,10 @@ def _validated_capacity_chain(
         raise ValueError("capacity chain must start at batch 8")
     fingerprint_names = (
         "method", "world_size", "gradient_accumulation_steps", "learning_rate",
-        "seed", "model", "data_path", "data_stat", "image_root",
+        "seed", "model", "data_path", "train_data_path", "data_stat", "image_root",
         "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
         "probe_rows", "probe_row_indices", "audit_digest", "tuning_config",
+        "prerequisite_chain", "prerequisite_chain_digest",
     )
     first_config = attempts[0][1]["launch_config"]
     for _, attempt in attempts[1:]:
@@ -1734,7 +2132,10 @@ def _check_evidence(args: argparse.Namespace) -> str:
     path = Path(args.evidence_dir) / "evidence.json"
     if not path.is_file():
         return "missing"
-    evidence = _load_evidence_without_expected(path)
+    evidence, seal = _load_producer_evidence(path)
+    if seal["run_config"]["kind"] != "stage1-smoke-run-manifest":
+        raise ValueError("check-evidence accepts only Task 15 smoke evidence")
+    _validate_smoke_resume_witness(seal["smoke_resume_witness"])
     if (
         evidence.status == "success"
         and evidence.method == args.method
@@ -1745,15 +2146,68 @@ def _check_evidence(args: argparse.Namespace) -> str:
     return "missing"
 
 
-def _require_evidence(paths: Sequence[str]) -> None:
-    evidences = []
+def _build_smoke_prerequisite_chain(
+    loaded: Sequence[tuple[Stage1BenchmarkEvidence, dict[str, object]]],
+) -> dict[str, object]:
+    evidences = [item[0] for item in loaded]
+    if len(evidences) != 2 or {item.method for item in evidences} != {"full", "dora"}:
+        raise ValueError("required evidence must be an exact full/DoRA pair")
+    by_method = {item[0].method: item for item in loaded}
+    for method, (evidence, seal) in by_method.items():
+        if seal["run_config"].get("kind") != "stage1-smoke-run-manifest":
+            raise ValueError("required evidence must be Task 15 smoke evidence")
+        _validate_smoke_resume_witness(seal.get("smoke_resume_witness"))
+        if evidence.micro_batch != 2 or evidence.world_size != 2:
+            raise ValueError("smoke prerequisite must use two ranks at micro-batch 2")
+    identity_names = (
+        "model", "source_data_path", "data_stat", "image_root", "world_size",
+        "gradient_accumulation_steps", "epochs", "learning_rate", "seed",
+        "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
+        "save_strategy", "audit_digest", "probe_row_indices",
+    )
+    full_config = by_method["full"][1]["run_config"]
+    dora_config = by_method["dora"][1]["run_config"]
+    shared_identity = {}
+    for name in identity_names:
+        if full_config.get(name) != dora_config.get(name):
+            raise ValueError(f"smoke prerequisite pair changes controlled field: {name}")
+        shared_identity[name] = full_config[name]
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-smoke-prerequisite-chain",
+        "shared_identity": shared_identity,
+        "shared_identity_digest": config_digest(shared_identity),
+        "producer_digests": {
+            method: by_method[method][1]["producer_digest"]
+            for method in ("full", "dora")
+        },
+        "resume_witness_digests": {
+            method: by_method[method][1]["smoke_resume_witness_digest"]
+            for method in ("full", "dora")
+        },
+    }
+    payload["prerequisite_chain_digest"] = config_digest(payload)
+    return payload
+
+
+def _require_evidence(paths: Sequence[str]) -> dict[str, object]:
+    loaded = []
     for raw_path in paths:
-        evidence = _load_evidence_without_expected(Path(raw_path))
+        evidence, seal = _load_producer_evidence(Path(raw_path))
         if evidence.status != "success":
             raise ValueError(f"required evidence is not successful: {raw_path}")
-        evidences.append(evidence)
-    if len(evidences) == 2 and {item.method for item in evidences} != {"full", "dora"}:
-        raise ValueError("required evidence must be an exact full/DoRA pair")
+        loaded.append((evidence, seal))
+    payload = _build_smoke_prerequisite_chain(loaded)
+    if all(Path(path).is_file() for path in paths):
+        common = Path(os.path.commonpath([str(Path(path).resolve()) for path in paths]))
+        while common.is_file() or common.name in {"full", "dora"}:
+            common = common.parent
+        chain_path = common / "prerequisite-chain.json"
+        if chain_path.exists() and _read_json_once(chain_path) != payload:
+            raise FileExistsError(f"different smoke prerequisite chain exists: {chain_path}")
+        if not chain_path.exists():
+            _atomic_write_json(chain_path, payload)
+    return payload
 
 
 def _summaries(paths: Sequence[str]) -> list[dict[str, object]]:
@@ -1799,6 +2253,7 @@ def _load_maximum(path: Path) -> dict[str, object]:
             "audit_digest",
             "data_stat",
             "probe_row_indices",
+            "prerequisite_chain_digest",
             "long_smoke_producer_digest",
             "rank_peak_allocated_bytes",
             "rank_peak_reserved_bytes",
@@ -1831,7 +2286,8 @@ def _load_maximum(path: Path) -> dict[str, object]:
         raise TypeError("maximum first_failure must be null or an object")
     _validate_probe_launch_config(payload.get("launch_config"))
     for name in (
-        "attempt_chain_digest", "audit_digest", "long_smoke_producer_digest"
+        "attempt_chain_digest", "audit_digest", "prerequisite_chain_digest",
+        "long_smoke_producer_digest"
     ):
         _require_digest(name, payload.get(name))
     if payload["audit_digest"] != payload["launch_config"]["audit_digest"]:
@@ -1840,6 +2296,11 @@ def _load_maximum(path: Path) -> dict[str, object]:
         raise ValueError("maximum data stat is not bound to launch config")
     if payload["probe_row_indices"] != payload["launch_config"]["probe_row_indices"]:
         raise ValueError("maximum probe row indices are not bound to launch config")
+    if (
+        payload["prerequisite_chain_digest"]
+        != payload["launch_config"]["prerequisite_chain_digest"]
+    ):
+        raise ValueError("maximum prerequisite chain is not bound to launch config")
     for name in ("rank_peak_allocated_bytes", "rank_peak_reserved_bytes"):
         values = payload.get(name)
         if type(values) is not list or len(values) != payload["world_size"]:
@@ -1890,6 +2351,8 @@ def _load_maximum(path: Path) -> dict[str, object]:
         or long_attempt["micro_batch"] != payload["selected_micro_batch"]
         or long_attempt["max_steps"] != payload["long_smoke_steps"]
         or long_attempt["exit_code"] != 0
+        or long_attempt["prerequisite_chain_digest"]
+        != payload["prerequisite_chain_digest"]
     ):
         raise ValueError("maximum attempt references do not match its selection")
     producer_path = Path(long_attempt["output_dir"]).parent / "evidence" / "producer-evidence.json"
@@ -1988,6 +2451,7 @@ def _validate_maximum(probe_dir: Path, long_smoke_steps: int) -> dict[str, objec
                 max_steps=long_smoke_steps,
                 deepspeed_config=selected["launch_config"]["deepspeed_config"],
                 probe_rows=selected["probe_rows"],
+                prerequisite_chain=selected["launch_config"]["prerequisite_chain"],
             )
         )
         _rewrite_command_flag(command, "--benchmark-run-config", str(run_config_path))
@@ -2074,6 +2538,7 @@ def _validate_maximum(probe_dir: Path, long_smoke_steps: int) -> dict[str, objec
         "audit_digest": selected["audit_digest"],
         "data_stat": selected["data_stat"],
         "probe_row_indices": selected["probe_row_indices"],
+        "prerequisite_chain_digest": selected["prerequisite_chain_digest"],
         "long_smoke_producer_digest": long_seal["producer_digest"],
         "rank_peak_allocated_bytes": list(long_evidence.rank_peak_allocated_bytes),
         "rank_peak_reserved_bytes": list(long_evidence.rank_peak_reserved_bytes),
@@ -2083,13 +2548,35 @@ def _validate_maximum(probe_dir: Path, long_smoke_steps: int) -> dict[str, objec
     return payload
 
 
+def _require_matching_maximum_controls(
+    maxima: Sequence[Mapping[str, object]],
+) -> None:
+    configs = [item["launch_config"] for item in maxima]
+    for name in (
+        "model", "data_path", "data_stat", "image_root", "world_size",
+        "gradient_accumulation_steps", "learning_rate", "seed",
+        "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
+        "probe_rows", "probe_row_indices", "audit_digest",
+        "prerequisite_chain_digest",
+    ):
+        if configs[0][name] != configs[1][name]:
+            raise ValueError(f"maximum comparison changes controlled field: {name}")
+
+
 def _compare_maxima(paths: Sequence[str]) -> dict[str, object]:
     maxima = [_load_maximum(Path(path)) for path in paths]
     if {item["method"] for item in maxima} != {"full", "dora"}:
         raise ValueError("maximum comparison requires separated full and DoRA manifests")
+    prerequisite_digests = {
+        item["prerequisite_chain_digest"] for item in maxima
+    }
+    if len(prerequisite_digests) != 1:
+        raise ValueError("maximum comparison changes the smoke prerequisite chain")
+    _require_matching_maximum_controls(maxima)
     return {
         "schema_version": _SCHEMA_VERSION,
         "kind": "stage1-capacity-comparison",
+        "prerequisite_chain_digest": next(iter(prerequisite_digests)),
         "methods": {
             item["method"]: {
                 "micro_batch": item["selected_micro_batch"],
@@ -2099,6 +2586,7 @@ def _compare_maxima(paths: Sequence[str]) -> dict[str, object]:
                 "rank_peak_allocated_bytes": item["rank_peak_allocated_bytes"],
                 "rank_peak_reserved_bytes": item["rank_peak_reserved_bytes"],
                 "maximum_config_digest": item["config_digest"],
+                "prerequisite_chain_digest": item["prerequisite_chain_digest"],
             }
             for item in maxima
         },
@@ -2148,13 +2636,19 @@ def _prepare_timed_run(args: argparse.Namespace) -> str:
         "probe_rows": source_config["probe_rows"],
         "probe_row_indices": source_config["probe_row_indices"],
         "maximum_config_digest": maximum["config_digest"],
+        "prerequisite_chain": source_config["prerequisite_chain"],
+        "prerequisite_chain_digest": maximum["prerequisite_chain_digest"],
     }
     launch_config["config_digest"] = config_digest(launch_config)
     manifest_path = output_dir / "launch-manifest.json"
     evidence_path = output_dir / "evidence.json"
     if evidence_path.is_file():
-        evidence, _ = _load_producer_evidence(evidence_path)
-        if evidence.config_digest == launch_config["config_digest"] and evidence.status == "success":
+        evidence, seal = _load_producer_evidence(evidence_path)
+        if (
+            evidence.config_digest == launch_config["config_digest"]
+            and seal["run_config"] == launch_config
+            and evidence.status == "success"
+        ):
             return "reusable-success"
         raise ValueError("timed output contains stale or malformed evidence")
     if output_dir.exists():
@@ -2177,6 +2671,7 @@ def _launcher_args_from_manifest(path: Path) -> list[str]:
     result = [
         "--method", str(payload["method"]),
         "--model", str(payload["model"]),
+        "--source-data-path", str(payload["source_data_path"]),
         "--data-path", str(payload["data_path"]),
         "--image-root", str(payload["image_root"]),
         "--output-dir", str(payload["output_dir"]),
@@ -2211,7 +2706,11 @@ def _validate_timed_run(run_dir: Path) -> str:
     evidence_path = run_dir / "evidence.json"
     if evidence_path.is_file():
         reusable, reusable_seal = _load_producer_evidence(evidence_path)
-        if reusable.config_digest != claimed or reusable.status != "success":
+        if (
+            reusable.config_digest != claimed
+            or reusable_seal["run_config"] != manifest
+            or reusable.status != "success"
+        ):
             raise ValueError("timed evidence is not successful")
         return "reusable-success"
     producer_path = run_dir / "producer-evidence.json"
@@ -2222,6 +2721,8 @@ def _validate_timed_run(run_dir: Path) -> str:
     producer, producer_seal = _load_producer_evidence(producer_path)
     if producer.config_digest != claimed:
         raise ValueError("producer evidence is not bound to the timed manifest")
+    if producer_seal["run_config"] != manifest:
+        raise ValueError("producer run config does not exactly match timed manifest")
     if producer.status != "success" or producer.method != manifest["method"]:
         raise ValueError("producer evidence does not match the successful timed run")
     if (
@@ -2250,10 +2751,11 @@ def _compare_runs(paths: Sequence[str], output: Path) -> dict[str, object]:
         raise ValueError("run comparison requires successful sealed evidence")
     configs = [item[1]["run_config"] for item in loaded]
     for name in (
-        "model", "source_data_path", "data_stat", "image_root", "world_size",
+        "model", "source_data_path", "data_path", "data_stat", "image_root", "world_size",
         "gradient_accumulation_steps", "epochs", "learning_rate", "seed",
         "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
         "save_strategy", "audit_digest", "probe_row_indices",
+        "prerequisite_chain_digest",
     ):
         if configs[0][name] != configs[1][name]:
             raise ValueError(f"run comparison changes controlled field: {name}")
@@ -2285,6 +2787,16 @@ def _final_report(args: argparse.Namespace) -> dict[str, object]:
             raise ValueError(f"{label} evidence must be successful")
     if {item["method"] for item in maximum} != {"full", "dora"}:
         raise ValueError("maximum manifests must contain separated full and DoRA methods")
+    prerequisite = _build_smoke_prerequisite_chain(smoke_loaded)
+    prerequisite_digest = prerequisite["prerequisite_chain_digest"]
+    if any(
+        item["prerequisite_chain_digest"] != prerequisite_digest
+        for item in maximum
+    ):
+        raise ValueError("maximum evidence does not descend from the smoke prerequisite")
+    _require_matching_maximum_controls(maximum)
+    for item in maximum:
+        _validate_prerequisite_controls(item["launch_config"], prerequisite)
     maximum_by_method = {item["method"]: item for item in maximum}
     for item in timed:
         selected = maximum_by_method[item.method]
@@ -2299,9 +2811,16 @@ def _final_report(args: argparse.Namespace) -> dict[str, object]:
         manifest = _load_timed_manifest(path.parent / "launch-manifest.json")
         if manifest["config_digest"] != item.config_digest:
             raise ValueError(f"timed evidence config digest mismatch: {path}")
+        if loaded[1]["run_config"] != manifest:
+            raise ValueError(f"timed evidence run config mismatch: {path}")
         selected = maximum_by_method[item.method]
         if loaded[1]["run_config"]["maximum_config_digest"] != selected["config_digest"]:
             raise ValueError(f"timed evidence maximum digest mismatch: {path}")
+        if (
+            loaded[1]["run_config"]["prerequisite_chain_digest"]
+            != prerequisite_digest
+        ):
+            raise ValueError(f"timed evidence prerequisite chain mismatch: {path}")
         if (
             loaded[1]["run_config"]["audit_digest"] != selected["audit_digest"]
             or loaded[1]["run_config"]["data_stat"] != selected["data_stat"]
@@ -2312,6 +2831,7 @@ def _final_report(args: argparse.Namespace) -> dict[str, object]:
         "schema_version": _SCHEMA_VERSION,
         "kind": "stage1-final-evidence-report",
         "paper_level_reproduction": False,
+        "prerequisite_chain_digest": prerequisite_digest,
         "smoke": {item.method: _evidence_to_dict(item) for item in smoke},
         "maximum": maximum_by_method,
         "timed": {item.method: _evidence_to_dict(item) for item in timed},
@@ -2378,6 +2898,7 @@ def _build_parser() -> argparse.ArgumentParser:
     probe_run.add_argument("--max-steps", type=int, required=True)
     probe_run.add_argument("--deepspeed-config", required=True)
     probe_run.add_argument("--probe-rows", required=True)
+    probe_run.add_argument("--prerequisite-chain", required=True)
 
     classify = subparsers.add_parser("classify-failure")
     classify.add_argument("--attempt", required=True)

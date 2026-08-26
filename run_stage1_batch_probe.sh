@@ -10,6 +10,7 @@ data_path=
 image_root=
 output_root=
 probe_rows=
+prerequisite_chain=${STAGE1_SMOKE_PREREQUISITE:-"$script_dir/outputs/stage1-smoke/prerequisite-chain.json"}
 start=8
 max_per_gpu=64
 fallback=
@@ -46,6 +47,7 @@ while (( $# )); do
         --image-root) require_value "$@"; image_root=$2; shift 2 ;;
         --output-root) require_value "$@"; output_root=$2; shift 2 ;;
         --probe-rows) require_value "$@"; probe_rows=$2; shift 2 ;;
+        --prerequisite-chain) require_value "$@"; prerequisite_chain=$2; shift 2 ;;
         --start) require_value "$@"; start=$2; shift 2 ;;
         --max-per-gpu) require_value "$@"; max_per_gpu=$2; shift 2 ;;
         --fallback) require_value "$@"; fallback=$2; shift 2 ;;
@@ -76,6 +78,7 @@ done
 [[ -f $data_path ]] || { printf 'error: data path is not a file: %s\n' "$data_path" >&2; exit 2; }
 [[ -d $image_root ]] || { printf 'error: image root is not a directory: %s\n' "$image_root" >&2; exit 2; }
 [[ -f $probe_rows ]] || { printf 'error: probe row audit is not a file: %s\n' "$probe_rows" >&2; exit 2; }
+[[ -f $prerequisite_chain ]] || { printf 'error: smoke prerequisite chain is not a file: %s\n' "$prerequisite_chain" >&2; exit 2; }
 for integer_name in start max_per_gpu gradient_accumulation seed dora_rank dora_alpha; do
     value=${!integer_name}
     if [[ ! $value =~ ^[0-9]+$ ]] || [[ $integer_name != seed && $value -lt 1 ]]; then
@@ -164,12 +167,14 @@ for micro_batch in "${candidates[@]}"; do
         --image-root "$image_root" --output-dir "$candidate_output" \
         --micro-batch "$micro_batch" --world-size 2 \
         --gradient-accumulation "$gradient_accumulation" --max-steps 3 \
-        --deepspeed-config "$deepspeed_config" --probe-rows "$probe_rows" >/dev/null
+        --deepspeed-config "$deepspeed_config" --probe-rows "$probe_rows" \
+        --prerequisite-chain "$prerequisite_chain" >/dev/null
 
     launch_command=(
         "$launcher"
         --method "$method"
         --model "$model"
+        --source-data-path "$data_path"
         --data-path "$probe_data"
         --image-root "$image_root"
         --output-dir "$candidate_output"

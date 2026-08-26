@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -74,6 +75,9 @@ def test_canonical_evidence_strings_reject_embedded_nul():
 
     with pytest.raises(ValueError, match="NUL"):
         evidence(git_commit="abc\0forged")
+
+    with pytest.raises(ValueError, match="NUL"):
+        config_digest({"safe\0forged": "value"})
 
 
 def test_exact_module_cli_runs_without_repository_pythonpath_override():
@@ -305,6 +309,27 @@ def _run_probe(tmp_path, *, fail_batches, extra=()):
     probe_payload = json.loads(probe_rows.read_text())
     probe_payload["audit_digest"] = config_digest(probe_payload)
     probe_rows.write_text(json.dumps(probe_payload), encoding="utf-8")
+    identity = {
+        "model": "model path;literal", "source_data_path": str(data_path.resolve()),
+        "data_stat": probe_payload["input_stat"], "image_root": str(image_root.resolve()),
+        "world_size": 2, "gradient_accumulation_steps": 2, "epochs": 3,
+        "learning_rate": 1e-5, "seed": 42,
+        "deepspeed_config": str((REPO_ROOT / "configs/config_stage3.json").resolve()),
+        "deepspeed_config_digest": hashlib.sha256(
+            (REPO_ROOT / "configs/config_stage3.json").read_bytes()
+        ).hexdigest(),
+        "attention_implementation": "flash_attention_2", "save_strategy": "no",
+        "audit_digest": probe_payload["audit_digest"], "probe_row_indices": [0],
+    }
+    prerequisite = {
+        "schema_version": 1, "kind": "stage1-smoke-prerequisite-chain",
+        "shared_identity": identity, "shared_identity_digest": config_digest(identity),
+        "producer_digests": {"full": "1" * 64, "dora": "2" * 64},
+        "resume_witness_digests": {"full": "3" * 64, "dora": "4" * 64},
+    }
+    prerequisite["prerequisite_chain_digest"] = config_digest(prerequisite)
+    prerequisite_path = tmp_path / "prerequisite-chain.json"
+    prerequisite_path.write_text(json.dumps(prerequisite))
     output_root = tmp_path / "probe outputs;literal"
     env = os.environ.copy()
     env.update(
@@ -331,6 +356,8 @@ def _run_probe(tmp_path, *, fail_batches, extra=()):
             output_root,
             "--probe-rows",
             probe_rows,
+            "--prerequisite-chain",
+            prerequisite_path,
             "--start",
             "8",
             "--max-per-gpu",
@@ -411,6 +438,134 @@ def test_attempt_seal_binds_top_level_fields_and_is_append_only(tmp_path):
         benchmark._record_probe_attempt(args)
 
 
+def test_attempt_rejects_data_argv_not_equal_to_materialized_audit_subset(tmp_path):
+    """Catches swapping the 64-row probe input for the full source JSONL."""
+    completed, _, output_root = _run_probe(tmp_path, fail_batches="8")
+    assert completed.returncode == 42
+    attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    payload = json.loads(attempt_path.read_text())
+    command = payload["command"]
+    command[command.index("--data-path") + 1] = payload["launch_config"]["data_path"]
+    payload["launch_config"]["command"] = command
+    payload["config_digest"] = config_digest(payload["launch_config"])
+    payload["attempt_digest"] = config_digest(
+        {key: value for key, value in payload.items() if key != "attempt_digest"}
+    )
+    attempt_path.write_text(json.dumps(payload))
+
+    import stage1.benchmark as benchmark
+    with pytest.raises(ValueError, match="materialized audited probe"):
+        benchmark._load_probe_attempt(attempt_path)
+
+
+def test_public_verified_loader_accepts_the_authoritative_producer_envelope(tmp_path):
+    """Catches public API and CLI consumers validating different formats."""
+    import stage1.benchmark as benchmark
+
+    data = tmp_path / "TRAIN.jsonl"
+    data.write_text("{}\n")
+    images = tmp_path / "images"
+    images.mkdir()
+    config = {
+        "schema_version": 1, "kind": "stage1-probe-run-manifest",
+        "method": "full", "tuning_config": None, "model": "model",
+        "source_data_path": str(data.resolve()), "data_path": str(data.resolve()),
+        "data_stat": benchmark._stat_payload(data), "image_root": str(images.resolve()),
+        "output_dir": str((tmp_path / "output").resolve()), "micro_batch": 8,
+        "world_size": 2, "gradient_accumulation_steps": 2,
+        "effective_global_batch": 32, "epochs": 3, "learning_rate": 1e-5,
+        "seed": 42, "max_steps": 3, "final_save": False,
+        "deepspeed_config": str((REPO_ROOT / "configs/config_stage3.json").resolve()),
+        "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2", "save_strategy": "no",
+        "audit_digest": "a" * 64, "probe_rows": str(tmp_path / "audit.json"),
+        "probe_row_indices": [7, 3], "maximum_config_digest": None,
+        "prerequisite_chain": str(tmp_path / "prerequisite-chain.json"),
+        "prerequisite_chain_digest": "f" * 64,
+    }
+    config["config_digest"] = config_digest(config)
+    config_path = tmp_path / "run-config.json"
+    config_path.write_text(json.dumps(config))
+    sealed_path = tmp_path / "producer-evidence.json"
+    benchmark.write_stage1_producer_evidence(
+        sealed_path,
+        run_config_path=config_path,
+        evidence=evidence(config_digest=config["config_digest"], checkpoint_bytes=0),
+    )
+
+    assert load_verified_evidence(sealed_path, config["config_digest"]) == evidence(
+        config_digest=config["config_digest"], checkpoint_bytes=0
+    )
+
+    forged = json.loads(sealed_path.read_text())
+    forged["benchmark_evidence"]["micro_batch"] = 16
+    forged["benchmark_evidence"]["effective_global_batch"] = 64
+    forged["producer_digest"] = config_digest(
+        {key: value for key, value in forged.items() if key != "producer_digest"}
+    )
+    forged_path = tmp_path / "forged-producer-evidence.json"
+    forged_path.write_text(json.dumps(forged))
+    with pytest.raises(ValueError, match="micro_batch"):
+        benchmark._load_producer_evidence(forged_path)
+
+
+def test_full_artifact_index_and_allowlisted_bytes_are_strict(tmp_path):
+    """Catches dangling shard indexes and logs counted as checkpoint bytes."""
+    import stage1.benchmark as benchmark
+
+    for name in ("config.json", "preprocessor_config.json", "tokenizer_config.json", "tokenizer.json"):
+        (tmp_path / name).write_text("{}")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"layer": "model-00001-of-00001.safetensors"}})
+    )
+    with pytest.raises(ValueError, match="shard"):
+        benchmark._build_artifact_manifest(tmp_path, method="full", final_save=True)
+
+    (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"shard")
+    indexed = benchmark._build_artifact_manifest(
+        tmp_path, method="full", final_save=True
+    )
+    assert indexed["weight_serialization"] == {
+        "kind": "indexed",
+        "index": "model.safetensors.index.json",
+        "shards": ["model-00001-of-00001.safetensors"],
+    }
+
+    (tmp_path / "model.safetensors.index.json").unlink()
+    (tmp_path / "model-00001-of-00001.safetensors").unlink()
+    (tmp_path / "model.safetensors").write_bytes(b"weight")
+    (tmp_path / "train.log").write_bytes(b"x" * 100)
+    manifest = benchmark._build_artifact_manifest(tmp_path, method="full", final_save=True)
+    assert "train.log" not in {item["name"] for item in manifest["files"]}
+    assert manifest["checkpoint_bytes"] == sum(
+        (tmp_path / name).stat().st_size
+        for name in ("config.json", "preprocessor_config.json", "tokenizer_config.json", "tokenizer.json", "model.safetensors")
+    )
+    assert manifest["weight_serialization"] == {
+        "kind": "standalone", "index": None, "shards": ["model.safetensors"]
+    }
+
+
+def test_dora_artifact_requires_positive_sidecars(tmp_path):
+    """Catches empty adapter/token/processor files presented as a final save."""
+    import stage1.benchmark as benchmark
+
+    for name in (
+        "adapter_config.json", "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors", "stage1_peft_metadata.json",
+        "preprocessor_config.json", "tokenizer_config.json", "tokenizer.json",
+    ):
+        (tmp_path / name).touch()
+    with pytest.raises(ValueError, match="positive"):
+        benchmark._build_artifact_manifest(tmp_path, method="dora", final_save=True)
+
+    for path in tmp_path.iterdir():
+        path.write_bytes(b"witness")
+    (tmp_path / "model.safetensors").write_bytes(b"forbidden-full-weight")
+    with pytest.raises(ValueError, match="full-model"):
+        benchmark._build_artifact_manifest(tmp_path, method="dora", final_save=True)
+
+
 def test_capacity_chain_rejects_duplicate_and_success_after_first_failure():
     """Catches re-search and a result selected from beyond the stopping point."""
     import stage1.benchmark as benchmark
@@ -418,10 +573,13 @@ def test_capacity_chain_rejects_duplicate_and_success_after_first_failure():
     immutable = {
         "method": "full", "world_size": 2, "gradient_accumulation_steps": 2,
         "learning_rate": 1e-5, "seed": 42, "model": "model",
-        "data_path": "/data", "data_stat": {"device": 1}, "image_root": "/images",
+        "data_path": "/data", "train_data_path": "/probe-data",
+        "data_stat": {"device": 1}, "image_root": "/images",
         "deepspeed_config": "/zero3.json", "deepspeed_config_digest": "d" * 64,
         "attention_implementation": "flash_attention_2", "probe_rows": "/audit",
         "probe_row_indices": [1], "audit_digest": "a" * 64, "tuning_config": None,
+        "prerequisite_chain": "/smoke/prerequisite-chain.json",
+        "prerequisite_chain_digest": "f" * 64,
     }
 
     def item(batch, exit_code, recorded):
@@ -464,13 +622,16 @@ def test_timed_validation_rejects_artifactless_and_plain_metric_evidence(tmp_pat
         "attention_implementation": "flash_attention_2", "save_strategy": "no",
         "audit_digest": "a" * 64, "probe_rows": "/audit",
         "probe_row_indices": [7, 3], "maximum_config_digest": "b" * 64,
+        "prerequisite_chain": "/smoke/prerequisite-chain.json",
+        "prerequisite_chain_digest": "f" * 64,
     }
     config["config_digest"] = config_digest(config)
     metrics = evidence(config_digest=config["config_digest"], checkpoint_bytes=0)
     artifact = {
         "schema_version": 1, "kind": "stage1-artifact-topology-witness",
         "method": "full", "artifact_kind": "none", "output_dir": str(tmp_path),
-        "final_save": True, "files": [], "checkpoint_bytes": 0,
+        "final_save": True, "weight_serialization": None,
+        "files": [], "checkpoint_bytes": 0,
     }
     artifact["artifact_manifest_digest"] = config_digest(artifact)
     seal = {
@@ -479,6 +640,8 @@ def test_timed_validation_rejects_artifactless_and_plain_metric_evidence(tmp_pat
         "benchmark_evidence": benchmark._evidence_to_dict(metrics),
         "artifact_manifest": artifact,
         "artifact_manifest_digest": artifact["artifact_manifest_digest"],
+        "smoke_resume_witness": None,
+        "smoke_resume_witness_digest": None,
     }
     seal["producer_digest"] = config_digest(seal)
     seal_path = tmp_path / "producer.json"
@@ -491,20 +654,81 @@ def test_compare_maxima_exposes_rank_local_ten_step_memory(monkeypatch):
     """Catches a maximum comparison that drops the required rank witnesses."""
     import stage1.benchmark as benchmark
 
+    controlled = {
+        "model": "model", "data_path": "/data",
+        "data_stat": {"device": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+        "image_root": "/images", "world_size": 2,
+        "gradient_accumulation_steps": 2, "learning_rate": 1e-5, "seed": 42,
+        "deepspeed_config": "/zero3.json", "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2", "probe_rows": "/audit",
+        "probe_row_indices": [7, 3], "audit_digest": "a" * 64,
+        "prerequisite_chain_digest": "f" * 64,
+    }
     maxima = {
         "full.json": {"method": "full", "selected_micro_batch": 8,
                       "effective_global_batch": 32, "long_smoke_steps": 10,
                       "first_failure": None, "rank_peak_allocated_bytes": [10, 11],
-                      "rank_peak_reserved_bytes": [12, 13], "config_digest": "a" * 64},
+                      "rank_peak_reserved_bytes": [12, 13], "config_digest": "a" * 64,
+                      "prerequisite_chain_digest": "f" * 64,
+                      "launch_config": dict(controlled)},
         "dora.json": {"method": "dora", "selected_micro_batch": 16,
                       "effective_global_batch": 64, "long_smoke_steps": 10,
                       "first_failure": None, "rank_peak_allocated_bytes": [20, 21],
-                      "rank_peak_reserved_bytes": [22, 23], "config_digest": "b" * 64},
+                      "rank_peak_reserved_bytes": [22, 23], "config_digest": "b" * 64,
+                      "prerequisite_chain_digest": "f" * 64,
+                      "launch_config": dict(controlled)},
     }
     monkeypatch.setattr(benchmark, "_load_maximum", lambda path: maxima[path.name])
     compared = benchmark._compare_maxima(["full.json", "dora.json"])
     assert compared["methods"]["full"]["rank_peak_allocated_bytes"] == [10, 11]
     assert compared["methods"]["dora"]["rank_peak_reserved_bytes"] == [22, 23]
+    assert compared["prerequisite_chain_digest"] == "f" * 64
+
+    maxima["dora.json"]["prerequisite_chain_digest"] = "e" * 64
+    with pytest.raises(ValueError, match="prerequisite"):
+        benchmark._compare_maxima(["full.json", "dora.json"])
+
+
+def test_smoke_pair_seals_resume_identity_and_rejects_control_mismatch(monkeypatch, tmp_path):
+    """Catches Task 16 accepting unrelated Task 15 smoke successes."""
+    import stage1.benchmark as benchmark
+
+    shared = {
+        "model": "Qwen/Qwen2.5-VL-3B-Instruct", "source_data_path": "/data/TRAIN.jsonl",
+        "data_stat": {"device": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+        "image_root": "/data", "world_size": 2, "gradient_accumulation_steps": 2,
+        "epochs": 3, "learning_rate": 1e-5, "seed": 42,
+        "deepspeed_config": "/repo/configs/config_stage3.json",
+        "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2", "save_strategy": "no",
+        "audit_digest": "a" * 64, "probe_row_indices": [7, 3],
+    }
+    resume = {
+        "initial_final_step": 3, "resume_initial_step": 3, "resume_final_step": 4,
+        "batch_size_observed": 2, "finite_loss": True,
+        "checkpoint_validated": True, "resume_artifact_digest": "e" * 64,
+    }
+    loaded = {}
+    for method in ("full", "dora"):
+        metrics = evidence(method=method, micro_batch=2, effective_global_batch=8)
+        loaded[f"{method}.json"] = (
+            metrics,
+            {
+                "producer_digest": ("1" if method == "full" else "2") * 64,
+                "run_config": {**shared, "kind": "stage1-smoke-run-manifest", "method": method},
+                "smoke_resume_witness": resume,
+                "smoke_resume_witness_digest": config_digest(resume),
+            },
+        )
+    monkeypatch.setattr(benchmark, "_load_producer_evidence", lambda path: loaded[path.name])
+    loaded["dora.json"][1]["run_config"]["model"] = "different-model"
+    with pytest.raises(ValueError, match="model"):
+        benchmark._require_evidence(["full.json", "dora.json"])
+
+    loaded["dora.json"][1]["run_config"]["model"] = shared["model"]
+    chain = benchmark._require_evidence(["full.json", "dora.json"])
+    assert chain["kind"] == "stage1-smoke-prerequisite-chain"
+    assert len(chain["prerequisite_chain_digest"]) == 64
 
 
 def test_probe_does_not_fallback_without_a_confirmed_initial_eight_oom(tmp_path):
@@ -545,6 +769,8 @@ def test_prepare_timed_run_restores_full_data_source_not_probe_subset(tmp_path, 
         "probe_rows": str(tmp_path / "high-cost.json"),
         "probe_row_indices": [1, 0],
         "audit_digest": "a" * 64,
+        "prerequisite_chain": str(tmp_path / "prerequisite-chain.json"),
+        "prerequisite_chain_digest": "f" * 64,
         "run_config_digest": "c" * 64,
         "command": [
             str(REPO_ROOT / "run_stage1_training.sh"),
@@ -572,6 +798,7 @@ def test_prepare_timed_run_restores_full_data_source_not_probe_subset(tmp_path, 
         "selected_attempt": "small-attempt.json",
         "first_failure": None,
         "launch_config": launch_config,
+        "prerequisite_chain_digest": "f" * 64,
     }
     maximum["config_digest"] = config_digest(maximum)
     output_dir = tmp_path / "timed full"
@@ -588,3 +815,46 @@ def test_prepare_timed_run_restores_full_data_source_not_probe_subset(tmp_path, 
     )
     assert manifest["data_path"] == str(original_data)
     assert manifest["data_path"] != str(probe_data)
+    assert manifest["prerequisite_chain"] == str(tmp_path / "prerequisite-chain.json")
+    assert manifest["prerequisite_chain_digest"] == "f" * 64
+
+
+def test_final_report_rejects_a_maximum_from_another_smoke_chain(tmp_path, monkeypatch):
+    """Catches Task 18 joining individually valid but unrelated evidence chains."""
+    import stage1.benchmark as benchmark
+
+    evidence_by_name = {
+        "smoke-full.json": (evidence(method="full", micro_batch=2,
+                                      effective_global_batch=8), {}),
+        "smoke-dora.json": (evidence(method="dora", micro_batch=2,
+                                      effective_global_batch=8), {}),
+        "timed-full.json": (evidence(method="full"), {}),
+        "timed-dora.json": (evidence(method="dora"), {}),
+    }
+    maxima = {
+        "maximum-full.json": {
+            "method": "full", "prerequisite_chain_digest": "f" * 64,
+        },
+        "maximum-dora.json": {
+            "method": "dora", "prerequisite_chain_digest": "e" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        benchmark, "_load_producer_evidence",
+        lambda path: evidence_by_name[path.name],
+    )
+    monkeypatch.setattr(benchmark, "_load_maximum", lambda path: maxima[path.name])
+    monkeypatch.setattr(
+        benchmark, "_build_smoke_prerequisite_chain",
+        lambda loaded: {"prerequisite_chain_digest": "f" * 64},
+    )
+
+    with pytest.raises(ValueError, match="smoke prerequisite"):
+        benchmark._final_report(
+            SimpleNamespace(
+                smoke_full="smoke-full.json", smoke_dora="smoke-dora.json",
+                maximum_full="maximum-full.json", maximum_dora="maximum-dora.json",
+                timed_full="timed-full.json", timed_dora="timed-dora.json",
+                output=str(tmp_path / "final.json"),
+            )
+        )

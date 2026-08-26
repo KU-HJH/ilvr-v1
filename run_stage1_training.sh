@@ -40,6 +40,7 @@ fi
 method=${STAGE1_METHOD:-}
 model=${STAGE1_MODEL:-}
 data_path=${STAGE1_DATA_PATH:-}
+source_data_path=${STAGE1_SOURCE_DATA_PATH:-}
 image_root=${STAGE1_IMAGE_ROOT:-}
 output_dir=${STAGE1_OUTPUT_DIR:-}
 micro_batch=${STAGE1_MICRO_BATCH:-8}
@@ -77,6 +78,7 @@ while (( $# )); do
         --method) require_value "$@"; method=$2; shift 2 ;;
         --model) require_value "$@"; model=$2; shift 2 ;;
         --data-path) require_value "$@"; data_path=$2; shift 2 ;;
+        --source-data-path) require_value "$@"; source_data_path=$2; shift 2 ;;
         --image-root) require_value "$@"; image_root=$2; shift 2 ;;
         --output-dir) require_value "$@"; output_dir=$2; shift 2 ;;
         --micro-batch) require_value "$@"; micro_batch=$2; shift 2 ;;
@@ -249,11 +251,12 @@ if [[ -n $max_steps ]]; then
     command+=(--max_steps "$max_steps")
 fi
 if [[ -n $benchmark_run_config || -n $benchmark_evidence_path ]]; then
-    if [[ -z $benchmark_run_config || -z $benchmark_evidence_path ]]; then
-        printf 'error: benchmark run config and producer evidence path are required together\n' >&2
+    if [[ -z $benchmark_run_config || -z $benchmark_evidence_path || -z $source_data_path ]]; then
+        printf 'error: benchmark run config, source data, and producer evidence path are required together\n' >&2
         exit 2
     fi
     command+=(
+        --benchmark_source_data_path "$source_data_path"
         --benchmark_run_config "$benchmark_run_config"
         --benchmark_evidence_path "$benchmark_evidence_path"
     )

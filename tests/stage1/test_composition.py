@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -135,6 +136,41 @@ def stage1_args(tmp_path, *extra, method="dora"):
             *extra,
         ]
     )
+
+
+def _write_benchmark_audit(tmp_path, args, indices=(7, 3)):
+    data = Path(args.data_path).resolve()
+    images = Path(args.image_root).resolve()
+    stat = data.stat()
+    payload = {
+        "schema_version": 1,
+        "kind": "stage1-high-cost-row-audit",
+        "data_path": str(data),
+        "image_root": str(images),
+        "requested_count": 64,
+        "row_count": len(indices),
+        "input_stat": {
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        },
+        "selected_rows": [
+            {
+                "source_row_index": index,
+                "token_estimate": 0,
+                "original_image_count": 0,
+                "helper_image_count": 0,
+                "latent_block_count": 0,
+                "example": {},
+            }
+            for index in indices
+        ],
+    }
+    payload["audit_digest"] = config_digest(payload)
+    path = tmp_path / "audit.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path, payload
 
 
 def _write_peft_resume_checkpoint(args, *, step=9):
@@ -724,11 +760,12 @@ def test_run_stage1_trains_once_and_only_final_saves_when_requested(
 
 
 def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     """Catches the real launcher/trainer path never publishing Task 17 input."""
     args = stage1_args(tmp_path, "--max_steps", "3", "--no_final_save", method="full")
     evidence_path = tmp_path / "producer evidence.json"
+    audit_path, audit = _write_benchmark_audit(tmp_path, args)
     config = {
         "schema_version": 1,
         "kind": "stage1-probe-run-manifest",
@@ -755,19 +792,24 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
         "max_steps": 3,
         "final_save": False,
         "deepspeed_config": str(Path(args.deepspeed_config).resolve()),
-        "deepspeed_config_digest": "d" * 64,
+        "deepspeed_config_digest": hashlib.sha256(
+            Path(args.deepspeed_config).read_bytes()
+        ).hexdigest(),
         "attention_implementation": "flash_attention_2",
         "save_strategy": "no",
-        "audit_digest": "a" * 64,
-        "probe_rows": str(tmp_path / "audit.json"),
+        "audit_digest": audit["audit_digest"],
+        "probe_rows": str(audit_path),
         "probe_row_indices": [7, 3],
         "maximum_config_digest": None,
+        "prerequisite_chain": str(tmp_path / "prerequisite-chain.json"),
+        "prerequisite_chain_digest": "f" * 64,
     }
     config["config_digest"] = config_digest(config)
     config_path = tmp_path / "run config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     args.benchmark_run_config = str(config_path)
     args.benchmark_evidence_path = str(evidence_path)
+    args.benchmark_source_data_path = str(Path(args.data_path).resolve())
 
     class EvidenceTrainer(RecordingTrainer):
         def __init__(self):
@@ -803,11 +845,37 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
         "dependency_versions": {"torch": "test"},
     }
 
+    import stage1.benchmark as benchmark
+    reads = []
+    original_read = benchmark._read_json_once
+    artifact_builds = 0
+    original_artifact_builder = benchmark._build_artifact_manifest
+
+    def counted_read(path):
+        reads.append(Path(path).resolve())
+        return original_read(path)
+
+    monkeypatch.setattr(benchmark, "_read_json_once", counted_read)
+
+    def counted_artifact_builder(*args, **kwargs):
+        nonlocal artifact_builds
+        artifact_builds += 1
+        return original_artifact_builder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        benchmark, "_build_artifact_manifest", counted_artifact_builder
+    )
+
+    def replace_manifest_after_preflight(selected):
+        config_path.write_text('{"replaced": true}', encoding="utf-8")
+        return bundle
+
     run_stage1(
         args,
-        component_builder=lambda selected: bundle,
+        component_builder=replace_manifest_after_preflight,
         monotonic=iter((1.0, 2.0, 3.0, 5.0, 6.0)).__next__,
         observability_provider=observed,
+        rank_config_digest_provider=lambda digest, world_size: (digest, digest),
     )
 
     sealed = json.loads(evidence_path.read_text())
@@ -815,4 +883,79 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
     assert sealed["benchmark_evidence"]["optimizer_steps"] == 3
     assert sealed["benchmark_evidence"]["samples_seen"] == 96
     assert sealed["artifact_manifest"]["artifact_kind"] == "none"
+    assert sealed["run_config"]["config_digest"] == config["config_digest"]
+    assert reads.count(config_path.resolve()) == 1
+    assert reads.count(audit_path.resolve()) == 1
+    assert artifact_builds == 1
     assert not list(tmp_path.glob(".producer evidence.json.*.tmp"))
+
+
+def test_run_stage1_rejects_runtime_or_rank_config_mismatch_before_build(tmp_path):
+    """Catches model construction before exact/rank-consistent config preflight."""
+    args = stage1_args(tmp_path, "--max_steps", "3", "--no_final_save", method="full")
+    audit_path, audit = _write_benchmark_audit(tmp_path, args)
+    config = {
+        "schema_version": 1, "kind": "stage1-probe-run-manifest",
+        "method": "full", "tuning_config": None, "model": args.model,
+        "source_data_path": str(Path(args.data_path).resolve()),
+        "data_path": str(Path(args.data_path).resolve()),
+        "data_stat": {
+            "device": Path(args.data_path).stat().st_dev,
+            "inode": Path(args.data_path).stat().st_ino,
+            "size": Path(args.data_path).stat().st_size,
+            "mtime_ns": Path(args.data_path).stat().st_mtime_ns,
+        },
+        "image_root": str(Path(args.image_root).resolve()),
+        "output_dir": str(Path(args.save_model_path).resolve()),
+        "micro_batch": 8, "world_size": 2, "gradient_accumulation_steps": 2,
+        "effective_global_batch": 32, "epochs": 3, "learning_rate": 1e-5,
+        "seed": 42, "max_steps": 3, "final_save": False,
+        "deepspeed_config": str(Path(args.deepspeed_config).resolve()),
+        "deepspeed_config_digest": hashlib.sha256(Path(args.deepspeed_config).read_bytes()).hexdigest(),
+        "attention_implementation": "flash_attention_2", "save_strategy": "no",
+        "audit_digest": audit["audit_digest"], "probe_rows": str(audit_path),
+        "probe_row_indices": [7, 3], "maximum_config_digest": None,
+        "prerequisite_chain": str(tmp_path / "prerequisite-chain.json"),
+        "prerequisite_chain_digest": "f" * 64,
+    }
+    config["config_digest"] = config_digest(config)
+    config_path = tmp_path / "run-config.json"
+    config_path.write_text(json.dumps(config))
+    args.benchmark_run_config = str(config_path)
+    args.benchmark_evidence_path = str(tmp_path / "evidence.json")
+    args.benchmark_source_data_path = config["source_data_path"]
+    builds = 0
+
+    def builder(selected):
+        nonlocal builds
+        builds += 1
+        raise AssertionError("builder must not run")
+
+    args.per_device_train_batch_size = 16
+    with pytest.raises(ValueError, match="micro_batch"):
+        run_stage1(
+            args, component_builder=builder,
+            rank_config_digest_provider=lambda digest, world_size: (digest, digest),
+        )
+    assert builds == 0
+
+    args.per_device_train_batch_size = 8
+    with pytest.raises(ValueError, match="rank.*digest"):
+        run_stage1(
+            args, component_builder=builder,
+            rank_config_digest_provider=lambda digest, world_size: (digest, "f" * 64),
+        )
+    assert builds == 0
+
+    forged = dict(config)
+    forged["audit_digest"] = "e" * 64
+    forged["config_digest"] = config_digest(
+        {key: value for key, value in forged.items() if key != "config_digest"}
+    )
+    config_path.write_text(json.dumps(forged))
+    with pytest.raises(ValueError, match="audit rows"):
+        run_stage1(
+            args, component_builder=builder,
+            rank_config_digest_provider=lambda digest, world_size: (digest, digest),
+        )
+    assert builds == 0

@@ -195,6 +195,8 @@ def test_timed_manifest_is_loaded_without_shell_evaluating_paths(tmp_path):
         "probe_rows": "/missing/audit.json",
         "probe_row_indices": [7, 3],
         "maximum_config_digest": "b" * 64,
+        "prerequisite_chain": "/smoke/prerequisite-chain.json",
+        "prerequisite_chain_digest": "f" * 64,
     }
     manifest["config_digest"] = config_digest(manifest)
     manifest_path = tmp_path / "launch manifest;literal.json"

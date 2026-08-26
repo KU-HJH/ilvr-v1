@@ -540,6 +540,7 @@ def run_stage1(
     component_builder: Callable = build_stage1_training_components,
     monotonic: Callable[[], float] = time.monotonic,
     observability_provider: Callable | None = None,
+    rank_config_digest_provider: Callable | None = None,
 ) -> None:
     """Train once and, when requested, perform one separately timed final save."""
 
@@ -552,6 +553,28 @@ def run_stage1(
         and getattr(args, "benchmark_evidence_path", None)
     ):
         raise ValueError("benchmark run config and evidence path are required together")
+    run_config_witness = None
+    if producing:
+        from stage1.benchmark import (
+            load_stage1_run_config_witness,
+            validate_stage1_runtime_args,
+        )
+
+        run_config_witness = load_stage1_run_config_witness(
+            Path(args.benchmark_run_config)
+        )
+        digest_provider = (
+            rank_config_digest_provider or _default_rank_config_digests
+        )
+        rank_digests = tuple(
+            digest_provider(run_config_witness.config_digest, 2)
+        )
+        if (
+            len(rank_digests) != 2
+            or any(item != run_config_witness.config_digest for item in rank_digests)
+        ):
+            raise ValueError("Stage 1 rank config digest collective mismatch")
+        config = validate_stage1_runtime_args(run_config_witness, args)
     total_start = monotonic() if producing else None
     components = component_builder(args)
     model_load_seconds = monotonic() - total_start if producing else 0.0
@@ -582,11 +605,11 @@ def run_stage1(
     from stage1.benchmark import (
         Stage1BenchmarkEvidence,
         _build_artifact_manifest,
-        _load_producer_run_config,
         write_stage1_producer_evidence,
     )
 
-    config = _load_producer_run_config(Path(args.benchmark_run_config))
+    assert run_config_witness is not None
+    config = run_config_witness.payload()
     if str(Path(args.save_model_path).resolve()) != config["output_dir"]:
         raise ValueError("producer output path does not match sealed run config")
     if bool(args.final_save) is not config["final_save"]:
@@ -648,9 +671,22 @@ def run_stage1(
     )
     write_stage1_producer_evidence(
         Path(args.benchmark_evidence_path),
-        run_config_path=Path(args.benchmark_run_config),
+        run_config_witness=run_config_witness,
         evidence=evidence,
+        artifact_manifest=artifact,
     )
+
+
+def _default_rank_config_digests(digest: str, world_size: int) -> tuple[str, ...]:
+    if not torch.distributed.is_initialized():
+        from accelerate import PartialState
+
+        state = PartialState()
+        if state.num_processes != world_size:
+            raise ValueError("sealed world size does not match Accelerate rank count")
+    gathered: list[object] = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, digest)
+    return tuple(str(item) for item in gathered)
 
 
 def _default_stage1_observability(args) -> dict[str, object]:
