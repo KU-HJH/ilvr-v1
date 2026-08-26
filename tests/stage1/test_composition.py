@@ -2,14 +2,17 @@ from dataclasses import replace
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import peft
 import pytest
 import torch
+from accelerate.state import AcceleratorState, GradientState, PartialState
 from torch import nn
 from transformers import Qwen2_5_VLConfig
+from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from peft_common import capture_qwen2_5_vl_architecture
 from stage1.checkpointing import (
@@ -36,6 +39,24 @@ from stage1.benchmark import config_digest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _clear_training_process_state() -> None:
+    os.environ.pop("ACCELERATE_USE_DEEPSPEED", None)
+    unset_hf_deepspeed_config()
+    AcceleratorState._reset_state(reset_partial_state=True)
+    PartialState._reset_state()
+    GradientState._reset_state()
+
+
+@pytest.fixture(autouse=True)
+def isolate_deepspeed_training_argument_state():
+    """Own cleanup for this module's DeepSpeed-configured SFTConfig fixtures."""
+    _clear_training_process_state()
+    try:
+        yield
+    finally:
+        _clear_training_process_state()
 
 
 class RecordingTokenizer:

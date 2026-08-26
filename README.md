@@ -131,64 +131,58 @@ bash run_training.sh
 
 ### Stage 1 full and DoRA training
 
-`run_stage1_training.sh` is the validated launcher for the Qwen2.5-VL-3B
-Stage 1 full/DoRA comparison. On this host the complete CoMT inputs are:
+The Qwen2.5-VL-3B full/DoRA comparison is a sealed four-stage workflow. Run
+the commands below in order; do not launch a three-epoch run with a batch size
+copied by hand. On this host the complete CoMT inputs are:
 
 ```text
 /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl
 /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data
 ```
 
-After separately validating the per-GPU micro-batch for each method, launch
-the full run on both GPUs as follows (replace `FULL_BATCH` with the sealed full
-maximum):
+First create or reuse the Task 15 two-rank, `B=2`, step-3-to-step-4
+save/resume witnesses. The checks read only the small evidence envelopes:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
-  --method full \
-  --model Qwen/Qwen2.5-VL-3B-Instruct \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
-  --output-dir outputs/stage1-timed/full-3epoch \
-  --log-file outputs/stage1-timed/full-3epoch/train.log \
-  --micro-batch FULL_BATCH \
-  --epochs 3 \
-  --learning-rate 1e-5 \
-  --gradient-accumulation 2 \
-  --seed 42 \
-  --deepspeed-config configs/config_stage3.json \
-  --attention-implementation flash_attention_2 \
-  --save-strategy no \
-  --final-save
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark check-evidence \
+  --evidence-dir outputs/stage1-smoke/full \
+  --method full --micro-batch 2 --world-size 2
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark check-evidence \
+  --evidence-dir outputs/stage1-smoke/dora \
+  --method dora --micro-batch 2 --world-size 2
 ```
 
-DoRA uses an independently validated `DORA_BATCH` and the launcher's fixed
-DoRA contract (`r=32`, `alpha=64`, `dropout=0.05`, and all seven decoder
-projection suffixes):
+Run only a case whose check printed `missing`; reuse `reusable-success`:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
-  --method dora \
-  --model Qwen/Qwen2.5-VL-3B-Instruct \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
-  --output-dir outputs/stage1-timed/dora-3epoch \
-  --log-file outputs/stage1-timed/dora-3epoch/train.log \
-  --micro-batch DORA_BATCH \
-  --epochs 3 \
-  --learning-rate 1e-5 \
-  --gradient-accumulation 2 \
-  --seed 42 \
-  --deepspeed-config configs/config_stage3.json \
-  --attention-implementation flash_attention_2 \
-  --save-strategy no \
-  --final-save
+CUDA_VISIBLE_DEVICES=0,1 ILVR_REAL_GPU_TESTS=1 ILVR_DISTRIBUTED_METHOD=full \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage1" \
+./venv/ilvr-venv/bin/pytest \
+  tests/stage1/test_distributed_smoke.py::test_two_rank_zero3_b2_save_resume_witness \
+  -k full -q -s
+
+CUDA_VISIBLE_DEVICES=0,1 ILVR_REAL_GPU_TESTS=1 ILVR_DISTRIBUTED_METHOD=dora \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage1" \
+./venv/ilvr-venv/bin/pytest \
+  tests/stage1/test_distributed_smoke.py::test_two_rank_zero3_b2_save_resume_witness \
+  -k dora -q -s
+
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark summarize \
+  outputs/stage1-smoke/full/evidence.json \
+  outputs/stage1-smoke/dora/evidence.json
 ```
 
-The methods must be probed independently. First create/reuse the high-cost-row
-audit, then invoke the probe once per method starting at 8:
+After both smoke witnesses succeed, seal their common prerequisite chain and
+then create or reuse the Task 16 high-cost-row audit. `require-evidence` writes
+`outputs/stage1-smoke/prerequisite-chain.json`:
 
 ```bash
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark require-evidence \
+  outputs/stage1-smoke/full/evidence.json \
+  outputs/stage1-smoke/dora/evidence.json
+
 ./venv/ilvr-venv/bin/python -m src.stage1.benchmark audit \
   --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
   --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
@@ -200,6 +194,7 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
   --output-root outputs/stage1-probes/full \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
+  --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
   --start 8 --gradient-accumulation 2 --learning-rate 1e-5 --seed 42
 
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
@@ -208,19 +203,78 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
   --output-root outputs/stage1-probes/dora \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
-  --start 8 --gradient-accumulation 2 --learning-rate 1e-5 --seed 42
+  --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
+  --start 8 --gradient-accumulation 2 --learning-rate 1e-5 --seed 42 \
+  --dora-rank 32 --dora-alpha 64 --dora-dropout 0.05
 ```
 
-The search stops at its first failure. Batch 8 failure must be classified
-before explicitly trying 4, then 2, then 1; the launcher never silently
-reduces a batch. For every run:
+Each primary probe stops at its first failure and prints the exact
+`attempt=...` directory. Diagnose that attempt before recording the only
+accepted failure class (set each variable to the literal path printed by its
+launcher):
+
+```bash
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark classify-failure \
+  --attempt "$FAILED_FULL_ATTEMPT" --classification capacity_oom
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark classify-failure \
+  --attempt "$FAILED_DORA_ATTEMPT" --classification capacity_oom
+```
+
+If the initial batch 8 fails, classification must precede an explicit
+fallback. Run 4, then—only after another recorded `capacity_oom`—2, then 1.
+The full fallback command is:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
+  --method full --model Qwen/Qwen2.5-VL-3B-Instruct \
+  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --output-root outputs/stage1-probes/full \
+  --probe-rows outputs/stage1-probes/high-cost-rows.json \
+  --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
+  --start 4 --descending \
+  --gradient-accumulation 2 --learning-rate 1e-5 --seed 42
+```
+
+The DoRA fallback uses its independent output and fixed topology:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
+  --method dora --model Qwen/Qwen2.5-VL-3B-Instruct \
+  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --output-root outputs/stage1-probes/dora \
+  --probe-rows outputs/stage1-probes/high-cost-rows.json \
+  --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
+  --start 4 --descending \
+  --gradient-accumulation 2 --learning-rate 1e-5 --seed 42 \
+  --dora-rank 32 --dora-alpha 64 --dora-dropout 0.05
+```
+
+For later fallbacks change `--start 4` to `--start 2`, then `--start 1`.
+The launcher verifies the already sealed attempt chain and never lowers a
+batch automatically. For every run:
 
 ```text
 effective global batch = world size × per-GPU micro-batch × accumulation
 ```
 
-The official three-epoch launch consumes those sealed maxima, so no batch
-placeholder is resolved by hand:
+Seal the preceding successful candidate with a fresh ten-step smoke, then
+compare the two small maximum manifests:
+
+```bash
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark validate-maximum \
+  --probe-dir outputs/stage1-probes/full --long-smoke-steps 10
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark validate-maximum \
+  --probe-dir outputs/stage1-probes/dora --long-smoke-steps 10
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark compare-maxima \
+  outputs/stage1-probes/full/maximum.json \
+  outputs/stage1-probes/dora/maximum.json
+```
+
+Task 17 consumes those sealed maxima. `prepare-timed-run` resolves the exact
+batch and writes an immutable manifest; the timed launcher accepts only that
+manifest, so no batch placeholder is resolved by hand:
 
 ```bash
 ./venv/ilvr-venv/bin/python -m src.stage1.benchmark prepare-timed-run \
@@ -241,6 +295,11 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
   --manifest outputs/stage1-timed/dora-3epoch/launch-manifest.json
 ./venv/ilvr-venv/bin/python -m src.stage1.benchmark validate-timed-run \
   --run-dir outputs/stage1-timed/dora-3epoch
+
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark compare-runs \
+  outputs/stage1-timed/full-3epoch/evidence.json \
+  outputs/stage1-timed/dora-3epoch/evidence.json \
+  --output outputs/stage1-timed/comparison.json
 ```
 
 If `prepare-timed-run` or the evidence check reports a reusable success, skip
@@ -254,19 +313,21 @@ processor files. A DoRA final artifact contains
 processor files, but no merged full-model weights. Numbered checkpoints add
 Trainer optimizer, scheduler, RNG, and global-step state.
 
-Resume an interrupted Stage 1 run by naming its exact numbered checkpoint:
+Resume an interrupted, separately checkpointed Stage 1 run by repeating its
+configuration and naming the exact numbered checkpoint. This `B=2` example
+uses a namespace distinct from smoke, probe, and timed evidence:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
   --method dora --model Qwen/Qwen2.5-VL-3B-Instruct \
   --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
   --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
-  --output-dir /path/to/stage1-dora-output \
-  --resume /path/to/stage1-dora-output/checkpoint-100 \
-  --micro-batch DORA_BATCH --epochs 3 --learning-rate 1e-5 \
+  --output-dir outputs/stage1-resume-example/dora \
+  --resume outputs/stage1-resume-example/dora/checkpoint-100 \
+  --micro-batch 2 --epochs 3 --learning-rate 1e-5 \
   --gradient-accumulation 2 --seed 42 \
   --deepspeed-config configs/config_stage3.json \
-  --attention-implementation flash_attention_2 --save-strategy no --final-save
+  --attention-implementation flash_attention_2 --save-strategy steps --final-save
 ```
 
 That restores Stage 1 optimizer/scheduler/global-step state. A fresh Stage 2
@@ -303,6 +364,23 @@ outputs/stage1-probes/{full,dora}/maximum.json
 outputs/stage1-timed/{full-3epoch,dora-3epoch}/evidence.json
 outputs/stage1-timed/comparison.json
 outputs/stage1-timed/final-report.json
+```
+
+The `stage1-smoke`, `stage1-probes`, and `stage1-timed` trees have distinct
+owners and must never be reused as one another's output directory.
+
+Task 18 validates and combines those six sealed inputs without rerunning a GPU
+job or traversing checkpoint trees:
+
+```bash
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark final-report \
+  --smoke-full outputs/stage1-smoke/full/evidence.json \
+  --smoke-dora outputs/stage1-smoke/dora/evidence.json \
+  --maximum-full outputs/stage1-probes/full/maximum.json \
+  --maximum-dora outputs/stage1-probes/dora/maximum.json \
+  --timed-full outputs/stage1-timed/full-3epoch/evidence.json \
+  --timed-dora outputs/stage1-timed/dora-3epoch/evidence.json \
+  --output outputs/stage1-timed/final-report.json
 ```
 
 Before any GPU smoke, probe, timed run, or report generation, load these small

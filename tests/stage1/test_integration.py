@@ -3,16 +3,18 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-from accelerate.state import AcceleratorState, GradientState
+from accelerate.state import AcceleratorState, GradientState, PartialState
 from safetensors.torch import load_file
 from torch import nn
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 from transformers import TrainerCallback, TrainingArguments
+import transformers.integrations.deepspeed as transformers_deepspeed
 from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from peft_common import resolve_qwen2_5_vl_model
@@ -26,7 +28,7 @@ from stage1.composition import (
     LATENT_TOKEN_STRINGS,
     build_stage1_training_components,
 )
-from stage1.targets import Stage1TeacherTargets
+from stage1.targets import Stage1TeacherTargetBuilder
 from stage1.token_rows import find_sparse_output_token_rows
 from stage1.trainer import CustomTrainerStage1
 from stage1.types import (
@@ -45,16 +47,21 @@ from tests.stage1.test_checkpointing import (
 
 
 @pytest.fixture(autouse=True)
-def isolated_accelerate_state(monkeypatch):
-    """Keep CPU lifecycle tests independent of distributed process globals."""
-    monkeypatch.delenv("ACCELERATE_USE_DEEPSPEED", raising=False)
-    unset_hf_deepspeed_config()
-    AcceleratorState._reset_state(reset_partial_state=True)
-    GradientState._reset_state()
-    yield
-    unset_hf_deepspeed_config()
-    AcceleratorState._reset_state(reset_partial_state=True)
-    GradientState._reset_state()
+def release_accelerate_state_after_lifecycle_test():
+    """Release state owned here without hiding pollution from earlier tests."""
+    assert "ACCELERATE_USE_DEEPSPEED" not in os.environ
+    assert not AcceleratorState._shared_state
+    assert not PartialState._shared_state
+    assert not GradientState._shared_state
+    assert transformers_deepspeed._hf_deepspeed_config_weak_ref is None
+    try:
+        yield
+    finally:
+        os.environ.pop("ACCELERATE_USE_DEEPSPEED", None)
+        unset_hf_deepspeed_config()
+        AcceleratorState._reset_state(reset_partial_state=True)
+        PartialState._reset_state()
+        GradientState._reset_state()
 
 
 class TinyIntegrationTokenizer:
@@ -96,6 +103,17 @@ class TinyIntegrationTokenizer:
                 return token
         return self.unk_token
 
+    def __call__(self, text, *, return_tensors):
+        assert return_tensors == "pt"
+        marker_ids = {
+            "<|im_start|>assistant": 1,
+            "<|im_start|>assistant\n": 1,
+            "<|vision_start|>": 81,
+            "<|vision_end|>": 82,
+        }
+        token_id = marker_ids.get(text, self.convert_tokens_to_ids(text))
+        return {"input_ids": torch.tensor([[token_id]], dtype=torch.long)}
+
     def save_pretrained(self, directory):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
@@ -120,6 +138,9 @@ class TinyIntegrationProcessor:
     def __init__(self, tokenizer=None):
         self.tokenizer = tokenizer or TinyIntegrationTokenizer()
 
+    def __call__(self, text, *, return_tensors):
+        return self.tokenizer(text, return_tensors=return_tensors)
+
     def save_pretrained(self, directory):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
@@ -137,11 +158,16 @@ class TinyIntegrationProcessor:
 class CountingFrozenVisual(nn.Module):
     """Cheap visual boundary: one call and one embedding per image token."""
 
+    spatial_merge_size = 1
+
     def __init__(self, hidden_size=8):
         super().__init__()
         self.hidden_size = hidden_size
         self.register_buffer("anchor", torch.zeros(()))
         self.calls = 0
+        self.original_calls = 0
+        self.helper_calls = 0
+        self.original_batch_sizes = []
 
     @property
     def dtype(self):
@@ -149,44 +175,18 @@ class CountingFrozenVisual(nn.Module):
 
     def forward(self, pixel_values, *, grid_thw):
         self.calls += 1
+        tags = pixel_values[:, 0]
+        if bool(torch.all(tags == 0).item()):
+            self.original_calls += 1
+            self.original_batch_sizes.append(int(grid_thw.shape[0]))
+        elif bool(torch.all(tags == 1).item()):
+            self.helper_calls += 1
+        else:
+            raise AssertionError("tiny visual inputs must be all original or all helper")
         token_count = int(grid_thw.prod(dim=-1).sum().item())
-        return torch.zeros(
-            (token_count, self.hidden_size),
-            device=pixel_values.device,
-            dtype=pixel_values.dtype,
-        )
-
-
-class TinyLifecycleTargetBuilder:
-    def __init__(self):
-        self.helper_visual_calls = 0
-        self.batch_sizes = []
-
-    def build(self, teacher, inputs, metadata):
-        del teacher
-        self.batch_sizes.append(metadata.batch_size)
-        self.helper_visual_calls += 1
-        helper_pixels = inputs.pop("pixel_values_latent")
-        inputs.pop("image_grid_thw_latent")
-        with torch.no_grad():
-            _ = helper_pixels.float().sum()
-
-        mask = torch.zeros_like(inputs["input_ids"], dtype=torch.bool)
-        for row, sample in enumerate(metadata.samples):
-            for span in sample.latent_spans:
-                mask[row, list(span.latent_positions)] = True
-        values = torch.arange(
-            1,
-            int(mask.sum().item()) * 8 + 1,
-            device=inputs["input_ids"].device,
-            dtype=torch.float32,
-        ).reshape(-1, 8) / 100.0
-        return Stage1TeacherTargets(
-            latent_values=values,
-            latent_mask=mask,
-            selected_counts=tuple((2,) for _ in metadata.samples),
-            diagnostics={"latent_count": torch.tensor(values.shape[0])},
-        )
+        if token_count != pixel_values.shape[0]:
+            raise AssertionError("tiny visual rows must match the declared grid")
+        return pixel_values[:, : self.hidden_size]
 
 
 class TinyLifecycleCollator:
@@ -218,7 +218,13 @@ class TinyLifecycleCollator:
             "input_ids": input_ids,
             "attention_mask": torch.ones_like(input_ids),
             "labels": input_ids.clone(),
-            "pixel_values": torch.ones((batch_size * 4, 8)),
+            "pixel_values": torch.cat(
+                (
+                    torch.zeros((batch_size * 4, 1)),
+                    torch.ones((batch_size * 4, 7)),
+                ),
+                dim=1,
+            ),
             "image_grid_thw": torch.tensor([[1, 2, 2]] * batch_size),
             "pixel_values_latent": torch.ones((batch_size, 8)),
             "image_grid_thw_latent": torch.ones((batch_size, 3), dtype=torch.long),
@@ -282,7 +288,7 @@ def _tiny_model(config):
     return model
 
 
-def _tiny_dependencies(target_builders):
+def _tiny_dependencies():
     def load_processor(source, **kwargs):
         del kwargs
         source = Path(source)
@@ -311,14 +317,6 @@ def _tiny_dependencies(target_builders):
         assert latent_size == 2
         return TinyLifecycleCollator(token_ids)
 
-    def trainer_factory(**kwargs):
-        target_builder = TinyLifecycleTargetBuilder()
-        target_builders.append(target_builder)
-        return CustomTrainerStage1(
-            **kwargs,
-            target_builder=target_builder,
-        )
-
     return replace(
         DEFAULT_STAGE1_DEPENDENCIES,
         load_processor=load_processor,
@@ -326,7 +324,6 @@ def _tiny_dependencies(target_builders):
         load_model=load_model,
         prepare_dataset=lambda data_path, image_root: list(range(8)),
         collator_factory=collator_factory,
-        trainer_factory=trainer_factory,
     )
 
 
@@ -386,7 +383,6 @@ def tiny_stage1_run(
     output_dir,
     legacy_lora=False,
 ):
-    target_builders = []
     args = _stage1_args(
         tmp_path,
         method=method,
@@ -398,27 +394,29 @@ def tiny_stage1_run(
         legacy_lora=legacy_lora,
     )
     components = build_stage1_training_components(
-        args, dependencies=_tiny_dependencies(target_builders)
+        args, dependencies=_tiny_dependencies()
     )
     assert type(components.trainer) is CustomTrainerStage1
+    assert type(components.trainer.target_builder) is Stage1TeacherTargetBuilder
     components.trainer.args.save_total_limit = 2
     result = components.trainer.train()
-    builder = target_builders[0]
     visual = resolve_qwen2_5_vl_model(components.model).visual
+    teacher_visual = resolve_qwen2_5_vl_model(
+        components.trainer.ema_teacher.model
+    ).visual
     checkpoint = Path(output_dir) / "checkpoint-1"
     return TinyStage1Run(
         components=components,
         checkpoint_1=checkpoint,
-        student_batch_sizes=list(builder.batch_sizes),
-        original_visual_calls=visual.calls,
-        helper_visual_calls=builder.helper_visual_calls,
-        micro_batches=len(builder.batch_sizes),
+        student_batch_sizes=list(visual.original_batch_sizes),
+        original_visual_calls=visual.original_calls,
+        helper_visual_calls=teacher_visual.helper_calls,
+        micro_batches=visual.original_calls,
         losses=[float(result.metrics["train_loss"])],
     )
 
 
 def tiny_stage1_resume(tmp_path, run, *, method, max_steps):
-    target_builders = []
     args = _stage1_args(
         tmp_path,
         method=method,
@@ -430,7 +428,7 @@ def tiny_stage1_resume(tmp_path, run, *, method, max_steps):
         resume=run.checkpoint_1,
     )
     components = build_stage1_training_components(
-        args, dependencies=_tiny_dependencies(target_builders)
+        args, dependencies=_tiny_dependencies()
     )
     witness = ResumeStateWitness()
     components.trainer.add_callback(witness)
@@ -538,7 +536,7 @@ def test_legacy_stage1_b1_loss_fixture_remains_finite(tmp_path):
     )
 
     assert run.student_batch_sizes == [1]
-    assert run.losses == pytest.approx([5.19940710067749], rel=0, abs=1e-6)
+    assert run.losses == pytest.approx([5.593050479888916], rel=0, abs=1e-6)
 
 
 def test_legacy_use_lora_one_step_saves_adapter_checkpoint(tmp_path):
