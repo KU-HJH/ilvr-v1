@@ -35,6 +35,7 @@ from stage1.checkpointing import (
     read_stage1_peft_metadata_snapshot,
 )
 from .peft import Stage2TuningConfig, resolve_stage2_target_module_names
+from transformers.utils.peft_utils import find_adapter_config_file
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
     validate_stage2_config,
@@ -691,6 +692,34 @@ LATENT_CONFIG_FIELDS = {
     "end_token_id": ("latent_end_token_id", "latent_end_id"),
 }
 
+_PEFT_CONFIG_METADATA_FIELDS = frozenset(
+    {
+        "task_type",
+        "auto_mapping",
+        "base_model_name_or_path",
+        "revision",
+        "inference_mode",
+    }
+)
+
+
+def _validate_stage2_sparse_original_base_model(base_model) -> None:
+    """Reject every supported in-memory adapter marker before base mutation."""
+
+    candidate = getattr(base_model, "module", base_model)
+    markers = []
+    if isinstance(candidate, PeftModel):
+        markers.append("PeftModel")
+    if getattr(candidate, "peft_config", None):
+        markers.append("peft_config")
+    if getattr(candidate, "_hf_peft_config_loaded", False):
+        markers.append("_hf_peft_config_loaded")
+    if markers:
+        raise ValueError(
+            "sparse Stage 2 resume requires an adapter-free original base; "
+            f"adapter-bearing markers={sorted(markers)}"
+        )
+
 
 def prepare_stage2_sparse_token_base(
     base_model,
@@ -701,6 +730,7 @@ def prepare_stage2_sparse_token_base(
 
     if metadata.token_row_source != "sparse_adapter":
         raise ValueError("sparse base preparation requires sparse_adapter metadata")
+    _validate_stage2_sparse_original_base_model(base_model)
     qwen = _resolve_stage1_qwen_base(base_model, expected_stage=None)
     validate_stage2_sparse_original_base_config(qwen.config, metadata)
     token_ids = validate_stage2_sparse_processor(tokenizer, metadata)
@@ -732,6 +762,21 @@ def validate_stage2_sparse_original_base_config(
         raise ValueError("sparse base validation requires sparse_adapter metadata")
     if getattr(config, "stage", None) is not None:
         raise ValueError("sparse Stage 2 resume requires a tag-free original base")
+    if getattr(config, "peft_type", None) is not None:
+        raise ValueError(
+            "sparse Stage 2 original base config contains PEFT peft_type metadata"
+        )
+    config_fields = getattr(config, "__dict__", {})
+    peft_metadata_fields = sorted(
+        field
+        for field in _PEFT_CONFIG_METADATA_FIELDS
+        if field in config_fields and config_fields[field] is not None
+    )
+    if peft_metadata_fields:
+        raise ValueError(
+            "sparse Stage 2 original base config contains PEFT metadata fields: "
+            f"{peft_metadata_fields}"
+        )
     expected_architecture = deepcopy(metadata.base_model_architecture)
     resized_vocab_size = int(expected_architecture["decoder"]["vocab_size"])
     expected_architecture["decoder"]["vocab_size"] = resized_vocab_size - 3
@@ -881,6 +926,8 @@ def resolve_stage2_load_decision(
     stage1_adapter_path: str | None = None,
     resume_from_checkpoint_path: str | None,
     load_config,
+    discover_adapter_config=find_adapter_config_file,
+    adapter_discovery_kwargs: Mapping[str, object] | None = None,
     load_peft_metadata=load_stage2_peft_metadata,
     load_stage1_metadata_snapshot=read_stage1_peft_metadata_snapshot,
     latent_size: int,
@@ -1068,9 +1115,13 @@ def resolve_stage2_load_decision(
                 f"checkpoint={checkpoint_value}, requested={requested}"
             )
     if metadata.token_row_source == "sparse_adapter":
-        if (Path(load_model_path) / "adapter_config.json").is_file():
+        discovered_adapter_config = discover_adapter_config(
+            load_model_path, **dict(adapter_discovery_kwargs or {})
+        )
+        if discovered_adapter_config is not None:
             raise ValueError(
-                "sparse Stage 2 resume requires the original full base model"
+                "sparse Stage 2 resume requires an adapter-free original base "
+                f"model; discovered adapter config at {discovered_adapter_config}"
             )
         validate_stage2_sparse_original_base_config(
             load_config(load_model_path), metadata

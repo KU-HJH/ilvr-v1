@@ -11,6 +11,7 @@ import torch
 from accelerate.state import AcceleratorState, GradientState
 from transformers import TrainerCallback, TrainingArguments, default_data_collator
 from transformers.integrations.deepspeed import unset_hf_deepspeed_config
+from transformers.utils.peft_utils import find_adapter_config_file
 
 import main
 from peft_common import resolve_qwen2_5_vl_model
@@ -570,6 +571,7 @@ def test_sparse_stage2_resume_decision_uses_tag_free_original_base(tmp_path):
         resume_from_checkpoint_path=str(stage2_dir),
         load_config=lambda source: config_sources.append(source)
         or tiny_tag_free_original_qwen().config,
+        discover_adapter_config=lambda unused, **unused_kwargs: None,
         latent_size=metadata.latent_size,
         supervise_latent_boundaries=metadata.supervise_latent_boundaries,
         tuning_method=None,
@@ -635,7 +637,9 @@ def test_main_sparse_stage2_resume_is_independent_of_stage1_source(
     )
     _stub_empty_stage2_data(monkeypatch)
 
-    components = main.build_stage2_training_components(args)
+    components = main.build_stage2_training_components(
+        args, discover_adapter_config=lambda unused, **unused_kwargs: None
+    )
 
     assert processor_sources == [str(stage2_dir)]
     assert config_sources == ["tiny/original-qwen"]
@@ -653,6 +657,251 @@ def test_main_sparse_stage2_resume_is_independent_of_stage1_source(
         resolve_qwen2_5_vl_model(components.model).lm_head(fixed_hidden),
         expected_logits,
     )
+
+
+@pytest.mark.parametrize("source_kind", ("local", "remote"))
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_sparse_stage2_resume_discovers_adapter_bearing_original_source_before_load(
+    tmp_path, monkeypatch, source_kind
+):
+    """Catches original-base routing silently following a local or Hub adapter."""
+    stage1_dir = tmp_path / "stage1"
+    stage2_dir = tmp_path / "stage2-checkpoint"
+    write_sparse_stage2_artifact(stage1_dir, stage2_dir)
+    shutil.rmtree(stage1_dir)
+    discovery_calls = []
+    calls = SimpleNamespace(
+        configs=0, processors=0, model_loads=0, attaches=0, trainers=0
+    )
+
+    if source_kind == "local":
+        original_source = tmp_path / "adapter-source"
+        original_source.mkdir()
+        (original_source / "adapter_config.json").write_text(
+            '{"base_model_name_or_path": "tiny/original-qwen"}\n',
+            encoding="utf-8",
+        )
+
+        def discover_adapter(source, **kwargs):
+            discovery_calls.append((source, kwargs))
+            return find_adapter_config_file(source, **kwargs)
+
+    else:
+        original_source = "org/remote-adapter"
+
+        def discover_adapter(source, **kwargs):
+            discovery_calls.append((source, kwargs))
+            return "/cache/adapter_config.json"
+
+    args = stage2_args(
+        stage1_adapter_path=None,
+        load_model_path=str(original_source),
+        resume_from_checkpoint_path=str(stage2_dir),
+        latent_size=2,
+        tuning_method=None,
+        tuning_method_explicit=False,
+        gradient_checkpointing=False,
+        cache_dir="/cache/models",
+        revision="tested-revision",
+        token="tested-token",
+        local_files_only=True,
+    )
+
+    def reject_config(*unused, **unused_kwargs):
+        calls.configs += 1
+        raise AssertionError("config load must not run after adapter discovery")
+
+    def reject_processor(*unused, **unused_kwargs):
+        calls.processors += 1
+        raise AssertionError("processor load must not run after adapter discovery")
+
+    def reject_model(*unused, **unused_kwargs):
+        calls.model_loads += 1
+        raise AssertionError("large model load must not run after adapter discovery")
+
+    def reject_attach(*unused, **unused_kwargs):
+        calls.attaches += 1
+        raise AssertionError("adapter attach must not run")
+
+    def reject_trainer(*unused, **unused_kwargs):
+        calls.trainers += 1
+        raise AssertionError("Trainer must not run")
+
+    monkeypatch.setattr(main.AutoConfig, "from_pretrained", reject_config)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", reject_processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration, "from_pretrained", reject_model
+    )
+    monkeypatch.setattr(main, "build_stage2_tuned_model", reject_attach)
+    monkeypatch.setattr(main, "Stage2Trainer", reject_trainer)
+
+    with pytest.raises(ValueError, match="original.*base.*adapter|adapter.*original.*base"):
+        main.build_stage2_training_components(
+            args, discover_adapter_config=discover_adapter
+        )
+
+    assert discovery_calls == [
+        (
+            str(original_source),
+            {
+                "cache_dir": "/cache/models",
+                "revision": "tested-revision",
+                "token": "tested-token",
+                "local_files_only": True,
+            },
+        )
+    ]
+    assert vars(calls) == {
+        "configs": 0,
+        "processors": 0,
+        "model_loads": 0,
+        "attaches": 0,
+        "trainers": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("marker", "value"),
+    [
+        ("peft_type", "LORA"),
+        ("base_model_name_or_path", "tiny/original-qwen"),
+        ("inference_mode", False),
+    ],
+)
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_sparse_stage2_resume_rejects_peft_metadata_in_original_config_before_load(
+    tmp_path, monkeypatch, marker, value
+):
+    """Catches PEFT adapter metadata masquerading as a tag-free Qwen config."""
+    stage1_dir = tmp_path / "stage1"
+    stage2_dir = tmp_path / "stage2-checkpoint"
+    write_sparse_stage2_artifact(stage1_dir, stage2_dir)
+    shutil.rmtree(stage1_dir)
+    config = tiny_tag_free_original_qwen().config
+    setattr(config, marker, value)
+    calls = SimpleNamespace(
+        configs=0, processors=0, model_loads=0, attaches=0, trainers=0
+    )
+
+    def load_config(unused, **unused_kwargs):
+        calls.configs += 1
+        return config
+
+    def reject_processor(*unused, **unused_kwargs):
+        calls.processors += 1
+        raise AssertionError("processor load must not run after config rejection")
+
+    def reject_model(*unused, **unused_kwargs):
+        calls.model_loads += 1
+        raise AssertionError("large model load must not run after config rejection")
+
+    def reject_attach(*unused, **unused_kwargs):
+        calls.attaches += 1
+        raise AssertionError("adapter attach must not run")
+
+    def reject_trainer(*unused, **unused_kwargs):
+        calls.trainers += 1
+        raise AssertionError("Trainer must not run")
+
+    monkeypatch.setattr(main.AutoConfig, "from_pretrained", load_config)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", reject_processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration, "from_pretrained", reject_model
+    )
+    monkeypatch.setattr(main, "build_stage2_tuned_model", reject_attach)
+    monkeypatch.setattr(main, "Stage2Trainer", reject_trainer)
+    args = stage2_args(
+        stage1_adapter_path=None,
+        load_model_path="tiny/original-qwen",
+        resume_from_checkpoint_path=str(stage2_dir),
+        latent_size=2,
+        tuning_method=None,
+        tuning_method_explicit=False,
+        gradient_checkpointing=False,
+    )
+
+    with pytest.raises(ValueError, match=f"PEFT.*{marker}|{marker}.*PEFT"):
+        main.build_stage2_training_components(
+            args, discover_adapter_config=lambda unused, **unused_kwargs: None
+        )
+
+    assert vars(calls) == {
+        "configs": 1,
+        "processors": 0,
+        "model_loads": 0,
+        "attaches": 0,
+        "trainers": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("runtime_marker", "runtime_value"),
+    [
+        ("peft_config", {"default": object()}),
+        ("_hf_peft_config_loaded", True),
+    ],
+)
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_sparse_stage2_resume_rejects_adapter_bearing_loaded_base_before_resize(
+    tmp_path, monkeypatch, runtime_marker, runtime_value
+):
+    """Catches a dynamically adapter-loaded Qwen reaching resize or attachment."""
+    stage1_dir = tmp_path / "stage1"
+    stage2_dir = tmp_path / "stage2-checkpoint"
+    processor, _, _, _ = write_sparse_stage2_artifact(stage1_dir, stage2_dir)
+    shutil.rmtree(stage1_dir)
+    loaded = tiny_tag_free_original_qwen()
+    setattr(loaded, runtime_marker, runtime_value)
+    original_vocab = loaded.config.vocab_size
+    calls = SimpleNamespace(model_loads=0, attaches=0, trainers=0)
+
+    monkeypatch.setattr(
+        main.AutoConfig,
+        "from_pretrained",
+        lambda unused: tiny_tag_free_original_qwen().config,
+    )
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", lambda unused: processor)
+
+    def load_model(*unused, **unused_kwargs):
+        calls.model_loads += 1
+        return loaded
+
+    def reject_attach(*unused, **unused_kwargs):
+        calls.attaches += 1
+        raise AssertionError("adapter attach must not run")
+
+    def reject_trainer(*unused, **unused_kwargs):
+        calls.trainers += 1
+        raise AssertionError("Trainer must not run")
+
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration, "from_pretrained", load_model
+    )
+    monkeypatch.setattr(main, "build_stage2_tuned_model", reject_attach)
+    monkeypatch.setattr(main, "Stage2Trainer", reject_trainer)
+    _stub_empty_stage2_data(monkeypatch)
+    args = stage2_args(
+        stage1_adapter_path=None,
+        load_model_path="tiny/original-qwen",
+        resume_from_checkpoint_path=str(stage2_dir),
+        latent_size=2,
+        tuning_method=None,
+        tuning_method_explicit=False,
+        gradient_checkpointing=False,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="adapter-free original base.*adapter-bearing|adapter-bearing.*original base",
+    ):
+        main.build_stage2_training_components(
+            args, discover_adapter_config=lambda unused, **unused_kwargs: None
+        )
+
+    assert calls.model_loads == 1
+    assert calls.attaches == 0
+    assert calls.trainers == 0
+    assert loaded.config.vocab_size == original_vocab
 
 
 @pytest.mark.parametrize(
@@ -730,7 +979,9 @@ def test_sparse_stage2_resume_rejects_wrong_original_sources_before_attach(
     _stub_empty_stage2_data(monkeypatch)
 
     with pytest.raises(ValueError, match=message):
-        main.build_stage2_training_components(args)
+        main.build_stage2_training_components(
+            args, discover_adapter_config=lambda unused, **unused_kwargs: None
+        )
 
     assert calls.model_loads == 0
     assert calls.adapter_attaches == 0

@@ -8,6 +8,7 @@ from transformers import (
     AutoConfig,
     AutoProcessor,
 )
+from transformers.utils.peft_utils import find_adapter_config_file
 from trl import SFTConfig
 from peft import PeftConfig
 
@@ -96,12 +97,21 @@ def validate_stage2_distributed_settings(
         )
 
 
-def build_stage2_training_components(args) -> Stage2TrainingComponents:
+def build_stage2_training_components(
+    args, *, discover_adapter_config=find_adapter_config_file
+) -> Stage2TrainingComponents:
+    adapter_discovery_kwargs = {
+        name: getattr(args, name)
+        for name in ("cache_dir", "revision", "token", "local_files_only")
+        if hasattr(args, name) and getattr(args, name) is not None
+    }
     decision = resolve_stage2_load_decision(
         load_model_path=args.load_model_path,
         stage1_adapter_path=getattr(args, "stage1_adapter_path", None),
         resume_from_checkpoint_path=args.resume_from_checkpoint_path,
         load_config=AutoConfig.from_pretrained,
+        discover_adapter_config=discover_adapter_config,
+        adapter_discovery_kwargs=adapter_discovery_kwargs,
         latent_size=args.latent_size,
         supervise_latent_boundaries=args.supervise_latent_boundaries,
         tuning_method=args.tuning_method,
