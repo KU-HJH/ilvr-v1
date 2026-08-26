@@ -55,11 +55,9 @@ from .stage2_latent_rollout import LatentRolloutEngine, parse_latent_spans, vali
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
-    from flash_attn.layers.rotary import apply_rotary_emb
 
 else:
     flash_attn_varlen_func = None
-    apply_rotary_emb = None
 
 
 if is_flash_attn_2_available():
@@ -161,16 +159,6 @@ class Qwen2_5_VLPatchMerger(nn.Module):
         return x
 
 
-def apply_rotary_pos_emb_flashatt(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.chunk(2, dim=-1)[0].contiguous()
-    sin = sin.chunk(2, dim=-1)[0].contiguous()
-    q_embed = apply_rotary_emb(q.float(), cos.float(), sin.float()).type_as(q)
-    k_embed = apply_rotary_emb(k.float(), cos.float(), sin.float()).type_as(k)
-    return q_embed, k_embed
-
-
 class Qwen2_5_VLVisionFlashAttention2(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
@@ -199,9 +187,7 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
             sin = emb.sin()
         else:
             cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
-        q = q.squeeze(0)
-        k = k.squeeze(0)
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
