@@ -26,6 +26,7 @@ from typing import Any, Literal, Mapping, Sequence
 
 _SCHEMA_VERSION = 1
 _HEX_DIGEST_LENGTH = 64
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _is_exact_int(value: object) -> bool:
@@ -2645,6 +2646,23 @@ def _load_probe_attempt(path: Path) -> dict[str, object]:
     return payload
 
 
+def _probe_data_argv_matches_materialized_input(
+    value: str, expected: str
+) -> bool:
+    """Accept the current absolute spelling or the producer's legacy repo-relative one."""
+
+    if value == expected:
+        return True
+    expected_path = Path(expected)
+    if not expected_path.is_absolute() or ".." in expected_path.parts:
+        return False
+    try:
+        repository_relative = expected_path.relative_to(_REPOSITORY_ROOT)
+    except ValueError:
+        return False
+    return value == str(repository_relative)
+
+
 def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
     command = attempt["command"]
     if type(command) is not list or not command:
@@ -2697,11 +2715,12 @@ def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
             if flag == "--learning-rate":
                 if float(value) != float(expected):
                     raise ValueError(f"probe argv value mismatch for {flag}")
-            elif value != expected:
-                if flag == "--data-path":
+            elif flag == "--data-path":
+                if not _probe_data_argv_matches_materialized_input(value, expected):
                     raise ValueError(
                         "probe --data-path must equal the materialized audited probe input"
                     )
+            elif value != expected:
                 raise ValueError(f"probe argv value mismatch for {flag}")
         seen.add(flag)
         index += 2
