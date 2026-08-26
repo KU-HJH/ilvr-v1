@@ -126,6 +126,64 @@ def test_zero_initialized_attachment_preserves_all_logits_bit_exactly():
     assert torch.count_nonzero(wrapper.output_delta) == 0
 
 
+def test_sparse_output_preparation_clones_declared_tied_head_once_with_logit_parity():
+    from tests.stage1.test_checkpointing import tiny_original_qwen
+
+    model = tiny_original_qwen()
+    model.config.tie_word_embeddings = True
+    model.tie_weights()
+    hidden = torch.linspace(-0.5, 0.75, 16).reshape(2, 8)
+    before = model.lm_head(hidden).detach().clone()
+    tied_weight = model.lm_head.weight
+
+    first = token_rows.prepare_sparse_output_head(model)
+    first_weight = first.weight
+    second = token_rows.prepare_sparse_output_head(model)
+
+    assert model.config.tie_word_embeddings is False
+    assert first is model.lm_head is second
+    assert first_weight is second.weight
+    assert first_weight is not tied_weight
+    assert first_weight is not model.model.embed_tokens.weight
+    assert first_weight.dtype == tied_weight.dtype
+    assert first_weight.device == tied_weight.device
+    assert first_weight.shape == tied_weight.shape
+    assert first_weight.requires_grad == tied_weight.requires_grad
+    torch.testing.assert_close(first_weight, tied_weight, rtol=0, atol=0)
+    torch.testing.assert_close(model.lm_head(hidden), before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "declared_tied,shared_weight",
+    [(True, False), (False, True), (None, False)],
+)
+def test_sparse_output_preparation_rejects_malformed_tie_state(
+    declared_tied, shared_weight
+):
+    from tests.stage1.test_checkpointing import tiny_original_qwen
+
+    model = tiny_original_qwen()
+    model.config.tie_word_embeddings = declared_tied
+    if shared_weight:
+        model.lm_head.weight = model.model.embed_tokens.weight
+
+    with pytest.raises(ValueError, match="tie_word_embeddings|tie topology"):
+        token_rows.prepare_sparse_output_head(model)
+
+
+def test_sparse_output_preparation_rejects_distinct_parameters_sharing_storage():
+    from tests.stage1.test_checkpointing import tiny_original_qwen
+
+    model = tiny_original_qwen()
+    model.config.tie_word_embeddings = False
+    model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach())
+
+    assert model.lm_head.weight is not model.model.embed_tokens.weight
+    assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+    with pytest.raises(ValueError, match="tie topology"):
+        token_rows.prepare_sparse_output_head(model)
+
+
 def test_only_output_delta_receives_gradient():
     wrapper = SparseOutputTokenRows(
         nn.Linear(4, 9, bias=False), token_ids=(1, 3, 8)

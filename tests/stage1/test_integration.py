@@ -457,7 +457,14 @@ def tiny_stage1_run(
     )
 
 
-def tiny_stage1_resume(tmp_path, run, *, method, max_steps):
+def tiny_stage1_resume(
+    tmp_path,
+    run,
+    *,
+    method,
+    max_steps,
+    source_tie_word_embeddings=None,
+):
     args = _stage1_args(
         tmp_path,
         method=method,
@@ -468,9 +475,13 @@ def tiny_stage1_resume(tmp_path, run, *, method, max_steps):
         save_steps=10,
         resume=run.checkpoint_1,
     )
-    tied = resolve_qwen2_5_vl_model(
-        run.components.model
-    ).config.tie_word_embeddings
+    tied = (
+        resolve_qwen2_5_vl_model(
+            run.components.model
+        ).config.tie_word_embeddings
+        if source_tie_word_embeddings is None
+        else source_tie_word_embeddings
+    )
     components = build_stage1_training_components(
         args, dependencies=_tiny_dependencies(tie_word_embeddings=tied)
     )
@@ -538,6 +549,51 @@ def test_tiny_tied_qwen_full_b2_train_save_resume_end_to_end(tmp_path):
     assert resumed.optimizer_state_restored
     assert resumed.scheduler_state_restored
     assert resumed_qwen.lm_head.weight is resumed_qwen.model.embed_tokens.weight
+
+
+def test_tiny_tied_qwen_dora_b2_train_save_resume_end_to_end(tmp_path):
+    run = tiny_stage1_run(
+        tmp_path,
+        method="dora",
+        batch_size=2,
+        gradient_accumulation_steps=2,
+        max_steps=2,
+        save_steps=1,
+        output_dir=tmp_path / "dora-tied",
+        tie_word_embeddings=True,
+    )
+    qwen = resolve_qwen2_5_vl_model(run.components.model)
+    teacher_qwen = resolve_qwen2_5_vl_model(
+        run.components.trainer.ema_teacher.model
+    )
+
+    assert qwen.config.tie_word_embeddings is False
+    assert teacher_qwen.config.tie_word_embeddings is False
+    assert qwen.lm_head.base_head.weight is not (
+        qwen.model.embed_tokens.token_adapter.base_layer.weight
+    )
+    assert teacher_qwen.lm_head.base_head.weight is not (
+        teacher_qwen.model.embed_tokens.token_adapter.base_layer.weight
+    )
+    assert run.checkpoint_1.is_dir()
+
+    resumed = tiny_stage1_resume(
+        tmp_path,
+        run,
+        method="dora",
+        max_steps=3,
+        source_tie_word_embeddings=True,
+    )
+    resumed_qwen = resolve_qwen2_5_vl_model(resumed.components.model)
+
+    assert resumed.initial_global_step == 1
+    assert resumed.final_global_step == 3
+    assert resumed.optimizer_state_restored
+    assert resumed.scheduler_state_restored
+    assert resumed_qwen.config.tie_word_embeddings is False
+    assert resumed_qwen.lm_head.base_head.weight is not (
+        resumed_qwen.model.embed_tokens.token_adapter.base_layer.weight
+    )
 
 
 def test_fresh_stage2_handoff_resets_training_state(tmp_path):

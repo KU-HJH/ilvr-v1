@@ -310,6 +310,11 @@ def build_stage2_training_components(
                 if stage1_metadata is not None
                 else None
             ),
+            source_base_model_architecture=(
+                stage1_metadata.base_model_architecture
+                if stage1_metadata is not None
+                else None
+            ),
         )
 
     raw_examples = load_jsonl_examples(Path(args.data_path))

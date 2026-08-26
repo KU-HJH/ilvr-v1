@@ -257,6 +257,34 @@ def test_sparse_metadata_builder_requires_complete_stage1_vocab_provenance():
         )
 
 
+def test_sparse_metadata_builder_requires_source_architecture_provenance():
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    tuning = Stage2TuningConfig(
+        method="dora",
+        r=2,
+        alpha=4,
+        dropout=0.0,
+        target_modules=("q_proj", "v_proj"),
+    )
+
+    with pytest.raises(ValueError, match="source architecture provenance"):
+        build_stage2_peft_metadata(
+            tuning=tuning,
+            base_model_reference="stage1/tiny",
+            model_config=model.config,
+            token_ids=LatentTokenIds(90, 91, 92),
+            resolved_target_names=resolve_stage2_target_module_names(
+                model, tuning.target_modules
+            ),
+            token_row_source="sparse_adapter",
+            stage1_adapter_reference="stage1/adapter",
+            tokenizer_base_vocab_size=90,
+            pretrained_model_vocab_size=96,
+            resized_vocab_size=93,
+        )
+
+
 def test_new_stage2_metadata_writes_schema_v4_vocab_provenance_fields(tmp_path):
     """Catches new Stage 2 sidecars losing padded original provenance."""
     metadata = sample_metadata()

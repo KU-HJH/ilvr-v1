@@ -832,6 +832,7 @@ def _validate_architecture(
     metadata: Stage1PeftMetadata,
     *,
     resized: bool,
+    sparse_runtime: bool = False,
 ) -> None:
     current = capture_qwen2_5_vl_architecture(qwen.config)
     expected_vocab = (
@@ -844,13 +845,14 @@ def _validate_architecture(
             "base vocabulary mismatch: "
             f"metadata={expected_vocab}, model={current['decoder']['vocab_size']}"
         )
-    comparable = deepcopy(current)
-    if resized:
-        comparable["decoder"]["vocab_size"] = (
-            metadata.pretrained_model_vocab_size
-        )
+    expected_architecture = deepcopy(metadata.base_model_architecture)
+    expected_architecture["decoder"]["vocab_size"] = expected_vocab
+    if sparse_runtime:
+        if not resized:
+            raise ValueError("sparse runtime architecture must be resized")
+        expected_architecture["decoder"]["tie_word_embeddings"] = False
     difference = first_architecture_difference(
-        metadata.base_model_architecture, comparable
+        expected_architecture, current
     )
     if difference is not None:
         path, expected, actual = difference
@@ -1061,7 +1063,9 @@ def _validate_stage1_peft_runtime(
     qwen = resolve_qwen2_5_vl_model(candidate)
     _validate_processor(processor, validated)
     _validate_latent_config(qwen.config, validated)
-    _validate_architecture(qwen, validated, resized=True)
+    _validate_architecture(
+        qwen, validated, resized=True, sparse_runtime=True
+    )
     _validate_adapter_config(
         qwen, candidate.peft_config[_ADAPTER_NAME], validated
     )
@@ -1134,7 +1138,10 @@ class Stage1PeftPreflightWitness:
 
 def _build_meta_stage1_base(config) -> nn.Module:
     with init_empty_weights():
-        return Qwen2_5_VLForConditionalGeneration(config)
+        model = Qwen2_5_VLForConditionalGeneration(config)
+    if config.tie_word_embeddings is True:
+        model.tie_weights()
+    return model
 
 
 def _architecture_json(architecture: Mapping[str, object]) -> bytes:
@@ -1240,6 +1247,16 @@ def preflight_stage1_peft_artifact(
     structural_model = model_factory(deepcopy(base_config))
     qwen = resolve_qwen2_5_vl_model(structural_model)
     _validate_architecture(qwen, validated, resized=False)
+    structural_model.resize_token_embeddings(
+        validated.resized_vocab_size, mean_resizing=False
+    )
+    _validate_architecture(qwen, validated, resized=True)
+    initialize_frozen_output_token_rows(
+        structural_model, validated.latent_token_ids
+    )
+    _validate_architecture(
+        qwen, validated, resized=True, sparse_runtime=True
+    )
     adapter_config_json = _read_regular_payload(
         artifact / _ADAPTER_CONFIG_FILENAME,
         label="Stage 1 adapter config",
@@ -1303,7 +1320,6 @@ def load_stage1_peft_artifact(
             processor,
             qwen.config,
             artifact,
-            model_factory=lambda config: candidate,
         )
     elif not isinstance(preflight, Stage1PeftPreflightWitness):
         raise TypeError("preflight must be a Stage1PeftPreflightWitness")
@@ -1331,6 +1347,9 @@ def load_stage1_peft_artifact(
     candidate.resize_token_embeddings(metadata.resized_vocab_size)
     _validate_architecture(qwen, metadata, resized=True)
     initialize_frozen_output_token_rows(candidate, metadata.latent_token_ids)
+    _validate_architecture(
+        qwen, metadata, resized=True, sparse_runtime=True
+    )
     _configure_latent_config(candidate.config, metadata)
     adapter_config.inference_mode = not is_trainable
     restored = get_peft_model(

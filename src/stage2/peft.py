@@ -362,7 +362,6 @@ def load_stage1_dora_for_fresh_stage2(
             processor,
             qwen.config,
             Path(stage1_adapter_path),
-            model_factory=lambda unused_config: qwen,
         )
     metadata = decode_stage1_peft_metadata_snapshot(
         Stage1PeftMetadataSnapshot(
@@ -661,6 +660,17 @@ def _preflight_stage2_inference_artifact(
         preflight_config = deepcopy(source_config)
     with init_empty_weights():
         preflight_model = Qwen2_5_VLForConditionalGeneration(preflight_config)
+    if preflight_config.tie_word_embeddings is True:
+        preflight_model.tie_weights()
+    ordered_ids = (
+        token_ids.pad_token_id,
+        token_ids.start_token_id,
+        token_ids.end_token_id,
+    )
+    if metadata.token_row_source == "sparse_adapter":
+        from stage1.token_rows import initialize_frozen_output_token_rows
+
+        initialize_frozen_output_token_rows(preflight_model, ordered_ids)
     validate_stage2_peft_compatibility(
         preflight_model,
         tokenizer,
@@ -693,11 +703,6 @@ def _preflight_stage2_inference_artifact(
         adapter_safetensors,
         dict(adapter_tensor_contract),
         metadata,
-    )
-    ordered_ids = (
-        token_ids.pad_token_id,
-        token_ids.start_token_id,
-        token_ids.end_token_id,
     )
     sparse_safetensors = inspection.sparse_safetensors
     if (metadata.token_row_source == "sparse_adapter") is not (

@@ -434,14 +434,25 @@ def test_build_rejects_invalid_latent_token_ids(tiny_qwen, bad_ids):
         build_stage1_tuned_model(tiny_qwen, tuning("dora"), bad_ids)
 
 
-def test_adapter_build_rejects_tied_latent_output_topology(
-    tiny_qwen, latent_token_ids
+@pytest.mark.parametrize("method", ["lora", "dora"])
+def test_adapter_build_unties_declared_qwen_head_for_sparse_output_rows(
+    tiny_qwen, latent_token_ids, method
 ):
     tiny_qwen.config.tie_word_embeddings = True
     tiny_qwen.tie_weights()
+    tied_weight = tiny_qwen.model.embed_tokens.weight
     assert tiny_qwen.lm_head.weight is tiny_qwen.model.embed_tokens.weight
 
-    with pytest.raises(ValueError, match="tied.*output"):
-        build_stage1_tuned_model(
-            tiny_qwen, tuning("dora"), latent_token_ids
-        )
+    model = build_stage1_tuned_model(
+        tiny_qwen, tuning(method), latent_token_ids
+    )
+    qwen = resolve_qwen2_5_vl_model(model)
+    rows = qwen.lm_head
+
+    assert qwen.config.tie_word_embeddings is False
+    assert isinstance(rows, SparseOutputTokenRows)
+    assert rows.base_head.weight is not tied_weight
+    assert rows.base_head.weight is not qwen.model.embed_tokens.token_adapter.base_layer.weight
+    assert rows.base_head.weight.requires_grad is False
+    assert qwen.model.embed_tokens.token_adapter.base_layer.weight.requires_grad is False
+    assert rows.output_delta.requires_grad is True

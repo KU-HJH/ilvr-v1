@@ -571,6 +571,7 @@ def build_stage2_peft_metadata(
     tokenizer_base_vocab_size: int | None = None,
     pretrained_model_vocab_size: int | None = None,
     resized_vocab_size: int | None = None,
+    source_base_model_architecture: Mapping[str, object] | None = None,
 ) -> Stage2PeftMetadata:
     """Build the sidecar for a fresh Stage 2 PEFT run."""
     if not tuning.is_peft:
@@ -586,12 +587,21 @@ def build_stage2_peft_metadata(
         raise ValueError(
             "sparse Stage 2 metadata requires complete Stage 1 vocabulary provenance"
         )
+    if (
+        token_row_source == "sparse_adapter"
+        and source_base_model_architecture is None
+    ):
+        raise ValueError(
+            "sparse Stage 2 metadata requires source architecture provenance"
+        )
     if token_row_source != "sparse_adapter" and any(
         value is not None for value in vocab_provenance
     ) and any(value is None for value in vocab_provenance):
         raise ValueError("Stage 2 vocabulary provenance must be provided all-or-none")
-    architecture = _capture_base_model_architecture(model_config)
-    architecture_vocab_size = int(architecture["decoder"]["vocab_size"])
+    runtime_architecture = _capture_base_model_architecture(model_config)
+    architecture_vocab_size = int(
+        runtime_architecture["decoder"]["vocab_size"]
+    )
     resized_vocab_size = (
         architecture_vocab_size
         if resized_vocab_size is None
@@ -607,6 +617,28 @@ def build_stage2_peft_metadata(
         if pretrained_model_vocab_size is None
         else pretrained_model_vocab_size
     )
+    if token_row_source == "sparse_adapter":
+        architecture = _normalize_base_model_architecture(
+            source_base_model_architecture
+        )
+        architecture["decoder"]["vocab_size"] = resized_vocab_size
+        expected_runtime = deepcopy(architecture)
+        expected_runtime["decoder"]["tie_word_embeddings"] = False
+        difference = _first_architecture_difference(
+            expected_runtime, runtime_architecture
+        )
+        if difference is not None:
+            path, expected, actual = difference
+            raise ValueError(
+                f"sparse runtime architecture mismatch at {path}: "
+                f"source-derived={expected!r}, runtime={actual!r}"
+            )
+    else:
+        if source_base_model_architecture is not None:
+            raise ValueError(
+                "source_base_model_architecture is only valid for sparse_adapter"
+            )
+        architecture = runtime_architecture
     return Stage2PeftMetadata.from_dict(
         {
             "schema_version": STAGE2_PEFT_SCHEMA_VERSION,
@@ -863,8 +895,11 @@ def validate_stage2_peft_compatibility(
     )
     config = qwen.config
     current_architecture = _capture_base_model_architecture(config)
+    expected_architecture = deepcopy(metadata.base_model_architecture)
+    if metadata.token_row_source == "sparse_adapter":
+        expected_architecture["decoder"]["tie_word_embeddings"] = False
     architecture_difference = _first_architecture_difference(
-        metadata.base_model_architecture, current_architecture
+        expected_architecture, current_architecture
     )
     if architecture_difference is not None:
         path, expected, actual = architecture_difference

@@ -98,6 +98,60 @@ def _attached_token_ids(rows: SparseOutputTokenRows) -> tuple[int, int, int]:
     return _validate_exact_latent_token_ids(values, rows.out_features)
 
 
+def _shares_parameter_storage(left: nn.Parameter, right: nn.Parameter) -> bool:
+    if left is right:
+        return True
+    if left.device.type == "meta" or right.device.type == "meta":
+        return False
+    return (
+        left.untyped_storage().data_ptr()
+        == right.untyped_storage().data_ptr()
+    )
+
+
+def prepare_sparse_output_head(model: nn.Module) -> nn.Linear:
+    """Untie the canonical Qwen output head for sparse-row PEFT exactly once."""
+
+    qwen = resolve_qwen2_5_vl_model(model)
+    head = qwen.lm_head
+    embedding = qwen.model.embed_tokens
+    if not isinstance(head, nn.Linear):
+        raise TypeError("Qwen2.5-VL lm_head must be a torch.nn.Linear")
+    if not isinstance(embedding, nn.Embedding):
+        raise TypeError("Qwen2.5-VL input embedding must be a torch.nn.Embedding")
+    if embedding.num_embeddings != head.out_features:
+        raise ValueError("input and output vocabulary sizes must match")
+    if embedding.weight.shape != head.weight.shape:
+        raise ValueError("input and output embedding shapes must match")
+
+    declared_tied = getattr(qwen.config, "tie_word_embeddings", None)
+    if type(declared_tied) is not bool:
+        raise ValueError("config.tie_word_embeddings must be exactly bool")
+    shares_parameter = head.weight is embedding.weight
+    shares_storage = _shares_parameter_storage(head.weight, embedding.weight)
+    if declared_tied:
+        if not shares_parameter:
+            raise ValueError(
+                "declared tied Qwen input/output embeddings have invalid tie topology"
+            )
+        source = head.weight
+        head.weight = nn.Parameter(
+            source.detach().clone(memory_format=torch.preserve_format),
+            requires_grad=source.requires_grad,
+        )
+        qwen.config.tie_word_embeddings = False
+    elif shares_storage:
+        raise ValueError(
+            "declared untied Qwen input/output embeddings have invalid tie topology"
+        )
+
+    if qwen.config.tie_word_embeddings is not False or _shares_parameter_storage(
+        head.weight, embedding.weight
+    ):
+        raise ValueError("failed to establish untied sparse-output topology")
+    return head
+
+
 def initialize_frozen_output_token_rows(
     model: nn.Module, token_ids: Sequence[int]
 ) -> None:
@@ -118,15 +172,7 @@ def initialize_frozen_output_token_rows(
         raise ValueError(
             "latent token IDs must be the exact appended output rows"
         )
-    if (
-        bool(getattr(qwen.config, "tie_word_embeddings", False))
-        or head.weight is embedding.weight
-    ):
-        raise ValueError(
-            "tied input/output embeddings are unsupported for sparse output rows"
-        )
-    if embedding.num_embeddings != head.out_features:
-        raise ValueError("input and output vocabulary sizes must match")
+    head = prepare_sparse_output_head(qwen)
 
     with torch.no_grad():
         ordinary_mean = head.weight[:base_vocab_size].float().mean(
@@ -378,6 +424,7 @@ __all__ = [
     "find_sparse_output_token_rows",
     "decode_sparse_token_rows_state",
     "initialize_frozen_output_token_rows",
+    "prepare_sparse_output_head",
     "load_sparse_token_rows",
     "save_sparse_token_rows",
 ]

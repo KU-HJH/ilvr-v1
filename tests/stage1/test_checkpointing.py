@@ -948,6 +948,63 @@ def test_padded_pretrained_vocabulary_preflights_and_restores_with_one_resize(
     assert qwen.lm_head.out_features == RESIZED_VOCAB_SIZE
 
 
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_tied_source_provenance_preflights_and_restores_as_sparse_runtime(
+    tmp_path,
+):
+    source = tiny_original_qwen(pretrained_vocab_size=132)
+    source.config.tie_word_embeddings = True
+    source.tie_weights()
+    metadata = sample_metadata(source)
+    source.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    source.config.latent_token_id = LATENT_TOKEN_IDS[0]
+    source.config.latent_start_id = LATENT_TOKEN_IDS[1]
+    source.config.latent_end_id = LATENT_TOKEN_IDS[2]
+    tuned = build_stage1_tuned_model(source, stage1_tuning(), LATENT_TOKEN_IDS)
+    processor = TinyStage1Processor()
+    hidden = torch.linspace(-0.5, 0.75, 16).reshape(2, 8)
+    expected = resolve_qwen2_5_vl_model(tuned).lm_head(hidden).detach().clone()
+
+    assert metadata.base_model_architecture["decoder"]["tie_word_embeddings"] is True
+    assert resolve_qwen2_5_vl_model(tuned).config.tie_word_embeddings is False
+    save_stage1_peft_artifact(tuned, processor, tmp_path, metadata)
+
+    structural = []
+
+    def capture_structural(config):
+        model = Qwen2_5_VLForConditionalGeneration(config)
+        structural.append(model)
+        return model
+
+    fresh = tiny_original_qwen(pretrained_vocab_size=132)
+    fresh.config.tie_word_embeddings = True
+    fresh.tie_weights()
+    witness = preflight_stage1_peft_artifact(
+        processor,
+        deepcopy(fresh.config),
+        tmp_path,
+        model_factory=capture_structural,
+    )
+    preflight_qwen = resolve_qwen2_5_vl_model(structural[0])
+    assert preflight_qwen.config.vocab_size == RESIZED_VOCAB_SIZE
+    assert preflight_qwen.config.tie_word_embeddings is False
+    assert preflight_qwen.lm_head.weight is not preflight_qwen.model.embed_tokens.weight
+
+    restored = load_stage1_peft_artifact(
+        fresh,
+        processor,
+        tmp_path,
+        is_trainable=False,
+        preflight=witness,
+    )
+    restored_qwen = resolve_qwen2_5_vl_model(restored)
+    assert restored_qwen.config.tie_word_embeddings is False
+    assert restored_qwen.lm_head.base_head.weight is not (
+        restored_qwen.model.embed_tokens.token_adapter.base_layer.weight
+    )
+    torch.testing.assert_close(restored_qwen.lm_head(hidden), expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("pretrained_vocab_size", [BASE_VOCAB_SIZE, 132])
 def test_public_vocab_validator_accepts_exact_post_resize_alignment(
     pretrained_vocab_size,

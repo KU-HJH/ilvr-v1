@@ -76,7 +76,9 @@ def stage2_dora_tuning(**overrides) -> Stage2TuningConfig:
     return Stage2TuningConfig(**values)
 
 
-def write_stage1_dora_artifact(directory, *, pretrained_vocab_size=None):
+def write_stage1_dora_artifact(
+    directory, *, pretrained_vocab_size=None, tie_word_embeddings=False
+):
     base = tiny_original_qwen(
         **(
             {}
@@ -84,6 +86,9 @@ def write_stage1_dora_artifact(directory, *, pretrained_vocab_size=None):
             else {"pretrained_vocab_size": pretrained_vocab_size}
         )
     )
+    base.config.tie_word_embeddings = tie_word_embeddings
+    if tie_word_embeddings:
+        base.tie_weights()
     metadata = sample_metadata(base)
     base.resize_token_embeddings(RESIZED_VOCAB_SIZE)
     base.config.latent_token_id = LATENT_TOKEN_IDS[0]
@@ -99,9 +104,14 @@ def write_stage1_dora_artifact(directory, *, pretrained_vocab_size=None):
     return processor, metadata
 
 
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
-def test_fresh_stage2_handoff_accepts_complete_legacy_stage1_v1_metadata(tmp_path):
-    processor, metadata = write_stage1_dora_artifact(tmp_path)
+def test_fresh_stage2_handoff_accepts_complete_legacy_stage1_v1_metadata(
+    tmp_path, tie_word_embeddings
+):
+    processor, metadata = write_stage1_dora_artifact(
+        tmp_path, tie_word_embeddings=tie_word_embeddings
+    )
     metadata_path = tmp_path / STAGE1_PEFT_METADATA_FILENAME
     legacy = metadata.to_dict()
     legacy["schema_version"] = 1
@@ -111,8 +121,12 @@ def test_fresh_stage2_handoff_accepts_complete_legacy_stage1_v1_metadata(tmp_pat
         encoding="utf-8",
     )
 
+    source = tiny_original_qwen()
+    source.config.tie_word_embeddings = tie_word_embeddings
+    if tie_word_embeddings:
+        source.tie_weights()
     continued = load_stage1_dora_for_fresh_stage2(
-        tiny_original_qwen(),
+        source,
         processor,
         tmp_path,
         stage2_dora_tuning(),
@@ -123,9 +137,12 @@ def test_fresh_stage2_handoff_accepts_complete_legacy_stage1_v1_metadata(tmp_pat
     assert qwen.model.embed_tokens.token_adapter.base_layer.num_embeddings == (
         RESIZED_VOCAB_SIZE
     )
+    assert qwen.config.tie_word_embeddings is False
 
 
-def tiny_tag_free_original_qwen(*, pretrained_vocab_size=None):
+def tiny_tag_free_original_qwen(
+    *, pretrained_vocab_size=None, tie_word_embeddings=False
+):
     """Return the actual sparse-resume base shape without Stage 1 ILVR tags."""
     model = tiny_original_qwen(
         **(
@@ -134,14 +151,18 @@ def tiny_tag_free_original_qwen(*, pretrained_vocab_size=None):
             else {"pretrained_vocab_size": pretrained_vocab_size}
         )
     )
+    model.config.tie_word_embeddings = tie_word_embeddings
+    if tie_word_embeddings:
+        model.tie_weights()
     model.config.__dict__.pop("stage", None)
     model.config.__dict__.pop("latent_size", None)
     return model
 
 
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
 def test_padded_stage1_v2_to_self_contained_stage2_direct_and_inference_parity(
-    tmp_path,
+    tmp_path, tie_word_embeddings,
 ):
     pretrained_vocab_size = 132
     stage1_dir = tmp_path / "stage1"
@@ -149,10 +170,17 @@ def test_padded_stage1_v2_to_self_contained_stage2_direct_and_inference_parity(
     processor, stage1_metadata = write_stage1_dora_artifact(
         stage1_dir,
         pretrained_vocab_size=pretrained_vocab_size,
+        tie_word_embeddings=tie_word_embeddings,
     )
     tuning = stage2_dora_tuning()
+    continuation_base = tiny_original_qwen(
+        pretrained_vocab_size=pretrained_vocab_size
+    )
+    continuation_base.config.tie_word_embeddings = tie_word_embeddings
+    if tie_word_embeddings:
+        continuation_base.tie_weights()
     continued = load_stage1_dora_for_fresh_stage2(
-        tiny_original_qwen(pretrained_vocab_size=pretrained_vocab_size),
+        continuation_base,
         processor,
         stage1_dir,
         tuning,
@@ -175,7 +203,12 @@ def test_padded_stage1_v2_to_self_contained_stage2_direct_and_inference_parity(
         tokenizer_base_vocab_size=stage1_metadata.base_vocab_size,
         pretrained_model_vocab_size=stage1_metadata.pretrained_model_vocab_size,
         resized_vocab_size=stage1_metadata.resized_vocab_size,
+        source_base_model_architecture=stage1_metadata.base_model_architecture,
     )
+    assert metadata.base_model_architecture["decoder"]["tie_word_embeddings"] is (
+        tie_word_embeddings
+    )
+    assert qwen.config.tie_word_embeddings is False
     Stage2Trainer(
         model=continued,
         args=TrainingArguments(
@@ -189,7 +222,8 @@ def test_padded_stage1_v2_to_self_contained_stage2_direct_and_inference_parity(
     shutil.rmtree(stage1_dir)
 
     direct_base = tiny_tag_free_original_qwen(
-        pretrained_vocab_size=pretrained_vocab_size
+        pretrained_vocab_size=pretrained_vocab_size,
+        tie_word_embeddings=tie_word_embeddings,
     )
     prepare_stage2_sparse_token_base(
         direct_base, processor.tokenizer, load_stage2_peft_metadata(stage2_dir)
@@ -213,11 +247,13 @@ def test_padded_stage1_v2_to_self_contained_stage2_direct_and_inference_parity(
         discover_adapter_config=lambda unused, **unused_kwargs: None,
         load_config=lambda unused, **unused_kwargs: deepcopy(
             tiny_tag_free_original_qwen(
-                pretrained_vocab_size=pretrained_vocab_size
+                pretrained_vocab_size=pretrained_vocab_size,
+                tie_word_embeddings=tie_word_embeddings,
             ).config
         ),
         load_model=lambda unused, **unused_kwargs: tiny_tag_free_original_qwen(
-            pretrained_vocab_size=pretrained_vocab_size
+            pretrained_vocab_size=pretrained_vocab_size,
+            tie_word_embeddings=tie_word_embeddings,
         ),
     )
     torch.testing.assert_close(
@@ -266,6 +302,7 @@ def write_sparse_stage2_artifact(stage1_dir, stage2_dir):
         tokenizer_base_vocab_size=stage1_metadata.base_vocab_size,
         pretrained_model_vocab_size=stage1_metadata.pretrained_model_vocab_size,
         resized_vocab_size=stage1_metadata.resized_vocab_size,
+        source_base_model_architecture=stage1_metadata.base_model_architecture,
     )
     Stage2Trainer(
         model=continued,
@@ -650,6 +687,7 @@ def test_saved_sparse_stage2_adapter_reloads_after_stage1_source_is_deleted(tmp_
         tokenizer_base_vocab_size=stage1_metadata.base_vocab_size,
         pretrained_model_vocab_size=stage1_metadata.pretrained_model_vocab_size,
         resized_vocab_size=stage1_metadata.resized_vocab_size,
+        source_base_model_architecture=stage1_metadata.base_model_architecture,
     )
     expected_state = active_stage1_state(continued)
     fixed_hidden = torch.linspace(-0.4, 0.9, 16).reshape(2, 8)
@@ -1365,6 +1403,7 @@ def test_sparse_stage2_numbered_resume_matches_uninterrupted_training(tmp_path):
         tokenizer_base_vocab_size=stage1_metadata.base_vocab_size,
         pretrained_model_vocab_size=stage1_metadata.pretrained_model_vocab_size,
         resized_vocab_size=stage1_metadata.resized_vocab_size,
+        source_base_model_architecture=stage1_metadata.base_model_architecture,
     )
     dataset = [_stage2_sparse_batch()]
 
