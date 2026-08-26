@@ -719,6 +719,35 @@ def _sealed_maximum_fixture(tmp_path, monkeypatch):
     return maximum_path, maximum, selected, long_attempt, producer_seal
 
 
+def _reseal_maximum(path, payload):
+    payload["config_digest"] = config_digest(
+        {key: value for key, value in payload.items() if key != "config_digest"}
+    )
+    path.write_text(json.dumps(payload))
+
+
+def _reseal_mock_long_producer(maximum_path, maximum, long_attempt, producer):
+    producer_config = producer["run_config"]
+    producer_config["config_digest"] = config_digest(
+        {
+            key: value
+            for key, value in producer_config.items()
+            if key != "config_digest"
+        }
+    )
+    long_attempt["launch_config"]["run_config_digest"] = producer_config[
+        "config_digest"
+    ]
+    producer["benchmark_evidence"]["config_digest"] = producer_config[
+        "config_digest"
+    ]
+    producer["producer_digest"] = config_digest(
+        {key: value for key, value in producer.items() if key != "producer_digest"}
+    )
+    maximum["long_smoke_producer_digest"] = producer["producer_digest"]
+    _reseal_maximum(maximum_path, maximum)
+
+
 def test_maximum_rejects_resealed_launch_config_not_equal_to_selected_attempt(
     tmp_path, monkeypatch,
 ):
@@ -751,6 +780,134 @@ def test_maximum_rejects_resealed_long_producer_not_bound_to_long_attempt(
     producer["benchmark_evidence"]["config_digest"] = "e" * 64
 
     with pytest.raises(ValueError, match="long-smoke producer.*attempt"):
+        benchmark._load_maximum(maximum_path)
+
+
+def test_maximum_rejects_resealed_top_level_batch_controls_not_from_selected(
+    tmp_path, monkeypatch,
+):
+    """Catches top-level accumulation/effective values relabeled after selection."""
+    import stage1.benchmark as benchmark
+
+    maximum_path, maximum, _, _, _ = _sealed_maximum_fixture(tmp_path, monkeypatch)
+    maximum["gradient_accumulation_steps"] = 3
+    maximum["effective_global_batch"] = 48
+    _reseal_maximum(maximum_path, maximum)
+
+    with pytest.raises(ValueError, match="selected attempt.*batch controls"):
+        benchmark._load_maximum(maximum_path)
+
+
+def test_maximum_rejects_full_selection_with_resealed_dora_long_attempt(
+    tmp_path, monkeypatch,
+):
+    """Catches a long-smoke method/config relabeled independently of selection."""
+    import stage1.benchmark as benchmark
+
+    maximum_path, maximum, _, long_attempt, producer = _sealed_maximum_fixture(
+        tmp_path, monkeypatch
+    )
+    dora_tuning = {
+        "use_dora": True,
+        "rank": 32,
+        "alpha": 64,
+        "dropout": 0.05,
+        "target_modules": (
+            "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+        ),
+    }
+    long_attempt["method"] = "dora"
+    long_attempt["launch_config"]["method"] = "dora"
+    long_attempt["launch_config"]["tuning_config"] = dora_tuning
+    producer["run_config"]["method"] = "dora"
+    producer["run_config"]["tuning_config"] = dora_tuning
+    producer["benchmark_evidence"]["method"] = "dora"
+    _reseal_mock_long_producer(
+        maximum_path, maximum, long_attempt, producer
+    )
+
+    with pytest.raises(ValueError, match="long-smoke.*selected"):
+        benchmark._load_maximum(maximum_path)
+
+
+def test_maximum_rejects_unrelated_long_launcher_command_change(
+    tmp_path, monkeypatch,
+):
+    """Catches long smoke changing more than attempt-local paths and max steps."""
+    import stage1.benchmark as benchmark
+
+    maximum_path, _, _, long_attempt, _ = _sealed_maximum_fixture(
+        tmp_path, monkeypatch
+    )
+    long_attempt["launch_config"]["command"] = ["unrelated-launcher"]
+
+    with pytest.raises(ValueError, match="long-smoke.*command"):
+        benchmark._load_maximum(maximum_path)
+
+
+def test_maximum_rejects_resealed_selected_attempt_not_exactly_three_steps(
+    tmp_path, monkeypatch,
+):
+    """Catches a capacity selection built from a non-three-step attempt."""
+    import stage1.benchmark as benchmark
+
+    maximum_path, maximum, selected, _, _ = _sealed_maximum_fixture(
+        tmp_path, monkeypatch
+    )
+    selected["max_steps"] = 4
+    selected["launch_config"]["max_steps"] = 4
+    maximum["launch_config"] = dict(selected["launch_config"])
+    _reseal_maximum(maximum_path, maximum)
+
+    with pytest.raises(ValueError, match="selected attempt.*3 steps"):
+        benchmark._load_maximum(maximum_path)
+
+
+def test_maximum_rejects_resealed_long_attempt_not_exactly_ten_steps(
+    tmp_path, monkeypatch,
+):
+    """Catches a capacity maximum whose long smoke is not the approved ten steps."""
+    import stage1.benchmark as benchmark
+
+    maximum_path, maximum, _, long_attempt, producer = _sealed_maximum_fixture(
+        tmp_path, monkeypatch
+    )
+    maximum["long_smoke_steps"] = 11
+    long_attempt["max_steps"] = 11
+    long_attempt["launch_config"]["max_steps"] = 11
+    producer["run_config"]["max_steps"] = 11
+    producer["benchmark_evidence"]["optimizer_steps"] = 11
+    producer["benchmark_evidence"]["samples_seen"] = 352
+    _reseal_mock_long_producer(
+        maximum_path, maximum, long_attempt, producer
+    )
+
+    with pytest.raises(ValueError, match="long smoke.*10 steps"):
+        benchmark._load_maximum(maximum_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("optimizer_steps", 9, "optimizer steps"),
+        ("samples_seen", 319, "samples seen"),
+    ],
+)
+def test_maximum_rejects_resealed_long_producer_step_or_sample_count(
+    tmp_path, monkeypatch, field, value, message,
+):
+    """Catches producer metrics not proving the exact ten-step long smoke."""
+    import stage1.benchmark as benchmark
+
+    maximum_path, maximum, _, long_attempt, producer = _sealed_maximum_fixture(
+        tmp_path, monkeypatch
+    )
+    producer["benchmark_evidence"][field] = value
+    _reseal_mock_long_producer(
+        maximum_path, maximum, long_attempt, producer
+    )
+
+    with pytest.raises(ValueError, match=message):
         benchmark._load_maximum(maximum_path)
 
 

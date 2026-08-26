@@ -2319,6 +2319,29 @@ def _load_maximum(path: Path) -> dict[str, object]:
     long_attempt = _load_probe_attempt(Path(payload["long_smoke_attempt"]))
     if payload["launch_config"] != selected["launch_config"]:
         raise ValueError("maximum selected attempt launch config mismatch")
+    selected_bindings = {
+        "method": "method",
+        "selected_micro_batch": "micro_batch",
+        "world_size": "world_size",
+        "gradient_accumulation_steps": "gradient_accumulation_steps",
+        "effective_global_batch": "effective_global_batch",
+    }
+    for maximum_name, attempt_name in selected_bindings.items():
+        if (
+            payload[maximum_name] != selected[attempt_name]
+            or selected[attempt_name]
+            != selected["launch_config"][attempt_name]
+        ):
+            raise ValueError(
+                "maximum selected attempt identity or batch controls mismatch"
+            )
+    if (
+        selected["max_steps"] != 3
+        or selected["launch_config"]["max_steps"] != 3
+    ):
+        raise ValueError("maximum selected attempt must run exactly 3 steps")
+    if payload["long_smoke_steps"] != 10:
+        raise ValueError("maximum long smoke must run exactly 10 steps")
     if len(selected_path.parents) < 6 or selected_path.parents[4].name != "attempts":
         raise ValueError("maximum selected attempt is outside a probe attempt tree")
     probe_root = selected_path.parents[5]
@@ -2349,25 +2372,73 @@ def _load_maximum(path: Path) -> dict[str, object]:
         }
     if payload["first_failure"] != expected_failure:
         raise ValueError("maximum first failure does not match its ordered chain")
-    if (
-        selected["method"] != payload["method"]
-        or selected["micro_batch"] != payload["selected_micro_batch"]
-        or long_attempt["micro_batch"] != payload["selected_micro_batch"]
-        or long_attempt["max_steps"] != payload["long_smoke_steps"]
-        or long_attempt["exit_code"] != 0
-        or long_attempt["prerequisite_chain_digest"]
-        != payload["prerequisite_chain_digest"]
+    long_launch = long_attempt["launch_config"]
+    selected_launch = selected["launch_config"]
+    immutable_launch_fields = {
+        "method", "micro_batch", "world_size", "gradient_accumulation_steps",
+        "effective_global_batch", "learning_rate", "seed", "final_save",
+        "model", "tuning_config", "data_path", "train_data_path", "data_stat",
+        "image_root", "deepspeed_config", "deepspeed_config_digest",
+        "attention_implementation", "probe_rows", "probe_row_indices",
+        "audit_digest", "prerequisite_chain_digest", "prerequisite_chain",
+    }
+    if any(
+        long_launch[name] != selected_launch[name]
+        for name in immutable_launch_fields
     ):
-        raise ValueError("maximum attempt references do not match its selection")
+        raise ValueError("maximum long-smoke attempt does not match selected maximum")
+    selected_command = selected_launch["command"]
+    normalized_long_command = list(long_launch["command"])
+    for flag in (
+        "--output-dir", "--log-file", "--max-steps",
+        "--benchmark-run-config", "--producer-evidence",
+    ):
+        if selected_command.count(flag) != normalized_long_command.count(flag):
+            raise ValueError("maximum long-smoke command changes its flag set")
+        if flag in selected_command:
+            selected_index = selected_command.index(flag)
+            long_index = normalized_long_command.index(flag)
+            normalized_long_command[long_index + 1] = selected_command[
+                selected_index + 1
+            ]
+    if normalized_long_command != selected_command:
+        raise ValueError(
+            "maximum long-smoke command changes more than attempt paths or steps"
+        )
+    long_attempt_bindings = {
+        "method": selected["method"],
+        "micro_batch": selected["micro_batch"],
+        "world_size": selected["world_size"],
+        "gradient_accumulation_steps": selected[
+            "gradient_accumulation_steps"
+        ],
+        "effective_global_batch": selected["effective_global_batch"],
+        "final_save": False,
+        "audit_digest": selected["audit_digest"],
+        "data_stat": selected["data_stat"],
+        "probe_row_indices": selected["probe_row_indices"],
+        "prerequisite_chain_digest": selected["prerequisite_chain_digest"],
+    }
+    for name, value in long_attempt_bindings.items():
+        if long_attempt[name] != value or long_launch[name] != value:
+            raise ValueError(
+                "maximum long-smoke attempt does not match selected maximum"
+            )
+    if (
+        long_attempt["max_steps"] != 10
+        or long_launch["max_steps"] != 10
+        or long_attempt["exit_code"] != 0
+    ):
+        raise ValueError("maximum long smoke must be a successful exact 10-step run")
     producer_path = Path(long_attempt["output_dir"]).parent / "evidence" / "producer-evidence.json"
     _, producer = _load_producer_evidence(producer_path)
     if producer["producer_digest"] != payload["long_smoke_producer_digest"]:
         raise ValueError("maximum long-smoke producer digest mismatch")
     producer_config = producer["run_config"]
-    long_launch = long_attempt["launch_config"]
     expected_producer_bindings = {
         "config_digest": long_launch["run_config_digest"],
         "method": long_attempt["method"],
+        "tuning_config": long_launch["tuning_config"],
         "micro_batch": long_attempt["micro_batch"],
         "world_size": long_attempt["world_size"],
         "gradient_accumulation_steps": long_attempt[
@@ -2376,6 +2447,8 @@ def _load_maximum(path: Path) -> dict[str, object]:
         "effective_global_batch": long_attempt["effective_global_batch"],
         "max_steps": long_attempt["max_steps"],
         "final_save": False,
+        "learning_rate": long_launch["learning_rate"],
+        "seed": long_launch["seed"],
         "model": long_launch["model"],
         "source_data_path": long_launch["data_path"],
         "data_path": long_launch["train_data_path"],
@@ -2384,6 +2457,8 @@ def _load_maximum(path: Path) -> dict[str, object]:
         "output_dir": long_attempt["output_dir"],
         "deepspeed_config": long_launch["deepspeed_config"],
         "deepspeed_config_digest": long_launch["deepspeed_config_digest"],
+        "attention_implementation": long_launch["attention_implementation"],
+        "probe_rows": long_launch["probe_rows"],
         "audit_digest": long_attempt["audit_digest"],
         "probe_row_indices": long_attempt["probe_row_indices"],
         "prerequisite_chain_digest": long_attempt[
@@ -2397,6 +2472,31 @@ def _load_maximum(path: Path) -> dict[str, object]:
                 f"maximum long-smoke producer is not bound to attempt field: {name}"
             )
     evidence = _evidence_from_dict(producer["benchmark_evidence"])
+    evidence_bindings = {
+        "method": long_attempt["method"],
+        "micro_batch": long_attempt["micro_batch"],
+        "world_size": long_attempt["world_size"],
+        "gradient_accumulation_steps": long_attempt[
+            "gradient_accumulation_steps"
+        ],
+        "effective_global_batch": long_attempt["effective_global_batch"],
+        "config_digest": producer_config["config_digest"],
+        "probe_row_indices": tuple(long_attempt["probe_row_indices"]),
+    }
+    for name, value in evidence_bindings.items():
+        if getattr(evidence, name) != value:
+            raise ValueError(
+                f"maximum long-smoke producer evidence mismatch for {name}"
+            )
+    if evidence.status != "success":
+        raise ValueError("maximum long-smoke producer evidence is not successful")
+    if evidence.optimizer_steps != 10:
+        raise ValueError("maximum long-smoke producer must record 10 optimizer steps")
+    expected_samples = 10 * long_attempt["effective_global_batch"]
+    if evidence.samples_seen != expected_samples:
+        raise ValueError(
+            "maximum long-smoke producer samples seen does not match its exact steps"
+        )
     if (
         list(evidence.rank_peak_allocated_bytes) != payload["rank_peak_allocated_bytes"]
         or list(evidence.rank_peak_reserved_bytes) != payload["rank_peak_reserved_bytes"]
