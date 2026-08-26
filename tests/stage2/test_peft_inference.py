@@ -20,6 +20,7 @@ from stage2.peft import (
     load_stage2_model_for_inference,
     resolve_stage2_qwen_model,
 )
+from stage2.checkpointing import inspect_stage2_artifact
 from tests.stage2.test_stage1_checkpoint_handoff import (
     tiny_tag_free_original_qwen,
     write_sparse_stage2_artifact,
@@ -59,6 +60,29 @@ def _reload_sparse_artifact(artifact):
         artifact.stage2_dir,
         artifact.processor,
     )
+
+
+def test_inference_inspection_is_bound_to_its_canonical_artifact_path(
+    sparse_inference_artifact,
+    tmp_path,
+):
+    inspection = inspect_stage2_artifact(sparse_inference_artifact.stage2_dir)
+    other_artifact = tmp_path / "other-stage2"
+    shutil.copytree(sparse_inference_artifact.stage2_dir, other_artifact)
+    model_loads = []
+
+    with pytest.raises(ValueError, match="inspection path witness mismatch"):
+        load_stage2_model_for_inference(
+            sparse_inference_artifact.original_base_dir,
+            other_artifact,
+            sparse_inference_artifact.processor,
+            artifact_inspection=inspection,
+            load_model=lambda *args, **kwargs: model_loads.append(
+                (args, kwargs)
+            ),
+        )
+
+    assert model_loads == []
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
@@ -243,6 +267,9 @@ def test_inference_shares_source_selectors_and_resizes_original_base_once(
         ("missing_selective_rows", "selective input-row tensor"),
         ("malformed_selective_rows", "selective input-row shape mismatch"),
         ("extra_tensor", "unexpected adapter tensor fields"),
+        ("prefix_renamed", "canonical adapter tensor fields"),
+        ("duplicated_alias", "canonical adapter tensor fields"),
+        ("adapter_name_corrupted", "canonical adapter tensor fields"),
     ],
 )
 def test_v3_adapter_tensor_topology_fails_before_large_base_load(
@@ -259,6 +286,16 @@ def test_v3_adapter_tensor_topology_fails_before_large_base_load(
     state = load_file(adapter_path)
     if mutation == "extra_tensor":
         state["unexpected.adapter_tensor"] = torch.zeros(1)
+    elif mutation in ("prefix_renamed", "duplicated_alias"):
+        key = next(name for name in state if "lora_A.weight" in name)
+        alias = "renamed." + key.removeprefix("base_model.model.")
+        state[alias] = state[key].clone()
+        if mutation == "prefix_renamed":
+            del state[key]
+    elif mutation == "adapter_name_corrupted":
+        key = next(name for name in state if "trainable_tokens_delta" in name)
+        corrupted = "base_model.default." + key.removeprefix("base_model.")
+        state[corrupted] = state.pop(key)
     else:
         component = {
             "missing_lora_a": "lora_A.weight",

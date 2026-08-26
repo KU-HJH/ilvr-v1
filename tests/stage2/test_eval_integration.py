@@ -1,7 +1,9 @@
 import copy
 import importlib
 import json
+import shutil
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +11,7 @@ import torch
 import transformers.modeling_utils as modeling_utils
 from peft import PeftModel
 from PIL import Image
+from safetensors.torch import load_file, save_file
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -31,6 +34,10 @@ from stage2.peft import (
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentRolloutEngine,
     LatentTokenIds,
+)
+from tests.stage2.test_stage1_checkpoint_handoff import (
+    tiny_tag_free_original_qwen,
+    write_sparse_stage2_artifact,
 )
 
 
@@ -252,6 +259,25 @@ def _save_exact_base_source(model, directory):
     )
 
 
+@pytest.fixture(scope="module")
+def sparse_eval_artifact(tmp_path_factory):
+    root = tmp_path_factory.mktemp("sparse-eval-inference")
+    stage1_dir = root / "stage1"
+    stage2_dir = root / "stage2"
+    base_dir = root / "original-base"
+    processor, _, _, source = write_sparse_stage2_artifact(
+        stage1_dir, stage2_dir
+    )
+    _save_exact_base_source(tiny_tag_free_original_qwen(), base_dir)
+    shutil.rmtree(stage1_dir)
+    return SimpleNamespace(
+        stage2_dir=stage2_dir,
+        base_dir=base_dir,
+        processor=processor,
+        source=source.eval(),
+    )
+
+
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
 def test_eval_cli_accepts_explicit_stage1_base(module_name, monkeypatch):
     """Omitting the base-model CLI route must fail this test."""
@@ -314,6 +340,126 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
     assert processor_sources == [str(artifact_dir)]
     assert model_sources == [str(base_dir)]
     assert resolve_stage2_qwen_model(model).config.stage == "stage2"
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("payload_mutation", ["delete", "replace"])
+def test_sparse_eval_reuses_one_route_inspection_after_payload_mutation(
+    module_name,
+    payload_mutation,
+    monkeypatch,
+    tmp_path,
+    sparse_eval_artifact,
+):
+    """Route inspection must own all bytes used after artifact mutation."""
+
+    module = _import_entry_point(module_name, monkeypatch)
+    artifact_dir = tmp_path / f"{module_name}-{payload_mutation}"
+    shutil.copytree(sparse_eval_artifact.stage2_dir, artifact_dir)
+    payload_paths = {
+        artifact_dir / name
+        for name in (
+            "stage2_peft_metadata.json",
+            "adapter_config.json",
+            "adapter_model.safetensors",
+            "ilvr_token_rows.safetensors",
+        )
+    }
+    reads = {path: 0 for path in payload_paths}
+    original_read_bytes = Path.read_bytes
+
+    def counted_read_bytes(path):
+        if path in reads:
+            reads[path] += 1
+        return original_read_bytes(path)
+
+    def load_processor(source, **_kwargs):
+        assert source == str(artifact_dir)
+        assert reads == {path: 1 for path in payload_paths}
+        for path in payload_paths:
+            if payload_mutation == "delete":
+                path.unlink()
+            else:
+                path.write_bytes(b"replaced after route inspection")
+        return sparse_eval_artifact.processor
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    monkeypatch.setattr(module.AutoProcessor, "from_pretrained", load_processor)
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **_kwargs: tiny_tag_free_original_qwen(),
+    )
+
+    restored, processor = module.load_evaluation_artifacts(
+        model_dir=str(artifact_dir),
+        base_model_dir=str(sparse_eval_artifact.base_dir),
+        cache_dir="cache",
+    )
+
+    assert reads == {path: 1 for path in payload_paths}
+    assert processor is sparse_eval_artifact.processor
+    expected_state = {
+        name: value.detach().cpu()
+        for name, value in sparse_eval_artifact.source.state_dict().items()
+        if "lora_" in name or "trainable_tokens_delta" in name
+    }
+    actual_state = {
+        name: value.detach().cpu()
+        for name, value in restored.state_dict().items()
+        if "lora_" in name or "trainable_tokens_delta" in name
+    }
+    assert actual_state.keys() == expected_state.keys()
+    for name, expected in expected_state.items():
+        torch.testing.assert_close(actual_state[name], expected, rtol=0, atol=0)
+    fixed_hidden = torch.linspace(-0.4, 0.9, 16).reshape(2, 8)
+    torch.testing.assert_close(
+        resolve_stage2_qwen_model(restored).lm_head(fixed_hidden),
+        resolve_stage2_qwen_model(sparse_eval_artifact.source).lm_head(
+            fixed_hidden
+        ),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_sparse_eval_rejects_noncanonical_adapter_key_before_large_load(
+    module_name,
+    monkeypatch,
+    tmp_path,
+    sparse_eval_artifact,
+):
+    """A prefix-renamed saved key must fail before the eval model load."""
+
+    module = _import_entry_point(module_name, monkeypatch)
+    artifact_dir = tmp_path / f"{module_name}-malformed"
+    shutil.copytree(sparse_eval_artifact.stage2_dir, artifact_dir)
+    adapter_path = artifact_dir / "adapter_model.safetensors"
+    state = load_file(adapter_path)
+    key = next(name for name in state if "lora_A.weight" in name)
+    state["renamed." + key.removeprefix("base_model.model.")] = state.pop(key)
+    save_file(state, adapter_path)
+    model_loads = []
+    monkeypatch.setattr(
+        module.AutoProcessor,
+        "from_pretrained",
+        lambda *_args, **_kwargs: sparse_eval_artifact.processor,
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda *args, **kwargs: model_loads.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="canonical adapter tensor fields"):
+        module.load_evaluation_artifacts(
+            model_dir=str(artifact_dir),
+            base_model_dir=str(sparse_eval_artifact.base_dir),
+            cache_dir="cache",
+        )
+
+    assert model_loads == []
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

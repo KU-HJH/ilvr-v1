@@ -13,6 +13,7 @@ from peft import (
     PeftConfig,
     PeftModel,
     get_peft_model,
+    get_peft_model_state_dict,
     set_peft_model_state_dict,
 )
 from safetensors import SafetensorError
@@ -497,6 +498,7 @@ class Stage2InferencePreflightWitness:
     adapter_config_json: bytes
     adapter_safetensors: bytes
     sparse_safetensors: bytes | None
+    adapter_tensor_contract: tuple[tuple[str, tuple[int, ...]], ...]
 
 
 def _canonical_json(value: Mapping[str, object]) -> bytes:
@@ -586,28 +588,40 @@ def _preflight_stage2_inference_artifact(
     source_kwargs,
     discover_adapter_config,
     load_config,
+    artifact_inspection=None,
 ):
     from accelerate import init_empty_weights
     from transformers import Qwen2_5_VLForConditionalGeneration
 
     from .checkpointing import (
+        Stage2ArtifactInspection,
         Stage2ArtifactKind,
-        _inspect_stage2_artifact,
-        _read_stage2_regular_payload,
         configure_stage2_metadata,
         decode_stage2_peft_metadata_snapshot,
+        inspect_stage2_artifact,
         resolve_latent_token_ids,
+        validate_stage2_adapter_tensor_contract,
         validate_stage2_peft_compatibility,
         validate_stage2_sparse_original_base_config,
         validate_stage2_sparse_processor,
     )
 
-    inspection = _inspect_stage2_artifact(stage2_artifact_path)
+    if artifact_inspection is None:
+        inspection = inspect_stage2_artifact(stage2_artifact_path)
+    else:
+        if type(artifact_inspection) is not Stage2ArtifactInspection:
+            raise TypeError(
+                "artifact_inspection must be a Stage2ArtifactInspection"
+            )
+        inspection = artifact_inspection
     if inspection.artifact_kind is not Stage2ArtifactKind.PEFT:
         raise ValueError("Stage 2 inference adapter path must be a PEFT artifact")
     metadata_snapshot = inspection.peft_metadata_snapshot
     if metadata_snapshot is None:
         raise ValueError("Stage 2 PEFT classification lost its metadata snapshot")
+    requested_artifact = Path(stage2_artifact_path).resolve(strict=False)
+    if requested_artifact != metadata_snapshot.artifact_dir:
+        raise ValueError("Stage 2 artifact inspection path witness mismatch")
     metadata = decode_stage2_peft_metadata_snapshot(metadata_snapshot)
     if metadata.peft_version != peft.__version__:
         raise ValueError(
@@ -618,13 +632,10 @@ def _preflight_stage2_inference_artifact(
     if tokenizer is None:
         raise ValueError("Stage 2 processor must expose its tokenizer")
     artifact = metadata_snapshot.artifact_dir
-    adapter_config_json = _read_stage2_regular_payload(
-        artifact / "adapter_config.json", label="Stage 2 adapter config"
-    )
-    adapter_safetensors = _read_stage2_regular_payload(
-        artifact / "adapter_model.safetensors",
-        label="Stage 2 adapter safetensors",
-    )
+    adapter_config_json = inspection.adapter_config_json
+    adapter_safetensors = inspection.adapter_safetensors
+    if adapter_config_json is None or adapter_safetensors is None:
+        raise ValueError("Stage 2 PEFT inspection lost required payload bytes")
     adapter_config = _decode_stage2_adapter_config(adapter_config_json)
     if metadata.token_row_source == "sparse_adapter":
         token_ids = validate_stage2_sparse_processor(tokenizer, metadata)
@@ -658,7 +669,32 @@ def _preflight_stage2_inference_artifact(
         metadata,
         adapter_config,
         artifact,
-        adapter_safetensors=adapter_safetensors,
+        validate_adapter_tensors=False,
+    )
+    contract_config = deepcopy(adapter_config)
+    contract_config.base_model_name_or_path = preflight_model.__dict__.get(
+        "name_or_path", None
+    )
+    expected_wrapped = get_peft_model(
+        preflight_model,
+        contract_config,
+        adapter_name="default",
+    )
+    expected_state = get_peft_model_state_dict(
+        expected_wrapped,
+        adapter_name="default",
+        save_embedding_layers=False,
+    )
+    adapter_tensor_contract = tuple(
+        sorted(
+            (key, tuple(int(value) for value in tensor.shape))
+            for key, tensor in expected_state.items()
+        )
+    )
+    validate_stage2_adapter_tensor_contract(
+        adapter_safetensors,
+        dict(adapter_tensor_contract),
+        metadata,
     )
     ordered_ids = (
         token_ids.pad_token_id,
@@ -690,6 +726,7 @@ def _preflight_stage2_inference_artifact(
         adapter_config_json=adapter_config_json,
         adapter_safetensors=adapter_safetensors,
         sparse_safetensors=sparse_safetensors,
+        adapter_tensor_contract=adapter_tensor_contract,
     )
 
 
@@ -703,6 +740,7 @@ def load_stage2_model_for_inference(
     discover_adapter_config=None,
     load_config=None,
     load_model=None,
+    artifact_inspection=None,
 ) -> PeftModel:
     """Load one frozen Stage 2 adapter from its validated original base."""
     from transformers import AutoConfig, Qwen2_5_VLForConditionalGeneration
@@ -751,6 +789,7 @@ def load_stage2_model_for_inference(
         source_kwargs=source_kwargs,
         discover_adapter_config=discover_adapter_config,
         load_config=load_config,
+        artifact_inspection=artifact_inspection,
     )
     base_model = load_model(
         str(base_model_path), **source_kwargs, **model_kwargs
@@ -779,6 +818,9 @@ def load_stage2_model_for_inference(
             adapter_config,
             witness.artifact_dir,
             adapter_safetensors=witness.adapter_safetensors,
+            expected_adapter_tensor_shapes=dict(
+                witness.adapter_tensor_contract
+            ),
         )
     else:
         token_ids = resolve_latent_token_ids(tokenizer, base_model.config)
@@ -789,6 +831,9 @@ def load_stage2_model_for_inference(
             adapter_config,
             witness.artifact_dir,
             adapter_safetensors=witness.adapter_safetensors,
+            expected_adapter_tensor_shapes=dict(
+                witness.adapter_tensor_contract
+            ),
         )
         configure_stage2_metadata(
             base_model.config,

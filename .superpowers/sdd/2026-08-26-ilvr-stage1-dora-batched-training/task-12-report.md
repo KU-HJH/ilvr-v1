@@ -302,3 +302,131 @@ No evaluation entrypoint, Stage 1, training, checkpoint-save, latent controller,
 or generic generation implementation changed in this round. No generated
 `__pycache__` remains from the implementation checks, and no open concern was
 found.
+
+## Fix round 2/5 — canonical PEFT keys and one-read eval inspection
+
+### Corrections
+
+- Adapter preflight no longer recognizes expected tensors by suffix. On the
+  already-created meta-only Qwen skeleton it constructs the explicit
+  `default` adapter with installed PEFT 0.17.1 and calls
+  `get_peft_model_state_dict(..., adapter_name="default",
+  save_embedding_layers=False)`. The resulting immutable exact key-to-logical-
+  shape map is retained in the inference witness and used both before the
+  large base load and when binding the actual loaded model.
+- The v3 contract contains every LoRA A/B and DoRA magnitude tensor plus the
+  one canonical selective `trainable_tokens_delta` key with logical shape
+  `[3, hidden_size]`. Its selective-token IDs remain strictly bound across
+  metadata, adapter config, processor, and runtime model. The explicit legacy
+  v2/base contract contains the same per-target adapter tensors and no
+  selective-token tensor. Missing, extra, prefix-renamed, duplicated-alias,
+  and adapter-name-corrupted keys now fail as an exact set mismatch before a
+  large model load.
+- `Stage2ArtifactInspection` is now a public frozen inspection capability and
+  retains the canonical artifact directory plus exact metadata, adapter-config,
+  adapter-safetensors, and optional sparse-safetensors bytes. The compatibility
+  classifier still returns only `Stage2ArtifactKind`, while direct inference
+  may inspect internally once.
+- Both evaluation entrypoints now inspect once for routing and pass that exact
+  inspection to `load_stage2_model_for_inference`. The loader binds it to the
+  requested canonical artifact path and consumes only retained bytes; it does
+  not classify or reopen any captured payload. Delete/replace after route
+  inspection therefore cannot alter the state, effective sparse logits, or
+  inference result.
+
+### TDD and verification evidence
+
+The focused RED selection was:
+
+```text
+9 failed, 6 passed, 119 deselected in 19.32s
+```
+
+Prefix-renamed and adapter-name-corrupted tensors passed suffix validation and
+reached the large-load double; a duplicate alias was noticed only as an
+unexpected suffix match. The eval tests also observed metadata/sparse reads at
+routing time but zero config/adapter reads, then a second classification in the
+loader. After replacing those originating boundaries, the same selection was
+pristine:
+
+```text
+15 passed, 119 deselected in 21.76s
+```
+
+Canonical artifact-path rebinding passed independently:
+
+```text
+1 passed in 15.73s
+```
+
+The legacy v2/base loader controls passed without a v3-only schema leak:
+
+```text
+4 passed, 2 pre-existing warnings in 10.82s
+```
+
+The existing path-based Stage 2 checkpoint compatibility controls also passed:
+
+```text
+3 passed in 7.96s
+```
+
+Final combined verification used the repository virtual environment exactly
+once for the requested Task 12, checkpoint/PEFT, eval, rollout, and generic
+generation scope:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage1:$PWD/tests/stage2" \
+./venv/ilvr-venv/bin/pytest \
+  tests/stage2/test_peft_inference.py \
+  tests/stage2/test_inference.py \
+  tests/stage2/test_rollout.py \
+  tests/stage2/test_peft_checkpointing.py \
+  tests/stage2/test_peft.py \
+  tests/stage2/test_eval_integration.py \
+  tests/stage2/test_generation_regression.py -q
+```
+
+```text
+321 passed, 10 warnings in 35.86s
+```
+
+All ten warnings are the existing PEFT missing-config warning emitted by
+temporary legacy fixture saves. The new PEFT meta-contract and immutable
+in-memory restore selection emitted no warning.
+
+### Systematic-debugging record
+
+- The adapter-key defect was reproduced before the large-load boundary, then
+  compared with PEFT 0.17.1's supported saved-state contract. On the existing
+  meta-only Qwen skeleton, explicit-default
+  `get_peft_model_state_dict` produced exactly the artifact's 22 v3 keys and
+  every logical shape, including the one `[3, 8]` selective delta. This showed
+  that manually broadening suffix rules would preserve the defect. The minimal
+  fix uses PEFT's exact normalized saved-key map; the legacy public checkpoint
+  validator uses the corresponding explicit default-adapter schema without
+  changing save/training behavior.
+- The eval double-read defect traced to route classification discarding all
+  information except its enum. The loader consequently had no capability to
+  consume the already-read payloads and inspected the path again. Retaining
+  all four payload bytes in the frozen public inspection, then threading that
+  same object through both entrypoints, removed the second read without
+  duplicating loader logic.
+- No new PEFT normalization, in-memory application, warning, or legacy v2
+  failure appeared after the fixes. Exact v2 reload and path-based checkpoint
+  controls were run before the single final combined verification.
+
+### Files additionally changed
+
+- `src/stage2/checkpointing.py`
+- `src/stage2/peft.py`
+- `src/stage2/__init__.py`
+- `eval.py`
+- `src/evaluate_deepseed.py`
+- `tests/stage2/test_peft_inference.py`
+- `tests/stage2/test_eval_integration.py`
+- `.superpowers/sdd/2026-08-26-ilvr-stage1-dora-batched-training/task-12-report.md`
+
+No Stage 1, training, checkpoint-save, latent-controller, rollout, or generic
+generation implementation changed in this round.

@@ -69,8 +69,10 @@ class Stage2ArtifactInspection:
     """Classified Stage 2 artifact with retained immutable PEFT payloads."""
 
     artifact_kind: Stage2ArtifactKind
-    peft_metadata_snapshot: Stage2PeftMetadataSnapshot | None
-    sparse_safetensors: bytes | None
+    peft_metadata_snapshot: Stage2PeftMetadataSnapshot | None = None
+    adapter_config_json: bytes | None = None
+    adapter_safetensors: bytes | None = None
+    sparse_safetensors: bytes | None = None
 
 
 _REQUIRED_PEFT_MARKERS = frozenset(
@@ -112,7 +114,7 @@ def _read_stage2_regular_payload(path: Path, *, label: str) -> bytes:
         raise ValueError(f"invalid {label} payload file: {path}") from error
 
 
-def _inspect_stage2_artifact(directory: str | Path) -> Stage2ArtifactInspection:
+def inspect_stage2_artifact(directory: str | Path) -> Stage2ArtifactInspection:
     """Classify once while retaining exact metadata and sparse payload bytes.
 
     Non-local references are left to ``from_pretrained`` and classified as full
@@ -122,7 +124,7 @@ def _inspect_stage2_artifact(directory: str | Path) -> Stage2ArtifactInspection:
     """
     candidate = Path(directory)
     if not candidate.exists():
-        return Stage2ArtifactInspection(Stage2ArtifactKind.FULL, None, None)
+        return Stage2ArtifactInspection(Stage2ArtifactKind.FULL)
     path = _canonical_stage2_artifact_dir(candidate)
 
     names = {entry.name for entry in path.iterdir()}
@@ -181,6 +183,13 @@ def _inspect_stage2_artifact(directory: str | Path) -> Stage2ArtifactInspection:
             )
         metadata_snapshot = read_stage2_peft_metadata_snapshot(path)
         metadata = decode_stage2_peft_metadata_snapshot(metadata_snapshot)
+        adapter_config_json = _read_stage2_regular_payload(
+            path / "adapter_config.json", label="Stage 2 adapter config"
+        )
+        adapter_safetensors = _read_stage2_regular_payload(
+            path / "adapter_model.safetensors",
+            label="Stage 2 adapter safetensors",
+        )
         has_sparse_rows = SPARSE_TOKEN_ROWS_FILENAME in names
         expects_sparse_rows = metadata.token_row_source == "sparse_adapter"
         if expects_sparse_rows and not has_sparse_rows:
@@ -227,13 +236,15 @@ def _inspect_stage2_artifact(directory: str | Path) -> Stage2ArtifactInspection:
                     f"stored={tuple(output_delta.shape)}, expected={expected_shape}"
                 )
         return Stage2ArtifactInspection(
-            Stage2ArtifactKind.PEFT,
-            metadata_snapshot,
-            sparse_safetensors,
+            artifact_kind=Stage2ArtifactKind.PEFT,
+            peft_metadata_snapshot=metadata_snapshot,
+            adapter_config_json=adapter_config_json,
+            adapter_safetensors=adapter_safetensors,
+            sparse_safetensors=sparse_safetensors,
         )
     if present_full:
         _validate_full_serialization(path, names)
-        return Stage2ArtifactInspection(Stage2ArtifactKind.FULL, None, None)
+        return Stage2ArtifactInspection(Stage2ArtifactKind.FULL)
     raise ValueError(
         f"unrecognized local Stage 2 artifact (missing model weights): {path}"
     )
@@ -242,7 +253,11 @@ def _inspect_stage2_artifact(directory: str | Path) -> Stage2ArtifactInspection:
 def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
     """Classify a Stage 2 artifact while preserving the public enum API."""
 
-    return _inspect_stage2_artifact(directory).artifact_kind
+    return inspect_stage2_artifact(directory).artifact_kind
+
+
+# Retain the fix-round-1 private name for internal compatibility.
+_inspect_stage2_artifact = inspect_stage2_artifact
 
 
 # Retain the Stage 2 helper names as direct compatibility wrappers.
@@ -589,72 +604,116 @@ def _expected_qwen_projection_weight_shape(config, suffix: str) -> tuple[int, in
     }[suffix]
 
 
-def _validate_stage2_adapter_tensor_shapes(
+def _legacy_stage2_adapter_tensor_contract(
     qwen: nn.Module,
-    tensor_shapes: Mapping[str, Sequence[int]],
     metadata: Stage2PeftMetadata,
-) -> None:
-    """Require the exact legacy-base or sparse-v3 adapter tensor schema."""
+) -> dict[str, tuple[int, ...]]:
+    """Return PEFT's explicit default-adapter saved-key contract.
+
+    Inference supplies the contract produced by installed PEFT itself.  This
+    explicit legacy path keeps checkpoint validation independent of a second
+    model wrapping operation while using the same canonical saved-key schema.
+    """
 
     modules = dict(qwen.named_modules())
-    keys = tuple(tensor_shapes)
-    matched: set[str] = set()
-    selective_matches = [
-        key
-        for key in keys
-        if key.endswith(
-            ".model.embed_tokens.token_adapter.trainable_tokens_delta"
-        )
-    ]
-    if metadata.token_row_source == "sparse_adapter":
-        if len(selective_matches) != 1:
-            raise ValueError(
-                "Stage 2 adapter must contain exactly one selective input-row tensor"
-            )
-        selective_key = selective_matches[0]
-        matched.add(selective_key)
-        expected_shape = [
-            3,
-            int(metadata.base_model_architecture["decoder"]["hidden_size"]),
-        ]
-        actual_shape = list(tensor_shapes[selective_key])
-        if actual_shape != expected_shape:
-            raise ValueError(
-                "Stage 2 selective input-row shape mismatch: "
-                f"adapter={actual_shape}, expected={expected_shape}"
-            )
-    elif selective_matches:
-        raise ValueError(
-            "legacy base-source Stage 2 adapter must not contain selective "
-            "input-row tensors"
-        )
-
+    expected: dict[str, tuple[int, ...]] = {}
     for target in metadata.resolved_target_module_names:
         module = modules[target]
-        expected_shapes = {
-            "lora_A.weight": [metadata.lora_r, module.in_features],
-            "lora_B.weight": [module.out_features, metadata.lora_r],
-        }
+        prefix = f"base_model.model.{target}"
+        expected[f"{prefix}.lora_A.weight"] = (
+            metadata.lora_r,
+            module.in_features,
+        )
+        expected[f"{prefix}.lora_B.weight"] = (
+            module.out_features,
+            metadata.lora_r,
+        )
         if metadata.tuning_method == "dora":
-            expected_shapes["lora_magnitude_vector"] = [module.out_features]
-        for component, expected_shape in expected_shapes.items():
-            suffix = f".{target}.{component}"
-            matches = [key for key in keys if key.endswith(suffix)]
-            if len(matches) != 1:
-                raise ValueError(
-                    f"adapter tensor mismatch for {target}: expected {component}"
-                )
-            key = matches[0]
-            matched.add(key)
-            actual_shape = list(tensor_shapes[key])
-            if actual_shape != expected_shape:
-                raise ValueError(
-                    f"target shape mismatch at {target}: "
-                    f"adapter={actual_shape}, expected={expected_shape}"
-                )
-    unexpected = sorted(set(keys) - matched)
-    if unexpected:
-        raise ValueError(f"unexpected adapter tensor fields: {unexpected}")
+            expected[f"{prefix}.lora_magnitude_vector"] = (
+                module.out_features,
+            )
+    if metadata.token_row_source == "sparse_adapter":
+        expected[
+            "base_model.model.model.embed_tokens.token_adapter."
+            "trainable_tokens_delta"
+        ] = (
+            3,
+            int(metadata.base_model_architecture["decoder"]["hidden_size"]),
+        )
+    return expected
+
+
+def _validate_stage2_adapter_tensor_shapes(
+    tensor_shapes: Mapping[str, Sequence[int]],
+    expected_shapes: Mapping[str, Sequence[int]],
+    metadata: Stage2PeftMetadata,
+) -> None:
+    """Require an exact canonical PEFT saved-key and logical-shape contract."""
+
+    actual_keys = set(tensor_shapes)
+    expected_keys = set(expected_shapes)
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    selective_key = (
+        "base_model.model.model.embed_tokens.token_adapter."
+        "trainable_tokens_delta"
+    )
+    if missing or unexpected:
+        if missing == [selective_key] and not unexpected:
+            raise ValueError(
+                "Stage 2 adapter must contain exactly one selective input-row tensor; "
+                "canonical adapter tensor fields mismatch"
+            )
+        missing_components = [
+            component
+            for component in ("lora_A", "lora_B", "lora_magnitude_vector")
+            if any(component in key for key in missing)
+        ]
+        details = []
+        if missing:
+            details.append(f"missing={missing}")
+        if unexpected:
+            details.append(f"unexpected adapter tensor fields={unexpected}")
+        if missing_components:
+            details.append(f"missing components={missing_components}")
+        raise ValueError(
+            "canonical adapter tensor fields mismatch: " + "; ".join(details)
+        )
+
+    for key in sorted(expected_keys):
+        actual_shape = tuple(int(value) for value in tensor_shapes[key])
+        expected_shape = tuple(int(value) for value in expected_shapes[key])
+        if actual_shape == expected_shape:
+            continue
+        if key == selective_key:
+            raise ValueError(
+                "Stage 2 selective input-row shape mismatch: "
+                f"adapter={list(actual_shape)}, expected={list(expected_shape)}"
+            )
+        target = key.removeprefix("base_model.model.").rsplit(".", 2)[0]
+        raise ValueError(
+            f"target shape mismatch at {target}: "
+            f"adapter={list(actual_shape)}, expected={list(expected_shape)}"
+        )
+
+
+def validate_stage2_adapter_tensor_contract(
+    adapter_safetensors: bytes,
+    expected_shapes: Mapping[str, Sequence[int]],
+    metadata: Stage2PeftMetadata,
+) -> None:
+    """Validate immutable adapter bytes against one canonical saved contract."""
+
+    if type(adapter_safetensors) is not bytes:
+        raise TypeError("adapter_safetensors must be bytes")
+    try:
+        adapter_state = load_safetensors(adapter_safetensors)
+    except SafetensorError as error:
+        raise ValueError("invalid Stage 2 adapter safetensors bytes") from error
+    tensor_shapes = {key: value.shape for key, value in adapter_state.items()}
+    _validate_stage2_adapter_tensor_shapes(
+        tensor_shapes, expected_shapes, metadata
+    )
 
 
 def validate_stage2_peft_compatibility(
@@ -665,6 +724,8 @@ def validate_stage2_peft_compatibility(
     adapter_path: str | Path,
     *,
     adapter_safetensors: bytes | None = None,
+    expected_adapter_tensor_shapes: Mapping[str, Sequence[int]] | None = None,
+    validate_adapter_tensors: bool = True,
 ) -> None:
     """Validate a relocated base against adapter metadata without reading weights."""
     qwen = _resolve_stage1_qwen_base(
@@ -804,6 +865,12 @@ def validate_stage2_peft_compatibility(
                 f"architecture={expected_shape}, target={actual_shape}"
             )
 
+    if not validate_adapter_tensors:
+        return
+    if expected_adapter_tensor_shapes is None:
+        expected_adapter_tensor_shapes = _legacy_stage2_adapter_tensor_contract(
+            qwen, metadata
+        )
     if adapter_safetensors is None:
         tensor_path = Path(adapter_path) / "adapter_model.safetensors"
         if not tensor_path.is_file():
@@ -812,15 +879,13 @@ def validate_stage2_peft_compatibility(
             tensor_shapes = {
                 key: tensors.get_slice(key).get_shape() for key in tensors.keys()
             }
-    else:
-        if type(adapter_safetensors) is not bytes:
-            raise TypeError("adapter_safetensors must be bytes")
-        try:
-            adapter_state = load_safetensors(adapter_safetensors)
-        except SafetensorError as error:
-            raise ValueError("invalid Stage 2 adapter safetensors bytes") from error
-        tensor_shapes = {key: value.shape for key, value in adapter_state.items()}
-    _validate_stage2_adapter_tensor_shapes(qwen, tensor_shapes, metadata)
+        _validate_stage2_adapter_tensor_shapes(
+            tensor_shapes, expected_adapter_tensor_shapes, metadata
+        )
+        return
+    validate_stage2_adapter_tensor_contract(
+        adapter_safetensors, expected_adapter_tensor_shapes, metadata
+    )
 
 
 LATENT_TOKEN_STRINGS = {
