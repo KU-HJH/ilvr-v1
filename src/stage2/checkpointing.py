@@ -530,9 +530,13 @@ def migrate_stage2_metadata(raw: Mapping[str, object]) -> Stage2PeftMetadata:
             )
         if raw["token_row_source"] == "sparse_adapter":
             raise ValueError(
-                "Stage 2 sparse schema v3 lacks pretrained padded vocabulary "
-                "provenance; re-save it from authenticated Stage 1 schema v2 "
-                "as Stage 2 schema v4"
+                "Stage 2 sparse schema v3 cannot be loaded or automatically "
+                "migrated because it lacks pretrained padded vocabulary "
+                "provenance; restart a fresh Stage 2 run from an authenticated "
+                "Stage 1 schema v2 checkpoint to create schema v4. Existing v3 "
+                "optimizer, scheduler, global-step, and Stage 2 weight state is "
+                "not preserved; preserving it requires a future audited offline "
+                "converter, which is not implemented"
             )
         migrated = dict(raw)
         architecture = _normalize_base_model_architecture(

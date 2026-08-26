@@ -187,7 +187,10 @@ def test_sparse_v3_inference_rejects_unknown_vocab_provenance_before_load(
     )
     calls = []
 
-    with pytest.raises(ValueError, match="sparse.*v3.*provenance"):
+    with pytest.raises(
+        ValueError,
+        match="sparse.*v3.*cannot be loaded or automatically migrated.*fresh Stage 2 run",
+    ):
         load_stage2_model_for_inference(
             claimed_origin,
             artifact_dir,

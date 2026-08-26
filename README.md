@@ -528,9 +528,14 @@ semantics. Strict complete v3 artifacts migrate only when
 unambiguous. A v3 `sparse_adapter` artifact is rejected even if its original
 model happened to be unpadded: v3 did not record the pretrained padded
 vocabulary, and the loader does not invent it from a path or from
-`resized_vocab_size - 3`. Re-save that artifact from its authenticated Stage 1
-schema-v2 source to produce a Stage 2 schema-v4 artifact. Do not manually add an
-inferred value. Schema v1 and partial or unknown v2/v3/v4 payloads are rejected.
+`resized_vocab_size - 3`. This repository has no state-preserving v3 converter,
+so a sparse v3 artifact cannot be loaded or automatically migrated. Restart a
+fresh Stage 2 run from its authenticated Stage 1 schema-v2 source checkpoint to
+produce a new schema-v4 artifact. This does not preserve the v3 optimizer,
+scheduler, global step, or trained Stage 2 weights. Preserving that state would
+require a separate future audited offline converter, which is not implemented.
+Do not manually add an inferred value. Schema v1 and partial or unknown
+v2/v3/v4 payloads are rejected.
 
 A numbered checkpoint also contains `trainer_state.json`, RNG state, and the
 optimizer/scheduler state required by its training backend. The concrete

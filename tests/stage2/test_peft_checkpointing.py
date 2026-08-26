@@ -193,7 +193,10 @@ def test_sparse_v3_metadata_without_vocab_provenance_fails_closed(
         latent_end_token_id=127,
     )
 
-    with pytest.raises(ValueError, match="sparse.*v3.*provenance"):
+    with pytest.raises(
+        ValueError,
+        match="sparse.*v3.*cannot be loaded or automatically migrated.*fresh Stage 2 run",
+    ):
         migrate_stage2_metadata(payload)
 
 
