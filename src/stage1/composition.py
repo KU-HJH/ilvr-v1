@@ -491,6 +491,8 @@ def build_stage1_training_components(
             trust_remote_code=True,
         )
         _configure_latent_model(config, latent_ids, latent_size=metadata.latent_size)
+        config.compress_strategy = args.compress_strategy
+        config.use_cache = False
         _validate_resume_tokens(
             processor,
             config,

@@ -576,6 +576,39 @@ def test_peft_resume_rejects_cli_base_source_mismatch_before_external_loads(tmp_
     )
 
 
+def test_peft_resume_canonicalizes_training_config_before_base_load(tmp_path):
+    """Catches remote inference defaults reaching resumed teacher construction."""
+
+    args = stage1_args(tmp_path)
+    checkpoint, metadata, processor = _write_peft_resume_checkpoint(args)
+    args.resume_from_checkpoint_path = str(checkpoint)
+    events = []
+    deps, _, model, _ = fake_dependencies(
+        events, processor=processor, metadata=metadata
+    )
+    model.config.use_cache = True
+    model.config.compress_strategy = "remote-default"
+    real_load_model = deps.load_model
+    observed = []
+
+    def inspect_model_load(source, **kwargs):
+        config = kwargs["config"]
+        observed.append((config.use_cache, config.compress_strategy))
+        return real_load_model(source, **kwargs)
+
+    deps = replace(
+        deps,
+        resolve_resume=resolve_stage1_resume,
+        load_peft_metadata=read_stage1_peft_metadata_snapshot,
+        decode_peft_metadata=decode_stage1_peft_metadata_snapshot,
+        load_model=inspect_model_load,
+    )
+
+    build_stage1_training_components(args, dependencies=deps)
+
+    assert observed == [(False, "average")]
+
+
 def test_real_explicit_resume_rejects_malformed_metadata_before_large_load(
     tmp_path,
 ):

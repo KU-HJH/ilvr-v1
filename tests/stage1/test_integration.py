@@ -523,6 +523,89 @@ def test_tiny_stage1_b2_train_save_resume_end_to_end(tmp_path, method):
     assert resumed.scheduler_state_restored
 
 
+def test_right_padded_b2_peft_resume_disables_teacher_and_student_cache(
+    tmp_path,
+):
+    """Catches an EMA teacher creating DynamicCache before Trainer GC setup."""
+
+    run = tiny_stage1_run(
+        tmp_path,
+        method="dora",
+        batch_size=2,
+        gradient_accumulation_steps=2,
+        max_steps=1,
+        save_steps=1,
+        output_dir=tmp_path / "right-padded-resume",
+    )
+    args = _stage1_args(
+        tmp_path,
+        method="dora",
+        output_dir=run.checkpoint_1.parent,
+        batch_size=2,
+        gradient_accumulation_steps=2,
+        max_steps=2,
+        save_steps=10,
+        resume=run.checkpoint_1,
+    )
+    components = build_stage1_training_components(
+        args, dependencies=_tiny_dependencies()
+    )
+    original_collator = components.trainer.data_collator
+
+    def right_padded_collator(rows):
+        batch = original_collator(rows)
+        batch["attention_mask"][0, -1] = 0
+        batch["labels"][0, -1] = -100
+        return batch
+
+    components.trainer.data_collator = right_padded_collator
+    student = resolve_qwen2_5_vl_model(components.model)
+    teacher = resolve_qwen2_5_vl_model(components.trainer.ema_teacher.model)
+    observed_caches = {"student": [], "teacher": []}
+
+    def install_real_flash_guard(qwen, label):
+        decoder = qwen.model
+        real_update = decoder._update_causal_mask
+
+        def update_mask(
+            attention_mask,
+            input_tensor,
+            cache_position,
+            past_key_values,
+            output_attentions,
+        ):
+            observed_caches[label].append(past_key_values)
+            implementation = decoder.config._attn_implementation
+            decoder.config._attn_implementation = "flash_attention_2"
+            try:
+                real_update(
+                    attention_mask,
+                    input_tensor,
+                    cache_position,
+                    past_key_values,
+                    output_attentions,
+                )
+            finally:
+                decoder.config._attn_implementation = implementation
+            return None
+
+        decoder._update_causal_mask = update_mask
+
+    install_real_flash_guard(student, "student")
+    install_real_flash_guard(teacher, "teacher")
+
+    components.trainer.train(resume_from_checkpoint=str(run.checkpoint_1))
+
+    assert student.config.use_cache is False
+    assert teacher.config.use_cache is False
+    assert student.config.compress_strategy == "average"
+    assert teacher.config.compress_strategy == "average"
+    assert observed_caches["student"]
+    assert observed_caches["teacher"]
+    assert all(cache is None for cache in observed_caches["student"])
+    assert all(cache is None for cache in observed_caches["teacher"])
+
+
 def test_tiny_tied_qwen_full_b2_train_save_resume_end_to_end(tmp_path):
     run = tiny_stage1_run(
         tmp_path,
