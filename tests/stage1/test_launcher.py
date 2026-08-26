@@ -1,9 +1,12 @@
 from pathlib import Path
+import json
 import os
 import shlex
 import subprocess
 
 import pytest
+
+from stage1.benchmark import config_digest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -139,6 +142,78 @@ def test_full_dry_run_omits_every_peft_argument(tmp_path):
         "--lora_target_modules",
     ):
         assert flag not in command
+
+
+def test_probe_flags_forward_exact_max_steps_without_final_save(tmp_path):
+    """Catches a capacity probe accidentally training fully or serializing weights."""
+    completed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "probe output"),
+        "--max-steps",
+        "3",
+        "--no-final-save",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = shlex.split(completed.stdout)
+    assert command[command.index("--max_steps") + 1] == "3"
+    assert "--no_final_save" in command
+    assert "--final_save" not in command
+
+
+def test_timed_manifest_is_loaded_without_shell_evaluating_paths(tmp_path):
+    """Catches the Task 17 manifest interface losing quoting or config binding."""
+    output = tmp_path / "timed output;$(touch MANIFEST_INJECTION)"
+    manifest = {
+        "schema_version": 1,
+        "kind": "stage1-timed-launch-manifest",
+        "method": "dora",
+        "model": "model path;literal",
+        "data_path": "/missing/data path;literal/TRAIN.jsonl",
+        "image_root": "/missing/image root & literal",
+        "output_dir": str(output),
+        "micro_batch": 16,
+        "world_size": 2,
+        "gradient_accumulation_steps": 2,
+        "effective_global_batch": 64,
+        "epochs": 3,
+        "learning_rate": 1e-5,
+        "seed": 42,
+        "attention_implementation": "flash_attention_2",
+        "deepspeed_config": str(REPO_ROOT / "configs/config_stage3.json"),
+        "save_strategy": "no",
+        "final_save": True,
+        "maximum_config_digest": "b" * 64,
+    }
+    manifest["config_digest"] = config_digest(manifest)
+    manifest_path = tmp_path / "launch manifest;literal.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    completed = run_launcher(
+        LAUNCHER, "--manifest", manifest_path, "--dry-run"
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = shlex.split(completed.stdout)
+    assert command[command.index("--model") + 1] == "model path;literal"
+    assert command[command.index("--save_model_path") + 1] == str(output)
+    assert command[command.index("--per_device_train_batch_size") + 1] == "16"
+    assert "--final_save" in command
+    assert not (REPO_ROOT / "MANIFEST_INJECTION").exists()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "3.5", "nan", "word"])
+def test_launcher_rejects_invalid_explicit_max_steps(tmp_path, value):
+    """Catches malformed probe limits reaching Trainer."""
+    completed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "probe output"),
+        "--max-steps",
+        value,
+    )
+
+    assert completed.returncode == 2
+    assert "max_steps" in completed.stderr
 
 
 def test_launcher_requires_all_explicit_sources():

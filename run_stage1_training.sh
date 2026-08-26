@@ -4,6 +4,39 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cd -- "$script_dir"
 
+manifest_mode=false
+manifest_path=
+if (( $# )) && [[ $1 == --manifest ]]; then
+    if (( $# != 2 && $# != 3 )) || [[ -z ${2:-} ]] || { (( $# == 3 )) && [[ $3 != --dry-run ]]; }; then
+        printf 'error: --manifest requires one path and optionally --dry-run\n' >&2
+        exit 2
+    fi
+    manifest_mode=true
+    manifest_path=$2
+    manifest_dry_run=false
+    if (( $# == 3 )); then
+        manifest_dry_run=true
+    fi
+    benchmark_python=${STAGE1_BENCHMARK_PYTHON:-"$script_dir/venv/ilvr-venv/bin/python"}
+    [[ -x $benchmark_python ]] || {
+        printf 'error: benchmark Python is not executable: %s\n' "$benchmark_python" >&2
+        exit 2
+    }
+    manifest_arguments=()
+    mapfile -d '' -t manifest_arguments < <(
+        "$benchmark_python" -m src.stage1.benchmark launcher-args \
+            --manifest "$manifest_path"
+    )
+    if (( ${#manifest_arguments[@]} == 0 )); then
+        printf 'error: manifest did not produce launcher arguments: %s\n' "$manifest_path" >&2
+        exit 2
+    fi
+    set -- "${manifest_arguments[@]}"
+    if [[ $manifest_dry_run == true ]]; then
+        set -- "$@" --dry-run
+    fi
+fi
+
 method=${STAGE1_METHOD:-}
 model=${STAGE1_MODEL:-}
 data_path=${STAGE1_DATA_PATH:-}
@@ -19,6 +52,7 @@ attention_implementation=${STAGE1_ATTENTION_IMPLEMENTATION:-flash_attention_2}
 save_strategy=${STAGE1_SAVE_STRATEGY:-no}
 resume_path=${STAGE1_RESUME_PATH:-}
 log_file=${STAGE1_LOG_FILE:-}
+max_steps=${STAGE1_MAX_STEPS:-}
 dry_run=false
 final_save=true
 legacy_use_lora=false
@@ -53,6 +87,7 @@ while (( $# )); do
         --save-strategy) require_value "$@"; save_strategy=$2; shift 2 ;;
         --resume) require_value "$@"; resume_path=$2; shift 2 ;;
         --log-file) require_value "$@"; log_file=$2; shift 2 ;;
+        --max-steps) require_value "$@"; max_steps=$2; shift 2 ;;
         --final-save) final_save=true; shift ;;
         --no-final-save) final_save=false; shift ;;
         --use_lora) legacy_use_lora=true; shift ;;
@@ -95,6 +130,10 @@ for integer_name in micro_batch gradient_accumulation seed; do
         exit 2
     fi
 done
+if [[ -n $max_steps && ( ! $max_steps =~ ^[0-9]+$ || $max_steps -lt 1 ) ]]; then
+    printf 'error: max_steps must be a positive integer\n' >&2
+    exit 2
+fi
 
 is_positive_finite() {
     local value=$1
@@ -112,12 +151,30 @@ for scalar_name in epochs learning_rate; do
 done
 
 if [[ $dry_run != true ]]; then
+    if [[ $manifest_mode == true ]]; then
+        resolved_manifest=$(readlink -f -- "$manifest_path") || {
+            printf 'error: manifest path cannot be resolved: %s\n' "$manifest_path" >&2
+            exit 2
+        }
+        expected_manifest=$(readlink -m -- "$output_dir/launch-manifest.json")
+        if [[ $resolved_manifest != "$expected_manifest" ]]; then
+            printf 'error: live manifest must be the output launch-manifest.json\n' >&2
+            exit 2
+        fi
+    fi
     if [[ -L $output_dir ]]; then
         printf 'error: output path must not be a symlink: %s\n' "$output_dir" >&2
         exit 2
     fi
     if [[ -d $output_dir ]] && find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-        if [[ -z $resume_path ]]; then
+        manifest_only=false
+        if [[ $manifest_mode == true ]]; then
+            entry_count=$(find "$output_dir" -mindepth 1 -maxdepth 1 -printf '.' | wc -c)
+            if [[ $entry_count == 1 && -f $output_dir/launch-manifest.json ]]; then
+                manifest_only=true
+            fi
+        fi
+        if [[ -z $resume_path && $manifest_only != true ]]; then
             printf 'error: output directory is nonempty; pass --resume explicitly: %s\n' "$output_dir" >&2
             exit 2
         fi
@@ -183,6 +240,9 @@ fi
 
 if [[ -n $resume_path ]]; then
     command+=(--resume_from_checkpoint_path "$resume_path")
+fi
+if [[ -n $max_steps ]]; then
+    command+=(--max_steps "$max_steps")
 fi
 if [[ $final_save == true ]]; then
     command+=(--final_save)
