@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,6 +65,15 @@ def test_capacity_candidates_follow_only_the_approved_order():
     assert fallback_candidates_after_initial_failure(start=8) == (4, 2, 1)
     with pytest.raises(ValueError, match="initial batch 8"):
         fallback_candidates_after_initial_failure(start=16)
+
+
+def test_canonical_evidence_strings_reject_embedded_nul():
+    """Catches argv/config truncation at a later NUL-delimited boundary."""
+    with pytest.raises(ValueError, match="NUL"):
+        config_digest({"model": "safe\0forged"})
+
+    with pytest.raises(ValueError, match="NUL"):
+        evidence(git_commit="abc\0forged")
 
 
 def test_exact_module_cli_runs_without_repository_pythonpath_override():
@@ -203,6 +213,36 @@ def test_high_cost_audit_fails_clearly_for_missing_references(tmp_path):
         select_high_cost_probe_rows(data_path, 1, tmp_path / "audit.json")
 
 
+def test_high_cost_audit_rejects_blank_physical_lines(tmp_path):
+    """Catches compacted row IDs that no longer identify physical JSONL rows."""
+    image = _touch(tmp_path / "image.bin")
+    row = {"image_input": image, "text_input": "x", "sequence_plan": []}
+    data_path = tmp_path / "TRAIN.jsonl"
+    data_path.write_text(json.dumps(row) + "\n\n" + json.dumps(row) + "\n")
+
+    with pytest.raises(ValueError, match=r"blank.*line 2"):
+        select_high_cost_probe_rows(data_path, 2, tmp_path / "audit.json")
+
+
+def test_probe_jsonl_rejects_audit_from_another_image_root(tmp_path):
+    """Catches replay of the right row list against a different image tree."""
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    other_root = tmp_path / "other-images"
+    other_root.mkdir()
+    image = _touch(image_root / "image.bin")
+    data = tmp_path / "TRAIN.jsonl"
+    data.write_text(json.dumps({"image_input": image, "sequence_plan": []}) + "\n")
+    audit = tmp_path / "audit.json"
+    select_high_cost_probe_rows(data, 64, audit, image_root=image_root)
+
+    import stage1.benchmark as benchmark
+    with pytest.raises(ValueError, match="source data/image root/stat"):
+        benchmark._atomic_write_probe_jsonl(
+            audit, tmp_path / "probe.jsonl", data_path=data, image_root=other_root
+        )
+
+
 def _write_fake_launcher(path: Path) -> None:
     path.write_text(
         """#!/usr/bin/env bash
@@ -240,7 +280,7 @@ def _run_probe(tmp_path, *, fail_batches, extra=()):
                 "kind": "stage1-high-cost-row-audit",
                 "data_path": str(data_path.resolve()),
                 "image_root": str(image_root.resolve()),
-                "requested_count": 1,
+                "requested_count": 64,
                 "row_count": 1,
                 "input_stat": {
                     "device": data_path.stat().st_dev,
@@ -262,6 +302,9 @@ def _run_probe(tmp_path, *, fail_batches, extra=()):
         ),
         encoding="utf-8",
     )
+    probe_payload = json.loads(probe_rows.read_text())
+    probe_payload["audit_digest"] = config_digest(probe_payload)
+    probe_rows.write_text(json.dumps(probe_payload), encoding="utf-8")
     output_root = tmp_path / "probe outputs;literal"
     env = os.environ.copy()
     env.update(
@@ -331,6 +374,139 @@ def test_probe_uses_fresh_processes_unique_paths_and_stops_at_first_failure(tmp_
     assert failed[0]["requires_oom_classification"] is True
 
 
+def test_attempt_seal_binds_top_level_fields_and_is_append_only(tmp_path):
+    """Catches post-hoc PID/method/argv edits and attempt-file replacement."""
+    completed, _, output_root = _run_probe(tmp_path, fail_batches="8")
+    assert completed.returncode == 42
+    attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    payload = json.loads(attempt_path.read_text())
+
+    import stage1.benchmark as benchmark
+
+    payload["process_id"] += 1000
+    attempt_path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="attempt digest"):
+        benchmark._load_probe_attempt(attempt_path)
+
+    # A recorded attempt is immutable even if a caller presents identical fields.
+    attempt_path.write_text(json.dumps({**payload, "process_id": payload["process_id"] - 1000}))
+    args = benchmark._build_parser().parse_args(
+        [
+            "record-attempt", "--attempt-dir", str(attempt_path.parents[1]),
+            "--attempt-id", payload["attempt_id"], "--method", "full",
+            "--micro-batch", "8", "--world-size", "2",
+            "--gradient-accumulation", "2", "--learning-rate", "1e-5",
+            "--seed", "42", "--model", payload["launch_config"]["model"],
+            "--source-data-path", payload["launch_config"]["data_path"],
+            "--image-root", payload["launch_config"]["image_root"],
+            "--deepspeed-config", payload["launch_config"]["deepspeed_config"],
+            "--attention-implementation", "flash_attention_2",
+            "--process-id", str(payload["process_id"] - 1000), "--exit-code", "42",
+            "--max-steps", "3", "--output-dir", payload["output_dir"],
+            "--stdout-path", payload["stdout_path"], "--stderr-path", payload["stderr_path"],
+            "--probe-rows", payload["probe_rows"], "--", *payload["command"],
+        ]
+    )
+    with pytest.raises(FileExistsError, match="append-only"):
+        benchmark._record_probe_attempt(args)
+
+
+def test_capacity_chain_rejects_duplicate_and_success_after_first_failure():
+    """Catches re-search and a result selected from beyond the stopping point."""
+    import stage1.benchmark as benchmark
+
+    immutable = {
+        "method": "full", "world_size": 2, "gradient_accumulation_steps": 2,
+        "learning_rate": 1e-5, "seed": 42, "model": "model",
+        "data_path": "/data", "data_stat": {"device": 1}, "image_root": "/images",
+        "deepspeed_config": "/zero3.json", "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2", "probe_rows": "/audit",
+        "probe_row_indices": [1], "audit_digest": "a" * 64, "tuning_config": None,
+    }
+
+    def item(batch, exit_code, recorded):
+        return Path(f"attempt-{recorded}.json"), {
+            "micro_batch": batch, "exit_code": exit_code,
+            "recorded_at_ns": recorded, "launch_config": immutable,
+        }
+
+    with pytest.raises(ValueError, match="duplicate"):
+        benchmark._validated_capacity_chain(
+            [item(8, 0, 1), item(8, 0, 2)], require_success=True
+        )
+    with pytest.raises(ValueError, match="after its first failure"):
+        benchmark._validated_capacity_chain(
+            [item(8, 0, 1), item(16, 42, 2), item(32, 0, 3)],
+            require_success=True,
+        )
+
+
+def test_timed_validation_rejects_artifactless_and_plain_metric_evidence(tmp_path):
+    """Catches sealing a successful metrics blob without final model topology."""
+    import stage1.benchmark as benchmark
+
+    plain = evidence(config_digest="c" * 64, checkpoint_bytes=0)
+    plain_path = tmp_path / "plain.json"
+    write_benchmark_evidence(plain_path, plain)
+    with pytest.raises((TypeError, ValueError), match="producer evidence"):
+        benchmark._load_evidence_without_expected(plain_path)
+
+    config = {
+        "schema_version": 1, "kind": "stage1-timed-launch-manifest",
+        "method": "full", "tuning_config": None, "model": "model",
+        "source_data_path": "/data", "data_path": "/data",
+        "data_stat": {"device": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+        "image_root": "/images", "output_dir": str(tmp_path), "micro_batch": 8,
+        "world_size": 2, "gradient_accumulation_steps": 2,
+        "effective_global_batch": 32, "epochs": 3, "learning_rate": 1e-5,
+        "seed": 42, "max_steps": 0, "final_save": True,
+        "deepspeed_config": "/zero3.json", "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2", "save_strategy": "no",
+        "audit_digest": "a" * 64, "probe_rows": "/audit",
+        "probe_row_indices": [7, 3], "maximum_config_digest": "b" * 64,
+    }
+    config["config_digest"] = config_digest(config)
+    metrics = evidence(config_digest=config["config_digest"], checkpoint_bytes=0)
+    artifact = {
+        "schema_version": 1, "kind": "stage1-artifact-topology-witness",
+        "method": "full", "artifact_kind": "none", "output_dir": str(tmp_path),
+        "final_save": True, "files": [], "checkpoint_bytes": 0,
+    }
+    artifact["artifact_manifest_digest"] = config_digest(artifact)
+    seal = {
+        "schema_version": 1, "kind": "stage1-producer-evidence",
+        "run_config": config,
+        "benchmark_evidence": benchmark._evidence_to_dict(metrics),
+        "artifact_manifest": artifact,
+        "artifact_manifest_digest": artifact["artifact_manifest_digest"],
+    }
+    seal["producer_digest"] = config_digest(seal)
+    seal_path = tmp_path / "producer.json"
+    seal_path.write_text(json.dumps(seal))
+    with pytest.raises(ValueError, match="topology"):
+        benchmark._load_producer_evidence(seal_path)
+
+
+def test_compare_maxima_exposes_rank_local_ten_step_memory(monkeypatch):
+    """Catches a maximum comparison that drops the required rank witnesses."""
+    import stage1.benchmark as benchmark
+
+    maxima = {
+        "full.json": {"method": "full", "selected_micro_batch": 8,
+                      "effective_global_batch": 32, "long_smoke_steps": 10,
+                      "first_failure": None, "rank_peak_allocated_bytes": [10, 11],
+                      "rank_peak_reserved_bytes": [12, 13], "config_digest": "a" * 64},
+        "dora.json": {"method": "dora", "selected_micro_batch": 16,
+                      "effective_global_batch": 64, "long_smoke_steps": 10,
+                      "first_failure": None, "rank_peak_allocated_bytes": [20, 21],
+                      "rank_peak_reserved_bytes": [22, 23], "config_digest": "b" * 64},
+    }
+    monkeypatch.setattr(benchmark, "_load_maximum", lambda path: maxima[path.name])
+    compared = benchmark._compare_maxima(["full.json", "dora.json"])
+    assert compared["methods"]["full"]["rank_peak_allocated_bytes"] == [10, 11]
+    assert compared["methods"]["dora"]["rank_peak_reserved_bytes"] == [22, 23]
+
+
 def test_probe_does_not_fallback_without_a_confirmed_initial_eight_oom(tmp_path):
     """Catches an implicit batch reduction after an unclassified failure."""
     completed, records, output_root = _run_probe(
@@ -343,12 +519,13 @@ def test_probe_does_not_fallback_without_a_confirmed_initial_eight_oom(tmp_path)
     assert not output_root.exists()
 
 
-def test_prepare_timed_run_restores_full_data_source_not_probe_subset(tmp_path):
+def test_prepare_timed_run_restores_full_data_source_not_probe_subset(tmp_path, monkeypatch):
     """Catches an approved three-epoch run accidentally using only probe rows."""
     original_data = tmp_path / "complete TRAIN.jsonl"
     probe_data = tmp_path / "64 high-cost rows.jsonl"
     launch_config = {
         "method": "full",
+        "tuning_config": None,
         "micro_batch": 16,
         "world_size": 2,
         "gradient_accumulation_steps": 2,
@@ -359,10 +536,16 @@ def test_prepare_timed_run_restores_full_data_source_not_probe_subset(tmp_path):
         "final_save": False,
         "model": "Qwen/Qwen2.5-VL-3B-Instruct",
         "data_path": str(original_data),
+        "train_data_path": str(probe_data),
+        "data_stat": {"device": 1, "inode": 2, "size": 3, "mtime_ns": 4},
         "image_root": str(tmp_path / "images"),
         "deepspeed_config": str(REPO_ROOT / "configs/config_stage3.json"),
+        "deepspeed_config_digest": "d" * 64,
         "attention_implementation": "flash_attention_2",
         "probe_rows": str(tmp_path / "high-cost.json"),
+        "probe_row_indices": [1, 0],
+        "audit_digest": "a" * 64,
+        "run_config_digest": "c" * 64,
         "command": [
             str(REPO_ROOT / "run_stage1_training.sh"),
             "--model",
@@ -391,38 +574,15 @@ def test_prepare_timed_run_restores_full_data_source_not_probe_subset(tmp_path):
         "launch_config": launch_config,
     }
     maximum["config_digest"] = config_digest(maximum)
-    maximum_path = tmp_path / "maximum.json"
-    maximum_path.write_text(json.dumps(maximum), encoding="utf-8")
     output_dir = tmp_path / "timed full"
-
-    completed = subprocess.run(
-        [
-            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
-            "-m",
-            "src.stage1.benchmark",
-            "prepare-timed-run",
-            "--method",
-            "full",
-            "--maximum",
-            str(maximum_path),
-            "--output-dir",
-            str(output_dir),
-            "--epochs",
-            "3",
-            "--learning-rate",
-            "1e-5",
-            "--gradient-accumulation",
-            "2",
-            "--world-size",
-            "2",
-        ],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
+    import stage1.benchmark as benchmark
+    monkeypatch.setattr(benchmark, "_load_maximum", lambda path: maximum)
+    benchmark._prepare_timed_run(
+        SimpleNamespace(
+            method="full", maximum="sealed-maximum.json", output_dir=str(output_dir),
+            epochs=3, learning_rate=1e-5, gradient_accumulation=2, world_size=2,
+        )
     )
-
-    assert completed.returncode == 0, completed.stderr
     manifest = json.loads(
         (output_dir / "launch-manifest.json").read_text(encoding="utf-8")
     )

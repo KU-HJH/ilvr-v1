@@ -138,6 +138,7 @@ class CustomTrainerStage1(SFTTrainer):
         self.helper_group_L = helper_group_L
         self.collect_stage1_diagnostics = bool(collect_stage1_diagnostics)
         self._latest_stage1_diagnostics = None
+        self._representative_gradient_norm: float | None = None
         self._successful_optimizer_steps = 0
         self._ema_execution_device: torch.device | None = None
         self._deepspeed_step_adapter: _DeepSpeedStepAdapter | None = None
@@ -396,6 +397,7 @@ class CustomTrainerStage1(SFTTrainer):
 
     def _record_gradient_diagnostic(self, norm: torch.Tensor) -> None:
         if self.collect_stage1_diagnostics:
+            self._representative_gradient_norm = float(norm.detach().item())
             if self._latest_stage1_diagnostics is None:
                 self._latest_stage1_diagnostics = {}
             self._latest_stage1_diagnostics["gradient_norm"] = norm.detach()

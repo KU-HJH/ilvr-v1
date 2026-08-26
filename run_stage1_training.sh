@@ -53,6 +53,8 @@ save_strategy=${STAGE1_SAVE_STRATEGY:-no}
 resume_path=${STAGE1_RESUME_PATH:-}
 log_file=${STAGE1_LOG_FILE:-}
 max_steps=${STAGE1_MAX_STEPS:-}
+benchmark_run_config=${STAGE1_BENCHMARK_RUN_CONFIG:-}
+benchmark_evidence_path=${STAGE1_BENCHMARK_EVIDENCE_PATH:-}
 dry_run=false
 final_save=true
 legacy_use_lora=false
@@ -88,6 +90,8 @@ while (( $# )); do
         --resume) require_value "$@"; resume_path=$2; shift 2 ;;
         --log-file) require_value "$@"; log_file=$2; shift 2 ;;
         --max-steps) require_value "$@"; max_steps=$2; shift 2 ;;
+        --benchmark-run-config) require_value "$@"; benchmark_run_config=$2; shift 2 ;;
+        --producer-evidence) require_value "$@"; benchmark_evidence_path=$2; shift 2 ;;
         --final-save) final_save=true; shift ;;
         --no-final-save) final_save=false; shift ;;
         --use_lora) legacy_use_lora=true; shift ;;
@@ -243,6 +247,16 @@ if [[ -n $resume_path ]]; then
 fi
 if [[ -n $max_steps ]]; then
     command+=(--max_steps "$max_steps")
+fi
+if [[ -n $benchmark_run_config || -n $benchmark_evidence_path ]]; then
+    if [[ -z $benchmark_run_config || -z $benchmark_evidence_path ]]; then
+        printf 'error: benchmark run config and producer evidence path are required together\n' >&2
+        exit 2
+    fi
+    command+=(
+        --benchmark_run_config "$benchmark_run_config"
+        --benchmark_evidence_path "$benchmark_evidence_path"
+    )
 fi
 if [[ $final_save == true ]]; then
     command+=(--final_save)

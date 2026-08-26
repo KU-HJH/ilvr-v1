@@ -138,10 +138,14 @@ fi
 
 probe_data="$output_root/probe-input.jsonl"
 "$benchmark_python" -m src.stage1.benchmark probe-jsonl \
-    --audit "$probe_rows" --output "$probe_data" >/dev/null
+    --audit "$probe_rows" --data-path "$data_path" \
+    --image-root "$image_root" --output "$probe_data" >/dev/null
 
 counter=0
 for micro_batch in "${candidates[@]}"; do
+    "$benchmark_python" -m src.stage1.benchmark require-candidate \
+        --probe-dir "$output_root" --method "$method" \
+        --candidate "$micro_batch" >/dev/null
     counter=$((counter + 1))
     attempt_id="$(date +%Y%m%dT%H%M%S%N)-$$-$counter"
     attempt_dir="$output_root/attempts/$method/micro-batch-$micro_batch/attempt-$attempt_id"
@@ -150,7 +154,17 @@ for micro_batch in "${candidates[@]}"; do
     candidate_output="$attempt_dir/output"
     stdout_path="$logs_dir/stdout.log"
     stderr_path="$logs_dir/stderr.log"
+    run_config="$evidence_dir/run-config.json"
+    producer_evidence="$evidence_dir/producer-evidence.json"
     mkdir -p -- "$logs_dir" "$evidence_dir"
+
+    "$benchmark_python" -m src.stage1.benchmark prepare-probe-run \
+        --run-config "$run_config" --method "$method" --model "$model" \
+        --source-data-path "$data_path" --data-path "$probe_data" \
+        --image-root "$image_root" --output-dir "$candidate_output" \
+        --micro-batch "$micro_batch" --world-size 2 \
+        --gradient-accumulation "$gradient_accumulation" --max-steps 3 \
+        --deepspeed-config "$deepspeed_config" --probe-rows "$probe_rows" >/dev/null
 
     launch_command=(
         "$launcher"
@@ -170,6 +184,8 @@ for micro_batch in "${candidates[@]}"; do
         --log-file "$logs_dir/train.log"
         --max-steps 3
         --no-final-save
+        --benchmark-run-config "$run_config"
+        --producer-evidence "$producer_evidence"
     )
 
     set +e

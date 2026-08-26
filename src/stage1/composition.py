@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import metadata as importlib_metadata
 import logging
 import math
 from pathlib import Path
+import subprocess
 import time
 from typing import Callable
 
@@ -517,6 +519,9 @@ def build_stage1_training_components(
         ce_weight=args.ce_weight,
         ema_method=tuning.method,
         stage1_peft_metadata=metadata,
+        collect_stage1_diagnostics=bool(
+            getattr(args, "benchmark_evidence_path", None)
+        ),
     )
     return Stage1TrainingComponents(
         model=model,
@@ -534,13 +539,25 @@ def run_stage1(
     *,
     component_builder: Callable = build_stage1_training_components,
     monotonic: Callable[[], float] = time.monotonic,
+    observability_provider: Callable | None = None,
 ) -> None:
     """Train once and, when requested, perform one separately timed final save."""
 
+    producing = bool(
+        getattr(args, "benchmark_run_config", None)
+        or getattr(args, "benchmark_evidence_path", None)
+    )
+    if producing and not (
+        getattr(args, "benchmark_run_config", None)
+        and getattr(args, "benchmark_evidence_path", None)
+    ):
+        raise ValueError("benchmark run config and evidence path are required together")
+    total_start = monotonic() if producing else None
     components = component_builder(args)
+    model_load_seconds = monotonic() - total_start if producing else 0.0
     resume = components.resume_decision.checkpoint_path
     trainer_start = monotonic()
-    components.trainer.train(
+    train_result = components.trainer.train(
         resume_from_checkpoint=None if resume is None else str(resume)
     )
     trainer_seconds = monotonic() - trainer_start
@@ -548,16 +565,121 @@ def run_stage1(
         raise RuntimeError("Stage 1 Trainer timing must be finite and non-negative")
     logging.info("Stage 1 Trainer time: %.3fs", trainer_seconds)
 
-    if not args.final_save:
+    save_seconds = 0.0
+    if args.final_save:
+        save_start = monotonic()
+        components.trainer.save_model(args.save_model_path)
+        if components.trainer.is_world_process_zero():
+            components.processor.save_pretrained(args.save_model_path)
+        save_seconds = monotonic() - save_start
+        if not math.isfinite(save_seconds) or save_seconds < 0:
+            raise RuntimeError("Stage 1 final save timing must be finite and non-negative")
+        logging.info("Stage 1 final save time: %.3fs", save_seconds)
+
+    if not producing:
         return
-    save_start = monotonic()
-    components.trainer.save_model(args.save_model_path)
-    if components.trainer.is_world_process_zero():
-        components.processor.save_pretrained(args.save_model_path)
-    save_seconds = monotonic() - save_start
-    if not math.isfinite(save_seconds) or save_seconds < 0:
-        raise RuntimeError("Stage 1 final save timing must be finite and non-negative")
-    logging.info("Stage 1 final save time: %.3fs", save_seconds)
+
+    from stage1.benchmark import (
+        Stage1BenchmarkEvidence,
+        _build_artifact_manifest,
+        _load_producer_run_config,
+        write_stage1_producer_evidence,
+    )
+
+    config = _load_producer_run_config(Path(args.benchmark_run_config))
+    if str(Path(args.save_model_path).resolve()) != config["output_dir"]:
+        raise ValueError("producer output path does not match sealed run config")
+    if bool(args.final_save) is not config["final_save"]:
+        raise ValueError("producer final-save mode does not match sealed run config")
+    observer = observability_provider or _default_stage1_observability
+    observed = observer(args)
+    rank_allocated = tuple(observed["rank_peak_allocated_bytes"])
+    rank_reserved = tuple(observed["rank_peak_reserved_bytes"])
+    gpu_names = tuple(observed["gpu_names"])
+    world_size = config["world_size"]
+    if len(rank_allocated) != world_size or len(rank_reserved) != world_size:
+        raise ValueError("producer rank memory witness length must equal world size")
+    metrics = getattr(train_result, "metrics", None)
+    metrics = metrics if isinstance(metrics, dict) else {}
+    state = getattr(components.trainer, "state", None)
+    optimizer_steps = getattr(state, "global_step", metrics.get("global_step", 0))
+    if type(optimizer_steps) is not int:
+        optimizer_steps = int(optimizer_steps)
+    effective = config["effective_global_batch"]
+    if getattr(args, "max_steps", -1) > 0:
+        samples_seen = optimizer_steps * effective
+    else:
+        samples_seen = len(components.dataset) * int(config.get("epochs", args.epochs))
+    if not components.trainer.is_world_process_zero():
+        return
+    artifact = _build_artifact_manifest(
+        Path(args.save_model_path), method=config["method"], final_save=args.final_save
+    )
+    total_seconds = monotonic() - total_start
+    evidence = Stage1BenchmarkEvidence(
+        status="success",
+        method=config["method"],
+        micro_batch=config["micro_batch"],
+        world_size=world_size,
+        gradient_accumulation_steps=config["gradient_accumulation_steps"],
+        effective_global_batch=effective,
+        optimizer_steps=optimizer_steps,
+        samples_seen=samples_seen,
+        model_load_seconds=float(model_load_seconds),
+        trainer_seconds=float(trainer_seconds),
+        total_seconds=float(total_seconds),
+        final_save_seconds=float(save_seconds),
+        samples_per_second=float(metrics.get("train_samples_per_second", 0.0)),
+        steps_per_second=float(metrics.get("train_steps_per_second", 0.0)),
+        rank_peak_allocated_bytes=rank_allocated,
+        rank_peak_reserved_bytes=rank_reserved,
+        trainable_parameters=components.parameter_report.trainable_parameters,
+        total_parameters=components.parameter_report.total_parameters,
+        checkpoint_bytes=artifact["checkpoint_bytes"],
+        final_loss=float(metrics.get("train_loss", 0.0)),
+        representative_gradient_norm=float(
+            getattr(components.trainer, "_representative_gradient_norm", 0.0) or 0.0
+        ),
+        git_commit=observed["git_commit"],
+        dependency_versions=dict(observed["dependency_versions"]),
+        gpu_names=gpu_names,
+        config_digest=config["config_digest"],
+        probe_row_indices=tuple(config["probe_row_indices"]),
+    )
+    write_stage1_producer_evidence(
+        Path(args.benchmark_evidence_path),
+        run_config_path=Path(args.benchmark_run_config),
+        evidence=evidence,
+    )
+
+
+def _default_stage1_observability(args) -> dict[str, object]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("benchmark evidence requires CUDA rank observability")
+    local = (
+        int(torch.cuda.max_memory_allocated()),
+        int(torch.cuda.max_memory_reserved()),
+        torch.cuda.get_device_name(torch.cuda.current_device()),
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        gathered: list[object] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, local)
+        ranks = gathered
+    else:
+        ranks = [local]
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"], text=True, capture_output=True, check=True
+    )
+    versions = {}
+    for package in ("torch", "transformers", "accelerate", "deepspeed", "peft", "trl"):
+        versions[package] = importlib_metadata.version(package)
+    return {
+        "rank_peak_allocated_bytes": tuple(item[0] for item in ranks),
+        "rank_peak_reserved_bytes": tuple(item[1] for item in ranks),
+        "gpu_names": tuple(item[2] for item in ranks),
+        "git_commit": completed.stdout.strip(),
+        "dependency_versions": versions,
+    }
 
 
 __all__ = [

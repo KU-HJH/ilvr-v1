@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from stage1.composition import (
     run_stage1,
 )
 from utils_deepseed import parse_args
+from stage1.benchmark import config_digest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -719,3 +721,98 @@ def test_run_stage1_trains_once_and_only_final_saves_when_requested(
         assert processor.saved == []
     assert trainer.events == expected
     assert "Stage 1 Trainer time: 3.500s" in caplog.text
+
+
+def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
+    tmp_path,
+):
+    """Catches the real launcher/trainer path never publishing Task 17 input."""
+    args = stage1_args(tmp_path, "--max_steps", "3", "--no_final_save", method="full")
+    evidence_path = tmp_path / "producer evidence.json"
+    config = {
+        "schema_version": 1,
+        "kind": "stage1-probe-run-manifest",
+        "method": "full",
+        "tuning_config": None,
+        "model": args.model,
+        "source_data_path": str(Path(args.data_path).resolve()),
+        "data_path": str(Path(args.data_path).resolve()),
+        "data_stat": {
+            "device": Path(args.data_path).stat().st_dev,
+            "inode": Path(args.data_path).stat().st_ino,
+            "size": Path(args.data_path).stat().st_size,
+            "mtime_ns": Path(args.data_path).stat().st_mtime_ns,
+        },
+        "image_root": str(Path(args.image_root).resolve()),
+        "output_dir": str(Path(args.save_model_path).resolve()),
+        "micro_batch": 8,
+        "world_size": 2,
+        "gradient_accumulation_steps": 2,
+        "effective_global_batch": 32,
+        "epochs": 3,
+        "learning_rate": 1e-5,
+        "seed": 42,
+        "max_steps": 3,
+        "final_save": False,
+        "deepspeed_config": str(Path(args.deepspeed_config).resolve()),
+        "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2",
+        "save_strategy": "no",
+        "audit_digest": "a" * 64,
+        "probe_rows": str(tmp_path / "audit.json"),
+        "probe_row_indices": [7, 3],
+        "maximum_config_digest": None,
+    }
+    config["config_digest"] = config_digest(config)
+    config_path = tmp_path / "run config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    args.benchmark_run_config = str(config_path)
+    args.benchmark_evidence_path = str(evidence_path)
+
+    class EvidenceTrainer(RecordingTrainer):
+        def __init__(self):
+            super().__init__(args=SimpleNamespace())
+            self.state = SimpleNamespace(global_step=3)
+            self._representative_gradient_norm = 0.25
+
+        def train(self, *, resume_from_checkpoint):
+            super().train(resume_from_checkpoint=resume_from_checkpoint)
+            return SimpleNamespace(
+                metrics={
+                    "train_samples_per_second": 24.0,
+                    "train_steps_per_second": 0.75,
+                    "train_loss": 0.5,
+                }
+            )
+
+    trainer = EvidenceTrainer()
+    bundle = SimpleNamespace(
+        trainer=trainer,
+        processor=RecordingProcessor(),
+        dataset=[{}] * 64,
+        parameter_report=SimpleNamespace(
+            trainable_parameters=20, total_parameters=100
+        ),
+        resume_decision=Stage1ResumeDecision(None, None, False),
+    )
+    observed = lambda selected: {
+        "rank_peak_allocated_bytes": (10, 11),
+        "rank_peak_reserved_bytes": (12, 13),
+        "gpu_names": ("stub-0", "stub-1"),
+        "git_commit": "abc1234",
+        "dependency_versions": {"torch": "test"},
+    }
+
+    run_stage1(
+        args,
+        component_builder=lambda selected: bundle,
+        monotonic=iter((1.0, 2.0, 3.0, 5.0, 6.0)).__next__,
+        observability_provider=observed,
+    )
+
+    sealed = json.loads(evidence_path.read_text())
+    assert sealed["kind"] == "stage1-producer-evidence"
+    assert sealed["benchmark_evidence"]["optimizer_steps"] == 3
+    assert sealed["benchmark_evidence"]["samples_seen"] == 96
+    assert sealed["artifact_manifest"]["artifact_kind"] == "none"
+    assert not list(tmp_path.glob(".producer evidence.json.*.tmp"))
