@@ -122,6 +122,8 @@ def test_fresh_stage2_handoff_accepts_complete_legacy_stage1_v1_metadata(
     )
 
     source = tiny_original_qwen()
+    # Transformers intentionally omits this mutable field from saved configs.
+    source.config._name_or_path = ""
     source.config.tie_word_embeddings = tie_word_embeddings
     if tie_word_embeddings:
         source.tie_weights()
@@ -130,6 +132,7 @@ def test_fresh_stage2_handoff_accepts_complete_legacy_stage1_v1_metadata(
         processor,
         tmp_path,
         stage2_dora_tuning(),
+        requested_base_model_reference="tiny/original-qwen",
     )
 
     qwen = resolve_qwen2_5_vl_model(continued)
@@ -138,6 +141,27 @@ def test_fresh_stage2_handoff_accepts_complete_legacy_stage1_v1_metadata(
         RESIZED_VOCAB_SIZE
     )
     assert qwen.config.tie_word_embeddings is False
+
+
+def test_fresh_stage2_handoff_rejects_requested_base_source_mismatch_before_mutation(
+    tmp_path,
+):
+    processor, _ = write_stage1_dora_artifact(tmp_path)
+    source = tiny_original_qwen()
+    source.config._name_or_path = ""
+    original_vocab_size = source.config.vocab_size
+
+    with pytest.raises(ValueError, match="base source mismatch"):
+        load_stage1_dora_for_fresh_stage2(
+            source,
+            processor,
+            tmp_path,
+            stage2_dora_tuning(),
+            requested_base_model_reference="tiny/different-qwen",
+        )
+
+    assert source.config.vocab_size == original_vocab_size
+    assert not hasattr(source.model.embed_tokens, "token_adapter")
 
 
 def tiny_tag_free_original_qwen(
@@ -184,6 +208,7 @@ def test_padded_stage1_v2_to_self_contained_stage2_direct_and_inference_parity(
         processor,
         stage1_dir,
         tuning,
+        requested_base_model_reference="tiny/original-qwen",
     )
     qwen = resolve_qwen2_5_vl_model(continued)
     configure_stage2_metadata(
@@ -282,7 +307,11 @@ def write_sparse_stage2_artifact(stage1_dir, stage2_dir):
     processor, stage1_metadata = write_stage1_dora_artifact(stage1_dir)
     tuning = stage2_dora_tuning()
     continued = load_stage1_dora_for_fresh_stage2(
-        tiny_original_qwen(), processor, stage1_dir, tuning
+        tiny_original_qwen(),
+        processor,
+        stage1_dir,
+        tuning,
+        requested_base_model_reference="tiny/original-qwen",
     )
     qwen = resolve_qwen2_5_vl_model(continued)
     configure_stage2_metadata(
@@ -398,10 +427,18 @@ def test_stage1_dora_handoff_preserves_same_adapter_rows_and_logits(tmp_path):
     """Catches merging, stacking, or dropping any learned Stage 1 sparse delta."""
     processor, _ = write_stage1_dora_artifact(tmp_path)
     before = load_stage1_peft_artifact(
-        tiny_original_qwen(), processor, tmp_path, is_trainable=False
+        tiny_original_qwen(),
+        processor,
+        tmp_path,
+        requested_base_model_reference="tiny/original-qwen",
+        is_trainable=False,
     )
     after = load_stage1_dora_for_fresh_stage2(
-        tiny_original_qwen(), processor, tmp_path, stage2_dora_tuning()
+        tiny_original_qwen(),
+        processor,
+        tmp_path,
+        stage2_dora_tuning(),
+        requested_base_model_reference="tiny/original-qwen",
     )
     fixed_hidden = torch.linspace(-0.6, 0.8, 16).reshape(2, 8)
 
@@ -634,7 +671,13 @@ def test_stage1_dora_handoff_rejects_changed_or_new_stage2_adapter_before_mutati
     original_vocab_size = fresh.config.vocab_size
 
     with pytest.raises(ValueError, match=message):
-        load_stage1_dora_for_fresh_stage2(fresh, processor, tmp_path, tuning)
+        load_stage1_dora_for_fresh_stage2(
+            fresh,
+            processor,
+            tmp_path,
+            tuning,
+            requested_base_model_reference="tiny/original-qwen",
+        )
 
     assert fresh.config.vocab_size == original_vocab_size
     assert not hasattr(fresh.model.embed_tokens, "token_adapter")
@@ -655,7 +698,11 @@ def test_stage1_lora_cannot_initialize_fresh_stage2_dora(tmp_path):
 
     with pytest.raises(ValueError, match="Stage 1 DoRA"):
         load_stage1_dora_for_fresh_stage2(
-            tiny_original_qwen(), processor, tmp_path, stage2_dora_tuning()
+            tiny_original_qwen(),
+            processor,
+            tmp_path,
+            stage2_dora_tuning(),
+            requested_base_model_reference="tiny/original-qwen",
         )
 
 
@@ -667,7 +714,11 @@ def test_saved_sparse_stage2_adapter_reloads_after_stage1_source_is_deleted(tmp_
     processor, stage1_metadata = write_stage1_dora_artifact(stage1_dir)
     tuning = stage2_dora_tuning()
     continued = load_stage1_dora_for_fresh_stage2(
-        tiny_original_qwen(), processor, stage1_dir, tuning
+        tiny_original_qwen(),
+        processor,
+        stage1_dir,
+        tuning,
+        requested_base_model_reference="tiny/original-qwen",
     )
     qwen = resolve_qwen2_5_vl_model(continued)
     configure_stage2_metadata(
@@ -1383,7 +1434,11 @@ def test_sparse_stage2_numbered_resume_matches_uninterrupted_training(tmp_path):
     processor, stage1_metadata = write_stage1_dora_artifact(stage1_dir)
     tuning = stage2_dora_tuning()
     initial = load_stage1_dora_for_fresh_stage2(
-        tiny_original_qwen(), processor, stage1_dir, tuning
+        tiny_original_qwen(),
+        processor,
+        stage1_dir,
+        tuning,
+        requested_base_model_reference="tiny/original-qwen",
     )
     qwen = resolve_qwen2_5_vl_model(initial)
     configure_stage2_metadata(

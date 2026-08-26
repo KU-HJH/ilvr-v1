@@ -440,6 +440,9 @@ def fake_dependencies(
     def load_peft_model(base, selected_processor, path, **kwargs):
         events.append(("peft", base, selected_processor, Path(path), kwargs))
         assert kwargs["preflight"] is preflight_witness
+        assert kwargs["requested_base_model_reference"] == (
+            "Qwen/Qwen2.5-VL-3B-Instruct"
+        )
         return model
 
     def build_tuned(base, tuning, latent_ids):
@@ -546,6 +549,31 @@ def test_real_peft_resume_reuses_classification_metadata_snapshot_through_prefli
     assert bundle.resume_decision.peft_metadata_snapshot is preflight_snapshots[0]
     assert preflight_snapshots[0].artifact_dir == checkpoint.resolve()
     assert bundle.trainer.kwargs["stage1_peft_metadata"] == metadata
+
+
+def test_peft_resume_rejects_cli_base_source_mismatch_before_external_loads(tmp_path):
+    args = stage1_args(tmp_path)
+    checkpoint, metadata, processor = _write_peft_resume_checkpoint(args)
+    args.resume_from_checkpoint_path = str(checkpoint)
+    args.model = "tiny/different-qwen"
+    events = []
+    deps, _, _, _ = fake_dependencies(
+        events, processor=processor, metadata=metadata
+    )
+    deps = replace(
+        deps,
+        resolve_resume=resolve_stage1_resume,
+        load_peft_metadata=read_stage1_peft_metadata_snapshot,
+        decode_peft_metadata=decode_stage1_peft_metadata_snapshot,
+    )
+
+    with pytest.raises(ValueError, match="base source mismatch"):
+        build_stage1_training_components(args, dependencies=deps)
+
+    assert not any(
+        event[0] in {"processor", "config", "model", "preflight"}
+        for event in events
+    )
 
 
 def test_real_explicit_resume_rejects_malformed_metadata_before_large_load(
@@ -754,7 +782,11 @@ def test_resume_composition_preserves_checkpoint_token_ids_without_readding(
         preflight_event = next(
             event for event in events if event[0] == "preflight"
         )
-        assert set(preflight_event[4]) == {"metadata_snapshot"}
+        assert set(preflight_event[4]) == {
+            "metadata_snapshot",
+            "requested_base_model_reference",
+        }
+        assert preflight_event[4]["requested_base_model_reference"] == args.model
         peft_event = next(event for event in events if event[0] == "peft")
         assert peft_event[3] == checkpoint
     else:

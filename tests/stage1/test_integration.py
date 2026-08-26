@@ -608,7 +608,11 @@ def test_fresh_stage2_handoff_resets_training_state(tmp_path):
     )
     processor = TinyIntegrationProcessor.from_pretrained(run.checkpoint_1)
     expected = load_stage1_peft_artifact(
-        tiny_original_qwen(), processor, run.checkpoint_1, is_trainable=True
+        tiny_original_qwen(),
+        processor,
+        run.checkpoint_1,
+        requested_base_model_reference="tiny/original-qwen",
+        is_trainable=True,
     )
     stage2 = load_stage1_dora_for_fresh_stage2(
         tiny_original_qwen(),
@@ -624,6 +628,7 @@ def test_fresh_stage2_handoff_resets_training_state(tmp_path):
                 "gate_proj", "up_proj", "down_proj",
             ),
         ),
+        requested_base_model_reference="tiny/original-qwen",
     )
     expected_rows = find_sparse_output_token_rows(expected)
     actual_rows = find_sparse_output_token_rows(stage2)

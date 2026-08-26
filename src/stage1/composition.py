@@ -309,6 +309,12 @@ def _validate_resume_tuning(
 
 
 def _validate_resume_semantics(args, metadata: Stage1PeftMetadata) -> None:
+    if args.model != metadata.base_model_reference:
+        raise ValueError(
+            "Stage 1 PEFT base source mismatch: "
+            f"metadata={metadata.base_model_reference!r}, "
+            f"requested={args.model!r}"
+        )
     expected = (
         metadata.latent_size,
         metadata.ce_weight,
@@ -480,7 +486,7 @@ def build_stage1_training_components(
     else:
         latent_ids = tuple(metadata.latent_token_ids)
         config = dependencies.load_config(
-            metadata.base_model_reference,
+            args.model,
             cache_dir=args.cache_dir,
             trust_remote_code=True,
         )
@@ -495,10 +501,11 @@ def build_stage1_training_components(
             processor,
             config,
             checkpoint,
+            requested_base_model_reference=args.model,
             metadata_snapshot=metadata_snapshot,
         )
         base_model = dependencies.load_model(
-            metadata.base_model_reference,
+            args.model,
             config=config,
             torch_dtype=torch.bfloat16,
             attn_implementation=args.attention_implementation,
@@ -509,6 +516,7 @@ def build_stage1_training_components(
             base_model,
             processor,
             checkpoint,
+            requested_base_model_reference=args.model,
             is_trainable=True,
             preflight=preflight,
         )

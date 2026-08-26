@@ -1163,12 +1163,15 @@ def _architecture_json(architecture: Mapping[str, object]) -> bytes:
         ) from error
 
 
-def _validate_base_source(config, expected: str) -> None:
-    actual = getattr(config, "_name_or_path", None)
-    if actual != expected:
+def _validate_base_source(requested: str, expected: str) -> None:
+    if not isinstance(requested, str) or not requested:
+        raise ValueError(
+            "Stage 1 PEFT requested base source must be a non-empty string"
+        )
+    if requested != expected:
         raise ValueError(
             "Stage 1 PEFT base source mismatch: "
-            f"metadata={expected!r}, runtime={actual!r}"
+            f"metadata={expected!r}, requested={requested!r}"
         )
 
 
@@ -1219,6 +1222,7 @@ def preflight_stage1_peft_artifact(
     base_config,
     artifact_dir: Path,
     *,
+    requested_base_model_reference: str,
     metadata_snapshot: Stage1PeftMetadataSnapshot | None = None,
     model_factory: Callable[[object], nn.Module] = _build_meta_stage1_base,
 ) -> Stage1PeftPreflightWitness:
@@ -1248,7 +1252,9 @@ def preflight_stage1_peft_artifact(
         )
     tokenizer = _validate_processor(processor, validated)
     _validate_latent_config(base_config, validated)
-    _validate_base_source(base_config, validated.base_model_reference)
+    _validate_base_source(
+        requested_base_model_reference, validated.base_model_reference
+    )
     structural_model = model_factory(deepcopy(base_config))
     qwen = resolve_qwen2_5_vl_model(structural_model)
     _validate_architecture(qwen, validated, resized=False)
@@ -1308,6 +1314,7 @@ def load_stage1_peft_artifact(
     processor,
     artifact_dir: Path,
     *,
+    requested_base_model_reference: str,
     is_trainable: bool,
     preflight: Stage1PeftPreflightWitness | None = None,
 ) -> nn.Module:
@@ -1325,6 +1332,7 @@ def load_stage1_peft_artifact(
             processor,
             qwen.config,
             artifact,
+            requested_base_model_reference=requested_base_model_reference,
         )
     elif not isinstance(preflight, Stage1PeftPreflightWitness):
         raise TypeError("preflight must be a Stage1PeftPreflightWitness")
@@ -1341,7 +1349,9 @@ def load_stage1_peft_artifact(
     _validate_processor(processor, metadata)
     _validate_latent_config(qwen.config, metadata)
     _validate_architecture(qwen, metadata, resized=False)
-    _validate_base_source(qwen.config, preflight.base_model_reference)
+    _validate_base_source(
+        requested_base_model_reference, preflight.base_model_reference
+    )
     actual_architecture_json = _architecture_json(
         capture_qwen2_5_vl_architecture(qwen.config)
     )

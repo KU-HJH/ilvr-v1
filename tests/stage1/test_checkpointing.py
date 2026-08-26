@@ -536,6 +536,7 @@ def test_incomplete_adapter_fails_before_peft_load(
             base,
             TinyStage1Processor.from_pretrained(saved_dora_artifact),
             saved_dora_artifact,
+            requested_base_model_reference="tiny/original-qwen",
             is_trainable=True,
         )
     assert calls == 0
@@ -745,6 +746,7 @@ def test_load_validates_architecture_token_shape_tuning_and_schema_before_peft(
             base,
             processor,
             saved_dora_artifact,
+            requested_base_model_reference="tiny/original-qwen",
             is_trainable=True,
         )
     assert calls == 0
@@ -775,6 +777,7 @@ def test_load_rejects_sparse_row_tensor_shape_before_peft(
             tiny_original_qwen(),
             TinyStage1Processor.from_pretrained(saved_dora_artifact),
             saved_dora_artifact,
+            requested_base_model_reference="tiny/original-qwen",
             is_trainable=True,
         )
     assert calls == 0
@@ -799,6 +802,7 @@ def test_load_rejects_extra_adapter_tensor_before_peft(
             tiny_original_qwen(),
             TinyStage1Processor.from_pretrained(saved_dora_artifact),
             saved_dora_artifact,
+            requested_base_model_reference="tiny/original-qwen",
             is_trainable=True,
         )
     assert calls == 0
@@ -857,6 +861,7 @@ def test_preflight_rejects_corrupt_artifact_before_any_large_model_load(
             TinyStage1Processor.from_pretrained(saved_dora_artifact),
             base_config,
             saved_dora_artifact,
+            requested_base_model_reference="tiny/original-qwen",
         )
 
     assert large_loads == 0
@@ -928,6 +933,7 @@ def test_preflight_rejects_peft_target_selector_modifiers_before_large_load(
             processor,
             base_config,
             tmp_path,
+            requested_base_model_reference="tiny/original-qwen",
         )
 
     assert large_loads == 0
@@ -958,6 +964,7 @@ def test_preflight_reads_each_small_payload_once_and_retains_immutable_bytes(
         TinyStage1Processor.from_pretrained(saved_dora_artifact),
         deepcopy(tiny_original_qwen().config),
         saved_dora_artifact,
+        requested_base_model_reference="tiny/original-qwen",
     )
 
     assert reads == {path: 1 for path in payload_paths}
@@ -993,6 +1000,7 @@ def test_padded_pretrained_vocabulary_preflights_and_restores_with_one_resize(
         processor,
         deepcopy(fresh.config),
         tmp_path,
+        requested_base_model_reference="tiny/original-qwen",
     )
     resize_calls = []
     original_resize = fresh.resize_token_embeddings
@@ -1006,6 +1014,7 @@ def test_padded_pretrained_vocabulary_preflights_and_restores_with_one_resize(
         fresh,
         processor,
         tmp_path,
+        requested_base_model_reference="tiny/original-qwen",
         is_trainable=True,
         preflight=witness,
     )
@@ -1057,6 +1066,7 @@ def test_tied_source_provenance_preflights_and_restores_as_sparse_runtime(
         processor,
         deepcopy(fresh.config),
         tmp_path,
+        requested_base_model_reference="tiny/original-qwen",
         model_factory=capture_structural,
     )
     preflight_qwen = resolve_qwen2_5_vl_model(structural[0])
@@ -1068,6 +1078,7 @@ def test_tied_source_provenance_preflights_and_restores_as_sparse_runtime(
         fresh,
         processor,
         tmp_path,
+        requested_base_model_reference="tiny/original-qwen",
         is_trainable=False,
         preflight=witness,
     )
@@ -1121,12 +1132,16 @@ def test_multilayer_optimized_targets_save_preflight_and_restore_exactly(tmp_pat
     fresh.tie_weights()
     fresh.config._name_or_path = "tiny/original-qwen"
     witness = preflight_stage1_peft_artifact(
-        processor, deepcopy(fresh.config), tmp_path
+        processor,
+        deepcopy(fresh.config),
+        tmp_path,
+        requested_base_model_reference="tiny/original-qwen",
     )
     restored = load_stage1_peft_artifact(
         fresh,
         processor,
         tmp_path,
+        requested_base_model_reference="tiny/original-qwen",
         is_trainable=True,
         preflight=witness,
     )
@@ -1172,7 +1187,10 @@ def test_peft_restore_rejects_malformed_resize_before_adapter_attach(
     processor = TinyStage1Processor.from_pretrained(saved_dora_artifact)
     fresh = tiny_original_qwen()
     witness = preflight_stage1_peft_artifact(
-        processor, deepcopy(fresh.config), saved_dora_artifact
+        processor,
+        deepcopy(fresh.config),
+        saved_dora_artifact,
+        requested_base_model_reference="tiny/original-qwen",
     )
     original_resize = fresh.resize_token_embeddings
     resize_calls = []
@@ -1202,6 +1220,7 @@ def test_peft_restore_rejects_malformed_resize_before_adapter_attach(
             fresh,
             processor,
             saved_dora_artifact,
+            requested_base_model_reference="tiny/original-qwen",
             is_trainable=True,
             preflight=witness,
         )
@@ -1227,6 +1246,7 @@ def test_peft_loader_reuses_preflight_witness_without_revalidating_files(
         processor,
         deepcopy(base.config),
         saved_dora_artifact,
+        requested_base_model_reference="tiny/original-qwen",
     )
 
     assert isinstance(witness, Stage1PeftPreflightWitness)
@@ -1281,6 +1301,7 @@ def test_peft_loader_reuses_preflight_witness_without_revalidating_files(
         base,
         processor,
         saved_dora_artifact,
+        requested_base_model_reference="tiny/original-qwen",
         is_trainable=is_trainable,
         preflight=witness,
     )
@@ -1306,19 +1327,71 @@ def test_peft_loader_reuses_preflight_witness_without_revalidating_files(
         assert not any(parameter.requires_grad for parameter in restored.parameters())
 
 
-def test_preflight_rejects_base_config_source_identity_mismatch(
+def test_preflight_rejects_explicit_base_source_identity_mismatch(
     saved_dora_artifact
 ):
     """Catches architecture-compatible replacement bases passing provenance."""
     config = deepcopy(tiny_original_qwen().config)
-    config._name_or_path = "tiny/different-qwen"
+    config._name_or_path = ""
 
     with pytest.raises(ValueError, match="base source mismatch"):
         preflight_stage1_peft_artifact(
             TinyStage1Processor.from_pretrained(saved_dora_artifact),
             config,
             saved_dora_artifact,
+            requested_base_model_reference="tiny/different-qwen",
         )
+
+
+def test_preflight_accepts_serialized_config_without_mutable_name_when_request_matches(
+    saved_dora_artifact,
+    tmp_path,
+):
+    """Catches self-saved configs losing the non-serialized _name_or_path field."""
+    config = deepcopy(tiny_original_qwen().config)
+    config._name_or_path = "tiny/original-qwen"
+    serialized_dir = tmp_path / "serialized-base"
+    config.save_pretrained(serialized_dir)
+    config = type(config).from_pretrained(serialized_dir)
+    assert config._name_or_path == ""
+
+    witness = preflight_stage1_peft_artifact(
+        TinyStage1Processor.from_pretrained(saved_dora_artifact),
+        config,
+        saved_dora_artifact,
+        requested_base_model_reference="tiny/original-qwen",
+    )
+
+    assert witness.base_model_reference == "tiny/original-qwen"
+
+
+@pytest.mark.parametrize(
+    "requested_base_model_reference",
+    ["tiny/different-qwen", "", None, 17],
+)
+def test_preflight_rejects_untrusted_requested_base_source_before_model_build(
+    saved_dora_artifact,
+    requested_base_model_reference,
+):
+    config = deepcopy(tiny_original_qwen().config)
+    config._name_or_path = ""
+    model_builds = 0
+
+    def reject_model_build(config):
+        nonlocal model_builds
+        model_builds += 1
+        raise AssertionError("model construction must follow source validation")
+
+    with pytest.raises(ValueError, match="base source|non-empty string"):
+        preflight_stage1_peft_artifact(
+            TinyStage1Processor.from_pretrained(saved_dora_artifact),
+            config,
+            saved_dora_artifact,
+            requested_base_model_reference=requested_base_model_reference,
+            model_factory=reject_model_build,
+        )
+
+    assert model_builds == 0
 
 
 def test_preflight_rejects_base_config_architecture_mismatch(
@@ -1333,6 +1406,7 @@ def test_preflight_rejects_base_config_architecture_mismatch(
             TinyStage1Processor.from_pretrained(saved_dora_artifact),
             config,
             saved_dora_artifact,
+            requested_base_model_reference="tiny/original-qwen",
         )
 
 
@@ -1355,9 +1429,11 @@ def test_peft_restore_binds_runtime_objects_to_witness(
         processor,
         deepcopy(tiny_original_qwen().config),
         saved_dora_artifact,
+        requested_base_model_reference="tiny/original-qwen",
     )
     base = tiny_original_qwen()
     artifact = saved_dora_artifact
+    requested_base_model_reference = "tiny/original-qwen"
     if mutation == "processor_vocab":
         processor = TinyStage1Processor(
             TinyStage1Tokenizer(size=RESIZED_VOCAB_SIZE + 1)
@@ -1367,7 +1443,7 @@ def test_peft_restore_binds_runtime_objects_to_witness(
             TinyStage1Tokenizer((124, 126, 127), size=RESIZED_VOCAB_SIZE)
         )
     elif mutation == "base_source":
-        base.config._name_or_path = "tiny/different-qwen"
+        requested_base_model_reference = "tiny/different-qwen"
     elif mutation == "model_architecture":
         base.config.hidden_act = "gelu"
     else:
@@ -1378,6 +1454,7 @@ def test_peft_restore_binds_runtime_objects_to_witness(
             base,
             processor,
             artifact,
+            requested_base_model_reference=requested_base_model_reference,
             is_trainable=True,
             preflight=witness,
         )
@@ -1397,6 +1474,7 @@ def test_processor_and_adapter_rows_round_trip_without_reassigning_tokens(
         tiny_original_qwen(),
         restored_processor,
         saved_dora_artifact,
+        requested_base_model_reference="tiny/original-qwen",
         is_trainable=True,
     )
 
@@ -1458,6 +1536,7 @@ def test_adapter_restore_preserves_effective_latent_output_rows_across_resize_rn
         restore_base,
         TinyStage1Processor.from_pretrained(tmp_path),
         tmp_path,
+        requested_base_model_reference="tiny/original-qwen",
         is_trainable=True,
     )
     restored_rows = find_sparse_output_token_rows(restored)
@@ -1486,6 +1565,7 @@ def test_load_honors_is_trainable_false(saved_dora_artifact):
         tiny_original_qwen(),
         TinyStage1Processor.from_pretrained(saved_dora_artifact),
         saved_dora_artifact,
+        requested_base_model_reference="tiny/original-qwen",
         is_trainable=False,
     )
 
@@ -2056,6 +2136,7 @@ def test_stage1_trainer_numbered_peft_checkpoint_keeps_resume_state(
         tiny_original_qwen(),
         TinyStage1Processor.from_pretrained(checkpoint),
         checkpoint,
+        requested_base_model_reference="tiny/original-qwen",
         is_trainable=True,
     )
     resumed = CheckpointLifecycleTrainer(

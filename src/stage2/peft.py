@@ -345,6 +345,7 @@ def load_stage1_dora_for_fresh_stage2(
     stage1_adapter_path: str | Path,
     stage2_tuning: Stage2TuningConfig,
     *,
+    requested_base_model_reference: str,
     preflight=None,
 ) -> nn.Module:
     """Continue one validated Stage 1 DoRA adapter with fresh Stage 2 state."""
@@ -362,6 +363,7 @@ def load_stage1_dora_for_fresh_stage2(
             processor,
             qwen.config,
             Path(stage1_adapter_path),
+            requested_base_model_reference=requested_base_model_reference,
         )
     metadata = decode_stage1_peft_metadata_snapshot(
         Stage1PeftMetadataSnapshot(
@@ -403,6 +405,7 @@ def load_stage1_dora_for_fresh_stage2(
         base_model,
         processor,
         Path(stage1_adapter_path),
+        requested_base_model_reference=requested_base_model_reference,
         is_trainable=True,
         preflight=preflight,
     )

@@ -175,6 +175,7 @@ def build_stage2_training_components(
             processor,
             base_config,
             Path(decision.stage1_adapter_source),
+            requested_base_model_reference=decision.base_model_source,
             metadata_snapshot=decision.stage1_metadata_snapshot,
         )
         stage1_metadata = decode_stage1_peft_metadata_snapshot(
@@ -194,6 +195,7 @@ def build_stage2_training_components(
             processor,
             decision.stage1_adapter_source,
             decision.tuning,
+            requested_base_model_reference=decision.base_model_source,
             preflight=stage1_preflight,
         )
         token_ids = resolve_latent_token_ids(processor.tokenizer, base_model.config)
