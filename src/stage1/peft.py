@@ -146,6 +146,35 @@ def _resolve_linear_decoder_targets(
     return tuple(canonical)
 
 
+def _configured_target_patterns_match(
+    qwen: nn.Module,
+    configured_targets,
+    expected_targets: Sequence[str],
+) -> bool:
+    if (
+        isinstance(configured_targets, str)
+        or not isinstance(configured_targets, (list, set, tuple))
+        or not configured_targets
+        or any(
+            not isinstance(target, str) or not target
+            for target in configured_targets
+        )
+    ):
+        return False
+    patterns = tuple(configured_targets)
+    if len(patterns) != len(set(patterns)):
+        return False
+    matched = {
+        name
+        for name, _ in qwen.named_modules()
+        if any(
+            name == pattern or name.endswith(f".{pattern}")
+            for pattern in patterns
+        )
+    }
+    return matched == set(expected_targets)
+
+
 def _peft_model(model: nn.Module) -> PeftModel:
     candidate = getattr(model, "module", model)
     if not isinstance(candidate, PeftModel):
@@ -394,8 +423,19 @@ def _validate_adapter_boundary(
         raise ValueError("Stage 1 PEFT adapter has unsupported saved base parameters")
 
     expected_targets = _resolve_linear_decoder_targets(qwen, tuning.target_suffixes)
-    configured_targets = tuple(config.target_modules or ())
-    if not configured_targets or set(configured_targets) != set(expected_targets):
+    configured_targets = config.target_modules
+    injected_targets = getattr(
+        peft_model.base_model, "targeted_module_names", None
+    )
+    if (
+        not _configured_target_patterns_match(
+            qwen, configured_targets, expected_targets
+        )
+        or not isinstance(injected_targets, list)
+        or any(not isinstance(name, str) for name in injected_targets)
+        or len(injected_targets) != len(set(injected_targets))
+        or set(injected_targets) != set(expected_targets)
+    ):
         raise ValueError("Stage 1 PEFT adapter targets do not match decoder tuning")
     adapter_ids = _adapter_parameter_ids(
         qwen, expected_targets, use_dora=tuning.method == "dora"

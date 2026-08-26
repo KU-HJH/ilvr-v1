@@ -39,7 +39,10 @@ from stage1.checkpointing import (
     save_stage1_peft_artifact,
     validate_stage1_vocab_alignment,
 )
-from stage1.peft import build_stage1_tuned_model
+from stage1.peft import (
+    build_stage1_tuned_model,
+    validate_stage1_trainable_boundary,
+)
 from stage1.token_rows import find_sparse_output_token_rows
 from stage1.trainer import CustomTrainerStage1
 from stage1.types import Stage1TuningConfig
@@ -1003,6 +1006,64 @@ def test_tied_source_provenance_preflights_and_restores_as_sparse_runtime(
         restored_qwen.model.embed_tokens.token_adapter.base_layer.weight
     )
     torch.testing.assert_close(restored_qwen.lm_head(hidden), expected, rtol=0, atol=0)
+
+
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_multilayer_optimized_targets_save_preflight_and_restore_exactly(tmp_path):
+    config = deepcopy(tiny_original_qwen().config)
+    config.num_hidden_layers = 4
+    config.tie_word_embeddings = True
+    source = Qwen2_5_VLForConditionalGeneration(config)
+    source.tie_weights()
+    source.config._name_or_path = "tiny/original-qwen"
+    resolved = tuple(
+        f"model.layers.{layer}.{owner}.{suffix}"
+        for suffix in stage1_tuning().target_suffixes
+        for layer in range(4)
+        for owner in (
+            "self_attn"
+            if suffix in ("q_proj", "k_proj", "v_proj", "o_proj")
+            else "mlp",
+        )
+    )
+    metadata = replace(
+        sample_metadata(source), resolved_target_names=resolved
+    )
+    source.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    source.config.latent_token_id = LATENT_TOKEN_IDS[0]
+    source.config.latent_start_id = LATENT_TOKEN_IDS[1]
+    source.config.latent_end_id = LATENT_TOKEN_IDS[2]
+    tuned = build_stage1_tuned_model(source, stage1_tuning(), LATENT_TOKEN_IDS)
+    processor = TinyStage1Processor()
+    save_stage1_peft_artifact(tuned, processor, tmp_path, metadata)
+    saved_config = json.loads(
+        (tmp_path / "adapter_config.json").read_text(encoding="utf-8")
+    )
+
+    assert set(saved_config["target_modules"]) != set(resolved)
+    assert set(tuned.base_model.targeted_module_names) == set(resolved)
+
+    fresh_config = deepcopy(config)
+    fresh_config.vocab_size = BASE_VOCAB_SIZE
+    fresh_config.tie_word_embeddings = True
+    fresh = Qwen2_5_VLForConditionalGeneration(fresh_config)
+    fresh.tie_weights()
+    fresh.config._name_or_path = "tiny/original-qwen"
+    witness = preflight_stage1_peft_artifact(
+        processor, deepcopy(fresh.config), tmp_path
+    )
+    restored = load_stage1_peft_artifact(
+        fresh,
+        processor,
+        tmp_path,
+        is_trainable=True,
+        preflight=witness,
+    )
+
+    assert set(restored.base_model.targeted_module_names) == set(resolved)
+    validate_stage1_trainable_boundary(
+        restored, stage1_tuning(), LATENT_TOKEN_IDS
+    )
 
 
 @pytest.mark.parametrize("pretrained_vocab_size", [BASE_VOCAB_SIZE, 132])

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 import torch
 from peft import PeftModel
@@ -120,6 +122,58 @@ def test_dora_targets_decoder_and_exact_latent_rows(tiny_qwen, latent_token_ids)
     assert report.categories["latent_output_parameters"] == 24
     assert any("lora_magnitude_vector" in name for name in report.trainable_names)
     assert all("visual" not in name.split(".") for name in report.trainable_names)
+
+
+@pytest.mark.parametrize("method", ["lora", "dora"])
+def test_multilayer_qwen_validates_exact_injected_targets_after_peft_optimization(
+    tiny_qwen, latent_token_ids, method
+):
+    config = deepcopy(tiny_qwen.config)
+    config.num_hidden_layers = 4
+    config.tie_word_embeddings = True
+    model = Qwen2_5_VLForConditionalGeneration(config)
+    model.tie_weights()
+    configured = tuning(method)
+
+    tuned = build_stage1_tuned_model(model, configured, latent_token_ids)
+    qwen = resolve_qwen2_5_vl_model(tuned)
+    expected = {
+        f"model.layers.{layer}.{owner}.{suffix}"
+        for layer in range(4)
+        for owner, suffixes in (
+            ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
+            ("mlp", ("gate_proj", "up_proj", "down_proj")),
+        )
+        for suffix in suffixes
+    }
+
+    assert set(tuned.base_model.targeted_module_names) == expected
+    assert set(tuned.peft_config["default"].target_modules) != expected
+    report = validate_stage1_trainable_boundary(
+        tuned, configured, latent_token_ids
+    )
+    assert report.categories["decoder_adapters"] > 0
+    assert qwen.config.tie_word_embeddings is False
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_adapter_boundary_rejects_inexact_injected_target_witness(
+    tiny_qwen, latent_token_ids, mutation
+):
+    configured = tuning("dora")
+    model = build_stage1_tuned_model(
+        tiny_qwen, configured, latent_token_ids
+    )
+    targeted = model.base_model.targeted_module_names
+    if mutation == "missing":
+        targeted.pop()
+    else:
+        targeted.append("visual.blocks.0.attn.qkv")
+
+    with pytest.raises(ValueError, match="adapter targets do not match"):
+        validate_stage1_trainable_boundary(
+            model, configured, latent_token_ids
+        )
 
 
 def test_full_freezes_visual_but_trains_all_language(tiny_qwen, latent_token_ids):

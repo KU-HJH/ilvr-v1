@@ -37,6 +37,7 @@ from peft_common import (
 )
 from stage1.ema import _parameter_shape
 from stage1.peft import (
+    _configured_target_patterns_match,
     _resolve_linear_decoder_targets,
     validate_stage1_trainable_boundary,
 )
@@ -929,8 +930,10 @@ def _validate_adapter_config(
             "Stage 1 adapter selective input-row mismatch: "
             f"metadata={expected_rows}, adapter={configured_rows}"
         )
-    target_modules = tuple(getattr(config, "target_modules", ()) or ())
-    if set(target_modules) != set(metadata.resolved_target_names):
+    target_modules = getattr(config, "target_modules", None)
+    if not _configured_target_patterns_match(
+        qwen, target_modules, metadata.resolved_target_names
+    ):
         raise ValueError("Stage 1 adapter resolved target mismatch")
     actual_resolved = _resolve_linear_decoder_targets(
         qwen, metadata.requested_target_suffixes
