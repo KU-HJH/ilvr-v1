@@ -129,6 +129,187 @@ bash run_training.sh
 - Gradient Accumulation Steps: 8
 - Latent Size: 8
 
+### Stage 1 full and DoRA training
+
+`run_stage1_training.sh` is the validated launcher for the Qwen2.5-VL-3B
+Stage 1 full/DoRA comparison. On this host the complete CoMT inputs are:
+
+```text
+/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl
+/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data
+```
+
+After separately validating the per-GPU micro-batch for each method, launch
+the full run on both GPUs as follows (replace `FULL_BATCH` with the sealed full
+maximum):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
+  --method full \
+  --model Qwen/Qwen2.5-VL-3B-Instruct \
+  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --output-dir outputs/stage1-timed/full-3epoch \
+  --log-file outputs/stage1-timed/full-3epoch/train.log \
+  --micro-batch FULL_BATCH \
+  --epochs 3 \
+  --learning-rate 1e-5 \
+  --gradient-accumulation 2 \
+  --seed 42 \
+  --deepspeed-config configs/config_stage3.json \
+  --attention-implementation flash_attention_2 \
+  --save-strategy no \
+  --final-save
+```
+
+DoRA uses an independently validated `DORA_BATCH` and the launcher's fixed
+DoRA contract (`r=32`, `alpha=64`, `dropout=0.05`, and all seven decoder
+projection suffixes):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
+  --method dora \
+  --model Qwen/Qwen2.5-VL-3B-Instruct \
+  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --output-dir outputs/stage1-timed/dora-3epoch \
+  --log-file outputs/stage1-timed/dora-3epoch/train.log \
+  --micro-batch DORA_BATCH \
+  --epochs 3 \
+  --learning-rate 1e-5 \
+  --gradient-accumulation 2 \
+  --seed 42 \
+  --deepspeed-config configs/config_stage3.json \
+  --attention-implementation flash_attention_2 \
+  --save-strategy no \
+  --final-save
+```
+
+The methods must be probed independently. First create/reuse the high-cost-row
+audit, then invoke the probe once per method starting at 8:
+
+```bash
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark audit \
+  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --output outputs/stage1-probes/high-cost-rows.json --count 64
+
+CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
+  --method full --model Qwen/Qwen2.5-VL-3B-Instruct \
+  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --output-root outputs/stage1-probes/full \
+  --probe-rows outputs/stage1-probes/high-cost-rows.json \
+  --start 8 --gradient-accumulation 2 --learning-rate 1e-5 --seed 42
+
+CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
+  --method dora --model Qwen/Qwen2.5-VL-3B-Instruct \
+  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --output-root outputs/stage1-probes/dora \
+  --probe-rows outputs/stage1-probes/high-cost-rows.json \
+  --start 8 --gradient-accumulation 2 --learning-rate 1e-5 --seed 42
+```
+
+The search stops at its first failure. Batch 8 failure must be classified
+before explicitly trying 4, then 2, then 1; the launcher never silently
+reduces a batch. For every run:
+
+```text
+effective global batch = world size × per-GPU micro-batch × accumulation
+```
+
+The official three-epoch launch consumes those sealed maxima, so no batch
+placeholder is resolved by hand:
+
+```bash
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark prepare-timed-run \
+  --method full --maximum outputs/stage1-probes/full/maximum.json \
+  --output-dir outputs/stage1-timed/full-3epoch \
+  --epochs 3 --learning-rate 1e-5 --gradient-accumulation 2 --world-size 2
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark prepare-timed-run \
+  --method dora --maximum outputs/stage1-probes/dora/maximum.json \
+  --output-dir outputs/stage1-timed/dora-3epoch \
+  --epochs 3 --learning-rate 1e-5 --gradient-accumulation 2 --world-size 2
+
+CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
+  --manifest outputs/stage1-timed/full-3epoch/launch-manifest.json
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark validate-timed-run \
+  --run-dir outputs/stage1-timed/full-3epoch
+
+CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
+  --manifest outputs/stage1-timed/dora-3epoch/launch-manifest.json
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark validate-timed-run \
+  --run-dir outputs/stage1-timed/dora-3epoch
+```
+
+If `prepare-timed-run` or the evidence check reports a reusable success, skip
+that training command. Each successful timed run is launched and validated
+once.
+
+A full final artifact contains model/config weights plus tokenizer and
+processor files. A DoRA final artifact contains
+`adapter_config.json`, `adapter_model.safetensors`,
+`ilvr_token_rows.safetensors`, `stage1_peft_metadata.json`, and tokenizer/
+processor files, but no merged full-model weights. Numbered checkpoints add
+Trainer optimizer, scheduler, RNG, and global-step state.
+
+Resume an interrupted Stage 1 run by naming its exact numbered checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
+  --method dora --model Qwen/Qwen2.5-VL-3B-Instruct \
+  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --output-dir /path/to/stage1-dora-output \
+  --resume /path/to/stage1-dora-output/checkpoint-100 \
+  --micro-batch DORA_BATCH --epochs 3 --learning-rate 1e-5 \
+  --gradient-accumulation 2 --seed 42 \
+  --deepspeed-config configs/config_stage3.json \
+  --attention-implementation flash_attention_2 --save-strategy no --final-save
+```
+
+That restores Stage 1 optimizer/scheduler/global-step state. A fresh Stage 2
+DoRA continuation is different: `--load_model_path` identifies the original
+full Qwen base while `--stage1_adapter_path` identifies the Stage 1 DoRA
+artifact. It copies the learned adapter and sparse latent-token rows but starts
+a new Stage 2 optimizer, scheduler, and global step:
+
+```bash
+PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+./venv/ilvr-venv/bin/python src/main.py \
+  --stage stage2 \
+  --load_model_path /path/to/original-qwen-base \
+  --stage1_adapter_path /path/to/stage1-dora-artifact \
+  --tuning_method dora \
+  --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 \
+  --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+  --data_path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
+  --image_root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --save_model_path /path/to/stage2-dora-output \
+  --per_device_train_batch_size 1 --learning_rate 1e-5
+```
+
+Adapter merging, stacking/fusion, and QLoRA are not supported. Stage 2 remains
+rank-local `B=1`, uses the correctness-first recurrence without a
+differentiable KV-cache optimization, and has not been run as a paper-level
+reproduction in this workflow.
+
+Small authenticated evidence is written at:
+
+```text
+outputs/stage1-smoke/{full,dora}/evidence.json
+outputs/stage1-probes/{full,dora}/maximum.json
+outputs/stage1-timed/{full-3epoch,dora-3epoch}/evidence.json
+outputs/stage1-timed/comparison.json
+outputs/stage1-timed/final-report.json
+```
+
+Before any GPU smoke, probe, timed run, or report generation, load these small
+manifests and reuse a matching successful witness. Do not rerun an expensive
+successful job or reread/hash unchanged model/checkpoint trees merely to
+recreate evidence.
+
 ### Stage 2 training
 
 Stage 2 starts from a Stage 1 checkpoint and replaces CoMT helper-image steps
@@ -210,10 +391,11 @@ DEEPSPEED_CONFIG=configs/config_stage3.json \
 ./run_stage2_training.sh
 ```
 
-All fresh modes load model and processor state from `STAGE1_CHECKPOINT`, then
-create new optimizer and scheduler state. The Stage 1 source must contain full
-base-model weights; a Stage 1 PEFT-only artifact is rejected because adapter
-stacking and implicit merging are not supported.
+Fresh full/LoRA/DoRA modes can load model and processor state from a complete
+full Stage 1 checkpoint, then create new optimizer and scheduler state. A
+Stage 1 DoRA artifact instead uses the explicitly separated original base and
+`--stage1_adapter_path` flow documented above. Stage 1 DoRA to Stage 2 full or
+LoRA, adapter stacking, and implicit merging are rejected.
 
 To resume PEFT training, keep the compatible Stage 1 base explicit and name
 the exact Stage 2 adapter checkpoint independently. Supplying all tuning
@@ -255,11 +437,11 @@ adapter_model.safetensors
 stage2_peft_metadata.json
 ```
 
-The sidecar uses the unreleased schema v2 and records a compact Qwen2.5-VL
+The sidecar uses schema v3 and records a compact Qwen2.5-VL
 text/vision architecture snapshot in addition to the adapter and latent-token
-contract. Pre-v2 sidecars are rejected because they do not carry enough origin
-architecture provenance for safe base relocation. Since no Stage 2 PEFT format
-has been released from this branch, there is no legacy migration path.
+contract. Strict complete v2 artifacts migrate as base-row sources; v1 and
+partial/unknown schemas are rejected because they lack enough origin
+architecture provenance for safe base relocation.
 
 A numbered checkpoint also contains `trainer_state.json`, RNG state, and the
 optimizer/scheduler state required by its training backend. The concrete

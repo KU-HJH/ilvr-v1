@@ -413,9 +413,9 @@ class CustomTrainerStage1(SFTTrainer):
         wrapped_device = getattr(getattr(self, "model_wrapped", None), "device", None)
         accelerator_device = getattr(getattr(self, "accelerator", None), "device", None)
         if wrapped_device is not None:
-            wrapped_device = torch.device(wrapped_device)
+            wrapped_device = self._canonical_execution_device(wrapped_device)
         if accelerator_device is not None:
-            accelerator_device = torch.device(accelerator_device)
+            accelerator_device = self._canonical_execution_device(accelerator_device)
         if (
             wrapped_device is not None
             and accelerator_device is not None
@@ -428,6 +428,13 @@ class CustomTrainerStage1(SFTTrainer):
         if device is None:
             raise RuntimeError("Stage 1 prepared execution device is unavailable")
         return device
+
+    @staticmethod
+    def _canonical_execution_device(device) -> torch.device:
+        result = torch.device(device)
+        if result.type == "cuda" and result.index is None:
+            return torch.device("cuda", torch.cuda.current_device())
+        return result
 
     def _prepare_ema_teacher_for_training(self) -> None:
         device = self._execution_device()

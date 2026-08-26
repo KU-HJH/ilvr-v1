@@ -22,6 +22,11 @@ class FakeTokenizer:
         return self.ids.get(token, self.unk_token_id)
 
 
+def no_stage2_peft_metadata(_):
+    """Model the full-checkpoint branch without touching a fake filesystem path."""
+    raise FileNotFoundError
+
+
 def test_resolve_latent_ids_requires_tokenizer_config_parity():
     tokenizer = FakeTokenizer(
         {
@@ -57,6 +62,7 @@ def test_resume_requires_stage2_and_uses_single_source_for_all_state():
         load_config=lambda _: SimpleNamespace(
             stage="stage2", latent_size=4, supervise_latent_boundaries=False
         ),
+        load_peft_metadata=no_stage2_peft_metadata,
         latent_size=4,
         supervise_latent_boundaries=False,
     )
@@ -77,6 +83,7 @@ def test_resume_rejects_stage1_source():
             load_model_path="stage1/model",
             resume_from_checkpoint_path="stage1/checkpoint-10",
             load_config=lambda _: SimpleNamespace(stage="stage1"),
+            load_peft_metadata=no_stage2_peft_metadata,
             latent_size=4,
             supervise_latent_boundaries=False,
         )
@@ -108,6 +115,7 @@ def test_resume_rejects_semantic_setting_changes(
             load_model_path="stage1/model",
             resume_from_checkpoint_path="stage2/checkpoint-10",
             load_config=lambda _: config,
+            load_peft_metadata=no_stage2_peft_metadata,
             **requested_values,
         )
 

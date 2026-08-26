@@ -98,6 +98,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--deepspeed_config")
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
+    parser.add_argument("--use_cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     # global_pad_to 已存在，保留
 # 其余不变

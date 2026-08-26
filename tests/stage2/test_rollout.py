@@ -76,6 +76,8 @@ def test_rollout_uses_hidden_before_each_latent_slot():
         result.latent_states[0],
         lm.calls[0][0][:, :2].cumsum(1)[:, -1] * lm.scale + 1,
     )
+    assert torch.allclose(result.latent_states[0], torch.tensor([[2.0, 3.0]]))
+    assert torch.allclose(result.latent_states[1], torch.tensor([[4.0, 5.5]]))
 
 
 def test_rollout_rejects_local_batch_larger_than_one():

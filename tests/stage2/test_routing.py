@@ -28,6 +28,7 @@ from stage2.checkpointing import (
     Stage2LoadDecision,
     build_stage2_peft_metadata,
     configure_stage2_metadata,
+    resolve_stage2_load_decision,
     validate_stage2_peft_compatibility,
 )
 from stage2.peft import (
@@ -209,6 +210,32 @@ def test_fresh_stage2_tuning_defaults_to_full():
 
     assert args.tuning_method == "full"
     assert args.tuning_method_explicit is False
+
+
+@pytest.mark.parametrize("method", ["full", "dora"])
+def test_full_stage1_checkpoint_routes_to_fresh_full_or_dora(method):
+    """Catches full Stage 1 sources being confused with Stage 2 resume state."""
+    decision = resolve_stage2_load_decision(
+        load_model_path="stage1/full-checkpoint",
+        stage1_adapter_path=None,
+        resume_from_checkpoint_path=None,
+        load_config=lambda source: SimpleNamespace(stage="stage1"),
+        discover_adapter_config=lambda *args, **kwargs: None,
+        latent_size=4,
+        supervise_latent_boundaries=True,
+        tuning_method=method,
+        tuning_method_explicit=True,
+        lora_r=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+        lora_target_modules=("q_proj", "v_proj"),
+    )
+
+    assert decision.base_model_source == "stage1/full-checkpoint"
+    assert decision.processor_source == "stage1/full-checkpoint"
+    assert decision.adapter_source is None
+    assert decision.trainer_resume_path is None
+    assert decision.tuning.method == method
 
 
 @pytest.mark.parametrize("method", ["lora", "dora"])
