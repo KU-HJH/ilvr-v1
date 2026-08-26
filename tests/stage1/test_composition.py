@@ -31,6 +31,7 @@ from stage1.checkpointing import (
 from stage1.composition import (
     DEFAULT_STAGE1_DEPENDENCIES,
     LATENT_TOKEN_STRINGS,
+    build_stage1_training_arguments,
     build_stage1_training_components,
     run_stage1,
 )
@@ -125,12 +126,16 @@ class RecordingTrainer:
 def stage1_args(tmp_path, *extra, method="dora"):
     (tmp_path / "TRAIN.jsonl").write_text("{}\n", encoding="utf-8")
     (tmp_path / "images").mkdir(exist_ok=True)
+    tuning_args = (
+        ["--use_lora"]
+        if method == "lora"
+        else ["--tuning_method", method]
+    )
     return parse_args(
         [
             "--stage",
             "stage1",
-            "--tuning_method",
-            method,
+            *tuning_args,
             "--model",
             "Qwen/Qwen2.5-VL-3B-Instruct",
             "--data_path",
@@ -158,6 +163,37 @@ def stage1_args(tmp_path, *extra, method="dora"):
             *extra,
         ]
     )
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_kwargs"),
+    [
+        ("full", {"use_reentrant": False}),
+        ("lora", {"use_reentrant": True}),
+        ("dora", {"use_reentrant": True}),
+    ],
+)
+def test_stage1_peft_uses_zero3_safe_reentrant_gradient_checkpointing(
+    tmp_path, method, expected_kwargs
+):
+    training_args = build_stage1_training_arguments(
+        stage1_args(tmp_path, "--gradient_checkpointing", method=method)
+    )
+
+    assert training_args.gradient_checkpointing is True
+    assert training_args.gradient_checkpointing_kwargs == expected_kwargs
+
+
+@pytest.mark.parametrize("method", ["full", "lora", "dora"])
+def test_disabled_stage1_gradient_checkpointing_has_no_backend_kwargs(
+    tmp_path, method
+):
+    training_args = build_stage1_training_arguments(
+        stage1_args(tmp_path, "--no-gradient_checkpointing", method=method)
+    )
+
+    assert training_args.gradient_checkpointing is False
+    assert training_args.gradient_checkpointing_kwargs is None
 
 
 def _write_benchmark_audit(tmp_path, args, indices=(7, 3)):

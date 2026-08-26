@@ -51,7 +51,6 @@ LATENT_TOKEN_STRINGS = (
     "<|latent_start|>",
     "<|latent_end|>",
 )
-_GRADIENT_CHECKPOINTING_KWARGS = {"use_reentrant": False}
 
 
 @dataclass(frozen=True)
@@ -334,6 +333,13 @@ def _validate_resume_semantics(args, metadata: Stage1PeftMetadata) -> None:
 def build_stage1_training_arguments(args) -> SFTConfig:
     """Build Stage 1 Trainer arguments only from validated runtime inputs."""
 
+    gradient_checkpointing_kwargs = None
+    if args.gradient_checkpointing:
+        tuning = resolve_stage1_tuning_config(args)
+        gradient_checkpointing_kwargs = {
+            "use_reentrant": tuning.method != "full"
+        }
+
     return SFTConfig(
         output_dir=args.save_model_path,
         num_train_epochs=args.epochs,
@@ -357,11 +363,7 @@ def build_stage1_training_arguments(args) -> SFTConfig:
         max_seq_length=args.max_seq_length_train,
         max_steps=args.max_steps,
         gradient_checkpointing=args.gradient_checkpointing,
-        gradient_checkpointing_kwargs=(
-            dict(_GRADIENT_CHECKPOINTING_KWARGS)
-            if args.gradient_checkpointing
-            else None
-        ),
+        gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False,
         seed=args.seed,
