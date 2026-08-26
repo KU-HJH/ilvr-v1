@@ -148,6 +148,30 @@ def test_full_freezes_visual_but_trains_all_language(tiny_qwen, latent_token_ids
     assert report.categories["latent_output_rows"] == 3
 
 
+def test_full_parameter_report_counts_tied_embeddings_once(
+    tiny_qwen, latent_token_ids
+):
+    tiny_qwen.config.tie_word_embeddings = True
+    tiny_qwen.tie_weights()
+
+    model = build_stage1_tuned_model(
+        tiny_qwen, tuning("full"), latent_token_ids
+    )
+    qwen = resolve_qwen2_5_vl_model(model)
+    report = validate_stage1_trainable_boundary(
+        model, tuning("full"), latent_token_ids
+    )
+    expected_trainable = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+    assert qwen.lm_head.weight is qwen.model.embed_tokens.weight
+    assert report.trainable_parameters == expected_trainable
+    assert len(report.trainable_names) == len(set(report.trainable_names))
+
+
 def test_full_ce_backward_reaches_language_but_not_visual(
     tiny_qwen, latent_token_ids
 ):

@@ -292,7 +292,7 @@ def _tiny_model(config):
     return model
 
 
-def _tiny_dependencies():
+def _tiny_dependencies(*, tie_word_embeddings=False):
     def load_processor(source, **kwargs):
         del kwargs
         source = Path(source)
@@ -304,15 +304,35 @@ def _tiny_dependencies():
         del kwargs
         source = Path(source)
         if source.is_dir() and (source / "config.json").is_file():
-            return Qwen2_5_VLConfig.from_pretrained(source)
-        return deepcopy(tiny_original_qwen().config)
+            config = Qwen2_5_VLConfig.from_pretrained(source)
+        else:
+            config = deepcopy(tiny_original_qwen().config)
+        config.tie_word_embeddings = tie_word_embeddings
+        return config
 
     def load_model(source, *, config, **kwargs):
         del kwargs
         source = Path(source)
         if source.is_dir() and (source / "model.safetensors").is_file():
             model = _tiny_model(config)
-            model.load_state_dict(load_file(source / "model.safetensors"), strict=True)
+            incompatible = model.load_state_dict(
+                load_file(source / "model.safetensors"), strict=False
+            )
+            expected_missing = (
+                {"lm_head.weight"}
+                if config.tie_word_embeddings is True
+                else set()
+            )
+            if (
+                set(incompatible.missing_keys) != expected_missing
+                or incompatible.unexpected_keys
+            ):
+                raise RuntimeError(
+                    "tiny checkpoint topology mismatch: "
+                    f"missing={incompatible.missing_keys}, "
+                    f"unexpected={incompatible.unexpected_keys}"
+                )
+            model.tie_weights()
             return model
         return _tiny_model(config)
 
@@ -386,6 +406,7 @@ def tiny_stage1_run(
     save_steps,
     output_dir,
     legacy_lora=False,
+    tie_word_embeddings=False,
 ):
     args = _stage1_args(
         tmp_path,
@@ -398,7 +419,10 @@ def tiny_stage1_run(
         legacy_lora=legacy_lora,
     )
     components = build_stage1_training_components(
-        args, dependencies=_tiny_dependencies()
+        args,
+        dependencies=_tiny_dependencies(
+            tie_word_embeddings=tie_word_embeddings
+        ),
     )
     assert type(components.trainer) is CustomTrainerStage1
     assert type(components.trainer.target_builder) is Stage1TeacherTargetBuilder
@@ -444,8 +468,11 @@ def tiny_stage1_resume(tmp_path, run, *, method, max_steps):
         save_steps=10,
         resume=run.checkpoint_1,
     )
+    tied = resolve_qwen2_5_vl_model(
+        run.components.model
+    ).config.tie_word_embeddings
     components = build_stage1_training_components(
-        args, dependencies=_tiny_dependencies()
+        args, dependencies=_tiny_dependencies(tie_word_embeddings=tied)
     )
     witness = ResumeStateWitness()
     components.trainer.add_callback(witness)
@@ -483,6 +510,34 @@ def test_tiny_stage1_b2_train_save_resume_end_to_end(tmp_path, method):
     assert resumed.final_global_step == 3
     assert resumed.optimizer_state_restored
     assert resumed.scheduler_state_restored
+
+
+def test_tiny_tied_qwen_full_b2_train_save_resume_end_to_end(tmp_path):
+    run = tiny_stage1_run(
+        tmp_path,
+        method="full",
+        batch_size=2,
+        gradient_accumulation_steps=2,
+        max_steps=2,
+        save_steps=1,
+        output_dir=tmp_path / "full-tied",
+        tie_word_embeddings=True,
+    )
+    qwen = resolve_qwen2_5_vl_model(run.components.model)
+
+    assert qwen.config.tie_word_embeddings is True
+    assert qwen.lm_head.weight is qwen.model.embed_tokens.weight
+    assert run.student_batch_sizes == [2, 2, 2, 2]
+    assert run.checkpoint_1.is_dir()
+
+    resumed = tiny_stage1_resume(tmp_path, run, method="full", max_steps=3)
+    resumed_qwen = resolve_qwen2_5_vl_model(resumed.components.model)
+
+    assert resumed.initial_global_step == 1
+    assert resumed.final_global_step == 3
+    assert resumed.optimizer_state_restored
+    assert resumed.scheduler_state_restored
+    assert resumed_qwen.lm_head.weight is resumed_qwen.model.embed_tokens.weight
 
 
 def test_fresh_stage2_handoff_resets_training_state(tmp_path):

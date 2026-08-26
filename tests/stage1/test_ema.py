@@ -59,6 +59,16 @@ class SingleParameterStudent(nn.Module):
         self.model = nn.Linear(2, 2, bias=False)
 
 
+class TiedEmbeddingStudent(nn.Module):
+    def __init__(self, *, declared: bool = True) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(tie_word_embeddings=declared)
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(5, 2)
+        self.lm_head = nn.Linear(2, 5, bias=False)
+        self.lm_head.weight = self.model.embed_tokens.weight
+
+
 class TwoParameterStudent(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -259,6 +269,133 @@ def test_parameter_map_rejects_duplicate_parameter_aliases():
         build_ema_parameter_map(student, teacher, method="full")
 
 
+def test_full_ema_updates_declared_qwen_tied_embeddings_exactly_once():
+    student = TiedEmbeddingStudent()
+    ema = Stage1EmaTeacher(student, decay=0.5, method="full")
+    before = ema.model.model.embed_tokens.weight.detach().clone()
+
+    assert student.lm_head.weight is student.model.embed_tokens.weight
+    assert ema.model.lm_head.weight is ema.model.model.embed_tokens.weight
+    assert "model.embed_tokens.weight" in ema.parameter_names
+    assert "lm_head.weight" not in ema.parameter_names
+
+    with torch.no_grad():
+        student.model.embed_tokens.weight.add_(2.0)
+    ema.update(student)
+
+    torch.testing.assert_close(
+        ema.model.model.embed_tokens.weight,
+        before + 1.0,
+    )
+    assert ema.model.lm_head.weight is ema.model.model.embed_tokens.weight
+
+
+def test_full_ema_rejects_undeclared_qwen_embedding_alias():
+    student = TiedEmbeddingStudent(declared=False)
+    teacher = TiedEmbeddingStudent(declared=False)
+
+    with pytest.raises(RuntimeError, match="duplicate.*alias.*lm_head.weight"):
+        build_ema_parameter_map(student, teacher, method="full")
+
+
+def test_full_ema_rejects_mismatched_teacher_tied_embedding_topology():
+    student = TiedEmbeddingStudent()
+    teacher = TiedEmbeddingStudent()
+    teacher.lm_head.weight = nn.Parameter(
+        teacher.lm_head.weight.detach().clone()
+    )
+
+    with pytest.raises(RuntimeError, match="alias topology mismatch"):
+        build_ema_parameter_map(student, teacher, method="full")
+
+
+def test_full_ema_rejects_declared_but_untied_embedding_topology():
+    student = TiedEmbeddingStudent()
+    student.lm_head.weight = nn.Parameter(
+        student.lm_head.weight.detach().clone()
+    )
+
+    with pytest.raises(RuntimeError, match="declared tied.*alias topology"):
+        Stage1EmaTeacher(student, decay=0.5, method="full")
+
+
+def test_full_ema_rejects_shared_storage_with_distinct_embedding_parameters():
+    student = TiedEmbeddingStudent()
+    student.lm_head.weight = nn.Parameter(student.model.embed_tokens.weight.data)
+
+    assert student.lm_head.weight is not student.model.embed_tokens.weight
+    assert (
+        student.lm_head.weight.untyped_storage().data_ptr()
+        == student.model.embed_tokens.weight.untyped_storage().data_ptr()
+    )
+    with pytest.raises(RuntimeError, match="declared tied.*same Parameter"):
+        Stage1EmaTeacher(student, decay=0.5, method="full")
+
+
+def test_full_ema_rejects_extra_third_alias_on_declared_tied_embedding():
+    student = TiedEmbeddingStudent()
+    student.extra_alias = student.model.embed_tokens.weight
+
+    with pytest.raises(RuntimeError, match="declared tied.*exactly"):
+        Stage1EmaTeacher(student, decay=0.5, method="full")
+
+
+def test_full_ema_accepts_engine_wrapped_declared_tied_embedding():
+    student = TiedEmbeddingStudent()
+    ema = Stage1EmaTeacher(ModuleWrapper(student), decay=0.5, method="full")
+
+    assert ema.parameter_names == ("model.embed_tokens.weight",)
+
+
+def test_declared_tied_embedding_normalizes_supported_peft_wrapper_prefix():
+    import stage1.ema as ema_module
+
+    student = TiedEmbeddingStudent()
+    weight = student.model.embed_tokens.weight
+    topology = ema_module._declared_qwen_tied_embedding_topology(
+        student,
+        {
+            "base_model.model.model.embed_tokens.weight": weight,
+            "base_model.model.lm_head.weight": weight,
+        },
+    )
+
+    assert topology.canonical_name == (
+        "base_model.model.model.embed_tokens.weight"
+    )
+
+
+def test_declared_tied_embedding_rejects_unsupported_wrapper_prefix():
+    import stage1.ema as ema_module
+
+    student = TiedEmbeddingStudent()
+    weight = student.model.embed_tokens.weight
+    with pytest.raises(RuntimeError, match="unsupported wrapper prefix"):
+        ema_module._declared_qwen_tied_embedding_topology(
+            student,
+            {
+                "untrusted.model.embed_tokens.weight": weight,
+                "untrusted.lm_head.weight": weight,
+            },
+        )
+
+
+def test_full_ema_accepts_real_local_qwen_declared_tied_embeddings():
+    from tests.stage1.test_checkpointing import tiny_original_qwen
+
+    student = tiny_original_qwen()
+    student.config.tie_word_embeddings = True
+    student.tie_weights()
+    student.visual.requires_grad_(False)
+
+    ema = Stage1EmaTeacher(student, decay=0.5, method="full")
+
+    assert student.lm_head.weight is student.model.embed_tokens.weight
+    assert ema.model.lm_head.weight is ema.model.model.embed_tokens.weight
+    assert "model.embed_tokens.weight" in ema.parameter_names
+    assert "lm_head.weight" not in ema.parameter_names
+
+
 class RecordingGather(AbstractContextManager):
     calls: list[tuple[tuple[nn.Parameter, ...], int | None]] = []
     replacement_by_id: dict[int, torch.Tensor] = {}
@@ -371,6 +508,22 @@ def test_ema_state_dict_round_trip_restores_model_and_decay(full_student):
     assert_named_parameters_equal(restored.model, clone_named_parameters(ema.model))
     assert restored.model.training is False
     assert all(parameter.requires_grad is False for parameter in restored.model.parameters())
+
+
+def test_tied_embedding_ema_state_dict_round_trip_preserves_alias_topology():
+    student = TiedEmbeddingStudent()
+    ema = Stage1EmaTeacher(student, decay=0.25, method="full")
+    state = ema.state_dict()
+    restored = Stage1EmaTeacher(student, decay=0.8, method="full")
+
+    restored.load_state_dict(state)
+
+    assert restored.parameter_names == ("model.embed_tokens.weight",)
+    assert restored.model.lm_head.weight is restored.model.model.embed_tokens.weight
+    torch.testing.assert_close(
+        restored.model.model.embed_tokens.weight,
+        ema.model.model.embed_tokens.weight,
+    )
 
 
 def test_ema_state_dict_rejects_incompatible_method(dora_student):

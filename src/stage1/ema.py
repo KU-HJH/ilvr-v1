@@ -11,6 +11,8 @@ from typing import Any, Iterator, Literal, Mapping
 import torch
 from torch import nn
 
+from peft_common import resolve_qwen2_5_vl_model
+
 
 Stage1EmaMethod = Literal["full", "lora", "dora"]
 _PEFT_PARAMETER_COMPONENTS = frozenset(
@@ -24,6 +26,7 @@ _PEFT_PARAMETER_COMPONENTS = frozenset(
         "output_delta",
     }
 )
+_SUPPORTED_QWEN_PARAMETER_PREFIXES = frozenset(("", "base_model.model."))
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,12 @@ class EmaParameterPair:
 
     name: str
     shape: torch.Size
+
+
+@dataclass(frozen=True)
+class _TiedEmbeddingAliasTopology:
+    canonical_name: str
+    alias_names: tuple[str, str]
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
@@ -73,10 +82,101 @@ def _is_peft_parameter(name: str) -> bool:
     )
 
 
+def _declared_qwen_tied_embedding_topology(
+    model: nn.Module,
+    named: Mapping[str, nn.Parameter],
+) -> _TiedEmbeddingAliasTopology | None:
+    config = getattr(model, "config", None)
+    if getattr(config, "tie_word_embeddings", None) is not True:
+        return None
+    try:
+        qwen = resolve_qwen2_5_vl_model(model)
+        input_weight = qwen.model.embed_tokens.weight
+        output_weight = qwen.lm_head.weight
+    except (AttributeError, TypeError) as error:
+        raise RuntimeError(
+            "EMA declared tied embedding alias topology does not satisfy the "
+            "Qwen2.5-VL input/output interface"
+        ) from error
+    if not isinstance(input_weight, nn.Parameter) or not isinstance(
+        output_weight, nn.Parameter
+    ):
+        raise RuntimeError(
+            "EMA declared tied embedding alias topology requires Parameters"
+        )
+    if input_weight is not output_weight:
+        raise RuntimeError(
+            "EMA declared tied embedding alias topology must use the same "
+            "Parameter and storage"
+        )
+    if _parameter_shape(input_weight) != _parameter_shape(output_weight):
+        raise RuntimeError(
+            "EMA declared tied embedding alias topology has mismatched shapes"
+        )
+
+    aliases = tuple(
+        sorted(name for name, parameter in named.items() if parameter is input_weight)
+    )
+    input_suffix = "model.embed_tokens.weight"
+    output_suffix = "lm_head.weight"
+    input_names = tuple(name for name in aliases if name.endswith(input_suffix))
+    output_names = tuple(name for name in aliases if name.endswith(output_suffix))
+    if len(aliases) != 2 or len(input_names) != 1 or len(output_names) != 1:
+        raise RuntimeError(
+            "EMA declared tied embedding alias topology must contain exactly "
+            "the decoder input embedding weight and lm_head.weight"
+        )
+    input_name = input_names[0]
+    output_name = output_names[0]
+    input_prefix = input_name[: -len(input_suffix)]
+    output_prefix = output_name[: -len(output_suffix)]
+    if input_prefix != output_prefix:
+        raise RuntimeError(
+            "EMA declared tied embedding alias topology has inconsistent "
+            "supported wrapper prefixes"
+        )
+    if input_prefix not in _SUPPORTED_QWEN_PARAMETER_PREFIXES:
+        raise RuntimeError(
+            "EMA declared tied embedding alias topology has an unsupported "
+            f"wrapper prefix: {input_prefix!r}"
+        )
+    return _TiedEmbeddingAliasTopology(
+        canonical_name=input_name,
+        alias_names=(input_name, output_name),
+    )
+
+
+def _validate_full_tied_embedding_parity(
+    student: nn.Module,
+    teacher: nn.Module,
+) -> None:
+    student_topology = _declared_qwen_tied_embedding_topology(
+        student, _named_parameters(student)
+    )
+    try:
+        teacher_topology = _declared_qwen_tied_embedding_topology(
+            teacher, _named_parameters(teacher)
+        )
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"EMA student/teacher alias topology mismatch: {error}"
+        ) from error
+    if student_topology != teacher_topology:
+        raise RuntimeError(
+            "EMA student/teacher alias topology mismatch for declared tied "
+            "embeddings"
+        )
+
+
 def _selected_parameters(
     model: nn.Module, method: Stage1EmaMethod
 ) -> dict[str, nn.Parameter]:
     named = _named_parameters(model)
+    tied_topology = (
+        _declared_qwen_tied_embedding_topology(model, named)
+        if method == "full"
+        else None
+    )
     trainable_visual = sorted(
         name
         for name, parameter in named.items()
@@ -114,7 +214,14 @@ def _selected_parameters(
         raise RuntimeError(f"EMA parameter set is empty for method {method}")
 
     parameter_owners: dict[int, str] = {}
+    canonical_selected: dict[str, nn.Parameter] = {}
     for name in sorted(selected):
+        if (
+            tied_topology is not None
+            and name in tied_topology.alias_names
+            and name != tied_topology.canonical_name
+        ):
+            continue
         identity = id(selected[name])
         previous = parameter_owners.get(identity)
         if previous is not None:
@@ -123,7 +230,8 @@ def _selected_parameters(
                 f"{previous} and {name}"
             )
         parameter_owners[identity] = name
-    return selected
+        canonical_selected[name] = selected[name]
+    return canonical_selected
 
 
 def _is_partitioned(parameter: nn.Parameter) -> bool:
@@ -159,6 +267,8 @@ def build_ema_parameter_map(
     validated_method = _validate_method(method)
     student = _unwrap_model(student)
     teacher = _unwrap_model(teacher)
+    if validated_method == "full":
+        _validate_full_tied_embedding_parity(student, teacher)
     selected = _selected_parameters(student, validated_method)
     teacher_named = _named_parameters(teacher)
 
@@ -259,6 +369,8 @@ class Stage1EmaTeacher:
         dict[str, nn.Parameter],
     ]:
         student = _unwrap_model(student)
+        if self.method == "full":
+            _validate_full_tied_embedding_parity(student, self.model)
         selected = _selected_parameters(student, self.method)
         selected_names = tuple(sorted(selected))
         if selected_names != self.parameter_names:
