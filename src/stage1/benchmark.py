@@ -453,7 +453,7 @@ def load_verified_evidence(
 
 _SMOKE_MARKER_FILENAME = "checkpoint-topology.json"
 _SMOKE_REGISTRY_KIND = "stage1-smoke-registry-evidence"
-_SMOKE_REGISTRY_SCHEMA_VERSION = 2
+_SMOKE_REGISTRY_SCHEMA_VERSION = 3
 _SMOKE_EXECUTION_LOCK = ".execution.lock"
 _SMOKE_ATTEMPTS_DIRECTORY = "attempts"
 _FAILED_ATTEMPT_ARCHIVE_NAMESPACE = ".failed-attempts"
@@ -464,6 +464,42 @@ _DIRECTORY_OPEN_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
+
+
+def _lexical_absolute_path(value: str | Path, *, base: Path | None = None) -> str:
+    raw = os.fspath(value)
+    if type(raw) is not str:
+        raise TypeError("requested path must decode to a string")
+    _require_string("requested path", raw)
+    if base is not None and not os.path.isabs(raw):
+        raw = os.path.join(os.fspath(base), raw)
+    return os.path.abspath(os.path.normpath(raw))
+
+
+def _repository_path_without_io() -> Path:
+    return Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+
+def _requested_smoke_paths(
+    *,
+    repository: Path,
+    data_path: str | Path,
+    image_root: str | Path,
+    deepspeed_config: str | Path,
+    launcher_path: str | Path | None,
+) -> dict[str, str]:
+    return {
+        "data_path": _lexical_absolute_path(data_path),
+        "image_root": _lexical_absolute_path(image_root),
+        "deepspeed_config": _lexical_absolute_path(
+            deepspeed_config, base=repository
+        ),
+        "launcher_path": _lexical_absolute_path(
+            repository / "run_stage1_training.sh"
+            if launcher_path is None
+            else launcher_path
+        ),
+    }
 
 
 def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -589,7 +625,7 @@ def _cleanup_owned_archive_lock(
         return False
 
 
-def archive_failed_distributed_attempt(evidence_dir: str | Path) -> Path:
+def _archive_failed_distributed_attempt_locked(evidence_dir: str | Path) -> Path:
     """Atomically archive one whole failed smoke directory to a unique path."""
 
     source = Path(evidence_dir)
@@ -739,6 +775,14 @@ def archive_failed_distributed_attempt(evidence_dir: str | Path) -> Path:
             os.close(source_fd)
     finally:
         os.close(parent_fd)
+
+
+def archive_failed_distributed_attempt(evidence_dir: str | Path) -> Path:
+    """Archive only while holding the same method-wide execution authority."""
+
+    source = Path(evidence_dir)
+    with _smoke_execution_lease(source, create=False):
+        return _archive_failed_distributed_attempt_locked(source)
 
 
 def _checkpoint_file_topology(checkpoint: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -1015,6 +1059,38 @@ def _exclusive_write_json(path: Path, payload: object) -> None:
         os.close(parent_fd)
 
 
+def _exclusive_write_json_at(directory_fd: int, name: str, payload: object) -> None:
+    """Publish immutable JSON relative to an already pinned directory."""
+
+    if Path(name).name != name:
+        raise ValueError("exclusive JSON name must be a basename")
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8") + b"\n"
+    descriptor = os.open(
+        name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        0o640,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
 def _read_canonical_evidence_json(
     path: Path, *, missing_ok: bool = False
 ) -> object | None:
@@ -1041,6 +1117,7 @@ def _read_canonical_evidence_json(
         descriptor = os.open(
             path.name,
             os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0),
             dir_fd=parent_fd,
@@ -1074,6 +1151,20 @@ def _read_canonical_evidence_json(
                 raise ValueError("canonical evidence changed during read")
         finally:
             os.close(descriptor)
+        try:
+            named_after = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise ValueError("canonical evidence changed during read") from error
+        if (
+            not stat_module.S_ISREG(named_after.st_mode)
+            or named_after.st_nlink != 1
+            or not _same_file_identity(opened, named_after)
+        ):
+            raise ValueError("canonical evidence changed during read")
     finally:
         os.close(parent_fd)
     try:
@@ -1085,11 +1176,32 @@ def _read_canonical_evidence_json(
 @dataclass(frozen=True)
 class _SmokeExecutionLease:
     directory: Path
+    parent_fd: int
+    method_name: str
     directory_fd: int
     lock_fd: int
+    directory_device: int
+    directory_inode: int
 
 
 def _validate_smoke_execution_lease(lease: _SmokeExecutionLease) -> None:
+    opened_directory = os.fstat(lease.directory_fd)
+    try:
+        named_directory = os.stat(
+            lease.method_name,
+            dir_fd=lease.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise ValueError("smoke method registry changed while lease was held") from error
+    if (
+        not stat_module.S_ISDIR(opened_directory.st_mode)
+        or not stat_module.S_ISDIR(named_directory.st_mode)
+        or (opened_directory.st_dev, opened_directory.st_ino)
+        != (lease.directory_device, lease.directory_inode)
+        or not _same_file_identity(opened_directory, named_directory)
+    ):
+        raise ValueError("smoke method registry changed while lease was held")
     opened = os.fstat(lease.lock_fd)
     try:
         named = os.stat(
@@ -1110,7 +1222,7 @@ def _validate_smoke_execution_lease(lease: _SmokeExecutionLease) -> None:
 
 
 @contextmanager
-def _smoke_execution_lease(evidence_directory: Path):
+def _smoke_execution_lease(evidence_directory: Path, *, create: bool = True):
     """Hold one method's persistent kernel execution lease until fd close."""
 
     directory = Path(os.path.abspath(evidence_directory))
@@ -1120,10 +1232,11 @@ def _smoke_execution_lease(evidence_directory: Path):
     directory_fd: int | None = None
     lock_fd: int | None = None
     try:
-        try:
-            os.mkdir(directory.name, 0o750, dir_fd=parent_fd)
-        except FileExistsError:
-            pass
+        if create:
+            try:
+                os.mkdir(directory.name, 0o750, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
         try:
             directory_fd = os.open(
                 directory.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd
@@ -1162,7 +1275,16 @@ def _smoke_execution_lease(evidence_directory: Path):
             label="method registry",
             require_directory=True,
         )
-        lease = _SmokeExecutionLease(directory, directory_fd, lock_fd)
+        directory_stat = os.fstat(directory_fd)
+        lease = _SmokeExecutionLease(
+            directory,
+            parent_fd,
+            directory.name,
+            directory_fd,
+            lock_fd,
+            directory_stat.st_dev,
+            directory_stat.st_ino,
+        )
         _validate_smoke_execution_lease(lease)
         yield lease
     finally:
@@ -1836,6 +1958,7 @@ def _validate_smoke_registry_payload(
             "marker_path",
             "marker_digest",
             "checkpoint_marker",
+            "request_provenance",
             "producer_evidence",
             "registry_digest",
         },
@@ -1870,6 +1993,40 @@ def _validate_smoke_registry_payload(
     )
     if producer["run_config"]["kind"] != "stage1-smoke-run-manifest":
         raise ValueError("registry evidence must contain smoke producer evidence")
+    provenance = payload.get("request_provenance")
+    _require_exact_keys(
+        provenance,
+        {
+            "data_path",
+            "image_root",
+            "deepspeed_config",
+            "launcher_path",
+            "sealed_deepspeed_config_path",
+            "sealed_deepspeed_config_digest",
+            "sealed_run_config_digest",
+        },
+        "Stage 1 smoke request provenance",
+    )
+    for name in (
+        "data_path", "image_root", "deepspeed_config", "launcher_path",
+        "sealed_deepspeed_config_path",
+    ):
+        value = _require_string(f"request_provenance.{name}", provenance.get(name))
+        if not os.path.isabs(value) or _lexical_absolute_path(value) != value:
+            raise ValueError(f"request_provenance.{name} must be lexical absolute")
+    config = producer["run_config"]
+    if (
+        provenance["sealed_deepspeed_config_path"] != config["deepspeed_config"]
+        or provenance["sealed_deepspeed_config_digest"]
+        != config["deepspeed_config_digest"]
+        or provenance["sealed_run_config_digest"] != config["config_digest"]
+    ):
+        raise ValueError("registry request provenance does not match producer seal")
+    _require_digest(
+        "sealed_deepspeed_config_digest",
+        provenance["sealed_deepspeed_config_digest"],
+    )
+    _require_digest("sealed_run_config_digest", provenance["sealed_run_config_digest"])
     producer_digest = _require_digest(
         "attempt_evidence_digest", payload.get("attempt_evidence_digest")
     )
@@ -1901,6 +2058,7 @@ def _smoke_registry_payload(
     evidence_directory: Path,
     producer: Mapping[str, object],
     checkpoint_marker: Mapping[str, object],
+    requested_paths: Mapping[str, str],
 ) -> dict[str, object]:
     evidence_directory = Path(evidence_directory).resolve(strict=True)
     attempt = Path(attempt).resolve(strict=True)
@@ -1918,6 +2076,13 @@ def _smoke_registry_payload(
         marker_path=marker_path,
         seal=producer,
     )
+    config = producer["run_config"]
+    provenance = {
+        **dict(requested_paths),
+        "sealed_deepspeed_config_path": config["deepspeed_config"],
+        "sealed_deepspeed_config_digest": config["deepspeed_config_digest"],
+        "sealed_run_config_digest": config["config_digest"],
+    }
     payload = {
         "schema_version": _SMOKE_REGISTRY_SCHEMA_VERSION,
         "kind": _SMOKE_REGISTRY_KIND,
@@ -1927,6 +2092,7 @@ def _smoke_registry_payload(
         "marker_path": f"{relative}/{_SMOKE_MARKER_FILENAME}",
         "marker_digest": marker_digest,
         "checkpoint_marker": marker,
+        "request_provenance": provenance,
         "producer_evidence": dict(producer),
     }
     payload["registry_digest"] = config_digest(payload)
@@ -3222,14 +3388,14 @@ def _distributed_smoke_result(
 
 def _load_canonical_smoke_evidence(
     evidence_path: Path,
-) -> tuple[Stage1BenchmarkEvidence, dict[str, object]] | None:
+) -> tuple[Stage1BenchmarkEvidence, dict[str, object], dict[str, object]] | None:
     raw = _read_canonical_evidence_json(evidence_path, missing_ok=True)
     if raw is None:
         return None
     if type(raw) is not dict or raw.get("kind") != _SMOKE_REGISTRY_KIND:
         raise ValueError("canonical smoke evidence must be a registry envelope")
     evidence, seal, _ = _validate_smoke_registry_payload(raw, evidence_path)
-    return evidence, seal
+    return evidence, seal, raw["request_provenance"]
 
 
 def _matching_canonical_smoke_result(
@@ -3242,11 +3408,12 @@ def _matching_canonical_smoke_result(
     world_size: int,
     initial_max_steps: int,
     resumed_max_steps: int,
+    requested_paths: Mapping[str, str],
 ) -> DistributedSmokeWitness | None:
     loaded = _load_canonical_smoke_evidence(evidence_path)
     if loaded is None:
         return None
-    evidence, seal = loaded
+    evidence, seal, provenance = loaded
     config = seal["run_config"]
     summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
     if (
@@ -3262,6 +3429,7 @@ def _matching_canonical_smoke_result(
         or config["world_size"] != world_size
         or summary["initial_final_step"] != initial_max_steps
         or summary["resume_final_step"] != resumed_max_steps
+        or any(provenance[name] != value for name, value in requested_paths.items())
     ):
         raise FileExistsError(
             "canonical smoke evidence belongs to a different semantic request"
@@ -3313,6 +3481,16 @@ def run_or_load_distributed_witness(
             "world-size 2, and exact 3-to-4 steps"
         )
     evidence_directory = Path(os.path.abspath(evidence_dir))
+    if evidence_directory.name != method:
+        raise ValueError("smoke evidence directory basename must match method")
+    repository = _repository_path_without_io()
+    requested_paths = _requested_smoke_paths(
+        repository=repository,
+        data_path=data_path,
+        image_root=image_root,
+        deepspeed_config=deepspeed_config,
+        launcher_path=launcher_path,
+    )
     evidence_path = evidence_directory / "evidence.json"
     expected_scalars = {
         "method": method,
@@ -3322,6 +3500,7 @@ def run_or_load_distributed_witness(
         "world_size": world_size,
         "initial_max_steps": initial_max_steps,
         "resumed_max_steps": resumed_max_steps,
+        "requested_paths": requested_paths,
     }
     if (
         reused := _matching_canonical_smoke_result(
@@ -3338,7 +3517,6 @@ def run_or_load_distributed_witness(
         ) is not None:
             return reused
 
-        repository = Path(__file__).resolve().parents[2]
         data = Path(data_path).resolve(strict=True)
         images = Path(image_root).resolve(strict=True)
         deepspeed = Path(deepspeed_config)
@@ -3388,6 +3566,7 @@ def run_or_load_distributed_witness(
             "--deepspeed-config", str(deepspeed),
             "--attention-implementation", "flash_attention_2",
         ]
+        _validate_smoke_execution_lease(execution_lease)
         _run_smoke_launcher(
             launcher,
             [
@@ -3436,18 +3615,25 @@ def run_or_load_distributed_witness(
             evidence_directory=evidence_directory,
             producer=seal,
             checkpoint_marker=checkpoint_snapshot.payload(),
+            requested_paths=requested_paths,
         )
         _validate_smoke_registry_payload(registry, evidence_path)
         _validate_smoke_execution_lease(execution_lease)
         try:
-            _exclusive_write_json(evidence_path, registry)
+            _exclusive_write_json_at(
+                execution_lease.directory_fd,
+                evidence_path.name,
+                registry,
+            )
         except FileExistsError:
+            _validate_smoke_execution_lease(execution_lease)
             reused = _matching_canonical_smoke_result(
                 evidence_path, **expected_scalars
             )
             if reused is None:  # pragma: no cover - colliding inode must exist.
                 raise RuntimeError("canonical smoke evidence disappeared")
             return reused
+        _validate_smoke_execution_lease(execution_lease)
         return _distributed_smoke_result(produced, seal)
 
 
@@ -3459,17 +3645,21 @@ def _load_evidence_without_expected(path: Path) -> Stage1BenchmarkEvidence:
 
 
 def _check_evidence(args: argparse.Namespace) -> str:
-    path = Path(args.evidence_dir) / "evidence.json"
+    method = _validated_method(args.method)
+    directory = Path(os.path.abspath(args.evidence_dir))
+    if directory.name != method:
+        raise ValueError("smoke evidence directory basename must match method")
+    path = directory / "evidence.json"
     loaded = _load_canonical_smoke_evidence(path)
     if loaded is None:
         return "missing"
-    evidence, seal = loaded
+    evidence, seal, _ = loaded
     if seal["run_config"]["kind"] != "stage1-smoke-run-manifest":
         raise ValueError("check-evidence accepts only Task 15 smoke evidence")
     _validate_smoke_resume_witness(seal["smoke_resume_witness"])
     if (
         evidence.status == "success"
-        and evidence.method == args.method
+        and evidence.method == method
         and evidence.micro_batch == args.micro_batch
         and evidence.world_size == args.world_size
     ):

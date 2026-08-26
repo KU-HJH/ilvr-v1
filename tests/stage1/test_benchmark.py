@@ -1496,6 +1496,97 @@ def test_distributed_smoke_reuse_rejects_a_tampered_small_checkpoint_marker(tmp_
         benchmark.run_or_load_distributed_witness(**kwargs)
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("data_path", "missing-other-data.jsonl"),
+        ("image_root", "missing-other-images"),
+        ("deepspeed_config", "missing-other-zero3.json"),
+        ("launcher_path", "missing-other-launcher"),
+    ],
+)
+def test_canonical_smoke_reuse_rejects_different_requested_path_without_io(
+    tmp_path, field, replacement
+):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    kwargs = dict(
+        method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path, image_root=image_root, micro_batch=2,
+        gradient_accumulation_steps=2, world_size=2, initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir, launcher_path=launcher,
+    )
+    benchmark.run_or_load_distributed_witness(**kwargs)
+    before = len(list(records.iterdir()))
+    kwargs[field] = tmp_path / replacement
+
+    with pytest.raises(FileExistsError, match="different.*request"):
+        benchmark.run_or_load_distributed_witness(**kwargs)
+
+    assert len(list(records.iterdir())) == before
+    assert [path.name for path in (evidence_dir / "attempts").iterdir()] == [
+        "attempt-1"
+    ]
+
+
+def test_smoke_rejects_method_directory_mismatch_before_launch_input_io(tmp_path):
+    import stage1.benchmark as benchmark
+
+    wrong = tmp_path / "evidence" / "not-full"
+    with pytest.raises(ValueError, match="evidence directory.*method"):
+        benchmark.run_or_load_distributed_witness(
+            method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+            data_path=tmp_path / "missing-data.jsonl",
+            image_root=tmp_path / "missing-images", micro_batch=2,
+            gradient_accumulation_steps=2, world_size=2,
+            initial_max_steps=3, resumed_max_steps=4,
+            deepspeed_config=tmp_path / "missing-zero3.json",
+            evidence_dir=wrong,
+            launcher_path=tmp_path / "missing-launcher",
+        )
+
+    assert not wrong.exists()
+    assert not (wrong.parent / "high-cost-rows.json").exists()
+
+    args = SimpleNamespace(
+        evidence_dir=str(wrong), method="full", micro_batch=2, world_size=2
+    )
+    with pytest.raises(ValueError, match="evidence directory.*method"):
+        benchmark._check_evidence(args)
+
+
+def test_canonical_smoke_reuse_rejects_model_and_setting_mismatch(tmp_path):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    kwargs = dict(
+        method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path, image_root=image_root, micro_batch=2,
+        gradient_accumulation_steps=2, world_size=2, initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir, launcher_path=launcher,
+    )
+    benchmark.run_or_load_distributed_witness(**kwargs)
+    before = len(list(records.iterdir()))
+
+    with pytest.raises(FileExistsError, match="different.*request"):
+        benchmark.run_or_load_distributed_witness(
+            **{**kwargs, "model": "Different/Model"}
+        )
+    with pytest.raises(ValueError, match="distributed smoke requires"):
+        benchmark.run_or_load_distributed_witness(
+            **{**kwargs, "gradient_accumulation_steps": 1}
+        )
+
+    assert len(list(records.iterdir())) == before
+
+
 def test_smoke_execution_lease_releases_on_close_and_is_method_scoped(tmp_path):
     import stage1.benchmark as benchmark
 
@@ -1676,6 +1767,93 @@ def test_smoke_wrapper_detects_execution_lock_replacement_between_launches(
     assert not (evidence_dir / "evidence.json").exists()
 
 
+def test_smoke_wrapper_detects_method_directory_replacement_before_resume(
+    tmp_path, monkeypatch
+):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    displaced = tmp_path / "evidence" / "full-displaced"
+    original = benchmark._run_smoke_launcher
+    calls = 0
+
+    def replace_method_after_first_launch(*args, **kwargs):
+        nonlocal calls
+        original(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            evidence_dir.rename(displaced)
+            evidence_dir.mkdir()
+
+    monkeypatch.setattr(
+        benchmark, "_run_smoke_launcher", replace_method_after_first_launch
+    )
+    with pytest.raises(ValueError, match="method registry changed"):
+        benchmark.run_or_load_distributed_witness(
+            method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+            data_path=data_path, image_root=image_root, micro_batch=2,
+            gradient_accumulation_steps=2, world_size=2,
+            initial_max_steps=3, resumed_max_steps=4,
+            deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+            evidence_dir=evidence_dir, launcher_path=launcher,
+        )
+
+    assert len(list(records.iterdir())) == 1
+    assert not (evidence_dir / "evidence.json").exists()
+    assert not (displaced / "evidence.json").exists()
+
+
+def test_canonical_publication_never_succeeds_through_replaced_method_name(
+    tmp_path, monkeypatch
+):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, records, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    displaced = tmp_path / "evidence" / "full-displaced"
+    original = benchmark._exclusive_write_json_at
+
+    def replace_method_at_publication(directory_fd, name, payload):
+        evidence_dir.rename(displaced)
+        evidence_dir.mkdir()
+        original(directory_fd, name, payload)
+
+    monkeypatch.setattr(
+        benchmark, "_exclusive_write_json_at", replace_method_at_publication
+    )
+    with pytest.raises(ValueError, match="method registry changed"):
+        benchmark.run_or_load_distributed_witness(
+            method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+            data_path=data_path, image_root=image_root, micro_batch=2,
+            gradient_accumulation_steps=2, world_size=2,
+            initial_max_steps=3, resumed_max_steps=4,
+            deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+            evidence_dir=evidence_dir, launcher_path=launcher,
+        )
+
+    assert len(list(records.iterdir())) == 2
+    assert not (evidence_dir / "evidence.json").exists()
+    assert (displaced / "evidence.json").is_file()
+
+
+def test_public_archive_cannot_overlap_a_smoke_execution_lease(archive_tmp_path):
+    import stage1.benchmark as benchmark
+
+    evidence_dir = archive_tmp_path / "evidence" / "full"
+    evidence_dir.mkdir(parents=True)
+    log = evidence_dir / "initial.log"
+    log.write_bytes(b"active execution")
+
+    with benchmark._smoke_execution_lease(evidence_dir):
+        with pytest.raises(RuntimeError, match="in progress"):
+            archive_failed_distributed_attempt(evidence_dir)
+        assert evidence_dir.is_dir()
+        assert log.read_bytes() == b"active execution"
+
+    assert list((evidence_dir.parent / ".failed-attempts").glob("full-attempt-*")) == []
+
+
 def test_check_evidence_rejects_every_noncanonical_file_topology(tmp_path):
     import stage1.benchmark as benchmark
 
@@ -1715,6 +1893,84 @@ def test_check_evidence_rejects_every_noncanonical_file_topology(tmp_path):
     os.mkfifo(canonical)
     with pytest.raises(ValueError, match="canonical.*regular"):
         benchmark._check_evidence(args)
+
+
+def test_canonical_reader_rejects_fifo_swap_without_blocking(tmp_path, monkeypatch):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, _, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    benchmark.run_or_load_distributed_witness(
+        method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path, image_root=image_root, micro_batch=2,
+        gradient_accumulation_steps=2, world_size=2, initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir, launcher_path=launcher,
+    )
+    canonical = evidence_dir / "evidence.json"
+    original_open = os.open
+    swapped = False
+
+    def swap_to_fifo_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == "evidence.json" and kwargs.get("dir_fd") is not None:
+            if not flags & os.O_NONBLOCK:
+                raise AssertionError("canonical FIFO would be opened in blocking mode")
+            if not swapped:
+                swapped = True
+                canonical.unlink()
+                os.mkfifo(canonical)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(benchmark.os, "open", swap_to_fifo_before_open)
+    with pytest.raises(ValueError, match="canonical evidence (changed|must be)"):
+        benchmark._check_evidence(
+            SimpleNamespace(
+                evidence_dir=str(evidence_dir), method="full",
+                micro_batch=2, world_size=2,
+            )
+        )
+
+
+def test_canonical_reader_rejects_name_replacement_during_read(
+    tmp_path, monkeypatch
+):
+    import stage1.benchmark as benchmark
+
+    data_path, image_root, _, launcher = _smoke_fixture(tmp_path)
+    evidence_dir = tmp_path / "evidence" / "full"
+    benchmark.run_or_load_distributed_witness(
+        method="full", model="Qwen/Qwen2.5-VL-3B-Instruct",
+        data_path=data_path, image_root=image_root, micro_batch=2,
+        gradient_accumulation_steps=2, world_size=2, initial_max_steps=3,
+        resumed_max_steps=4,
+        deepspeed_config=REPO_ROOT / "configs/config_stage3.json",
+        evidence_dir=evidence_dir, launcher_path=launcher,
+    )
+    canonical = evidence_dir / "evidence.json"
+    displaced = evidence_dir / "evidence-original.json"
+    replacement = canonical.read_bytes()
+    original_read = os.read
+    swapped = False
+
+    def replace_name_after_read(fd, size):
+        nonlocal swapped
+        data = original_read(fd, size)
+        if data and not swapped:
+            swapped = True
+            canonical.rename(displaced)
+            canonical.write_bytes(replacement)
+        return data
+
+    monkeypatch.setattr(benchmark.os, "read", replace_name_after_read)
+    with pytest.raises(ValueError, match="canonical evidence changed"):
+        benchmark._check_evidence(
+            SimpleNamespace(
+                evidence_dir=str(evidence_dir), method="full",
+                micro_batch=2, world_size=2,
+            )
+        )
 
 
 def test_legacy_flat_failure_is_retained_while_registry_retry_uses_attempt_2(
@@ -1923,7 +2179,9 @@ def test_failed_smoke_archive_rejects_unsafe_paths(archive_tmp_path, corruption)
             archive_root.mkdir()
             (archive_root / "full-attempt-zero").mkdir()
 
-    with pytest.raises((ValueError, FileExistsError), match="symlink|archive|target"):
+    with pytest.raises(
+        (ValueError, FileExistsError), match="symlink|archive|target|registry"
+    ):
         archive_failed_distributed_attempt(evidence_dir)
 
     assert evidence_dir.exists()

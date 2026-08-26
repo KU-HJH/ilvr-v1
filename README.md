@@ -162,11 +162,17 @@ method directory are also retained and reserve attempt 1. A persistent
 mode-`0600` `.execution.lock` uses a kernel `flock` lease across allocation,
 both launches, checkpoint sealing, and success publication. A concurrent
 invocation fails with an explicit in-progress/retry message and cannot allocate
-or launch; process exit releases the lease without deleting the lock inode. On
+or launch; process exit releases the lease without deleting the lock inode.
+The lease also pins the method parent/name/inode, and failed-attempt archival
+must acquire this same lease before moving anything. On
 success, the wrapper publishes exactly one small canonical
 `outputs/stage1-smoke/<method>/evidence.json` with exclusive-create semantics.
-That evidence embeds both the authenticated producer envelope and the sealed
-checkpoint marker while retaining their contained relative provenance paths.
+That schema-v3 evidence embeds both the authenticated producer envelope and the
+sealed checkpoint marker while retaining their contained relative provenance
+paths. It also binds the lexical absolute requested data, image, DeepSpeed, and
+launcher paths to the sealed DeepSpeed/run-config digests. Reuse requires exact
+request-path and experiment-setting equality without resolving or statting
+those paths.
 Reuse reads only this canonical regular, non-aliased evidence inode; it does not
 require the source data, images, attempt directory, checkpoint tree, or
 attempt-local evidence file. The legacy `archive-failed-attempt` command
