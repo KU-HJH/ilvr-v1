@@ -769,7 +769,7 @@ def _smoke_attempt_number(name: str) -> int:
 
 
 def _exclusive_write_json(path: Path, payload: object) -> None:
-    """Publish one small immutable JSON object without replacing any inode."""
+    """Atomically publish one complete JSON inode without replacing a target."""
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -780,26 +780,31 @@ def _exclusive_write_json(path: Path, payload: object) -> None:
         sort_keys=True,
         indent=2,
     ).encode("utf-8") + b"\n"
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    descriptor = os.open(path, flags, 0o640)
+    temporary: Path | None = None
     try:
-        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o640)
             handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        temporary.unlink()
+        temporary = None
+        parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     finally:
-        os.close(descriptor)
-    parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _exclusive_write_json_at(directory_fd: int, name: str, payload: object) -> None:
@@ -2805,9 +2810,9 @@ def _classification_path(attempt_path: Path) -> Path:
 def _classify_failure(attempt_path: Path, classification: str) -> None:
     attempt = _load_probe_attempt(attempt_path)
     if attempt["exit_code"] == 0:
-        raise ValueError("a successful probe attempt cannot be classified as an OOM")
-    if classification != "capacity_oom":
-        raise ValueError("only the systematic-debugging result capacity_oom is accepted")
+        raise ValueError("a successful probe attempt cannot be classified as a failure")
+    if classification not in {"capacity_oom", "integration_failure"}:
+        raise ValueError("unsupported probe failure classification")
     payload = {
         "schema_version": _SCHEMA_VERSION,
         "kind": "stage1-probe-failure-classification",
@@ -2819,18 +2824,60 @@ def _classify_failure(attempt_path: Path, classification: str) -> None:
     }
     payload["classification_digest"] = config_digest(payload)
     path = _classification_path(attempt_path)
-    if path.exists():
+    try:
+        _exclusive_write_json(path, payload)
+    except FileExistsError:
         if _read_json_once(path) != payload:
-            raise FileExistsError(f"different failure classification already exists: {path}")
-        return
-    _atomic_write_json(path, payload)
+            raise FileExistsError(
+                f"different failure classification already exists: {path}"
+            ) from None
 
 
-def _confirmed_capacity_oom(attempt_path: Path) -> bool:
+def _probe_execution_lock_identity(fd: int, path: Path) -> tuple[os.stat_result, Path]:
+    fd = _require_int("probe lock fd", fd, positive=True)
+    path = Path(os.path.abspath(path))
+    opened = os.fstat(fd)
+    try:
+        named = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("probe execution lock path is invalid") from error
+    if (
+        not stat_module.S_ISREG(opened.st_mode)
+        or not stat_module.S_ISREG(named.st_mode)
+        or opened.st_nlink != 1
+        or named.st_nlink != 1
+        or not _same_file_identity(opened, named)
+    ):
+        raise ValueError("probe execution lock must be one mode-0600 regular file")
+    return opened, path
+
+
+def _validate_probe_execution_lock(fd: int, path: Path) -> None:
+    opened, _ = _probe_execution_lock_identity(fd, path)
+    if stat_module.S_IMODE(opened.st_mode) != 0o600:
+        raise ValueError("probe execution lock must be one mode-0600 regular file")
+
+
+def _acquire_probe_execution_lock(fd: int, path: Path) -> None:
+    """Acquire one controller lease on the Bash-owned open file description."""
+
+    opened, path = _probe_execution_lock_identity(fd, path)
+    os.fchmod(fd, 0o600)
+    opened = os.fstat(fd)
+    if stat_module.S_IMODE(opened.st_mode) != 0o600:
+        raise ValueError("probe execution lock must be one mode-0600 regular file")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise RuntimeError(f"probe execution is in progress: {path.parent}") from error
+    _validate_probe_execution_lock(fd, path)
+
+
+def _failure_classification(attempt_path: Path) -> str | None:
     attempt = _load_probe_attempt(attempt_path)
     path = _classification_path(attempt_path)
     if not path.is_file():
-        return False
+        return None
     classification = _read_json_once(path)
     _require_exact_keys(
         classification,
@@ -2844,15 +2891,23 @@ def _confirmed_capacity_oom(attempt_path: Path) -> bool:
     digest_input.pop("classification_digest")
     if config_digest(digest_input) != claimed:
         raise ValueError("probe failure classification digest mismatch")
-    return bool(
+    value = classification.get("classification")
+    if value not in {"capacity_oom", "integration_failure"}:
+        raise ValueError("unsupported probe failure classification")
+    if not (
         classification.get("schema_version") == _SCHEMA_VERSION
         and classification.get("kind") == "stage1-probe-failure-classification"
-        and classification.get("classification") == "capacity_oom"
         and classification.get("method") == attempt["method"]
         and classification.get("micro_batch") == attempt["micro_batch"]
         and classification.get("attempt_config_digest") == attempt["config_digest"]
         and classification.get("attempt_digest") == attempt["attempt_digest"]
-    )
+    ):
+        raise ValueError("probe failure classification does not match its attempt")
+    return value
+
+
+def _confirmed_capacity_oom(attempt_path: Path) -> bool:
+    return _failure_classification(attempt_path) == "capacity_oom"
 
 
 def _attempt_files(probe_dir: Path, method: str | None = None) -> list[Path]:
@@ -2874,14 +2929,9 @@ def _validated_capacity_chain(
         if require_success:
             raise ValueError("capacity chain contains no attempts")
         return None, None
-    batches = [attempt["micro_batch"] for _, attempt in attempts]
-    if len(set(batches)) != len(batches):
-        raise ValueError("capacity chain contains a duplicate candidate")
     timestamps = [attempt["recorded_at_ns"] for _, attempt in attempts]
     if len(set(timestamps)) != len(timestamps) or timestamps != sorted(timestamps):
         raise ValueError("capacity chain does not have one strict recorded order")
-    if batches[0] != 8:
-        raise ValueError("capacity chain must start at batch 8")
     fingerprint_names = (
         "method", "world_size", "gradient_accumulation_steps", "learning_rate",
         "seed", "model", "data_path", "train_data_path", "data_stat", "image_root",
@@ -2894,17 +2944,45 @@ def _validated_capacity_chain(
         for name in fingerprint_names:
             if attempt["launch_config"][name] != first_config[name]:
                 raise ValueError(f"capacity chain changes immutable field: {name}")
+    capacity_attempts: list[tuple[Path, dict[str, object]]] = []
+    pending_retry: int | None = None
+    for path, attempt in attempts:
+        if pending_retry is not None and attempt["micro_batch"] != pending_retry:
+            raise ValueError(
+                "an integration failure must be retried at the same candidate"
+            )
+        classification = None
+        if attempt["exit_code"] != 0 and _classification_path(path).is_file():
+            classification = _failure_classification(path)
+        if classification == "integration_failure":
+            pending_retry = attempt["micro_batch"]
+            continue
+        pending_retry = None
+        capacity_attempts.append((path, attempt))
+    if pending_retry is not None and require_success:
+        raise ValueError(
+            "integration failure requires an append-only retry at the same candidate"
+        )
+    if not capacity_attempts:
+        if require_success:
+            raise ValueError("capacity chain contains no successful candidate")
+        return None, None
+    batches = [attempt["micro_batch"] for _, attempt in capacity_attempts]
+    if len(set(batches)) != len(batches):
+        raise ValueError("capacity chain contains a duplicate candidate")
+    if batches[0] != 8:
+        raise ValueError("capacity chain must start at batch 8")
     selected = None
     first_failure = None
-    if attempts[0][1]["exit_code"] == 0:
+    if capacity_attempts[0][1]["exit_code"] == 0:
         expected = 8
-        for index, item in enumerate(attempts):
+        for index, item in enumerate(capacity_attempts):
             _, attempt = item
             if attempt["micro_batch"] != expected:
                 raise ValueError("ascending capacity chain skips or reorders a candidate")
             if attempt["exit_code"] != 0:
                 first_failure = item
-                if index != len(attempts) - 1:
+                if index != len(capacity_attempts) - 1:
                     raise ValueError("capacity chain launches after its first failure")
             else:
                 if first_failure is not None:
@@ -2913,7 +2991,7 @@ def _validated_capacity_chain(
             expected *= 2
     else:
         expected_order = (8, 4, 2, 1)
-        for index, item in enumerate(attempts):
+        for index, item in enumerate(capacity_attempts):
             _, attempt = item
             if index >= len(expected_order) or attempt["micro_batch"] != expected_order[index]:
                 raise ValueError("fallback capacity chain skips or reorders a candidate")
@@ -2921,7 +2999,7 @@ def _validated_capacity_chain(
                 first_failure = item
             if attempt["exit_code"] == 0:
                 selected = item
-                if index != len(attempts) - 1:
+                if index != len(capacity_attempts) - 1:
                     raise ValueError("fallback capacity chain launches after success")
             elif selected is not None:
                 raise ValueError("fallback capacity chain launches after success")
@@ -2930,31 +3008,70 @@ def _validated_capacity_chain(
     return selected, first_failure
 
 
-def _require_candidate(probe_dir: Path, method: str, candidate: int) -> None:
+def _require_candidate(probe_dir: Path, method: str, candidate: int) -> str:
     method = _validated_method(method)
     candidate = _require_int("candidate", candidate, positive=True)
     attempts = [
         (path, _load_probe_attempt(path)) for path in _attempt_files(probe_dir, method)
     ]
-    selected, first_failure = _validated_capacity_chain(attempts, require_success=False)
+    selected, _ = _validated_capacity_chain(attempts, require_success=False)
     if not attempts:
         if candidate != 8:
             raise ValueError("first capacity candidate must be 8")
-        return
+        return "confirmed-candidate"
+    capacity_attempts = [
+        (path, attempt)
+        for path, attempt in attempts
+        if not (
+            attempt["exit_code"] != 0
+            and _classification_path(path).is_file()
+            and _failure_classification(path) == "integration_failure"
+        )
+    ]
+    if any(
+        attempt["exit_code"] == 0 and attempt["micro_batch"] == candidate
+        for _, attempt in capacity_attempts
+    ):
+        return "already-successful"
     last_path, last = attempts[-1]
     if last["exit_code"] != 0:
-        if not _confirmed_capacity_oom(last_path):
+        classification = _failure_classification(last_path)
+        if classification == "integration_failure":
+            if not capacity_attempts:
+                expected = 8
+            elif capacity_attempts[0][1]["exit_code"] == 0:
+                if capacity_attempts[-1][1]["exit_code"] != 0:
+                    expected = None
+                else:
+                    expected = capacity_attempts[-1][1]["micro_batch"] * 2
+            elif capacity_attempts[-1][1]["exit_code"] != 0:
+                expected = {8: 4, 4: 2, 2: 1}.get(
+                    capacity_attempts[-1][1]["micro_batch"]
+                )
+            else:
+                expected = None
+            if candidate != last["micro_batch"] or candidate != expected:
+                raise ValueError(
+                    "integration failure retry must use the same next candidate"
+                )
+            return "confirmed-candidate"
+        if classification != "capacity_oom":
             raise ValueError("next candidate requires classification of the prior failure")
-        if batches := [item[1]["micro_batch"] for item in attempts]:
+        if batches := [item[1]["micro_batch"] for item in capacity_attempts]:
             expected = {8: 4, 4: 2, 2: 1}.get(batches[-1])
-        if batches[0] != 8 or attempts[0][1]["exit_code"] == 0 or candidate != expected:
+        if (
+            batches[0] != 8
+            or capacity_attempts[0][1]["exit_code"] == 0
+            or candidate != expected
+        ):
             raise ValueError("no launch is allowed after the first ascending failure")
-        return
-    if attempts[0][1]["exit_code"] != 0:
+        return "confirmed-candidate"
+    if capacity_attempts[0][1]["exit_code"] != 0:
         raise ValueError("fallback search stops at its first success")
     expected = last["micro_batch"] * 2
     if candidate != expected:
         raise ValueError(f"next ascending candidate must be {expected}")
+    return "confirmed-candidate"
 
 
 def _require_initial_oom(probe_dir: Path, method: str) -> Path:
@@ -2962,9 +3079,13 @@ def _require_initial_oom(probe_dir: Path, method: str) -> Path:
     matches = []
     for path in _attempt_files(probe_dir, method):
         attempt = _load_probe_attempt(path)
-        if attempt["micro_batch"] == 8 and attempt["exit_code"] != 0:
+        if (
+            attempt["micro_batch"] == 8
+            and attempt["exit_code"] != 0
+            and _confirmed_capacity_oom(path)
+        ):
             matches.append(path)
-    if len(matches) != 1 or not _confirmed_capacity_oom(matches[0]):
+    if len(matches) != 1:
         raise ValueError(
             "fallback requires exactly one initial batch 8 failure with a confirmed "
             "capacity_oom classification"
@@ -2985,6 +3106,11 @@ def _require_fallback(probe_dir: Path, method: str, candidate: int) -> None:
             (path, attempt)
             for path, attempt in attempts
             if attempt["micro_batch"] == required_batch
+            and not (
+                attempt["exit_code"] != 0
+                and _classification_path(path).is_file()
+                and _failure_classification(path) == "integration_failure"
+            )
         ]
         if len(matches) != 1:
             raise ValueError(
@@ -3615,7 +3741,7 @@ def _load_maximum(path: Path) -> dict[str, object]:
     )
     assert chain_selected is not None
     for attempt_path, attempt in chain:
-        if attempt["exit_code"] != 0 and not _confirmed_capacity_oom(attempt_path):
+        if attempt["exit_code"] != 0 and _failure_classification(attempt_path) is None:
             raise ValueError("maximum chain contains an unclassified failure")
     if config_digest(
         {"attempt_digests": [attempt["attempt_digest"] for _, attempt in chain]}
@@ -3803,7 +3929,7 @@ def _validate_maximum(probe_dir: Path, long_smoke_steps: int) -> dict[str, objec
     assert selected_item is not None
     failed = [(path, attempt) for path, attempt in attempts if attempt["exit_code"] != 0]
     for path, _ in failed:
-        if not _confirmed_capacity_oom(path):
+        if _failure_classification(path) is None:
             raise ValueError(f"requires-classification: {path}")
     selected_path, selected = selected_item
     long_root = (
@@ -4342,7 +4468,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     classify = subparsers.add_parser("classify-failure")
     classify.add_argument("--attempt", required=True)
-    classify.add_argument("--classification", choices=("capacity_oom",), required=True)
+    classify.add_argument(
+        "--classification",
+        choices=("capacity_oom", "integration_failure"),
+        required=True,
+    )
+
+    acquire_probe_lock = subparsers.add_parser("acquire-probe-lock")
+    acquire_probe_lock.add_argument("--fd", type=int, required=True)
+    acquire_probe_lock.add_argument("--path", required=True)
+
+    validate_probe_lock = subparsers.add_parser("validate-probe-lock")
+    validate_probe_lock.add_argument("--fd", type=int, required=True)
+    validate_probe_lock.add_argument("--path", required=True)
 
     require_initial = subparsers.add_parser("require-initial-oom")
     require_initial.add_argument("--probe-dir", required=True)
@@ -4441,15 +4579,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_prepare_probe_run(args))
     elif command == "classify-failure":
         _classify_failure(Path(args.attempt), args.classification)
-        print("capacity_oom")
+        print(args.classification)
+    elif command == "acquire-probe-lock":
+        _acquire_probe_execution_lock(args.fd, Path(args.path))
+        print("probe-lock-acquired")
+    elif command == "validate-probe-lock":
+        _validate_probe_execution_lock(args.fd, Path(args.path))
+        print("probe-lock-valid")
     elif command == "require-initial-oom":
         print(_require_initial_oom(Path(args.probe_dir), args.method))
     elif command == "require-fallback":
         _require_fallback(Path(args.probe_dir), args.method, args.candidate)
         print("confirmed-fallback")
     elif command == "require-candidate":
-        _require_candidate(Path(args.probe_dir), args.method, args.candidate)
-        print("confirmed-candidate")
+        print(_require_candidate(Path(args.probe_dir), args.method, args.candidate))
     elif command == "check-evidence":
         print(_check_evidence(args))
     elif command == "archive-failed-attempt":

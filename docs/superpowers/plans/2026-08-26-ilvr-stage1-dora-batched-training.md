@@ -1892,7 +1892,7 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --seed 42
 ```
 
-Expected: fresh process IDs for 8, 16, 32, … and a stop at the first failure. If 8 fails, invoke `superpowers:systematic-debugging`, classify it, then explicitly rerun the script with `--start 4 --descending`. No automatic fallback occurs.
+Expected: fresh process IDs for 8, 16, 32, … and a stop at the first failure. If 8 fails, invoke `superpowers:systematic-debugging`. A classified `integration_failure` is retried append-only at batch 8 by rerunning the same primary command; only a confirmed `capacity_oom` permits explicitly rerunning with `--start 4 --descending`. No automatic fallback occurs.
 
 - [ ] **Step 3: Classify the first full failure and validate its preceding success**
 
@@ -1933,7 +1933,7 @@ Invoke `superpowers:systematic-debugging` at its first failure, then validate th
   --long-smoke-steps 10
 ```
 
-Expected: `outputs/stage1-probes/dora/maximum.json` records an independently selected batch. If batch 8 fails, use the same explicit `--start 4 --descending` policy after classification.
+Expected: `outputs/stage1-probes/dora/maximum.json` records an independently selected batch. If batch 8 has an `integration_failure`, rerun the same primary command for an append-only batch-8 retry; only a confirmed `capacity_oom` permits the explicit `--start 4 --descending` fallback policy.
 
 - [ ] **Step 5: Compare small manifests without rerunning probes**
 

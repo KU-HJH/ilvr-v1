@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cd -- "$script_dir"
+repository_python="$script_dir/venv/ilvr-venv/bin/python"
 
 method=
 model=
@@ -24,7 +25,7 @@ dora_dropout=0.05
 deepspeed_config="$script_dir/configs/config_stage3.json"
 attention_implementation=flash_attention_2
 launcher=${STAGE1_LAUNCHER:-"$script_dir/run_stage1_training.sh"}
-benchmark_python=${STAGE1_BENCHMARK_PYTHON:-"$script_dir/venv/ilvr-venv/bin/python"}
+benchmark_python=$repository_python
 
 usage() {
     printf '%s\n' \
@@ -139,6 +140,28 @@ else
     )
 fi
 
+mkdir -p -- "$output_root"
+probe_lock_path="$output_root/.probe-execution.lock"
+saved_umask=$(umask)
+umask 077
+exec {probe_lock_fd}>>"$probe_lock_path"
+umask "$saved_umask"
+if ! "$benchmark_python" -m src.stage1.benchmark acquire-probe-lock \
+    --fd "$probe_lock_fd" --path "$probe_lock_path" >/dev/null; then
+    printf 'error: probe execution is in progress or its lock is invalid: %s\n' \
+        "$output_root" >&2
+    exit 2
+fi
+validate_probe_lock() {
+    "$benchmark_python" -m src.stage1.benchmark validate-probe-lock \
+        --fd "$probe_lock_fd" --path "$probe_lock_path" >/dev/null
+}
+if [[ -n $fallback ]]; then
+    "$benchmark_python" -m src.stage1.benchmark require-fallback \
+        --probe-dir "$output_root" --method "$method" \
+        --candidate "$fallback" >/dev/null
+fi
+
 probe_data="$output_root/probe-input.jsonl"
 "$benchmark_python" -m src.stage1.benchmark probe-jsonl \
     --audit "$probe_rows" --data-path "$data_path" \
@@ -146,9 +169,18 @@ probe_data="$output_root/probe-input.jsonl"
 
 counter=0
 for micro_batch in "${candidates[@]}"; do
-    "$benchmark_python" -m src.stage1.benchmark require-candidate \
+    validate_probe_lock
+    candidate_status=$("$benchmark_python" -m src.stage1.benchmark require-candidate \
         --probe-dir "$output_root" --method "$method" \
-        --candidate "$micro_batch" >/dev/null
+        --candidate "$micro_batch")
+    if [[ $candidate_status == already-successful ]]; then
+        continue
+    fi
+    if [[ $candidate_status != confirmed-candidate ]]; then
+        printf 'error: unexpected candidate state: %s\n' "$candidate_status" >&2
+        exit 2
+    fi
+    validate_probe_lock
     counter=$((counter + 1))
     attempt_id="$(date +%Y%m%dT%H%M%S%N)-$$-$counter"
     attempt_dir="$output_root/attempts/$method/micro-batch-$micro_batch/attempt-$attempt_id"
@@ -193,6 +225,7 @@ for micro_batch in "${candidates[@]}"; do
         --producer-evidence "$producer_evidence"
     )
 
+    validate_probe_lock
     set +e
     "${launch_command[@]}" >"$stdout_path" 2>"$stderr_path" &
     child_pid=$!
@@ -200,6 +233,7 @@ for micro_batch in "${candidates[@]}"; do
     exit_code=$?
     set -e
 
+    validate_probe_lock
     "$benchmark_python" -m src.stage1.benchmark record-attempt \
         --attempt-dir "$attempt_dir" \
         --attempt-id "$attempt_id" \

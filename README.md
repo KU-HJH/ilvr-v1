@@ -234,9 +234,9 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
 ```
 
 Each primary probe stops at its first failure and prints the exact
-`attempt=...` directory. Diagnose that attempt before recording the only
-accepted failure class (set each variable to the literal path printed by its
-launcher):
+`attempt=...` directory. Diagnose that attempt before recording a failure
+class (set each variable to the literal path printed by its launcher).
+Record `capacity_oom` only for a confirmed capacity failure:
 
 ```bash
 ./venv/ilvr-venv/bin/python -m src.stage1.benchmark classify-failure \
@@ -245,8 +245,22 @@ launcher):
   --attempt "$FAILED_DORA_ATTEMPT" --classification capacity_oom
 ```
 
-If the initial batch 8 fails, classification must precede an explicit
-fallback. Run 4, then—only after another recorded `capacity_oom`—2, then 1.
+For a non-capacity launcher or integration failure, retain the failed attempt
+and classify it explicitly instead:
+
+```bash
+./venv/ilvr-venv/bin/python -m src.stage1.benchmark classify-failure \
+  --attempt "$FAILED_ATTEMPT" --classification integration_failure
+```
+
+Then rerun the same primary probe command. The controller skips its already
+successful prefix, appends a new attempt for the same failed batch, and only
+then continues the ordered search. An `integration_failure` never authorizes a
+lower fallback and is never reported as the first capacity failure.
+
+If the initial batch 8 is classified `capacity_oom`, that classification must
+precede an explicit fallback. Run 4, then—only after another recorded
+`capacity_oom`—2, then 1.
 The full fallback command is:
 
 ```bash

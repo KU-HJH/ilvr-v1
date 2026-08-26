@@ -3,6 +3,16 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cd -- "$script_dir"
+repository_python="$script_dir/venv/ilvr-venv/bin/python"
+repository_accelerate="$script_dir/venv/ilvr-venv/bin/accelerate"
+[[ -x $repository_python ]] || {
+    printf 'error: repository Python is not executable: %s\n' "$repository_python" >&2
+    exit 2
+}
+[[ -x $repository_accelerate ]] || {
+    printf 'error: repository Accelerate is not executable: %s\n' "$repository_accelerate" >&2
+    exit 2
+}
 
 manifest_mode=false
 manifest_path=
@@ -17,14 +27,9 @@ if (( $# )) && [[ $1 == --manifest ]]; then
     if (( $# == 3 )); then
         manifest_dry_run=true
     fi
-    benchmark_python=${STAGE1_BENCHMARK_PYTHON:-"$script_dir/venv/ilvr-venv/bin/python"}
-    [[ -x $benchmark_python ]] || {
-        printf 'error: benchmark Python is not executable: %s\n' "$benchmark_python" >&2
-        exit 2
-    }
     manifest_arguments=()
     mapfile -d '' -t manifest_arguments < <(
-        "$benchmark_python" -m src.stage1.benchmark launcher-args \
+        "$repository_python" -m src.stage1.benchmark launcher-args \
             --manifest "$manifest_path"
     )
     if (( ${#manifest_arguments[@]} == 0 )); then
@@ -207,7 +212,7 @@ if [[ -z $log_file ]]; then
 fi
 
 command=(
-    accelerate launch
+    "$repository_accelerate" launch
     --num_processes 2
     --main_process_port 29501
     src/main.py
@@ -287,4 +292,5 @@ fi
 
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTHON_EXEC="$repository_python"
 "${command[@]}"

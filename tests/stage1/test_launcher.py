@@ -61,20 +61,46 @@ def live_args(tmp_path, output_dir, *, method="dora"):
 
 
 def fake_accelerate_environment(tmp_path):
-    """Return a harmless executable boundary and a log proving dispatch."""
-    bin_dir = tmp_path / "fake bin"
-    bin_dir.mkdir()
+    """Return a copied wrapper with harmless pinned and poisoned boundaries."""
+    copied_repo = tmp_path / "copied repository"
+    copied_repo.mkdir()
+    copied_launcher = copied_repo / LAUNCHER.name
+    copied_launcher.write_bytes(LAUNCHER.read_bytes())
+    copied_launcher.chmod(0o755)
+    config_dir = copied_repo / "configs"
+    config_dir.mkdir()
+    (config_dir / "config_stage3.json").write_bytes(
+        (REPO_ROOT / "configs/config_stage3.json").read_bytes()
+    )
+    bin_dir = copied_repo / "venv/ilvr-venv/bin"
+    bin_dir.mkdir(parents=True)
     log_path = tmp_path / "accelerate argv.log"
     executable = bin_dir / "accelerate"
     executable.write_text(
-        "#!/usr/bin/env bash\nprintf '%q ' \"$@\" > \"$FAKE_ACCELERATE_LOG\"\n",
+        "#!/usr/bin/env bash\n"
+        "printf '%q ' \"$@\" > \"$FAKE_ACCELERATE_LOG\"\n"
+        "printf '%s' \"${PYTHON_EXEC-}\" > \"$FAKE_PYTHON_EXEC_LOG\"\n",
         encoding="utf-8",
     )
     executable.chmod(0o755)
+    repository_python = bin_dir / "python"
+    repository_python.write_text("#!/usr/bin/env bash\nexit 97\n", encoding="utf-8")
+    repository_python.chmod(0o755)
+    wrong_bin = tmp_path / "wrong PATH bin"
+    wrong_bin.mkdir()
+    wrong_log = tmp_path / "wrong accelerate.log"
+    wrong_accelerate = wrong_bin / "accelerate"
+    wrong_accelerate.write_text(
+        "#!/usr/bin/env bash\ntouch \"$WRONG_ACCELERATE_LOG\"\nexit 98\n",
+        encoding="utf-8",
+    )
+    wrong_accelerate.chmod(0o755)
     env = os.environ.copy()
-    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    env["PATH"] = f"{wrong_bin}{os.pathsep}{env['PATH']}"
     env["FAKE_ACCELERATE_LOG"] = str(log_path)
-    return env, log_path
+    env["FAKE_PYTHON_EXEC_LOG"] = str(tmp_path / "python exec.log")
+    env["WRONG_ACCELERATE_LOG"] = str(wrong_log)
+    return env, log_path, wrong_log, copied_launcher
 
 
 def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_path):
@@ -88,7 +114,7 @@ def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_
     assert not (REPO_ROOT / "SHOULD_NOT_EXIST").exists()
     command = shlex.split(completed.stdout.strip())
     assert command[:7] == [
-        "accelerate",
+        str(REPO_ROOT / "venv/ilvr-venv/bin/accelerate"),
         "launch",
         "--num_processes",
         "2",
@@ -201,17 +227,38 @@ def test_timed_manifest_is_loaded_without_shell_evaluating_paths(tmp_path):
     manifest["config_digest"] = config_digest(manifest)
     manifest_path = tmp_path / "launch manifest;literal.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    original_manifest_bytes = manifest_path.read_bytes()
+
+    poison_bin = tmp_path / "wrong path bin"
+    poison_bin.mkdir()
+    poison_marker = tmp_path / "wrong interpreter used"
+    for name in ("python", "accelerate"):
+        executable = poison_bin / name
+        executable.write_text(
+            "#!/usr/bin/env bash\n"
+            "touch \"$POISON_MARKER\"\n"
+            "exit 97\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{poison_bin}{os.pathsep}{env['PATH']}"
+    env["STAGE1_BENCHMARK_PYTHON"] = str(poison_bin / "python")
+    env["POISON_MARKER"] = str(poison_marker)
 
     completed = run_launcher(
-        LAUNCHER, "--manifest", manifest_path, "--dry-run"
+        LAUNCHER, "--manifest", manifest_path, "--dry-run", env=env
     )
 
     assert completed.returncode == 0, completed.stderr
     command = shlex.split(completed.stdout)
+    assert command[0] == str(REPO_ROOT / "venv/ilvr-venv/bin/accelerate")
     assert command[command.index("--model") + 1] == "model path;literal"
     assert command[command.index("--save_model_path") + 1] == str(output)
     assert command[command.index("--per_device_train_batch_size") + 1] == "16"
     assert "--final_save" in command
+    assert manifest_path.read_bytes() == original_manifest_bytes
+    assert not poison_marker.exists()
     assert not (REPO_ROOT / "MANIFEST_INJECTION").exists()
 
 
@@ -242,15 +289,16 @@ def test_live_launcher_refuses_nonempty_output_without_explicit_resume(tmp_path)
     output = tmp_path / "occupied"
     output.mkdir()
     (output / "evidence.txt").write_text("owned", encoding="utf-8")
-    env, accelerate_log = fake_accelerate_environment(tmp_path)
+    env, accelerate_log, wrong_log, launcher = fake_accelerate_environment(tmp_path)
 
     refused = run_launcher(
-        LAUNCHER, *live_args(tmp_path, output), env=env
+        launcher, *live_args(tmp_path, output), env=env
     )
 
     assert refused.returncode == 2
     assert "nonempty" in refused.stderr
     assert not accelerate_log.exists()
+    assert not wrong_log.exists()
 
 
 def test_live_launcher_allows_nonempty_output_only_with_explicit_resume(tmp_path):
@@ -258,10 +306,11 @@ def test_live_launcher_allows_nonempty_output_only_with_explicit_resume(tmp_path
     output = tmp_path / "occupied"
     checkpoint = output / "checkpoint-7"
     checkpoint.mkdir(parents=True)
-    env, accelerate_log = fake_accelerate_environment(tmp_path)
+    env, accelerate_log, wrong_log, launcher = fake_accelerate_environment(tmp_path)
+    env["PYTHON_EXEC"] = "/wrong/hjh-venv/bin/python"
 
     resumed = run_launcher(
-        LAUNCHER,
+        launcher,
         *live_args(tmp_path, output),
         "--resume",
         checkpoint,
@@ -270,6 +319,10 @@ def test_live_launcher_allows_nonempty_output_only_with_explicit_resume(tmp_path
 
     assert resumed.returncode == 0, resumed.stderr
     assert accelerate_log.is_file()
+    assert not wrong_log.exists()
+    assert (tmp_path / "python exec.log").read_text() == str(
+        launcher.parent / "venv/ilvr-venv/bin/python"
+    )
     resumed_command = shlex.split(accelerate_log.read_text(encoding="utf-8"))
     index = resumed_command.index("--resume_from_checkpoint_path")
     assert resumed_command[index + 1] == str(checkpoint)
@@ -293,15 +346,16 @@ def test_live_launcher_rejects_symlink_output_before_dispatch(
         (target / "owned.txt").write_text("owned", encoding="utf-8")
     output = experiment_root / "linked output"
     output.symlink_to(target, target_is_directory=True)
-    env, accelerate_log = fake_accelerate_environment(tmp_path)
+    env, accelerate_log, wrong_log, launcher = fake_accelerate_environment(tmp_path)
 
     completed = run_launcher(
-        LAUNCHER, *live_args(tmp_path, output), env=env
+        launcher, *live_args(tmp_path, output), env=env
     )
 
     assert completed.returncode == 2
     assert "symlink" in completed.stderr
     assert not accelerate_log.exists()
+    assert not wrong_log.exists()
 
 
 @pytest.mark.parametrize("output_kind", ["nonempty", "symlink", "dangling"])

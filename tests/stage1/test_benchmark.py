@@ -248,6 +248,12 @@ for ((i=1; i<=$#; i++)); do
     fi
 done
 printf '%s\\0' "$BASHPID" "$@" > "$STUB_RECORD_DIR/$BASHPID.argv0"
+if [[ -n ${STUB_START_DIR:-} ]]; then
+    touch "$STUB_START_DIR/$BASHPID"
+fi
+if [[ -n ${STUB_HOLD_SECONDS:-} ]]; then
+    sleep "$STUB_HOLD_SECONDS"
+fi
 if [[ ,${STUB_FAIL_BATCHES:-}, == *,$micro,* ]]; then
     exit 42
 fi
@@ -257,48 +263,51 @@ fi
     path.chmod(0o755)
 
 
-def _run_probe(tmp_path, *, fail_batches, extra=()):
+def _run_probe(tmp_path, *, fail_batches, extra=(), poison_benchmark_python=False):
     fake_launcher = tmp_path / "fake stage1 launcher"
     _write_fake_launcher(fake_launcher)
     records = tmp_path / "process records"
-    records.mkdir()
+    records.mkdir(exist_ok=True)
     data_path = tmp_path / "probe.jsonl"
-    data_path.write_text("{}\n", encoding="utf-8")
+    if not data_path.exists():
+        data_path.write_text("{}\n", encoding="utf-8")
     image_root = tmp_path / "images"
-    image_root.mkdir()
+    image_root.mkdir(exist_ok=True)
     probe_rows = tmp_path / "rows.json"
-    probe_rows.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "kind": "stage1-high-cost-row-audit",
-                "data_path": str(data_path.resolve()),
-                "image_root": str(image_root.resolve()),
-                "requested_count": 64,
-                "row_count": 1,
-                "input_stat": {
-                    "device": data_path.stat().st_dev,
-                    "inode": data_path.stat().st_ino,
-                    "size": data_path.stat().st_size,
-                    "mtime_ns": data_path.stat().st_mtime_ns,
-                },
-                "selected_rows": [
-                    {
-                        "source_row_index": 0,
-                        "token_estimate": 0,
-                        "original_image_count": 0,
-                        "helper_image_count": 0,
-                        "latent_block_count": 0,
-                        "example": {},
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    if not probe_rows.exists():
+        probe_rows.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "stage1-high-cost-row-audit",
+                    "data_path": str(data_path.resolve()),
+                    "image_root": str(image_root.resolve()),
+                    "requested_count": 64,
+                    "row_count": 1,
+                    "input_stat": {
+                        "device": data_path.stat().st_dev,
+                        "inode": data_path.stat().st_ino,
+                        "size": data_path.stat().st_size,
+                        "mtime_ns": data_path.stat().st_mtime_ns,
+                    },
+                    "selected_rows": [
+                        {
+                            "source_row_index": 0,
+                            "token_estimate": 0,
+                            "original_image_count": 0,
+                            "helper_image_count": 0,
+                            "latent_block_count": 0,
+                            "example": {},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        probe_payload = json.loads(probe_rows.read_text())
+        probe_payload["audit_digest"] = config_digest(probe_payload)
+        probe_rows.write_text(json.dumps(probe_payload), encoding="utf-8")
     probe_payload = json.loads(probe_rows.read_text())
-    probe_payload["audit_digest"] = config_digest(probe_payload)
-    probe_rows.write_text(json.dumps(probe_payload), encoding="utf-8")
     identity = {
         "model": "model path;literal", "source_data_path": str(data_path.resolve()),
         "data_stat": probe_payload["input_stat"], "image_root": str(image_root.resolve()),
@@ -319,7 +328,8 @@ def _run_probe(tmp_path, *, fail_batches, extra=()):
     }
     prerequisite["prerequisite_chain_digest"] = config_digest(prerequisite)
     prerequisite_path = tmp_path / "prerequisite-chain.json"
-    prerequisite_path.write_text(json.dumps(prerequisite))
+    if not prerequisite_path.exists():
+        prerequisite_path.write_text(json.dumps(prerequisite))
     output_root = tmp_path / "probe outputs;literal"
     env = os.environ.copy()
     env.update(
@@ -331,6 +341,22 @@ def _run_probe(tmp_path, *, fail_batches, extra=()):
             "PYTHONPATH": f"{REPO_ROOT}:{REPO_ROOT / 'src'}",
         }
     )
+    poison_marker = tmp_path / "wrong benchmark python used"
+    if poison_benchmark_python:
+        poison_bin = tmp_path / "wrong python bin"
+        poison_bin.mkdir(exist_ok=True)
+        for name in ("python", "accelerate"):
+            executable = poison_bin / name
+            executable.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$POISON_MARKER\"\n"
+                "exit 97\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+        env["PATH"] = f"{poison_bin}{os.pathsep}{env['PATH']}"
+        env["STAGE1_BENCHMARK_PYTHON"] = str(poison_bin / "python")
+        env["POISON_MARKER"] = str(poison_marker)
     completed = subprocess.run(
         [
             str(PROBE),
@@ -360,12 +386,12 @@ def _run_probe(tmp_path, *, fail_batches, extra=()):
         capture_output=True,
         check=False,
     )
-    return completed, records, output_root
+    return completed, records, output_root, poison_marker
 
 
 def test_probe_uses_fresh_processes_unique_paths_and_stops_at_first_failure(tmp_path):
     """Catches mocked isolation, dirty-process reuse, retry, and output collision."""
-    completed, records, output_root = _run_probe(tmp_path, fail_batches="32")
+    completed, records, output_root, _ = _run_probe(tmp_path, fail_batches="32")
 
     assert completed.returncode != 0
     assert "requires-classification" in completed.stderr
@@ -391,9 +417,264 @@ def test_probe_uses_fresh_processes_unique_paths_and_stops_at_first_failure(tmp_
     assert failed[0]["requires_oom_classification"] is True
 
 
+def test_probe_pins_benchmark_python_when_path_and_override_are_wrong(tmp_path):
+    """Catches the probe controller escaping the mandatory repository venv."""
+
+    completed, records, output_root, poison_marker = _run_probe(
+        tmp_path,
+        fail_batches="8",
+        poison_benchmark_python=True,
+    )
+
+    assert completed.returncode == 42, completed.stderr
+    assert not poison_marker.exists()
+    assert len(list(records.glob("*.argv0"))) == 1
+    assert len(list(output_root.glob("attempts/full/**/evidence/attempt.json"))) == 1
+
+
+@pytest.mark.parametrize("failed_batch", [8, 16])
+def test_integration_failure_retries_same_batch_append_only_then_continues(
+    tmp_path, failed_batch
+):
+    """Catches import/harness failures being treated as OOMs or overwritten."""
+
+    failed, _, output_root, _ = _run_probe(
+        tmp_path, fail_batches=str(failed_batch)
+    )
+    assert failed.returncode == 42
+    failed_attempt = next(
+        output_root.glob(
+            f"attempts/full/micro-batch-{failed_batch}/*/evidence/attempt.json"
+        )
+    )
+    original_attempt_bytes = failed_attempt.read_bytes()
+
+    import stage1.benchmark as benchmark
+
+    benchmark._classify_failure(failed_attempt, "integration_failure")
+    classification_path = benchmark._classification_path(failed_attempt)
+    classification_bytes = classification_path.read_bytes()
+    benchmark._classify_failure(failed_attempt, "integration_failure")
+    assert classification_path.read_bytes() == classification_bytes
+    assert not benchmark._confirmed_capacity_oom(failed_attempt)
+
+    retried, records, _, _ = _run_probe(tmp_path, fail_batches="")
+
+    assert retried.returncode == 0, retried.stderr
+    assert failed_attempt.read_bytes() == original_attempt_bytes
+    attempts = [
+        (path, benchmark._load_probe_attempt(path))
+        for path in benchmark._attempt_files(output_root, "full")
+    ]
+    expected_batches = (
+        [8, 8, 16, 32, 64]
+        if failed_batch == 8
+        else [8, 16, 16, 32, 64]
+    )
+    expected_exits = (
+        [42, 0, 0, 0, 0]
+        if failed_batch == 8
+        else [0, 42, 0, 0, 0]
+    )
+    assert [attempt["micro_batch"] for _, attempt in attempts] == expected_batches
+    assert [attempt["exit_code"] for _, attempt in attempts] == expected_exits
+    selected, capacity_failure = benchmark._validated_capacity_chain(
+        attempts, require_success=True
+    )
+    assert selected is not None and selected[1]["micro_batch"] == 64
+    assert capacity_failure is None
+    assert len(list(records.glob("*.argv0"))) == 5
+
+
+def test_integration_failure_never_authorizes_capacity_fallback(tmp_path):
+    """Catches a harness failure silently lowering the requested batch."""
+
+    failed, records, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    assert failed.returncode == 42
+    failed_attempt = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+
+    import stage1.benchmark as benchmark
+
+    benchmark._classify_failure(failed_attempt, "integration_failure")
+    before = sorted(records.glob("*.argv0"))
+    fallback, _, _, _ = _run_probe(
+        tmp_path, fail_batches="", extra=("--fallback", "4")
+    )
+
+    assert fallback.returncode != 0
+    assert "confirmed capacity OOM" in fallback.stderr
+    assert sorted(records.glob("*.argv0")) == before
+
+
+def test_conflicting_failure_classifications_publish_exactly_once(
+    tmp_path, monkeypatch
+):
+    """Catches a concurrent integration/OOM classification overwrite."""
+
+    failed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    assert failed.returncode == 42
+    failed_attempt = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+
+    import stage1.benchmark as benchmark
+
+    barrier = __import__("threading").Barrier(2)
+    original_exclusive = benchmark._exclusive_write_json
+
+    def synchronized_exclusive(path, payload):
+        barrier.wait(timeout=5)
+        return original_exclusive(path, payload)
+
+    monkeypatch.setattr(
+        benchmark, "_exclusive_write_json", synchronized_exclusive
+    )
+
+    def classify(value):
+        try:
+            benchmark._classify_failure(failed_attempt, value)
+        except Exception as error:  # the losing conflicting publication must fail
+            return error
+        return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(
+            pool.map(classify, ("integration_failure", "capacity_oom"))
+        )
+
+    assert sum(outcome is None for outcome in outcomes) == 1
+    published = benchmark._failure_classification(failed_attempt)
+    successful = (
+        "integration_failure" if outcomes[0] is None else "capacity_oom"
+    )
+    assert published == successful
+
+
+def test_identical_classification_is_invisible_until_atomic_publication(
+    tmp_path, monkeypatch
+):
+    """Catches readers observing an empty/partial final classification inode."""
+
+    failed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    assert failed.returncode == 42
+    failed_attempt = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+
+    import stage1.benchmark as benchmark
+
+    target = benchmark._classification_path(failed_attempt)
+    first_link_ready = __import__("threading").Event()
+    release_first_link = __import__("threading").Event()
+    calls = 0
+    calls_lock = __import__("threading").Lock()
+    original_link = os.link
+
+    def controlled_link(source, destination, *args, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_link_ready.set()
+            assert release_first_link.wait(timeout=5)
+        return original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(benchmark.os, "link", controlled_link)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            benchmark._classify_failure, failed_attempt, "integration_failure"
+        )
+        assert first_link_ready.wait(timeout=5)
+        assert not target.exists()
+        second = pool.submit(
+            benchmark._classify_failure, failed_attempt, "integration_failure"
+        )
+        second.result(timeout=5)
+        release_first_link.set()
+        first.result(timeout=5)
+
+    assert benchmark._failure_classification(failed_attempt) == "integration_failure"
+    assert not list(target.parent.glob(f".{target.name}.*.tmp"))
+
+
+def test_concurrent_probe_controllers_cannot_launch_duplicate_retry(tmp_path):
+    """Catches two controllers passing the same candidate gate concurrently."""
+
+    failed, records, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    assert failed.returncode == 42
+    failed_attempt = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+
+    import stage1.benchmark as benchmark
+
+    benchmark._classify_failure(failed_attempt, "integration_failure")
+    fake_launcher = tmp_path / "fake stage1 launcher"
+    starts = tmp_path / "controller starts"
+    starts.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "STAGE1_LAUNCHER": str(fake_launcher),
+            "STUB_RECORD_DIR": str(records),
+            "STUB_FAIL_BATCHES": "",
+            "STUB_START_DIR": str(starts),
+            "STUB_HOLD_SECONDS": "0.5",
+            "PYTHONPATH": f"{REPO_ROOT}:{REPO_ROOT / 'src'}",
+        }
+    )
+    command = list(failed.args)
+    first = subprocess.Popen(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 5
+    while not list(starts.iterdir()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert list(starts.iterdir()), "first controller did not reach its launcher"
+    second = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    first_stdout, first_stderr = first.communicate(timeout=10)
+
+    assert first.returncode == 0, first_stderr
+    assert second.returncode != 0
+    assert "probe execution is in progress" in second.stderr
+    assert stat.S_IMODE((output_root / ".probe-execution.lock").stat().st_mode) == 0o600
+    attempts = [
+        benchmark._load_probe_attempt(path)
+        for path in benchmark._attempt_files(output_root, "full")
+    ]
+    assert [item["micro_batch"] for item in attempts].count(8) == 2
+
+
+def test_probe_execution_lock_rejects_named_inode_replacement(tmp_path):
+    """Catches a replacement lock disconnecting the held controller lease."""
+
+    import stage1.benchmark as benchmark
+
+    lock_path = tmp_path / ".probe-execution.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        benchmark._acquire_probe_execution_lock(descriptor, lock_path)
+        replaced = tmp_path / "replaced.lock"
+        lock_path.rename(replaced)
+        lock_path.write_bytes(b"replacement")
+        lock_path.chmod(0o600)
+
+        with pytest.raises(ValueError, match="mode-0600 regular file"):
+            benchmark._validate_probe_execution_lock(descriptor, lock_path)
+    finally:
+        os.close(descriptor)
+
+
 def test_attempt_seal_binds_top_level_fields_and_is_append_only(tmp_path):
     """Catches post-hoc PID/method/argv edits and attempt-file replacement."""
-    completed, _, output_root = _run_probe(tmp_path, fail_batches="8")
+    completed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert completed.returncode == 42
     attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
     payload = json.loads(attempt_path.read_text())
@@ -430,7 +711,7 @@ def test_attempt_seal_binds_top_level_fields_and_is_append_only(tmp_path):
 
 def test_attempt_rejects_data_argv_not_equal_to_materialized_audit_subset(tmp_path):
     """Catches swapping the 64-row probe input for the full source JSONL."""
-    completed, _, output_root = _run_probe(tmp_path, fail_batches="8")
+    completed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert completed.returncode == 42
     attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
     payload = json.loads(attempt_path.read_text())
@@ -1049,7 +1330,7 @@ def test_smoke_pair_seals_resume_identity_and_rejects_control_mismatch(monkeypat
 
 def test_probe_does_not_fallback_without_a_confirmed_initial_eight_oom(tmp_path):
     """Catches an implicit batch reduction after an unclassified failure."""
-    completed, records, output_root = _run_probe(
+    completed, records, output_root, _ = _run_probe(
         tmp_path, fail_batches="8", extra=("--fallback", "4")
     )
 
