@@ -147,3 +147,158 @@ schema-v2/base-source reload parametrization.
   or checkpoint-save flow was run or changed. Real sharded/remote model loading
   remains an environment integration risk, not a known correctness defect.
 - No open implementation concern found.
+
+## Fix round 1/5 — immutable inference witness and exact topology
+
+### Corrections
+
+- Source provenance selectors (`cache_dir`, `revision`, `token`, and
+  `local_files_only`) are now forbidden in `model_load_kwargs` unconditionally,
+  including when the immutable source mapping is empty. The model-only mapping
+  can no longer become an alternate source selector channel.
+- Stage 2 classification now has an internal immutable inspection result while
+  retaining the public `classify_stage2_artifact(...) -> Stage2ArtifactKind`
+  API. The inspection binds a canonical non-symlink artifact directory to the
+  exact one-read metadata snapshot and optional sparse-row bytes.
+- Added a frozen `Stage2InferencePreflightWitness`. Preflight reads metadata,
+  adapter config, adapter safetensors, and sparse safetensors once and retains
+  immutable bytes plus canonical artifact/source identity, immutable selector
+  tuples, source architecture JSON, and the processor token/vocabulary
+  contract. The actual loaded model, source selectors, architecture, and
+  processor are rebound to that witness before adapter application.
+- Removed all post-large-load artifact reopening. Inference now constructs the
+  validated adapter with `get_peft_model`, decodes a new state dictionary from
+  witnessed safetensor bytes, restores it with
+  `set_peft_model_state_dict`, attaches repository sparse output rows after
+  PEFT, and applies witnessed sparse bytes in memory. It never calls
+  `PeftModel.from_pretrained`, never merges, and freezes every parameter.
+- Adapter preflight now validates an exact tensor schema. Both legacy
+  base-source and sparse-v3 branches require exactly one LoRA A/B tensor and,
+  for DoRA, one magnitude tensor for every resolved target, with exact logical
+  shapes and no unexpected keys. Sparse v3 additionally requires exactly one
+  selective input-row delta with shape `[3, hidden_size]` and adapter-config
+  IDs equal to metadata; legacy base-source explicitly forbids that tensor.
+- PEFT resolution now validates exactly one configured and one matching active
+  adapter for every PEFT model, even if no sparse row wrapper is present. The
+  active adapter's selective-token contract determines whether exactly one
+  sparse wrapper must be at the active Qwen `lm_head`, or whether legacy
+  base-source inference must have none. Direct and one-level DeepSpeed wrappers
+  use the same checks.
+
+### TDD evidence
+
+The four-finding RED selection was:
+
+```text
+8 failed, 6 passed, 8 deselected in 18.10s
+```
+
+The failures independently demonstrated:
+
+- a source selector escaped through model options when the source mapping was
+  empty;
+- missing/malformed selective rows and an extra adapter tensor reached the
+  large-model boundary;
+- metadata/config/adapter/sparse payloads were not read once into a retained
+  witness, and delete/replace after preflight could not restore in memory;
+- a selective-token PEFT adapter with no sparse `lm_head` wrapper passed direct
+  and DeepSpeed-wrapped resolution.
+
+Existing LoRA A/B and DoRA-magnitude missing-key checks and wrong-location row
+checks were the six controls that already passed. After the first minimal
+implementation the same selection passed, but exposed a new PEFT warning:
+
+```text
+14 passed, 8 deselected, 4 warnings in 17.14s
+```
+
+After the config-copy-only warning fix, the identical selection was pristine:
+
+```text
+14 passed, 8 deselected in 18.22s
+```
+
+The complete Task 12 loader module then passed after the clean-base ordering
+correction:
+
+```text
+22 passed in 21.27s
+```
+
+The first combined Task 12 plus checkpoint/PEFT/generic run caught the legacy
+processor regression documented below:
+
+```text
+206 passed, 2 failed, 2 warnings in 29.97s
+```
+
+The two original legacy reload cases passed after the v3-only vocabulary fix:
+
+```text
+2 passed, 31 deselected, 2 warnings in 9.58s
+```
+
+Final combined verification used the repository virtual environment:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage1:$PWD/tests/stage2" \
+./venv/ilvr-venv/bin/pytest \
+  tests/stage2/test_peft_inference.py \
+  tests/stage2/test_inference.py \
+  tests/stage2/test_rollout.py \
+  tests/stage2/test_peft_checkpointing.py \
+  tests/stage2/test_peft.py \
+  tests/stage2/test_generation_regression.py -q
+```
+
+```text
+208 passed, 2 warnings in 31.79s
+```
+
+The two warnings are the pre-existing PEFT missing-config warnings emitted
+while the legacy v2 test fixture saves its temporary adapters. This round's
+new relocated-source warning is absent. Eval entrypoints did not change in this
+round, so the previously recorded focused eval witness was not rerun.
+
+### Systematic-debugging record
+
+- The four review findings traced to four distinct guards: model selectors
+  checked only set overlap; adapter validation matched only expected LoRA/DoRA
+  suffixes without a complete matched-key set or selective-row branch;
+  classification returned only an enum and discarded already-read payloads
+  before path-based PEFT restoration; and resolver checks lived under
+  `if sparse_rows`, so zero rows skipped the active adapter contract. Each was
+  fixed at its originating boundary rather than with post-load checks.
+- The first in-memory GREEN produced four new warnings. Inspection of PEFT
+  `mapping_func.get_peft_model` showed it overwrites
+  `base_model_name_or_path` and warns when a valid relocated runtime model
+  differs from the artifact's recorded source. Metadata, adapter config, and
+  runtime architecture had already passed strict witness validation. The
+  minimal fix changes only the freshly decoded adapter-config copy immediately
+  before PEFT construction; immutable artifact bytes/provenance remain intact.
+  Repeating the identical focused selection removed all four warnings.
+- The first complete loader run failed one source-order assertion. Tracing call
+  order showed extraction of common config logic had moved `load_config`
+  before Task 11's clean-base adapter discovery. Sparse v3 now restores the
+  required `processor -> adapter discovery -> source config` sequence; legacy
+  base-source performs only its established config path.
+- The first combined run reproducibly failed both legacy v2 reload variants at
+  `len(TinyLatentTokenizer)`. Contract comparison showed sparse v3 requires an
+  exact appended vocabulary and therefore a length witness, while legacy v2
+  historically requires only resolved token IDs and permits tokenizer doubles
+  without `__len__`. The witness now records vocabulary size only for sparse
+  v3 and records `None` explicitly for legacy base-source. The original two
+  failures then passed, followed by the successful 208-test combined run.
+
+### Files additionally changed
+
+- `src/stage2/checkpointing.py`
+- `src/stage2/peft.py`
+- `tests/stage2/test_peft_inference.py`
+- `.superpowers/sdd/2026-08-26-ilvr-stage1-dora-batched-training/task-12-report.md`
+
+No evaluation entrypoint, Stage 1, training, checkpoint-save, latent controller,
+or generic generation implementation changed in this round. No generated
+`__pycache__` remains from the implementation checks, and no open concern was
+found.

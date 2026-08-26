@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from peft import PeftModel
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from peft_common import resolve_qwen2_5_vl_model
@@ -152,6 +155,29 @@ def test_inference_source_provenance_rejects_model_only_selectors(
         )
 
 
+@pytest.mark.parametrize(
+    "source_provenance_kwargs",
+    [{}, {"revision": "immutable-source-revision"}],
+)
+def test_inference_rejects_source_selectors_in_model_options_unconditionally(
+    sparse_inference_artifact,
+    source_provenance_kwargs,
+):
+    """A provenance selector must never be accepted from model-only options."""
+
+    with pytest.raises(ValueError, match="model options.*source provenance"):
+        load_stage2_model_for_inference(
+            sparse_inference_artifact.original_base_dir,
+            sparse_inference_artifact.stage2_dir,
+            sparse_inference_artifact.processor,
+            source_provenance_kwargs=source_provenance_kwargs,
+            model_load_kwargs={"revision": "model-only-revision"},
+            discover_adapter_config=lambda *args, **kwargs: pytest.fail(
+                "adapter discovery must not run after selector rejection"
+            ),
+        )
+
+
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
 def test_inference_shares_source_selectors_and_resizes_original_base_once(
     sparse_inference_artifact,
@@ -208,6 +234,164 @@ def test_inference_shares_source_selectors_and_resizes_original_base_once(
     assert resize_calls == [128]
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_lora_a", "lora_A"),
+        ("missing_lora_b", "lora_B"),
+        ("missing_dora_magnitude", "lora_magnitude_vector"),
+        ("missing_selective_rows", "selective input-row tensor"),
+        ("malformed_selective_rows", "selective input-row shape mismatch"),
+        ("extra_tensor", "unexpected adapter tensor fields"),
+    ],
+)
+def test_v3_adapter_tensor_topology_fails_before_large_base_load(
+    sparse_inference_artifact,
+    tmp_path,
+    mutation,
+    message,
+):
+    """Missing, malformed, or extra v3 state must fail at small preflight."""
+
+    artifact_dir = tmp_path / mutation
+    shutil.copytree(sparse_inference_artifact.stage2_dir, artifact_dir)
+    adapter_path = artifact_dir / "adapter_model.safetensors"
+    state = load_file(adapter_path)
+    if mutation == "extra_tensor":
+        state["unexpected.adapter_tensor"] = torch.zeros(1)
+    else:
+        component = {
+            "missing_lora_a": "lora_A.weight",
+            "missing_lora_b": "lora_B.weight",
+            "missing_dora_magnitude": "lora_magnitude_vector",
+            "missing_selective_rows": "trainable_tokens_delta",
+            "malformed_selective_rows": "trainable_tokens_delta",
+        }[mutation]
+        key = next(name for name in state if component in name)
+        if mutation == "malformed_selective_rows":
+            state[key] = state[key][:-1].clone()
+        else:
+            del state[key]
+    save_file(state, adapter_path)
+    model_loads = []
+
+    with pytest.raises(ValueError, match=message):
+        load_stage2_model_for_inference(
+            sparse_inference_artifact.original_base_dir,
+            artifact_dir,
+            sparse_inference_artifact.processor,
+            load_model=lambda *args, **kwargs: model_loads.append((args, kwargs)),
+        )
+
+    assert model_loads == []
+
+
+@pytest.mark.parametrize("payload_mutation", ["delete", "replace"])
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_inference_reuses_one_read_immutable_payload_witness(
+    sparse_inference_artifact,
+    tmp_path,
+    monkeypatch,
+    payload_mutation,
+):
+    """Artifact replacement after preflight must not alter restored inference."""
+
+    artifact_dir = tmp_path / payload_mutation
+    shutil.copytree(sparse_inference_artifact.stage2_dir, artifact_dir)
+    payload_names = (
+        "stage2_peft_metadata.json",
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors",
+    )
+    payload_paths = {artifact_dir / name for name in payload_names}
+    reads = {path: 0 for path in payload_paths}
+    original_read_bytes = Path.read_bytes
+
+    def counted_read_bytes(path):
+        if path in reads:
+            reads[path] += 1
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    source = sparse_inference_artifact.trained.eval()
+    source_state = {
+        name: value.detach().cpu().clone()
+        for name, value in source.state_dict().items()
+        if "lora_" in name or "trainable_tokens_delta" in name
+    }
+    scaffold = torch.tensor(
+        [[1, 126, 125, 125, 127, 2, 126, 125, 125, 127, 3]]
+    )
+    attention_mask = torch.ones_like(scaffold)
+    with torch.inference_mode():
+        expected = source(
+            input_ids=scaffold,
+            attention_mask=attention_mask,
+            return_stage2_latent_states=True,
+        )
+
+    def load_base_after_preflight(*args, **kwargs):
+        assert reads == {path: 1 for path in payload_paths}
+        for path in payload_paths:
+            if payload_mutation == "delete":
+                path.unlink()
+            else:
+                path.write_bytes(b"replaced after preflight")
+        monkeypatch.setattr(
+            Path,
+            "read_bytes",
+            lambda *args, **kwargs: pytest.fail("artifact payload was reopened"),
+        )
+        monkeypatch.setattr(
+            Path,
+            "open",
+            lambda *args, **kwargs: pytest.fail("artifact payload was reopened"),
+        )
+        monkeypatch.setattr(
+            "stage2.checkpointing.safe_open",
+            lambda *args, **kwargs: pytest.fail("adapter payload was reopened"),
+        )
+        monkeypatch.setattr(
+            PeftModel,
+            "from_pretrained",
+            lambda *args, **kwargs: pytest.fail("path-based PEFT restore was used"),
+        )
+        return tiny_tag_free_original_qwen()
+
+    restored = load_stage2_model_for_inference(
+        sparse_inference_artifact.original_base_dir,
+        artifact_dir,
+        sparse_inference_artifact.processor,
+        load_model=load_base_after_preflight,
+    )
+
+    restored_state = {
+        name: value.detach().cpu()
+        for name, value in restored.state_dict().items()
+        if "lora_" in name or "trainable_tokens_delta" in name
+    }
+    assert restored_state.keys() == source_state.keys()
+    for name, expected_value in source_state.items():
+        torch.testing.assert_close(
+            restored_state[name], expected_value, rtol=0, atol=0
+        )
+    assert not any(parameter.requires_grad for parameter in restored.parameters())
+    with torch.inference_mode():
+        actual = restored(
+            input_ids=scaffold,
+            attention_mask=attention_mask,
+            return_stage2_latent_states=True,
+        )
+    torch.testing.assert_close(actual.logits, expected.logits, rtol=0, atol=0)
+    for actual_state, expected_state in zip(
+        actual.stage2_latent_states,
+        expected.stage2_latent_states,
+        strict=True,
+    ):
+        torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
 def test_sparse_resolution_supports_direct_and_deepspeed_wrapped_models(
     sparse_inference_artifact,
@@ -258,3 +442,25 @@ def test_sparse_resolution_rejects_malformed_or_duplicate_row_wrappers(
     )
     with pytest.raises(ValueError, match="exactly one sparse output-token row"):
         resolve_stage2_qwen_model(duplicate)
+
+
+@pytest.mark.parametrize("deepspeed_wrapped", [False, True])
+@pytest.mark.parametrize("row_location", ["missing", "wrong"])
+@pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
+def test_sparse_resolution_uses_active_adapter_contract_when_rows_are_absent(
+    sparse_inference_artifact,
+    deepspeed_wrapped,
+    row_location,
+):
+    """Selective-token PEFT config requires its sparse rows at active lm_head."""
+
+    model = _reload_sparse_artifact(sparse_inference_artifact)
+    qwen = model.get_base_model()
+    rows = qwen.lm_head
+    qwen.lm_head = rows.base_head
+    if row_location == "wrong":
+        qwen.unexpected_sparse_rows = rows
+    candidate = SimpleNamespace(module=model) if deepspeed_wrapped else model
+
+    with pytest.raises(ValueError, match="exactly one sparse output-token row"):
+        resolve_stage2_qwen_model(candidate)

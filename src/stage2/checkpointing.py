@@ -1,5 +1,7 @@
 """Validate Stage 2 token metadata and checkpoint transitions."""
 
+from __future__ import annotations
+
 import json
 import logging
 from collections.abc import Mapping, Sequence
@@ -11,7 +13,8 @@ from typing import Literal
 
 import peft
 from peft import PeftModel
-from safetensors import safe_open
+from safetensors import SafetensorError, safe_open
+from safetensors.torch import load as load_safetensors
 from torch import nn
 
 from peft_common import (
@@ -53,6 +56,23 @@ class Stage2ArtifactKind(str, Enum):
     PEFT = "peft"
 
 
+@dataclass(frozen=True)
+class Stage2PeftMetadataSnapshot:
+    """One canonical-path-bound immutable read of Stage 2 metadata."""
+
+    artifact_dir: Path
+    metadata_json: bytes
+
+
+@dataclass(frozen=True)
+class Stage2ArtifactInspection:
+    """Classified Stage 2 artifact with retained immutable PEFT payloads."""
+
+    artifact_kind: Stage2ArtifactKind
+    peft_metadata_snapshot: Stage2PeftMetadataSnapshot | None
+    sparse_safetensors: bytes | None
+
+
 _REQUIRED_PEFT_MARKERS = frozenset(
     {
         STAGE2_PEFT_METADATA_FILENAME,
@@ -68,19 +88,42 @@ _OTHER_PEFT_MARKERS = frozenset(
         SPARSE_TOKEN_ROWS_FILENAME,
     }
 )
-def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
-    """Classify a local artifact from filenames, failing closed on mixtures.
+def _canonical_stage2_artifact_dir(directory: str | Path) -> Path:
+    candidate = Path(directory)
+    if candidate.is_symlink():
+        raise ValueError(
+            f"Stage 2 artifact directory must not be a symlink: {candidate}"
+        )
+    try:
+        canonical = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"Stage 2 artifact does not exist: {candidate}") from error
+    if not canonical.is_dir():
+        raise ValueError(f"Stage 2 artifact is not a directory: {candidate}")
+    return canonical
+
+
+def _read_stage2_regular_payload(path: Path, *, label: str) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"invalid {label} payload file: {path}")
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"invalid {label} payload file: {path}") from error
+
+
+def _inspect_stage2_artifact(directory: str | Path) -> Stage2ArtifactInspection:
+    """Classify once while retaining exact metadata and sparse payload bytes.
 
     Non-local references are left to ``from_pretrained`` and classified as full
     because their remote files cannot be inspected here. Local full artifacts
     follow Task 9's standalone/indexed-family contract; this repository's PEFT
     publication contract remains the unsharded safetensors marker set above.
     """
-    path = Path(directory)
-    if not path.exists():
-        return Stage2ArtifactKind.FULL
-    if not path.is_dir():
-        raise ValueError(f"Stage 2 artifact is not a directory: {path}")
+    candidate = Path(directory)
+    if not candidate.exists():
+        return Stage2ArtifactInspection(Stage2ArtifactKind.FULL, None, None)
+    path = _canonical_stage2_artifact_dir(candidate)
 
     names = {entry.name for entry in path.iterdir()}
     present_peft = names & (_REQUIRED_PEFT_MARKERS | _OTHER_PEFT_MARKERS)
@@ -136,7 +179,8 @@ def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
                 "Stage 2 PEFT payloads must be regular non-symlink files: "
                 f"{invalid_files}"
             )
-        metadata = load_stage2_peft_metadata(path)
+        metadata_snapshot = read_stage2_peft_metadata_snapshot(path)
+        metadata = decode_stage2_peft_metadata_snapshot(metadata_snapshot)
         has_sparse_rows = SPARSE_TOKEN_ROWS_FILENAME in names
         expects_sparse_rows = metadata.token_row_source == "sparse_adapter"
         if expects_sparse_rows and not has_sparse_rows:
@@ -149,11 +193,15 @@ def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
                 "mixed Stage 2 PEFT token-row layout: "
                 "token_row_source=base but sparse token rows are present"
             )
+        sparse_safetensors = None
         if expects_sparse_rows:
             sparse_path = path / SPARSE_TOKEN_ROWS_FILENAME
             try:
+                sparse_safetensors = _read_stage2_regular_payload(
+                    sparse_path, label="Stage 2 sparse token rows"
+                )
                 stored_ids, output_delta = decode_sparse_token_rows_state(
-                    sparse_path.read_bytes()
+                    sparse_safetensors
                 )
             except (OSError, ValueError) as error:
                 raise ValueError(
@@ -178,13 +226,23 @@ def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
                     "sparse Stage 2 output shape does not match metadata: "
                     f"stored={tuple(output_delta.shape)}, expected={expected_shape}"
                 )
-        return Stage2ArtifactKind.PEFT
+        return Stage2ArtifactInspection(
+            Stage2ArtifactKind.PEFT,
+            metadata_snapshot,
+            sparse_safetensors,
+        )
     if present_full:
         _validate_full_serialization(path, names)
-        return Stage2ArtifactKind.FULL
+        return Stage2ArtifactInspection(Stage2ArtifactKind.FULL, None, None)
     raise ValueError(
         f"unrecognized local Stage 2 artifact (missing model weights): {path}"
     )
+
+
+def classify_stage2_artifact(directory: str | Path) -> Stage2ArtifactKind:
+    """Classify a Stage 2 artifact while preserving the public enum API."""
+
+    return _inspect_stage2_artifact(directory).artifact_kind
 
 
 # Retain the Stage 2 helper names as direct compatibility wrappers.
@@ -450,16 +508,43 @@ def save_stage2_peft_metadata(
     temporary.replace(destination)
 
 
-def load_stage2_peft_metadata(directory: str | Path) -> Stage2PeftMetadata:
-    """Load and fail closed on a missing or malformed adapter sidecar."""
-    source = Path(directory) / STAGE2_PEFT_METADATA_FILENAME
+def read_stage2_peft_metadata_snapshot(
+    directory: str | Path,
+) -> Stage2PeftMetadataSnapshot:
+    """Read Stage 2 metadata once and bind it to a canonical artifact path."""
+
+    artifact = _canonical_stage2_artifact_dir(directory)
+    source = artifact / STAGE2_PEFT_METADATA_FILENAME
     if not source.is_file():
         raise ValueError(f"missing Stage 2 PEFT metadata: {source}")
+    return Stage2PeftMetadataSnapshot(
+        artifact_dir=artifact,
+        metadata_json=_read_stage2_regular_payload(
+            source, label="Stage 2 PEFT metadata"
+        ),
+    )
+
+
+def decode_stage2_peft_metadata_snapshot(
+    snapshot: Stage2PeftMetadataSnapshot,
+) -> Stage2PeftMetadata:
+    """Decode strict Stage 2 metadata only from immutable witnessed bytes."""
+
+    if not isinstance(snapshot, Stage2PeftMetadataSnapshot):
+        raise TypeError("snapshot must be a Stage2PeftMetadataSnapshot")
     try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid Stage 2 PEFT metadata: {source}") from error
+        payload = json.loads(snapshot.metadata_json.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid Stage 2 PEFT metadata bytes") from error
     return Stage2PeftMetadata.from_dict(payload)
+
+
+def load_stage2_peft_metadata(directory: str | Path) -> Stage2PeftMetadata:
+    """Load and fail closed on a missing or malformed adapter sidecar."""
+
+    return decode_stage2_peft_metadata_snapshot(
+        read_stage2_peft_metadata_snapshot(directory)
+    )
 
 
 def _resolve_stage1_qwen_base(
@@ -504,12 +589,82 @@ def _expected_qwen_projection_weight_shape(config, suffix: str) -> tuple[int, in
     }[suffix]
 
 
+def _validate_stage2_adapter_tensor_shapes(
+    qwen: nn.Module,
+    tensor_shapes: Mapping[str, Sequence[int]],
+    metadata: Stage2PeftMetadata,
+) -> None:
+    """Require the exact legacy-base or sparse-v3 adapter tensor schema."""
+
+    modules = dict(qwen.named_modules())
+    keys = tuple(tensor_shapes)
+    matched: set[str] = set()
+    selective_matches = [
+        key
+        for key in keys
+        if key.endswith(
+            ".model.embed_tokens.token_adapter.trainable_tokens_delta"
+        )
+    ]
+    if metadata.token_row_source == "sparse_adapter":
+        if len(selective_matches) != 1:
+            raise ValueError(
+                "Stage 2 adapter must contain exactly one selective input-row tensor"
+            )
+        selective_key = selective_matches[0]
+        matched.add(selective_key)
+        expected_shape = [
+            3,
+            int(metadata.base_model_architecture["decoder"]["hidden_size"]),
+        ]
+        actual_shape = list(tensor_shapes[selective_key])
+        if actual_shape != expected_shape:
+            raise ValueError(
+                "Stage 2 selective input-row shape mismatch: "
+                f"adapter={actual_shape}, expected={expected_shape}"
+            )
+    elif selective_matches:
+        raise ValueError(
+            "legacy base-source Stage 2 adapter must not contain selective "
+            "input-row tensors"
+        )
+
+    for target in metadata.resolved_target_module_names:
+        module = modules[target]
+        expected_shapes = {
+            "lora_A.weight": [metadata.lora_r, module.in_features],
+            "lora_B.weight": [module.out_features, metadata.lora_r],
+        }
+        if metadata.tuning_method == "dora":
+            expected_shapes["lora_magnitude_vector"] = [module.out_features]
+        for component, expected_shape in expected_shapes.items():
+            suffix = f".{target}.{component}"
+            matches = [key for key in keys if key.endswith(suffix)]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"adapter tensor mismatch for {target}: expected {component}"
+                )
+            key = matches[0]
+            matched.add(key)
+            actual_shape = list(tensor_shapes[key])
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"target shape mismatch at {target}: "
+                    f"adapter={actual_shape}, expected={expected_shape}"
+                )
+    unexpected = sorted(set(keys) - matched)
+    if unexpected:
+        raise ValueError(f"unexpected adapter tensor fields: {unexpected}")
+
+
 def validate_stage2_peft_compatibility(
     base_model,
     tokenizer,
     metadata: Stage2PeftMetadata,
     adapter_config,
     adapter_path: str | Path,
+    *,
+    adapter_safetensors: bytes | None = None,
 ) -> None:
     """Validate a relocated base against adapter metadata without reading weights."""
     qwen = _resolve_stage1_qwen_base(
@@ -649,35 +804,23 @@ def validate_stage2_peft_compatibility(
                 f"architecture={expected_shape}, target={actual_shape}"
             )
 
-    tensor_path = Path(adapter_path) / "adapter_model.safetensors"
-    if not tensor_path.is_file():
-        raise ValueError(f"missing adapter safetensors: {tensor_path}")
-    with safe_open(tensor_path, framework="pt", device="cpu") as tensors:
-        keys = tuple(tensors.keys())
-        for target in metadata.resolved_target_module_names:
-            module = modules[target]
-            expected_shapes = {
-                "lora_A": [metadata.lora_r, module.in_features],
-                "lora_B": [module.out_features, metadata.lora_r],
+    if adapter_safetensors is None:
+        tensor_path = Path(adapter_path) / "adapter_model.safetensors"
+        if not tensor_path.is_file():
+            raise ValueError(f"missing adapter safetensors: {tensor_path}")
+        with safe_open(tensor_path, framework="pt", device="cpu") as tensors:
+            tensor_shapes = {
+                key: tensors.get_slice(key).get_shape() for key in tensors.keys()
             }
-            if expected_use_dora:
-                expected_shapes["lora_magnitude_vector"] = [module.out_features]
-            for tensor_name, expected_shape in expected_shapes.items():
-                parameter_suffix = (
-                    "" if tensor_name == "lora_magnitude_vector" else ".weight"
-                )
-                suffix = f".{target}.{tensor_name}{parameter_suffix}"
-                matches = [key for key in keys if key.endswith(suffix)]
-                if len(matches) != 1:
-                    raise ValueError(
-                        f"adapter tensor mismatch for {target}: expected {tensor_name}"
-                    )
-                actual_shape = tensors.get_slice(matches[0]).get_shape()
-                if actual_shape != expected_shape:
-                    raise ValueError(
-                        f"target shape mismatch at {target}: "
-                        f"adapter={actual_shape}, expected={expected_shape}"
-                    )
+    else:
+        if type(adapter_safetensors) is not bytes:
+            raise TypeError("adapter_safetensors must be bytes")
+        try:
+            adapter_state = load_safetensors(adapter_safetensors)
+        except SafetensorError as error:
+            raise ValueError("invalid Stage 2 adapter safetensors bytes") from error
+        tensor_shapes = {key: value.shape for key, value in adapter_state.items()}
+    _validate_stage2_adapter_tensor_shapes(qwen, tensor_shapes, metadata)
 
 
 LATENT_TOKEN_STRINGS = {
