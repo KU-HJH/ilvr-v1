@@ -1736,6 +1736,7 @@ from stage1.benchmark import (
     load_stage1_run_config_witness,
     write_stage1_producer_evidence,
 )
+from stage1.ema import STAGE1_EMA_TEACHER_STATE_FILENAME
 
 args = sys.argv[1:]
 def value(flag):
@@ -1760,7 +1761,13 @@ if max_steps == 3:
     (checkpoint / "trainer_state.json").write_text(
         json.dumps({{"global_step": 3}})
     )
-    for name in ("optimizer.pt", "scheduler.pt", "rng_state_0.pth", "rng_state_1.pth"):
+    for name in (
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state_0.pth",
+        "rng_state_1.pth",
+        STAGE1_EMA_TEACHER_STATE_FILENAME,
+    ):
         (checkpoint / name).write_bytes(b"state")
 elif max_steps == 4:
     config_path = Path(value("--benchmark-run-config"))
