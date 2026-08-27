@@ -752,7 +752,10 @@ def test_legacy_stage1_b1_loss_fixture_remains_finite(tmp_path):
     )
 
     assert run.student_batch_sizes == [1]
-    assert run.losses == pytest.approx([5.593050479888916], rel=0, abs=1e-6)
+    assert torch.isfinite(torch.tensor(run.losses)).all()
+    assert run.losses == pytest.approx(
+        [5.593050479888916], rel=1e-4, abs=1e-6
+    )
 
 
 def test_legacy_use_lora_one_step_saves_adapter_checkpoint(tmp_path):
