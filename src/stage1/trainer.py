@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 import tempfile
@@ -14,9 +15,14 @@ from torch import nn
 import torch.nn.functional as F
 from transformers import TrainerCallback
 from transformers.trainer import TRAINING_ARGS_NAME
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 from trl import SFTTrainer
 
-from .ema import Stage1EmaTeacher
+from .ema import (
+    STAGE1_EMA_TEACHER_STATE_FILENAME,
+    Stage1EmaTeacher,
+    _decode_ema_state,
+)
 from .targets import Stage1TeacherTargetBuilder
 from .types import Stage1BatchMetadata, Stage1TeacherTargets
 
@@ -26,6 +32,8 @@ _HELPER_INPUTS = frozenset(
 )
 _SUPPORTED_ACCELERATE_VERSION = "1.10.1"
 _SUPPORTED_DEEPSPEED_VERSION = "0.18.0"
+_STAGE1_EMA_TEACHER_STATE_SCHEMA_VERSION = 1
+_STAGE1_EMA_TEACHER_STATE_KIND = "stage1_ema_teacher"
 
 
 class _DeepSpeedStepAdapter:
@@ -79,6 +87,7 @@ class _Stage1OptimizerCallback(TrainerCallback):
         if trainer is not None:
             # Trainer invokes this only after Accelerator/DeepSpeed prepare.
             trainer._prepare_ema_teacher_for_training()
+            trainer._restore_pending_stage1_ema_checkpoint()
             trainer._install_deepspeed_step_adapter()
         return control
 
@@ -143,6 +152,9 @@ class CustomTrainerStage1(SFTTrainer):
         self._successful_optimizer_steps = 0
         self._ema_execution_device: torch.device | None = None
         self._deepspeed_step_adapter: _DeepSpeedStepAdapter | None = None
+        self._stage1_pending_ema_checkpoint: Path | None = None
+        self._defer_stage1_checkpoint_rotation = False
+        self._stage1_deferred_checkpoint_rotation = None
 
         if target_builder is None:
             processing_class = getattr(self, "processing_class", None)
@@ -490,6 +502,22 @@ class CustomTrainerStage1(SFTTrainer):
                 f"construction: teacher={teacher_device}, batch={input_ids.device}"
             )
 
+    def _restore_pending_stage1_ema_checkpoint(self) -> None:
+        checkpoint = self._stage1_pending_ema_checkpoint
+        if checkpoint is None:
+            return
+        if self._ema_execution_device is None:
+            raise RuntimeError(
+                "Stage 1 EMA teacher restore requires prepared device placement"
+            )
+        devices = self._module_devices(self.ema_teacher.model)
+        if devices and devices != {self._ema_execution_device}:
+            raise RuntimeError(
+                "Stage 1 EMA teacher restore device mismatch after preparation"
+            )
+        self._load_stage1_ema_checkpoint(checkpoint)
+        self._stage1_pending_ema_checkpoint = None
+
     def _validate_deepspeed_gradient_norm(self, engine) -> torch.Tensor:
         optimizer = getattr(engine, "optimizer", None)
         get_norm_groups = getattr(optimizer, "_get_norm_groups", None)
@@ -649,6 +677,229 @@ class CustomTrainerStage1(SFTTrainer):
                     logs[f"stage1/{name}"] = float(value.item())
         super().log(logs, start_time=start_time)
 
+    def _save_stage1_ema_checkpoint(self, checkpoint_dir: str | Path) -> None:
+        target = Path(checkpoint_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        state = self.ema_teacher.state_dict()
+        payload = {
+            "schema_version": _STAGE1_EMA_TEACHER_STATE_SCHEMA_VERSION,
+            "kind": _STAGE1_EMA_TEACHER_STATE_KIND,
+            "state": state,
+        }
+        final_path = target / STAGE1_EMA_TEACHER_STATE_FILENAME
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=target,
+                prefix=f".{STAGE1_EMA_TEACHER_STATE_FILENAME}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                torch.save(payload, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, final_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _stage1_ema_checkpoint_path(checkpoint_dir: str | Path) -> Path:
+        checkpoint_path = Path(checkpoint_dir) / STAGE1_EMA_TEACHER_STATE_FILENAME
+        if checkpoint_path.is_symlink():
+            raise RuntimeError(
+                "resumable Stage 1 EMA teacher state must not be a symlink: "
+                f"{checkpoint_path}"
+            )
+        if not checkpoint_path.is_file():
+            raise RuntimeError(
+                "resumable Stage 1 checkpoint is missing EMA teacher state: "
+                f"{checkpoint_path}"
+            )
+        return checkpoint_path
+
+    def _load_stage1_ema_checkpoint(self, checkpoint_dir: str | Path) -> None:
+        checkpoint_path = self._stage1_ema_checkpoint_path(checkpoint_dir)
+        try:
+            payload = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                f"invalid Stage 1 EMA teacher state: {checkpoint_path}"
+            ) from error
+
+        required = {"schema_version", "kind", "state"}
+        if type(payload) is not dict or set(payload) != required:
+            raise RuntimeError("invalid Stage 1 EMA teacher state schema")
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"]
+            != _STAGE1_EMA_TEACHER_STATE_SCHEMA_VERSION
+        ):
+            raise RuntimeError("unsupported Stage 1 EMA teacher state schema version")
+        if (
+            type(payload["kind"]) is not str
+            or payload["kind"] != _STAGE1_EMA_TEACHER_STATE_KIND
+        ):
+            raise RuntimeError("invalid Stage 1 EMA teacher state kind")
+
+        state = payload["state"]
+        try:
+            (
+                state_method,
+                state_decay,
+                state_names,
+                checkpoint_shapes,
+                parameters,
+            ) = _decode_ema_state(state)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"invalid Stage 1 EMA teacher {error}"
+            ) from error
+        if state_method != self.ema_teacher.method:
+            raise RuntimeError(
+                "Stage 1 EMA teacher method mismatch: "
+                f"checkpoint={state_method}, runtime={self.ema_teacher.method}"
+            )
+        if state_decay != self.ema_teacher.decay:
+            raise RuntimeError(
+                "Stage 1 EMA teacher decay mismatch: "
+                f"checkpoint={state_decay}, runtime={self.ema_teacher.decay}"
+            )
+
+        if state_names != self.ema_teacher.parameter_names:
+            raise RuntimeError("Stage 1 EMA teacher parameter names mismatch")
+        teacher_parameters = dict(
+            self.ema_teacher.model.named_parameters(remove_duplicate=False)
+        )
+        expected_shapes = tuple(
+            (
+                name,
+                tuple(int(dimension) for dimension in teacher_parameters[name].shape),
+            )
+            for name in self.ema_teacher.parameter_names
+        )
+        if checkpoint_shapes != expected_shapes:
+            raise RuntimeError("Stage 1 EMA teacher parameter shapes mismatch")
+        if tuple(parameters) != state_names:
+            raise RuntimeError("invalid Stage 1 EMA teacher parameters")
+        for name, expected_shape in expected_shapes:
+            tensor = parameters.get(name)
+            if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != expected_shape:
+                raise RuntimeError(
+                    f"Stage 1 EMA teacher tensor shape mismatch for {name}"
+                )
+        self.ema_teacher.load_state_dict(state)
+
+    def _save_checkpoint(self, model, trial):
+        """Append replicated EMA state after Trainer/DeepSpeed checkpointing."""
+
+        self._defer_stage1_checkpoint_rotation = True
+        self._stage1_deferred_checkpoint_rotation = None
+        try:
+            super()._save_checkpoint(model, trial)
+        except Exception:
+            self._stage1_deferred_checkpoint_rotation = None
+            raise
+        finally:
+            self._defer_stage1_checkpoint_rotation = False
+        run_dir = Path(self._get_output_dir(trial=trial))
+        checkpoint_dir = run_dir / (
+            f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        )
+        ema_save_error: Exception | None = None
+        try:
+            if self.args.should_save:
+                try:
+                    self._save_stage1_ema_checkpoint(checkpoint_dir)
+                except Exception as error:
+                    ema_save_error = error
+            local_failure = torch.tensor(
+                int(ema_save_error is not None),
+                dtype=torch.int32,
+                device=self.accelerator.device,
+            )
+            failed_processes = self.accelerator.reduce(
+                local_failure, reduction="sum"
+            )
+            if int(failed_processes.item()) != 0:
+                if ema_save_error is not None:
+                    raise ema_save_error
+                raise RuntimeError(
+                    "Stage 1 EMA checkpoint save failed on another process"
+                )
+            self.accelerator.wait_for_everyone()
+            deferred = self._stage1_deferred_checkpoint_rotation
+            if deferred is not None:
+                use_mtime, output_dir = deferred
+                super()._rotate_checkpoints(
+                    use_mtime=use_mtime, output_dir=output_dir
+                )
+        finally:
+            self._stage1_deferred_checkpoint_rotation = None
+
+    def _rotate_checkpoints(self, use_mtime=False, output_dir=None) -> None:
+        if getattr(self, "_defer_stage1_checkpoint_rotation", False):
+            if self._stage1_deferred_checkpoint_rotation is not None:
+                raise RuntimeError("Stage 1 checkpoint rotation was requested twice")
+            self._stage1_deferred_checkpoint_rotation = (use_mtime, output_dir)
+            return
+        super()._rotate_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
+
+    def train(
+        self,
+        resume_from_checkpoint=None,
+        trial=None,
+        ignore_keys_for_eval=None,
+        **kwargs,
+    ):
+        """Require and defer compatible EMA state for Stage 1 resume."""
+
+        if resume_from_checkpoint is False:
+            resume_from_checkpoint = None
+        requested_resume = (
+            kwargs["model_path"]
+            if "model_path" in kwargs
+            else resume_from_checkpoint
+        )
+
+        if requested_resume is True:
+            checkpoint = get_last_checkpoint(self.args.output_dir)
+            if checkpoint is None:
+                raise ValueError(
+                    "No valid checkpoint found in output directory "
+                    f"({self.args.output_dir})"
+                )
+            pending_checkpoint = Path(checkpoint)
+        elif requested_resume is None:
+            pending_checkpoint = None
+        elif isinstance(requested_resume, (str, os.PathLike)):
+            pending_checkpoint = Path(requested_resume)
+        else:
+            raise TypeError(
+                "Stage 1 resume_from_checkpoint must be a path, True, or None"
+            )
+
+        if pending_checkpoint is not None:
+            self._stage1_ema_checkpoint_path(pending_checkpoint)
+        self._stage1_pending_ema_checkpoint = pending_checkpoint
+        resolved_resume = (
+            None if pending_checkpoint is None else str(pending_checkpoint)
+        )
+        if "model_path" in kwargs:
+            kwargs["model_path"] = resolved_resume
+        return super().train(
+            resume_from_checkpoint=resolved_resume,
+            trial=trial,
+            ignore_keys_for_eval=ignore_keys_for_eval,
+            **kwargs,
+        )
+
     def _save(self, output_dir=None, state_dict=None):
         """Keep Trainer's gathered state while writing canonical PEFT weights."""
 
@@ -717,4 +968,4 @@ class CustomTrainerStage1(SFTTrainer):
             classify_stage1_artifact(target)
 
 
-__all__ = ["CustomTrainerStage1"]
+__all__ = ["CustomTrainerStage1", "STAGE1_EMA_TEACHER_STATE_FILENAME"]

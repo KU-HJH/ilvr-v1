@@ -15,6 +15,7 @@ from peft_common import resolve_qwen2_5_vl_model
 
 
 Stage1EmaMethod = Literal["full", "lora", "dora"]
+STAGE1_EMA_TEACHER_STATE_FILENAME = "stage1_ema_teacher.pt"
 _PEFT_PARAMETER_COMPONENTS = frozenset(
     {
         "lora_A",
@@ -27,6 +28,7 @@ _PEFT_PARAMETER_COMPONENTS = frozenset(
     }
 )
 _SUPPORTED_QWEN_PARAMETER_PREFIXES = frozenset(("", "base_model.model."))
+_STAGE1_EMA_STATE_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -340,6 +342,84 @@ def _topology_mismatch(
     return RuntimeError("EMA topology mismatch: " + "; ".join(details))
 
 
+def _decode_ema_state(
+    state: Mapping[str, Any],
+) -> tuple[
+    Stage1EmaMethod,
+    float,
+    tuple[str, ...],
+    tuple[tuple[str, tuple[int, ...]], ...],
+    dict[str, torch.Tensor],
+]:
+    required = {
+        "schema_version",
+        "decay",
+        "method",
+        "parameter_names",
+        "parameter_shapes",
+        "parameters",
+    }
+    if type(state) is not dict:
+        raise RuntimeError("invalid EMA state mapping")
+    missing = sorted(required - set(state))
+    extra = sorted(set(state) - required)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if extra:
+            details.append("unexpected " + ", ".join(extra))
+        raise RuntimeError("invalid EMA state: " + "; ".join(details))
+    version = state["schema_version"]
+    if type(version) is not int or version != _STAGE1_EMA_STATE_SCHEMA_VERSION:
+        raise RuntimeError("unsupported EMA state schema version")
+
+    raw_method = state["method"]
+    if type(raw_method) is not str:
+        raise RuntimeError("invalid EMA state method")
+    try:
+        method = _validate_method(raw_method)
+    except ValueError as error:
+        raise RuntimeError("invalid EMA state method") from error
+    decay = state["decay"]
+    if type(decay) is not float or not math.isfinite(decay) or not 0.0 <= decay < 1.0:
+        raise RuntimeError("invalid EMA state decay")
+
+    names = state["parameter_names"]
+    if (
+        type(names) is not tuple
+        or not names
+        or any(type(name) is not str or not name for name in names)
+    ):
+        raise RuntimeError("invalid EMA state parameter names")
+    if len(set(names)) != len(names):
+        raise RuntimeError("invalid EMA state parameter names")
+
+    shapes = state["parameter_shapes"]
+    if type(shapes) is not tuple:
+        raise RuntimeError("invalid EMA state parameter shapes")
+    decoded_shapes: list[tuple[str, tuple[int, ...]]] = []
+    for entry in shapes:
+        if type(entry) is not tuple or len(entry) != 2:
+            raise RuntimeError("invalid EMA state parameter shapes")
+        name, shape = entry
+        if (
+            type(name) is not str
+            or not name
+            or type(shape) is not tuple
+            or any(type(dimension) is not int or dimension < 0 for dimension in shape)
+        ):
+            raise RuntimeError("invalid EMA state parameter shapes")
+        decoded_shapes.append((name, shape))
+    if tuple(name for name, _ in decoded_shapes) != names:
+        raise RuntimeError("invalid EMA state parameter shapes")
+
+    parameters = state["parameters"]
+    if type(parameters) is not dict:
+        raise RuntimeError("invalid EMA state parameters")
+    return method, decay, names, tuple(decoded_shapes), parameters
+
+
 class Stage1EmaTeacher:
     """A frozen EMA copy updated through an exact named-parameter contract."""
 
@@ -434,37 +514,95 @@ class Stage1EmaTeacher:
                 target.mul_(self.decay).add_(source_value, alpha=1.0 - self.decay)
 
     def state_dict(self) -> dict[str, Any]:
+        teacher_named = _named_parameters(self.model)
+        parameters: dict[str, torch.Tensor] = {}
+        parameter_shapes: list[tuple[str, tuple[int, ...]]] = []
+        for pair in self._pairs:
+            target = teacher_named.get(pair.name)
+            if target is None:
+                raise RuntimeError(
+                    f"EMA topology mismatch: teacher is missing {pair.name}"
+                )
+            if _is_partitioned(target):
+                raise RuntimeError(
+                    "EMA teacher checkpoint state must be replicated, found "
+                    f"partitioned parameter {pair.name}"
+                )
+            shape = tuple(int(dimension) for dimension in target.shape)
+            if torch.Size(shape) != pair.shape:
+                raise RuntimeError(
+                    f"EMA topology mismatch: shape for {pair.name} is "
+                    f"expected={tuple(pair.shape)}, teacher={shape}"
+                )
+            parameter_shapes.append((pair.name, shape))
+            parameters[pair.name] = target.detach().to(device="cpu").clone()
         return {
-            "model": self.model.state_dict(),
+            "schema_version": _STAGE1_EMA_STATE_SCHEMA_VERSION,
             "decay": self.decay,
             "method": self.method,
             "parameter_names": self.parameter_names,
+            "parameter_shapes": tuple(parameter_shapes),
+            "parameters": parameters,
         }
 
+    @torch.no_grad()
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        required = {"model", "decay", "method", "parameter_names"}
-        missing = sorted(required - set(state))
-        extra = sorted(set(state) - required)
-        if missing or extra:
-            details = []
-            if missing:
-                details.append("missing " + ", ".join(missing))
-            if extra:
-                details.append("unexpected " + ", ".join(extra))
-            raise RuntimeError("invalid EMA state: " + "; ".join(details))
-
-        state_method = _validate_method(state["method"])
+        (
+            state_method,
+            state_decay,
+            state_names,
+            state_shapes,
+            parameters,
+        ) = _decode_ema_state(state)
         if state_method != self.method:
             raise RuntimeError(
                 f"EMA state method mismatch: state={state_method}, "
                 f"teacher={self.method}"
             )
-        state_names = tuple(state["parameter_names"])
         if state_names != self.parameter_names:
             raise _topology_mismatch(self.parameter_names, state_names)
-        state_decay = _validate_decay(state["decay"])
+        expected_shapes = tuple(
+            (pair.name, tuple(int(dimension) for dimension in pair.shape))
+            for pair in self._pairs
+        )
+        if state_shapes != expected_shapes:
+            raise RuntimeError("EMA state parameter shapes mismatch")
 
-        self.model.load_state_dict(state["model"], strict=True)
+        parameter_keys = tuple(parameters)
+        if parameter_keys != self.parameter_names:
+            raise _topology_mismatch(self.parameter_names, parameter_keys)
+        teacher_named = _named_parameters(self.model)
+        copies: list[tuple[nn.Parameter, torch.Tensor]] = []
+        for pair in self._pairs:
+            target = teacher_named.get(pair.name)
+            source = parameters.get(pair.name)
+            if target is None or not isinstance(source, torch.Tensor):
+                raise RuntimeError(
+                    f"invalid EMA state tensor for {pair.name}"
+                )
+            expected_shape = tuple(int(dimension) for dimension in pair.shape)
+            if tuple(source.shape) != expected_shape:
+                raise RuntimeError(
+                    f"EMA state tensor shape mismatch for {pair.name}: "
+                    f"expected={expected_shape}, state={tuple(source.shape)}"
+                )
+            if source.device.type != "cpu" or source.layout != torch.strided:
+                raise RuntimeError(
+                    f"invalid EMA state tensor storage for {pair.name}"
+                )
+            if source.dtype != target.dtype:
+                raise RuntimeError(
+                    f"EMA state tensor dtype mismatch for {pair.name}: "
+                    f"state={source.dtype}, teacher={target.dtype}"
+                )
+            if tuple(target.shape) != expected_shape:
+                raise RuntimeError(
+                    f"EMA teacher tensor shape mismatch for {pair.name}: "
+                    f"expected={expected_shape}, teacher={tuple(target.shape)}"
+                )
+            copies.append((target, source))
+        for target, source in copies:
+            target.copy_(source)
         self.decay = state_decay
         self.model.eval()
         self.model.requires_grad_(False)
@@ -472,6 +610,7 @@ class Stage1EmaTeacher:
 
 __all__ = [
     "EmaParameterPair",
+    "STAGE1_EMA_TEACHER_STATE_FILENAME",
     "Stage1EmaTeacher",
     "build_ema_parameter_map",
 ]

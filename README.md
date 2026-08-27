@@ -350,7 +350,10 @@ processor files. A DoRA final artifact contains
 `adapter_config.json`, `adapter_model.safetensors`,
 `ilvr_token_rows.safetensors`, `stage1_peft_metadata.json`, and tokenizer/
 processor files, but no merged full-model weights. Numbered checkpoints add
-Trainer optimizer, scheduler, RNG, and global-step state.
+Trainer optimizer, scheduler, RNG, global-step state, and the versioned
+`stage1_ema_teacher.pt` sidecar. The EMA sidecar contains only the exact
+EMA-selected parameter snapshots plus method, decay, name, and shape metadata;
+it is required when resuming a numbered Stage 1 checkpoint.
 
 Resume an interrupted, separately checkpointed Stage 1 run by repeating its
 configuration and naming the exact numbered checkpoint. This `B=2` example

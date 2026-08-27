@@ -2038,6 +2038,8 @@ class CheckpointLifecycleTrainer(CustomTrainerStage1):
     """Use the real Stage 1 save override with ordinary Trainer state ownership."""
 
     log = Trainer.log
+    train = Trainer.train
+    _save_checkpoint = Trainer._save_checkpoint
 
     def __init__(
         self,
@@ -2454,7 +2456,3 @@ def test_stage1_trainer_full_numbered_checkpoint_resume_matches_uninterrupted(
     torch.testing.assert_close(
         _capture_logits(resumed.model), expected_logits, rtol=0, atol=0
     )
-
-
-def test_stage1_trainer_keeps_trainer_checkpoint_ownership():
-    assert CustomTrainerStage1._save_checkpoint is Trainer._save_checkpoint

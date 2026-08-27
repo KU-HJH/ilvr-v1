@@ -255,6 +255,26 @@ class ResumeStateWitness(TrainerCallback):
         self.scheduler_state_restored = scheduler.state_dict()["last_epoch"] > 0
 
 
+class FirstTargetEmaRestoreWitness:
+    """Require the first resumed helper target to use checkpoint EMA tensors."""
+
+    def __init__(self, delegate, expected):
+        self.delegate = delegate
+        self.expected = expected
+        self.calls = 0
+
+    def build(self, teacher, inputs, metadata):
+        if self.calls == 0:
+            named = dict(teacher.named_parameters(remove_duplicate=False))
+            assert set(self.expected) <= set(named)
+            for name, expected in self.expected.items():
+                torch.testing.assert_close(
+                    named[name], expected, rtol=0.0, atol=0.0
+                )
+        self.calls += 1
+        return self.delegate.build(teacher, inputs, metadata)
+
+
 @dataclass
 class TinyStage1Run:
     components: object
@@ -521,6 +541,55 @@ def test_tiny_stage1_b2_train_save_resume_end_to_end(tmp_path, method):
     assert resumed.final_global_step == 3
     assert resumed.optimizer_state_restored
     assert resumed.scheduler_state_restored
+
+
+@pytest.mark.parametrize("method", ["full", "dora"])
+def test_actual_train_resume_restores_ema_before_first_teacher_target(
+    tmp_path, method
+):
+    run = tiny_stage1_run(
+        tmp_path,
+        method=method,
+        batch_size=2,
+        gradient_accumulation_steps=2,
+        max_steps=1,
+        save_steps=1,
+        output_dir=tmp_path / f"ema-resume-{method}",
+    )
+    saved_teacher = run.components.trainer.ema_teacher
+    saved_named = dict(
+        saved_teacher.model.named_parameters(remove_duplicate=False)
+    )
+    expected = {
+        name: saved_named[name].detach().clone()
+        for name in saved_teacher.parameter_names
+    }
+    args = _stage1_args(
+        tmp_path,
+        method=method,
+        output_dir=run.checkpoint_1.parent,
+        batch_size=2,
+        gradient_accumulation_steps=2,
+        max_steps=2,
+        save_steps=10,
+        resume=run.checkpoint_1,
+    )
+    resumed = build_stage1_training_components(
+        args, dependencies=_tiny_dependencies()
+    )
+    fresh_named = dict(
+        resumed.trainer.ema_teacher.model.named_parameters(remove_duplicate=False)
+    )
+    assert any(
+        not torch.equal(fresh_named[name], expected_value)
+        for name, expected_value in expected.items()
+    )
+    witness = FirstTargetEmaRestoreWitness(resumed.trainer.target_builder, expected)
+    resumed.trainer.target_builder = witness
+
+    resumed.trainer.train(resume_from_checkpoint=str(run.checkpoint_1))
+
+    assert witness.calls > 0
 
 
 def test_right_padded_b2_peft_resume_disables_teacher_and_student_cache(

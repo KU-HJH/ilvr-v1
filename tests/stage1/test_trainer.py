@@ -7,9 +7,11 @@ import pytest
 import torch
 from torch import nn
 import torch.nn.functional as F
+from trl import SFTTrainer
 
 from accelerate.utils import DeepSpeedEngineWrapper, DistributedType
 from peft_common import resolve_qwen2_5_vl_model
+from stage1.ema import Stage1EmaTeacher
 from stage1.peft import build_stage1_tuned_model
 from stage1.types import (
     Stage1BatchMetadata,
@@ -25,7 +27,10 @@ from tests.stage1.test_peft import (
     tuning,
 )
 from trainer import CustomTrainerStage1
-from stage1.trainer import _Stage1OptimizerCallback
+from stage1.trainer import (
+    STAGE1_EMA_TEACHER_STATE_FILENAME,
+    _Stage1OptimizerCallback,
+)
 
 
 class CountingTargetBuilder:
@@ -146,6 +151,30 @@ class RecordingEma:
         self.values_at_update.append(parameter.detach().clone())
 
 
+class EmaCheckpointProbeStudent(nn.Module):
+    """Tiny full/PEFT topology whose forward exposes its EMA-selected value."""
+
+    def __init__(self, method):
+        super().__init__()
+        self.visual = nn.Linear(1, 1, bias=False)
+        self.visual.requires_grad_(False)
+        if method == "full":
+            self.language_weight = nn.Parameter(torch.tensor(1.0))
+        else:
+            self.decoder = nn.Module()
+            self.decoder.lora_A = nn.Parameter(torch.tensor(1.0))
+        self.method = method
+
+    @property
+    def ema_value(self):
+        if self.method == "full":
+            return self.language_weight
+        return self.decoder.lora_A
+
+    def forward(self, inputs):
+        return inputs * self.ema_value
+
+
 class FakeZero3Optimizer:
     """Small ZeRO-3 norm witness matching DeepSpeed 0.18's step prelude."""
 
@@ -255,6 +284,7 @@ def make_trainer(model, target_builder, *, sim_weight=1.0, ce_weight=1.0, diagno
     trainer._successful_optimizer_steps = 0
     trainer._ema_execution_device = None
     trainer._deepspeed_step_adapter = None
+    trainer._stage1_pending_ema_checkpoint = None
     trainer.model_wrapped = model
     trainer.accelerator = SimpleNamespace(
         optimizer_step_was_skipped=False,
@@ -637,6 +667,542 @@ def test_accelerate_deepspeed_overflow_witness_prevents_ema_update():
     assert engine.mutation_count == 0
     assert trainer._successful_optimizer_steps == 0
     assert trainer.ema_teacher.update_count == 0
+
+
+@pytest.mark.parametrize("method", ["full", "dora"])
+def test_numbered_checkpoint_resume_matches_uninterrupted_ema_targets(
+    tmp_path, method
+):
+    """Catches rebuilding resumed helper targets from the student snapshot."""
+
+    uninterrupted_student = EmaCheckpointProbeStudent(method)
+    interrupted_student = deepcopy(uninterrupted_student)
+    uninterrupted_ema = Stage1EmaTeacher(
+        uninterrupted_student, decay=0.5, method=method
+    )
+    interrupted_ema = Stage1EmaTeacher(
+        interrupted_student, decay=0.5, method=method
+    )
+    with torch.no_grad():
+        uninterrupted_student.ema_value.fill_(3.0)
+        interrupted_student.ema_value.fill_(3.0)
+    uninterrupted_ema.update(uninterrupted_student)
+    interrupted_ema.update(interrupted_student)
+
+    checkpoint = tmp_path / "checkpoint-1"
+    writer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    writer.ema_teacher = interrupted_ema
+    writer._save_stage1_ema_checkpoint(checkpoint)
+
+    resumed_student = deepcopy(interrupted_student)
+    resumed_ema = Stage1EmaTeacher(resumed_student, decay=0.5, method=method)
+    resumed = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    resumed.ema_teacher = resumed_ema
+    resumed._load_stage1_ema_checkpoint(checkpoint)
+
+    with torch.no_grad():
+        uninterrupted_student.ema_value.fill_(5.0)
+        resumed_student.ema_value.fill_(5.0)
+    uninterrupted_ema.update(uninterrupted_student)
+    resumed_ema.update(resumed_student)
+
+    probe = torch.tensor([2.0])
+    torch.testing.assert_close(
+        resumed_ema.model(probe), uninterrupted_ema.model(probe), rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        resumed_ema.model.ema_value,
+        uninterrupted_ema.model.ema_value,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_numbered_checkpoint_saves_ema_after_parent_checkpoint_on_writing_rank(
+    tmp_path, monkeypatch
+):
+    """Catches racing EMA publication ahead of Trainer/DeepSpeed state."""
+
+    checkpoint = tmp_path / "checkpoint-7"
+    parent_marker = checkpoint / "deepspeed-parent-save-complete"
+
+    def parent_save(trainer, model, trial):
+        del trainer, model, trial
+        checkpoint.mkdir()
+        parent_marker.write_text("complete\n", encoding="utf-8")
+
+    monkeypatch.setattr(SFTTrainer, "_save_checkpoint", parent_save)
+    student = EmaCheckpointProbeStudent("full")
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+    trainer.args = SimpleNamespace(should_save=True)
+    trainer.state = SimpleNamespace(global_step=7)
+    trainer._get_output_dir = lambda trial: str(tmp_path)
+    barriers = []
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: barriers.append("barrier")
+    )
+
+    trainer._save_checkpoint(student, trial=None)
+
+    assert parent_marker.is_file()
+    assert (checkpoint / STAGE1_EMA_TEACHER_STATE_FILENAME).is_file()
+    assert barriers == ["barrier"]
+
+
+def test_numbered_checkpoint_nonwriting_rank_never_materializes_ema_state(
+    tmp_path, monkeypatch
+):
+    """Catches duplicate per-rank EMA serialization or gathering."""
+
+    checkpoint = tmp_path / "checkpoint-7"
+
+    def parent_save(trainer, model, trial):
+        del trainer, model, trial
+        checkpoint.mkdir()
+
+    monkeypatch.setattr(SFTTrainer, "_save_checkpoint", parent_save)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.ema_teacher = SimpleNamespace(
+        state_dict=lambda: pytest.fail("non-writing rank serialized EMA")
+    )
+    trainer.args = SimpleNamespace(should_save=False)
+    trainer.state = SimpleNamespace(global_step=7)
+    trainer._get_output_dir = lambda trial: str(tmp_path)
+    barriers = []
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: barriers.append("barrier")
+    )
+
+    trainer._save_checkpoint(nn.Identity(), trial=None)
+
+    assert not (checkpoint / STAGE1_EMA_TEACHER_STATE_FILENAME).exists()
+    assert barriers == ["barrier"]
+
+
+def test_ema_save_failure_preserves_previous_checkpoint_before_rotation(
+    tmp_path, monkeypatch
+):
+    previous = tmp_path / "checkpoint-6"
+    current = tmp_path / "checkpoint-7"
+    previous.mkdir()
+    (previous / STAGE1_EMA_TEACHER_STATE_FILENAME).write_bytes(b"complete")
+    rotations = []
+
+    def parent_save(trainer, model, trial):
+        del model, trial
+        current.mkdir()
+        trainer._rotate_checkpoints(use_mtime=False, output_dir=str(tmp_path))
+
+    def parent_rotate(trainer, *, use_mtime, output_dir):
+        del trainer, use_mtime, output_dir
+        rotations.append("rotate")
+        (previous / STAGE1_EMA_TEACHER_STATE_FILENAME).unlink()
+        previous.rmdir()
+
+    monkeypatch.setattr(SFTTrainer, "_save_checkpoint", parent_save)
+    monkeypatch.setattr(SFTTrainer, "_rotate_checkpoints", parent_rotate)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(should_save=True)
+    trainer.state = SimpleNamespace(global_step=7)
+    trainer._get_output_dir = lambda trial: str(tmp_path)
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: None,
+    )
+    trainer._save_stage1_ema_checkpoint = lambda path: (_ for _ in ()).throw(
+        OSError("EMA disk failure")
+    )
+
+    with pytest.raises(OSError, match="EMA disk failure"):
+        trainer._save_checkpoint(nn.Identity(), trial=None)
+
+    assert previous.is_dir()
+    assert rotations == []
+
+
+def test_ema_save_failure_is_collectively_reported_before_writer_raises(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "checkpoint-7"
+    events = []
+
+    def parent_save(trainer, model, trial):
+        del trainer, model, trial
+        checkpoint.mkdir()
+
+    def save_ema(path):
+        del path
+        events.append("save")
+        raise OSError("EMA disk failure")
+
+    def reduce_failure(value, *, reduction):
+        events.append(("reduce", int(value.item()), reduction))
+        return value
+
+    monkeypatch.setattr(SFTTrainer, "_save_checkpoint", parent_save)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(should_save=True)
+    trainer.state = SimpleNamespace(global_step=7)
+    trainer._get_output_dir = lambda trial: str(tmp_path)
+    trainer._save_stage1_ema_checkpoint = save_ema
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=reduce_failure,
+        wait_for_everyone=lambda: pytest.fail("failed save reached barrier"),
+    )
+
+    with pytest.raises(OSError, match="EMA disk failure"):
+        trainer._save_checkpoint(nn.Identity(), trial=None)
+
+    assert events == ["save", ("reduce", 1, "sum")]
+
+
+def test_remote_ema_save_failure_makes_nonwriting_rank_fail_without_barrier(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "checkpoint-7"
+    reductions = []
+
+    def parent_save(trainer, model, trial):
+        del trainer, model, trial
+        checkpoint.mkdir()
+
+    def reduce_remote_failure(value, *, reduction):
+        reductions.append((int(value.item()), reduction))
+        return value.new_tensor(1)
+
+    monkeypatch.setattr(SFTTrainer, "_save_checkpoint", parent_save)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(should_save=False)
+    trainer.state = SimpleNamespace(global_step=7)
+    trainer._get_output_dir = lambda trial: str(tmp_path)
+    trainer._save_stage1_ema_checkpoint = lambda path: pytest.fail(
+        "non-writing rank serialized EMA"
+    )
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=reduce_remote_failure,
+        wait_for_everyone=lambda: pytest.fail("failed save reached barrier"),
+    )
+
+    with pytest.raises(RuntimeError, match="another process"):
+        trainer._save_checkpoint(nn.Identity(), trial=None)
+
+    assert reductions == [(0, "sum")]
+
+
+def test_checkpoint_rotation_runs_after_ema_publication_and_rank_sync(
+    tmp_path, monkeypatch
+):
+    current = tmp_path / "checkpoint-7"
+    rotations = []
+    barriers = []
+
+    def parent_save(trainer, model, trial):
+        del model, trial
+        current.mkdir()
+        trainer._rotate_checkpoints(use_mtime=False, output_dir=str(tmp_path))
+
+    def parent_rotate(trainer, *, use_mtime, output_dir):
+        del trainer, use_mtime, output_dir
+        rotations.append(
+            (
+                (current / STAGE1_EMA_TEACHER_STATE_FILENAME).is_file(),
+                tuple(barriers),
+            )
+        )
+
+    monkeypatch.setattr(SFTTrainer, "_save_checkpoint", parent_save)
+    monkeypatch.setattr(SFTTrainer, "_rotate_checkpoints", parent_rotate)
+    student = EmaCheckpointProbeStudent("full")
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+    trainer.args = SimpleNamespace(should_save=True)
+    trainer.state = SimpleNamespace(global_step=7)
+    trainer._get_output_dir = lambda trial: str(tmp_path)
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: barriers.append("barrier")
+    )
+
+    trainer._save_checkpoint(student, trial=None)
+
+    assert rotations == [(True, ("barrier",))]
+
+
+def test_explicit_stage1_resume_requires_ema_sidecar_before_parent_train(
+    tmp_path, monkeypatch
+):
+    """Catches silently resuming with a teacher copied from the student."""
+
+    checkpoint = tmp_path / "checkpoint-3"
+    checkpoint.mkdir()
+    parent_calls = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del trainer, args, kwargs
+        parent_calls.append("train")
+
+    monkeypatch.setattr(SFTTrainer, "train", parent_train)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+
+    with pytest.raises(RuntimeError, match=r"missing EMA teacher state.*checkpoint-3"):
+        trainer.train(resume_from_checkpoint=str(checkpoint))
+
+    assert parent_calls == []
+
+
+def test_stage1_resume_rejects_symlinked_ema_sidecar(tmp_path):
+    student = EmaCheckpointProbeStudent("full")
+    external = tmp_path / "external"
+    writer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    writer.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+    writer._save_stage1_ema_checkpoint(external)
+    checkpoint = tmp_path / "checkpoint-3"
+    checkpoint.mkdir()
+    (checkpoint / STAGE1_EMA_TEACHER_STATE_FILENAME).symlink_to(
+        external / STAGE1_EMA_TEACHER_STATE_FILENAME
+    )
+    resumed = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    resumed.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+
+    with pytest.raises(RuntimeError, match="EMA teacher state.*symlink"):
+        resumed._load_stage1_ema_checkpoint(checkpoint)
+
+
+def test_stage1_resume_discovery_requires_ema_on_latest_checkpoint(
+    tmp_path, monkeypatch
+):
+    """Catches checking a stale checkpoint instead of Trainer's latest choice."""
+
+    older = tmp_path / "checkpoint-2"
+    latest = tmp_path / "checkpoint-11"
+    older.mkdir()
+    latest.mkdir()
+    (older / STAGE1_EMA_TEACHER_STATE_FILENAME).write_bytes(b"older")
+    monkeypatch.setattr(
+        SFTTrainer,
+        "train",
+        lambda *args, **kwargs: pytest.fail("parent train accepted incomplete resume"),
+    )
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+
+    with pytest.raises(RuntimeError, match=r"missing EMA teacher state.*checkpoint-11"):
+        trainer.train(resume_from_checkpoint=True)
+
+
+def test_stage1_resume_discovery_forwards_one_resolved_path_to_parent(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "checkpoint-11"
+    student = EmaCheckpointProbeStudent("full")
+    writer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    writer.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+    writer._save_stage1_ema_checkpoint(checkpoint)
+    parent_calls = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del args
+        parent_calls.append(kwargs["resume_from_checkpoint"])
+        assert trainer._stage1_pending_ema_checkpoint == checkpoint
+        return "resumed"
+
+    monkeypatch.setattr(SFTTrainer, "train", parent_train)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+
+    result = trainer.train(resume_from_checkpoint=True)
+
+    assert result == "resumed"
+    assert parent_calls == [str(checkpoint)]
+
+
+def test_stage1_deprecated_model_path_precedence_binds_the_same_ema_checkpoint(
+    tmp_path, monkeypatch
+):
+    student = EmaCheckpointProbeStudent("full")
+    writer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    writer.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+    explicit = tmp_path / "checkpoint-3"
+    deprecated = tmp_path / "checkpoint-7"
+    writer._save_stage1_ema_checkpoint(explicit)
+    writer._save_stage1_ema_checkpoint(deprecated)
+    parent_calls = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del args
+        parent_calls.append(
+            (kwargs["resume_from_checkpoint"], kwargs["model_path"])
+        )
+        assert trainer._stage1_pending_ema_checkpoint == deprecated
+        return "resumed"
+
+    monkeypatch.setattr(SFTTrainer, "train", parent_train)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+
+    result = trainer.train(
+        resume_from_checkpoint=str(explicit), model_path=str(deprecated)
+    )
+
+    assert result == "resumed"
+    assert parent_calls == [(str(deprecated), str(deprecated))]
+
+
+def test_stage1_deprecated_model_path_true_forwards_the_resolved_checkpoint_once(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "checkpoint-11"
+    student = EmaCheckpointProbeStudent("full")
+    writer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    writer.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+    writer._save_stage1_ema_checkpoint(checkpoint)
+    parent_calls = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del args
+        parent_calls.append(
+            (kwargs["resume_from_checkpoint"], kwargs["model_path"])
+        )
+        assert trainer._stage1_pending_ema_checkpoint == checkpoint
+        return "resumed"
+
+    monkeypatch.setattr(SFTTrainer, "train", parent_train)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+
+    result = trainer.train(model_path=True)
+
+    assert result == "resumed"
+    assert parent_calls == [(str(checkpoint), str(checkpoint))]
+
+
+def test_fresh_stage1_train_does_not_require_ema_sidecar(tmp_path, monkeypatch):
+    parent_calls = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del trainer, args
+        parent_calls.append(kwargs.get("resume_from_checkpoint"))
+        return "fresh-result"
+
+    monkeypatch.setattr(SFTTrainer, "train", parent_train)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+
+    result = trainer.train(resume_from_checkpoint=None)
+
+    assert result == "fresh-result"
+    assert parent_calls == [None]
+
+
+def test_training_begin_restores_pending_ema_after_teacher_device_preparation(
+    tmp_path,
+):
+    """Catches loading too early or building the first target before restore."""
+
+    student = EmaCheckpointProbeStudent("full")
+    saved_ema = Stage1EmaTeacher(student, decay=0.5, method="full")
+    with torch.no_grad():
+        student.ema_value.fill_(3.0)
+    saved_ema.update(student)
+    checkpoint = tmp_path / "checkpoint-1"
+    writer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    writer.ema_teacher = saved_ema
+    writer._save_stage1_ema_checkpoint(checkpoint)
+
+    resumed_student = deepcopy(student)
+    resumed = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    resumed.model = resumed_student
+    resumed.model_wrapped = resumed_student
+    resumed.accelerator = SimpleNamespace(
+        device=torch.device("cpu"), distributed_type=DistributedType.NO
+    )
+    resumed.ema_teacher = Stage1EmaTeacher(
+        resumed_student, decay=0.5, method="full"
+    )
+    resumed._ema_execution_device = None
+    resumed._deepspeed_step_adapter = None
+    resumed._stage1_pending_ema_checkpoint = checkpoint
+
+    _Stage1OptimizerCallback(resumed).on_train_begin(
+        SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+    )
+
+    assert resumed._ema_execution_device == torch.device("cpu")
+    torch.testing.assert_close(
+        resumed.ema_teacher.model(torch.tensor([2.0])),
+        torch.tensor([4.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        ("schema", "schema version"),
+        ("method", "method mismatch"),
+        ("decay", "decay mismatch"),
+        ("names", "parameter names mismatch"),
+        ("shapes", "parameter shapes mismatch"),
+        ("schema_type", "schema version"),
+        ("decay_type", "decay"),
+        ("names_type", "parameter names"),
+        ("shapes_type", "parameter shapes"),
+    ],
+)
+def test_stage1_ema_checkpoint_rejects_incompatible_schema_and_topology(
+    tmp_path, corruption, message
+):
+    student = EmaCheckpointProbeStudent("full")
+    writer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    writer.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+    checkpoint = tmp_path / "checkpoint-1"
+    writer._save_stage1_ema_checkpoint(checkpoint)
+    path = checkpoint / STAGE1_EMA_TEACHER_STATE_FILENAME
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if corruption == "schema":
+        payload["schema_version"] = 2
+    elif corruption == "method":
+        payload["state"]["method"] = "dora"
+    elif corruption == "decay":
+        payload["state"]["decay"] = 0.75
+    elif corruption == "names":
+        extra_name = "decoder.extra.weight"
+        payload["state"]["parameter_names"] += (extra_name,)
+        payload["state"]["parameter_shapes"] += ((extra_name, ()),)
+        payload["state"]["parameters"][extra_name] = torch.tensor(0.0)
+    elif corruption == "shapes":
+        name, _ = payload["state"]["parameter_shapes"][0]
+        payload["state"]["parameter_shapes"] = ((name, (17,)),)
+    elif corruption == "schema_type":
+        payload["schema_version"] = True
+    elif corruption == "decay_type":
+        payload["state"]["decay"] = "0.5"
+    elif corruption == "names_type":
+        payload["state"]["parameter_names"] = list(
+            payload["state"]["parameter_names"]
+        )
+    else:
+        payload["state"]["parameter_shapes"] = tuple(
+            (name, list(shape))
+            for name, shape in payload["state"]["parameter_shapes"]
+        )
+    torch.save(payload, path)
+    resumed = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    resumed.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+
+    with pytest.raises(RuntimeError, match=message):
+        resumed._load_stage1_ema_checkpoint(checkpoint)
 
 
 @pytest.mark.parametrize(

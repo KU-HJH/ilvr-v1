@@ -35,7 +35,7 @@ from peft_common import (
     normalize_qwen2_5_vl_architecture,
     resolve_qwen2_5_vl_model,
 )
-from stage1.ema import _parameter_shape
+from stage1.ema import STAGE1_EMA_TEACHER_STATE_FILENAME, _parameter_shape
 from stage1.peft import (
     _configured_target_patterns_match,
     _resolve_linear_decoder_targets,
@@ -100,6 +100,7 @@ _NON_MODEL_BINARY_FILES = frozenset(
         "scheduler.pt",
         "scaler.pt",
         "rng_state.pth",
+        STAGE1_EMA_TEACHER_STATE_FILENAME,
         "training_args.bin",
     }
 )

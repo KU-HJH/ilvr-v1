@@ -510,6 +510,43 @@ def test_ema_state_dict_round_trip_restores_model_and_decay(full_student):
     assert all(parameter.requires_grad is False for parameter in restored.model.parameters())
 
 
+@pytest.mark.parametrize(
+    ("fixture_name", "method"),
+    [("full_student", "full"), ("dora_student", "dora")],
+)
+def test_ema_state_dict_serializes_only_selected_parameter_snapshots(
+    request, fixture_name, method
+):
+    """Catches duplicating frozen visual/base tensors in numbered checkpoints."""
+
+    ema = Stage1EmaTeacher(
+        request.getfixturevalue(fixture_name), decay=0.25, method=method
+    )
+
+    state = ema.state_dict()
+
+    assert set(state) == {
+        "schema_version",
+        "decay",
+        "method",
+        "parameter_names",
+        "parameter_shapes",
+        "parameters",
+    }
+    assert tuple(state["parameters"]) == ema.parameter_names
+    assert state["parameter_shapes"] == tuple(
+        (name, tuple(state["parameters"][name].shape))
+        for name in ema.parameter_names
+    )
+    assert all(tensor.device.type == "cpu" for tensor in state["parameters"].values())
+    assert not any("visual" in name.split(".") for name in state["parameters"])
+    if method == "dora":
+        assert not any(
+            name.endswith("base_layer.weight") or name.endswith("base_head.weight")
+            for name in state["parameters"]
+        )
+
+
 def test_tied_embedding_ema_state_dict_round_trip_preserves_alias_topology():
     student = TiedEmbeddingStudent()
     ema = Stage1EmaTeacher(student, decay=0.25, method="full")
