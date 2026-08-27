@@ -270,7 +270,14 @@ fi
     path.chmod(0o755)
 
 
-def _run_probe(tmp_path, *, fail_batches, extra=(), poison_benchmark_python=False):
+def _run_probe(
+    tmp_path,
+    *,
+    fail_batches,
+    extra=(),
+    poison_benchmark_python=False,
+    controller_id=None,
+):
     fake_launcher = tmp_path / "fake stage1 launcher"
     _write_fake_launcher(fake_launcher)
     records = tmp_path / "process records"
@@ -337,7 +344,9 @@ def _run_probe(tmp_path, *, fail_batches, extra=(), poison_benchmark_python=Fals
     prerequisite_path = tmp_path / "prerequisite-chain.json"
     if not prerequisite_path.exists():
         prerequisite_path.write_text(json.dumps(prerequisite))
-    probe_id = "probe-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:20]
+    probe_id = controller_id or (
+        "probe-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:20]
+    )
     output_root = resolve_run_artifact_paths(probe_id).result_dir
     env = os.environ.copy()
     env.update(
@@ -439,6 +448,24 @@ def test_probe_launches_each_candidate_with_one_canonical_artifact_identity(tmp_
     assert output.parent == CANONICAL_CHECKPOINT_ROOT
     assert log.parent == CANONICAL_LOG_ROOT / output.name
     assert run_config.parent == evidence.parent == CANONICAL_RESULT_ROOT / output.name
+
+
+def test_probe_accepts_a_maximum_length_controller_experiment_id(tmp_path):
+    """Catches candidate suffixes overflowing the resolver's experiment-ID limit."""
+    controller_id = (
+        "p" + hashlib.sha256(str(tmp_path).encode()).hexdigest() + "a" * 63
+    )
+    completed, records, _output_root, _ = _run_probe(
+        tmp_path, fail_batches="8", controller_id=controller_id
+    )
+
+    assert completed.returncode == 42, completed.stderr
+    parts = next(records.glob("*.argv0")).read_bytes().split(b"\0")[:-1]
+    candidate_id = Path(parts[parts.index(b"--output-dir") + 1].decode()).name
+    assert len(candidate_id) <= 128
+    controller_prefix, unique_suffix = candidate_id.split("-mb8-", maxsplit=1)
+    assert controller_id.startswith(controller_prefix)
+    assert unique_suffix
 
 
 def test_probe_pins_benchmark_python_when_path_and_override_are_wrong(tmp_path):

@@ -227,11 +227,26 @@ if [[ $dry_run != true ]]; then
         printf 'error: resume log file must be distinct: %s\n' "$log_file" >&2
         exit 2
     elif [[ ${STAGE1_ARTIFACTS_PRECLAIMED:-false} == true ]]; then
+        artifact_claim_token=${STAGE1_ARTIFACT_CLAIM_TOKEN:-}
+        if [[ ! $artifact_claim_token =~ ^[0-9a-f]{64}$ ]]; then
+            printf 'error: preclaimed artifacts require a valid claim token\n' >&2
+            exit 2
+        fi
         for target_dir in "${artifact_dirs[@]}"; do
             [[ -d $target_dir ]] || {
                 printf 'error: preclaimed artifact directory is missing: %s\n' "$target_dir" >&2
                 exit 2
             }
+            claim_marker="$target_dir/.stage1-artifact-claim"
+            if [[ -L $claim_marker || ! -f $claim_marker ]] || \
+                [[ $(stat -c '%a' -- "$claim_marker") != 600 ]] || \
+                [[ $(<"$claim_marker") != "$artifact_claim_token" ]]; then
+                printf 'error: preclaimed artifact claim token is invalid: %s\n' "$target_dir" >&2
+                exit 2
+            fi
+        done
+        for target_dir in "${artifact_dirs[@]}"; do
+            rm -- "$target_dir/.stage1-artifact-claim"
         done
     else
         mkdir -p -- "$output_dir" "$(dirname -- "$log_file")"

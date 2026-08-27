@@ -263,6 +263,25 @@ def test_live_launcher_rejects_mismatched_canonical_artifact_ids_before_setup(tm
     assert "share one experiment ID" in completed.stderr
 
 
+def test_live_launcher_rejects_bare_preclaimed_artifact_bypass(tmp_path):
+    """Catches an environment boolean reusing unclaimed artifact directories."""
+    paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-preclaim")
+    env = os.environ.copy()
+    env["STAGE1_ARTIFACTS_PRECLAIMED"] = "true"
+    completed = run_launcher(
+        LAUNCHER,
+        *live_args(tmp_path, paths.checkpoint_dir),
+        "--log-file",
+        paths.log_dir / "train.log",
+        "--deepspeed-config",
+        REPO_ROOT / "configs/deepspeed_zero3.json",
+        env=env,
+    )
+
+    assert completed.returncode == 2
+    assert "claim token" in completed.stderr
+
+
 def test_full_dry_run_omits_every_peft_argument(tmp_path):
     """Catches full tuning accidentally inheriting adapter configuration."""
     completed = run_launcher(

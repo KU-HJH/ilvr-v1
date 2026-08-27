@@ -194,7 +194,9 @@ for micro_batch in "${candidates[@]}"; do
     validate_probe_lock
     counter=$((counter + 1))
     attempt_id="$(date +%Y%m%dt%H%M%S%N)-$$-$counter"
-    candidate_experiment_id="$probe_experiment_id-mb$micro_batch-$attempt_id"
+    candidate_suffix="-mb$micro_batch-$attempt_id"
+    candidate_prefix_length=$((128 - ${#candidate_suffix}))
+    candidate_experiment_id="${probe_experiment_id:0:candidate_prefix_length}$candidate_suffix"
     "$repository_python" -m src.artifact_paths resolve --experiment-id "$candidate_experiment_id" >/dev/null
     attempt_dir="$output_root/attempts/$method/micro-batch-$micro_batch/attempt-$attempt_id"
     logs_dir="$canonical_log_root/$candidate_experiment_id"
@@ -218,6 +220,17 @@ for micro_batch in "${candidates[@]}"; do
         printf 'error: fresh run artifact directory already exists: %s\n' "$evidence_dir" >&2
         exit 2
     fi
+    artifact_claim_token=$("$repository_python" -c 'import secrets; print(secrets.token_hex(32))')
+    for target_dir in "$candidate_output" "$logs_dir" "$evidence_dir"; do
+        (
+            umask 077
+            set -C
+            printf '%s\n' "$artifact_claim_token" > "$target_dir/.stage1-artifact-claim"
+        ) || {
+            printf 'error: cannot create preclaimed artifact marker: %s\n' "$target_dir" >&2
+            exit 2
+        }
+    done
 
     "$benchmark_python" -m src.stage1.benchmark prepare-probe-run \
         --run-config "$run_config" --method "$method" --model "$model" \
@@ -253,7 +266,8 @@ for micro_batch in "${candidates[@]}"; do
 
     validate_probe_lock
     set +e
-    STAGE1_ARTIFACTS_PRECLAIMED=true "${launch_command[@]}" >"$stdout_path" 2>"$stderr_path" &
+    STAGE1_ARTIFACTS_PRECLAIMED=true STAGE1_ARTIFACT_CLAIM_TOKEN="$artifact_claim_token" \
+        "${launch_command[@]}" >"$stdout_path" 2>"$stderr_path" &
     child_pid=$!
     wait "$child_pid"
     exit_code=$?
