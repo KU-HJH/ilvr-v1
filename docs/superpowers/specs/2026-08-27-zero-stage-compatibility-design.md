@@ -122,6 +122,41 @@ GPU 순서를 유지한다.
 Resume은 seed, epoch, world size 및 이미 소비한 batch 수로 sampler 순서를
 결정적으로 재구성한다. 다른 world size로의 resume은 허용하지 않는다.
 
+## 산출물 저장 계약
+
+primary checkout과 모든 linked worktree에서 생성되는 산출물은 worktree-local
+`outputs/`에 저장하지 않고 다음 canonical root를 사용한다.
+
+- weight, final model 및 numbered checkpoint:
+  `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/`
+- evidence, witness, manifest, audit, report 및 표:
+  `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/`
+- training log, stdout 및 stderr:
+  `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/`
+
+각 독립 training attempt와 standalone probe는 고유한 experiment ID를 사용한다.
+같은 실행의 checkpoint, result 및 log 디렉터리는 세 root 아래에서 동일한
+experiment ID를 공유한다. 하나의 bounded lifecycle 안에서 checkpoint를 만들고
+즉시 same-identity resume하는 두 phase는 동일한 논리 실험이므로 같은 ID를
+유지하고 별도 log 파일로 구분한다. 반면 matrix의 selected-save와
+selected-resume처럼 독립적으로 재실행하거나 재사용할 수 있는 producer는 서로
+다른 ID를 사용한다. ID는 의미 있는 prefix와 충돌하지 않는 run suffix를
+결합한다. 예를 들어 Stage 1 ZeRO-2 DoRA batch 후보는
+`stage1-zero2-dora-mb4-ga2-candidate-20260827t101500-1234-1` 형식을 사용하고,
+선택된 resume은 별도 실행임을 나타내는
+`stage1-zero2-dora-mb4-ga2-selected-resume-20260827t111500-1234-2` 형식을
+사용한다.
+
+단위 테스트의 실제 training을 수행하지 않는 임시 fixture만 pytest `tmp_path`를
+사용할 수 있다. 분산 integration harness가 만드는 checkpoint, witness 및 log는
+작더라도 canonical root에 저장한다. dataset, cache 및 다운로드한 pretrained
+weight에는 이 계약을 적용하지 않는다.
+
+기존 worktree-local `outputs/` 산출물은 이동, 이름 변경, 덮어쓰기 또는 재검증하지
+않는다. identity가 정확히 일치하는 기존 witness는 원래 절대 경로와 인증된
+digest를 read-only provenance로 기록해 재사용할 수 있다. 새 checkpoint, result
+또는 log는 항상 canonical root에 생성한다.
+
 ## 저장과 resume 계약
 
 모든 numbered checkpoint는 다음 identity와 상태를 가져야 한다.
@@ -234,3 +269,7 @@ evidence를 그대로 전달한다.
    기록된다.
 7. 기존 ZeRO-3 결과를 불필요하게 다시 계산하지 않고 모든 필수 검증이 한 번씩
    완료된다.
+8. 새 checkpoint, result 및 log가 세 canonical root 아래에 저장되고, 각 독립
+   producer의 세 경로가 같은 고유 experiment ID를 사용하며, legacy `outputs/`에는
+   새 파일을 쓰지 않는다. bounded same-identity resume lifecycle은 하나의 논리
+   실험 ID를 유지한다.

@@ -31,6 +31,12 @@
 - A config file is hashed once when its runtime profile is created; every downstream manifest, checkpoint sidecar, and report passes that digest forward.
 - Follow `superpowers:test-driven-development` for each production behavior change and `superpowers:systematic-debugging` for any unexpected test, numerical, OOM, DeepSpeed, NCCL, or timeout failure.
 - Do not push, merge, publish, or create a PR without explicit user permission.
+- Store every generated weight, final model, and numbered checkpoint under `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/`; never use a linked-worktree-local checkpoint directory.
+- Store every generated evidence, witness, manifest, audit, report, table, or plot under `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/`.
+- Store every training log, execution log, stdout, and stderr under `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/`.
+- Give every independent training attempt and standalone probe a distinct experiment ID and reuse that exact ID under checkpoint, result, and log roots. A two-phase checkpoint→same-identity-resume lifecycle keeps one ID because it is one logical experiment; independently reusable selected-save and selected-resume producers use different IDs.
+- Unit tests that do not perform real training may use pytest `tmp_path`; every distributed integration harness uses the canonical roots even when its checkpoint is tiny.
+- Treat pre-policy `outputs/` artifacts as read-only legacy provenance: never move, rename, overwrite, revalidate, or add new files to them. Reuse only exact identity-matching witnesses at their original absolute paths.
 
 ---
 
@@ -38,6 +44,7 @@
 
 ### New production files
 
+- `src/artifact_paths.py` — exact canonical checkpoint/result/log roots, safe experiment-ID validation, three-way run path resolution, and CLI path preflight shared by launchers and harnesses.
 - `src/deepspeed_runtime.py` — immutable DeepSpeed identity, canonical config validation, one-time digesting, process-safe checkpoint sidecars, and strict resume matching shared by both stages.
 - `src/stage2/sampler.py` — deterministic latent-block-balanced global sampler, padding statistics, and checkpoint identity serialization.
 - `src/stage1/zero_matrix.py` — fixed-EGB candidate definitions, exact evidence reuse decisions, failure classification, winner selection, and machine-readable matrix reporting.
@@ -61,11 +68,12 @@
 - `src/stage1/benchmark.py` — add ZeRO identity to evidence and generalize producer config validation without changing legacy ZeRO-3 report semantics.
 - `src/stage2/trainer.py` — install the balanced sampler in multi-GPU mode, save sampler/runtime identities, and validate them before resume.
 - `src/stage1/token_rows.py` and `src/stage2/trainer.py` — perform sparse collective gather only for parameters actually partitioned by ZeRO-3.
-- `run_stage1_training.sh`, `run_stage1_batch_probe.sh`, `run_stage2_training.sh` — canonical config defaults/selection and runtime-profile preflight.
+- `run_stage1_training.sh`, `run_stage1_batch_probe.sh`, `run_stage2_training.sh` — canonical config selection plus checkpoint/result/log ownership and runtime-profile preflight.
 - `README.md` — link the detailed ZeRO training guide.
 
 ### New and modified tests
 
+- `tests/test_artifact_paths.py` — canonical root resolution, shared experiment identifiers, traversal rejection, worktree-local output rejection, and CLI preflight.
 - `tests/test_deepspeed_runtime.py` — profile parsing, topology conflict rejection, stable digest, sidecar round trip, and resume mismatch tests.
 - `tests/stage1/test_trainer.py`, `tests/stage1/test_ema.py`, `tests/stage1/test_peft.py`, `tests/stage1/test_composition.py` — ZeRO-1/2 optimizer strategy, exact EMA update, ZeRO-3-only registration, and profile propagation.
 - `tests/stage1/test_checkpointing.py` — numbered-checkpoint runtime identity and legacy/fresh artifact classification.
@@ -76,28 +84,175 @@
 
 ## Execution Dependency Map
 
-Task 1 defines the shared runtime identity consumed everywhere else. Task 2 adds Stage 1 optimizer and PEFT behavior; Task 3 adds checkpoint identity to both stages. Task 4 introduces the Stage 2 sampler and its checkpoint contract. Task 5 generalizes producer evidence, and Task 6 builds the bounded Stage 1 matrix workflow on that schema. Task 7 adds the minimal distributed harnesses. Task 8 closes CPU regressions and documentation before any costly run. Tasks 9 and 10 are the only GPU-heavy gates: lifecycle/rank-skew compatibility first, then missing Stage 1 matrix producers and selected resumes. Task 11 records results and performs one proportionate final verification without repeating authenticated runs.
+Task 1 defines canonical artifact ownership and the shared runtime identity consumed everywhere else. Task 2 adds Stage 1 optimizer and PEFT behavior; Task 3 adds checkpoint identity to both stages. Task 4 introduces the Stage 2 sampler and its checkpoint contract. Task 5 generalizes producer evidence, and Task 6 builds the bounded Stage 1 matrix workflow on that schema. Task 7 adds the minimal distributed harnesses. Task 8 closes CPU regressions and documentation before any costly run. Tasks 9 and 10 are the only GPU-heavy gates: lifecycle/rank-skew compatibility first, then missing Stage 1 matrix producers and selected resumes. Task 11 records results and performs one proportionate final verification without repeating authenticated runs.
 
-### Task 1: Canonical DeepSpeed Runtime Identity
+### Task 1: Canonical Artifact Layout and DeepSpeed Runtime Identity
 
 **Files:**
+- Create: `src/artifact_paths.py`
 - Create: `src/deepspeed_runtime.py`
 - Create: `configs/deepspeed_zero1.json`
 - Create: `configs/deepspeed_zero2.json`
 - Create: `configs/deepspeed_zero3.json`
 - Create: `tests/test_deepspeed_runtime.py`
+- Create: `tests/test_artifact_paths.py`
 - Modify: `src/utils_deepseed.py:95-105`
+- Modify: `src/main.py:499-516`
 - Modify: `run_stage1_training.sh:50-100`
 - Modify: `run_stage1_batch_probe.sh:20-70`
 - Modify: `run_stage2_training.sh:35-60`
 - Test: `tests/stage1/test_launcher.py`
+- Test: `tests/stage1/test_cli.py`
+- Test: `tests/stage2/test_routing.py`
 - Test: `tests/stage2/integration/test_distributed_contract.py`
 
 **Interfaces:**
-- Consumes: a DeepSpeed JSON path or `None`, and the positive process `world_size` discovered before CUDA initialization.
-- Produces: `DeepSpeedRuntimeProfile`, `validate_supported_deepspeed_policy(payload: Mapping[str, object]) -> None`, `load_deepspeed_runtime_profile(config_path: str | Path | None, *, world_size: int) -> DeepSpeedRuntimeProfile`, `bind_deepspeed_runtime_profile(args: argparse.Namespace, *, world_size: int | None = None) -> DeepSpeedRuntimeProfile`, and `canonical_deepspeed_config_path(zero_stage: int) -> Path`.
+- Consumes: one safe experiment ID, a DeepSpeed JSON path or `None`, and the positive process `world_size` discovered before CUDA initialization.
+- Produces: `RunArtifactPaths`, `resolve_run_artifact_paths(experiment_id: str) -> RunArtifactPaths`, `require_canonical_artifact_path(path: str | Path, *, kind: Literal["checkpoint", "result", "log"]) -> Path`, `validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPaths`, `DeepSpeedRuntimeProfile`, `validate_supported_deepspeed_policy(payload: Mapping[str, object]) -> None`, `load_deepspeed_runtime_profile(config_path: str | Path | None, *, world_size: int) -> DeepSpeedRuntimeProfile`, `bind_deepspeed_runtime_profile(args: argparse.Namespace, *, world_size: int | None = None) -> DeepSpeedRuntimeProfile`, and `canonical_deepspeed_config_path(zero_stage: int) -> Path`.
 
-- [ ] **Step 1: Write failing profile and canonical-config tests**
+- [ ] **Step 1: Write failing canonical artifact-layout tests**
+
+```python
+def test_run_paths_share_one_experiment_identifier():
+    paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
+    assert paths.checkpoint_dir == Path(
+        "/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/"
+        "checkpoints/zero-stage-compatibility/stage1-zero2-dora-mb4-ga2-candidate"
+    )
+    assert paths.result_dir.name == paths.checkpoint_dir.name
+    assert paths.log_dir.name == paths.checkpoint_dir.name
+
+
+@pytest.mark.parametrize("experiment_id", ["../escape", "has/slash", "UPPER", ""])
+def test_experiment_identifier_rejects_unsafe_values(experiment_id):
+    with pytest.raises(ValueError, match="experiment ID"):
+        resolve_run_artifact_paths(experiment_id)
+
+
+def test_worktree_local_outputs_are_not_canonical():
+    with pytest.raises(ValueError, match="canonical result root"):
+        require_canonical_artifact_path(
+            Path.cwd() / "outputs" / "evidence.json", kind="result"
+        )
+
+
+def test_generated_checkpoint_result_and_log_share_experiment_id(stage1_args):
+    paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
+    stage1_args.save_model_path = str(paths.checkpoint_dir)
+    stage1_args.log_file = str(paths.log_dir / "train.log")
+    stage1_args.benchmark_evidence_path = str(
+        paths.result_dir / "producer-evidence.json"
+    )
+    assert validate_generated_artifact_paths(stage1_args) == paths
+```
+
+- [ ] **Step 2: Run artifact-layout tests and confirm RED**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
+./venv/ilvr-venv/bin/pytest tests/test_artifact_paths.py -q
+```
+
+Expected: collection fails because `src.artifact_paths` does not exist.
+
+- [ ] **Step 3: Implement exact canonical roots and path containment checks**
+
+```python
+CANONICAL_REPOSITORY_ROOT = Path(
+    "/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR"
+)
+CANONICAL_CHECKPOINT_ROOT = (
+    CANONICAL_REPOSITORY_ROOT / "checkpoints" / "zero-stage-compatibility"
+)
+CANONICAL_RESULT_ROOT = (
+    CANONICAL_REPOSITORY_ROOT / "results" / "zero-stage-compatibility"
+)
+CANONICAL_LOG_ROOT = (
+    CANONICAL_REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
+)
+EXPERIMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
+
+
+@dataclass(frozen=True)
+class RunArtifactPaths:
+    experiment_id: str
+    checkpoint_dir: Path
+    result_dir: Path
+    log_dir: Path
+
+
+def resolve_run_artifact_paths(experiment_id: str) -> RunArtifactPaths:
+    if not EXPERIMENT_ID_PATTERN.fullmatch(experiment_id):
+        raise ValueError(
+            "experiment ID must be 3-128 lowercase letters, digits, or hyphens"
+        )
+    return RunArtifactPaths(
+        experiment_id=experiment_id,
+        checkpoint_dir=CANONICAL_CHECKPOINT_ROOT / experiment_id,
+        result_dir=CANONICAL_RESULT_ROOT / experiment_id,
+        log_dir=CANONICAL_LOG_ROOT / experiment_id,
+    )
+
+
+def require_canonical_artifact_path(
+    path: str | Path,
+    *,
+    kind: Literal["checkpoint", "result", "log"],
+) -> Path:
+    roots = {
+        "checkpoint": CANONICAL_CHECKPOINT_ROOT,
+        "result": CANONICAL_RESULT_ROOT,
+        "log": CANONICAL_LOG_ROOT,
+    }
+    candidate = Path(path).expanduser().resolve(strict=False)
+    root = roots[kind].resolve(strict=False)
+    if candidate == root or not candidate.is_relative_to(root):
+        raise ValueError(f"path must be below the canonical {kind} root: {root}")
+    return candidate
+
+
+def validate_generated_artifact_paths(
+    args: argparse.Namespace,
+) -> RunArtifactPaths:
+    checkpoint_dir = require_canonical_artifact_path(
+        args.save_model_path, kind="checkpoint"
+    )
+    log_path = require_canonical_artifact_path(args.log_file, kind="log")
+    experiment_id = checkpoint_dir.name
+    paths = resolve_run_artifact_paths(experiment_id)
+    if checkpoint_dir != paths.checkpoint_dir or log_path.parent != paths.log_dir:
+        raise ValueError("checkpoint and log paths must share one experiment ID")
+    for attribute in (
+        "benchmark_run_config",
+        "benchmark_evidence_path",
+        "benchmark_smoke_resume_witness",
+    ):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            result = require_canonical_artifact_path(value, kind="result")
+            if result.parent != paths.result_dir:
+                raise ValueError(
+                    f"{attribute} must use result experiment ID {experiment_id}"
+                )
+    return paths
+```
+
+Expose `python -m src.artifact_paths resolve --experiment-id ID` as compact JSON and `validate --kind checkpoint|result|log --path PATH` as an exit-2 preflight. The resolver creates no directory. A fresh producer creates only the resolved artifact directories it will write and fails if any target experiment directory already exists; an in-place same-identity resume may reuse its validated checkpoint/result directory and writes a distinct log file below the same log directory. Call `validate_generated_artifact_paths(args)` in `main_train` immediately after argument parsing and before seeding, model import, or CUDA initialization so direct `src/main.py` execution cannot bypass canonical ownership.
+
+- [ ] **Step 4: Run artifact-layout tests and confirm GREEN**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
+./venv/ilvr-venv/bin/pytest tests/test_artifact_paths.py -q
+```
+
+Expected: all artifact-layout tests pass without creating anything below the canonical roots.
+
+- [ ] **Step 5: Write failing profile and canonical-config tests**
 
 ```python
 @pytest.mark.parametrize("zero_stage", [1, 2, 3])
@@ -134,7 +289,7 @@ def test_disabled_profile_has_no_config_identity():
     )
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [ ] **Step 6: Run the focused tests and confirm RED**
 
 Run:
 
@@ -145,7 +300,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
 
 Expected: collection fails because `src.deepspeed_runtime` and the canonical configs do not exist.
 
-- [ ] **Step 3: Implement the immutable parser and one-time digest**
+- [ ] **Step 7: Implement the immutable parser and one-time digest**
 
 ```python
 @dataclass(frozen=True)
@@ -244,7 +399,7 @@ def validate_supported_deepspeed_policy(payload: Mapping[str, object]) -> None:
 
 `bind_deepspeed_runtime_profile` must cache the immutable object on `args.deepspeed_runtime_profile`; a second call returns the same object and never re-reads or re-hashes the file.
 
-- [ ] **Step 4: Add the three concrete canonical JSON policies**
+- [ ] **Step 8: Add the three concrete canonical JSON policies**
 
 Use the validated stage-specific policies rather than inventing a common bucket policy. The canonical ZeRO-2 file is exactly the current `configs/config_stage2.json` policy with `sequence_parallel_size`, `data_parallel_size`, and `sequence_parallel_mode` removed:
 
@@ -318,7 +473,7 @@ Use this exact ZeRO-3 file:
 
 None of the three canonical files contains data/sequence topology or enabled offload.
 
-- [ ] **Step 5: Switch launcher defaults and add a preflight command**
+- [ ] **Step 9: Switch launcher defaults and add config/artifact preflight commands**
 
 Set Stage 1 defaults to `configs/deepspeed_zero3.json`, leave Stage 2 DeepSpeed optional, and validate an explicit config before `accelerate launch`:
 
@@ -329,6 +484,8 @@ Set Stage 1 defaults to `configs/deepspeed_zero3.json`, leave Stage 2 DeepSpeed 
 ```
 
 Expected CLI output is one compact JSON object containing `enabled`, `zero_stage`, `config_path`, `config_digest`, and `world_size`. The CLI exits 2 before GPU launch for malformed policy or topology mismatch.
+
+Every real launcher accepts or derives one experiment ID, resolves its three canonical directories once, and rejects user-supplied checkpoint/result/log paths outside their corresponding roots before creating directories or initializing CUDA. `run_stage1_training.sh` validates `--output-dir` as `checkpoint`, `--log-file` as `log`, and `--producer-evidence`, `--benchmark-run-config`, and `--smoke-resume-witness` as `result`. `run_stage2_training.sh` validates `OUTPUT_DIR` as `checkpoint` and `LOG_FILE` as `log`.
 
 Add `STAGE1_NUM_PROCESSES` and `STAGE2_NUM_PROCESSES`, both defaulting to 2 for DeepSpeed launches and both validated as positive integers. Stage 1 passes the former to its existing Accelerate command instead of hard-coding 2. Stage 2 keeps the current direct one-process Python command when `DEEPSPEED_CONFIG` is absent, but wraps the same `src/main.py` arguments with the repository Accelerate executable when it is present:
 
@@ -374,7 +531,7 @@ fi
 
 Official benchmark scripts set the process count to 2; fresh non-benchmark users may select another positive count.
 
-- [ ] **Step 6: Run runtime and launcher tests**
+- [ ] **Step 10: Run runtime and launcher tests**
 
 Run:
 
@@ -382,21 +539,27 @@ Run:
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
 ./venv/ilvr-venv/bin/pytest \
   tests/test_deepspeed_runtime.py \
+  tests/test_artifact_paths.py \
   tests/stage1/test_launcher.py \
+  tests/stage1/test_cli.py \
+  tests/stage2/test_routing.py \
   tests/stage2/integration/test_distributed_contract.py -q
 ```
 
 Expected: all selected tests pass; dry-run launch commands use canonical ZeRO-3 by default and preserve explicit ZeRO-1/2 paths.
 
-- [ ] **Step 7: Commit the runtime identity boundary**
+- [ ] **Step 11: Commit the artifact and runtime identity boundaries**
 
 ```bash
-git add src/deepspeed_runtime.py configs/deepspeed_zero1.json \
+git add src/artifact_paths.py src/deepspeed_runtime.py src/main.py \
+  configs/deepspeed_zero1.json \
   configs/deepspeed_zero2.json configs/deepspeed_zero3.json \
   src/utils_deepseed.py run_stage1_training.sh run_stage1_batch_probe.sh \
-  run_stage2_training.sh tests/test_deepspeed_runtime.py \
-  tests/stage1/test_launcher.py tests/stage2/integration/test_distributed_contract.py
-git commit -m "feat: add canonical ZeRO runtime profiles"
+  run_stage2_training.sh tests/test_artifact_paths.py \
+  tests/test_deepspeed_runtime.py \
+  tests/stage1/test_launcher.py tests/stage1/test_cli.py \
+  tests/stage2/test_routing.py tests/stage2/integration/test_distributed_contract.py
+git commit -m "feat: add canonical ZeRO run ownership"
 ```
 
 ### Task 2: Stage 1 ZeRO-Aware Optimizer and PEFT Lifecycle
@@ -1397,33 +1560,55 @@ def select_fastest_success(rows: Sequence[ZeroMatrixAttempt]) -> ZeroMatrixAttem
 - [ ] **Step 4: Implement the coordinator CLI without model/checkpoint hashing**
 
 ```bash
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
 ./venv/ilvr-venv/bin/python -m src.stage1.zero_matrix reuse-status \
-  --matrix-root outputs/stage1-zero-matrix \
+  --matrix-result-dir "$zero_result_root/stage1-zero-matrix" \
   --method dora \
   --deepspeed-config configs/deepspeed_zero2.json \
   --world-size 2 \
-  --sample-audit outputs/stage1-zero-matrix/sample-audit.json
+  --sample-audit "$zero_result_root/stage1-zero-matrix/sample-audit.json"
 ```
 
-The command returns JSON rows in fixed candidate order with `reuse=true` only for a complete exact identity. `audit-status --audit PATH --data-path PATH --image-root PATH --count 8` exits 0 only when the existing small audit's stored path/stat/count identity matches; it never reads or hashes dataset contents. `prepare` writes small run configs that reference the existing sample-audit digest. `select` writes `zero-matrix-report.json` atomically and copies producer witness paths/digests; it must not re-run validators or hash model/checkpoint trees.
+The command returns JSON rows in fixed candidate order with `reuse=true` only for a complete exact identity. `audit-status --candidate-audit PATH` accepts the canonical result path followed by optional read-only legacy paths, validates only stored path/stat/count identity, prints the first exact match, and exits nonzero if none match; it never writes candidates or reads/hashes dataset contents. `prepare` writes small run configs that reference the selected sample-audit digest. `select` writes `zero-matrix-report.json` atomically under the canonical matrix result directory and copies producer witness paths/digests; it must not re-run validators or hash model/checkpoint trees.
 
 For a full-matrix CLI invocation, load each of the three canonical runtime profiles exactly once into `{zero_stage: profile}` and pass those objects through all method/candidate rows. Do not call the config loader from the inner candidate loop.
 
 - [ ] **Step 5: Implement the reverse-order shell controller and selected resume**
 
-The launcher loops stages `3 2 1`, methods `full dora`, and the four fixed candidates. Before each producer it runs `reuse-status`; reusable success/failure rows are not relaunched. Each missing producer calls the existing training launcher with exactly:
+The launcher loops stages `3 2 1`, methods `full dora`, and the four fixed candidates. Before each producer it runs `reuse-status`; reusable success/failure rows are not relaunched. For each actual launch it creates a collision-resistant run suffix and resolves three distinct directories from one experiment ID:
 
 ```bash
+zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-$counter"
+experiment_id="stage1-zero${zero_stage}-${method}-mb${micro_batch}-ga${gradient_accumulation}-candidate-$run_suffix"
+checkpoint_dir="$zero_checkpoint_root/$experiment_id"
+result_dir="$zero_result_root/$experiment_id"
+log_dir="$zero_log_root/$experiment_id"
+
+mkdir -p -- "$zero_checkpoint_root" "$zero_result_root" "$zero_log_root"
+mkdir -- "$checkpoint_dir" "$result_dir" "$log_dir"
+"$launcher" \
+--method "$method" \
+--model "$model" \
+--source-data-path "$source_data_path" \
+--data-path "$probe_data" \
+--image-root "$image_root" \
+--deepspeed-config "configs/deepspeed_zero${zero_stage}.json" \
 --micro-batch "$micro_batch" \
 --gradient-accumulation "$gradient_accumulation" \
 --max-steps 3 \
 --save-strategy no \
 --no-final-save \
---benchmark-run-config "$attempt_dir/run-config.json" \
---producer-evidence "$attempt_dir/producer-evidence.json"
+--output-dir "$checkpoint_dir" \
+--log-file "$log_dir/train.log" \
+--benchmark-run-config "$result_dir/run-config.json" \
+--producer-evidence "$result_dir/producer-evidence.json" \
+>"$log_dir/stdout.log" 2>"$log_dir/stderr.log"
 ```
 
-After all four rows are present, `select` chooses the highest observed samples/sec among successes. Launch exactly one selected checkpoint-producing run and one one-step same-identity resume per `(zero_stage, method)`; if the selected resume witness already matches, skip it.
+After all four rows are present, `select` chooses the highest observed samples/sec among successes. Launch exactly one selected checkpoint-producing run using semantic segment `selected-save` and one one-step same-identity resume using `selected-resume` per `(zero_stage, method)`; append a distinct run suffix to each and use the resulting ID under all three canonical roots. If the selected resume witness already matches, skip it. Refactor `run_stage1_batch_probe.sh` to use the same checkpoint/result/log split and never create an attempt-local `output/`, `evidence/`, or `logs/` bundle under a caller-provided mixed root.
 
 - [ ] **Step 6: Run coordinator and launcher dry-run tests**
 
@@ -1456,8 +1641,8 @@ git commit -m "feat: add bounded Stage 1 ZeRO batch matrix"
 - Modify: `tests/stage2/integration/test_distributed_contract.py`
 
 **Interfaces:**
-- Consumes: canonical configs, runtime sidecars, Stage 1 trainer lifecycle, and Stage 2 balanced sampler.
-- Produces: opt-in JSON witnesses for Stage 1 `(zero_stage, method, save/resume)` and Stage 2 `(zero_stage, per-rank latent-block sequence, one applied step)`.
+- Consumes: `resolve_run_artifact_paths` from Task 1, canonical configs, runtime sidecars, Stage 1 trainer lifecycle, and Stage 2 balanced sampler.
+- Produces: opt-in canonical JSON witnesses for Stage 1 `(zero_stage, method, save/resume)` and Stage 2 `(zero_stage, per-rank latent-block sequence, one applied step)` without accepting arbitrary output paths.
 
 - [ ] **Step 1: Write failing harness command-contract tests**
 
@@ -1469,7 +1654,7 @@ def test_stage1_diagnostic_accepts_all_supported_pairs():
             args = parser.parse_args([
                 "--zero-stage", str(stage), "--method", method,
                 "--deepspeed", f"configs/deepspeed_zero{stage}.json",
-                "--output-dir", "/tmp/witness",
+                "--experiment-id", f"stage1-zero{stage}-{method}-tiny-lifecycle",
             ])
             assert (args.zero_stage, args.method) == (stage, method)
 
@@ -1481,7 +1666,7 @@ def test_rank_skew_harness_requires_one_optimizer_step():
         "--stage1-checkpoint", "/tmp/stage1",
         "--data-path", "/tmp/train.jsonl",
         "--image-root", "/tmp/images",
-        "--output", "/tmp/witness.json",
+        "--experiment-id", "stage2-zero3-dora-mb1-ga8-rank-skew",
     ])
     assert args.max_steps == 1
     assert args.micro_batch == 1
@@ -1506,6 +1691,8 @@ Expected: imports fail for the new harness parser functions.
 Adapt the existing tiny model/data fixtures, but parameterize config and method instead of copying the production benchmark. The process must perform one applied optimizer step, save `checkpoint-1`, resume the same identity for one more step, and write only small scalar/path evidence:
 
 ```python
+paths = resolve_run_artifact_paths(args.experiment_id)
+checkpoint = paths.checkpoint_dir / "checkpoint-1"
 witness = {
     "schema_version": 1,
     "stage": "stage1",
@@ -1519,10 +1706,13 @@ witness = {
     "checkpoint": str(checkpoint),
 }
 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-    (args.output_dir / "witness.json").write_text(
+    paths.result_dir.mkdir(parents=True, exist_ok=False)
+    (paths.result_dir / "witness.json").write_text(
         json.dumps(witness, sort_keys=True, indent=2) + "\n"
     )
 ```
+
+Both Trainer phases belong to one bounded lifecycle execution: they write below `paths.checkpoint_dir`, the second phase reads its `checkpoint-1`, and the invoking shell redirects combined stdout/stderr below `paths.log_dir`. Update `tiny_stage2_train.py` to use the same single `--experiment-id` contract and place its combined resume witness under `paths.result_dir`.
 
 Use this harness only for ZeRO-1/2 Full/DoRA during Task 9; the existing validated ZeRO-3 lifecycle supplies the regression witness unless common-path tests demand the one lightweight rerun.
 
@@ -1548,6 +1738,7 @@ def select_probe_examples(examples: Sequence[Stage2PreparedExample]):
 This yields 16 retained examples split evenly across two buckets. With world size 2, micro-batch 1, and accumulation 8, the balanced sampler supplies exactly eight aligned micro-steps per rank without a second data pass.
 
 ```python
+paths = resolve_run_artifact_paths(args.experiment_id)
 witness = {
     "schema_version": 1,
     "stage": "stage2",
@@ -1563,6 +1754,11 @@ witness = {
     "rank_peak_allocated_bytes": gathered_peak_allocated,
     "rank_peak_reserved_bytes": gathered_peak_reserved,
 }
+if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    paths.result_dir.mkdir(parents=True, exist_ok=False)
+    (paths.result_dir / "rank-skew.json").write_text(
+        json.dumps(witness, sort_keys=True, indent=2) + "\n"
+    )
 ```
 
 Exit nonzero if the step count is not 1, either rank executes other than eight micro-steps, any rank sequence differs in length, any micro-step has differing block counts/forward counts, a memory metric is invalid, or the output profile does not match the selected config. This single probe is both the rank-skew compatibility check and the Stage 2 peak-memory producer; do not add another Stage 2 smoke or memory run.
@@ -1611,15 +1807,23 @@ Document this support table:
 
 Include fresh Stage 1 and Stage 2 commands selecting `configs/deepspeed_zero1.json`, `deepspeed_zero2.json`, or `deepspeed_zero3.json`, plus same-identity resume examples. State that changing stage, digest, or world size is rejected before DeepSpeed initialization.
 
+Add an artifact-ownership section containing the three exact canonical roots, the shared experiment-ID rule, and the read-only legacy `outputs/` rule. State explicitly that checkpoint inputs may come from other validated locations, while every newly generated checkpoint/result/log must be written below its canonical root even when the command runs from a linked worktree.
+
 Use these exact ZeRO-2 examples in the guide; changing only the canonical config filename selects another stage:
 
 ```bash
+zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+experiment_id="stage1-zero2-dora-fresh-example-$run_suffix"
+
 ./run_stage1_training.sh \
   --method dora \
   --model Qwen/Qwen2.5-VL-3B-Instruct \
   --data-path "$PWD/data/TRAIN.jsonl" \
   --image-root "$PWD/data" \
-  --output-dir "$PWD/outputs/stage1-zero2-dora" \
+  --output-dir "$zero_checkpoint_root/$experiment_id" \
+  --log-file "$zero_log_root/$experiment_id/train.log" \
   --micro-batch 1 \
   --gradient-accumulation 8 \
   --epochs 3 \
@@ -1634,34 +1838,40 @@ Use these exact ZeRO-2 examples in the guide; changing only the canonical config
   --model Qwen/Qwen2.5-VL-3B-Instruct \
   --data-path "$PWD/data/TRAIN.jsonl" \
   --image-root "$PWD/data" \
-  --output-dir "$PWD/outputs/stage1-zero2-dora" \
+  --output-dir "$zero_checkpoint_root/$experiment_id" \
+  --log-file "$zero_log_root/$experiment_id/resume.log" \
   --micro-batch 1 \
   --gradient-accumulation 8 \
   --epochs 3 \
   --learning-rate 1e-5 \
   --seed 42 \
   --deepspeed-config "$PWD/configs/deepspeed_zero2.json" \
-  --resume "$PWD/outputs/stage1-zero2-dora/checkpoint-100"
+  --resume "$zero_checkpoint_root/$experiment_id/checkpoint-100"
 ```
 
 ```bash
-STAGE1_CHECKPOINT="$PWD/outputs/stage1-dora-final" \
+zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+experiment_id="stage2-zero2-dora-fresh-example-$run_suffix"
+
+STAGE1_CHECKPOINT="$zero_checkpoint_root/stage1-dora-final" \
 DATA_PATH="$PWD/data/TRAIN.jsonl" \
 IMAGE_ROOT="$PWD/data" \
-OUTPUT_DIR="$PWD/outputs/stage2-zero2-dora" \
-LOG_FILE="$PWD/outputs/stage2-zero2-dora/train.log" \
+OUTPUT_DIR="$zero_checkpoint_root/$experiment_id" \
+LOG_FILE="$zero_log_root/$experiment_id/train.log" \
 TUNING_METHOD=dora \
 DEEPSPEED_CONFIG="$PWD/configs/deepspeed_zero2.json" \
 GRADIENT_ACCUMULATION_STEPS=8 \
 ATTENTION_IMPLEMENTATION=flash_attention_2 \
 ./run_stage2_training.sh
 
-STAGE1_CHECKPOINT="$PWD/outputs/stage1-dora-final" \
+STAGE1_CHECKPOINT="$zero_checkpoint_root/stage1-dora-final" \
 DATA_PATH="$PWD/data/TRAIN.jsonl" \
 IMAGE_ROOT="$PWD/data" \
-OUTPUT_DIR="$PWD/outputs/stage2-zero2-dora" \
-LOG_FILE="$PWD/outputs/stage2-zero2-dora/resume.log" \
-RESUME_CHECKPOINT="$PWD/outputs/stage2-zero2-dora/checkpoint-100" \
+OUTPUT_DIR="$zero_checkpoint_root/$experiment_id" \
+LOG_FILE="$zero_log_root/$experiment_id/resume.log" \
+RESUME_CHECKPOINT="$zero_checkpoint_root/$experiment_id/checkpoint-100" \
 DEEPSPEED_CONFIG="$PWD/configs/deepspeed_zero2.json" \
 GRADIENT_ACCUMULATION_STEPS=8 \
 ATTENTION_IMPLEMENTATION=flash_attention_2 \
@@ -1680,7 +1890,7 @@ Use explicit status rows instead of numeric filler:
 | 3 | Full | recorded by Task 10 | not recorded in this document yet | not recorded in this document yet | pending Task 10 |
 ```
 
-Explain that machine-readable results live under `outputs/stage1-zero-matrix/zero-matrix-report.json` and Stage 2 rank-skew witnesses under `outputs/stage2-zero-compat/`; do not claim hardware success before Tasks 9–10.
+Explain that the matrix report lives at `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json` and each Stage 2 rank-skew witness lives below the same canonical result root in its experiment-ID directory; do not claim hardware success before Tasks 9–10.
 
 - [ ] **Step 3: Run one focused CPU suite**
 
@@ -1690,6 +1900,7 @@ Run:
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src:$PWD/tests/stage1:$PWD/tests/stage2" \
 ./venv/ilvr-venv/bin/pytest \
   tests/test_deepspeed_runtime.py \
+  tests/test_artifact_paths.py \
   tests/stage1/test_trainer.py \
   tests/stage1/test_ema.py \
   tests/stage1/test_peft.py \
@@ -1727,8 +1938,9 @@ git commit -m "docs: describe ZeRO stage training and resume"
 ### Task 9: Run Only Missing Distributed Compatibility Gates
 
 **Files:**
-- Record: `outputs/stage1-zero-compat/zero{1,2}-{full,dora}/witness.json`
-- Record: `outputs/stage2-zero-compat/zero{1,2,3}-rank-skew.json`
+- Record checkpoints: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/<experiment-id>/`
+- Record witnesses: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/<experiment-id>/*.json`
+- Record logs: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/<experiment-id>/{stdout,stderr}.log`
 - Reuse: existing Stage 2 ZeRO-1/2 DoRA save/resume feasibility evidence
 
 **Interfaces:**
@@ -1740,47 +1952,77 @@ git commit -m "docs: describe ZeRO stage training and resume"
 Run:
 
 ```bash
-find outputs -maxdepth 4 -type f \
-  \( -name '*zero*evidence*.json' -o -name '*rank-skew*.json' -o -name '*resume*.json' \) \
-  -print | sort
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+for evidence_root in "$zero_result_root" "$PWD/outputs"; do
+  if [[ -d "$evidence_root" ]]; then
+    rg --files "$evidence_root" | rg '(evidence|witness|rank-skew|resume).*\.json$'
+  fi
+done | sort -u
 ```
 
-Open only candidate JSON files smaller than 1 MiB and compare `zero_stage`, `config_digest`, `world_size`, method, and harness schema. Do not read or hash checkpoint weights. The task log records the exact reusable paths; no extra manifest is needed.
+The second root is legacy read-only provenance. Open only candidate JSON files smaller than 1 MiB and compare `zero_stage`, `config_digest`, `world_size`, method, and harness schema. Do not move legacy files, write into `outputs/`, or read/hash checkpoint weights. The task log records exact reusable paths; no extra manifest is needed.
 
 - [ ] **Step 2: Run missing Stage 1 ZeRO-1 Full/DoRA tiny lifecycles**
 
 Run each missing method once:
 
 ```bash
+zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+experiment_id="stage1-zero1-full-tiny-lifecycle-$run_suffix"
+mkdir -p -- "$zero_log_root"
+mkdir -- "$zero_log_root/$experiment_id"
 CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
   --standalone --nproc_per_node=2 tests/stage1/zero_compat_diagnostic.py \
   --zero-stage 1 --method full \
   --deepspeed configs/deepspeed_zero1.json \
-  --output-dir outputs/stage1-zero-compat/zero1-full
+  --experiment-id "$experiment_id" \
+  >"$zero_log_root/$experiment_id/stdout.log" \
+  2>"$zero_log_root/$experiment_id/stderr.log"
 
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+experiment_id="stage1-zero1-dora-tiny-lifecycle-$run_suffix"
+mkdir -- "$zero_log_root/$experiment_id"
 CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
   --standalone --nproc_per_node=2 tests/stage1/zero_compat_diagnostic.py \
   --zero-stage 1 --method dora \
   --deepspeed configs/deepspeed_zero1.json \
-  --output-dir outputs/stage1-zero-compat/zero1-dora
+  --experiment-id "$experiment_id" \
+  >"$zero_log_root/$experiment_id/stdout.log" \
+  2>"$zero_log_root/$experiment_id/stderr.log"
 ```
 
-Expected: each command exits 0 and its small JSON records steps 1→2, finite norm, matching runtime sidecar, and method.
+Expected: each command exits 0; its checkpoint, witness, and logs share the experiment ID under their respective canonical roots, and the witness records steps 1→2, finite norm, matching runtime sidecar, and method.
 
 - [ ] **Step 3: Run missing Stage 1 ZeRO-2 Full/DoRA tiny lifecycles**
 
 ```bash
+zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+experiment_id="stage1-zero2-full-tiny-lifecycle-$run_suffix"
+mkdir -p -- "$zero_log_root"
+mkdir -- "$zero_log_root/$experiment_id"
 CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
   --standalone --nproc_per_node=2 tests/stage1/zero_compat_diagnostic.py \
   --zero-stage 2 --method full \
   --deepspeed configs/deepspeed_zero2.json \
-  --output-dir outputs/stage1-zero-compat/zero2-full
+  --experiment-id "$experiment_id" \
+  >"$zero_log_root/$experiment_id/stdout.log" \
+  2>"$zero_log_root/$experiment_id/stderr.log"
 
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+experiment_id="stage1-zero2-dora-tiny-lifecycle-$run_suffix"
+mkdir -- "$zero_log_root/$experiment_id"
 CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
   --standalone --nproc_per_node=2 tests/stage1/zero_compat_diagnostic.py \
   --zero-stage 2 --method dora \
   --deepspeed configs/deepspeed_zero2.json \
-  --output-dir outputs/stage1-zero-compat/zero2-dora
+  --experiment-id "$experiment_id" \
+  >"$zero_log_root/$experiment_id/stdout.log" \
+  2>"$zero_log_root/$experiment_id/stderr.log"
 ```
 
 Expected: each command exits 0 with the same bounded witness contract. If any run fails unexpectedly, stop the compatibility gate and invoke systematic debugging; do not proceed to the performance matrix.
@@ -1790,21 +2032,31 @@ Expected: each command exits 0 with the same bounded witness contract. If any ru
 Verify only their small recorded identity/result documents. If they lack the new sidecar schema because Task 3 changed the checkpoint contract, run the tiny Stage 2 harness exactly once for the affected ZeRO stage; otherwise do not repeat those save/resume jobs.
 
 ```bash
+zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+experiment_id="stage2-zero1-dora-tiny-lifecycle-$run_suffix"
+mkdir -p -- "$zero_log_root"
+mkdir -- "$zero_log_root/$experiment_id"
 CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
   --standalone --nproc_per_node=2 \
   tests/stage2/integration/tiny_stage2_train.py \
-  --output-dir outputs/stage2-zero-compat/zero1-dora-resume \
-  --witness-path outputs/stage2-zero-compat/zero1-dora-resume.json \
+  --experiment-id "$experiment_id" \
   --deepspeed configs/deepspeed_zero1.json \
-  --tuning-method dora
+  --tuning-method dora \
+  >"$zero_log_root/$experiment_id/stdout.log" \
+  2>"$zero_log_root/$experiment_id/stderr.log"
 
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+experiment_id="stage2-zero2-dora-tiny-lifecycle-$run_suffix"
+mkdir -- "$zero_log_root/$experiment_id"
 CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
   --standalone --nproc_per_node=2 \
   tests/stage2/integration/tiny_stage2_train.py \
-  --output-dir outputs/stage2-zero-compat/zero2-dora-resume \
-  --witness-path outputs/stage2-zero-compat/zero2-dora-resume.json \
+  --experiment-id "$experiment_id" \
   --deepspeed configs/deepspeed_zero2.json \
-  --tuning-method dora
+  --tuning-method dora \
+  >"$zero_log_root/$experiment_id/stdout.log" \
+  2>"$zero_log_root/$experiment_id/stderr.log"
 ```
 
 Run only the command(s) whose exact identity check failed in Step 1; do not execute both when either stage already has a matching sidecar-era witness.
@@ -1815,7 +2067,12 @@ Run exactly these three commands, skipping an exact successful witness found in 
 
 ```bash
 : "${STAGE1_CHECKPOINT:?set STAGE1_CHECKPOINT to the validated Stage 1 DoRA handoff}"
+zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
 for zero_stage in 1 2 3; do
+  run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+  experiment_id="stage2-zero${zero_stage}-dora-mb1-ga8-rank-skew-$run_suffix"
+  mkdir -p -- "$zero_log_root"
+  mkdir -- "$zero_log_root/$experiment_id"
   CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
     --standalone --nproc_per_node=2 \
     tests/stage2/integration/stage2_rank_skew_probe.py \
@@ -1827,7 +2084,9 @@ for zero_stage in 1 2 3; do
     --tuning-method dora \
     --micro-batch 1 \
     --gradient-accumulation-steps 8 \
-    --output "outputs/stage2-zero-compat/zero${zero_stage}-rank-skew.json"
+    --experiment-id "$experiment_id" \
+    >"$zero_log_root/$experiment_id/stdout.log" \
+    2>"$zero_log_root/$experiment_id/stderr.log"
 done
 ```
 
@@ -1841,7 +2100,11 @@ Run:
 ./venv/ilvr-venv/bin/python - <<'PY'
 import json
 from pathlib import Path
-for path in sorted(Path("outputs").glob("stage*-zero-compat/**/*.json")):
+root = Path(
+    "/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/"
+    "results/zero-stage-compatibility"
+)
+for path in sorted(root.glob("stage*-zero*/**/*.json")):
     payload = json.loads(path.read_text())
     print(path, payload.get("zero_stage"), payload.get("optimizer_steps"),
           payload.get("aligned_at_every_micro_step", payload.get("resumed_global_step")))
@@ -1853,9 +2116,10 @@ Expected: each required identity has one successful witness. Do not run a second
 ### Task 10: Run the Missing Stage 1 Batch Matrix in Reverse Order
 
 **Files:**
-- Record: `outputs/stage1-zero-matrix/**/producer-evidence.json`
-- Record: `outputs/stage1-zero-matrix/zero-matrix-report.json`
-- Record: selected checkpoint/resume witnesses only
+- Record candidate/selected checkpoints: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/<experiment-id>/`
+- Record per-run evidence: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/<experiment-id>/producer-evidence.json`
+- Record aggregate report: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json`
+- Record per-run logs: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/<experiment-id>/`
 
 **Interfaces:**
 - Consumes: Task 6 coordinator, Task 9 compatibility success, existing exact ZeRO-3 evidence, and one authenticated sample-audit digest.
@@ -1866,35 +2130,51 @@ Expected: each required identity has one successful witness. Do not run a second
 If no valid sample-audit witness exists, run the benchmark's existing bounded audit command once against `data/TRAIN.jsonl` and `data/`, then pass its digest to every matrix producer. If it exists and matches model, dataset path/stat identity, seed 42, and row selection, do not rerun or rehash the dataset.
 
 ```bash
-mkdir -p outputs/stage1-zero-matrix
-if ! PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+canonical_audit="$zero_result_root/stage1-zero-matrix/sample-audit.json"
+legacy_audit="$PWD/outputs/stage1-zero-matrix/sample-audit.json"
+mkdir -p -- "$zero_result_root/stage1-zero-matrix"
+if ! sample_audit=$(PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
   ./venv/ilvr-venv/bin/python -m src.stage1.zero_matrix audit-status \
-    --audit "$PWD/outputs/stage1-zero-matrix/sample-audit.json" \
+    --candidate-audit "$canonical_audit" \
+    --candidate-audit "$legacy_audit" \
     --data-path "$PWD/data/TRAIN.jsonl" \
     --image-root "$PWD/data" \
-    --count 8; then
+    --count 8); then
   PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
   ./venv/ilvr-venv/bin/python -m src.stage1.benchmark audit \
     --data-path "$PWD/data/TRAIN.jsonl" \
     --image-root "$PWD/data" \
-    --output "$PWD/outputs/stage1-zero-matrix/sample-audit.json" \
+    --output "$canonical_audit" \
     --count 8
+  sample_audit="$canonical_audit"
 fi
+printf 'sample_audit=%s\n' "$sample_audit"
 ```
 
-Expected: a pre-existing exact audit is left untouched, or one new small audit JSON is produced. The executor records its returned digest and does not read/hash the dataset again in this workflow.
+Expected: an exact canonical or legacy audit path is printed and left untouched, or one new small audit JSON is produced under the canonical result root. Nothing is written into legacy `outputs/`, and the dataset is not read/hashed again in this workflow.
 
 - [ ] **Step 2: Ask the coordinator which producers are reusable**
 
 Run:
 
 ```bash
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+canonical_audit="$zero_result_root/stage1-zero-matrix/sample-audit.json"
+legacy_audit="$PWD/outputs/stage1-zero-matrix/sample-audit.json"
+sample_audit=$(PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
+  ./venv/ilvr-venv/bin/python -m src.stage1.zero_matrix audit-status \
+  --candidate-audit "$canonical_audit" \
+  --candidate-audit "$legacy_audit" \
+  --data-path "$PWD/data/TRAIN.jsonl" \
+  --image-root "$PWD/data" \
+  --count 8)
 PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
 ./venv/ilvr-venv/bin/python -m src.stage1.zero_matrix reuse-status \
-  --matrix-root outputs/stage1-zero-matrix \
+  --matrix-result-dir "$zero_result_root/stage1-zero-matrix" \
   --world-size 2 \
   --effective-global-batch 16 \
-  --sample-audit outputs/stage1-zero-matrix/sample-audit.json
+  --sample-audit "$sample_audit"
 ```
 
 Expected: JSON lists stages 3→2→1, methods Full/DoRA, candidates 8→4→2→1, and exact reuse reasons. If the existing authenticated ZeRO-3 producer identity matches, reuse it. Do not hash its checkpoint tree. Omitting `--method` and `--deepspeed-config` deliberately requests the full canonical matrix; the single-profile form from Task 6 remains available for debugging one row.
@@ -1904,30 +2184,40 @@ Expected: JSON lists stages 3→2→1, methods Full/DoRA, candidates 8→4→2�
 Run:
 
 ```bash
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+matrix_result_id=stage1-zero-matrix
+run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+controller_log_id="stage1-zero-matrix-controller-$run_suffix"
+mkdir -p -- "$zero_log_root"
+mkdir -- "$zero_log_root/$controller_log_id"
 CUDA_VISIBLE_DEVICES=0,1 \
 STAGE1_MODEL_NAME_OR_PATH=Qwen/Qwen2.5-VL-3B-Instruct \
 STAGE1_DATA_PATH="$PWD/data/TRAIN.jsonl" \
 STAGE1_IMAGE_ROOT="$PWD/data" \
 ./run_stage1_zero_matrix.sh \
-  --matrix-root "$PWD/outputs/stage1-zero-matrix" \
+  --matrix-result-dir "$zero_result_root/$matrix_result_id" \
   --world-size 2 \
-  --seed 42
+  --seed 42 \
+  >"$zero_log_root/$controller_log_id/stdout.log" \
+  2>"$zero_log_root/$controller_log_id/stderr.log"
 ```
 
 Expected: the controller runs only missing candidates, each for exactly three optimizer steps, in stage order 3→2→1 and candidate order 8→4→2→1. Successful rows contain samples/sec, seconds/step, rank peak allocated/reserved bytes, finite diagnostics, and identity. CUDA allocator failures are recorded as `capacity_oom`; any other failure stops that `(stage, method)` workflow as `integration_failure`.
 
 - [ ] **Step 4: Confirm selected-only resume witnesses**
 
-Inspect `zero-matrix-report.json`. For each successful `(zero_stage, method)`, confirm exactly one selected candidate and exactly one same-identity checkpoint→one-step-resume witness. If the controller stopped before selected resume, run its printed exact resume command once; do not save/resume losing candidates.
+Inspect `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json`. For each successful `(zero_stage, method)`, confirm exactly one selected candidate and exactly one same-identity checkpoint→one-step-resume witness. Confirm every recorded checkpoint/result/log path belongs to its canonical root and uses the same experiment ID. If the controller stopped before selected resume, run its printed exact canonical-path resume command once; do not save/resume losing candidates.
 
 - [ ] **Step 5: Stop compute after the report is complete**
 
 Run the coordinator's small report validator once:
 
 ```bash
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
 PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
 ./venv/ilvr-venv/bin/python -m src.stage1.zero_matrix select \
-  --matrix-root outputs/stage1-zero-matrix \
+  --matrix-result-dir "$zero_result_root/stage1-zero-matrix" \
   --require-selected-resume
 ```
 
@@ -1946,7 +2236,7 @@ Expected: exit 0 and the existing report path/digest. This validator reads produ
 
 - [ ] **Step 1: Copy measured scalar results into the guide**
 
-For each Stage 1 stage/method row, copy `micro_batch`, `gradient_accumulation_steps`, `rank_peak_reserved_bytes`, `samples_per_second`, status, and resume result from `zero-matrix-report.json`. For Stage 2, record fixed micro 1/accumulation 8 plus rank-skew compatibility and any already-observed peak memory witness. Cite the small JSON path and digest; do not derive a new checkpoint digest.
+For each Stage 1 stage/method row, copy `micro_batch`, `gradient_accumulation_steps`, `rank_peak_reserved_bytes`, `samples_per_second`, status, and resume result from the canonical `results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json`. For Stage 2, record fixed micro 1/accumulation 8 plus rank-skew compatibility and any already-observed peak memory witness. Cite the absolute canonical result path and digest; do not derive a new checkpoint digest.
 
 - [ ] **Step 2: Inspect the implementation diff for contract gaps**
 
@@ -1972,7 +2262,7 @@ git diff --cached --check
 git commit -m "docs: record ZeRO batch and memory results"
 ```
 
-If a focused regression fix exists, commit its production and test files separately before this documentation commit. Never stage `outputs/`, `cache/`, `__pycache__/`, or unrelated pre-existing changes.
+If a focused regression fix exists, commit its production and test files separately before this documentation commit. Never stage generated `checkpoints/`, `results/`, `logs/`, legacy `outputs/`, `cache/`, `__pycache__/`, or unrelated pre-existing changes.
 
 - [ ] **Step 5: Apply completion criteria without another hardware run**
 
@@ -1984,5 +2274,6 @@ Confirm from existing witnesses that:
 4. Numbered checkpoints and selected resumes contain matching runtime identity; Stage 1 also contains EMA and Stage 2 sampler identity.
 5. Every Stage 1 stage/method has four classified candidates or an explicitly reported integration failure, one selected fastest success, and one selected resume witness.
 6. Documentation contains measured values and evidence paths without claiming unsupported world sizes.
+7. Every newly generated checkpoint, result, and log path is below its exact canonical root; each independent producer uses one unique experiment ID across its artifact types, bounded same-identity lifecycle phases keep their logical experiment ID, and no legacy `outputs/` path has been modified.
 
 Stop and report immediately when these checks are satisfied; do not add a broad smoke suite, rerun a producer, or recursively validate artifacts.
