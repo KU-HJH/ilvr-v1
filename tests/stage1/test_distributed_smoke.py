@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from stage1.benchmark import run_or_load_distributed_witness
-from zero_compat_diagnostic import build_zero_compat_parser
+from tests.stage1.zero_compat_diagnostic import build_zero_compat_parser
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
