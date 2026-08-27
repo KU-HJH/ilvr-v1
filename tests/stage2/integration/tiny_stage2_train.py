@@ -23,6 +23,7 @@ from transformers import (
     TrainerCallback,
 )
 
+from artifact_paths import resolve_run_artifact_paths
 from main import build_stage2_training_arguments
 from deepspeed_runtime import load_deepspeed_runtime_profile
 from stage2.checkpointing import build_stage2_peft_metadata
@@ -286,6 +287,27 @@ def _is_world_process_zero() -> bool:
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
 
+def _claim_owned_paths(experiment_id: str):
+    paths = resolve_run_artifact_paths(experiment_id)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1 and not dist.is_initialized():
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    collision = paths.checkpoint_dir.exists() or paths.result_dir.exists()
+    if dist.is_initialized():
+        device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        observed = torch.tensor(int(collision), dtype=torch.int32, device=device)
+        dist.all_reduce(observed, op=dist.ReduceOp.MAX)
+        collision = bool(observed.item())
+    if collision:
+        raise FileExistsError(f"refusing to reuse experiment ID: {experiment_id}")
+    paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if dist.is_initialized():
+        dist.barrier()
+    return paths
+
+
 def _tuning_config(method: str) -> Stage2TuningConfig:
     return Stage2TuningConfig(
         method=method,
@@ -424,12 +446,13 @@ def _assert_contract(witness):
 
 def run_harness(
     *,
-    output_dir: Path,
-    witness_path: Path,
+    experiment_id: str,
     deepspeed: str | None,
     tuning_method: str,
 ):
-    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = _claim_owned_paths(experiment_id)
+    output_dir = paths.checkpoint_dir
+    witness_path = paths.result_dir / "witness.json"
     runtime_profile = load_deepspeed_runtime_profile(
         deepspeed, world_size=int(os.environ.get("WORLD_SIZE", "1"))
     )
@@ -573,31 +596,33 @@ def run_harness(
         "peft_version": peft.__version__,
         "harness_path": str(Path(__file__).resolve()),
         "checkpoint": str(checkpoint),
+        "experiment_id": paths.experiment_id,
     }
     _assert_contract(witness)
     if _is_world_process_zero():
-        witness_path.parent.mkdir(parents=True, exist_ok=True)
+        witness_path.parent.mkdir(parents=True, exist_ok=False)
         witness_path.write_text(json.dumps(witness, indent=2, sort_keys=True) + "\n")
         print(json.dumps(witness, sort_keys=True), flush=True)
 
 
-def parse_args():
+def build_tiny_stage2_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--witness-path", type=Path)
+    parser.add_argument("--experiment-id", required=True)
     parser.add_argument("--deepspeed")
     parser.add_argument(
         "--tuning-method", choices=("full", "lora", "dora"), default="full"
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None):
+    return build_tiny_stage2_parser().parse_args(argv)
 
 
 def main():
     args = parse_args()
-    witness_path = args.witness_path or args.output_dir / "witness.json"
     run_harness(
-        output_dir=args.output_dir.resolve(),
-        witness_path=witness_path.resolve(),
+        experiment_id=args.experiment_id,
         deepspeed=args.deepspeed,
         tuning_method=args.tuning_method,
     )

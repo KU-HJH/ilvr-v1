@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from stage1.benchmark import run_or_load_distributed_witness
+from zero_compat_diagnostic import build_zero_compat_parser
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +17,46 @@ if SELECTED_METHOD not in {None, "full", "dora"}:
         "invalid ILVR_DISTRIBUTED_METHOD: expected full or dora, "
         f"got {SELECTED_METHOD!r}"
     )
+
+
+def test_stage1_diagnostic_accepts_all_supported_pairs():
+    """Catches a supported ZeRO/method lifecycle becoming unlaunchable."""
+    parser = build_zero_compat_parser()
+    for stage in (1, 2, 3):
+        for method in ("full", "dora"):
+            args = parser.parse_args(
+                [
+                    "--zero-stage",
+                    str(stage),
+                    "--method",
+                    method,
+                    "--deepspeed",
+                    f"configs/deepspeed_zero{stage}.json",
+                    "--experiment-id",
+                    f"stage1-zero{stage}-{method}-tiny-lifecycle",
+                ]
+            )
+            assert (args.zero_stage, args.method) == (stage, method)
+
+
+def test_stage1_diagnostic_has_no_arbitrary_generated_path_arguments():
+    """Catches callers bypassing canonical artifact ownership."""
+    parser = build_zero_compat_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--zero-stage",
+                "2",
+                "--method",
+                "dora",
+                "--deepspeed",
+                "configs/deepspeed_zero2.json",
+                "--experiment-id",
+                "stage1-zero2-dora-tiny-lifecycle",
+                "--output-dir",
+                "/tmp/unowned",
+            ]
+        )
 
 
 @pytest.fixture

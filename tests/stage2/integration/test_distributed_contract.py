@@ -21,6 +21,10 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     parse_latent_spans,
 )
 from src.artifact_paths import resolve_run_artifact_paths
+from stage2_rank_skew_probe import (
+    build_rank_skew_parser,
+    select_probe_examples,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -34,6 +38,86 @@ def _load_harness_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def test_tiny_stage2_harness_owns_checkpoint_and_witness_by_one_id():
+    """Catches the save/resume harness accepting split generated destinations."""
+    parser = _load_harness_module().build_tiny_stage2_parser()
+    args = parser.parse_args(
+        ["--experiment-id", "stage2-zero2-dora-tiny-lifecycle"]
+    )
+    assert args.experiment_id == "stage2-zero2-dora-tiny-lifecycle"
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--experiment-id",
+                "stage2-zero2-dora-tiny-lifecycle",
+                "--witness-path",
+                "/tmp/unowned.json",
+            ]
+        )
+
+
+def test_rank_skew_harness_requires_one_optimizer_step():
+    """Catches the bounded distributed probe growing beyond one applied step."""
+    args = build_rank_skew_parser().parse_args(
+        [
+            "--deepspeed",
+            "configs/deepspeed_zero3.json",
+            "--model",
+            "Qwen/Qwen2.5-VL-3B-Instruct",
+            "--stage1-checkpoint",
+            "/tmp/stage1",
+            "--data-path",
+            "/tmp/train.jsonl",
+            "--image-root",
+            "/tmp/images",
+            "--experiment-id",
+            "stage2-zero3-dora-mb1-ga8-rank-skew",
+        ]
+    )
+
+    assert args.method == "dora"
+    assert args.max_steps == 1
+    assert args.micro_batch == 1
+    assert args.gradient_accumulation_steps == 8
+
+
+def test_rank_skew_harness_selects_eight_examples_from_two_buckets():
+    """Catches the probe selecting insufficient or unbalanced latent work."""
+    examples = [
+        SimpleNamespace(latent_block_count=count, marker=marker)
+        for marker, count in enumerate((1, 2, 1, 3))
+    ]
+
+    selected = select_probe_examples(examples)
+
+    assert len(selected) == 16
+    assert [row.latent_block_count for row in selected] == [1] * 8 + [2] * 8
+
+
+def test_rank_skew_harness_has_no_arbitrary_generated_path_arguments():
+    """Catches the probe accepting an unowned witness destination."""
+    parser = build_rank_skew_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--deepspeed",
+                "configs/deepspeed_zero3.json",
+                "--model",
+                "Qwen/Qwen2.5-VL-3B-Instruct",
+                "--stage1-checkpoint",
+                "/tmp/stage1",
+                "--data-path",
+                "/tmp/train.jsonl",
+                "--image-root",
+                "/tmp/images",
+                "--experiment-id",
+                "stage2-zero3-dora-mb1-ga8-rank-skew",
+                "--witness-path",
+                "/tmp/unowned.json",
+            ]
+        )
 
 
 def _stage2_args(**overrides):
@@ -314,15 +398,14 @@ def test_boundary_counts_zero_sized_zero3_parameter_names():
 @pytest.mark.parametrize("method", ["full", "lora", "dora"])
 def test_tiny_stage2_harness_restores_full_training_state(tmp_path, method):
     """Catches resume losing model artifacts, frozen vision, or Trainer state."""
-    witness_path = tmp_path / "witness.json"
+    experiment_id = f"stage2-zero-disabled-{method}-tiny-lifecycle"
+    paths = resolve_run_artifact_paths(experiment_id)
     result = subprocess.run(
         [
             sys.executable,
             str(REPO_ROOT / "tests/stage2/integration/tiny_stage2_train.py"),
-            "--output-dir",
-            str(tmp_path / "train"),
-            "--witness-path",
-            str(witness_path),
+            "--experiment-id",
+            experiment_id,
             "--tuning-method",
             method,
         ],
@@ -334,7 +417,7 @@ def test_tiny_stage2_harness_restores_full_training_state(tmp_path, method):
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
-    witness = json.loads(witness_path.read_text())
+    witness = json.loads((paths.result_dir / "witness.json").read_text())
     assert witness["tuning_method"] == method
     assert witness["first_global_step"] == 1
     assert witness["resumed_global_step"] == 2
