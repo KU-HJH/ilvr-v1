@@ -7,10 +7,12 @@ import os
 import argparse
 import math
 import sys
+from pathlib import Path
 from datasets import Dataset
 from transformers import LogitsProcessor
 from stage2.peft import normalize_stage2_target_modules
 from peft_common import normalize_decoder_target_suffixes
+from artifact_paths import resolve_run_artifact_paths
 
 from transformers import LogitsProcessor
 import torch
@@ -29,7 +31,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--epochs", type=float, default=2)
     parser.add_argument("--data_path", type=str, default='PathToJsonlData')
-    parser.add_argument("--log_file", type=str, default='./log.txt')
+    parser.add_argument("--log_file", type=str, default=None)
     parser.add_argument("--save_model_path", type=str, default='./checkpoints/model_stage1')
     parser.add_argument("--load_model_path", type=str, default='./checkpoints/model_stage1')
     parser.add_argument("--cache_dir", type=str, default='./cache')
@@ -106,6 +108,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
+    if args.log_file is None:
+        try:
+            paths = resolve_run_artifact_paths(Path(args.save_model_path).name)
+        except ValueError:
+            pass
+        else:
+            args.log_file = str(paths.log_dir / "train.log")
     args.tuning_method_explicit = any(
         item == "--tuning_method" or item.startswith("--tuning_method=")
         for item in raw_argv

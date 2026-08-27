@@ -22,7 +22,8 @@ seed=42
 dora_rank=32
 dora_alpha=64
 dora_dropout=0.05
-deepspeed_config="$script_dir/configs/config_stage3.json"
+deepspeed_config="$script_dir/configs/deepspeed_zero3.json"
+stage1_num_processes=${STAGE1_NUM_PROCESSES:-2}
 attention_implementation=flash_attention_2
 launcher=${STAGE1_LAUNCHER:-"$script_dir/run_stage1_training.sh"}
 benchmark_python=$repository_python
@@ -80,7 +81,7 @@ done
 [[ -d $image_root ]] || { printf 'error: image root is not a directory: %s\n' "$image_root" >&2; exit 2; }
 [[ -f $probe_rows ]] || { printf 'error: probe row audit is not a file: %s\n' "$probe_rows" >&2; exit 2; }
 [[ -f $prerequisite_chain ]] || { printf 'error: smoke prerequisite chain is not a file: %s\n' "$prerequisite_chain" >&2; exit 2; }
-for integer_name in start max_per_gpu gradient_accumulation seed dora_rank dora_alpha; do
+for integer_name in start max_per_gpu gradient_accumulation seed dora_rank dora_alpha stage1_num_processes; do
     value=${!integer_name}
     if [[ ! $value =~ ^[0-9]+$ ]] || [[ $integer_name != seed && $value -lt 1 ]]; then
         printf 'error: %s must be a valid integer\n' "$integer_name" >&2
@@ -197,7 +198,7 @@ for micro_batch in "${candidates[@]}"; do
         --run-config "$run_config" --method "$method" --model "$model" \
         --source-data-path "$data_path" --data-path "$probe_data" \
         --image-root "$image_root" --output-dir "$candidate_output" \
-        --micro-batch "$micro_batch" --world-size 2 \
+        --micro-batch "$micro_batch" --world-size "$stage1_num_processes" \
         --gradient-accumulation "$gradient_accumulation" --max-steps 3 \
         --deepspeed-config "$deepspeed_config" --probe-rows "$probe_rows" \
         --prerequisite-chain "$prerequisite_chain" >/dev/null
@@ -239,7 +240,7 @@ for micro_batch in "${candidates[@]}"; do
         --attempt-id "$attempt_id" \
         --method "$method" \
         --micro-batch "$micro_batch" \
-        --world-size 2 \
+        --world-size "$stage1_num_processes" \
         --gradient-accumulation "$gradient_accumulation" \
         --learning-rate "$learning_rate" \
         --seed "$seed" \

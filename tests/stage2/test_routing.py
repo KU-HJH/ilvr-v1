@@ -746,6 +746,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
     training_args = object()
     RecordingTrainer.world_process_zero = world_process_zero
     monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(main, "validate_generated_artifact_paths", lambda selected: None)
     monkeypatch.setattr(main, "build_stage2_training_components", lambda selected: components)
     monkeypatch.setattr(main, "build_stage2_training_arguments", lambda selected: training_args)
     monkeypatch.setattr(
@@ -779,9 +780,48 @@ def test_main_stage1_uses_requested_global_seed(monkeypatch, tmp_path):
         log_file=str(tmp_path / "stage1.log"),
     )
     monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(main, "validate_generated_artifact_paths", lambda selected: None)
     monkeypatch.setattr(main, "route_training", lambda selected: "stage1-result")
 
     result = main_train()
 
     assert result == "stage1-result"
     assert torch.initial_seed() == 73
+
+
+def test_main_establishes_artifact_and_deepspeed_identity_before_seeding(monkeypatch):
+    """Catches CUDA-adjacent startup preceding canonical run preflight."""
+    from src.artifact_paths import resolve_run_artifact_paths
+
+    paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
+    args = stage2_args(
+        stage="stage1",
+        save_model_path=str(paths.checkpoint_dir),
+        log_file=str(paths.log_dir / "train.log"),
+        deepspeed_config=None,
+    )
+    observed = []
+    monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(
+        main,
+        "validate_generated_artifact_paths",
+        lambda selected: observed.append("artifacts"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main,
+        "bind_deepspeed_runtime_profile",
+        lambda selected: observed.append("runtime"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main, "seed_everything", lambda **kwargs: observed.append("seed")
+    )
+    monkeypatch.setattr(main, "route_training", lambda selected: observed.append("route"))
+    monkeypatch.setattr(main.logging, "FileHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "StreamHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "basicConfig", lambda **kwargs: None)
+
+    main_train()
+
+    assert observed == ["artifacts", "runtime", "seed", "route"]

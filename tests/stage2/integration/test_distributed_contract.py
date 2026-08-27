@@ -20,6 +20,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
     parse_latent_spans,
 )
+from src.artifact_paths import resolve_run_artifact_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -79,10 +80,10 @@ def test_stage2_accepts_unit_rank_local_batch_with_accumulation():
 def test_stage2_training_arguments_enable_deepspeed_only_when_selected():
     """Catches Stage 2 forcing ZeRO-3 or selecting a non-reloadable ZeRO config."""
     args = build_stage2_training_arguments(
-        _stage2_args(deepspeed_config=str(REPO_ROOT / "configs/config_stage3.json"))
+        _stage2_args(deepspeed_config=str(REPO_ROOT / "configs/deepspeed_zero3.json"))
     )
 
-    assert args.deepspeed == str(REPO_ROOT / "configs/config_stage3.json")
+    assert args.deepspeed == str(REPO_ROOT / "configs/deepspeed_zero3.json")
     assert (
         args.hf_deepspeed_config.get_value(
             "zero_optimization.stage3_gather_16bit_weights_on_model_save"
@@ -92,14 +93,14 @@ def test_stage2_training_arguments_enable_deepspeed_only_when_selected():
 
 
 def _dry_run_launcher(*, deepspeed_config=None):
+    paths = resolve_run_artifact_paths("stage2-zero2-full-mb1-ga8-candidate")
     env = os.environ.copy()
     env.update(
         {
             "STAGE1_CHECKPOINT": "/tmp/stage1",
             "DATA_PATH": "/tmp/train.jsonl",
             "IMAGE_ROOT": "/tmp/images",
-            "OUTPUT_DIR": "/tmp/out",
-            "LOG_FILE": "/tmp/train.log",
+            "OUTPUT_DIR": str(paths.checkpoint_dir),
             "STAGE2_DRY_RUN": "true",
         }
     )
@@ -123,10 +124,13 @@ def test_stage2_launcher_passes_optional_deepspeed_selection_by_behavior():
     assert without_deepspeed.returncode == 0, without_deepspeed.stderr
     assert "--deepspeed_config" not in without_deepspeed.stdout
 
-    config = str(REPO_ROOT / "configs/config_stage3.json")
+    config = str(REPO_ROOT / "configs/deepspeed_zero2.json")
     with_deepspeed = _dry_run_launcher(deepspeed_config=config)
     assert with_deepspeed.returncode == 0, with_deepspeed.stderr
     assert f"--deepspeed_config {config}" in with_deepspeed.stdout
+    assert "accelerate launch --num_processes 2" in with_deepspeed.stdout
+    paths = resolve_run_artifact_paths("stage2-zero2-full-mb1-ga8-candidate")
+    assert f"--log_file {paths.log_dir / 'train.log'}" in with_deepspeed.stdout
 
 
 def test_recording_collator_delegates_production_stage2_batch_contract(tmp_path):

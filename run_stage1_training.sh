@@ -53,7 +53,8 @@ epochs=${STAGE1_EPOCHS:-3}
 learning_rate=${STAGE1_LEARNING_RATE:-1e-5}
 gradient_accumulation=${STAGE1_GRADIENT_ACCUMULATION:-2}
 seed=${STAGE1_SEED:-42}
-deepspeed_config=${STAGE1_DEEPSPEED_CONFIG:-"$script_dir/configs/config_stage3.json"}
+deepspeed_config=${STAGE1_DEEPSPEED_CONFIG:-"$script_dir/configs/deepspeed_zero3.json"}
+stage1_num_processes=${STAGE1_NUM_PROCESSES:-2}
 attention_implementation=${STAGE1_ATTENTION_IMPLEMENTATION:-flash_attention_2}
 save_strategy=${STAGE1_SAVE_STRATEGY:-no}
 save_steps=${STAGE1_SAVE_STEPS:-612}
@@ -138,7 +139,7 @@ case $attention_implementation in
     eager|sdpa|flash_attention_2) ;;
     *) printf 'error: unsupported attention implementation\n' >&2; exit 2 ;;
 esac
-for integer_name in micro_batch gradient_accumulation seed save_steps; do
+for integer_name in micro_batch gradient_accumulation seed save_steps stage1_num_processes; do
     value=${!integer_name}
     if [[ ! $value =~ ^[0-9]+$ ]] || [[ $integer_name != seed && $value -lt 1 ]]; then
         printf 'error: %s must be a valid integer\n' "$integer_name" >&2
@@ -165,7 +166,24 @@ for scalar_name in epochs learning_rate; do
     fi
 done
 
+experiment_id=${output_dir##*/}
+canonical_log_root='/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility'
+if [[ -z $log_file ]]; then
+    if [[ -n $resume_path ]]; then
+        log_file="$canonical_log_root/$experiment_id/resume-$(date +%Y%m%dT%H%M%S)-$$.log"
+    else
+        log_file="$canonical_log_root/$experiment_id/train.log"
+    fi
+fi
+
 if [[ $dry_run != true ]]; then
+    "$repository_python" -m src.artifact_paths validate --kind checkpoint --path "$output_dir" >/dev/null
+    "$repository_python" -m src.artifact_paths validate --kind log --path "$log_file" >/dev/null
+    for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness"; do
+        if [[ -n $result_path ]]; then
+            "$repository_python" -m src.artifact_paths validate --kind result --path "$result_path" >/dev/null
+        fi
+    done
     if [[ $manifest_mode == true ]]; then
         resolved_manifest=$(readlink -f -- "$manifest_path") || {
             printf 'error: manifest path cannot be resolved: %s\n' "$manifest_path" >&2
@@ -177,26 +195,6 @@ if [[ $dry_run != true ]]; then
             exit 2
         fi
     fi
-    if [[ -L $output_dir ]]; then
-        printf 'error: output path must not be a symlink: %s\n' "$output_dir" >&2
-        exit 2
-    fi
-    if [[ -d $output_dir ]] && find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-        manifest_only=false
-        if [[ $manifest_mode == true ]]; then
-            entry_count=$(find "$output_dir" -mindepth 1 -maxdepth 1 -printf '.' | wc -c)
-            if [[ $entry_count == 1 && -f $output_dir/launch-manifest.json ]]; then
-                manifest_only=true
-            fi
-        fi
-        if [[ -z $resume_path && $manifest_only != true ]]; then
-            printf 'error: output directory is nonempty; pass --resume explicitly: %s\n' "$output_dir" >&2
-            exit 2
-        fi
-    elif [[ -e $output_dir && ! -d $output_dir ]]; then
-        printf 'error: output path exists and is not a directory: %s\n' "$output_dir" >&2
-        exit 2
-    fi
     [[ -f $data_path ]] || { printf 'error: data path is not a file: %s\n' "$data_path" >&2; exit 2; }
     [[ -d $image_root ]] || { printf 'error: image root is not a directory: %s\n' "$image_root" >&2; exit 2; }
     [[ -f $deepspeed_config ]] || { printf 'error: DeepSpeed config is not a file: %s\n' "$deepspeed_config" >&2; exit 2; }
@@ -204,16 +202,36 @@ if [[ $dry_run != true ]]; then
         printf 'error: resume path is not a directory: %s\n' "$resume_path" >&2
         exit 2
     fi
-    mkdir -p -- "$output_dir"
-fi
-
-if [[ -z $log_file ]]; then
-    log_file=$output_dir/train.log
+    "$repository_python" -m src.deepspeed_runtime validate \
+        --config "$deepspeed_config" --world-size "$stage1_num_processes" >/dev/null
+    if [[ -z $resume_path ]]; then
+        for target_dir in "$output_dir" "$(dirname -- "$log_file")"; do
+            if [[ -e $target_dir ]]; then
+                printf 'error: fresh run artifact directory already exists: %s\n' "$target_dir" >&2
+                exit 2
+            fi
+        done
+        for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness"; do
+            if [[ -n $result_path && -e $(dirname -- "$result_path") ]]; then
+                printf 'error: fresh run artifact directory already exists: %s\n' "$(dirname -- "$result_path")" >&2
+                exit 2
+            fi
+        done
+    elif [[ -e $log_file ]]; then
+        printf 'error: resume log file must be distinct: %s\n' "$log_file" >&2
+        exit 2
+    fi
+    mkdir -p -- "$output_dir" "$(dirname -- "$log_file")"
+    for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness"; do
+        if [[ -n $result_path ]]; then
+            mkdir -p -- "$(dirname -- "$result_path")"
+        fi
+    done
 fi
 
 command=(
     "$repository_accelerate" launch
-    --num_processes 2
+    --num_processes "$stage1_num_processes"
     --main_process_port 29501
     src/main.py
     --stage stage1

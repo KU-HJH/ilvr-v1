@@ -7,6 +7,7 @@ import subprocess
 import pytest
 
 from stage1.benchmark import config_digest
+from src.artifact_paths import resolve_run_artifact_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -69,9 +70,13 @@ def fake_accelerate_environment(tmp_path):
     copied_launcher.chmod(0o755)
     config_dir = copied_repo / "configs"
     config_dir.mkdir()
-    (config_dir / "config_stage3.json").write_bytes(
-        (REPO_ROOT / "configs/config_stage3.json").read_bytes()
+    (config_dir / "deepspeed_zero3.json").write_bytes(
+        (REPO_ROOT / "configs/deepspeed_zero3.json").read_bytes()
     )
+    source_dir = copied_repo / "src"
+    source_dir.mkdir()
+    for name in ("artifact_paths.py", "deepspeed_runtime.py"):
+        (source_dir / name).write_bytes((REPO_ROOT / "src" / name).read_bytes())
     bin_dir = copied_repo / "venv/ilvr-venv/bin"
     bin_dir.mkdir(parents=True)
     log_path = tmp_path / "accelerate argv.log"
@@ -84,7 +89,11 @@ def fake_accelerate_environment(tmp_path):
     )
     executable.chmod(0o755)
     repository_python = bin_dir / "python"
-    repository_python.write_text("#!/usr/bin/env bash\nexit 97\n", encoding="utf-8")
+    repository_python.write_text(
+        "#!/usr/bin/env bash\n"
+        f"exec {shlex.quote(str(REPO_ROOT / 'venv/ilvr-venv/bin/python'))} \"$@\"\n",
+        encoding="utf-8",
+    )
     repository_python.chmod(0o755)
     wrong_bin = tmp_path / "wrong PATH bin"
     wrong_bin.mkdir()
@@ -113,8 +122,8 @@ def live_import_worker_environment(tmp_path):
     copied_launcher.chmod(0o755)
     config_dir = copied_repo / "configs"
     config_dir.mkdir()
-    (config_dir / "config_stage3.json").write_bytes(
-        (REPO_ROOT / "configs/config_stage3.json").read_bytes()
+    (config_dir / "deepspeed_zero3.json").write_bytes(
+        (REPO_ROOT / "configs/deepspeed_zero3.json").read_bytes()
     )
     (copied_repo / "transformers").symlink_to(
         REPO_ROOT / "transformers", target_is_directory=True
@@ -122,6 +131,8 @@ def live_import_worker_environment(tmp_path):
 
     source_dir = copied_repo / "src"
     source_dir.mkdir()
+    for name in ("artifact_paths.py", "deepspeed_runtime.py"):
+        (source_dir / name).write_bytes((REPO_ROOT / "src" / name).read_bytes())
     (source_dir / "main.py").write_text(
         """import json
 import os
@@ -217,9 +228,22 @@ def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_
         index = command.index(flag)
         assert command[index + 1] == value
     deepspeed = Path(command[command.index("--deepspeed_config") + 1])
-    assert deepspeed == REPO_ROOT / "configs/config_stage3.json"
+    assert deepspeed == REPO_ROOT / "configs/deepspeed_zero3.json"
     assert "--final_save" in command
     assert "--gradient_checkpointing" in command
+
+
+def test_dry_run_derives_canonical_log_from_checkpoint_experiment_id():
+    """Catches omitted logs falling back below a checkpoint or the worktree."""
+    paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
+
+    completed = run_launcher(LAUNCHER, *base_args(paths.checkpoint_dir))
+
+    assert completed.returncode == 0, completed.stderr
+    command = shlex.split(completed.stdout)
+    assert command[command.index("--log_file") + 1] == str(
+        paths.log_dir / "train.log"
+    )
 
 
 def test_full_dry_run_omits_every_peft_argument(tmp_path):
@@ -283,7 +307,7 @@ def test_timed_manifest_is_loaded_without_shell_evaluating_paths(tmp_path):
         "seed": 42,
         "max_steps": 0,
         "attention_implementation": "flash_attention_2",
-        "deepspeed_config": str(REPO_ROOT / "configs/config_stage3.json"),
+        "deepspeed_config": str(REPO_ROOT / "configs/deepspeed_zero3.json"),
         "deepspeed_config_digest": "d" * 64,
         "save_strategy": "no",
         "final_save": True,
@@ -366,13 +390,13 @@ def test_live_launcher_refuses_nonempty_output_without_explicit_resume(tmp_path)
     )
 
     assert refused.returncode == 2
-    assert "nonempty" in refused.stderr
+    assert "canonical checkpoint root" in refused.stderr
     assert not accelerate_log.exists()
     assert not wrong_log.exists()
 
 
-def test_live_launcher_allows_nonempty_output_only_with_explicit_resume(tmp_path):
-    """Catches safe explicit resume being rejected by output collision checks."""
+def test_live_launcher_rejects_noncanonical_resume_output(tmp_path):
+    """Catches resume bypassing canonical checkpoint ownership."""
     output = tmp_path / "occupied"
     checkpoint = output / "checkpoint-7"
     checkpoint.mkdir(parents=True)
@@ -387,19 +411,14 @@ def test_live_launcher_allows_nonempty_output_only_with_explicit_resume(tmp_path
         env=env,
     )
 
-    assert resumed.returncode == 0, resumed.stderr
-    assert accelerate_log.is_file()
+    assert resumed.returncode == 2
+    assert "canonical checkpoint root" in resumed.stderr
+    assert not accelerate_log.exists()
     assert not wrong_log.exists()
-    assert (tmp_path / "python exec.log").read_text() == str(
-        launcher.parent / "venv/ilvr-venv/bin/python"
-    )
-    resumed_command = shlex.split(accelerate_log.read_text(encoding="utf-8"))
-    index = resumed_command.index("--resume_from_checkpoint_path")
-    assert resumed_command[index + 1] == str(checkpoint)
 
 
-def test_live_worker_imports_local_transformers_before_hostile_pythonpath(tmp_path):
-    """Catches Accelerate workers resolving the venv's stale editable fork."""
+def test_live_worker_rejects_noncanonical_output_before_dispatch(tmp_path):
+    """Catches an inherited worker environment bypassing artifact preflight."""
 
     environment, worker_log, launcher, copied_repo = live_import_worker_environment(
         tmp_path
@@ -410,21 +429,9 @@ def test_live_worker_imports_local_transformers_before_hostile_pythonpath(tmp_pa
         env=environment,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    payload = json.loads(worker_log.read_text(encoding="utf-8"))
-    assert payload["pythonpath"] == os.pathsep.join(
-        (str(copied_repo / "transformers/src"), str(copied_repo / "src"))
-    )
-    assert Path(payload["transformers"]).resolve() == (
-        REPO_ROOT / "transformers/src/transformers/__init__.py"
-    ).resolve()
-    assert Path(payload["rollout"]).resolve() == (
-        REPO_ROOT
-        / "transformers/src/transformers/models/qwen2_5_vl/stage2_latent_rollout.py"
-    ).resolve()
-    assert Path(payload["qwen_vl_utils"]).resolve().is_relative_to(
-        (REPO_ROOT / "venv/ilvr-venv").resolve()
-    )
+    assert completed.returncode == 2
+    assert "canonical checkpoint root" in completed.stderr
+    assert not worker_log.exists()
 
 
 @pytest.mark.parametrize("target_location", ["inside", "outside"])
@@ -452,7 +459,7 @@ def test_live_launcher_rejects_symlink_output_before_dispatch(
     )
 
     assert completed.returncode == 2
-    assert "symlink" in completed.stderr
+    assert "canonical checkpoint root" in completed.stderr
     assert not accelerate_log.exists()
     assert not wrong_log.exists()
 

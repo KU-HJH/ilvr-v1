@@ -9,7 +9,16 @@ export TOKENIZERS_PARALLELISM=false
 : "${DATA_PATH:?set DATA_PATH}"
 : "${IMAGE_ROOT:?set IMAGE_ROOT}"
 : "${OUTPUT_DIR:?set OUTPUT_DIR}"
-: "${LOG_FILE:?set LOG_FILE}"
+
+experiment_id=${OUTPUT_DIR##*/}
+canonical_log_root='/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility'
+if [[ -z "${LOG_FILE:-}" ]]; then
+  if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+    LOG_FILE="$canonical_log_root/$experiment_id/resume-$(date +%Y%m%dT%H%M%S)-$$.log"
+  else
+    LOG_FILE="$canonical_log_root/$experiment_id/train.log"
+  fi
+fi
 
 if [[ -v TUNING_METHOD ]]; then
   TUNING_METHOD_EXPLICIT=true
@@ -203,9 +212,7 @@ if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
   DEEPSPEED_ARGS+=(--deepspeed_config "$DEEPSPEED_CONFIG")
 fi
 
-COMMAND=(
-  "$REPO_ROOT/venv/ilvr-venv/bin/python"
-  "$REPO_ROOT/src/main.py"
+TRAINING_ARGS=(
   --stage stage2
   --load_model_path "$STAGE1_CHECKPOINT"
   --data_path "$DATA_PATH"
@@ -225,6 +232,49 @@ COMMAND=(
   "${DEEPSPEED_ARGS[@]}"
   "$@"
 )
+
+if [[ "${STAGE2_DRY_RUN:-false}" != "true" ]]; then
+  "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.artifact_paths validate \
+    --kind checkpoint --path "$OUTPUT_DIR" >/dev/null
+  "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.artifact_paths validate \
+    --kind log --path "$LOG_FILE" >/dev/null
+  if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
+    STAGE2_NUM_PROCESSES=${STAGE2_NUM_PROCESSES:-2}
+    require_positive_integer STAGE2_NUM_PROCESSES "$STAGE2_NUM_PROCESSES"
+    "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.deepspeed_runtime validate \
+      --config "$DEEPSPEED_CONFIG" --world-size "$STAGE2_NUM_PROCESSES" >/dev/null
+  fi
+  if [[ -z "${RESUME_CHECKPOINT:-}" ]]; then
+    for target_dir in "$OUTPUT_DIR" "$(dirname -- "$LOG_FILE")"; do
+      if [[ -e $target_dir ]]; then
+        printf 'fresh run artifact directory already exists: %s\n' "$target_dir" >&2
+        exit 2
+      fi
+    done
+  elif [[ -e $LOG_FILE ]]; then
+    printf 'resume log file must be distinct: %s\n' "$LOG_FILE" >&2
+    exit 2
+  fi
+  mkdir -p -- "$OUTPUT_DIR" "$(dirname -- "$LOG_FILE")"
+fi
+
+if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
+  STAGE2_NUM_PROCESSES=${STAGE2_NUM_PROCESSES:-2}
+  require_positive_integer STAGE2_NUM_PROCESSES "$STAGE2_NUM_PROCESSES"
+  COMMAND=(
+    "$REPO_ROOT/venv/ilvr-venv/bin/accelerate" launch
+    --num_processes "$STAGE2_NUM_PROCESSES"
+    --main_process_port "${STAGE2_MAIN_PROCESS_PORT:-29502}"
+    "$REPO_ROOT/src/main.py"
+    "${TRAINING_ARGS[@]}"
+  )
+else
+  COMMAND=(
+    "$REPO_ROOT/venv/ilvr-venv/bin/python"
+    "$REPO_ROOT/src/main.py"
+    "${TRAINING_ARGS[@]}"
+  )
+fi
 
 if [[ "${STAGE2_DRY_RUN:-false}" == "true" ]]; then
   printf 'PYTHONPATH=%q TOKENIZERS_PARALLELISM=%q ' \

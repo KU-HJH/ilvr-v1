@@ -17,6 +17,8 @@ from peft import PeftConfig
 from qwen_vl_utils import process_vision_info
 
 from utils_deepseed import *
+from artifact_paths import validate_generated_artifact_paths
+from deepspeed_runtime import bind_deepspeed_runtime_profile
 from task_deepseed import *
 from stage1.checkpointing import (
     decode_stage1_peft_metadata_snapshot,
@@ -498,6 +500,8 @@ def route_training(args, *, stage1_handler=None, stage2_handler=None):
 # ==============================================================
 def main_train():
     args = get_args()
+    validate_generated_artifact_paths(args)
+    bind_deepspeed_runtime_profile(args)
     seed_everything(seed=42 if args.stage == "stage2" else args.seed)
 
     logging.basicConfig(
