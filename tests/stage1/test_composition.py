@@ -1013,11 +1013,16 @@ def test_run_stage1_trains_once_and_only_final_saves_when_requested(
     )
     args = SimpleNamespace(final_save=final_save, save_model_path=str(tmp_path / "out"))
     ticks = iter((10.0, 13.5, 20.0, 21.25))
+    observed_profiles = []
+
+    def component_builder(selected):
+        observed_profiles.append(selected.deepspeed_runtime_profile)
+        return bundle
 
     with caplog.at_level(logging.INFO):
         result = run_stage1(
             args,
-            component_builder=lambda selected, **kwargs: bundle,
+            component_builder=component_builder,
             monotonic=lambda: next(ticks),
         )
 
@@ -1030,6 +1035,7 @@ def test_run_stage1_trains_once_and_only_final_saves_when_requested(
     else:
         assert processor.saved == []
     assert trainer.events == expected
+    assert observed_profiles == [args.deepspeed_runtime_profile]
     assert "Stage 1 Trainer time: 3.500s" in caplog.text
 
 
@@ -1140,7 +1146,7 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
         benchmark, "_build_artifact_manifest", counted_artifact_builder
     )
 
-    def replace_manifest_after_preflight(selected, **kwargs):
+    def replace_manifest_after_preflight(selected):
         config_path.write_text('{"replaced": true}', encoding="utf-8")
         return bundle
 
@@ -1200,7 +1206,7 @@ def test_run_stage1_rejects_runtime_or_rank_config_mismatch_before_build(tmp_pat
     args.benchmark_source_data_path = config["source_data_path"]
     builds = 0
 
-    def builder(selected, **kwargs):
+    def builder(selected):
         nonlocal builds
         builds += 1
         raise AssertionError("builder must not run")
@@ -1266,7 +1272,7 @@ def test_distributed_preflight_collects_one_rank_runtime_error_before_uniform_fa
         }
         return (local_result, remote_success)
 
-    def builder(selected, **kwargs):
+    def builder(selected):
         nonlocal builds
         builds += 1
         raise AssertionError("builder must not run")
@@ -1300,9 +1306,7 @@ def test_distributed_preflight_collects_manifest_read_error_before_uniform_failu
     with pytest.raises(ValueError, match="distributed preflight"):
         run_stage1(
             args,
-            component_builder=lambda selected, **kwargs: pytest.fail(
-                "builder must not run"
-            ),
+            component_builder=lambda selected: pytest.fail("builder must not run"),
             rank_config_digest_provider=collective,
         )
     assert len(gathered) == 1
@@ -1330,9 +1334,7 @@ def test_distributed_preflight_rejects_successful_ranks_with_runtime_digest_mism
     with pytest.raises(ValueError, match="runtime digest"):
         run_stage1(
             args,
-            component_builder=lambda selected, **kwargs: pytest.fail(
-                "builder must not run"
-            ),
+            component_builder=lambda selected: pytest.fail("builder must not run"),
             rank_config_digest_provider=collective,
         )
 
@@ -1419,7 +1421,7 @@ def test_run_stage1_prevalidates_smoke_marker_and_embeds_it_in_producer_evidence
 
     run_stage1(
         args,
-        component_builder=lambda selected, **kwargs: bundle,
+        component_builder=lambda selected: bundle,
         monotonic=iter((1.0, 2.0, 3.0, 5.0, 6.0)).__next__,
         observability_provider=lambda selected: {
             "rank_peak_allocated_bytes": (10, 11),

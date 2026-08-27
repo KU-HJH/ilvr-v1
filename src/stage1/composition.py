@@ -693,9 +693,7 @@ def run_stage1(
         if config["kind"] == "stage1-smoke-run-manifest":
             assert smoke_resume_snapshot is not None
     total_start = monotonic() if producing else None
-    components = component_builder(
-        args, deepspeed_runtime_profile=profile
-    )
+    components = component_builder(args)
     model_load_seconds = monotonic() - total_start if producing else 0.0
     resume = components.resume_decision.checkpoint_path
     trainer_start = monotonic()
