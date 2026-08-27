@@ -95,6 +95,9 @@ The dataset follows the JSONL format:
 
 ## 🚀 Training
 
+For canonical ZeRO-1/2/3 configuration selection, artifact ownership, and
+same-identity resume commands, see [the ZeRO stage training guide](docs/zero-stage-training.md).
+
 We provide a shell script `run_training.sh` to launch distributed training.
 
 ### 1. Configure Script
