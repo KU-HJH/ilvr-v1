@@ -86,6 +86,20 @@ class ScriptedHead(nn.Module):
         return logits
 
 
+class RankedHead(nn.Module):
+    def __init__(self, *, highest_id, fallback_id, vocab_size=128):
+        super().__init__()
+        self.highest_id = highest_id
+        self.fallback_id = fallback_id
+        self.vocab_size = vocab_size
+
+    def forward(self, hidden):
+        logits = hidden.new_full((*hidden.shape[:-1], self.vocab_size), -torch.inf)
+        logits[..., self.highest_id] = 100
+        logits[..., self.fallback_id] = 0
+        return logits
+
+
 class ScriptedStage2Model(nn.Module):
     def __init__(self, *, emitted_ids, latent_size):
         super().__init__()
@@ -174,6 +188,35 @@ def test_eos_is_checked_only_after_a_completed_latent_block():
 
     assert result.sequences[0, -5:].tolist() == [91, 90, 90, 92, 3]
     assert model.lm_head.calls == 2
+
+
+@pytest.mark.parametrize(
+    ("forbidden_id", "temperature"),
+    [
+        (TOKENS.pad_token_id, 0.0),
+        (TOKENS.end_token_id, 0.0),
+        (TOKENS.pad_token_id, 1.0),
+        (TOKENS.end_token_id, 1.0),
+    ],
+)
+def test_normal_text_generation_masks_block_internal_latent_tokens(
+    forbidden_id, temperature
+):
+    model = scripted_model(latent_size=2, emitted_ids=[])
+    model.lm_head = RankedHead(highest_id=forbidden_id, fallback_id=4)
+
+    result = Stage2InferenceController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=Stage2GenerationConfig(
+            max_new_tokens=1,
+            temperature=temperature,
+        ),
+    )
+
+    assert result.sequences[0, -1].item() == 4
 
 
 @pytest.mark.parametrize("emitted_eos", [3, 7])

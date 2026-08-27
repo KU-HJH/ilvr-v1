@@ -156,6 +156,9 @@ class Stage2InferenceController:
                 generate_mode=True,
             )
             logits = model.lm_head(outputs.last_hidden_state[:, -1, :])
+            logits = logits.clone()
+            logits[..., token_ids.pad_token_id] = -torch.inf
+            logits[..., token_ids.end_token_id] = -torch.inf
             next_id = _select_text_token(logits, generation_config)
             next_token_id = int(next_id.item())
 
