@@ -1,8 +1,10 @@
 # ZeRO stage training and resume
 
 This guide is the operator contract for the canonical DeepSpeed configurations.
-ZeRO-3 is the launcher default; select ZeRO-1 or ZeRO-2 explicitly with the
-matching canonical configuration.  New runs use
+Stage 1 defaults to ZeRO-3 when its configuration is omitted; select ZeRO-1 or
+ZeRO-2 explicitly with the matching canonical configuration. Stage 2 keeps
+DeepSpeed optional for direct single-process operation, so set
+`DEEPSPEED_CONFIG` explicitly to enable or select ZeRO. New runs use
 `configs/deepspeed_zero1.json`, `configs/deepspeed_zero2.json`, or
 `configs/deepspeed_zero3.json`; do not use the older `configs/config_stage*.json`
 files for new compatibility evidence.
