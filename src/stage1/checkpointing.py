@@ -1600,6 +1600,12 @@ def _has_complete_deepspeed_trainer_state(
 
 
 def _validate_complete_trainer_state(path: Path) -> None:
+    ema_state = path / STAGE1_EMA_TEACHER_STATE_FILENAME
+    if not _is_regular_file(ema_state):
+        raise ValueError(
+            "Stage 1 resume requires EMA teacher state as a non-symlink "
+            f"regular file: {ema_state}"
+        )
     if not _is_regular_file(path / "trainer_state.json"):
         raise ValueError(
             f"Stage 1 resume requires complete trainer_state.json: {path}"

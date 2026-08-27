@@ -42,6 +42,7 @@ from stage1.checkpointing import (
     save_stage1_peft_artifact,
     validate_stage1_vocab_alignment,
 )
+from stage1.ema import STAGE1_EMA_TEACHER_STATE_FILENAME
 from stage1.peft import (
     build_stage1_tuned_model,
     validate_stage1_trainable_boundary,
@@ -328,6 +329,7 @@ def _write_fake_peft(directory, metadata, *, weight="adapter_model.safetensors")
 def _write_full_checkpoint(directory, *, complete=True):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "model.safetensors").write_bytes(b"fixture")
+    (directory / STAGE1_EMA_TEACHER_STATE_FILENAME).write_bytes(b"fixture")
     if complete:
         _write_standard_trainer_state(directory)
     else:
@@ -364,7 +366,12 @@ def _write_full_index(directory, *, binary=False, shard_names=None, weight_map=N
 
 def _write_standard_trainer_state(directory, *, rank_count=None):
     directory.mkdir(parents=True, exist_ok=True)
-    for filename in ("trainer_state.json", "optimizer.pt", "scheduler.pt"):
+    for filename in (
+        "trainer_state.json",
+        "optimizer.pt",
+        "scheduler.pt",
+        STAGE1_EMA_TEACHER_STATE_FILENAME,
+    ):
         (directory / filename).write_bytes(b"fixture")
     if rank_count is None:
         (directory / "rng_state.pth").write_bytes(b"fixture")
@@ -375,6 +382,7 @@ def _write_standard_trainer_state(directory, *, rank_count=None):
 
 def _write_deepspeed_trainer_state(directory, *, step, replicated_model=False):
     directory.mkdir(parents=True, exist_ok=True)
+    (directory / STAGE1_EMA_TEACHER_STATE_FILENAME).write_bytes(b"fixture")
     (directory / "trainer_state.json").write_text(
         json.dumps({"global_step": step}) + "\n", encoding="utf-8"
     )
@@ -1760,6 +1768,22 @@ def test_explicit_full_resume_precedence_rejects_incomplete_selected_path(
         resolve_stage1_resume(output, explicit)
 
 
+@pytest.mark.parametrize("ema_entry", ["missing", "symlink"])
+def test_explicit_resume_rejects_unsafe_ema_teacher_state(tmp_path, ema_entry):
+    output = tmp_path / "output"
+    explicit = output / "checkpoint-2"
+    _write_full_checkpoint(explicit)
+    ema_state = explicit / STAGE1_EMA_TEACHER_STATE_FILENAME
+    ema_state.unlink()
+    if ema_entry == "symlink":
+        external = tmp_path / "external-ema.pt"
+        external.write_bytes(b"fixture")
+        ema_state.symlink_to(external)
+
+    with pytest.raises(ValueError, match="EMA teacher state.*regular file"):
+        resolve_stage1_resume(output, explicit)
+
+
 def test_explicit_full_resume_retains_normal_trainer_path_semantics(tmp_path):
     explicit = tmp_path / "named-full-trainer-save"
     _write_full_checkpoint(explicit)
@@ -1799,6 +1823,19 @@ def test_auto_resume_skips_incomplete_full_checkpoint(tmp_path):
     decision = resolve_stage1_resume(output, None)
 
     assert decision.checkpoint_path == valid
+
+
+def test_auto_resume_skips_newest_checkpoint_without_regular_ema_state(tmp_path):
+    output = tmp_path / "output"
+    older = output / "checkpoint-2"
+    newest = output / "checkpoint-11"
+    _write_full_checkpoint(older)
+    _write_full_checkpoint(newest)
+    (newest / STAGE1_EMA_TEACHER_STATE_FILENAME).unlink()
+
+    decision = resolve_stage1_resume(output, None)
+
+    assert decision.checkpoint_path == older
 
 
 def test_auto_resume_never_selects_final_adapter_directory(
@@ -2352,6 +2389,7 @@ def test_stage1_trainer_numbered_peft_checkpoint_keeps_resume_state(
     interrupted.train()
 
     checkpoint = output / "checkpoint-1"
+    (checkpoint / STAGE1_EMA_TEACHER_STATE_FILENAME).write_bytes(b"fixture")
     decision = resolve_stage1_resume(output, None)
     assert decision.checkpoint_path == checkpoint
     assert decision.artifact_kind is Stage1ArtifactKind.PEFT
@@ -2364,6 +2402,7 @@ def test_stage1_trainer_numbered_peft_checkpoint_keeps_resume_state(
         "optimizer.pt",
         "scheduler.pt",
         "rng_state.pth",
+        STAGE1_EMA_TEACHER_STATE_FILENAME,
     ):
         assert (checkpoint / filename).is_file(), filename
     assert not (checkpoint / "model.safetensors").exists()
@@ -2448,6 +2487,7 @@ def test_stage1_trainer_full_numbered_checkpoint_resume_matches_uninterrupted(
     )
     interrupted.train()
     checkpoint = output / "checkpoint-1"
+    (checkpoint / STAGE1_EMA_TEACHER_STATE_FILENAME).write_bytes(b"fixture")
     decision = resolve_stage1_resume(output, None)
     assert decision.checkpoint_path == checkpoint
     assert decision.artifact_kind is Stage1ArtifactKind.FULL

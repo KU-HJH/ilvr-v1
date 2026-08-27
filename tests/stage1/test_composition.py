@@ -35,6 +35,7 @@ from stage1.composition import (
     build_stage1_training_components,
     run_stage1,
 )
+from stage1.ema import STAGE1_EMA_TEACHER_STATE_FILENAME
 from utils_deepseed import parse_args
 from stage1.benchmark import config_digest
 
@@ -365,6 +366,7 @@ def _write_peft_resume_checkpoint(args, *, step=9):
         "optimizer.pt",
         "scheduler.pt",
         "rng_state.pth",
+        STAGE1_EMA_TEACHER_STATE_FILENAME,
     ):
         (checkpoint / filename).write_bytes(b"fixture")
     save_stage1_peft_metadata(checkpoint, metadata)
