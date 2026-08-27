@@ -89,7 +89,8 @@ next_experiment_id() {
 
 emit_plan() {
     local zero_stage=$1 method=$2 micro_batch=$3 accumulation=$4 run_kind=$5
-    local experiment_id checkpoint_dir result_dir log_dir max_steps final_save resume_from_kind
+    local experiment_id checkpoint_dir result_dir log_dir max_steps final_save
+    local resume_from_kind save_strategy save_steps checkpoint_path resume_from
     experiment_id=$(next_experiment_id \
         "$zero_stage" "$method" "$micro_batch" "$accumulation" "$run_kind")
     checkpoint_dir="$canonical_checkpoint_root/$experiment_id"
@@ -98,15 +99,27 @@ emit_plan() {
     max_steps=3
     final_save=false
     resume_from_kind=null
+    save_strategy=no
+    save_steps=null
+    checkpoint_path=null
+    resume_from=null
     if [[ $run_kind == selected-save ]]; then
-        final_save=true
+        save_strategy=steps
+        save_steps=3
+        checkpoint_path="\"$checkpoint_dir/checkpoint-3\""
+        planned_selected_checkpoint="$checkpoint_dir/checkpoint-3"
     elif [[ $run_kind == selected-resume ]]; then
         max_steps=4
+        save_strategy=steps
+        save_steps=1
         resume_from_kind='"selected-save"'
+        resume_from="\"$planned_selected_checkpoint\""
+        checkpoint_path="\"$checkpoint_dir/checkpoint-4\""
     fi
-    printf '{"zero_stage":%s,"method":"%s","micro_batch":%s,"gradient_accumulation":%s,"run_kind":"%s","max_steps":%s,"final_save":%s,"resume_from_kind":%s,"experiment_id":"%s","checkpoint_dir":"%s","result_dir":"%s","log_dir":"%s"}\n' \
+    printf '{"zero_stage":%s,"method":"%s","micro_batch":%s,"gradient_accumulation":%s,"run_kind":"%s","max_steps":%s,"save_strategy":"%s","save_steps":%s,"final_save":%s,"resume_from_kind":%s,"resume_from":%s,"checkpoint_path":%s,"experiment_id":"%s","checkpoint_dir":"%s","result_dir":"%s","log_dir":"%s"}\n' \
         "$zero_stage" "$method" "$micro_batch" "$accumulation" "$run_kind" \
-        "$max_steps" "$final_save" "$resume_from_kind" \
+        "$max_steps" "$save_strategy" "$save_steps" "$final_save" \
+        "$resume_from_kind" "$resume_from" "$checkpoint_path" \
         "$experiment_id" "$checkpoint_dir" "$result_dir" "$log_dir"
 }
 
@@ -202,7 +215,8 @@ claim_run_directories() {
 launch_candidate() {
     local zero_stage=$1 method=$2 micro_batch=$3 accumulation=$4 run_kind=$5
     local resume_path=${6:-}
-    local experiment_id run_config producer_evidence stdout_path stderr_path exit_code max_steps
+    local experiment_id run_config producer_evidence stdout_path stderr_path
+    local exit_code max_steps save_strategy save_steps
     experiment_id=$(next_experiment_id \
         "$zero_stage" "$method" "$micro_batch" "$accumulation" "$run_kind")
     claim_run_directories "$experiment_id"
@@ -211,8 +225,23 @@ launch_candidate() {
     stdout_path="$log_dir/stdout.log"
     stderr_path="$log_dir/stderr.log"
     max_steps=3
+    save_strategy=no
+    save_steps=
+    selected_checkpoint_path=
+    selected_initial_step=0
+    selected_final_step=3
+    if [[ $run_kind == selected-save ]]; then
+        save_strategy=steps
+        save_steps=3
+        selected_checkpoint_path="$checkpoint_dir/checkpoint-3"
+    fi
     if [[ $run_kind == selected-resume ]]; then
         max_steps=4
+        save_strategy=steps
+        save_steps=1
+        selected_checkpoint_path="$checkpoint_dir/checkpoint-4"
+        selected_initial_step=3
+        selected_final_step=4
     fi
 
     if [[ $run_kind == candidate ]]; then
@@ -235,12 +264,16 @@ launch_candidate() {
         --image-root "$image_root"
         --deepspeed-config "configs/deepspeed_zero${zero_stage}.json"
         --micro-batch "$micro_batch" --gradient-accumulation "$accumulation"
-        --max-steps "$max_steps" --save-strategy no --output-dir "$checkpoint_dir"
+        --max-steps "$max_steps" --save-strategy "$save_strategy"
+        --no-final-save --output-dir "$checkpoint_dir"
         --log-file "$log_dir/train.log"
     )
+    if [[ -n $save_steps ]]; then
+        launch_command+=(--save-steps "$save_steps")
+    fi
     if [[ $run_kind == candidate ]]; then
         launch_command+=(
-            --no-final-save --benchmark-run-config "$run_config"
+            --benchmark-run-config "$run_config"
             --producer-evidence "$producer_evidence"
         )
     fi
@@ -316,19 +349,21 @@ for zero_stage in "${stages[@]}"; do
             'import json,sys; print(str(json.loads(sys.argv[1])["reuse"]).lower())' \
             "$selected_save_status") == true ]]; then
             selected_checkpoint=$("$repository_python" -c \
-                'import json,sys; print(json.loads(sys.argv[1])["witness"]["checkpoint_dir"])' \
+                'import json,sys; print(json.loads(sys.argv[1])["witness"]["checkpoint_path"])' \
                 "$selected_save_status")
         else
             launch_candidate "$zero_stage" "$method" "$selected_micro" \
                 "$selected_accumulation" selected-save >/dev/null
-            selected_checkpoint=$checkpoint_dir
+            selected_checkpoint=$selected_checkpoint_path
             for selected_witness in \
                 "$result_dir/selected-run-witness.json" "$selected_save_registry"; do
                 "$repository_python" -m src.stage1.zero_matrix record-selected \
                     --witness "$selected_witness" --run-kind selected-save \
                     --identity-json "$selected_identity" --experiment-id "${checkpoint_dir##*/}" \
                     --checkpoint-dir "$checkpoint_dir" --result-dir "$result_dir" \
-                    --log-dir "$log_dir" >/dev/null
+                    --checkpoint-path "$selected_checkpoint_path" \
+                    --log-dir "$log_dir" --initial-step "$selected_initial_step" \
+                    --final-step "$selected_final_step" >/dev/null
             done
         fi
         # The resume run has a distinct experiment ID and output roots.  It resumes
@@ -348,7 +383,10 @@ for zero_stage in "${stages[@]}"; do
                     --witness "$selected_witness" --run-kind selected-resume \
                     --identity-json "$selected_identity" --experiment-id "${checkpoint_dir##*/}" \
                     --checkpoint-dir "$checkpoint_dir" --result-dir "$result_dir" \
-                    --log-dir "$log_dir" --resume-from "$selected_checkpoint" >/dev/null
+                    --checkpoint-path "$selected_checkpoint_path" \
+                    --log-dir "$log_dir" --initial-step "$selected_initial_step" \
+                    --final-step "$selected_final_step" \
+                    --resume-from "$selected_checkpoint" >/dev/null
             done
         fi
     done

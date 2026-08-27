@@ -20,6 +20,7 @@ from src.deepspeed_runtime import (
     DeepSpeedRuntimeProfile,
     canonical_deepspeed_config_path,
     load_deepspeed_runtime_profile,
+    read_deepspeed_runtime_sidecar,
 )
 from src.artifact_paths import resolve_run_artifact_paths
 from src.stage1.benchmark import (
@@ -397,6 +398,48 @@ def _directory_stat_witness(path: Path) -> dict[str, int]:
     }
 
 
+def _checkpoint_step_witness(
+    checkpoint_path: Path,
+    *,
+    expected_step: int,
+    identity: Stage1ProducerIdentity,
+) -> dict[str, object]:
+    checkpoint = Path(checkpoint_path)
+    if checkpoint.name != f"checkpoint-{expected_step}":
+        raise ValueError(
+            f"selected run requires exact checkpoint-{expected_step}: {checkpoint}"
+        )
+    checkpoint_stat = _directory_stat_witness(checkpoint)
+    trainer_state = checkpoint / "trainer_state.json"
+    if not trainer_state.is_file() or trainer_state.is_symlink():
+        raise ValueError(
+            f"selected run checkpoint requires real trainer_state.json: {checkpoint}"
+        )
+    state = _read_json(trainer_state)
+    if type(state) is not dict or state.get("global_step") != expected_step:
+        raise ValueError(
+            f"selected run checkpoint global_step must be {expected_step}: {checkpoint}"
+        )
+    # This validator examines only checkpoint metadata/layout; it never hashes or
+    # loads model, optimizer, EMA, or RNG tensors.
+    from src.stage1.checkpointing import _validate_complete_trainer_state
+
+    _validate_complete_trainer_state(checkpoint)
+    runtime = read_deepspeed_runtime_sidecar(checkpoint)
+    if (
+        runtime.zero_stage != identity.zero_stage
+        or runtime.config_digest != identity.deepspeed_config_digest
+        or runtime.world_size != identity.world_size
+    ):
+        raise ValueError("selected checkpoint runtime identity does not match producer")
+    runtime_path = checkpoint / "deepspeed-runtime.json"
+    return {
+        "checkpoint_stat": checkpoint_stat,
+        "trainer_state_stat": path_stat_witness(trainer_state),
+        "runtime_stat": path_stat_witness(runtime_path),
+    }
+
+
 def write_selected_run_witness(
     path: Path,
     *,
@@ -404,15 +447,20 @@ def write_selected_run_witness(
     identity: Stage1ProducerIdentity,
     experiment_id: str,
     checkpoint_dir: Path,
+    checkpoint_path: Path,
     result_dir: Path,
     log_dir: Path,
+    initial_step: int,
+    final_step: int,
     resume_from: Path | None,
 ) -> Path:
-    """Seal one successful selected run using only directory identity metadata."""
+    """Seal one selected numbered checkpoint and its bounded step transition."""
     if run_kind not in {"selected-save", "selected-resume"}:
         raise ValueError("invalid selected run kind")
     if not isinstance(identity, Stage1ProducerIdentity):
         raise TypeError("identity must be Stage1ProducerIdentity")
+    if f"-{run_kind}-" not in experiment_id:
+        raise ValueError("selected run experiment ID must name its run kind")
     directories = {
         "checkpoint_dir": Path(checkpoint_dir).resolve(strict=True),
         "result_dir": Path(result_dir).resolve(strict=True),
@@ -420,19 +468,54 @@ def write_selected_run_witness(
     }
     if any(directory.name != experiment_id for directory in directories.values()):
         raise ValueError("selected run directories must share one experiment ID")
+    owned = resolve_run_artifact_paths(experiment_id)
+    if any(
+        directories[name] != getattr(owned, name)
+        for name in ("checkpoint_dir", "result_dir", "log_dir")
+    ):
+        raise ValueError("selected run directories must use canonical ownership")
+    checkpoint = Path(checkpoint_path).resolve(strict=True)
+    if checkpoint.parent != directories["checkpoint_dir"]:
+        raise ValueError("selected checkpoint must be immediate in its experiment root")
     if run_kind == "selected-save" and resume_from is not None:
         raise ValueError("selected-save cannot name a resume source")
     if run_kind == "selected-resume" and resume_from is None:
         raise ValueError("selected-resume requires the selected-save checkpoint")
+    if run_kind == "selected-save" and (initial_step, final_step) != (0, 3):
+        raise ValueError("selected-save must prove optimizer steps 0 to 3")
+    if run_kind == "selected-resume" and (initial_step, final_step) != (3, 4):
+        raise ValueError("selected-resume must prove optimizer step 3 to 4")
+    checkpoint_witness = _checkpoint_step_witness(
+        checkpoint, expected_step=final_step, identity=identity
+    )
+    resolved_resume = None
+    resume_witness = None
+    if resume_from is not None:
+        resolved_resume = Path(resume_from).resolve(strict=True)
+        if (
+            resolved_resume.parent == directories["checkpoint_dir"]
+            or "-selected-save-" not in resolved_resume.parent.name
+        ):
+            raise ValueError(
+                "selected-resume requires checkpoint-3 from a distinct selected-save run"
+            )
+        resume_witness = _checkpoint_step_witness(
+            resolved_resume, expected_step=initial_step, identity=identity
+        )
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "stage1-selected-run-witness",
         "run_kind": run_kind,
         "identity": identity.to_dict(),
         "experiment_id": experiment_id,
         **{name: str(directory) for name, directory in directories.items()},
-        "resume_from": None if resume_from is None else str(Path(resume_from).resolve(strict=True)),
-        "checkpoint_stat": _directory_stat_witness(directories["checkpoint_dir"]),
+        "checkpoint_path": str(checkpoint),
+        "initial_step": initial_step,
+        "final_step": final_step,
+        "resume_from": None if resolved_resume is None else str(resolved_resume),
+        "checkpoint_root_stat": _directory_stat_witness(directories["checkpoint_dir"]),
+        "checkpoint_stat": checkpoint_witness,
+        "resume_stat": resume_witness,
         "log_stat": _directory_stat_witness(directories["log_dir"]),
     }
     payload["witness_digest"] = config_digest(payload)
@@ -456,10 +539,15 @@ def load_reusable_selected_run(
             "identity",
             "experiment_id",
             "checkpoint_dir",
+            "checkpoint_path",
             "result_dir",
             "log_dir",
+            "initial_step",
+            "final_step",
             "resume_from",
+            "checkpoint_root_stat",
             "checkpoint_stat",
+            "resume_stat",
             "log_stat",
             "witness_digest",
         }
@@ -471,28 +559,63 @@ def load_reusable_selected_run(
         if config_digest(digest_input) != claimed:
             return None
         if (
-            payload["schema_version"] != 1
+            payload["schema_version"] != 2
             or payload["kind"] != "stage1-selected-run-witness"
             or payload["run_kind"] != run_kind
             or payload["identity"] != identity.to_dict()
         ):
             return None
         experiment_id = payload["experiment_id"]
+        if type(experiment_id) is not str or f"-{run_kind}-" not in experiment_id:
+            return None
         directories = {
             name: Path(payload[name]).resolve(strict=True)
             for name in ("checkpoint_dir", "result_dir", "log_dir")
         }
         if any(directory.name != experiment_id for directory in directories.values()):
             return None
-        if payload["checkpoint_stat"] != _directory_stat_witness(directories["checkpoint_dir"]):
+        owned = resolve_run_artifact_paths(experiment_id)
+        if any(
+            directories[name] != getattr(owned, name)
+            for name in ("checkpoint_dir", "result_dir", "log_dir")
+        ):
+            return None
+        checkpoint = Path(payload["checkpoint_path"]).resolve(strict=True)
+        if checkpoint.parent != directories["checkpoint_dir"]:
+            return None
+        if payload["checkpoint_root_stat"] != _directory_stat_witness(
+            directories["checkpoint_dir"]
+        ):
+            return None
+        if payload["checkpoint_stat"] != _checkpoint_step_witness(
+            checkpoint, expected_step=payload["final_step"], identity=identity
+        ):
             return None
         if payload["log_stat"] != _directory_stat_witness(directories["log_dir"]):
             return None
-        if run_kind == "selected-save" and payload["resume_from"] is not None:
-            return None
+        if run_kind == "selected-save":
+            if (
+                payload["resume_from"] is not None
+                or payload["resume_stat"] is not None
+                or (payload["initial_step"], payload["final_step"]) != (0, 3)
+            ):
+                return None
         if run_kind == "selected-resume":
             resume_from = payload["resume_from"]
-            if type(resume_from) is not str or not Path(resume_from).is_dir():
+            if (
+                type(resume_from) is not str
+                or (payload["initial_step"], payload["final_step"]) != (3, 4)
+                or Path(resume_from).resolve(strict=True).parent
+                == directories["checkpoint_dir"]
+                or "-selected-save-"
+                not in Path(resume_from).resolve(strict=True).parent.name
+                or payload["resume_stat"]
+                != _checkpoint_step_witness(
+                    Path(resume_from),
+                    expected_step=payload["initial_step"],
+                    identity=identity,
+                )
+            ):
                 return None
         return payload
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -866,8 +989,11 @@ def _main(argv: list[str] | None = None) -> int:
     record_selected_parser.add_argument("--identity-json", required=True)
     record_selected_parser.add_argument("--experiment-id", required=True)
     record_selected_parser.add_argument("--checkpoint-dir", required=True)
+    record_selected_parser.add_argument("--checkpoint-path", required=True)
     record_selected_parser.add_argument("--result-dir", required=True)
     record_selected_parser.add_argument("--log-dir", required=True)
+    record_selected_parser.add_argument("--initial-step", type=int, required=True)
+    record_selected_parser.add_argument("--final-step", type=int, required=True)
     record_selected_parser.add_argument("--resume-from")
 
     selected_status_parser = subparsers.add_parser("selected-status")
@@ -1063,8 +1189,11 @@ def _main(argv: list[str] | None = None) -> int:
                 identity=Stage1ProducerIdentity(**identity_payload),
                 experiment_id=args.experiment_id,
                 checkpoint_dir=Path(args.checkpoint_dir),
+                checkpoint_path=Path(args.checkpoint_path),
                 result_dir=Path(args.result_dir),
                 log_dir=Path(args.log_dir),
+                initial_step=args.initial_step,
+                final_step=args.final_step,
                 resume_from=None if args.resume_from is None else Path(args.resume_from),
             )
             print(path)

@@ -296,6 +296,9 @@ for micro_batch in "${candidates[@]}"; do
         --stderr-path "$stderr_path" \
         --probe-rows "$probe_rows" \
         -- "${launch_command[@]}" >/dev/null
+    "$benchmark_python" -m src.stage1.benchmark register-attempt \
+        --probe-dir "$output_root" \
+        --attempt "$attempt_dir/evidence/attempt.json" >/dev/null
 
     if (( exit_code != 0 )); then
         printf 'requires-classification: method=%s micro_batch=%s attempt=%s\n' \

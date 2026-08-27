@@ -72,9 +72,21 @@ def test_zero_matrix_dry_run_orders_stages_methods_and_candidates_without_writes
                 "selected-save", "selected-resume"
             ]
             assert pair[-2]["max_steps"] == 3
-            assert pair[-2]["final_save"] is True
+            assert pair[-2]["save_strategy"] == "steps"
+            assert pair[-2]["save_steps"] == 3
+            assert pair[-2]["final_save"] is False
+            assert pair[-2]["checkpoint_path"] == (
+                f'{pair[-2]["checkpoint_dir"]}/checkpoint-3'
+            )
             assert pair[-1]["max_steps"] == 4
+            assert pair[-1]["save_strategy"] == "steps"
+            assert pair[-1]["save_steps"] == 1
+            assert pair[-1]["final_save"] is False
             assert pair[-1]["resume_from_kind"] == "selected-save"
+            assert pair[-1]["resume_from"] == pair[-2]["checkpoint_path"]
+            assert pair[-1]["checkpoint_path"] == (
+                f'{pair[-1]["checkpoint_dir"]}/checkpoint-4'
+            )
             assert pair[-2]["experiment_id"] != pair[-1]["experiment_id"]
             for row in pair:
                 assert row["checkpoint_dir"].split("/")[-1] == row["experiment_id"]

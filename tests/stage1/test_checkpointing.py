@@ -13,6 +13,7 @@ import numpy as np
 import peft
 import pytest
 import torch
+import stage1.checkpointing as checkpointing
 from accelerate.state import AcceleratorState, GradientState, PartialState
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
@@ -1874,6 +1875,43 @@ def test_explicit_peft_resume_accepts_complete_standard_state(
 
     assert decision.checkpoint_path == checkpoint
     assert decision.artifact_kind is Stage1ArtifactKind.PEFT
+
+
+def test_explicit_peft_resume_accepts_complete_numbered_checkpoint_from_distinct_canonical_run(
+    tmp_path, saved_dora_artifact, monkeypatch
+):
+    canonical_root = tmp_path / "canonical-checkpoints"
+    monkeypatch.setattr(checkpointing, "CANONICAL_CHECKPOINT_ROOT", canonical_root)
+    save_output = canonical_root / "stage1-zero3-dora-selected-save-unit"
+    resume_output = canonical_root / "stage1-zero3-dora-selected-resume-unit"
+    checkpoint = _copy_numbered_peft(saved_dora_artifact, save_output, 3)
+    _write_standard_trainer_state(checkpoint, rank_count=2)
+
+    decision = resolve_stage1_resume(resume_output, checkpoint)
+
+    assert decision.checkpoint_path == checkpoint
+    assert decision.artifact_kind is Stage1ArtifactKind.PEFT
+
+
+@pytest.mark.parametrize("source_location", ["outside", "canonical-nested"])
+def test_explicit_peft_resume_rejects_complete_cross_output_checkpoint_outside_direct_canonical_runs(
+    tmp_path, saved_dora_artifact, monkeypatch, source_location
+):
+    canonical_root = tmp_path / "canonical-checkpoints"
+    monkeypatch.setattr(checkpointing, "CANONICAL_CHECKPOINT_ROOT", canonical_root)
+    source_output = (
+        tmp_path / "arbitrary-save-output"
+        if source_location == "outside"
+        else canonical_root
+        / "nested"
+        / "stage1-zero3-dora-selected-save-unit"
+    )
+    resume_output = canonical_root / "stage1-zero3-dora-selected-resume-unit"
+    checkpoint = _copy_numbered_peft(saved_dora_artifact, source_output, 3)
+    _write_standard_trainer_state(checkpoint, rank_count=2)
+
+    with pytest.raises(ValueError, match="canonical|same output|immediate"):
+        resolve_stage1_resume(resume_output, checkpoint)
 
 
 @pytest.mark.parametrize(

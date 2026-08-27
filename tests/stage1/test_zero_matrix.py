@@ -374,20 +374,60 @@ def test_report_preserves_prior_stage_method_matrix(tmp_path):
     ]
 
 
-def test_selected_save_and_resume_witnesses_are_independently_reusable(tmp_path):
+@pytest.mark.parametrize("method", ["full", "dora"])
+def test_selected_save_and_resume_witnesses_are_independently_reusable(
+    tmp_path, method, monkeypatch
+):
     """Catches selected resume reuse being conflated with selected save reuse."""
     from src.stage1.zero_matrix import (
         load_reusable_selected_run,
         write_selected_run_witness,
     )
+    import src.artifact_paths as artifact_paths
 
-    identity = attempt(micro=4, speed=4.0).identity
+    monkeypatch.setattr(
+        artifact_paths, "CANONICAL_CHECKPOINT_ROOT", tmp_path / "checkpoints"
+    )
+    monkeypatch.setattr(
+        artifact_paths, "CANONICAL_RESULT_ROOT", tmp_path / "results"
+    )
+    monkeypatch.setattr(artifact_paths, "CANONICAL_LOG_ROOT", tmp_path / "logs")
+
+    identity = replace(attempt(micro=4, speed=4.0).identity, method=method)
     roots = {}
     for run_kind in ("selected-save", "selected-resume"):
-        experiment_id = f"stage1-zero3-full-mb4-ga2-{run_kind}-unit"
+        experiment_id = f"stage1-zero3-{method}-mb4-ga2-{run_kind}-unit"
         directories = [tmp_path / root / experiment_id for root in ("checkpoints", "results", "logs")]
         for directory in directories:
             directory.mkdir(parents=True)
+        final_step = 3 if run_kind == "selected-save" else 4
+        checkpoint = directories[0] / f"checkpoint-{final_step}"
+        checkpoint.mkdir()
+        (checkpoint / "trainer_state.json").write_text(
+            json.dumps({"global_step": final_step}) + "\n", encoding="utf-8"
+        )
+        for name in (
+            "optimizer.pt",
+            "scheduler.pt",
+            "rng_state_0.pth",
+            "rng_state_1.pth",
+            "stage1_ema_teacher.pt",
+        ):
+            (checkpoint / name).write_bytes(b"fixture")
+        (checkpoint / "deepspeed-runtime.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "enabled": True,
+                    "zero_stage": identity.zero_stage,
+                    "config_path": "/canonical/deepspeed.json",
+                    "config_digest": identity.deepspeed_config_digest,
+                    "world_size": identity.world_size,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         roots[run_kind] = directories
         write_selected_run_witness(
             directories[1] / "selected-run-witness.json",
@@ -395,10 +435,15 @@ def test_selected_save_and_resume_witnesses_are_independently_reusable(tmp_path)
             identity=identity,
             experiment_id=experiment_id,
             checkpoint_dir=directories[0],
+            checkpoint_path=checkpoint,
             result_dir=directories[1],
             log_dir=directories[2],
+            initial_step=0 if run_kind == "selected-save" else 3,
+            final_step=final_step,
             resume_from=(
-                None if run_kind == "selected-save" else roots["selected-save"][0]
+                None
+                if run_kind == "selected-save"
+                else roots["selected-save"][0] / "checkpoint-3"
             ),
         )
 
@@ -414,7 +459,13 @@ def test_selected_save_and_resume_witnesses_are_independently_reusable(tmp_path)
     )
 
     assert save is not None and save["experiment_id"] != resume["experiment_id"]
-    assert resume is not None and resume["resume_from"] == str(roots["selected-save"][0])
+    assert save["checkpoint_path"].endswith("/checkpoint-3")
+    assert save["initial_step"] == 0 and save["final_step"] == 3
+    assert resume is not None and resume["resume_from"] == str(
+        roots["selected-save"][0] / "checkpoint-3"
+    )
+    assert resume["checkpoint_path"].endswith("/checkpoint-4")
+    assert resume["initial_step"] == 3 and resume["final_step"] == 4
     assert (
         load_reusable_selected_run(
             roots["selected-resume"][1] / "selected-run-witness.json",
@@ -423,3 +474,12 @@ def test_selected_save_and_resume_witnesses_are_independently_reusable(tmp_path)
         )
         is None
     )
+    resume_checkpoint = roots["selected-resume"][0] / "checkpoint-4"
+    (resume_checkpoint / "trainer_state.json").write_text(
+        '{"global_step":5}\n', encoding="utf-8"
+    )
+    assert load_reusable_selected_run(
+        roots["selected-resume"][1] / "selected-run-witness.json",
+        run_kind="selected-resume",
+        identity=identity,
+    ) is None

@@ -29,6 +29,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
+from artifact_paths import CANONICAL_CHECKPOINT_ROOT, EXPERIMENT_ID_PATTERN
 from peft_common import (
     capture_qwen2_5_vl_architecture,
     first_architecture_difference,
@@ -1657,10 +1658,31 @@ def _validate_peft_resume_location(output_dir: Path, checkpoint: Path) -> None:
             f"Stage 1 adapter resume rejects symlink checkpoints: {checkpoint}"
         )
     output = output_dir.resolve()
-    if checkpoint.parent.resolve() != output or checkpoint.resolve().parent != output:
+    if checkpoint.parent.resolve() == output and checkpoint.resolve().parent == output:
+        return
+
+    canonical_root = CANONICAL_CHECKPOINT_ROOT.resolve(strict=False)
+    source_output = checkpoint.parent
+    source = source_output.resolve(strict=False)
+    destination = output_dir.resolve(strict=False)
+    source_is_canonical = (
+        not source_output.is_symlink()
+        and source.parent == canonical_root
+        and source_output.parent.resolve(strict=False) == canonical_root
+        and EXPERIMENT_ID_PATTERN.fullmatch(source.name) is not None
+    )
+    destination_is_canonical = (
+        not output_dir.is_symlink()
+        and destination.parent == canonical_root
+        and output_dir.parent.resolve(strict=False) == canonical_root
+        and EXPERIMENT_ID_PATTERN.fullmatch(destination.name) is not None
+    )
+    if not source_is_canonical or not destination_is_canonical or source == destination:
         raise ValueError(
-            "Stage 1 adapter resume requires an immediate checkpoint in the "
-            f"same output directory: output={output_dir}, checkpoint={checkpoint}"
+            "Stage 1 adapter resume requires an immediate checkpoint in the same "
+            "output directory or a complete numbered checkpoint from a distinct "
+            "canonical checkpoint experiment: "
+            f"output={output_dir}, checkpoint={checkpoint}"
         )
 
 

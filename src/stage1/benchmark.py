@@ -24,6 +24,12 @@ import tempfile
 import time
 from typing import Any, Literal, Mapping, Sequence
 
+from artifact_paths import (
+    CANONICAL_CHECKPOINT_ROOT,
+    CANONICAL_LOG_ROOT,
+    CANONICAL_RESULT_ROOT,
+)
+
 
 _SCHEMA_VERSION = 1
 LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION = 1
@@ -2836,25 +2842,25 @@ def _load_probe_attempt(path: Path) -> dict[str, object]:
     if len(path.parents) >= 4 and path.name == "attempt.json":
         attempt_dir = path.parents[1]
         legacy_topology = (
-            path.parents[3].name != payload["method"]
-            or path.parents[2].name != f"micro-batch-{payload['micro_batch']}"
-            or attempt_dir.name != f"attempt-{payload['attempt_id']}"
+            path.parents[3].name == payload["method"]
+            and path.parents[2].name == f"micro-batch-{payload['micro_batch']}"
+            and attempt_dir.name == f"attempt-{payload['attempt_id']}"
         )
         canonical_output = Path(payload["output_dir"])
         canonical_logs = (Path(payload["stdout_path"]), Path(payload["stderr_path"]))
         canonical_topology = (
-            canonical_output.parent.name == "zero-stage-compatibility"
-            and canonical_output.parent.parent.name == "checkpoints"
+            attempt_dir.name == "attempt-record"
+            and path.parents[2] == CANONICAL_RESULT_ROOT / canonical_output.name
+            and canonical_output.parent == CANONICAL_CHECKPOINT_ROOT
             and all(
-                path.parent.name == canonical_output.name
-                and path.parent.parent.name == "zero-stage-compatibility"
-                and path.parent.parent.parent.name == "logs"
-                for path in canonical_logs
+                log.parent == CANONICAL_LOG_ROOT / canonical_output.name
+                for log in canonical_logs
             )
         )
-        if legacy_topology or not (
+        if not (
             (
-                canonical_output == (attempt_dir / "output").resolve()
+                legacy_topology
+                and canonical_output == (attempt_dir / "output").resolve()
                 and canonical_logs
                 == (
                     (attempt_dir / "logs" / "stdout.log").resolve(),
@@ -3217,6 +3223,36 @@ def _confirmed_capacity_oom(attempt_path: Path) -> bool:
 def _attempt_files(probe_dir: Path, method: str | None = None) -> list[Path]:
     pattern = "attempts/*/micro-batch-*/attempt-*/evidence/attempt.json"
     paths = list(probe_dir.glob(pattern))
+    for pointer_path in (Path(probe_dir) / "attempt-index").glob("*.json"):
+        if pointer_path.is_symlink() or not pointer_path.is_file():
+            raise ValueError(f"unsafe probe attempt pointer: {pointer_path}")
+        pointer = _read_json_once(pointer_path)
+        _require_exact_keys(
+            pointer,
+            {
+                "schema_version",
+                "kind",
+                "attempt_path",
+                "attempt_digest",
+                "pointer_digest",
+            },
+            "probe attempt pointer",
+        )
+        claimed_pointer_digest = _require_digest(
+            "pointer_digest", pointer["pointer_digest"]
+        )
+        pointer_input = dict(pointer)
+        pointer_input.pop("pointer_digest")
+        if config_digest(pointer_input) != claimed_pointer_digest:
+            raise ValueError("probe attempt pointer digest mismatch")
+        attempt_path = Path(_require_string("attempt_path", pointer["attempt_path"]))
+        attempt = _load_probe_attempt(attempt_path)
+        if attempt["attempt_digest"] != _require_digest(
+            "attempt_digest", pointer["attempt_digest"]
+        ):
+            raise ValueError("probe attempt pointer does not match attempt digest")
+        paths.append(attempt_path)
+    paths = list(dict.fromkeys(paths))
     attempts: list[tuple[int, Path]] = []
     for path in paths:
         attempt = _load_probe_attempt(path)
@@ -3224,6 +3260,48 @@ def _attempt_files(probe_dir: Path, method: str | None = None) -> list[Path]:
             attempts.append((attempt["recorded_at_ns"], path))
     attempts.sort(key=lambda item: item[0])
     return [path for _, path in attempts]
+
+
+def _register_probe_attempt(probe_dir: Path, attempt_path: Path) -> Path:
+    """Publish a small controller-local pointer to canonical per-run evidence."""
+    attempt_path = Path(attempt_path)
+    if attempt_path.is_symlink() or not attempt_path.is_file():
+        raise ValueError(f"probe attempt must be a real file: {attempt_path}")
+    resolved_attempt = attempt_path.resolve(strict=True)
+    result_root = CANONICAL_RESULT_ROOT.resolve(strict=False)
+    result_dir = resolved_attempt.parents[2]
+    if (
+        resolved_attempt.name != "attempt.json"
+        or resolved_attempt.parent.name != "evidence"
+        or resolved_attempt.parents[1].name != "attempt-record"
+        or result_dir.parent.resolve(strict=False) != result_root
+        or result_dir.is_symlink()
+    ):
+        raise ValueError(
+            "probe attempt pointer requires canonical per-run result evidence"
+        )
+    attempt = _load_probe_attempt(resolved_attempt)
+    for previous_path in _attempt_files(Path(probe_dir), attempt["method"]):
+        previous = _load_probe_attempt(previous_path)
+        if previous["process_id"] == attempt["process_id"]:
+            raise RuntimeError(
+                "probe process ID was reused instead of remaining unique: "
+                f'{attempt["process_id"]}'
+            )
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-probe-attempt-pointer",
+        "attempt_path": str(resolved_attempt),
+        "attempt_digest": attempt["attempt_digest"],
+    }
+    payload["pointer_digest"] = config_digest(payload)
+    pointer = (
+        Path(probe_dir)
+        / "attempt-index"
+        / f'{attempt["attempt_digest"]}.json'
+    )
+    _exclusive_write_json(pointer, payload)
+    return pointer
 
 
 def _validated_capacity_chain(
@@ -4853,6 +4931,10 @@ def _build_parser() -> argparse.ArgumentParser:
     record.add_argument("--probe-rows", required=True)
     record.add_argument("command", nargs=argparse.REMAINDER)
 
+    register = subparsers.add_parser("register-attempt")
+    register.add_argument("--probe-dir", required=True)
+    register.add_argument("--attempt", required=True)
+
     probe_run = subparsers.add_parser("prepare-probe-run")
     probe_run.add_argument("--run-config", required=True)
     probe_run.add_argument("--method", required=True)
@@ -4978,6 +5060,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_probe_attempt_path(Path(args.attempt_dir)))
         if payload["requires_oom_classification"]:
             print("requires-classification", file=sys.stderr)
+    elif command == "register-attempt":
+        print(_register_probe_attempt(Path(args.probe_dir), Path(args.attempt)))
     elif command == "prepare-probe-run":
         print(_prepare_probe_run(args))
     elif command == "classify-failure":

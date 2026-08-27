@@ -479,6 +479,29 @@ def _run_probe(
     return completed, records, output_root, poison_marker
 
 
+def _probe_attempt_files(output_root, method="full"):
+    """Discover indexed attempts while preserving their canonical result ownership."""
+    import stage1.benchmark as benchmark
+
+    attempts = benchmark._attempt_files(output_root, method)
+    for attempt in attempts:
+        assert attempt.parent.parent.parent.parent == CANONICAL_RESULT_ROOT
+        assert attempt.parent.name == "evidence"
+        assert attempt.parent.parent.name == "attempt-record"
+        assert not attempt.is_relative_to(output_root)
+    return attempts
+
+
+def _probe_attempt_for_batch(output_root, micro_batch):
+    import stage1.benchmark as benchmark
+
+    return next(
+        path
+        for path in _probe_attempt_files(output_root)
+        if benchmark._load_probe_attempt(path)["micro_batch"] == micro_batch
+    )
+
+
 def test_probe_uses_fresh_processes_unique_paths_and_stops_at_first_failure(tmp_path):
     """Catches mocked isolation, dirty-process reuse, retry, and output collision."""
     completed, records, output_root, _ = _run_probe(tmp_path, fail_batches="32")
@@ -498,7 +521,7 @@ def test_probe_uses_fresh_processes_unique_paths_and_stops_at_first_failure(tmp_
         assert parts[parts.index(b"--max-steps") + 1] == b"3"
         assert b"--no-final-save" in parts
         assert b"--max-steps" in parts
-    attempts = list(output_root.glob("attempts/full/micro-batch-*/attempt-*/evidence/attempt.json"))
+    attempts = _probe_attempt_files(output_root)
     assert len(attempts) == 3
     assert len({path.parent.parent.parent for path in attempts}) == 3
     failed = [json.loads(path.read_text()) for path in attempts if json.loads(path.read_text())["exit_code"]]
@@ -553,7 +576,7 @@ def test_probe_pins_benchmark_python_when_path_and_override_are_wrong(tmp_path):
     assert completed.returncode == 42, completed.stderr
     assert not poison_marker.exists()
     assert len(list(records.glob("*.argv0"))) == 1
-    assert len(list(output_root.glob("attempts/full/**/evidence/attempt.json"))) == 1
+    assert len(_probe_attempt_files(output_root)) == 1
 
 
 @pytest.mark.parametrize("failed_batch", [8, 16])
@@ -566,11 +589,7 @@ def test_integration_failure_retries_same_batch_append_only_then_continues(
         tmp_path, fail_batches=str(failed_batch)
     )
     assert failed.returncode == 42
-    failed_attempt = next(
-        output_root.glob(
-            f"attempts/full/micro-batch-{failed_batch}/*/evidence/attempt.json"
-        )
-    )
+    failed_attempt = _probe_attempt_for_batch(output_root, failed_batch)
     original_attempt_bytes = failed_attempt.read_bytes()
 
     import stage1.benchmark as benchmark
@@ -615,7 +634,7 @@ def test_integration_failure_never_authorizes_capacity_fallback(tmp_path):
 
     failed, records, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert failed.returncode == 42
-    failed_attempt = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    failed_attempt = _probe_attempt_for_batch(output_root, 8)
 
     import stage1.benchmark as benchmark
 
@@ -637,7 +656,7 @@ def test_conflicting_failure_classifications_publish_exactly_once(
 
     failed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert failed.returncode == 42
-    failed_attempt = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    failed_attempt = _probe_attempt_for_batch(output_root, 8)
 
     import stage1.benchmark as benchmark
 
@@ -679,7 +698,7 @@ def test_identical_classification_is_invisible_until_atomic_publication(
 
     failed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert failed.returncode == 42
-    failed_attempt = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    failed_attempt = _probe_attempt_for_batch(output_root, 8)
 
     import stage1.benchmark as benchmark
 
@@ -723,7 +742,7 @@ def test_concurrent_probe_controllers_cannot_launch_duplicate_retry(tmp_path):
 
     failed, records, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert failed.returncode == 42
-    failed_attempt = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    failed_attempt = _probe_attempt_for_batch(output_root, 8)
 
     import stage1.benchmark as benchmark
 
@@ -800,7 +819,7 @@ def test_attempt_seal_binds_top_level_fields_and_is_append_only(tmp_path):
     """Catches post-hoc PID/method/argv edits and attempt-file replacement."""
     completed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert completed.returncode == 42
-    attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    attempt_path = _probe_attempt_for_batch(output_root, 8)
     payload = json.loads(attempt_path.read_text())
 
     import stage1.benchmark as benchmark
@@ -837,7 +856,7 @@ def test_attempt_rejects_data_argv_not_equal_to_materialized_audit_subset(tmp_pa
     """Catches swapping the 64-row probe input for the full source JSONL."""
     completed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert completed.returncode == 42
-    attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    attempt_path = _probe_attempt_for_batch(output_root, 8)
     payload = json.loads(attempt_path.read_text())
     command = payload["command"]
     command[command.index("--data-path") + 1] = payload["launch_config"]["data_path"]
@@ -884,7 +903,7 @@ def pre_fix_preserved_relative_probe_attempt(tmp_path, monkeypatch):
 
     completed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert completed.returncode == 42
-    attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    attempt_path = _probe_attempt_for_batch(output_root, 8)
 
     import stage1.benchmark as benchmark
 
@@ -939,7 +958,7 @@ def test_pre_fix_probe_argv_compatibility_rejects_noncanonical_aliases(
 
     completed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert completed.returncode == 42
-    attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    attempt_path = _probe_attempt_for_batch(output_root, 8)
 
     import stage1.benchmark as benchmark
 
@@ -997,7 +1016,7 @@ def test_probe_argv_relative_compatibility_excludes_input_authorities(
 ):
     completed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
     assert completed.returncode == 42
-    attempt_path = next(output_root.glob("attempts/full/**/evidence/attempt.json"))
+    attempt_path = _probe_attempt_for_batch(output_root, 8)
     payload = json.loads(attempt_path.read_text())
 
     import stage1.benchmark as benchmark
