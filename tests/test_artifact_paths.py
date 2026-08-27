@@ -58,3 +58,14 @@ def test_generated_checkpoint_result_and_log_share_experiment_id(stage1_args):
     )
 
     assert validate_generated_artifact_paths(stage1_args) == paths
+
+
+def test_generated_paths_reject_different_canonical_experiment_ids(stage1_args):
+    """Catches launcher preflight accepting separate canonical run directories."""
+    checkpoint = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
+    other = resolve_run_artifact_paths("stage1-zero3-dora-mb4-ga2-candidate")
+    stage1_args.save_model_path = str(checkpoint.checkpoint_dir)
+    stage1_args.log_file = str(other.log_dir / "train.log")
+
+    with pytest.raises(ValueError, match="share one experiment ID"):
+        validate_generated_artifact_paths(stage1_args)

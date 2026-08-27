@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -825,3 +826,35 @@ def test_main_establishes_artifact_and_deepspeed_identity_before_seeding(monkeyp
     main_train()
 
     assert observed == ["artifacts", "runtime", "seed", "route"]
+
+
+def test_direct_main_rejects_artifacts_before_importing_transformers(tmp_path):
+    """Catches direct main execution importing model dependencies before preflight."""
+    poison = tmp_path / "poison"
+    transformers = poison / "transformers"
+    transformers.mkdir(parents=True)
+    (transformers / "__init__.py").write_text(
+        "raise RuntimeError('transformers import reached before preflight')\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(poison)
+
+    completed = subprocess.run(
+        [
+            str(Path(sys.executable)),
+            str(Path(main.__file__).resolve()),
+            "--save_model_path",
+            "/tmp/noncanonical-checkpoint",
+            "--log_file",
+            "/tmp/noncanonical.log",
+        ],
+        cwd=Path(main.__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "canonical checkpoint root" in completed.stderr
+    assert "transformers import reached before preflight" not in completed.stderr

@@ -246,6 +246,23 @@ def test_dry_run_derives_canonical_log_from_checkpoint_experiment_id():
     )
 
 
+def test_live_launcher_rejects_mismatched_canonical_artifact_ids_before_setup(tmp_path):
+    """Catches preflight accepting canonical paths that belong to different runs."""
+    checkpoint = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
+    other = resolve_run_artifact_paths("stage1-zero3-dora-mb4-ga2-candidate")
+    completed = run_launcher(
+        LAUNCHER,
+        *live_args(tmp_path, checkpoint.checkpoint_dir),
+        "--log-file",
+        other.log_dir / "train.log",
+        "--deepspeed-config",
+        tmp_path / "not-reached.json",
+    )
+
+    assert completed.returncode == 2
+    assert "share one experiment ID" in completed.stderr
+
+
 def test_full_dry_run_omits_every_peft_argument(tmp_path):
     """Catches full tuning accidentally inheriting adapter configuration."""
     completed = run_launcher(

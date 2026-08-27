@@ -100,12 +100,29 @@ def _main(argv: list[str] | None = None) -> int:
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--kind", choices=("checkpoint", "result", "log"), required=True)
     validate_parser.add_argument("--path", required=True)
+    run_parser = subparsers.add_parser("validate-run")
+    run_parser.add_argument("--checkpoint", required=True)
+    run_parser.add_argument("--log", required=True)
+    run_parser.add_argument("--benchmark-run-config")
+    run_parser.add_argument("--benchmark-evidence-path")
+    run_parser.add_argument("--benchmark-smoke-resume-witness")
     args = parser.parse_args(argv)
     try:
         if args.command == "resolve":
             print(_json_paths(resolve_run_artifact_paths(args.experiment_id)))
-        else:
+        elif args.command == "validate":
             print(require_canonical_artifact_path(args.path, kind=args.kind))
+        else:
+            paths = validate_generated_artifact_paths(
+                argparse.Namespace(
+                    save_model_path=args.checkpoint,
+                    log_file=args.log,
+                    benchmark_run_config=args.benchmark_run_config,
+                    benchmark_evidence_path=args.benchmark_evidence_path,
+                    benchmark_smoke_resume_witness=args.benchmark_smoke_resume_witness,
+                )
+            )
+            print(_json_paths(paths))
     except ValueError as error:
         parser.error(str(error))
     return 0

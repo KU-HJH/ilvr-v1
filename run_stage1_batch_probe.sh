@@ -113,6 +113,16 @@ if [[ $method == dora ]] && ! awk -v value="$dora_dropout" 'BEGIN { number = val
     exit 2
 fi
 
+probe_experiment_id=${output_root##*/}
+canonical_checkpoint_root='/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility'
+canonical_result_root='/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility'
+canonical_log_root='/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility'
+"$repository_python" -m src.artifact_paths resolve --experiment-id "$probe_experiment_id" >/dev/null
+if [[ $(readlink -m -- "$output_root") != "$canonical_result_root/$probe_experiment_id" ]]; then
+    printf 'error: output root must be the canonical result directory for one experiment\n' >&2
+    exit 2
+fi
+
 if [[ $descending == true ]]; then
     if [[ -n $fallback && $fallback != "$start" ]]; then
         printf 'error: --fallback and --start disagree\n' >&2
@@ -183,16 +193,31 @@ for micro_batch in "${candidates[@]}"; do
     fi
     validate_probe_lock
     counter=$((counter + 1))
-    attempt_id="$(date +%Y%m%dT%H%M%S%N)-$$-$counter"
+    attempt_id="$(date +%Y%m%dt%H%M%S%N)-$$-$counter"
+    candidate_experiment_id="$probe_experiment_id-mb$micro_batch-$attempt_id"
+    "$repository_python" -m src.artifact_paths resolve --experiment-id "$candidate_experiment_id" >/dev/null
     attempt_dir="$output_root/attempts/$method/micro-batch-$micro_batch/attempt-$attempt_id"
-    logs_dir="$attempt_dir/logs"
-    evidence_dir="$attempt_dir/evidence"
-    candidate_output="$attempt_dir/output"
+    logs_dir="$canonical_log_root/$candidate_experiment_id"
+    evidence_dir="$canonical_result_root/$candidate_experiment_id"
+    candidate_output="$canonical_checkpoint_root/$candidate_experiment_id"
     stdout_path="$logs_dir/stdout.log"
     stderr_path="$logs_dir/stderr.log"
     run_config="$evidence_dir/run-config.json"
     producer_evidence="$evidence_dir/producer-evidence.json"
-    mkdir -p -- "$logs_dir" "$evidence_dir"
+    mkdir -p -- "$canonical_checkpoint_root" "$canonical_log_root" "$canonical_result_root" \
+        "$attempt_dir/evidence"
+    if ! mkdir -- "$candidate_output"; then
+        printf 'error: fresh run artifact directory already exists: %s\n' "$candidate_output" >&2
+        exit 2
+    fi
+    if ! mkdir -- "$logs_dir"; then
+        printf 'error: fresh run artifact directory already exists: %s\n' "$logs_dir" >&2
+        exit 2
+    fi
+    if ! mkdir -- "$evidence_dir"; then
+        printf 'error: fresh run artifact directory already exists: %s\n' "$evidence_dir" >&2
+        exit 2
+    fi
 
     "$benchmark_python" -m src.stage1.benchmark prepare-probe-run \
         --run-config "$run_config" --method "$method" --model "$model" \
@@ -228,7 +253,7 @@ for micro_batch in "${candidates[@]}"; do
 
     validate_probe_lock
     set +e
-    "${launch_command[@]}" >"$stdout_path" 2>"$stderr_path" &
+    STAGE1_ARTIFACTS_PRECLAIMED=true "${launch_command[@]}" >"$stdout_path" 2>"$stderr_path" &
     child_pid=$!
     wait "$child_pid"
     exit_code=$?

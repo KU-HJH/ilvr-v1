@@ -53,7 +53,7 @@ def load_deepspeed_runtime_profile(
     config_path: str | Path | None, *, world_size: int
 ) -> DeepSpeedRuntimeProfile:
     """Load and digest one DeepSpeed config exactly once for this runtime."""
-    if world_size < 1:
+    if type(world_size) is not int or world_size < 1:
         raise ValueError("world_size must be positive")
     if config_path is None:
         return DeepSpeedRuntimeProfile(False, None, None, None, world_size)
@@ -66,14 +66,17 @@ def load_deepspeed_runtime_profile(
     if not isinstance(zero, Mapping):
         raise ValueError("zero_optimization must be a JSON object")
     zero_stage = zero.get("stage")
-    if zero_stage not in (1, 2, 3):
+    if type(zero_stage) is not int or zero_stage not in (1, 2, 3):
         raise ValueError("zero_optimization.stage must be 1, 2, or 3")
-    try:
-        mesh = int(payload.get("data_parallel_size", 1)) * int(
-            payload.get("sequence_parallel_size", 1)
-        )
-    except (TypeError, ValueError) as error:
-        raise ValueError("DeepSpeed mesh dimensions must be integers") from error
+    mesh_dimensions = {}
+    for field in ("data_parallel_size", "sequence_parallel_size"):
+        value = payload.get(field, 1)
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{field} must be a positive integer")
+        mesh_dimensions[field] = value
+    mesh = mesh_dimensions["data_parallel_size"] * mesh_dimensions[
+        "sequence_parallel_size"
+    ]
     if mesh > 1 and mesh != world_size:
         raise ValueError(f"DeepSpeed mesh requires world size {mesh}, got {world_size}")
     validate_supported_deepspeed_policy(payload)

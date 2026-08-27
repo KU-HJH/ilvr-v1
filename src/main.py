@@ -1,7 +1,39 @@
+import argparse
 import logging
+import sys
+from pathlib import Path
+
+from artifact_paths import resolve_run_artifact_paths, validate_generated_artifact_paths
+from deepspeed_runtime import bind_deepspeed_runtime_profile
+
+
+def _preflight_direct_main(argv: list[str]) -> object:
+    """Validate generated ownership before importing the training runtime."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--save_model_path", default="./checkpoints/model_stage1")
+    parser.add_argument("--log_file")
+    parser.add_argument("--benchmark_run_config")
+    parser.add_argument("--benchmark_evidence_path")
+    parser.add_argument("--benchmark_smoke_resume_witness")
+    parser.add_argument("--deepspeed_config")
+    args, _unknown = parser.parse_known_args(argv)
+    if args.log_file is None:
+        try:
+            paths = resolve_run_artifact_paths(Path(args.save_model_path).name)
+        except ValueError:
+            pass
+        else:
+            args.log_file = str(paths.log_dir / "train.log")
+    validate_generated_artifact_paths(args)
+    return bind_deepspeed_runtime_profile(args)
+
+
+_DIRECT_MAIN_PROFILE = (
+    _preflight_direct_main(sys.argv[1:]) if __name__ == "__main__" else None
+)
+
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from types import MappingProxyType
 
 import torch
@@ -17,8 +49,6 @@ from peft import PeftConfig
 from qwen_vl_utils import process_vision_info
 
 from utils_deepseed import *
-from artifact_paths import validate_generated_artifact_paths
-from deepspeed_runtime import bind_deepspeed_runtime_profile
 from task_deepseed import *
 from stage1.checkpointing import (
     decode_stage1_peft_metadata_snapshot,
@@ -501,6 +531,8 @@ def route_training(args, *, stage1_handler=None, stage2_handler=None):
 def main_train():
     args = get_args()
     validate_generated_artifact_paths(args)
+    if _DIRECT_MAIN_PROFILE is not None:
+        args.deepspeed_runtime_profile = _DIRECT_MAIN_PROFILE
     bind_deepspeed_runtime_profile(args)
     seed_everything(seed=42 if args.stage == "stage2" else args.seed)
 

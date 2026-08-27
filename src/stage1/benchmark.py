@@ -2601,13 +2601,33 @@ def _load_probe_attempt(path: Path) -> dict[str, object]:
         _require_string(name, payload.get(name))
     if len(path.parents) >= 4 and path.name == "attempt.json":
         attempt_dir = path.parents[1]
-        if (
+        legacy_topology = (
             path.parents[3].name != payload["method"]
             or path.parents[2].name != f"micro-batch-{payload['micro_batch']}"
             or attempt_dir.name != f"attempt-{payload['attempt_id']}"
-            or Path(payload["output_dir"]) != (attempt_dir / "output").resolve()
-            or Path(payload["stdout_path"]) != (attempt_dir / "logs" / "stdout.log").resolve()
-            or Path(payload["stderr_path"]) != (attempt_dir / "logs" / "stderr.log").resolve()
+        )
+        canonical_output = Path(payload["output_dir"])
+        canonical_logs = (Path(payload["stdout_path"]), Path(payload["stderr_path"]))
+        canonical_topology = (
+            canonical_output.parent.name == "zero-stage-compatibility"
+            and canonical_output.parent.parent.name == "checkpoints"
+            and all(
+                path.parent.name == canonical_output.name
+                and path.parent.parent.name == "zero-stage-compatibility"
+                and path.parent.parent.parent.name == "logs"
+                for path in canonical_logs
+            )
+        )
+        if legacy_topology or not (
+            (
+                canonical_output == (attempt_dir / "output").resolve()
+                and canonical_logs
+                == (
+                    (attempt_dir / "logs" / "stdout.log").resolve(),
+                    (attempt_dir / "logs" / "stderr.log").resolve(),
+                )
+            )
+            or canonical_topology
         ):
             raise ValueError("probe attempt path topology does not match sealed identity")
     expected_status = "success" if payload["exit_code"] == 0 else "requires-classification"
@@ -2688,6 +2708,20 @@ def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
         raise TypeError("probe attempt command must be a nonempty string array")
     for index, item in enumerate(command):
         _require_string(f"command[{index}]", item)
+    output_dir = Path(str(attempt["output_dir"]))
+    canonical_output = (
+        output_dir.parent.name == "zero-stage-compatibility"
+        and output_dir.parent.parent.name == "checkpoints"
+    )
+    if canonical_output:
+        repository = output_dir.parents[2]
+        log_path = (
+            repository / "logs" / "zero-stage-compatibility" / output_dir.name / "train.log"
+        )
+        result_dir = repository / "results" / "zero-stage-compatibility" / output_dir.name
+    else:
+        log_path = Path(str(attempt["stdout_path"])).with_name("train.log")
+        result_dir = output_dir.parent / "evidence"
     flag_values = {
         "--method": str(attempt["method"]),
         "--model": str(attempt["launch_config"]["model"]),
@@ -2703,14 +2737,10 @@ def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
         "--deepspeed-config": str(attempt["launch_config"]["deepspeed_config"]),
         "--attention-implementation": str(attempt["launch_config"]["attention_implementation"]),
         "--save-strategy": "no",
-        "--log-file": str(attempt["stdout_path"]).replace("stdout.log", "train.log"),
+        "--log-file": str(log_path),
         "--max-steps": str(attempt["max_steps"]),
-        "--benchmark-run-config": str(
-            Path(str(attempt["output_dir"])).parent / "evidence" / "run-config.json"
-        ),
-        "--producer-evidence": str(
-            Path(str(attempt["output_dir"])).parent / "evidence" / "producer-evidence.json"
-        ),
+        "--benchmark-run-config": str(result_dir / "run-config.json"),
+        "--producer-evidence": str(result_dir / "producer-evidence.json"),
     }
     allowed = set(flag_values) | {"--no-final-save"}
     seen: set[str] = set()

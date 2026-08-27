@@ -177,13 +177,14 @@ if [[ -z $log_file ]]; then
 fi
 
 if [[ $dry_run != true ]]; then
-    "$repository_python" -m src.artifact_paths validate --kind checkpoint --path "$output_dir" >/dev/null
-    "$repository_python" -m src.artifact_paths validate --kind log --path "$log_file" >/dev/null
-    for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness"; do
-        if [[ -n $result_path ]]; then
-            "$repository_python" -m src.artifact_paths validate --kind result --path "$result_path" >/dev/null
-        fi
-    done
+    artifact_preflight=(
+        "$repository_python" -m src.artifact_paths validate-run
+        --checkpoint "$output_dir" --log "$log_file"
+    )
+    [[ -z $benchmark_run_config ]] || artifact_preflight+=(--benchmark-run-config "$benchmark_run_config")
+    [[ -z $benchmark_evidence_path ]] || artifact_preflight+=(--benchmark-evidence-path "$benchmark_evidence_path")
+    [[ -z $benchmark_smoke_resume_witness ]] || artifact_preflight+=(--benchmark-smoke-resume-witness "$benchmark_smoke_resume_witness")
+    "${artifact_preflight[@]}" >/dev/null
     if [[ $manifest_mode == true ]]; then
         resolved_manifest=$(readlink -f -- "$manifest_path") || {
             printf 'error: manifest path cannot be resolved: %s\n' "$manifest_path" >&2
@@ -204,29 +205,37 @@ if [[ $dry_run != true ]]; then
     fi
     "$repository_python" -m src.deepspeed_runtime validate \
         --config "$deepspeed_config" --world-size "$stage1_num_processes" >/dev/null
-    if [[ -z $resume_path ]]; then
-        for target_dir in "$output_dir" "$(dirname -- "$log_file")"; do
-            if [[ -e $target_dir ]]; then
+    artifact_dirs=("$output_dir" "$(dirname -- "$log_file")")
+    for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness"; do
+        if [[ -n $result_path ]]; then
+            artifact_dirs+=("$(dirname -- "$result_path")")
+            break
+        fi
+    done
+    if [[ -z $resume_path && ${STAGE1_ARTIFACTS_PRECLAIMED:-false} != true ]]; then
+        mkdir -p -- "$(dirname -- "$output_dir")" "$(dirname -- "$(dirname -- "$log_file")")"
+        if (( ${#artifact_dirs[@]} == 3 )); then
+            mkdir -p -- "$(dirname -- "${artifact_dirs[2]}")"
+        fi
+        for target_dir in "${artifact_dirs[@]}"; do
+            if ! mkdir -- "$target_dir"; then
                 printf 'error: fresh run artifact directory already exists: %s\n' "$target_dir" >&2
-                exit 2
-            fi
-        done
-        for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness"; do
-            if [[ -n $result_path && -e $(dirname -- "$result_path") ]]; then
-                printf 'error: fresh run artifact directory already exists: %s\n' "$(dirname -- "$result_path")" >&2
                 exit 2
             fi
         done
     elif [[ -e $log_file ]]; then
         printf 'error: resume log file must be distinct: %s\n' "$log_file" >&2
         exit 2
+    elif [[ ${STAGE1_ARTIFACTS_PRECLAIMED:-false} == true ]]; then
+        for target_dir in "${artifact_dirs[@]}"; do
+            [[ -d $target_dir ]] || {
+                printf 'error: preclaimed artifact directory is missing: %s\n' "$target_dir" >&2
+                exit 2
+            }
+        done
+    else
+        mkdir -p -- "$output_dir" "$(dirname -- "$log_file")"
     fi
-    mkdir -p -- "$output_dir" "$(dirname -- "$log_file")"
-    for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness"; do
-        if [[ -n $result_path ]]; then
-            mkdir -p -- "$(dirname -- "$result_path")"
-        fi
-    done
 fi
 
 command=(

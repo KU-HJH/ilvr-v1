@@ -25,6 +25,13 @@ from stage1.benchmark import (
     _write_legacy_benchmark_evidence,
     config_digest,
 )
+from src.artifact_paths import (
+    CANONICAL_CHECKPOINT_ROOT,
+    CANONICAL_LOG_ROOT,
+    CANONICAL_REPOSITORY_ROOT,
+    CANONICAL_RESULT_ROOT,
+    resolve_run_artifact_paths,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -313,9 +320,9 @@ def _run_probe(tmp_path, *, fail_batches, extra=(), poison_benchmark_python=Fals
         "data_stat": probe_payload["input_stat"], "image_root": str(image_root.resolve()),
         "world_size": 2, "gradient_accumulation_steps": 2, "epochs": 3,
         "learning_rate": 1e-5, "seed": 42,
-        "deepspeed_config": str((REPO_ROOT / "configs/config_stage3.json").resolve()),
+        "deepspeed_config": str((REPO_ROOT / "configs/deepspeed_zero3.json").resolve()),
         "deepspeed_config_digest": hashlib.sha256(
-            (REPO_ROOT / "configs/config_stage3.json").read_bytes()
+            (REPO_ROOT / "configs/deepspeed_zero3.json").read_bytes()
         ).hexdigest(),
         "attention_implementation": "flash_attention_2", "save_strategy": "no",
         "audit_digest": probe_payload["audit_digest"], "probe_row_indices": [0],
@@ -330,7 +337,8 @@ def _run_probe(tmp_path, *, fail_batches, extra=(), poison_benchmark_python=Fals
     prerequisite_path = tmp_path / "prerequisite-chain.json"
     if not prerequisite_path.exists():
         prerequisite_path.write_text(json.dumps(prerequisite))
-    output_root = tmp_path / "probe outputs;literal"
+    probe_id = "probe-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:20]
+    output_root = resolve_run_artifact_paths(probe_id).result_dir
     env = os.environ.copy()
     env.update(
         {
@@ -415,6 +423,22 @@ def test_probe_uses_fresh_processes_unique_paths_and_stops_at_first_failure(tmp_
     assert len(failed) == 1
     assert failed[0]["micro_batch"] == 32
     assert failed[0]["requires_oom_classification"] is True
+
+
+def test_probe_launches_each_candidate_with_one_canonical_artifact_identity(tmp_path):
+    """Catches a probe wiring checkpoint, log, and evidence through one root."""
+    completed, records, _output_root, _ = _run_probe(tmp_path, fail_batches="8")
+
+    assert completed.returncode == 42
+    parts = next(records.glob("*.argv0")).read_bytes().split(b"\0")[:-1]
+    output = Path(parts[parts.index(b"--output-dir") + 1].decode())
+    log = Path(parts[parts.index(b"--log-file") + 1].decode())
+    run_config = Path(parts[parts.index(b"--benchmark-run-config") + 1].decode())
+    evidence = Path(parts[parts.index(b"--producer-evidence") + 1].decode())
+
+    assert output.parent == CANONICAL_CHECKPOINT_ROOT
+    assert log.parent == CANONICAL_LOG_ROOT / output.name
+    assert run_config.parent == evidence.parent == CANONICAL_RESULT_ROOT / output.name
 
 
 def test_probe_pins_benchmark_python_when_path_and_override_are_wrong(tmp_path):
@@ -744,16 +768,13 @@ def _rewrite_probe_attempt_argv(attempt_path, replacements):
 
 def _probe_output_path_expectations(payload):
     output_dir = Path(payload["output_dir"])
+    paths = resolve_run_artifact_paths(output_dir.name)
     return {
         "--data-path": payload["launch_config"]["train_data_path"],
         "--output-dir": payload["output_dir"],
-        "--log-file": payload["stdout_path"].replace("stdout.log", "train.log"),
-        "--benchmark-run-config": str(
-            output_dir.parent / "evidence" / "run-config.json"
-        ),
-        "--producer-evidence": str(
-            output_dir.parent / "evidence" / "producer-evidence.json"
-        ),
+        "--log-file": str(paths.log_dir / "train.log"),
+        "--benchmark-run-config": str(paths.result_dir / "run-config.json"),
+        "--producer-evidence": str(paths.result_dir / "producer-evidence.json"),
     }
 
 
@@ -767,11 +788,13 @@ def pre_fix_preserved_relative_probe_attempt(tmp_path, monkeypatch):
 
     import stage1.benchmark as benchmark
 
-    monkeypatch.setattr(benchmark, "_REPOSITORY_ROOT", tmp_path, raising=False)
+    monkeypatch.setattr(
+        benchmark, "_REPOSITORY_ROOT", CANONICAL_REPOSITORY_ROOT, raising=False
+    )
     payload = json.loads(attempt_path.read_text())
     expected_paths = _probe_output_path_expectations(payload)
     relative_paths = {
-        flag: str(Path(expected).relative_to(tmp_path))
+        flag: str(Path(expected).relative_to(CANONICAL_REPOSITORY_ROOT))
         for flag, expected in expected_paths.items()
     }
     assert set(relative_paths) == {
@@ -820,11 +843,13 @@ def test_pre_fix_probe_argv_compatibility_rejects_noncanonical_aliases(
 
     import stage1.benchmark as benchmark
 
-    monkeypatch.setattr(benchmark, "_REPOSITORY_ROOT", tmp_path, raising=False)
+    monkeypatch.setattr(
+        benchmark, "_REPOSITORY_ROOT", CANONICAL_REPOSITORY_ROOT, raising=False
+    )
     expected = Path(
         json.loads(attempt_path.read_text())["launch_config"]["train_data_path"]
     )
-    canonical = str(expected.relative_to(tmp_path))
+    canonical = str(expected.relative_to(CANONICAL_REPOSITORY_ROOT))
     if alias_kind == "dot":
         alias = f"./{canonical}"
     elif alias_kind == "parent":

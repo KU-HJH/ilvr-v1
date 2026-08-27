@@ -234,10 +234,8 @@ TRAINING_ARGS=(
 )
 
 if [[ "${STAGE2_DRY_RUN:-false}" != "true" ]]; then
-  "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.artifact_paths validate \
-    --kind checkpoint --path "$OUTPUT_DIR" >/dev/null
-  "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.artifact_paths validate \
-    --kind log --path "$LOG_FILE" >/dev/null
+  "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.artifact_paths validate-run \
+    --checkpoint "$OUTPUT_DIR" --log "$LOG_FILE" >/dev/null
   if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
     STAGE2_NUM_PROCESSES=${STAGE2_NUM_PROCESSES:-2}
     require_positive_integer STAGE2_NUM_PROCESSES "$STAGE2_NUM_PROCESSES"
@@ -245,17 +243,22 @@ if [[ "${STAGE2_DRY_RUN:-false}" != "true" ]]; then
       --config "$DEEPSPEED_CONFIG" --world-size "$STAGE2_NUM_PROCESSES" >/dev/null
   fi
   if [[ -z "${RESUME_CHECKPOINT:-}" ]]; then
-    for target_dir in "$OUTPUT_DIR" "$(dirname -- "$LOG_FILE")"; do
-      if [[ -e $target_dir ]]; then
-        printf 'fresh run artifact directory already exists: %s\n' "$target_dir" >&2
-        exit 2
-      fi
-    done
+    mkdir -p -- "$(dirname -- "$OUTPUT_DIR")" "$(dirname -- "$(dirname -- "$LOG_FILE")")"
+    if ! mkdir -- "$OUTPUT_DIR"; then
+      printf 'fresh run artifact directory already exists: %s\n' "$OUTPUT_DIR" >&2
+      exit 2
+    fi
+    if ! mkdir -- "$(dirname -- "$LOG_FILE")"; then
+      printf 'fresh run artifact directory already exists: %s\n' "$(dirname -- "$LOG_FILE")" >&2
+      exit 2
+    fi
   elif [[ -e $LOG_FILE ]]; then
     printf 'resume log file must be distinct: %s\n' "$LOG_FILE" >&2
     exit 2
   fi
-  mkdir -p -- "$OUTPUT_DIR" "$(dirname -- "$LOG_FILE")"
+  if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+    mkdir -p -- "$OUTPUT_DIR" "$(dirname -- "$LOG_FILE")"
+  fi
 fi
 
 if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
