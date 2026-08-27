@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ import numpy as np
 import peft
 import pytest
 import torch
+from accelerate.state import AcceleratorState, GradientState, PartialState
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
 from torch import nn
@@ -22,6 +24,7 @@ from transformers import (
     TrainingArguments,
     default_data_collator,
 )
+from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from peft_common import capture_qwen2_5_vl_architecture, resolve_qwen2_5_vl_model
 from stage1.checkpointing import (
@@ -46,6 +49,24 @@ from stage1.peft import (
 from stage1.token_rows import find_sparse_output_token_rows
 from stage1.trainer import CustomTrainerStage1
 from stage1.types import Stage1TuningConfig
+
+
+def _clear_training_process_state() -> None:
+    os.environ.pop("ACCELERATE_USE_DEEPSPEED", None)
+    unset_hf_deepspeed_config()
+    AcceleratorState._reset_state(reset_partial_state=True)
+    PartialState._reset_state()
+    GradientState._reset_state()
+
+
+@pytest.fixture(autouse=True)
+def isolate_checkpointing_trainer_state():
+    """Prevent Trainer lifecycle tests from leaking Accelerate state."""
+    _clear_training_process_state()
+    try:
+        yield
+    finally:
+        _clear_training_process_state()
 
 
 BASE_VOCAB_SIZE = 125
