@@ -191,16 +191,16 @@ def test_eos_is_checked_only_after_a_completed_latent_block():
 
 
 @pytest.mark.parametrize(
-    ("forbidden_id", "temperature"),
+    ("forbidden_id", "temperature", "top_p"),
     [
-        (TOKENS.pad_token_id, 0.0),
-        (TOKENS.end_token_id, 0.0),
-        (TOKENS.pad_token_id, 1.0),
-        (TOKENS.end_token_id, 1.0),
+        (TOKENS.pad_token_id, 0.0, 1.0),
+        (TOKENS.end_token_id, 0.0, 1.0),
+        (TOKENS.pad_token_id, 1.0, 0.5),
+        (TOKENS.end_token_id, 1.0, 0.5),
     ],
 )
 def test_normal_text_generation_masks_block_internal_latent_tokens(
-    forbidden_id, temperature
+    forbidden_id, temperature, top_p
 ):
     model = scripted_model(latent_size=2, emitted_ids=[])
     model.lm_head = RankedHead(highest_id=forbidden_id, fallback_id=4)
@@ -213,10 +213,30 @@ def test_normal_text_generation_masks_block_internal_latent_tokens(
         generation_config=Stage2GenerationConfig(
             max_new_tokens=1,
             temperature=temperature,
+            top_p=top_p,
         ),
     )
 
     assert result.sequences[0, -1].item() == 4
+
+
+def test_nucleus_sampling_can_enter_latent_mode_through_latent_start():
+    model = scripted_model(latent_size=2, emitted_ids=[])
+    model.lm_head = RankedHead(highest_id=TOKENS.start_token_id, fallback_id=4)
+
+    result = Stage2InferenceController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=Stage2GenerationConfig(
+            max_new_tokens=1,
+            temperature=1.0,
+            top_p=0.5,
+        ),
+    )
+
+    assert result.sequences[0, -4:].tolist() == [91, 90, 90, 92]
 
 
 @pytest.mark.parametrize("emitted_eos", [3, 7])
