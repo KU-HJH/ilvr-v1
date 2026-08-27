@@ -16,6 +16,10 @@ from stage1.types import (
 )
 
 
+class _UnsupportedAttentionInterface(Exception):
+    """Signal that a teacher cannot provide the optional attention query."""
+
+
 class Stage1TeacherTargetBuilder:
     """Build sample-isolated helper-image targets from one batched teacher pass."""
 
@@ -125,6 +129,7 @@ class Stage1TeacherTargetBuilder:
             helper_features, helper_grid, teacher
         )
         original_counts = self._visual_token_counts(original_grid, teacher)
+        image_token_id = self._teacher_image_token_id(teacher)
 
         latent_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
         packed: list[torch.Tensor] = []
@@ -141,9 +146,6 @@ class Stage1TeacherTargetBuilder:
                 sample_index, : sample.unpadded_length
             ]
             assistant_start = self._assistant_start(sample_ids, sample)
-            image_token_id = int(
-                getattr(teacher.config, "image_token_id", 151655)
-            )
             user_query = self._user_query(
                 teacher=teacher,
                 sample=sample,
@@ -235,6 +237,20 @@ class Stage1TeacherTargetBuilder:
             return next(teacher.parameters()).device
         except StopIteration:
             return fallback
+
+    @staticmethod
+    def _teacher_image_token_id(teacher: nn.Module) -> int:
+        config = getattr(teacher, "config", None)
+        image_token_id = getattr(config, "image_token_id", None)
+        if (
+            isinstance(image_token_id, bool)
+            or not isinstance(image_token_id, int)
+            or image_token_id < 0
+        ):
+            raise ValueError(
+                "teacher.config.image_token_id must be a non-negative integer"
+            )
+        return image_token_id
 
     @staticmethod
     def _validate_batch_shape(
@@ -349,7 +365,7 @@ class Stage1TeacherTargetBuilder:
                     prompt_indices,
                     image_indices,
                 )
-            except (AttributeError, IndexError, RuntimeError, ValueError):
+            except _UnsupportedAttentionInterface:
                 return self._cosine_user_query(
                     hidden_last, prompt_indices, image_indices
                 )
@@ -375,11 +391,31 @@ class Stage1TeacherTargetBuilder:
 
     @staticmethod
     def _last_self_attention(teacher):
-        try:
-            return teacher.model.layers[-1].self_attn
-        except AttributeError:
+        model = getattr(teacher, "model", None)
+        layers = getattr(model, "layers", None)
+        if layers is None:
+            get_base_model = getattr(teacher, "get_base_model", None)
+            if not callable(get_base_model):
+                raise _UnsupportedAttentionInterface
             base = teacher.get_base_model()
-            return base.model.layers[-1].self_attn
+            layers = getattr(getattr(base, "model", None), "layers", None)
+        if layers is None:
+            raise _UnsupportedAttentionInterface
+        try:
+            attention = getattr(layers[-1], "self_attn", None)
+        except (IndexError, TypeError) as error:
+            raise _UnsupportedAttentionInterface from error
+        if attention is None:
+            raise _UnsupportedAttentionInterface
+        if not callable(getattr(attention, "q_proj", None)) or not callable(
+            getattr(attention, "k_proj", None)
+        ):
+            raise _UnsupportedAttentionInterface
+        if getattr(attention, "num_heads", None) is None or getattr(
+            attention, "num_key_value_heads", None
+        ) is None:
+            raise _UnsupportedAttentionInterface
+        return attention
 
     def _attention_user_query(
         self, teacher, hidden_pre, hidden_last, prompt_indices, image_indices

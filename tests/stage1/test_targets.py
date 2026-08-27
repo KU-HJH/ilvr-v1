@@ -54,6 +54,15 @@ class IdentityAttention(nn.Module):
             self.k_proj.weight.copy_(torch.eye(2))
 
 
+class RaisingProjection(nn.Module):
+    def __init__(self, error: Exception):
+        super().__init__()
+        self.error = error
+
+    def forward(self, unused):
+        raise self.error
+
+
 class FakeDecoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -434,3 +443,69 @@ def test_none_helper_group_uses_legacy_image_pool_k():
         rtol=1e-5,
         atol=1e-6,
     )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("synthetic attention kernel failure"),
+        torch.cuda.OutOfMemoryError("synthetic attention OOM"),
+        ValueError("synthetic attention shape failure"),
+        AttributeError("synthetic projection implementation failure"),
+        IndexError("synthetic attention indexing failure"),
+    ],
+    ids=("runtime", "oom", "shape", "internal-attribute", "index"),
+)
+def test_attention_query_execution_failures_propagate(target_builder, error):
+    """Catches runtime, OOM, or shape failures being hidden by cosine fallback."""
+    case = make_case((ONE_BLOCK,))
+    case.teacher.model.layers[-1].self_attn.q_proj = RaisingProjection(error)
+
+    with pytest.raises(type(error), match=str(error)) as caught:
+        target_builder.build(case.teacher, case.inputs, case.metadata)
+
+    assert caught.value is error
+
+
+def test_missing_attention_interface_uses_cosine_fallback(target_builder):
+    """Catches removal of the intentional fallback for unsupported teachers."""
+    case = make_case((ONE_BLOCK,))
+    del case.teacher.model
+
+    result = target_builder.build(
+        case.teacher, case.inputs, case.metadata
+    )
+
+    assert result.selected_counts == ((1,),)
+    assert torch.isfinite(result.latent_values).all()
+
+
+@pytest.mark.parametrize(
+    "image_token_id",
+    [None, True, -1, "99"],
+    ids=("none", "bool", "negative", "string"),
+)
+def test_invalid_teacher_image_token_id_fails_clearly(
+    target_builder, image_token_id
+):
+    """Catches malformed image-token metadata reaching query construction."""
+    case = make_case((ONE_BLOCK,))
+    case.teacher.config.image_token_id = image_token_id
+
+    with pytest.raises(
+        ValueError,
+        match=r"teacher\.config\.image_token_id must be a non-negative integer",
+    ):
+        target_builder.build(case.teacher, case.inputs, case.metadata)
+
+
+def test_missing_teacher_image_token_id_fails_clearly(target_builder):
+    """Catches the Qwen-specific token ID being replaced by a hard-coded default."""
+    case = make_case((ONE_BLOCK,))
+    del case.teacher.config.image_token_id
+
+    with pytest.raises(
+        ValueError,
+        match=r"teacher\.config\.image_token_id must be a non-negative integer",
+    ):
+        target_builder.build(case.teacher, case.inputs, case.metadata)
