@@ -24,11 +24,20 @@ import tempfile
 import time
 from typing import Any, Literal, Mapping, Sequence
 
-from artifact_paths import (
-    CANONICAL_CHECKPOINT_ROOT,
-    CANONICAL_LOG_ROOT,
-    CANONICAL_RESULT_ROOT,
-)
+try:
+    from artifact_paths import (
+        CANONICAL_CHECKPOINT_ROOT,
+        CANONICAL_LOG_ROOT,
+        CANONICAL_RESULT_ROOT,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "artifact_paths":
+        raise
+    from src.artifact_paths import (
+        CANONICAL_CHECKPOINT_ROOT,
+        CANONICAL_LOG_ROOT,
+        CANONICAL_RESULT_ROOT,
+    )
 
 
 _SCHEMA_VERSION = 1
