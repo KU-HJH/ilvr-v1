@@ -1,8 +1,8 @@
 # ILVR Stage 1 Batched Full/DoRA Training Design
 
-**Date:** 2026-08-26  
-**Status:** Proposed for user review  
-**Repository:** `XD111ds/ILVR`  
+**Date:** 2026-08-26
+**Status:** Proposed for user review
+**Repository:** `XD111ds/ILVR`
 **Depends on:**
 
 - `2026-08-24-ilvr-stage2-reimplementation-design.md`
