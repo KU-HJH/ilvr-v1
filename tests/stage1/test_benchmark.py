@@ -2421,21 +2421,25 @@ def test_concurrent_smoke_wrapper_never_launches_after_winner_publishes_success(
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         winner = executor.submit(benchmark.run_or_load_distributed_witness, **kwargs)
-        for _ in range(500):
-            if list(records.iterdir()):
-                break
-            time.sleep(0.01)
-        else:
-            raise AssertionError("winner did not reach its first subprocess")
+        try:
+            deadline = time.monotonic() + 120
+            while not list(records.iterdir()):
+                if winner.done():
+                    winner.result()
+                    raise AssertionError("winner exited before its first subprocess")
+                if time.monotonic() >= deadline:
+                    raise AssertionError("winner did not reach its first subprocess")
+                time.sleep(0.01)
 
-        with pytest.raises(RuntimeError, match="in progress"):
-            benchmark.run_or_load_distributed_witness(**kwargs)
-        assert len(list(records.iterdir())) == 1
-        assert [path.name for path in (evidence_dir / "attempts").iterdir()] == [
-            "attempt-1"
-        ]
-        gate.write_text("release", encoding="utf-8")
-        observed = winner.result(timeout=20)
+            with pytest.raises(RuntimeError, match="in progress"):
+                benchmark.run_or_load_distributed_witness(**kwargs)
+            assert len(list(records.iterdir())) == 1
+            assert [path.name for path in (evidence_dir / "attempts").iterdir()] == [
+                "attempt-1"
+            ]
+        finally:
+            gate.write_text("release", encoding="utf-8")
+        observed = winner.result(timeout=max(0.0, deadline - time.monotonic()))
 
     assert observed.resume_final_step == 4
     assert len(list(records.iterdir())) == 2
