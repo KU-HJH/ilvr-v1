@@ -76,6 +76,18 @@ def evidence(**overrides):
     return Stage1BenchmarkEvidence(**values)
 
 
+def independent_digest(payload):
+    """Test-only canonical digest derived independently of production helpers."""
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def test_stage1_evidence_serializes_zero_identity():
     """Catches producer JSON omitting the ZeRO and sample-stream reuse key."""
     payload = evidence(zero_stage=2, samples_seen=48).to_dict()
@@ -1000,8 +1012,7 @@ def test_probe_argv_relative_compatibility_excludes_input_authorities(
         benchmark._load_probe_attempt(attempt_path)
 
 
-def test_public_verified_loader_accepts_the_authoritative_producer_envelope(tmp_path):
-    """Catches public API and CLI consumers validating different formats."""
+def _write_authoritative_producer_envelope(tmp_path):
     import stage1.benchmark as benchmark
 
     data = tmp_path / "TRAIN.jsonl"
@@ -1034,6 +1045,14 @@ def test_public_verified_loader_accepts_the_authoritative_producer_envelope(tmp_
         run_config_path=config_path,
         evidence=evidence(config_digest=config["config_digest"], checkpoint_bytes=0),
     )
+    return sealed_path, config
+
+
+def test_public_verified_loader_accepts_the_authoritative_producer_envelope(tmp_path):
+    """Catches public API and CLI consumers validating different formats."""
+    import stage1.benchmark as benchmark
+
+    sealed_path, config = _write_authoritative_producer_envelope(tmp_path)
 
     assert load_verified_evidence(sealed_path, config["config_digest"]) == evidence(
         config_digest=config["config_digest"], checkpoint_bytes=0
@@ -1049,6 +1068,23 @@ def test_public_verified_loader_accepts_the_authoritative_producer_envelope(tmp_
     forged_path.write_text(json.dumps(forged))
     with pytest.raises(ValueError, match="micro_batch"):
         benchmark._load_producer_evidence(forged_path)
+
+
+def test_schema1_producer_rejects_authenticated_current_evidence_body(tmp_path):
+    """Catches a schema-1 envelope bypassing mandatory historical migration."""
+    import stage1.benchmark as benchmark
+
+    sealed_path, _ = _write_authoritative_producer_envelope(tmp_path)
+    hybrid = json.loads(sealed_path.read_text())
+    hybrid["schema_version"] = 1
+    hybrid["producer_digest"] = independent_digest(
+        {key: value for key, value in hybrid.items() if key != "producer_digest"}
+    )
+    hybrid_path = tmp_path / "schema1-current-body.json"
+    hybrid_path.write_text(json.dumps(hybrid), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="historical evidence fields"):
+        benchmark._load_producer_evidence(hybrid_path)
 
 
 def test_full_artifact_index_and_allowlisted_bytes_are_strict(tmp_path):
@@ -1506,7 +1542,7 @@ def test_timed_validation_rejects_artifactless_and_plain_metric_evidence(tmp_pat
     }
     artifact["artifact_manifest_digest"] = config_digest(artifact)
     seal = {
-        "schema_version": 1, "kind": "stage1-producer-evidence",
+        "schema_version": 2, "kind": "stage1-producer-evidence",
         "run_config": config,
         "benchmark_evidence": benchmark._evidence_to_dict(metrics),
         "artifact_manifest": artifact,
@@ -1772,6 +1808,67 @@ def test_capacity_prerequisite_controls_do_not_require_run_only_fields():
             prerequisite,
             require_run_controls=True,
         )
+
+
+def test_authenticated_legacy_comparison_loads_without_rewrite(tmp_path):
+    """Catches the schema-2 metric parser breaking sealed historical reports."""
+    import stage1.benchmark as benchmark
+
+    def historical_row(method):
+        return {
+            "status": "success",
+            "method": method,
+            "micro_batch": 8,
+            "world_size": 2,
+            "gradient_accumulation_steps": 2,
+            "effective_global_batch": 32,
+            "optimizer_steps": 3,
+            "samples_seen": 96,
+            "model_load_seconds": 1.0,
+            "trainer_seconds": 2.0,
+            "total_seconds": 4.0,
+            "final_save_seconds": 1.0,
+            "samples_per_second": 24.0,
+            "steps_per_second": 0.75,
+            "rank_peak_allocated_bytes": [10, 11],
+            "rank_peak_reserved_bytes": [12, 13],
+            "trainable_parameters": 20,
+            "total_parameters": 100,
+            "checkpoint_bytes": 200,
+            "final_loss": 0.5,
+            "representative_gradient_norm": 0.25,
+            "git_commit": "abc1234",
+            "dependency_versions": {"torch": "2.7.1"},
+            "gpu_names": ["B200", "B200"],
+            "config_digest": "a" * 64,
+            "probe_row_indices": [7, 3],
+        }
+
+    comparison = {
+        "schema_version": 1,
+        "kind": "stage1-maximum-throughput-comparison",
+        "paper_level_reproduction": False,
+        "common_batch_control": False,
+        "prerequisite_chain_digest": "f" * 64,
+        "methods": {
+            "full": historical_row("full"),
+            "dora": historical_row("dora"),
+        },
+    }
+    comparison["comparison_digest"] = independent_digest(comparison)
+    path = tmp_path / "legacy-comparison.json"
+    path.write_text(json.dumps(comparison, sort_keys=True), encoding="utf-8")
+    original = path.read_bytes()
+
+    assert benchmark._load_run_comparison(path) == comparison
+    assert path.read_bytes() == original
+
+    tampered = json.loads(path.read_text())
+    tampered["methods"]["full"]["status"] = "failure"
+    tampered_path = tmp_path / "tampered-legacy-comparison.json"
+    tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="comparison digest"):
+        benchmark._load_run_comparison(tampered_path)
 
 
 def test_timed_comparison_is_a_standalone_canonical_prerequisite_seal(

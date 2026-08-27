@@ -2081,11 +2081,11 @@ def _validate_producer_evidence_payload(
     config = _validate_producer_run_config_payload(payload["run_config"])
     config_claimed = config["config_digest"]
     raw_evidence = payload["benchmark_evidence"]
-    if (
-        schema_version == LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION
-        and type(raw_evidence) is dict
-        and set(raw_evidence) == _LEGACY_EVIDENCE_FIELDS
-    ):
+    if schema_version == LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION:
+        if type(raw_evidence) is not dict or set(raw_evidence) != _LEGACY_EVIDENCE_FIELDS:
+            raise ValueError(
+                "schema-1 producer must contain exact historical evidence fields"
+            )
         migrated = migrate_stage1_producer_evidence(
             {
                 **raw_evidence,
@@ -2098,11 +2098,6 @@ def _validate_producer_evidence_payload(
         evidence = _evidence_from_dict(migrated)
     else:
         evidence = _evidence_from_dict(raw_evidence)
-    if (
-        schema_version == LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION
-        and evidence.zero_stage != 3
-    ):
-        raise ValueError("legacy Stage 1 evidence must identify ZeRO-3")
     if evidence.config_digest != config_claimed:
         raise ValueError("producer metric/config digest mismatch")
     metric_bindings = {
@@ -4574,6 +4569,86 @@ def _validate_timed_run(run_dir: Path) -> str:
     return str(evidence_path)
 
 
+def _validate_legacy_comparison_evidence(payload: object) -> dict[str, object]:
+    """Validate one historical comparison row without inventing current identity."""
+
+    _require_exact_keys(payload, _LEGACY_EVIDENCE_FIELDS, "legacy benchmark evidence")
+    if payload.get("status") not in {"success", "oom", "failure"}:
+        raise ValueError("legacy evidence status must be success, oom, or failure")
+    if payload.get("method") not in {"full", "dora"}:
+        raise ValueError("legacy evidence method must be full or dora")
+    for name in ("micro_batch", "world_size", "gradient_accumulation_steps"):
+        _require_int(name, payload.get(name), positive=True)
+    for name in (
+        "effective_global_batch",
+        "optimizer_steps",
+        "samples_seen",
+        "trainable_parameters",
+        "total_parameters",
+        "checkpoint_bytes",
+    ):
+        _require_int(name, payload.get(name))
+    if payload["effective_global_batch"] != (
+        payload["world_size"]
+        * payload["micro_batch"]
+        * payload["gradient_accumulation_steps"]
+    ):
+        raise ValueError("legacy evidence effective global batch invariant failed")
+    if payload["trainable_parameters"] > payload["total_parameters"]:
+        raise ValueError("legacy evidence trainable parameters exceed total parameters")
+    for name in (
+        "model_load_seconds",
+        "trainer_seconds",
+        "total_seconds",
+        "final_save_seconds",
+        "samples_per_second",
+        "steps_per_second",
+        "final_loss",
+        "representative_gradient_norm",
+    ):
+        _require_float(name, payload.get(name))
+    if payload["total_seconds"] < (
+        payload["model_load_seconds"]
+        + payload["trainer_seconds"]
+        + payload["final_save_seconds"]
+    ):
+        raise ValueError("legacy evidence total time does not cover component timings")
+    if payload["status"] == "success" and payload["optimizer_steps"] == 0:
+        raise ValueError("successful legacy evidence requires optimizer steps")
+    rank_values = []
+    for name in ("rank_peak_allocated_bytes", "rank_peak_reserved_bytes"):
+        values = payload.get(name)
+        if type(values) is not list or len(values) != payload["world_size"]:
+            raise ValueError(f"legacy {name} length must equal world_size")
+        for index, value in enumerate(values):
+            _require_int(f"{name}[{index}]", value)
+        rank_values.append(values)
+    if any(
+        allocated > reserved
+        for allocated, reserved in zip(rank_values[0], rank_values[1])
+    ):
+        raise ValueError("legacy rank peak allocated bytes exceed reserved bytes")
+    gpu_names = payload.get("gpu_names")
+    if type(gpu_names) is not list or len(gpu_names) != payload["world_size"]:
+        raise ValueError("legacy gpu_names length must equal world_size")
+    for index, value in enumerate(gpu_names):
+        _require_string(f"gpu_names[{index}]", value)
+    indices = payload.get("probe_row_indices")
+    if type(indices) is not list or len(set(indices)) != len(indices):
+        raise ValueError("legacy probe_row_indices must be a unique array")
+    for index, value in enumerate(indices):
+        _require_int(f"probe_row_indices[{index}]", value)
+    _require_string("git_commit", payload.get("git_commit"))
+    _require_digest("config_digest", payload.get("config_digest"))
+    versions = payload.get("dependency_versions")
+    if type(versions) is not dict:
+        raise TypeError("legacy dependency_versions must be an object")
+    for name, version in versions.items():
+        _require_string("dependency_versions key", name)
+        _require_string(f"dependency_versions[{name!r}]", version)
+    return dict(payload)
+
+
 def _validate_run_comparison_payload(payload: object) -> dict[str, object]:
     _require_exact_keys(
         payload,
@@ -4602,9 +4677,27 @@ def _validate_run_comparison_payload(payload: object) -> dict[str, object]:
         raise ValueError("Stage 1 timed comparison digest mismatch")
     methods = payload.get("methods")
     _require_exact_keys(methods, {"full", "dora"}, "timed comparison methods")
+    method_shapes = {
+        frozenset(raw_evidence) if type(raw_evidence) is dict else frozenset()
+        for raw_evidence in methods.values()
+    }
+    if method_shapes == {frozenset(_LEGACY_EVIDENCE_FIELDS)}:
+        evidence_parser = _validate_legacy_comparison_evidence
+    elif method_shapes == {frozenset(_EVIDENCE_FIELDS)}:
+        evidence_parser = _evidence_from_dict
+    else:
+        raise ValueError("timed comparison methods use inconsistent evidence schemas")
     for method, raw_evidence in methods.items():
-        evidence = _evidence_from_dict(raw_evidence)
-        if evidence.method != method or evidence.status != "success":
+        evidence = evidence_parser(raw_evidence)
+        evidence_method = (
+            evidence.method if isinstance(evidence, Stage1BenchmarkEvidence)
+            else evidence["method"]
+        )
+        evidence_status = (
+            evidence.status if isinstance(evidence, Stage1BenchmarkEvidence)
+            else evidence["status"]
+        )
+        if evidence_method != method or evidence_status != "success":
             raise ValueError("timed comparison method evidence mismatch")
     return dict(payload)
 
