@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -10,7 +11,13 @@ import torch.nn.functional as F
 from trl import SFTTrainer
 
 from accelerate.utils import DeepSpeedEngineWrapper, DistributedType
-from deepspeed_runtime import DeepSpeedRuntimeProfile
+from deepspeed_runtime import (
+    DEEPSPEED_RUNTIME_FILENAME,
+    DeepSpeedRuntimeProfile,
+    canonical_deepspeed_config_path,
+    load_deepspeed_runtime_profile,
+    write_deepspeed_runtime_sidecar,
+)
 from peft_common import resolve_qwen2_5_vl_model
 from stage1.ema import Stage1EmaTeacher
 from stage1.peft import build_stage1_tuned_model
@@ -306,6 +313,22 @@ def make_trainer(model, target_builder, *, sim_weight=1.0, ce_weight=1.0, diagno
         device=model.device,
     )
     return trainer
+
+
+def configure_checkpoint_runtime(trainer, output_dir):
+    trainer.args = SimpleNamespace(output_dir=str(output_dir), should_save=True)
+    trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
+        enabled=False,
+        zero_stage=None,
+        config_path=None,
+        config_digest=None,
+        world_size=1,
+    )
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: None,
+    )
 
 
 @pytest.fixture
@@ -789,6 +812,9 @@ def test_numbered_checkpoint_saves_ema_after_parent_checkpoint_on_writing_rank(
     student = EmaCheckpointProbeStudent("full")
     trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
     trainer.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+    trainer.deepspeed_runtime_profile = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(2), world_size=2
+    )
     trainer.args = SimpleNamespace(should_save=True)
     trainer.state = SimpleNamespace(global_step=7)
     trainer._get_output_dir = lambda trial: str(tmp_path)
@@ -803,7 +829,80 @@ def test_numbered_checkpoint_saves_ema_after_parent_checkpoint_on_writing_rank(
 
     assert parent_marker.is_file()
     assert (checkpoint / STAGE1_EMA_TEACHER_STATE_FILENAME).is_file()
+    payload = json.loads(
+        (checkpoint / DEEPSPEED_RUNTIME_FILENAME).read_text(encoding="utf-8")
+    )
+    assert payload["zero_stage"] == 2
+    assert payload["world_size"] == 2
     assert barriers == ["barrier"]
+
+
+def test_train_publishes_runtime_identity_at_output_root(tmp_path, monkeypatch):
+    """Catches a run starting without its immutable runtime manifest."""
+    parent_calls = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del trainer, args, kwargs
+        parent_calls.append("train")
+        return "trained"
+
+    monkeypatch.setattr(SFTTrainer, "train", parent_train)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path), should_save=True)
+    trainer.deepspeed_runtime_profile = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(2), world_size=2
+    )
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: None,
+    )
+
+    result = trainer.train()
+
+    payload = json.loads(
+        (tmp_path / DEEPSPEED_RUNTIME_FILENAME).read_text(encoding="utf-8")
+    )
+    assert payload["zero_stage"] == 2
+    assert result == "trained"
+    assert parent_calls == ["train"]
+
+
+def test_stage1_resume_rejects_runtime_mismatch_before_parent_train(
+    tmp_path, monkeypatch
+):
+    """Catches incompatible runtime state reaching Trainer restore."""
+    checkpoint = tmp_path / "checkpoint-3"
+    checkpoint.mkdir()
+    write_deepspeed_runtime_sidecar(
+        checkpoint,
+        load_deepspeed_runtime_profile(
+            canonical_deepspeed_config_path(1), world_size=2
+        ),
+    )
+    parent_calls = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del trainer, args, kwargs
+        parent_calls.append("train")
+
+    monkeypatch.setattr(SFTTrainer, "train", parent_train)
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path), should_save=True)
+    trainer.deepspeed_runtime_profile = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(2), world_size=2
+    )
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: None,
+    )
+    trainer._stage1_ema_checkpoint_path = lambda path: checkpoint / "ema.pt"
+
+    with pytest.raises(ValueError, match="zero_stage"):
+        trainer.train(resume_from_checkpoint=str(checkpoint))
+
+    assert parent_calls == []
 
 
 def test_numbered_checkpoint_nonwriting_rank_never_materializes_ema_state(
@@ -977,6 +1076,9 @@ def test_checkpoint_rotation_runs_after_ema_publication_and_rank_sync(
     student = EmaCheckpointProbeStudent("full")
     trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
     trainer.ema_teacher = Stage1EmaTeacher(student, decay=0.5, method="full")
+    trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
+        False, None, None, None, 1
+    )
     trainer.args = SimpleNamespace(should_save=True)
     trainer.state = SimpleNamespace(global_step=7)
     trainer._get_output_dir = lambda trial: str(tmp_path)
@@ -1006,7 +1108,10 @@ def test_explicit_stage1_resume_requires_ema_sidecar_before_parent_train(
 
     monkeypatch.setattr(SFTTrainer, "train", parent_train)
     trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
-    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+    configure_checkpoint_runtime(trainer, tmp_path)
+    write_deepspeed_runtime_sidecar(
+        checkpoint, trainer.deepspeed_runtime_profile
+    )
 
     with pytest.raises(RuntimeError, match=r"missing EMA teacher state.*checkpoint-3"):
         trainer.train(resume_from_checkpoint=str(checkpoint))
@@ -1048,7 +1153,8 @@ def test_stage1_resume_discovery_requires_ema_on_latest_checkpoint(
         lambda *args, **kwargs: pytest.fail("parent train accepted incomplete resume"),
     )
     trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
-    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+    configure_checkpoint_runtime(trainer, tmp_path)
+    write_deepspeed_runtime_sidecar(latest, trainer.deepspeed_runtime_profile)
 
     with pytest.raises(RuntimeError, match=r"missing EMA teacher state.*checkpoint-11"):
         trainer.train(resume_from_checkpoint=True)
@@ -1072,7 +1178,10 @@ def test_stage1_resume_discovery_forwards_one_resolved_path_to_parent(
 
     monkeypatch.setattr(SFTTrainer, "train", parent_train)
     trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
-    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+    configure_checkpoint_runtime(trainer, tmp_path)
+    write_deepspeed_runtime_sidecar(
+        checkpoint, trainer.deepspeed_runtime_profile
+    )
 
     result = trainer.train(resume_from_checkpoint=True)
 
@@ -1102,7 +1211,10 @@ def test_stage1_deprecated_model_path_precedence_binds_the_same_ema_checkpoint(
 
     monkeypatch.setattr(SFTTrainer, "train", parent_train)
     trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
-    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+    configure_checkpoint_runtime(trainer, tmp_path)
+    write_deepspeed_runtime_sidecar(
+        deprecated, trainer.deepspeed_runtime_profile
+    )
 
     result = trainer.train(
         resume_from_checkpoint=str(explicit), model_path=str(deprecated)
@@ -1132,7 +1244,10 @@ def test_stage1_deprecated_model_path_true_forwards_the_resolved_checkpoint_once
 
     monkeypatch.setattr(SFTTrainer, "train", parent_train)
     trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
-    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+    configure_checkpoint_runtime(trainer, tmp_path)
+    write_deepspeed_runtime_sidecar(
+        checkpoint, trainer.deepspeed_runtime_profile
+    )
 
     result = trainer.train(model_path=True)
 
@@ -1150,7 +1265,7 @@ def test_fresh_stage1_train_does_not_require_ema_sidecar(tmp_path, monkeypatch):
 
     monkeypatch.setattr(SFTTrainer, "train", parent_train)
     trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
-    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+    configure_checkpoint_runtime(trainer, tmp_path)
 
     result = trainer.train(resume_from_checkpoint=None)
 

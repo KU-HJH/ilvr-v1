@@ -223,6 +223,13 @@ def find_sparse_output_token_rows(model: nn.Module) -> SparseOutputTokenRows:
     return rows
 
 
+def sparse_token_rows_are_partitioned(model: nn.Module) -> bool:
+    """Report whether the sparse output delta actually carries ZeRO metadata."""
+
+    rows = find_sparse_output_token_rows(model)
+    return _is_partitioned(rows.output_delta)
+
+
 @contextmanager
 def _gathered_output_delta(parameter: nn.Parameter) -> Iterator[None]:
     """Gather only a partitioned sparse delta, following the Stage 1 EMA gate."""
@@ -427,4 +434,5 @@ __all__ = [
     "prepare_sparse_output_head",
     "load_sparse_token_rows",
     "save_sparse_token_rows",
+    "sparse_token_rows_are_partitioned",
 ]

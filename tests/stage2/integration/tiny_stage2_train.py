@@ -24,6 +24,7 @@ from transformers import (
 )
 
 from main import build_stage2_training_arguments
+from deepspeed_runtime import load_deepspeed_runtime_profile
 from stage2.checkpointing import build_stage2_peft_metadata
 from stage2.data import Stage2DataCollator, prepare_stage2_example
 from stage2.peft import (
@@ -429,6 +430,9 @@ def run_harness(
     tuning_method: str,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
+    runtime_profile = load_deepspeed_runtime_profile(
+        deepspeed, world_size=int(os.environ.get("WORLD_SIZE", "1"))
+    )
     dataset = TinyStage2Dataset(build_rank_local_tiny_prepared_example(output_dir))
     tuning = _tuning_config(tuning_method)
     first_model = _build_tuned_model(tuning)
@@ -457,6 +461,7 @@ def run_harness(
         callbacks=[first_recorder],
         processing_class=first_processor,
         stage2_peft_metadata=metadata,
+        deepspeed_runtime_profile=runtime_profile,
     )
     first_result = first_trainer.train()
     first_global_step = int(first_trainer.state.global_step)
@@ -490,6 +495,7 @@ def run_harness(
         callbacks=[resumed_recorder],
         processing_class=resumed_processor,
         stage2_peft_metadata=metadata,
+        deepspeed_runtime_profile=runtime_profile,
     )
     resumed_result = resumed_trainer.train(resume_from_checkpoint=str(checkpoint))
 

@@ -4,9 +4,25 @@ import argparse
 import hashlib
 import json
 import os
+import tempfile
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
+
+
+DEEPSPEED_RUNTIME_FILENAME = "deepspeed-runtime.json"
+DEEPSPEED_RUNTIME_SCHEMA_VERSION = 1
+_DEEPSPEED_RUNTIME_FIELDS = frozenset(
+    {
+        "schema_version",
+        "enabled",
+        "zero_stage",
+        "config_path",
+        "config_digest",
+        "world_size",
+    }
+)
+_MAX_DEEPSPEED_RUNTIME_BYTES = 16 * 1024
 
 
 @dataclass(frozen=True)
@@ -25,6 +41,138 @@ class DeepSpeedRuntimeProfile:
             "config_digest": self.config_digest,
             "world_size": self.world_size,
         }
+
+
+def _deepspeed_runtime_payload(
+    profile: DeepSpeedRuntimeProfile,
+) -> dict[str, object]:
+    if not isinstance(profile, DeepSpeedRuntimeProfile):
+        raise TypeError("profile must be a DeepSpeedRuntimeProfile")
+    return {
+        "schema_version": DEEPSPEED_RUNTIME_SCHEMA_VERSION,
+        **profile.to_dict(),
+    }
+
+
+def write_deepspeed_runtime_sidecar(
+    directory: Path, profile: DeepSpeedRuntimeProfile
+) -> Path:
+    """Atomically publish one immutable runtime identity in ``directory``."""
+
+    destination = Path(directory)
+    destination.mkdir(parents=True, exist_ok=True)
+    path = destination / DEEPSPEED_RUNTIME_FILENAME
+    payload = _deepspeed_runtime_payload(profile)
+    encoded = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    if path.exists() or path.is_symlink():
+        if read_deepspeed_runtime_sidecar(destination) == profile:
+            return path
+        raise FileExistsError(
+            f"refusing to replace different runtime identity: {path}"
+        )
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{DEEPSPEED_RUNTIME_FILENAME}.",
+            suffix=".tmp",
+            dir=destination,
+            delete=False,
+        ) as temporary:
+            temporary.write(encoded)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            if read_deepspeed_runtime_sidecar(destination) != profile:
+                raise FileExistsError(
+                    f"refusing to replace different runtime identity: {path}"
+                ) from None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return path
+
+
+def read_deepspeed_runtime_sidecar(directory: Path) -> DeepSpeedRuntimeProfile:
+    """Read and strictly decode a numbered-checkpoint runtime identity."""
+
+    path = Path(directory) / DEEPSPEED_RUNTIME_FILENAME
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"missing DeepSpeed runtime identity: {path}")
+    try:
+        if path.stat().st_size > _MAX_DEEPSPEED_RUNTIME_BYTES:
+            raise ValueError(f"invalid DeepSpeed runtime identity: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid DeepSpeed runtime identity: {path}") from error
+    if not isinstance(payload, dict) or set(payload) != _DEEPSPEED_RUNTIME_FIELDS:
+        raise ValueError(f"invalid DeepSpeed runtime identity schema: {path}")
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != DEEPSPEED_RUNTIME_SCHEMA_VERSION
+    ):
+        raise ValueError(f"unsupported DeepSpeed runtime identity schema: {path}")
+
+    enabled = payload["enabled"]
+    zero_stage = payload["zero_stage"]
+    config_path = payload["config_path"]
+    config_digest = payload["config_digest"]
+    world_size = payload["world_size"]
+    if type(enabled) is not bool:
+        raise ValueError("invalid DeepSpeed runtime identity enabled")
+    if type(world_size) is not int or world_size < 1:
+        raise ValueError("invalid DeepSpeed runtime identity world_size")
+    if enabled:
+        if type(zero_stage) is not int or zero_stage not in (1, 2, 3):
+            raise ValueError("invalid DeepSpeed runtime identity zero_stage")
+        if (
+            type(config_path) is not str
+            or not config_path
+            or not Path(config_path).is_absolute()
+        ):
+            raise ValueError("invalid DeepSpeed runtime identity config_path")
+        if (
+            type(config_digest) is not str
+            or len(config_digest) != 64
+            or any(character not in "0123456789abcdef" for character in config_digest)
+        ):
+            raise ValueError("invalid DeepSpeed runtime identity config_digest")
+        restored_path = Path(config_path)
+    else:
+        if zero_stage is not None or config_path is not None or config_digest is not None:
+            raise ValueError(
+                "invalid DeepSpeed runtime identity enabled/profile combination"
+            )
+        restored_path = None
+    return DeepSpeedRuntimeProfile(
+        enabled=enabled,
+        zero_stage=zero_stage,
+        config_path=restored_path,
+        config_digest=config_digest,
+        world_size=world_size,
+    )
+
+
+def validate_deepspeed_resume_identity(
+    checkpoint: Path, expected: DeepSpeedRuntimeProfile
+) -> None:
+    """Reject a Trainer resume whose execution identity is incompatible."""
+
+    if not isinstance(expected, DeepSpeedRuntimeProfile):
+        raise TypeError("expected must be a DeepSpeedRuntimeProfile")
+    actual = read_deepspeed_runtime_sidecar(Path(checkpoint))
+    for field in ("enabled", "zero_stage", "config_digest", "world_size"):
+        checkpoint_value = getattr(actual, field)
+        current_value = getattr(expected, field)
+        if checkpoint_value != current_value:
+            raise ValueError(
+                f"DeepSpeed resume identity mismatch for {field}: "
+                f"checkpoint={checkpoint_value!r}, current={current_value!r}"
+            )
 
 
 def validate_supported_deepspeed_policy(payload: Mapping[str, object]) -> None:

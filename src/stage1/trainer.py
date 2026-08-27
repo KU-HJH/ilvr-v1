@@ -18,7 +18,11 @@ from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 from trl import SFTTrainer
 
-from deepspeed_runtime import DeepSpeedRuntimeProfile
+from deepspeed_runtime import (
+    DeepSpeedRuntimeProfile,
+    validate_deepspeed_resume_identity,
+    write_deepspeed_runtime_sidecar,
+)
 from .ema import (
     STAGE1_EMA_TEACHER_STATE_FILENAME,
     Stage1EmaTeacher,
@@ -270,6 +274,33 @@ class CustomTrainerStage1(SFTTrainer):
             self.model, decay=float(ema_tau), method=method
         )
         self.add_callback(_Stage1OptimizerCallback(self))
+
+    def _publish_deepspeed_runtime_identity(
+        self, directory: Path, *, label: str
+    ) -> None:
+        """Publish on rank zero and propagate failure before synchronization."""
+
+        local_error: Exception | None = None
+        if self.args.should_save:
+            try:
+                write_deepspeed_runtime_sidecar(
+                    directory, self.deepspeed_runtime_profile
+                )
+            except Exception as error:
+                local_error = error
+        local_failure = torch.tensor(
+            int(local_error is not None),
+            dtype=torch.int32,
+            device=self.accelerator.device,
+        )
+        failed_processes = self.accelerator.reduce(
+            local_failure, reduction="sum"
+        )
+        if int(failed_processes.item()) != 0:
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(f"{label} failed on another process")
+        self.accelerator.wait_for_everyone()
 
     @staticmethod
     def _finite_weight(value: float, name: str) -> float:
@@ -877,6 +908,9 @@ class CustomTrainerStage1(SFTTrainer):
             if self.args.should_save:
                 try:
                     self._save_stage1_ema_checkpoint(checkpoint_dir)
+                    write_deepspeed_runtime_sidecar(
+                        checkpoint_dir, self.deepspeed_runtime_profile
+                    )
                 except Exception as error:
                     ema_save_error = error
             local_failure = torch.tensor(
@@ -920,6 +954,10 @@ class CustomTrainerStage1(SFTTrainer):
     ):
         """Require and defer compatible EMA state for Stage 1 resume."""
 
+        self._publish_deepspeed_runtime_identity(
+            Path(self.args.output_dir), label="Stage 1 runtime identity publication"
+        )
+
         if resume_from_checkpoint is False:
             resume_from_checkpoint = None
         requested_resume = (
@@ -946,6 +984,9 @@ class CustomTrainerStage1(SFTTrainer):
             )
 
         if pending_checkpoint is not None:
+            validate_deepspeed_resume_identity(
+                pending_checkpoint, self.deepspeed_runtime_profile
+            )
             self._stage1_ema_checkpoint_path(pending_checkpoint)
         self._stage1_pending_ema_checkpoint = pending_checkpoint
         resolved_resume = (

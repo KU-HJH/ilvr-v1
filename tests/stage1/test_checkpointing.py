@@ -47,7 +47,10 @@ from stage1.peft import (
     build_stage1_tuned_model,
     validate_stage1_trainable_boundary,
 )
-from stage1.token_rows import find_sparse_output_token_rows
+from stage1.token_rows import (
+    find_sparse_output_token_rows,
+    sparse_token_rows_are_partitioned,
+)
 from stage1.trainer import CustomTrainerStage1
 from stage1.types import Stage1TuningConfig
 
@@ -2328,6 +2331,16 @@ def test_stage1_peft_save_uses_logical_zero_shape_before_collective(
             stage1_dora_bundle.metadata,
         )
     assert gathered == [rows.output_delta]
+
+
+def test_sparse_partition_detection_uses_tensor_metadata(stage1_dora_bundle):
+    """Catches a selected ZeRO config forcing gathers for replicated rows."""
+    rows = find_sparse_output_token_rows(stage1_dora_bundle.model)
+
+    assert sparse_token_rows_are_partitioned(stage1_dora_bundle.model) is False
+
+    rows.output_delta.ds_id = 17
+    assert sparse_token_rows_are_partitioned(stage1_dora_bundle.model) is True
 
 
 @pytest.mark.parametrize(

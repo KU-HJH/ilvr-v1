@@ -3,9 +3,13 @@ import json
 import pytest
 
 from src.deepspeed_runtime import (
+    DEEPSPEED_RUNTIME_FILENAME,
     DeepSpeedRuntimeProfile,
     canonical_deepspeed_config_path,
     load_deepspeed_runtime_profile,
+    read_deepspeed_runtime_sidecar,
+    validate_deepspeed_resume_identity,
+    write_deepspeed_runtime_sidecar,
 )
 
 
@@ -54,6 +58,82 @@ def test_disabled_profile_has_no_config_identity():
         config_digest=None,
         world_size=1,
     )
+
+
+def test_runtime_sidecar_round_trip(tmp_path):
+    """Catches checkpoint identity losing an exact runtime profile field."""
+    profile = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(2), world_size=2
+    )
+
+    path = write_deepspeed_runtime_sidecar(tmp_path, profile)
+
+    assert path.name == "deepspeed-runtime.json"
+    assert read_deepspeed_runtime_sidecar(tmp_path) == profile
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("enabled", False),
+        ("zero_stage", 1),
+        ("config_digest", "0" * 64),
+        ("world_size", 4),
+    ],
+)
+def test_resume_rejects_runtime_identity_mismatch(
+    tmp_path, field, replacement
+):
+    """Catches a numbered checkpoint crossing an incompatible runtime."""
+    expected = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(2), world_size=2
+    )
+    payload = {"schema_version": 1, **expected.to_dict(), field: replacement}
+    (tmp_path / DEEPSPEED_RUNTIME_FILENAME).write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match=field):
+        validate_deepspeed_resume_identity(tmp_path, expected)
+
+
+def test_resume_identity_uses_digest_not_old_config_location(tmp_path):
+    """Catches portable resumes requiring the producer's absolute config path."""
+    expected = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(2), world_size=2
+    )
+    payload = {
+        "schema_version": 1,
+        **expected.to_dict(),
+        "config_path": "/deleted/producer/config.json",
+    }
+    (tmp_path / DEEPSPEED_RUNTIME_FILENAME).write_text(json.dumps(payload))
+
+    validate_deepspeed_resume_identity(tmp_path, expected)
+
+
+def test_resume_rejects_missing_runtime_identity(tmp_path):
+    """Catches legacy or incomplete numbered checkpoints reaching restore."""
+    expected = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(2), world_size=2
+    )
+
+    with pytest.raises(ValueError, match="missing DeepSpeed runtime identity"):
+        validate_deepspeed_resume_identity(tmp_path, expected)
+
+
+def test_runtime_sidecar_refuses_to_replace_different_identity(tmp_path):
+    """Catches concurrent or repeated writers silently changing run identity."""
+    first = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(1), world_size=2
+    )
+    second = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(2), world_size=2
+    )
+    write_deepspeed_runtime_sidecar(tmp_path, first)
+
+    with pytest.raises(FileExistsError, match="different runtime identity"):
+        write_deepspeed_runtime_sidecar(tmp_path, second)
+
+    assert read_deepspeed_runtime_sidecar(tmp_path) == first
 
 
 @pytest.mark.parametrize("stage", [True, 1.0, "1", 0, 4])

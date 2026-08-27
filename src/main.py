@@ -504,6 +504,9 @@ def run_stage1(args):
 def run_stage2(args):
     """Run the existing Stage 2 path without importing Stage 1 Trainer code."""
 
+    profile = bind_deepspeed_runtime_profile(
+        args, world_size=int(os.environ.get("WORLD_SIZE", "1"))
+    )
     components = build_stage2_training_components(args)
     trainer = components.trainer_class(
         model=components.model,
@@ -512,6 +515,7 @@ def run_stage2(args):
         data_collator=components.data_collator,
         processing_class=components.processor,
         stage2_peft_metadata=components.peft_metadata,
+        deepspeed_runtime_profile=profile,
     )
     trainer.train(resume_from_checkpoint=components.trainer_resume_path)
     if args.save_final_model:

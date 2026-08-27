@@ -14,6 +14,12 @@ from transformers import TrainingArguments, default_data_collator
 from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from .helpers import tiny_stage2_qwen
+from deepspeed_runtime import (
+    DEEPSPEED_RUNTIME_FILENAME,
+    canonical_deepspeed_config_path,
+    load_deepspeed_runtime_profile,
+    write_deepspeed_runtime_sidecar,
+)
 from src.peft_common import capture_qwen2_5_vl_architecture
 from stage2.checkpointing import (
     STAGE2_PEFT_METADATA_FILENAME,
@@ -35,6 +41,12 @@ from stage2.peft import (
 )
 from stage2.trainer import Stage2Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
+
+
+def runtime_profile(zero_stage=2, *, world_size=1):
+    return load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(zero_stage), world_size=world_size
+    )
 
 
 def sample_metadata() -> Stage2PeftMetadata:
@@ -1324,6 +1336,89 @@ def isolated_trainer_deepspeed_state(monkeypatch):
     GradientState._reset_state()
 
 
+@pytest.mark.parametrize("zero_stage", [1, 2, 3])
+@pytest.mark.parametrize("method", ["full", "lora", "dora"])
+def test_stage2_trainer_accepts_every_supported_method_profile(
+    zero_stage, method, monkeypatch
+):
+    """Catches Stage 2 dropping a supported tuning/runtime combination."""
+    monkeypatch.setattr(
+        "stage2.trainer.Trainer.__init__", lambda trainer, *args, **kwargs: None
+    )
+    metadata = None if method == "full" else SimpleNamespace(tuning_method=method)
+    profile = runtime_profile(zero_stage, world_size=2)
+
+    trainer = Stage2Trainer(
+        stage2_peft_metadata=metadata,
+        deepspeed_runtime_profile=profile,
+    )
+
+    assert trainer.deepspeed_runtime_profile is profile
+    if method == "full":
+        assert trainer.stage2_peft_metadata is None
+    else:
+        assert trainer.stage2_peft_metadata.tuning_method == method
+
+
+def test_stage2_numbered_checkpoint_writes_runtime_identity(tmp_path, monkeypatch):
+    """Catches Stage 2 numbered checkpoints missing their resume identity."""
+    checkpoint = tmp_path / "checkpoint-3"
+
+    def parent_save(trainer, model, trial):
+        del trainer, model, trial
+        checkpoint.mkdir()
+
+    monkeypatch.setattr("stage2.trainer.Trainer._save_checkpoint", parent_save)
+    trainer = object.__new__(Stage2Trainer)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path), should_save=True)
+    trainer.state = SimpleNamespace(global_step=3)
+    trainer.model = object()
+    trainer.deepspeed_runtime_profile = runtime_profile(2, world_size=2)
+    trainer._get_output_dir = lambda trial: str(tmp_path)
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: None,
+    )
+
+    trainer._save_checkpoint(trainer.model, trial=None)
+
+    payload = json.loads(
+        (checkpoint / DEEPSPEED_RUNTIME_FILENAME).read_text(encoding="utf-8")
+    )
+    assert payload["zero_stage"] == 2
+    assert payload["world_size"] == 2
+
+
+def test_stage2_resume_rejects_runtime_before_parent_train(tmp_path, monkeypatch):
+    """Catches DeepSpeed initialization preceding resume identity validation."""
+    checkpoint = tmp_path / "checkpoint-3"
+    checkpoint.mkdir()
+    write_deepspeed_runtime_sidecar(
+        checkpoint, runtime_profile(1, world_size=2)
+    )
+    parent_calls = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del trainer, args, kwargs
+        parent_calls.append("train")
+
+    monkeypatch.setattr("stage2.trainer.Trainer.train", parent_train)
+    trainer = object.__new__(Stage2Trainer)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path), should_save=True)
+    trainer.deepspeed_runtime_profile = runtime_profile(2, world_size=2)
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: None,
+    )
+
+    with pytest.raises(ValueError, match="zero_stage"):
+        trainer.train(resume_from_checkpoint=str(checkpoint))
+
+    assert parent_calls == []
+
+
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
 def test_stage2_trainer_final_peft_save_is_adapter_only_with_sidecar(
     tmp_path, isolated_trainer_deepspeed_state
@@ -1339,6 +1434,7 @@ def test_stage2_trainer_final_peft_save_is_adapter_only_with_sidecar(
         model=model,
         args=TrainingArguments(output_dir=str(tmp_path), report_to=[], use_cpu=True),
         stage2_peft_metadata=metadata,
+        deepspeed_runtime_profile=runtime_profile(),
     )
 
     trainer.save_model(tmp_path)
@@ -1397,6 +1493,9 @@ def test_stage2_sparse_deepspeed_save_has_all_rank_collective_participation(
     monkeypatch.setattr("stage2.trainer.Trainer.save_model", framework_save)
     monkeypatch.setattr("stage2.trainer.save_sparse_token_rows", sparse_save)
     monkeypatch.setattr("stage2.trainer.save_stage2_peft_metadata", metadata_save)
+    monkeypatch.setattr(
+        "stage2.trainer.sparse_token_rows_are_partitioned", lambda model: True
+    )
 
     trainer = object.__new__(Stage2Trainer)
     trainer.model = object()
@@ -1422,6 +1521,40 @@ def test_stage2_sparse_deepspeed_save_has_all_rank_collective_participation(
     assert (actual_output / "ilvr_token_rows.safetensors").is_file()
     assert (actual_output / STAGE2_PEFT_METADATA_FILENAME).is_file()
     assert (actual_output / "processor.json").is_file()
+
+
+def test_stage2_sparse_replicated_save_is_rank_zero_only(tmp_path, monkeypatch):
+    """Catches ZeRO-1/2 replicated sparse rows entering a gather collective."""
+    metadata = replace(sample_metadata(), token_row_source="sparse_adapter")
+    saved_ranks = []
+    active_rank = None
+
+    monkeypatch.setattr(
+        "stage2.trainer.Trainer.save_model",
+        lambda trainer, output_dir=None, _internal_call=False: None,
+    )
+    monkeypatch.setattr(
+        "stage2.trainer.sparse_token_rows_are_partitioned", lambda model: False
+    )
+    monkeypatch.setattr(
+        "stage2.trainer.save_sparse_token_rows",
+        lambda model, output_dir: saved_ranks.append(active_rank),
+    )
+    monkeypatch.setattr(
+        "stage2.trainer.save_stage2_peft_metadata",
+        lambda output_dir, saved_metadata: None,
+    )
+    trainer = object.__new__(Stage2Trainer)
+    trainer.model = object()
+    trainer.stage2_peft_metadata = metadata
+    for rank, should_save in ((1, False), (0, True)):
+        active_rank = rank
+        trainer.args = SimpleNamespace(
+            output_dir=str(tmp_path), should_save=should_save
+        )
+        trainer.save_model()
+
+    assert saved_ranks == [0]
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
@@ -1451,6 +1584,7 @@ def test_stage2_trainer_numbered_peft_checkpoint_keeps_resume_state(
         data_collator=default_data_collator,
         processing_class=TinySavingProcessor(),
         stage2_peft_metadata=metadata,
+        deepspeed_runtime_profile=runtime_profile(),
     )
 
     trainer.train()
@@ -1494,6 +1628,7 @@ def test_stage2_trainer_numbered_peft_checkpoint_keeps_resume_state(
         data_collator=default_data_collator,
         processing_class=TinySavingProcessor(),
         stage2_peft_metadata=metadata,
+        deepspeed_runtime_profile=runtime_profile(),
     )
 
     resumed_trainer.train(resume_from_checkpoint=str(checkpoint))
@@ -1511,6 +1646,7 @@ def test_stage2_trainer_full_save_writes_no_peft_sidecar(
     trainer = Stage2Trainer(
         model=tiny_stage2_qwen(),
         args=TrainingArguments(output_dir=str(tmp_path), report_to=[], use_cpu=True),
+        deepspeed_runtime_profile=runtime_profile(),
     )
 
     trainer.save_model(tmp_path)

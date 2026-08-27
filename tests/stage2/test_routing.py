@@ -766,6 +766,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         "data_collator": collator,
         "processing_class": processor,
         "stage2_peft_metadata": "preserved-sidecar",
+        "deepspeed_runtime_profile": args.deepspeed_runtime_profile,
     }
     assert trainer.resume_path == "stage2/checkpoint-4"
     assert trainer.saved_path == "out"
