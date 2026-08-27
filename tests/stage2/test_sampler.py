@@ -22,6 +22,19 @@ def examples_with_counts(counts):
     return [CountedExample(count) for count in counts]
 
 
+class CountingDataset:
+    def __init__(self, counts):
+        self.examples = examples_with_counts(counts)
+        self.item_reads = 0
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, index):
+        self.item_reads += 1
+        return self.examples[index]
+
+
 def test_global_groups_have_one_latent_count_across_ranks():
     dataset = examples_with_counts([1, 2, 1, 3, 2, 3, 3])
     sampler = LatentBlockBalancedSampler(dataset, num_replicas=2, seed=42)
@@ -155,3 +168,38 @@ def test_multigpu_trainer_publishes_sampler_identity(tmp_path, monkeypatch):
     assert payload["dataset_size"] == 5
     assert payload["padded_samples"] == 1
     assert payload["global_step"] == 0
+
+
+def test_trainer_reuses_sampler_only_for_unchanged_sampling_geometry():
+    dataset = CountingDataset([1, 1, 2, 2])
+    trainer = object.__new__(Stage2Trainer)
+    trainer.args = type("Args", (), {"world_size": 2, "seed": 42})()
+    trainer.train_dataset = dataset
+    trainer.stage2_sampler_identity = None
+
+    initial = trainer._get_train_sampler()
+    repeated = trainer._get_train_sampler()
+
+    assert repeated is initial
+    assert dataset.item_reads == len(dataset)
+
+    trainer.args.seed = 43
+    changed_seed = trainer._get_train_sampler()
+    assert changed_seed is not initial
+    assert dataset.item_reads == 2 * len(dataset)
+
+    trainer.args.world_size = 3
+    changed_world_size = trainer._get_train_sampler()
+    assert changed_world_size is not changed_seed
+    assert dataset.item_reads == 3 * len(dataset)
+
+    replacement = CountingDataset([1, 1, 2, 2])
+    trainer.train_dataset = replacement
+    changed_dataset = trainer._get_train_sampler()
+    assert changed_dataset is not changed_world_size
+    assert replacement.item_reads == len(replacement)
+
+    replacement.examples.append(CountedExample(3))
+    changed_length = trainer._get_train_sampler()
+    assert changed_length is not changed_dataset
+    assert replacement.item_reads == 9

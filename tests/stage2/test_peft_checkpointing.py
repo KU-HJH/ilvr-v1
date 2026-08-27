@@ -1492,6 +1492,69 @@ def test_stage2_resume_rejects_sampler_identity_before_parent_train(
     assert parent_calls == []
 
 
+def test_stage2_resume_reuses_validated_sampler_for_parent_dataloader(
+    tmp_path, monkeypatch
+):
+    """Catches resume validation scanning every distributed sample twice."""
+
+    class CountingDataset:
+        def __init__(self, counts):
+            self.examples = [
+                SimpleNamespace(latent_block_count=count) for count in counts
+            ]
+            self.item_reads = 0
+
+        def __len__(self):
+            return len(self.examples)
+
+        def __getitem__(self, index):
+            self.item_reads += 1
+            return self.examples[index]
+
+    checkpoint = tmp_path / "checkpoint-3"
+    checkpoint.mkdir()
+    profile = runtime_profile(2, world_size=2)
+    write_deepspeed_runtime_sidecar(checkpoint, profile)
+    counts = (1, 1, 1, 2, 2)
+    checkpoint_identity = LatentBlockBalancedSampler(
+        [SimpleNamespace(latent_block_count=count) for count in counts],
+        num_replicas=2,
+        seed=42,
+    ).identity
+    write_stage2_sampler_sidecar(checkpoint, checkpoint_identity, global_step=3)
+    dataset = CountingDataset(counts)
+    parent_samplers = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del args, kwargs
+        sampler = trainer._get_train_sampler()
+        parent_samplers.append(sampler)
+        return sampler
+
+    monkeypatch.setattr("stage2.trainer.Trainer.train", parent_train)
+    trainer = object.__new__(Stage2Trainer)
+    trainer.args = SimpleNamespace(
+        output_dir=str(tmp_path),
+        should_save=True,
+        world_size=2,
+        seed=42,
+    )
+    trainer.train_dataset = dataset
+    trainer.stage2_sampler_identity = None
+    trainer.deepspeed_runtime_profile = profile
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: None,
+    )
+
+    sampler = trainer.train(resume_from_checkpoint=str(checkpoint))
+
+    assert parent_samplers == [sampler]
+    assert sampler.dataset is dataset
+    assert dataset.item_reads == len(dataset)
+
+
 def test_stage2_resume_rejects_runtime_before_parent_train(tmp_path, monkeypatch):
     """Catches DeepSpeed initialization preceding resume identity validation."""
     checkpoint = tmp_path / "checkpoint-3"

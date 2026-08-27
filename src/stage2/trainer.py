@@ -61,6 +61,7 @@ class Stage2Trainer(Trainer):
         self.deepspeed_runtime_profile = deepspeed_runtime_profile
         self.stage2_peft_metadata = stage2_peft_metadata
         self.stage2_sampler_identity: Stage2SamplerIdentity | None = None
+        self._stage2_train_sampler: LatentBlockBalancedSampler | None = None
         super().__init__(*args, **kwargs)
 
     def _publish_deepspeed_runtime_identity(
@@ -88,18 +89,33 @@ class Stage2Trainer(Trainer):
             raise RuntimeError(f"{label} failed on another process")
         self.accelerator.wait_for_everyone()
 
-    def _ensure_stage2_sampler_identity(self) -> Stage2SamplerIdentity | None:
+    def _ensure_stage2_train_sampler(
+        self,
+    ) -> LatentBlockBalancedSampler | None:
         if self.args.world_size <= 1:
             self.stage2_sampler_identity = None
+            self._stage2_train_sampler = None
             return None
-        if self.stage2_sampler_identity is None:
+        sampler = getattr(self, "_stage2_train_sampler", None)
+        if (
+            sampler is None
+            or sampler.dataset is not self.train_dataset
+            or sampler.num_replicas != self.args.world_size
+            or sampler.seed != self.args.seed
+            or sampler.identity.dataset_size != len(self.train_dataset)
+        ):
             sampler = LatentBlockBalancedSampler(
                 self.train_dataset,
                 num_replicas=self.args.world_size,
                 seed=self.args.seed,
             )
-            self.stage2_sampler_identity = sampler.identity
-        return self.stage2_sampler_identity
+            self._stage2_train_sampler = sampler
+        self.stage2_sampler_identity = sampler.identity
+        return sampler
+
+    def _ensure_stage2_sampler_identity(self) -> Stage2SamplerIdentity | None:
+        sampler = self._ensure_stage2_train_sampler()
+        return None if sampler is None else sampler.identity
 
     def _publish_stage2_sampler_identity(
         self, directory: Path, *, global_step: int, label: str
@@ -132,13 +148,10 @@ class Stage2Trainer(Trainer):
     def _get_train_sampler(self):
         if self.args.world_size <= 1:
             self.stage2_sampler_identity = None
+            self._stage2_train_sampler = None
             return super()._get_train_sampler()
-        sampler = LatentBlockBalancedSampler(
-            self.train_dataset,
-            num_replicas=self.args.world_size,
-            seed=self.args.seed,
-        )
-        self.stage2_sampler_identity = sampler.identity
+        sampler = self._ensure_stage2_train_sampler()
+        assert sampler is not None
         return sampler
 
     def get_train_dataloader(self):
