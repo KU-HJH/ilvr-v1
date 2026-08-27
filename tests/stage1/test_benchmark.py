@@ -42,12 +42,17 @@ def evidence(**overrides):
     values = {
         "status": "success",
         "method": "full",
+        "zero_stage": 3,
+        "deepspeed_config_digest": "d" * 64,
         "micro_batch": 8,
         "world_size": 2,
         "gradient_accumulation_steps": 2,
         "effective_global_batch": 32,
         "optimizer_steps": 3,
         "samples_seen": 96,
+        "sample_stream_digest": "a" * 64,
+        "model_id": "model",
+        "seed": 42,
         "model_load_seconds": 1.0,
         "trainer_seconds": 2.0,
         "total_seconds": 4.0,
@@ -69,6 +74,62 @@ def evidence(**overrides):
     }
     values.update(overrides)
     return Stage1BenchmarkEvidence(**values)
+
+
+def test_stage1_evidence_serializes_zero_identity():
+    """Catches producer JSON omitting the ZeRO and sample-stream reuse key."""
+    payload = evidence(zero_stage=2, samples_seen=48).to_dict()
+
+    assert payload["zero_stage"] == 2
+    assert payload["deepspeed_config_digest"] == "d" * 64
+    assert payload["optimizer_steps"] == 3
+    assert payload["samples_seen"] == 48
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("zero_stage", 1),
+        ("deepspeed_config_digest", "f" * 64),
+        ("sample_stream_digest", "e" * 64),
+    ],
+)
+def test_producer_reuse_rejects_identity_change(field, replacement):
+    """Catches cross-stage, cross-config, or cross-stream producer reuse."""
+    import stage1.benchmark as benchmark
+
+    producer = evidence()
+    requested = producer.identity.to_dict() | {field: replacement}
+
+    assert benchmark.reusable_stage1_producer(producer, requested) is False
+
+
+def test_legacy_zero3_evidence_migrates_without_rehashing(monkeypatch):
+    """Catches migration reopening the sealed legacy DeepSpeed config."""
+    import stage1.benchmark as benchmark
+
+    legacy = {
+        "schema_version": 1,
+        "status": "oom",
+        "run_config": {
+            "deepspeed_config_digest": "d" * 64,
+            "audit_digest": "e" * 64,
+            "model": "model",
+            "seed": 42,
+        },
+    }
+    monkeypatch.setattr(
+        benchmark,
+        "_small_config_digest",
+        lambda path: (_ for _ in ()).throw(AssertionError("migration rehashed config")),
+    )
+
+    migrated = benchmark.migrate_stage1_producer_evidence(legacy)
+
+    assert migrated["zero_stage"] == 3
+    assert migrated["deepspeed_config_digest"] == "d" * 64
+    assert migrated["sample_stream_digest"] == "e" * 64
+    assert migrated["status"] == "capacity_oom"
 
 
 def test_capacity_candidates_follow_only_the_approved_order():
@@ -1209,7 +1270,10 @@ def _sealed_maximum_fixture(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         benchmark, "_load_producer_evidence",
-        lambda path: (long_evidence, producer_seal),
+        lambda path: (
+            benchmark._evidence_from_dict(producer_seal["benchmark_evidence"]),
+            producer_seal,
+        ),
     )
     return maximum_path, maximum, selected, long_attempt, producer_seal
 
@@ -1840,10 +1904,14 @@ elif max_steps == 4:
     )
     metrics = Stage1BenchmarkEvidence(
         status="success", method=config["method"],
+        zero_stage=3,
+        deepspeed_config_digest=config["deepspeed_config_digest"],
         micro_batch=config["micro_batch"], world_size=config["world_size"],
         gradient_accumulation_steps=config["gradient_accumulation_steps"],
         effective_global_batch=config["effective_global_batch"],
         optimizer_steps=4, samples_seen=4 * config["effective_global_batch"],
+        sample_stream_digest=config["audit_digest"], model_id=config["model"],
+        seed=config["seed"],
         model_load_seconds=1.0, trainer_seconds=2.0, total_seconds=3.0,
         final_save_seconds=0.0, samples_per_second=1.0,
         steps_per_second=1.0,

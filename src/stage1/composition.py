@@ -634,7 +634,11 @@ def run_stage1(
             run_config_witness = load_stage1_run_config_witness(
                 Path(args.benchmark_run_config)
             )
-            config = validate_stage1_runtime_args(run_config_witness, args)
+            config = validate_stage1_runtime_args(
+                run_config_witness,
+                args,
+                profile,
+            )
             smoke_path = getattr(args, "benchmark_smoke_resume_witness", None)
             if config["kind"] == "stage1-smoke-run-manifest":
                 if not smoke_path or not getattr(args, "resume_from_checkpoint_path", None):
@@ -756,15 +760,26 @@ def run_stage1(
         Path(args.save_model_path), method=config["method"], final_save=args.final_save
     )
     total_seconds = monotonic() - total_start
+    if profile.zero_stage is None or profile.config_digest is None:
+        raise ValueError("Stage 1 matrix producers require DeepSpeed")
     evidence = Stage1BenchmarkEvidence(
         status="success",
         method=config["method"],
-        micro_batch=config["micro_batch"],
-        world_size=world_size,
-        gradient_accumulation_steps=config["gradient_accumulation_steps"],
-        effective_global_batch=effective,
+        zero_stage=profile.zero_stage,
+        deepspeed_config_digest=profile.config_digest,
+        micro_batch=args.per_device_train_batch_size,
+        world_size=profile.world_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        effective_global_batch=(
+            args.per_device_train_batch_size
+            * profile.world_size
+            * args.gradient_accumulation_steps
+        ),
         optimizer_steps=optimizer_steps,
         samples_seen=samples_seen,
+        sample_stream_digest=config["audit_digest"],
+        model_id=config["model"],
+        seed=config["seed"],
         model_load_seconds=float(model_load_seconds),
         trainer_seconds=float(trainer_seconds),
         total_seconds=float(total_seconds),

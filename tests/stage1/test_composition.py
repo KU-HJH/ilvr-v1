@@ -1043,12 +1043,21 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
     tmp_path, monkeypatch,
 ):
     """Catches the real launcher/trainer path never publishing Task 17 input."""
-    args = stage1_args(tmp_path, "--max_steps", "3", "--no_final_save", method="full")
+    args = stage1_args(
+        tmp_path,
+        "--max_steps",
+        "3",
+        "--gradient_accumulation_steps",
+        "1",
+        "--no_final_save",
+        method="full",
+    )
     evidence_path = tmp_path / "producer evidence.json"
     audit_path, audit = _write_benchmark_audit(tmp_path, args)
     config = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "stage1-probe-run-manifest",
+        "producer_kind": "zero_matrix",
         "method": "full",
         "tuning_config": None,
         "model": args.model,
@@ -1064,12 +1073,13 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
         "output_dir": str(Path(args.save_model_path).resolve()),
         "micro_batch": 8,
         "world_size": 2,
-        "gradient_accumulation_steps": 2,
-        "effective_global_batch": 32,
+        "gradient_accumulation_steps": 1,
+        "effective_global_batch": 16,
         "epochs": 3,
         "learning_rate": 1e-5,
         "seed": 42,
         "max_steps": 3,
+        "optimizer_steps": 3,
         "final_save": False,
         "deepspeed_config": str(Path(args.deepspeed_config).resolve()),
         "deepspeed_config_digest": hashlib.sha256(
@@ -1136,6 +1146,13 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
         return original_read(path)
 
     monkeypatch.setattr(benchmark, "_read_json_once", counted_read)
+    monkeypatch.setattr(
+        benchmark,
+        "_small_config_digest",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError("bound runtime profile must supply the config digest")
+        ),
+    )
 
     def counted_artifact_builder(*args, **kwargs):
         nonlocal artifact_builds
@@ -1150,9 +1167,11 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
         config_path.write_text('{"replaced": true}', encoding="utf-8")
         return bundle
 
+    profile = bind_deepspeed_runtime_profile(args, world_size=2)
     run_stage1(
         args,
         component_builder=replace_manifest_after_preflight,
+        deepspeed_runtime_profile=profile,
         monotonic=iter((1.0, 2.0, 3.0, 5.0, 6.0)).__next__,
         observability_provider=observed,
         rank_config_digest_provider=lambda digest, world_size: (digest, digest),
@@ -1161,7 +1180,12 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
     sealed = json.loads(evidence_path.read_text())
     assert sealed["kind"] == "stage1-producer-evidence"
     assert sealed["benchmark_evidence"]["optimizer_steps"] == 3
-    assert sealed["benchmark_evidence"]["samples_seen"] == 96
+    assert sealed["benchmark_evidence"]["samples_seen"] == 48
+    assert sealed["benchmark_evidence"]["zero_stage"] == 3
+    assert sealed["benchmark_evidence"]["deepspeed_config_digest"] == (
+        args.deepspeed_runtime_profile.config_digest
+    )
+    assert sealed["benchmark_evidence"]["sample_stream_digest"] == audit["audit_digest"]
     assert sealed["artifact_manifest"]["artifact_kind"] == "none"
     assert sealed["run_config"]["config_digest"] == config["config_digest"]
     assert reads.count(config_path.resolve()) == 1
@@ -1211,10 +1235,12 @@ def test_run_stage1_rejects_runtime_or_rank_config_mismatch_before_build(tmp_pat
         builds += 1
         raise AssertionError("builder must not run")
 
+    profile = bind_deepspeed_runtime_profile(args, world_size=2)
     args.per_device_train_batch_size = 16
     with pytest.raises(ValueError, match="micro_batch"):
         run_stage1(
             args, component_builder=builder,
+            deepspeed_runtime_profile=profile,
             rank_config_digest_provider=lambda digest, world_size: (digest, digest),
         )
     assert builds == 0
@@ -1228,6 +1254,7 @@ def test_run_stage1_rejects_runtime_or_rank_config_mismatch_before_build(tmp_pat
     with pytest.raises(ValueError, match="config digest"):
         run_stage1(
             args, component_builder=builder,
+            deepspeed_runtime_profile=profile,
             rank_config_digest_provider=config_mismatch,
         )
     assert builds == 0
@@ -1241,6 +1268,7 @@ def test_run_stage1_rejects_runtime_or_rank_config_mismatch_before_build(tmp_pat
     with pytest.raises(ValueError, match="audit rows"):
         run_stage1(
             args, component_builder=builder,
+            deepspeed_runtime_profile=profile,
             rank_config_digest_provider=lambda digest, world_size: (digest, digest),
         )
     assert builds == 0
@@ -1331,10 +1359,12 @@ def test_distributed_preflight_rejects_successful_ranks_with_runtime_digest_mism
         remote["runtime_digest"] = "e" * 64
         return (local_result, remote)
 
+    profile = bind_deepspeed_runtime_profile(args, world_size=2)
     with pytest.raises(ValueError, match="runtime digest"):
         run_stage1(
             args,
             component_builder=lambda selected: pytest.fail("builder must not run"),
+            deepspeed_runtime_profile=profile,
             rank_config_digest_provider=collective,
         )
 
@@ -1419,9 +1449,11 @@ def test_run_stage1_prevalidates_smoke_marker_and_embeds_it_in_producer_evidence
         ),
     )
 
+    profile = bind_deepspeed_runtime_profile(args, world_size=2)
     run_stage1(
         args,
         component_builder=lambda selected: bundle,
+        deepspeed_runtime_profile=profile,
         monotonic=iter((1.0, 2.0, 3.0, 5.0, 6.0)).__next__,
         observability_provider=lambda selected: {
             "rank_peak_allocated_bytes": (10, 11),

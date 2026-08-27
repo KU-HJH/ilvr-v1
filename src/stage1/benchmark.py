@@ -8,6 +8,7 @@ an artifact tree.
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 import fcntl
@@ -25,6 +26,8 @@ from typing import Any, Literal, Mapping, Sequence
 
 
 _SCHEMA_VERSION = 1
+LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION = 1
+STAGE1_PRODUCER_SCHEMA_VERSION = 2
 _HEX_DIGEST_LENGTH = 64
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
@@ -150,15 +153,62 @@ def fallback_candidates_after_initial_failure(start: int) -> tuple[int, ...]:
 
 
 @dataclass(frozen=True)
+class Stage1ProducerIdentity:
+    method: str
+    zero_stage: int
+    deepspeed_config_digest: str
+    world_size: int
+    micro_batch: int
+    gradient_accumulation_steps: int
+    effective_global_batch: int
+    sample_stream_digest: str
+    model_id: str
+    seed: int
+
+    def __post_init__(self) -> None:
+        if type(self.method) is not str or self.method not in {"full", "dora"}:
+            raise ValueError("method must be full or dora")
+        zero_stage = _require_int("zero_stage", self.zero_stage, positive=True)
+        if zero_stage not in (1, 2, 3):
+            raise ValueError("zero_stage must be 1, 2, or 3")
+        _require_digest("deepspeed_config_digest", self.deepspeed_config_digest)
+        for name in (
+            "world_size",
+            "micro_batch",
+            "gradient_accumulation_steps",
+            "effective_global_batch",
+        ):
+            _require_int(name, getattr(self, name), positive=True)
+        if self.effective_global_batch != (
+            self.world_size * self.micro_batch * self.gradient_accumulation_steps
+        ):
+            raise ValueError(
+                "effective_global_batch must equal "
+                "world_size * micro_batch * gradient_accumulation_steps"
+            )
+        _require_digest("sample_stream_digest", self.sample_stream_digest)
+        _require_string("model_id", self.model_id)
+        _require_int("seed", self.seed)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class Stage1BenchmarkEvidence:
-    status: Literal["success", "oom", "failure"]
-    method: Literal["full", "dora"]
+    status: Literal["success", "capacity_oom", "integration_failure"]
+    method: str
+    zero_stage: int
+    deepspeed_config_digest: str
     micro_batch: int
     world_size: int
     gradient_accumulation_steps: int
     effective_global_batch: int
     optimizer_steps: int
     samples_seen: int
+    sample_stream_digest: str
+    model_id: str
+    seed: int
     model_load_seconds: float
     trainer_seconds: float
     total_seconds: float
@@ -179,10 +229,16 @@ class Stage1BenchmarkEvidence:
     probe_row_indices: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if type(self.status) is not str or self.status not in {"success", "oom", "failure"}:
-            raise ValueError("status must be success, oom, or failure")
-        if type(self.method) is not str or self.method not in {"full", "dora"}:
-            raise ValueError("method must be full or dora")
+        if type(self.status) is not str or self.status not in {
+            "success",
+            "capacity_oom",
+            "integration_failure",
+        }:
+            raise ValueError(
+                "status must be success, capacity_oom, or integration_failure"
+            )
+        # Reuse identity validation is shared with request parsing.
+        self.identity
         for name in (
             "micro_batch",
             "world_size",
@@ -238,6 +294,8 @@ class Stage1BenchmarkEvidence:
             raise ValueError("total_seconds must cover load, trainer, and final save")
         if self.status == "success" and self.optimizer_steps == 0:
             raise ValueError("successful evidence requires optimizer steps")
+        if self.status == "success" and self.samples_seen == 0:
+            raise ValueError("successful evidence requires samples_seen")
         if type(self.gpu_names) is not tuple or len(self.gpu_names) != self.world_size:
             raise ValueError("gpu_names tuple length must equal world_size")
         for index, value in enumerate(self.gpu_names):
@@ -255,6 +313,24 @@ class Stage1BenchmarkEvidence:
         for name, version in self.dependency_versions.items():
             _require_string("dependency_versions key", name)
             _require_string(f"dependency_versions[{name!r}]", version)
+
+    @property
+    def identity(self) -> Stage1ProducerIdentity:
+        return Stage1ProducerIdentity(
+            method=self.method,
+            zero_stage=self.zero_stage,
+            deepspeed_config_digest=self.deepspeed_config_digest,
+            world_size=self.world_size,
+            micro_batch=self.micro_batch,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            effective_global_batch=self.effective_global_batch,
+            sample_stream_digest=self.sample_stream_digest,
+            model_id=self.model_id,
+            seed=self.seed,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return _evidence_to_dict(self)
 
     def _validate_rank_int_tuple(self, name: str, values: object) -> None:
         if type(values) is not tuple or len(values) != self.world_size:
@@ -299,6 +375,13 @@ class Stage1SmokeResumeSnapshot:
 
 
 _EVIDENCE_FIELDS = {field.name for field in fields(Stage1BenchmarkEvidence)}
+_LEGACY_EVIDENCE_FIELDS = _EVIDENCE_FIELDS - {
+    "zero_stage",
+    "deepspeed_config_digest",
+    "sample_stream_digest",
+    "model_id",
+    "seed",
+}
 _LEGACY_RAW_EVIDENCE_CACHE: dict[
     Path, tuple[tuple[int, int, int, int], Stage1BenchmarkEvidence]
 ] = {}
@@ -338,6 +421,59 @@ def _evidence_from_dict(payload: object) -> Stage1BenchmarkEvidence:
     if type(values["dependency_versions"]) is not dict:
         raise TypeError("dependency_versions must be a JSON object")
     return Stage1BenchmarkEvidence(**values)
+
+
+def reusable_stage1_producer(
+    producer: Stage1BenchmarkEvidence,
+    requested: Mapping[str, object],
+) -> bool:
+    """Return true only for a complete, strictly parsed producer identity match."""
+
+    if not isinstance(producer, Stage1BenchmarkEvidence) or not isinstance(
+        requested, Mapping
+    ):
+        return False
+    if set(requested) != {field.name for field in fields(Stage1ProducerIdentity)}:
+        return False
+    try:
+        identity = Stage1ProducerIdentity(**dict(requested))
+    except (TypeError, ValueError):
+        return False
+    return producer.identity == identity
+
+
+def migrate_stage1_producer_evidence(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Migrate an authenticated schema-1 metric payload in memory only."""
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("legacy Stage 1 evidence must be an object")
+    migrated = copy.deepcopy(dict(payload))
+    if migrated.get("schema_version") != LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION:
+        raise ValueError("unsupported legacy Stage 1 evidence schema")
+    run_config = migrated.get("run_config")
+    if type(run_config) is not dict:
+        raise ValueError("legacy evidence is missing its sealed run_config")
+    migrated["zero_stage"] = 3
+    migrated["deepspeed_config_digest"] = _require_digest(
+        "deepspeed_config_digest", run_config.get("deepspeed_config_digest")
+    )
+    migrated["sample_stream_digest"] = _require_digest(
+        "audit_digest", run_config.get("audit_digest")
+    )
+    migrated["model_id"] = _require_string("model", run_config.get("model"))
+    migrated["seed"] = _require_int("seed", run_config.get("seed"))
+    status = migrated.get("status")
+    try:
+        migrated["status"] = {
+            "success": "success",
+            "oom": "capacity_oom",
+            "failure": "integration_failure",
+        }[status]
+    except (KeyError, TypeError) as error:
+        raise ValueError("legacy evidence has an unsupported status") from error
+    return migrated
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:
@@ -1297,7 +1433,9 @@ def load_stage1_run_config_witness(path: Path) -> Stage1RunConfigWitness:
 
 
 def validate_stage1_runtime_args(
-    witness: Stage1RunConfigWitness, args: object
+    witness: Stage1RunConfigWitness,
+    args: object,
+    deepspeed_runtime_profile: object,
 ) -> dict[str, object]:
     config = witness.payload()
     expected = {
@@ -1331,8 +1469,24 @@ def validate_stage1_runtime_args(
             raise ValueError(
                 f"Stage 1 runtime {name} does not match sealed run config"
             )
-    if config["deepspeed_config_digest"] != _small_config_digest(
-        Path(expected["deepspeed_config"])
+    from deepspeed_runtime import DeepSpeedRuntimeProfile
+
+    if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
+        raise TypeError("Stage 1 producer requires a bound DeepSpeed runtime profile")
+    if (
+        not deepspeed_runtime_profile.enabled
+        or deepspeed_runtime_profile.zero_stage is None
+        or deepspeed_runtime_profile.config_path is None
+        or deepspeed_runtime_profile.config_digest is None
+    ):
+        raise ValueError("Stage 1 matrix producers require DeepSpeed")
+    if deepspeed_runtime_profile.world_size != config["world_size"]:
+        raise ValueError("Stage 1 runtime world size does not match sealed run config")
+    if str(deepspeed_runtime_profile.config_path) != config["deepspeed_config"]:
+        raise ValueError("Stage 1 runtime DeepSpeed config path mismatch")
+    if (
+        config["deepspeed_config_digest"]
+        != deepspeed_runtime_profile.config_digest
     ):
         raise ValueError("Stage 1 runtime DeepSpeed config digest mismatch")
     if _stat_payload(Path(config["source_data_path"])) != config["data_stat"]:
@@ -1367,24 +1521,32 @@ def validate_stage1_runtime_args(
 def _validate_producer_run_config_payload(payload: object) -> dict[str, object]:
     if type(payload) is not dict:
         raise TypeError("Stage 1 producer run config must be an object")
+    legacy_fields = {
+        "schema_version", "kind", "method", "tuning_config", "model",
+        "source_data_path", "data_path", "data_stat", "image_root",
+        "output_dir", "micro_batch", "world_size",
+        "gradient_accumulation_steps", "effective_global_batch", "epochs",
+        "learning_rate", "seed", "max_steps", "final_save",
+        "deepspeed_config", "deepspeed_config_digest",
+        "attention_implementation", "save_strategy", "audit_digest",
+        "probe_rows", "probe_row_indices", "maximum_config_digest",
+        "prerequisite_chain_digest", "prerequisite_chain", "config_digest",
+    }
+    schema_version = payload.get("schema_version")
+    if schema_version == LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION:
+        expected_fields = legacy_fields
+        producer_kind = "legacy_zero3"
+    elif schema_version == STAGE1_PRODUCER_SCHEMA_VERSION:
+        expected_fields = legacy_fields | {"producer_kind", "optimizer_steps"}
+        producer_kind = payload.get("producer_kind")
+    else:
+        raise ValueError("unsupported Stage 1 producer run config schema")
     _require_exact_keys(
         payload,
-        {
-            "schema_version", "kind", "method", "tuning_config", "model",
-            "source_data_path", "data_path", "data_stat", "image_root",
-            "output_dir", "micro_batch", "world_size",
-            "gradient_accumulation_steps", "effective_global_batch", "epochs",
-            "learning_rate", "seed", "max_steps", "final_save",
-            "deepspeed_config", "deepspeed_config_digest",
-            "attention_implementation", "save_strategy", "audit_digest",
-            "probe_rows", "probe_row_indices", "maximum_config_digest",
-            "prerequisite_chain_digest",
-            "prerequisite_chain",
-            "config_digest",
-        },
+        expected_fields,
         "Stage 1 producer run config",
     )
-    if payload.get("schema_version") != _SCHEMA_VERSION or payload.get("kind") not in {
+    if payload.get("kind") not in {
         "stage1-probe-run-manifest", "stage1-timed-launch-manifest",
         "stage1-smoke-run-manifest",
     }:
@@ -1429,13 +1591,32 @@ def _validate_producer_run_config_payload(payload: object) -> dict[str, object]:
         or payload.get("seed") != 42
         or payload.get("attention_implementation") != "flash_attention_2"
         or payload.get("save_strategy") != "no"
-        or payload.get("gradient_accumulation_steps") != 2
-        or payload.get("world_size") != 2
     ):
         raise ValueError("producer run config violates approved experiment invariants")
     _require_int("epochs", payload.get("epochs"), positive=True)
     _require_int("seed", payload.get("seed"))
     _require_int("max_steps", payload.get("max_steps"))
+    if producer_kind == "zero_matrix":
+        if payload["world_size"] != 2:
+            raise ValueError("official zero_matrix producers require world_size 2")
+        if payload["effective_global_batch"] != 16:
+            raise ValueError(
+                "official zero_matrix producers require effective global batch 16"
+            )
+        if payload["optimizer_steps"] != 3:
+            raise ValueError("zero_matrix producers require exactly 3 optimizer steps")
+        if payload["max_steps"] != payload["optimizer_steps"]:
+            raise ValueError("zero_matrix max_steps must equal optimizer_steps")
+    elif producer_kind == "legacy_zero3":
+        if (
+            payload["gradient_accumulation_steps"] != 2
+            or payload["world_size"] != 2
+        ):
+            raise ValueError(
+                "legacy ZeRO-3 producer run config violates fixed controls"
+            )
+    else:
+        raise ValueError("unsupported Stage 1 producer kind")
     stat_witness = payload.get("data_stat")
     _require_exact_keys(
         stat_witness, {"device", "inode", "size", "mtime_ns"}, "producer data stat witness"
@@ -1551,9 +1732,9 @@ def _small_config_digest(path: Path) -> str:
     if (
         type(payload) is not dict
         or type(payload.get("zero_optimization")) is not dict
-        or payload["zero_optimization"].get("stage") != 3
+        or payload["zero_optimization"].get("stage") not in (1, 2, 3)
     ):
-        raise ValueError("Stage 1 benchmark requires an exact ZeRO-3 configuration")
+        raise ValueError("Stage 1 benchmark requires a supported ZeRO configuration")
     return hashlib.sha256(data).hexdigest()
 
 
@@ -1645,6 +1826,19 @@ def write_stage1_producer_evidence(
         raise ValueError("producer evidence is not bound to its run config")
     if evidence.method != config["method"]:
         raise ValueError("producer evidence method does not match run config")
+    identity_bindings = {
+        "deepspeed_config_digest": config["deepspeed_config_digest"],
+        "world_size": config["world_size"],
+        "micro_batch": config["micro_batch"],
+        "gradient_accumulation_steps": config["gradient_accumulation_steps"],
+        "effective_global_batch": config["effective_global_batch"],
+        "sample_stream_digest": config["audit_digest"],
+        "model_id": config["model"],
+        "seed": config["seed"],
+    }
+    for name, value in identity_bindings.items():
+        if getattr(evidence, name) != value:
+            raise ValueError(f"producer evidence identity mismatch for {name}")
     smoke_digest = None
     if config["kind"] == "stage1-smoke-run-manifest":
         smoke_resume_witness = _validate_smoke_resume_witness(smoke_resume_witness)
@@ -1663,7 +1857,7 @@ def write_stage1_producer_evidence(
     if evidence.checkpoint_bytes != artifact["checkpoint_bytes"]:
         raise ValueError("producer checkpoint_bytes does not match artifact witness")
     payload = {
-        "schema_version": _SCHEMA_VERSION,
+        "schema_version": STAGE1_PRODUCER_SCHEMA_VERSION,
         "kind": "stage1-producer-evidence",
         "run_config": config,
         "benchmark_evidence": _evidence_to_dict(evidence),
@@ -1869,7 +2063,14 @@ def _validate_producer_evidence_payload(
          "smoke_resume_witness", "smoke_resume_witness_digest"},
         "Stage 1 producer evidence",
     )
-    if payload.get("schema_version") != _SCHEMA_VERSION or payload.get("kind") != "stage1-producer-evidence":
+    schema_version = payload.get("schema_version")
+    if (
+        schema_version not in {
+            LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION,
+            STAGE1_PRODUCER_SCHEMA_VERSION,
+        }
+        or payload.get("kind") != "stage1-producer-evidence"
+    ):
         raise ValueError("invalid Stage 1 producer evidence schema")
     claimed = payload.get("producer_digest")
     _require_digest("producer_digest", claimed)
@@ -1879,7 +2080,29 @@ def _validate_producer_evidence_payload(
         raise ValueError("producer evidence digest mismatch")
     config = _validate_producer_run_config_payload(payload["run_config"])
     config_claimed = config["config_digest"]
-    evidence = _evidence_from_dict(payload["benchmark_evidence"])
+    raw_evidence = payload["benchmark_evidence"]
+    if (
+        schema_version == LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION
+        and type(raw_evidence) is dict
+        and set(raw_evidence) == _LEGACY_EVIDENCE_FIELDS
+    ):
+        migrated = migrate_stage1_producer_evidence(
+            {
+                **raw_evidence,
+                "schema_version": schema_version,
+                "run_config": config,
+            }
+        )
+        migrated.pop("schema_version")
+        migrated.pop("run_config")
+        evidence = _evidence_from_dict(migrated)
+    else:
+        evidence = _evidence_from_dict(raw_evidence)
+    if (
+        schema_version == LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION
+        and evidence.zero_stage != 3
+    ):
+        raise ValueError("legacy Stage 1 evidence must identify ZeRO-3")
     if evidence.config_digest != config_claimed:
         raise ValueError("producer metric/config digest mismatch")
     metric_bindings = {
@@ -1888,11 +2111,27 @@ def _validate_producer_evidence_payload(
         "world_size": evidence.world_size,
         "gradient_accumulation_steps": evidence.gradient_accumulation_steps,
         "effective_global_batch": evidence.effective_global_batch,
+        "deepspeed_config_digest": evidence.deepspeed_config_digest,
+        "sample_stream_digest": evidence.sample_stream_digest,
+        "model_id": evidence.model_id,
+        "seed": evidence.seed,
         "probe_row_indices": list(evidence.probe_row_indices),
     }
+    config_names = {
+        "sample_stream_digest": "audit_digest",
+        "model_id": "model",
+    }
     for name, value in metric_bindings.items():
-        if config.get(name) != value:
+        if config.get(config_names.get(name, name)) != value:
             raise ValueError(f"producer metric/run config mismatch for {name}")
+    if config.get("producer_kind") == "zero_matrix" and (
+        evidence.optimizer_steps != config["optimizer_steps"]
+        or evidence.samples_seen
+        != config["effective_global_batch"] * config["optimizer_steps"]
+    ):
+        raise ValueError(
+            "zero_matrix producer does not prove exact optimizer steps and samples seen"
+        )
     smoke_witness = payload.get("smoke_resume_witness")
     smoke_digest = payload.get("smoke_resume_witness_digest")
     if config["kind"] == "stage1-smoke-run-manifest":
@@ -3888,7 +4127,7 @@ def _load_maximum(path: Path) -> dict[str, object]:
     ):
         raise ValueError("maximum long smoke must be a successful exact 10-step run")
     producer_path = Path(long_attempt["output_dir"]).parent / "evidence" / "producer-evidence.json"
-    _, producer = _load_producer_evidence(producer_path)
+    evidence, producer = _load_producer_evidence(producer_path)
     if producer["producer_digest"] != payload["long_smoke_producer_digest"]:
         raise ValueError("maximum long-smoke producer digest mismatch")
     producer_config = producer["run_config"]
@@ -3928,7 +4167,6 @@ def _load_maximum(path: Path) -> dict[str, object]:
             raise ValueError(
                 f"maximum long-smoke producer is not bound to attempt field: {name}"
             )
-    evidence = _evidence_from_dict(producer["benchmark_evidence"])
     evidence_bindings = {
         "method": long_attempt["method"],
         "micro_batch": long_attempt["micro_batch"],
