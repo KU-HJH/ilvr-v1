@@ -13,6 +13,7 @@ from src.artifact_paths import resolve_run_artifact_paths
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / "run_stage1_training.sh"
 LEGACY_LAUNCHER = REPO_ROOT / "run_training.sh"
+ZERO_MATRIX_LAUNCHER = REPO_ROOT / "run_stage1_zero_matrix.sh"
 
 
 def run_launcher(script, *args, env=None):
@@ -24,6 +25,77 @@ def run_launcher(script, *args, env=None):
         check=False,
         env=env,
     )
+
+
+def test_zero_matrix_dry_run_orders_stages_methods_and_candidates_without_writes(
+    tmp_path,
+):
+    """Catches the controller reordering rows or creating artifacts during planning."""
+    completed = run_launcher(
+        ZERO_MATRIX_LAUNCHER,
+        "--dry-run",
+        "--model",
+        "model",
+        "--source-data-path",
+        tmp_path / "source.jsonl",
+        "--data-path",
+        tmp_path / "probe.jsonl",
+        "--image-root",
+        tmp_path / "images",
+        "--sample-audit",
+        tmp_path / "sample-audit.json",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    plans = [json.loads(line) for line in completed.stdout.splitlines()]
+    candidates = [
+        (row["zero_stage"], row["method"], row["micro_batch"], row["gradient_accumulation"])
+        for row in plans
+        if row["run_kind"] == "candidate"
+    ]
+    assert candidates == [
+        (stage, method, micro, accumulation)
+        for stage in (3, 2, 1)
+        for method in ("full", "dora")
+        for micro, accumulation in ((8, 1), (4, 2), (2, 4), (1, 8))
+    ]
+    candidate_plans = [row for row in plans if row["run_kind"] == "candidate"]
+    assert all(row["max_steps"] == 3 for row in candidate_plans)
+    assert all(row["final_save"] is False for row in candidate_plans)
+    for stage in (3, 2, 1):
+        for method in ("full", "dora"):
+            pair = [
+                row for row in plans
+                if row["zero_stage"] == stage and row["method"] == method
+            ]
+            assert [row["run_kind"] for row in pair[-2:]] == [
+                "selected-save", "selected-resume"
+            ]
+            assert pair[-2]["max_steps"] == 3
+            assert pair[-2]["final_save"] is True
+            assert pair[-1]["max_steps"] == 4
+            assert pair[-1]["resume_from_kind"] == "selected-save"
+            assert pair[-2]["experiment_id"] != pair[-1]["experiment_id"]
+            for row in pair:
+                assert row["checkpoint_dir"].split("/")[-1] == row["experiment_id"]
+                assert row["result_dir"].split("/")[-1] == row["experiment_id"]
+                assert row["log_dir"].split("/")[-1] == row["experiment_id"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_batch_probe_keeps_attempt_record_below_its_per_run_result_directory(tmp_path):
+    """Catches recreation of a mixed-root attempts/evidence bundle."""
+    from test_benchmark import _run_probe
+
+    completed, records, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+
+    assert completed.returncode == 42
+    parts = next(records.glob("*.argv0")).read_bytes().split(b"\0")[:-1]
+    run_config = Path(parts[parts.index(b"--benchmark-run-config") + 1].decode())
+    attempt_records = list(run_config.parent.glob("attempt-record/evidence/attempt.json"))
+
+    assert len(attempt_records) == 1
+    assert not (output_root / "attempts").exists()
 
 
 def base_args(output_dir, *, method="dora"):

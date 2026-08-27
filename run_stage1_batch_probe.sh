@@ -198,16 +198,15 @@ for micro_batch in "${candidates[@]}"; do
     candidate_prefix_length=$((128 - ${#candidate_suffix}))
     candidate_experiment_id="${probe_experiment_id:0:candidate_prefix_length}$candidate_suffix"
     "$repository_python" -m src.artifact_paths resolve --experiment-id "$candidate_experiment_id" >/dev/null
-    attempt_dir="$output_root/attempts/$method/micro-batch-$micro_batch/attempt-$attempt_id"
     logs_dir="$canonical_log_root/$candidate_experiment_id"
     evidence_dir="$canonical_result_root/$candidate_experiment_id"
     candidate_output="$canonical_checkpoint_root/$candidate_experiment_id"
+    attempt_dir="$evidence_dir/attempt-record"
     stdout_path="$logs_dir/stdout.log"
     stderr_path="$logs_dir/stderr.log"
     run_config="$evidence_dir/run-config.json"
     producer_evidence="$evidence_dir/producer-evidence.json"
-    mkdir -p -- "$canonical_checkpoint_root" "$canonical_log_root" "$canonical_result_root" \
-        "$attempt_dir/evidence"
+    mkdir -p -- "$canonical_checkpoint_root" "$canonical_log_root" "$canonical_result_root"
     if ! mkdir -- "$candidate_output"; then
         printf 'error: fresh run artifact directory already exists: %s\n' "$candidate_output" >&2
         exit 2
@@ -220,6 +219,7 @@ for micro_batch in "${candidates[@]}"; do
         printf 'error: fresh run artifact directory already exists: %s\n' "$evidence_dir" >&2
         exit 2
     fi
+    mkdir -p -- "$attempt_dir/evidence"
     artifact_claim_token=$("$repository_python" -c 'import secrets; print(secrets.token_hex(32))')
     for target_dir in "$candidate_output" "$logs_dir" "$evidence_dir"; do
         (
