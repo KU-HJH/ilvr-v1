@@ -40,6 +40,11 @@ from stage2.peft import (
     resolve_stage2_target_module_names,
 )
 from stage2.trainer import Stage2Trainer
+from stage2.sampler import (
+    STAGE2_SAMPLER_FILENAME,
+    LatentBlockBalancedSampler,
+    write_stage2_sampler_sidecar,
+)
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 
@@ -1406,9 +1411,17 @@ def test_stage2_numbered_checkpoint_writes_runtime_identity(tmp_path, monkeypatc
 
     monkeypatch.setattr("stage2.trainer.Trainer._save_checkpoint", parent_save)
     trainer = object.__new__(Stage2Trainer)
-    trainer.args = SimpleNamespace(output_dir=str(tmp_path), should_save=True)
+    trainer.args = SimpleNamespace(
+        output_dir=str(tmp_path), should_save=True, world_size=2, seed=42
+    )
     trainer.state = SimpleNamespace(global_step=3)
     trainer.model = object()
+    trainer.train_dataset = [
+        SimpleNamespace(latent_block_count=count) for count in (1, 1, 1, 2, 2)
+    ]
+    trainer.stage2_sampler_identity = LatentBlockBalancedSampler(
+        trainer.train_dataset, num_replicas=2, seed=42
+    ).identity
     trainer.deepspeed_runtime_profile = runtime_profile(2, world_size=2)
     trainer._get_output_dir = lambda trial: str(tmp_path)
     trainer.accelerator = SimpleNamespace(
@@ -1424,6 +1437,59 @@ def test_stage2_numbered_checkpoint_writes_runtime_identity(tmp_path, monkeypatc
     )
     assert payload["zero_stage"] == 2
     assert payload["world_size"] == 2
+    sampler_payload = json.loads(
+        (checkpoint / STAGE2_SAMPLER_FILENAME).read_text(encoding="utf-8")
+    )
+    assert sampler_payload["global_step"] == 3
+    assert sampler_payload["bucket_sizes"] == {"1": 3, "2": 2}
+    assert sampler_payload["padded_samples"] == 1
+
+
+def test_stage2_resume_rejects_sampler_identity_before_parent_train(
+    tmp_path, monkeypatch
+):
+    """Catches changed distributed data geometry reaching Trainer restore."""
+    checkpoint = tmp_path / "checkpoint-3"
+    checkpoint.mkdir()
+    write_deepspeed_runtime_sidecar(
+        checkpoint, runtime_profile(2, world_size=2)
+    )
+    checkpoint_dataset = [
+        SimpleNamespace(latent_block_count=count) for count in (1, 1, 2, 2)
+    ]
+    checkpoint_identity = LatentBlockBalancedSampler(
+        checkpoint_dataset, num_replicas=2, seed=42
+    ).identity
+    write_stage2_sampler_sidecar(checkpoint, checkpoint_identity, global_step=3)
+    parent_calls = []
+
+    def parent_train(trainer, *args, **kwargs):
+        del trainer, args, kwargs
+        parent_calls.append("train")
+
+    monkeypatch.setattr("stage2.trainer.Trainer.train", parent_train)
+    trainer = object.__new__(Stage2Trainer)
+    trainer.args = SimpleNamespace(
+        output_dir=str(tmp_path),
+        should_save=True,
+        world_size=2,
+        seed=42,
+    )
+    trainer.train_dataset = [
+        SimpleNamespace(latent_block_count=count) for count in (1, 1, 1, 2, 2)
+    ]
+    trainer.stage2_sampler_identity = None
+    trainer.deepspeed_runtime_profile = runtime_profile(2, world_size=2)
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda value, reduction: value,
+        wait_for_everyone=lambda: None,
+    )
+
+    with pytest.raises(ValueError, match="dataset_size"):
+        trainer.train(resume_from_checkpoint=str(checkpoint))
+
+    assert parent_calls == []
 
 
 def test_stage2_resume_rejects_runtime_before_parent_train(tmp_path, monkeypatch):

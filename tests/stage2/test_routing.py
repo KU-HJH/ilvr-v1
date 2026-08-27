@@ -37,6 +37,7 @@ from stage2.peft import (
     build_stage2_tuned_model,
     resolve_stage2_target_module_names,
 )
+from stage2.sampler import LatentBlockBalancedSampler
 
 
 class DiagnosticStage2Model:
@@ -136,9 +137,24 @@ def test_stage2_trainer_rejects_helper_image_tensors_before_model_call():
     assert model.last_inputs is None
 
 
-def test_stage2_trainer_keeps_checkpointing_model_owned():
-    """Catches observability plumbing replacing Trainer checkpoint behavior."""
-    assert Stage2Trainer._save_checkpoint is Trainer._save_checkpoint
+def test_stage2_single_process_keeps_framework_train_sampler(monkeypatch):
+    """Catches balanced distributed ordering leaking into one-process runs."""
+    framework_sampler = object()
+    monkeypatch.setattr(
+        Trainer,
+        "_get_train_sampler",
+        lambda selected: framework_sampler,
+    )
+    trainer = object.__new__(Stage2Trainer)
+    trainer.args = SimpleNamespace(world_size=1, seed=42)
+    trainer.train_dataset = [SimpleNamespace(latent_block_count=1)]
+    trainer.stage2_sampler_identity = "stale"
+
+    sampler = trainer._get_train_sampler()
+
+    assert sampler is framework_sampler
+    assert not isinstance(sampler, LatentBlockBalancedSampler)
+    assert trainer.stage2_sampler_identity is None
 
 
 def test_stage_routing_selects_independent_trainers():

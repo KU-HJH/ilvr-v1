@@ -15,6 +15,12 @@ from deepspeed_runtime import (
     write_deepspeed_runtime_sidecar,
 )
 from .checkpointing import save_stage2_peft_metadata
+from .sampler import (
+    LatentBlockBalancedSampler,
+    Stage2SamplerIdentity,
+    validate_stage2_sampler_resume_identity,
+    write_stage2_sampler_sidecar,
+)
 from stage1.token_rows import (
     save_sparse_token_rows,
     sparse_token_rows_are_partitioned,
@@ -54,6 +60,7 @@ class Stage2Trainer(Trainer):
             raise TypeError("Stage 2 trainer requires a DeepSpeed runtime profile")
         self.deepspeed_runtime_profile = deepspeed_runtime_profile
         self.stage2_peft_metadata = stage2_peft_metadata
+        self.stage2_sampler_identity: Stage2SamplerIdentity | None = None
         super().__init__(*args, **kwargs)
 
     def _publish_deepspeed_runtime_identity(
@@ -81,6 +88,69 @@ class Stage2Trainer(Trainer):
             raise RuntimeError(f"{label} failed on another process")
         self.accelerator.wait_for_everyone()
 
+    def _ensure_stage2_sampler_identity(self) -> Stage2SamplerIdentity | None:
+        if self.args.world_size <= 1:
+            self.stage2_sampler_identity = None
+            return None
+        if self.stage2_sampler_identity is None:
+            sampler = LatentBlockBalancedSampler(
+                self.train_dataset,
+                num_replicas=self.args.world_size,
+                seed=self.args.seed,
+            )
+            self.stage2_sampler_identity = sampler.identity
+        return self.stage2_sampler_identity
+
+    def _publish_stage2_sampler_identity(
+        self, directory: Path, *, global_step: int, label: str
+    ) -> None:
+        identity = self._ensure_stage2_sampler_identity()
+        if identity is None:
+            return
+        local_error: Exception | None = None
+        if self.args.should_save:
+            try:
+                write_stage2_sampler_sidecar(
+                    directory, identity, global_step=global_step
+                )
+            except Exception as error:
+                local_error = error
+        local_failure = torch.tensor(
+            int(local_error is not None),
+            dtype=torch.int32,
+            device=self.accelerator.device,
+        )
+        failed_processes = self.accelerator.reduce(
+            local_failure, reduction="sum"
+        )
+        if int(failed_processes.item()) != 0:
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(f"{label} failed on another process")
+        self.accelerator.wait_for_everyone()
+
+    def _get_train_sampler(self):
+        if self.args.world_size <= 1:
+            self.stage2_sampler_identity = None
+            return super()._get_train_sampler()
+        sampler = LatentBlockBalancedSampler(
+            self.train_dataset,
+            num_replicas=self.args.world_size,
+            seed=self.args.seed,
+        )
+        self.stage2_sampler_identity = sampler.identity
+        return sampler
+
+    def get_train_dataloader(self):
+        dataloader = super().get_train_dataloader()
+        if self.stage2_sampler_identity is not None:
+            self._publish_stage2_sampler_identity(
+                Path(self.args.output_dir),
+                global_step=0,
+                label="Stage 2 sampler identity publication",
+            )
+        return dataloader
+
     def train(self, *args, resume_from_checkpoint=None, **kwargs):
         self._publish_deepspeed_runtime_identity(
             Path(self.args.output_dir), label="Stage 2 runtime identity publication"
@@ -102,6 +172,11 @@ class Stage2Trainer(Trainer):
             validate_deepspeed_resume_identity(
                 Path(resume_from_checkpoint), self.deepspeed_runtime_profile
             )
+            sampler_identity = self._ensure_stage2_sampler_identity()
+            if sampler_identity is not None:
+                validate_stage2_sampler_resume_identity(
+                    Path(resume_from_checkpoint), sampler_identity
+                )
         return super().train(
             *args, resume_from_checkpoint=resume_from_checkpoint, **kwargs
         )
@@ -113,6 +188,11 @@ class Stage2Trainer(Trainer):
         )
         self._publish_deepspeed_runtime_identity(
             checkpoint, label="Stage 2 checkpoint runtime identity publication"
+        )
+        self._publish_stage2_sampler_identity(
+            checkpoint,
+            global_step=self.state.global_step,
+            label="Stage 2 checkpoint sampler identity publication",
         )
 
     def compute_loss(
