@@ -1615,6 +1615,49 @@ def test_final_report_rejects_a_maximum_from_another_smoke_chain(tmp_path, monke
         )
 
 
+def test_capacity_prerequisite_controls_do_not_require_run_only_fields():
+    """Capacity launch configs have max_steps, not epochs/save_strategy fields."""
+    import stage1.benchmark as benchmark
+
+    common = {
+        "model": "tiny/model",
+        "source_data_path": "/data/TRAIN.jsonl",
+        "data_stat": {"device": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+        "image_root": "/data/images",
+        "world_size": 2,
+        "gradient_accumulation_steps": 2,
+        "learning_rate": 1e-5,
+        "seed": 42,
+        "deepspeed_config": "/configs/zero3.json",
+        "deepspeed_config_digest": "d" * 64,
+        "attention_implementation": "flash_attention_2",
+    }
+    prerequisite = {
+        "shared_identity": {
+            **common,
+            "epochs": 3,
+            "save_strategy": "no",
+        }
+    }
+    capacity = {
+        **common,
+        "data_path": common["source_data_path"],
+        "max_steps": 3,
+    }
+
+    benchmark._validate_prerequisite_controls(
+        capacity,
+        prerequisite,
+        require_run_controls=False,
+    )
+    with pytest.raises(ValueError, match="epochs"):
+        benchmark._validate_prerequisite_controls(
+            capacity,
+            prerequisite,
+            require_run_controls=True,
+        )
+
+
 def test_timed_comparison_is_a_standalone_canonical_prerequisite_seal(
     tmp_path, monkeypatch,
 ):

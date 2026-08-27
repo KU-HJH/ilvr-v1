@@ -1513,17 +1513,23 @@ def _load_prerequisite_chain(path: Path) -> dict[str, object]:
 
 _PREREQUISITE_CONTROL_FIELDS = (
     "model", "source_data_path", "data_stat", "image_root", "world_size",
-    "gradient_accumulation_steps", "epochs", "learning_rate", "seed",
+    "gradient_accumulation_steps", "learning_rate", "seed",
     "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
-    "save_strategy",
 )
+_PREREQUISITE_RUN_CONTROL_FIELDS = ("epochs", "save_strategy")
 
 
 def _validate_prerequisite_controls(
-    config: Mapping[str, object], prerequisite: Mapping[str, object]
+    config: Mapping[str, object],
+    prerequisite: Mapping[str, object],
+    *,
+    require_run_controls: bool,
 ) -> None:
     identity = prerequisite["shared_identity"]
-    for name in _PREREQUISITE_CONTROL_FIELDS:
+    fields = _PREREQUISITE_CONTROL_FIELDS
+    if require_run_controls:
+        fields += _PREREQUISITE_RUN_CONTROL_FIELDS
+    for name in fields:
         source_name = (
             "source_data_path"
             if name == "source_data_path" and "source_data_path" in config
@@ -1601,7 +1607,9 @@ def _prepare_probe_run(args: argparse.Namespace) -> str:
         "prerequisite_chain_digest": prerequisite["prerequisite_chain_digest"],
         "prerequisite_chain": str(Path(args.prerequisite_chain).resolve(strict=True)),
     }
-    _validate_prerequisite_controls(config, prerequisite)
+    _validate_prerequisite_controls(
+        config, prerequisite, require_run_controls=True
+    )
     config["config_digest"] = config_digest(config)
     path = Path(args.run_config)
     if path.exists():
@@ -4394,7 +4402,9 @@ def _final_report(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("maximum evidence does not descend from the smoke prerequisite")
     _require_matching_maximum_controls(maximum)
     for item in maximum:
-        _validate_prerequisite_controls(item["launch_config"], prerequisite)
+        _validate_prerequisite_controls(
+            item["launch_config"], prerequisite, require_run_controls=False
+        )
     maximum_by_method = {item["method"]: item for item in maximum}
     for item in timed:
         selected = maximum_by_method[item.method]
