@@ -8,6 +8,7 @@ from peft import PeftModel
 from torch import nn
 
 from peft_common import resolve_qwen2_5_vl_model
+import stage1.peft as stage1_peft
 from stage1 import (
     Stage1ParameterReport,
     Stage1TuningConfig,
@@ -131,7 +132,7 @@ def test_dora_registers_exact_zero3_externals_on_magnitude_consumers(
 
     configured = tuning("dora")
     model = build_stage1_tuned_model(
-        tiny_qwen, configured, latent_token_ids
+        tiny_qwen, configured, latent_token_ids, zero_stage=3
     )
     qwen = resolve_qwen2_5_vl_model(model)
     modules = dict(qwen.named_modules())
@@ -153,8 +154,12 @@ def test_dora_registers_exact_zero3_externals_on_magnitude_consumers(
 
     # Runtime and checkpoint validation can revisit this boundary; registration
     # remains one exact identity-keyed set rather than accumulating duplicates.
-    validate_stage1_trainable_boundary(model, configured, latent_token_ids)
-    validate_stage1_trainable_boundary(model, configured, latent_token_ids)
+    validate_stage1_trainable_boundary(
+        model, configured, latent_token_ids, zero_stage=3
+    )
+    validate_stage1_trainable_boundary(
+        model, configured, latent_token_ids, zero_stage=3
+    )
     external_counts = set()
     for target_name in model.base_model.targeted_module_names:
         target = modules[target_name]
@@ -164,6 +169,28 @@ def test_dora_registers_exact_zero3_externals_on_magnitude_consumers(
         assert len(tuple(consumer.ds_external_parameters())) == expected_count
         external_counts.add(expected_count)
     assert external_counts == {3, 4}
+
+
+@pytest.mark.parametrize(
+    "zero_stage,expected_calls", [(1, 0), (2, 0), (3, 1)]
+)
+def test_dora_external_parameters_are_registered_only_for_zero3(
+    tiny_qwen, latent_token_ids, monkeypatch, zero_stage, expected_calls
+):
+    configured = tuning("dora")
+    model = build_stage1_tuned_model(tiny_qwen, configured, latent_token_ids)
+    calls = []
+    monkeypatch.setattr(
+        stage1_peft,
+        "_register_dora_zero3_external_parameters",
+        lambda qwen, target_names: calls.append((qwen, tuple(target_names))),
+    )
+
+    validate_stage1_trainable_boundary(
+        model, configured, latent_token_ids, zero_stage=zero_stage
+    )
+
+    assert len(calls) == expected_calls
 
 
 def test_lora_does_not_register_dora_zero3_externals(

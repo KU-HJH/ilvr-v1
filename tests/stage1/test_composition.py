@@ -15,6 +15,10 @@ from transformers import Qwen2_5_VLConfig
 from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from peft_common import capture_qwen2_5_vl_architecture
+from deepspeed_runtime import (
+    bind_deepspeed_runtime_profile,
+    canonical_deepspeed_config_path,
+)
 from stage1.checkpointing import (
     STAGE1_PEFT_METADATA_FILENAME,
     STAGE1_PEFT_SCHEMA_VERSION,
@@ -447,11 +451,13 @@ def fake_dependencies(
         )
         return model
 
-    def build_tuned(base, tuning, latent_ids):
+    def build_tuned(base, tuning, latent_ids, *, zero_stage=None):
+        del zero_stage
         events.append(("topology", tuning.method, tuple(latent_ids)))
         return base
 
-    def validate_boundary(candidate, tuning, latent_ids):
+    def validate_boundary(candidate, tuning, latent_ids, *, zero_stage=None):
+        del zero_stage
         events.append(("boundary", tuning.method, tuple(latent_ids)))
         return parameter_report
 
@@ -676,6 +682,18 @@ def test_fresh_dora_composition_adds_tokens_once_and_propagates_runtime_args(tmp
         event[0] for event in events
     ].index("trainer")
     assert all(not parameter.requires_grad for parameter in model.visual.parameters())
+
+
+def test_stage1_components_share_bound_runtime_profile(tmp_path):
+    events = []
+    deps, _, _, _ = fake_dependencies(events, metadata=object())
+    args = stage1_args(tmp_path)
+    args.deepspeed_config = str(canonical_deepspeed_config_path(2))
+    profile = bind_deepspeed_runtime_profile(args, world_size=2)
+
+    components = build_stage1_training_components(args, dependencies=deps)
+
+    assert components.trainer.kwargs["deepspeed_runtime_profile"] is profile
 
 
 @pytest.mark.parametrize("method", ["full", "dora"])
@@ -999,7 +1017,7 @@ def test_run_stage1_trains_once_and_only_final_saves_when_requested(
     with caplog.at_level(logging.INFO):
         result = run_stage1(
             args,
-            component_builder=lambda selected: bundle,
+            component_builder=lambda selected, **kwargs: bundle,
             monotonic=lambda: next(ticks),
         )
 
@@ -1122,7 +1140,7 @@ def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
         benchmark, "_build_artifact_manifest", counted_artifact_builder
     )
 
-    def replace_manifest_after_preflight(selected):
+    def replace_manifest_after_preflight(selected, **kwargs):
         config_path.write_text('{"replaced": true}', encoding="utf-8")
         return bundle
 
@@ -1182,7 +1200,7 @@ def test_run_stage1_rejects_runtime_or_rank_config_mismatch_before_build(tmp_pat
     args.benchmark_source_data_path = config["source_data_path"]
     builds = 0
 
-    def builder(selected):
+    def builder(selected, **kwargs):
         nonlocal builds
         builds += 1
         raise AssertionError("builder must not run")
@@ -1248,7 +1266,7 @@ def test_distributed_preflight_collects_one_rank_runtime_error_before_uniform_fa
         }
         return (local_result, remote_success)
 
-    def builder(selected):
+    def builder(selected, **kwargs):
         nonlocal builds
         builds += 1
         raise AssertionError("builder must not run")
@@ -1282,7 +1300,9 @@ def test_distributed_preflight_collects_manifest_read_error_before_uniform_failu
     with pytest.raises(ValueError, match="distributed preflight"):
         run_stage1(
             args,
-            component_builder=lambda selected: pytest.fail("builder must not run"),
+            component_builder=lambda selected, **kwargs: pytest.fail(
+                "builder must not run"
+            ),
             rank_config_digest_provider=collective,
         )
     assert len(gathered) == 1
@@ -1310,7 +1330,9 @@ def test_distributed_preflight_rejects_successful_ranks_with_runtime_digest_mism
     with pytest.raises(ValueError, match="runtime digest"):
         run_stage1(
             args,
-            component_builder=lambda selected: pytest.fail("builder must not run"),
+            component_builder=lambda selected, **kwargs: pytest.fail(
+                "builder must not run"
+            ),
             rank_config_digest_provider=collective,
         )
 
@@ -1397,7 +1419,7 @@ def test_run_stage1_prevalidates_smoke_marker_and_embeds_it_in_producer_evidence
 
     run_stage1(
         args,
-        component_builder=lambda selected: bundle,
+        component_builder=lambda selected, **kwargs: bundle,
         monotonic=iter((1.0, 2.0, 3.0, 5.0, 6.0)).__next__,
         observability_provider=lambda selected: {
             "rank_peak_allocated_bytes": (10, 11),

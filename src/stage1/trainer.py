@@ -18,6 +18,7 @@ from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 from trl import SFTTrainer
 
+from deepspeed_runtime import DeepSpeedRuntimeProfile
 from .ema import (
     STAGE1_EMA_TEACHER_STATE_FILENAME,
     Stage1EmaTeacher,
@@ -34,6 +35,85 @@ _SUPPORTED_ACCELERATE_VERSION = "1.10.1"
 _SUPPORTED_DEEPSPEED_VERSION = "0.18.0"
 _STAGE1_EMA_TEACHER_STATE_SCHEMA_VERSION = 1
 _STAGE1_EMA_TEACHER_STATE_KIND = "stage1_ema_teacher"
+
+
+def collect_deepspeed_pre_step_norm(
+    optimizer: object, *, zero_stage: int
+) -> torch.Tensor:
+    """Collect the pinned optimizer's unscaled norm before its step mutates state."""
+
+    if zero_stage == 3:
+        get_norm_groups = getattr(optimizer, "_get_norm_groups", None)
+        if not callable(get_norm_groups):
+            raise RuntimeError("ZeRO-3 gradient norm groups are unavailable")
+        raw_groups = get_norm_groups()
+        if not isinstance(raw_groups, (tuple, list)) or not raw_groups:
+            raise FloatingPointError("ZeRO-3 gradient norm groups are missing")
+        scalar_groups: list[torch.Tensor] = []
+        for value in raw_groups:
+            group = torch.as_tensor(value).detach().float()
+            if (
+                group.numel() != 1
+                or not bool(torch.isfinite(group).all().item())
+                or bool((group < 0).item())
+            ):
+                raise FloatingPointError(
+                    "DeepSpeed pre-step gradient norm must be finite"
+                )
+            scalar_groups.append(group.reshape(()))
+        reference_device = scalar_groups[0].device
+        scaled_norm = torch.linalg.vector_norm(
+            torch.stack(
+                [group.to(device=reference_device) for group in scalar_groups]
+            )
+        )
+    elif zero_stage in (1, 2):
+        expected_partitioning = zero_stage == 2
+        if bool(getattr(optimizer, "partition_gradients", None)) != (
+            expected_partitioning
+        ):
+            raise RuntimeError(
+                f"ZeRO-{zero_stage} optimizer partition contract mismatch"
+            )
+        scaled_global_norm = getattr(optimizer, "scaled_global_norm", None)
+        if not callable(scaled_global_norm):
+            raise RuntimeError(
+                f"ZeRO-{zero_stage} scaled global norm is unavailable"
+            )
+        scaled_norm = torch.as_tensor(scaled_global_norm()).detach().float()
+        if (
+            scaled_norm.numel() != 1
+            or not bool(torch.isfinite(scaled_norm).all().item())
+            or bool((scaled_norm < 0).item())
+        ):
+            raise FloatingPointError(
+                "DeepSpeed pre-step gradient norm must be finite"
+            )
+        scaled_norm = scaled_norm.reshape(())
+        reference_device = scaled_norm.device
+    else:
+        raise RuntimeError(f"Unsupported DeepSpeed ZeRO stage: {zero_stage}")
+
+    raw_loss_scale = getattr(optimizer, "loss_scale", None)
+    if raw_loss_scale is None:
+        raise FloatingPointError("DeepSpeed gradient loss scale is missing")
+    loss_scale = torch.as_tensor(
+        raw_loss_scale, dtype=torch.float32, device=reference_device
+    )
+    if (
+        loss_scale.numel() != 1
+        or not bool(torch.isfinite(loss_scale).all().item())
+        or not bool((loss_scale > 0).item())
+    ):
+        raise FloatingPointError("DeepSpeed gradient loss scale is invalid")
+    norm = torch.as_tensor(
+        scaled_norm / loss_scale.reshape(()), dtype=torch.float32
+    )
+    if norm.numel() != 1 or not bool(torch.isfinite(norm).all().item()):
+        raise FloatingPointError(
+            "DeepSpeed pre-step gradient norm must be finite"
+        )
+    return norm.reshape(())
 
 
 class _DeepSpeedStepAdapter:
@@ -121,6 +201,7 @@ class CustomTrainerStage1(SFTTrainer):
     def __init__(
         self,
         *args,
+        deepspeed_runtime_profile: DeepSpeedRuntimeProfile,
         sim_weight: float = 1.0,
         ema_tau: float = 0.999,
         coverage_p: float = 0.9,
@@ -134,6 +215,9 @@ class CustomTrainerStage1(SFTTrainer):
         collect_stage1_diagnostics: bool = False,
         **kwargs,
     ) -> None:
+        if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
+            raise TypeError("Stage 1 trainer requires a DeepSpeed runtime profile")
+        self.deepspeed_runtime_profile = deepspeed_runtime_profile
         self.stage1_peft_metadata = stage1_peft_metadata
         # Preserve the repository's legacy constructor spelling across the
         # tokenizer -> processing_class Trainer API migration.
@@ -519,57 +603,14 @@ class CustomTrainerStage1(SFTTrainer):
         self._stage1_pending_ema_checkpoint = None
 
     def _validate_deepspeed_gradient_norm(self, engine) -> torch.Tensor:
-        optimizer = getattr(engine, "optimizer", None)
-        get_norm_groups = getattr(optimizer, "_get_norm_groups", None)
-        if not callable(get_norm_groups):
+        zero_stage = self.deepspeed_runtime_profile.zero_stage
+        if zero_stage is None:
             raise RuntimeError(
-                "unsupported DeepSpeed Stage 1 lifecycle: ZeRO-3 norm witness "
-                "is unavailable"
+                "DeepSpeed norm collection requires an enabled profile"
             )
-        norm_groups = get_norm_groups()
-        if not isinstance(norm_groups, (tuple, list)) or not norm_groups:
-            raise FloatingPointError(
-                "Stage 1 representative DeepSpeed gradient evidence is missing"
-            )
-
-        scalar_norms: list[torch.Tensor] = []
-        for raw_norm in norm_groups:
-            norm = torch.as_tensor(raw_norm).detach().float()
-            if norm.numel() != 1:
-                raise FloatingPointError(
-                    "Stage 1 DeepSpeed gradient norm must be scalar"
-                )
-            if not bool(torch.isfinite(norm).all().item()) or bool((norm < 0).item()):
-                raise FloatingPointError(
-                    "Stage 1 DeepSpeed gradient norm is nonfinite"
-                )
-            scalar_norms.append(norm.reshape(()))
-
-        reference_device = scalar_norms[0].device
-        stacked = torch.stack(
-            [norm.to(device=reference_device) for norm in scalar_norms]
+        norm = collect_deepspeed_pre_step_norm(
+            engine.optimizer, zero_stage=zero_stage
         )
-        raw_loss_scale = getattr(optimizer, "loss_scale", None)
-        if raw_loss_scale is None:
-            raise FloatingPointError(
-                "Stage 1 DeepSpeed gradient loss scale is missing"
-            )
-        loss_scale = torch.as_tensor(
-            raw_loss_scale,
-            dtype=torch.float32,
-            device=reference_device,
-        )
-        if (
-            loss_scale.numel() != 1
-            or not bool(torch.isfinite(loss_scale).all().item())
-            or not bool((loss_scale > 0).item())
-        ):
-            raise FloatingPointError(
-                "Stage 1 DeepSpeed gradient loss scale is invalid"
-            )
-        norm = torch.linalg.vector_norm(stacked) / loss_scale
-        if not bool(torch.isfinite(norm).all().item()):
-            raise FloatingPointError("Stage 1 DeepSpeed gradient norm is nonfinite")
         self._record_gradient_diagnostic(norm)
         return norm
 
@@ -621,6 +662,7 @@ class CustomTrainerStage1(SFTTrainer):
                 "wrapper is unavailable after prepare"
             )
         from deepspeed.runtime.engine import DeepSpeedEngine
+        from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
         from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 
         engine = wrapper.engine
@@ -633,10 +675,28 @@ class CustomTrainerStage1(SFTTrainer):
                 "unsupported DeepSpeed Stage 1 lifecycle: Trainer and "
                 "Accelerate prepared different engines"
             )
-        if not isinstance(getattr(engine, "optimizer", None), DeepSpeedZeroOptimizer_Stage3):
+        profile = self.deepspeed_runtime_profile
+        zero_stage = profile.zero_stage if profile.enabled else None
+        optimizer = getattr(engine, "optimizer", None)
+        if zero_stage == 3:
+            optimizer_matches = isinstance(
+                optimizer, DeepSpeedZeroOptimizer_Stage3
+            )
+        elif zero_stage in (1, 2):
+            optimizer_matches = isinstance(optimizer, DeepSpeedZeroOptimizer)
+            if optimizer_matches:
+                optimizer_matches = bool(optimizer.partition_gradients) == (
+                    zero_stage == 2
+                )
+        else:
             raise RuntimeError(
-                "unsupported DeepSpeed Stage 1 lifecycle: only the pinned "
-                "ZeRO-3 optimizer exposes the pre-step gradient witness"
+                "unsupported DeepSpeed Stage 1 lifecycle: enabled profile "
+                "must select ZeRO stage 1, 2, or 3"
+            )
+        if not optimizer_matches:
+            raise RuntimeError(
+                "unsupported DeepSpeed Stage 1 lifecycle: prepared optimizer "
+                f"does not match the bound ZeRO-{zero_stage} optimizer"
             )
         self._attach_deepspeed_step_adapter(engine)
 
@@ -968,4 +1028,8 @@ class CustomTrainerStage1(SFTTrainer):
             classify_stage1_artifact(target)
 
 
-__all__ = ["CustomTrainerStage1", "STAGE1_EMA_TEACHER_STATE_FILENAME"]
+__all__ = [
+    "CustomTrainerStage1",
+    "STAGE1_EMA_TEACHER_STATE_FILENAME",
+    "collect_deepspeed_pre_step_norm",
+]

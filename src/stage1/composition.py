@@ -7,6 +7,7 @@ from importlib import metadata as importlib_metadata
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -21,6 +22,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 from trl import SFTConfig
 
+from deepspeed_runtime import (
+    DeepSpeedRuntimeProfile,
+    bind_deepspeed_runtime_profile,
+)
 from peft_common import capture_qwen2_5_vl_architecture
 from stage1.checkpointing import (
     STAGE1_PEFT_SCHEMA_VERSION,
@@ -380,8 +385,24 @@ def build_stage1_training_components(
     args,
     *,
     dependencies: Stage1CompositionDependencies = DEFAULT_STAGE1_DEPENDENCIES,
+    deepspeed_runtime_profile: DeepSpeedRuntimeProfile | None = None,
 ) -> Stage1TrainingComponents:
     """Validate sources, construct final topology, then create one Trainer."""
+
+    if deepspeed_runtime_profile is None:
+        profile = bind_deepspeed_runtime_profile(
+            args, world_size=int(os.environ.get("WORLD_SIZE", "1"))
+        )
+    else:
+        if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
+            raise TypeError("invalid Stage 1 DeepSpeed runtime profile")
+        if getattr(args, "deepspeed_runtime_profile", None) is None:
+            args.deepspeed_runtime_profile = deepspeed_runtime_profile
+        profile = bind_deepspeed_runtime_profile(
+            args, world_size=deepspeed_runtime_profile.world_size
+        )
+        if profile is not deepspeed_runtime_profile:
+            raise RuntimeError("Stage 1 DeepSpeed runtime profile identity changed")
 
     if args.stage != "stage1":
         raise ValueError("Stage 1 composition requires --stage stage1")
@@ -449,7 +470,9 @@ def build_stage1_training_components(
             resolved_target_names = tuple(
                 dependencies.resolve_target_names(base_model, tuning.target_suffixes)
             )
-        model = dependencies.build_tuned_model(base_model, tuning, latent_ids)
+        model = dependencies.build_tuned_model(
+            base_model, tuning, latent_ids, zero_stage=profile.zero_stage
+        )
         if tuning.method != "full":
             metadata = dependencies.build_peft_metadata(
                 base_model_reference=args.model,
@@ -482,7 +505,9 @@ def build_stage1_training_components(
             cache_dir=args.cache_dir,
             trust_remote_code=True,
         )
-        model = dependencies.build_tuned_model(model, tuning, latent_ids)
+        model = dependencies.build_tuned_model(
+            model, tuning, latent_ids, zero_stage=profile.zero_stage
+        )
     else:
         latent_ids = tuple(metadata.latent_token_ids)
         config = dependencies.load_config(
@@ -524,7 +549,9 @@ def build_stage1_training_components(
         )
 
     model.visual.requires_grad_(False)
-    parameter_report = dependencies.validate_boundary(model, tuning, latent_ids)
+    parameter_report = dependencies.validate_boundary(
+        model, tuning, latent_ids, zero_stage=profile.zero_stage
+    )
     dataset = dependencies.prepare_dataset(data_path, image_root)
     if args.max_train_samples is not None:
         dataset = dataset[: args.max_train_samples]
@@ -542,6 +569,7 @@ def build_stage1_training_components(
         image_pool_k=args.image_pool_k,
         helper_group_L=args.helper_group_L,
         ce_weight=args.ce_weight,
+        deepspeed_runtime_profile=profile,
         ema_method=tuning.method,
         stage1_peft_metadata=metadata,
         collect_stage1_diagnostics=bool(
@@ -563,11 +591,22 @@ def run_stage1(
     args,
     *,
     component_builder: Callable = build_stage1_training_components,
+    deepspeed_runtime_profile: DeepSpeedRuntimeProfile | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     observability_provider: Callable | None = None,
     rank_config_digest_provider: Callable | None = None,
 ) -> None:
     """Train once and, when requested, perform one separately timed final save."""
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if deepspeed_runtime_profile is None:
+        profile = bind_deepspeed_runtime_profile(args, world_size=world_size)
+    else:
+        if getattr(args, "deepspeed_runtime_profile", None) is None:
+            args.deepspeed_runtime_profile = deepspeed_runtime_profile
+        profile = bind_deepspeed_runtime_profile(args, world_size=world_size)
+        if profile is not deepspeed_runtime_profile:
+            raise RuntimeError("Stage 1 DeepSpeed runtime profile identity changed")
 
     producing = bool(
         getattr(args, "benchmark_run_config", None)
@@ -654,7 +693,9 @@ def run_stage1(
         if config["kind"] == "stage1-smoke-run-manifest":
             assert smoke_resume_snapshot is not None
     total_start = monotonic() if producing else None
-    components = component_builder(args)
+    components = component_builder(
+        args, deepspeed_runtime_profile=profile
+    )
     model_load_seconds = monotonic() - total_start if producing else 0.0
     resume = components.resume_decision.checkpoint_path
     trainer_start = monotonic()

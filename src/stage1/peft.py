@@ -456,6 +456,8 @@ def _validate_adapter_boundary(
     qwen: nn.Module,
     tuning: Stage1TuningConfig,
     latent_token_ids: tuple[int, int, int],
+    *,
+    zero_stage: int | None,
 ) -> Stage1ParameterReport:
     peft_model = _peft_model(model)
     config = _adapter_config(peft_model)
@@ -543,7 +545,7 @@ def _validate_adapter_boundary(
         for _, parameter in parameters
         if id(parameter) in adapter_ids
     )
-    if tuning.method == "dora":
+    if tuning.method == "dora" and zero_stage == 3:
         _register_dora_zero3_external_parameters(qwen, expected_targets)
     return _report(
         model,
@@ -565,19 +567,27 @@ def validate_stage1_trainable_boundary(
     model: nn.Module,
     tuning: Stage1TuningConfig,
     latent_token_ids: Sequence[int],
+    *,
+    zero_stage: int | None = None,
 ) -> Stage1ParameterReport:
     """Fail closed unless trainability matches the selected Stage 1 method."""
+    if zero_stage is not None and zero_stage not in (1, 2, 3):
+        raise ValueError("zero_stage must be 1, 2, 3, or None")
     qwen = resolve_qwen2_5_vl_model(model)
     ids = _validated_latent_token_ids(qwen, latent_token_ids)
     if tuning.method == "full":
         return _validate_full_boundary(model, qwen, ids)
-    return _validate_adapter_boundary(model, qwen, tuning, ids)
+    return _validate_adapter_boundary(
+        model, qwen, tuning, ids, zero_stage=zero_stage
+    )
 
 
 def build_stage1_tuned_model(
     base_model: nn.Module,
     tuning: Stage1TuningConfig,
     latent_token_ids: Sequence[int],
+    *,
+    zero_stage: int | None = None,
 ) -> nn.Module:
     """Freeze vision and compose the requested Stage 1 language topology."""
     qwen = resolve_qwen2_5_vl_model(base_model)
@@ -586,7 +596,9 @@ def build_stage1_tuned_model(
     if tuning.method == "full":
         qwen.requires_grad_(True)
         qwen.visual.requires_grad_(False)
-        validate_stage1_trainable_boundary(base_model, tuning, ids)
+        validate_stage1_trainable_boundary(
+            base_model, tuning, ids, zero_stage=zero_stage
+        )
         return base_model
 
     initialize_frozen_output_token_rows(qwen, ids)
@@ -604,7 +616,9 @@ def build_stage1_tuned_model(
     )
     model = get_peft_model(base_model, config)
     attach_sparse_output_token_rows(resolve_qwen2_5_vl_model(model), ids)
-    validate_stage1_trainable_boundary(model, tuning, ids)
+    validate_stage1_trainable_boundary(
+        model, tuning, ids, zero_stage=zero_stage
+    )
     return model
 
 

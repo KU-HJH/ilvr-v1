@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -491,9 +492,13 @@ def collate_fn_stage1(examples, processor, args):
 def run_stage1(args):
     """Load the Stage 1 runtime only after Stage 1 was selected."""
 
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    profile = bind_deepspeed_runtime_profile(args, world_size=world_size)
     from stage1.composition import run_stage1 as run_composed_stage1
 
-    return run_composed_stage1(args)
+    return run_composed_stage1(
+        args, deepspeed_runtime_profile=profile
+    )
 
 
 def run_stage2(args):

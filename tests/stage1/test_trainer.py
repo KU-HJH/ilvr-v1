@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from trl import SFTTrainer
 
 from accelerate.utils import DeepSpeedEngineWrapper, DistributedType
+from deepspeed_runtime import DeepSpeedRuntimeProfile
 from peft_common import resolve_qwen2_5_vl_model
 from stage1.ema import Stage1EmaTeacher
 from stage1.peft import build_stage1_tuned_model
@@ -29,8 +30,10 @@ from tests.stage1.test_peft import (
 from trainer import CustomTrainerStage1
 from stage1.trainer import (
     STAGE1_EMA_TEACHER_STATE_FILENAME,
+    _DeepSpeedStepAdapter,
     _Stage1OptimizerCallback,
 )
+import stage1.trainer as stage1_trainer_module
 
 
 class CountingTargetBuilder:
@@ -186,6 +189,17 @@ class FakeZero3Optimizer:
     def _get_norm_groups(self):
         self.events.append("optimizer.norm_groups")
         return self.norm_groups
+
+
+class FakeZero12Optimizer:
+    def __init__(self, *, partition_gradients: bool):
+        self.partition_gradients = partition_gradients
+        self.loss_scale = 2.0
+        self.calls = 0
+
+    def scaled_global_norm(self):
+        self.calls += 1
+        return torch.tensor(12.0)
 
 
 class FakeDeepSpeedEngine(nn.Module):
@@ -574,6 +588,9 @@ def make_deepspeed_trainer(*, norm_groups, step_applied=True):
         norm_groups=norm_groups,
         step_applied=step_applied,
     )
+    trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
+        True, 3, None, None, 2
+    )
     trainer.ema_teacher = RecordingEma(events=engine.events)
     trainer._attach_deepspeed_step_adapter(engine)
     return trainer, engine, DeepSpeedEngineWrapper(engine)
@@ -667,6 +684,43 @@ def test_accelerate_deepspeed_overflow_witness_prevents_ema_update():
     assert engine.mutation_count == 0
     assert trainer._successful_optimizer_steps == 0
     assert trainer.ema_teacher.update_count == 0
+
+
+@pytest.mark.parametrize("stage,partitioned", [(1, False), (2, True)])
+def test_zero12_norm_uses_partition_aware_scaled_norm(stage, partitioned):
+    optimizer = FakeZero12Optimizer(partition_gradients=partitioned)
+
+    norm = stage1_trainer_module.collect_deepspeed_pre_step_norm(
+        optimizer, zero_stage=stage
+    )
+
+    assert norm.item() == pytest.approx(6.0)
+    assert optimizer.calls == 1
+
+
+def test_ema_updates_once_only_when_deepspeed_applies_step(
+    stage1_trainer, monkeypatch
+):
+    applied = iter((False, True))
+    engine = SimpleNamespace(
+        is_gradient_accumulation_boundary=lambda: True,
+        was_step_applied=lambda: next(applied),
+    )
+    finishes = []
+    monkeypatch.setattr(
+        stage1_trainer, "_validate_deepspeed_gradient_norm", lambda _: None
+    )
+    monkeypatch.setattr(
+        stage1_trainer,
+        "_finish_optimizer_step",
+        lambda model, *, successful: finishes.append(successful),
+    )
+    adapter = _DeepSpeedStepAdapter(stage1_trainer, engine, lambda: None)
+
+    adapter()
+    adapter()
+
+    assert finishes == [False, True]
 
 
 @pytest.mark.parametrize("method", ["full", "dora"])
@@ -1247,6 +1301,103 @@ def test_unsupported_deepspeed_prepare_lifecycle_fails_closed():
 
     with pytest.raises(RuntimeError, match="unsupported DeepSpeed"):
         trainer._install_deepspeed_step_adapter()
+
+
+@pytest.mark.parametrize("zero_stage", [1, 2, 3])
+def test_deepspeed_prepare_accepts_optimizer_for_bound_zero_stage(
+    monkeypatch, zero_stage
+):
+    import deepspeed.runtime.engine as engine_module
+    import deepspeed.runtime.zero.stage_1_and_2 as zero12_module
+    import deepspeed.runtime.zero.stage3 as zero3_module
+
+    mask = torch.tensor([[False, True, False]])
+    trainer = make_trainer(
+        CountingStudent(),
+        CountingTargetBuilder(torch.tensor([[1.0]]), mask, ((1,),)),
+    )
+    if zero_stage == 3:
+        optimizer = FakeZero3Optimizer([torch.tensor(1.0)], [])
+    else:
+        optimizer = FakeZero12Optimizer(
+            partition_gradients=zero_stage == 2
+        )
+    engine = SimpleNamespace(
+        optimizer=optimizer,
+        step=lambda: None,
+        is_gradient_accumulation_boundary=lambda: True,
+        was_step_applied=lambda: True,
+    )
+    monkeypatch.setattr(engine_module, "DeepSpeedEngine", type(engine))
+    monkeypatch.setattr(
+        zero12_module, "DeepSpeedZeroOptimizer", FakeZero12Optimizer
+    )
+    monkeypatch.setattr(
+        zero3_module, "DeepSpeedZeroOptimizer_Stage3", FakeZero3Optimizer
+    )
+    monkeypatch.setattr(
+        stage1_trainer_module.importlib_metadata,
+        "version",
+        lambda package: {
+            "accelerate": "1.10.1",
+            "deepspeed": "0.18.0",
+        }[package],
+    )
+    trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
+        True, zero_stage, None, None, 2
+    )
+    trainer.model_wrapped = engine
+    trainer.accelerator.distributed_type = DistributedType.DEEPSPEED
+    trainer.accelerator.deepspeed_engine_wrapped = DeepSpeedEngineWrapper(engine)
+
+    trainer._install_deepspeed_step_adapter()
+
+    assert trainer._deepspeed_step_adapter.engine is engine
+
+
+def test_deepspeed_prepare_rejects_optimizer_mismatched_to_bound_stage(monkeypatch):
+    import deepspeed.runtime.engine as engine_module
+    import deepspeed.runtime.zero.stage_1_and_2 as zero12_module
+    import deepspeed.runtime.zero.stage3 as zero3_module
+
+    mask = torch.tensor([[False, True, False]])
+    trainer = make_trainer(
+        CountingStudent(),
+        CountingTargetBuilder(torch.tensor([[1.0]]), mask, ((1,),)),
+    )
+    optimizer = FakeZero3Optimizer([torch.tensor(1.0)], [])
+    engine = SimpleNamespace(
+        optimizer=optimizer,
+        step=lambda: None,
+        is_gradient_accumulation_boundary=lambda: True,
+        was_step_applied=lambda: True,
+    )
+    monkeypatch.setattr(engine_module, "DeepSpeedEngine", type(engine))
+    monkeypatch.setattr(
+        zero12_module, "DeepSpeedZeroOptimizer", FakeZero12Optimizer
+    )
+    monkeypatch.setattr(
+        zero3_module, "DeepSpeedZeroOptimizer_Stage3", FakeZero3Optimizer
+    )
+    monkeypatch.setattr(
+        stage1_trainer_module.importlib_metadata,
+        "version",
+        lambda package: {
+            "accelerate": "1.10.1",
+            "deepspeed": "0.18.0",
+        }[package],
+    )
+    trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
+        True, 2, None, None, 2
+    )
+    trainer.model_wrapped = engine
+    trainer.accelerator.distributed_type = DistributedType.DEEPSPEED
+    trainer.accelerator.deepspeed_engine_wrapped = DeepSpeedEngineWrapper(engine)
+
+    with pytest.raises(RuntimeError, match="ZeRO-2 optimizer"):
+        trainer._install_deepspeed_step_adapter()
+
+    assert trainer._deepspeed_step_adapter is None
 
 
 def test_nonfinite_loss_raises_before_backward_or_step():

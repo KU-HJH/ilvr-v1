@@ -456,6 +456,27 @@ def test_zero3_gathers_only_current_source_and_partitioned_target(
     torch.testing.assert_close(target, initial_target + 1.0)
 
 
+def test_replicated_ema_parameters_update_without_deepspeed_gather(monkeypatch):
+    student = SingleParameterStudent()
+    ema = Stage1EmaTeacher(student, decay=0.5, method="full")
+    target = ema.model.model.weight
+    initial_target = target.detach().clone()
+    with torch.no_grad():
+        student.model.weight.add_(2.0)
+    fake_deepspeed = SimpleNamespace(
+        zero=SimpleNamespace(
+            GatheredParameters=lambda *args, **kwargs: pytest.fail(
+                "replicated EMA tensors entered partition gathering"
+            )
+        )
+    )
+    monkeypatch.setitem(sys.modules, "deepspeed", fake_deepspeed)
+
+    ema.update(student)
+
+    torch.testing.assert_close(target, initial_target + 1.0)
+
+
 def test_gathered_shape_preflight_prevents_partial_ema_update(monkeypatch):
     student = TwoParameterStudent()
     ema = Stage1EmaTeacher(student, decay=0.5, method="full")
