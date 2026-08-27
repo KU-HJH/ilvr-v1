@@ -1360,6 +1360,42 @@ def test_stage2_trainer_accepts_every_supported_method_profile(
         assert trainer.stage2_peft_metadata.tuning_method == method
 
 
+def test_stage2_trainer_direct_non_deepspeed_constructor_derives_profile(
+    monkeypatch,
+):
+    """Catches the identity contract breaking legacy CPU construction."""
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setattr(
+        "stage2.trainer.Trainer.__init__", lambda trainer, *args, **kwargs: None
+    )
+
+    trainer = Stage2Trainer(args=SimpleNamespace(deepspeed=None))
+
+    assert trainer.deepspeed_runtime_profile.enabled is False
+    assert trainer.deepspeed_runtime_profile.zero_stage is None
+    assert trainer.deepspeed_runtime_profile.config_digest is None
+    assert trainer.deepspeed_runtime_profile.world_size == 4
+
+
+def test_stage2_trainer_deepspeed_constructor_requires_explicit_profile(
+    monkeypatch,
+):
+    """Catches an active DeepSpeed trainer being mislabeled as disabled."""
+    monkeypatch.setattr(
+        "stage2.trainer.Trainer.__init__",
+        lambda trainer, *args, **kwargs: pytest.fail(
+            "DeepSpeed construction reached parent Trainer without identity"
+        ),
+    )
+
+    with pytest.raises(TypeError, match="deepspeed_runtime_profile"):
+        Stage2Trainer(
+            args=SimpleNamespace(
+                deepspeed=str(canonical_deepspeed_config_path(2))
+            )
+        )
+
+
 def test_stage2_numbered_checkpoint_writes_runtime_identity(tmp_path, monkeypatch):
     """Catches Stage 2 numbered checkpoints missing their resume identity."""
     checkpoint = tmp_path / "checkpoint-3"

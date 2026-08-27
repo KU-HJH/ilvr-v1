@@ -1,5 +1,6 @@
 """Thin Hugging Face Trainer adapter for Stage 2 model-native loss."""
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoin
 
 from deepspeed_runtime import (
     DeepSpeedRuntimeProfile,
+    load_deepspeed_runtime_profile,
     validate_deepspeed_resume_identity,
     write_deepspeed_runtime_sidecar,
 )
@@ -25,10 +27,29 @@ class Stage2Trainer(Trainer):
     def __init__(
         self,
         *args,
-        deepspeed_runtime_profile: DeepSpeedRuntimeProfile,
+        deepspeed_runtime_profile: DeepSpeedRuntimeProfile | None = None,
         stage2_peft_metadata=None,
         **kwargs,
     ):
+        if deepspeed_runtime_profile is None:
+            training_args = kwargs.get("args")
+            if training_args is None and len(args) > 1:
+                training_args = args[1]
+            configured_deepspeed = getattr(training_args, "deepspeed", None)
+            accelerate_deepspeed = os.environ.get(
+                "ACCELERATE_USE_DEEPSPEED", ""
+            ).strip().lower() in {"1", "true", "yes"}
+            if (
+                configured_deepspeed is not None
+                and configured_deepspeed is not False
+            ) or accelerate_deepspeed:
+                raise TypeError(
+                    "Stage 2 DeepSpeed construction requires an explicit "
+                    "deepspeed_runtime_profile"
+                )
+            deepspeed_runtime_profile = load_deepspeed_runtime_profile(
+                None, world_size=int(os.environ.get("WORLD_SIZE", "1"))
+            )
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
             raise TypeError("Stage 2 trainer requires a DeepSpeed runtime profile")
         self.deepspeed_runtime_profile = deepspeed_runtime_profile
