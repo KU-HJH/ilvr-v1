@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 from types import SimpleNamespace
 
 import peft
@@ -283,6 +284,25 @@ def _collect_rank_records(record):
     return gathered
 
 
+def _validate_rank_lifecycle_records(records) -> None:
+    if not records:
+        raise AssertionError("Stage 2 lifecycle gathered no rank records")
+    first_steps = {record["first_global_step"] for record in records}
+    resumed_steps = {record["resumed_global_step"] for record in records}
+    if first_steps != {1} or resumed_steps != {2}:
+        raise AssertionError(
+            "Stage 2 rank global steps disagree with the 1-to-2 lifecycle: "
+            f"{records}"
+        )
+    losses = [
+        float(record[field])
+        for record in records
+        for field in ("first_loss", "resumed_loss")
+    ]
+    if not losses or not all(math.isfinite(loss) for loss in losses):
+        raise AssertionError(f"Stage 2 ranks did not report finite losses: {records}")
+
+
 def _is_world_process_zero() -> bool:
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
@@ -306,6 +326,71 @@ def _claim_owned_paths(experiment_id: str):
     if dist.is_initialized():
         dist.barrier()
     return paths
+
+
+def _write_witness_atomically(path: Path, witness: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=False)
+    encoded = (json.dumps(witness, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as temporary:
+            temporary.write(encoded)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.link(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _distributed_failure_count(local_failure: int) -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return local_failure
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    failed = torch.tensor(local_failure, dtype=torch.int32, device=device)
+    dist.all_reduce(failed, op=dist.ReduceOp.SUM)
+    return int(failed.item())
+
+
+def _synchronize_ranks() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _publish_rank_agreed_witness(
+    path: Path,
+    witness: dict[str, object],
+    *,
+    is_writer: bool | None = None,
+    writer=None,
+    failure_counter=None,
+    synchronize=None,
+) -> None:
+    writer = _write_witness_atomically if writer is None else writer
+    failure_counter = (
+        _distributed_failure_count if failure_counter is None else failure_counter
+    )
+    synchronize = _synchronize_ranks if synchronize is None else synchronize
+    is_writer = _is_world_process_zero() if is_writer is None else is_writer
+    local_error: Exception | None = None
+    if is_writer:
+        try:
+            writer(path, witness)
+        except Exception as error:  # propagate after the mandatory reduction
+            local_error = error
+    failed_ranks = failure_counter(int(local_error is not None))
+    if failed_ranks:
+        if local_error is not None:
+            raise local_error
+        raise RuntimeError("Stage 2 witness publication failed on rank zero")
+    synchronize()
 
 
 def _tuning_config(method: str) -> Stage2TuningConfig:
@@ -535,6 +620,10 @@ def run_harness(
 
     rank_records = _collect_rank_records(
         {
+            "first_global_step": first_global_step,
+            "resumed_global_step": int(resumed_trainer.state.global_step),
+            "first_loss": float(first_result.training_loss),
+            "resumed_loss": float(resumed_result.training_loss),
             "first_batches": first_collator.local_batch_sizes,
             "resumed_batches": resumed_collator.local_batch_sizes,
             "optimizer_step_at_resume": resumed_recorder.optimizer_step,
@@ -544,6 +633,7 @@ def run_harness(
             "base_trainable_parameters": base_trainable,
         }
     )
+    _validate_rank_lifecycle_records(rank_records)
     observed_batch_sizes = [
         batch_size
         for record in rank_records
@@ -564,6 +654,14 @@ def run_harness(
         "tuning_method": tuning.method,
         "first_global_step": first_global_step,
         "resumed_global_step": int(resumed_trainer.state.global_step),
+        "rank_first_global_steps": [
+            record["first_global_step"] for record in rank_records
+        ],
+        "rank_resumed_global_steps": [
+            record["resumed_global_step"] for record in rank_records
+        ],
+        "rank_first_losses": [record["first_loss"] for record in rank_records],
+        "rank_resumed_losses": [record["resumed_loss"] for record in rank_records],
         "optimizer_state_restored": optimizer_steps == {1},
         "scheduler_state_restored": scheduler_steps == {1},
         "optimizer_step_at_resume": next(iter(optimizer_steps))
@@ -599,9 +697,8 @@ def run_harness(
         "experiment_id": paths.experiment_id,
     }
     _assert_contract(witness)
+    _publish_rank_agreed_witness(witness_path, witness)
     if _is_world_process_zero():
-        witness_path.parent.mkdir(parents=True, exist_ok=False)
-        witness_path.write_text(json.dumps(witness, indent=2, sort_keys=True) + "\n")
         print(json.dumps(witness, sort_keys=True), flush=True)
 
 

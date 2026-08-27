@@ -22,6 +22,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 )
 from src.artifact_paths import resolve_run_artifact_paths
 from stage2_rank_skew_probe import (
+    _observe_decoder_forwards,
     build_rank_skew_parser,
     select_probe_examples,
 )
@@ -58,12 +59,15 @@ def test_tiny_stage2_harness_owns_checkpoint_and_witness_by_one_id():
         )
 
 
-def test_rank_skew_harness_requires_one_optimizer_step():
-    """Catches the bounded distributed probe growing beyond one applied step."""
+@pytest.mark.parametrize("zero_stage", [1, 2, 3])
+def test_rank_skew_harness_supports_each_canonical_zero_stage(zero_stage):
+    """Catches a canonical ZeRO profile becoming unlaunchable for the probe."""
     args = build_rank_skew_parser().parse_args(
         [
+            "--zero-stage",
+            str(zero_stage),
             "--deepspeed",
-            "configs/deepspeed_zero3.json",
+            f"configs/deepspeed_zero{zero_stage}.json",
             "--model",
             "Qwen/Qwen2.5-VL-3B-Instruct",
             "--stage1-checkpoint",
@@ -73,14 +77,47 @@ def test_rank_skew_harness_requires_one_optimizer_step():
             "--image-root",
             "/tmp/images",
             "--experiment-id",
-            "stage2-zero3-dora-mb1-ga8-rank-skew",
+            f"stage2-zero{zero_stage}-dora-mb1-ga8-rank-skew",
         ]
     )
 
+    assert args.zero_stage == zero_stage
     assert args.method == "dora"
     assert args.max_steps == 1
     assert args.micro_batch == 1
     assert args.gradient_accumulation_steps == 8
+
+
+def test_rank_skew_observes_extra_decoder_invocation_directly():
+    """Catches decoder-forward evidence reverting to a block-count formula."""
+
+    class FakeStage2Qwen(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Linear(2, 2)
+            self.lm_head = torch.nn.Linear(2, 2)
+            self.config = SimpleNamespace(stage="stage2", latent_size=2)
+            self.stage2_rollout_engine = object()
+
+        def prepare_stage2_base_inputs_embeds(self):
+            raise AssertionError("not used by this boundary test")
+
+        def get_rope_index(self):
+            raise AssertionError("not used by this boundary test")
+
+    model = FakeStage2Qwen()
+    inputs = torch.ones(1, 2)
+
+    _, ordinary_count = _observe_decoder_forwards(
+        model, lambda: (model.model(inputs), model.model(inputs))
+    )
+    _, extra_count = _observe_decoder_forwards(
+        model,
+        lambda: (model.model(inputs), model.model(inputs), model.model(inputs)),
+    )
+
+    assert ordinary_count == 2
+    assert extra_count == 3
 
 
 def test_rank_skew_harness_selects_eight_examples_from_two_buckets():
@@ -104,6 +141,8 @@ def test_rank_skew_harness_has_no_arbitrary_generated_path_arguments():
             [
                 "--deepspeed",
                 "configs/deepspeed_zero3.json",
+                "--zero-stage",
+                "3",
                 "--model",
                 "Qwen/Qwen2.5-VL-3B-Instruct",
                 "--stage1-checkpoint",
@@ -118,6 +157,104 @@ def test_rank_skew_harness_has_no_arbitrary_generated_path_arguments():
                 "/tmp/unowned.json",
             ]
         )
+
+
+def _tiny_rank_record(**overrides):
+    record = {
+        "first_global_step": 1,
+        "resumed_global_step": 2,
+        "first_loss": 0.25,
+        "resumed_loss": 0.20,
+        "first_batches": [1],
+        "resumed_batches": [1],
+        "optimizer_step_at_resume": 1,
+        "scheduler_step_at_resume": 1,
+        "adapter_parameters_changed": True,
+        "visual_trainable_parameters": 0,
+        "base_trainable_parameters": 0,
+    }
+    record.update(overrides)
+    return record
+
+
+@pytest.mark.parametrize(
+    ("second_override", "message"),
+    [
+        ({"resumed_global_step": 3}, "global steps"),
+        ({"first_loss": float("nan")}, "finite losses"),
+    ],
+)
+def test_tiny_stage2_rejects_rank_lifecycle_disagreement(second_override, message):
+    """Catches one rank's bad step or loss being hidden by rank-zero scalars."""
+    harness = _load_harness_module()
+    records = [_tiny_rank_record(), _tiny_rank_record(**second_override)]
+
+    with pytest.raises(AssertionError, match=message):
+        harness._validate_rank_lifecycle_records(records)
+
+
+def test_tiny_stage2_writer_failure_reduces_before_barrier(tmp_path):
+    """Catches rank-zero publication failure hanging peers at a barrier."""
+    harness = _load_harness_module()
+    events = []
+
+    def failing_writer(path, witness):
+        assert path == tmp_path / "witness.json"
+        assert witness == {"schema_version": 1}
+        raise OSError("disk full")
+
+    def failure_counter(local_failure):
+        events.append(("reduce", local_failure))
+        return local_failure
+
+    with pytest.raises(OSError, match="disk full"):
+        harness._publish_rank_agreed_witness(
+            tmp_path / "witness.json",
+            {"schema_version": 1},
+            is_writer=True,
+            writer=failing_writer,
+            failure_counter=failure_counter,
+            synchronize=lambda: events.append(("barrier", None)),
+        )
+
+    assert events == [("reduce", 1)]
+
+
+def test_tiny_stage2_nonwriter_propagates_remote_writer_failure(tmp_path):
+    """Catches a non-writer rank reporting success after rank-zero failure."""
+    harness = _load_harness_module()
+    events = []
+
+    with pytest.raises(RuntimeError, match="rank zero"):
+        harness._publish_rank_agreed_witness(
+            tmp_path / "witness.json",
+            {"schema_version": 1},
+            is_writer=False,
+            writer=lambda *_: pytest.fail("non-writer attempted publication"),
+            failure_counter=lambda local: events.append(("reduce", local)) or 1,
+            synchronize=lambda: events.append(("barrier", None)),
+        )
+
+    assert events == [("reduce", 0)]
+
+
+def test_tiny_stage2_rank_agreed_publication_is_atomic(tmp_path):
+    """Catches successful publication leaving a partial temporary witness."""
+    harness = _load_harness_module()
+    witness_path = tmp_path / "result" / "witness.json"
+    events = []
+
+    harness._publish_rank_agreed_witness(
+        witness_path,
+        {"schema_version": 1},
+        is_writer=True,
+        failure_counter=lambda local: events.append(("reduce", local)) or local,
+        synchronize=lambda: events.append(("barrier", None)),
+    )
+
+    assert json.loads(witness_path.read_text()) == {"schema_version": 1}
+    assert list(witness_path.parent.iterdir()) == [witness_path]
+    assert events == [("reduce", 0), ("barrier", None)]
 
 
 def _stage2_args(**overrides):

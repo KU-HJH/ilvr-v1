@@ -25,6 +25,7 @@ from utils_deepseed import parse_args as parse_training_args
 
 def build_rank_skew_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--zero-stage", type=int, choices=(1, 2, 3), required=True)
     parser.add_argument("--deepspeed", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--stage1-checkpoint", type=Path, required=True)
@@ -69,6 +70,23 @@ class RecordingRankSkewCollator:
         return self.delegate(examples)
 
 
+def _observe_decoder_forwards(model, operation):
+    """Run one micro-step operation while counting actual decoder forwards."""
+    qwen = resolve_stage2_qwen_model(model)
+    forward_count = 0
+
+    def record_forward(_module, _args, _output):
+        nonlocal forward_count
+        forward_count += 1
+
+    handle = qwen.model.register_forward_hook(record_forward)
+    try:
+        result = operation()
+    finally:
+        handle.remove()
+    return result, forward_count
+
+
 class RankSkewProbeTrainer(Stage2Trainer):
     """Production Stage2Trainer with a read-only decoder-work recorder."""
 
@@ -79,19 +97,22 @@ class RankSkewProbeTrainer(Stage2Trainer):
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
-        result = super().compute_loss(
+        parent_compute_loss = super().compute_loss
+        result, forward_count = _observe_decoder_forwards(
             model,
-            inputs,
-            return_outputs=return_outputs,
-            num_items_in_batch=num_items_in_batch,
+            lambda: parent_compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            ),
         )
         diagnostics = self._latest_stage2_diagnostics
         if diagnostics is None:
             raise AssertionError("Stage 2 forward diagnostics were not collected")
-        block_count = int(diagnostics["block_count"].item())
-        qwen = resolve_stage2_qwen_model(model)
-        latent_size = int(qwen.config.latent_size)
-        self.decoder_forward_counts.append(block_count * latent_size + 1)
+        if forward_count < 1:
+            raise AssertionError("Stage 2 decoder did not execute")
+        self.decoder_forward_counts.append(forward_count)
         return result
 
 
@@ -224,11 +245,11 @@ def run_rank_skew_probe(args: argparse.Namespace) -> dict[str, object]:
     profile = load_deepspeed_runtime_profile(
         training_args.deepspeed_config, world_size=2
     )
-    if (
-        profile.zero_stage != 3
-        or profile.config_path != canonical_deepspeed_config_path(3).resolve()
-    ):
-        raise ValueError("rank-skew probe requires the canonical ZeRO-3 profile")
+    expected_config = canonical_deepspeed_config_path(args.zero_stage).resolve()
+    if profile.zero_stage != args.zero_stage or profile.config_path != expected_config:
+        raise ValueError(
+            f"rank-skew probe ZeRO-{args.zero_stage} requires {expected_config}"
+        )
     training_args.deepspeed_runtime_profile = profile
 
     components = build_stage2_training_components(training_args)
