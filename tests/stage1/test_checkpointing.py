@@ -1033,6 +1033,29 @@ def test_preflight_rejects_peft_target_selector_modifiers_before_large_load(
     assert large_loads == 0
 
 
+def test_meta_preflight_skips_nested_zero3_init_and_keeps_parameters_meta(
+    monkeypatch,
+):
+    """Catches ZeRO-3 recursively partitioning the structural meta model."""
+    import deepspeed
+
+    config = deepcopy(tiny_original_qwen().config)
+
+    def reject_zero_init(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("meta preflight must not enter DeepSpeed ZeRO Init")
+
+    monkeypatch.setattr(
+        "transformers.modeling_utils.is_deepspeed_zero3_enabled", lambda: True
+    )
+    monkeypatch.setattr(deepspeed.zero, "Init", reject_zero_init)
+
+    model = checkpointing._build_meta_stage1_base(config)
+
+    assert tuple(model.parameters())
+    assert all(parameter.device.type == "meta" for parameter in model.parameters())
+
+
 def test_preflight_reads_each_small_payload_once_and_retains_immutable_bytes(
     saved_dora_artifact, monkeypatch
 ):

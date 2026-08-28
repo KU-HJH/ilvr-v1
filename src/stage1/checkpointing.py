@@ -25,6 +25,7 @@ from peft import (
 from safetensors import SafetensorError, safe_open
 from safetensors.torch import load as load_safetensors
 from torch import nn
+from transformers.modeling_utils import set_zero3_state
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
 )
@@ -1173,7 +1174,7 @@ class Stage1PeftPreflightWitness:
 
 
 def _build_meta_stage1_base(config) -> nn.Module:
-    with init_empty_weights():
+    with init_empty_weights(), set_zero3_state():
         model = Qwen2_5_VLForConditionalGeneration(config)
     if config.tie_word_embeddings is True:
         model.tie_weights()
