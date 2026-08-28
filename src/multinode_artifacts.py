@@ -16,6 +16,7 @@ from typing import Protocol
 
 _MANIFEST_SCHEMA_VERSION = 1
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
+_SAFE_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _OPTIMIZER_SHARD = re.compile(
     r"(?:bf16_|fp16_)?zero_pp_rank_(0|[1-9][0-9]*)_mp_rank_00_optim_states\.pt\Z"
 )
@@ -697,14 +698,26 @@ def _process_rank(path: Path) -> int | None:
 
 
 def _safe_relative_path(path: Path) -> Path:
+    return validate_coordinator_relative_path(path, label="artifact")
+
+
+def validate_coordinator_relative_path(
+    path: str | Path, *, label: str
+) -> Path:
+    """Restrict coordinator-owned remote path components to one safe grammar."""
     candidate = Path(path)
     if (
         candidate.is_absolute()
         or not candidate.parts
-        or any(part in ("", ".", "..") for part in candidate.parts)
-        or any("\n" in part or "\r" in part or "\0" in part for part in candidate.parts)
+        or any(
+            part in ("", ".", "..")
+            or _SAFE_COMPONENT_PATTERN.fullmatch(part) is None
+            for part in candidate.parts
+        )
     ):
-        raise ValueError(f"artifact relative path is invalid: {candidate}")
+        raise ValueError(
+            f"{label} relative path must use canonical safe components: {candidate}"
+        )
     return candidate
 
 
@@ -1371,6 +1384,7 @@ def _rsync_prefix(files_from: Path) -> tuple[str, ...]:
         "/usr/bin/rsync",
         "--archive",
         "--ignore-existing",
+        "--secluded-args",
         "--files-from",
         str(files_from),
         "--from0",
@@ -1897,8 +1911,7 @@ def build_evaluation_pull_command(
         relative = output.relative_to(_LOCAL_REPOSITORY / "results")
     except ValueError as error:
         raise ValueError("evaluation output must be under the canonical result root") from error
-    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
-        raise ValueError("evaluation output must belong to a fresh result subtree")
+    validate_coordinator_relative_path(relative, label="evaluation output")
     _validate_run_id(relative.parts[0])
     remote = _REMOTE_HOST_REPOSITORY / "results" / relative
     return (
@@ -1924,8 +1937,7 @@ def build_prepared_inference_pull_command(
         relative = source.relative_to(_LOCAL_REPOSITORY / "results")
     except ValueError as error:
         raise ValueError("prepared inference source must be under the result root") from error
-    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
-        raise ValueError("prepared inference source path is invalid")
+    validate_coordinator_relative_path(relative, label="prepared inference source")
     remote = _REMOTE_HOST_REPOSITORY / "results" / relative
     return (
         *_rsync_prefix(Path(files_from)),

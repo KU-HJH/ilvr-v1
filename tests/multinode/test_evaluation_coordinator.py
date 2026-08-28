@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -10,6 +12,7 @@ from src.multinode_artifacts import (
     ArtifactEntry,
     NodeArtifactManifest,
     build_evaluation_pull_command,
+    build_prepared_inference_pull_command,
     evaluation_result_files_bytes,
     prepare_inference_copy,
     validate_evaluation_sidecars,
@@ -17,8 +20,11 @@ from src.multinode_artifacts import (
 from src.multinode_evaluation import write_shard_manifest
 from src.multinode_runtime import (
     EvaluationPlan,
+    EvaluationSubprocessRunner,
+    OwnershipRecord,
     build_evaluation_assignments,
     build_evaluation_commands,
+    prepare_attempt_directory,
     run_evaluation,
 )
 
@@ -128,11 +134,17 @@ class FakeEvaluationRunner:
         *,
         exit_codes: dict[int, int] | None = None,
         invalid_exit_shard: int | None = None,
+        launch_timeout_shard: int | None = None,
+        poll_timeout_shard: int | None = None,
+        cleanup_error_shards: set[int] | None = None,
         valid=True,
     ):
         self.exit_codes = {index: 0 for index in range(4)}
         self.exit_codes.update(exit_codes or {})
         self.invalid_exit_shard = invalid_exit_shard
+        self.launch_timeout_shard = launch_timeout_shard
+        self.poll_timeout_shard = poll_timeout_shard
+        self.cleanup_error_shards = cleanup_error_shards or set()
         self.valid = valid
         self.events: list[str] = []
 
@@ -144,17 +156,25 @@ class FakeEvaluationRunner:
         return "b" * 40
 
     def start_worker(self, worker):
-        self.events.append(f"start-{worker.assignment.shard_index}")
+        shard = worker.assignment.shard_index
+        self.events.append(f"start-{shard}")
+        if shard == self.launch_timeout_shard:
+            raise subprocess.TimeoutExpired(worker.launch, timeout=30)
 
     def poll_worker(self, worker):
         shard = worker.assignment.shard_index
         self.events.append(f"poll-{shard}")
         if shard == self.invalid_exit_shard:
             raise ValueError("invalid owned exit record")
+        if shard == self.poll_timeout_shard:
+            raise subprocess.TimeoutExpired("exit-show", timeout=30)
         return self.exit_codes[shard]
 
     def cleanup_worker(self, worker):
-        self.events.append(f"cleanup-{worker.assignment.shard_index}")
+        shard = worker.assignment.shard_index
+        self.events.append(f"cleanup-{shard}")
+        if shard in self.cleanup_error_shards:
+            raise RuntimeError(f"cleanup {shard} failed")
         return True
 
     def pull_remote_results(self, commands):
@@ -185,6 +205,282 @@ def test_inference_manifest_is_prepared_before_any_worker_is_created():
     assert runner.events[-3:] == ["pull", "sidecars", "merge"]
 
 
+def test_production_runner_prepares_fresh_local_then_remote_control_namespace_once(
+    tmp_path
+):
+    events = []
+    log_root = tmp_path / "logs"
+
+    def local_prepare(**kwargs):
+        events.append(("local-prepare", kwargs))
+        return prepare_attempt_directory(**kwargs)
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        events.append(("remote-prepare", tuple(command)))
+        assert "prepare-attempt" in " ".join(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    runner = EvaluationSubprocessRunner(
+        _plan(),
+        commit="b" * 40,
+        log_root=log_root,
+        command_runner=fake_command,
+        attempt_preparer=local_prepare,
+    )
+
+    runner.prepare_control_namespaces()
+
+    assert [event[0] for event in events] == [
+        "local-prepare", "remote-prepare"
+    ]
+    assert (log_root / "eval-four-gpu/initial").is_dir()
+    with pytest.raises(RuntimeError, match="already prepared"):
+        runner.prepare_control_namespaces()
+    assert len(events) == 2
+
+
+def test_stale_local_control_namespace_blocks_remote_preparation_and_launch(tmp_path):
+    log_root = tmp_path / "logs"
+    prepare_attempt_directory(
+        log_root=log_root,
+        run_id="eval-four-gpu",
+        attempt_id="initial",
+    )
+    calls = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    runner = EvaluationSubprocessRunner(
+        _plan(),
+        commit="b" * 40,
+        log_root=log_root,
+        command_runner=fake_command,
+    )
+
+    with pytest.raises(FileExistsError):
+        runner.prepare_control_namespaces()
+    commands = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(), commit="b" * 40
+    )
+    with pytest.raises(RuntimeError, match="control namespaces"):
+        runner.start_worker(commands.workers[0])
+    assert calls == []
+
+
+def test_stale_remote_control_namespace_blocks_launch_after_local_reservation(
+    tmp_path
+):
+    calls = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(
+            command, 2, stdout="", stderr="stale remote attempt"
+        )
+
+    runner = EvaluationSubprocessRunner(
+        _plan(),
+        commit="b" * 40,
+        log_root=tmp_path / "logs",
+        command_runner=fake_command,
+    )
+
+    with pytest.raises(RuntimeError, match="stale remote attempt"):
+        runner.prepare_control_namespaces()
+    assert (tmp_path / "logs/eval-four-gpu/initial").is_dir()
+    worker = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(), commit="b" * 40
+    ).workers[0]
+    with pytest.raises(RuntimeError, match="control namespaces"):
+        runner.start_worker(worker)
+    assert len(calls) == 1
+
+
+def test_production_inference_preparation_reserves_controls_before_copy(
+    tmp_path, monkeypatch
+):
+    import src.multinode_artifacts as artifacts_module
+
+    events = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        display = " ".join(command)
+        if "prepared-inference-show" in display:
+            events.append("manifest")
+            stdout = json.dumps(_manifest().to_json())
+        elif "prepare-attempt" in display:
+            events.append("remote-control")
+            stdout = ""
+        elif "prepare-evaluation-output" in display:
+            events.append("remote-output")
+            stdout = ""
+        else:
+            raise AssertionError(f"unexpected fake command: {command}")
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    def local_prepare(**kwargs):
+        events.append("local-control")
+        return Path(kwargs["log_root"]) / kwargs["run_id"] / kwargs["attempt_id"]
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "reserve_inference_destination",
+        lambda path: events.append("reserve-output") or Path(path),
+    )
+    monkeypatch.setattr(
+        artifacts_module,
+        "prepare_inference_copy",
+        lambda manifest, destination, runner: events.append("copy") or Path(destination),
+    )
+    runner = EvaluationSubprocessRunner(
+        _plan(),
+        commit="b" * 40,
+        log_root=tmp_path / "logs",
+        command_runner=fake_command,
+        attempt_preparer=local_prepare,
+    )
+
+    assert runner.prepare_inference(_plan()) == _manifest()
+    assert events == [
+        "manifest",
+        "local-control",
+        "remote-control",
+        "reserve-output",
+        "copy",
+        "remote-output",
+    ]
+
+
+def test_production_runner_poll_timeout_is_exposed_to_coordinator_cleanup(tmp_path):
+    calls = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        calls.append(tuple(command))
+        display = " ".join(command)
+        if "exit-show" in display:
+            raise subprocess.TimeoutExpired(command, timeout_seconds)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    runner = EvaluationSubprocessRunner(
+        _plan(),
+        commit="b" * 40,
+        log_root=tmp_path / "logs",
+        command_runner=fake_command,
+    )
+    runner.prepare_control_namespaces()
+    worker = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(), commit="b" * 40
+    ).workers[0]
+    runner.start_worker(worker)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner.poll_worker(worker)
+    assert any("exit-show" in " ".join(call) for call in calls)
+
+
+def test_production_runner_transfer_publishes_exact_list_before_fake_rsync(
+    tmp_path
+):
+    calls = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    commands = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(), commit="b" * 40
+    )
+    files_path = tmp_path / "evaluation-pull.files"
+    commands = dataclasses.replace(commands, remote_files_path=files_path)
+    runner = EvaluationSubprocessRunner(
+        _plan(), commit="b" * 40, command_runner=fake_command
+    )
+
+    runner.pull_remote_results(commands)
+
+    assert files_path.read_bytes() == evaluation_result_files_bytes()
+    assert calls == [commands.remote_pull]
+    assert "--secluded-args" in calls[0]
+
+
+def test_production_runner_cleanup_uses_exact_owned_signal_command():
+    commands = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(), commit="b" * 40
+    )
+    worker = commands.workers[0]
+    spec = worker.node_spec
+    ownership = OwnershipRecord.create(
+        run_id=_plan().run_id,
+        attempt_id=_plan().attempt_id,
+        machine_rank=worker.assignment.machine_rank,
+        pid=4312,
+        process_start_ticks=9981,
+        commit="b" * 40,
+        command=spec.command,
+        environment=dict(spec.environment),
+    )
+    calls = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        calls.append(tuple(command))
+        if "ownership-show" in " ".join(command):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(ownership.to_json()),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    runner = EvaluationSubprocessRunner(
+        _plan(), commit="b" * 40, command_runner=fake_command
+    )
+
+    assert runner.cleanup_worker(worker) is True
+    assert len(calls) == 2
+    assert "ownership-show" in " ".join(calls[0])
+    assert "signal-owned" in " ".join(calls[1])
+    assert str(ownership.pid) in calls[1][-1]
+
+
+def test_production_runner_reports_exact_owned_signal_failure():
+    commands = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(), commit="b" * 40
+    )
+    worker = commands.workers[0]
+    ownership = OwnershipRecord.create(
+        run_id=_plan().run_id,
+        attempt_id=_plan().attempt_id,
+        machine_rank=worker.assignment.machine_rank,
+        pid=4312,
+        process_start_ticks=9981,
+        commit="b" * 40,
+        command=worker.node_spec.command,
+        environment=dict(worker.node_spec.environment),
+    )
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        if "ownership-show" in " ".join(command):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(ownership.to_json()),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            command, 5, stdout="", stderr="pidfd signal failed"
+        )
+
+    runner = EvaluationSubprocessRunner(
+        _plan(), commit="b" * 40, command_runner=fake_command
+    )
+
+    with pytest.raises(RuntimeError, match="signal-owned.*pidfd signal failed"):
+        runner.cleanup_worker(worker)
+
+
 def test_incomplete_worker_set_is_not_merged_and_only_live_peers_are_cleaned():
     runner = FakeEvaluationRunner(exit_codes={1: 9})
 
@@ -212,13 +508,53 @@ def test_invalid_sidecar_prevents_merge():
 def test_invalid_owned_exit_record_stops_only_still_live_exact_peers():
     runner = FakeEvaluationRunner(invalid_exit_shard=1)
 
-    with pytest.raises(RuntimeError, match="all four evaluation workers"):
+    with pytest.raises(ValueError, match="invalid owned exit record"):
         run_evaluation(_plan(), runner)
 
     assert "merge" not in runner.events
     assert {event for event in runner.events if event.startswith("cleanup-")} == {
         "cleanup-1", "cleanup-2", "cleanup-3"
     }
+
+
+def test_ambiguous_launch_timeout_cleans_current_and_prior_possibly_live_workers():
+    runner = FakeEvaluationRunner(launch_timeout_shard=2)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_evaluation(_plan(), runner)
+
+    assert [event for event in runner.events if event.startswith("cleanup-")] == [
+        "cleanup-0", "cleanup-1", "cleanup-2"
+    ]
+
+
+def test_poll_timeout_cleans_every_worker_without_a_proven_exit():
+    runner = FakeEvaluationRunner(poll_timeout_shard=1)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_evaluation(_plan(), runner)
+
+    assert [event for event in runner.events if event.startswith("cleanup-")] == [
+        "cleanup-1", "cleanup-2", "cleanup-3"
+    ]
+
+
+def test_cleanup_exception_does_not_mask_launch_timeout_or_skip_later_workers():
+    runner = FakeEvaluationRunner(
+        launch_timeout_shard=2,
+        cleanup_error_shards={0},
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        run_evaluation(_plan(), runner)
+
+    assert [event for event in runner.events if event.startswith("cleanup-")] == [
+        "cleanup-0", "cleanup-1", "cleanup-2"
+    ]
+    assert any(
+        "cleanup 0 failed" in note
+        for note in getattr(captured.value, "__notes__", ())
+    )
 
 
 def test_remote_result_pull_is_one_explicit_nul_list_and_never_recursive():
@@ -237,17 +573,89 @@ def test_remote_result_pull_is_one_explicit_nul_list_and_never_recursive():
         b"shard-0.jsonl\0shard-0.jsonl.manifest.json\0"
         b"shard-1.jsonl\0shard-1.jsonl.manifest.json\0"
     )
-    assert command[:3] == (
-        "/usr/bin/rsync", "--archive", "--ignore-existing"
-    )
-    assert command[command.index("--files-from") + 1] == str(files_path)
-    assert "--from0" in command
-    assert command[-2:] == (
+    assert command == (
+        "/usr/bin/rsync",
+        "--archive",
+        "--ignore-existing",
+        "--secluded-args",
+        "--files-from",
+        str(files_path),
+        "--from0",
+        "--rsh",
+        "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8",
+        "--",
         "korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/"
         "results/eval-four-gpu/",
         "/root/workspace/ILVR/results/eval-four-gpu/",
     )
     assert "--recursive" not in command
+
+
+@pytest.mark.parametrize(
+    "unsafe_component",
+    (
+        "bad`touch-owned`",
+        "bad$PATH",
+        "bad'quote",
+        'bad"quote',
+        "bad:host",
+        "bad\ncontrol",
+    ),
+)
+def test_unsafe_result_component_is_rejected_before_runner_creation(
+    unsafe_component
+):
+    with pytest.raises(ValueError, match="safe component"):
+        EvaluationPlan(
+            run_id="eval-four-gpu",
+            model_dir=Path(
+                "/root/workspace/ILVR/results/trained-model-run/inference"
+            ),
+            test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
+            task_name="zebra-cot",
+            output_dir=(
+                Path("/root/workspace/ILVR/results")
+                / unsafe_component
+                / "eval-four-gpu"
+            ),
+        )
+
+
+def test_prepared_inference_backtick_source_is_rejected_before_rsync():
+    with pytest.raises(ValueError, match="safe component"):
+        build_prepared_inference_pull_command(
+            _manifest(),
+            Path("/root/workspace/ILVR/results/bad`touch-owned`/inference"),
+            Path("/root/workspace/ILVR/results/eval-four-gpu/inference-model"),
+            files_from=Path("/root/workspace/ILVR/logs/evaluation.files"),
+        )
+
+
+def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
+    files_path = Path("/root/workspace/ILVR/logs/evaluation.files")
+
+    command = build_prepared_inference_pull_command(
+        _manifest(),
+        Path("/root/workspace/ILVR/results/trained-model-run/inference"),
+        Path("/root/workspace/ILVR/results/eval-four-gpu/inference-model"),
+        files_from=files_path,
+    )
+
+    assert command == (
+        "/usr/bin/rsync",
+        "--archive",
+        "--ignore-existing",
+        "--secluded-args",
+        "--files-from",
+        str(files_path),
+        "--from0",
+        "--rsh",
+        "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8",
+        "--",
+        "korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/"
+        "results/trained-model-run/inference/",
+        "/root/workspace/ILVR/results/eval-four-gpu/inference-model/",
+    )
 
 
 def test_task6_inference_copy_publishes_identity_manifest_for_task8(tmp_path):

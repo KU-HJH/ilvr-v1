@@ -1011,6 +1011,8 @@ class EvaluationPlan:
     attempt_timeout_seconds: int = 24 * 60 * 60
 
     def __post_init__(self) -> None:
+        from src.multinode_artifacts import validate_coordinator_relative_path
+
         _require_identifier("run_id", self.run_id)
         _require_identifier("attempt_id", self.attempt_id)
         for label, path in (
@@ -1033,6 +1035,18 @@ class EvaluationPlan:
             raise ValueError("output_dir must be under the canonical result root") from error
         if not relative_output.parts or relative_output.parts[-1] != self.run_id:
             raise ValueError("output_dir must belong to the evaluation run ID")
+        validate_coordinator_relative_path(
+            relative_output, label="evaluation output"
+        )
+        try:
+            relative_model = self.model_dir.relative_to(_RESULT_ROOT)
+        except ValueError as error:
+            raise ValueError(
+                "model_dir must be a Task 6 artifact under the canonical result root"
+            ) from error
+        validate_coordinator_relative_path(
+            relative_model, label="prepared inference model"
+        )
         if (
             not isinstance(self.task_name, str)
             or not self.task_name.strip()
@@ -1273,47 +1287,45 @@ def run_evaluation(
     commands = build_evaluation_commands(
         plan, inference_manifest=manifest, commit=runner.repository_commit()
     )
-    started: list[EvaluationWorkerCommand] = []
+    possibly_live: dict[int, EvaluationWorkerCommand] = {}
     try:
         for worker in commands.workers:
+            possibly_live[worker.assignment.shard_index] = worker
             runner.start_worker(worker)
-            started.append(worker)
-    except BaseException:
-        for worker in started:
-            runner.cleanup_worker(worker)
-        raise
-
-    pending = {worker.assignment.shard_index: worker for worker in commands.workers}
-    exits: dict[int, int] = {}
-    deadline = time.monotonic() + plan.attempt_timeout_seconds
-    while pending:
-        for shard_index, worker in tuple(pending.items()):
-            try:
+        exits: dict[int, int] = {}
+        deadline = time.monotonic() + plan.attempt_timeout_seconds
+        while possibly_live:
+            for shard_index, worker in tuple(possibly_live.items()):
                 exit_code = runner.poll_worker(worker)
-            except (OSError, RuntimeError, TypeError, ValueError) as error:
-                for peer in pending.values():
-                    runner.cleanup_worker(peer)
-                raise RuntimeError(
-                    "all four evaluation workers require valid owned exit records"
-                ) from error
-            if exit_code is None:
-                continue
-            exits[shard_index] = exit_code
-            del pending[shard_index]
-            if exit_code != 0:
-                for peer in pending.values():
-                    runner.cleanup_worker(peer)
-                raise RuntimeError(
-                    "all four evaluation workers must exit zero before merge"
+                if exit_code is None:
+                    continue
+                exits[shard_index] = exit_code
+                del possibly_live[shard_index]
+                if exit_code != 0:
+                    raise RuntimeError(
+                        "all four evaluation workers must exit zero before merge"
+                    )
+            if possibly_live:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "all four evaluation workers must complete before timeout"
+                    )
+                runner.sleep(poll_interval_seconds)
+    except BaseException as primary_error:
+        cleanup_errors: list[tuple[int, BaseException]] = []
+        for worker in possibly_live.values():
+            try:
+                runner.cleanup_worker(worker)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    (worker.assignment.shard_index, cleanup_error)
                 )
-        if pending:
-            if time.monotonic() >= deadline:
-                for worker in pending.values():
-                    runner.cleanup_worker(worker)
-                raise RuntimeError(
-                    "all four evaluation workers must complete before timeout"
-                )
-            runner.sleep(poll_interval_seconds)
+        for shard_index, cleanup_error in cleanup_errors:
+            primary_error.add_note(
+                f"evaluation cleanup failed for shard {shard_index}: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise
     if exits != {0: 0, 1: 0, 2: 0, 3: 0}:
         raise RuntimeError("all four evaluation workers must exit zero before merge")
     runner.pull_remote_results(commands)
@@ -2236,6 +2248,7 @@ class EvaluationSubprocessRunner:
         commit: str,
         log_root: str | Path = _LOG_ROOT,
         command_runner: CommandRunner = _subprocess_command_runner,
+        attempt_preparer: Callable[..., Path] = prepare_attempt_directory,
     ) -> None:
         if not isinstance(plan, EvaluationPlan):
             raise TypeError("plan must be an EvaluationPlan")
@@ -2245,8 +2258,10 @@ class EvaluationSubprocessRunner:
         self.commit_value = commit
         self.log_root = Path(log_root)
         self.command_runner = command_runner
+        self.attempt_preparer = attempt_preparer
         self._manifest: object | None = None
         self._started: dict[int, EvaluationWorkerCommand] = {}
+        self._controls_prepared = False
 
     def _run(
         self, command: Sequence[str], *, input_bytes: bytes | None = None
@@ -2287,6 +2302,34 @@ class EvaluationSubprocessRunner:
     def repository_commit(self) -> str:
         return self.commit_value
 
+    def prepare_control_namespaces(self) -> None:
+        """Exclusively reserve local then remote Task 5 attempt directories."""
+        if self._controls_prepared:
+            raise RuntimeError("evaluation control namespaces are already prepared")
+        self.attempt_preparer(
+            log_root=self.log_root,
+            run_id=self.plan.run_id,
+            attempt_id=self.plan.attempt_id,
+        )
+        python = _REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"
+        self._run(
+            build_remote_exec(
+                (
+                    str(python),
+                    "-m",
+                    "src.multinode",
+                    "prepare-attempt",
+                    "--log-root",
+                    str(self.log_root),
+                    "--run-id",
+                    self.plan.run_id,
+                    "--attempt-id",
+                    self.plan.attempt_id,
+                )
+            )
+        )
+        self._controls_prepared = True
+
     def prepare_inference(self, plan: EvaluationPlan) -> object:
         """Validate the remote Task 6 artifact and make one fresh verified copy."""
         from src.multinode_artifacts import (
@@ -2319,6 +2362,7 @@ class EvaluationSubprocessRunner:
         validate_inference_manifest_identity(
             manifest, expected_identity=manifest.runtime_identity
         )
+        self.prepare_control_namespaces()
         reserve_inference_destination(plan.output_dir)
         self._manifest = manifest
         prepare_inference_copy(manifest, plan.local_model_dir, self)
@@ -2386,6 +2430,8 @@ class EvaluationSubprocessRunner:
         validate_transferred_entries(destination, entries)
 
     def start_worker(self, worker: EvaluationWorkerCommand) -> None:
+        if not self._controls_prepared:
+            raise RuntimeError("evaluation control namespaces are not prepared")
         shard = worker.assignment.shard_index
         if shard in self._started:
             raise ValueError("evaluation worker was already started")
@@ -2469,7 +2515,12 @@ class EvaluationSubprocessRunner:
             input_bytes=None,
             timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
         )
-        return signaled.returncode == 0
+        if signaled.returncode != 0:
+            raise RuntimeError(
+                f"evaluation signal-owned failed ({signaled.returncode}): "
+                f"{signaled.stderr.strip()}"
+            )
+        return True
 
     def pull_remote_results(self, commands: EvaluationCommands) -> None:
         from src.multinode_runtime import publish_small_file

@@ -119,3 +119,129 @@ operation.
 The remaining external concern is intentional: Task 12 must validate the real
 remote prepared-artifact provisioning, Docker namespace paths, rsync host-path
 mapping, tmux ownership lifecycle, and evaluator/CUDA behavior on hardware.
+
+## Fix round 1
+
+Addressed all three review findings. Every artifact rsync command now retains
+the fixed SSH transport and `--` boundary while adding `--secluded-args`.
+Coordinator-owned remote artifact and result subpaths accept only canonical
+alphanumeric, dot, underscore, and hyphen components beginning with an
+alphanumeric character. Backticks, dollar signs, quotes, colons, controls,
+absolute paths, and traversal are rejected while the plan or command argv is
+still being built.
+
+The production evaluation runner now reserves the local Task 5 attempt
+directory and then the remote Task 5 attempt directory through the exclusive
+`prepare-attempt` interfaces before output reservation, artifact copy, or any
+worker launch. Both are called once; an existing local or remote control
+namespace blocks launch.
+
+The coordinator records each worker as possibly live before invoking its tmux
+launch subprocess. Launch and poll failures clean every worker without a
+proven exit independently. Cleanup failures are collected as notes on the
+primary exception, so no peer is skipped and the original failure is retained.
+
+### Fix-round RED evidence
+
+The path/rsync causal set first exposed eight failures:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest \
+  tests/multinode/test_evaluation_coordinator.py -q \
+  -k 'secluded or unsafe_result_component or backtick_source or remote_result_pull'
+
+8 failed, 10 deselected
+```
+
+The failures were the absent `--secluded-args` option and unsafe path cases
+that did not raise before command construction. After the security change, the
+same command reported:
+
+```text
+8 passed, 10 deselected in 0.06s
+```
+
+The ambiguous worker lifecycle causal set initially reported three failures:
+the launch-timeout shard was omitted from cleanup, a poll timeout performed no
+cleanup, and the first cleanup exception masked the primary launch timeout.
+After moving insertion before launch and isolating cleanup calls, that set
+reported `3 passed, 20 deselected in 0.06s`.
+
+The final cleanup-error collection assertion was deliberately added after the
+best-effort loop and failed because the swallowed error was not observable:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest \
+  tests/multinode/test_evaluation_coordinator.py -q -k cleanup_exception
+
+1 failed, 27 deselected in 0.08s
+```
+
+After preserving cleanup failures as notes on the primary exception, the exact
+command reported:
+
+```text
+1 passed, 27 deselected in 0.07s
+```
+
+A final production-runner causal test distinguished a safely missing ownership
+record from failure after an exact owner had been validated:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest \
+  tests/multinode/test_evaluation_coordinator.py -q \
+  -k exact_owned_signal_failure
+
+1 failed, 29 deselected in 0.08s
+```
+
+The runner had returned `False` and lost the signal failure. It now raises that
+failure for the coordinator's isolated cleanup collector, while a missing or
+invalid ownership record remains an ignored `False`. The same command then
+reported `1 passed, 29 deselected in 0.06s`.
+
+Direct production-runner tests using only fake command execution cover fresh
+local/remote control preparation, stale local and remote rejection, inference
+preparation ordering, poll timeout propagation, exact NUL-list result
+transfer, and exact Task 5 owned cleanup. No test invoked SSH, rsync, Docker,
+tmux, an evaluator, CUDA, or a GPU.
+
+### Fix-round GREEN verification
+
+```text
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest \
+  tests/multinode/test_evaluation.py \
+  tests/multinode/test_evaluation_coordinator.py -q
+
+52 passed in 0.13s
+```
+
+```text
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest \
+  tests/multinode/test_artifacts.py tests/multinode/test_coordinator.py -q
+
+162 passed in 3.84s
+```
+
+`bash -n run_multinode_evaluation.sh`, wrapper `--help`, a fully specified
+evaluation `--dry-run`, and `git diff --check` all returned zero. Help and dry
+run remained local-only and mutation-free.
+
+### Fix-round self-review
+
+- The two exact rsync argv assertions include `--archive`,
+  `--ignore-existing`, `--secluded-args`, the NUL allowlist, fixed SSH
+  transport, `--`, and canonical source/destination operands.
+- Canonical path checks run before runner construction or transfer invocation;
+  the backtick cases therefore cannot reach an external command.
+- Only workers lacking a proven owned exit remain cleanup candidates. The
+  production cleanup still delegates identity and liveness proof to Task 5 and
+  safely ignores a missing ownership record.
+- Local preparation precedes remote preparation, both precede launch, and
+  failure in either namespace leaves `_controls_prepared` false.
+- The intentional Task 12 hardware concern remains unchanged.
