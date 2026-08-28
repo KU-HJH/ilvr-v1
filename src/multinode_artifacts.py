@@ -7,20 +7,21 @@ import os
 import re
 import stat
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
 
 _MANIFEST_SCHEMA_VERSION = 1
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
-_RANKED_SHARD_PATTERNS = (
-    re.compile(
-        r"(?:bf16_)?zero_pp_rank_(0|[1-9][0-9]*)_mp_rank_[0-9]+_"
-        r"(?:optim|model)_states\.pt\Z"
-    ),
-    re.compile(r"rng_state_(0|[1-9][0-9]*)\.pth\Z"),
+_OPTIMIZER_SHARD = re.compile(
+    r"(?:bf16_|fp16_)?zero_pp_rank_(0|[1-9][0-9]*)_mp_rank_00_optim_states\.pt\Z"
 )
+_PARTITIONED_MODEL_SHARD = re.compile(
+    r"zero_pp_rank_(0|[1-9][0-9]*)_mp_rank_00_model_states\.pt\Z"
+)
+_REPLICATED_MODEL_STATE = "mp_rank_00_model_states.pt"
+_RNG_STATE = re.compile(r"rng_state_(0|[1-9][0-9]*)\.pth\Z")
 _MANIFEST_IDENTITY_FIELDS = (
     "stage",
     "tuning_method",
@@ -28,12 +29,8 @@ _MANIFEST_IDENTITY_FIELDS = (
     "deepspeed_config_digest",
     "world_size",
     "rank_mapping",
-    "commit",
-    "run_id",
-)
-_RESUME_IDENTITY_FIELDS = (
-    *_MANIFEST_IDENTITY_FIELDS[:-2],
     "global_step",
+    "model_state_layout",
     "optimizer",
     "scheduler",
     "rng_ranks",
@@ -41,17 +38,62 @@ _RESUME_IDENTITY_FIELDS = (
     "commit",
     "run_id",
 )
+_RESUME_IDENTITY_FIELDS = _MANIFEST_IDENTITY_FIELDS
 _LOCAL_REPOSITORY = Path("/root/workspace/ILVR")
 _REMOTE_HOST_REPOSITORY = Path("/home/korea/Workspace/hjh/workspace/ILVR")
 _REMOTE_HOST = "korea@10.1.102.41"
 _RSYNC_SSH = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8"
 _MAX_COMMON_METADATA_BYTES = 4 * 1024 * 1024
-_COMMON_METADATA_SUFFIXES = frozenset({".json", ".txt", ".yaml", ".yml", ".md"})
-_COMMON_STATE_NAMES = frozenset({"latest", "scheduler.pt", "scaler.pt", "training_args.bin"})
+_INFERENCE_STATIC_NAMES = frozenset(
+    {
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "config.json",
+        "generation_config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "chat_template.json",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+        "ilvr_token_rows.safetensors",
+    }
+)
+_INFERENCE_SHARD = re.compile(
+    r"(?:model-[0-9]{5}-of-[0-9]{5}\.safetensors|"
+    r"pytorch_model-[0-9]{5}-of-[0-9]{5}\.bin)\Z"
+)
+_BASE_CHECKPOINT_METADATA = frozenset(
+    {"latest", "trainer_state.json", "scheduler.pt", "deepspeed-runtime.json"}
+)
+_STAGE_METHOD_CHECKPOINT_METADATA = {
+    ("stage1", "full"): _BASE_CHECKPOINT_METADATA | {"stage1_ema_teacher.pt"},
+    ("stage1", "lora"): _BASE_CHECKPOINT_METADATA
+    | {"stage1_ema_teacher.pt", "stage1_peft_metadata.json"},
+    ("stage1", "dora"): _BASE_CHECKPOINT_METADATA
+    | {"stage1_ema_teacher.pt", "stage1_peft_metadata.json"},
+    ("stage2", "full"): _BASE_CHECKPOINT_METADATA | {"stage2-sampler.json"},
+    ("stage2", "lora"): _BASE_CHECKPOINT_METADATA
+    | {"stage2-sampler.json", "stage2_peft_metadata.json"},
+    ("stage2", "dora"): _BASE_CHECKPOINT_METADATA
+    | {"stage2-sampler.json", "stage2_peft_metadata.json"},
+}
+_COMMON_METADATA_ALLOWLIST = {
+    (stage, method, zero_stage): frozenset(Path(name) for name in names)
+    for (stage, method), names in _STAGE_METHOD_CHECKPOINT_METADATA.items()
+    for zero_stage in (1, 2, 3)
+}
 
 
 def _process_rank(path: Path) -> int | None:
-    for pattern in _RANKED_SHARD_PATTERNS:
+    for pattern in (_OPTIMIZER_SHARD, _PARTITIONED_MODEL_SHARD, _RNG_STATE):
         match = pattern.fullmatch(path.name)
         if match is not None:
             return int(match.group(1))
@@ -87,17 +129,6 @@ class ArtifactEntry:
         """Return ownership encoded by a canonical DeepSpeed shard filename."""
         return _process_rank(self.relative_path)
 
-    @property
-    def is_common_metadata(self) -> bool:
-        return (
-            self.process_rank is None
-            and self.byte_size <= _MAX_COMMON_METADATA_BYTES
-            and (
-                self.relative_path.suffix.lower() in _COMMON_METADATA_SUFFIXES
-                or self.relative_path.name in _COMMON_STATE_NAMES
-            )
-        )
-
     def to_json(self) -> dict[str, object]:
         return {
             "relative_path": self.relative_path.as_posix(),
@@ -111,10 +142,21 @@ class ArtifactEntry:
         expected = {"relative_path", "byte_size", "node_rank", "process_rank"}
         if type(payload) is not dict or set(payload) != expected:
             raise ValueError("invalid artifact entry fields")
+        if type(payload["relative_path"]) is not str:
+            raise ValueError("artifact relative path must be a string")
+        if type(payload["byte_size"]) is not int or payload["byte_size"] < 0:
+            raise ValueError("artifact byte size must be a nonnegative integer")
+        if type(payload["node_rank"]) is not int or payload["node_rank"] not in (0, 1):
+            raise ValueError("artifact entry node rank is invalid")
+        process_rank = payload["process_rank"]
+        if process_rank is not None and (
+            type(process_rank) is not int or process_rank not in range(4)
+        ):
+            raise ValueError("artifact process rank is invalid")
         entry = cls(
             relative_path=_safe_relative_path(Path(str(payload["relative_path"]))),
-            byte_size=payload["byte_size"],  # type: ignore[arg-type]
-            node_rank=payload["node_rank"],  # type: ignore[arg-type]
+            byte_size=payload["byte_size"],
+            node_rank=payload["node_rank"],
         )
         if payload["process_rank"] != entry.process_rank:
             raise ValueError("artifact process-rank ownership mismatch")
@@ -130,6 +172,7 @@ class NodeArtifactManifest:
     entries: tuple[ArtifactEntry, ...]
     runtime_identity: Mapping[str, object]
     completion_marker: bool = True
+    checkpoint_relative: Path = Path("checkpoint-2")
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -140,6 +183,7 @@ class NodeArtifactManifest:
             "entries": [entry.to_json() for entry in self.entries],
             "runtime_identity": _json_value(self.runtime_identity),
             "completion_marker": self.completion_marker,
+            "checkpoint_relative": self.checkpoint_relative.as_posix(),
         }
 
     @classmethod
@@ -152,6 +196,7 @@ class NodeArtifactManifest:
             "entries",
             "runtime_identity",
             "completion_marker",
+            "checkpoint_relative",
         }
         if type(payload) is not dict or set(payload) != expected:
             raise ValueError("invalid node artifact manifest fields")
@@ -162,6 +207,18 @@ class NodeArtifactManifest:
             raise ValueError("invalid node artifact manifest sequence fields")
         if type(runtime_identity) is not dict:
             raise ValueError("invalid node artifact runtime identity")
+        if type(payload["schema_version"]) is not int:
+            raise ValueError("invalid node artifact schema version")
+        if type(payload["run_id"]) is not str:
+            raise ValueError("invalid node artifact run ID")
+        if type(payload["node_rank"]) is not int:
+            raise ValueError("invalid node artifact node rank")
+        if any(type(rank) is not int for rank in ranks):
+            raise ValueError("invalid node artifact process ranks")
+        if type(payload["completion_marker"]) is not bool:
+            raise ValueError("invalid node artifact completion marker")
+        if type(payload["checkpoint_relative"]) is not str:
+            raise ValueError("invalid node artifact checkpoint path")
         return cls(
             schema_version=payload["schema_version"],  # type: ignore[arg-type]
             run_id=payload["run_id"],  # type: ignore[arg-type]
@@ -170,6 +227,9 @@ class NodeArtifactManifest:
             entries=tuple(ArtifactEntry.from_json(entry) for entry in entries),
             runtime_identity=runtime_identity,
             completion_marker=payload["completion_marker"],  # type: ignore[arg-type]
+            checkpoint_relative=_safe_relative_path(
+                Path(str(payload["checkpoint_relative"]))
+            ),
         )
 
 
@@ -228,15 +288,28 @@ def build_node_manifest(
     run_id: str | None = None,
     runtime_identity: Mapping[str, object] | None = None,
     completion_marker: bool = True,
+    checkpoint_root: str | Path = _LOCAL_REPOSITORY / "checkpoints",
+    canonical_owner: bool = False,
 ) -> NodeArtifactManifest:
     """Inspect only lstat metadata and describe one completed node-local tree."""
     directory = Path(run_directory)
     if type(node_rank) is not int or node_rank not in (0, 1):
         raise ValueError("node rank must be 0 or 1")
+    identity = _validate_identity(dict(runtime_identity or {}))
     ranks = tuple(process_ranks)
-    expected_ranks = (0, 1) if node_rank == 0 else (2, 3)
+    expected_ranks = (
+        (0, 1, 2, 3)
+        if canonical_owner
+        else ((0, 1) if node_rank == 0 else (2, 3))
+    )
     if ranks != expected_ranks:
         raise ValueError("node manifest must claim only its assigned process ranks")
+    checkpoint_relative = Path(f"checkpoint-{identity['global_step']}")
+    expected_directory = Path(checkpoint_root) / str(identity["run_id"]) / checkpoint_relative
+    if directory.absolute() != expected_directory.absolute():
+        raise ValueError(
+            "checkpoint directory must be the exact canonical run/checkpoint path"
+        )
     entries: list[ArtifactEntry] = []
     for relative, metadata in _walk_regular_files(directory):
         item = ArtifactEntry(relative, metadata.st_size, node_rank)
@@ -247,12 +320,13 @@ def build_node_manifest(
         entries.append(item)
     return NodeArtifactManifest(
         schema_version=_MANIFEST_SCHEMA_VERSION,
-        run_id=_validate_run_id(run_id or directory.name),
+        run_id=_validate_run_id(run_id or str(identity["run_id"])),
         node_rank=node_rank,
         process_ranks=ranks,
         entries=tuple(entries),
-        runtime_identity=dict(runtime_identity or {}),
+        runtime_identity=identity,
         completion_marker=completion_marker,
+        checkpoint_relative=checkpoint_relative,
     )
 
 
@@ -261,35 +335,148 @@ def _validate_identity(
     *,
     required_fields: Sequence[str] = _MANIFEST_IDENTITY_FIELDS,
 ) -> dict[str, object]:
-    if not isinstance(identity, Mapping):
-        raise ValueError("runtime identity must be a mapping")
+    if type(identity) is not dict:
+        raise ValueError("runtime identity must be an exact JSON object")
     missing = [field for field in required_fields if field not in identity]
     if missing:
         raise ValueError(f"runtime identity is missing fields: {', '.join(missing)}")
+    if set(identity) != set(required_fields):
+        extra = sorted(set(identity) - set(required_fields))
+        if extra:
+            raise ValueError(f"runtime identity has unexpected fields: {', '.join(extra)}")
+    raw_rank_mapping = identity.get("rank_mapping")
+    if (
+        type(raw_rank_mapping) is not dict
+        or set(raw_rank_mapping) != {"0", "1"}
+        or any(type(key) is not str for key in raw_rank_mapping)
+        or any(type(value) is not list for value in raw_rank_mapping.values())
+        or any(
+            type(rank) is not int
+            for value in raw_rank_mapping.values()
+            for rank in value
+        )
+        or raw_rank_mapping != {"0": [0, 1], "1": [2, 3]}
+    ):
+        raise ValueError("runtime identity rank_mapping is invalid")
     normalized = _json_value(identity)
     assert isinstance(normalized, dict)
+    if normalized["stage"] not in ("stage1", "stage2") or type(normalized["stage"]) is not str:
+        raise ValueError("runtime identity stage is invalid")
+    if (
+        normalized["tuning_method"] not in ("full", "lora", "dora")
+        or type(normalized["tuning_method"]) is not str
+    ):
+        raise ValueError("runtime identity tuning_method is invalid")
+    zero_stage = normalized["zero_stage"]
+    if type(zero_stage) is not int or zero_stage not in (1, 2, 3):
+        raise ValueError("runtime identity zero_stage is invalid")
+    world_size = normalized["world_size"]
+    if type(world_size) is not int or world_size != 4:
+        raise ValueError("runtime identity world_size is invalid")
+    global_step = normalized["global_step"]
+    if type(global_step) is not int or global_step < 0:
+        raise ValueError("runtime identity global_step is invalid")
+    digest = normalized["deepspeed_config_digest"]
+    if (
+        type(digest) is not str
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError("runtime identity deepspeed_config_digest is invalid")
+    commit = normalized["commit"]
+    if (
+        type(commit) is not str
+        or len(commit) != 40
+        or any(character not in "0123456789abcdef" for character in commit)
+    ):
+        raise ValueError("runtime identity commit is invalid")
     _validate_run_id(normalized["run_id"])
+    layout = normalized["model_state_layout"]
+    if type(layout) is not str or layout not in ("replicated", "partitioned"):
+        raise ValueError("runtime identity model_state_layout is invalid")
+    if normalized["optimizer"] is not True:
+        raise ValueError("runtime identity optimizer must be true")
+    if normalized["scheduler"] is not True:
+        raise ValueError("runtime identity scheduler must be true")
+    if (
+        type(normalized["rng_ranks"]) is not list
+        or any(type(rank) is not int for rank in normalized["rng_ranks"])
+        or normalized["rng_ranks"] != [0, 1, 2, 3]
+    ):
+        raise ValueError("runtime identity rng_ranks is invalid")
+    expected_sidecar = _primary_stage_sidecar(normalized)
+    if (
+        type(normalized["stage_sidecar"]) is not str
+        or normalized["stage_sidecar"] != expected_sidecar
+    ):
+        raise ValueError("runtime identity stage_sidecar is invalid")
     return normalized
+
+
+def validate_runtime_identity(identity: Mapping[str, object]) -> dict[str, object]:
+    """Return the exact, type-strict checkpoint runtime identity."""
+    return _validate_identity(identity)
+
+
+def _primary_stage_sidecar(identity: Mapping[str, object]) -> str:
+    stage = identity["stage"]
+    method = identity["tuning_method"]
+    if stage == "stage1":
+        return (
+            "stage1_peft_metadata.json"
+            if method in ("lora", "dora")
+            else "stage1_ema_teacher.pt"
+        )
+    return (
+        "stage2_peft_metadata.json"
+        if method in ("lora", "dora")
+        else "stage2-sampler.json"
+    )
+
+
+def _required_common_paths(identity: Mapping[str, object]) -> frozenset[Path]:
+    key = (identity["stage"], identity["tuning_method"], identity["zero_stage"])
+    try:
+        return _COMMON_METADATA_ALLOWLIST[key]
+    except KeyError as error:
+        raise ValueError("checkpoint metadata identity has no explicit allowlist") from error
+
+
+def select_common_metadata_entries(
+    manifest: NodeArtifactManifest,
+) -> tuple[ArtifactEntry, ...]:
+    """Select only explicitly approved metadata for this stage/method contract."""
+    allowed = _required_common_paths(_validate_identity(manifest.runtime_identity))
+    return tuple(entry for entry in manifest.entries if entry.relative_path in allowed)
 
 
 def _validate_manifest(manifest: NodeArtifactManifest, *, world_size: int) -> None:
     if not isinstance(manifest, NodeArtifactManifest):
         raise TypeError("collection members must be NodeArtifactManifest values")
-    if manifest.schema_version != _MANIFEST_SCHEMA_VERSION:
+    if (
+        type(manifest.schema_version) is not int
+        or manifest.schema_version != _MANIFEST_SCHEMA_VERSION
+    ):
         raise ValueError("artifact manifest schema mismatch")
     _validate_run_id(manifest.run_id)
-    if manifest.node_rank not in (0, 1):
+    if type(manifest.node_rank) is not int or manifest.node_rank not in (0, 1):
         raise ValueError("artifact manifest node rank is invalid")
     expected = (0, 1) if manifest.node_rank == 0 else (2, 3)
-    if manifest.process_ranks != expected:
+    canonical_expected = (0, 1, 2, 3) if manifest.node_rank == 0 else expected
+    if manifest.process_ranks not in (expected, canonical_expected):
         raise ValueError("node manifest process ranks do not match assigned process ranks")
-    if manifest.completion_marker is not True:
+    if any(type(rank) is not int for rank in manifest.process_ranks):
+        raise ValueError("node manifest process ranks must be exact integers")
+    if type(manifest.completion_marker) is not bool or manifest.completion_marker is not True:
         raise ValueError("node artifact completion marker is missing")
     identity = _validate_identity(manifest.runtime_identity)
     if identity["run_id"] != manifest.run_id:
         raise ValueError("runtime identity run ID differs from manifest run ID")
     if identity["world_size"] != world_size:
         raise ValueError("runtime identity world_size mismatch")
+    expected_checkpoint = Path(f"checkpoint-{identity['global_step']}")
+    if manifest.checkpoint_relative != expected_checkpoint:
+        raise ValueError("checkpoint-N does not match runtime identity global_step")
     seen: set[Path] = set()
     for entry in manifest.entries:
         relative = _safe_relative_path(entry.relative_path)
@@ -298,9 +485,9 @@ def _validate_manifest(manifest: NodeArtifactManifest, *, world_size: int) -> No
         seen.add(relative)
         if type(entry.byte_size) is not int or entry.byte_size < 0:
             raise ValueError("artifact byte size must be nonnegative")
-        if entry.node_rank != manifest.node_rank:
+        if type(entry.node_rank) is not int or entry.node_rank != manifest.node_rank:
             raise ValueError("artifact entry node-rank ownership mismatch")
-        if entry.process_rank is not None and entry.process_rank not in expected:
+        if entry.process_rank is not None and entry.process_rank not in manifest.process_ranks:
             raise ValueError("artifact entry is outside assigned process ranks")
 
 
@@ -321,21 +508,25 @@ def validate_collection(
     identities = [_validate_identity(manifest.runtime_identity) for manifest in values]
     if any(candidate != identities[0] for candidate in identities[1:]):
         raise ValueError("artifact manifests have different runtime identity")
-    owned_ranks = {
-        entry.process_rank
-        for manifest in values
-        for entry in manifest.entries
-        if entry.process_rank is not None
-    }
-    if owned_ranks != set(range(world_size)):
-        raise ValueError("artifact collection requires exactly ranks 0 through 3")
     node_ranks = [manifest.node_rank for manifest in values]
     if sorted(node_ranks) != [0, 1]:
-        raise ValueError("artifact collection requires one manifest from each node")
+        raise ValueError(
+            "artifact collection requires one manifest from each node and ranks 0 through 3"
+        )
 
     combined: dict[Path, ArtifactEntry] = {}
+    identity = identities[0]
+    allowed_common = _required_common_paths(identity)
+    step_directory = f"global_step{identity['global_step']}"
     for manifest in sorted(values, key=lambda item: item.node_rank):
         for entry in manifest.entries:
+            path = entry.relative_path
+            if (
+                path.parts
+                and path.parts[0].startswith("global_step")
+                and path.parts[0] != step_directory
+            ):
+                raise ValueError("artifact global_step directory mismatches runtime identity")
             previous = combined.get(entry.relative_path)
             if previous is None:
                 combined[entry.relative_path] = entry
@@ -344,12 +535,102 @@ def validate_collection(
                 raise ValueError(
                     f"duplicate artifact path has different sizes: {entry.relative_path}"
                 )
-            if not previous.is_common_metadata or not entry.is_common_metadata:
+            duplicate_allowed = (
+                entry.relative_path in allowed_common
+                or (
+                    identity["model_state_layout"] == "replicated"
+                    and entry.relative_path
+                    == Path(step_directory) / _REPLICATED_MODEL_STATE
+                )
+            )
+            oversized_common = (
+                entry.relative_path in allowed_common
+                and entry.byte_size > _MAX_COMMON_METADATA_BYTES
+            )
+            if not duplicate_allowed or oversized_common:
                 raise ValueError(
-                    f"ambiguous duplicate artifact path: {entry.relative_path}"
+                    "ambiguous duplicate artifact is not allowlisted common metadata: "
+                    f"{entry.relative_path}"
                 )
             # Equal-sized common metadata under an identical runtime identity is
             # represented once, retaining the canonical owner's node-0 entry.
+    paths = set(combined)
+    missing_common = sorted(allowed_common - paths, key=lambda path: path.as_posix())
+    if missing_common:
+        raise ValueError(f"required checkpoint sidecar is missing: {missing_common[0]}")
+    optimizer_entries = [
+        entry
+        for entry in combined.values()
+        if _OPTIMIZER_SHARD.fullmatch(entry.relative_path.name)
+    ]
+    optimizer_ranks = {
+        entry.process_rank
+        for entry in optimizer_entries
+    }
+    if len(optimizer_entries) != world_size or optimizer_ranks != set(range(world_size)):
+        raise ValueError("checkpoint requires optimizer ranks 0 through 3")
+    for entry in combined.values():
+        if (
+            _OPTIMIZER_SHARD.fullmatch(entry.relative_path.name)
+            or _PARTITIONED_MODEL_SHARD.fullmatch(entry.relative_path.name)
+        ) and entry.relative_path.parent != Path(step_directory):
+            raise ValueError("checkpoint shard global_step directory mismatches runtime identity")
+    rng_entries = [
+        entry
+        for entry in combined.values()
+        if _RNG_STATE.fullmatch(entry.relative_path.name)
+    ]
+    rng_ranks = {
+        entry.process_rank
+        for entry in rng_entries
+    }
+    if (
+        len(rng_entries) != world_size
+        or rng_ranks != set(range(world_size))
+        or any(entry.relative_path.parent != Path() for entry in rng_entries)
+    ):
+        raise ValueError("checkpoint requires RNG ranks 0 through 3")
+    if identity["model_state_layout"] == "partitioned":
+        model_entries = [
+            entry
+            for entry in combined.values()
+            if _PARTITIONED_MODEL_SHARD.fullmatch(entry.relative_path.name)
+        ]
+        model_ranks = {
+            entry.process_rank
+            for entry in model_entries
+        }
+        if len(model_entries) != world_size or model_ranks != set(range(world_size)):
+            raise ValueError("partitioned checkpoint requires model-state ranks 0 through 3")
+        if Path(step_directory) / _REPLICATED_MODEL_STATE in paths:
+            raise ValueError("partitioned checkpoint rejects replicated model state")
+    else:
+        if Path(step_directory) / _REPLICATED_MODEL_STATE not in paths:
+            raise ValueError("replicated checkpoint requires common model state")
+        if any(
+            _PARTITIONED_MODEL_SHARD.fullmatch(entry.relative_path.name)
+            for entry in combined.values()
+        ):
+            raise ValueError("replicated checkpoint rejects partitioned model states")
+    for path in paths:
+        if path.name in {"trainer_state.json", "scheduler.pt", "deepspeed-runtime.json", "latest"}:
+            continue
+        if path in allowed_common:
+            continue
+        if (
+            _OPTIMIZER_SHARD.fullmatch(path.name)
+            or _RNG_STATE.fullmatch(path.name)
+            or _PARTITIONED_MODEL_SHARD.fullmatch(path.name)
+            or path == Path(step_directory) / _REPLICATED_MODEL_STATE
+        ):
+            continue
+        occurrences = sum(
+            path == entry.relative_path
+            for manifest in values
+            for entry in manifest.entries
+        )
+        if occurrences > 1:
+            raise ValueError(f"duplicate artifact is not allowlisted common metadata: {path}")
     return tuple(combined[path] for path in sorted(combined, key=lambda item: item.as_posix()))
 
 
@@ -388,10 +669,16 @@ def validate_transfer_destination(
         if (
             expected_size is not None
             and expected_size <= _MAX_COMMON_METADATA_BYTES
-            and (
-                destination.suffix.lower() in _COMMON_METADATA_SUFFIXES
-                or destination.name in _COMMON_STATE_NAMES
-            )
+            and destination.name
+            in {
+                "latest",
+                "trainer_state.json",
+                "scheduler.pt",
+                "deepspeed-runtime.json",
+                "stage1_peft_metadata.json",
+                "stage2_peft_metadata.json",
+                "stage2-sampler.json",
+            }
             and stat.S_ISREG(metadata.st_mode)
             and metadata.st_size == expected_size
         ):
@@ -428,8 +715,18 @@ def build_push_command(
 ) -> tuple[str, ...]:
     """Build a fixed local-ranks-to-canonical-owner rsync argv."""
     _validate_run_id(manifest.run_id)
-    source = _LOCAL_REPOSITORY / "checkpoints" / manifest.run_id
-    destination = _REMOTE_HOST_REPOSITORY / "checkpoints" / manifest.run_id
+    source = (
+        _LOCAL_REPOSITORY
+        / "checkpoints"
+        / manifest.run_id
+        / manifest.checkpoint_relative
+    )
+    destination = (
+        _REMOTE_HOST_REPOSITORY
+        / "checkpoints"
+        / manifest.run_id
+        / manifest.checkpoint_relative
+    )
     list_path = Path(files_from) if files_from is not None else _files_from_path(manifest, "push")
     return (
         *_rsync_prefix(list_path),
@@ -442,11 +739,39 @@ def select_resume_entries(
     manifest: NodeArtifactManifest,
 ) -> tuple[ArtifactEntry, ...]:
     """Select local ranks 2/3 and the small common metadata needed by resume."""
+    identity = _validate_identity(manifest.runtime_identity)
+    allowed_common = _required_common_paths(identity)
     return tuple(
         entry
         for entry in manifest.entries
-        if entry.is_common_metadata or entry.process_rank in (2, 3)
+        if entry.relative_path in allowed_common or entry.process_rank in (2, 3)
     )
+
+
+def select_inference_entries(
+    manifest: NodeArtifactManifest,
+) -> tuple[ArtifactEntry, ...]:
+    """Select only explicit model/processor artifacts, never training state."""
+    identity = _validate_identity(manifest.runtime_identity)
+    selected = tuple(
+        entry
+        for entry in manifest.entries
+        if (
+            entry.relative_path == Path(entry.relative_path.name)
+            and (
+                entry.relative_path.name in _INFERENCE_STATIC_NAMES
+                or _INFERENCE_SHARD.fullmatch(entry.relative_path.name)
+            )
+        )
+    )
+    if not any(
+        entry.relative_path.name
+        in {"adapter_model.safetensors", "model.safetensors", "pytorch_model.bin"}
+        or _INFERENCE_SHARD.fullmatch(entry.relative_path.name)
+        for entry in selected
+    ):
+        raise ValueError("inference manifest has no allowlisted model weights")
+    return selected
 
 
 def build_pull_command(
@@ -457,7 +782,12 @@ def build_pull_command(
 ) -> tuple[str, ...]:
     """Build a canonical-owner-to-local rsync argv for resume artifacts."""
     _validate_run_id(manifest.run_id)
-    source = _REMOTE_HOST_REPOSITORY / "checkpoints" / manifest.run_id
+    source = (
+        _REMOTE_HOST_REPOSITORY
+        / "checkpoints"
+        / manifest.run_id
+        / manifest.checkpoint_relative
+    )
     local_destination = (
         _LOCAL_REPOSITORY / "checkpoints" / manifest.run_id
         if destination is None
@@ -511,7 +841,151 @@ def build_inference_pull_command(
             raise ValueError("remote inference artifact size is invalid")
         if entry.node_rank != remote_manifest.node_rank:
             raise ValueError("remote inference artifact node ownership mismatch")
+    select_inference_entries(remote_manifest)
     return build_pull_command(remote_manifest, target, files_from=files_from)
+
+
+def reserve_inference_destination(destination: str | Path) -> Path:
+    """Atomically reserve one fresh trusted inference destination directory."""
+    from src.multinode_runtime import _open_child_directory, _open_trusted_directory
+
+    target = Path(destination)
+    if not target.is_absolute() or ".." in target.parts:
+        raise ValueError("fresh inference destination must be an absolute trusted path")
+    parent_descriptor = _open_trusted_directory(target.parent, create=True)
+    child_descriptor: int | None = None
+    try:
+        try:
+            child_descriptor = _open_child_directory(
+                parent_descriptor,
+                target.name,
+                create=True,
+                exclusive=True,
+            )
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"fresh inference destination already exists: {target}"
+            ) from error
+    finally:
+        if child_descriptor is not None:
+            os.close(child_descriptor)
+        os.close(parent_descriptor)
+    return target
+
+
+def resolve_local_checkpoint_destination(destination: str | Path) -> Path:
+    """Map one fixed logical checkpoint path through its trusted storage link."""
+    logical_root = _LOCAL_REPOSITORY / "checkpoints"
+    target = Path(destination)
+    if not target.is_absolute() or ".." in target.parts:
+        raise ValueError("checkpoint destination must be an absolute canonical path")
+    try:
+        relative = target.relative_to(logical_root)
+    except ValueError as error:
+        raise ValueError("checkpoint destination is outside the canonical root") from error
+    if len(relative.parts) < 2:
+        raise ValueError("checkpoint destination must belong to a run subtree")
+    _validate_run_id(relative.parts[0])
+    physical_root = logical_root.resolve(strict=True)
+    return physical_root.joinpath(*relative.parts)
+
+
+def reserve_checkpoint_destination(destination: str | Path) -> Path:
+    """Securely reserve a fresh run-owned directory behind the fixed root link."""
+    physical = resolve_local_checkpoint_destination(destination)
+    return reserve_inference_destination(physical)
+
+
+def validate_reserved_inference_destination(destination: str | Path) -> None:
+    """Re-open a reserved destination without symlinks and require it is empty."""
+    from src.multinode_runtime import _open_trusted_directory
+
+    descriptor = _open_trusted_directory(destination)
+    try:
+        if os.listdir(descriptor):
+            raise FileExistsError("fresh inference destination is no longer empty")
+    finally:
+        os.close(descriptor)
+
+
+def validate_transferred_entries(
+    destination: str | Path, expected_entries: Sequence[ArtifactEntry]
+) -> None:
+    """Validate an exact transferred file set using lstat metadata only."""
+    observed = {
+        relative: metadata.st_size
+        for relative, metadata in _walk_regular_files(Path(destination))
+    }
+    expected = {
+        entry.relative_path: entry.byte_size
+        for entry in expected_entries
+    }
+    if len(expected) != len(tuple(expected_entries)) or observed != expected:
+        raise ValueError("transferred destination must match exact path and size list")
+
+
+def validate_canonical_destination(
+    expected_entries: Sequence[ArtifactEntry],
+    observed_manifest: NodeArtifactManifest,
+    *,
+    expected_identity: Mapping[str, object],
+    expected_run_id: str,
+) -> None:
+    """Require a fresh remote rebuild to equal the expected collection exactly."""
+    identity = _validate_identity(expected_identity)
+    _validate_manifest(observed_manifest, world_size=4)
+    if observed_manifest.node_rank != 0 or observed_manifest.process_ranks != (0, 1, 2, 3):
+        raise ValueError("canonical destination manifest rank map is invalid")
+    if observed_manifest.run_id != expected_run_id or identity["run_id"] != expected_run_id:
+        raise ValueError("canonical destination manifest run ID mismatch")
+    if _validate_identity(observed_manifest.runtime_identity) != identity:
+        raise ValueError("canonical destination runtime identity mismatch")
+    expected = {
+        (entry.relative_path, entry.byte_size, entry.process_rank)
+        for entry in expected_entries
+    }
+    observed = {
+        (entry.relative_path, entry.byte_size, entry.process_rank)
+        for entry in observed_manifest.entries
+    }
+    if expected != observed or len(observed) != len(observed_manifest.entries):
+        raise ValueError("canonical destination must match exact path and size union")
+
+
+def validate_canonical_checkpoint_manifest(
+    manifest: NodeArtifactManifest,
+    *,
+    expected_identity: Mapping[str, object],
+) -> tuple[ArtifactEntry, ...]:
+    """Validate a rank-0 canonical manifest as a complete four-rank checkpoint."""
+    validate_canonical_destination(
+        manifest.entries,
+        manifest,
+        expected_identity=expected_identity,
+        expected_run_id=str(expected_identity.get("run_id")),
+    )
+    remote_entries = tuple(
+        replace(entry, node_rank=0)
+        for entry in manifest.entries
+        if entry.process_rank in (None, 0, 1)
+    )
+    local_entries = tuple(
+        replace(entry, node_rank=1)
+        for entry in manifest.entries
+        if entry.process_rank in (2, 3)
+    )
+    remote = replace(
+        manifest,
+        process_ranks=(0, 1),
+        entries=remote_entries,
+    )
+    local = replace(
+        manifest,
+        node_rank=1,
+        process_ranks=(2, 3),
+        entries=local_entries,
+    )
+    return validate_collection((remote, local), world_size=4)
 
 
 def files_list_bytes(entries: Sequence[ArtifactEntry]) -> bytes:
@@ -542,7 +1016,7 @@ def publish_node_manifest(
 def publish_files_list(
     path: str | Path, entries: Sequence[ArtifactEntry]
 ) -> Path:
-    """Exclusively publish the exact newline-delimited rsync input list."""
+    """Exclusively publish the exact NUL-delimited rsync input list."""
     from src.multinode_runtime import publish_small_file
 
     return publish_small_file(path, files_list_bytes(entries))
@@ -591,7 +1065,9 @@ def prepare_inference_copy(
 ) -> Path:
     """Validate a remote inference manifest and pull it once to a fresh path."""
     target = Path(destination)
-    build_inference_pull_command(remote_manifest, target)
     runner.validate_inference_manifest(remote_manifest)
+    select_inference_entries(remote_manifest)
+    reserve_inference_destination(target)
+    validate_reserved_inference_destination(target)
     runner.pull_inference_artifacts(remote_manifest, target)
     return target

@@ -33,6 +33,7 @@ from src.multinode_runtime import (
     collect_node_snapshot,
     prepare_attempt_directory,
     receive_launch_plan,
+    redistribute_resume_checkpoint,
     read_ownership,
     monitor_owned_jobs,
     owned_listener_is_ready,
@@ -690,10 +691,14 @@ def _artifact_manifest(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="python -m src.multinode artifact-manifest")
     parser.add_argument("--run-directory", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--checkpoint-root", default=str(_REPOSITORY_ROOT / "checkpoints")
+    )
     parser.add_argument("--node-rank", type=int, choices=(0, 1), required=True)
     parser.add_argument("--process-rank", type=int, action="append", required=True)
     parser.add_argument("--runtime-identity-json", required=True)
     parser.add_argument("--completion-marker", action="store_true")
+    parser.add_argument("--canonical-owner", action="store_true")
     args = parser.parse_args(argv)
     try:
         identity = json.loads(args.runtime_identity_json)
@@ -706,6 +711,8 @@ def _artifact_manifest(argv: list[str]) -> int:
             run_id=args.run_id,
             runtime_identity=identity,
             completion_marker=args.completion_marker,
+            checkpoint_root=args.checkpoint_root,
+            canonical_owner=args.canonical_owner,
         )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
@@ -716,6 +723,9 @@ def _artifact_manifest(argv: list[str]) -> int:
 def _artifact_destination_check(argv: list[str]) -> int:
     from src.multinode_artifacts import (
         ArtifactEntry,
+        NodeArtifactManifest,
+        select_common_metadata_entries,
+        validate_runtime_identity,
         validate_transfer_destination,
     )
 
@@ -724,14 +734,13 @@ def _artifact_destination_check(argv: list[str]) -> int:
     )
     parser.add_argument("--run-directory", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--checkpoint-root", default=str(_REPOSITORY_ROOT / "checkpoints")
+    )
     args = parser.parse_args(argv)
     try:
         run_directory = Path(args.run_directory)
-        if (
-            not run_directory.is_absolute()
-            or ".." in run_directory.parts
-            or run_directory.name != args.run_id
-        ):
+        if not run_directory.is_absolute() or ".." in run_directory.parts:
             raise ValueError("artifact destination must be the run-owned directory")
         raw = sys.stdin.buffer.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
@@ -747,14 +756,39 @@ def _artifact_destination_check(argv: list[str]) -> int:
             or type(payload["runtime_identity"]) is not dict
         ):
             raise ValueError("invalid artifact destination request values")
-        if payload["runtime_identity"].get("run_id") != args.run_id:
+        identity = validate_runtime_identity(payload["runtime_identity"])
+        checkpoint_root = Path(args.checkpoint_root)
+        expected_directory = (
+            checkpoint_root
+            / args.run_id
+            / f"checkpoint-{identity['global_step']}"
+        )
+        if run_directory != expected_directory:
+            raise ValueError("artifact destination must be the run-owned checkpoint")
+        if identity["run_id"] != args.run_id:
             raise ValueError("artifact destination request run ID mismatch")
         entries = tuple(ArtifactEntry.from_json(item) for item in payload["entries"])
-        destinations = tuple(run_directory / entry.relative_path for entry in entries)
+        physical_checkpoint = (
+            checkpoint_root.resolve(strict=True)
+            / args.run_id
+            / f"checkpoint-{identity['global_step']}"
+        )
+        destinations = tuple(
+            physical_checkpoint / entry.relative_path for entry in entries
+        )
+        request_manifest = NodeArtifactManifest(
+            schema_version=1,
+            run_id=args.run_id,
+            node_rank=1,
+            process_ranks=(2, 3),
+            entries=entries,
+            runtime_identity=identity,
+            completion_marker=True,
+            checkpoint_relative=Path(f"checkpoint-{identity['global_step']}"),
+        )
         allowed_common = {
-            run_directory / entry.relative_path: entry.byte_size
-            for entry in entries
-            if entry.is_common_metadata
+            physical_checkpoint / entry.relative_path: entry.byte_size
+            for entry in select_common_metadata_entries(request_manifest)
         }
         validate_transfer_destination(
             destinations,
@@ -796,15 +830,62 @@ def _replace_argument_value(
     return tuple(values)
 
 
+def _checkpoint_artifact_identity(
+    plan: LaunchPlan,
+    *,
+    commit: str,
+    global_step: int,
+    model_state_layout: str,
+) -> dict[str, object]:
+    """Build the strict checkpoint identity used on both non-shared nodes."""
+    if type(global_step) is not int or global_step < 0:
+        raise ValueError("checkpoint global step must be a nonnegative integer")
+    if model_state_layout not in ("replicated", "partitioned"):
+        raise ValueError("checkpoint model state layout is invalid")
+    if plan.stage == "stage1":
+        sidecar = (
+            "stage1_peft_metadata.json"
+            if plan.tuning_method in ("lora", "dora")
+            else "stage1_ema_teacher.pt"
+        )
+    else:
+        sidecar = (
+            "stage2_peft_metadata.json"
+            if plan.tuning_method in ("lora", "dora")
+            else "stage2-sampler.json"
+        )
+    return {
+        "stage": plan.stage,
+        "tuning_method": plan.tuning_method,
+        "zero_stage": plan.zero_stage,
+        "deepspeed_config_digest": plan.deepspeed_config_digest,
+        "world_size": plan.world_size,
+        "rank_mapping": {"0": [0, 1], "1": [2, 3]},
+        "global_step": global_step,
+        "model_state_layout": model_state_layout,
+        "optimizer": True,
+        "scheduler": True,
+        "rng_ranks": [0, 1, 2, 3],
+        "stage_sidecar": sidecar,
+        "commit": commit,
+        "run_id": plan.run_id,
+    }
+
+
 def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog=f"python -m src.multinode train-{stage}"
+        prog=f"python -m src.multinode train-{stage}", allow_abbrev=False
     )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", default="initial")
     parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)
     parser.add_argument("--main-process-port", type=int, required=True)
     parser.add_argument("--result-root", default=str(_REPOSITORY_ROOT / "results"))
+    parser.add_argument(
+        "--model-state-layout",
+        choices=("replicated", "partitioned"),
+        default="partitioned",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args, stage_arguments = parser.parse_known_args(argv)
     try:
@@ -894,7 +975,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         checkpoint_root = _REPOSITORY_ROOT / "checkpoints"
         log_root = _REPOSITORY_ROOT / "logs" / "multinode"
         stage_log_root = _REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
-        checkpoint_path = checkpoint_root / plan.run_id
+        checkpoint_run_path = checkpoint_root / plan.run_id
         control_directory = log_root / plan.run_id / plan.attempt_id
         witness_path = result_root / plan.run_id / f"{plan.attempt_id}-train-witness.json"
         stage_log_file = (
@@ -924,7 +1005,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         artifact_roots = (checkpoint_root, result_root, _REPOSITORY_ROOT / "logs")
         run_paths = [control_directory, witness_path, stage_log_file]
         if not resume_requested:
-            run_paths.append(checkpoint_path)
+            run_paths.append(checkpoint_run_path)
         sessions = (
             f"ilvr-{plan.run_id}-{plan.attempt_id}-rank0",
             f"ilvr-{plan.run_id}-{plan.attempt_id}-rank1",
@@ -979,6 +1060,49 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             commit=commit,
             log_root=log_root,
         )
+        if resume_requested:
+            resume_source = (
+                Path(_argument_value(forwarded, "--resume"))
+                if stage == "stage1"
+                else Path(stage_environment["RESUME_CHECKPOINT"])
+            )
+            match = re.fullmatch(r"checkpoint-(0|[1-9][0-9]*)", resume_source.name)
+            if match is None:
+                raise ValueError("resume source must be a numbered checkpoint-N")
+            resume_step = int(match.group(1))
+            resume_identity = _checkpoint_artifact_identity(
+                plan,
+                commit=commit,
+                global_step=resume_step,
+                model_state_layout=args.model_state_layout,
+            )
+            redistributed = (
+                checkpoint_run_path
+                / f"resume-{plan.attempt_id}"
+                / f"checkpoint-{resume_step}"
+            )
+            redistribute_resume_checkpoint(
+                runner,
+                checkpoint_path=checkpoint_run_path / f"checkpoint-{resume_step}",
+                checkpoint_identity=resume_identity,
+                requested_identity=resume_identity,
+                destination=redistributed,
+            )
+            redistributed = redistributed.resolve(strict=True)
+            if stage == "stage1":
+                forwarded = _replace_argument_value(
+                    forwarded, "--resume", str(redistributed)
+                )
+            else:
+                stage_environment["RESUME_CHECKPOINT"] = str(redistributed)
+            commands = build_owned_tmux_commands(
+                plan,
+                commit=commit,
+                stage_arguments=forwarded,
+                stage_environment=stage_environment,
+                result_root=result_root,
+            )
+            runner.commands = commands
         start_rank0_then_rank1(plan, runner, commands=commands)
         exit_codes = monitor_owned_jobs(
             plan,
@@ -991,16 +1115,18 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         )
         if exit_codes != {0: 0, 1: 0}:
             raise RuntimeError(f"multi-node training failed: exit_codes={exit_codes}")
-        artifact_identity = {
-            "stage": plan.stage,
-            "tuning_method": plan.tuning_method,
-            "zero_stage": plan.zero_stage,
-            "deepspeed_config_digest": plan.deepspeed_config_digest,
-            "world_size": plan.world_size,
-            "rank_mapping": {"0": [0, 1], "1": [2, 3]},
-            "commit": commit,
-            "run_id": plan.run_id,
-        }
+        step_option = "--max-steps" if stage == "stage1" else "--max_steps"
+        step_value = _argument_value(forwarded, step_option)
+        if step_value is None or not step_value.isdecimal() or int(step_value) <= 0:
+            raise ValueError(f"{step_option} must identify the final checkpoint step")
+        final_step = int(step_value)
+        checkpoint_path = checkpoint_run_path / f"checkpoint-{final_step}"
+        artifact_identity = _checkpoint_artifact_identity(
+            plan,
+            commit=commit,
+            global_step=final_step,
+            model_state_layout=args.model_state_layout,
+        )
         collect_checkpoint_artifacts(
             runner,
             checkpoint_path=checkpoint_path,

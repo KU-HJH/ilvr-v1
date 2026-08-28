@@ -1223,6 +1223,7 @@ class SubprocessCoordinatorRunner:
         self.serialized_plan: SerializedLaunchPlan | None = None
         self._seen_ownership: set[int] = set()
         self._artifact_checkpoint_paths: dict[int, Path] = {}
+        self._reserved_transfer_destinations: dict[Path, Path] = {}
 
     def _run(
         self, command: Sequence[str], *, input_bytes: bytes | None = None
@@ -1550,8 +1551,27 @@ class SubprocessCoordinatorRunner:
         runtime_identity: Mapping[str, object],
     ) -> object:
         """Collect one bounded node-local lstat manifest through the node CLI."""
-        from src.multinode_artifacts import NodeArtifactManifest
+        from src.multinode_artifacts import (
+            NodeArtifactManifest,
+            validate_runtime_identity,
+        )
 
+        identity = validate_runtime_identity(runtime_identity)
+        if (
+            identity["run_id"] != self.plan.run_id
+            or identity["stage"] != self.plan.stage
+            or identity["tuning_method"] != self.plan.tuning_method
+            or identity["zero_stage"] != self.plan.zero_stage
+            or identity["world_size"] != self.plan.world_size
+        ):
+            raise ValueError("artifact identity differs from the coordinator plan")
+        expected_checkpoint = (
+            _CHECKPOINT_ROOT
+            / self.plan.run_id
+            / f"checkpoint-{identity['global_step']}"
+        )
+        if checkpoint_path != expected_checkpoint:
+            raise ValueError("artifact manifest path is not the canonical checkpoint")
         ranks = (0, 1) if machine_rank == 0 else (2, 3)
         arguments = [
             "--run-directory",
@@ -1582,6 +1602,58 @@ class SubprocessCoordinatorRunner:
         if manifest.node_rank != machine_rank or manifest.run_id != self.plan.run_id:
             raise ValueError("artifact manifest differs from requested node identity")
         self._artifact_checkpoint_paths[machine_rank] = checkpoint_path
+        return manifest
+
+    def read_canonical_artifact_manifest(
+        self,
+        checkpoint_path: Path,
+        runtime_identity: Mapping[str, object],
+    ) -> object:
+        """Rebuild the canonical owner manifest after rsync for exact comparison."""
+        from src.multinode_artifacts import (
+            NodeArtifactManifest,
+            validate_runtime_identity,
+        )
+
+        identity = validate_runtime_identity(runtime_identity)
+        if identity["run_id"] != self.plan.run_id:
+            raise ValueError("canonical artifact identity run ID mismatch")
+        expected_checkpoint = (
+            _CHECKPOINT_ROOT
+            / self.plan.run_id
+            / f"checkpoint-{identity['global_step']}"
+        )
+        if checkpoint_path != expected_checkpoint:
+            raise ValueError("canonical artifact path is not the fixed checkpoint")
+
+        arguments = [
+            "--run-directory",
+            str(checkpoint_path),
+            "--run-id",
+            self.plan.run_id,
+            "--node-rank",
+            "0",
+            "--runtime-identity-json",
+            json.dumps(runtime_identity, sort_keys=True, separators=(",", ":"), allow_nan=False),
+            "--completion-marker",
+            "--canonical-owner",
+        ]
+        for rank in (0, 1, 2, 3):
+            arguments.extend(("--process-rank", str(rank)))
+        completed = self._run(
+            self._internal_command(0, "artifact-manifest", arguments)
+        )
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise ValueError("canonical artifact manifest returned invalid JSON") from error
+        manifest = NodeArtifactManifest.from_json(payload)
+        if (
+            manifest.node_rank != 0
+            or manifest.process_ranks != (0, 1, 2, 3)
+            or manifest.run_id != self.plan.run_id
+        ):
+            raise ValueError("canonical artifact manifest owner identity mismatch")
         return manifest
 
     def validate_push_destination(
@@ -1654,6 +1726,101 @@ class SubprocessCoordinatorRunner:
         )
         publish_files_list(files_path, entries)  # type: ignore[arg-type]
         self._run(build_push_command(manifest, files_from=files_path))
+
+    def validate_resume_destination(
+        self, entries: Sequence[object], destination: Path
+    ) -> None:
+        """Reserve one fresh local checkpoint directory before redistribution."""
+        from src.multinode_artifacts import (
+            ArtifactEntry,
+            reserve_checkpoint_destination,
+        )
+
+        if not all(isinstance(entry, ArtifactEntry) for entry in entries):
+            raise TypeError("resume entries must be ArtifactEntry values")
+        expected_run_root = _CHECKPOINT_ROOT / self.plan.run_id
+        try:
+            destination.relative_to(expected_run_root)
+        except ValueError as error:
+            raise ValueError("resume destination must belong to the fixed run") from error
+        physical = reserve_checkpoint_destination(destination)
+        self._reserved_transfer_destinations[destination] = physical
+
+    def pull_resume_artifacts(
+        self, manifest: object, entries: Sequence[object], destination: Path
+    ) -> None:
+        """Pull the exact rank-2/3 resume list, then validate local lstat metadata."""
+        from src.multinode_artifacts import (
+            ArtifactEntry,
+            NodeArtifactManifest,
+            build_pull_command,
+            publish_files_list,
+            validate_reserved_inference_destination,
+            validate_transferred_entries,
+            resolve_local_checkpoint_destination,
+        )
+
+        if not isinstance(manifest, NodeArtifactManifest):
+            raise TypeError("resume manifest must be a NodeArtifactManifest")
+        if not all(isinstance(entry, ArtifactEntry) for entry in entries):
+            raise TypeError("resume entries must be ArtifactEntry values")
+        physical = self._reserved_transfer_destinations.get(destination)
+        if physical is None or physical != resolve_local_checkpoint_destination(destination):
+            raise ValueError("resume destination reservation changed before transfer")
+        validate_reserved_inference_destination(physical)
+        files_path = (
+            self.log_root
+            / self.plan.run_id
+            / self.plan.attempt_id
+            / "artifact-resume-rank1.files"
+        )
+        publish_files_list(files_path, entries)  # type: ignore[arg-type]
+        self._run(build_pull_command(manifest, physical, files_from=files_path))
+        validate_transferred_entries(physical, entries)  # type: ignore[arg-type]
+
+    def validate_inference_manifest(self, manifest: object) -> None:
+        """Bind a complete canonical manifest to this fixed run and identity."""
+        from src.multinode_artifacts import (
+            NodeArtifactManifest,
+            select_inference_entries,
+            validate_canonical_checkpoint_manifest,
+        )
+
+        if not isinstance(manifest, NodeArtifactManifest):
+            raise TypeError("inference manifest must be a NodeArtifactManifest")
+        if manifest.run_id != self.plan.run_id:
+            raise ValueError("inference manifest run ID mismatch")
+        validate_canonical_checkpoint_manifest(
+            manifest, expected_identity=manifest.runtime_identity
+        )
+        select_inference_entries(manifest)
+
+    def pull_inference_artifacts(
+        self, manifest: object, destination: Path
+    ) -> None:
+        """Pull only allowlisted inference files into the reserved directory."""
+        from src.multinode_artifacts import (
+            NodeArtifactManifest,
+            build_pull_command,
+            publish_files_list,
+            select_inference_entries,
+            validate_reserved_inference_destination,
+            validate_transferred_entries,
+        )
+
+        if not isinstance(manifest, NodeArtifactManifest):
+            raise TypeError("inference manifest must be a NodeArtifactManifest")
+        entries = select_inference_entries(manifest)
+        validate_reserved_inference_destination(destination)
+        files_path = (
+            self.log_root
+            / self.plan.run_id
+            / self.plan.attempt_id
+            / "artifact-inference.files"
+        )
+        publish_files_list(files_path, entries)
+        self._run(build_pull_command(manifest, destination, files_from=files_path))
+        validate_transferred_entries(destination, entries)
 
 
 class CoordinatorRunner(Protocol):
@@ -1747,6 +1914,9 @@ class ArtifactCollectionRunner(Protocol):
     def push_artifacts(
         self, manifest: object, entries: Sequence[object]
     ) -> None: ...
+    def read_canonical_artifact_manifest(
+        self, checkpoint_path: Path, runtime_identity: Mapping[str, object]
+    ) -> object: ...
 
 
 def collect_checkpoint_artifacts(
@@ -1758,7 +1928,11 @@ def collect_checkpoint_artifacts(
     world_size: int,
 ) -> tuple[object, ...]:
     """Collect local shards only after both node supervisors prove exit zero."""
-    from src.multinode_artifacts import validate_collection
+    from src.multinode_artifacts import (
+        select_resume_entries,
+        validate_canonical_destination,
+        validate_collection,
+    )
 
     if dict(exit_codes) != {0: 0, 1: 0}:
         raise ValueError("checkpoint collection requires zero exits from both nodes")
@@ -1766,14 +1940,68 @@ def collect_checkpoint_artifacts(
     remote = runner.read_artifact_manifest(0, checkpoint, runtime_identity)
     local = runner.read_artifact_manifest(1, checkpoint, runtime_identity)
     combined = validate_collection((remote, local), world_size=world_size)
-    local_entries = tuple(
-        entry
-        for entry in local.entries
-        if entry.is_common_metadata or entry.process_rank in (2, 3)
-    )
+    local_entries = select_resume_entries(local)
     runner.validate_push_destination(local, local_entries)
     runner.push_artifacts(local, local_entries)
+    observed = runner.read_canonical_artifact_manifest(checkpoint, runtime_identity)
+    validate_canonical_destination(
+        combined,
+        observed,
+        expected_identity=runtime_identity,
+        expected_run_id=str(runtime_identity["run_id"]),
+    )
     return combined
+
+
+def redistribute_resume_checkpoint(
+    runner: object,
+    *,
+    checkpoint_path: str | Path,
+    checkpoint_identity: Mapping[str, object],
+    requested_identity: Mapping[str, object],
+    destination: str | Path,
+) -> tuple[object, ...]:
+    """Validate the remote canonical checkpoint and restore local ranks before launch."""
+    from src.multinode_artifacts import (
+        prepare_resume_transfer,
+        validate_canonical_checkpoint_manifest,
+        validate_resume_identity,
+    )
+
+    validate_resume_identity(checkpoint_identity, requested_identity)
+    read_manifest = getattr(runner, "read_canonical_artifact_manifest")
+    manifest = read_manifest(Path(checkpoint_path), checkpoint_identity)
+    validate_canonical_checkpoint_manifest(
+        manifest, expected_identity=checkpoint_identity
+    )
+    return prepare_resume_transfer(
+        checkpoint_identity,
+        requested_identity,
+        manifest,
+        destination,
+        runner,
+    )
+
+
+def prepare_inference_artifacts(
+    runner: object,
+    *,
+    checkpoint_path: str | Path,
+    runtime_identity: Mapping[str, object],
+    destination: str | Path,
+) -> Path:
+    """Prepare one fresh inference-only copy before an evaluator is started."""
+    from src.multinode_artifacts import (
+        prepare_inference_copy,
+        validate_canonical_checkpoint_manifest,
+    )
+
+    read_manifest = getattr(runner, "read_canonical_artifact_manifest")
+    manifest = read_manifest(Path(checkpoint_path), runtime_identity)
+    validate_canonical_checkpoint_manifest(
+        manifest, expected_identity=runtime_identity
+    )
+    return prepare_inference_copy(manifest, destination, runner)
 
 
 def stop_owned_peer(record: OwnershipRecord, runner: OwnedProcessRunner) -> None:

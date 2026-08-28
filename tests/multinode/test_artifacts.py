@@ -17,12 +17,20 @@ from src.multinode_artifacts import (
     prepare_resume_transfer,
     publish_files_list,
     publish_node_manifest,
+    reserve_inference_destination,
+    select_inference_entries,
     select_resume_entries,
+    validate_canonical_destination,
     validate_collection,
     validate_resume_identity,
     validate_transfer_destination,
+    validate_reserved_inference_destination,
 )
 from src.multinode_runtime import collect_checkpoint_artifacts
+from src.multinode_runtime import (
+    prepare_inference_artifacts,
+    redistribute_resume_checkpoint,
+)
 from src.multinode import build_launch_plan
 from src.multinode_runtime import SubprocessCoordinatorRunner, build_owned_tmux_commands
 
@@ -36,6 +44,7 @@ def identity(**changes):
         "world_size": 4,
         "rank_mapping": {"0": [0, 1], "1": [2, 3]},
         "global_step": 2,
+        "model_state_layout": "partitioned",
         "optimizer": True,
         "scheduler": True,
         "rng_ranks": [0, 1, 2, 3],
@@ -45,6 +54,59 @@ def identity(**changes):
     }
     values.update(changes)
     return values
+
+
+def strict_manifest(node_rank, *, prefix="bf16_", omit=(), changes=None):
+    owned = (0, 1) if node_rank == 0 else (2, 3)
+    values = identity(**(changes or {}))
+    entries = []
+    for rank in owned:
+        entries.extend(
+            (
+                ArtifactEntry(
+                    Path(
+                        f"global_step2/{prefix}zero_pp_rank_{rank}_mp_rank_00_optim_states.pt"
+                    ),
+                    10 + rank,
+                    node_rank,
+                ),
+                ArtifactEntry(Path(f"rng_state_{rank}.pth"), 20 + rank, node_rank),
+                ArtifactEntry(
+                    Path(
+                        f"global_step2/zero_pp_rank_{rank}_mp_rank_00_model_states.pt"
+                    ),
+                    30 + rank,
+                    node_rank,
+                ),
+            )
+        )
+    if node_rank == 0:
+        entries.extend(
+            ArtifactEntry(Path(name), size, 0)
+            for name, size in (
+                ("latest", 12),
+                ("trainer_state.json", 40),
+                ("scheduler.pt", 50),
+                ("deepspeed-runtime.json", 60),
+                ("stage1_ema_teacher.pt", 70),
+                ("stage1_peft_metadata.json", 80),
+            )
+        )
+    omitted = set(omit)
+    entries = tuple(entry for entry in entries if entry.relative_path.as_posix() not in omitted)
+    return NodeArtifactManifest(
+        schema_version=1,
+        run_id=values["run_id"],
+        node_rank=node_rank,
+        process_ranks=owned,
+        entries=entries,
+        runtime_identity=values,
+        completion_marker=True,
+    )
+
+
+def strict_manifests(**kwargs):
+    return strict_manifest(0, **kwargs), strict_manifest(1, **kwargs)
 
 
 def entry(rank, *, size=8, node_rank=None):
@@ -97,8 +159,10 @@ def launch_plan():
 
 
 def test_manifest_records_size_and_rank_without_weight_hash(tmp_path, monkeypatch):
-    shard = tmp_path / "global_step2/zero_pp_rank_2_mp_rank_00_optim_states.pt"
-    shard.parent.mkdir()
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint = checkpoint_root / identity()["run_id"] / "checkpoint-2"
+    shard = checkpoint / "global_step2/zero_pp_rank_2_mp_rank_00_optim_states.pt"
+    shard.parent.mkdir(parents=True)
     shard.write_bytes(b"rank-two")
 
     def reject_content_read(*args, **kwargs):
@@ -106,11 +170,12 @@ def test_manifest_records_size_and_rank_without_weight_hash(tmp_path, monkeypatc
 
     monkeypatch.setattr(Path, "read_bytes", reject_content_read)
     manifest = build_node_manifest(
-        tmp_path,
+        checkpoint,
         node_rank=1,
         process_ranks=(2, 3),
         run_id="stage1-lora-zero3-four-gpu",
         runtime_identity=identity(),
+        checkpoint_root=checkpoint_root,
     )
 
     assert manifest.entries == (
@@ -126,40 +191,62 @@ def test_manifest_records_size_and_rank_without_weight_hash(tmp_path, monkeypatc
 
 
 def test_manifest_rejects_symlink_and_nonregular_file(tmp_path):
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint = checkpoint_root / identity()["run_id"] / "checkpoint-2"
+    checkpoint.mkdir(parents=True)
     outside = tmp_path.parent / "outside-shard"
     outside.write_bytes(b"outside")
-    (tmp_path / "linked.pt").symlink_to(outside)
+    (checkpoint / "linked.pt").symlink_to(outside)
 
     with pytest.raises(ValueError, match="symlink"):
         build_node_manifest(
-            tmp_path,
+            checkpoint,
             node_rank=1,
             process_ranks=(2, 3),
             runtime_identity=identity(),
+            checkpoint_root=checkpoint_root,
         )
 
-    (tmp_path / "linked.pt").unlink()
-    os.mkfifo(tmp_path / "fifo")
+    (checkpoint / "linked.pt").unlink()
+    os.mkfifo(checkpoint / "fifo")
     with pytest.raises(ValueError, match="regular"):
         build_node_manifest(
-            tmp_path,
+            checkpoint,
             node_rank=1,
             process_ranks=(2, 3),
             runtime_identity=identity(),
+            checkpoint_root=checkpoint_root,
         )
 
 
 def test_manifest_rejects_shard_owned_by_another_node(tmp_path):
-    shard = tmp_path / "global_step2/zero_pp_rank_0_mp_rank_00_optim_states.pt"
-    shard.parent.mkdir()
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint = checkpoint_root / identity()["run_id"] / "checkpoint-2"
+    shard = checkpoint / "global_step2/zero_pp_rank_0_mp_rank_00_optim_states.pt"
+    shard.parent.mkdir(parents=True)
     shard.write_bytes(b"foreign")
 
     with pytest.raises(ValueError, match="assigned process ranks"):
         build_node_manifest(
-            tmp_path,
+            checkpoint,
             node_rank=1,
             process_ranks=(2, 3),
             runtime_identity=identity(),
+            checkpoint_root=checkpoint_root,
+        )
+
+
+def test_manifest_rejects_noncanonical_run_or_checkpoint_directory(tmp_path):
+    checkpoint_root = tmp_path / "checkpoints"
+    wrong = checkpoint_root / identity()["run_id"] / "checkpoint-3"
+    wrong.mkdir(parents=True)
+    with pytest.raises(ValueError, match="exact canonical"):
+        build_node_manifest(
+            wrong,
+            node_rank=1,
+            process_ranks=(2, 3),
+            runtime_identity=identity(),
+            checkpoint_root=checkpoint_root,
         )
 
 
@@ -233,13 +320,18 @@ def test_collection_rejects_invalid_manifests(manifests, message):
 
 
 def test_collection_accepts_identical_small_common_metadata_once():
-    common_remote = ArtifactEntry(Path("trainer_state.json"), 31, 0)
-    common_local = ArtifactEntry(Path("trainer_state.json"), 31, 1)
+    remote, local = strict_manifests()
+    trainer = next(
+        entry
+        for entry in remote.entries
+        if entry.relative_path == Path("trainer_state.json")
+    )
+    local = dataclasses.replace(
+        local,
+        entries=local.entries + (dataclasses.replace(trainer, node_rank=1),),
+    )
     entries = validate_collection(
-        (
-            manifest_for((0, 1), extra_entries=(common_remote,)),
-            manifest_for((2, 3), extra_entries=(common_local,)),
-        ),
+        (remote, local),
         world_size=4,
     )
     assert [item.relative_path for item in entries].count(Path("trainer_state.json")) == 1
@@ -251,8 +343,14 @@ def test_collection_never_treats_equal_sized_weights_as_common_metadata():
     with pytest.raises(ValueError, match="ambiguous duplicate"):
         validate_collection(
             (
-                manifest_for((0, 1), extra_entries=(remote_weight,)),
-                manifest_for((2, 3), extra_entries=(local_weight,)),
+                dataclasses.replace(
+                    strict_manifest(0),
+                    entries=strict_manifest(0).entries + (remote_weight,),
+                ),
+                dataclasses.replace(
+                    strict_manifest(1),
+                    entries=strict_manifest(1).entries + (local_weight,),
+                ),
             ),
             world_size=4,
         )
@@ -293,11 +391,14 @@ def test_push_never_overwrites_and_is_scoped_to_the_run():
     assert "--files-from" in command
     assert "--from0" in command
     assert "--checksum" not in command
-    assert command[-2] == "/root/workspace/ILVR/checkpoints/stage1-lora-zero3-four-gpu/"
+    assert command[-2] == (
+        "/root/workspace/ILVR/checkpoints/"
+        "stage1-lora-zero3-four-gpu/checkpoint-2/"
+    )
     assert command[-1] == (
         "korea@10.1.102.41:"
         "/home/korea/Workspace/hjh/workspace/ILVR/checkpoints/"
-        "stage1-lora-zero3-four-gpu/"
+        "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert not any("venv" in argument or "/data/" in argument for argument in command)
 
@@ -420,31 +521,38 @@ def test_small_manifest_and_files_list_publish_exclusively(tmp_path):
 class FakeArtifactRunner:
     def __init__(self):
         self.events = []
-        common_remote = ArtifactEntry(Path("trainer_state.json"), 31, 0)
-        common_local = ArtifactEntry(Path("trainer_state.json"), 31, 1)
         self.manifests = {
-            0: manifest_for((0, 1), extra_entries=(common_remote,)),
-            1: manifest_for((2, 3), extra_entries=(common_local,)),
+            0: strict_manifest(0),
+            1: strict_manifest(1),
         }
 
     def read_artifact_manifest(self, machine_rank, checkpoint_path, runtime_identity):
         self.events.append(f"manifest-rank{machine_rank}")
-        assert checkpoint_path.name == "stage1-lora-zero3-four-gpu"
+        assert checkpoint_path.name == "checkpoint-2"
         assert runtime_identity == identity()
         return self.manifests[machine_rank]
 
     def validate_push_destination(self, manifest, entries):
         self.events.append("destination-precondition")
         assert manifest.node_rank == 1
-        assert {item.process_rank for item in entries} == {None, 2, 3}
+        assert {item.process_rank for item in entries} == {2, 3}
 
     def push_artifacts(self, manifest, entries):
         self.events.append("push")
 
+    def read_canonical_artifact_manifest(self, checkpoint_path, runtime_identity):
+        self.events.append("post-push-manifest")
+        expected = validate_collection(tuple(self.manifests.values()), world_size=4)
+        return dataclasses.replace(
+            self.manifests[0],
+            process_ranks=(0, 1, 2, 3),
+            entries=tuple(dataclasses.replace(entry, node_rank=0) for entry in expected),
+        )
+
 
 def test_collection_runs_after_both_zero_exits_and_checks_destination_first(tmp_path):
     runner = FakeArtifactRunner()
-    checkpoint = tmp_path / "stage1-lora-zero3-four-gpu"
+    checkpoint = tmp_path / "stage1-lora-zero3-four-gpu" / "checkpoint-2"
 
     entries = collect_checkpoint_artifacts(
         runner,
@@ -465,6 +573,7 @@ def test_collection_runs_after_both_zero_exits_and_checks_destination_first(tmp_
         "manifest-rank1",
         "destination-precondition",
         "push",
+        "post-push-manifest",
     ]
 
 
@@ -473,7 +582,7 @@ def test_failed_node_exit_never_fabricates_collection(tmp_path):
     with pytest.raises(ValueError, match="zero exits"):
         collect_checkpoint_artifacts(
             runner,
-            checkpoint_path=tmp_path / "stage1-lora-zero3-four-gpu",
+            checkpoint_path=tmp_path / "stage1-lora-zero3-four-gpu" / "checkpoint-2",
             runtime_identity=identity(),
             exit_codes={0: 0, 1: 7},
             world_size=4,
@@ -500,10 +609,11 @@ class FakeTransferRunner:
 
 def test_resume_validates_identity_before_destination_or_transfer(tmp_path):
     runner = FakeTransferRunner()
+    expected = validate_collection(strict_manifests(), world_size=4)
     remote = dataclasses.replace(
-        manifest_for((0, 1)),
+        strict_manifest(0),
         process_ranks=(0, 1, 2, 3),
-        entries=tuple(entry(rank, node_rank=0) for rank in range(4)),
+        entries=tuple(dataclasses.replace(entry, node_rank=0) for entry in expected),
     )
     with pytest.raises(ValueError, match="zero_stage"):
         prepare_resume_transfer(
@@ -532,19 +642,19 @@ def test_inference_preparation_validates_manifest_before_one_pull(tmp_path):
     prepare_inference_copy(remote, destination, runner)
 
     assert runner.events == ["inference-manifest", "inference-pull"]
-    assert not destination.exists()
+    assert destination.is_dir()
 
 
 def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path):
     plan = launch_plan()
     commands = build_owned_tmux_commands(plan, commit="b" * 40)
-    remote_manifest = manifest_for(
-        (0, 1),
-        extra_entries=(ArtifactEntry(Path("trainer_state.json"), 31, 0),),
-    )
-    local_manifest = manifest_for(
-        (2, 3),
-        extra_entries=(ArtifactEntry(Path("trainer_state.json"), 31, 1),),
+    remote_manifest = strict_manifest(0)
+    local_manifest = strict_manifest(1)
+    combined = validate_collection((remote_manifest, local_manifest), world_size=4)
+    canonical_manifest = dataclasses.replace(
+        remote_manifest,
+        process_ranks=(0, 1, 2, 3),
+        entries=tuple(dataclasses.replace(entry, node_rank=0) for entry in combined),
     )
     calls = []
 
@@ -553,7 +663,10 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
         calls.append((argv, input_bytes, timeout_seconds))
         display = " ".join(argv)
         if "artifact-manifest" in display:
-            payload = remote_manifest if argv[0] == "/usr/bin/ssh" else local_manifest
+            if "--canonical-owner" in display:
+                payload = canonical_manifest
+            else:
+                payload = remote_manifest if argv[0] == "/usr/bin/ssh" else local_manifest
             stdout = json.dumps(payload.to_json())
         else:
             stdout = ""
@@ -568,7 +681,7 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
         log_root=tmp_path / "logs",
         command_runner=fake_command,
     )
-    checkpoint = Path("/root/workspace/ILVR/checkpoints") / plan.run_id
+    checkpoint = Path("/root/workspace/ILVR/checkpoints") / plan.run_id / "checkpoint-2"
 
     collected = collect_checkpoint_artifacts(
         runner,
@@ -578,9 +691,9 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
         world_size=4,
     )
 
-    assert len(collected) == 5
+    assert len(collected) == len(combined)
     displays = [" ".join(call[0]) for call in calls]
-    assert sum("artifact-manifest" in display for display in displays) == 2
+    assert sum("artifact-manifest" in display for display in displays) == 3
     destination_call = next(
         call for call in calls if "artifact-destination-check" in " ".join(call[0])
     )
@@ -591,17 +704,16 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
     assert "--files-from" in rsync
     assert "--checksum" not in rsync
     files_path = Path(rsync[rsync.index("--files-from") + 1])
-    assert files_path.read_bytes().split(b"\0") == [
-        b"checkpoint-2/global_step2/zero_pp_rank_2_mp_rank_00_optim_states.pt",
-        b"checkpoint-2/global_step2/zero_pp_rank_3_mp_rank_00_optim_states.pt",
-        b"trainer_state.json",
-        b"",
-    ]
+    transferred = set(files_path.read_bytes().split(b"\0"))
+    assert b"global_step2/bf16_zero_pp_rank_2_mp_rank_00_optim_states.pt" in transferred
+    assert b"rng_state_3.pth" in transferred
+    assert b"" in transferred
     assert all(call[2] == 30 for call in calls)
 
 
 def test_artifact_manifest_cli_emits_only_small_json_metadata(tmp_path):
-    run_directory = tmp_path / "stage1-lora-zero3-four-gpu"
+    checkpoint_root = tmp_path / "checkpoints"
+    run_directory = checkpoint_root / "stage1-lora-zero3-four-gpu" / "checkpoint-2"
     shard = run_directory / "global_step2/zero_pp_rank_2_mp_rank_00_optim_states.pt"
     shard.parent.mkdir(parents=True)
     shard.write_bytes(b"rank-two")
@@ -615,7 +727,9 @@ def test_artifact_manifest_cli_emits_only_small_json_metadata(tmp_path):
             "--run-directory",
             str(run_directory),
             "--run-id",
-            run_directory.name,
+            identity()["run_id"],
+            "--checkpoint-root",
+            str(checkpoint_root),
             "--node-rank",
             "1",
             "--process-rank",
@@ -647,7 +761,7 @@ def test_artifact_manifest_cli_emits_only_small_json_metadata(tmp_path):
 
 
 def test_destination_cli_rejects_ranked_collision_but_allows_identical_common(tmp_path):
-    run_directory = tmp_path / "stage1-lora-zero3-four-gpu"
+    run_directory = tmp_path / "stage1-lora-zero3-four-gpu" / "checkpoint-2"
     ranked = run_directory / "global_step2/zero_pp_rank_2_mp_rank_00_optim_states.pt"
     common = run_directory / "trainer_state.json"
     ranked.parent.mkdir(parents=True)
@@ -672,7 +786,9 @@ def test_destination_cli_rejects_ranked_collision_but_allows_identical_common(tm
         "--run-directory",
         str(run_directory),
         "--run-id",
-        run_directory.name,
+        identity()["run_id"],
+        "--checkpoint-root",
+        str(tmp_path),
     )
 
     completed = subprocess.run(
@@ -698,3 +814,349 @@ def test_destination_cli_rejects_ranked_collision_but_allows_identical_common(tm
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("prefix", ("bf16_", "fp16_", ""))
+def test_collection_accepts_all_canonical_optimizer_prefixes(prefix):
+    entries = validate_collection(strict_manifests(prefix=prefix), world_size=4)
+    optimizer_ranks = {
+        entry.process_rank
+        for entry in entries
+        if entry.relative_path.name.endswith("_optim_states.pt")
+    }
+    assert optimizer_ranks == {0, 1, 2, 3}
+
+
+def test_collection_rejects_rng_only_rank_completeness():
+    manifests = []
+    for node_rank in (0, 1):
+        manifest = strict_manifest(node_rank)
+        manifests.append(
+            dataclasses.replace(
+                manifest,
+                entries=tuple(
+                    entry
+                    for entry in manifest.entries
+                    if not entry.relative_path.name.endswith("_optim_states.pt")
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="optimizer ranks 0 through 3"):
+        validate_collection(tuple(manifests), world_size=4)
+
+
+def test_collection_rejects_more_than_one_optimizer_shard_per_rank():
+    remote, local = strict_manifests()
+    duplicate = ArtifactEntry(
+        Path("global_step2/fp16_zero_pp_rank_0_mp_rank_00_optim_states.pt"),
+        10,
+        0,
+    )
+    remote = dataclasses.replace(remote, entries=remote.entries + (duplicate,))
+    with pytest.raises(ValueError, match="optimizer ranks 0 through 3"):
+        validate_collection((remote, local), world_size=4)
+
+
+@pytest.mark.parametrize(
+    ("omitted", "message"),
+    [
+        ("rng_state_3.pth", "RNG ranks 0 through 3"),
+        ("scheduler.pt", "scheduler.pt"),
+        ("trainer_state.json", "trainer_state.json"),
+        ("deepspeed-runtime.json", "deepspeed-runtime.json"),
+        ("stage1_ema_teacher.pt", "stage1_ema_teacher.pt"),
+        ("stage1_peft_metadata.json", "stage1_peft_metadata.json"),
+        (
+            "global_step2/zero_pp_rank_3_mp_rank_00_model_states.pt",
+            "model-state ranks 0 through 3",
+        ),
+    ],
+)
+def test_collection_requires_every_checkpoint_component(omitted, message):
+    remote = strict_manifest(0, omit=(omitted,))
+    local = strict_manifest(1, omit=(omitted,))
+    with pytest.raises(ValueError, match=message):
+        validate_collection((remote, local), world_size=4)
+
+
+def test_collection_rejects_checkpoint_and_global_step_mismatch():
+    remote, local = strict_manifests()
+    local = dataclasses.replace(
+        local,
+        entries=tuple(
+            dataclasses.replace(
+                entry,
+                relative_path=Path(
+                    str(entry.relative_path).replace("global_step2", "global_step3")
+                ),
+            )
+            for entry in local.entries
+        ),
+    )
+    with pytest.raises(ValueError, match="global_step"):
+        validate_collection((remote, local), world_size=4)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("zero_stage", True),
+        ("world_size", True),
+        ("global_step", True),
+        ("zero_stage", "3"),
+        ("world_size", "4"),
+        ("rank_mapping", {0: [0, 1], 1: [2, 3]}),
+        ("rank_mapping", {"0": [False, True], "1": [2, 3]}),
+        ("rng_ranks", [False, True, 2, 3]),
+        ("model_state_layout", "unknown"),
+    ],
+)
+def test_manifest_identity_rejects_coercive_or_wrong_types(field, value):
+    remote, local = strict_manifests(changes={field: value})
+    with pytest.raises(ValueError, match=field):
+        validate_collection((remote, local), world_size=4)
+
+
+def test_common_metadata_uses_explicit_identity_allowlist():
+    remote, local = strict_manifests()
+    remote = dataclasses.replace(
+        remote,
+        entries=remote.entries + (ArtifactEntry(Path("invented.json"), 5, 0),),
+    )
+    local = dataclasses.replace(
+        local,
+        entries=local.entries + (ArtifactEntry(Path("invented.json"), 5, 1),),
+    )
+    with pytest.raises(ValueError, match="not allowlisted"):
+        validate_collection((remote, local), world_size=4)
+
+
+def test_post_push_requires_exact_fresh_remote_manifest():
+    expected = validate_collection(strict_manifests(), world_size=4)
+    observed = dataclasses.replace(
+        strict_manifest(0),
+        process_ranks=(0, 1, 2, 3),
+        entries=tuple(dataclasses.replace(entry, node_rank=0) for entry in expected),
+    )
+    validate_canonical_destination(
+        expected,
+        observed,
+        expected_identity=identity(),
+        expected_run_id=identity()["run_id"],
+    )
+    corrupted = dataclasses.replace(
+        observed,
+        entries=observed.entries[:-1]
+        + (dataclasses.replace(observed.entries[-1], byte_size=999),),
+    )
+    with pytest.raises(ValueError, match="exact path and size"):
+        validate_canonical_destination(
+            expected,
+            corrupted,
+            expected_identity=identity(),
+            expected_run_id=identity()["run_id"],
+        )
+
+
+def test_inference_selection_excludes_all_training_state():
+    manifest = dataclasses.replace(
+        strict_manifest(0),
+        entries=strict_manifest(0).entries
+        + (
+            ArtifactEntry(Path("adapter_model.safetensors"), 101, 0),
+            ArtifactEntry(Path("adapter_config.json"), 102, 0),
+            ArtifactEntry(Path("config.json"), 103, 0),
+        ),
+    )
+    selected = select_inference_entries(manifest)
+    assert {entry.relative_path.name for entry in selected} == {
+        "adapter_model.safetensors",
+        "adapter_config.json",
+        "config.json",
+    }
+
+
+def test_inference_destination_is_securely_reserved(tmp_path):
+    destination = tmp_path / "fresh" / "model"
+    assert reserve_inference_destination(destination) == destination
+    assert destination.is_dir()
+    with pytest.raises(FileExistsError, match="fresh inference destination"):
+        reserve_inference_destination(destination)
+
+
+def test_reserved_inference_destination_detects_pretransfer_race(tmp_path):
+    destination = reserve_inference_destination(tmp_path / "fresh" / "model")
+    (destination / "raced-file").write_bytes(b"foreign")
+    with pytest.raises(FileExistsError, match="no longer empty"):
+        validate_reserved_inference_destination(destination)
+
+
+class FakeProductionTransferRunner(FakeTransferRunner):
+    def __init__(self):
+        super().__init__()
+        expected = validate_collection(strict_manifests(), world_size=4)
+        self.canonical = dataclasses.replace(
+            strict_manifest(0),
+            process_ranks=(0, 1, 2, 3),
+            entries=tuple(dataclasses.replace(item, node_rank=0) for item in expected),
+        )
+
+    def read_canonical_artifact_manifest(self, checkpoint_path, runtime_identity):
+        self.events.append("remote-canonical-manifest")
+        return self.canonical
+
+
+def test_production_resume_redistribution_validates_before_transfer(tmp_path):
+    runner = FakeProductionTransferRunner()
+    destination = tmp_path / "resume-checkpoint"
+
+    entries = redistribute_resume_checkpoint(
+        runner,
+        checkpoint_path=Path("/root/workspace/ILVR/checkpoints")
+        / identity()["run_id"]
+        / "checkpoint-2",
+        checkpoint_identity=identity(),
+        requested_identity=identity(),
+        destination=destination,
+    )
+
+    assert {entry.process_rank for entry in entries} == {None, 2, 3}
+    assert runner.events == [
+        "remote-canonical-manifest",
+        "resume-destination",
+        "resume-pull",
+    ]
+
+
+def test_inference_preparation_is_callable_before_evaluation(tmp_path):
+    runner = FakeProductionTransferRunner()
+    runner.canonical = dataclasses.replace(
+        runner.canonical,
+        entries=runner.canonical.entries
+        + (ArtifactEntry(Path("adapter_model.safetensors"), 101, 0),),
+    )
+    destination = tmp_path / "evaluation-model"
+
+    prepared = prepare_inference_artifacts(
+        runner,
+        checkpoint_path=Path("/root/workspace/ILVR/checkpoints")
+        / identity()["run_id"]
+        / "checkpoint-2",
+        runtime_identity=identity(),
+        destination=destination,
+    )
+
+    assert prepared == destination
+    assert destination.is_dir()
+    assert runner.events == [
+        "remote-canonical-manifest",
+        "inference-manifest",
+        "inference-pull",
+    ]
+
+
+def test_collection_rejects_post_rsync_manifest_mismatch(tmp_path):
+    runner = FakeArtifactRunner()
+    original = runner.read_canonical_artifact_manifest
+
+    def corrupted(checkpoint_path, runtime_identity):
+        manifest = original(checkpoint_path, runtime_identity)
+        return dataclasses.replace(manifest, entries=manifest.entries[:-1])
+
+    runner.read_canonical_artifact_manifest = corrupted
+    with pytest.raises(ValueError, match="exact path and size"):
+        collect_checkpoint_artifacts(
+            runner,
+            checkpoint_path=tmp_path
+            / identity()["run_id"]
+            / "checkpoint-2",
+            runtime_identity=identity(),
+            exit_codes={0: 0, 1: 0},
+            world_size=4,
+        )
+    assert runner.events[-2:] == ["push", "post-push-manifest"]
+
+
+def test_subprocess_runner_executes_resume_and_inference_file_lists(
+    tmp_path, monkeypatch
+):
+    import src.multinode_artifacts as artifacts_module
+    import src.multinode_runtime as runtime_module
+
+    repository = tmp_path / "repo"
+    checkpoint_root = repository / "checkpoints"
+    checkpoint_root.mkdir(parents=True)
+    monkeypatch.setattr(artifacts_module, "_LOCAL_REPOSITORY", repository)
+    monkeypatch.setattr(runtime_module, "_CHECKPOINT_ROOT", checkpoint_root)
+
+    plan = launch_plan()
+    commands = build_owned_tmux_commands(plan, commit="b" * 40)
+    expected = validate_collection(strict_manifests(), world_size=4)
+    canonical = dataclasses.replace(
+        strict_manifest(0),
+        process_ranks=(0, 1, 2, 3),
+        entries=tuple(dataclasses.replace(item, node_rank=0) for item in expected)
+        + (ArtifactEntry(Path("adapter_model.safetensors"), 101, 0),),
+    )
+    sizes = {item.relative_path.as_posix(): item.byte_size for item in canonical.entries}
+    calls = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        argv = tuple(command)
+        calls.append(argv)
+        if argv[0] == "/usr/bin/rsync":
+            files_path = Path(argv[argv.index("--files-from") + 1])
+            destination = Path(argv[-1].removesuffix("/"))
+            for encoded in files_path.read_bytes().split(b"\0"):
+                if not encoded:
+                    continue
+                relative = encoded.decode("utf-8")
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x" * sizes[relative])
+            stdout = ""
+        else:
+            stdout = json.dumps(canonical.to_json())
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    runner = SubprocessCoordinatorRunner(
+        plan,
+        commands=commands,
+        commit="b" * 40,
+        log_root=tmp_path / "logs",
+        command_runner=fake_command,
+    )
+    canonical_checkpoint = checkpoint_root / plan.run_id / "checkpoint-2"
+    resume_destination = (
+        checkpoint_root / plan.run_id / "resume-attempt" / "checkpoint-2"
+    )
+    redistribute_resume_checkpoint(
+        runner,
+        checkpoint_path=canonical_checkpoint,
+        checkpoint_identity=identity(),
+        requested_identity=identity(),
+        destination=resume_destination,
+    )
+    inference_destination = tmp_path / "results" / "evaluation-model"
+    prepare_inference_artifacts(
+        runner,
+        checkpoint_path=canonical_checkpoint,
+        runtime_identity=identity(),
+        destination=inference_destination,
+    )
+
+    rsync_calls = [call for call in calls if call[0] == "/usr/bin/rsync"]
+    assert len(rsync_calls) == 2
+    resume_names = {
+        path.relative_to(resume_destination).as_posix()
+        for path in resume_destination.rglob("*")
+        if path.is_file()
+    }
+    assert "rng_state_2.pth" in resume_names
+    assert not any("rank_0_" in name for name in resume_names)
+    inference_names = {
+        path.relative_to(inference_destination).as_posix()
+        for path in inference_destination.rglob("*")
+        if path.is_file()
+    }
+    assert inference_names == {"adapter_model.safetensors"}
