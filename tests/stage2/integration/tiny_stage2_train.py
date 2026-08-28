@@ -284,14 +284,16 @@ def _collect_rank_records(record):
     return gathered
 
 
-def _validate_rank_lifecycle_records(records) -> None:
+def _validate_rank_lifecycle_records(
+    records, *, initial_steps: int = 1, resumed_steps: int = 2
+) -> None:
     if not records:
         raise AssertionError("Stage 2 lifecycle gathered no rank records")
-    first_steps = {record["first_global_step"] for record in records}
-    resumed_steps = {record["resumed_global_step"] for record in records}
-    if first_steps != {1} or resumed_steps != {2}:
+    first_step_set = {record["first_global_step"] for record in records}
+    resumed_step_set = {record["resumed_global_step"] for record in records}
+    if first_step_set != {initial_steps} or resumed_step_set != {resumed_steps}:
         raise AssertionError(
-            "Stage 2 rank global steps disagree with the 1-to-2 lifecycle: "
+            "Stage 2 rank global steps disagree with the requested lifecycle: "
             f"{records}"
         )
     losses = [
@@ -487,12 +489,15 @@ def _deepspeed_identity(deepspeed: str | None) -> tuple[str | None, int | None]:
     return str(path), int(config["zero_optimization"]["stage"])
 
 
-def _assert_contract(witness):
-    if witness["first_global_step"] != 1 or witness["resumed_global_step"] != 2:
+def _assert_contract(witness, *, initial_steps: int = 1, resumed_steps: int = 2):
+    if (
+        witness["first_global_step"] != initial_steps
+        or witness["resumed_global_step"] != resumed_steps
+    ):
         raise AssertionError(f"global step was not restored: {witness}")
-    if witness["optimizer_step_at_resume"] != 1:
+    if witness["optimizer_step_at_resume"] != initial_steps:
         raise AssertionError(f"optimizer state was not restored: {witness}")
-    if witness["scheduler_step_at_resume"] != 1:
+    if witness["scheduler_step_at_resume"] != initial_steps:
         raise AssertionError(f"scheduler state was not restored: {witness}")
     if not witness["observed_local_batch_sizes"] or set(
         witness["observed_local_batch_sizes"]
@@ -534,6 +539,8 @@ def run_harness(
     experiment_id: str,
     deepspeed: str | None,
     tuning_method: str,
+    initial_steps: int = 1,
+    resumed_steps: int = 2,
 ):
     paths = _claim_owned_paths(experiment_id)
     output_dir = paths.checkpoint_dir
@@ -563,7 +570,7 @@ def run_harness(
     first_recorder = ResumeStateRecorder()
     first_trainer = Stage2Trainer(
         model=first_model,
-        args=_training_args(output_dir, max_steps=1, deepspeed=deepspeed),
+        args=_training_args(output_dir, max_steps=initial_steps, deepspeed=deepspeed),
         train_dataset=dataset,
         data_collator=first_collator,
         callbacks=[first_recorder],
@@ -573,7 +580,7 @@ def run_harness(
     )
     first_result = first_trainer.train()
     first_global_step = int(first_trainer.state.global_step)
-    checkpoint = output_dir / "checkpoint-1"
+    checkpoint = output_dir / f"checkpoint-{initial_steps}"
     if not checkpoint.is_dir():
         raise AssertionError(f"first Stage 2 checkpoint was not saved: {checkpoint}")
     adapter_checkpoint_present = all(
@@ -597,7 +604,7 @@ def run_harness(
     resumed_recorder = ResumeStateRecorder()
     resumed_trainer = Stage2Trainer(
         model=resumed_model,
-        args=_training_args(output_dir, max_steps=2, deepspeed=deepspeed),
+        args=_training_args(output_dir, max_steps=resumed_steps, deepspeed=deepspeed),
         train_dataset=dataset,
         data_collator=resumed_collator,
         callbacks=[resumed_recorder],
@@ -633,7 +640,9 @@ def run_harness(
             "base_trainable_parameters": base_trainable,
         }
     )
-    _validate_rank_lifecycle_records(rank_records)
+    _validate_rank_lifecycle_records(
+        rank_records, initial_steps=initial_steps, resumed_steps=resumed_steps
+    )
     observed_batch_sizes = [
         batch_size
         for record in rank_records
@@ -662,8 +671,8 @@ def run_harness(
         ],
         "rank_first_losses": [record["first_loss"] for record in rank_records],
         "rank_resumed_losses": [record["resumed_loss"] for record in rank_records],
-        "optimizer_state_restored": optimizer_steps == {1},
-        "scheduler_state_restored": scheduler_steps == {1},
+        "optimizer_state_restored": optimizer_steps == {initial_steps},
+        "scheduler_state_restored": scheduler_steps == {initial_steps},
         "optimizer_step_at_resume": next(iter(optimizer_steps))
         if len(optimizer_steps) == 1
         else None,
@@ -696,19 +705,38 @@ def run_harness(
         "checkpoint": str(checkpoint),
         "experiment_id": paths.experiment_id,
     }
-    _assert_contract(witness)
+    _assert_contract(
+        witness, initial_steps=initial_steps, resumed_steps=resumed_steps
+    )
     _publish_rank_agreed_witness(witness_path, witness)
     if _is_world_process_zero():
         print(json.dumps(witness, sort_keys=True), flush=True)
 
 
+def _positive_step(value: str) -> int:
+    step = int(value)
+    if step <= 0:
+        raise argparse.ArgumentTypeError("lifecycle steps must be positive")
+    return step
+
+
+class _LifecycleParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        if parsed.resumed_steps != parsed.initial_steps + 1:
+            self.error("--resumed-steps must equal --initial-steps + 1")
+        return parsed
+
+
 def build_tiny_stage2_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+    parser = _LifecycleParser()
     parser.add_argument("--experiment-id", required=True)
     parser.add_argument("--deepspeed")
     parser.add_argument(
         "--tuning-method", choices=("full", "lora", "dora"), default="full"
     )
+    parser.add_argument("--initial-steps", type=_positive_step, default=1)
+    parser.add_argument("--resumed-steps", type=_positive_step, default=2)
     return parser
 
 
@@ -722,6 +750,8 @@ def main():
         experiment_id=args.experiment_id,
         deepspeed=args.deepspeed,
         tuning_method=args.tuning_method,
+        initial_steps=args.initial_steps,
+        resumed_steps=args.resumed_steps,
     )
 
 

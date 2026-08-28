@@ -34,14 +34,31 @@ from utils_deepseed import parse_args as parse_training_args
 SUPPORTED_DIAGNOSTIC_METHODS = ("full", "lora", "dora")
 
 
+def _positive_step(value: str) -> int:
+    step = int(value)
+    if step <= 0:
+        raise argparse.ArgumentTypeError("lifecycle steps must be positive")
+    return step
+
+
+class _LifecycleParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        if parsed.resumed_steps != parsed.initial_steps + 1:
+            self.error("--resumed-steps must equal --initial-steps + 1")
+        return parsed
+
+
 def build_zero_compat_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _LifecycleParser(description=__doc__)
     parser.add_argument("--zero-stage", type=int, choices=(1, 2, 3), required=True)
     parser.add_argument(
         "--method", choices=SUPPORTED_DIAGNOSTIC_METHODS, required=True
     )
     parser.add_argument("--deepspeed", type=Path, required=True)
     parser.add_argument("--experiment-id", required=True)
+    parser.add_argument("--initial-steps", type=_positive_step, default=1)
+    parser.add_argument("--resumed-steps", type=_positive_step, default=2)
     return parser
 
 
@@ -207,7 +224,7 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
         fixture_root=fixture_root,
         method=args.method,
         deepspeed=profile.config_path,
-        max_steps=1,
+        max_steps=args.initial_steps,
     )
     first_args.deepspeed_runtime_profile = profile
     first = build_stage1_training_components(
@@ -218,11 +235,16 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
     first.trainer.collect_stage1_diagnostics = True
     first.trainer.args.save_total_limit = 2
     first.trainer.train()
-    checkpoint = paths.checkpoint_dir / "checkpoint-1"
-    if int(first.trainer.state.global_step) != 1 or not checkpoint.is_dir():
-        raise AssertionError("Stage 1 did not save a complete checkpoint-1")
-    if first.trainer._successful_optimizer_steps != 1:
-        raise AssertionError("Stage 1 initial phase did not apply exactly one step")
+    checkpoint = paths.checkpoint_dir / f"checkpoint-{args.initial_steps}"
+    if (
+        int(first.trainer.state.global_step) != args.initial_steps
+        or not checkpoint.is_dir()
+    ):
+        raise AssertionError(
+            f"Stage 1 did not save a complete checkpoint-{args.initial_steps}"
+        )
+    if first.trainer._successful_optimizer_steps != args.initial_steps:
+        raise AssertionError("Stage 1 initial phase applied the wrong number of steps")
 
     artifact_kind = classify_stage1_artifact(checkpoint)
     adapter_checkpoint_present = (checkpoint / "adapter_model.safetensors").is_file()
@@ -267,23 +289,26 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
         fixture_root=fixture_root,
         method=args.method,
         deepspeed=profile.config_path,
-        max_steps=2,
+        max_steps=args.resumed_steps,
         resume=checkpoint,
     )
     resumed_args.deepspeed_runtime_profile = profile
     resumed = _build_resumed_stage1_components(args=resumed_args, profile=profile)
     resumed.trainer.collect_stage1_diagnostics = True
     resumed.trainer.train(resume_from_checkpoint=str(checkpoint))
-    if int(resumed.trainer.state.global_step) != 2:
-        raise AssertionError("Stage 1 resume did not advance from step 1 to step 2")
+    if int(resumed.trainer.state.global_step) != args.resumed_steps:
+        raise AssertionError(
+            "Stage 1 resume did not advance from step "
+            f"{args.initial_steps} to step {args.resumed_steps}"
+        )
     if resumed.trainer._successful_optimizer_steps != 1:
         raise AssertionError("Stage 1 resumed phase did not apply exactly one step")
 
     local_record = {
-        "initial_global_step": 1,
+        "initial_global_step": args.initial_steps,
         "resumed_global_step": int(resumed.trainer.state.global_step),
         "finite_gradient_norm": math.isfinite(observed_norm),
-        "successful_steps": 2,
+        "successful_steps": args.resumed_steps,
     }
     records = _collect_records(local_record)
     if any(record != records[0] for record in records[1:]):
@@ -298,11 +323,11 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
         "method": args.method,
         "artifact_kind": artifact_kind.value,
         "adapter_checkpoint_present": adapter_checkpoint_present,
-        "initial_global_step": 1,
-        "resumed_global_step": 2,
+        "initial_global_step": args.initial_steps,
+        "resumed_global_step": args.resumed_steps,
         "finite_gradient_norm": True,
         "representative_gradient_norm": observed_norm,
-        "successful_optimizer_steps": 2,
+        "successful_optimizer_steps": args.resumed_steps,
         "checkpoint": str(checkpoint),
         "experiment_id": paths.experiment_id,
     }

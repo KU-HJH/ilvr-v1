@@ -1,6 +1,7 @@
 """Pure fixed topology and launch planning for ILVR multi-node runs."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal, Sequence
 
 if __name__ == "__main__":
     # Keep runtime type checks stable when this module is executed with ``-m``.
@@ -141,6 +142,191 @@ class LaunchPlan:
             raise ValueError("deepspeed_config_digest must be a SHA-256 digest")
 
 
+@dataclass(frozen=True)
+class LifecycleCase:
+    """One deterministic cell in the four-rank save/resume matrix."""
+
+    stage: Literal["stage1", "stage2"]
+    method: Literal["full", "lora", "dora"]
+    zero_stage: Literal[1, 2, 3]
+    initial_steps: int = 2
+    resumed_steps: int = 3
+
+
+@dataclass(frozen=True)
+class LifecycleAttemptPlan:
+    """One existing coordinator invocation inside a lifecycle cell."""
+
+    attempt_id: Literal["initial", "resume"]
+    from_step: int
+    to_step: int
+    command: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LifecyclePlan:
+    """The two immutable coordinator commands for one matrix cell."""
+
+    case: LifecycleCase
+    child_run_id: str
+    main_process_port: int
+    witness_path: Path
+    initial: LifecycleAttemptPlan
+    resume: LifecycleAttemptPlan
+
+
+def build_lifecycle_matrix() -> tuple[LifecycleCase, ...]:
+    """Return the binding stage → method → ZeRO Cartesian order."""
+    return tuple(
+        LifecycleCase(stage=stage, method=method, zero_stage=zero_stage)
+        for stage in ("stage1", "stage2")
+        for method in ("full", "lora", "dora")
+        for zero_stage in (1, 2, 3)
+    )
+
+
+def _lifecycle_command(
+    *,
+    case: LifecycleCase,
+    child_run_id: str,
+    main_process_port: int,
+    attempt_id: Literal["initial", "resume"],
+    result_root: Path,
+    python_executable: str,
+) -> tuple[str, ...]:
+    to_step = case.initial_steps if attempt_id == "initial" else case.resumed_steps
+    environment: tuple[str, ...] = ()
+    if case.stage == "stage2":
+        assignments = [f"TUNING_METHOD={case.method}"]
+        if attempt_id == "resume":
+            resume_checkpoint = (
+                _REPOSITORY_ROOT
+                / "checkpoints"
+                / child_run_id
+                / f"checkpoint-{case.initial_steps}"
+            )
+            assignments.append(f"RESUME_CHECKPOINT={resume_checkpoint}")
+        environment = ("/usr/bin/env", *assignments)
+    command = (
+        *environment,
+        python_executable,
+        "-m",
+        "src.multinode",
+        f"train-{case.stage}",
+        "--run-id",
+        child_run_id,
+        "--attempt-id",
+        attempt_id,
+        "--zero-stage",
+        str(case.zero_stage),
+        "--main-process-port",
+        str(main_process_port),
+        "--result-root",
+        str(result_root),
+    )
+    if case.stage == "stage1":
+        command += (
+            "--method",
+            case.method,
+            "--micro-batch",
+            "2",
+            "--save-strategy",
+            "steps",
+            "--save-steps",
+            str(to_step),
+            "--max-steps",
+            str(to_step),
+            "--no-final-save",
+        )
+        if attempt_id == "resume":
+            command += (
+                "--resume",
+                str(
+                    _REPOSITORY_ROOT
+                    / "checkpoints"
+                    / child_run_id
+                    / f"checkpoint-{case.initial_steps}"
+                ),
+            )
+    else:
+        command += (
+            "--save_strategy",
+            "steps",
+            "--max_steps",
+            str(to_step),
+            "--no-save_final_model",
+        )
+    return command
+
+
+def build_lifecycle_plans(
+    *,
+    parent_run_id: str,
+    first_port: int,
+    result_root: str | Path,
+    python_executable: str,
+) -> tuple[LifecyclePlan, ...]:
+    """Validate all 18 identities and ports before constructing any side effect."""
+    _validate_identifier("parent_run_id", parent_run_id)
+    if type(first_port) is not int:
+        raise ValueError("the 18 ports require an integer first_port")
+    ports = tuple(first_port + offset for offset in range(18))
+    if (
+        len(set(ports)) != 18
+        or any(type(port) is not int or not 1024 <= port <= 65535 for port in ports)
+    ):
+        raise ValueError("all 18 ports must be unique and between 1024 and 65535")
+    root = Path(result_root)
+    if not root.is_absolute() or ".." in root.parts:
+        raise ValueError("result_root must be an absolute path without traversal")
+    if not isinstance(python_executable, str) or not python_executable:
+        raise ValueError("python_executable must be nonempty")
+
+    plans: list[LifecyclePlan] = []
+    for case, port in zip(build_lifecycle_matrix(), ports, strict=True):
+        child_run_id = (
+            f"{parent_run_id}-{case.stage}-{case.method}-zero{case.zero_stage}"
+        )
+        _validate_identifier("child_run_id", child_run_id)
+        initial_command = _lifecycle_command(
+            case=case,
+            child_run_id=child_run_id,
+            main_process_port=port,
+            attempt_id="initial",
+            result_root=root,
+            python_executable=python_executable,
+        )
+        resume_command = _lifecycle_command(
+            case=case,
+            child_run_id=child_run_id,
+            main_process_port=port,
+            attempt_id="resume",
+            result_root=root,
+            python_executable=python_executable,
+        )
+        plans.append(
+            LifecyclePlan(
+                case=case,
+                child_run_id=child_run_id,
+                main_process_port=port,
+                witness_path=root / parent_run_id / f"{child_run_id}.json",
+                initial=LifecycleAttemptPlan(
+                    attempt_id="initial",
+                    from_step=0,
+                    to_step=case.initial_steps,
+                    command=initial_command,
+                ),
+                resume=LifecycleAttemptPlan(
+                    attempt_id="resume",
+                    from_step=case.initial_steps,
+                    to_step=case.resumed_steps,
+                    command=resume_command,
+                ),
+            )
+        )
+    return tuple(plans)
+
+
 def _validate_identifier(name: str, value: object) -> None:
     if not isinstance(value, str) or not _RUN_ID_PATTERN.fullmatch(value):
         raise ValueError(f"{name} must match {_RUN_ID_PATTERN.pattern}")
@@ -216,6 +402,348 @@ def _json_ready(value: object) -> object:
     if isinstance(value, tuple):
         return [_json_ready(item) for item in value]
     return value
+
+
+_TRAINING_WITNESS_FIELDS = {
+    "schema_version",
+    "run_id",
+    "attempt_id",
+    "stage",
+    "method",
+    "zero_stage",
+    "batch_per_gpu",
+    "world_size",
+    "machine_ranks",
+    "exit_codes",
+    "checkpoint_path",
+    "finite_loss_evidence",
+}
+_FINITE_REFERENCE_FIELDS = {
+    "status",
+    "path",
+    "sha256",
+    "size",
+    "finite_loss",
+}
+
+
+def _strict_small_json(path: Path, *, description: str) -> dict[str, object]:
+    from src.multinode_runtime import _read_regular_file
+
+    try:
+        raw = _read_regular_file(path, maximum_size=1024 * 1024)
+
+        def reject_duplicate(pairs: Sequence[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"{description} contains a duplicate field")
+                result[key] = value
+            return result
+
+        payload = json.loads(raw, object_pairs_hook=reject_duplicate)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid {description}: {path}") from error
+    if type(payload) is not dict:
+        raise ValueError(f"invalid {description}: expected a JSON object")
+    return payload
+
+
+def _validate_matrix_training_witness(
+    path: Path,
+    *,
+    plan: LifecyclePlan,
+    attempt: LifecycleAttemptPlan,
+    result_root: Path,
+) -> None:
+    expected_path = (
+        result_root
+        / plan.child_run_id
+        / f"{attempt.attempt_id}-train-witness.json"
+    )
+    if path != expected_path:
+        raise ValueError("training witness path differs from the lifecycle plan")
+    payload = _strict_small_json(path, description="training witness")
+    if set(payload) != _TRAINING_WITNESS_FIELDS:
+        raise ValueError("training witness fields are invalid")
+    case = plan.case
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != 1
+        or type(payload["run_id"]) is not str
+        or payload["run_id"] != plan.child_run_id
+        or type(payload["attempt_id"]) is not str
+        or payload["attempt_id"] != attempt.attempt_id
+        or type(payload["stage"]) is not str
+        or payload["stage"] != case.stage
+        or type(payload["method"]) is not str
+        or payload["method"] != case.method
+        or type(payload["zero_stage"]) is not int
+        or payload["zero_stage"] != case.zero_stage
+        or type(payload["batch_per_gpu"]) is not int
+        or payload["batch_per_gpu"] <= 0
+        or type(payload["world_size"]) is not int
+        or payload["world_size"] != 4
+        or type(payload["machine_ranks"]) is not list
+        or payload["machine_ranks"] != [0, 1]
+        or any(type(rank) is not int for rank in payload["machine_ranks"])
+        or type(payload["exit_codes"]) is not dict
+        or payload["exit_codes"] != {"0": 0, "1": 0}
+        or any(type(code) is not int for code in payload["exit_codes"].values())
+        or type(payload["checkpoint_path"]) is not str
+    ):
+        raise ValueError("training witness identity is invalid")
+    checkpoint_root = Path(payload["checkpoint_path"])
+    if checkpoint_root.name != plan.child_run_id:
+        raise ValueError("training witness checkpoint identity is invalid")
+    checkpoint = checkpoint_root / f"checkpoint-{attempt.to_step}"
+    if checkpoint.is_symlink() or not checkpoint.is_dir():
+        raise ValueError("training witness is missing its numbered checkpoint")
+    if not any(
+        child.is_file() and not child.is_symlink() and child.stat().st_size > 0
+        for child in checkpoint.rglob("*")
+    ):
+        raise ValueError("training witness checkpoint has no collected shard output")
+
+    finite = payload["finite_loss_evidence"]
+    if type(finite) is not dict or set(finite) != _FINITE_REFERENCE_FIELDS:
+        raise ValueError("training witness finite evidence fields are invalid")
+    if (
+        finite["status"] != "validated"
+        or finite["finite_loss"] is not True
+        or type(finite["path"]) is not str
+        or type(finite["sha256"]) is not str
+        or len(finite["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in finite["sha256"])
+        or type(finite["size"]) is not int
+        or finite["size"] <= 0
+    ):
+        raise ValueError("training witness finite evidence is invalid")
+    finite_path = Path(finite["path"])
+    expected_finite = (
+        result_root
+        / plan.child_run_id
+        / f"{attempt.attempt_id}-producer-evidence.json"
+    )
+    if finite_path != expected_finite:
+        raise ValueError("training witness finite evidence path is invalid")
+    from src.multinode_runtime import _read_regular_file
+
+    evidence_bytes = _read_regular_file(finite_path, maximum_size=1024 * 1024)
+    if (
+        len(evidence_bytes) != finite["size"]
+        or hashlib.sha256(evidence_bytes).hexdigest() != finite["sha256"]
+    ):
+        raise ValueError("training witness finite evidence digest is invalid")
+    evidence = json.loads(evidence_bytes)
+    benchmark = evidence.get("benchmark_evidence", evidence) if type(evidence) is dict else None
+    if type(benchmark) is not dict or benchmark.get("finite_loss") is not True:
+        raise ValueError("training witness does not prove finite loss")
+
+
+def _run_lifecycle_attempt(
+    plan: LifecyclePlan,
+    attempt: LifecycleAttemptPlan,
+    *,
+    result_root: Path,
+    command_runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+) -> dict[str, object]:
+    completed = command_runner(attempt.command)
+    if type(completed.returncode) is not int or completed.returncode != 0:
+        raise RuntimeError(
+            f"lifecycle {plan.child_run_id}/{attempt.attempt_id} failed without retry: "
+            f"exit={completed.returncode} stderr={str(completed.stderr)[-4096:]}"
+        )
+    try:
+        output = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("coordinator output is not one bounded JSON object") from error
+    if type(output) is not dict or set(output) != {"training_witness"}:
+        raise ValueError("coordinator output fields are invalid")
+    if type(output["training_witness"]) is not str:
+        raise ValueError("coordinator training witness path is invalid")
+    witness_path = Path(output["training_witness"])
+    _validate_matrix_training_witness(
+        witness_path,
+        plan=plan,
+        attempt=attempt,
+        result_root=result_root,
+    )
+    method_artifact = (
+        "full" if plan.case.method == "full" else f"peft-{plan.case.method}"
+    )
+    return {
+        "attempt_id": attempt.attempt_id,
+        "from_step": attempt.from_step,
+        "to_step": attempt.to_step,
+        "exit_code": completed.returncode,
+        "machine_ranks": [0, 1],
+        "process_ranks": [0, 1, 2, 3],
+        "checkpoint": f"checkpoint-{attempt.to_step}",
+        "method_artifact": method_artifact,
+        "finite_loss": True,
+        "finite_gradient": True,
+        "worker_errors": [],
+    }
+
+
+def _default_lifecycle_command_runner(
+    command: Sequence[str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def run_lifecycle_matrix(
+    *,
+    parent_run_id: str,
+    first_port: int,
+    result_root: str | Path,
+    python_executable: str,
+    command_runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] = (
+        _default_lifecycle_command_runner
+    ),
+    dry_run: bool = False,
+) -> tuple[LifecyclePlan, ...]:
+    """Run each initial/resume pair serially and complete only after all 18."""
+    plans = build_lifecycle_plans(
+        parent_run_id=parent_run_id,
+        first_port=first_port,
+        result_root=result_root,
+        python_executable=python_executable,
+    )
+    if dry_run:
+        return plans
+    root = Path(result_root)
+    matrix_root = root / parent_run_id
+    completion_path = matrix_root / "matrix-complete.json"
+    if os.path.lexists(matrix_root):
+        raise FileExistsError(
+            f"parent result namespace must be fresh: {matrix_root}"
+        )
+    if os.path.lexists(completion_path):
+        raise FileExistsError(f"matrix completion must be fresh: {completion_path}")
+    matrix_root.mkdir(parents=True, exist_ok=False)
+
+    from src.multinode_runtime import _canonical_json_bytes, _publish_bytes_no_replace
+
+    completed_cases: list[dict[str, object]] = []
+    for plan in plans:
+        initial = _run_lifecycle_attempt(
+            plan,
+            plan.initial,
+            result_root=root,
+            command_runner=command_runner,
+        )
+        resume = _run_lifecycle_attempt(
+            plan,
+            plan.resume,
+            result_root=root,
+            command_runner=command_runner,
+        )
+        case = plan.case
+        case_payload = {
+            "schema_version": 1,
+            "kind": "multinode-lifecycle-case",
+            "parent_run_id": parent_run_id,
+            "child_run_id": plan.child_run_id,
+            "stage": case.stage,
+            "method": case.method,
+            "zero_stage": case.zero_stage,
+            "world_size": 4,
+            "main_process_port": plan.main_process_port,
+            "attempts": [initial, resume],
+        }
+        _publish_bytes_no_replace(
+            plan.witness_path,
+            _canonical_json_bytes(case_payload) + b"\n",
+        )
+        completed_cases.append(
+            {
+                "stage": case.stage,
+                "method": case.method,
+                "zero_stage": case.zero_stage,
+                "child_run_id": plan.child_run_id,
+                "main_process_port": plan.main_process_port,
+                "witness": plan.witness_path.name,
+                "exit_codes": [initial["exit_code"], resume["exit_code"]],
+            }
+        )
+    completion = {
+        "schema_version": 1,
+        "kind": "multinode-lifecycle-matrix-complete",
+        "run_id": parent_run_id,
+        "world_size": 4,
+        "first_port": first_port,
+        "cases": completed_cases,
+    }
+    _publish_bytes_no_replace(
+        completion_path,
+        _canonical_json_bytes(completion) + b"\n",
+    )
+    return plans
+
+
+def _lifecycle_plan_json(plan: LifecyclePlan) -> dict[str, object]:
+    return {
+        "stage": plan.case.stage,
+        "method": plan.case.method,
+        "zero_stage": plan.case.zero_stage,
+        "child_run_id": plan.child_run_id,
+        "main_process_port": plan.main_process_port,
+        "initial": {
+            "attempt_id": plan.initial.attempt_id,
+            "from_step": plan.initial.from_step,
+            "to_step": plan.initial.to_step,
+            "command": list(plan.initial.command),
+        },
+        "resume": {
+            "attempt_id": plan.resume.attempt_id,
+            "from_step": plan.resume.from_step,
+            "to_step": plan.resume.to_step,
+            "command": list(plan.resume.command),
+        },
+    }
+
+
+def _lifecycle_matrix_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode lifecycle-matrix", allow_abbrev=False
+    )
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--first-port", required=True, type=int)
+    parser.add_argument("--result-root", default=str(_REPOSITORY_ROOT / "results"))
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        plans = run_lifecycle_matrix(
+            parent_run_id=args.run_id,
+            first_port=args.first_port,
+            result_root=args.result_root,
+            python_executable=sys.executable,
+            dry_run=args.dry_run,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    if args.dry_run:
+        for plan in plans:
+            print(json.dumps(_lifecycle_plan_json(plan), sort_keys=True))
+    else:
+        print(
+            json.dumps(
+                {
+                    "matrix_complete": str(
+                        Path(args.result_root) / args.run_id / "matrix-complete.json"
+                    )
+                },
+                sort_keys=True,
+            )
+        )
+    return 0
 
 
 def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1366,6 +1894,12 @@ def _evaluate_main(argv: list[str]) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "lifecycle-matrix":
+        return _lifecycle_matrix_main(argv[1:])
+    if argv and argv[0] == "validate-results":
+        from src.multinode_results import validate_results_main
+
+        return validate_results_main(argv[1:])
     if argv and argv[0] == "capacity-stage1":
         from src.multinode_capacity import capacity_stage1_main
 

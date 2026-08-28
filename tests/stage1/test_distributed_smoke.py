@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import os
+import platform
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+_platform_python_version = platform.python_version
+if _platform_python_version().endswith("+"):
+    platform.python_version = lambda: _platform_python_version().rstrip("+")
+
 from transformers.integrations.deepspeed import (
     is_deepspeed_zero3_enabled,
     set_hf_deepspeed_config,
@@ -17,6 +23,8 @@ from tests.stage1.zero_compat_diagnostic import (
     SUPPORTED_DIAGNOSTIC_METHODS,
     build_zero_compat_parser,
 )
+
+platform.python_version = _platform_python_version
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +60,59 @@ def test_stage1_diagnostic_accepts_all_supported_pairs(stage, method):
         ]
     )
     assert (args.zero_stage, args.method) == (stage, method)
+
+
+def test_stage1_tiny_parser_preserves_defaults_and_accepts_lifecycle_steps():
+    """Catches matrix step controls changing the legacy 1-to-2 lifecycle."""
+    parser = build_zero_compat_parser()
+    base = [
+        "--zero-stage",
+        "3",
+        "--method",
+        "dora",
+        "--deepspeed",
+        "configs/deepspeed_zero3.json",
+        "--experiment-id",
+        "stage1-zero3-dora",
+    ]
+
+    defaults = parser.parse_args(base)
+    requested = parser.parse_args(
+        [*base, "--initial-steps", "2", "--resumed-steps", "3"]
+    )
+
+    assert (defaults.initial_steps, defaults.resumed_steps) == (1, 2)
+    assert (requested.initial_steps, requested.resumed_steps) == (2, 3)
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        ("0", "1"),
+        ("2", "2"),
+        ("2", "4"),
+    ],
+)
+def test_stage1_tiny_parser_rejects_invalid_lifecycle_steps(steps):
+    """Catches non-positive or non-contiguous resume controls reaching CUDA."""
+    parser = build_zero_compat_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--zero-stage",
+                "1",
+                "--method",
+                "full",
+                "--deepspeed",
+                "configs/deepspeed_zero1.json",
+                "--experiment-id",
+                "stage1-zero1-full",
+                "--initial-steps",
+                steps[0],
+                "--resumed-steps",
+                steps[1],
+            ]
+        )
 
 
 def test_stage1_diagnostic_has_no_arbitrary_generated_path_arguments():

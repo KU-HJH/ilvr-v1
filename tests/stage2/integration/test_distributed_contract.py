@@ -161,6 +161,50 @@ def test_tiny_stage2_harness_owns_checkpoint_and_witness_by_one_id():
         )
 
 
+def test_stage2_tiny_parser_preserves_defaults_and_accepts_lifecycle_steps():
+    """Catches matrix step controls changing the legacy 1-to-2 lifecycle."""
+    parser = _load_harness_module().build_tiny_stage2_parser()
+
+    defaults = parser.parse_args(["--experiment-id", "stage2-defaults"])
+    requested = parser.parse_args(
+        [
+            "--experiment-id",
+            "stage2-requested",
+            "--initial-steps",
+            "2",
+            "--resumed-steps",
+            "3",
+        ]
+    )
+
+    assert (defaults.initial_steps, defaults.resumed_steps) == (1, 2)
+    assert (requested.initial_steps, requested.resumed_steps) == (2, 3)
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        ("0", "1"),
+        ("2", "2"),
+        ("2", "4"),
+    ],
+)
+def test_stage2_tiny_parser_rejects_invalid_lifecycle_steps(steps):
+    """Catches non-positive or non-contiguous resume controls reaching CUDA."""
+    parser = _load_harness_module().build_tiny_stage2_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--experiment-id",
+                "stage2-invalid-steps",
+                "--initial-steps",
+                steps[0],
+                "--resumed-steps",
+                steps[1],
+            ]
+        )
+
+
 @pytest.mark.parametrize("zero_stage", [1, 2, 3])
 def test_rank_skew_harness_supports_each_canonical_zero_stage(zero_stage):
     """Catches a canonical ZeRO profile becoming unlaunchable for the probe."""
