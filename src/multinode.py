@@ -29,6 +29,7 @@ from src.multinode_runtime import (
     _proc_start_ticks,
     build_owned_tmux_commands,
     build_preflight_commands,
+    collect_checkpoint_artifacts,
     collect_node_snapshot,
     prepare_attempt_directory,
     receive_launch_plan,
@@ -683,6 +684,87 @@ def _exit_show(argv: list[str]) -> int:
     return 0
 
 
+def _artifact_manifest(argv: list[str]) -> int:
+    from src.multinode_artifacts import build_node_manifest
+
+    parser = argparse.ArgumentParser(prog="python -m src.multinode artifact-manifest")
+    parser.add_argument("--run-directory", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--node-rank", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--process-rank", type=int, action="append", required=True)
+    parser.add_argument("--runtime-identity-json", required=True)
+    parser.add_argument("--completion-marker", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        identity = json.loads(args.runtime_identity_json)
+        if type(identity) is not dict:
+            raise ValueError("runtime identity must be a JSON object")
+        manifest = build_node_manifest(
+            args.run_directory,
+            node_rank=args.node_rank,
+            process_ranks=tuple(args.process_rank),
+            run_id=args.run_id,
+            runtime_identity=identity,
+            completion_marker=args.completion_marker,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    print(json.dumps(manifest.to_json(), sort_keys=True))
+    return 0
+
+
+def _artifact_destination_check(argv: list[str]) -> int:
+    from src.multinode_artifacts import (
+        ArtifactEntry,
+        validate_transfer_destination,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode artifact-destination-check"
+    )
+    parser.add_argument("--run-directory", required=True)
+    parser.add_argument("--run-id", required=True)
+    args = parser.parse_args(argv)
+    try:
+        run_directory = Path(args.run_directory)
+        if (
+            not run_directory.is_absolute()
+            or ".." in run_directory.parts
+            or run_directory.name != args.run_id
+        ):
+            raise ValueError("artifact destination must be the run-owned directory")
+        raw = sys.stdin.buffer.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("artifact destination request exceeds the size limit")
+        payload = json.loads(raw)
+        if type(payload) is not dict or set(payload) != {
+            "entries",
+            "runtime_identity",
+        }:
+            raise ValueError("invalid artifact destination request fields")
+        if (
+            type(payload["entries"]) is not list
+            or type(payload["runtime_identity"]) is not dict
+        ):
+            raise ValueError("invalid artifact destination request values")
+        if payload["runtime_identity"].get("run_id") != args.run_id:
+            raise ValueError("artifact destination request run ID mismatch")
+        entries = tuple(ArtifactEntry.from_json(item) for item in payload["entries"])
+        destinations = tuple(run_directory / entry.relative_path for entry in entries)
+        allowed_common = {
+            run_directory / entry.relative_path: entry.byte_size
+            for entry in entries
+            if entry.is_common_metadata
+        }
+        validate_transfer_destination(
+            destinations,
+            validated_identical_common_metadata=allowed_common,
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    return 0
+
+
 def _argument_value(arguments: tuple[str, ...], option: str) -> str | None:
     result: str | None = None
     index = 0
@@ -909,6 +991,23 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         )
         if exit_codes != {0: 0, 1: 0}:
             raise RuntimeError(f"multi-node training failed: exit_codes={exit_codes}")
+        artifact_identity = {
+            "stage": plan.stage,
+            "tuning_method": plan.tuning_method,
+            "zero_stage": plan.zero_stage,
+            "deepspeed_config_digest": plan.deepspeed_config_digest,
+            "world_size": plan.world_size,
+            "rank_mapping": {"0": [0, 1], "1": [2, 3]},
+            "commit": commit,
+            "run_id": plan.run_id,
+        }
+        collect_checkpoint_artifacts(
+            runner,
+            checkpoint_path=checkpoint_path,
+            runtime_identity=artifact_identity,
+            exit_codes=exit_codes,
+            world_size=plan.world_size,
+        )
         if stage == "stage1":
             batch_value = _argument_value(forwarded, "--micro-batch") or "8"
             batch_per_gpu = int(batch_value)
@@ -964,6 +1063,10 @@ def _main(argv: list[str] | None = None) -> int:
         return _signal_owned(argv[1:])
     if argv and argv[0] == "exit-show":
         return _exit_show(argv[1:])
+    if argv and argv[0] == "artifact-manifest":
+        return _artifact_manifest(argv[1:])
+    if argv and argv[0] == "artifact-destination-check":
+        return _artifact_destination_check(argv[1:])
     if argv and argv[0] == "prepare-attempt":
         internal = argparse.ArgumentParser(prog="python -m src.multinode prepare-attempt")
         internal.add_argument("--log-root", required=True)

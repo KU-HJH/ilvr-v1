@@ -159,6 +159,15 @@ def _publish_bytes_no_replace(path: str | Path, payload: bytes) -> Path:
     return destination
 
 
+def publish_small_file(path: str | Path, payload: bytes) -> Path:
+    """Publish bounded control metadata through the trusted no-replace path."""
+    if not isinstance(payload, bytes):
+        raise TypeError("small publication payload must be bytes")
+    if len(payload) > _MAX_TRANSFER_BYTES:
+        raise ValueError("small publication payload exceeds the size limit")
+    return _publish_bytes_no_replace(path, payload)
+
+
 def _read_regular_file(path: str | Path, *, maximum_size: int = _MAX_TRANSFER_BYTES) -> bytes:
     source = _trusted_absolute_path(path)
     parent_descriptor = _open_trusted_directory(source.parent)
@@ -1213,6 +1222,7 @@ class SubprocessCoordinatorRunner:
         self.command_runner = command_runner
         self.serialized_plan: SerializedLaunchPlan | None = None
         self._seen_ownership: set[int] = set()
+        self._artifact_checkpoint_paths: dict[int, Path] = {}
 
     def _run(
         self, command: Sequence[str], *, input_bytes: bytes | None = None
@@ -1533,6 +1543,118 @@ class SubprocessCoordinatorRunner:
             self.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         return False
 
+    def read_artifact_manifest(
+        self,
+        machine_rank: int,
+        checkpoint_path: Path,
+        runtime_identity: Mapping[str, object],
+    ) -> object:
+        """Collect one bounded node-local lstat manifest through the node CLI."""
+        from src.multinode_artifacts import NodeArtifactManifest
+
+        ranks = (0, 1) if machine_rank == 0 else (2, 3)
+        arguments = [
+            "--run-directory",
+            str(checkpoint_path),
+            "--run-id",
+            self.plan.run_id,
+            "--node-rank",
+            str(machine_rank),
+            "--runtime-identity-json",
+            json.dumps(
+                runtime_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+            "--completion-marker",
+        ]
+        for rank in ranks:
+            arguments.extend(("--process-rank", str(rank)))
+        completed = self._run(
+            self._internal_command(machine_rank, "artifact-manifest", arguments)
+        )
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise ValueError("artifact-manifest returned invalid JSON") from error
+        manifest = NodeArtifactManifest.from_json(payload)
+        if manifest.node_rank != machine_rank or manifest.run_id != self.plan.run_id:
+            raise ValueError("artifact manifest differs from requested node identity")
+        self._artifact_checkpoint_paths[machine_rank] = checkpoint_path
+        return manifest
+
+    def validate_push_destination(
+        self, manifest: object, entries: Sequence[object]
+    ) -> None:
+        """Ask the canonical owner to prove every selected destination is fresh."""
+        from src.multinode_artifacts import ArtifactEntry, NodeArtifactManifest
+
+        if not isinstance(manifest, NodeArtifactManifest) or manifest.node_rank != 1:
+            raise ValueError("push validation requires the local node manifest")
+        if not all(isinstance(entry, ArtifactEntry) for entry in entries):
+            raise TypeError("push entries must be ArtifactEntry values")
+        destination = self._artifact_checkpoint_paths.get(0)
+        if destination is None:
+            raise ValueError("remote artifact manifest must be collected first")
+        payload = {
+            "entries": [entry.to_json() for entry in entries],
+            "runtime_identity": manifest.runtime_identity,
+        }
+        encoded = (
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        if len(encoded) > _MAX_TRANSFER_BYTES:
+            raise ValueError("artifact destination request exceeds the size limit")
+        python = (
+            self.plan.cluster.remote_repo_root
+            / "venv"
+            / "ilvr-venv"
+            / "bin"
+            / "python"
+        )
+        command = (
+            str(python),
+            "-m",
+            "src.multinode",
+            "artifact-destination-check",
+            "--run-directory",
+            str(destination),
+            "--run-id",
+            self.plan.run_id,
+        )
+        self._run(_build_remote_stdin_exec(command), input_bytes=encoded)
+
+    def push_artifacts(
+        self, manifest: object, entries: Sequence[object]
+    ) -> None:
+        """Push only the prevalidated local manifest list; never move sources."""
+        from src.multinode_artifacts import (
+            ArtifactEntry,
+            NodeArtifactManifest,
+            build_push_command,
+            publish_files_list,
+        )
+
+        if not isinstance(manifest, NodeArtifactManifest) or manifest.node_rank != 1:
+            raise ValueError("artifact push requires the local node manifest")
+        if not all(isinstance(entry, ArtifactEntry) for entry in entries):
+            raise TypeError("push entries must be ArtifactEntry values")
+        files_path = (
+            self.log_root
+            / self.plan.run_id
+            / self.plan.attempt_id
+            / "artifact-push-rank1.files"
+        )
+        publish_files_list(files_path, entries)  # type: ignore[arg-type]
+        self._run(build_push_command(manifest, files_from=files_path))
+
 
 class CoordinatorRunner(Protocol):
     def prepare_plan(self, plan: "LaunchPlan") -> None: ...
@@ -1608,6 +1730,50 @@ class OwnedProcessRunner(Protocol):
     def poll_exit(self, machine_rank: int) -> int | None: ...
     def sleep(self, seconds: float) -> None: ...
     def cleanup_owned(self, machine_rank: int, *, timeout_seconds: float) -> bool: ...
+
+
+class ArtifactCollectionRunner(Protocol):
+    def read_artifact_manifest(
+        self,
+        machine_rank: int,
+        checkpoint_path: Path,
+        runtime_identity: Mapping[str, object],
+    ) -> object: ...
+
+    def validate_push_destination(
+        self, manifest: object, entries: Sequence[object]
+    ) -> None: ...
+
+    def push_artifacts(
+        self, manifest: object, entries: Sequence[object]
+    ) -> None: ...
+
+
+def collect_checkpoint_artifacts(
+    runner: ArtifactCollectionRunner,
+    *,
+    checkpoint_path: str | Path,
+    runtime_identity: Mapping[str, object],
+    exit_codes: Mapping[int, int],
+    world_size: int,
+) -> tuple[object, ...]:
+    """Collect local shards only after both node supervisors prove exit zero."""
+    from src.multinode_artifacts import validate_collection
+
+    if dict(exit_codes) != {0: 0, 1: 0}:
+        raise ValueError("checkpoint collection requires zero exits from both nodes")
+    checkpoint = Path(checkpoint_path)
+    remote = runner.read_artifact_manifest(0, checkpoint, runtime_identity)
+    local = runner.read_artifact_manifest(1, checkpoint, runtime_identity)
+    combined = validate_collection((remote, local), world_size=world_size)
+    local_entries = tuple(
+        entry
+        for entry in local.entries
+        if entry.is_common_metadata or entry.process_rank in (2, 3)
+    )
+    runner.validate_push_destination(local, local_entries)
+    runner.push_artifacts(local, local_entries)
+    return combined
 
 
 def stop_owned_peer(record: OwnershipRecord, runner: OwnedProcessRunner) -> None:
