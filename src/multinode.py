@@ -2,7 +2,9 @@
 
 import argparse
 import json
+import os
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -11,16 +13,35 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Literal
 
+if __name__ == "__main__":
+    # Keep runtime type checks stable when this module is executed with ``-m``.
+    sys.modules.setdefault("src.multinode", sys.modules[__name__])
+
 from src.deepspeed_runtime import (
     canonical_deepspeed_config_path,
     load_deepspeed_runtime_profile,
 )
 from src.multinode_runtime import (
     NodeSnapshot,
+    OwnershipRecord,
+    SubprocessCoordinatorRunner,
+    _nul_fields,
+    _proc_start_ticks,
+    build_owned_tmux_commands,
     build_preflight_commands,
     collect_node_snapshot,
+    read_ownership,
+    monitor_owned_jobs,
+    start_rank0_then_rank1,
+    validate_owned_process,
+    validate_ownership,
     validate_node_config_digest,
     validate_preflight,
+    validate_stage1_arguments,
+    validate_stage2_arguments,
+    validated_stage2_environment,
+    write_ownership,
+    write_training_witness,
 )
 
 
@@ -319,7 +340,487 @@ def _remote_master_port_is_free(port: int) -> bool:
     return True
 
 
+def _environment_assignments(values: list[str]) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for assignment in values:
+        name, separator, value = assignment.partition("=")
+        if not separator or not name or name in environment:
+            raise ValueError("--env requires a unique NAME=VALUE assignment")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or "\0" in value:
+            raise ValueError("--env contains an invalid environment assignment")
+        environment[name] = value
+    return environment
+
+
+def _node_run(argv: list[str]) -> int:
+    if "--" not in argv:
+        raise ValueError("node-run requires -- followed by the Stage launcher command")
+    separator = argv.index("--")
+    parser = argparse.ArgumentParser(prog="python -m src.multinode node-run")
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--machine-rank", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--ownership-path", required=True)
+    parser.add_argument("--env", action="append", default=[])
+    args = parser.parse_args(argv[:separator])
+    command = tuple(argv[separator + 1 :])
+    environment = _environment_assignments(args.env)
+    ownership = OwnershipRecord.create(
+        run_id=args.run_id,
+        attempt_id=args.attempt_id,
+        machine_rank=args.machine_rank,
+        pid=os.getpid(),
+        process_start_ticks=_proc_start_ticks(os.getpid()),
+        commit=args.commit,
+        command=command,
+        environment=environment,
+    )
+    write_ownership(args.ownership_path, ownership)
+    child_environment = os.environ.copy()
+    child_environment.update(environment)
+    child_environment["ILVR_OWNED_COMMAND_DIGEST"] = ownership.command_digest
+    os.execvpe(command[0], command, child_environment)
+    raise AssertionError("os.execvpe returned unexpectedly")
+
+
+def _write_exit_record(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="python -m src.multinode node-exit")
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--machine-rank", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--exit-path", required=True)
+    parser.add_argument("--ownership-path", required=True)
+    parser.add_argument("--command-digest", required=True)
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--exit-code", type=int, required=True)
+    args = parser.parse_args(argv)
+    ownership = read_ownership(args.ownership_path)
+    validate_ownership(
+        ownership,
+        expected_run_id=args.run_id,
+        expected_attempt_id=args.attempt_id,
+        expected_machine_rank=args.machine_rank,
+        expected_pid=ownership.pid,
+        expected_commit=args.commit,
+        expected_command_digest=args.command_digest,
+        observed_start_ticks=ownership.process_start_ticks,
+    )
+    exit_path = Path(args.exit_path)
+    payload = {
+        "schema_version": 1,
+        **ownership.to_json(),
+        "exit_code": args.exit_code,
+    }
+    descriptor = os.open(exit_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(exit_path, 0o600)
+    return 0
+
+
+def _ownership_show(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="python -m src.multinode ownership-show")
+    parser.add_argument("--ownership-path", required=True)
+    args = parser.parse_args(argv)
+    print(json.dumps(read_ownership(args.ownership_path).to_json(), sort_keys=True))
+    return 0
+
+
+def _owned_process_info(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode owned-process-info"
+    )
+    parser.add_argument("--pid", type=int, required=True)
+    parser.add_argument("--environment-name", action="append", default=[])
+    args = parser.parse_args(argv)
+    if len(set(args.environment_name)) != len(args.environment_name):
+        raise ValueError("environment names must be unique")
+    process_directory = Path("/proc") / str(args.pid)
+    command = _nul_fields(process_directory / "cmdline")
+    environment_names = {*args.environment_name, "ILVR_OWNED_COMMAND_DIGEST"}
+    environment: dict[str, str] = {}
+    for assignment in _nul_fields(process_directory / "environ"):
+        name, separator, value = assignment.partition("=")
+        if separator and name in environment_names:
+            environment[name] = value
+    print(
+        json.dumps(
+            {
+                "command": command,
+                "environment": environment,
+                "process_start_ticks": _proc_start_ticks(args.pid),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _owned_validation_arguments(
+    argv: list[str], *, prog: str, include_signal_identity: bool
+) -> tuple[argparse.Namespace, tuple[str, ...], dict[str, str]]:
+    if "--" not in argv:
+        raise ValueError(f"{prog} requires -- followed by the exact Stage command")
+    separator = argv.index("--")
+    parser = argparse.ArgumentParser(prog=f"python -m src.multinode {prog}")
+    parser.add_argument("--ownership-path", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--machine-rank", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--command-digest", required=True)
+    parser.add_argument("--env", action="append", default=[])
+    if include_signal_identity:
+        parser.add_argument("--pid", type=int, required=True)
+        parser.add_argument("--process-start-ticks", type=int, required=True)
+    else:
+        parser.add_argument("--master-addr", required=True)
+        parser.add_argument("--main-process-port", type=int, required=True)
+    args = parser.parse_args(argv[:separator])
+    return args, tuple(argv[separator + 1 :]), _environment_assignments(args.env)
+
+
+def _ownership_ready(argv: list[str]) -> int:
+    args, command, environment = _owned_validation_arguments(
+        argv, prog="ownership-ready", include_signal_identity=False
+    )
+    ownership = read_ownership(args.ownership_path)
+    if ownership.command_digest != args.command_digest:
+        raise ValueError("ownership command digest mismatch")
+    validate_owned_process(
+        ownership,
+        expected_run_id=args.run_id,
+        expected_attempt_id=args.attempt_id,
+        expected_machine_rank=args.machine_rank,
+        expected_commit=args.commit,
+        expected_command=command,
+        expected_environment=environment,
+    )
+    if args.master_addr != ClusterSpec.default().master_addr:
+        raise ValueError("readiness master address must match the fixed topology")
+    if not 1024 <= args.main_process_port <= 65535:
+        raise ValueError("readiness port must be between 1024 and 65535")
+    probe = socket.create_connection(
+        (args.master_addr, args.main_process_port), timeout=0.2
+    )
+    probe.close()
+    return 0
+
+
+def _signal_owned(argv: list[str]) -> int:
+    args, command, environment = _owned_validation_arguments(
+        argv, prog="signal-owned", include_signal_identity=True
+    )
+    ownership = read_ownership(args.ownership_path)
+    validate_ownership(
+        ownership,
+        expected_run_id=args.run_id,
+        expected_attempt_id=args.attempt_id,
+        expected_machine_rank=args.machine_rank,
+        expected_pid=args.pid,
+        expected_commit=args.commit,
+        expected_command_digest=args.command_digest,
+        observed_start_ticks=args.process_start_ticks,
+    )
+    validate_owned_process(
+        ownership,
+        expected_run_id=args.run_id,
+        expected_attempt_id=args.attempt_id,
+        expected_machine_rank=args.machine_rank,
+        expected_commit=args.commit,
+        expected_command=command,
+        expected_environment=environment,
+    )
+    os.kill(ownership.pid, signal.SIGTERM)
+    return 0
+
+
+def _exit_show(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="python -m src.multinode exit-show")
+    parser.add_argument("--exit-path", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--machine-rank", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--command-digest", required=True)
+    args = parser.parse_args(argv)
+    path = Path(args.exit_path)
+    if path.is_symlink() or not path.is_file():
+        return 3
+    payload = json.loads(path.read_bytes())
+    expected_fields = {
+        "schema_version",
+        "run_id",
+        "attempt_id",
+        "machine_rank",
+        "pid",
+        "process_start_ticks",
+        "commit",
+        "command_digest",
+        "exit_code",
+    }
+    if type(payload) is not dict or set(payload) != expected_fields:
+        raise ValueError("invalid exit record fields")
+    ownership = OwnershipRecord.from_json(
+        {name: value for name, value in payload.items() if name != "exit_code"}
+    )
+    validate_ownership(
+        ownership,
+        expected_run_id=args.run_id,
+        expected_attempt_id=args.attempt_id,
+        expected_machine_rank=args.machine_rank,
+        expected_pid=ownership.pid,
+        expected_commit=args.commit,
+        expected_command_digest=args.command_digest,
+        observed_start_ticks=ownership.process_start_ticks,
+    )
+    if type(payload["exit_code"]) is not int:
+        raise ValueError("exit code must be an integer")
+    print(json.dumps({"exit_code": payload["exit_code"]}, sort_keys=True))
+    return 0
+
+
+def _argument_value(arguments: tuple[str, ...], option: str) -> str | None:
+    result: str | None = None
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == option:
+            result = arguments[index + 1]
+            index += 2
+            continue
+        if token.startswith(f"{option}="):
+            result = token.split("=", 1)[1]
+        index += 1
+    return result
+
+
+def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=f"python -m src.multinode train-{stage}"
+    )
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", default="initial")
+    parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)
+    parser.add_argument("--main-process-port", type=int, required=True)
+    parser.add_argument("--result-root", default=str(_REPOSITORY_ROOT / "results"))
+    parser.add_argument("--dry-run", action="store_true")
+    args, stage_arguments = parser.parse_known_args(argv)
+    try:
+        result_root = Path(args.result_root)
+        canonical_result_root = _REPOSITORY_ROOT / "results"
+        if not result_root.is_absolute() or ".." in result_root.parts:
+            raise ValueError("result_root must be an absolute path without traversal")
+        try:
+            result_root.relative_to(canonical_result_root)
+        except ValueError as error:
+            raise ValueError(
+                "result_root must be inside /root/workspace/ILVR/results"
+            ) from error
+        forwarded = tuple(stage_arguments)
+        if stage == "stage1":
+            forwarded = validate_stage1_arguments(forwarded)
+            tuning_method = _argument_value(forwarded, "--method")
+            if tuning_method not in ("full", "lora", "dora"):
+                raise ValueError("Stage 1 requires --method full, lora, or dora")
+            stage_environment: dict[str, str] = {}
+            resume_requested = _argument_value(forwarded, "--resume") is not None
+        else:
+            forwarded = validate_stage2_arguments(forwarded)
+            tuning_method = os.environ.get("TUNING_METHOD", "full")
+            if tuning_method not in ("full", "lora", "dora"):
+                raise ValueError("TUNING_METHOD must be full, lora, or dora")
+            output_dir = _REPOSITORY_ROOT / "checkpoints" / args.run_id
+            log_file = (
+                _REPOSITORY_ROOT
+                / "logs"
+                / "zero-stage-compatibility"
+                / args.run_id
+                / f"{args.attempt_id}-train.log"
+            )
+            stage_environment = validated_stage2_environment(
+                os.environ,
+                output_dir=str(output_dir),
+                log_file=str(log_file),
+                deepspeed_config=str(canonical_deepspeed_config(args.zero_stage)),
+            )
+            resume_requested = "RESUME_CHECKPOINT" in stage_environment
+        if resume_requested and args.attempt_id == "initial":
+            raise ValueError("resume requires a fresh --attempt-id, not 'initial'")
+        plan = build_launch_plan(
+            stage=stage,
+            tuning_method=tuning_method,
+            zero_stage=args.zero_stage,
+            run_id=args.run_id,
+            main_process_port=args.main_process_port,
+            attempt_id=args.attempt_id,
+        )
+        source_repository = Path(__file__).resolve().parents[1]
+        commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=source_repository)
+        commands = build_owned_tmux_commands(
+            plan,
+            commit=commit,
+            stage_arguments=forwarded,
+            stage_environment=stage_environment,
+            result_root=result_root,
+        )
+        if args.dry_run:
+            print(
+                json.dumps(
+                    {
+                        "command_digests": commands.command_digests,
+                        "local": commands.local,
+                        "plan": _json_ready(plan),
+                        "remote": commands.remote,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        checkpoint_root = _REPOSITORY_ROOT / "checkpoints"
+        log_root = _REPOSITORY_ROOT / "logs" / "multinode"
+        stage_log_root = _REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
+        checkpoint_path = checkpoint_root / plan.run_id
+        control_directory = log_root / plan.run_id / plan.attempt_id
+        witness_path = result_root / plan.run_id / f"{plan.attempt_id}-train-witness.json"
+        stage_log_file = (
+            stage_log_root / plan.run_id / f"{plan.attempt_id}-train.log"
+        )
+        if stage == "stage1":
+            input_paths = tuple(
+                Path(value)
+                for option in (
+                    "--data-path",
+                    "--source-data-path",
+                    "--image-root",
+                    "--resume",
+                )
+                if (value := _argument_value(forwarded, option)) is not None
+            )
+            model = _argument_value(forwarded, "--model")
+            if model is not None and Path(model).is_absolute():
+                input_paths += (Path(model),)
+        else:
+            input_paths = tuple(
+                Path(stage_environment[name])
+                for name in ("STAGE1_CHECKPOINT", "DATA_PATH", "IMAGE_ROOT")
+            )
+            if "RESUME_CHECKPOINT" in stage_environment:
+                input_paths += (Path(stage_environment["RESUME_CHECKPOINT"]),)
+        artifact_roots = (checkpoint_root, result_root, _REPOSITORY_ROOT / "logs")
+        run_paths = [control_directory, witness_path, stage_log_file]
+        if not resume_requested:
+            run_paths.append(checkpoint_path)
+        sessions = (
+            f"ilvr-{plan.run_id}-{plan.attempt_id}-rank0",
+            f"ilvr-{plan.run_id}-{plan.attempt_id}-rank1",
+        )
+        preflight_commands = build_preflight_commands(
+            plan,
+            input_paths=input_paths,
+            artifact_roots=artifact_roots,
+            remote_run_paths=run_paths,
+            local_run_paths=run_paths,
+            remote_tmux_sessions=(sessions[0],),
+            local_tmux_sessions=(sessions[1],),
+        )
+
+        def subprocess_runner(command: list[str] | tuple[str, ...]):
+            return subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+
+        remote_snapshot = collect_node_snapshot(
+            plan,
+            node="remote",
+            runner=subprocess_runner,
+            commands=preflight_commands,
+            input_paths=input_paths,
+            artifact_roots=artifact_roots,
+            run_paths=run_paths,
+            tmux_sessions=(sessions[0],),
+            repository=plan.cluster.remote_repo_root,
+        )
+        local_snapshot = collect_node_snapshot(
+            plan,
+            node="local",
+            runner=subprocess_runner,
+            commands=preflight_commands,
+            input_paths=input_paths,
+            artifact_roots=artifact_roots,
+            run_paths=run_paths,
+            tmux_sessions=(sessions[1],),
+            repository=plan.cluster.remote_repo_root,
+        )
+        report = validate_preflight(remote_snapshot, local_snapshot)
+        if report.commit != commit:
+            raise ValueError("validated preflight commit changed before launch")
+        runner = SubprocessCoordinatorRunner(
+            plan,
+            commands=commands,
+            commit=commit,
+            log_root=log_root,
+        )
+        start_rank0_then_rank1(plan, runner, commands=commands)
+        exit_codes = monitor_owned_jobs(
+            plan,
+            runner,
+            expected_commit=commit,
+            expected_command_digests={
+                0: commands.command_digests[0],
+                1: commands.command_digests[1],
+            },
+        )
+        if exit_codes != {0: 0, 1: 0}:
+            raise RuntimeError(f"multi-node training failed: exit_codes={exit_codes}")
+        if stage == "stage1":
+            batch_value = _argument_value(forwarded, "--micro-batch") or "8"
+            batch_per_gpu = int(batch_value)
+        else:
+            batch_per_gpu = 1
+        witness = write_training_witness(
+            plan,
+            result_root=result_root,
+            exit_codes=exit_codes,
+            checkpoint_path=checkpoint_path,
+            batch_per_gpu=batch_per_gpu,
+            finite_loss_evidence_path=commands.finite_loss_evidence_path,
+        )
+        print(json.dumps({"training_witness": str(witness)}, sort_keys=True))
+        return 0
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    return 2
+
+
 def _main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("train-stage1", "train-stage2"):
+        return _training_main(argv[0].removeprefix("train-"), argv[1:])  # type: ignore[arg-type]
+    if argv and argv[0] == "node-run":
+        return _node_run(argv[1:])
+    if argv and argv[0] == "node-exit":
+        return _write_exit_record(argv[1:])
+    if argv and argv[0] == "ownership-show":
+        return _ownership_show(argv[1:])
+    if argv and argv[0] == "owned-process-info":
+        try:
+            return _owned_process_info(argv[1:])
+        except (OSError, ValueError):
+            return 3
+    if argv and argv[0] == "ownership-ready":
+        try:
+            return _ownership_ready(argv[1:])
+        except (OSError, ValueError, json.JSONDecodeError):
+            return 1
+    if argv and argv[0] == "signal-owned":
+        return _signal_owned(argv[1:])
+    if argv and argv[0] == "exit-show":
+        return _exit_show(argv[1:])
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     plan_parser = subparsers.add_parser("plan")
