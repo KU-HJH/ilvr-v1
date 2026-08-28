@@ -16,14 +16,11 @@ files for new compatibility evidence.
 | Stage 1 | ZeRO-1 / ZeRO-2 / ZeRO-3 | ZeRO-1 / ZeRO-2 / ZeRO-3 | ZeRO-1 / ZeRO-2 / ZeRO-3 | matrix-selected, EGB 16 |
 | Stage 2 | ZeRO-1 / ZeRO-2 / ZeRO-3 | ZeRO-1 / ZeRO-2 / ZeRO-3 | ZeRO-1 / ZeRO-2 / ZeRO-3 | micro 1 / accumulation 8 |
 
-The official evidence environment is exactly two NVIDIA B200 GPUs. Ordinary
-fresh training may use another positive world size, but its result is not an
-official two-GPU matrix row. Stage 1's official effective global batch is 16;
-capacity probing begins at per-GPU micro-batch 2. It tries 4 and 8 after
-successful candidates; micro-batch 1 is considered only after micro-batch 2
-has a confirmed CUDA capacity OOM. Stage 2 fixes the local micro batch to 1
-and uses gradient accumulation 8 for the official setting; there is no Stage 2
-batch sweep.
+The final compatibility lifecycle evidence was collected on exactly two NVIDIA
+H100 NVL GPUs at commit `431c519`. Ordinary fresh training may use another
+positive world size, but its result is not an official two-rank compatibility
+row. The Stage 1 and Stage 2 settings below describe compatibility contracts;
+they are not throughput, capacity, or peak-memory measurements.
 
 ## Artifact ownership and experiment identity
 
@@ -69,6 +66,7 @@ prevents a fresh attempt from colliding with another independent experiment.
 
 ```bash
 zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
 zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-lora-fresh-example-$run_suffix"
@@ -111,6 +109,7 @@ Stage 1 supports Full, LoRA, and DoRA for all three canonical ZeRO stages.
 
 ```bash
 zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
 zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero2-dora-fresh-example-$run_suffix"
@@ -160,34 +159,39 @@ The Stage 1 performance comparison matrix remains scoped to Full and DoRA.
 LoRA is included in the canonical ZeRO compatibility matrix, not the
 Full/DoRA performance comparison.
 
-The aggregate Stage 1 matrix report is:
-
-```text
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json
-```
+The final aggregate is the compatibility lifecycle evidence linked below; it
+does not report throughput, capacity, or peak-memory performance.
 
 Each Stage 2 rank-skew witness is written below the same canonical result root
 in its experiment-ID directory. It records the one-step/eight-micro-step
-two-rank compatibility and peak-memory witness; no second Stage 2 memory run is
-required.
+two-rank compatibility lifecycle only; it is not a peak-memory measurement.
 
-## Result status: pending GPU evidence
+## Final compatibility lifecycle evidence
 
-The following is a schema, not a measurement. Tasks 9 and 10 have not yet
-recorded hardware results here; this guide does not claim compatibility,
-throughput, or memory success for them.
+All 18 Stage 1/Stage 2 × Full/LoRA/DoRA × ZeRO-1/2/3 two-rank save/resume
+checks passed on two NVIDIA H100 NVL GPUs at commit `431c519`. The exact final
+aggregate and manifest are
+[aggregate_validation.json](/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/sdd-task7-r4-20260828-aggregate-20260828t123316-1956316/aggregate_validation.json)
+and
+[manifest.md](/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/sdd-task7-r4-20260828-aggregate-20260828t123316-1956316/manifest.md).
+
+Throughput, capacity, and peak-memory performance measurements were not run.
+The tables below remain schemas, not measurements; compatibility save/resume
+success must not be read as a performance result. The Stage 1 performance
+comparison scope remains Full and DoRA only; LoRA appears only in the
+compatibility matrix.
 
 | ZeRO | Method | Micro/GA | Peak reserved GiB | samples/s | Resume |
 |---|---|---|---:|---:|---|
-| 3 | Full | recorded by Task 10 | not recorded in this document yet | not recorded in this document yet | pending Task 10 |
-| 3 | DoRA | recorded by Task 10 | not recorded in this document yet | not recorded in this document yet | pending Task 10 |
-| 2 | Full | recorded by Task 10 | not recorded in this document yet | not recorded in this document yet | pending Task 10 |
-| 2 | DoRA | recorded by Task 10 | not recorded in this document yet | not recorded in this document yet | pending Task 10 |
-| 1 | Full | recorded by Task 10 | not recorded in this document yet | not recorded in this document yet | pending Task 10 |
-| 1 | DoRA | recorded by Task 10 | not recorded in this document yet | not recorded in this document yet | pending Task 10 |
+| 3 | Full | schema only | not measured | not measured | compatibility passed; no performance measurement |
+| 3 | DoRA | schema only | not measured | not measured | compatibility passed; no performance measurement |
+| 2 | Full | schema only | not measured | not measured | compatibility passed; no performance measurement |
+| 2 | DoRA | schema only | not measured | not measured | compatibility passed; no performance measurement |
+| 1 | Full | schema only | not measured | not measured | compatibility passed; no performance measurement |
+| 1 | DoRA | schema only | not measured | not measured | compatibility passed; no performance measurement |
 
 | ZeRO | Method | Micro/GA | Peak reserved GiB | samples/s | Resume |
 |---|---|---|---:|---:|---|
-| 3 | Full/LoRA/DoRA | micro 1 / accumulation 8 | not recorded in this document yet | not recorded in this document yet | pending Task 9 |
-| 2 | Full/LoRA/DoRA | micro 1 / accumulation 8 | not recorded in this document yet | not recorded in this document yet | pending Task 9 |
-| 1 | Full/LoRA/DoRA | micro 1 / accumulation 8 | not recorded in this document yet | not recorded in this document yet | pending Task 9 |
+| 3 | Full/LoRA/DoRA | schema only | not measured | not measured | compatibility passed; no performance measurement |
+| 2 | Full/LoRA/DoRA | schema only | not measured | not measured | compatibility passed; no performance measurement |
+| 1 | Full/LoRA/DoRA | schema only | not measured | not measured | compatibility passed; no performance measurement |

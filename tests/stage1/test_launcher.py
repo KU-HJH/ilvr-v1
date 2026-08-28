@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import os
+import re
 import shlex
 import subprocess
 
@@ -25,6 +26,37 @@ def run_launcher(script, *args, env=None):
         check=False,
         env=env,
     )
+
+
+def test_readme_active_operator_examples_keep_generated_artifacts_canonical():
+    """Catches active README examples sending new artifacts to legacy paths."""
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    historical_block = re.compile(
+        r"<!-- BEGIN HISTORICAL NONCANONICAL PERFORMANCE WORKFLOW -->.*?"
+        r"<!-- END HISTORICAL NONCANONICAL PERFORMANCE WORKFLOW -->",
+        re.DOTALL,
+    )
+    active_readme, substitutions = historical_block.subn("", readme)
+
+    assert substitutions == 1
+    assert "outputs/" not in active_readme
+    assert not re.search(r"configs/config_stage[0-9]+\\.json", active_readme)
+    assert "zero_checkpoint_root=" in active_readme
+    assert "zero_result_root=" in active_readme
+    assert "zero_log_root=" in active_readme
+    assert 'OUTPUT_DIR="$zero_checkpoint_root/$experiment_id"' in active_readme
+    assert 'LOG_FILE="$zero_log_root/$experiment_id/' in active_readme
+    assert '--output_json_path "$zero_result_root/$experiment_id/' in active_readme
+    assert not re.search(
+        r"^(?:SAVE_MODEL_PATH|OUTPUT_DIR|LOG_FILE)=/(?!NHNHOME/WORKSPACE/)",
+        active_readme,
+        re.MULTILINE,
+    )
+    assert not re.search(
+        r"--(?:output-dir|log-file|save_model_path|output_json_path)\s+/path/to/",
+        active_readme,
+    )
+    assert "STAGE1_CHECKPOINT=/path/to/" in active_readme
 
 
 def test_zero_matrix_dry_run_orders_stages_methods_and_candidates_without_writes(
