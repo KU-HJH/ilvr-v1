@@ -5,8 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from transformers.integrations.deepspeed import (
+    is_deepspeed_zero3_enabled,
+    set_hf_deepspeed_config,
+    unset_hf_deepspeed_config,
+)
 
 from stage1.benchmark import run_or_load_distributed_witness
+from tests.stage1 import zero_compat_diagnostic
 from tests.stage1.zero_compat_diagnostic import (
     SUPPORTED_DIAGNOSTIC_METHODS,
     build_zero_compat_parser,
@@ -66,6 +72,44 @@ def test_stage1_diagnostic_has_no_arbitrary_generated_path_arguments():
                 "/tmp/unowned",
             ]
         )
+
+
+def test_diagnostic_resume_handoff_clears_live_zero3_state_before_build(
+    monkeypatch,
+):
+    """Catches a first diagnostic Trainer leaking ZeRO-3 into resume setup."""
+
+    class LiveZero3Config:
+        def is_zero3(self):
+            return True
+
+    live_config = LiveZero3Config()
+    marker = object()
+    seen_zero3_states = []
+
+    def build_resumed_components(*args, **kwargs):
+        del args, kwargs
+        seen_zero3_states.append(is_deepspeed_zero3_enabled())
+        return marker
+
+    set_hf_deepspeed_config(live_config)
+    try:
+        assert is_deepspeed_zero3_enabled()
+        monkeypatch.setattr(
+            zero_compat_diagnostic,
+            "build_stage1_training_components",
+            build_resumed_components,
+        )
+
+        result = zero_compat_diagnostic._build_resumed_stage1_components(
+            args=object(), profile=object()
+        )
+
+        assert result is marker
+        assert seen_zero3_states == [False]
+        assert not is_deepspeed_zero3_enabled()
+    finally:
+        unset_hf_deepspeed_config()
 
 
 @pytest.fixture

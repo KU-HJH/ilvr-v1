@@ -14,6 +14,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from artifact_paths import resolve_run_artifact_paths
 from deepspeed_runtime import (
@@ -177,6 +178,16 @@ def _publish_witness(paths, witness: dict[str, object]) -> None:
         raise local_error
 
 
+def _build_resumed_stage1_components(*, args, profile):
+    """Start resume construction without the first Trainer's global ZeRO hint."""
+    unset_hf_deepspeed_config()
+    return build_stage1_training_components(
+        args,
+        dependencies=_tiny_dependencies(),
+        deepspeed_runtime_profile=profile,
+    )
+
+
 def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
     _initialize_distributed()
     paths = resolve_run_artifact_paths(args.experiment_id)
@@ -260,11 +271,7 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
         resume=checkpoint,
     )
     resumed_args.deepspeed_runtime_profile = profile
-    resumed = build_stage1_training_components(
-        resumed_args,
-        dependencies=_tiny_dependencies(),
-        deepspeed_runtime_profile=profile,
-    )
+    resumed = _build_resumed_stage1_components(args=resumed_args, profile=profile)
     resumed.trainer.collect_stage1_diagnostics = True
     resumed.trainer.train(resume_from_checkpoint=str(checkpoint))
     if int(resumed.trainer.state.global_step) != 2:
