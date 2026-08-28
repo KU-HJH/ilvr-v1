@@ -3,6 +3,10 @@
 import argparse
 import json
 import re
+import shutil
+import socket
+import subprocess
+import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Literal
@@ -10,6 +14,13 @@ from typing import Literal
 from src.deepspeed_runtime import (
     canonical_deepspeed_config_path,
     load_deepspeed_runtime_profile,
+)
+from src.multinode_runtime import (
+    NodeSnapshot,
+    build_remote_exec,
+    collect_node_snapshot,
+    validate_node_config_digest,
+    validate_preflight,
 )
 
 
@@ -173,28 +184,258 @@ def _json_ready(value: object) -> object:
     return value
 
 
+def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--stage", choices=("stage1", "stage2"), required=True)
+    parser.add_argument(
+        "--tuning-method", choices=("full", "lora", "dora"), required=True
+    )
+    parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", default="initial")
+    parser.add_argument("--main-process-port", type=int, required=True)
+
+
+def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
+    return build_launch_plan(
+        stage=args.stage,
+        tuning_method=args.tuning_method,
+        zero_stage=args.zero_stage,
+        run_id=args.run_id,
+        main_process_port=args.main_process_port,
+        attempt_id=args.attempt_id,
+    )
+
+
+def _node_info(args: argparse.Namespace) -> NodeSnapshot:
+    """Collect node-local evidence after validating the exact config bytes."""
+    repository = Path(args.repository)
+    validate_node_config_digest(
+        args.deepspeed_config,
+        zero_stage=args.zero_stage,
+        expected_digest=args.deepspeed_config_digest,
+    )
+
+    commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=repository)
+    tracked_clean = not _command_stdout(
+        ("git", "status", "--porcelain", "--untracked-files=no"), cwd=repository
+    )
+    interface = _interface_name()
+    input_paths = tuple(Path(path) for path in args.input_path)
+    artifact_roots = tuple(Path(path) for path in args.artifact_root)
+    run_paths = tuple(Path(path) for path in args.run_path)
+    free_roots = artifact_roots or (repository,)
+    artifact_roots_writable, artifact_free_bytes = _artifact_root_evidence(free_roots)
+
+    # Importing torch and asking CUDA only occurs after the policy/digest check above.
+    import accelerate
+    import deepspeed
+    import torch
+
+    return NodeSnapshot(
+        node=args.node,
+        machine_rank=args.machine_rank,
+        commit=commit,
+        tracked_clean=tracked_clean,
+        repository=repository,
+        container_running=None,
+        python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+        torch_version=torch.__version__,
+        accelerate_version=accelerate.__version__,
+        deepspeed_version=deepspeed.__version__,
+        torchrun_ok=shutil.which("torchrun") is not None,
+        gpu_names=tuple(
+            torch.cuda.get_device_name(index)
+            for index in range(torch.cuda.device_count())
+        ),
+        interface=interface,
+        input_paths_ok=all(path.exists() for path in input_paths),
+        artifact_roots_writable=artifact_roots_writable,
+        artifact_free_bytes=artifact_free_bytes,
+        run_paths_fresh=all(not path.exists() for path in run_paths),
+        tmux_sessions_fresh=all(_tmux_session_is_fresh(name) for name in args.tmux_session),
+        master_port_free=(
+            _remote_master_port_is_free(args.main_process_port)
+            if (args.node, args.machine_rank) == ("remote", 0)
+            else True
+        ),
+    )
+
+
+def os_access_writable(path: Path) -> bool:
+    """Keep the write check explicit and side-effect free for existing roots."""
+    import os
+
+    return os.access(path, os.W_OK)
+
+
+def _artifact_root_evidence(roots: tuple[Path, ...]) -> tuple[bool, int]:
+    """Inspect existing artifact roots only; preflight never creates them."""
+    if not all(root.is_dir() and root.exists() and os_access_writable(root) for root in roots):
+        return False, 0
+    return True, min(shutil.disk_usage(root).free for root in roots)
+
+
+def _command_stdout(command: tuple[str, ...], *, cwd: Path) -> str:
+    completed = subprocess.run(
+        command, cwd=cwd, capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"command failed: {' '.join(command)}")
+    return completed.stdout.strip()
+
+
+def _interface_name() -> str:
+    completed = subprocess.run(
+        ("ip", "-o", "link", "show", "bond1.102"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return "bond1.102" if completed.returncode == 0 else ""
+
+
+def _tmux_session_is_fresh(name: str) -> bool:
+    completed = subprocess.run(
+        ("tmux", "has-session", "-t", name),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.returncode != 0
+
+
+def _remote_master_port_is_free(port: int) -> bool:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((ClusterSpec.default().master_addr, port))
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def _preflight_commands(plan: LaunchPlan) -> tuple[list[str], list[str]]:
+    """Render commands only; this helper deliberately performs no probing."""
+    common = [
+        "node-info",
+        "--main-process-port",
+        str(plan.main_process_port),
+        "--deepspeed-config",
+        str(plan.deepspeed_config),
+        "--deepspeed-config-digest",
+        plan.deepspeed_config_digest,
+        "--zero-stage",
+        str(plan.zero_stage),
+    ]
+    local = [*common[:1], "--node", "local", "--machine-rank", "1", *common[1:]]
+    remote_argv = [
+        *common[:1],
+        "--node",
+        "remote",
+        "--machine-rank",
+        "0",
+        *common[1:],
+    ]
+    return local, build_remote_exec(remote_argv)
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     plan_parser = subparsers.add_parser("plan")
-    plan_parser.add_argument("--stage", choices=("stage1", "stage2"), required=True)
-    plan_parser.add_argument(
-        "--tuning-method", choices=("full", "lora", "dora"), required=True
-    )
-    plan_parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)
-    plan_parser.add_argument("--run-id", required=True)
-    plan_parser.add_argument("--attempt-id", default="initial")
-    plan_parser.add_argument("--main-process-port", type=int, required=True)
+    _add_plan_arguments(plan_parser)
+    preflight_parser = subparsers.add_parser("preflight")
+    _add_plan_arguments(preflight_parser)
+    preflight_parser.add_argument("--input-path", action="append", default=[])
+    preflight_parser.add_argument("--artifact-root", action="append", default=[])
+    preflight_parser.add_argument("--dry-run", action="store_true")
+    node_info_parser = subparsers.add_parser("node-info")
+    node_info_parser.add_argument("--node", choices=("remote", "local"), required=True)
+    node_info_parser.add_argument("--machine-rank", type=int, required=True)
+    node_info_parser.add_argument("--repository", required=True)
+    node_info_parser.add_argument("--main-process-port", type=int, required=True)
+    node_info_parser.add_argument("--deepspeed-config", required=True)
+    node_info_parser.add_argument("--deepspeed-config-digest", required=True)
+    node_info_parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)
+    node_info_parser.add_argument("--input-path", action="append", default=[])
+    node_info_parser.add_argument("--artifact-root", action="append", default=[])
+    node_info_parser.add_argument("--run-path", action="append", default=[])
+    node_info_parser.add_argument("--tmux-session", action="append", default=[])
     args = parser.parse_args(argv)
     try:
-        plan = build_launch_plan(
-            stage=args.stage,
-            tuning_method=args.tuning_method,
-            zero_stage=args.zero_stage,
-            run_id=args.run_id,
-            main_process_port=args.main_process_port,
-            attempt_id=args.attempt_id,
-        )
+        if args.command == "node-info":
+            print(json.dumps(_node_info(args).to_json(), sort_keys=True))
+            return 0
+        plan = _plan_from_args(args)
+        if args.command == "preflight":
+            local_command, remote_command = _preflight_commands(plan)
+            if args.dry_run:
+                print(
+                    json.dumps(
+                        {
+                            "local_command": local_command,
+                            "plan": _json_ready(plan),
+                            "remote_command": remote_command,
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 0
+            local_repo = Path.cwd()
+            if args.artifact_root:
+                local_roots = tuple(Path(path) for path in args.artifact_root)
+                remote_roots = local_roots
+            else:
+                local_roots = (
+                    local_repo / "checkpoints",
+                    local_repo / "results",
+                    local_repo / "logs",
+                )
+                remote_roots = (
+                    plan.cluster.remote_repo_root / "checkpoints",
+                    plan.cluster.remote_repo_root / "results",
+                    plan.cluster.remote_repo_root / "logs",
+                )
+            remote_run_paths = tuple(
+                root / plan.run_id / plan.attempt_id for root in remote_roots
+            )
+            local_run_paths = tuple(
+                root / plan.run_id / plan.attempt_id for root in local_roots
+            )
+            sessions = (
+                f"ilvr-{plan.run_id}-{plan.attempt_id}-rank0",
+                f"ilvr-{plan.run_id}-{plan.attempt_id}-rank1",
+            )
+
+            def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(command, capture_output=True, text=True, check=False)
+
+            remote = collect_node_snapshot(
+                plan,
+                node="remote",
+                input_paths=args.input_path,
+                artifact_roots=remote_roots,
+                run_paths=remote_run_paths,
+                tmux_sessions=(sessions[0],),
+                runner=runner,
+                repository=plan.cluster.remote_repo_root,
+            )
+            local = collect_node_snapshot(
+                plan,
+                node="local",
+                input_paths=args.input_path,
+                artifact_roots=local_roots,
+                run_paths=local_run_paths,
+                tmux_sessions=(sessions[1],),
+                runner=runner,
+                repository=local_repo,
+            )
+            report = validate_preflight(
+                remote, local, required_free_bytes=plan.required_free_bytes
+            )
+            print(json.dumps(_json_ready(report), sort_keys=True))
+            return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(_json_ready(plan), sort_keys=True))
