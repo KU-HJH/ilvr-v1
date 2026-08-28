@@ -23,6 +23,11 @@ if SELECTED_METHOD not in {None, *SUPPORTED_DIAGNOSTIC_METHODS}:
     )
 
 
+def test_stage1_diagnostic_supported_methods_include_lora():
+    """Catches accidental removal of LoRA from the diagnostic contract."""
+    assert SUPPORTED_DIAGNOSTIC_METHODS == ("full", "lora", "dora")
+
+
 @pytest.mark.parametrize("stage", (1, 2, 3))
 @pytest.mark.parametrize("method", SUPPORTED_DIAGNOSTIC_METHODS)
 def test_stage1_diagnostic_accepts_all_supported_pairs(stage, method):
