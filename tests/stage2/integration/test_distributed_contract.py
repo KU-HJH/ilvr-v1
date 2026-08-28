@@ -106,6 +106,9 @@ def run_stage2_dry(updates):
         (four_gpu_env(0) | {"ILVR_NUM_PROCESSES": "3"}, "exactly 4"),
         (four_gpu_env(2), "machine rank"),
         (four_gpu_env(0) | {"ILVR_SOCKET_IFNAME": ""}, "interface"),
+        (four_gpu_env(0) | {"ILVR_MAIN_PROCESS_PORT": "not-a-port"}, "1024"),
+        (four_gpu_env(0) | {"ILVR_MAIN_PROCESS_PORT": "1023"}, "1024"),
+        (four_gpu_env(0) | {"ILVR_MAIN_PROCESS_PORT": "65536"}, "65535"),
     ],
 )
 @pytest.mark.parametrize("run", (run_stage1_dry, run_stage2_dry))
