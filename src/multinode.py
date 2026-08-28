@@ -57,6 +57,7 @@ class LaunchPlan:
     main_process_port: int
     world_size: int
     deepspeed_config: Path
+    deepspeed_config_digest: str
     cluster: ClusterSpec
     attempt_id: str = "initial"
     required_free_bytes: int = _TRAINING_REQUIRED_FREE_BYTES
@@ -84,6 +85,15 @@ class LaunchPlan:
         expected_config = canonical_deepspeed_config(self.zero_stage)
         if self.deepspeed_config != expected_config:
             raise ValueError("deepspeed_config must be the canonical ZeRO config")
+        if (
+            not isinstance(self.deepspeed_config_digest, str)
+            or len(self.deepspeed_config_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.deepspeed_config_digest
+            )
+        ):
+            raise ValueError("deepspeed_config_digest must be a SHA-256 digest")
 
 
 def _validate_identifier(name: str, value: object) -> None:
@@ -114,6 +124,13 @@ def build_launch_plan(
     """Validate and build the fixed four-process training launch plan."""
     cluster = ClusterSpec.default()
     config_path = canonical_deepspeed_config(zero_stage)
+    profile = load_deepspeed_runtime_profile(
+        canonical_deepspeed_config_path(zero_stage), world_size=cluster.num_processes
+    )
+    if profile.zero_stage != zero_stage:
+        raise ValueError(
+            "zero_optimization.stage must match the requested zero_stage"
+        )
     plan = LaunchPlan(
         stage=stage,
         tuning_method=tuning_method,
@@ -122,17 +139,26 @@ def build_launch_plan(
         main_process_port=main_process_port,
         world_size=cluster.num_processes,
         deepspeed_config=config_path,
+        deepspeed_config_digest=profile.config_digest,
         cluster=cluster,
         attempt_id=attempt_id,
     )
-    profile = load_deepspeed_runtime_profile(
-        canonical_deepspeed_config_path(zero_stage), world_size=cluster.num_processes
-    )
-    if profile.zero_stage != zero_stage:
-        raise ValueError(
-            "zero_optimization.stage must match the requested zero_stage"
-        )
     return plan
+
+
+def validate_node_local_deepspeed_config(
+    plan: LaunchPlan, node_config_path: str | Path
+) -> None:
+    """Require a node's canonical config to match the validated launch plan."""
+    if not isinstance(plan, LaunchPlan):
+        raise TypeError("plan must be a LaunchPlan")
+    profile = load_deepspeed_runtime_profile(
+        node_config_path, world_size=plan.world_size
+    )
+    if profile.zero_stage != plan.zero_stage:
+        raise ValueError("node-local DeepSpeed zero_optimization.stage mismatch")
+    if profile.config_digest != plan.deepspeed_config_digest:
+        raise ValueError("node-local DeepSpeed config digest mismatch")
 
 
 def _json_ready(value: object) -> object:

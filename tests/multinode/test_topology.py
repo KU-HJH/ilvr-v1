@@ -7,11 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from src.deepspeed_runtime import canonical_deepspeed_config_path
 from src.multinode import (
     ClusterSpec,
     LaunchPlan,
     build_launch_plan,
     canonical_deepspeed_config,
+    validate_node_local_deepspeed_config,
 )
 
 
@@ -63,6 +65,70 @@ def test_canonical_config_is_validated_for_the_four_process_world(zero_stage):
     assert plan.zero_stage == zero_stage
     assert plan.world_size == 4
     assert canonical_deepspeed_config(zero_stage) == plan.deepspeed_config
+
+
+def test_node_local_config_must_match_the_launch_plan_digest(tmp_path):
+    """Catches a node launching a policy-valid config with different bytes."""
+    plan = build_launch_plan(
+        stage="stage1",
+        tuning_method="lora",
+        zero_stage=2,
+        run_id="stage1-lora-zero2-four-gpu",
+        main_process_port=29613,
+    )
+    node_config = tmp_path / "deepspeed_zero2.json"
+    payload = json.loads(
+        Path("configs/deepspeed_zero2.json").read_text(encoding="utf-8")
+    )
+    payload["wall_clock_breakdown"] = True
+    node_config.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="digest"):
+        validate_node_local_deepspeed_config(plan, node_config)
+
+
+def test_node_local_config_accepts_the_exact_validated_bytes():
+    """Catches node-local validation rejecting the config that built the plan."""
+    plan = build_launch_plan(
+        stage="stage1",
+        tuning_method="lora",
+        zero_stage=2,
+        run_id="stage1-lora-zero2-four-gpu",
+        main_process_port=29613,
+    )
+
+    assert validate_node_local_deepspeed_config(
+        plan, canonical_deepspeed_config_path(2)
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"zero_optimization": {"stage": 1}}, "stage"),
+        ({"train_batch_size": 4}, "train_batch_size"),
+    ],
+)
+def test_node_local_config_rejects_stage_or_policy_mismatch(
+    tmp_path, changes, message
+):
+    """Catches a node bypassing the launch plan's ZeRO or policy contract."""
+    plan = build_launch_plan(
+        stage="stage1",
+        tuning_method="lora",
+        zero_stage=2,
+        run_id="stage1-lora-zero2-four-gpu",
+        main_process_port=29613,
+    )
+    node_config = tmp_path / "deepspeed_zero2.json"
+    payload = json.loads(
+        canonical_deepspeed_config_path(2).read_text(encoding="utf-8")
+    )
+    payload.update(changes)
+    node_config.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        validate_node_local_deepspeed_config(plan, node_config)
 
 
 @pytest.mark.parametrize(
@@ -148,6 +214,7 @@ def test_plan_cli_prints_sorted_json_without_creating_files(tmp_path):
     assert payload["attempt_id"] == "initial"
     assert payload["cluster"]["num_processes"] == 4
     assert payload["deepspeed_config"] == "/root/workspace/ILVR/configs/deepspeed_zero2.json"
+    assert len(payload["deepspeed_config_digest"]) == 64
     assert set(tmp_path.iterdir()) == before
 
 
