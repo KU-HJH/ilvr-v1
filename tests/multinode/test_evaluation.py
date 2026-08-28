@@ -170,6 +170,26 @@ def test_merge_rejects_invalid_worker_output(
     assert not (tmp_path / "summary.json").exists()
 
 
+def test_merge_rejects_error_row_even_when_shaped_as_legacy_summary(tmp_path):
+    shards = _write_fake_shards(
+        tmp_path,
+        row_overrides={
+            0: {
+                "summary": True,
+                "index": 0,
+                "task_name": "task",
+                "match": False,
+                "error": "OOM",
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="error row"):
+        _merge(tmp_path, shards, expected_sample_count=4)
+    assert not (tmp_path / "merged.jsonl").exists()
+    assert not (tmp_path / "summary.json").exists()
+
+
 def test_merge_requires_exactly_four_unique_shard_manifests(tmp_path):
     shards = _write_fake_shards(tmp_path)
     with pytest.raises(ValueError, match="exactly four"):

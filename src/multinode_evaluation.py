@@ -223,13 +223,13 @@ def _read_shard_rows(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(
                     f"invalid JSON object in shard JSONL {path} line {line_number}"
                 )
-            if row.get("summary") is True:
-                continue
             if "error" in row:
                 raise ValueError(
                     f"error row in shard JSONL {path} line {line_number}: "
                     f"{row['error']}"
                 )
+            if row.get("summary") is True:
+                continue
             if set(("index", "task_name", "match")) - set(row):
                 raise ValueError(
                     f"missing evaluation fields in shard JSONL {path} line {line_number}"

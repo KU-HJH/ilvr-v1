@@ -149,3 +149,55 @@ One environment concern remains: the exact combined pytest executable cannot
 collect the existing Stage 2 integration module while the venv interpreter
 identifies itself as `3.11.15+`. The process-local normalization demonstrates
 that the Task 7 and existing evaluator tests pass without a Task 7 code change.
+
+## Fix round 1: error precedence over legacy-summary exclusion
+
+Reviewer finding: `_read_shard_rows()` excluded a JSON object with
+`summary: true` before checking whether that same object contained `error`.
+This violated the binding rule that every error row is rejected and caused the
+merge to surface a later missing-index diagnostic instead.
+
+The causal regression command was:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest tests/multinode/test_evaluation.py \
+  -q -k legacy_summary
+```
+
+RED output before the production change:
+
+```text
+F.                                                                       [100%]
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'error row'
+E         Actual message: 'missing source index 0'
+1 failed, 1 passed, 20 deselected in 0.03s
+```
+
+The minimal production change moved the existing `error` check ahead of the
+existing `summary is True` exclusion. The identical focused command then gave:
+
+```text
+..                                                                       [100%]
+2 passed, 20 deselected in 0.02s
+```
+
+The complete pure Task 7 suite command was:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest tests/multinode/test_evaluation.py -q
+```
+
+GREEN output:
+
+```text
+......................                                                   [100%]
+22 passed in 0.04s
+```
+
+Self-review confirmed the regression exercises the real merge path, asserts
+the causal error-row diagnostic, and asserts neither merged output is
+published. Error-free legacy summary rows remain excluded by the existing
+test. No evaluator integration file or behavior changed in this fix round.
