@@ -114,9 +114,9 @@ if [[ $method == dora ]] && ! awk -v value="$dora_dropout" 'BEGIN { number = val
 fi
 
 probe_experiment_id=${output_root##*/}
-canonical_checkpoint_root='/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility'
-canonical_result_root='/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility'
-canonical_log_root='/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility'
+canonical_checkpoint_root='/root/workspace/ILVR/checkpoints/zero-stage-compatibility'
+canonical_result_root='/root/workspace/ILVR/results/zero-stage-compatibility'
+canonical_log_root='/root/workspace/ILVR/logs/zero-stage-compatibility'
 "$repository_python" -m src.artifact_paths resolve --experiment-id "$probe_experiment_id" >/dev/null
 if [[ $(readlink -m -- "$output_root") != "$canonical_result_root/$probe_experiment_id" ]]; then
     printf 'error: output root must be the canonical result directory for one experiment\n' >&2

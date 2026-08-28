@@ -14,9 +14,9 @@
 
 - Invoke Python, pytest, torchrun, Accelerate, and training only through `./venv/ilvr-venv`.
 - Preserve all pre-existing user changes; never stage deleted `src/__pycache__` files or unrelated untracked files.
-- Write generated weights only below `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/`.
-- Write generated results only below `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/`.
-- Write generated logs only below `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/`.
+- Write generated weights only below `/root/workspace/ILVR/checkpoints/zero-stage-compatibility/`.
+- Write generated results only below `/root/workspace/ILVR/results/zero-stage-compatibility/`.
+- Write generated logs only below `/root/workspace/ILVR/logs/zero-stage-compatibility/`.
 - Do not convert optimizer state between ZeRO stages or world sizes; resume requires the same ZeRO stage, config digest, and world size.
 - Do not run full-size 3B/7B training or a performance benchmark in this task.
 - Capacity probing starts at micro-batch/GPU 2; only a confirmed CUDA capacity OOM at 2 permits fallback to 1.
@@ -596,8 +596,8 @@ Expected: GPUs 0 and 1 are available and no foreign training process owns them. 
 Run:
 
 ```bash
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 witness_paths=()
 for zero_stage in 1 2 3; do
   for method in full lora dora; do
@@ -640,8 +640,8 @@ Expected: nine zero exits. Each witness records `initial_global_step=1`, `resume
 Run:
 
 ```bash
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 witness_paths=()
 for zero_stage in 1 2 3; do
   for method in full lora dora; do

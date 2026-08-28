@@ -158,9 +158,9 @@ For fresh full tuning, provide a complete Stage 1 checkpoint and do not set
 `RESUME_CHECKPOINT`:
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero3-full-fresh-example-$run_suffix"
 STAGE1_CHECKPOINT=/path/to/stage1/checkpoint \
@@ -187,9 +187,9 @@ the checkpoint and log paths above.
 Fresh LoRA training uses the same Stage 1 base but trains adapters only:
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero3-lora-fresh-example-$run_suffix"
 STAGE1_CHECKPOINT=/path/to/stage1/checkpoint \
@@ -210,9 +210,9 @@ DoRA has the same target and hyperparameter contract, with
 `TUNING_METHOD=dora`:
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero3-dora-fresh-example-$run_suffix"
 STAGE1_CHECKPOINT=/path/to/stage1/checkpoint \
@@ -337,7 +337,7 @@ artifact by supplying the adapter as `--model_dir` and its compatible Stage 1
 base separately:
 
 ```bash
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-lora-evaluation-example-$run_suffix"
 mkdir -p -- "$zero_result_root/$experiment_id"

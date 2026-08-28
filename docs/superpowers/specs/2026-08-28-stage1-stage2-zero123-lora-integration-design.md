@@ -129,9 +129,9 @@ state를 보존하며 전체 base embedding을 중복 저장하지 않는다.
 새 산출물은 다음 canonical root에 저장한다.
 
 ```text
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/
+/root/workspace/ILVR/checkpoints/zero-stage-compatibility/
+/root/workspace/ILVR/results/zero-stage-compatibility/
+/root/workspace/ILVR/logs/zero-stage-compatibility/
 ```
 
 각 독립 lifecycle은 세 root에서 동일한 collision-resistant experiment ID를

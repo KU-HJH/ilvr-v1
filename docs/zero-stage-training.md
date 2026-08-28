@@ -27,9 +27,9 @@ they are not throughput, capacity, or peak-memory measurements.
 Every newly generated artifact belongs beneath one of these exact roots:
 
 ```text
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+/root/workspace/ILVR/results/zero-stage-compatibility
+/root/workspace/ILVR/logs/zero-stage-compatibility
 ```
 
 Use one lowercase, collision-resistant experiment ID beneath all three roots
@@ -65,9 +65,9 @@ prevents a fresh attempt from colliding with another independent experiment.
 ### Stage 1 LoRA
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-lora-fresh-example-$run_suffix"
 
@@ -108,9 +108,9 @@ Stage 1 supports Full, LoRA, and DoRA for all three canonical ZeRO stages.
 ### Stage 2 DoRA
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero2-dora-fresh-example-$run_suffix"
 
@@ -171,9 +171,9 @@ two-rank compatibility lifecycle only; it is not a peak-memory measurement.
 All 18 Stage 1/Stage 2 × Full/LoRA/DoRA × ZeRO-1/2/3 two-rank save/resume
 checks passed on two NVIDIA H100 NVL GPUs at commit `431c519`. The exact final
 aggregate and manifest are
-[aggregate_validation.json](/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/sdd-task7-r4-20260828-aggregate-20260828t123316-1956316/aggregate_validation.json)
+[aggregate_validation.json](/root/workspace/ILVR/results/zero-stage-compatibility/sdd-task7-r4-20260828-aggregate-20260828t123316-1956316/aggregate_validation.json)
 and
-[manifest.md](/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/sdd-task7-r4-20260828-aggregate-20260828t123316-1956316/manifest.md).
+[manifest.md](/root/workspace/ILVR/results/zero-stage-compatibility/sdd-task7-r4-20260828-aggregate-20260828t123316-1956316/manifest.md).
 
 Throughput, capacity, and peak-memory performance measurements were not run.
 The tables below remain schemas, not measurements; compatibility save/resume

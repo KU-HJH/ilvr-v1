@@ -26,7 +26,7 @@ def test_run_paths_share_one_experiment_identifier():
     paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
 
     assert paths.checkpoint_dir == Path(
-        "/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/"
+        "/root/workspace/ILVR/"
         "checkpoints/zero-stage-compatibility/stage1-zero2-dora-mb4-ga2-candidate"
     )
     assert paths.result_dir.name == paths.checkpoint_dir.name
@@ -46,6 +46,15 @@ def test_worktree_local_outputs_are_not_canonical():
         require_canonical_artifact_path(
             Path.cwd() / "outputs" / "evidence.json", kind="result"
         )
+
+
+def test_canonical_checkpoint_path_preserves_repository_symlink_spelling():
+    """Catches validation returning the checkpoint symlink's storage target."""
+    canonical = Path(
+        "/root/workspace/ILVR/checkpoints/zero-stage-compatibility/example-run"
+    )
+
+    assert require_canonical_artifact_path(canonical, kind="checkpoint") == canonical
 
 
 def test_generated_checkpoint_result_and_log_share_experiment_id(stage1_args):

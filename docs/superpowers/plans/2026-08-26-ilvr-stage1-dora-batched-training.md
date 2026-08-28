@@ -1698,7 +1698,7 @@ Correct only root causes surfaced by the tests. The end-to-end factory must use 
 
 Update `README.md` with:
 
-- the actual local example data path `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl` and image root `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data`;
+- the actual local example data path `/root/workspace/ILVR/data/TRAIN.jsonl` and image root `/root/workspace/ILVR/data`;
 - exact full and DoRA launcher commands;
 - independent batch probing and the effective-batch formula;
 - Stage 1 full and adapter artifact contents;
@@ -1866,8 +1866,8 @@ Run:
   outputs/stage1-smoke/full/evidence.json \
   outputs/stage1-smoke/dora/evidence.json
 ./venv/ilvr-venv/bin/python -m src.stage1.benchmark audit \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
   --output outputs/stage1-probes/high-cost-rows.json \
   --count 64
 ```
@@ -1882,8 +1882,8 @@ Run:
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --method full \
   --model Qwen/Qwen2.5-VL-3B-Instruct \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
   --output-root outputs/stage1-probes/full \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --start 8 \
@@ -1914,8 +1914,8 @@ Run:
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --method dora \
   --model Qwen/Qwen2.5-VL-3B-Instruct \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
   --output-root outputs/stage1-probes/dora \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --start 8 \
