@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ipaddress
 import math
 import os
 import re
+import secrets
 import shlex
+import stat
 import subprocess
-import tempfile
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -31,8 +33,18 @@ _LOG_ROOT = _REPOSITORY_ROOT / "logs" / "multinode"
 _STAGE_LOG_ROOT = _REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
 _OWNERSHIP_SCHEMA_VERSION = 1
 _WITNESS_SCHEMA_VERSION = 1
+_INCOMPLETE_SCHEMA_VERSION = 1
+_CONTROL_TIMEOUT_SECONDS = 30
+_MAX_TRANSFER_BYTES = 1024 * 1024
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_MINIMAL_EXEC_ENVIRONMENT = {
+    "HOME": "/root",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PYTHONUNBUFFERED": "1",
+}
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
@@ -43,6 +55,140 @@ def _canonical_json_bytes(payload: object) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _trusted_absolute_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute() or any(part in ("", ".", "..") for part in candidate.parts[1:]):
+        raise ValueError("trusted publication path must be absolute without traversal")
+    return candidate
+
+
+def _open_trusted_directory(
+    path: str | Path, *, create: bool = False, mode: int = 0o700
+) -> int:
+    """Open an absolute directory chain without following any symlink ancestor."""
+    directory = _trusted_absolute_path(path)
+    descriptor = os.open("/", _DIRECTORY_FLAGS)
+    try:
+        for component in directory.parts[1:]:
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, mode=mode, dir_fd=descriptor)
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except OSError as error:
+                if error.errno in (getattr(os, "ELOOP", 40), 20):
+                    raise ValueError("trusted directory chain contains a symlink") from error
+                raise
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_child_directory(
+    parent_descriptor: int,
+    name: str,
+    *,
+    create: bool,
+    exclusive: bool = False,
+    mode: int = 0o700,
+) -> int:
+    if not name or name in (".", "..") or "/" in name:
+        raise ValueError("directory component is invalid")
+    if create:
+        try:
+            os.mkdir(name, mode=mode, dir_fd=parent_descriptor)
+        except FileExistsError:
+            if exclusive:
+                raise
+    return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_descriptor)
+
+
+def _publish_bytes_no_replace(path: str | Path, payload: bytes) -> Path:
+    """Atomically publish bytes via a trusted dirfd and an exclusive hard link."""
+    destination = _trusted_absolute_path(path)
+    parent_descriptor = _open_trusted_directory(destination.parent, create=True)
+    temporary_name = f".{destination.name}.{secrets.token_hex(12)}.tmp"
+    file_descriptor: int | None = None
+    try:
+        file_descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        os.fchmod(file_descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(file_descriptor, view)
+            if written <= 0:
+                raise OSError("short write while publishing attempt record")
+            view = view[written:]
+        os.fsync(file_descriptor)
+        os.close(file_descriptor)
+        file_descriptor = None
+        try:
+            os.link(
+                temporary_name,
+                destination.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            raise FileExistsError(f"refusing to replace attempt record: {destination}") from error
+        os.fsync(parent_descriptor)
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        os.close(parent_descriptor)
+    return destination
+
+
+def _read_regular_file(path: str | Path, *, maximum_size: int = _MAX_TRANSFER_BYTES) -> bytes:
+    source = _trusted_absolute_path(path)
+    parent_descriptor = _open_trusted_directory(source.parent)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            source.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("attempt record must be a regular file")
+        if metadata.st_size > maximum_size:
+            raise ValueError("attempt record exceeds the size limit")
+        chunks: list[bytes] = []
+        remaining = maximum_size + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > maximum_size:
+            raise ValueError("attempt record exceeds the size limit")
+        return raw
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_descriptor)
 
 
 def _require_identifier(name: str, value: object) -> str:
@@ -217,40 +363,12 @@ def write_ownership(path: str | Path, record: OwnershipRecord) -> Path:
     """Atomically publish one mode-0600 ownership record without replacement."""
     if not isinstance(record, OwnershipRecord):
         raise TypeError("record must be an OwnershipRecord")
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() or destination.is_symlink():
-        raise FileExistsError(f"refusing to replace ownership: {destination}")
     payload = _canonical_json_bytes(record.to_json()) + b"\n"
-    file_descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        os.fchmod(file_descriptor, 0o600)
-        with os.fdopen(file_descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        if destination.exists() or destination.is_symlink():
-            raise FileExistsError(f"refusing to replace ownership: {destination}")
-        os.replace(temporary, destination)
-        os.chmod(destination, 0o600)
-    except BaseException:
-        try:
-            os.close(file_descriptor)
-        except OSError:
-            pass
-        temporary.unlink(missing_ok=True)
-        raise
-    return destination
+    return _publish_bytes_no_replace(path, payload)
 
 
 def read_ownership(path: str | Path) -> OwnershipRecord:
-    ownership_path = Path(path)
-    if ownership_path.is_symlink() or not ownership_path.is_file():
-        raise ValueError("ownership path must be a regular file")
-    return OwnershipRecord.from_json(json.loads(ownership_path.read_bytes()))
+    return OwnershipRecord.from_json(json.loads(_read_regular_file(path)))
 
 
 def _proc_start_ticks(pid: int, *, proc_root: str | Path = "/proc") -> int:
@@ -294,18 +412,21 @@ def validate_owned_process(
     """Bind an ownership record to the current PID, start ticks, argv, and env."""
     process_directory = Path(proc_root) / str(record.pid)
     observed_command = _nul_fields(process_directory / "cmdline")
-    if not observed_command:
-        raise ValueError("owned process command is empty")
+    expected_argv, expected_pairs = _validated_command(
+        expected_command, expected_environment
+    )
+    if observed_command != expected_argv:
+        raise ValueError("live ownership command mismatch")
     raw_environment = _nul_fields(process_directory / "environ")
     observed_environment: dict[str, str] = {}
-    expected_names = {*expected_environment, "ILVR_OWNED_COMMAND_DIGEST"}
     for assignment in raw_environment:
         name, separator, value = assignment.partition("=")
-        if separator and name in expected_names:
-            observed_environment[name] = value
+        if not separator or name in observed_environment:
+            raise ValueError("live ownership environment is malformed")
+        observed_environment[name] = value
+    expected_environment_dict = dict(expected_pairs)
     expected_digest = canonical_command_digest(expected_command, expected_environment)
-    observed_digest = observed_environment.pop("ILVR_OWNED_COMMAND_DIGEST", None)
-    if observed_environment != dict(expected_environment):
+    if observed_environment != expected_environment_dict:
         raise ValueError("live ownership environment mismatch")
     observed_commit = observed_environment.get("ILVR_REPOSITORY_COMMIT")
     return validate_ownership(
@@ -317,9 +438,129 @@ def validate_owned_process(
         expected_commit=expected_commit,
         expected_command_digest=expected_digest,
         observed_start_ticks=_proc_start_ticks(record.pid, proc_root=proc_root),
-        observed_command_digest=observed_digest,
+        observed_command_digest=expected_digest,
         observed_commit=observed_commit,
     )
+
+
+def _process_tree_pids(owner_pid: int, *, proc_root: str | Path = "/proc") -> set[int]:
+    if type(owner_pid) is not int or owner_pid <= 1:
+        raise ValueError("owner PID must identify a non-init process")
+    root = Path(proc_root)
+    discovered: set[int] = set()
+    pending = [owner_pid]
+    while pending:
+        pid = pending.pop()
+        if pid in discovered:
+            continue
+        discovered.add(pid)
+        try:
+            tasks = tuple((root / str(pid) / "task").iterdir())
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        for task in tasks:
+            try:
+                children = (task / "children").read_text(encoding="ascii").split()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            for value in children:
+                try:
+                    child = int(value)
+                except ValueError as error:
+                    raise ValueError("process children list contains a non-PID") from error
+                if child > 1 and child not in discovered:
+                    pending.append(child)
+    return discovered
+
+
+def _listening_socket_inodes(
+    *, master_addr: str, port: int, proc_root: str | Path = "/proc"
+) -> set[str]:
+    if type(port) is not int or not 1024 <= port <= 65535:
+        raise ValueError("readiness port must be between 1024 and 65535")
+    expected_port = f"{port:04X}"
+    address = ipaddress.ip_address(master_addr)
+    if not isinstance(address, ipaddress.IPv4Address):
+        raise ValueError("readiness master address must be IPv4")
+    expected_ipv4 = address.packed[::-1].hex().upper()
+    inodes: set[str] = set()
+    for table_name in ("tcp", "tcp6"):
+        table = Path(proc_root) / "net" / table_name
+        try:
+            lines = table.read_text(encoding="ascii").splitlines()[1:]
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10:
+                continue
+            local = fields[1].rsplit(":", 1)
+            if len(local) != 2 or local[1].upper() != expected_port:
+                continue
+            local_address = local[0].upper()
+            if table_name == "tcp":
+                if local_address not in ("00000000", expected_ipv4):
+                    continue
+            elif local_address != "0" * 32 and not local_address.endswith(expected_ipv4):
+                continue
+            if fields[3].upper() == "0A":
+                inodes.add(fields[9])
+    return inodes
+
+
+def owned_listener_is_ready(
+    owner_pid: int,
+    *,
+    master_addr: str,
+    port: int,
+    proc_root: str | Path = "/proc",
+) -> bool:
+    """Prove that the requested LISTEN socket belongs to the owned process tree."""
+    if master_addr != "10.1.102.41":
+        raise ValueError("readiness master address must match the fixed topology")
+    listening = _listening_socket_inodes(
+        master_addr=master_addr, port=port, proc_root=proc_root
+    )
+    if not listening:
+        return False
+    root = Path(proc_root)
+    for pid in _process_tree_pids(owner_pid, proc_root=root):
+        fd_directory = root / str(pid) / "fd"
+        try:
+            entries = tuple(fd_directory.iterdir())
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        for entry in entries:
+            try:
+                target = os.readlink(entry)
+            except (FileNotFoundError, OSError):
+                continue
+            if target.startswith("socket:[") and target.endswith("]"):
+                if target[8:-1] in listening:
+                    return True
+    return False
+
+
+def validate_resume_path(
+    run_id: str,
+    resume_path: str | Path,
+    *,
+    checkpoint_root: str | Path = _CHECKPOINT_ROOT,
+) -> Path:
+    """Canonicalize a resume checkpoint and bind it to the same run identity."""
+    _require_identifier("run_id", run_id)
+    root = Path(checkpoint_root).resolve(strict=False)
+    candidate = Path(resume_path)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("resume checkpoint must be an absolute canonical path")
+    canonical = candidate.resolve(strict=False)
+    try:
+        relative = canonical.relative_to(root)
+    except ValueError as error:
+        raise ValueError("resume checkpoint must belong to the same run ID") from error
+    if not relative.parts or relative.parts[0] != run_id or len(relative.parts) < 2:
+        raise ValueError("resume checkpoint must belong to the same run ID")
+    return canonical
 
 
 @dataclass(frozen=True)
@@ -349,25 +590,76 @@ def serialize_launch_plan(
 
     if not isinstance(plan, LaunchPlan):
         raise TypeError("plan must be a LaunchPlan")
-    root = Path(log_root)
-    root.mkdir(parents=True, exist_ok=True)
-    run_directory = root / plan.run_id
-    run_directory.mkdir(mode=0o700, exist_ok=True)
-    attempt_directory = run_directory / plan.attempt_id
-    attempt_directory.mkdir(mode=0o700, exist_ok=False)
+    root = _trusted_absolute_path(log_root)
+    root_descriptor = _open_trusted_directory(root, create=True)
+    run_descriptor: int | None = None
+    attempt_descriptor: int | None = None
+    try:
+        run_descriptor = _open_child_directory(
+            root_descriptor, plan.run_id, create=True
+        )
+        attempt_descriptor = _open_child_directory(
+            run_descriptor, plan.attempt_id, create=True, exclusive=True
+        )
+    finally:
+        if attempt_descriptor is not None:
+            os.close(attempt_descriptor)
+        if run_descriptor is not None:
+            os.close(run_descriptor)
+        os.close(root_descriptor)
+    attempt_directory = root / plan.run_id / plan.attempt_id
     path = attempt_directory / "launch-plan.json"
     payload = _canonical_json_bytes(_json_ready(plan)) + b"\n"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.chmod(path, 0o600)
+    _publish_bytes_no_replace(path, payload)
     return SerializedLaunchPlan(
         path=path,
         size=len(payload),
         sha256=hashlib.sha256(payload).hexdigest(),
     )
+
+
+def prepare_attempt_directory(
+    *, log_root: str | Path, run_id: str, attempt_id: str
+) -> Path:
+    """Create a fresh attempt directory through trusted directory descriptors."""
+    _require_identifier("run_id", run_id)
+    _require_identifier("attempt_id", attempt_id)
+    root = _trusted_absolute_path(log_root)
+    root_descriptor = _open_trusted_directory(root, create=True)
+    run_descriptor: int | None = None
+    attempt_descriptor: int | None = None
+    try:
+        run_descriptor = _open_child_directory(root_descriptor, run_id, create=True)
+        attempt_descriptor = _open_child_directory(
+            run_descriptor, attempt_id, create=True, exclusive=True
+        )
+    finally:
+        if attempt_descriptor is not None:
+            os.close(attempt_descriptor)
+        if run_descriptor is not None:
+            os.close(run_descriptor)
+        os.close(root_descriptor)
+    return root / run_id / attempt_id
+
+
+def receive_launch_plan(
+    *,
+    path: str | Path,
+    raw: bytes,
+    expected_size: int,
+    expected_sha256: str,
+) -> Path:
+    """Validate and exclusively publish the one permitted stdin transfer."""
+    if type(expected_size) is not int or not 0 < expected_size <= _MAX_TRANSFER_BYTES:
+        raise ValueError("launch plan transfer size is invalid")
+    _require_digest("launch plan transfer digest", expected_sha256)
+    if len(raw) != expected_size or hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("launch plan transfer mismatch")
+    destination = _publish_bytes_no_replace(path, raw)
+    stored = _read_regular_file(destination)
+    if len(stored) != expected_size or hashlib.sha256(stored).hexdigest() != expected_sha256:
+        raise ValueError("stored launch plan mismatch")
+    return destination
 
 
 _STAGE1_VALUE_OPTIONS = {
@@ -601,13 +893,14 @@ def _node_shell_command(
     stage_command: tuple[str, ...],
     environment: Mapping[str, str],
     log_root: Path,
-) -> tuple[str, str, OwnedNodeCommand]:
+) -> tuple[tuple[str, ...], str, OwnedNodeCommand]:
     repository = plan.cluster.remote_repo_root
     attempt_directory = log_root / plan.run_id / plan.attempt_id
     ownership_path = attempt_directory / f"ownership-rank{machine_rank}.json"
     exit_path = attempt_directory / f"exit-rank{machine_rank}.json"
-    digest = canonical_command_digest(stage_command, environment)
-    node_run = [
+    if len(stage_command) < 2 or stage_command[0] != "/usr/bin/bash":
+        raise ValueError("Stage launcher must be an explicit /usr/bin/bash command")
+    supervisor_command = [
         str(repository / "venv" / "ilvr-venv" / "bin" / "python"),
         "-m",
         "src.multinode",
@@ -622,43 +915,26 @@ def _node_shell_command(
         commit,
         "--ownership-path",
         str(ownership_path),
-    ]
-    for name, value in sorted(environment.items()):
-        node_run.extend(("--env", f"{name}={value}"))
-    node_run.extend(("--", *stage_command))
-    node_exit = [
-        str(repository / "venv" / "ilvr-venv" / "bin" / "python"),
-        "-m",
-        "src.multinode",
-        "node-exit",
-        "--run-id",
-        plan.run_id,
-        "--attempt-id",
-        plan.attempt_id,
-        "--machine-rank",
-        str(machine_rank),
         "--exit-path",
         str(exit_path),
-        "--ownership-path",
-        str(ownership_path),
-        "--command-digest",
-        digest,
-        "--commit",
-        commit,
     ]
-    # This fixed shell layer exists only to persist the exec'd launcher's exit code.
-    # All variable values enter through shlex.join and never as shell syntax.
-    payload = (
-        f"{shlex.join(node_run)}; exit_status=$?; "
-        f"{shlex.join(node_exit)} --exit-code \"$exit_status\"; "
-        'exit "$exit_status"'
+    for name, value in sorted(environment.items()):
+        supervisor_command.extend(("--env", f"{name}={value}"))
+    supervisor_command.extend(("--", *stage_command))
+    owned_command = tuple(supervisor_command)
+    digest = canonical_command_digest(owned_command, environment)
+    isolated_supervisor = (
+        "/usr/bin/env",
+        "-i",
+        *(f"{name}={value}" for name, value in sorted(environment.items())),
+        *owned_command,
     )
     return (
-        payload,
+        isolated_supervisor,
         digest,
         OwnedNodeCommand(
             machine_rank=machine_rank,
-            command=stage_command,
+            command=owned_command,
             environment=tuple(sorted(environment.items())),
             ownership_path=ownership_path,
             exit_path=exit_path,
@@ -687,8 +963,11 @@ def build_owned_tmux_commands(
     repository = plan.cluster.remote_repo_root
     checkpoint = Path(checkpoint_root) / plan.run_id
     attempt_log = Path(stage_log_root) / plan.run_id / f"{plan.attempt_id}-train.log"
-    base_environment = dict(stage_environment or {})
+    supplied_environment = dict(stage_environment or {})
     if plan.stage == "stage1":
+        if supplied_environment:
+            raise ValueError("Stage 1 does not accept coordinator environment overrides")
+        base_environment: dict[str, str] = {}
         forwarded = validate_stage1_arguments(stage_arguments)
         stage_owned_arguments: tuple[str, ...] = ()
         if any(
@@ -734,6 +1013,22 @@ def build_owned_tmux_commands(
     else:
         finite_loss_evidence_path = None
         forwarded = validate_stage2_arguments(stage_arguments)
+        approved_stage2_names = _STAGE2_ENVIRONMENT_ALLOWLIST | {
+            "OUTPUT_DIR",
+            "LOG_FILE",
+            "DEEPSPEED_CONFIG",
+        }
+        unexpected = sorted(set(supplied_environment) - approved_stage2_names)
+        if unexpected:
+            raise ValueError(
+                f"unapproved Stage 2 environment: {', '.join(unexpected)}"
+            )
+        missing = sorted(
+            name for name in _STAGE2_REQUIRED_ENVIRONMENT if not supplied_environment.get(name)
+        )
+        if missing:
+            raise ValueError(f"missing required Stage 2 environment: {', '.join(missing)}")
+        base_environment = supplied_environment
         stage_command = (
             "/usr/bin/bash",
             str(repository / "run_stage2_training.sh"),
@@ -744,11 +1039,12 @@ def build_owned_tmux_commands(
     node_specs: list[OwnedNodeCommand] = []
     for machine_rank in (plan.cluster.remote_rank, plan.cluster.local_rank):
         environment = {
+            **_MINIMAL_EXEC_ENVIRONMENT,
             **base_environment,
             **_distributed_environment(plan, machine_rank),
             "ILVR_REPOSITORY_COMMIT": commit,
         }
-        payload, digest, node_spec = _node_shell_command(
+        supervisor, digest, node_spec = _node_shell_command(
             plan,
             machine_rank=machine_rank,
             commit=commit,
@@ -758,7 +1054,15 @@ def build_owned_tmux_commands(
         )
         session = f"ilvr-{plan.run_id}-{plan.attempt_id}-rank{machine_rank}"
         node_commands.append(
-            ("tmux", "new-session", "-d", "-s", session, "--", "bash", "-lc", payload)
+            (
+                "/usr/bin/tmux",
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "--",
+                *supervisor,
+            )
         )
         digests.append(digest)
         node_specs.append(node_spec)
@@ -775,12 +1079,26 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def _subprocess_command_runner(
-    command: Sequence[str], *, input_bytes: bytes | None = None
+    command: Sequence[str],
+    *,
+    input_bytes: bytes | None = None,
+    timeout_seconds: float = _CONTROL_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
     if input_bytes is None:
-        return subprocess.run(command, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
     completed = subprocess.run(
-        command, input=input_bytes, capture_output=True, text=False, check=False
+        command,
+        input=input_bytes,
+        capture_output=True,
+        text=False,
+        check=False,
+        timeout=timeout_seconds,
     )
     return subprocess.CompletedProcess(
         completed.args,
@@ -813,7 +1131,11 @@ class SubprocessCoordinatorRunner:
     def _run(
         self, command: Sequence[str], *, input_bytes: bytes | None = None
     ) -> subprocess.CompletedProcess[str]:
-        completed = self.command_runner(command, input_bytes=input_bytes)
+        completed = self.command_runner(
+            command,
+            input_bytes=input_bytes,
+            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+        )
         if completed.returncode != 0:
             raise RuntimeError(
                 f"coordinator command failed ({completed.returncode}): "
@@ -854,10 +1176,7 @@ class SubprocessCoordinatorRunner:
         )
 
     def _process_snapshot(self, ownership: OwnershipRecord) -> dict[str, object]:
-        spec = self._node_spec(ownership.machine_rank)
         arguments = ["--pid", str(ownership.pid)]
-        for name, _value in spec.environment:
-            arguments.extend(("--environment-name", name))
         completed = self._run(
             self._internal_command(
                 ownership.machine_rank, "owned-process-info", arguments
@@ -877,44 +1196,42 @@ class SubprocessCoordinatorRunner:
         serialized = serialize_launch_plan(plan, log_root=self.log_root)
         if serialized.size > 1024 * 1024:
             raise ValueError("launch plan exceeds the one-MiB transfer limit")
-        remote_directory = self.log_root / plan.run_id / plan.attempt_id
         repository_python = (
             plan.cluster.remote_repo_root / "venv" / "ilvr-venv" / "bin" / "python"
         )
-        mkdir_script = (
-            "from pathlib import Path; import sys; "
-            "Path(sys.argv[1]).mkdir(parents=True, mode=0o700, exist_ok=False)"
-        )
         self._run(
             build_remote_exec(
-                (str(repository_python), "-c", mkdir_script, str(remote_directory))
+                (
+                    str(repository_python),
+                    "-m",
+                    "src.multinode",
+                    "prepare-attempt",
+                    "--log-root",
+                    str(self.log_root),
+                    "--run-id",
+                    plan.run_id,
+                    "--attempt-id",
+                    plan.attempt_id,
+                )
             )
         )
-        transfer_script = (
-            "import hashlib, os, pathlib, sys; "
-            "path=pathlib.Path(sys.argv[1]); size=int(sys.argv[2]); digest=sys.argv[3]; "
-            "raw=sys.stdin.buffer.read(1048577); "
-            "(len(raw)==size and len(raw)<=1048576 and hashlib.sha256(raw).hexdigest()==digest) "
-            "or sys.exit('launch plan transfer mismatch'); "
-            "fd=os.open(path, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600); "
-            "stream=os.fdopen(fd, 'wb'); stream.write(raw); stream.flush(); "
-            "os.fsync(stream.fileno()); stream.close(); stored=path.read_bytes(); "
-            "(len(stored)==size and hashlib.sha256(stored).hexdigest()==digest) "
-            "or sys.exit('stored launch plan mismatch')"
-        )
-        remote_path = remote_directory / "launch-plan.json"
+        remote_path = self.log_root / plan.run_id / plan.attempt_id / "launch-plan.json"
         self._run(
             _build_remote_stdin_exec(
                 (
                     str(repository_python),
-                    "-c",
-                    transfer_script,
+                    "-m",
+                    "src.multinode",
+                    "receive-plan",
+                    "--path",
                     str(remote_path),
+                    "--size",
                     str(serialized.size),
+                    "--sha256",
                     serialized.sha256,
                 )
             ),
-            input_bytes=serialized.path.read_bytes(),
+            input_bytes=_read_regular_file(serialized.path),
         )
         self.serialized_plan = serialized
 
@@ -959,7 +1276,9 @@ class SubprocessCoordinatorRunner:
             command.extend(("--env", f"{name}={value}"))
         command.extend(("--", *spec.command))
         completed = self.command_runner(
-            build_remote_exec(command), input_bytes=None
+            build_remote_exec(command),
+            input_bytes=None,
+            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
         )
         return completed.returncode == 0
 
@@ -997,16 +1316,19 @@ class SubprocessCoordinatorRunner:
 
     def command_digest(self, ownership: OwnershipRecord) -> str:
         payload = self._process_snapshot(ownership)
+        command = payload.get("command")
         environment = payload.get("environment")
+        if type(command) is not list or not all(type(value) is str for value in command):
+            raise ValueError("owned process command is invalid")
         if type(environment) is not dict or not all(
             type(key) is str and type(value) is str
             for key, value in environment.items()
         ):
             raise ValueError("owned process environment is invalid")
-        digest = environment.get("ILVR_OWNED_COMMAND_DIGEST")
-        if type(digest) is not str:
-            raise ValueError("owned process command digest is missing")
-        return _require_digest("owned process command digest", digest)
+        spec = self._node_spec(ownership.machine_rank)
+        if tuple(command) != spec.command or environment != dict(spec.environment):
+            raise ValueError("owned process argv or environment mismatch")
+        return canonical_command_digest(command, environment)
 
     def commit(self, ownership: OwnershipRecord) -> str:
         payload = self._process_snapshot(ownership)
@@ -1066,6 +1388,7 @@ class SubprocessCoordinatorRunner:
         completed = self.command_runner(
             self._internal_command(machine_rank, "exit-show", arguments),
             input_bytes=None,
+            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
         )
         if completed.returncode == 0:
             try:
@@ -1085,10 +1408,44 @@ class SubprocessCoordinatorRunner:
                 return None
             return 125
         try:
-            self._process_snapshot(ownership)
+            self.command_digest(ownership)
         except (RuntimeError, ValueError):
             return 125
         return None
+
+    def cleanup_owned(self, machine_rank: int, *, timeout_seconds: float) -> bool:
+        """Signal only an exactly revalidated owner, then boundedly observe exit."""
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("cleanup timeout must be positive and finite")
+        try:
+            ownership = self.read_ownership(machine_rank)
+            spec = self._node_spec(machine_rank)
+            validate_ownership(
+                ownership,
+                expected_run_id=self.plan.run_id,
+                expected_attempt_id=self.plan.attempt_id,
+                expected_machine_rank=machine_rank,
+                expected_pid=ownership.pid,
+                expected_commit=self.commit_value,
+                expected_command_digest=self.commands.command_digests[machine_rank],
+                observed_start_ticks=self.process_start_ticks(ownership),
+                observed_command_digest=self.command_digest(ownership),
+                observed_commit=self.commit(ownership),
+            )
+            if ownership.command_digest != canonical_command_digest(
+                spec.command, dict(spec.environment)
+            ):
+                raise ValueError("owned cleanup command digest mismatch")
+            stop_owned_peer(ownership, self)
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+            return False
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            exit_code = self.poll_exit(machine_rank)
+            if exit_code is not None:
+                return True
+            self.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        return False
 
 
 class CoordinatorRunner(Protocol):
@@ -1097,6 +1454,7 @@ class CoordinatorRunner(Protocol):
     def rank0_is_ready(self, plan: "LaunchPlan") -> bool: ...
     def start_local(self, command: Sequence[str]) -> None: ...
     def sleep(self, seconds: float) -> None: ...
+    def cleanup_owned(self, machine_rank: int, *, timeout_seconds: float) -> bool: ...
 
 
 def start_rank0_then_rank1(
@@ -1123,17 +1481,35 @@ def start_rank0_then_rank1(
     if dry_run:
         return result
     runner.prepare_plan(plan)
-    runner.start_remote(commands.remote)
-    checks = max(1, math.ceil(ready_timeout_seconds / 0.25))
-    deadline = time.monotonic() + ready_timeout_seconds
-    for check in range(checks):
-        if check and time.monotonic() >= deadline:
-            break
-        if runner.rank0_is_ready(plan):
-            runner.start_local(commands.local)
-            return result
-        if check + 1 < checks and time.monotonic() < deadline:
-            runner.sleep(0.25)
+    local_start_attempted = False
+    try:
+        runner.start_remote(commands.remote)
+        checks = max(1, math.ceil(ready_timeout_seconds / 0.25))
+        deadline = time.monotonic() + ready_timeout_seconds
+        for check in range(checks):
+            if check and time.monotonic() >= deadline:
+                break
+            if runner.rank0_is_ready(plan):
+                local_start_attempted = True
+                runner.start_local(commands.local)
+                return result
+            if check + 1 < checks and time.monotonic() < deadline:
+                runner.sleep(0.25)
+    except BaseException:
+        if local_start_attempted:
+            runner.cleanup_owned(
+                plan.cluster.local_rank,
+                timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+            )
+        runner.cleanup_owned(
+            plan.cluster.remote_rank,
+            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+        )
+        raise
+    runner.cleanup_owned(
+        plan.cluster.remote_rank,
+        timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+    )
     raise TimeoutError("rank 0 readiness was not observed before timeout")
 
 
@@ -1145,6 +1521,7 @@ class OwnedProcessRunner(Protocol):
     def signal(self, ownership: OwnershipRecord) -> None: ...
     def poll_exit(self, machine_rank: int) -> int | None: ...
     def sleep(self, seconds: float) -> None: ...
+    def cleanup_owned(self, machine_rank: int, *, timeout_seconds: float) -> bool: ...
 
 
 def stop_owned_peer(record: OwnershipRecord, runner: OwnedProcessRunner) -> None:
@@ -1172,10 +1549,19 @@ def monitor_owned_jobs(
     expected_commit: str,
     expected_command_digests: Mapping[int, str],
     poll_interval_seconds: float = 0.25,
+    attempt_timeout_seconds: float | None = None,
 ) -> dict[int, int]:
     """Collect both exits and stop only a revalidated live peer after failure."""
     exits: dict[int, int] = {}
     ranks = (plan.cluster.remote_rank, plan.cluster.local_rank)
+    timeout = (
+        plan.attempt_timeout_seconds
+        if attempt_timeout_seconds is None
+        else attempt_timeout_seconds
+    )
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("attempt timeout must be positive and finite")
+    deadline = time.monotonic() + timeout
     while len(exits) < len(ranks):
         for machine_rank in ranks:
             if machine_rank in exits:
@@ -1188,37 +1574,30 @@ def monitor_owned_jobs(
                 for peer_rank in ranks:
                     if peer_rank == machine_rank or peer_rank in exits:
                         continue
-                    peer = runner.read_ownership(peer_rank)
-                    validate_ownership(
-                        peer,
-                        expected_run_id=plan.run_id,
-                        expected_attempt_id=plan.attempt_id,
-                        expected_machine_rank=peer_rank,
-                        expected_pid=peer.pid,
-                        expected_commit=expected_commit,
-                        expected_command_digest=expected_command_digests[peer_rank],
-                        observed_start_ticks=runner.process_start_ticks(peer),
-                        observed_command_digest=runner.command_digest(peer),
-                        observed_commit=runner.commit(peer),
-                    )
-                    stop_owned_peer(peer, runner)
-                    exits[peer_rank] = -15
+                    if runner.cleanup_owned(
+                        peer_rank, timeout_seconds=_CONTROL_TIMEOUT_SECONDS
+                    ):
+                        exits[peer_rank] = -15
                 return exits
         if len(exits) < len(ranks):
+            if time.monotonic() >= deadline:
+                for machine_rank in ranks:
+                    if machine_rank not in exits:
+                        runner.cleanup_owned(
+                            machine_rank, timeout_seconds=_CONTROL_TIMEOUT_SECONDS
+                        )
+                raise TimeoutError("training attempt exceeded its 24-hour deadline")
             runner.sleep(poll_interval_seconds)
     return exits
 
 
 def _finite_loss_reference(path: Path | None) -> dict[str, object]:
     if path is None:
-        return {
-            "status": "pending-producer-evidence",
-            "path": None,
-            "finite_loss": None,
-        }
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("finite loss evidence must be a regular file")
-    raw = path.read_bytes()
+        raise ValueError("finite loss evidence is required for a successful attempt")
+    try:
+        raw = _read_regular_file(path)
+    except (OSError, ValueError) as error:
+        raise ValueError("finite loss evidence must be a trusted regular file") from error
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as error:
@@ -1233,6 +1612,48 @@ def _finite_loss_reference(path: Path | None) -> dict[str, object]:
         "size": len(raw),
         "finite_loss": True,
     }
+
+
+def _checkpoint_has_concrete_output(checkpoint: Path) -> bool:
+    for root, directories, files in os.walk(checkpoint, followlinks=False):
+        root_path = Path(root)
+        directories[:] = [
+            name for name in directories if not (root_path / name).is_symlink()
+        ]
+        for name in files:
+            candidate = root_path / name
+            if not candidate.is_symlink() and candidate.is_file() and candidate.stat().st_size > 0:
+                return True
+    return False
+
+
+def write_incomplete_attempt(
+    plan: "LaunchPlan",
+    *,
+    result_root: str | Path,
+    reason: str,
+    exit_codes: Mapping[int, int] | None = None,
+) -> Path:
+    """Publish a distinct non-success record when witness evidence is incomplete."""
+    if not isinstance(reason, str) or not reason or "\0" in reason:
+        raise ValueError("incomplete attempt reason must be a nonempty string")
+    payload = {
+        "schema_version": _INCOMPLETE_SCHEMA_VERSION,
+        "status": "incomplete",
+        "run_id": plan.run_id,
+        "attempt_id": plan.attempt_id,
+        "stage": plan.stage,
+        "reason": reason,
+        "exit_codes": {
+            str(rank): code for rank, code in sorted((exit_codes or {}).items())
+        },
+    }
+    path = (
+        _trusted_absolute_path(result_root)
+        / plan.run_id
+        / f"{plan.attempt_id}-train-incomplete.json"
+    )
+    return _publish_bytes_no_replace(path, _canonical_json_bytes(payload) + b"\n")
 
 
 def write_training_witness(
@@ -1252,13 +1673,26 @@ def write_training_witness(
     checkpoint = Path(checkpoint_path)
     if checkpoint.is_symlink() or not checkpoint.is_dir():
         raise ValueError("training witness checkpoint must be an existing directory")
+    if checkpoint.name != plan.run_id:
+        raise ValueError("training witness checkpoint must be owned by the run ID")
+    canonical_checkpoint = checkpoint.resolve(strict=False)
+    canonical_repository_checkpoint_root = _CHECKPOINT_ROOT.resolve(strict=False)
+    try:
+        checkpoint.relative_to(_CHECKPOINT_ROOT)
+    except ValueError:
+        checkpoint_scope = checkpoint.parent.resolve(strict=False)
+    else:
+        checkpoint_scope = canonical_repository_checkpoint_root
+    if canonical_checkpoint != checkpoint_scope / plan.run_id:
+        raise ValueError("training witness checkpoint escaped its run-owned root")
+    if not _checkpoint_has_concrete_output(checkpoint):
+        raise ValueError("training witness checkpoint must contain nonempty output")
     finite_loss = _finite_loss_reference(
         Path(finite_loss_evidence_path)
         if finite_loss_evidence_path is not None
         else None
     )
-    run_directory = Path(result_root) / plan.run_id
-    run_directory.mkdir(parents=True, exist_ok=True)
+    run_directory = _trusted_absolute_path(result_root) / plan.run_id
     path = run_directory / f"{plan.attempt_id}-train-witness.json"
     payload = {
         "schema_version": _WITNESS_SCHEMA_VERSION,
@@ -1274,13 +1708,7 @@ def write_training_witness(
         "checkpoint_path": str(checkpoint),
         "finite_loss_evidence": finite_loss,
     }
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(_canonical_json_bytes(payload) + b"\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.chmod(path, 0o600)
-    return path
+    return _publish_bytes_no_replace(path, _canonical_json_bytes(payload) + b"\n")
 
 
 @dataclass(frozen=True)
@@ -1339,38 +1767,33 @@ class PreflightCommands:
 
 def build_remote_exec(argv: Sequence[str]) -> list[str]:
     """Build the fixed, noninteractive remote container command safely."""
+    remote_command = shlex.join(
+        ("/usr/bin/docker", "exec", _REMOTE_CONTAINER, "/usr/bin/bash", "-lc", shlex.join(argv))
+    )
     return [
-        "ssh",
+        "/usr/bin/ssh",
         "-o",
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
         _REMOTE_HOST,
-        "docker",
-        "exec",
-        _REMOTE_CONTAINER,
-        "bash",
-        "-lc",
-        shlex.join(argv),
+        remote_command,
     ]
 
 
 def _build_remote_stdin_exec(argv: Sequence[str]) -> list[str]:
     """Build the fixed remote container boundary with stdin attached."""
+    remote_command = shlex.join(
+        ("/usr/bin/docker", "exec", "-i", _REMOTE_CONTAINER, "/usr/bin/bash", "-lc", shlex.join(argv))
+    )
     return [
-        "ssh",
+        "/usr/bin/ssh",
         "-o",
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
         _REMOTE_HOST,
-        "docker",
-        "exec",
-        "-i",
-        _REMOTE_CONTAINER,
-        "bash",
-        "-lc",
-        shlex.join(argv),
+        remote_command,
     ]
 
 
@@ -1475,17 +1898,21 @@ def build_preflight_commands(
     )
     return PreflightCommands(
         container_inspect=(
-            "ssh",
+            "/usr/bin/ssh",
             "-o",
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=8",
             plan.cluster.remote_host,
-            "docker",
-            "inspect",
-            "--format",
-            "{{.State.Running}}",
-            plan.cluster.remote_container,
+            shlex.join(
+                (
+                    "/usr/bin/docker",
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    plan.cluster.remote_container,
+                )
+            ),
         ),
         remote_node_info=tuple(build_remote_exec(remote_argv)),
         local_node_info=tuple(local_argv),

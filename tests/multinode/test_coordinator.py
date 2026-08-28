@@ -1,8 +1,10 @@
 import json
 import os
 import shlex
+import signal
 import stat
 import subprocess
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,17 +14,22 @@ from src.multinode import build_launch_plan
 from src.multinode_runtime import (
     OwnershipRecord,
     SubprocessCoordinatorRunner,
+    _build_remote_stdin_exec,
+    build_remote_exec,
     build_owned_tmux_commands,
     canonical_command_digest,
     monitor_owned_jobs,
+    owned_listener_is_ready,
     serialize_launch_plan,
     start_rank0_then_rank1,
     stop_owned_peer,
+    validate_resume_path,
     validate_owned_process,
     validate_ownership,
     validate_stage1_arguments,
     validated_stage2_environment,
     write_ownership,
+    write_incomplete_attempt,
     write_training_witness,
 )
 
@@ -69,7 +76,7 @@ class FakeRunner:
 
     def start_remote(self, command):
         assert command[:6] == (
-            "ssh",
+            "/usr/bin/ssh",
             "-o",
             "BatchMode=yes",
             "-o",
@@ -84,7 +91,7 @@ class FakeRunner:
 
     def start_local(self, command):
         assert command[:5] == (
-            "tmux",
+            "/usr/bin/tmux",
             "new-session",
             "-d",
             "-s",
@@ -112,6 +119,14 @@ class FakeRunner:
 
     def poll_exit(self, machine_rank):
         return self.statuses[machine_rank]
+
+    def cleanup_owned(self, machine_rank, *, timeout_seconds):
+        assert timeout_seconds == 30
+        self.events.append(f"cleanup-rank{machine_rank}")
+        ownership = self.read_ownership(machine_rank)
+        stop_owned_peer(ownership, self)
+        self.events.append(f"observed-exit-rank{machine_rank}")
+        return True
 
 
 @pytest.fixture
@@ -233,6 +248,75 @@ def test_plan_is_attempt_scoped_exclusive_and_digest_bound(tmp_path):
         serialize_launch_plan(launch_plan, log_root=tmp_path)
 
 
+def test_publication_rejects_symlink_ancestor_and_racing_replacement(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+    ownership = record()
+
+    with pytest.raises((OSError, ValueError), match="symlink|trusted"):
+        write_ownership(linked / "run/initial/ownership.json", ownership)
+    assert not any(outside.iterdir())
+
+    path = tmp_path / "safe/run/initial/ownership.json"
+    outcomes = []
+
+    def publish():
+        try:
+            write_ownership(path, ownership)
+            outcomes.append("created")
+        except FileExistsError:
+            outcomes.append("exists")
+
+    threads = [threading.Thread(target=publish) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(outcomes) == ["created", "exists"]
+    assert json.loads(path.read_text(encoding="utf-8")) == ownership.to_json()
+
+
+@pytest.mark.parametrize("stdin_attached", [False, True])
+def test_remote_exec_survives_openssh_joining_and_preserves_stdin(
+    stdin_attached, tmp_path
+):
+    marker = tmp_path / "NEVER"
+    target = (
+        "/usr/bin/python3",
+        "-c",
+        "import sys; print(sys.argv[1]); print(sys.stdin.buffer.read().hex())",
+        f"literal value;$(touch {marker})",
+    )
+    command = (
+        _build_remote_stdin_exec(target)
+        if stdin_attached
+        else build_remote_exec(target)
+    )
+
+    # OpenSSH joins everything after the host into one remote shell command.
+    remote_words = command[6:]
+    assert len(remote_words) == 1
+    docker_argv = shlex.split(" ".join(remote_words))
+    assert ("-i" in docker_argv) is stdin_attached
+    assert docker_argv[:2] == ["/usr/bin/docker", "exec"]
+    assert docker_argv[-3:-1] == ["/usr/bin/bash", "-lc"]
+    assert tuple(shlex.split(docker_argv[-1])) == target
+    transferred = b"plan-bytes\x00unchanged" if stdin_attached else b""
+
+    # This is a fake Docker boundary: execute only the decoded container target.
+    completed = subprocess.run(
+        docker_argv[-3:],
+        input=transferred,
+        capture_output=True,
+        check=True,
+    )
+    lines = completed.stdout.decode().splitlines()
+    assert lines == [target[-1], transferred.hex()]
+    assert not marker.exists()
+
+
 def test_tmux_commands_use_fixed_sessions_and_quote_shell_metacharacters():
     marker = Path("COORDINATOR_INJECTION")
     launch_plan = plan()
@@ -240,23 +324,20 @@ def test_tmux_commands_use_fixed_sessions_and_quote_shell_metacharacters():
         launch_plan,
         commit="a" * 40,
         stage_arguments=("--model", "literal;$(touch COORDINATOR_INJECTION)"),
-        stage_environment={"TOKEN": "value with spaces;$(touch ENV_INJECTION)"},
     )
 
     assert commands.local[:5] == (
-        "tmux",
+        "/usr/bin/tmux",
         "new-session",
         "-d",
         "-s",
         f"ilvr-{launch_plan.run_id}-initial-rank1",
     )
-    assert commands.local[5:8] == ("--", "bash", "-lc")
-    shell_tokens = shlex.split(commands.local[8].split("; exit_status=$?", 1)[0])
-    assert "literal;$(touch COORDINATOR_INJECTION)" in shell_tokens
-    assert "TOKEN=value with spaces;$(touch ENV_INJECTION)" in shell_tokens
+    assert commands.local[5:8] == ("--", "/usr/bin/env", "-i")
+    assert "literal;$(touch COORDINATOR_INJECTION)" in commands.local
     assert not marker.exists()
     assert commands.remote[:6] == (
-        "ssh",
+        "/usr/bin/ssh",
         "-o",
         "BatchMode=yes",
         "-o",
@@ -281,6 +362,25 @@ def test_rank_zero_timeout_prevents_rank_one_start(fake_runner):
             plan(), fake_runner, ready_timeout_seconds=0.5
         )
     assert "local-tmux-start" not in fake_runner.events
+    assert fake_runner.events[-3:] == [
+        "cleanup-rank0",
+        "signal",
+        "observed-exit-rank0",
+    ]
+
+
+def test_local_start_failure_cleans_up_owned_rank_zero(fake_runner):
+    def fail_local(_command):
+        raise RuntimeError("local tmux failed")
+
+    fake_runner.start_local = fail_local
+    with pytest.raises(RuntimeError, match="local tmux failed"):
+        start_rank0_then_rank1(plan(), fake_runner)
+    assert fake_runner.events[-3:] == [
+        "cleanup-rank0",
+        "signal",
+        "observed-exit-rank0",
+    ]
 
 
 def test_dry_run_starts_neither_node(fake_runner):
@@ -310,7 +410,40 @@ def test_monitor_stops_live_peer_only_after_exact_revalidation(fake_runner):
     )
 
     assert exits == {0: 7, 1: -15}
-    assert fake_runner.events == ["signal"]
+    assert fake_runner.events == [
+        "cleanup-rank1",
+        "signal",
+        "observed-exit-rank1",
+    ]
+
+
+def test_attempt_monitor_has_fixed_24_hour_bound_and_cleans_proven_peers(
+    fake_runner, monkeypatch
+):
+    launch_plan = plan()
+    assert launch_plan.attempt_timeout_seconds == 24 * 60 * 60
+    clock = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr("src.multinode_runtime.time.monotonic", lambda: next(clock))
+
+    with pytest.raises(TimeoutError, match="24-hour"):
+        monitor_owned_jobs(
+            launch_plan,
+            fake_runner,
+            expected_commit="a" * 40,
+            expected_command_digests={
+                0: fake_runner.ownership[0].command_digest,
+                1: fake_runner.ownership[1].command_digest,
+            },
+            attempt_timeout_seconds=0.5,
+        )
+    assert fake_runner.events == [
+        "cleanup-rank0",
+        "signal",
+        "observed-exit-rank0",
+        "cleanup-rank1",
+        "signal",
+        "observed-exit-rank1",
+    ]
 
 
 def test_stage1_allowlist_rejects_coordinator_owned_and_unknown_flags():
@@ -347,6 +480,26 @@ def test_stage2_forwards_only_allowlisted_environment_and_safe_arguments():
     assert "ILVR_MACHINE_RANK" not in environment
     assert "UNRELATED_SECRET" not in environment
 
+    commands = build_owned_tmux_commands(
+        plan(stage="stage2", method="dora"),
+        commit="a" * 40,
+        stage_environment=environment,
+    )
+    effective = dict(commands.node_specs[0].environment)
+    assert effective["PATH"].startswith("/usr/local/sbin:")
+    assert effective["HOME"] == "/root"
+    assert "UNRELATED_SECRET" not in effective
+    assert "STAGE2_DRY_RUN" not in effective
+
+
+def test_stage1_rejects_any_environment_override():
+    with pytest.raises(ValueError, match="does not accept"):
+        build_owned_tmux_commands(
+            plan(),
+            commit="a" * 40,
+            stage_environment={"UNRELATED_SECRET": "must-not-forward"},
+        )
+
 
 def test_success_witness_references_real_finite_loss_evidence_exclusively(tmp_path):
     producer = tmp_path / "producer-evidence.json"
@@ -357,6 +510,7 @@ def test_success_witness_references_real_finite_loss_evidence_exclusively(tmp_pa
     launch_plan = plan()
     checkpoint = tmp_path / "checkpoints" / launch_plan.run_id
     checkpoint.mkdir(parents=True)
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
 
     witness = write_training_witness(
         launch_plan,
@@ -395,8 +549,9 @@ def test_witness_never_invents_missing_finite_loss_evidence(tmp_path):
         json.dumps({"benchmark_evidence": {"finite_loss": False}}),
         encoding="utf-8",
     )
-    checkpoint = tmp_path / "checkpoints/run"
+    checkpoint = tmp_path / "checkpoints" / plan().run_id
     checkpoint.mkdir(parents=True)
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
 
     with pytest.raises(ValueError, match="finite loss"):
         write_training_witness(
@@ -417,6 +572,47 @@ def test_witness_rejects_a_missing_checkpoint_reference(tmp_path):
             exit_codes={0: 0, 1: 0},
             checkpoint_path=tmp_path / "missing-checkpoint",
             batch_per_gpu=2,
+        )
+
+
+def test_missing_evidence_creates_only_an_incomplete_attempt_record(tmp_path):
+    launch_plan = plan()
+    checkpoint = tmp_path / "checkpoints" / launch_plan.run_id
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
+
+    with pytest.raises(ValueError, match="finite loss evidence is required"):
+        write_training_witness(
+            launch_plan,
+            result_root=tmp_path / "results",
+            exit_codes={0: 0, 1: 0},
+            checkpoint_path=checkpoint,
+            batch_per_gpu=2,
+        )
+    incomplete = write_incomplete_attempt(
+        launch_plan,
+        result_root=tmp_path / "results",
+        reason="finite-loss-evidence-missing",
+        exit_codes={0: 0, 1: 0},
+    )
+    assert incomplete.name == "initial-train-incomplete.json"
+    assert not (incomplete.parent / "initial-train-witness.json").exists()
+    assert json.loads(incomplete.read_text())["status"] == "incomplete"
+
+
+def test_success_witness_rejects_empty_checkpoint(tmp_path):
+    producer = tmp_path / "producer.json"
+    producer.write_text(json.dumps({"finite_loss": True}), encoding="utf-8")
+    checkpoint = tmp_path / "checkpoints" / plan().run_id
+    checkpoint.mkdir(parents=True)
+    with pytest.raises(ValueError, match="nonempty"):
+        write_training_witness(
+            plan(),
+            result_root=tmp_path / "results",
+            exit_codes={0: 0, 1: 0},
+            checkpoint_path=checkpoint,
+            batch_per_gpu=2,
+            finite_loss_evidence_path=producer,
         )
 
 
@@ -471,7 +667,7 @@ def test_stage1_wrapper_dry_run_builds_both_nodes_without_remote_calls(tmp_path)
     payload = json.loads(completed.stdout)
     assert payload["plan"]["world_size"] == 4
     assert payload["remote"][:6] == [
-        "ssh",
+        "/usr/bin/ssh",
         "-o",
         "BatchMode=yes",
         "-o",
@@ -479,7 +675,7 @@ def test_stage1_wrapper_dry_run_builds_both_nodes_without_remote_calls(tmp_path)
         "korea@10.1.102.41",
     ]
     assert payload["local"][:5] == [
-        "tmux",
+        "/usr/bin/tmux",
         "new-session",
         "-d",
         "-s",
@@ -521,51 +717,136 @@ def test_resume_requires_a_fresh_noninitial_attempt_id():
     assert "fresh --attempt-id" in completed.stderr
 
 
-def test_node_run_publishes_exact_ownership_before_exec(tmp_path, monkeypatch):
-    ownership_path = tmp_path / "logs/run/initial/ownership-rank0.json"
-    observed = {}
+def test_resume_checkpoint_must_belong_to_the_same_run(tmp_path):
+    checkpoint_root = tmp_path / "checkpoints"
+    own = checkpoint_root / "current-run/checkpoint-2"
+    foreign = checkpoint_root / "other-run/checkpoint-2"
+    own.mkdir(parents=True)
+    foreign.mkdir(parents=True)
+    assert validate_resume_path(
+        "current-run", own, checkpoint_root=checkpoint_root
+    ) == own.resolve()
+    with pytest.raises(ValueError, match="same run"):
+        validate_resume_path(
+            "current-run", foreign, checkpoint_root=checkpoint_root
+        )
 
-    def fake_exec(program, command, environment):
-        observed["program"] = program
-        observed["command"] = tuple(command)
-        observed["environment"] = environment
+
+def test_wrapper_rejects_different_run_resume_before_any_remote_call():
+    completed = subprocess.run(
+        (
+            REPO_ROOT / "run_multinode_stage1_training.sh",
+            "--run-id",
+            "stage1-lora-zero3-four-gpu",
+            "--attempt-id",
+            "resume-step-two",
+            "--zero-stage",
+            "3",
+            "--main-process-port",
+            "29631",
+            "--dry-run",
+            "--method",
+            "lora",
+            "--model",
+            "model",
+            "--data-path",
+            "/data/train.jsonl",
+            "--image-root",
+            "/data/images",
+            "--resume",
+            "/root/workspace/ILVR/checkpoints/a-different-run/checkpoint-2",
+        ),
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert completed.returncode == 2
+    assert "same run ID" in completed.stderr
+
+
+def test_node_run_supervises_child_with_pidfd_and_records_exact_exit(
+    tmp_path, monkeypatch
+):
+    ownership_path = tmp_path / "logs/run/initial/ownership-rank0.json"
+    exit_path = tmp_path / "logs/run/initial/exit-rank0.json"
+    observed = {}
+    handlers = {}
+    child_pidfd = os.open("/dev/null", os.O_RDONLY)
+
+    class FakeChild:
+        pid = 5312
+
+        def wait(self):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return 7
+
+    def fake_popen(command, **kwargs):
+        observed["child_command"] = tuple(command)
+        observed["child_environment"] = kwargs["env"]
         observed["ownership"] = json.loads(ownership_path.read_text(encoding="utf-8"))
-        raise RuntimeError("exec boundary reached")
+        return FakeChild()
+
+    supervisor_argv = (
+        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "-m",
+        "src.multinode",
+        "node-run",
+        "--run-id",
+        "stage1-lora-zero3-four-gpu",
+        "--attempt-id",
+        "initial",
+        "--machine-rank",
+        "0",
+        "--commit",
+        "a" * 40,
+        "--ownership-path",
+        str(ownership_path),
+        "--exit-path",
+        str(exit_path),
+        "--env",
+        "ILVR_MACHINE_RANK=0",
+        "--",
+        "/usr/bin/bash",
+        "/root/workspace/ILVR/run_stage1_training.sh",
+        "--model",
+        "literal;$(touch BAD)",
+    )
 
     monkeypatch.setattr("src.multinode.os.getpid", lambda: 4312)
     monkeypatch.setattr("src.multinode._proc_start_ticks", lambda pid: 9981)
-    monkeypatch.setattr("src.multinode.os.execvpe", fake_exec)
+    monkeypatch.setattr("src.multinode.sys.orig_argv", list(supervisor_argv))
+    monkeypatch.setattr("src.multinode.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "src.multinode.signal.signal",
+        lambda signum, handler: handlers.setdefault(signum, handler),
+    )
+    monkeypatch.setattr(
+        "src.multinode.os.pidfd_open", lambda pid: child_pidfd
+    )
+    forwarded = []
+    monkeypatch.setattr(
+        "src.multinode.signal.pidfd_send_signal",
+        lambda fd, signum: forwarded.append((fd, signum)),
+    )
+    monkeypatch.setattr(
+        "src.multinode.os.environ", {"ILVR_MACHINE_RANK": "0"}
+    )
 
-    with pytest.raises(RuntimeError, match="exec boundary"):
-        from src.multinode import _node_run
+    from src.multinode import _node_run
 
-        _node_run(
-            [
-                "--run-id",
-                "stage1-lora-zero3-four-gpu",
-                "--attempt-id",
-                "initial",
-                "--machine-rank",
-                "0",
-                "--commit",
-                "a" * 40,
-                "--ownership-path",
-                str(ownership_path),
-                "--env",
-                "ILVR_MACHINE_RANK=0",
-                "--",
-                "/usr/bin/bash",
-                "/root/workspace/ILVR/run_stage1_training.sh",
-                "--model",
-                "literal;$(touch BAD)",
-            ]
-        )
+    assert _node_run(list(supervisor_argv[4:])) == 7
 
-    assert observed["program"] == "/usr/bin/bash"
-    assert observed["command"][-1] == "literal;$(touch BAD)"
-    assert observed["environment"]["ILVR_MACHINE_RANK"] == "0"
+    assert observed["child_command"][-1] == "literal;$(touch BAD)"
+    assert observed["child_environment"] == {"ILVR_MACHINE_RANK": "0"}
     assert observed["ownership"]["pid"] == 4312
     assert observed["ownership"]["process_start_ticks"] == 9981
+    assert observed["ownership"]["command_digest"] == canonical_command_digest(
+        supervisor_argv, {"ILVR_MACHINE_RANK": "0"}
+    )
+    assert forwarded == [(child_pidfd, signal.SIGTERM)]
+    assert json.loads(exit_path.read_text(encoding="utf-8"))["exit_code"] == 7
     assert stat.S_IMODE(ownership_path.stat().st_mode) == 0o600
 
 
@@ -573,8 +854,8 @@ class FakeCommandRunner:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, command, *, input_bytes=None):
-        self.calls.append((tuple(command), input_bytes))
+    def __call__(self, command, *, input_bytes=None, timeout_seconds=None):
+        self.calls.append((tuple(command), input_bytes, timeout_seconds))
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
 
@@ -599,11 +880,57 @@ def test_subprocess_runner_transfers_only_attempt_plan_with_size_and_sha(tmp_pat
     assert len(command_runner.calls) == 2
     mkdir_command, transfer_command = command_runner.calls
     assert mkdir_command[1] is None
+    assert mkdir_command[2] == transfer_command[2] == 30
     assert transfer_command[1] == runner.serialized_plan.path.read_bytes()
     transfer_display = " ".join(transfer_command[0])
     assert str(runner.serialized_plan.size) in transfer_display
     assert runner.serialized_plan.sha256 in transfer_display
     assert not any("rsync" in token or "scp" in token for token in transfer_command[0])
+
+
+def test_cleanup_does_not_signal_when_live_ownership_cannot_be_proven(tmp_path):
+    launch_plan = plan()
+    commands = build_owned_tmux_commands(launch_plan, commit="a" * 40)
+    spec = commands.node_specs[0]
+    ownership = OwnershipRecord.create(
+        run_id=launch_plan.run_id,
+        attempt_id=launch_plan.attempt_id,
+        machine_rank=0,
+        pid=4312,
+        process_start_ticks=9981,
+        commit="a" * 40,
+        command=spec.command,
+        environment=dict(spec.environment),
+    )
+    calls = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        display = " ".join(command)
+        calls.append(display)
+        if "ownership-show" in display:
+            stdout = json.dumps(ownership.to_json())
+        elif "owned-process-info" in display:
+            stdout = json.dumps(
+                {
+                    "command": list(spec.command),
+                    "environment": dict(spec.environment),
+                    "process_start_ticks": 9982,
+                }
+            )
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    runner = SubprocessCoordinatorRunner(
+        launch_plan,
+        commands=commands,
+        commit="a" * 40,
+        log_root=tmp_path,
+        command_runner=fake_command,
+    )
+
+    assert not runner.cleanup_owned(0, timeout_seconds=30)
+    assert not any("signal-owned" in call for call in calls)
 
 
 def test_live_process_validation_reads_exact_proc_argv_env_and_start_ticks(tmp_path):
@@ -637,10 +964,7 @@ def test_live_process_validation_reads_exact_proc_argv_env_and_start_ticks(tmp_p
     (process_directory / "cmdline").write_bytes(
         b"\0".join(item.encode() for item in command) + b"\0"
     )
-    live_environment = {
-        **environment,
-        "ILVR_OWNED_COMMAND_DIGEST": ownership.command_digest,
-    }
+    live_environment = dict(environment)
     (process_directory / "environ").write_bytes(
         b"\0".join(
             f"{key}={value}".encode() for key, value in live_environment.items()
@@ -659,30 +983,11 @@ def test_live_process_validation_reads_exact_proc_argv_env_and_start_ticks(tmp_p
         proc_root=tmp_path,
     )
 
-    # Stage 2 legitimately execs Accelerate in place; the launch-bound digest
-    # survives that exec in the owned environment while PID/start ticks stay fixed.
+    # An environment marker cannot make an arbitrary post-exec argv owned.
     (process_directory / "cmdline").write_bytes(
         b"/root/workspace/ILVR/venv/ilvr-venv/bin/python\0accelerate\0"
     )
-    assert validate_owned_process(
-        ownership,
-        expected_run_id=ownership.run_id,
-        expected_attempt_id="initial",
-        expected_machine_rank=0,
-        expected_commit="a" * 40,
-        expected_command=command,
-        expected_environment=environment,
-        proc_root=tmp_path,
-    )
-
-    live_environment["ILVR_OWNED_COMMAND_DIGEST"] = "b" * 64
-    (process_directory / "environ").write_bytes(
-        b"\0".join(
-            f"{key}={value}".encode() for key, value in live_environment.items()
-        )
-        + b"\0"
-    )
-    with pytest.raises(ValueError, match="command digest"):
+    with pytest.raises(ValueError, match="command"):
         validate_owned_process(
             ownership,
             expected_run_id=ownership.run_id,
@@ -693,3 +998,124 @@ def test_live_process_validation_reads_exact_proc_argv_env_and_start_ticks(tmp_p
             expected_environment=environment,
             proc_root=tmp_path,
         )
+
+    (process_directory / "cmdline").write_bytes(
+        b"\0".join(item.encode() for item in command) + b"\0"
+    )
+    live_environment["UNAPPROVED_SECRET"] = "secret"
+    (process_directory / "environ").write_bytes(
+        b"\0".join(
+            f"{key}={value}".encode() for key, value in live_environment.items()
+        )
+        + b"\0"
+    )
+    with pytest.raises(ValueError, match="environment"):
+        validate_owned_process(
+            ownership,
+            expected_run_id=ownership.run_id,
+            expected_attempt_id="initial",
+            expected_machine_rank=0,
+            expected_commit="a" * 40,
+            expected_command=command,
+            expected_environment=environment,
+            proc_root=tmp_path,
+        )
+
+
+def test_owned_listener_rejects_foreign_socket_and_accepts_descendant(tmp_path):
+    owner = 4312
+    child = 4313
+    (tmp_path / "net").mkdir()
+    (tmp_path / str(owner) / "task" / str(owner)).mkdir(parents=True)
+    (tmp_path / str(owner) / "task" / str(owner) / "children").write_text(
+        str(child), encoding="ascii"
+    )
+    (tmp_path / str(child) / "task" / str(child)).mkdir(parents=True)
+    (tmp_path / str(child) / "task" / str(child) / "children").write_text(
+        "", encoding="ascii"
+    )
+    (tmp_path / str(owner) / "fd").mkdir()
+    (tmp_path / str(child) / "fd").mkdir()
+    header = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+    line = "   0: 00000000:73BF 00000000:0000 0A 0:0 0:0 00:0 0 0 44444\n"
+    (tmp_path / "net/tcp").write_text(header + line, encoding="ascii")
+    (tmp_path / "net/tcp6").write_text(header, encoding="ascii")
+
+    assert not owned_listener_is_ready(
+        owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
+    )
+    (tmp_path / str(child) / "fd/7").symlink_to("socket:[44444]")
+    assert owned_listener_is_ready(
+        owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
+    )
+
+
+def test_signal_owned_uses_pidfd_and_never_os_kill(tmp_path, monkeypatch):
+    from src.multinode import _signal_owned
+    import src.multinode_runtime as runtime
+
+    command = ("/usr/bin/bash", "/root/workspace/ILVR/run_stage1_training.sh")
+    environment = {"ILVR_MACHINE_RANK": "0", "ILVR_REPOSITORY_COMMIT": "a" * 40}
+    ownership = OwnershipRecord.create(
+        run_id="stage1-lora-zero3-four-gpu",
+        attempt_id="initial",
+        machine_rank=0,
+        pid=4312,
+        process_start_ticks=9981,
+        commit="a" * 40,
+        command=command,
+        environment=environment,
+    )
+    ownership_path = tmp_path / "logs/run/initial/ownership.json"
+    write_ownership(ownership_path, ownership)
+    process_directory = tmp_path / "proc/4312"
+    process_directory.mkdir(parents=True)
+    fields = ["S", *("0" for _ in range(18)), "9981", "0"]
+    (process_directory / "stat").write_text(
+        f"4312 (bash) {' '.join(fields)}\n", encoding="utf-8"
+    )
+    (process_directory / "cmdline").write_bytes(
+        b"\0".join(part.encode() for part in command) + b"\0"
+    )
+    (process_directory / "environ").write_bytes(
+        b"\0".join(f"{key}={value}".encode() for key, value in environment.items())
+        + b"\0"
+    )
+    events = []
+    pidfd = os.open("/dev/null", os.O_RDONLY)
+    real_nul_fields = runtime._nul_fields
+
+    def observed_proc_read(path):
+        events.append(("proc-read", Path(path).name))
+        return real_nul_fields(path)
+
+    monkeypatch.setattr("src.multinode._PROC_ROOT", tmp_path / "proc")
+    monkeypatch.setattr("src.multinode.os.pidfd_open", lambda pid: events.append(("open", pid)) or pidfd)
+    monkeypatch.setattr(runtime, "_nul_fields", observed_proc_read)
+    monkeypatch.setattr(
+        "src.multinode.signal.pidfd_send_signal",
+        lambda fd, sig: events.append(("signal", fd, sig)),
+    )
+    monkeypatch.setattr(
+        "src.multinode.os.kill",
+        lambda *_args: pytest.fail("PID-based signaling is forbidden"),
+    )
+    arguments = [
+        "--ownership-path", str(ownership_path), "--run-id", ownership.run_id,
+        "--attempt-id", ownership.attempt_id, "--machine-rank", "0",
+        "--pid", str(ownership.pid), "--process-start-ticks", "9981",
+        "--commit", ownership.commit, "--command-digest", ownership.command_digest,
+    ]
+    for name, value in environment.items():
+        arguments.extend(("--env", f"{name}={value}"))
+    arguments.extend(("--", *command))
+
+    assert _signal_owned(arguments) == 0
+    assert events == [
+        ("open", 4312),
+        ("proc-read", "cmdline"),
+        ("proc-read", "environ"),
+        ("signal", pidfd, signal.SIGTERM),
+    ]
+    with pytest.raises(OSError):
+        os.fstat(pidfd)

@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import shlex
 from pathlib import Path
 import subprocess
 
@@ -104,20 +105,19 @@ def plan():
 def test_remote_exec_shell_quotes_each_argument():
     command = build_remote_exec(("python", "-c", "print('safe value')"))
 
-    assert command == [
-        "ssh",
+    assert command[:6] == [
+        "/usr/bin/ssh",
         "-o",
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
         "korea@10.1.102.41",
-        "docker",
-        "exec",
-        "llm_kd",
-        "bash",
-        "-lc",
-        """python -c 'print('"'"'safe value'"'"')'""",
     ]
+    assert len(command) == 7
+    remote = shlex.split(command[6])
+    assert remote[:3] == ["/usr/bin/docker", "exec", "llm_kd"]
+    assert remote[3:5] == ["/usr/bin/bash", "-lc"]
+    assert shlex.split(remote[5]) == ["python", "-c", "print('safe value')"]
 
 
 def test_remote_collection_checks_container_then_parses_probe_json():
@@ -125,7 +125,7 @@ def test_remote_collection_checks_container_then_parses_probe_json():
 
     def runner(command):
         calls.append(list(command))
-        if "inspect" in command:
+        if any("inspect" in token for token in command):
             return subprocess.CompletedProcess(command, 0, "true\n", "")
         return subprocess.CompletedProcess(
             command, 0, json.dumps(snapshot("remote", 0).to_json()), ""
@@ -142,23 +142,22 @@ def test_remote_collection_checks_container_then_parses_probe_json():
     )
 
     assert result.container_running is True
-    assert calls[0][-5:] == [
-        "docker",
+    assert shlex.split(calls[0][-1]) == [
+        "/usr/bin/docker",
         "inspect",
         "--format",
         "{{.State.Running}}",
         "llm_kd",
     ]
-    assert calls[1][:8] == [
-        "ssh",
+    assert calls[1][:6] == [
+        "/usr/bin/ssh",
         "-o",
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
         "korea@10.1.102.41",
-        "docker",
-        "exec",
     ]
+    assert shlex.split(calls[1][6])[:2] == ["/usr/bin/docker", "exec"]
 
 
 def test_local_collection_never_uses_ssh_or_docker():
@@ -187,7 +186,7 @@ def test_local_collection_never_uses_ssh_or_docker():
         "PYTHONPATH=/root/workspace/ILVR",
         "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
     ]
-    assert "ssh" not in calls[0]
+    assert "/usr/bin/ssh" not in calls[0]
     assert "docker" not in calls[0]
 
 
@@ -226,7 +225,7 @@ def test_preflight_dry_run_prints_commands_without_probing(monkeypatch, capsys):
         "src.multinode",
         "node-info",
     ]
-    assert payload["remote_node_info"][:2] == ["ssh", "-o"]
+    assert payload["remote_node_info"][:2] == ["/usr/bin/ssh", "-o"]
 
 
 def test_preflight_uses_each_node_repository_artifact_roots(monkeypatch, capsys):
@@ -305,9 +304,12 @@ def test_preflight_commands_use_the_canonical_repo_venv_and_config():
     assert commands.local_node_info[
         commands.local_node_info.index("--deepspeed-config") + 1
     ] == "/root/workspace/ILVR/configs/deepspeed_zero2.json"
-    assert commands.remote_node_info[-1].startswith(
-        "env PYTHONPATH=/root/workspace/ILVR "
-    )
+    remote_docker = shlex.split(commands.remote_node_info[-1])
+    assert remote_docker[:3] == ["/usr/bin/docker", "exec", "llm_kd"]
+    assert shlex.split(remote_docker[-1])[:2] == [
+        "env",
+        "PYTHONPATH=/root/workspace/ILVR",
+    ]
 
 
 def test_live_collection_uses_the_exact_prebuilt_dry_run_commands():

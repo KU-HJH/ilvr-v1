@@ -30,8 +30,11 @@ from src.multinode_runtime import (
     build_owned_tmux_commands,
     build_preflight_commands,
     collect_node_snapshot,
+    prepare_attempt_directory,
+    receive_launch_plan,
     read_ownership,
     monitor_owned_jobs,
+    owned_listener_is_ready,
     start_rank0_then_rank1,
     validate_owned_process,
     validate_ownership,
@@ -39,8 +42,10 @@ from src.multinode_runtime import (
     validate_preflight,
     validate_stage1_arguments,
     validate_stage2_arguments,
+    validate_resume_path,
     validated_stage2_environment,
     write_ownership,
+    write_incomplete_attempt,
     write_training_witness,
 )
 
@@ -48,6 +53,9 @@ from src.multinode_runtime import (
 _REPOSITORY_ROOT = Path("/root/workspace/ILVR")
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _TRAINING_REQUIRED_FREE_BYTES = 100 * 1024**3
+_ATTEMPT_TIMEOUT_SECONDS = 24 * 60 * 60
+_CONTROL_TIMEOUT_SECONDS = 30
+_PROC_ROOT = Path("/proc")
 
 
 @dataclass(frozen=True)
@@ -93,6 +101,7 @@ class LaunchPlan:
     cluster: ClusterSpec
     attempt_id: str = "initial"
     required_free_bytes: int = _TRAINING_REQUIRED_FREE_BYTES
+    attempt_timeout_seconds: int = _ATTEMPT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         if self.stage not in ("stage1", "stage2"):
@@ -114,6 +123,8 @@ class LaunchPlan:
             raise ValueError("world_size must equal the fixed four-process topology")
         if self.required_free_bytes != _TRAINING_REQUIRED_FREE_BYTES:
             raise ValueError("required_free_bytes must be 100 GiB for training")
+        if self.attempt_timeout_seconds != _ATTEMPT_TIMEOUT_SECONDS:
+            raise ValueError("attempt_timeout_seconds must be the fixed 24-hour bound")
         expected_config = canonical_deepspeed_config(self.zero_stage)
         if self.deepspeed_config != expected_config:
             raise ValueError("deepspeed_config must be the canonical ZeRO config")
@@ -302,7 +313,12 @@ def _artifact_root_evidence(roots: tuple[Path, ...]) -> tuple[bool, int]:
 
 def _command_stdout(command: tuple[str, ...], *, cwd: Path) -> str:
     completed = subprocess.run(
-        command, cwd=cwd, capture_output=True, text=True, check=False
+        command,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_CONTROL_TIMEOUT_SECONDS,
     )
     if completed.returncode != 0:
         raise RuntimeError(f"command failed: {' '.join(command)}")
@@ -315,6 +331,7 @@ def _interface_name() -> str:
         capture_output=True,
         text=True,
         check=False,
+        timeout=_CONTROL_TIMEOUT_SECONDS,
     )
     return "bond1.102" if completed.returncode == 0 else ""
 
@@ -325,6 +342,7 @@ def _tmux_session_is_fresh(name: str) -> bool:
         capture_output=True,
         text=True,
         check=False,
+        timeout=_CONTROL_TIMEOUT_SECONDS,
     )
     return completed.returncode != 0
 
@@ -362,10 +380,23 @@ def _node_run(argv: list[str]) -> int:
     parser.add_argument("--machine-rank", type=int, choices=(0, 1), required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--ownership-path", required=True)
+    parser.add_argument("--exit-path", required=True)
     parser.add_argument("--env", action="append", default=[])
     args = parser.parse_args(argv[:separator])
     command = tuple(argv[separator + 1 :])
+    if not command or not Path(command[0]).is_absolute():
+        raise ValueError("owned Stage command must use an absolute executable")
     environment = _environment_assignments(args.env)
+    if dict(os.environ) != environment:
+        raise ValueError("node-run environment differs from the complete launch environment")
+    supervisor_command = tuple(sys.orig_argv)
+    expected_suffix = ("-m", "src.multinode", "node-run", *argv)
+    if (
+        not supervisor_command
+        or not Path(supervisor_command[0]).is_absolute()
+        or tuple(supervisor_command[1:]) != expected_suffix
+    ):
+        raise ValueError("node-run supervisor argv differs from the immutable launch")
     ownership = OwnershipRecord.create(
         run_id=args.run_id,
         attempt_id=args.attempt_id,
@@ -373,15 +404,74 @@ def _node_run(argv: list[str]) -> int:
         pid=os.getpid(),
         process_start_ticks=_proc_start_ticks(os.getpid()),
         commit=args.commit,
-        command=command,
+        command=supervisor_command,
         environment=environment,
     )
     write_ownership(args.ownership_path, ownership)
-    child_environment = os.environ.copy()
-    child_environment.update(environment)
-    child_environment["ILVR_OWNED_COMMAND_DIGEST"] = ownership.command_digest
-    os.execvpe(command[0], command, child_environment)
-    raise AssertionError("os.execvpe returned unexpectedly")
+    child_pidfd: int | None = None
+    pending_signals: list[int] = []
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        if child_pidfd is None:
+            pending_signals.append(signum)
+            return
+        try:
+            signal.pidfd_send_signal(child_pidfd, signum)
+        except ProcessLookupError:
+            pass
+
+    handled_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    previous_handlers = {
+        signum: signal.signal(signum, forward_signal) for signum in handled_signals
+    }
+    exit_code: int
+    try:
+        child = subprocess.Popen(
+            command,
+            env=environment,
+            close_fds=True,
+            start_new_session=False,
+        )
+        child_pidfd = os.pidfd_open(child.pid)
+        for signum in pending_signals:
+            try:
+                signal.pidfd_send_signal(child_pidfd, signum)
+            except ProcessLookupError:
+                break
+        pending_signals.clear()
+        exit_code = child.wait()
+    finally:
+        if child_pidfd is not None:
+            descriptor = child_pidfd
+            child_pidfd = None
+            os.close(descriptor)
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+    _publish_exit_record(
+        ownership=ownership,
+        exit_path=Path(args.exit_path),
+        exit_code=exit_code,
+    )
+    if exit_code < 0:
+        return 128 + min(-exit_code, 127)
+    return min(exit_code, 255)
+
+
+def _publish_exit_record(
+    *, ownership: OwnershipRecord, exit_path: Path, exit_code: int
+) -> None:
+    from src.multinode_runtime import _canonical_json_bytes, _publish_bytes_no_replace
+
+    if type(exit_code) is not int:
+        raise ValueError("exit code must be an integer")
+    payload = {
+        "schema_version": 1,
+        **ownership.to_json(),
+        "exit_code": exit_code,
+    }
+    _publish_bytes_no_replace(
+        exit_path, _canonical_json_bytes(payload) + b"\n"
+    )
 
 
 def _write_exit_record(argv: list[str]) -> int:
@@ -407,18 +497,11 @@ def _write_exit_record(argv: list[str]) -> int:
         observed_start_ticks=ownership.process_start_ticks,
     )
     exit_path = Path(args.exit_path)
-    payload = {
-        "schema_version": 1,
-        **ownership.to_json(),
-        "exit_code": args.exit_code,
-    }
-    descriptor = os.open(exit_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.chmod(exit_path, 0o600)
+    _publish_exit_record(
+        ownership=ownership,
+        exit_path=exit_path,
+        exit_code=args.exit_code,
+    )
     return 0
 
 
@@ -435,24 +518,21 @@ def _owned_process_info(argv: list[str]) -> int:
         prog="python -m src.multinode owned-process-info"
     )
     parser.add_argument("--pid", type=int, required=True)
-    parser.add_argument("--environment-name", action="append", default=[])
     args = parser.parse_args(argv)
-    if len(set(args.environment_name)) != len(args.environment_name):
-        raise ValueError("environment names must be unique")
-    process_directory = Path("/proc") / str(args.pid)
+    process_directory = _PROC_ROOT / str(args.pid)
     command = _nul_fields(process_directory / "cmdline")
-    environment_names = {*args.environment_name, "ILVR_OWNED_COMMAND_DIGEST"}
     environment: dict[str, str] = {}
     for assignment in _nul_fields(process_directory / "environ"):
         name, separator, value = assignment.partition("=")
-        if separator and name in environment_names:
-            environment[name] = value
+        if not separator or name in environment:
+            raise ValueError("owned process environment is malformed")
+        environment[name] = value
     print(
         json.dumps(
             {
                 "command": command,
                 "environment": environment,
-                "process_start_ticks": _proc_start_ticks(args.pid),
+                "process_start_ticks": _proc_start_ticks(args.pid, proc_root=_PROC_ROOT),
             },
             sort_keys=True,
         )
@@ -491,23 +571,31 @@ def _ownership_ready(argv: list[str]) -> int:
     ownership = read_ownership(args.ownership_path)
     if ownership.command_digest != args.command_digest:
         raise ValueError("ownership command digest mismatch")
-    validate_owned_process(
-        ownership,
-        expected_run_id=args.run_id,
-        expected_attempt_id=args.attempt_id,
-        expected_machine_rank=args.machine_rank,
-        expected_commit=args.commit,
-        expected_command=command,
-        expected_environment=environment,
-    )
     if args.master_addr != ClusterSpec.default().master_addr:
         raise ValueError("readiness master address must match the fixed topology")
     if not 1024 <= args.main_process_port <= 65535:
         raise ValueError("readiness port must be between 1024 and 65535")
-    probe = socket.create_connection(
-        (args.master_addr, args.main_process_port), timeout=0.2
-    )
-    probe.close()
+    pidfd = os.pidfd_open(ownership.pid)
+    try:
+        validate_owned_process(
+            ownership,
+            expected_run_id=args.run_id,
+            expected_attempt_id=args.attempt_id,
+            expected_machine_rank=args.machine_rank,
+            expected_commit=args.commit,
+            expected_command=command,
+            expected_environment=environment,
+            proc_root=_PROC_ROOT,
+        )
+        if not owned_listener_is_ready(
+            ownership.pid,
+            master_addr=args.master_addr,
+            port=args.main_process_port,
+            proc_root=_PROC_ROOT,
+        ):
+            raise ValueError("owned rendezvous listener is not ready")
+    finally:
+        os.close(pidfd)
     return 0
 
 
@@ -526,20 +614,27 @@ def _signal_owned(argv: list[str]) -> int:
         expected_command_digest=args.command_digest,
         observed_start_ticks=args.process_start_ticks,
     )
-    validate_owned_process(
-        ownership,
-        expected_run_id=args.run_id,
-        expected_attempt_id=args.attempt_id,
-        expected_machine_rank=args.machine_rank,
-        expected_commit=args.commit,
-        expected_command=command,
-        expected_environment=environment,
-    )
-    os.kill(ownership.pid, signal.SIGTERM)
+    pidfd = os.pidfd_open(ownership.pid)
+    try:
+        validate_owned_process(
+            ownership,
+            expected_run_id=args.run_id,
+            expected_attempt_id=args.attempt_id,
+            expected_machine_rank=args.machine_rank,
+            expected_commit=args.commit,
+            expected_command=command,
+            expected_environment=environment,
+            proc_root=_PROC_ROOT,
+        )
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+    finally:
+        os.close(pidfd)
     return 0
 
 
 def _exit_show(argv: list[str]) -> int:
+    from src.multinode_runtime import _read_regular_file
+
     parser = argparse.ArgumentParser(prog="python -m src.multinode exit-show")
     parser.add_argument("--exit-path", required=True)
     parser.add_argument("--run-id", required=True)
@@ -549,9 +644,11 @@ def _exit_show(argv: list[str]) -> int:
     parser.add_argument("--command-digest", required=True)
     args = parser.parse_args(argv)
     path = Path(args.exit_path)
-    if path.is_symlink() or not path.is_file():
+    try:
+        raw = _read_regular_file(path)
+    except (FileNotFoundError, OSError, ValueError):
         return 3
-    payload = json.loads(path.read_bytes())
+    payload = json.loads(raw)
     expected_fields = {
         "schema_version",
         "run_id",
@@ -597,6 +694,22 @@ def _argument_value(arguments: tuple[str, ...], option: str) -> str | None:
             result = token.split("=", 1)[1]
         index += 1
     return result
+
+
+def _replace_argument_value(
+    arguments: tuple[str, ...], option: str, replacement: str
+) -> tuple[str, ...]:
+    values = list(arguments)
+    index = 0
+    while index < len(values):
+        if values[index] == option:
+            values[index + 1] = replacement
+            index += 2
+            continue
+        if values[index].startswith(f"{option}="):
+            values[index] = f"{option}={replacement}"
+        index += 1
+    return tuple(values)
 
 
 def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
@@ -651,6 +764,19 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             resume_requested = "RESUME_CHECKPOINT" in stage_environment
         if resume_requested and args.attempt_id == "initial":
             raise ValueError("resume requires a fresh --attempt-id, not 'initial'")
+        if stage == "stage1" and resume_requested:
+            resume = _argument_value(forwarded, "--resume")
+            assert resume is not None
+            canonical_resume = validate_resume_path(args.run_id, resume)
+            forwarded = _replace_argument_value(
+                forwarded, "--resume", str(canonical_resume)
+            )
+        elif stage == "stage2" and resume_requested:
+            stage_environment["RESUME_CHECKPOINT"] = str(
+                validate_resume_path(
+                    args.run_id, stage_environment["RESUME_CHECKPOINT"]
+                )
+            )
         plan = build_launch_plan(
             stage=stage,
             tuning_method=tuning_method,
@@ -731,7 +857,11 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
 
         def subprocess_runner(command: list[str] | tuple[str, ...]):
             return subprocess.run(
-                command, capture_output=True, text=True, check=False
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_CONTROL_TIMEOUT_SECONDS,
             )
 
         remote_snapshot = collect_node_snapshot(
@@ -782,14 +912,25 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             batch_per_gpu = int(batch_value)
         else:
             batch_per_gpu = 1
-        witness = write_training_witness(
-            plan,
-            result_root=result_root,
-            exit_codes=exit_codes,
-            checkpoint_path=checkpoint_path,
-            batch_per_gpu=batch_per_gpu,
-            finite_loss_evidence_path=commands.finite_loss_evidence_path,
-        )
+        try:
+            witness = write_training_witness(
+                plan,
+                result_root=result_root,
+                exit_codes=exit_codes,
+                checkpoint_path=checkpoint_path,
+                batch_per_gpu=batch_per_gpu,
+                finite_loss_evidence_path=commands.finite_loss_evidence_path,
+            )
+        except ValueError as error:
+            incomplete = write_incomplete_attempt(
+                plan,
+                result_root=result_root,
+                reason=str(error),
+                exit_codes=exit_codes,
+            )
+            raise RuntimeError(
+                f"training attempt incomplete; record={incomplete}: {error}"
+            ) from error
         print(json.dumps({"training_witness": str(witness)}, sort_keys=True))
         return 0
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
@@ -821,6 +962,32 @@ def _main(argv: list[str] | None = None) -> int:
         return _signal_owned(argv[1:])
     if argv and argv[0] == "exit-show":
         return _exit_show(argv[1:])
+    if argv and argv[0] == "prepare-attempt":
+        internal = argparse.ArgumentParser(prog="python -m src.multinode prepare-attempt")
+        internal.add_argument("--log-root", required=True)
+        internal.add_argument("--run-id", required=True)
+        internal.add_argument("--attempt-id", required=True)
+        parsed = internal.parse_args(argv[1:])
+        prepare_attempt_directory(
+            log_root=parsed.log_root,
+            run_id=parsed.run_id,
+            attempt_id=parsed.attempt_id,
+        )
+        return 0
+    if argv and argv[0] == "receive-plan":
+        internal = argparse.ArgumentParser(prog="python -m src.multinode receive-plan")
+        internal.add_argument("--path", required=True)
+        internal.add_argument("--size", type=int, required=True)
+        internal.add_argument("--sha256", required=True)
+        parsed = internal.parse_args(argv[1:])
+        raw = sys.stdin.buffer.read(1024 * 1024 + 1)
+        receive_launch_plan(
+            path=parsed.path,
+            raw=raw,
+            expected_size=parsed.size,
+            expected_sha256=parsed.sha256,
+        )
+        return 0
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     plan_parser = subparsers.add_parser("plan")
@@ -891,7 +1058,13 @@ def _main(argv: list[str] | None = None) -> int:
                 return 0
 
             def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(command, capture_output=True, text=True, check=False)
+                return subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=_CONTROL_TIMEOUT_SECONDS,
+                )
 
             remote = collect_node_snapshot(
                 plan,
