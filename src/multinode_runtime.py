@@ -1411,6 +1411,7 @@ def build_owned_lifecycle_harness_commands(
     plan: "LaunchPlan",
     *,
     commit: str,
+    phase: str | None = None,
     harness_path: str | Path | None = None,
     harness_arguments: Sequence[str] | None = None,
     log_root: str | Path = _LOG_ROOT,
@@ -1420,8 +1421,11 @@ def build_owned_lifecycle_harness_commands(
 
     if not isinstance(plan, LaunchPlan):
         raise TypeError("plan must be a LaunchPlan")
-    if plan.attempt_id != "lifecycle":
-        raise ValueError("lifecycle harness plan requires attempt_id=lifecycle")
+    selected_phase = plan.attempt_id if phase is None else phase
+    if selected_phase not in ("initial", "resume"):
+        raise ValueError("lifecycle harness phase must be initial or resume")
+    if plan.attempt_id != selected_phase:
+        raise ValueError("lifecycle harness phase must match the attempt ID")
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise ValueError("commit must be a lowercase 40-character Git object ID")
     repository = plan.cluster.remote_repo_root
@@ -1435,6 +1439,8 @@ def build_owned_lifecycle_harness_commands(
         raise ValueError("lifecycle command must use the approved harness path")
     method_flag = "--method" if plan.stage == "stage1" else "--tuning-method"
     expected_arguments = (
+        "--phase",
+        selected_phase,
         "--zero-stage",
         str(plan.zero_stage),
         method_flag,
@@ -2005,6 +2011,32 @@ class SubprocessCoordinatorRunner:
         except (RuntimeError, ValueError):
             return 125
         return None
+
+    def read_lifecycle_phase_evidence(
+        self, machine_rank: int, phase: str
+    ) -> bytes:
+        """Read one fixed canonical node-local phase witness without path input."""
+        if phase not in ("initial", "resume") or self.plan.attempt_id != phase:
+            raise ValueError("lifecycle evidence phase must match the owned attempt")
+        path = (
+            self.plan.cluster.remote_repo_root
+            / "results"
+            / self.plan.run_id
+            / f"{phase}-witness.json"
+        )
+        if machine_rank == self.plan.cluster.local_rank:
+            return _read_regular_file(path, maximum_size=1024 * 1024)
+        completed = self._run(
+            self._internal_command(
+                machine_rank,
+                "lifecycle-evidence-show",
+                ("--run-id", self.plan.run_id, "--phase", phase),
+            )
+        )
+        raw = completed.stdout.encode("utf-8")
+        if not raw or len(raw) > 1024 * 1024:
+            raise ValueError("remote lifecycle evidence size is invalid")
+        return raw
 
     def cleanup_owned(self, machine_rank: int, *, timeout_seconds: float) -> bool:
         """Signal only an exactly revalidated owner, then boundedly observe exit."""
@@ -2739,8 +2771,9 @@ def start_rank0_then_rank1(
     if dry_run:
         return result
     runner.prepare_plan(plan)
-    local_start_attempted = False
+    possibly_live: list[int] = []
     try:
+        possibly_live.append(plan.cluster.remote_rank)
         runner.start_remote(commands.remote)
         checks = max(1, math.ceil(ready_timeout_seconds / 0.25))
         deadline = time.monotonic() + ready_timeout_seconds
@@ -2748,27 +2781,17 @@ def start_rank0_then_rank1(
             if check and time.monotonic() >= deadline:
                 break
             if runner.rank0_is_ready(plan):
-                local_start_attempted = True
+                possibly_live.append(plan.cluster.local_rank)
                 runner.start_local(commands.local)
                 return result
             if check + 1 < checks and time.monotonic() < deadline:
                 runner.sleep(0.25)
-    except BaseException:
-        if local_start_attempted:
-            runner.cleanup_owned(
-                plan.cluster.local_rank,
-                timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
-            )
-        runner.cleanup_owned(
-            plan.cluster.remote_rank,
-            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
-        )
+    except BaseException as primary:
+        _cleanup_possibly_live(runner, possibly_live, primary=primary)
         raise
-    runner.cleanup_owned(
-        plan.cluster.remote_rank,
-        timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
-    )
-    raise TimeoutError("rank 0 readiness was not observed before timeout")
+    primary = TimeoutError("rank 0 readiness was not observed before timeout")
+    _cleanup_possibly_live(runner, possibly_live, primary=primary)
+    raise primary
 
 
 class OwnedProcessRunner(Protocol):
@@ -2780,6 +2803,25 @@ class OwnedProcessRunner(Protocol):
     def poll_exit(self, machine_rank: int) -> int | None: ...
     def sleep(self, seconds: float) -> None: ...
     def cleanup_owned(self, machine_rank: int, *, timeout_seconds: float) -> bool: ...
+
+
+def _cleanup_possibly_live(
+    runner: OwnedProcessRunner,
+    machine_ranks: Sequence[int],
+    *,
+    primary: BaseException,
+) -> None:
+    """Attempt each exact-owned cleanup independently without hiding primary."""
+    for machine_rank in dict.fromkeys(machine_ranks):
+        try:
+            runner.cleanup_owned(
+                machine_rank, timeout_seconds=_CONTROL_TIMEOUT_SECONDS
+            )
+        except BaseException as cleanup_error:
+            primary.add_note(
+                f"cleanup rank {machine_rank} failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
 
 class ArtifactCollectionRunner(Protocol):
@@ -2948,32 +2990,37 @@ def monitor_owned_jobs(
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("attempt timeout must be positive and finite")
     deadline = time.monotonic() + timeout
-    while len(exits) < len(ranks):
-        for machine_rank in ranks:
-            if machine_rank in exits:
-                continue
-            exit_code = runner.poll_exit(machine_rank)
-            if exit_code is None:
-                continue
-            exits[machine_rank] = exit_code
-            if exit_code != 0:
-                for peer_rank in ranks:
-                    if peer_rank == machine_rank or peer_rank in exits:
-                        continue
-                    if runner.cleanup_owned(
-                        peer_rank, timeout_seconds=_CONTROL_TIMEOUT_SECONDS
-                    ):
-                        exits[peer_rank] = -15
-                return exits
-        if len(exits) < len(ranks):
-            if time.monotonic() >= deadline:
-                for machine_rank in ranks:
-                    if machine_rank not in exits:
-                        runner.cleanup_owned(
-                            machine_rank, timeout_seconds=_CONTROL_TIMEOUT_SECONDS
-                        )
-                raise TimeoutError("training attempt exceeded its 24-hour deadline")
-            runner.sleep(poll_interval_seconds)
+    try:
+        while len(exits) < len(ranks):
+            for machine_rank in ranks:
+                if machine_rank in exits:
+                    continue
+                exit_code = runner.poll_exit(machine_rank)
+                if exit_code is None:
+                    continue
+                exits[machine_rank] = exit_code
+                if exit_code != 0:
+                    for peer_rank in ranks:
+                        if peer_rank == machine_rank or peer_rank in exits:
+                            continue
+                        if runner.cleanup_owned(
+                            peer_rank, timeout_seconds=_CONTROL_TIMEOUT_SECONDS
+                        ):
+                            exits[peer_rank] = -15
+                    return exits
+            if len(exits) < len(ranks):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "training attempt exceeded its 24-hour deadline"
+                    )
+                runner.sleep(poll_interval_seconds)
+    except BaseException as primary:
+        _cleanup_possibly_live(
+            runner,
+            (rank for rank in ranks if rank not in exits),
+            primary=primary,
+        )
+        raise
     return exits
 
 

@@ -3,10 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
+import src.multinode_evidence as lifecycle_evidence_module
 import src.multinode_results as results_module
+from src.multinode_evidence import build_lifecycle_phase_evidence
 from src.multinode_results import publish_validation_outputs, validate_results
 from stage2.evidence import build_stage2_producer_evidence
 
@@ -21,73 +24,39 @@ def _write_json(path: Path, payload: object) -> Path:
     return path
 
 
-def _raw_lifecycle(stage: str, method: str, zero_stage: int, child: str, checkpoint: Path):
-    artifact = "full" if method == "full" else f"peft-{method}"
-    if stage == "stage1":
-        return {
-            "schema_version": 1, "stage": stage, "zero_stage": zero_stage,
-            "config_digest": "a" * 64, "world_size": 4, "method": method,
-            "artifact_kind": "full" if method == "full" else "peft",
-            "method_artifact": artifact,
-            "adapter_checkpoint_present": method != "full",
-            "initial_global_step": 2, "resumed_global_step": 3,
-            "finite_gradient_norm": True, "representative_gradient_norm": 1.0,
-            "successful_optimizer_steps": 3, "finite_loss": True,
-            "first_loss": 0.5, "resumed_loss": 0.25,
-            "process_ranks": [0, 1, 2, 3],
-            "rank_records": [
-                {
-                    "rank": rank, "initial_global_step": 2,
-                    "resumed_global_step": 3, "initial_optimizer_steps": 2,
-                    "resumed_optimizer_steps": 1, "first_loss": 0.5 + rank,
-                    "resumed_loss": 0.25 + rank, "finite_gradient_norm": True,
-                    "representative_gradient_norm": 1.0 + rank,
-                    "method_artifact": artifact, "worker_error": None,
-                }
-                for rank in range(4)
-            ],
-            "worker_errors": [], "checkpoint": str(checkpoint),
-            "experiment_id": child,
-        }
-    records = [
-        {
-            "rank": rank, "first_global_step": 2, "resumed_global_step": 3,
-            "optimizer_step": 3, "first_loss": 0.5 + rank,
-            "resumed_loss": 0.25 + rank, "gradient_norm": 1.0 + rank,
-            "worker_error": None, "first_batches": [1], "resumed_batches": [1],
-            "optimizer_step_at_resume": 2, "scheduler_step_at_resume": 2,
-            "adapter_parameters_changed": method != "full",
-            "visual_trainable_parameters": 0,
-            "base_trainable_parameters": 1 if method == "full" else 0,
-        }
-        for rank in range(4)
-    ]
-    return {
-        "schema_version": 1, "stage": "stage2", "method": method,
-        "zero_stage": zero_stage, "config_digest": "a" * 64,
-        "artifact_kind": artifact, "tuning_method": method,
-        "first_global_step": 2, "resumed_global_step": 3,
-        "rank_first_global_steps": [2] * 4, "rank_resumed_global_steps": [3] * 4,
-        "rank_first_losses": [r["first_loss"] for r in records],
-        "rank_resumed_losses": [r["resumed_loss"] for r in records],
-        "rank_records": records, "process_ranks": [0, 1, 2, 3],
-        "finite_loss": True, "finite_gradient": True, "worker_errors": [],
-        "optimizer_state_restored": True, "scheduler_state_restored": True,
-        "optimizer_step_at_resume": 2, "scheduler_step_at_resume": 2,
-        "observed_local_batch_sizes": [1] * 8, "world_size": 4,
-        "first_loss": 0.5, "resumed_loss": 0.25, "deepspeed": True,
-        "deepspeed_config": f"/root/workspace/ILVR/configs/deepspeed_zero{zero_stage}.json",
-        "deepspeed_zero_stage": zero_stage,
-        "adapter_parameters_changed": method != "full",
-        "adapter_checkpoint_present": method != "full", "sidecar_present": method != "full",
-        "processor_present": True, "full_model_weights_absent": method != "full",
-        "visual_trainable_parameters": 0,
-        "base_trainable_parameters": 1 if method == "full" else 0,
-        "git_commit": "a" * 40, "torch_version": "2.7.1",
-        "transformers_version": "4.50", "peft_version": "0.15",
-        "harness_path": "/root/workspace/ILVR/tests/stage2/integration/tiny_stage2_train.py",
-        "checkpoint": str(checkpoint), "experiment_id": child,
-    }
+def _raw_phase(
+    stage: str, method: str, zero_stage: int, child: str, checkpoint: Path,
+    phase: str,
+):
+    global_step = 2 if phase == "initial" else 3
+    optimizer_step = 2 if phase == "initial" else (1 if stage == "stage1" else 3)
+    gradient_base = 1.0 if phase == "initial" else 9.0
+    return build_lifecycle_phase_evidence(
+        phase=phase, stage=stage, method=method, zero_stage=zero_stage,
+        config_digest="a" * 64, experiment_id=child,
+        checkpoint_path=checkpoint,
+        artifact_kind="full" if method == "full" else "peft",
+        rank_records=[{
+            "rank": rank, "global_step": global_step,
+            "optimizer_step": optimizer_step, "loss": 0.5 + rank,
+            "gradient_norm": gradient_base + rank, "worker_error": None,
+        } for rank in range(4)],
+    )
+
+
+@pytest.fixture(autouse=True)
+def _canonical_fixture_roots(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        results_module, "_CANONICAL_RESULT_ROOT", tmp_path / "canonical-results"
+    )
+    monkeypatch.setattr(
+        results_module, "_CANONICAL_CHECKPOINT_ROOT", tmp_path / "canonical-checkpoints"
+    )
+    monkeypatch.setattr(
+        lifecycle_evidence_module,
+        "_CANONICAL_CHECKPOINT_ROOT",
+        tmp_path / "canonical-checkpoints",
+    )
 
 
 def write_matrix_witnesses(root: Path) -> Path:
@@ -99,39 +68,53 @@ def write_matrix_witnesses(root: Path) -> Path:
             for zero_stage in ZERO_STAGES:
                 child = f"matrix-parent-{stage}-{method}-zero{zero_stage}"
                 witness_name = f"{child}.json"
-                checkpoint = root / "checkpoints" / child / "checkpoint-2"
+                checkpoint = results_module._CANONICAL_CHECKPOINT_ROOT / child / "checkpoint-2"
                 checkpoint.mkdir(parents=True)
-                raw_path = root / "raw" / child / "witness.json"
-                raw = _write_json(raw_path, _raw_lifecycle(
-                    stage, method, zero_stage, child, checkpoint
-                )).read_bytes()
-                records = json.loads(raw)["rank_records"]
-                gradient_key = "representative_gradient_norm" if stage == "stage1" else "gradient_norm"
-                artifact = "full" if method == "full" else f"peft-{method}"
+                (checkpoint / "rank-shard.bin").write_bytes(b"observed")
+                raw_root = results_module._CANONICAL_RESULT_ROOT / child
+                raw_paths = {}
+                raw_bytes = {}
+                raw_payloads = {}
+                for phase in ("initial", "resume"):
+                    raw_paths[phase] = raw_root / f"{phase}-witness.json"
+                    raw_bytes[phase] = _write_json(
+                        raw_paths[phase],
+                        _raw_phase(stage, method, zero_stage, child, checkpoint, phase),
+                    ).read_bytes()
+                    raw_payloads[phase] = json.loads(raw_bytes[phase])
+                artifact = "full" if method == "full" else "peft"
                 _write_json(matrix / witness_name, {
                     "schema_version": 1, "kind": "multinode-lifecycle-case",
                     "parent_run_id": "matrix-parent", "child_run_id": child,
                     "stage": stage, "method": method, "zero_stage": zero_stage,
                     "world_size": 4, "main_process_port": port,
                     "machine_ranks": [0, 1], "process_ranks": [0, 1, 2, 3],
-                    "method_artifact": artifact, "checkpoint": "checkpoint-2",
-                    "raw_witness": {"path": str(raw_path),
-                                    "sha256": hashlib.sha256(raw).hexdigest(),
-                                    "size": len(raw)},
+                    "artifact_kind": artifact, "checkpoint": "checkpoint-2",
+                    "raw_witnesses": {
+                        phase: {"path": str(raw_paths[phase]),
+                                "sha256": hashlib.sha256(raw_bytes[phase]).hexdigest(),
+                                "size": len(raw_bytes[phase])}
+                        for phase in ("initial", "resume")
+                    },
                     "attempts": [
                         {"from_step": 0, "to_step": 2,
-                         "rank_losses": [r["first_loss"] for r in records],
-                         "rank_gradients": [r[gradient_key] for r in records]},
+                         "rank_losses": [r["loss"] for r in raw_payloads["initial"]["ranks"]],
+                         "rank_gradients": [r["gradient_norm"] for r in raw_payloads["initial"]["ranks"]]},
                         {"from_step": 2, "to_step": 3,
-                         "rank_losses": [r["resumed_loss"] for r in records],
-                         "rank_gradients": [r[gradient_key] for r in records]},
+                         "rank_losses": [r["loss"] for r in raw_payloads["resume"]["ranks"]],
+                         "rank_gradients": [r["gradient_norm"] for r in raw_payloads["resume"]["ranks"]]},
                     ],
                     "finite_loss": True, "finite_gradient": True, "worker_errors": [],
-                    "collected_node_manifests": 2, "exit_codes": {"0": 0, "1": 0},
+                    "collected_node_manifests": 2, "redistributed_entries": 7,
+                    "exit_codes": {
+                        "initial": {"0": 0, "1": 0},
+                        "resume": {"0": 0, "1": 0},
+                    },
                 })
                 cases.append({"stage": stage, "method": method, "zero_stage": zero_stage,
                               "child_run_id": child, "main_process_port": port,
-                              "witness": witness_name, "exit_codes": [0, 0]})
+                              "witness": witness_name,
+                              "exit_codes": {"initial": [0, 0], "resume": [0, 0]}})
                 port += 1
     _write_json(matrix / "matrix-complete.json", {
         "schema_version": 1, "kind": "multinode-lifecycle-matrix-complete",
@@ -204,7 +187,7 @@ def write_capacity_witnesses(root: Path) -> Path:
                 "recommended_batch_per_gpu": 2,
             })
             stage2_run = f"stage2-batch1-{key}"
-            checkpoint_root = root / "checkpoints" / stage2_run
+            checkpoint_root = results_module._CANONICAL_CHECKPOINT_ROOT / stage2_run
             checkpoint = checkpoint_root / "checkpoint-1"
             checkpoint.mkdir(parents=True)
             (checkpoint / "rank-shard.bin").write_bytes(b"observed")
@@ -216,7 +199,7 @@ def write_capacity_witnesses(root: Path) -> Path:
                 build_stage2_producer_evidence(
                     run_id=stage2_run, method=method, zero_stage=zero_stage,
                     checkpoint_path=checkpoint,
-                    artifact_kind="full" if method == "full" else f"peft-{method}",
+                    artifact_kind="full" if method == "full" else "peft",
                     rank_records=records,
                 ),
             )
@@ -256,6 +239,25 @@ def test_validate_results_requires_nested_direct_capacity_producer_paths(tmp_pat
     (run / "capacity.json").unlink()
     _write_json(capacity / "capacity" / "dora-zero3.json", payload)
     with pytest.raises(ValueError, match="Stage 1 capacity"):
+        validate_results(matrix, evaluation, capacity)
+
+
+@pytest.mark.parametrize(
+    "location",
+    ("evaluation-root", "capacity-root", "stage1-run", "stage2-run"),
+)
+def test_validate_results_rejects_unexpected_direct_producer_paths(
+    tmp_path, location
+):
+    matrix, evaluation, capacity = _valid_roots(tmp_path)
+    roots = {
+        "evaluation-root": evaluation,
+        "capacity-root": capacity,
+        "stage1-run": capacity / "capacity" / "capacity-full-zero1",
+        "stage2-run": capacity / "stage2-batch1" / "stage2-batch1-full-zero1",
+    }
+    _write_json(roots[location] / "unexpected.json", {"foreign": True})
+    with pytest.raises(ValueError, match="evaluation|capacity|Stage 1|Stage 2"):
         validate_results(matrix, evaluation, capacity)
 
 
@@ -300,6 +302,125 @@ def test_descriptor_bound_reader_rejects_final_component_swap(tmp_path):
         validate_results(matrix, evaluation, capacity)
 
 
+@pytest.mark.parametrize(
+    ("target", "replacement"),
+    (
+        ("completion-zero", True),
+        ("case-machine-ranks", [0.0, 1]),
+        ("case-attempt-from-step", False),
+        ("sidecar-source-indices", [False]),
+    ),
+)
+def test_validate_results_rejects_bool_or_float_identity_types(
+    tmp_path, target, replacement
+):
+    matrix, evaluation, capacity = _valid_roots(tmp_path)
+    if target == "completion-zero":
+        path = matrix / "matrix-complete.json"
+        payload = json.loads(path.read_text())
+        payload["cases"][0]["zero_stage"] = replacement
+    elif target == "case-machine-ranks":
+        path = matrix / "matrix-parent-stage1-full-zero1.json"
+        payload = json.loads(path.read_text())
+        payload["machine_ranks"] = replacement
+    elif target == "case-attempt-from-step":
+        path = matrix / "matrix-parent-stage1-full-zero1.json"
+        payload = json.loads(path.read_text())
+        payload["attempts"][0]["from_step"] = replacement
+    else:
+        path = evaluation / "shard-0.jsonl.manifest.json"
+        payload = json.loads(path.read_text())
+        payload["expected_source_indices"] = replacement
+    _write_json(path, payload)
+    with pytest.raises(ValueError, match="matrix|evaluation"):
+        validate_results(matrix, evaluation, capacity)
+
+
+def test_validate_results_rejects_noncanonical_matrix_raw_path(tmp_path):
+    matrix, evaluation, capacity = _valid_roots(tmp_path)
+    case = matrix / "matrix-parent-stage1-full-zero1.json"
+    payload = json.loads(case.read_text())
+    reference = payload["raw_witnesses"]["initial"]
+    source = Path(reference["path"])
+    lookalike = tmp_path / "lookalike" / source.parent.name / source.name
+    lookalike.parent.mkdir(parents=True)
+    lookalike.write_bytes(source.read_bytes())
+    reference["path"] = str(lookalike)
+    _write_json(case, payload)
+    with pytest.raises(ValueError, match="canonical"):
+        validate_results(matrix, evaluation, capacity)
+
+
+def test_validate_results_rejects_noncanonical_stage2_checkpoint_root(tmp_path):
+    matrix, evaluation, capacity = _valid_roots(tmp_path)
+    run_id = "stage2-batch1-full-zero1"
+    run = capacity / "stage2-batch1" / run_id
+    witness_path = run / "initial-train-witness.json"
+    producer_path = run / "initial-producer-evidence.json"
+    lookalike_root = tmp_path / "lookalike-checkpoints" / run_id
+    checkpoint = lookalike_root / "checkpoint-1"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "rank-shard.bin").write_bytes(b"foreign")
+    records = [{"rank": rank, "global_step": 1, "optimizer_step": 1,
+                "loss": 0.25 + rank, "gradient_norm": 1.0 + rank,
+                "worker_error": None} for rank in range(4)]
+    producer = _write_json(producer_path, build_stage2_producer_evidence(
+        run_id=run_id, method="full", zero_stage=1,
+        checkpoint_path=checkpoint, artifact_kind="full", rank_records=records,
+    ))
+    raw = producer.read_bytes()
+    witness = json.loads(witness_path.read_text())
+    witness["checkpoint_path"] = str(lookalike_root)
+    witness["finite_loss_evidence"]["sha256"] = hashlib.sha256(raw).hexdigest()
+    witness["finite_loss_evidence"]["size"] = len(raw)
+    _write_json(witness_path, witness)
+    with pytest.raises(ValueError, match="canonical"):
+        validate_results(matrix, evaluation, capacity)
+
+
+def test_matrix_directory_swap_after_enumeration_uses_pinned_snapshot(
+    tmp_path, monkeypatch
+):
+    matrix, evaluation, capacity = _valid_roots(tmp_path)
+    replacement = tmp_path / "replacement-matrix"
+    shutil.copytree(matrix, replacement)
+    corrupt = replacement / "matrix-parent-stage1-full-zero1.json"
+    corrupt.write_text("{}\n", encoding="utf-8")
+    original = tmp_path / "original-matrix"
+    real_listdir = results_module.os.listdir
+    matrix_stat = matrix.stat()
+    swapped = False
+
+    def swap_after_listdir(descriptor):
+        nonlocal swapped
+        names = real_listdir(descriptor)
+        metadata = results_module.os.fstat(descriptor)
+        if (
+            not swapped and metadata.st_dev == matrix_stat.st_dev
+            and metadata.st_ino == matrix_stat.st_ino
+        ):
+            matrix.rename(original)
+            replacement.rename(matrix)
+            swapped = True
+        return names
+
+    monkeypatch.setattr(results_module.os, "listdir", swap_after_listdir)
+    report = validate_results(matrix, evaluation, capacity)
+    assert report.matrix_cases == 18
+    assert swapped is True
+
+
+def test_validate_results_allows_only_the_fixed_checkpoint_root_symlink(tmp_path):
+    matrix, evaluation, capacity = _valid_roots(tmp_path)
+    logical = results_module._CANONICAL_CHECKPOINT_ROOT
+    physical = tmp_path / "physical-checkpoints"
+    logical.rename(physical)
+    logical.symlink_to(physical, target_is_directory=True)
+
+    report = validate_results(matrix, evaluation, capacity)
+    assert report.matrix_cases == 18
+
+
 def test_publish_validation_outputs_writes_matching_tables_exclusively(tmp_path):
     report = validate_results(*_valid_roots(tmp_path))
     manifest = tmp_path / "report.json"
@@ -322,15 +443,42 @@ def test_publish_validation_outputs_rolls_back_json_if_markdown_publish_fails(
     report = validate_results(*_valid_roots(tmp_path))
     manifest = tmp_path / "report.json"
     summary = tmp_path / "report.md"
-    original_publish = results_module._publish_bytes_no_replace
+    original_publish = results_module._publish_output_bytes_no_replace
 
     def failing_publish(path, payload):
         if Path(path) == summary:
             raise OSError("simulated Markdown publication failure")
         return original_publish(path, payload)
 
-    monkeypatch.setattr(results_module, "_publish_bytes_no_replace", failing_publish)
+    monkeypatch.setattr(results_module, "_publish_output_bytes_no_replace", failing_publish)
     with pytest.raises(OSError, match="Markdown"):
         publish_validation_outputs(report, manifest, summary)
     assert not manifest.exists()
+    assert not summary.exists()
+
+
+def test_rollback_preserves_same_byte_foreign_inode_after_destination_swap(
+    tmp_path, monkeypatch
+):
+    report = validate_results(*_valid_roots(tmp_path))
+    manifest = tmp_path / "report.json"
+    summary = tmp_path / "report.md"
+    displaced = tmp_path / "displaced-owned.json"
+    original_publish = results_module._publish_output_bytes_no_replace
+
+    def swap_then_fail(path, payload):
+        if Path(path) == summary:
+            foreign_bytes = manifest.read_bytes()
+            manifest.rename(displaced)
+            manifest.write_bytes(foreign_bytes)
+            raise OSError("simulated swapped Markdown failure")
+        return original_publish(path, payload)
+
+    monkeypatch.setattr(
+        results_module, "_publish_output_bytes_no_replace", swap_then_fail
+    )
+    with pytest.raises(OSError, match="swapped Markdown"):
+        publish_validation_outputs(report, manifest, summary)
+    assert manifest.exists()
+    assert manifest.read_bytes() == displaced.read_bytes()
     assert not summary.exists()

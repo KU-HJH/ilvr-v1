@@ -4,19 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from contextvars import ContextVar
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 from types import MappingProxyType
 
 from src.multinode_runtime import (
     _canonical_json_bytes,
     _open_trusted_directory,
-    _publish_bytes_no_replace,
     _read_regular_file,
 )
 
@@ -35,6 +36,165 @@ _CELL_IDENTITIES = tuple(
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_SMALL_BYTES = 1024 * 1024
+_MAX_SNAPSHOT_ENTRIES = 4096
+_CANONICAL_RESULT_ROOT = Path("/root/workspace/ILVR/results")
+_CANONICAL_CHECKPOINT_ROOT = Path("/root/workspace/ILVR/checkpoints")
+
+
+@dataclass(frozen=True)
+class _SnapshotFile:
+    raw: bytes | None
+    size: int
+    device: int
+    inode: int
+
+
+@dataclass
+class _SnapshotState:
+    files: dict[Path, _SnapshotFile]
+    directories: set[Path]
+    entries: dict[Path, dict[str, str]]
+
+    @classmethod
+    def empty(cls) -> "_SnapshotState":
+        return cls(files={}, directories=set(), entries={})
+
+    def merge(self, other: "_SnapshotState") -> None:
+        owned = set(self.files) | self.directories
+        incoming = set(other.files) | other.directories
+        if owned & incoming:
+            raise ValueError("allowed evidence snapshots overlap")
+        self.files.update(other.files)
+        self.directories.update(other.directories)
+        self.entries.update(other.entries)
+
+
+_ACTIVE_SNAPSHOT: ContextVar[_SnapshotState | None] = ContextVar(
+    "multinode_result_snapshot", default=None
+)
+
+
+def _snapshot_tree(
+    root: Path,
+    *,
+    description: str,
+    capture_bytes: bool = True,
+    maximum_depth: int = 5,
+) -> _SnapshotState:
+    """Snapshot one bounded tree through retained no-follow directory fds."""
+    root = Path(root)
+    try:
+        root_descriptor = _open_trusted_directory(root)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid {description} root") from error
+    state = _SnapshotState.empty()
+    count = 0
+
+    def walk(descriptor: int, path: Path, depth: int) -> None:
+        nonlocal count
+        if depth > maximum_depth:
+            raise ValueError(f"{description} exceeds the snapshot depth bound")
+        state.directories.add(path)
+        direct: dict[str, str] = {}
+        names = os.listdir(descriptor)
+        for name in sorted(names):
+            if not name or name in (".", "..") or "/" in name or "\0" in name:
+                raise ValueError(f"unsafe child in {description}")
+            count += 1
+            if count > _MAX_SNAPSHOT_ENTRIES:
+                raise ValueError(f"{description} exceeds the snapshot entry bound")
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            child_path = path / name
+            if stat.S_ISDIR(metadata.st_mode):
+                direct[name] = "directory"
+                child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=descriptor,
+                )
+                try:
+                    observed = os.fstat(child)
+                    if (
+                        observed.st_dev != metadata.st_dev
+                        or observed.st_ino != metadata.st_ino
+                        or not stat.S_ISDIR(observed.st_mode)
+                    ):
+                        raise ValueError(
+                            f"swapped directory in {description}: {name}"
+                        )
+                    walk(child, child_path, depth + 1)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(metadata.st_mode):
+                direct[name] = "file"
+                raw: bytes | None = None
+                if capture_bytes:
+                    if metadata.st_size > _MAX_SMALL_BYTES:
+                        raise ValueError(f"oversized small file in {description}: {name}")
+                    child = os.open(
+                        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        observed = os.fstat(child)
+                        if (
+                            observed.st_dev != metadata.st_dev
+                            or observed.st_ino != metadata.st_ino
+                            or not stat.S_ISREG(observed.st_mode)
+                        ):
+                            raise ValueError(f"swapped file in {description}: {name}")
+                        chunks = []
+                        remaining = _MAX_SMALL_BYTES + 1
+                        while remaining:
+                            chunk = os.read(child, min(65536, remaining))
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            remaining -= len(chunk)
+                        raw = b"".join(chunks)
+                        if len(raw) != observed.st_size:
+                            raise ValueError(f"changed file in {description}: {name}")
+                    finally:
+                        os.close(child)
+                state.files[child_path] = _SnapshotFile(
+                    raw=raw, size=metadata.st_size,
+                    device=metadata.st_dev, inode=metadata.st_ino,
+                )
+            else:
+                raise ValueError(f"unsupported child in {description}: {name}")
+        state.entries[path] = direct
+
+    try:
+        walk(root_descriptor, root, 0)
+    finally:
+        os.close(root_descriptor)
+    return state
+
+
+def _snapshot_checkpoint_run(
+    run_id: str, *, description: str
+) -> _SnapshotState:
+    """Snapshot below the one allowed fixed logical checkpoint-root symlink."""
+    run = _safe_id(run_id, "checkpoint snapshot run ID")
+    try:
+        physical_root = _CANONICAL_CHECKPOINT_ROOT.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("canonical checkpoint root is invalid") from error
+    logical_run = _CANONICAL_CHECKPOINT_ROOT / run
+    physical_run = physical_root / run
+    physical = _snapshot_tree(
+        physical_run, description=description, capture_bytes=False
+    )
+
+    def logical(path: Path) -> Path:
+        relative = path.relative_to(physical_run)
+        return logical_run / relative
+
+    return _SnapshotState(
+        files={logical(path): value for path, value in physical.files.items()},
+        directories={logical(path) for path in physical.directories},
+        entries={logical(path): value for path, value in physical.entries.items()},
+    )
 
 
 @dataclass(frozen=True)
@@ -58,6 +218,12 @@ def _reject_duplicates(description: str):
 
 
 def _read_bytes(path: Path, *, description: str) -> bytes:
+    snapshot = _ACTIVE_SNAPSHOT.get()
+    if snapshot is not None:
+        observed = snapshot.files.get(Path(path))
+        if observed is None or observed.raw is None:
+            raise ValueError(f"invalid {description}: {path}")
+        return observed.raw
     try:
         return _read_regular_file(path, maximum_size=_MAX_SMALL_BYTES)
     except (OSError, ValueError) as error:
@@ -95,6 +261,12 @@ def _finite(value: object) -> bool:
 
 def _direct_entries(root: Path, *, description: str) -> dict[str, str]:
     """Enumerate one no-follow directory while its descriptor is pinned."""
+    snapshot = _ACTIVE_SNAPSHOT.get()
+    if snapshot is not None:
+        entries = snapshot.entries.get(Path(root))
+        if entries is None:
+            raise ValueError(f"invalid {description} root")
+        return dict(entries)
     try:
         descriptor = _open_trusted_directory(root)
     except (OSError, ValueError) as error:
@@ -116,6 +288,23 @@ def _direct_entries(root: Path, *, description: str) -> dict[str, str]:
         os.close(descriptor)
 
 
+def _path_kind(path: Path) -> str | None:
+    snapshot = _ACTIVE_SNAPSHOT.get()
+    if snapshot is not None:
+        if path in snapshot.files:
+            return "file"
+        if path in snapshot.directories:
+            return "directory"
+        return None
+    if path.is_symlink():
+        return None
+    if path.is_file():
+        return "file"
+    if path.is_dir():
+        return "directory"
+    return None
+
+
 _COMPLETION_FIELDS = {
     "schema_version", "kind", "run_id", "world_size", "first_port", "cases"
 }
@@ -126,90 +315,27 @@ _COMPLETION_CASE_FIELDS = {
 _CASE_FIELDS = {
     "schema_version", "kind", "parent_run_id", "child_run_id", "stage",
     "method", "zero_stage", "world_size", "main_process_port", "machine_ranks",
-    "process_ranks", "method_artifact", "checkpoint", "raw_witness", "attempts",
+    "process_ranks", "artifact_kind", "checkpoint", "raw_witnesses", "attempts",
     "finite_loss", "finite_gradient", "worker_errors", "collected_node_manifests",
-    "exit_codes",
+    "redistributed_entries", "exit_codes",
 }
 _RAW_REFERENCE_FIELDS = {"path", "sha256", "size"}
 _CASE_ATTEMPT_FIELDS = {"from_step", "to_step", "rank_losses", "rank_gradients"}
 
 
 def _validate_raw_matrix_witness(
-    raw: bytes, *, stage: str, method: str, zero_stage: int,
-    child_run_id: str, checkpoint_path: Path,
+    raw: bytes, *, phase: str, stage: str, method: str, zero_stage: int,
+    child_run_id: str, checkpoint_path: Path, config_digest: str,
 ) -> dict[str, object]:
-    from src.multinode import (
-        _STAGE1_RAW_FIELDS,
-        _STAGE1_RANK_FIELDS,
-        _STAGE2_RAW_FIELDS,
-        _STAGE2_RANK_FIELDS,
-    )
+    from src.multinode_evidence import decode_lifecycle_phase_evidence
 
-    payload = _decode_json(raw, description="matrix raw witness")
-    if type(payload) is not dict:
-        raise ValueError("matrix raw witness must be an object")
-    fields = _STAGE1_RAW_FIELDS if stage == "stage1" else _STAGE2_RAW_FIELDS
-    rank_fields = _STAGE1_RANK_FIELDS if stage == "stage1" else _STAGE2_RANK_FIELDS
-    _exact(payload, fields, "matrix raw witness")
-    method_field = "method" if stage == "stage1" else "tuning_method"
-    if (
-        not checkpoint_path.is_absolute()
-        or checkpoint_path.name != "checkpoint-2"
-        or checkpoint_path.parent.name != child_run_id
-        or type(payload["schema_version"]) is not int or payload["schema_version"] != 1
-        or payload["stage"] != stage or type(payload["stage"]) is not str
-        or payload[method_field] != method or type(payload[method_field]) is not str
-        or type(payload["zero_stage"]) is not int or payload["zero_stage"] != zero_stage
-        or type(payload["config_digest"]) is not str
-        or _HEX64.fullmatch(payload["config_digest"]) is None
-        or type(payload["world_size"]) is not int or payload["world_size"] != 4
-        or payload["process_ranks"] != [0, 1, 2, 3]
-        or payload["worker_errors"] != []
-        or payload["experiment_id"] != child_run_id
-        or payload["checkpoint"] != str(checkpoint_path)
-    ):
-        raise ValueError("matrix raw witness identity is invalid")
-    artifact = "full" if method == "full" else f"peft-{method}"
-    artifact_field = "method_artifact" if stage == "stage1" else "artifact_kind"
-    if payload[artifact_field] != artifact:
-        raise ValueError("matrix raw method artifact is invalid")
-    records = payload["rank_records"]
-    if type(records) is not list or len(records) != 4:
-        raise ValueError("matrix raw witness requires four ranks")
-    for rank, record in enumerate(records):
-        if type(record) is not dict or set(record) != rank_fields or record["rank"] != rank:
-            raise ValueError("matrix raw rank fields are invalid")
-        if stage == "stage1":
-            valid = (
-                record["initial_global_step"] == 2
-                and record["resumed_global_step"] == 3
-                and record["initial_optimizer_steps"] == 2
-                and record["resumed_optimizer_steps"] == 1
-                and record["method_artifact"] == artifact
-                and record["finite_gradient_norm"] is True
-                and _finite(record["representative_gradient_norm"])
-            )
-        else:
-            valid = (
-                record["first_global_step"] == 2
-                and record["resumed_global_step"] == 3
-                and record["optimizer_step"] == 3
-                and record["optimizer_step_at_resume"] == 2
-                and record["scheduler_step_at_resume"] == 2
-                and _finite(record["gradient_norm"])
-            )
-        if (
-            not valid or record["worker_error"] is not None
-            or not _finite(record["first_loss"])
-            or not _finite(record["resumed_loss"])
-        ):
-            raise ValueError("matrix raw rank diagnostics are invalid")
-    finite_gradient = (
-        payload["finite_gradient_norm"] if stage == "stage1" else payload["finite_gradient"]
+    if checkpoint_path != _CANONICAL_CHECKPOINT_ROOT / child_run_id / "checkpoint-2":
+        raise ValueError("matrix raw checkpoint is not canonical")
+    return decode_lifecycle_phase_evidence(
+        raw, phase=phase, stage=stage, method=method, zero_stage=zero_stage,
+        config_digest=config_digest, experiment_id=child_run_id,
+        checkpoint_path=checkpoint_path,
     )
-    if payload["finite_loss"] is not True or finite_gradient is not True:
-        raise ValueError("matrix raw diagnostics are invalid")
-    return payload
 
 
 def _validate_matrix(matrix_root: Path) -> int:
@@ -241,16 +367,34 @@ def _validate_matrix(matrix_root: Path) -> int:
         stage, method, zero_stage = identity
         child = f"{parent}-{stage}-{method}-zero{zero_stage}"
         witness_name = f"{child}.json"
-        if summary != {
-            "stage": stage, "method": method, "zero_stage": zero_stage,
-            "child_run_id": child,
-            "main_process_port": completion["first_port"] + index,
-            "witness": witness_name, "exit_codes": [0, 0],
-        }:
+        expected_completion_exits = {"initial": [0, 0], "resume": [0, 0]}
+        if (
+            type(summary["stage"]) is not str or summary["stage"] != stage
+            or type(summary["method"]) is not str or summary["method"] != method
+            or type(summary["zero_stage"]) is not int
+            or summary["zero_stage"] != zero_stage
+            or type(summary["child_run_id"]) is not str
+            or summary["child_run_id"] != child
+            or type(summary["main_process_port"]) is not int
+            or summary["main_process_port"] != completion["first_port"] + index
+            or type(summary["witness"]) is not str or summary["witness"] != witness_name
+            or type(summary["exit_codes"]) is not dict
+            or summary["exit_codes"] != expected_completion_exits
+            or any(
+                type(code) is not int
+                for values in summary["exit_codes"].values()
+                if type(values) is list
+                for code in values
+            )
+        ):
             raise ValueError("matrix completion case identity is invalid")
         witness = _read_json(matrix_root / witness_name, description="matrix case witness")
         _exact(witness, _CASE_FIELDS, "matrix case witness")
-        artifact = "full" if method == "full" else f"peft-{method}"
+        artifact = "full" if method == "full" else "peft"
+        expected_phase_exits = {
+            "initial": {"0": 0, "1": 0},
+            "resume": {"0": 0, "1": 0},
+        }
         if (
             type(witness["schema_version"]) is not int or witness["schema_version"] != 1
             or witness["kind"] != "multinode-lifecycle-case"
@@ -260,63 +404,104 @@ def _validate_matrix(matrix_root: Path) -> int:
             or type(witness["world_size"]) is not int or witness["world_size"] != 4
             or type(witness["main_process_port"]) is not int
             or witness["main_process_port"] != completion["first_port"] + index
+            or type(witness["machine_ranks"]) is not list
             or witness["machine_ranks"] != [0, 1]
+            or any(type(rank) is not int for rank in witness["machine_ranks"])
+            or type(witness["process_ranks"]) is not list
             or witness["process_ranks"] != [0, 1, 2, 3]
-            or witness["method_artifact"] != artifact
+            or any(type(rank) is not int for rank in witness["process_ranks"])
+            or type(witness["artifact_kind"]) is not str
+            or witness["artifact_kind"] != artifact
             or witness["checkpoint"] != "checkpoint-2"
             or witness["finite_loss"] is not True or witness["finite_gradient"] is not True
             or witness["worker_errors"] != []
             or type(witness["collected_node_manifests"]) is not int
             or witness["collected_node_manifests"] != 2
-            or witness["exit_codes"] != {"0": 0, "1": 0}
+            or type(witness["redistributed_entries"]) is not int
+            or witness["redistributed_entries"] <= 0
+            or type(witness["exit_codes"]) is not dict
+            or witness["exit_codes"] != expected_phase_exits
         ):
             raise ValueError("matrix case witness identity is invalid")
-        reference = witness["raw_witness"]
-        if type(reference) is not dict:
-            raise ValueError("matrix raw witness reference is invalid")
-        _exact(reference, _RAW_REFERENCE_FIELDS, "matrix raw witness reference")
-        if (
-            type(reference["path"]) is not str or not Path(reference["path"]).is_absolute()
-            or Path(reference["path"]).name != "witness.json"
-            or Path(reference["path"]).parent.name != child
-            or type(reference["sha256"]) is not str
-            or _HEX64.fullmatch(reference["sha256"]) is None
-            or type(reference["size"]) is not int or reference["size"] <= 0
+        raw_references = witness["raw_witnesses"]
+        if type(raw_references) is not dict or set(raw_references) != {"initial", "resume"}:
+            raise ValueError("matrix raw witness references are invalid")
+        raw_root = _CANONICAL_RESULT_ROOT / child
+        if _direct_entries(raw_root, description="matrix raw evidence") != {
+            "initial-witness.json": "file",
+            "resume-witness.json": "file",
+        }:
+            raise ValueError("matrix raw evidence has unexpected direct children")
+        raw_payloads: dict[str, dict[str, object]] = {}
+        config_digest: str | None = None
+        for phase in ("initial", "resume"):
+            reference = raw_references[phase]
+            if type(reference) is not dict:
+                raise ValueError("matrix raw witness reference is invalid")
+            _exact(reference, _RAW_REFERENCE_FIELDS, "matrix raw witness reference")
+            expected_path = (
+                _CANONICAL_RESULT_ROOT / child / f"{phase}-witness.json"
+            )
+            if (
+                type(reference["path"]) is not str
+                or Path(reference["path"]) != expected_path
+                or type(reference["sha256"]) is not str
+                or _HEX64.fullmatch(reference["sha256"]) is None
+                or type(reference["size"]) is not int or reference["size"] <= 0
+            ):
+                raise ValueError("matrix raw witness path is not canonical")
+            raw = _read_bytes(expected_path, description="matrix raw witness")
+            if (
+                len(raw) != reference["size"]
+                or hashlib.sha256(raw).hexdigest() != reference["sha256"]
+            ):
+                raise ValueError("matrix raw witness digest is invalid")
+            decoded = _decode_json(raw, description="matrix raw witness")
+            if type(decoded) is not dict or type(decoded.get("config_digest")) is not str:
+                raise ValueError("matrix raw witness config digest is invalid")
+            if config_digest is None:
+                config_digest = decoded["config_digest"]
+            elif decoded["config_digest"] != config_digest:
+                raise ValueError("matrix phase config digests disagree")
+            raw_payloads[phase] = _validate_raw_matrix_witness(
+                raw, phase=phase, stage=stage, method=method,
+                zero_stage=zero_stage, child_run_id=child,
+                checkpoint_path=_CANONICAL_CHECKPOINT_ROOT / child / "checkpoint-2",
+                config_digest=config_digest,
+            )
+        if not _checkpoint_has_output(
+            _CANONICAL_CHECKPOINT_ROOT / child / "checkpoint-2"
         ):
-            raise ValueError("matrix raw witness reference is invalid")
-        raw = _read_bytes(Path(reference["path"]), description="matrix raw witness")
-        if len(raw) != reference["size"] or hashlib.sha256(raw).hexdigest() != reference["sha256"]:
-            raise ValueError("matrix raw witness digest is invalid")
-        raw_payload = _validate_raw_matrix_witness(
-            raw, stage=stage, method=method, zero_stage=zero_stage,
-            child_run_id=child, checkpoint_path=Path(raw_payload_checkpoint(raw)),
-        )
+            raise ValueError("matrix checkpoint-2 metadata is invalid")
         attempts = witness["attempts"]
         if type(attempts) is not list or len(attempts) != 2:
             raise ValueError("matrix case attempts are invalid")
-        records = raw_payload["rank_records"]
-        gradient_key = "representative_gradient_norm" if stage == "stage1" else "gradient_norm"
-        for attempt_index, (from_step, to_step, loss_key) in enumerate(
-            ((0, 2, "first_loss"), (2, 3, "resumed_loss"))
+        for attempt_index, (phase, from_step, to_step) in enumerate(
+            (("initial", 0, 2), ("resume", 2, 3))
         ):
             attempt = attempts[attempt_index]
             if type(attempt) is not dict:
                 raise ValueError("matrix case attempt is invalid")
             _exact(attempt, _CASE_ATTEMPT_FIELDS, "matrix case attempt")
+            if (
+                type(attempt["from_step"]) is not int
+                or type(attempt["to_step"]) is not int
+                or type(attempt["rank_losses"]) is not list
+                or len(attempt["rank_losses"]) != 4
+                or not all(_finite(value) for value in attempt["rank_losses"])
+                or type(attempt["rank_gradients"]) is not list
+                or len(attempt["rank_gradients"]) != 4
+                or not all(_finite(value) for value in attempt["rank_gradients"])
+            ):
+                raise ValueError("matrix case attempt types are invalid")
+            records = raw_payloads[phase]["ranks"]
             if attempt != {
                 "from_step": from_step, "to_step": to_step,
-                "rank_losses": [record[loss_key] for record in records],
-                "rank_gradients": [record[gradient_key] for record in records],
+                "rank_losses": [record["loss"] for record in records],
+                "rank_gradients": [record["gradient_norm"] for record in records],
             }:
                 raise ValueError("matrix case diagnostics differ from raw witness")
     return 18
-
-
-def raw_payload_checkpoint(raw: bytes) -> str:
-    value = _decode_json(raw, description="matrix raw witness")
-    if type(value) is not dict or type(value.get("checkpoint")) is not str:
-        raise ValueError("matrix raw checkpoint is invalid")
-    return value["checkpoint"]
 
 
 _SUMMARY_FIELDS = {
@@ -358,6 +543,14 @@ def _read_jsonl(path: Path, *, description: str) -> list[dict[str, object]]:
 
 
 def _validate_evaluation(root: Path) -> int:
+    expected_files = {"summary.json"}
+    for shard_index in range(4):
+        expected_files.add(f"shard-{shard_index}.jsonl")
+        expected_files.add(f"shard-{shard_index}.jsonl.manifest.json")
+    if _direct_entries(root, description="evaluation") != {
+        name: "file" for name in expected_files
+    }:
+        raise ValueError("evaluation has unexpected direct children")
     summary = _read_json(root / "summary.json", description="evaluation summary")
     _exact(summary, _SUMMARY_FIELDS, "evaluation summary")
     if (
@@ -386,6 +579,16 @@ def _validate_evaluation(root: Path) -> int:
             or sidecar["result_jsonl"] != f"shard-{shard_index}.jsonl"
             or type(sidecar["shard_index"]) is not int or sidecar["shard_index"] != shard_index
             or type(sidecar["num_shards"]) is not int or sidecar["num_shards"] != 4
+            or type(sidecar["expected_source_indices"]) is not list
+            or any(
+                type(index) is not int
+                for index in sidecar["expected_source_indices"]
+            )
+            or type(sidecar["processed_source_indices"]) is not list
+            or any(
+                type(index) is not int
+                for index in sidecar["processed_source_indices"]
+            )
             or sidecar["expected_source_indices"] != expected
             or sidecar["processed_source_indices"] != expected
             or type(sidecar["worker_exit_status"]) is not int
@@ -449,6 +652,11 @@ def _validate_stage1_child(
     from src.multinode_capacity import _decode_training_witness
 
     producer = path.parent / "initial-producer-evidence.json"
+    if _direct_entries(path.parent, description="Stage 1 child evidence") != {
+        "initial-producer-evidence.json": "file",
+        "initial-train-witness.json": "file",
+    }:
+        raise ValueError("Stage 1 child evidence has unexpected direct children")
     raw_witness = _read_bytes(path, description="Stage 1 child training witness")
     witness = _decode_training_witness(
         raw_witness, child_run_id=child, zero_stage=zero_stage,
@@ -469,6 +677,10 @@ def _validate_stage1_child(
 def _validate_capacity_report(
     path: Path, *, stage1_root: Path
 ) -> tuple[tuple[str, int], int, set[str]]:
+    if _direct_entries(path.parent, description="Stage 1 capacity run") != {
+        "capacity.json": "file"
+    }:
+        raise ValueError("Stage 1 capacity run has unexpected direct children")
     payload = _read_json(path, description="Stage 1 capacity cell")
     _exact(payload, _CAPACITY_FIELDS, "Stage 1 capacity cell")
     run_id = _safe_id(payload["run_id"], "Stage 1 capacity run ID")
@@ -533,6 +745,15 @@ def _validate_capacity_report(
 
 
 def _checkpoint_has_output(checkpoint: Path) -> bool:
+    snapshot = _ACTIVE_SNAPSHOT.get()
+    if snapshot is not None:
+        if checkpoint not in snapshot.directories:
+            return False
+        prefix = checkpoint.parts
+        return any(
+            path.parts[: len(prefix)] == prefix and metadata.size > 0
+            for path, metadata in snapshot.files.items()
+        )
     if checkpoint.is_symlink() or not checkpoint.is_dir():
         return False
     for root, directories, files in os.walk(checkpoint, followlinks=False):
@@ -549,6 +770,11 @@ def _checkpoint_has_output(checkpoint: Path) -> bool:
 
 
 def _validate_stage2_witness(path: Path) -> tuple[tuple[str, int], int]:
+    if _direct_entries(path.parent, description="Stage 2 batch-1 run") != {
+        "initial-producer-evidence.json": "file",
+        "initial-train-witness.json": "file",
+    }:
+        raise ValueError("Stage 2 batch-1 run has unexpected direct children")
     witness = _read_json(path, description="Stage 2 batch-1 witness")
     _exact(witness, _TRAINING_WITNESS_FIELDS, "Stage 2 batch-1 witness")
     run_id = _safe_id(witness["run_id"], "Stage 2 batch-1 run ID")
@@ -558,22 +784,31 @@ def _validate_stage2_witness(path: Path) -> tuple[tuple[str, int], int]:
     producer = path.parent / "initial-producer-evidence.json"
     finite = witness["finite_loss_evidence"]
     if (
-        path.parent.name != run_id or witness["attempt_id"] != "initial"
-        or witness["stage"] != "stage2" or type(method) is not str or method not in _METHODS
+        path.parent.name != run_id
+        or type(witness["attempt_id"]) is not str or witness["attempt_id"] != "initial"
+        or type(witness["stage"]) is not str or witness["stage"] != "stage2"
+        or type(method) is not str or method not in _METHODS
         or type(zero_stage) is not int or zero_stage not in _ZERO_STAGES
         or type(witness["schema_version"]) is not int or witness["schema_version"] != 1
         or type(witness["batch_per_gpu"]) is not int or witness["batch_per_gpu"] != 1
         or type(witness["world_size"]) is not int or witness["world_size"] != 4
-        or witness["machine_ranks"] != [0, 1] or witness["exit_codes"] != {"0": 0, "1": 0}
-        or not checkpoint_root.is_absolute() or checkpoint_root.name != run_id
+        or type(witness["machine_ranks"]) is not list
+        or witness["machine_ranks"] != [0, 1]
+        or any(type(rank) is not int for rank in witness["machine_ranks"])
+        or type(witness["exit_codes"]) is not dict
+        or witness["exit_codes"] != {"0": 0, "1": 0}
+        or any(type(code) is not int for code in witness["exit_codes"].values())
+        or checkpoint_root != _CANONICAL_CHECKPOINT_ROOT / run_id
         or type(finite) is not dict or set(finite) != _STAGE2_FINITE_FIELDS
         or finite["status"] != "validated" or finite["path"] != str(producer)
         or type(finite["sha256"]) is not str or _HEX64.fullmatch(finite["sha256"]) is None
         or type(finite["size"]) is not int or finite["size"] <= 0
         or finite["finite_loss"] is not True or finite["finite_gradient"] is not True
+        or type(finite["process_ranks"]) is not list
         or finite["process_ranks"] != [0, 1, 2, 3]
+        or any(type(rank) is not int for rank in finite["process_ranks"])
     ):
-        raise ValueError("Stage 2 batch-1 witness is invalid")
+        raise ValueError("Stage 2 batch-1 witness canonical identity is invalid")
     checkpoint = checkpoint_root / "checkpoint-1"
     if not _checkpoint_has_output(checkpoint):
         raise ValueError("Stage 2 batch-1 checkpoint step 1 is invalid")
@@ -591,6 +826,11 @@ def _validate_stage2_witness(path: Path) -> tuple[tuple[str, int], int]:
 
 
 def _validate_capacity(root: Path) -> tuple[Mapping[str, int], Mapping[str, int]]:
+    if _direct_entries(root, description="capacity evidence") != {
+        "capacity": "directory",
+        "stage2-batch1": "directory",
+    }:
+        raise ValueError("capacity evidence has unexpected direct children")
     stage1_root = root / "capacity"
     entries = _direct_entries(stage1_root, description="Stage 1 capacity")
     if any(kind != "directory" or _SAFE_ID.fullmatch(name) is None for name, kind in entries.items()):
@@ -598,8 +838,7 @@ def _validate_capacity(root: Path) -> tuple[Mapping[str, int], Mapping[str, int]
     reports = [
         stage1_root / name / "capacity.json"
         for name in sorted(entries)
-        if (stage1_root / name / "capacity.json").is_file()
-        and not (stage1_root / name / "capacity.json").is_symlink()
+        if _path_kind(stage1_root / name / "capacity.json") == "file"
     ]
     if len(reports) != 9:
         raise ValueError("exactly nine Stage 1 capacity cells are required")
@@ -645,14 +884,64 @@ def _validate_capacity(root: Path) -> tuple[Mapping[str, int], Mapping[str, int]
 def validate_results(
     matrix_root: Path, evaluation_root: Path, capacity_root: Path
 ) -> ValidationReport:
-    """Validate only direct Task 10 producer paths using descriptor-bound reads."""
-    stage1, stage2 = _validate_capacity(Path(capacity_root))
-    return ValidationReport(
-        matrix_cases=_validate_matrix(Path(matrix_root)),
-        evaluation_samples=_validate_evaluation(Path(evaluation_root)),
-        stage1_recommendations=stage1,
-        stage2_recommendations=stage2,
+    """Snapshot all allowed evidence first, then validate immutable observations."""
+    matrix_root = Path(matrix_root)
+    evaluation_root = Path(evaluation_root)
+    capacity_root = Path(capacity_root)
+    snapshot = _SnapshotState.empty()
+    matrix_snapshot = _snapshot_tree(matrix_root, description="matrix evidence")
+    evaluation_snapshot = _snapshot_tree(
+        evaluation_root, description="evaluation evidence"
     )
+    capacity_snapshot = _snapshot_tree(
+        capacity_root, description="capacity evidence"
+    )
+    snapshot.merge(matrix_snapshot)
+    snapshot.merge(evaluation_snapshot)
+    snapshot.merge(capacity_snapshot)
+
+    completion_file = matrix_snapshot.files.get(matrix_root / "matrix-complete.json")
+    if completion_file is None or completion_file.raw is None:
+        raise ValueError("matrix completion is missing from the pinned snapshot")
+    completion = _decode_json(
+        completion_file.raw, description="matrix completion snapshot"
+    )
+    if type(completion) is not dict:
+        raise ValueError("matrix completion snapshot must be an object")
+    parent = _safe_id(completion.get("run_id"), "matrix run ID")
+    for stage, method, zero_stage in _MATRIX_IDENTITIES:
+        child = f"{parent}-{stage}-{method}-zero{zero_stage}"
+        snapshot.merge(_snapshot_tree(
+            _CANONICAL_RESULT_ROOT / child,
+            description=f"matrix raw evidence {child}",
+        ))
+        snapshot.merge(_snapshot_checkpoint_run(
+            child, description=f"matrix checkpoint metadata {child}"
+        ))
+
+    stage2_root = capacity_root / "stage2-batch1"
+    stage2_entries = capacity_snapshot.entries.get(stage2_root)
+    if stage2_entries is None:
+        raise ValueError("Stage 2 batch-1 snapshot is missing")
+    for run_id, kind in stage2_entries.items():
+        _safe_id(run_id, "Stage 2 batch-1 run ID")
+        if kind != "directory":
+            raise ValueError("Stage 2 batch-1 snapshot child is invalid")
+        snapshot.merge(_snapshot_checkpoint_run(
+            run_id, description=f"Stage 2 checkpoint metadata {run_id}"
+        ))
+
+    token = _ACTIVE_SNAPSHOT.set(snapshot)
+    try:
+        stage1, stage2 = _validate_capacity(capacity_root)
+        return ValidationReport(
+            matrix_cases=_validate_matrix(matrix_root),
+            evaluation_samples=_validate_evaluation(evaluation_root),
+            stage1_recommendations=stage1,
+            stage2_recommendations=stage2,
+        )
+    finally:
+        _ACTIVE_SNAPSHOT.reset(token)
 
 
 def _report_payload(report: ValidationReport) -> dict[str, object]:
@@ -689,18 +978,76 @@ def _report_markdown(report: ValidationReport) -> str:
     ])
 
 
-def _rollback_exact(path: Path, expected: bytes) -> None:
-    """Remove only the exact regular bytes this call just published."""
+@dataclass(frozen=True)
+class _PublishedOutput:
+    path: Path
+    device: int
+    inode: int
+
+
+def _publish_output_bytes_no_replace(
+    path: str | Path, payload: bytes
+) -> _PublishedOutput:
+    """Atomically link prepared bytes and retain the created inode identity."""
+    destination = Path(path)
+    parent = _open_trusted_directory(destination.parent, create=True)
+    temporary = f".{destination.name}.{secrets.token_hex(12)}.tmp"
+    descriptor: int | None = None
     try:
-        observed = _read_regular_file(path, maximum_size=max(_MAX_SMALL_BYTES, len(expected)))
-    except (OSError, ValueError):
-        return
-    if observed != expected:
-        return
-    try:
-        descriptor = _open_trusted_directory(path.parent)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while publishing validation output")
+            view = view[written:]
+        os.fsync(descriptor)
+        identity = os.fstat(descriptor)
+        os.close(descriptor)
+        descriptor = None
         try:
-            os.unlink(path.name, dir_fd=descriptor)
+            os.link(
+                temporary, destination.name,
+                src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"refusing to replace validation output: {destination}"
+            ) from error
+        os.fsync(parent)
+        return _PublishedOutput(destination, identity.st_dev, identity.st_ino)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        os.close(parent)
+
+
+def _rollback_published(output: _PublishedOutput | None) -> None:
+    """Unlink only the same inode this invocation linked into the destination."""
+    if output is None:
+        return
+    try:
+        descriptor = _open_trusted_directory(output.path.parent)
+        try:
+            observed = os.stat(
+                output.path.name, dir_fd=descriptor, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_dev != output.device
+                or observed.st_ino != output.inode
+            ):
+                return
+            os.unlink(output.path.name, dir_fd=descriptor)
         finally:
             os.close(descriptor)
     except (OSError, ValueError):
@@ -723,15 +1070,14 @@ def publish_validation_outputs(
         raise FileExistsError(manifest)
     if os.path.lexists(summary):
         raise FileExistsError(summary)
-    manifest_created = False
+    manifest_created: _PublishedOutput | None = None
+    summary_created: _PublishedOutput | None = None
     try:
-        _publish_bytes_no_replace(manifest, manifest_bytes)
-        manifest_created = True
-        _publish_bytes_no_replace(summary, summary_bytes)
+        manifest_created = _publish_output_bytes_no_replace(manifest, manifest_bytes)
+        summary_created = _publish_output_bytes_no_replace(summary, summary_bytes)
     except BaseException:
-        _rollback_exact(summary, summary_bytes)
-        if manifest_created:
-            _rollback_exact(manifest, manifest_bytes)
+        _rollback_published(summary_created)
+        _rollback_published(manifest_created)
         raise
 
 

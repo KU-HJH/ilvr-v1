@@ -377,10 +377,13 @@ def test_local_start_failure_cleans_up_owned_rank_zero(fake_runner):
     fake_runner.start_local = fail_local
     with pytest.raises(RuntimeError, match="local tmux failed"):
         start_rank0_then_rank1(plan(), fake_runner)
-    assert fake_runner.events[-3:] == [
+    assert fake_runner.events[-6:] == [
         "cleanup-rank0",
         "signal",
         "observed-exit-rank0",
+        "cleanup-rank1",
+        "signal",
+        "observed-exit-rank1",
     ]
 
 
@@ -445,6 +448,37 @@ def test_attempt_monitor_has_fixed_24_hour_bound_and_cleans_proven_peers(
         "signal",
         "observed-exit-rank1",
     ]
+
+
+def test_monitor_poll_exception_attempts_independent_cleanup_for_both_nodes(
+    fake_runner,
+):
+    """Catches an ambiguous poll failure leaving either owned GPU job alive."""
+    events = []
+
+    def fail_poll(machine_rank):
+        events.append(f"poll-rank{machine_rank}")
+        raise RuntimeError("poll transport failed")
+
+    def cleanup(machine_rank, *, timeout_seconds):
+        assert timeout_seconds == 30
+        events.append(f"cleanup-rank{machine_rank}")
+        if machine_rank == 0:
+            raise OSError("rank0 cleanup transport failed")
+        return True
+
+    fake_runner.poll_exit = fail_poll
+    fake_runner.cleanup_owned = cleanup
+    with pytest.raises(RuntimeError, match="poll transport failed") as caught:
+        monitor_owned_jobs(
+            plan(), fake_runner, expected_commit="a" * 40,
+            expected_command_digests={
+                0: fake_runner.ownership[0].command_digest,
+                1: fake_runner.ownership[1].command_digest,
+            },
+        )
+    assert events == ["poll-rank0", "cleanup-rank0", "cleanup-rank1"]
+    assert any("rank0 cleanup transport failed" in note for note in caught.value.__notes__)
 
 
 def test_stage1_allowlist_rejects_coordinator_owned_and_unknown_flags():
@@ -628,7 +662,7 @@ def test_stage2_training_witness_revalidates_finite_gradient_and_rank_evidence(
                 method="dora",
                 zero_stage=3,
                 checkpoint_path=checkpoint,
-                artifact_kind="peft-dora",
+                artifact_kind="peft",
                 rank_records=records,
             )
         ),

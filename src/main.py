@@ -74,6 +74,7 @@ from stage2.data import (
     prepare_stage2_example,
 )
 from stage2.trainer import Stage2Trainer
+from stage2.evidence import observe_stage2_checkpoint_artifact
 from stage2.peft import (
     build_stage2_tuned_model,
     load_stage1_dora_for_fresh_stage2,
@@ -524,7 +525,9 @@ def publish_stage2_training_evidence(args, *, trainer, train_result, profile):
     if checkpoint.is_symlink() or not checkpoint.is_dir():
         raise ValueError("Stage 2 producer requires its numbered checkpoint")
     method = args.tuning_method
-    artifact_kind = "full" if method == "full" else f"peft-{method}"
+    artifact_kind = observe_stage2_checkpoint_artifact(
+        checkpoint, method=method
+    )
     try:
         rank = int(os.environ.get("RANK", "0"))
     except ValueError as error:

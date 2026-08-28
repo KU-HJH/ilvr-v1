@@ -1715,6 +1715,7 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         commands=commands,
         commit="b" * 40,
         log_root=tmp_path / "logs",
+        checkpoint_root=checkpoint_root,
         command_runner=fake_command,
     )
     canonical_checkpoint = checkpoint_root / plan.run_id / "checkpoint-2"

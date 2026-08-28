@@ -27,6 +27,7 @@ from stage2.data import Stage2DataCollator
 from stage2.evidence import (
     build_stage2_producer_evidence,
     decode_stage2_producer_evidence,
+    observe_stage2_checkpoint_artifact,
     publish_stage2_producer_evidence,
 )
 from stage2.trainer import Stage2Trainer
@@ -69,7 +70,7 @@ def test_stage2_producer_evidence_requires_observed_finite_values_on_all_ranks(
         method="dora",
         zero_stage=3,
         checkpoint_path=checkpoint,
-        artifact_kind="peft-dora",
+        artifact_kind="peft",
         rank_records=[_producer_rank(rank) for rank in range(4)],
     )
 
@@ -94,19 +95,19 @@ def test_stage2_producer_evidence_requires_observed_finite_values_on_all_ranks(
             method="dora",
             zero_stage=3,
             checkpoint_path=checkpoint,
-            artifact_kind="peft-dora",
+            artifact_kind="peft",
             rank_records=bad,
         )
 
 
-def test_stage2_producer_publication_propagates_writer_failure(tmp_path):
-    """Catches non-writer ranks claiming success after rank-zero publication fails."""
+def test_stage2_producer_publication_propagates_either_node_writer_failure(tmp_path):
+    """Catches ranks claiming success when either machine-local leader fails."""
     checkpoint = tmp_path / "checkpoints" / "stage2-run" / "checkpoint-3"
     checkpoint.mkdir(parents=True)
     path = tmp_path / "producer.json"
     records = [_producer_rank(rank) for rank in range(4)]
 
-    with pytest.raises(RuntimeError, match="rank zero"):
+    with pytest.raises(RuntimeError, match="machine-local leader"):
         publish_stage2_producer_evidence(
             path,
             run_id="stage2-run",
@@ -116,11 +117,53 @@ def test_stage2_producer_publication_propagates_writer_failure(tmp_path):
             artifact_kind="full",
             local_rank_record=records[1],
             gather_records=lambda _record: records,
-            is_writer=False,
+            is_machine_leader=False,
             failure_counter=lambda _failed: 1,
             synchronize=lambda: None,
         )
     assert not path.exists()
+
+
+def test_stage2_artifact_is_observed_on_rank0_and_broadcast_not_method_derived(tmp_path):
+    checkpoint = tmp_path / "checkpoint-2"
+    checkpoint.mkdir()
+    events = []
+
+    observed = observe_stage2_checkpoint_artifact(
+        checkpoint,
+        method="dora",
+        is_rank_zero=True,
+        classifier=lambda path: events.append(("classify", path)) or "peft",
+        peft_method_reader=lambda path: events.append(("metadata", path)) or "dora",
+        broadcaster=lambda value: events.append(("broadcast", value)) or value,
+    )
+
+    assert observed == "peft"
+    assert events == [
+        ("classify", checkpoint), ("metadata", checkpoint), ("broadcast", "peft")
+    ]
+
+
+def test_stage2_producer_writes_identical_bytes_on_both_node_filesystems(tmp_path):
+    checkpoint = tmp_path / "checkpoints" / "stage2-run" / "checkpoint-3"
+    checkpoint.mkdir(parents=True)
+    records = [_producer_rank(rank) for rank in range(4)]
+    paths = [tmp_path / node / "producer.json" for node in ("remote", "local")]
+    for path in paths:
+        publish_stage2_producer_evidence(
+            path,
+            run_id="stage2-run",
+            method="dora",
+            zero_stage=3,
+            checkpoint_path=checkpoint,
+            artifact_kind="peft",
+            local_rank_record=records[0],
+            gather_records=lambda _record: records,
+            is_machine_leader=True,
+            failure_counter=lambda failed: failed,
+            synchronize=lambda: None,
+        )
+    assert paths[0].read_bytes() == paths[1].read_bytes()
 
 
 def test_stage2_trainer_records_a_finite_representative_trainable_gradient():
@@ -152,6 +195,9 @@ def test_normal_stage2_path_passes_only_observed_rank_metrics_to_producer(
         return {"finite_loss": True, "finite_gradient": True}
 
     monkeypatch.setattr("stage2.evidence.publish_stage2_producer_evidence", record_publish)
+    monkeypatch.setattr(
+        "main.observe_stage2_checkpoint_artifact", lambda *args, **kwargs: "peft"
+    )
     monkeypatch.setenv("RANK", "2")
     trainer = SimpleNamespace(
         state=SimpleNamespace(global_step=3),
@@ -175,7 +221,7 @@ def test_normal_stage2_path_passes_only_observed_rank_metrics_to_producer(
     assert captured["path"] == evidence
     assert captured["run_id"] == "stage2-run"
     assert captured["checkpoint_path"] == checkpoint
-    assert captured["artifact_kind"] == "peft-dora"
+    assert captured["artifact_kind"] == "peft"
     assert captured["local_rank_record"] == {
         "rank": 2,
         "global_step": 3,
@@ -353,6 +399,44 @@ def test_stage2_tiny_parser_preserves_defaults_and_accepts_lifecycle_steps():
 
     assert (defaults.initial_steps, defaults.resumed_steps) == (1, 2)
     assert (requested.initial_steps, requested.resumed_steps) == (2, 3)
+    assert defaults.phase == "lifecycle"
+
+
+@pytest.mark.parametrize("phase", ("lifecycle", "initial", "resume"))
+def test_stage2_tiny_parser_accepts_only_fixed_lifecycle_phases(phase):
+    args = _load_harness_module().build_tiny_stage2_parser().parse_args([
+        "--phase", phase, "--experiment-id", "stage2-zero2-lora-phase",
+    ])
+    assert args.phase == phase
+
+
+def test_resume_phase_rejects_missing_node_local_checkpoint_before_model_load(
+    tmp_path, monkeypatch
+):
+    """Catches rank 2 loading before Task 6 redistribution reaches its node."""
+    harness = _load_harness_module()
+    paths = SimpleNamespace(
+        experiment_id="stage2-zero2-lora-phase",
+        checkpoint_dir=tmp_path / "node-local-checkpoints",
+        result_dir=tmp_path / "node-local-results",
+    )
+    model_loads = []
+    monkeypatch.setattr(harness, "_phase_paths", lambda _experiment_id: paths)
+    monkeypatch.setattr(
+        harness, "_build_tuned_model",
+        lambda *args, **kwargs: model_loads.append((args, kwargs)),
+    )
+
+    with pytest.raises(FileNotFoundError, match="node-local"):
+        harness._run_resume_phase(
+            experiment_id=paths.experiment_id,
+            deepspeed="configs/deepspeed_zero2.json",
+            tuning_method="lora",
+            zero_stage=2,
+            initial_steps=2,
+            resumed_steps=3,
+        )
+    assert model_loads == []
 
 
 @pytest.mark.parametrize(
@@ -548,11 +632,11 @@ def test_tiny_stage2_writer_failure_reduces_before_barrier(tmp_path):
 
 
 def test_tiny_stage2_nonwriter_propagates_remote_writer_failure(tmp_path):
-    """Catches a non-writer rank reporting success after rank-zero failure."""
+    """Catches a non-writer rank reporting success after either node failure."""
     harness = _load_harness_module()
     events = []
 
-    with pytest.raises(RuntimeError, match="rank zero"):
+    with pytest.raises(RuntimeError, match="machine-local leader"):
         harness._publish_rank_agreed_witness(
             tmp_path / "witness.json",
             {"schema_version": 1},
@@ -582,6 +666,21 @@ def test_tiny_stage2_rank_agreed_publication_is_atomic(tmp_path):
     assert json.loads(witness_path.read_text()) == {"schema_version": 1}
     assert list(witness_path.parent.iterdir()) == [witness_path]
     assert events == [("reduce", 0), ("barrier", None)]
+
+
+def test_tiny_stage2_machine_leaders_publish_identical_phase_bytes(tmp_path):
+    harness = _load_harness_module()
+    witness = {"schema_version": 1, "phase": "initial", "ranks": [0, 1, 2, 3]}
+    paths = [tmp_path / node / "initial-witness.json" for node in ("remote", "local")]
+    for path in paths:
+        harness._publish_rank_agreed_witness(
+            path,
+            witness,
+            is_writer=True,
+            failure_counter=lambda local: local,
+            synchronize=lambda: None,
+        )
+    assert paths[0].read_bytes() == paths[1].read_bytes()
 
 
 def _stage2_args(**overrides):

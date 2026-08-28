@@ -9,7 +9,6 @@ import math
 import os
 from pathlib import Path
 import subprocess
-import tempfile
 from types import SimpleNamespace
 
 import peft
@@ -318,6 +317,14 @@ def _is_world_process_zero() -> bool:
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
 
+def _is_machine_local_leader() -> bool:
+    return (
+        not dist.is_available()
+        or not dist.is_initialized()
+        or int(os.environ["LOCAL_RANK"]) == 0
+    )
+
+
 def _claim_owned_paths(experiment_id: str):
     paths = resolve_run_artifact_paths(experiment_id)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -339,26 +346,40 @@ def _claim_owned_paths(experiment_id: str):
     return paths
 
 
+def _phase_paths(experiment_id: str):
+    validated = resolve_run_artifact_paths(experiment_id)
+    return SimpleNamespace(
+        experiment_id=validated.experiment_id,
+        checkpoint_dir=Path("/root/workspace/ILVR/checkpoints") / experiment_id,
+        result_dir=Path("/root/workspace/ILVR/results") / experiment_id,
+    )
+
+
+def _claim_initial_phase_paths(experiment_id: str):
+    paths = _phase_paths(experiment_id)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1 and not dist.is_initialized():
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    collision = paths.checkpoint_dir.exists() or paths.result_dir.exists()
+    if dist.is_initialized():
+        device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        observed = torch.tensor(int(collision), dtype=torch.int32, device=device)
+        dist.all_reduce(observed, op=dist.ReduceOp.MAX)
+        collision = bool(observed.item())
+    if collision:
+        raise FileExistsError(f"refusing to reuse experiment ID: {experiment_id}")
+    paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if dist.is_initialized():
+        dist.barrier()
+    return paths
+
+
 def _write_witness_atomically(path: Path, witness: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=False)
-    encoded = (json.dumps(witness, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            dir=path.parent,
-            delete=False,
-        ) as temporary:
-            temporary.write(encoded)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            temporary_path = Path(temporary.name)
-        os.link(temporary_path, path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+    from multinode_runtime import _canonical_json_bytes, _publish_bytes_no_replace
+
+    _publish_bytes_no_replace(path, _canonical_json_bytes(witness) + b"\n")
 
 
 def _distributed_failure_count(local_failure: int) -> int:
@@ -389,7 +410,7 @@ def _publish_rank_agreed_witness(
         _distributed_failure_count if failure_counter is None else failure_counter
     )
     synchronize = _synchronize_ranks if synchronize is None else synchronize
-    is_writer = _is_world_process_zero() if is_writer is None else is_writer
+    is_writer = _is_machine_local_leader() if is_writer is None else is_writer
     local_error: Exception | None = None
     if is_writer:
         try:
@@ -400,7 +421,9 @@ def _publish_rank_agreed_witness(
     if failed_ranks:
         if local_error is not None:
             raise local_error
-        raise RuntimeError("Stage 2 witness publication failed on rank zero")
+        raise RuntimeError(
+            "Stage 2 witness publication failed on a machine-local leader"
+        )
     synchronize()
 
 
@@ -543,6 +566,153 @@ def _assert_contract(witness, *, initial_steps: int = 1, resumed_steps: int = 2)
             raise AssertionError(f"base parameters became trainable: {witness}")
 
 
+def _phase_metadata(tuning, model):
+    if not tuning.is_peft:
+        return None
+    qwen = resolve_stage2_qwen_model(model)
+    return build_stage2_peft_metadata(
+        tuning=tuning,
+        base_model_reference="tiny-stage1-base",
+        model_config=qwen.config,
+        token_ids=LatentTokenIds(90, 91, 92),
+        resolved_target_names=tuple(model.peft_config["default"].target_modules),
+    )
+
+
+def _run_initial_phase(
+    *, experiment_id: str, deepspeed: str | None, tuning_method: str,
+    zero_stage: int | None, initial_steps: int,
+):
+    from multinode_evidence import build_lifecycle_phase_evidence
+    from stage2.evidence import observe_stage2_checkpoint_artifact
+
+    paths = _claim_initial_phase_paths(experiment_id)
+    output_dir = paths.checkpoint_dir
+    runtime_profile = load_deepspeed_runtime_profile(
+        deepspeed, world_size=int(os.environ.get("WORLD_SIZE", "1"))
+    )
+    if zero_stage is not None and runtime_profile.zero_stage != zero_stage:
+        raise ValueError("--zero-stage must match the canonical DeepSpeed config")
+    dataset = TinyStage2Dataset(build_rank_local_tiny_prepared_example(output_dir))
+    tuning = _tuning_config(tuning_method)
+    model = _build_tuned_model(tuning)
+    processor = TinyStage2Processor()
+    trainer = Stage2Trainer(
+        model=model,
+        args=_training_args(output_dir, max_steps=initial_steps, deepspeed=deepspeed),
+        train_dataset=dataset,
+        data_collator=_recording_production_collator(processor),
+        processing_class=processor,
+        stage2_peft_metadata=_phase_metadata(tuning, model),
+        deepspeed_runtime_profile=runtime_profile,
+    )
+    result = trainer.train()
+    checkpoint = output_dir / f"checkpoint-{initial_steps}"
+    if not checkpoint.is_dir() or int(trainer.state.global_step) != initial_steps:
+        raise AssertionError("Stage 2 initial phase did not produce checkpoint-2")
+    optimizer_step = trainer._observed_optimizer_step
+    gradient = trainer._representative_gradient_norm
+    if type(optimizer_step) is not int or optimizer_step != initial_steps:
+        raise AssertionError("Stage 2 initial optimizer step is invalid")
+    if type(gradient) not in (int, float) or not math.isfinite(gradient):
+        raise AssertionError("Stage 2 initial gradient is invalid")
+    artifact_kind = observe_stage2_checkpoint_artifact(
+        checkpoint, method=tuning.method
+    )
+    records = _collect_rank_records({
+        "rank": resolve_launcher_rank(),
+        "global_step": int(trainer.state.global_step),
+        "optimizer_step": optimizer_step,
+        "loss": float(result.training_loss),
+        "gradient_norm": float(gradient),
+        "worker_error": None,
+    })
+    witness = build_lifecycle_phase_evidence(
+        phase="initial", stage="stage2", method=tuning.method,
+        zero_stage=runtime_profile.zero_stage,
+        config_digest=runtime_profile.config_digest,
+        experiment_id=paths.experiment_id, checkpoint_path=checkpoint,
+        artifact_kind=artifact_kind, rank_records=records,
+    )
+    _publish_rank_agreed_witness(
+        paths.result_dir / "initial-witness.json", witness
+    )
+    if _is_world_process_zero():
+        print(json.dumps(witness, sort_keys=True), flush=True)
+    return witness
+
+
+def _run_resume_phase(
+    *, experiment_id: str, deepspeed: str | None, tuning_method: str,
+    zero_stage: int | None, initial_steps: int, resumed_steps: int,
+):
+    from multinode_evidence import build_lifecycle_phase_evidence
+    from stage2.evidence import observe_stage2_checkpoint_artifact
+
+    paths = _phase_paths(experiment_id)
+    output_dir = paths.checkpoint_dir
+    checkpoint = output_dir / f"checkpoint-{initial_steps}"
+    if not checkpoint.is_dir():
+        raise FileNotFoundError("Stage 2 resume checkpoint-2 is not node-local")
+    runtime_profile = load_deepspeed_runtime_profile(
+        deepspeed, world_size=int(os.environ.get("WORLD_SIZE", "1"))
+    )
+    if zero_stage is not None and runtime_profile.zero_stage != zero_stage:
+        raise ValueError("--zero-stage must match the canonical DeepSpeed config")
+    tuning = _tuning_config(tuning_method)
+    artifact_kind = observe_stage2_checkpoint_artifact(
+        checkpoint, method=tuning.method
+    )
+    dataset = TinyStage2Dataset(build_rank_local_tiny_prepared_example(output_dir))
+    model = _build_tuned_model(tuning, adapter_path=checkpoint)
+    if deepspeed is not None:
+        # Registration exists before Trainer/DeepSpeed wraps the model.
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        _move_registered_buffers_to_device(model, torch.device("cuda", local_rank))
+    processor = TinyStage2Processor()
+    trainer = Stage2Trainer(
+        model=model,
+        args=_training_args(output_dir, max_steps=resumed_steps, deepspeed=deepspeed),
+        train_dataset=dataset,
+        data_collator=_recording_production_collator(processor),
+        processing_class=processor,
+        stage2_peft_metadata=_phase_metadata(tuning, model),
+        deepspeed_runtime_profile=runtime_profile,
+    )
+    result = trainer.train(resume_from_checkpoint=str(checkpoint))
+    optimizer_step = trainer._observed_optimizer_step
+    gradient = trainer._representative_gradient_norm
+    if (
+        int(trainer.state.global_step) != resumed_steps
+        or type(optimizer_step) is not int
+        or optimizer_step != resumed_steps
+    ):
+        raise AssertionError("Stage 2 resume phase did not advance 2-to-3")
+    if type(gradient) not in (int, float) or not math.isfinite(gradient):
+        raise AssertionError("Stage 2 resume gradient is invalid")
+    records = _collect_rank_records({
+        "rank": resolve_launcher_rank(),
+        "global_step": int(trainer.state.global_step),
+        "optimizer_step": optimizer_step,
+        "loss": float(result.training_loss),
+        "gradient_norm": float(gradient),
+        "worker_error": None,
+    })
+    witness = build_lifecycle_phase_evidence(
+        phase="resume", stage="stage2", method=tuning.method,
+        zero_stage=runtime_profile.zero_stage,
+        config_digest=runtime_profile.config_digest,
+        experiment_id=paths.experiment_id, checkpoint_path=checkpoint,
+        artifact_kind=artifact_kind, rank_records=records,
+    )
+    _publish_rank_agreed_witness(
+        paths.result_dir / "resume-witness.json", witness
+    )
+    if _is_world_process_zero():
+        print(json.dumps(witness, sort_keys=True), flush=True)
+    return witness
+
+
 def run_harness(
     *,
     experiment_id: str,
@@ -551,7 +721,22 @@ def run_harness(
     zero_stage: int | None = None,
     initial_steps: int = 1,
     resumed_steps: int = 2,
+    phase: str = "lifecycle",
 ):
+    if phase not in ("lifecycle", "initial", "resume"):
+        raise ValueError("phase must be lifecycle, initial, or resume")
+    if phase == "initial":
+        return _run_initial_phase(
+            experiment_id=experiment_id, deepspeed=deepspeed,
+            tuning_method=tuning_method, zero_stage=zero_stage,
+            initial_steps=initial_steps,
+        )
+    if phase == "resume":
+        return _run_resume_phase(
+            experiment_id=experiment_id, deepspeed=deepspeed,
+            tuning_method=tuning_method, zero_stage=zero_stage,
+            initial_steps=initial_steps, resumed_steps=resumed_steps,
+        )
     paths = _claim_owned_paths(experiment_id)
     output_dir = paths.checkpoint_dir
     witness_path = paths.result_dir / "witness.json"
@@ -678,7 +863,11 @@ def run_harness(
         record["base_trainable_parameters"] for record in rank_records
     }
     deepspeed_config, deepspeed_zero_stage = _deepspeed_identity(deepspeed)
-    artifact_kind = "full" if tuning.method == "full" else f"peft-{tuning.method}"
+    from stage2.evidence import observe_stage2_checkpoint_artifact
+
+    artifact_kind = observe_stage2_checkpoint_artifact(
+        checkpoint, method=tuning.method
+    )
     witness = {
         "schema_version": 1,
         "stage": "stage2",
@@ -761,6 +950,9 @@ class _LifecycleParser(argparse.ArgumentParser):
 
 def build_tiny_stage2_parser() -> argparse.ArgumentParser:
     parser = _LifecycleParser()
+    parser.add_argument(
+        "--phase", choices=("lifecycle", "initial", "resume"), default="lifecycle"
+    )
     parser.add_argument("--experiment-id", required=True)
     parser.add_argument("--deepspeed")
     parser.add_argument("--zero-stage", type=int, choices=(1, 2, 3))
@@ -779,6 +971,7 @@ def parse_args(argv: list[str] | None = None):
 def main():
     args = parse_args()
     run_harness(
+        phase=args.phase,
         experiment_id=args.experiment_id,
         deepspeed=args.deepspeed,
         tuning_method=args.tuning_method,

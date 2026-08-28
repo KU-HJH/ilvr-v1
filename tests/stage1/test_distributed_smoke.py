@@ -83,6 +83,44 @@ def test_stage1_tiny_parser_preserves_defaults_and_accepts_lifecycle_steps():
 
     assert (defaults.initial_steps, defaults.resumed_steps) == (1, 2)
     assert (requested.initial_steps, requested.resumed_steps) == (2, 3)
+    assert defaults.phase == "lifecycle"
+
+
+@pytest.mark.parametrize("phase", ("lifecycle", "initial", "resume"))
+def test_stage1_tiny_parser_accepts_only_fixed_lifecycle_phases(phase):
+    parser = build_zero_compat_parser()
+    args = parser.parse_args([
+        "--phase", phase, "--zero-stage", "2", "--method", "lora",
+        "--deepspeed", "configs/deepspeed_zero2.json",
+        "--experiment-id", "stage1-zero2-lora-phase",
+    ])
+    assert args.phase == phase
+
+
+def test_stage1_phase_witness_writes_identical_bytes_on_both_nodes(tmp_path):
+    witness = {"schema_version": 1, "phase": "initial"}
+    paths = [
+        SimpleNamespace(result_dir=tmp_path / node) for node in ("remote", "local")
+    ]
+    for owned_paths in paths:
+        zero_compat_diagnostic._publish_witness(
+            owned_paths, witness, filename="initial-witness.json",
+            is_writer=True, failure_counter=lambda failed: failed,
+            synchronize=lambda: None,
+        )
+    assert (
+        paths[0].result_dir.joinpath("initial-witness.json").read_bytes()
+        == paths[1].result_dir.joinpath("initial-witness.json").read_bytes()
+    )
+
+
+def test_stage1_nonwriter_propagates_other_node_writer_failure(tmp_path):
+    with pytest.raises(RuntimeError, match="machine-local leader"):
+        zero_compat_diagnostic._publish_witness(
+            SimpleNamespace(result_dir=tmp_path), {"schema_version": 1},
+            is_writer=False, writer=lambda *_: pytest.fail("nonwriter wrote"),
+            failure_counter=lambda _failed: 1, synchronize=lambda: None,
+        )
 
 
 @pytest.mark.parametrize(

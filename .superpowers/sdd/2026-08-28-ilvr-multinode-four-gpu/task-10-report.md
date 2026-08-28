@@ -356,3 +356,167 @@ generated `/tmp/ilvr-task10-fix.*` fixture was removed afterward.
 
 No live hardware result is claimed; that execution was explicitly outside this
 Task 10 fake/dry-run scope.
+
+## Review fix round 2/5
+
+This section supersedes the round-1 description of one harness process doing
+both phases. Each cell now uses two separately owned fixed harness jobs with the
+same run ID and port: `initial` produces and validates `checkpoint-2`, Task 6
+collects and redistributes that same logical checkpoint to the local node, and
+only then does `resume` start and advance step 2 to 3. The legacy in-process
+`lifecycle` harness default remains available for its existing tests, but the
+matrix command builder accepts only the exact `initial` or `resume` phase.
+
+### RED evidence
+
+The first phase/evidence selection failed during collection because the normal
+Stage 2 producer did not expose the required observed-artifact interface:
+
+```text
+ImportError: cannot import name 'observe_stage2_checkpoint_artifact'
+```
+
+The first validator run reported 14 errors before product validation because
+the new canonical checkpoint root was patched in the result validator fixture
+but not in the shared lifecycle evidence decoder. After fixing that test-only
+root binding, the validator exposed no product failures and passed 14/14.
+
+An additional exact-type regression was deliberately added and run with:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_result_validation.py::test_validate_results_rejects_bool_or_float_identity_types
+```
+
+Observed RED (exit 1):
+
+```text
+..FF
+2 failed, 2 passed in 3.05s
+```
+
+The failures proved that `False == 0` could satisfy a matrix attempt step and
+that `[False] == [0]` could satisfy an evaluation sidecar source-index list.
+Explicit container and element type checks closed both gaps.
+
+The documented-direct-path regression was also run before its checks existed:
+
+```text
+FFFF
+4 failed in 2.93s
+```
+
+Unexpected direct JSON under the evaluation root, capacity root, a Stage 1
+capacity run, and a Stage 2 batch-1 run was still ignored. Exact direct-child
+sets were then added for those producer namespaces and canonical matrix raw
+phase directories.
+
+One final causal check replaced the fixture checkpoint root with the repository's
+documented fixed logical symlink. It failed because the generic no-follow tree
+opener rejected the root symlink before reaching its protected descendants.
+The checkpoint snapshot now resolves only that fixed logical root, opens the
+physical root, and retains no-follow descriptors for every run/checkpoint child.
+Symlinked descendants remain rejected. The resulting standalone validator suite
+passed 21/21.
+
+### GREEN evidence
+
+Focused Task 10 suites:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_lifecycle_matrix.py \
+  tests/multinode/test_result_validation.py \
+  tests/stage1/test_distributed_smoke.py \
+  tests/stage2/integration/test_distributed_contract.py
+```
+
+```text
+112 passed, 6 skipped in 10.47s
+```
+
+The six skips remain the opt-in real distributed/GPU harness executions.
+Standalone validator verification was `21 passed in 3.24s`.
+
+Affected Task 5, Task 6 and capacity suites:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_coordinator.py \
+  tests/multinode/test_artifacts.py \
+  tests/multinode/test_capacity.py
+```
+
+```text
+211 passed in 4.28s
+```
+
+Affected Stage 2 checkpoint suite, using the repository's existing
+trailing-`+` interpreter-version import normalization:
+
+```text
+139 passed in 4.65s
+```
+
+Syntax and dry-run inspection passed:
+
+```text
+wrapper: help ok; 18 plans; ports 29700..29717;
+initial/redistribute/resume; no result root
+AST OK: 8 files
+```
+
+The wrapper emitted exactly 18 JSON objects. Every object had ordered
+`initial`, `redistribute`, and `resume` lifecycle members, initial steps `[0,2]`,
+resume steps `[2,3]`, exact phase arguments in both node command arrays, and no
+filesystem publication, SSH execution, or GPU work.
+
+Two independent fake validator publications were compared with literal
+`diff -u` for both complete JSON and Markdown outputs. Both diffs returned zero;
+the report covered 18 matrix cases, four evaluation samples, nine Stage 1
+capacity cells, and nine Stage 2 batch-1 cells. The exact generated directory
+`/tmp/ilvr-task10-round2-validator-symlink-ogdrva1m` used the documented fixed
+checkpoint-root symlink and was removed when verification finished; it is not
+stored in the repository or result tree.
+
+### Round-2 self-review
+
+- Both approved harnesses retain `phase=lifecycle` as their default and expose
+  exact `initial` and `resume` phases. Each phase publishes its own four-rank
+  loss, gradient, optimizer/global step, artifact and error observations.
+- Global rank 0 classifies the real saved artifact and broadcasts the observed
+  family. Machine-local leaders then publish identical agreed bytes on both
+  node-local filesystems; either leader's writer failure propagates.
+- The coordinator compares the remote and local initial evidence bytes,
+  validates the phase schema, performs Task 6 collection and same-path
+  redistribution, and does not create the resume process set on transfer
+  failure. It repeats the node-byte comparison and strict validation for the
+  separately observed resume evidence.
+- The production command test inspects both real Accelerate arrays and rejects
+  arbitrary harness paths/arguments. Remote evidence reads use only the fixed
+  bounded `lifecycle-evidence-show --run-id ... --phase ...` node CLI; local
+  reads use the descriptor-bound bounded reader.
+- A direct nonshared-filesystem regression proves the Stage 2 resume phase
+  fails before the model loader when the local checkpoint is absent.
+- Launch/readiness/poll/control exceptions retain the primary error, attach
+  cleanup notes, and independently attempt exact-owned cleanup for every
+  possibly-live node.
+- Validation snapshots all allowed evidence bytes and checkpoint metadata from
+  pinned no-follow directory descriptors, including child-directory inode/dev
+  revalidation. It then validates only those immutable observations and exact
+  canonical raw/checkpoint paths.
+- Matrix attempts and evaluation sidecars now reject boolean/float substitutions
+  for integer identities. Stage 2 producer bytes, digest, all-rank diagnostics,
+  observed artifact family and canonical run-owned `checkpoint-1` remain
+  cross-validated.
+- Output rollback records the created device/inode and removes the destination
+  only while it still matches; the same-byte foreign-inode swap regression
+  leaves the foreign file intact.
+- `git diff --check` passed. Pre-existing untracked `__pycache__` paths were
+  preserved. No real SSH, GPU, or training command was run.

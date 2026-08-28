@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -51,6 +52,9 @@ class _LifecycleParser(argparse.ArgumentParser):
 
 def build_zero_compat_parser() -> argparse.ArgumentParser:
     parser = _LifecycleParser(description=__doc__)
+    parser.add_argument(
+        "--phase", choices=("lifecycle", "initial", "resume"), default="lifecycle"
+    )
     parser.add_argument("--zero-stage", type=int, choices=(1, 2, 3), required=True)
     parser.add_argument(
         "--method", choices=SUPPORTED_DIAGNOSTIC_METHODS, required=True
@@ -87,6 +91,45 @@ def _collect_records(record: dict[str, object]) -> list[dict[str, object]]:
     if any(item is None for item in gathered):
         raise RuntimeError("Stage 1 lifecycle collective returned an empty record")
     return [item for item in gathered if item is not None]
+
+
+def _machine_local_leader() -> bool:
+    if not dist.is_initialized():
+        return True
+    return int(os.environ["LOCAL_RANK"]) == 0
+
+
+def _broadcast_rank0(value: str | None) -> str:
+    if not dist.is_initialized():
+        if type(value) is not str:
+            raise ValueError("rank zero did not observe a Stage 1 artifact")
+        return value
+    values: list[str | None] = [value]
+    dist.broadcast_object_list(values, src=0)
+    if type(values[0]) is not str:
+        raise ValueError("rank zero broadcast an invalid Stage 1 artifact")
+    return values[0]
+
+
+def _observe_stage1_artifact(checkpoint: Path, method: str) -> str:
+    observed: str | None = None
+    if _rank() == 0:
+        observed = classify_stage1_artifact(checkpoint).value
+        if observed == "peft":
+            if load_stage1_peft_metadata(checkpoint).tuning_method != method:
+                raise ValueError("observed Stage 1 PEFT method is inconsistent")
+        elif observed != "full" or method != "full":
+            raise ValueError("observed Stage 1 artifact kind is inconsistent")
+    return _broadcast_rank0(observed)
+
+
+def _phase_paths(experiment_id: str):
+    validated = resolve_run_artifact_paths(experiment_id)
+    return SimpleNamespace(
+        experiment_id=validated.experiment_id,
+        checkpoint_dir=Path("/root/workspace/ILVR/checkpoints") / experiment_id,
+        result_dir=Path("/root/workspace/ILVR/results") / experiment_id,
+    )
 
 
 def _require_fresh_run(paths) -> None:
@@ -159,40 +202,63 @@ def _training_args(
     return parse_training_args(argv)
 
 
-def _prepare_fixture(paths) -> Path:
+def _prepare_fixture(paths, *, fresh: bool = True) -> Path:
     fixture_root = paths.checkpoint_dir / "tiny-data"
-    if _rank() == 0:
-        (fixture_root / "images").mkdir(parents=True, exist_ok=False)
-        (fixture_root / "TRAIN.jsonl").write_text("{}\n", encoding="utf-8")
+    if _machine_local_leader():
+        if fresh:
+            (fixture_root / "images").mkdir(parents=True, exist_ok=False)
+            (fixture_root / "TRAIN.jsonl").write_text("{}\n", encoding="utf-8")
+        elif (
+            not (fixture_root / "images").is_dir()
+            or not (fixture_root / "TRAIN.jsonl").is_file()
+        ):
+            raise FileNotFoundError("Stage 1 resume fixture is not node-local")
     if dist.is_initialized():
         dist.barrier()
     return fixture_root
 
 
-def _publish_witness(paths, witness: dict[str, object]) -> None:
+def _publish_witness(
+    paths,
+    witness: dict[str, object],
+    *,
+    filename: str = "witness.json",
+    is_writer: bool | None = None,
+    writer=None,
+    failure_counter=None,
+    synchronize=None,
+) -> None:
+    from multinode_runtime import _canonical_json_bytes, _publish_bytes_no_replace
+
+    selected_writer = _publish_bytes_no_replace if writer is None else writer
+    if failure_counter is None:
+        def failure_counter(local_failure):
+            if not dist.is_initialized():
+                return local_failure
+            device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+            failed = torch.tensor(local_failure, dtype=torch.int32, device=device)
+            dist.all_reduce(failed, op=dist.ReduceOp.SUM)
+            return int(failed.item())
+    if synchronize is None:
+        synchronize = lambda: dist.barrier() if dist.is_initialized() else None
     local_error: Exception | None = None
-    if _rank() == 0:
+    machine_writer = _machine_local_leader() if is_writer is None else is_writer
+    if machine_writer:
         try:
-            paths.result_dir.mkdir(parents=True, exist_ok=False)
-            (paths.result_dir / "witness.json").write_text(
-                json.dumps(witness, sort_keys=True, indent=2) + "\n",
-                encoding="utf-8",
+            selected_writer(
+                paths.result_dir / filename,
+                _canonical_json_bytes(witness) + b"\n",
             )
         except Exception as error:  # propagated to every launched rank below
             local_error = error
-    if dist.is_initialized():
-        device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-        failed = torch.tensor(
-            int(local_error is not None), dtype=torch.int32, device=device
+    failed_writers = failure_counter(int(local_error is not None))
+    if failed_writers:
+        if local_error is not None:
+            raise local_error
+        raise RuntimeError(
+            "Stage 1 witness publication failed on a machine-local leader"
         )
-        dist.all_reduce(failed, op=dist.ReduceOp.SUM)
-        if int(failed.item()):
-            if local_error is not None:
-                raise local_error
-            raise RuntimeError("Stage 1 witness publication failed on rank zero")
-        dist.barrier()
-    elif local_error is not None:
-        raise local_error
+    synchronize()
 
 
 def _build_resumed_stage1_components(*, args, profile):
@@ -205,7 +271,7 @@ def _build_resumed_stage1_components(*, args, profile):
     )
 
 
-def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
+def _run_lifecycle(args: argparse.Namespace) -> dict[str, object]:
     _initialize_distributed()
     paths = resolve_run_artifact_paths(args.experiment_id)
     _require_fresh_run(paths)
@@ -364,6 +430,119 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
     }
     _publish_witness(paths, witness)
     return witness
+
+
+def _phase_profile(args: argparse.Namespace):
+    profile = load_deepspeed_runtime_profile(
+        args.deepspeed, world_size=_world_size()
+    )
+    expected_config = canonical_deepspeed_config_path(args.zero_stage).resolve()
+    if profile.zero_stage != args.zero_stage or profile.config_path != expected_config:
+        raise ValueError(f"--zero-stage {args.zero_stage} requires {expected_config}")
+    return profile
+
+
+def _run_initial_phase(args: argparse.Namespace) -> dict[str, object]:
+    from multinode_evidence import build_lifecycle_phase_evidence
+
+    _initialize_distributed()
+    paths = _phase_paths(args.experiment_id)
+    _require_fresh_run(paths)
+    profile = _phase_profile(args)
+    fixture_root = _prepare_fixture(paths)
+    training_args = _training_args(
+        paths=paths, fixture_root=fixture_root, method=args.method,
+        deepspeed=profile.config_path, max_steps=args.initial_steps,
+    )
+    training_args.deepspeed_runtime_profile = profile
+    components = build_stage1_training_components(
+        training_args, dependencies=_tiny_dependencies(),
+        deepspeed_runtime_profile=profile,
+    )
+    components.trainer.collect_stage1_diagnostics = True
+    components.trainer.args.save_total_limit = 2
+    result = components.trainer.train()
+    checkpoint = paths.checkpoint_dir / f"checkpoint-{args.initial_steps}"
+    if (
+        int(components.trainer.state.global_step) != args.initial_steps
+        or components.trainer._successful_optimizer_steps != args.initial_steps
+        or not checkpoint.is_dir()
+    ):
+        raise AssertionError("Stage 1 initial phase did not produce checkpoint-2")
+    gradient = components.trainer._representative_gradient_norm
+    if type(gradient) not in (int, float) or not math.isfinite(gradient):
+        raise AssertionError("Stage 1 initial phase did not observe a finite gradient")
+    artifact_kind = _observe_stage1_artifact(checkpoint, args.method)
+    records = _collect_records({
+        "rank": _rank(),
+        "global_step": int(components.trainer.state.global_step),
+        "optimizer_step": components.trainer._successful_optimizer_steps,
+        "loss": float(result.training_loss),
+        "gradient_norm": float(gradient),
+        "worker_error": None,
+    })
+    witness = build_lifecycle_phase_evidence(
+        phase="initial", stage="stage1", method=args.method,
+        zero_stage=profile.zero_stage, config_digest=profile.config_digest,
+        experiment_id=paths.experiment_id, checkpoint_path=checkpoint,
+        artifact_kind=artifact_kind, rank_records=records,
+    )
+    _publish_witness(paths, witness, filename="initial-witness.json")
+    return witness
+
+
+def _run_resume_phase(args: argparse.Namespace) -> dict[str, object]:
+    from multinode_evidence import build_lifecycle_phase_evidence
+
+    _initialize_distributed()
+    paths = _phase_paths(args.experiment_id)
+    profile = _phase_profile(args)
+    checkpoint = paths.checkpoint_dir / f"checkpoint-{args.initial_steps}"
+    if not checkpoint.is_dir():
+        raise FileNotFoundError("Stage 1 resume checkpoint-2 is not node-local")
+    artifact_kind = _observe_stage1_artifact(checkpoint, args.method)
+    fixture_root = _prepare_fixture(paths, fresh=False)
+    resumed_args = _training_args(
+        paths=paths, fixture_root=fixture_root, method=args.method,
+        deepspeed=profile.config_path, max_steps=args.resumed_steps,
+        resume=checkpoint,
+    )
+    resumed_args.deepspeed_runtime_profile = profile
+    resumed = _build_resumed_stage1_components(args=resumed_args, profile=profile)
+    resumed.trainer.collect_stage1_diagnostics = True
+    result = resumed.trainer.train(resume_from_checkpoint=str(checkpoint))
+    if (
+        int(resumed.trainer.state.global_step) != args.resumed_steps
+        or resumed.trainer._successful_optimizer_steps != 1
+    ):
+        raise AssertionError("Stage 1 resume phase did not advance 2-to-3")
+    gradient = resumed.trainer._representative_gradient_norm
+    if type(gradient) not in (int, float) or not math.isfinite(gradient):
+        raise AssertionError("Stage 1 resume phase did not observe a finite gradient")
+    records = _collect_records({
+        "rank": _rank(),
+        "global_step": int(resumed.trainer.state.global_step),
+        "optimizer_step": resumed.trainer._successful_optimizer_steps,
+        "loss": float(result.training_loss),
+        "gradient_norm": float(gradient),
+        "worker_error": None,
+    })
+    witness = build_lifecycle_phase_evidence(
+        phase="resume", stage="stage1", method=args.method,
+        zero_stage=profile.zero_stage, config_digest=profile.config_digest,
+        experiment_id=paths.experiment_id, checkpoint_path=checkpoint,
+        artifact_kind=artifact_kind, rank_records=records,
+    )
+    _publish_witness(paths, witness, filename="resume-witness.json")
+    return witness
+
+
+def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
+    if args.phase == "initial":
+        return _run_initial_phase(args)
+    if args.phase == "resume":
+        return _run_resume_phase(args)
+    return _run_lifecycle(args)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -3,7 +3,6 @@
 import argparse
 import hashlib
 import json
-import math
 import os
 import re
 import signal
@@ -158,16 +157,19 @@ class LifecycleCase:
 
 @dataclass(frozen=True)
 class LifecyclePlan:
-    """One immutable owned tiny-harness job for one matrix cell."""
+    """Two owned phase jobs separated by mandatory checkpoint redistribution."""
 
     case: LifecycleCase
     child_run_id: str
     main_process_port: int
     witness_path: Path
-    raw_witness_path: Path
+    initial_witness_path: Path
+    resume_witness_path: Path
     checkpoint_path: Path
-    launch_plan: LaunchPlan
-    commands: OwnedTmuxCommands
+    initial_launch_plan: LaunchPlan
+    resume_launch_plan: LaunchPlan
+    initial_commands: OwnedTmuxCommands
+    resume_commands: OwnedTmuxCommands
 
 
 def build_lifecycle_matrix() -> tuple[LifecycleCase, ...]:
@@ -218,43 +220,46 @@ def build_lifecycle_plans(
             f"{parent_run_id}-{case.stage}-{case.method}-zero{case.zero_stage}"
         )
         _validate_identifier("child_run_id", child_run_id)
-        launch_plan = LaunchPlan(
-            stage=case.stage,
-            tuning_method=case.method,
-            zero_stage=case.zero_stage,
-            run_id=child_run_id,
-            main_process_port=port,
-            world_size=4,
-            deepspeed_config=canonical_deepspeed_config(case.zero_stage),
-            deepspeed_config_digest=digests[case.zero_stage],
-            cluster=ClusterSpec.default(),
-            attempt_id="lifecycle",
-        )
-        commands = build_owned_lifecycle_harness_commands(
-            launch_plan, commit=commit
-        )
+        phase_plans = {
+            phase: LaunchPlan(
+                stage=case.stage,
+                tuning_method=case.method,
+                zero_stage=case.zero_stage,
+                run_id=child_run_id,
+                main_process_port=port,
+                world_size=4,
+                deepspeed_config=canonical_deepspeed_config(case.zero_stage),
+                deepspeed_config_digest=digests[case.zero_stage],
+                cluster=ClusterSpec.default(),
+                attempt_id=phase,
+            )
+            for phase in ("initial", "resume")
+        }
+        phase_commands = {
+            phase: build_owned_lifecycle_harness_commands(
+                phase_plans[phase], commit=commit, phase=phase
+            )
+            for phase in ("initial", "resume")
+        }
+        raw_root = _REPOSITORY_ROOT / "results" / child_run_id
         plans.append(
             LifecyclePlan(
                 case=case,
                 child_run_id=child_run_id,
                 main_process_port=port,
                 witness_path=root / parent_run_id / f"{child_run_id}.json",
-                raw_witness_path=(
-                    _REPOSITORY_ROOT
-                    / "results"
-                    / "zero-stage-compatibility"
-                    / child_run_id
-                    / "witness.json"
-                ),
+                initial_witness_path=raw_root / "initial-witness.json",
+                resume_witness_path=raw_root / "resume-witness.json",
                 checkpoint_path=(
                     _REPOSITORY_ROOT
                     / "checkpoints"
-                    / "zero-stage-compatibility"
                     / child_run_id
                     / f"checkpoint-{case.initial_steps}"
                 ),
-                launch_plan=launch_plan,
-                commands=commands,
+                initial_launch_plan=phase_plans["initial"],
+                resume_launch_plan=phase_plans["resume"],
+                initial_commands=phase_commands["initial"],
+                resume_commands=phase_commands["resume"],
             )
         )
     return tuple(plans)
@@ -337,140 +342,106 @@ def _json_ready(value: object) -> object:
     return value
 
 
-_STAGE1_RAW_FIELDS = {
-    "schema_version", "stage", "zero_stage", "config_digest", "world_size",
-    "method", "artifact_kind", "method_artifact", "adapter_checkpoint_present",
-    "initial_global_step", "resumed_global_step", "finite_gradient_norm",
-    "representative_gradient_norm", "successful_optimizer_steps", "finite_loss",
-    "first_loss", "resumed_loss", "process_ranks", "rank_records",
-    "worker_errors", "checkpoint", "experiment_id",
-}
-_STAGE1_RANK_FIELDS = {
-    "rank", "initial_global_step", "resumed_global_step",
-    "initial_optimizer_steps", "resumed_optimizer_steps", "first_loss",
-    "resumed_loss", "finite_gradient_norm", "representative_gradient_norm",
-    "method_artifact", "worker_error",
-}
-_STAGE2_RAW_FIELDS = {
-    "schema_version", "stage", "method", "zero_stage", "config_digest",
-    "artifact_kind", "tuning_method", "first_global_step",
-    "resumed_global_step", "rank_first_global_steps", "rank_resumed_global_steps",
-    "rank_first_losses", "rank_resumed_losses", "rank_records", "process_ranks",
-    "finite_loss", "finite_gradient", "worker_errors", "optimizer_state_restored",
-    "scheduler_state_restored", "optimizer_step_at_resume",
-    "scheduler_step_at_resume", "observed_local_batch_sizes", "world_size",
-    "first_loss", "resumed_loss", "deepspeed", "deepspeed_config",
-    "deepspeed_zero_stage", "adapter_parameters_changed",
-    "adapter_checkpoint_present", "sidecar_present", "processor_present",
-    "full_model_weights_absent", "visual_trainable_parameters",
-    "base_trainable_parameters", "git_commit", "torch_version",
-    "transformers_version", "peft_version", "harness_path", "checkpoint",
-    "experiment_id",
-}
-_STAGE2_RANK_FIELDS = {
-    "rank", "first_global_step", "resumed_global_step", "optimizer_step",
-    "first_loss", "resumed_loss", "gradient_norm", "worker_error",
-    "first_batches", "resumed_batches", "optimizer_step_at_resume",
-    "scheduler_step_at_resume", "adapter_parameters_changed",
-    "visual_trainable_parameters", "base_trainable_parameters",
-}
+def _validate_lifecycle_phase_witness(
+    plan: LifecyclePlan, *, phase: Literal["initial", "resume"], raw: bytes
+) -> dict[str, object]:
+    """Validate one separately observed phase witness from either node."""
+    from src.multinode_evidence import decode_lifecycle_phase_evidence
 
-
-def _finite_number(value: object) -> bool:
-    return type(value) in (int, float) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def _validate_lifecycle_raw_witness(
-    plan: LifecyclePlan,
-) -> tuple[dict[str, object], bytes]:
-    """Validate the approved harness's direct strict raw witness."""
-    from src.multinode_runtime import _read_regular_file
-
-    raw = _read_regular_file(plan.raw_witness_path, maximum_size=1024 * 1024)
-    def reject_duplicate(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("lifecycle raw witness contains a duplicate field")
-            result[key] = value
-        return result
-
-    try:
-        payload = json.loads(raw, object_pairs_hook=reject_duplicate)
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("lifecycle raw witness is invalid JSON") from error
-    if type(payload) is not dict:
-        raise ValueError("lifecycle raw witness must be an object")
-    case = plan.case
-    fields = _STAGE1_RAW_FIELDS if case.stage == "stage1" else _STAGE2_RAW_FIELDS
-    if set(payload) != fields:
-        raise ValueError("lifecycle raw witness fields are invalid")
-    method_field = "method" if case.stage == "stage1" else "tuning_method"
-    if (
-        payload["schema_version"] != 1
-        or type(payload["schema_version"]) is not int
-        or payload["stage"] != case.stage
-        or type(payload["stage"]) is not str
-        or payload[method_field] != case.method
-        or type(payload[method_field]) is not str
-        or payload["zero_stage"] != case.zero_stage
-        or type(payload["zero_stage"]) is not int
-        or payload["config_digest"] != plan.launch_plan.deepspeed_config_digest
-        or type(payload["config_digest"]) is not str
-        or payload["world_size"] != 4
-        or type(payload["world_size"]) is not int
-        or payload["process_ranks"] != [0, 1, 2, 3]
-        or payload["worker_errors"] != []
-        or payload["experiment_id"] != plan.child_run_id
-        or payload["checkpoint"] != str(plan.checkpoint_path)
-    ):
-        raise ValueError("lifecycle raw witness identity is invalid")
-    records = payload["rank_records"]
-    rank_fields = _STAGE1_RANK_FIELDS if case.stage == "stage1" else _STAGE2_RANK_FIELDS
-    if type(records) is not list or len(records) != 4:
-        raise ValueError("lifecycle raw witness requires four ranks")
-    method_artifact = "full" if case.method == "full" else f"peft-{case.method}"
-    for rank, record in enumerate(records):
-        if type(record) is not dict or set(record) != rank_fields or record["rank"] != rank:
-            raise ValueError("lifecycle raw rank evidence is invalid")
-        if case.stage == "stage1":
-            valid = (
-                record["initial_global_step"] == 2
-                and record["resumed_global_step"] == 3
-                and record["initial_optimizer_steps"] == 2
-                and record["resumed_optimizer_steps"] == 1
-                and record["method_artifact"] == method_artifact
-                and record["finite_gradient_norm"] is True
-                and _finite_number(record["representative_gradient_norm"])
-            )
-            gradient = record["representative_gradient_norm"]
-        else:
-            valid = (
-                record["first_global_step"] == 2
-                and record["resumed_global_step"] == 3
-                and record["optimizer_step"] == 3
-                and record["optimizer_step_at_resume"] == 2
-                and record["scheduler_step_at_resume"] == 2
-                and _finite_number(record["gradient_norm"])
-            )
-            gradient = record["gradient_norm"]
-        if (
-            not valid
-            or record["worker_error"] is not None
-            or not _finite_number(record["first_loss"])
-            or not _finite_number(record["resumed_loss"])
-            or not _finite_number(gradient)
-        ):
-            raise ValueError("lifecycle raw rank diagnostics are invalid")
-    artifact_field = "method_artifact" if case.stage == "stage1" else "artifact_kind"
-    if payload[artifact_field] != method_artifact:
-        raise ValueError("lifecycle raw method artifact is invalid")
-    finite_gradient = (
-        payload["finite_gradient_norm"] if case.stage == "stage1" else payload["finite_gradient"]
+    return decode_lifecycle_phase_evidence(
+        raw,
+        phase=phase,
+        stage=plan.case.stage,
+        method=plan.case.method,
+        zero_stage=plan.case.zero_stage,
+        config_digest=plan.initial_launch_plan.deepspeed_config_digest,
+        experiment_id=plan.child_run_id,
+        checkpoint_path=plan.checkpoint_path,
     )
-    if payload["finite_loss"] is not True or finite_gradient is not True:
-        raise ValueError("lifecycle raw diagnostics are not finite")
-    return payload, raw
+
+
+def _execute_lifecycle_attempts(
+    plan: LifecyclePlan,
+    *,
+    initial_runner: object,
+    resume_runner: object,
+    commit: str,
+) -> dict[str, object]:
+    """Run initial, collect/redistribute, then and only then run resume."""
+    phase_results: dict[str, object] = {}
+    initial = plan.initial_launch_plan
+    start_rank0_then_rank1(initial, initial_runner, commands=plan.initial_commands)
+    initial_exits = monitor_owned_jobs(
+        initial,
+        initial_runner,
+        expected_commit=commit,
+        expected_command_digests={
+            0: plan.initial_commands.command_digests[0],
+            1: plan.initial_commands.command_digests[1],
+        },
+    )
+    if initial_exits != {0: 0, 1: 0}:
+        raise RuntimeError(f"initial lifecycle phase failed: {initial_exits}")
+    initial_copies = tuple(
+        initial_runner.read_lifecycle_phase_evidence(rank, "initial")
+        for rank in (0, 1)
+    )
+    if initial_copies[0] != initial_copies[1]:
+        raise ValueError("initial lifecycle phase differs between node filesystems")
+    initial_payload = _validate_lifecycle_phase_witness(
+        plan, phase="initial", raw=initial_copies[0]
+    )
+    artifact_identity = _checkpoint_artifact_identity(
+        initial, commit=commit, global_step=2
+    )
+    manifests = collect_checkpoint_artifacts(
+        initial_runner,
+        checkpoint_path=plan.checkpoint_path,
+        runtime_identity=artifact_identity,
+        exit_codes=initial_exits,
+        world_size=4,
+    )
+    redistributed = redistribute_resume_checkpoint(
+        initial_runner,
+        checkpoint_path=plan.checkpoint_path,
+        checkpoint_identity=artifact_identity,
+        requested_identity=artifact_identity,
+        destination=plan.checkpoint_path,
+    )
+
+    resume = plan.resume_launch_plan
+    start_rank0_then_rank1(resume, resume_runner, commands=plan.resume_commands)
+    resume_exits = monitor_owned_jobs(
+        resume,
+        resume_runner,
+        expected_commit=commit,
+        expected_command_digests={
+            0: plan.resume_commands.command_digests[0],
+            1: plan.resume_commands.command_digests[1],
+        },
+    )
+    if resume_exits != {0: 0, 1: 0}:
+        raise RuntimeError(f"resume lifecycle phase failed: {resume_exits}")
+    resume_copies = tuple(
+        resume_runner.read_lifecycle_phase_evidence(rank, "resume")
+        for rank in (0, 1)
+    )
+    if resume_copies[0] != resume_copies[1]:
+        raise ValueError("resume lifecycle phase differs between node filesystems")
+    resume_payload = _validate_lifecycle_phase_witness(
+        plan, phase="resume", raw=resume_copies[0]
+    )
+    phase_results.update({
+        "initial_payload": initial_payload,
+        "initial_bytes": initial_copies[0],
+        "initial_exit_codes": initial_exits,
+        "resume_payload": resume_payload,
+        "resume_bytes": resume_copies[0],
+        "resume_exit_codes": resume_exits,
+        "manifests": manifests,
+        "redistributed": redistributed,
+    })
+    return phase_results
 
 
 def run_lifecycle_matrix(
@@ -521,24 +492,28 @@ def run_lifecycle_matrix(
 
     completed_cases: list[dict[str, object]] = []
     for plan in plans:
-        launch = plan.launch_plan
-        commands = plan.commands
-        checkpoint_root = _REPOSITORY_ROOT / "checkpoints" / "zero-stage-compatibility"
-        control = _REPOSITORY_ROOT / "logs" / "multinode" / plan.child_run_id / "lifecycle"
+        launch = plan.initial_launch_plan
+        checkpoint_root = _REPOSITORY_ROOT / "checkpoints"
+        control_root = _REPOSITORY_ROOT / "logs" / "multinode" / plan.child_run_id
         harness = (
             _REPOSITORY_ROOT / "tests/stage1/zero_compat_diagnostic.py"
             if plan.case.stage == "stage1"
             else _REPOSITORY_ROOT / "tests/stage2/integration/tiny_stage2_train.py"
         )
         run_paths = (
-            control,
-            plan.raw_witness_path.parent,
+            control_root / "initial",
+            control_root / "resume",
+            plan.initial_witness_path.parent,
             plan.checkpoint_path.parent,
             plan.witness_path,
         )
-        sessions = (
-            f"ilvr-{plan.child_run_id}-lifecycle-rank0",
-            f"ilvr-{plan.child_run_id}-lifecycle-rank1",
+        remote_sessions = (
+            f"ilvr-{plan.child_run_id}-initial-rank0",
+            f"ilvr-{plan.child_run_id}-resume-rank0",
+        )
+        local_sessions = (
+            f"ilvr-{plan.child_run_id}-initial-rank1",
+            f"ilvr-{plan.child_run_id}-resume-rank1",
         )
         preflight = build_preflight_commands(
             launch,
@@ -548,8 +523,8 @@ def run_lifecycle_matrix(
             ),
             remote_run_paths=run_paths,
             local_run_paths=run_paths,
-            remote_tmux_sessions=(sessions[0],),
-            local_tmux_sessions=(sessions[1],),
+            remote_tmux_sessions=remote_sessions,
+            local_tmux_sessions=local_sessions,
         )
 
         def preflight_runner(command):
@@ -564,7 +539,7 @@ def run_lifecycle_matrix(
             artifact_roots=(
                 checkpoint_root, _REPOSITORY_ROOT / "results", _REPOSITORY_ROOT / "logs"
             ),
-            run_paths=run_paths, tmux_sessions=(sessions[0],),
+            run_paths=run_paths, tmux_sessions=remote_sessions,
             repository=launch.cluster.remote_repo_root,
         )
         local = collect_node_snapshot(
@@ -573,44 +548,43 @@ def run_lifecycle_matrix(
             artifact_roots=(
                 checkpoint_root, _REPOSITORY_ROOT / "results", _REPOSITORY_ROOT / "logs"
             ),
-            run_paths=run_paths, tmux_sessions=(sessions[1],),
+            run_paths=run_paths, tmux_sessions=local_sessions,
             repository=launch.cluster.remote_repo_root,
         )
         report = validate_preflight(remote, local)
         if report.commit != commit:
             raise ValueError("validated lifecycle preflight commit changed")
-        runner = SubprocessCoordinatorRunner(
-            launch, commands=commands, commit=commit,
+        initial_runner = SubprocessCoordinatorRunner(
+            plan.initial_launch_plan, commands=plan.initial_commands, commit=commit,
             log_root=_REPOSITORY_ROOT / "logs" / "multinode",
             checkpoint_root=checkpoint_root,
         )
-        start_rank0_then_rank1(launch, runner, commands=commands)
-        exit_codes = monitor_owned_jobs(
-            launch, runner, expected_commit=commit,
-            expected_command_digests={
-                0: commands.command_digests[0], 1: commands.command_digests[1]
-            },
+        resume_runner = SubprocessCoordinatorRunner(
+            plan.resume_launch_plan, commands=plan.resume_commands, commit=commit,
+            log_root=_REPOSITORY_ROOT / "logs" / "multinode",
+            checkpoint_root=checkpoint_root,
         )
-        if exit_codes != {0: 0, 1: 0}:
-            raise RuntimeError(
-                f"lifecycle {plan.child_run_id} failed without retry: {exit_codes}"
-            )
-        raw_payload, raw_bytes = _validate_lifecycle_raw_witness(plan)
-        artifact_identity = _checkpoint_artifact_identity(
-            launch, commit=commit, global_step=2
-        )
-        manifests = collect_checkpoint_artifacts(
-            runner, checkpoint_path=plan.checkpoint_path,
-            runtime_identity=artifact_identity, exit_codes=exit_codes, world_size=4,
+        observed = _execute_lifecycle_attempts(
+            plan, initial_runner=initial_runner, resume_runner=resume_runner,
+            commit=commit,
         )
         case = plan.case
-        method_artifact = "full" if case.method == "full" else f"peft-{case.method}"
-        records = raw_payload["rank_records"]
-        first_loss_key = "first_loss"
-        resumed_loss_key = "resumed_loss"
-        gradient_key = (
-            "representative_gradient_norm" if case.stage == "stage1" else "gradient_norm"
-        )
+        initial_payload = observed["initial_payload"]
+        resume_payload = observed["resume_payload"]
+        initial_bytes = observed["initial_bytes"]
+        resume_bytes = observed["resume_bytes"]
+        initial_exits = observed["initial_exit_codes"]
+        resume_exits = observed["resume_exit_codes"]
+        manifests = observed["manifests"]
+        redistributed = observed["redistributed"]
+        if (
+            type(initial_payload) is not dict or type(resume_payload) is not dict
+            or type(initial_bytes) is not bytes or type(resume_bytes) is not bytes
+            or type(initial_exits) is not dict or type(resume_exits) is not dict
+        ):
+            raise TypeError("validated lifecycle phase result types are invalid")
+        if initial_payload["artifact_kind"] != resume_payload["artifact_kind"]:
+            raise ValueError("lifecycle phase artifact observations disagree")
         case_payload = {
             "schema_version": 1,
             "kind": "multinode-lifecycle-case",
@@ -621,32 +595,43 @@ def run_lifecycle_matrix(
             "zero_stage": case.zero_stage,
             "world_size": 4,
             "main_process_port": plan.main_process_port,
-            "machine_ranks": sorted(exit_codes),
-            "process_ranks": raw_payload["process_ranks"],
-            "method_artifact": method_artifact,
+            "machine_ranks": [0, 1],
+            "process_ranks": initial_payload["process_ranks"],
+            "artifact_kind": initial_payload["artifact_kind"],
             "checkpoint": "checkpoint-2",
-            "raw_witness": {
-                "path": str(plan.raw_witness_path),
-                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
-                "size": len(raw_bytes),
+            "raw_witnesses": {
+                "initial": {
+                    "path": str(plan.initial_witness_path),
+                    "sha256": hashlib.sha256(initial_bytes).hexdigest(),
+                    "size": len(initial_bytes),
+                },
+                "resume": {
+                    "path": str(plan.resume_witness_path),
+                    "sha256": hashlib.sha256(resume_bytes).hexdigest(),
+                    "size": len(resume_bytes),
+                },
             },
             "attempts": [
                 {
                     "from_step": 0, "to_step": 2,
-                    "rank_losses": [record[first_loss_key] for record in records],
-                    "rank_gradients": [record[gradient_key] for record in records],
+                    "rank_losses": [record["loss"] for record in initial_payload["ranks"]],
+                    "rank_gradients": [record["gradient_norm"] for record in initial_payload["ranks"]],
                 },
                 {
                     "from_step": 2, "to_step": 3,
-                    "rank_losses": [record[resumed_loss_key] for record in records],
-                    "rank_gradients": [record[gradient_key] for record in records],
+                    "rank_losses": [record["loss"] for record in resume_payload["ranks"]],
+                    "rank_gradients": [record["gradient_norm"] for record in resume_payload["ranks"]],
                 },
             ],
             "finite_loss": True,
             "finite_gradient": True,
-            "worker_errors": raw_payload["worker_errors"],
+            "worker_errors": [],
             "collected_node_manifests": len(manifests),
-            "exit_codes": {str(rank): code for rank, code in sorted(exit_codes.items())},
+            "redistributed_entries": len(redistributed),
+            "exit_codes": {
+                "initial": {str(rank): initial_exits[rank] for rank in (0, 1)},
+                "resume": {str(rank): resume_exits[rank] for rank in (0, 1)},
+            },
         }
         _publish_bytes_no_replace(
             plan.witness_path,
@@ -660,7 +645,7 @@ def run_lifecycle_matrix(
                 "child_run_id": plan.child_run_id,
                 "main_process_port": plan.main_process_port,
                 "witness": plan.witness_path.name,
-                "exit_codes": [exit_codes[0], exit_codes[1]],
+                "exit_codes": {"initial": [0, 0], "resume": [0, 0]},
             }
         )
     completion = {
@@ -686,9 +671,21 @@ def _lifecycle_plan_json(plan: LifecyclePlan) -> dict[str, object]:
         "child_run_id": plan.child_run_id,
         "main_process_port": plan.main_process_port,
         "lifecycle": {
-            "remote": list(plan.commands.remote),
-            "local": list(plan.commands.local),
-            "steps": [0, 2, 3],
+            "initial": {
+                "remote": list(plan.initial_commands.remote),
+                "local": list(plan.initial_commands.local),
+                "steps": [0, 2],
+            },
+            "redistribute": {
+                "checkpoint": "checkpoint-2",
+                "remote_path": str(plan.checkpoint_path),
+                "local_path": str(plan.checkpoint_path),
+            },
+            "resume": {
+                "remote": list(plan.resume_commands.remote),
+                "local": list(plan.resume_commands.local),
+                "steps": [2, 3],
+            },
         },
     }
 
@@ -726,6 +723,30 @@ def _lifecycle_matrix_main(argv: list[str]) -> int:
                 sort_keys=True,
             )
         )
+    return 0
+
+
+def _lifecycle_evidence_show(argv: list[str]) -> int:
+    """Emit one bounded canonical node-local phase witness for comparison."""
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode lifecycle-evidence-show",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--phase", choices=("initial", "resume"), required=True)
+    args = parser.parse_args(argv)
+    try:
+        _validate_identifier("run_id", args.run_id)
+        from src.multinode_runtime import _read_regular_file
+
+        raw = _read_regular_file(
+            _REPOSITORY_ROOT / "results" / args.run_id
+            / f"{args.phase}-witness.json",
+            maximum_size=1024 * 1024,
+        )
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    sys.stdout.buffer.write(raw)
     return 0
 
 
@@ -1899,6 +1920,8 @@ def _main(argv: list[str] | None = None) -> int:
         from src.multinode_capacity import _capacity_evidence_main
 
         return _capacity_evidence_main(argv[1:])
+    if argv and argv[0] == "lifecycle-evidence-show":
+        return _lifecycle_evidence_show(argv[1:])
     if argv and argv[0] in ("train-stage1", "train-stage2"):
         return _training_main(argv[0].removeprefix("train-"), argv[1:])  # type: ignore[arg-type]
     if argv and argv[0] == "prepare-inference":

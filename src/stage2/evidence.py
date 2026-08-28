@@ -82,9 +82,10 @@ def _validate_identity(
         or not checkpoint.name.startswith("checkpoint-")
     ):
         raise ValueError("Stage 2 producer checkpoint identity is invalid")
-    expected_artifact = "full" if method == "full" else f"peft-{method}"
-    if type(artifact_kind) is not str or artifact_kind != expected_artifact:
+    if type(artifact_kind) is not str or artifact_kind not in ("full", "peft"):
         raise ValueError("Stage 2 producer method artifact is invalid")
+    if (method == "full") != (artifact_kind == "full"):
+        raise ValueError("Stage 2 producer observed artifact disagrees with method")
     return run_id, method, zero_stage, checkpoint, artifact_kind
 
 
@@ -221,6 +222,66 @@ def _synchronize() -> None:
         dist.barrier()
 
 
+def _broadcast_artifact(value: str | None) -> str:
+    if not dist.is_available() or not dist.is_initialized():
+        if type(value) is not str:
+            raise ValueError("rank zero did not observe a Stage 2 artifact")
+        return value
+    values: list[str | None] = [value]
+    dist.broadcast_object_list(values, src=0)
+    if type(values[0]) is not str:
+        raise ValueError("rank zero broadcast an invalid Stage 2 artifact")
+    return values[0]
+
+
+def observe_stage2_checkpoint_artifact(
+    checkpoint_path: str | Path,
+    *,
+    method: str,
+    is_rank_zero: bool | None = None,
+    classifier: Callable[[Path], object] | None = None,
+    peft_method_reader: Callable[[Path], str] | None = None,
+    broadcaster: Callable[[str | None], str] = _broadcast_artifact,
+) -> str:
+    """Classify on global rank zero, bind PEFT metadata, then broadcast."""
+    checkpoint = Path(checkpoint_path)
+    rank_zero = (
+        not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+        if is_rank_zero is None
+        else is_rank_zero
+    )
+    observed: str | None = None
+    if rank_zero:
+        if classifier is None:
+            from stage2.checkpointing import classify_stage2_artifact
+
+            classifier = classify_stage2_artifact
+        classified = classifier(checkpoint)
+        observed = getattr(classified, "value", classified)
+        if observed == "peft":
+            if peft_method_reader is None:
+                from stage2.checkpointing import load_stage2_peft_metadata
+
+                peft_method_reader = lambda path: load_stage2_peft_metadata(path).tuning_method
+            if peft_method_reader(checkpoint) != method:
+                raise ValueError("observed Stage 2 PEFT method is inconsistent")
+        elif observed != "full" or method != "full":
+            raise ValueError("observed Stage 2 artifact kind is inconsistent")
+    broadcast = broadcaster(observed)
+    if broadcast not in ("full", "peft"):
+        raise ValueError("broadcast Stage 2 artifact kind is invalid")
+    return broadcast
+
+
+def _is_machine_local_leader() -> bool:
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    try:
+        return int(__import__("os").environ["LOCAL_RANK"]) == 0
+    except (KeyError, ValueError) as error:
+        raise ValueError("LOCAL_RANK is required for dual-node publication") from error
+
+
 def publish_stage2_producer_evidence(
     path: str | Path,
     *,
@@ -231,7 +292,7 @@ def publish_stage2_producer_evidence(
     artifact_kind: str,
     local_rank_record: dict[str, object],
     gather_records: Callable[[dict[str, object]], list[dict[str, object]]] = _gather_records,
-    is_writer: bool | None = None,
+    is_machine_leader: bool | None = None,
     failure_counter: Callable[[int], int] = _failure_count,
     synchronize: Callable[[], None] = _synchronize,
 ) -> dict[str, object]:
@@ -246,9 +307,9 @@ def publish_stage2_producer_evidence(
         rank_records=records,
     )
     writer = (
-        not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
-        if is_writer is None
-        else is_writer
+        _is_machine_local_leader()
+        if is_machine_leader is None
+        else is_machine_leader
     )
     local_error: Exception | None = None
     if writer:
@@ -261,6 +322,6 @@ def publish_stage2_producer_evidence(
     if failure_counter(int(local_error is not None)):
         if local_error is not None:
             raise local_error
-        raise RuntimeError("Stage 2 producer publication failed on rank zero")
+        raise RuntimeError("Stage 2 producer publication failed on a machine-local leader")
     synchronize()
     return payload
