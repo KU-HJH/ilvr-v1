@@ -151,8 +151,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     elif args.stage == "stage1":
         if args.use_lora and args.tuning_method_explicit:
             raise ValueError("--use_lora and --tuning_method cannot be combined")
-        if args.tuning_method_explicit and args.tuning_method not in ("full", "dora"):
-            raise ValueError("Stage 1 --tuning_method accepts only full or dora")
+        if args.tuning_method_explicit and args.tuning_method not in (
+            "full", "lora", "dora"
+        ):
+            raise ValueError(
+                "Stage 1 --tuning_method accepts only full, lora, or dora"
+            )
         normalize_decoder_target_suffixes(
             args.lora_target_modules, stage_label="Stage 1 PEFT target modules"
         )

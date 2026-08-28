@@ -70,7 +70,7 @@ legacy_use_lora=false
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 --method full|dora --model MODEL --data-path FILE" \
+        "Usage: $0 --method full|lora|dora --model MODEL --data-path FILE" \
         "  --image-root DIR --output-dir DIR [options]"
 }
 
@@ -123,9 +123,8 @@ for required in method model data_path image_root output_dir; do
 done
 
 case $method in
-    full|dora) ;;
-    lora) legacy_use_lora=true ;;
-    *) printf 'error: --method must be full or dora (lora is legacy-only)\n' >&2; exit 2 ;;
+    full|lora|dora) ;;
+    *) printf 'error: --method must be full, lora, or dora\n' >&2; exit 2 ;;
 esac
 if [[ $legacy_use_lora == true && $method != lora ]]; then
     printf 'error: --use_lora requires legacy --method lora\n' >&2
@@ -276,19 +275,10 @@ command=(
     --gradient_checkpointing
 )
 
-if [[ $method == dora ]]; then
+command+=(--tuning_method "$method")
+
+if [[ $method == lora || $method == dora ]]; then
     command+=(
-        --tuning_method dora
-        --lora_r 32
-        --lora_alpha 64
-        --lora_dropout 0.05
-        --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
-    )
-elif [[ $method == full ]]; then
-    command+=(--tuning_method full)
-else
-    command+=(
-        --use_lora
         --lora_r 32
         --lora_alpha 64
         --lora_dropout 0.05

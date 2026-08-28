@@ -317,6 +317,24 @@ def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_
     assert "--gradient_checkpointing" in command
 
 
+def test_stage1_launcher_routes_canonical_lora(tmp_path):
+    """Catches canonical LoRA being translated back into the legacy CLI flag."""
+    completed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "lora-output", method="lora"),
+        "--deepspeed-config",
+        REPO_ROOT / "configs/deepspeed_zero2.json",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = shlex.split(completed.stdout.strip())
+    assert command[command.index("--tuning_method") + 1] == "lora"
+    assert "--use_lora" not in command
+    assert command[command.index("--deepspeed_config") + 1].endswith(
+        "configs/deepspeed_zero2.json"
+    )
+
+
 def test_dry_run_derives_canonical_log_from_checkpoint_experiment_id():
     """Catches omitted logs falling back below a checkpoint or the worktree."""
     paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
@@ -686,8 +704,8 @@ def test_launcher_preserves_valid_scalar_environment_overrides(tmp_path):
     assert command[command.index("--learning_rate") + 1] == "2E-5"
 
 
-def test_legacy_launcher_forwards_use_lora_without_promoting_it_to_dora(tmp_path):
-    """Catches the legacy --use_lora selector being dropped or changed to DoRA."""
+def test_legacy_launcher_normalizes_use_lora_to_canonical_lora(tmp_path):
+    """Catches the legacy selector being dropped or translated to the wrong method."""
     completed = run_launcher(
         LEGACY_LAUNCHER,
         "--dry-run",
@@ -704,8 +722,8 @@ def test_legacy_launcher_forwards_use_lora_without_promoting_it_to_dora(tmp_path
 
     assert completed.returncode == 0, completed.stderr
     command = shlex.split(completed.stdout.strip())
-    assert "--use_lora" in command
-    assert "--tuning_method" not in command
+    assert command[command.index("--tuning_method") + 1] == "lora"
+    assert "--use_lora" not in command
 
 
 def test_smoke_launcher_forwards_exact_numbered_save_and_resume_witness(tmp_path):

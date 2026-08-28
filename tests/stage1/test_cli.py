@@ -48,6 +48,16 @@ def test_stage1_legacy_use_lora_resolves_only_to_lora():
     assert tuning.method == "lora"
 
 
+def test_stage1_explicit_lora_is_a_canonical_tuning_method():
+    """Catches explicit Stage 1 LoRA being rejected despite its PEFT support."""
+    args = parse_args(["--stage", "stage1", "--tuning_method", "lora"])
+
+    tuning = resolve_stage1_tuning_config(args)
+
+    assert tuning.method == "lora"
+    assert args.tuning_method_explicit is True
+
+
 def test_stage1_explicit_target_order_is_preserved_after_normalization():
     """Catches an explicit Stage 1 PEFT target order being replaced by defaults."""
     tuning = resolve_stage1_tuning_config(
@@ -107,10 +117,6 @@ def test_cli_rejects_contradictory_or_nonfinite_values(argv, message):
         (
             ["--stage", "stage1", "--gradient_accumulation_steps", "0"],
             "at least 1",
-        ),
-        (
-            ["--stage", "stage1", "--tuning_method", "lora"],
-            "accepts only full or dora",
         ),
     ],
 )
