@@ -302,6 +302,235 @@ def test_eval_cli_accepts_explicit_stage1_base(module_name, monkeypatch):
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch):
+    """Changing the default entrypoint output mode must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            module_name,
+            "--model_dir",
+            "model",
+            "--test_data_path",
+            "test.jsonl",
+            "--task_name",
+            "task",
+        ],
+    )
+
+    args = module.get_eval_args()
+
+    assert args.num_shards == 1
+    assert args.shard_index == 0
+    assert args.model_identity is None
+
+
+def _run_main_with_fake_sample(
+    module, monkeypatch, tmp_path, *, num_shards, shard_index=0, fail_index=None
+):
+    dataset = tmp_path / "test.jsonl"
+    dataset.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "text_input": f"question-{index}",
+                    "image_input": ["image.png"],
+                    "original_final_answer": "42",
+                }
+            )
+            + "\n"
+            for index in range(6)
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "worker.jsonl"
+    monkeypatch.setattr(
+        module,
+        "get_eval_args",
+        lambda: SimpleNamespace(
+            model_dir="relative-model",
+            base_model_dir=None,
+            test_data_path=str(dataset),
+            task_name="zebra-cot",
+            output_json_path=str(output),
+            cache_dir="cache",
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            num_shards=num_shards,
+            shard_index=shard_index,
+            model_identity=None,
+        ),
+    )
+    monkeypatch.setattr(module, "load_evaluation_artifacts", lambda **_kwargs: (object(), object()))
+
+    def run_one(_model, _processor, sample, _gen_kwargs):
+        index = int(sample["text_input"].rsplit("-", 1)[1])
+        if index == fail_index:
+            raise RuntimeError("causal sample failure")
+        result = {
+            "raw_output": "raw answer",
+            "assistant_only": "answer",
+            "extracted_final_answer": "42",
+        }
+        if module.__name__ == "eval":
+            result["inference_time"] = 1.25
+        return result
+
+    monkeypatch.setattr(module, "run_one_example", run_one)
+    return dataset, output, module.main()
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_default_single_worker_preserves_existing_output_bytes(
+    module_name, monkeypatch, tmp_path
+):
+    """Adding sharding must not alter existing JSONL or summary bytes."""
+    module = _import_entry_point(module_name, monkeypatch)
+    _dataset, output, result = _run_main_with_fake_sample(
+        module, monkeypatch, tmp_path, num_shards=1
+    )
+
+    if module_name == "eval":
+        row = {
+            "index": 0,
+            "task_name": "zebra-cot",
+            "image_input": ["image.png"],
+            "prediction": "answer",
+            "extracted_final_answer": "42",
+            "gold_final_answer": "42",
+            "match": True,
+            "inference_time_sec": 1.25,
+        }
+        rows = [dict(row, index=index) for index in range(6)]
+        rows.append(
+            {
+                "summary": True,
+                "num_samples": 6,
+                "average_inference_time_sec": 1.25,
+                "total_inference_time_sec": 7.5,
+                "accuracy": 1.0,
+                "success": 6,
+            }
+        )
+    else:
+        row = {
+            "index": 0,
+            "task_name": "zebra-cot",
+            "prediction": "answer",
+            "extracted_final_answer": "42",
+            "gold_final_answer": "42",
+            "match": True,
+        }
+        rows = [dict(row, index=index) for index in range(6)]
+
+    expected = "".join(
+        json.dumps(row, ensure_ascii=False) + "\n" for row in rows
+    )
+    assert result is None
+    assert output.read_text(encoding="utf-8") == expected
+    assert not Path(f"{output}.manifest.json").exists()
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_four_shard_worker_uses_global_indices_and_writes_success_sidecar(
+    module_name, monkeypatch, tmp_path
+):
+    """Enumerating the filtered shard locally must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    dataset, output, result = _run_main_with_fake_sample(
+        module, monkeypatch, tmp_path, num_shards=4, shard_index=1
+    )
+
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    manifest = json.loads(
+        Path(f"{output}.manifest.json").read_text(encoding="utf-8")
+    )
+    dataset_stat = dataset.stat()
+    assert result == 0
+    assert [row["index"] for row in rows] == [1, 5]
+    assert all("summary" not in row for row in rows)
+    assert manifest["dataset_identity"] == {
+        "path": str(dataset.absolute()),
+        "size": dataset_stat.st_size,
+        "mtime_ns": dataset_stat.st_mtime_ns,
+    }
+    assert manifest["model_identity"] == f"direct:{Path('relative-model').absolute()}"
+    assert manifest["expected_source_indices"] == [1, 5]
+    assert manifest["processed_source_indices"] == [1, 5]
+    assert manifest["worker_exit_status"] == 0
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_four_shard_worker_retains_error_and_returns_nonzero(
+    module_name, monkeypatch, tmp_path
+):
+    """Treating a partial diagnostic shard as successful must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    _dataset, output, result = _run_main_with_fake_sample(
+        module,
+        monkeypatch,
+        tmp_path,
+        num_shards=4,
+        shard_index=1,
+        fail_index=5,
+    )
+
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    manifest = json.loads(Path(f"{output}.manifest.json").read_text())
+    assert result == 1
+    assert rows[-1]["index"] == 5
+    assert rows[-1]["error"] == "causal sample failure"
+    assert manifest["processed_source_indices"] == [1, 5]
+    assert manifest["worker_exit_status"] == 1
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_empty_four_shard_worker_still_publishes_mergeable_success_sidecar(
+    module_name, monkeypatch, tmp_path
+):
+    """Returning before the zero-sample shard sidecar must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    dataset = tmp_path / "empty.jsonl"
+    dataset.write_text("", encoding="utf-8")
+    output = tmp_path / "worker.jsonl"
+    monkeypatch.setattr(
+        module,
+        "get_eval_args",
+        lambda: SimpleNamespace(
+            model_dir="model",
+            base_model_dir=None,
+            test_data_path=str(dataset),
+            task_name="task",
+            output_json_path=str(output),
+            cache_dir="cache",
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            num_shards=4,
+            shard_index=3,
+            model_identity="validated-checkpoint-identity",
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "load_evaluation_artifacts",
+        lambda **_kwargs: (object(), object()),
+    )
+
+    result = module.main()
+
+    manifest = json.loads(Path(f"{output}.manifest.json").read_text())
+    assert result == 0
+    assert output.read_bytes() == b""
+    assert manifest["expected_source_indices"] == []
+    assert manifest["processed_source_indices"] == []
+    assert manifest["model_identity"] == "validated-checkpoint-identity"
+    assert manifest["worker_exit_status"] == 0
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
 def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
     module_name, monkeypatch, tmp_path
 ):

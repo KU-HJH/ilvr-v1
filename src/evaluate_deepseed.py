@@ -4,6 +4,7 @@ import re
 import json
 import argparse
 import logging
+import sys
 from typing import List, Dict, Any, Union
 
 import torch
@@ -23,6 +24,13 @@ from stage2.inference import (
 from stage2.peft import (
     load_stage2_model_for_inference,
     resolve_stage2_qwen_model,
+)
+from multinode_evaluation import (
+    dataset_identity,
+    iter_owned_samples,
+    resolve_model_identity,
+    shard_manifest_path,
+    write_shard_manifest,
 )
 
 try:
@@ -52,6 +60,9 @@ def get_eval_args():
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--model-identity", type=str)
     return parser.parse_args()
 
 
@@ -321,6 +332,16 @@ def main():
     args = get_eval_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+    sharded = args.num_shards == 4
+    if not (
+        (args.num_shards == 1 and args.shard_index == 0)
+        or (sharded and args.shard_index in range(4))
+    ):
+        raise ValueError(
+            "evaluation requires num_shards=1 with shard_index=0 or four "
+            "shards indexed 0-3"
+        )
+
     logging.info(f"Loading model: {args.model_dir}")
     model, processor = load_evaluation_artifacts(
         model_dir=args.model_dir,
@@ -338,7 +359,8 @@ def main():
 
     if not data:
         logging.error("Test set is empty, exiting.")
-        return
+        if not sharded:
+            return
 
     gen_kwargs = dict(
         max_new_tokens=args.max_new_tokens,
@@ -348,11 +370,20 @@ def main():
     )
 
     total = len(data)
+    owned_samples = (
+        list(iter_owned_samples(data, args.num_shards, args.shard_index))
+        if sharded
+        else list(enumerate(data))
+    )
+    worker_total = len(owned_samples)
     success = 0
     results = []
+    processed_indices = []
+    worker_failed = False
 
-    logging.info(f"Starting evaluation: num_samples={total}")
-    for i, sample in enumerate(data):
+    logging.info(f"Starting evaluation: num_samples={worker_total if sharded else total}")
+    for local_index, (i, sample) in enumerate(owned_samples):
+        processed_indices.append(i)
         try:
             pred = run_one_example(model, processor, sample, gen_kwargs)
             out_text = pred["raw_output"]
@@ -394,24 +425,47 @@ def main():
                     "match": bool(ok)
                 })
 
-            if (i + 1) % 10 == 0 or (i + 1) == total:
-                logging.info(f"[{i+1}/{total}] Current accuracy={success/(i+1):.4f}")
+            progress = local_index + 1 if sharded else i + 1
+            progress_total = worker_total if sharded else total
+            if progress % 10 == 0 or progress == progress_total:
+                logging.info(f"[{progress}/{progress_total}] Current accuracy={success/progress:.4f}")
 
         except Exception as e:
             logging.error(f"[{i}] Evaluation failed: {e}")
+            if sharded:
+                worker_failed = True
             results.append({
                 "index": i,
                 "task_name": args.task_name,
                 "error": str(e)
             })
 
-    acc = success / total
+    metric_total = worker_total if sharded else total
+    acc = success / metric_total if metric_total > 0 else 0.0
     with open(args.output_json_path, "w", encoding="utf-8") as fout:
         for r in results:
             fout.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    logging.info(f"Evaluation finished: success {success}/{total}; accuracy={acc:.4f}")
-    print(f"Accuracy = {acc:.4f}  ({success}/{total})")
+    if sharded:
+        write_shard_manifest(
+            shard_manifest_path(args.output_json_path),
+            shard_jsonl=args.output_json_path,
+            dataset_identity=dataset_identity(args.test_data_path),
+            model_identity=resolve_model_identity(
+                args.model_dir, args.model_identity
+            ),
+            shard_index=args.shard_index,
+            num_shards=args.num_shards,
+            expected_source_indices=[index for index, _sample in owned_samples],
+            processed_source_indices=processed_indices,
+            worker_exit_status=1 if worker_failed else 0,
+        )
+
+    report_total = worker_total if sharded else total
+    logging.info(f"Evaluation finished: success {success}/{report_total}; accuracy={acc:.4f}")
+    print(f"Accuracy = {acc:.4f}  ({success}/{report_total})")
+    if sharded:
+        return 1 if worker_failed else 0
     
 
 
@@ -460,4 +514,4 @@ def extract_path_from_text(generated_text: str) -> str:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
