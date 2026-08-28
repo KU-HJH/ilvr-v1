@@ -7,36 +7,40 @@ from types import SimpleNamespace
 import pytest
 
 from stage1.benchmark import run_or_load_distributed_witness
-from tests.stage1.zero_compat_diagnostic import build_zero_compat_parser
+from tests.stage1.zero_compat_diagnostic import (
+    SUPPORTED_DIAGNOSTIC_METHODS,
+    build_zero_compat_parser,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTED_METHOD = os.environ.get("ILVR_DISTRIBUTED_METHOD") or None
-if SELECTED_METHOD not in {None, "full", "dora"}:
+if SELECTED_METHOD not in {None, *SUPPORTED_DIAGNOSTIC_METHODS}:
     raise pytest.UsageError(
-        "invalid ILVR_DISTRIBUTED_METHOD: expected full or dora, "
+        "invalid ILVR_DISTRIBUTED_METHOD: expected one of "
+        f"{', '.join(SUPPORTED_DIAGNOSTIC_METHODS)}, "
         f"got {SELECTED_METHOD!r}"
     )
 
 
-def test_stage1_diagnostic_accepts_all_supported_pairs():
+@pytest.mark.parametrize("stage", (1, 2, 3))
+@pytest.mark.parametrize("method", SUPPORTED_DIAGNOSTIC_METHODS)
+def test_stage1_diagnostic_accepts_all_supported_pairs(stage, method):
     """Catches a supported ZeRO/method lifecycle becoming unlaunchable."""
     parser = build_zero_compat_parser()
-    for stage in (1, 2, 3):
-        for method in ("full", "dora"):
-            args = parser.parse_args(
-                [
-                    "--zero-stage",
-                    str(stage),
-                    "--method",
-                    method,
-                    "--deepspeed",
-                    f"configs/deepspeed_zero{stage}.json",
-                    "--experiment-id",
-                    f"stage1-zero{stage}-{method}-tiny-lifecycle",
-                ]
-            )
-            assert (args.zero_stage, args.method) == (stage, method)
+    args = parser.parse_args(
+        [
+            "--zero-stage",
+            str(stage),
+            "--method",
+            method,
+            "--deepspeed",
+            f"configs/deepspeed_zero{stage}.json",
+            "--experiment-id",
+            f"stage1-zero{stage}-{method}-tiny-lifecycle",
+        ]
+    )
+    assert (args.zero_stage, args.method) == (stage, method)
 
 
 def test_stage1_diagnostic_has_no_arbitrary_generated_path_arguments():
@@ -74,7 +78,7 @@ def evidence_dir():
 
 @pytest.mark.gpu
 @pytest.mark.distributed
-@pytest.mark.parametrize("method", ["full", "dora"])
+@pytest.mark.parametrize("method", SUPPORTED_DIAGNOSTIC_METHODS)
 def test_two_rank_zero3_b2_save_resume_witness(
     method, real_comt_paths, evidence_dir
 ):

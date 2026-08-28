@@ -20,15 +20,25 @@ from deepspeed_runtime import (
     canonical_deepspeed_config_path,
     load_deepspeed_runtime_profile,
 )
+from stage1.checkpointing import (
+    Stage1ArtifactKind,
+    classify_stage1_artifact,
+    load_stage1_peft_metadata,
+)
 from stage1.composition import build_stage1_training_components
 from tests.stage1.test_integration import _tiny_dependencies
 from utils_deepseed import parse_args as parse_training_args
 
 
+SUPPORTED_DIAGNOSTIC_METHODS = ("full", "lora", "dora")
+
+
 def build_zero_compat_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zero-stage", type=int, choices=(1, 2, 3), required=True)
-    parser.add_argument("--method", choices=("full", "dora"), required=True)
+    parser.add_argument(
+        "--method", choices=SUPPORTED_DIAGNOSTIC_METHODS, required=True
+    )
     parser.add_argument("--deepspeed", type=Path, required=True)
     parser.add_argument("--experiment-id", required=True)
     return parser
@@ -203,6 +213,40 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
     if first.trainer._successful_optimizer_steps != 1:
         raise AssertionError("Stage 1 initial phase did not apply exactly one step")
 
+    artifact_kind = classify_stage1_artifact(checkpoint)
+    adapter_checkpoint_present = (checkpoint / "adapter_model.safetensors").is_file()
+    if args.method in ("lora", "dora"):
+        required = {
+            "adapter_config.json",
+            "adapter_model.safetensors",
+            "ilvr_token_rows.safetensors",
+            "stage1_peft_metadata.json",
+        }
+        missing = sorted(
+            name for name in required if not (checkpoint / name).is_file()
+        )
+        if missing:
+            raise AssertionError(f"Stage 1 PEFT checkpoint is incomplete: {missing}")
+        if (checkpoint / "model.safetensors").exists():
+            raise AssertionError("Stage 1 PEFT checkpoint contains full model weights")
+        if artifact_kind is not Stage1ArtifactKind.PEFT:
+            raise AssertionError(
+                f"Stage 1 {args.method} checkpoint kind is {artifact_kind.value}"
+            )
+        if args.method == "lora":
+            metadata = load_stage1_peft_metadata(checkpoint)
+            if metadata.tuning_method != "lora":
+                raise AssertionError("Stage 1 LoRA metadata does not report method=lora")
+            peft_config = json.loads(
+                (checkpoint / "adapter_config.json").read_text(encoding="utf-8")
+            )
+            if peft_config.get("use_dora") is not False:
+                raise AssertionError("Stage 1 LoRA PEFT config enables DoRA")
+    elif artifact_kind is not Stage1ArtifactKind.FULL:
+        raise AssertionError(
+            f"Stage 1 full checkpoint kind is {artifact_kind.value}"
+        )
+
     observed_norm = first.trainer._representative_gradient_norm
     if observed_norm is None or not math.isfinite(observed_norm):
         raise AssertionError("Stage 1 did not observe a finite gradient norm")
@@ -245,6 +289,8 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
         "config_digest": profile.config_digest,
         "world_size": profile.world_size,
         "method": args.method,
+        "artifact_kind": artifact_kind.value,
+        "adapter_checkpoint_present": adapter_checkpoint_present,
         "initial_global_step": 1,
         "resumed_global_step": 2,
         "finite_gradient_norm": True,
