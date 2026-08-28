@@ -17,7 +17,7 @@ from src.deepspeed_runtime import (
 )
 from src.multinode_runtime import (
     NodeSnapshot,
-    build_remote_exec,
+    build_preflight_commands,
     collect_node_snapshot,
     validate_node_config_digest,
     validate_preflight,
@@ -209,6 +209,10 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
 def _node_info(args: argparse.Namespace) -> NodeSnapshot:
     """Collect node-local evidence after validating the exact config bytes."""
     repository = Path(args.repository)
+    if repository != _REPOSITORY_ROOT:
+        raise ValueError("node-info repository must be /root/workspace/ILVR")
+    if Path(args.deepspeed_config) != canonical_deepspeed_config(args.zero_stage):
+        raise ValueError("node-info config must be the canonical DeepSpeed config")
     validate_node_config_digest(
         args.deepspeed_config,
         zero_stage=args.zero_stage,
@@ -315,31 +319,6 @@ def _remote_master_port_is_free(port: int) -> bool:
     return True
 
 
-def _preflight_commands(plan: LaunchPlan) -> tuple[list[str], list[str]]:
-    """Render commands only; this helper deliberately performs no probing."""
-    common = [
-        "node-info",
-        "--main-process-port",
-        str(plan.main_process_port),
-        "--deepspeed-config",
-        str(plan.deepspeed_config),
-        "--deepspeed-config-digest",
-        plan.deepspeed_config_digest,
-        "--zero-stage",
-        str(plan.zero_stage),
-    ]
-    local = [*common[:1], "--node", "local", "--machine-rank", "1", *common[1:]]
-    remote_argv = [
-        *common[:1],
-        "--node",
-        "remote",
-        "--machine-rank",
-        "0",
-        *common[1:],
-    ]
-    return local, build_remote_exec(remote_argv)
-
-
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -369,44 +348,46 @@ def _main(argv: list[str] | None = None) -> int:
             return 0
         plan = _plan_from_args(args)
         if args.command == "preflight":
-            local_command, remote_command = _preflight_commands(plan)
-            if args.dry_run:
-                print(
-                    json.dumps(
-                        {
-                            "local_command": local_command,
-                            "plan": _json_ready(plan),
-                            "remote_command": remote_command,
-                        },
-                        sort_keys=True,
-                    )
-                )
-                return 0
-            local_repo = Path.cwd()
             if args.artifact_root:
-                local_roots = tuple(Path(path) for path in args.artifact_root)
-                remote_roots = local_roots
+                artifact_roots = tuple(Path(path) for path in args.artifact_root)
             else:
-                local_roots = (
-                    local_repo / "checkpoints",
-                    local_repo / "results",
-                    local_repo / "logs",
-                )
-                remote_roots = (
+                artifact_roots = (
                     plan.cluster.remote_repo_root / "checkpoints",
                     plan.cluster.remote_repo_root / "results",
                     plan.cluster.remote_repo_root / "logs",
                 )
             remote_run_paths = tuple(
-                root / plan.run_id / plan.attempt_id for root in remote_roots
+                root / plan.run_id / plan.attempt_id for root in artifact_roots
             )
             local_run_paths = tuple(
-                root / plan.run_id / plan.attempt_id for root in local_roots
+                root / plan.run_id / plan.attempt_id for root in artifact_roots
             )
             sessions = (
                 f"ilvr-{plan.run_id}-{plan.attempt_id}-rank0",
                 f"ilvr-{plan.run_id}-{plan.attempt_id}-rank1",
             )
+            commands = build_preflight_commands(
+                plan,
+                input_paths=args.input_path,
+                artifact_roots=artifact_roots,
+                remote_run_paths=remote_run_paths,
+                local_run_paths=local_run_paths,
+                remote_tmux_sessions=(sessions[0],),
+                local_tmux_sessions=(sessions[1],),
+            )
+            if args.dry_run:
+                print(
+                    json.dumps(
+                        {
+                            "container_inspect": commands.container_inspect,
+                            "local_node_info": commands.local_node_info,
+                            "plan": _json_ready(plan),
+                            "remote_node_info": commands.remote_node_info,
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 0
 
             def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(command, capture_output=True, text=True, check=False)
@@ -415,25 +396,25 @@ def _main(argv: list[str] | None = None) -> int:
                 plan,
                 node="remote",
                 input_paths=args.input_path,
-                artifact_roots=remote_roots,
+                artifact_roots=artifact_roots,
                 run_paths=remote_run_paths,
                 tmux_sessions=(sessions[0],),
                 runner=runner,
+                commands=commands,
                 repository=plan.cluster.remote_repo_root,
             )
             local = collect_node_snapshot(
                 plan,
                 node="local",
                 input_paths=args.input_path,
-                artifact_roots=local_roots,
+                artifact_roots=artifact_roots,
                 run_paths=local_run_paths,
                 tmux_sessions=(sessions[1],),
                 runner=runner,
-                repository=local_repo,
+                commands=commands,
+                repository=plan.cluster.remote_repo_root,
             )
-            report = validate_preflight(
-                remote, local, required_free_bytes=plan.required_free_bytes
-            )
+            report = validate_preflight(remote, local)
             print(json.dumps(_json_ready(report), sort_keys=True))
             return 0
     except (OSError, ValueError, json.JSONDecodeError) as error:

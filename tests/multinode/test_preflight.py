@@ -8,7 +8,9 @@ import pytest
 from src.multinode import build_launch_plan
 from src.multinode_runtime import (
     NodeSnapshot,
+    PreflightCommands,
     build_remote_exec,
+    build_preflight_commands,
     collect_node_snapshot,
     validate_preflight,
 )
@@ -176,12 +178,15 @@ def test_local_collection_never_uses_ssh_or_docker():
         run_paths=(),
         tmux_sessions=(),
         runner=runner,
-        repository="/node/repository",
     )
 
     assert result.container_running is None
     assert len(calls) == 1
-    assert calls[0][0] == "/node/repository/venv/ilvr-venv/bin/python"
+    assert calls[0][:3] == [
+        "env",
+        "PYTHONPATH=/root/workspace/ILVR",
+        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+    ]
     assert "ssh" not in calls[0]
     assert "docker" not in calls[0]
 
@@ -213,8 +218,15 @@ def test_preflight_dry_run_prints_commands_without_probing(monkeypatch, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["plan"]["world_size"] == 4
-    assert payload["local_command"][:3] == ["node-info", "--node", "local"]
-    assert payload["remote_command"][:2] == ["ssh", "-o"]
+    assert payload["local_node_info"][:6] == [
+        "env",
+        "PYTHONPATH=/root/workspace/ILVR",
+        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "-m",
+        "src.multinode",
+        "node-info",
+    ]
+    assert payload["remote_node_info"][:2] == ["ssh", "-o"]
 
 
 def test_preflight_uses_each_node_repository_artifact_roots(monkeypatch, capsys):
@@ -251,9 +263,9 @@ def test_preflight_uses_each_node_repository_artifact_roots(monkeypatch, capsys)
         Path("/root/workspace/ILVR/logs"),
     )
     assert calls[1]["artifact_roots"] == (
-        Path.cwd() / "checkpoints",
-        Path.cwd() / "results",
-        Path.cwd() / "logs",
+        Path("/root/workspace/ILVR/checkpoints"),
+        Path("/root/workspace/ILVR/results"),
+        Path("/root/workspace/ILVR/logs"),
     )
 
 
@@ -264,3 +276,95 @@ def test_missing_artifact_root_is_reported_without_creating_it(tmp_path):
 
     assert _artifact_root_evidence((missing,)) == (False, 0)
     assert not missing.exists()
+
+
+def test_preflight_commands_use_the_canonical_repo_venv_and_config():
+    commands = build_preflight_commands(
+        plan(),
+        input_paths=("/input",),
+        artifact_roots=("/root/workspace/ILVR/checkpoints",),
+        remote_run_paths=("/root/workspace/ILVR/checkpoints/fresh-remote",),
+        local_run_paths=("/root/workspace/ILVR/checkpoints/fresh-local",),
+        remote_tmux_sessions=("ilvr-remote",),
+        local_tmux_sessions=("ilvr-local",),
+    )
+
+    expected_prefix = [
+        "env",
+        "PYTHONPATH=/root/workspace/ILVR",
+        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "-m",
+        "src.multinode",
+        "node-info",
+    ]
+    assert list(commands.local_node_info[:6]) == expected_prefix
+    assert "--repository" in commands.local_node_info
+    assert commands.local_node_info[
+        commands.local_node_info.index("--repository") + 1
+    ] == "/root/workspace/ILVR"
+    assert commands.local_node_info[
+        commands.local_node_info.index("--deepspeed-config") + 1
+    ] == "/root/workspace/ILVR/configs/deepspeed_zero2.json"
+    assert commands.remote_node_info[-1].startswith(
+        "env PYTHONPATH=/root/workspace/ILVR "
+    )
+
+
+def test_live_collection_uses_the_exact_prebuilt_dry_run_commands():
+    commands = build_preflight_commands(
+        plan(),
+        input_paths=("/input",),
+        artifact_roots=("/root/workspace/ILVR/checkpoints",),
+        remote_run_paths=("/root/workspace/ILVR/checkpoints/fresh-remote",),
+        local_run_paths=("/root/workspace/ILVR/checkpoints/fresh-local",),
+        remote_tmux_sessions=("ilvr-remote",),
+        local_tmux_sessions=("ilvr-local",),
+    )
+    calls = []
+
+    def runner(command):
+        calls.append(tuple(command))
+        if tuple(command) == commands.container_inspect:
+            return subprocess.CompletedProcess(command, 0, "true\n", "")
+        node = "remote" if tuple(command) == commands.remote_node_info else "local"
+        return subprocess.CompletedProcess(command, 0, json.dumps(snapshot(node, 0 if node == "remote" else 1).to_json()), "")
+
+    collect_node_snapshot(plan(), node="remote", commands=commands, runner=runner)
+    collect_node_snapshot(plan(), node="local", commands=commands, runner=runner)
+
+    assert calls == [
+        commands.container_inspect,
+        commands.remote_node_info,
+        commands.local_node_info,
+    ]
+
+
+def test_dry_run_prints_the_same_three_executable_commands(monkeypatch, capsys):
+    import src.multinode as multinode
+
+    def forbidden_probe(*args, **kwargs):
+        raise AssertionError("dry run must not collect node info")
+
+    monkeypatch.setattr(multinode, "collect_node_snapshot", forbidden_probe)
+
+    assert multinode._main(
+        [
+            "preflight", "--stage", "stage1", "--tuning-method", "lora",
+            "--zero-stage", "2", "--run-id", "stage1-lora-zero2-four-gpu",
+            "--main-process-port", "29613", "--dry-run",
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {"container_inspect", "local_node_info", "plan", "remote_node_info"}
+    assert payload["local_node_info"][:6] == [
+        "env", "PYTHONPATH=/root/workspace/ILVR",
+        "/root/workspace/ILVR/venv/ilvr-venv/bin/python", "-m", "src.multinode", "node-info",
+    ]
+
+
+def test_preflight_cannot_lower_the_immutable_training_free_space_limit():
+    remote = dataclasses.replace(snapshot("remote", 0), artifact_free_bytes=1024)
+
+    with pytest.raises(TypeError, match="required_free_bytes"):
+        validate_preflight(remote, snapshot("local", 1), required_free_bytes=1)

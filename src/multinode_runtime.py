@@ -65,6 +65,15 @@ class PreflightReport:
     world_size: int
 
 
+@dataclass(frozen=True)
+class PreflightCommands:
+    """The three external commands a live preflight is permitted to run."""
+
+    container_inspect: tuple[str, ...]
+    remote_node_info: tuple[str, ...]
+    local_node_info: tuple[str, ...]
+
+
 def build_remote_exec(argv: Sequence[str]) -> list[str]:
     """Build the fixed, noninteractive remote container command safely."""
     return [
@@ -83,12 +92,7 @@ def build_remote_exec(argv: Sequence[str]) -> list[str]:
     ]
 
 
-def validate_preflight(
-    remote: NodeSnapshot,
-    local: NodeSnapshot,
-    *,
-    required_free_bytes: int = _REQUIRED_FREE_BYTES,
-) -> PreflightReport:
+def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot) -> PreflightReport:
     """Reject all launch blockers before either machine initializes CUDA."""
     if (remote.node, remote.machine_rank) != ("remote", 0):
         raise ValueError("remote snapshot must be machine rank 0")
@@ -98,13 +102,13 @@ def validate_preflight(
         raise ValueError("nodes must have the same tracked commit")
 
     for node in (remote, local):
-        _validate_snapshot(node, required_free_bytes=required_free_bytes)
+        _validate_snapshot(node)
     if remote.container_running is not True:
         raise ValueError("remote llm_kd container is not running")
     return PreflightReport(commit=remote.commit, world_size=4)
 
 
-def _validate_snapshot(node: NodeSnapshot, *, required_free_bytes: int) -> None:
+def _validate_snapshot(node: NodeSnapshot) -> None:
     if not node.tracked_clean:
         raise ValueError(f"{node.node}: tracked files are dirty")
     if (
@@ -125,7 +129,7 @@ def _validate_snapshot(node: NodeSnapshot, *, required_free_bytes: int) -> None:
         raise ValueError(f"{node.node}: input paths are missing")
     if not node.artifact_roots_writable:
         raise ValueError(f"{node.node}: artifact roots are not writable")
-    if node.artifact_free_bytes < required_free_bytes:
+    if node.artifact_free_bytes < _REQUIRED_FREE_BYTES:
         raise ValueError(f"{node.node}: insufficient free space")
     if not node.run_paths_fresh:
         raise ValueError(f"{node.node}: fresh run paths are required")
@@ -155,56 +159,93 @@ def validate_node_config_digest(
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 
+def build_preflight_commands(
+    plan: "LaunchPlan",
+    *,
+    input_paths: Sequence[str | Path],
+    artifact_roots: Sequence[str | Path],
+    remote_run_paths: Sequence[str | Path],
+    local_run_paths: Sequence[str | Path],
+    remote_tmux_sessions: Sequence[str],
+    local_tmux_sessions: Sequence[str],
+) -> PreflightCommands:
+    """Build once the exact arrays shared by dry-run and live preflight."""
+    repository = plan.cluster.remote_repo_root
+    remote_argv = _node_info_command(
+        plan,
+        node="remote",
+        machine_rank=plan.cluster.remote_rank,
+        repository=repository,
+        input_paths=input_paths,
+        artifact_roots=artifact_roots,
+        run_paths=remote_run_paths,
+        tmux_sessions=remote_tmux_sessions,
+    )
+    local_argv = _node_info_command(
+        plan,
+        node="local",
+        machine_rank=plan.cluster.local_rank,
+        repository=repository,
+        input_paths=input_paths,
+        artifact_roots=artifact_roots,
+        run_paths=local_run_paths,
+        tmux_sessions=local_tmux_sessions,
+    )
+    return PreflightCommands(
+        container_inspect=(
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            plan.cluster.remote_host,
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+            plan.cluster.remote_container,
+        ),
+        remote_node_info=tuple(build_remote_exec(remote_argv)),
+        local_node_info=tuple(local_argv),
+    )
+
+
 def collect_node_snapshot(
     plan: "LaunchPlan",
     *,
     node: str,
-    input_paths: Sequence[str | Path],
-    artifact_roots: Sequence[str | Path],
-    run_paths: Sequence[str | Path],
-    tmux_sessions: Sequence[str],
     runner: Runner,
+    commands: PreflightCommands | None = None,
+    input_paths: Sequence[str | Path] = (),
+    artifact_roots: Sequence[str | Path] = (),
+    run_paths: Sequence[str | Path] = (),
+    tmux_sessions: Sequence[str] = (),
     repository: str | Path | None = None,
 ) -> NodeSnapshot:
     """Run exactly one node-info probe, using SSH only for the remote node."""
     if node not in {"remote", "local"}:
         raise ValueError("node must be 'remote' or 'local'")
-    machine_rank = plan.cluster.remote_rank if node == "remote" else plan.cluster.local_rank
-    repo = Path(repository) if repository is not None else (
-        plan.cluster.remote_repo_root if node == "remote" else Path.cwd()
-    )
-    node_info = _node_info_command(
-        plan,
-        node=node,
-        machine_rank=machine_rank,
-        repository=repo,
-        input_paths=input_paths,
-        artifact_roots=artifact_roots,
-        run_paths=run_paths,
-        tmux_sessions=tmux_sessions,
-    )
-    if node == "remote":
-        inspect = runner(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=8",
-                plan.cluster.remote_host,
-                "docker",
-                "inspect",
-                "--format",
-                "{{.State.Running}}",
-                plan.cluster.remote_container,
-            ]
+    repository = Path(repository) if repository is not None else plan.cluster.remote_repo_root
+    if repository != plan.cluster.remote_repo_root:
+        raise ValueError("node-info repository must be the canonical ILVR checkout")
+    if commands is None:
+        commands = build_preflight_commands(
+            plan,
+            input_paths=input_paths,
+            artifact_roots=artifact_roots,
+            remote_run_paths=run_paths,
+            local_run_paths=run_paths,
+            remote_tmux_sessions=tmux_sessions,
+            local_tmux_sessions=tmux_sessions,
         )
+    if node == "remote":
+        inspect = runner(commands.container_inspect)
         if inspect.returncode != 0:
             raise RuntimeError("remote docker inspect failed")
-        completed = runner(build_remote_exec(node_info))
+        completed = runner(commands.remote_node_info)
         container_running: bool | None = inspect.stdout.strip() == "true"
     else:
-        completed = runner(node_info)
+        completed = runner(commands.local_node_info)
         container_running = None
     if completed.returncode != 0:
         raise RuntimeError(f"{node} node-info failed: {completed.stderr.strip()}")
@@ -227,6 +268,8 @@ def _node_info_command(
     tmux_sessions: Sequence[str],
 ) -> list[str]:
     command = [
+        "env",
+        f"PYTHONPATH={repository}",
         str(repository / "venv" / "ilvr-venv" / "bin" / "python"),
         "-m",
         "src.multinode",
