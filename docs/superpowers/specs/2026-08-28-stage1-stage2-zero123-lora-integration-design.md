@@ -86,7 +86,7 @@ boundary, EMA parameter mapping과 adapter checkpoint 경로가 있다. 새 구�
 별도의 LoRA 모델 계층을 만들지 않고 다음 제한만 제거한다.
 
 1. 공식 launcher와 parser가 `lora`를 Full/DoRA와 같은 method로 받는다.
-2. ZeRO compatibility diagnostic과 matrix identity가 `lora`를 허용한다.
+2. ZeRO compatibility diagnostic과 lifecycle identity가 `lora`를 허용한다.
 3. LoRA가 정확히 decoder LoRA parameter와 selective latent token row만
    학습하고 visual/base parameter를 열지 않는지 검증한다.
 4. ZeRO-1/2는 replicated LoRA/EMA parameter를 rank-local로 갱신하고 rank 0만
@@ -98,6 +98,13 @@ boundary, EMA parameter mapping과 adapter checkpoint 경로가 있다. 새 구�
 Stage 1 Full/LoRA/DoRA는 같은 ZeRO runtime identity와 save/resume 계약을
 사용한다. 기존 Full/DoRA benchmark 비교 schema의 의미를 불필요하게 바꾸지
 않으며, 이번 작업에서 LoRA 성능 최적화 matrix를 실행하지 않는다.
+
+Stage 1 batch probe가 필요한 경우 micro-batch/GPU 2부터 시작한다. 2가
+성공하면 4, 8 순서로 증가시키고, 2가 실제 CUDA capacity OOM으로 실패한
+경우에만 micro-batch 1을 fallback으로 검사한다. effective global batch 16을
+유지하도록 gradient accumulation은 각각 4, 2, 1, 8을 사용한다. NCCL,
+checkpoint 또는 다른 integration failure는 batch 축소의 근거로 사용하지
+않는다.
 
 ## Stage 2 보존 사항
 
@@ -147,11 +154,13 @@ state를 보존하며 전체 base embedding을 중복 저장하지 않는다.
 2. Stage 1 Full/LoRA/DoRA의 optimizer/EMA/checkpoint ZeRO stage 분기 테스트
 3. Stage 2 PEFT target 및 adapter-only 저장 regression test
 4. 공통 config/runtime identity, Stage 2 sampler 및 checkpoint focused tests
-5. 두 H100 GPU에서 tiny model을 사용한 실제 DeepSpeed one-step save와 one-step
+5. Stage 1 batch probe가 micro-batch 2에서 시작해 4, 8로 증가하고, 2의 실제
+   capacity OOM에서만 1로 fallback하는 순서/분류 테스트
+6. 두 H100 GPU에서 tiny model을 사용한 실제 DeepSpeed one-step save와 one-step
    resume lifecycle 18개:
    - Stage 1: Full/LoRA/DoRA x ZeRO-1/2/3
    - Stage 2: Full/LoRA/DoRA x ZeRO-1/2/3
-6. 각 lifecycle에서 finite loss/gradient, optimizer step, checkpoint identity,
+7. 각 lifecycle에서 finite loss/gradient, optimizer step, checkpoint identity,
    method별 artifact 및 resumed global step을 한 번 확인한다.
 
 한 producer가 필요한 witness를 만들면 같은 조합의 장시간 smoke나 broad test
@@ -168,3 +177,4 @@ cycle을 반복하지 않는다.
 5. cross-ZeRO/cross-world-size resume은 명확하게 거부된다.
 6. 모든 새 checkpoint/result/log가 canonical root에 저장된다.
 7. 사용자 소유 변경과 기존 failure log를 덮어쓰거나 삭제하지 않는다.
+8. Stage 1 batch probe의 첫 후보는 micro-batch/GPU 2이다.
