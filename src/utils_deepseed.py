@@ -5,14 +5,20 @@ import json
 import random
 import os
 import argparse
+import math
+import sys
+from pathlib import Path
 from datasets import Dataset
 from transformers import LogitsProcessor
+from stage2.peft import normalize_stage2_target_modules
+from peft_common import normalize_decoder_target_suffixes
+from artifact_paths import resolve_run_artifact_paths
 
 from transformers import LogitsProcessor
 import torch
 
 
-def get_args():
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--evaluation_output_path", type=str, default="evaluation_results.json", help="Path to save evaluation results JSON file.")
     parser.add_argument("--model", type=str, default='Qwen/Qwen2.5-VL-7B-Instruct')
@@ -25,7 +31,7 @@ def get_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--epochs", type=float, default=2)
     parser.add_argument("--data_path", type=str, default='PathToJsonlData')
-    parser.add_argument("--log_file", type=str, default='./log.txt')
+    parser.add_argument("--log_file", type=str, default=None)
     parser.add_argument("--save_model_path", type=str, default='./checkpoints/model_stage1')
     parser.add_argument("--load_model_path", type=str, default='./checkpoints/model_stage1')
     parser.add_argument("--cache_dir", type=str, default='./cache')
@@ -40,9 +46,14 @@ def get_args():
     parser.add_argument("--lora_r", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=64)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    
     parser.add_argument("--lora_target_modules", type=str,
         default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj")
+    parser.add_argument(
+        "--tuning_method",
+        choices=("full", "lora", "dora"),
+        default=None,
+    )
+    parser.add_argument("--stage1_adapter_path", type=str, default=None)
     
     parser.add_argument(
         "--resume_from_checkpoint_path",
@@ -57,10 +68,101 @@ def get_args():
     )
     parser.add_argument("--max_seq_length_train", type=int, default=8192,
         help="Stage-2")  # 改默认 8192
+    parser.add_argument(
+        "--supervise_latent_boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--save_final_model", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--save_strategy", choices=("no", "steps", "epoch"), default="steps"
+    )
+    parser.add_argument("--final_save", action="store_true", default=True)
+    parser.add_argument("--no_final_save", action="store_false", dest="final_save")
+    parser.add_argument("--image_root", required=False)
+    parser.add_argument("--max_train_samples", type=int)
+    parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--benchmark_run_config")
+    parser.add_argument("--benchmark_evidence_path")
+    parser.add_argument("--benchmark_source_data_path")
+    parser.add_argument("--benchmark_smoke_resume_witness")
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--attention_implementation",
+        choices=("eager", "sdpa", "flash_attention_2"),
+        default="sdpa",
+    )
+    parser.add_argument("--deepspeed_config")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=1)
+    parser.add_argument("--use_cpu", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
     # global_pad_to 已存在，保留
 # 其余不变
 
-    return parser.parse_args()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    if args.log_file is None:
+        try:
+            paths = resolve_run_artifact_paths(Path(args.save_model_path).name)
+        except ValueError:
+            pass
+        else:
+            args.log_file = str(paths.log_dir / "train.log")
+    args.tuning_method_explicit = any(
+        item == "--tuning_method" or item.startswith("--tuning_method=")
+        for item in raw_argv
+    )
+    args.lora_target_modules_explicit = any(
+        item == "--lora_target_modules"
+        or item.startswith("--lora_target_modules=")
+        for item in raw_argv
+    )
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        raise ValueError("Learning rate must be finite and positive")
+    if args.lora_r <= 0 or args.lora_alpha <= 0:
+        raise ValueError("LoRA rank and alpha must be positive")
+    if not math.isfinite(args.lora_dropout) or not 0.0 <= args.lora_dropout < 1.0:
+        raise ValueError("LoRA dropout must be finite and in [0, 1)")
+    if args.per_device_train_batch_size < 1:
+        raise ValueError("per_device_train_batch_size must be at least 1")
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    if args.stage == "stage2":
+        if args.use_lora:
+            raise ValueError(
+                "Stage 2 does not accept --use_lora; use --tuning_method lora"
+            )
+        if args.stage1_adapter_path and args.resume_from_checkpoint_path:
+            raise ValueError(
+                "--stage1_adapter_path and --resume_from_checkpoint_path are mutually exclusive"
+            )
+        if args.tuning_method is None and args.resume_from_checkpoint_path is None:
+            args.tuning_method = "full"
+        normalize_stage2_target_modules(args.lora_target_modules)
+        if args.per_device_train_batch_size != 1:
+            raise ValueError("Stage 2 requires per_device_train_batch_size=1")
+    elif args.stage == "stage1":
+        if args.use_lora and args.tuning_method_explicit:
+            raise ValueError("--use_lora and --tuning_method cannot be combined")
+        if args.tuning_method_explicit and args.tuning_method not in ("full", "dora"):
+            raise ValueError("Stage 1 --tuning_method accepts only full or dora")
+        normalize_decoder_target_suffixes(
+            args.lora_target_modules, stage_label="Stage 1 PEFT target modules"
+        )
+    elif args.tuning_method_explicit:
+        raise ValueError("--tuning_method is only valid for Stage 1 or Stage 2")
+    return args
+
+
+def get_args():
+    return parse_args()
 
 def seed_everything(seed: int = 42):
     random.seed(seed)
@@ -204,6 +306,99 @@ def replace_subsequent_image_parts_1d(
         new_seq_pieces.append(seq[prev_end:])
     new_seq = torch.cat(new_seq_pieces, dim=0)
     return new_seq
+
+
+def normalize_stage1_latent_blocks_1d(
+    seq: torch.Tensor,
+    *,
+    start_token: int,
+    end_token: int,
+    latent_pad_token: int,
+    latent_size: int,
+    source_index: int,
+) -> torch.Tensor:
+    """Replace visual block interiors while preserving prebuilt latent scaffolds.
+
+    A real processor expands assistant image placeholders between latent boundary
+    tokens. Tests and already-tokenized inputs may instead contain latent-pad
+    tokens, which are kept so the Stage 1 parser can validate their exact count.
+    """
+    if seq.ndim != 1:
+        raise ValueError(
+            f"source_index={source_index}: observed tensor rank {seq.ndim}; "
+            "expected a one-dimensional token row"
+        )
+    if latent_size <= 0:
+        raise ValueError(
+            f"source_index={source_index}: observed latent_size={latent_size}; "
+            "expected a positive latent_size"
+        )
+
+    pieces = []
+    cursor = 0
+    open_start = None
+    values = seq.tolist()
+    for position, raw_token in enumerate(values):
+        token = int(raw_token)
+        if open_start is None:
+            if token == start_token:
+                open_start = position
+            elif token == end_token:
+                raise ValueError(
+                    f"source_index={source_index}: observed latent_end at position "
+                    f"{position} without latent_start; expected ordered complete boundaries"
+                )
+            elif token == latent_pad_token:
+                raise ValueError(
+                    f"source_index={source_index}: observed latent_pad at position "
+                    f"{position} outside a latent block; expected pads only inside a block"
+                )
+            continue
+
+        if token == start_token:
+            raise ValueError(
+                f"source_index={source_index}: observed nested latent_start at position "
+                f"{position}; expected ordered, nonnested latent boundaries"
+            )
+        if token != end_token:
+            continue
+
+        interior = seq[open_start + 1 : position]
+        interior_is_latent = bool(interior.numel()) and bool(
+            torch.all(interior == latent_pad_token)
+        )
+        interior_has_latent = bool(
+            interior.numel() and torch.any(interior == latent_pad_token)
+        )
+        if interior_has_latent and not interior_is_latent:
+            observed = interior.tolist()
+            raise ValueError(
+                f"source_index={source_index}: observed mixed latent/visual block "
+                f"tokens {observed}; expected either a visual placeholder or only "
+                "latent_pad slots"
+            )
+
+        pieces.append(seq[cursor : open_start + 1])
+        if interior_is_latent:
+            pieces.append(interior)
+        else:
+            pieces.append(
+                seq.new_full((latent_size,), fill_value=int(latent_pad_token))
+            )
+        pieces.append(seq[position : position + 1])
+        cursor = position + 1
+        open_start = None
+
+    if open_start is not None:
+        raise ValueError(
+            f"source_index={source_index}: observed incomplete latent block starting "
+            f"at position {open_start}; expected a complete latent_start/latent_end pair"
+        )
+
+    if not pieces:
+        return seq.clone()
+    pieces.append(seq[cursor:])
+    return torch.cat(pieces)
 
 def process_batch(
     input_ids: torch.Tensor,

@@ -8,9 +8,22 @@ from typing import List, Dict, Any, Union
 
 import torch
 from PIL import Image
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, LogitsProcessorList
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-from utils_deepseed import LatentTemplateLogitsProcessor  
+from stage2.checkpointing import (
+    Stage2ArtifactKind,
+    inspect_stage2_artifact,
+    resolve_latent_token_ids,
+)
+from stage2.backend_fallback import is_flash_attention_initialization_error
+from stage2.inference import (
+    Stage2InferenceController,
+    build_stage2_generation_config,
+)
+from stage2.peft import (
+    load_stage2_model_for_inference,
+    resolve_stage2_qwen_model,
+)
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -31,6 +44,7 @@ BASE_DATASET_DIR = ''
 def get_eval_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", type=str, required=True, help="Path to the trained model directory.")
+    parser.add_argument("--base_model_dir", type=str, help="Stage 1 base directory for a Stage 2 PEFT artifact.")
     parser.add_argument("--test_data_path", type=str, required=True, help="Path to the test data jsonl file.")
     parser.add_argument("--task_name", type=str, required=True, help="Task name for bookkeeping.")
     parser.add_argument("--output_json_path", type=str, default="evaluation_results.jsonl", help="Where to save per-sample results.")
@@ -60,6 +74,8 @@ def load_model(model_dir: str, cache_dir: str):
             attn_implementation="flash_attention_2"
         )
     except Exception as e:
+        if not is_flash_attention_initialization_error(e):
+            raise
         logging.warning(f"flash_attention_2 initialization failed ({e}), falling back to eager.")
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_dir,
@@ -74,6 +90,32 @@ def load_model(model_dir: str, cache_dir: str):
     except Exception:
         pass
     return model
+
+
+def load_evaluation_artifacts(
+    *, model_dir: str, base_model_dir: str | None, cache_dir: str
+):
+    """Load either one full Stage 2 artifact or a Stage 1 base plus adapter."""
+    artifact_inspection = inspect_stage2_artifact(model_dir)
+    if artifact_inspection.artifact_kind is Stage2ArtifactKind.FULL:
+        if base_model_dir is not None:
+            raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
+        return load_model(model_dir, cache_dir), load_processor(model_dir, cache_dir)
+
+    if base_model_dir is None:
+        raise ValueError("base_model_dir is required for a Stage 2 PEFT artifact")
+    processor = AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
+    model = load_stage2_model_for_inference(
+        base_model_dir,
+        model_dir,
+        processor,
+        source_provenance_kwargs={"cache_dir": cache_dir},
+        load_model=lambda source, **selectors: load_model(
+            source, selectors["cache_dir"]
+        ),
+        artifact_inspection=artifact_inspection,
+    )
+    return model, processor
 
 def _resolve_image_paths(image_input: Union[str, List[str]]) -> List[str]:
 
@@ -224,24 +266,48 @@ def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[s
         return_tensors="pt",
         padding=True
     )
-    
-    inputs = {k: v.to(model.device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
 
-    latent_pad_id   = processor.tokenizer("<|latent_pad|>", return_tensors="pt")["input_ids"][0,0].item()
-    latent_start_id = processor.tokenizer("<|latent_start|>", return_tensors="pt")["input_ids"][0,0].item()
-    latent_end_id   = processor.tokenizer("<|latent_end|>", return_tensors="pt")["input_ids"][0,0].item()
-    K = int(getattr(model.config, "latent_size", 8))
-    lp = LogitsProcessorList([
-        LatentTemplateLogitsProcessor(latent_start_id, latent_end_id, latent_pad_id, K)
-    ])
+    stage2_model = resolve_stage2_qwen_model(model)
+    effective_device = getattr(model, "device", None)
+    if effective_device is None:
+        effective_device = getattr(stage2_model, "device", None)
+    if effective_device is None:
+        raise ValueError("Unable to determine the Stage 2 evaluation device")
+    inputs = {
+        k: v.to(effective_device)
+        for k, v in inputs.items()
+        if isinstance(v, torch.Tensor)
+    }
+
+    input_ids = inputs["input_ids"]
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise NotImplementedError("Stage 2 evaluation currently supports batch_size=1 only")
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+    latent_size = getattr(stage2_model.config, "latent_size", None)
+    if not isinstance(latent_size, int) or isinstance(latent_size, bool) or latent_size <= 0:
+        raise ValueError("Stage 2 checkpoint config must contain a positive latent_size")
+    token_ids = resolve_latent_token_ids(processor.tokenizer, stage2_model.config)
+    generation_config = build_stage2_generation_config(
+        model_config=stage2_model.config,
+        model_generation_config=getattr(stage2_model, "generation_config", None),
+        tokenizer=processor.tokenizer,
+        generation_kwargs=gen_kwargs,
+    )
 
     with torch.inference_mode():
-        out_ids = model.generate(
-            **inputs,
-            **gen_kwargs,
-            logits_processor=lp,
-            tokenizer=processor.tokenizer,
+        generation_result = Stage2InferenceController().generate(
+            model=stage2_model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_ids=token_ids,
+            generation_config=generation_config,
+            pixel_values=inputs.get("pixel_values"),
+            image_grid_thw=inputs.get("image_grid_thw"),
+            return_latent_states=False,
         )
+    out_ids = generation_result.sequences
     out_text = processor.batch_decode(out_ids, skip_special_tokens=False)[0].strip()
 
     # Extract the answer from the assistant's segment only — running the
@@ -256,8 +322,11 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
     logging.info(f"Loading model: {args.model_dir}")
-    model = load_model(args.model_dir, args.cache_dir)
-    processor = load_processor(args.model_dir, args.cache_dir)
+    model, processor = load_evaluation_artifacts(
+        model_dir=args.model_dir,
+        base_model_dir=args.base_model_dir,
+        cache_dir=args.cache_dir,
+    )
 
 
     data = []

@@ -26,8 +26,9 @@
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
-from torch.utils.checkpoint import checkpoint
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,15 +50,14 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
+from .stage2_latent_rollout import LatentRolloutEngine, parse_latent_spans, validate_stage2_config
 
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
-    from flash_attn.layers.rotary import apply_rotary_emb
 
 else:
     flash_attn_varlen_func = None
-    apply_rotary_emb = None
 
 
 if is_flash_attn_2_available():
@@ -159,16 +159,6 @@ class Qwen2_5_VLPatchMerger(nn.Module):
         return x
 
 
-def apply_rotary_pos_emb_flashatt(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.chunk(2, dim=-1)[0].contiguous()
-    sin = sin.chunk(2, dim=-1)[0].contiguous()
-    q_embed = apply_rotary_emb(q.float(), cos.float(), sin.float()).type_as(q)
-    k_embed = apply_rotary_emb(k.float(), cos.float(), sin.float()).type_as(k)
-    return q_embed, k_embed
-
-
 class Qwen2_5_VLVisionFlashAttention2(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
@@ -197,9 +187,7 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
             sin = emb.sin()
         else:
             cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
-        q = q.squeeze(0)
-        k = k.squeeze(0)
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
@@ -1652,6 +1640,8 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
     inputs_embeds: Optional[torch.FloatTensor] = None
+    stage2_latent_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    stage2_diagnostics: Optional[Dict[str, torch.Tensor]] = None
 
 
 QWEN2_5_VL_INPUTS_DOCSTRING = r"""
@@ -1758,7 +1748,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
         # Initialize weights and apply final processing
         self.post_init()
-        
+
+        if getattr(self.config, "stage", None) == "stage2":
+            self.visual.requires_grad_(False)
+
+        self.stage2_rollout_engine = LatentRolloutEngine()
         self.latent_model = False
 
     def get_input_embeddings(self):
@@ -1956,6 +1950,145 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
             return position_ids, mrope_position_deltas
 
+    def prepare_stage2_base_inputs_embeds(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        """Build the complete Stage 2 scaffold embeddings before latent replacement."""
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        if pixel_values is None:
+            return inputs_embeds
+
+        with torch.no_grad():
+            image_embeds = self.visual(pixel_values.to(dtype=self.visual.dtype), grid_thw=image_grid_thw)
+        image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        if int(image_mask[..., 0].sum()) != image_embeds.shape[0]:
+            raise ValueError("Stage 2 image token/feature count mismatch")
+
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        return inputs_embeds.masked_scatter(image_mask.to(inputs_embeds.device), image_embeds)
+
+    def _forward_stage2(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        labels: Optional[torch.LongTensor],
+        pixel_values: Optional[torch.Tensor],
+        image_grid_thw: Optional[torch.LongTensor],
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+        return_stage2_latent_states: bool,
+        collect_stage2_diagnostics: bool,
+        retain_stage2_latent_grads: bool,
+    ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
+        if input_ids is None:
+            raise ValueError("Stage 2 forward requires input_ids")
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise NotImplementedError("Stage 2 forward currently supports batch_size=1 only")
+
+        base_inputs_embeds = self.prepare_stage2_base_inputs_embeds(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        attention_mask = attention_mask.to(base_inputs_embeds.device)
+
+        stage2_rope_deltas = None
+        if position_ids is None:
+            full_position_ids, stage2_rope_deltas = self.get_rope_index(
+                input_ids,
+                image_grid_thw=image_grid_thw,
+                attention_mask=attention_mask,
+            )
+        else:
+            full_position_ids = position_ids
+            if full_position_ids.ndim == 2:
+                full_position_ids = full_position_ids.unsqueeze(0).expand(3, -1, -1)
+        full_position_ids = full_position_ids.to(base_inputs_embeds.device)
+
+        token_ids, latent_size = validate_stage2_config(self.config)
+        latent_spans = parse_latent_spans(
+            input_ids[0],
+            token_ids=token_ids,
+            latent_size=latent_size,
+        )
+        language_model = partial(self.model, generate_mode=True)
+        rollout = self.stage2_rollout_engine.rollout(
+            language_model=language_model,
+            base_inputs_embeds=base_inputs_embeds,
+            attention_mask=attention_mask,
+            full_position_ids=full_position_ids,
+            latent_spans=latent_spans,
+            retain_latent_grads=retain_stage2_latent_grads,
+            collect_diagnostics=collect_stage2_diagnostics,
+        )
+
+        final_outputs = language_model(
+            inputs_embeds=rollout.final_inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=full_position_ids,
+            use_cache=False,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+        logits = self.lm_head(final_outputs.last_hidden_state)
+
+        loss = None
+        if labels is not None:
+            logits = logits.float()
+            shift_logits = logits[..., :-1, :].contiguous().view(-1, self.config.vocab_size)
+            shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
+            loss = CrossEntropyLoss()(shift_logits, shift_labels)
+
+        diagnostics = None
+        if rollout.diagnostics is not None:
+            diagnostics = {
+                "block_count": torch.tensor(
+                    rollout.diagnostics.block_count,
+                    device=base_inputs_embeds.device,
+                ),
+                "latent_l2_norms": rollout.diagnostics.latent_l2_norms.detach(),
+                "adjacent_cosine_similarities": rollout.diagnostics.adjacent_cosine_similarities.detach(),
+            }
+
+        if not return_dict:
+            decoder_outputs = tuple(
+                value
+                for value in (
+                    getattr(final_outputs, "hidden_states", None),
+                    getattr(final_outputs, "attentions", None),
+                )
+                if value is not None
+            )
+            stage2_outputs = ()
+            if return_stage2_latent_states:
+                stage2_outputs += (rollout.latent_states,)
+            if collect_stage2_diagnostics:
+                stage2_outputs += (diagnostics,)
+            output = (logits,) + decoder_outputs + stage2_outputs
+            return (loss,) + output if loss is not None else output
+
+        return Qwen2_5_VLCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=getattr(final_outputs, "hidden_states", None),
+            attentions=getattr(final_outputs, "attentions", None),
+            rope_deltas=stage2_rope_deltas,
+            inputs_embeds=rollout.final_inputs_embeds,
+            stage2_latent_states=rollout.latent_states if return_stage2_latent_states else None,
+            stage2_diagnostics=diagnostics,
+        )
+
     @add_start_docstrings_to_model_forward(QWEN2_5_VL_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=Qwen2_5_VLCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -1981,7 +2114,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         image_grid_thw_latent: Optional[torch.LongTensor] = None, 
         image_out_mask: Optional[torch.Tensor] = None, 
         generate_mode: Optional[bool] = False,
-        latent_hidden_states: Optional[torch.Tensor] = None, 
+        latent_hidden_states: Optional[torch.Tensor] = None,
+        return_stage2_latent_states: bool = False,
+        collect_stage2_diagnostics: bool = False,
+        retain_stage2_latent_grads: bool = False,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -1998,6 +2134,32 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if getattr(self.config, "stage", None) == "stage2":
+            for name, value in (
+                ("pixel_values_latent", pixel_values_latent),
+                ("image_grid_thw_latent", image_grid_thw_latent),
+                ("image_out_mask", image_out_mask),
+                ("latent_hidden_states", latent_hidden_states),
+            ):
+                if value is not None:
+                    raise ValueError(f"Stage 2 helper input `{name}` is not supported")
+            if inputs_embeds is not None:
+                raise ValueError("Stage 2 forward requires input_ids rather than inputs_embeds")
+            return self._forward_stage2(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                return_stage2_latent_states=return_stage2_latent_states,
+                collect_stage2_diagnostics=collect_stage2_diagnostics,
+                retain_stage2_latent_grads=retain_stage2_latent_grads,
+            )
 
         # ===================================================================
         # 1. 基础 Embedding 构建 (文本 + 视觉输入注入)
@@ -2085,206 +2247,92 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 latent_image_embeds = latent_image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, latent_image_embeds)
             
-            # --- 处理 Latent Hidden States (Stage 2 Teacher Forcing) ---
+            # --- 处理预先计算的 Latent Hidden States ---
             elif latent_hidden_states is not None and not generate_mode:
-                latent_mask_2d = (input_ids == self.config.latent_token_id)
-                if image_out_mask is not None:
-                    latent_mask_2d = latent_mask_2d & image_out_mask.to(device=input_ids.device, dtype=torch.bool)
-                latent_mask = latent_mask_2d.unsqueeze(-1).expand_as(inputs_embeds)
-                inputs_embeds = inputs_embeds.masked_scatter(latent_mask, latent_hidden_states)
+                if image_out_mask is None:
+                    raise ValueError("image_out_mask must have shape [B, T]")
+                if not isinstance(image_out_mask, torch.Tensor):
+                    raise TypeError("image_out_mask must be a BoolTensor")
+                if tuple(image_out_mask.shape) != tuple(input_ids.shape):
+                    raise ValueError("image_out_mask must have shape [B, T]")
+                if image_out_mask.dtype != torch.bool:
+                    raise TypeError("image_out_mask must be a BoolTensor")
+                if not isinstance(latent_hidden_states, torch.Tensor):
+                    raise TypeError("latent_hidden_states must be a tensor")
+                if not latent_hidden_states.is_floating_point():
+                    raise TypeError(
+                        "latent_hidden_states must use a floating-point dtype"
+                    )
+                if latent_hidden_states.ndim != 2:
+                    raise ValueError(
+                        "latent_hidden_states must have shape [N, H]"
+                    )
+                expected = int(image_out_mask.sum().item())
+                if latent_hidden_states.shape[0] != expected:
+                    raise ValueError(
+                        f"latent_hidden_states rows ({latent_hidden_states.shape[0]}) "
+                        f"must equal true image_out_mask entries ({expected})"
+                    )
+                if latent_hidden_states.shape[1] != inputs_embeds.shape[-1]:
+                    raise ValueError(
+                        "latent_hidden_states hidden width must match input embeddings"
+                    )
+                latent_mask = image_out_mask.to(
+                    device=inputs_embeds.device
+                ).unsqueeze(-1)
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    latent_mask,
+                    latent_hidden_states.to(
+                        device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                    ),
+                )
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
 
-        all_hidden_states_seq = []
-        
-        if self.config.stage == 'stage2' and not generate_mode:
-
-            latent_indices = (input_ids == self.config.latent_token_id).nonzero()
-
-            latent_lists = [
-                [idx[1].item() for idx in latent_indices if idx[0] == i] for i in range(input_ids.shape[0])
-            ]
-            max_n_latents = max(len(lst) for lst in latent_lists) if latent_lists else 0
-
-
-            full_position_ids, full_rope_deltas = self.get_rope_index(
-                input_ids,
-                image_grid_thw,
-                video_grid_thw,
-                second_per_grid_ts,
-                attention_mask,
-            )
-            self.rope_deltas = full_rope_deltas
-
-
-            def latent_step_forward(step_embeds, step_mask, step_pos_ids):
-
-
-                is_gc_enabled = getattr(self.model, "gradient_checkpointing", False)
-                if is_gc_enabled:
-                    self.model.gradient_checkpointing = False
-                
-
-                out = self.model(
-                    input_ids=None,
-                    inputs_embeds=step_embeds,
-                    attention_mask=step_mask,
-                    position_ids=step_pos_ids,
-                    use_cache=False, 
-                    output_attentions=False,
-                    output_hidden_states=False,
-                    return_dict=True
+        if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
+            if (
+                (cache_position is not None and cache_position[0] == 0)
+                or self.rope_deltas is None
+                or (past_key_values is None or past_key_values.get_seq_length() == 0)
+            ):
+                position_ids, rope_deltas = self.get_rope_index(
+                    input_ids,
+                    image_grid_thw,
+                    video_grid_thw,
+                    second_per_grid_ts,
+                    attention_mask,
                 )
-                
+                self.rope_deltas = rope_deltas
+            else:
+                batch_size, seq_length, _ = inputs_embeds.shape
+                delta = (
+                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
+                    if cache_position is not None
+                    else 0
+                )
+                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
+                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                if cache_position is not None:
+                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+                position_ids = position_ids.add(delta)
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-                if is_gc_enabled:
-                    self.model.gradient_checkpointing = True
-                    
-                return out.last_hidden_state
-
-
-            global_first_latent_idx = latent_indices[:, 1].min().item() if len(latent_indices) > 0 else input_ids.shape[1]
-            next_compute_range = (0, global_first_latent_idx)
-            
-
-            curr_inputs_embeds = inputs_embeds
-            if self.training and not curr_inputs_embeds.requires_grad:
-                curr_inputs_embeds.requires_grad_(True)
-
-            for latent_i in range(max_n_latents):
-                slice_start, slice_end = next_compute_range
-                cur_end = slice_end
-
-
-                prefix_inputs = curr_inputs_embeds[:, :cur_end, :]
-                prefix_mask = attention_mask[:, :cur_end]
-                prefix_pos_ids = full_position_ids[:, :, :cur_end]
-
-
-                if self.training:
-                    hidden_full = checkpoint(
-                        latent_step_forward,
-                        prefix_inputs,
-                        prefix_mask,
-                        prefix_pos_ids,
-                        use_reentrant=False 
-                    )
-                else:
-                    hidden_full = latent_step_forward(prefix_inputs, prefix_mask, prefix_pos_ids)
-
-
-                hidden_new = hidden_full[:, slice_start:slice_end, :]
-                all_hidden_states_seq.append(hidden_new)
-
-
-                hidden_last = hidden_full[:, cur_end - 1 : cur_end, :]
-
-
-                
-                new_embeds_batch_list = []
-                batch_size = curr_inputs_embeds.shape[0]
-                
-                for b in range(batch_size):
-
-                    if latent_i < len(latent_lists[b]):
-                        target_idx = latent_lists[b][latent_i]
-                        
-
-                        emb_prefix = curr_inputs_embeds[b, :target_idx, :]
-                        emb_latent = hidden_last[b] # [1, H]
-                        emb_suffix = curr_inputs_embeds[b, target_idx+1:, :]
-                        
-                        new_row = torch.cat([emb_prefix, emb_latent, emb_suffix], dim=0)
-                        new_embeds_batch_list.append(new_row)
-                    else:
-
-                        new_embeds_batch_list.append(curr_inputs_embeds[b])
-                
-                curr_inputs_embeds = torch.stack(new_embeds_batch_list, dim=0)
-
-
-                next_latent_pos = input_ids.shape[1] 
-                if latent_i + 1 < max_n_latents:
-
-                     next_positions = [lst[latent_i+1] for lst in latent_lists if len(lst) > latent_i+1]
-                     if next_positions:
-                         next_latent_pos = min(next_positions)
-                
-
-                if next_latent_pos <= cur_end:
-                    next_latent_pos = cur_end + 1
-                    
-                next_compute_range = (cur_end, next_latent_pos)
-
-            slice_start, slice_end = next_compute_range
-            if slice_start < input_ids.shape[1]:
-
-                prefix_inputs = curr_inputs_embeds 
-                prefix_mask = attention_mask
-                prefix_pos_ids = full_position_ids
-                
-                if self.training:
-                     hidden_full = checkpoint(latent_step_forward, prefix_inputs, prefix_mask, prefix_pos_ids, use_reentrant=False)
-                else:
-                     hidden_full = latent_step_forward(prefix_inputs, prefix_mask, prefix_pos_ids)
-                
-                hidden_tail = hidden_full[:, slice_start:, :]
-                all_hidden_states_seq.append(hidden_tail)
-
-
-            hidden_states = torch.cat(all_hidden_states_seq, dim=1)
-            
-
-            if hidden_states.shape[1] != input_ids.shape[1]:
-
-                hidden_states = hidden_full 
-
-        else:
-
-            if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
-                if (
-                    (cache_position is not None and cache_position[0] == 0)
-                    or self.rope_deltas is None
-                    or (past_key_values is None or past_key_values.get_seq_length() == 0)
-                ):
-                    position_ids, rope_deltas = self.get_rope_index(
-                        input_ids,
-                        image_grid_thw,
-                        video_grid_thw,
-                        second_per_grid_ts,
-                        attention_mask,
-                    )
-                    self.rope_deltas = rope_deltas
-                else:
-                    batch_size, seq_length, _ = inputs_embeds.shape
-                    delta = (
-                        (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
-                        if cache_position is not None
-                        else 0
-                    )
-                    position_ids = torch.arange(seq_length, device=inputs_embeds.device)
-                    position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-                    if cache_position is not None:
-                        delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
-                    position_ids = position_ids.add(delta)
-                    position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-
-            # 正常模型前向
-            outputs = self.model(
-                input_ids=None,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                cache_position=cache_position,
-                generate_mode=generate_mode,
-            )
-            hidden_states = outputs[0]
+        # 正常模型前向
+        outputs = self.model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            generate_mode=generate_mode,
+        )
+        hidden_states = outputs[0]
             
 
         logits = self.lm_head(hidden_states)
@@ -2350,6 +2398,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
 
         model_inputs["position_ids"] = None
+        model_inputs["generate_mode"] = True
 
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None
