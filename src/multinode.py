@@ -799,6 +799,41 @@ def _artifact_destination_check(argv: list[str]) -> int:
     return 0
 
 
+def _artifact_inference_manifest(argv: list[str]) -> int:
+    from src.multinode_artifacts import build_inference_manifest, build_node_manifest
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode artifact-inference-manifest"
+    )
+    parser.add_argument("--run-directory", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--runtime-identity-json", required=True)
+    parser.add_argument("--completion-marker", action="store_true")
+    parser.add_argument(
+        "--checkpoint-root", default=str(_REPOSITORY_ROOT / "checkpoints")
+    )
+    args = parser.parse_args(argv)
+    try:
+        identity = json.loads(args.runtime_identity_json)
+        if type(identity) is not dict:
+            raise ValueError("runtime identity must be a JSON object")
+        manifest = build_node_manifest(
+            args.run_directory,
+            node_rank=0,
+            process_ranks=(0, 1, 2, 3),
+            run_id=args.run_id,
+            runtime_identity=identity,
+            completion_marker=args.completion_marker,
+            checkpoint_root=args.checkpoint_root,
+            canonical_owner=True,
+        )
+        filtered = build_inference_manifest(args.run_directory, manifest)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    print(json.dumps(filtered.to_json(), sort_keys=True))
+    return 0
+
+
 def _argument_value(arguments: tuple[str, ...], option: str) -> str | None:
     result: str | None = None
     index = 0
@@ -835,13 +870,13 @@ def _checkpoint_artifact_identity(
     *,
     commit: str,
     global_step: int,
-    model_state_layout: str,
 ) -> dict[str, object]:
     """Build the strict checkpoint identity used on both non-shared nodes."""
     if type(global_step) is not int or global_step < 0:
         raise ValueError("checkpoint global step must be a nonnegative integer")
-    if model_state_layout not in ("replicated", "partitioned"):
-        raise ValueError("checkpoint model state layout is invalid")
+    from src.multinode_artifacts import derive_model_state_layout
+
+    model_state_layout = derive_model_state_layout(plan.zero_stage)
     if plan.stage == "stage1":
         sidecar = (
             "stage1_peft_metadata.json"
@@ -881,11 +916,6 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
     parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)
     parser.add_argument("--main-process-port", type=int, required=True)
     parser.add_argument("--result-root", default=str(_REPOSITORY_ROOT / "results"))
-    parser.add_argument(
-        "--model-state-layout",
-        choices=("replicated", "partitioned"),
-        default="partitioned",
-    )
     parser.add_argument("--dry-run", action="store_true")
     args, stage_arguments = parser.parse_known_args(argv)
     try:
@@ -1074,13 +1104,8 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 plan,
                 commit=commit,
                 global_step=resume_step,
-                model_state_layout=args.model_state_layout,
             )
-            redistributed = (
-                checkpoint_run_path
-                / f"resume-{plan.attempt_id}"
-                / f"checkpoint-{resume_step}"
-            )
+            redistributed = checkpoint_run_path / f"checkpoint-{resume_step}"
             redistribute_resume_checkpoint(
                 runner,
                 checkpoint_path=checkpoint_run_path / f"checkpoint-{resume_step}",
@@ -1088,21 +1113,6 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 requested_identity=resume_identity,
                 destination=redistributed,
             )
-            redistributed = redistributed.resolve(strict=True)
-            if stage == "stage1":
-                forwarded = _replace_argument_value(
-                    forwarded, "--resume", str(redistributed)
-                )
-            else:
-                stage_environment["RESUME_CHECKPOINT"] = str(redistributed)
-            commands = build_owned_tmux_commands(
-                plan,
-                commit=commit,
-                stage_arguments=forwarded,
-                stage_environment=stage_environment,
-                result_root=result_root,
-            )
-            runner.commands = commands
         start_rank0_then_rank1(plan, runner, commands=commands)
         exit_codes = monitor_owned_jobs(
             plan,
@@ -1125,7 +1135,6 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             plan,
             commit=commit,
             global_step=final_step,
-            model_state_layout=args.model_state_layout,
         )
         collect_checkpoint_artifacts(
             runner,
@@ -1165,10 +1174,68 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
     return 2
 
 
+def _prepare_inference_main(argv: list[str]) -> int:
+    """Prepare a complete local inference artifact without starting evaluators."""
+    from src.multinode_runtime import prepare_inference_artifacts
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode prepare-inference", allow_abbrev=False
+    )
+    _add_plan_arguments(parser)
+    parser.add_argument("--checkpoint-step", type=int, required=True)
+    parser.add_argument("--destination", required=True)
+    args = parser.parse_args(argv)
+    try:
+        if args.checkpoint_step < 0:
+            raise ValueError("checkpoint step must be nonnegative")
+        plan = _plan_from_args(args)
+        destination = Path(args.destination)
+        result_root = _REPOSITORY_ROOT / "results"
+        if not destination.is_absolute() or ".." in destination.parts:
+            raise ValueError("inference destination must be an absolute trusted path")
+        try:
+            destination.relative_to(result_root / plan.run_id)
+        except ValueError as error:
+            raise ValueError(
+                "inference destination must belong to the run result tree"
+            ) from error
+        source_repository = Path(__file__).resolve().parents[1]
+        commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=source_repository)
+        commands = build_owned_tmux_commands(plan, commit=commit)
+        runner = SubprocessCoordinatorRunner(
+            plan,
+            commands=commands,
+            commit=commit,
+            log_root=_REPOSITORY_ROOT / "logs" / "multinode",
+        )
+        runtime_identity = _checkpoint_artifact_identity(
+            plan,
+            commit=commit,
+            global_step=args.checkpoint_step,
+        )
+        prepared = prepare_inference_artifacts(
+            runner,
+            checkpoint_path=(
+                _REPOSITORY_ROOT
+                / "checkpoints"
+                / plan.run_id
+                / f"checkpoint-{args.checkpoint_step}"
+            ),
+            runtime_identity=runtime_identity,
+            destination=destination,
+        )
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    print(json.dumps({"inference_artifact": str(prepared)}, sort_keys=True))
+    return 0
+
+
 def _main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in ("train-stage1", "train-stage2"):
         return _training_main(argv[0].removeprefix("train-"), argv[1:])  # type: ignore[arg-type]
+    if argv and argv[0] == "prepare-inference":
+        return _prepare_inference_main(argv[1:])
     if argv and argv[0] == "node-run":
         return _node_run(argv[1:])
     if argv and argv[0] == "node-exit":
@@ -1193,6 +1260,8 @@ def _main(argv: list[str] | None = None) -> int:
         return _artifact_manifest(argv[1:])
     if argv and argv[0] == "artifact-destination-check":
         return _artifact_destination_check(argv[1:])
+    if argv and argv[0] == "artifact-inference-manifest":
+        return _artifact_inference_manifest(argv[1:])
     if argv and argv[0] == "prepare-attempt":
         internal = argparse.ArgumentParser(prog="python -m src.multinode prepare-attempt")
         internal.add_argument("--log-root", required=True)
