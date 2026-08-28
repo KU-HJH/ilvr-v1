@@ -1155,7 +1155,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 plan,
                 result_root=result_root,
                 exit_codes=exit_codes,
-                checkpoint_path=checkpoint_path,
+                checkpoint_path=checkpoint_run_path,
                 batch_per_gpu=batch_per_gpu,
                 finite_loss_evidence_path=commands.finite_loss_evidence_path,
             )
@@ -1366,6 +1366,14 @@ def _evaluate_main(argv: list[str]) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "capacity-stage1":
+        from src.multinode_capacity import capacity_stage1_main
+
+        return capacity_stage1_main(argv[1:])
+    if argv and argv[0] == "capacity-evidence-show":
+        from src.multinode_capacity import _capacity_evidence_main
+
+        return _capacity_evidence_main(argv[1:])
     if argv and argv[0] in ("train-stage1", "train-stage2"):
         return _training_main(argv[0].removeprefix("train-"), argv[1:])  # type: ignore[arg-type]
     if argv and argv[0] == "prepare-inference":
