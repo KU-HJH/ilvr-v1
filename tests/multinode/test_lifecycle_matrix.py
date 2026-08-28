@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 from pathlib import Path
 import subprocess
 
@@ -12,6 +11,7 @@ from src.multinode import (
     build_lifecycle_plans,
     run_lifecycle_matrix,
 )
+from src.multinode_runtime import build_owned_lifecycle_harness_commands
 
 
 EXPECTED_IDENTITIES = [
@@ -36,8 +36,84 @@ def test_matrix_contains_exactly_eighteen_cases_in_binding_order():
     } == {(2, 3)}
 
 
-def test_lifecycle_plans_bind_safe_child_ids_ports_and_two_attempt_arrays(tmp_path):
-    """Catches a case changing identity or port between initial and resume."""
+def test_matrix_plans_one_exact_approved_harness_job_per_cell(tmp_path):
+    """Catches matrix cells reverting to incomplete normal training commands."""
+    plans = build_lifecycle_plans(
+        parent_run_id="four-gpu-matrix",
+        first_port=29700,
+        result_root=tmp_path / "results",
+        python_executable="/repo/venv/ilvr-venv/bin/python",
+        commit="a" * 40,
+    )
+
+    assert len(plans) == 18
+    for plan in plans:
+        assert not hasattr(plan, "initial")
+        assert not hasattr(plan, "resume")
+        assert len(plan.commands.node_specs) == 2
+        expected_harness = (
+            "/root/workspace/ILVR/tests/stage1/zero_compat_diagnostic.py"
+            if plan.case.stage == "stage1"
+            else "/root/workspace/ILVR/tests/stage2/integration/tiny_stage2_train.py"
+        )
+        for machine_rank, node in enumerate(plan.commands.node_specs):
+            command = node.command
+            child = command[command.index("--") + 1 :]
+            assert child[0] == "/root/workspace/ILVR/venv/ilvr-venv/bin/accelerate"
+            assert child[1] == "launch"
+            assert child[child.index("--num_machines") + 1] == "2"
+            assert child[child.index("--num_processes") + 1] == "4"
+            assert child[child.index("--machine_rank") + 1] == str(machine_rank)
+            assert child[child.index("--main_process_ip") + 1] == "10.1.102.41"
+            assert child[child.index("--main_process_port") + 1] == str(
+                plan.main_process_port
+            )
+            assert expected_harness in child
+            harness_index = child.index(expected_harness)
+            harness_args = child[harness_index + 1 :]
+            method_flag = "--method" if plan.case.stage == "stage1" else "--tuning-method"
+            assert harness_args == (
+                "--zero-stage",
+                str(plan.case.zero_stage),
+                method_flag,
+                plan.case.method,
+                "--deepspeed",
+                f"/root/workspace/ILVR/configs/deepspeed_zero{plan.case.zero_stage}.json",
+                "--experiment-id",
+                plan.child_run_id,
+                "--initial-steps",
+                "2",
+                "--resumed-steps",
+                "3",
+            )
+
+
+def test_owned_harness_builder_rejects_arbitrary_path_or_arguments():
+    """Catches the lifecycle coordinator becoming an arbitrary command escape."""
+    launch_plan = build_lifecycle_plans(
+        parent_run_id="four-gpu-matrix",
+        first_port=29700,
+        result_root=Path("/root/workspace/ILVR/results"),
+        python_executable="/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        commit="a" * 40,
+    )[0].launch_plan
+
+    with pytest.raises(ValueError, match="approved harness"):
+        build_owned_lifecycle_harness_commands(
+            launch_plan,
+            commit="a" * 40,
+            harness_path=Path("/tmp/arbitrary.py"),
+        )
+    with pytest.raises(ValueError, match="exact harness arguments"):
+        build_owned_lifecycle_harness_commands(
+            launch_plan,
+            commit="a" * 40,
+            harness_arguments=("--zero-stage", "3"),
+        )
+
+
+def test_lifecycle_plans_bind_safe_child_ids_ports_and_one_lifecycle_job(tmp_path):
+    """Catches a case changing identity or port inside its owned harness job."""
     result_root = tmp_path / "results"
     plans = build_lifecycle_plans(
         parent_run_id="four-gpu-matrix",
@@ -52,18 +128,11 @@ def test_lifecycle_plans_bind_safe_child_ids_ports_and_two_attempt_arrays(tmp_pa
         stage, method, zero_stage = EXPECTED_IDENTITIES[index]
         child = f"four-gpu-matrix-{stage}-{method}-zero{zero_stage}"
         assert plan.child_run_id == child
-        assert plan.initial.attempt_id == "initial"
-        assert (plan.initial.from_step, plan.initial.to_step) == (0, 2)
-        assert plan.resume.attempt_id == "resume"
-        assert (plan.resume.from_step, plan.resume.to_step) == (2, 3)
-        for attempt in (plan.initial, plan.resume):
-            command = list(attempt.command)
-            assert command[command.index("--run-id") + 1] == child
-            assert command[command.index("--main-process-port") + 1] == str(
-                29700 + index
-            )
-            assert command[command.index("--attempt-id") + 1] == attempt.attempt_id
-        assert "checkpoint-2" in " ".join(plan.resume.command)
+        assert plan.launch_plan.run_id == child
+        assert plan.launch_plan.attempt_id == "lifecycle"
+        assert plan.launch_plan.main_process_port == 29700 + index
+        assert len(plan.commands.node_specs) == 2
+        assert plan.checkpoint_path.name == "checkpoint-2"
 
 
 @pytest.mark.parametrize("first_port", [1023, 65519])
@@ -84,155 +153,16 @@ def test_lifecycle_dry_run_has_no_filesystem_or_runner_side_effect(tmp_path):
     """Catches dry-run reserving the parent namespace or starting a command."""
     result_root = tmp_path / "missing-results"
 
-    def forbidden_runner(_command):
-        raise AssertionError("dry-run called the external runner")
-
     plans = run_lifecycle_matrix(
         parent_run_id="four-gpu-matrix-dry",
         first_port=29700,
         result_root=result_root,
         python_executable="/repo/python",
-        command_runner=forbidden_runner,
         dry_run=True,
     )
 
     assert len(plans) == 18
     assert not result_root.exists()
-
-
-def _write_training_witness(
-    result_root: Path,
-    *,
-    child_run_id: str,
-    attempt_id: str,
-    stage: str,
-    method: str,
-    zero_stage: int,
-    final_step: int,
-) -> Path:
-    run_root = result_root / child_run_id
-    run_root.mkdir(parents=True, exist_ok=True)
-    checkpoint = (
-        result_root.parent / "checkpoints" / child_run_id / f"checkpoint-{final_step}"
-    )
-    checkpoint.mkdir(parents=True, exist_ok=True)
-    (checkpoint / "rank-shard.bin").write_bytes(b"bounded-fake-shard")
-    finite = run_root / f"{attempt_id}-producer-evidence.json"
-    finite.write_text(
-        json.dumps({"benchmark_evidence": {"finite_loss": True}}) + "\n",
-        encoding="utf-8",
-    )
-    finite_bytes = finite.read_bytes()
-    witness = run_root / f"{attempt_id}-train-witness.json"
-    witness.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "run_id": child_run_id,
-                "attempt_id": attempt_id,
-                "stage": stage,
-                "method": method,
-                "zero_stage": zero_stage,
-                "batch_per_gpu": 2 if stage == "stage1" else 1,
-                "world_size": 4,
-                "machine_ranks": [0, 1],
-                "exit_codes": {"0": 0, "1": 0},
-                "checkpoint_path": str(checkpoint.parent),
-                "finite_loss_evidence": {
-                    "status": "validated",
-                    "path": str(finite),
-                    "sha256": hashlib.sha256(finite_bytes).hexdigest(),
-                    "size": len(finite_bytes),
-                    "finite_loss": True,
-                },
-            },
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return witness
-
-
-def test_matrix_runs_initial_then_resume_and_completes_only_after_all_cases(tmp_path):
-    """Catches retry/interleaving or early parent completion publication."""
-    result_root = tmp_path / "results"
-    seen: list[tuple[str, str]] = []
-
-    def runner(command):
-        values = list(command)
-        child = values[values.index("--run-id") + 1]
-        attempt = values[values.index("--attempt-id") + 1]
-        stage = values[values.index("-m") + 2].removeprefix("train-")
-        zero_stage = int(values[values.index("--zero-stage") + 1])
-        method = child.split("-")[-2]
-        final_step = 2 if attempt == "initial" else 3
-        if attempt == "resume":
-            assert seen[-1] == (child, "initial")
-        assert not (result_root / "four-gpu-matrix" / "matrix-complete.json").exists()
-        witness = _write_training_witness(
-            result_root,
-            child_run_id=child,
-            attempt_id=attempt,
-            stage=stage,
-            method=method,
-            zero_stage=zero_stage,
-            final_step=final_step,
-        )
-        seen.append((child, attempt))
-        return subprocess.CompletedProcess(
-            command, 0, stdout=json.dumps({"training_witness": str(witness)}), stderr=""
-        )
-
-    plans = run_lifecycle_matrix(
-        parent_run_id="four-gpu-matrix",
-        first_port=29700,
-        result_root=result_root,
-        python_executable="/repo/python",
-        command_runner=runner,
-    )
-
-    assert len(seen) == 36
-    assert seen[:4] == [
-        ("four-gpu-matrix-stage1-full-zero1", "initial"),
-        ("four-gpu-matrix-stage1-full-zero1", "resume"),
-        ("four-gpu-matrix-stage1-full-zero2", "initial"),
-        ("four-gpu-matrix-stage1-full-zero2", "resume"),
-    ]
-    completion = json.loads(
-        (result_root / "four-gpu-matrix" / "matrix-complete.json").read_text()
-    )
-    assert len(completion["cases"]) == len(plans) == 18
-
-
-def test_matrix_stops_without_retry_or_completion_on_bad_attempt_witness(tmp_path):
-    """Catches a malformed initial attempt being retried or followed by resume."""
-    result_root = tmp_path / "results"
-    calls = 0
-
-    def runner(command):
-        nonlocal calls
-        calls += 1
-        values = list(command)
-        child = values[values.index("--run-id") + 1]
-        witness = result_root / child / "initial-train-witness.json"
-        witness.parent.mkdir(parents=True)
-        witness.write_text('{"schema_version":1}\n', encoding="utf-8")
-        return subprocess.CompletedProcess(
-            command, 0, stdout=json.dumps({"training_witness": str(witness)}), stderr=""
-        )
-
-    with pytest.raises(ValueError, match="training witness"):
-        run_lifecycle_matrix(
-            parent_run_id="four-gpu-matrix",
-            first_port=29700,
-            result_root=result_root,
-            python_executable="/repo/python",
-            command_runner=runner,
-        )
-
-    assert calls == 1
-    assert not (result_root / "four-gpu-matrix" / "matrix-complete.json").exists()
 
 
 def test_matrix_prechecks_parent_namespace_before_any_attempt(tmp_path):
@@ -241,23 +171,14 @@ def test_matrix_prechecks_parent_namespace_before_any_attempt(tmp_path):
     parent = result_root / "four-gpu-matrix"
     parent.mkdir(parents=True)
     (parent / "stale.json").write_text("{}\n", encoding="utf-8")
-    calls = 0
-
-    def runner(_command):
-        nonlocal calls
-        calls += 1
-        raise AssertionError("stale namespace reached runner")
-
     with pytest.raises(FileExistsError, match="parent result namespace"):
         run_lifecycle_matrix(
             parent_run_id="four-gpu-matrix",
             first_port=29700,
             result_root=result_root,
             python_executable="/repo/python",
-            command_runner=runner,
         )
 
-    assert calls == 0
 
 
 def test_wrapper_dry_run_prints_exactly_eighteen_lifecycle_plan_objects(tmp_path):
@@ -289,8 +210,9 @@ def test_wrapper_dry_run_prints_exactly_eighteen_lifecycle_plan_objects(tmp_path
         "zero_stage",
         "child_run_id",
         "main_process_port",
-        "initial",
-        "resume",
+        "lifecycle",
     } for plan in plans)
+    assert all(set(plan["lifecycle"]) == {"remote", "local", "steps"} for plan in plans)
+    assert all(plan["lifecycle"]["steps"] == [0, 2, 3] for plan in plans)
     assert [plan["main_process_port"] for plan in plans] == list(range(29700, 29718))
     assert not result_root.exists()

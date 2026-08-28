@@ -4,12 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import stat
 from types import MappingProxyType
+
+from src.multinode_runtime import (
+    _canonical_json_bytes,
+    _open_trusted_directory,
+    _publish_bytes_no_replace,
+    _read_regular_file,
+)
 
 
 _METHODS = ("full", "lora", "dora")
@@ -25,7 +34,7 @@ _CELL_IDENTITIES = tuple(
 )
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_MAX_JSON_BYTES = 1024 * 1024
+_MAX_SMALL_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -36,493 +45,611 @@ class ValidationReport:
     stage2_recommendations: Mapping[str, int]
 
 
-def _read_json(path: Path, *, description: str) -> dict[str, object]:
+def _reject_duplicates(description: str):
+    def hook(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{description} contains a duplicate field")
+            result[key] = value
+        return result
+
+    return hook
+
+
+def _read_bytes(path: Path, *, description: str) -> bytes:
     try:
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing {description}: {path}")
-        size = path.stat().st_size
-        if size <= 0 or size > _MAX_JSON_BYTES:
-            raise ValueError(f"{description} size is invalid: {path}")
-        raw = path.read_bytes()
+        return _read_regular_file(path, maximum_size=_MAX_SMALL_BYTES)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid {description}: {path}") from error
 
-        def reject_duplicates(pairs):
-            result = {}
-            for key, value in pairs:
-                if key in result:
-                    raise ValueError(f"{description} contains a duplicate field")
-                result[key] = value
-            return result
 
-        payload = json.loads(raw, object_pairs_hook=reject_duplicates)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid JSON in {description}: {path}") from error
-    if type(payload) is not dict:
+def _decode_json(raw: bytes, *, description: str) -> object:
+    try:
+        return json.loads(raw, object_pairs_hook=_reject_duplicates(description))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid JSON in {description}") from error
+
+
+def _read_json(path: Path, *, description: str) -> dict[str, object]:
+    value = _decode_json(_read_bytes(path, description=description), description=description)
+    if type(value) is not dict:
         raise ValueError(f"{description} must be a JSON object")
-    return payload
+    return value
 
 
-def _require_fields(
-    payload: Mapping[str, object], required: set[str], *, description: str
-) -> None:
-    if set(payload) != required:
+def _exact(payload: Mapping[str, object], fields: set[str], description: str) -> None:
+    if set(payload) != fields:
         raise ValueError(f"{description} fields are invalid")
 
 
-def _require_id(value: object, *, description: str) -> str:
+def _safe_id(value: object, description: str) -> str:
     if type(value) is not str or _SAFE_ID.fullmatch(value) is None:
         raise ValueError(f"{description} is invalid")
     return value
 
 
-def _is_number(value: object) -> bool:
-    return type(value) in (int, float) and math.isfinite(value)
+def _finite(value: object) -> bool:
+    return type(value) in (int, float) and not isinstance(value, bool) and math.isfinite(value)
 
 
-_ATTEMPT_FIELDS = {
-    "attempt_id",
-    "from_step",
-    "to_step",
-    "exit_code",
-    "machine_ranks",
-    "process_ranks",
-    "checkpoint",
-    "method_artifact",
-    "finite_loss",
-    "finite_gradient",
-    "worker_errors",
-}
+def _direct_entries(root: Path, *, description: str) -> dict[str, str]:
+    """Enumerate one no-follow directory while its descriptor is pinned."""
+    try:
+        descriptor = _open_trusted_directory(root)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid {description} root") from error
+    try:
+        entries: dict[str, str] = {}
+        for name in os.listdir(descriptor):
+            if not name or name in (".", "..") or "/" in name or "\0" in name:
+                raise ValueError(f"unsafe direct child in {description}")
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISREG(metadata.st_mode):
+                entries[name] = "file"
+            elif stat.S_ISDIR(metadata.st_mode):
+                entries[name] = "directory"
+            else:
+                raise ValueError(f"unsupported direct child in {description}: {name}")
+        return entries
+    finally:
+        os.close(descriptor)
 
 
-def _validate_case_attempt(
-    value: object,
-    *,
-    attempt_id: str,
-    from_step: int,
-    to_step: int,
-    method: str,
-) -> None:
-    if type(value) is not dict:
-        raise ValueError("matrix case attempt must be an object")
-    _require_fields(value, _ATTEMPT_FIELDS, description="matrix case attempt")
-    expected_artifact = "full" if method == "full" else f"peft-{method}"
-    if (
-        type(value["attempt_id"]) is not str
-        or value["attempt_id"] != attempt_id
-        or type(value["from_step"]) is not int
-        or value["from_step"] != from_step
-        or type(value["to_step"]) is not int
-        or value["to_step"] != to_step
-        or type(value["exit_code"]) is not int
-        or value["exit_code"] != 0
-        or type(value["machine_ranks"]) is not list
-        or value["machine_ranks"] != [0, 1]
-        or any(type(rank) is not int for rank in value["machine_ranks"])
-        or type(value["process_ranks"]) is not list
-        or value["process_ranks"] != [0, 1, 2, 3]
-        or any(type(rank) is not int for rank in value["process_ranks"])
-        or type(value["checkpoint"]) is not str
-        or value["checkpoint"] != f"checkpoint-{to_step}"
-        or type(value["method_artifact"]) is not str
-        or value["method_artifact"] != expected_artifact
-        or type(value["worker_errors"]) is not list
-        or value["worker_errors"]
-    ):
-        raise ValueError("matrix case attempt identity or worker evidence is invalid")
-    if value["finite_loss"] is not True or value["finite_gradient"] is not True:
-        raise ValueError("matrix case finite diagnostics are invalid")
-
-
-_CASE_FIELDS = {
-    "schema_version",
-    "kind",
-    "parent_run_id",
-    "child_run_id",
-    "stage",
-    "method",
-    "zero_stage",
-    "world_size",
-    "main_process_port",
-    "attempts",
+_COMPLETION_FIELDS = {
+    "schema_version", "kind", "run_id", "world_size", "first_port", "cases"
 }
 _COMPLETION_CASE_FIELDS = {
-    "stage",
-    "method",
-    "zero_stage",
-    "child_run_id",
-    "main_process_port",
-    "witness",
+    "stage", "method", "zero_stage", "child_run_id", "main_process_port",
+    "witness", "exit_codes",
+}
+_CASE_FIELDS = {
+    "schema_version", "kind", "parent_run_id", "child_run_id", "stage",
+    "method", "zero_stage", "world_size", "main_process_port", "machine_ranks",
+    "process_ranks", "method_artifact", "checkpoint", "raw_witness", "attempts",
+    "finite_loss", "finite_gradient", "worker_errors", "collected_node_manifests",
     "exit_codes",
 }
+_RAW_REFERENCE_FIELDS = {"path", "sha256", "size"}
+_CASE_ATTEMPT_FIELDS = {"from_step", "to_step", "rank_losses", "rank_gradients"}
+
+
+def _validate_raw_matrix_witness(
+    raw: bytes, *, stage: str, method: str, zero_stage: int,
+    child_run_id: str, checkpoint_path: Path,
+) -> dict[str, object]:
+    from src.multinode import (
+        _STAGE1_RAW_FIELDS,
+        _STAGE1_RANK_FIELDS,
+        _STAGE2_RAW_FIELDS,
+        _STAGE2_RANK_FIELDS,
+    )
+
+    payload = _decode_json(raw, description="matrix raw witness")
+    if type(payload) is not dict:
+        raise ValueError("matrix raw witness must be an object")
+    fields = _STAGE1_RAW_FIELDS if stage == "stage1" else _STAGE2_RAW_FIELDS
+    rank_fields = _STAGE1_RANK_FIELDS if stage == "stage1" else _STAGE2_RANK_FIELDS
+    _exact(payload, fields, "matrix raw witness")
+    method_field = "method" if stage == "stage1" else "tuning_method"
+    if (
+        not checkpoint_path.is_absolute()
+        or checkpoint_path.name != "checkpoint-2"
+        or checkpoint_path.parent.name != child_run_id
+        or type(payload["schema_version"]) is not int or payload["schema_version"] != 1
+        or payload["stage"] != stage or type(payload["stage"]) is not str
+        or payload[method_field] != method or type(payload[method_field]) is not str
+        or type(payload["zero_stage"]) is not int or payload["zero_stage"] != zero_stage
+        or type(payload["config_digest"]) is not str
+        or _HEX64.fullmatch(payload["config_digest"]) is None
+        or type(payload["world_size"]) is not int or payload["world_size"] != 4
+        or payload["process_ranks"] != [0, 1, 2, 3]
+        or payload["worker_errors"] != []
+        or payload["experiment_id"] != child_run_id
+        or payload["checkpoint"] != str(checkpoint_path)
+    ):
+        raise ValueError("matrix raw witness identity is invalid")
+    artifact = "full" if method == "full" else f"peft-{method}"
+    artifact_field = "method_artifact" if stage == "stage1" else "artifact_kind"
+    if payload[artifact_field] != artifact:
+        raise ValueError("matrix raw method artifact is invalid")
+    records = payload["rank_records"]
+    if type(records) is not list or len(records) != 4:
+        raise ValueError("matrix raw witness requires four ranks")
+    for rank, record in enumerate(records):
+        if type(record) is not dict or set(record) != rank_fields or record["rank"] != rank:
+            raise ValueError("matrix raw rank fields are invalid")
+        if stage == "stage1":
+            valid = (
+                record["initial_global_step"] == 2
+                and record["resumed_global_step"] == 3
+                and record["initial_optimizer_steps"] == 2
+                and record["resumed_optimizer_steps"] == 1
+                and record["method_artifact"] == artifact
+                and record["finite_gradient_norm"] is True
+                and _finite(record["representative_gradient_norm"])
+            )
+        else:
+            valid = (
+                record["first_global_step"] == 2
+                and record["resumed_global_step"] == 3
+                and record["optimizer_step"] == 3
+                and record["optimizer_step_at_resume"] == 2
+                and record["scheduler_step_at_resume"] == 2
+                and _finite(record["gradient_norm"])
+            )
+        if (
+            not valid or record["worker_error"] is not None
+            or not _finite(record["first_loss"])
+            or not _finite(record["resumed_loss"])
+        ):
+            raise ValueError("matrix raw rank diagnostics are invalid")
+    finite_gradient = (
+        payload["finite_gradient_norm"] if stage == "stage1" else payload["finite_gradient"]
+    )
+    if payload["finite_loss"] is not True or finite_gradient is not True:
+        raise ValueError("matrix raw diagnostics are invalid")
+    return payload
 
 
 def _validate_matrix(matrix_root: Path) -> int:
-    completion = _read_json(
-        matrix_root / "matrix-complete.json", description="matrix completion"
-    )
-    _require_fields(
-        completion,
-        {"schema_version", "kind", "run_id", "world_size", "first_port", "cases"},
-        description="matrix completion",
-    )
-    parent_run_id = _require_id(completion["run_id"], description="matrix run ID")
+    completion = _read_json(matrix_root / "matrix-complete.json", description="matrix completion")
+    _exact(completion, _COMPLETION_FIELDS, "matrix completion")
+    parent = _safe_id(completion["run_id"], "matrix run ID")
     cases = completion["cases"]
     if (
-        type(completion["schema_version"]) is not int
-        or completion["schema_version"] != 1
+        type(completion["schema_version"]) is not int or completion["schema_version"] != 1
         or completion["kind"] != "multinode-lifecycle-matrix-complete"
-        or type(completion["world_size"]) is not int
-        or completion["world_size"] != 4
+        or type(completion["world_size"]) is not int or completion["world_size"] != 4
         or type(completion["first_port"]) is not int
-        or type(cases) is not list
-        or len(cases) != 18
+        or not 1024 <= completion["first_port"] <= 65518
+        or type(cases) is not list or len(cases) != 18
     ):
         raise ValueError("matrix completion identity is invalid")
-    first_port = completion["first_port"]
-    if not 1024 <= first_port or first_port + 17 > 65535:
-        raise ValueError("matrix completion port range is invalid")
+    expected_files = {"matrix-complete.json"}
+    for stage, method, zero_stage in _MATRIX_IDENTITIES:
+        expected_files.add(f"{parent}-{stage}-{method}-zero{zero_stage}.json")
+    if _direct_entries(matrix_root, description="matrix") != {
+        name: "file" for name in expected_files
+    }:
+        raise ValueError("matrix requires exactly 18 direct case summaries")
 
     for index, (summary, identity) in enumerate(zip(cases, _MATRIX_IDENTITIES, strict=True)):
         if type(summary) is not dict:
             raise ValueError("matrix completion case must be an object")
-        _require_fields(
-            summary, _COMPLETION_CASE_FIELDS, description="matrix completion case"
-        )
+        _exact(summary, _COMPLETION_CASE_FIELDS, "matrix completion case")
         stage, method, zero_stage = identity
-        child_run_id = f"{parent_run_id}-{stage}-{method}-zero{zero_stage}"
-        witness_name = f"{child_run_id}.json"
-        if (
-            type(summary["stage"]) is not str
-            or summary["stage"] != stage
-            or type(summary["method"]) is not str
-            or summary["method"] != method
-            or type(summary["zero_stage"]) is not int
-            or summary["zero_stage"] != zero_stage
-            or type(summary["child_run_id"]) is not str
-            or summary["child_run_id"] != child_run_id
-            or type(summary["main_process_port"]) is not int
-            or summary["main_process_port"] != first_port + index
-            or type(summary["witness"]) is not str
-            or summary["witness"] != witness_name
-            or type(summary["exit_codes"]) is not list
-            or summary["exit_codes"] != [0, 0]
-            or any(type(code) is not int for code in summary["exit_codes"])
-        ):
+        child = f"{parent}-{stage}-{method}-zero{zero_stage}"
+        witness_name = f"{child}.json"
+        if summary != {
+            "stage": stage, "method": method, "zero_stage": zero_stage,
+            "child_run_id": child,
+            "main_process_port": completion["first_port"] + index,
+            "witness": witness_name, "exit_codes": [0, 0],
+        }:
             raise ValueError("matrix completion case identity is invalid")
-
-        witness = _read_json(
-            matrix_root / witness_name, description="matrix case witness"
-        )
-        _require_fields(witness, _CASE_FIELDS, description="matrix case witness")
-        attempts = witness["attempts"]
+        witness = _read_json(matrix_root / witness_name, description="matrix case witness")
+        _exact(witness, _CASE_FIELDS, "matrix case witness")
+        artifact = "full" if method == "full" else f"peft-{method}"
         if (
-            type(witness["schema_version"]) is not int
-            or witness["schema_version"] != 1
+            type(witness["schema_version"]) is not int or witness["schema_version"] != 1
             or witness["kind"] != "multinode-lifecycle-case"
-            or type(witness["parent_run_id"]) is not str
-            or witness["parent_run_id"] != parent_run_id
-            or type(witness["child_run_id"]) is not str
-            or witness["child_run_id"] != child_run_id
-            or type(witness["stage"]) is not str
-            or witness["stage"] != stage
-            or type(witness["method"]) is not str
-            or witness["method"] != method
-            or type(witness["zero_stage"]) is not int
-            or witness["zero_stage"] != zero_stage
-            or type(witness["world_size"]) is not int
-            or witness["world_size"] != 4
+            or witness["parent_run_id"] != parent or witness["child_run_id"] != child
+            or witness["stage"] != stage or witness["method"] != method
+            or type(witness["zero_stage"]) is not int or witness["zero_stage"] != zero_stage
+            or type(witness["world_size"]) is not int or witness["world_size"] != 4
             or type(witness["main_process_port"]) is not int
-            or witness["main_process_port"] != first_port + index
-            or type(attempts) is not list
-            or len(attempts) != 2
+            or witness["main_process_port"] != completion["first_port"] + index
+            or witness["machine_ranks"] != [0, 1]
+            or witness["process_ranks"] != [0, 1, 2, 3]
+            or witness["method_artifact"] != artifact
+            or witness["checkpoint"] != "checkpoint-2"
+            or witness["finite_loss"] is not True or witness["finite_gradient"] is not True
+            or witness["worker_errors"] != []
+            or type(witness["collected_node_manifests"]) is not int
+            or witness["collected_node_manifests"] != 2
+            or witness["exit_codes"] != {"0": 0, "1": 0}
         ):
             raise ValueError("matrix case witness identity is invalid")
-        _validate_case_attempt(
-            attempts[0],
-            attempt_id="initial",
-            from_step=0,
-            to_step=2,
-            method=method,
+        reference = witness["raw_witness"]
+        if type(reference) is not dict:
+            raise ValueError("matrix raw witness reference is invalid")
+        _exact(reference, _RAW_REFERENCE_FIELDS, "matrix raw witness reference")
+        if (
+            type(reference["path"]) is not str or not Path(reference["path"]).is_absolute()
+            or Path(reference["path"]).name != "witness.json"
+            or Path(reference["path"]).parent.name != child
+            or type(reference["sha256"]) is not str
+            or _HEX64.fullmatch(reference["sha256"]) is None
+            or type(reference["size"]) is not int or reference["size"] <= 0
+        ):
+            raise ValueError("matrix raw witness reference is invalid")
+        raw = _read_bytes(Path(reference["path"]), description="matrix raw witness")
+        if len(raw) != reference["size"] or hashlib.sha256(raw).hexdigest() != reference["sha256"]:
+            raise ValueError("matrix raw witness digest is invalid")
+        raw_payload = _validate_raw_matrix_witness(
+            raw, stage=stage, method=method, zero_stage=zero_stage,
+            child_run_id=child, checkpoint_path=Path(raw_payload_checkpoint(raw)),
         )
-        _validate_case_attempt(
-            attempts[1],
-            attempt_id="resume",
-            from_step=2,
-            to_step=3,
-            method=method,
-        )
+        attempts = witness["attempts"]
+        if type(attempts) is not list or len(attempts) != 2:
+            raise ValueError("matrix case attempts are invalid")
+        records = raw_payload["rank_records"]
+        gradient_key = "representative_gradient_norm" if stage == "stage1" else "gradient_norm"
+        for attempt_index, (from_step, to_step, loss_key) in enumerate(
+            ((0, 2, "first_loss"), (2, 3, "resumed_loss"))
+        ):
+            attempt = attempts[attempt_index]
+            if type(attempt) is not dict:
+                raise ValueError("matrix case attempt is invalid")
+            _exact(attempt, _CASE_ATTEMPT_FIELDS, "matrix case attempt")
+            if attempt != {
+                "from_step": from_step, "to_step": to_step,
+                "rank_losses": [record[loss_key] for record in records],
+                "rank_gradients": [record[gradient_key] for record in records],
+            }:
+                raise ValueError("matrix case diagnostics differ from raw witness")
     return 18
 
 
+def raw_payload_checkpoint(raw: bytes) -> str:
+    value = _decode_json(raw, description="matrix raw witness")
+    if type(value) is not dict or type(value.get("checkpoint")) is not str:
+        raise ValueError("matrix raw checkpoint is invalid")
+    return value["checkpoint"]
+
+
 _SUMMARY_FIELDS = {
-    "summary",
-    "num_samples",
-    "average_inference_time_sec",
-    "total_inference_time_sec",
-    "accuracy",
-    "success",
+    "summary", "num_samples", "average_inference_time_sec",
+    "total_inference_time_sec", "accuracy", "success",
 }
 _SIDECAR_FIELDS = {
-    "schema_version",
-    "result_jsonl",
-    "dataset_identity",
-    "model_identity",
-    "shard_index",
-    "num_shards",
-    "expected_source_indices",
-    "processed_source_indices",
-    "worker_exit_status",
-    "successful",
+    "schema_version", "result_jsonl", "dataset_identity", "model_identity",
+    "shard_index", "num_shards", "expected_source_indices",
+    "processed_source_indices", "worker_exit_status", "successful",
 }
 
 
-def _validate_evaluation(evaluation_root: Path) -> int:
-    summary = _read_json(
-        evaluation_root / "summary.json", description="evaluation summary"
-    )
-    _require_fields(summary, _SUMMARY_FIELDS, description="evaluation summary")
+def _read_jsonl(path: Path, *, description: str) -> list[dict[str, object]]:
+    raw = _read_bytes(path, description=description)
+    rows: list[dict[str, object]] = []
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            continue
+        row = _decode_json(line, description=f"{description} line {line_number}")
+        if type(row) is not dict:
+            raise ValueError(f"{description} row must be an object")
+        if "error" in row:
+            raise ValueError(f"error row in {description}")
+        if row.get("summary") is True:
+            raise ValueError(f"summary row in {description}")
+        if not {"index", "task_name", "match"}.issubset(row):
+            raise ValueError(f"evaluation fields missing in {description}")
+        if (
+            type(row["index"]) is not int or type(row["task_name"]) is not str
+            or type(row["match"]) is not bool
+        ):
+            raise ValueError(f"evaluation row types are invalid in {description}")
+        inference = row.get("inference_time_sec")
+        if inference is not None and (not _finite(inference) or inference < 0):
+            raise ValueError("evaluation inference time is invalid")
+        rows.append(row)
+    return rows
+
+
+def _validate_evaluation(root: Path) -> int:
+    summary = _read_json(root / "summary.json", description="evaluation summary")
+    _exact(summary, _SUMMARY_FIELDS, "evaluation summary")
     if (
-        summary["summary"] is not True
-        or type(summary["num_samples"]) is not int
-        or summary["num_samples"] != 4
-        or type(summary["success"]) is not int
-        or not 0 <= summary["success"] <= 4
-        or not _is_number(summary["average_inference_time_sec"])
-        or summary["average_inference_time_sec"] < 0
-        or not _is_number(summary["total_inference_time_sec"])
-        or summary["total_inference_time_sec"] < 0
-        or not _is_number(summary["accuracy"])
-        or not 0 <= summary["accuracy"] <= 1
+        summary["summary"] is not True or type(summary["num_samples"]) is not int
+        or summary["num_samples"] < 0 or type(summary["success"]) is not int
+        or not _finite(summary["accuracy"]) or not _finite(summary["total_inference_time_sec"])
+        or not _finite(summary["average_inference_time_sec"])
     ):
         raise ValueError("evaluation summary is invalid")
-
+    sample_count = summary["num_samples"]
     common_dataset = None
     common_model = None
-    observed_indices: list[int] = []
+    rows_by_index: dict[int, dict[str, object]] = {}
+    inference_times: list[float] = []
     for shard_index in range(4):
         sidecar = _read_json(
-            evaluation_root / f"shard-{shard_index}.jsonl.manifest.json",
+            root / f"shard-{shard_index}.jsonl.manifest.json",
             description=f"evaluation sidecar {shard_index}",
         )
-        _require_fields(
-            sidecar, _SIDECAR_FIELDS, description=f"evaluation sidecar {shard_index}"
-        )
+        _exact(sidecar, _SIDECAR_FIELDS, f"evaluation sidecar {shard_index}")
+        expected = list(range(shard_index, sample_count, 4))
         dataset = sidecar["dataset_identity"]
         model = sidecar["model_identity"]
         if (
-            type(sidecar["schema_version"]) is not int
-            or sidecar["schema_version"] != 1
+            type(sidecar["schema_version"]) is not int or sidecar["schema_version"] != 1
             or sidecar["result_jsonl"] != f"shard-{shard_index}.jsonl"
-            or type(sidecar["shard_index"]) is not int
-            or sidecar["shard_index"] != shard_index
-            or type(sidecar["num_shards"]) is not int
-            or sidecar["num_shards"] != 4
-            or type(sidecar["expected_source_indices"]) is not list
-            or sidecar["expected_source_indices"] != [shard_index]
-            or any(type(value) is not int for value in sidecar["expected_source_indices"])
-            or type(sidecar["processed_source_indices"]) is not list
-            or sidecar["processed_source_indices"] != [shard_index]
-            or any(type(value) is not int for value in sidecar["processed_source_indices"])
+            or type(sidecar["shard_index"]) is not int or sidecar["shard_index"] != shard_index
+            or type(sidecar["num_shards"]) is not int or sidecar["num_shards"] != 4
+            or sidecar["expected_source_indices"] != expected
+            or sidecar["processed_source_indices"] != expected
             or type(sidecar["worker_exit_status"]) is not int
-            or sidecar["worker_exit_status"] != 0
-            or sidecar["successful"] is not True
-            or type(model) is not str
-            or not model.startswith("task6:")
+            or sidecar["worker_exit_status"] != 0 or sidecar["successful"] is not True
+            or type(model) is not str or not model.startswith("task6:")
             or _HEX64.fullmatch(model.removeprefix("task6:")) is None
-            or type(dataset) is not dict
-            or set(dataset) != {"path", "size", "mtime_ns"}
-            or type(dataset["path"]) is not str
-            or not Path(dataset["path"]).is_absolute()
-            or type(dataset["size"]) is not int
-            or dataset["size"] < 0
-            or type(dataset["mtime_ns"]) is not int
-            or dataset["mtime_ns"] < 0
+            or type(dataset) is not dict or set(dataset) != {"path", "size", "mtime_ns"}
+            or type(dataset["path"]) is not str or not Path(dataset["path"]).is_absolute()
+            or type(dataset["size"]) is not int or dataset["size"] < 0
+            or type(dataset["mtime_ns"]) is not int or dataset["mtime_ns"] < 0
         ):
             raise ValueError(f"evaluation sidecar {shard_index} is invalid")
         if common_dataset is None:
-            common_dataset = dataset
-            common_model = model
+            common_dataset, common_model = dataset, model
         elif dataset != common_dataset or model != common_model:
             raise ValueError("evaluation sidecar identities disagree")
-        observed_indices.extend(sidecar["processed_source_indices"])
-    if observed_indices != [0, 1, 2, 3] or len(set(observed_indices)) != 4:
+        rows = _read_jsonl(root / sidecar["result_jsonl"], description=f"evaluation shard {shard_index}")
+        if [row["index"] for row in rows] != expected:
+            raise ValueError("evaluation shard coverage differs from sidecar")
+        for row in rows:
+            index = row["index"]
+            if index in rows_by_index:
+                raise ValueError("duplicate evaluation source index")
+            rows_by_index[index] = row
+            if row.get("inference_time_sec") is not None:
+                inference_times.append(float(row["inference_time_sec"]))
+    if sorted(rows_by_index) != list(range(sample_count)):
         raise ValueError("evaluation source indices are incomplete")
-    return 4
+    successes = sum(int(rows_by_index[index]["match"]) for index in range(sample_count))
+    total = sum(inference_times, 0.0)
+    accuracy = successes / sample_count if sample_count else 0.0
+    average = total / sample_count if sample_count else 0.0
+    if (
+        summary["success"] != successes or summary["accuracy"] != accuracy
+        or summary["total_inference_time_sec"] != total
+        or summary["average_inference_time_sec"] != average
+    ):
+        raise ValueError("evaluation accuracy or timing is inconsistent")
+    return sample_count
 
 
 _CAPACITY_FIELDS = {
-    "schema_version",
-    "kind",
-    "run_id",
-    "stage",
-    "method",
-    "zero_stage",
-    "attempts",
-    "recommended_batch_per_gpu",
+    "schema_version", "kind", "run_id", "stage", "method", "zero_stage",
+    "attempts", "recommended_batch_per_gpu",
 }
 _CAPACITY_ATTEMPT_FIELDS = {
-    "batch_per_gpu",
-    "child_run_id",
-    "main_process_port",
-    "status",
-    "evidence_paths",
+    "batch_per_gpu", "child_run_id", "main_process_port", "status", "evidence_paths"
 }
-_STAGE2_WITNESS_FIELDS = {
-    "schema_version",
-    "run_id",
-    "attempt_id",
-    "stage",
-    "method",
-    "zero_stage",
-    "batch_per_gpu",
-    "world_size",
-    "machine_ranks",
-    "exit_codes",
-    "checkpoint_path",
+_TRAINING_WITNESS_FIELDS = {
+    "schema_version", "run_id", "attempt_id", "stage", "method", "zero_stage",
+    "batch_per_gpu", "world_size", "machine_ranks", "exit_codes", "checkpoint_path",
     "finite_loss_evidence",
 }
-_FINITE_FIELDS = {"status", "path", "sha256", "size", "finite_loss"}
+_STAGE1_FINITE_FIELDS = {"status", "path", "sha256", "size", "finite_loss"}
+_STAGE2_FINITE_FIELDS = _STAGE1_FINITE_FIELDS | {"finite_gradient", "process_ranks"}
 
 
-def _validate_capacity_attempt(value: object) -> int:
-    if type(value) is not dict:
-        raise ValueError("Stage 1 capacity attempt must be an object")
-    _require_fields(
-        value, _CAPACITY_ATTEMPT_FIELDS, description="Stage 1 capacity attempt"
+def _validate_stage1_child(
+    path: Path, *, child: str, method: str, zero_stage: int, batch: int
+) -> None:
+    from src.multinode_capacity import _decode_training_witness
+
+    producer = path.parent / "initial-producer-evidence.json"
+    raw_witness = _read_bytes(path, description="Stage 1 child training witness")
+    witness = _decode_training_witness(
+        raw_witness, child_run_id=child, zero_stage=zero_stage,
+        tuning_method=method, batch_per_gpu=batch, producer_path=producer,
     )
-    evidence = value["evidence_paths"]
+    raw_producer = _read_bytes(producer, description="Stage 1 child producer evidence")
+    finite = witness["finite_loss_evidence"]
+    payload = _decode_json(raw_producer, description="Stage 1 child producer evidence")
+    evidence = payload.get("benchmark_evidence", payload) if type(payload) is dict else None
     if (
-        type(value["batch_per_gpu"]) is not int
-        or value["batch_per_gpu"] <= 0
-        or type(value["child_run_id"]) is not str
-        or _SAFE_ID.fullmatch(value["child_run_id"]) is None
-        or type(value["main_process_port"]) is not int
-        or not 1024 <= value["main_process_port"] <= 65535
-        or type(value["status"]) is not str
-        or value["status"] not in {"success", "capacity_oom"}
-        or type(evidence) is not list
-        or not evidence
+        type(evidence) is not dict or evidence.get("finite_loss") is not True
+        or finite["size"] != len(raw_producer)
+        or finite["sha256"] != hashlib.sha256(raw_producer).hexdigest()
     ):
-        raise ValueError("Stage 1 capacity attempt is invalid")
-    for reference in evidence:
+        raise ValueError("Stage 1 successful child witness is invalid")
+
+
+def _validate_capacity_report(
+    path: Path, *, stage1_root: Path
+) -> tuple[tuple[str, int], int, set[str]]:
+    payload = _read_json(path, description="Stage 1 capacity cell")
+    _exact(payload, _CAPACITY_FIELDS, "Stage 1 capacity cell")
+    run_id = _safe_id(payload["run_id"], "Stage 1 capacity run ID")
+    method = payload["method"]
+    zero_stage = payload["zero_stage"]
+    attempts = payload["attempts"]
+    recommendation = payload["recommended_batch_per_gpu"]
+    if (
+        type(payload["schema_version"]) is not int or payload["schema_version"] != 1
+        or payload["kind"] != "stage1-multinode-capacity" or payload["stage"] != "stage1"
+        or type(method) is not str or method not in _METHODS
+        or type(zero_stage) is not int or zero_stage not in _ZERO_STAGES
+        or type(attempts) is not list or not attempts
+        or type(recommendation) is not int or recommendation not in (1, 2, 4, 8)
+        or path.parent.name != run_id
+    ):
+        raise ValueError("Stage 1 capacity cell is invalid")
+    batches: list[int] = []
+    successes: set[int] = set()
+    child_ids: set[str] = set()
+    for attempt in attempts:
+        if type(attempt) is not dict:
+            raise ValueError("Stage 1 capacity attempt is invalid")
+        _exact(attempt, _CAPACITY_ATTEMPT_FIELDS, "Stage 1 capacity attempt")
+        batch = attempt["batch_per_gpu"]
+        child = _safe_id(attempt["child_run_id"], "Stage 1 child run ID")
+        evidence_paths = attempt["evidence_paths"]
         if (
-            type(reference) is not dict
-            or set(reference) != {"node", "path"}
-            or reference["node"] not in {"remote", "local", "coordinator"}
-            or type(reference["path"]) is not str
-            or not Path(reference["path"]).is_absolute()
+            type(batch) is not int or batch <= 0
+            or child != f"{run_id}-batch{batch}"
+            or type(attempt["main_process_port"]) is not int
+            or not 1024 <= attempt["main_process_port"] <= 65535
+            or attempt["status"] not in {"success", "capacity_oom", "integration_failure"}
+            or type(evidence_paths) is not list or not evidence_paths
         ):
-            raise ValueError("Stage 1 capacity evidence reference is invalid")
-    return value["batch_per_gpu"]
+            raise ValueError("Stage 1 capacity attempt is invalid")
+        batches.append(batch)
+        child_ids.add(child)
+        if attempt["status"] == "success":
+            expected_witness = stage1_root / child / "initial-train-witness.json"
+            if evidence_paths != [{"node": "coordinator", "path": str(expected_witness)}]:
+                raise ValueError("Stage 1 success does not reference its direct child witness")
+            _validate_stage1_child(
+                expected_witness, child=child, method=method,
+                zero_stage=zero_stage, batch=batch,
+            )
+            successes.add(batch)
+        else:
+            for reference in evidence_paths:
+                if (
+                    type(reference) is not dict or set(reference) != {"node", "path"}
+                    or reference["node"] not in {"remote", "local", "coordinator"}
+                    or type(reference["path"]) is not str
+                    or not Path(reference["path"]).is_absolute()
+                ):
+                    raise ValueError("Stage 1 failure evidence reference is invalid")
+    if batches not in ([2], [2, 4], [2, 4, 8], [2, 1]):
+        raise ValueError("Stage 1 capacity attempts must begin at batch 2")
+    if recommendation not in successes:
+        raise ValueError("Stage 1 recommendation must be a successful attempted batch")
+    return (method, zero_stage), recommendation, child_ids
 
 
-def _validate_capacity(capacity_root: Path) -> tuple[Mapping[str, int], Mapping[str, int]]:
-    stage1_root = capacity_root / "capacity"
-    stage2_root = capacity_root / "stage2-batch1"
-    expected_names = {f"{method}-zero{zero_stage}.json" for method, zero_stage in _CELL_IDENTITIES}
-    observed_stage1 = (
-        {path.name for path in stage1_root.iterdir() if path.is_file() and not path.is_symlink()}
-        if stage1_root.is_dir()
-        else set()
+def _checkpoint_has_output(checkpoint: Path) -> bool:
+    if checkpoint.is_symlink() or not checkpoint.is_dir():
+        return False
+    for root, directories, files in os.walk(checkpoint, followlinks=False):
+        root_path = Path(root)
+        directories[:] = [name for name in directories if not (root_path / name).is_symlink()]
+        if any(
+            not (root_path / name).is_symlink()
+            and (root_path / name).is_file()
+            and (root_path / name).stat().st_size > 0
+            for name in files
+        ):
+            return True
+    return False
+
+
+def _validate_stage2_witness(path: Path) -> tuple[tuple[str, int], int]:
+    witness = _read_json(path, description="Stage 2 batch-1 witness")
+    _exact(witness, _TRAINING_WITNESS_FIELDS, "Stage 2 batch-1 witness")
+    run_id = _safe_id(witness["run_id"], "Stage 2 batch-1 run ID")
+    method = witness["method"]
+    zero_stage = witness["zero_stage"]
+    checkpoint_root = Path(witness["checkpoint_path"]) if type(witness["checkpoint_path"]) is str else Path()
+    producer = path.parent / "initial-producer-evidence.json"
+    finite = witness["finite_loss_evidence"]
+    if (
+        path.parent.name != run_id or witness["attempt_id"] != "initial"
+        or witness["stage"] != "stage2" or type(method) is not str or method not in _METHODS
+        or type(zero_stage) is not int or zero_stage not in _ZERO_STAGES
+        or type(witness["schema_version"]) is not int or witness["schema_version"] != 1
+        or type(witness["batch_per_gpu"]) is not int or witness["batch_per_gpu"] != 1
+        or type(witness["world_size"]) is not int or witness["world_size"] != 4
+        or witness["machine_ranks"] != [0, 1] or witness["exit_codes"] != {"0": 0, "1": 0}
+        or not checkpoint_root.is_absolute() or checkpoint_root.name != run_id
+        or type(finite) is not dict or set(finite) != _STAGE2_FINITE_FIELDS
+        or finite["status"] != "validated" or finite["path"] != str(producer)
+        or type(finite["sha256"]) is not str or _HEX64.fullmatch(finite["sha256"]) is None
+        or type(finite["size"]) is not int or finite["size"] <= 0
+        or finite["finite_loss"] is not True or finite["finite_gradient"] is not True
+        or finite["process_ranks"] != [0, 1, 2, 3]
+    ):
+        raise ValueError("Stage 2 batch-1 witness is invalid")
+    checkpoint = checkpoint_root / "checkpoint-1"
+    if not _checkpoint_has_output(checkpoint):
+        raise ValueError("Stage 2 batch-1 checkpoint step 1 is invalid")
+    raw = _read_bytes(producer, description="Stage 2 producer evidence")
+    if len(raw) != finite["size"] or hashlib.sha256(raw).hexdigest() != finite["sha256"]:
+        raise ValueError("Stage 2 producer evidence digest is invalid")
+    from stage2.evidence import decode_stage2_producer_evidence
+
+    decode_stage2_producer_evidence(
+        raw, expected_run_id=run_id, expected_method=method,
+        expected_zero_stage=zero_stage, expected_checkpoint=checkpoint,
+        expected_global_step=1,
     )
-    observed_stage2 = (
-        {path.name for path in stage2_root.iterdir() if path.is_file() and not path.is_symlink()}
-        if stage2_root.is_dir()
-        else set()
-    )
-    if observed_stage1 != expected_names:
+    return (method, zero_stage), 1
+
+
+def _validate_capacity(root: Path) -> tuple[Mapping[str, int], Mapping[str, int]]:
+    stage1_root = root / "capacity"
+    entries = _direct_entries(stage1_root, description="Stage 1 capacity")
+    if any(kind != "directory" or _SAFE_ID.fullmatch(name) is None for name, kind in entries.items()):
+        raise ValueError("Stage 1 capacity direct children are invalid")
+    reports = [
+        stage1_root / name / "capacity.json"
+        for name in sorted(entries)
+        if (stage1_root / name / "capacity.json").is_file()
+        and not (stage1_root / name / "capacity.json").is_symlink()
+    ]
+    if len(reports) != 9:
         raise ValueError("exactly nine Stage 1 capacity cells are required")
-    if observed_stage2 != expected_names:
+    stage1: dict[str, int] = {}
+    parent_ids: set[str] = set()
+    child_ids: set[str] = set()
+    identities: set[tuple[str, int]] = set()
+    for report_path in reports:
+        identity, recommendation, children = _validate_capacity_report(
+            report_path, stage1_root=stage1_root
+        )
+        if identity in identities:
+            raise ValueError("duplicate Stage 1 capacity identity")
+        identities.add(identity)
+        parent_ids.add(report_path.parent.name)
+        child_ids.update(children)
+        stage1[f"{identity[0]}-zero{identity[1]}"] = recommendation
+    if identities != set(_CELL_IDENTITIES) or set(entries) != parent_ids | child_ids:
+        raise ValueError("exactly nine Stage 1 capacity cells are required")
+
+    stage2_root = root / "stage2-batch1"
+    stage2_entries = _direct_entries(stage2_root, description="Stage 2 batch-1")
+    if len(stage2_entries) != 9 or any(
+        kind != "directory" or _SAFE_ID.fullmatch(name) is None
+        for name, kind in stage2_entries.items()
+    ):
         raise ValueError("exactly nine Stage 2 batch-1 cells are required")
-
-    stage1_recommendations: dict[str, int] = {}
-    stage2_recommendations: dict[str, int] = {}
-    for method, zero_stage in _CELL_IDENTITIES:
-        key = f"{method}-zero{zero_stage}"
-        capacity = _read_json(stage1_root / f"{key}.json", description="Stage 1 capacity cell")
-        _require_fields(capacity, _CAPACITY_FIELDS, description="Stage 1 capacity cell")
-        attempts = capacity["attempts"]
-        recommendation = capacity["recommended_batch_per_gpu"]
-        if (
-            type(capacity["schema_version"]) is not int
-            or capacity["schema_version"] != 1
-            or capacity["kind"] != "stage1-multinode-capacity"
-            or type(capacity["run_id"]) is not str
-            or _SAFE_ID.fullmatch(capacity["run_id"]) is None
-            or capacity["stage"] != "stage1"
-            or type(capacity["method"]) is not str
-            or capacity["method"] != method
-            or type(capacity["zero_stage"]) is not int
-            or capacity["zero_stage"] != zero_stage
-            or type(attempts) is not list
-            or not attempts
-            or type(recommendation) is not int
-            or recommendation not in (1, 2, 4, 8)
-        ):
-            raise ValueError("Stage 1 capacity cell is invalid")
-        batches = [_validate_capacity_attempt(attempt) for attempt in attempts]
-        if batches[0] != 2 or batches not in ([2], [2, 4], [2, 4, 8], [2, 1]):
-            raise ValueError("Stage 1 capacity attempts must begin at batch 2")
-        stage1_recommendations[key] = recommendation
-
-        witness = _read_json(
-            stage2_root / f"{key}.json", description="Stage 2 batch-1 witness"
+    stage2: dict[str, int] = {}
+    stage2_identities: set[tuple[str, int]] = set()
+    for name in sorted(stage2_entries):
+        identity, recommendation = _validate_stage2_witness(
+            stage2_root / name / "initial-train-witness.json"
         )
-        _require_fields(
-            witness, _STAGE2_WITNESS_FIELDS, description="Stage 2 batch-1 witness"
-        )
-        finite = witness["finite_loss_evidence"]
-        if (
-            type(witness["schema_version"]) is not int
-            or witness["schema_version"] != 1
-            or type(witness["run_id"]) is not str
-            or _SAFE_ID.fullmatch(witness["run_id"]) is None
-            or witness["attempt_id"] != "initial"
-            or witness["stage"] != "stage2"
-            or type(witness["method"]) is not str
-            or witness["method"] != method
-            or type(witness["zero_stage"]) is not int
-            or witness["zero_stage"] != zero_stage
-            or type(witness["batch_per_gpu"]) is not int
-            or witness["batch_per_gpu"] != 1
-            or type(witness["world_size"]) is not int
-            or witness["world_size"] != 4
-            or type(witness["machine_ranks"]) is not list
-            or witness["machine_ranks"] != [0, 1]
-            or any(type(rank) is not int for rank in witness["machine_ranks"])
-            or type(witness["exit_codes"]) is not dict
-            or witness["exit_codes"] != {"0": 0, "1": 0}
-            or any(type(code) is not int for code in witness["exit_codes"].values())
-            or type(witness["checkpoint_path"]) is not str
-            or not Path(witness["checkpoint_path"]).is_absolute()
-            or type(finite) is not dict
-            or set(finite) != _FINITE_FIELDS
-            or finite["status"] != "validated"
-            or finite["finite_loss"] is not True
-            or type(finite["path"]) is not str
-            or not Path(finite["path"]).is_absolute()
-            or type(finite["sha256"]) is not str
-            or _HEX64.fullmatch(finite["sha256"]) is None
-            or type(finite["size"]) is not int
-            or finite["size"] <= 0
-        ):
-            raise ValueError("Stage 2 batch-1 witness is invalid")
-        stage2_recommendations[key] = 1
-    return MappingProxyType(stage1_recommendations), MappingProxyType(stage2_recommendations)
+        if identity in stage2_identities:
+            raise ValueError("duplicate Stage 2 batch-1 identity")
+        stage2_identities.add(identity)
+        stage2[f"{identity[0]}-zero{identity[1]}"] = recommendation
+    if stage2_identities != set(_CELL_IDENTITIES):
+        raise ValueError("exactly nine Stage 2 batch-1 cells are required")
+    return MappingProxyType(stage1), MappingProxyType(stage2)
 
 
 def validate_results(
     matrix_root: Path, evaluation_root: Path, capacity_root: Path
 ) -> ValidationReport:
-    """Validate only the documented direct Task 10 result paths."""
-    matrix = Path(matrix_root)
-    evaluation = Path(evaluation_root)
-    capacity = Path(capacity_root)
-    matrix_cases = _validate_matrix(matrix)
-    evaluation_samples = _validate_evaluation(evaluation)
-    stage1, stage2 = _validate_capacity(capacity)
+    """Validate only direct Task 10 producer paths using descriptor-bound reads."""
+    stage1, stage2 = _validate_capacity(Path(capacity_root))
     return ValidationReport(
-        matrix_cases=matrix_cases,
-        evaluation_samples=evaluation_samples,
+        matrix_cases=_validate_matrix(Path(matrix_root)),
+        evaluation_samples=_validate_evaluation(Path(evaluation_root)),
         stage1_recommendations=stage1,
         stage2_recommendations=stage2,
     )
@@ -540,9 +667,7 @@ def _report_payload(report: ValidationReport) -> dict[str, object]:
 
 def _recommendation_table(title: str, values: Mapping[str, int]) -> list[str]:
     lines = [
-        f"## {title}",
-        "",
-        "| Method | ZeRO 1 | ZeRO 2 | ZeRO 3 |",
+        f"## {title}", "", "| Method | ZeRO 1 | ZeRO 2 | ZeRO 3 |",
         "| --- | ---: | ---: | ---: |",
     ]
     for method in _METHODS:
@@ -554,62 +679,59 @@ def _recommendation_table(title: str, values: Mapping[str, int]) -> list[str]:
 
 
 def _report_markdown(report: ValidationReport) -> str:
-    lines = [
-        "# ILVR Four-GPU Validation Summary",
-        "",
-        f"Validated matrix cases: {report.matrix_cases}",
-        "",
-        f"Validated evaluation samples: {report.evaluation_samples}",
-        "",
+    return "\n".join([
+        "# ILVR Four-GPU Validation Summary", "",
+        f"Validated matrix cases: {report.matrix_cases}", "",
+        f"Validated evaluation samples: {report.evaluation_samples}", "",
         *_recommendation_table("Stage 1 recommendations", report.stage1_recommendations),
+        "", *_recommendation_table("Stage 2 recommendations", report.stage2_recommendations),
         "",
-        *_recommendation_table("Stage 2 recommendations", report.stage2_recommendations),
-        "",
-    ]
-    return "\n".join(lines)
+    ])
+
+
+def _rollback_exact(path: Path, expected: bytes) -> None:
+    """Remove only the exact regular bytes this call just published."""
+    try:
+        observed = _read_regular_file(path, maximum_size=max(_MAX_SMALL_BYTES, len(expected)))
+    except (OSError, ValueError):
+        return
+    if observed != expected:
+        return
+    try:
+        descriptor = _open_trusted_directory(path.parent)
+        try:
+            os.unlink(path.name, dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError):
+        return
 
 
 def publish_validation_outputs(
-    report: ValidationReport,
-    output_manifest: str | Path,
-    output_summary: str | Path,
+    report: ValidationReport, output_manifest: str | Path, output_summary: str | Path
 ) -> None:
-    """Publish matching JSON/Markdown exclusively and roll back partial output."""
+    """Prepare both outputs, precheck both absent, publish exclusively, roll back."""
     if not isinstance(report, ValidationReport):
         raise TypeError("report must be a ValidationReport")
     manifest = Path(output_manifest)
     summary = Path(output_summary)
     if manifest == summary:
         raise ValueError("output manifest and summary must differ")
+    manifest_bytes = _canonical_json_bytes(_report_payload(report)) + b"\n"
+    summary_bytes = _report_markdown(report).encode("utf-8")
     if os.path.lexists(manifest):
         raise FileExistsError(manifest)
     if os.path.lexists(summary):
         raise FileExistsError(summary)
-    manifest_bytes = (
-        json.dumps(
-            _report_payload(report),
-            allow_nan=False,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
-    summary_text = _report_markdown(report)
     manifest_created = False
-    summary_created = False
     try:
-        with manifest.open("x", encoding="utf-8") as stream:
-            manifest_created = True
-            stream.write(manifest_bytes)
-        with summary.open("x", encoding="utf-8") as stream:
-            summary_created = True
-            stream.write(summary_text)
+        _publish_bytes_no_replace(manifest, manifest_bytes)
+        manifest_created = True
+        _publish_bytes_no_replace(summary, summary_bytes)
     except BaseException:
-        if summary_created:
-            summary.unlink(missing_ok=True)
+        _rollback_exact(summary, summary_bytes)
         if manifest_created:
-            manifest.unlink(missing_ok=True)
+            _rollback_exact(manifest, manifest_bytes)
         raise
 
 
@@ -627,13 +749,9 @@ def validate_results_main(argv: Sequence[str]) -> int:
     args = parser.parse_args(argv)
     try:
         report = validate_results(
-            Path(args.matrix_root),
-            Path(args.evaluation_root),
-            Path(args.capacity_root),
+            Path(args.matrix_root), Path(args.evaluation_root), Path(args.capacity_root)
         )
-        publish_validation_outputs(
-            report, Path(args.output_manifest), Path(args.output_summary)
-        )
+        publish_validation_outputs(report, args.output_manifest, args.output_summary)
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(_report_payload(report), allow_nan=False, sort_keys=True))

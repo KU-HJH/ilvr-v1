@@ -234,7 +234,7 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
     )
     first.trainer.collect_stage1_diagnostics = True
     first.trainer.args.save_total_limit = 2
-    first.trainer.train()
+    first_result = first.trainer.train()
     checkpoint = paths.checkpoint_dir / f"checkpoint-{args.initial_steps}"
     if (
         int(first.trainer.state.global_step) != args.initial_steps
@@ -295,7 +295,7 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
     resumed_args.deepspeed_runtime_profile = profile
     resumed = _build_resumed_stage1_components(args=resumed_args, profile=profile)
     resumed.trainer.collect_stage1_diagnostics = True
-    resumed.trainer.train(resume_from_checkpoint=str(checkpoint))
+    resumed_result = resumed.trainer.train(resume_from_checkpoint=str(checkpoint))
     if int(resumed.trainer.state.global_step) != args.resumed_steps:
         raise AssertionError(
             "Stage 1 resume did not advance from step "
@@ -305,13 +305,35 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
         raise AssertionError("Stage 1 resumed phase did not apply exactly one step")
 
     local_record = {
+        "rank": _rank(),
         "initial_global_step": args.initial_steps,
         "resumed_global_step": int(resumed.trainer.state.global_step),
+        "initial_optimizer_steps": first.trainer._successful_optimizer_steps,
+        "resumed_optimizer_steps": resumed.trainer._successful_optimizer_steps,
+        "first_loss": float(first_result.training_loss),
+        "resumed_loss": float(resumed_result.training_loss),
         "finite_gradient_norm": math.isfinite(observed_norm),
-        "successful_steps": args.resumed_steps,
+        "representative_gradient_norm": observed_norm,
+        "method_artifact": (
+            "full" if args.method == "full" else f"peft-{args.method}"
+        ),
+        "worker_error": None,
     }
     records = _collect_records(local_record)
-    if any(record != records[0] for record in records[1:]):
+    if [record["rank"] for record in records] != list(range(len(records))):
+        raise AssertionError(f"Stage 1 process ranks are incomplete: {records}")
+    if any(
+        record["initial_global_step"] != args.initial_steps
+        or record["resumed_global_step"] != args.resumed_steps
+        or record["initial_optimizer_steps"] != args.initial_steps
+        or record["resumed_optimizer_steps"] != 1
+        or not math.isfinite(record["first_loss"])
+        or not math.isfinite(record["resumed_loss"])
+        or not record["finite_gradient_norm"]
+        or not math.isfinite(record["representative_gradient_norm"])
+        or record["worker_error"] is not None
+        for record in records
+    ):
         raise AssertionError(f"Stage 1 ranks disagreed on lifecycle: {records}")
 
     witness = {
@@ -322,12 +344,21 @@ def run_zero_compat(args: argparse.Namespace) -> dict[str, object]:
         "world_size": profile.world_size,
         "method": args.method,
         "artifact_kind": artifact_kind.value,
+        "method_artifact": (
+            "full" if args.method == "full" else f"peft-{args.method}"
+        ),
         "adapter_checkpoint_present": adapter_checkpoint_present,
         "initial_global_step": args.initial_steps,
         "resumed_global_step": args.resumed_steps,
         "finite_gradient_norm": True,
         "representative_gradient_norm": observed_norm,
         "successful_optimizer_steps": args.resumed_steps,
+        "finite_loss": True,
+        "first_loss": float(first_result.training_loss),
+        "resumed_loss": float(resumed_result.training_loss),
+        "process_ranks": [record["rank"] for record in records],
+        "rank_records": records,
+        "worker_errors": [],
         "checkpoint": str(checkpoint),
         "experiment_id": paths.experiment_id,
     }

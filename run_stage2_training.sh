@@ -133,6 +133,7 @@ MANAGED_OPTIONS=(
   --lora_alpha
   --lora_dropout
   --lora_target_modules
+  --benchmark_evidence_path
 )
 
 reject_managed_arguments() {
@@ -282,6 +283,11 @@ if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
   DEEPSPEED_ARGS+=(--deepspeed_config "$DEEPSPEED_CONFIG")
 fi
 
+EVIDENCE_ARGS=()
+if [[ -n "${BENCHMARK_EVIDENCE_PATH:-}" ]]; then
+  EVIDENCE_ARGS+=(--benchmark_evidence_path "$BENCHMARK_EVIDENCE_PATH")
+fi
+
 TRAINING_ARGS=(
   --stage stage2
   --load_model_path "$STAGE1_CHECKPOINT"
@@ -300,6 +306,7 @@ TRAINING_ARGS=(
   "${TUNING_ARGS[@]}"
   "${RESUME_ARGS[@]}"
   "${DEEPSPEED_ARGS[@]}"
+  "${EVIDENCE_ARGS[@]}"
   "$@"
 )
 

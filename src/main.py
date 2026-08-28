@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -501,6 +502,53 @@ def run_stage1(args):
     )
 
 
+def publish_stage2_training_evidence(args, *, trainer, train_result, profile):
+    """Publish only rank-local values observed by a completed Stage 2 trainer."""
+    evidence_path = getattr(args, "benchmark_evidence_path", None)
+    if evidence_path is None:
+        return None
+    global_step = trainer.state.global_step
+    optimizer_step = trainer._observed_optimizer_step
+    gradient_norm = trainer._representative_gradient_norm
+    loss = train_result.training_loss
+    if type(global_step) is not int or global_step <= 0:
+        raise ValueError("Stage 2 producer requires an observed positive global step")
+    if type(optimizer_step) is not int or optimizer_step != global_step:
+        raise ValueError("Stage 2 producer optimizer/global step disagreement")
+    if type(loss) not in (int, float) or not math.isfinite(loss):
+        raise ValueError("Stage 2 producer requires an observed finite loss")
+    if type(gradient_norm) not in (int, float) or not math.isfinite(gradient_norm):
+        raise ValueError("Stage 2 producer requires an observed finite gradient")
+    output = Path(args.save_model_path)
+    checkpoint = output / f"checkpoint-{global_step}"
+    if checkpoint.is_symlink() or not checkpoint.is_dir():
+        raise ValueError("Stage 2 producer requires its numbered checkpoint")
+    method = args.tuning_method
+    artifact_kind = "full" if method == "full" else f"peft-{method}"
+    try:
+        rank = int(os.environ.get("RANK", "0"))
+    except ValueError as error:
+        raise ValueError("Stage 2 producer RANK is invalid") from error
+    from stage2.evidence import publish_stage2_producer_evidence
+
+    return publish_stage2_producer_evidence(
+        evidence_path,
+        run_id=output.name,
+        method=method,
+        zero_stage=profile.zero_stage,
+        checkpoint_path=checkpoint,
+        artifact_kind=artifact_kind,
+        local_rank_record={
+            "rank": rank,
+            "global_step": global_step,
+            "optimizer_step": optimizer_step,
+            "loss": float(loss),
+            "gradient_norm": float(gradient_norm),
+            "worker_error": None,
+        },
+    )
+
+
 def run_stage2(args):
     """Run the existing Stage 2 path without importing Stage 1 Trainer code."""
 
@@ -517,7 +565,12 @@ def run_stage2(args):
         stage2_peft_metadata=components.peft_metadata,
         deepspeed_runtime_profile=profile,
     )
-    trainer.train(resume_from_checkpoint=components.trainer_resume_path)
+    train_result = trainer.train(
+        resume_from_checkpoint=components.trainer_resume_path
+    )
+    publish_stage2_training_evidence(
+        args, trainer=trainer, train_result=train_result, profile=profile
+    )
     if args.save_final_model:
         trainer.save_model(args.save_model_path)
         if trainer.is_world_process_zero():

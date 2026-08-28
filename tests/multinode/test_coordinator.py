@@ -32,6 +32,7 @@ from src.multinode_runtime import (
     write_incomplete_attempt,
     write_training_witness,
 )
+from stage2.evidence import build_stage2_producer_evidence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -492,6 +493,41 @@ def test_stage2_forwards_only_allowlisted_environment_and_safe_arguments():
     assert "STAGE2_DRY_RUN" not in effective
 
 
+def test_stage2_coordinator_owns_a_fresh_producer_evidence_path():
+    """Catches Stage 2 returning to Task 5's intentionally incomplete state."""
+    launch_plan = plan(stage="stage2", method="dora")
+    producer = Path(
+        "/root/workspace/ILVR/results/stage2-dora-zero3-four-gpu/"
+        "initial-producer-evidence.json"
+    )
+    environment = validated_stage2_environment(
+        {
+            "STAGE1_CHECKPOINT": "/models/stage1",
+            "DATA_PATH": "/data/train.jsonl",
+            "IMAGE_ROOT": "/data/images",
+            "TUNING_METHOD": "dora",
+        },
+        output_dir=f"/root/workspace/ILVR/checkpoints/{launch_plan.run_id}",
+        log_file=(
+            "/root/workspace/ILVR/logs/zero-stage-compatibility/"
+            f"{launch_plan.run_id}/initial-train.log"
+        ),
+        deepspeed_config=str(launch_plan.deepspeed_config),
+        benchmark_evidence_path=str(producer),
+    )
+
+    commands = build_owned_tmux_commands(
+        launch_plan,
+        commit="a" * 40,
+        stage_environment=environment,
+    )
+
+    assert commands.finite_loss_evidence_path == producer
+    assert dict(commands.node_specs[0].environment)[
+        "BENCHMARK_EVIDENCE_PATH"
+    ] == str(producer)
+
+
 def test_stage1_rejects_any_environment_override():
     with pytest.raises(ValueError, match="does not accept"):
         build_owned_tmux_commands(
@@ -562,6 +598,56 @@ def test_witness_never_invents_missing_finite_loss_evidence(tmp_path):
             batch_per_gpu=2,
             finite_loss_evidence_path=producer,
         )
+
+
+def test_stage2_training_witness_revalidates_finite_gradient_and_rank_evidence(
+    tmp_path,
+):
+    """Catches Task 5 accepting an aggregate-only Stage 2 producer file."""
+    launch_plan = plan(stage="stage2", method="dora")
+    checkpoint_root = tmp_path / "checkpoints" / launch_plan.run_id
+    checkpoint = checkpoint_root / "checkpoint-3"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
+    records = [
+        {
+            "rank": rank,
+            "global_step": 3,
+            "optimizer_step": 3,
+            "loss": 0.25 + rank,
+            "gradient_norm": 1.0 + rank,
+            "worker_error": None,
+        }
+        for rank in range(4)
+    ]
+    producer = tmp_path / "producer.json"
+    producer.write_text(
+        json.dumps(
+            build_stage2_producer_evidence(
+                run_id=launch_plan.run_id,
+                method="dora",
+                zero_stage=3,
+                checkpoint_path=checkpoint,
+                artifact_kind="peft-dora",
+                rank_records=records,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    witness = write_training_witness(
+        launch_plan,
+        result_root=tmp_path / "results",
+        exit_codes={0: 0, 1: 0},
+        checkpoint_path=checkpoint_root,
+        batch_per_gpu=1,
+        finite_loss_evidence_path=producer,
+    )
+
+    reference = json.loads(witness.read_text())["finite_loss_evidence"]
+    assert reference["finite_loss"] is True
+    assert reference["finite_gradient"] is True
+    assert reference["process_ranks"] == [0, 1, 2, 3]
 
 
 def test_witness_rejects_a_missing_checkpoint_reference(tmp_path):

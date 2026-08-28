@@ -296,6 +296,8 @@ def _validate_rank_lifecycle_records(
             "Stage 2 rank global steps disagree with the requested lifecycle: "
             f"{records}"
         )
+    if {record["optimizer_step"] for record in records} != {resumed_steps}:
+        raise AssertionError(f"Stage 2 optimizer steps disagree: {records}")
     losses = [
         float(record[field])
         for record in records
@@ -303,6 +305,13 @@ def _validate_rank_lifecycle_records(
     ]
     if not losses or not all(math.isfinite(loss) for loss in losses):
         raise AssertionError(f"Stage 2 ranks did not report finite losses: {records}")
+    gradients = [record["gradient_norm"] for record in records]
+    if not all(type(value) in (int, float) and math.isfinite(value) for value in gradients):
+        raise AssertionError(f"Stage 2 ranks did not report finite gradients: {records}")
+    if [record["rank"] for record in records] != list(range(len(records))):
+        raise AssertionError(f"Stage 2 process ranks are incomplete: {records}")
+    if any(record["worker_error"] is not None for record in records):
+        raise AssertionError(f"Stage 2 rank reported a worker error: {records}")
 
 
 def _is_world_process_zero() -> bool:
@@ -539,6 +548,7 @@ def run_harness(
     experiment_id: str,
     deepspeed: str | None,
     tuning_method: str,
+    zero_stage: int | None = None,
     initial_steps: int = 1,
     resumed_steps: int = 2,
 ):
@@ -548,6 +558,8 @@ def run_harness(
     runtime_profile = load_deepspeed_runtime_profile(
         deepspeed, world_size=int(os.environ.get("WORLD_SIZE", "1"))
     )
+    if zero_stage is not None and runtime_profile.zero_stage != zero_stage:
+        raise ValueError("--zero-stage must match the canonical DeepSpeed config")
     dataset = TinyStage2Dataset(build_rank_local_tiny_prepared_example(output_dir))
     tuning = _tuning_config(tuning_method)
     first_model = _build_tuned_model(tuning)
@@ -613,6 +625,9 @@ def run_harness(
         deepspeed_runtime_profile=runtime_profile,
     )
     resumed_result = resumed_trainer.train(resume_from_checkpoint=str(checkpoint))
+    resumed_optimizer_step = _find_optimizer_step(
+        resumed_trainer.optimizer.state_dict()
+    )
 
     final_trainable = _snapshot_trainable_parameters(resumed_model)
     adapter_parameters_changed = (
@@ -627,10 +642,14 @@ def run_harness(
 
     rank_records = _collect_rank_records(
         {
+            "rank": resolve_launcher_rank(),
             "first_global_step": first_global_step,
             "resumed_global_step": int(resumed_trainer.state.global_step),
+            "optimizer_step": resumed_optimizer_step,
             "first_loss": float(first_result.training_loss),
             "resumed_loss": float(resumed_result.training_loss),
+            "gradient_norm": resumed_trainer._representative_gradient_norm,
+            "worker_error": None,
             "first_batches": first_collator.local_batch_sizes,
             "resumed_batches": resumed_collator.local_batch_sizes,
             "optimizer_step_at_resume": resumed_recorder.optimizer_step,
@@ -659,7 +678,14 @@ def run_harness(
         record["base_trainable_parameters"] for record in rank_records
     }
     deepspeed_config, deepspeed_zero_stage = _deepspeed_identity(deepspeed)
+    artifact_kind = "full" if tuning.method == "full" else f"peft-{tuning.method}"
     witness = {
+        "schema_version": 1,
+        "stage": "stage2",
+        "method": tuning.method,
+        "zero_stage": runtime_profile.zero_stage,
+        "config_digest": runtime_profile.config_digest,
+        "artifact_kind": artifact_kind,
         "tuning_method": tuning.method,
         "first_global_step": first_global_step,
         "resumed_global_step": int(resumed_trainer.state.global_step),
@@ -671,6 +697,11 @@ def run_harness(
         ],
         "rank_first_losses": [record["first_loss"] for record in rank_records],
         "rank_resumed_losses": [record["resumed_loss"] for record in rank_records],
+        "rank_records": rank_records,
+        "process_ranks": [record["rank"] for record in rank_records],
+        "finite_loss": True,
+        "finite_gradient": True,
+        "worker_errors": [],
         "optimizer_state_restored": optimizer_steps == {initial_steps},
         "scheduler_state_restored": scheduler_steps == {initial_steps},
         "optimizer_step_at_resume": next(iter(optimizer_steps))
@@ -732,6 +763,7 @@ def build_tiny_stage2_parser() -> argparse.ArgumentParser:
     parser = _LifecycleParser()
     parser.add_argument("--experiment-id", required=True)
     parser.add_argument("--deepspeed")
+    parser.add_argument("--zero-stage", type=int, choices=(1, 2, 3))
     parser.add_argument(
         "--tuning-method", choices=("full", "lora", "dora"), default="full"
     )
@@ -750,6 +782,7 @@ def main():
         experiment_id=args.experiment_id,
         deepspeed=args.deepspeed,
         tuning_method=args.tuning_method,
+        zero_stage=args.zero_stage,
         initial_steps=args.initial_steps,
         resumed_steps=args.resumed_steps,
     )

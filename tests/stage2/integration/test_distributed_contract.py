@@ -18,11 +18,18 @@ if _platform_python_version().endswith("+"):
 
 from main import (
     build_stage2_training_arguments,
+    publish_stage2_training_evidence,
     validate_stage2_distributed_settings,
 )
 
 platform.python_version = _platform_python_version
 from stage2.data import Stage2DataCollator
+from stage2.evidence import (
+    build_stage2_producer_evidence,
+    decode_stage2_producer_evidence,
+    publish_stage2_producer_evidence,
+)
+from stage2.trainer import Stage2Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
     parse_latent_spans,
@@ -38,6 +45,173 @@ from stage2_rank_skew_probe import (
 REPO_ROOT = Path(__file__).resolve().parents[3]
 HARNESS_PATH = REPO_ROOT / "tests/stage2/integration/tiny_stage2_train.py"
 TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
+
+
+def _producer_rank(rank: int) -> dict[str, object]:
+    return {
+        "rank": rank,
+        "global_step": 3,
+        "optimizer_step": 3,
+        "loss": 0.25 + rank,
+        "gradient_norm": 1.5 + rank,
+        "worker_error": None,
+    }
+
+
+def test_stage2_producer_evidence_requires_observed_finite_values_on_all_ranks(
+    tmp_path,
+):
+    """Catches the normal Stage 2 path manufacturing aggregate success fields."""
+    checkpoint = tmp_path / "checkpoints" / "stage2-run" / "checkpoint-3"
+    checkpoint.mkdir(parents=True)
+    payload = build_stage2_producer_evidence(
+        run_id="stage2-run",
+        method="dora",
+        zero_stage=3,
+        checkpoint_path=checkpoint,
+        artifact_kind="peft-dora",
+        rank_records=[_producer_rank(rank) for rank in range(4)],
+    )
+
+    decoded = decode_stage2_producer_evidence(
+        json.dumps(payload).encode(),
+        expected_run_id="stage2-run",
+        expected_method="dora",
+        expected_zero_stage=3,
+        expected_checkpoint=checkpoint,
+        expected_global_step=3,
+    )
+    assert decoded["world_size"] == 4
+    assert decoded["process_ranks"] == [0, 1, 2, 3]
+    assert decoded["finite_loss"] is True
+    assert decoded["finite_gradient"] is True
+
+    bad = [_producer_rank(rank) for rank in range(4)]
+    bad[2]["gradient_norm"] = float("nan")
+    with pytest.raises(ValueError, match="finite gradient"):
+        build_stage2_producer_evidence(
+            run_id="stage2-run",
+            method="dora",
+            zero_stage=3,
+            checkpoint_path=checkpoint,
+            artifact_kind="peft-dora",
+            rank_records=bad,
+        )
+
+
+def test_stage2_producer_publication_propagates_writer_failure(tmp_path):
+    """Catches non-writer ranks claiming success after rank-zero publication fails."""
+    checkpoint = tmp_path / "checkpoints" / "stage2-run" / "checkpoint-3"
+    checkpoint.mkdir(parents=True)
+    path = tmp_path / "producer.json"
+    records = [_producer_rank(rank) for rank in range(4)]
+
+    with pytest.raises(RuntimeError, match="rank zero"):
+        publish_stage2_producer_evidence(
+            path,
+            run_id="stage2-run",
+            method="full",
+            zero_stage=2,
+            checkpoint_path=checkpoint,
+            artifact_kind="full",
+            local_rank_record=records[1],
+            gather_records=lambda _record: records,
+            is_writer=False,
+            failure_counter=lambda _failed: 1,
+            synchronize=lambda: None,
+        )
+    assert not path.exists()
+
+
+def test_stage2_trainer_records_a_finite_representative_trainable_gradient():
+    """Catches Stage 2 producer evidence having no observed gradient source."""
+    trainer = object.__new__(Stage2Trainer)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1))
+    model[0].weight.requires_grad_(False)
+    model(torch.ones(1, 2)).sum().backward()
+
+    trainer._record_representative_gradient_norm(model)
+
+    assert math.isfinite(trainer._representative_gradient_norm)
+    assert trainer._representative_gradient_norm > 0
+
+
+def test_normal_stage2_path_passes_only_observed_rank_metrics_to_producer(
+    tmp_path, monkeypatch
+):
+    """Catches normal Stage 2 publishing fields not observed by its trainer."""
+    output = tmp_path / "stage2-run"
+    checkpoint = output / "checkpoint-3"
+    checkpoint.mkdir(parents=True)
+    evidence = tmp_path / "producer.json"
+    captured = {}
+
+    def record_publish(path, **kwargs):
+        captured["path"] = Path(path)
+        captured.update(kwargs)
+        return {"finite_loss": True, "finite_gradient": True}
+
+    monkeypatch.setattr("stage2.evidence.publish_stage2_producer_evidence", record_publish)
+    monkeypatch.setenv("RANK", "2")
+    trainer = SimpleNamespace(
+        state=SimpleNamespace(global_step=3),
+        _observed_optimizer_step=3,
+        _representative_gradient_norm=1.75,
+    )
+    result = SimpleNamespace(training_loss=0.625)
+    args = SimpleNamespace(
+        save_model_path=str(output),
+        benchmark_evidence_path=str(evidence),
+        tuning_method="dora",
+    )
+
+    publish_stage2_training_evidence(
+        args,
+        trainer=trainer,
+        train_result=result,
+        profile=SimpleNamespace(zero_stage=3),
+    )
+
+    assert captured["path"] == evidence
+    assert captured["run_id"] == "stage2-run"
+    assert captured["checkpoint_path"] == checkpoint
+    assert captured["artifact_kind"] == "peft-dora"
+    assert captured["local_rank_record"] == {
+        "rank": 2,
+        "global_step": 3,
+        "optimizer_step": 3,
+        "loss": 0.625,
+        "gradient_norm": 1.75,
+        "worker_error": None,
+    }
+
+
+def test_normal_stage2_evidence_rejects_optimizer_global_step_disagreement(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "stage2-run"
+    (output / "checkpoint-3").mkdir(parents=True)
+    args = SimpleNamespace(
+        save_model_path=str(output),
+        benchmark_evidence_path=str(tmp_path / "producer.json"),
+        tuning_method="full",
+    )
+    trainer = SimpleNamespace(
+        state=SimpleNamespace(global_step=3),
+        _observed_optimizer_step=2,
+        _representative_gradient_norm=1.0,
+    )
+    monkeypatch.setattr(
+        "stage2.evidence.publish_stage2_producer_evidence",
+        lambda *args, **kwargs: {"finite_loss": True},
+    )
+    with pytest.raises(ValueError, match="optimizer/global step"):
+        publish_stage2_training_evidence(
+            args,
+            trainer=trainer,
+            train_result=SimpleNamespace(training_loss=0.5),
+            profile=SimpleNamespace(zero_stage=2),
+        )
 
 
 def four_gpu_env(rank):
@@ -307,8 +481,10 @@ def test_rank_skew_harness_has_no_arbitrary_generated_path_arguments():
 
 def _tiny_rank_record(**overrides):
     record = {
+        "rank": 0,
         "first_global_step": 1,
         "resumed_global_step": 2,
+        "optimizer_step": 2,
         "first_loss": 0.25,
         "resumed_loss": 0.20,
         "first_batches": [1],
@@ -318,6 +494,8 @@ def _tiny_rank_record(**overrides):
         "adapter_parameters_changed": True,
         "visual_trainable_parameters": 0,
         "base_trainable_parameters": 0,
+        "gradient_norm": 1.0,
+        "worker_error": None,
     }
     record.update(overrides)
     return record
@@ -333,7 +511,10 @@ def _tiny_rank_record(**overrides):
 def test_tiny_stage2_rejects_rank_lifecycle_disagreement(second_override, message):
     """Catches one rank's bad step or loss being hidden by rank-zero scalars."""
     harness = _load_harness_module()
-    records = [_tiny_rank_record(), _tiny_rank_record(**second_override)]
+    records = [
+        _tiny_rank_record(rank=0),
+        _tiny_rank_record(rank=1, **second_override),
+    ]
 
     with pytest.raises(AssertionError, match=message):
         harness._validate_rank_lifecycle_records(records)

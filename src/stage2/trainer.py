@@ -1,12 +1,13 @@
 """Thin Hugging Face Trainer adapter for Stage 2 model-native loss."""
 
 import os
+import math
 import tempfile
 from pathlib import Path
 
 import torch
 from peft import PeftModel
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 
@@ -27,6 +28,15 @@ from stage1.token_rows import (
     save_sparse_token_rows,
     sparse_token_rows_are_partitioned,
 )
+
+
+class _ObservedOptimizerStep(TrainerCallback):
+    def __init__(self, owner):
+        self.owner = owner
+
+    def on_step_end(self, args, state, control, **kwargs):
+        del args, control, kwargs
+        self.owner._observed_optimizer_step = int(state.global_step)
 
 
 class Stage2Trainer(Trainer):
@@ -64,7 +74,34 @@ class Stage2Trainer(Trainer):
         self.stage2_peft_metadata = stage2_peft_metadata
         self.stage2_sampler_identity: Stage2SamplerIdentity | None = None
         self._stage2_train_sampler: LatentBlockBalancedSampler | None = None
+        self._representative_gradient_norm: float | None = None
+        self._observed_optimizer_step: int | None = None
+        callbacks = list(kwargs.pop("callbacks", ()) or ())
+        callbacks.append(_ObservedOptimizerStep(self))
+        kwargs["callbacks"] = callbacks
         super().__init__(*args, **kwargs)
+
+    def _record_representative_gradient_norm(self, model) -> None:
+        squared_norm = 0.0
+        observed = False
+        for parameter in model.parameters():
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            local_norm = float(parameter.grad.detach().float().norm(2).cpu().item())
+            if not math.isfinite(local_norm):
+                self._representative_gradient_norm = float("nan")
+                return
+            squared_norm += local_norm * local_norm
+            observed = True
+        if observed:
+            self._representative_gradient_norm = math.sqrt(squared_norm)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(
+            model, inputs, num_items_in_batch=num_items_in_batch
+        )
+        self._record_representative_gradient_norm(model)
+        return loss
 
     def _publish_deepspeed_runtime_identity(
         self, directory: Path, *, label: str

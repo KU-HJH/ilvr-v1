@@ -851,6 +851,7 @@ _STAGE2_ENVIRONMENT_ALLOWLIST = {
     "GRADIENT_CHECKPOINTING",
     "MAX_SEQUENCE_LENGTH",
     "RESUME_CHECKPOINT",
+    "BENCHMARK_EVIDENCE_PATH",
 }
 _STAGE2_REQUIRED_ENVIRONMENT = {"STAGE1_CHECKPOINT", "DATA_PATH", "IMAGE_ROOT"}
 
@@ -861,6 +862,7 @@ def validated_stage2_environment(
     output_dir: str,
     log_file: str,
     deepspeed_config: str,
+    benchmark_evidence_path: str | None = None,
 ) -> dict[str, str]:
     """Copy only the existing approved Stage 2 knobs and owned artifact values."""
     result = {
@@ -880,6 +882,11 @@ def validated_stage2_environment(
             "DEEPSPEED_CONFIG": deepspeed_config,
         }
     )
+    if benchmark_evidence_path is not None:
+        evidence = Path(benchmark_evidence_path)
+        if not evidence.is_absolute() or ".." in evidence.parts:
+            raise ValueError("Stage 2 producer evidence path must be absolute")
+        result["BENCHMARK_EVIDENCE_PATH"] = str(evidence)
     _validated_command(("stage2-environment",), result)
     return result
 
@@ -1346,13 +1353,18 @@ def _node_shell_command(
     stage_command: tuple[str, ...],
     environment: Mapping[str, str],
     log_root: Path,
+    require_bash_launcher: bool = True,
 ) -> tuple[tuple[str, ...], str, OwnedNodeCommand]:
     repository = plan.cluster.remote_repo_root
     attempt_directory = log_root / plan.run_id / plan.attempt_id
     ownership_path = attempt_directory / f"ownership-rank{machine_rank}.json"
     exit_path = attempt_directory / f"exit-rank{machine_rank}.json"
-    if len(stage_command) < 2 or stage_command[0] != "/usr/bin/bash":
+    if require_bash_launcher and (
+        len(stage_command) < 2 or stage_command[0] != "/usr/bin/bash"
+    ):
         raise ValueError("Stage launcher must be an explicit /usr/bin/bash command")
+    if not require_bash_launcher and not stage_command:
+        raise ValueError("owned lifecycle harness command must be nonempty")
     supervisor_command = [
         str(repository / "venv" / "ilvr-venv" / "bin" / "python"),
         "-m",
@@ -1392,6 +1404,122 @@ def _node_shell_command(
             ownership_path=ownership_path,
             exit_path=exit_path,
         ),
+    )
+
+
+def build_owned_lifecycle_harness_commands(
+    plan: "LaunchPlan",
+    *,
+    commit: str,
+    harness_path: str | Path | None = None,
+    harness_arguments: Sequence[str] | None = None,
+    log_root: str | Path = _LOG_ROOT,
+) -> OwnedTmuxCommands:
+    """Build one exact two-node Accelerate job for an approved tiny harness."""
+    from src.multinode import LaunchPlan
+
+    if not isinstance(plan, LaunchPlan):
+        raise TypeError("plan must be a LaunchPlan")
+    if plan.attempt_id != "lifecycle":
+        raise ValueError("lifecycle harness plan requires attempt_id=lifecycle")
+    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        raise ValueError("commit must be a lowercase 40-character Git object ID")
+    repository = plan.cluster.remote_repo_root
+    expected_harness = repository / (
+        "tests/stage1/zero_compat_diagnostic.py"
+        if plan.stage == "stage1"
+        else "tests/stage2/integration/tiny_stage2_train.py"
+    )
+    selected_harness = expected_harness if harness_path is None else Path(harness_path)
+    if selected_harness != expected_harness:
+        raise ValueError("lifecycle command must use the approved harness path")
+    method_flag = "--method" if plan.stage == "stage1" else "--tuning-method"
+    expected_arguments = (
+        "--zero-stage",
+        str(plan.zero_stage),
+        method_flag,
+        plan.tuning_method,
+        "--deepspeed",
+        str(plan.deepspeed_config),
+        "--experiment-id",
+        plan.run_id,
+        "--initial-steps",
+        "2",
+        "--resumed-steps",
+        "3",
+    )
+    selected_arguments = (
+        expected_arguments
+        if harness_arguments is None
+        else tuple(harness_arguments)
+    )
+    if selected_arguments != expected_arguments:
+        raise ValueError("lifecycle command requires the exact harness arguments")
+
+    node_commands: list[tuple[str, ...]] = []
+    digests: list[str] = []
+    node_specs: list[OwnedNodeCommand] = []
+    for machine_rank in (plan.cluster.remote_rank, plan.cluster.local_rank):
+        environment = {
+            **_MINIMAL_EXEC_ENVIRONMENT,
+            **_distributed_environment(plan, machine_rank),
+            "MASTER_ADDR": plan.cluster.master_addr,
+            "GLOO_SOCKET_IFNAME": plan.cluster.socket_ifname,
+            "NCCL_SOCKET_IFNAME": plan.cluster.socket_ifname,
+            "PYTHONPATH": f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}",
+            "ILVR_REPOSITORY_COMMIT": commit,
+        }
+        harness_command = (
+            str(repository / "venv/ilvr-venv/bin/accelerate"),
+            "launch",
+            "--num_machines",
+            str(plan.cluster.num_machines),
+            "--num_processes",
+            str(plan.cluster.num_processes),
+            "--machine_rank",
+            str(machine_rank),
+            "--main_process_ip",
+            plan.cluster.master_addr,
+            "--main_process_port",
+            str(plan.main_process_port),
+            "--mixed_precision",
+            "bf16",
+            "--use_deepspeed",
+            "--deepspeed_config_file",
+            str(plan.deepspeed_config),
+            str(selected_harness),
+            *selected_arguments,
+        )
+        supervisor, digest, node_spec = _node_shell_command(
+            plan,
+            machine_rank=machine_rank,
+            commit=commit,
+            stage_command=harness_command,
+            environment=environment,
+            log_root=Path(log_root),
+            require_bash_launcher=False,
+        )
+        session = f"ilvr-{plan.run_id}-{plan.attempt_id}-rank{machine_rank}"
+        tmux = (
+            "/usr/bin/tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "--",
+            *supervisor,
+        )
+        node_commands.append(
+            tuple(build_remote_exec(tmux)) if machine_rank == 0 else tmux
+        )
+        digests.append(digest)
+        node_specs.append(node_spec)
+    return OwnedTmuxCommands(
+        remote=node_commands[0],
+        local=node_commands[1],
+        command_digests=(digests[0], digests[1]),
+        node_specs=(node_specs[0], node_specs[1]),
+        finite_loss_evidence_path=None,
     )
 
 
@@ -1464,7 +1592,6 @@ def build_owned_tmux_commands(
             *stage_owned_arguments,
         )
     else:
-        finite_loss_evidence_path = None
         forwarded = validate_stage2_arguments(stage_arguments)
         approved_stage2_names = _STAGE2_ENVIRONMENT_ALLOWLIST | {
             "OUTPUT_DIR",
@@ -1482,6 +1609,10 @@ def build_owned_tmux_commands(
         if missing:
             raise ValueError(f"missing required Stage 2 environment: {', '.join(missing)}")
         base_environment = supplied_environment
+        evidence_value = supplied_environment.get("BENCHMARK_EVIDENCE_PATH")
+        finite_loss_evidence_path = (
+            Path(evidence_value) if evidence_value is not None else None
+        )
         stage_command = (
             "/usr/bin/bash",
             str(repository / "run_stage2_training.sh"),
@@ -1571,12 +1702,19 @@ class SubprocessCoordinatorRunner:
         commands: OwnedTmuxCommands,
         commit: str,
         log_root: str | Path = _LOG_ROOT,
+        checkpoint_root: str | Path = _CHECKPOINT_ROOT,
         command_runner: CommandRunner = _subprocess_command_runner,
     ) -> None:
         self.plan = plan
         self.commands = commands
         self.commit_value = commit
         self.log_root = Path(log_root)
+        self.checkpoint_root = Path(checkpoint_root)
+        if self.checkpoint_root not in (
+            _CHECKPOINT_ROOT,
+            _CHECKPOINT_ROOT / "zero-stage-compatibility",
+        ):
+            raise ValueError("coordinator checkpoint root is not approved")
         self.command_runner = command_runner
         self.serialized_plan: SerializedLaunchPlan | None = None
         self._seen_ownership: set[int] = set()
@@ -1924,7 +2062,7 @@ class SubprocessCoordinatorRunner:
         ):
             raise ValueError("artifact identity differs from the coordinator plan")
         expected_checkpoint = (
-            _CHECKPOINT_ROOT
+            self.checkpoint_root
             / self.plan.run_id
             / f"checkpoint-{identity['global_step']}"
         )
@@ -1936,6 +2074,8 @@ class SubprocessCoordinatorRunner:
             str(checkpoint_path),
             "--run-id",
             self.plan.run_id,
+            "--checkpoint-root",
+            str(self.checkpoint_root),
             "--node-rank",
             str(machine_rank),
             "--runtime-identity-json",
@@ -1977,7 +2117,7 @@ class SubprocessCoordinatorRunner:
         if identity["run_id"] != self.plan.run_id:
             raise ValueError("canonical artifact identity run ID mismatch")
         expected_checkpoint = (
-            _CHECKPOINT_ROOT
+            self.checkpoint_root
             / self.plan.run_id
             / f"checkpoint-{identity['global_step']}"
         )
@@ -1989,6 +2129,8 @@ class SubprocessCoordinatorRunner:
             str(checkpoint_path),
             "--run-id",
             self.plan.run_id,
+            "--checkpoint-root",
+            str(self.checkpoint_root),
             "--node-rank",
             "0",
             "--runtime-identity-json",
@@ -2028,7 +2170,7 @@ class SubprocessCoordinatorRunner:
 
         identity = validate_runtime_identity(runtime_identity)
         expected = (
-            _CHECKPOINT_ROOT
+            self.checkpoint_root
             / self.plan.run_id
             / f"checkpoint-{identity['global_step']}"
         )
@@ -2039,6 +2181,8 @@ class SubprocessCoordinatorRunner:
             str(checkpoint_path),
             "--run-id",
             self.plan.run_id,
+            "--checkpoint-root",
+            str(self.checkpoint_root),
             "--runtime-identity-json",
             json.dumps(
                 identity,
@@ -2105,6 +2249,8 @@ class SubprocessCoordinatorRunner:
             str(destination),
             "--run-id",
             self.plan.run_id,
+            "--checkpoint-root",
+            str(self.checkpoint_root),
         )
         self._run(_build_remote_stdin_exec(command), input_bytes=encoded)
 
@@ -2149,7 +2295,7 @@ class SubprocessCoordinatorRunner:
             raise ValueError("resume destination must be immediate checkpoint-N")
         physical = validate_checkpoint_directory(
             destination,
-            checkpoint_root=_CHECKPOINT_ROOT,
+            checkpoint_root=self.checkpoint_root,
             run_id=self.plan.run_id,
             global_step=int(match.group(1)),
         )
@@ -2831,17 +2977,61 @@ def monitor_owned_jobs(
     return exits
 
 
-def _finite_loss_reference(path: Path | None) -> dict[str, object]:
+def _finite_loss_reference(
+    path: Path | None,
+    *,
+    plan: "LaunchPlan" | None = None,
+    checkpoint_root: Path | None = None,
+) -> dict[str, object]:
     if path is None:
         raise ValueError("finite loss evidence is required for a successful attempt")
     try:
         raw = _read_regular_file(path)
     except (OSError, ValueError) as error:
         raise ValueError("finite loss evidence must be a trusted regular file") from error
+    def reject_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("finite loss evidence contains a duplicate field")
+            result[key] = value
+        return result
+
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw, object_pairs_hook=reject_duplicates)
     except json.JSONDecodeError as error:
         raise ValueError("finite loss evidence is invalid JSON") from error
+    if plan is not None and plan.stage == "stage2":
+        if type(payload) is not dict:
+            raise ValueError("Stage 2 producer evidence must be a JSON object")
+        global_step = payload.get("global_step")
+        producer_checkpoint = payload.get("checkpoint_path")
+        if type(global_step) is not int or type(producer_checkpoint) is not str:
+            raise ValueError("Stage 2 producer evidence identity is invalid")
+        from stage2.evidence import decode_stage2_producer_evidence
+
+        decoded = decode_stage2_producer_evidence(
+            raw,
+            expected_run_id=plan.run_id,
+            expected_method=plan.tuning_method,
+            expected_zero_stage=plan.zero_stage,
+            expected_checkpoint=producer_checkpoint,
+            expected_global_step=global_step,
+        )
+        if (
+            checkpoint_root is None
+            or Path(decoded["checkpoint_path"]).parent != checkpoint_root
+        ):
+            raise ValueError("Stage 2 producer checkpoint differs from training output")
+        return {
+            "status": "validated",
+            "path": str(path),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size": len(raw),
+            "finite_loss": True,
+            "finite_gradient": True,
+            "process_ranks": [0, 1, 2, 3],
+        }
     evidence = payload.get("benchmark_evidence", payload) if type(payload) is dict else None
     if type(evidence) is not dict or evidence.get("finite_loss") is not True:
         raise ValueError("finite loss evidence does not prove finite loss")
@@ -2930,7 +3120,9 @@ def write_training_witness(
     finite_loss = _finite_loss_reference(
         Path(finite_loss_evidence_path)
         if finite_loss_evidence_path is not None
-        else None
+        else None,
+        plan=plan,
+        checkpoint_root=checkpoint,
     )
     run_directory = _trusted_absolute_path(result_root) / plan.run_id
     path = run_directory / f"{plan.attempt_id}-train-witness.json"
