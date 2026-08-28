@@ -1047,7 +1047,7 @@ class ValidationReport:
     stage2_recommendations: Mapping[str, int]
 ```
 
-Require all 18 `(stage, method, zero_stage)` witnesses, four unique evaluation shard indices and source indices, nine Stage 1 capacity reports whose first candidate is 2, and nine Stage 2 witnesses with batch/GPU 1. Reject non-finite loss or gradient, wrong world size, incomplete ranks, missing numbered step-2 checkpoint/resume step 3, mismatched checkpoint identity/method artifact, and any worker error. Add `python -m src.multinode validate-results` with required `--matrix-root`, `--evaluation-root`, `--capacity-root`, `--output-manifest`, and `--output-summary` flags. Create both outputs exclusively: JSON contains the complete report and Markdown contains matching 3×3 Stage 1/2 recommendation tables.
+Require all 18 `(stage, method, zero_stage)` witnesses, four unique evaluation shard indices and source indices, nine Stage 1 capacity reports whose `attempts[0].batch_per_gpu` is 2 and whose recommendation comes from `recommended_batch_per_gpu`, and nine Stage 2 witnesses with batch/GPU 1. Reject non-finite loss or gradient, wrong world size, incomplete ranks, missing numbered step-2 checkpoint/resume step 3, mismatched checkpoint identity/method artifact, and any worker error. Add `python -m src.multinode validate-results` with required `--matrix-root`, `--evaluation-root`, `--capacity-root`, `--output-manifest`, and `--output-summary` flags. Create both outputs exclusively: JSON contains the complete report and Markdown contains matching 3×3 Stage 1/2 recommendation tables.
 
 - [ ] **Step 6: Run focused matrix tests and dry run**
 
@@ -1359,7 +1359,7 @@ Expected: shard indices 0-3, every source index exactly once, one merged JSONL i
 
 - [ ] **Step 7: Probe Stage 1 capacity and confirm Stage 2 batch 1**
 
-Run the nine Stage 1 capacity probes. Each probe owns one port and uses fresh child run IDs for candidates 2, 4, and 8; candidate 1 is permitted only by the OOM rule:
+Run the nine Stage 1 capacity probes. Each probe owns four distinct ports and uses fresh child run IDs for candidates 2, 4, and 8; candidate 1 is permitted only by the OOM rule and uses the fourth port:
 
 ```bash
 capacity_root="$hardware_result_root/capacity"
@@ -1370,12 +1370,16 @@ case_index=0
 for method in "${methods[@]}"; do
   for zero_stage in "${zero_stages[@]}"; do
     run_id="${hardware_id}-stage1-capacity-${method}-zero${zero_stage}"
+    port_base=$((30000 + case_index * 4))
     ./run_multinode_stage1_batch_probe.sh \
       --run-id "$run_id" \
       --result-root "$capacity_root" \
       --zero-stage "$zero_stage" \
-      --main-process-port "$((30000 + case_index))" \
-      --method "$method" \
+      --tuning-method "$method" \
+      --main-process-port "$port_base" \
+      --main-process-port "$((port_base + 1))" \
+      --main-process-port "$((port_base + 2))" \
+      --main-process-port "$((port_base + 3))" \
       --model /root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct \
       --data-path /root/workspace/ILVR/data/multinode-capacity-subset.jsonl \
       --image-root /root/workspace/ILVR/data/images_comt \
@@ -1385,7 +1389,7 @@ for method in "${methods[@]}"; do
 done
 ```
 
-Expected: exactly nine `capacity.json` reports; every report records `attempts[0].micro_batch == 2`, a selected successful candidate, and at most one first CUDA capacity OOM.
+Expected: exactly nine `capacity.json` reports; every report records `attempts[0].batch_per_gpu == 2`, a non-null `recommended_batch_per_gpu` backed by a successful child witness, and at most one first CUDA capacity OOM.
 
 Run the nine Stage 2 one-step confirmations at the fixed batch/GPU 1:
 

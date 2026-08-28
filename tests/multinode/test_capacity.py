@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 from types import SimpleNamespace
 
@@ -46,6 +47,36 @@ def test_batch_one_requires_candidate_two_cuda_oom():
     ],
 )
 def test_only_cuda_capacity_text_without_integration_markers_is_oom(
+    evidence, expected
+):
+    assert classify_failure(evidence) == expected
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        (
+            "torch.OutOfMemoryError: CUDA out of memory at checkpoint-2",
+            "capacity_oom",
+        ),
+        ("checkpoint write error: CUDA out of memory", "integration_failure"),
+        (
+            "DeepSpeed CUDA allocator failed allocation at checkpoint-2",
+            "capacity_oom",
+        ),
+        (
+            "checkpoint-2\nunrelated error\ntorch.OutOfMemoryError: CUDA out of memory",
+            "capacity_oom",
+        ),
+        (
+            "checkpoint write failed\ntorch.OutOfMemoryError: CUDA out of memory",
+            "integration_failure",
+        ),
+        ("CUDA out of memory\nNCCL watchdog timeout", "integration_failure"),
+        ("CUDA out of memory\nloss became nonfinite", "integration_failure"),
+    ],
+)
+def test_conditional_integration_subjects_are_line_local_after_oom_exclusion(
     evidence, expected
 ):
     assert classify_failure(evidence) == expected
@@ -282,6 +313,85 @@ def test_zero_exit_with_stale_finite_loss_reference_is_integration_failure(tmp_p
     assert payload["recommended_batch_per_gpu"] is None
 
 
+def _mutate_witness(payload, case):
+    if case == "top-extra":
+        payload["unexpected"] = "stale"
+    elif case == "top-missing":
+        del payload["checkpoint_path"]
+    elif case == "schema-float":
+        payload["schema_version"] = 1.0
+    elif case == "schema-bool":
+        payload["schema_version"] = True
+    elif case == "zero-bool":
+        payload["zero_stage"] = True
+    elif case == "batch-float":
+        payload["batch_per_gpu"] = 2.0
+    elif case == "world-float":
+        payload["world_size"] = 4.0
+    elif case == "ranks-floats":
+        payload["machine_ranks"] = [0.0, 1.0]
+    elif case == "ranks-bool":
+        payload["machine_ranks"] = [0, True]
+    elif case == "ranks-extra":
+        payload["machine_ranks"] = [0, 1, 2]
+    elif case == "exit-float":
+        payload["exit_codes"] = {"0": 0.0, "1": 0}
+    elif case == "exit-extra":
+        payload["exit_codes"] = {"0": 0, "1": 0, "2": 0}
+    elif case == "finite-extra":
+        payload["finite_loss_evidence"]["unexpected"] = True
+    elif case == "finite-size-float":
+        payload["finite_loss_evidence"]["size"] = float(
+            payload["finite_loss_evidence"]["size"]
+        )
+    else:
+        raise AssertionError(f"unknown witness mutation: {case}")
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "top-extra",
+        "top-missing",
+        "schema-float",
+        "schema-bool",
+        "zero-bool",
+        "batch-float",
+        "world-float",
+        "ranks-floats",
+        "ranks-bool",
+        "ranks-extra",
+        "exit-float",
+        "exit-extra",
+        "finite-extra",
+        "finite-size-float",
+    ),
+)
+def test_malformed_child_witness_never_authorizes_recommendation(tmp_path, case):
+    result_root = tmp_path / "results"
+    runner = FakeCapacityRunner(result_root, {2: "success"})
+    original_launch = runner.launch
+
+    def launch_with_malformed_witness(command, *, child_run_id, batch_per_gpu):
+        execution = original_launch(
+            command,
+            child_run_id=child_run_id,
+            batch_per_gpu=batch_per_gpu,
+        )
+        witness = result_root / child_run_id / "initial-train-witness.json"
+        payload = json.loads(witness.read_text(encoding="utf-8"))
+        _mutate_witness(payload, case)
+        witness.write_text(json.dumps(payload), encoding="utf-8")
+        return execution
+
+    runner.launch = launch_with_malformed_witness
+    payload = _run(tmp_path, runner)
+
+    assert [attempt["batch_per_gpu"] for attempt in payload["attempts"]] == [2]
+    assert payload["attempts"][0]["status"] == "integration_failure"
+    assert payload["recommended_batch_per_gpu"] is None
+
+
 def test_capacity_report_is_exclusive(tmp_path):
     result_root = tmp_path / "results"
     first = FakeCapacityRunner(result_root, {2: "capacity_oom", 1: "capacity_oom"})
@@ -357,6 +467,38 @@ def test_subprocess_runner_rejects_remote_evidence_outside_exact_child(tmp_path)
 
     def control_runner(command, *, capture_output, text, check, timeout):
         control_commands.append(tuple(command))
+        assert tuple(command[:6]) == (
+            "/usr/bin/ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "korea@10.1.102.41",
+        )
+        remote_argv = shlex.split(command[6])
+        assert remote_argv[:5] == [
+            "/usr/bin/docker",
+            "exec",
+            "llm_kd",
+            "/usr/bin/bash",
+            "-lc",
+        ]
+        assert shlex.split(remote_argv[5]) == [
+            "env",
+            "PYTHONPATH=/root/workspace/ILVR",
+            "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+            "-m",
+            "src.multinode",
+            "capacity-evidence-show",
+            "--run-id",
+            "capacity-parent-batch2",
+            "--node",
+            "remote",
+            "--machine-rank",
+            "0",
+            "--result-root",
+            str(tmp_path / "results"),
+        ]
         return subprocess.CompletedProcess(
             command,
             0,
@@ -470,6 +612,60 @@ def test_wrapper_help_and_dry_run_are_local_and_do_not_publish():
     payload = json.loads(dry_result.stdout)
     assert [attempt["batch_per_gpu"] for attempt in payload["attempts"]] == [2, 4, 8]
     assert payload["fallback"]["batch_per_gpu"] == 1
+    assert not parent_result.exists()
+
+
+def test_task12_capacity_invocation_shape_dry_runs_without_publication():
+    repository = Path(__file__).resolve().parents[2]
+    wrapper = repository / "run_multinode_stage1_batch_probe.sh"
+    run_id = "task12-stage1-capacity-lora-zero3-dry"
+    capacity_root = Path("/root/workspace/ILVR/results/task12-dry/capacity")
+    parent_result = capacity_root / run_id
+    assert not parent_result.exists()
+
+    completed = subprocess.run(
+        (
+            wrapper,
+            "--run-id",
+            run_id,
+            "--result-root",
+            str(capacity_root),
+            "--zero-stage",
+            "3",
+            "--tuning-method",
+            "lora",
+            "--main-process-port",
+            "30032",
+            "--main-process-port",
+            "30033",
+            "--main-process-port",
+            "30034",
+            "--main-process-port",
+            "30035",
+            "--dry-run",
+            "--model",
+            "/root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct",
+            "--data-path",
+            "/root/workspace/ILVR/data/multinode-capacity-subset.jsonl",
+            "--image-root",
+            "/root/workspace/ILVR/data/images_comt",
+            "--max-steps",
+            "1",
+        ),
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert [
+        (attempt["batch_per_gpu"], attempt["main_process_port"])
+        for attempt in payload["attempts"]
+    ] == [(2, 30032), (4, 30033), (8, 30034)]
+    assert payload["fallback"]["main_process_port"] == 30035
     assert not parent_result.exists()
 
 

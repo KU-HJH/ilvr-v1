@@ -184,3 +184,123 @@ The dry-run parent path remained absent. `git diff --check` returned zero.
 Live SSH/Docker/tmux behavior, remote bounded evidence retrieval, CUDA OOM
 classification on real node logs, and four-GPU training remain intentionally
 deferred to the planned hardware validation task.
+
+## Fix round 1/5
+
+Four Important review findings were reproduced and fixed without external or
+hardware execution.
+
+### RED: line-local conditional integration classification
+
+The causal table included the two binding examples, an allocator OOM beside a
+normal checkpoint path, cross-line subject/token separation, and unconditional
+NCCL/nonfinite overrides:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest tests/multinode/test_capacity.py -q \
+  -k conditional_integration_subjects
+
+4 failed, 3 passed, 37 deselected in 0.08s
+```
+
+The old global predicate combined conditional subjects with failure substrings
+from unrelated lines and from `OutOfMemoryError`/allocator OOM phrases. The new
+classifier preserves global NCCL, collective-mismatch, and nonfinite overrides,
+then processes each remaining line independently after removing recognized CUDA
+OOM exception phrases. Conditional subjects require a standalone failure token
+on that sanitized line. The classifier-focused set then reported:
+
+```text
+13 passed, 31 deselected in 0.04s
+```
+
+### RED: canonical remote evidence environment
+
+The fake control boundary decoded the complete fixed SSH/Docker/bash command
+and failed because the container argv began directly with Python:
+
+```text
+FAILED test_subprocess_runner_rejects_remote_evidence_outside_exact_child
+E At index 0 diff: '/root/workspace/ILVR/venv/ilvr-venv/bin/python' != 'env'
+1 failed, 43 deselected in 0.07s
+```
+
+The command now matches the Task 4 pattern exactly inside the fixed container:
+`env PYTHONPATH=/root/workspace/ILVR` followed by the canonical absolute venv
+Python and `-m src.multinode capacity-evidence-show`. The same test reported:
+
+```text
+1 passed, 43 deselected in 0.05s
+```
+
+No SSH, Docker, or shell command executed; the injected control runner inspected
+argv and returned fake JSON.
+
+### RED: exact child witness decoding
+
+Parameterized real-file/controller tests mutated top-level and nested witness
+fields, JSON scalar types, ranks, exit codes, and finite-loss metadata. Ten of
+fourteen malformed variants incorrectly authorized the next candidate:
+
+```text
+10 failed, 4 passed, 32 deselected in 0.23s
+```
+
+The replacement decoder rejects duplicate, extra, and missing fields and
+requires exact JSON container/scalar types. In particular, floats and booleans
+cannot compare equal to integer schema, batch, world-size, rank, exit-code, or
+finite-evidence fields. It also validates the exact nested finite-loss field set
+before rechecking producer bytes, SHA-256, size, and finite status. The same
+table then reported:
+
+```text
+14 passed, 32 deselected in 0.07s
+```
+
+### Task 12 plan reconciliation and dry-run regression
+
+The real wrapper accepted the corrected Task 12 shape before the prose edit:
+
+```text
+1 passed, 43 deselected in 0.10s
+```
+
+The authorized plan update now uses `--tuning-method` and four repeated,
+distinct `--main-process-port` values for every capacity cell. Task 10 and Task
+12 consumers refer to `attempts[0].batch_per_gpu` and
+`recommended_batch_per_gpu`, not the nonexistent `micro_batch`/implicit
+selection fields. A separate manual Task 12-shaped dry run printed:
+
+```text
+Task12-shaped dry run validated without publication
+```
+
+It used four ports, method DoRA, canonical real-model/input paths, and
+`--max-steps 1`; the parent result path remained absent.
+
+### Fix-round GREEN verification and self-review
+
+```text
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest \
+  tests/multinode/test_capacity.py tests/multinode/test_coordinator.py -q
+
+89 passed in 0.68s
+```
+
+`bash -n run_multinode_stage1_batch_probe.sh`, public wrapper help, internal
+evidence help, the exact Task 12-shaped dry run, its no-publication assertion,
+and `git diff --check` all returned zero.
+
+- Conditional integration evidence is now line-local and OOM phrases cannot
+  donate their `Error`/`failed` tokens to normal checkpoint paths.
+- The remote evidence subprocess is cwd-independent and retains the fixed
+  noninteractive SSH/Docker boundary.
+- Recommendations are impossible until the exact child witness schema, nested
+  types, ranks/exits, finite producer reference, and digest all validate.
+- Task 12 assigns ports 30000–30035 across nine capacity cells without overlap;
+  Stage 2 remains in its separate 30100+ range.
+- The checkpoint-root caller fix remains unchanged and covered.
+- Pre-existing untracked `__pycache__` files/directories remain untouched.
+- Live remote/container/CUDA/four-GPU validation remains deferred to Task 12.

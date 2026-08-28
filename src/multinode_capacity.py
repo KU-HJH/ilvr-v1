@@ -26,27 +26,21 @@ from src.multinode_runtime import (
 
 AttemptStatus = Literal["success", "capacity_oom", "integration_failure"]
 
-_INTEGRATION_MARKERS = (
-    "nccl",
-    "collective mismatch",
-    "nonfinite loss",
-    "non-finite loss",
-    "nonfinite gradient",
-    "non-finite gradient",
-)
 _INTEGRATION_FAILURE_SUBJECTS = ("checkpoint", "ssh", "docker", "rendezvous")
-_FAILURE_MARKERS = (
-    "fail",
-    "error",
-    "invalid",
-    "mismatch",
-    "missing",
-    "not found",
-    "not running",
-    "refused",
-    "timeout",
-    "timed out",
-    "unavailable",
+_FAILURE_TOKEN_PATTERN = re.compile(
+    r"\b(?:error|fail|failed|failure|invalid|mismatch|missing|refused|timeout|unavailable)\b"
+)
+_FAILURE_PHRASES = ("not found", "not running", "timed out")
+_CUDA_OOM_EXCEPTION_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"torch\.outofmemoryerror",
+        r"cuda(?:\s+error\s*:)?\s+out\s+of\s+memory",
+        r"cuda\s+(?:allocator|allocation)\s+(?:error|failed|failure)"
+        r"(?:\s+(?:allocation|allocating)(?:\s+device\s+memory)?)?",
+        r"cudamalloc\s+(?:error|failed|failure)"
+        r"(?:\s+allocating(?:\s+device\s+memory)?)?",
+    )
 )
 _CAPACITY_MARKERS = (
     "torch.outofmemoryerror",
@@ -59,6 +53,21 @@ _RESULT_ROOT = _REPOSITORY_ROOT / "results"
 _LOG_ROOT = _REPOSITORY_ROOT / "logs" / "multinode"
 _STAGE_LOG_ROOT = _REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
 _CAPACITY_LOG_ROOT = _REPOSITORY_ROOT / "logs" / "capacity"
+_TRAINING_WITNESS_FIELDS = {
+    "schema_version",
+    "run_id",
+    "attempt_id",
+    "stage",
+    "method",
+    "zero_stage",
+    "batch_per_gpu",
+    "world_size",
+    "machine_ranks",
+    "exit_codes",
+    "checkpoint_path",
+    "finite_loss_evidence",
+}
+_FINITE_LOSS_FIELDS = {"status", "path", "sha256", "size", "finite_loss"}
 
 
 @dataclass(frozen=True)
@@ -240,6 +249,8 @@ class SubprocessCapacityRunner:
         python = _REPOSITORY_ROOT / "venv" / "ilvr-venv" / "bin" / "python"
         command = build_remote_exec(
             (
+                "env",
+                f"PYTHONPATH={_REPOSITORY_ROOT}",
                 str(python),
                 "-m",
                 "src.multinode",
@@ -388,12 +399,29 @@ def classify_failure(evidence: str) -> AttemptStatus:
     if not isinstance(evidence, str):
         raise TypeError("failure evidence must be text")
     normalized = evidence.casefold()
-    if any(marker in normalized for marker in _INTEGRATION_MARKERS):
-        return "integration_failure"
-    if any(subject in normalized for subject in _INTEGRATION_FAILURE_SUBJECTS) and any(
-        marker in normalized for marker in _FAILURE_MARKERS
+    nonfinite_diagnostic = re.search(
+        r"\b(?:non[- ]?finite)\s+(?:loss|gradient)\b"
+        r"|\b(?:loss|gradient)\b[^\n]{0,64}\bnon[- ]?finite\b",
+        normalized,
+    )
+    if (
+        "nccl" in normalized
+        or "collective mismatch" in normalized
+        or nonfinite_diagnostic is not None
     ):
         return "integration_failure"
+    for line in normalized.splitlines():
+        conditional_line = line
+        for pattern in _CUDA_OOM_EXCEPTION_PATTERNS:
+            conditional_line = pattern.sub(" ", conditional_line)
+        if any(
+            re.search(rf"\b{subject}\b", conditional_line)
+            for subject in _INTEGRATION_FAILURE_SUBJECTS
+        ) and (
+            _FAILURE_TOKEN_PATTERN.search(conditional_line) is not None
+            or any(phrase in conditional_line for phrase in _FAILURE_PHRASES)
+        ):
+            return "integration_failure"
     if any(marker in normalized for marker in _CAPACITY_MARKERS):
         return "capacity_oom"
     allocator_oom = (
@@ -435,6 +463,85 @@ def _validate_stage_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
     return values
 
 
+def _decode_training_witness(
+    raw: bytes,
+    *,
+    child_run_id: str,
+    zero_stage: int,
+    tuning_method: str,
+    batch_per_gpu: int,
+    producer_path: Path,
+) -> dict[str, object]:
+    def exact_object(pairs):
+        payload = {}
+        for name, value in pairs:
+            if name in payload:
+                raise ValueError("training witness contains a duplicate field")
+            payload[name] = value
+        return payload
+
+    payload = json.loads(raw, object_pairs_hook=exact_object)
+    if type(payload) is not dict or set(payload) != _TRAINING_WITNESS_FIELDS:
+        raise ValueError("training witness fields are invalid")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise ValueError("training witness schema version is invalid")
+    expected_text = {
+        "run_id": child_run_id,
+        "attempt_id": "initial",
+        "stage": "stage1",
+        "method": tuning_method,
+        "checkpoint_path": f"/root/workspace/ILVR/checkpoints/{child_run_id}",
+    }
+    if any(
+        type(payload[name]) is not str or payload[name] != expected
+        for name, expected in expected_text.items()
+    ):
+        raise ValueError("training witness text identity is invalid")
+    expected_integers = {
+        "zero_stage": zero_stage,
+        "batch_per_gpu": batch_per_gpu,
+        "world_size": 4,
+    }
+    if any(
+        type(payload[name]) is not int or payload[name] != expected
+        for name, expected in expected_integers.items()
+    ):
+        raise ValueError("training witness integer identity is invalid")
+    ranks = payload["machine_ranks"]
+    if (
+        type(ranks) is not list
+        or len(ranks) != 2
+        or any(type(rank) is not int for rank in ranks)
+        or ranks != [0, 1]
+    ):
+        raise ValueError("training witness machine ranks are invalid")
+    exit_codes = payload["exit_codes"]
+    if (
+        type(exit_codes) is not dict
+        or set(exit_codes) != {"0", "1"}
+        or any(type(code) is not int or code != 0 for code in exit_codes.values())
+    ):
+        raise ValueError("training witness exit codes are invalid")
+    finite_loss = payload["finite_loss_evidence"]
+    if type(finite_loss) is not dict or set(finite_loss) != _FINITE_LOSS_FIELDS:
+        raise ValueError("training witness finite-loss fields are invalid")
+    if (
+        type(finite_loss["status"]) is not str
+        or finite_loss["status"] != "validated"
+        or type(finite_loss["path"]) is not str
+        or finite_loss["path"] != str(producer_path)
+        or type(finite_loss["sha256"]) is not str
+        or len(finite_loss["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in finite_loss["sha256"])
+        or type(finite_loss["size"]) is not int
+        or finite_loss["size"] < 0
+        or type(finite_loss["finite_loss"]) is not bool
+        or finite_loss["finite_loss"] is not True
+    ):
+        raise ValueError("training witness finite-loss evidence is invalid")
+    return payload
+
+
 def _valid_training_witness(
     path: Path,
     *,
@@ -443,43 +550,32 @@ def _valid_training_witness(
     tuning_method: str,
     batch_per_gpu: int,
 ) -> bool:
-    try:
-        payload = json.loads(_read_regular_file(path))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return False
-    if type(payload) is not dict:
-        return False
-    finite_loss = payload.get("finite_loss_evidence")
-    expected = {
-        "schema_version": 1,
-        "run_id": child_run_id,
-        "attempt_id": "initial",
-        "stage": "stage1",
-        "method": tuning_method,
-        "zero_stage": zero_stage,
-        "batch_per_gpu": batch_per_gpu,
-        "world_size": 4,
-        "machine_ranks": [0, 1],
-        "exit_codes": {"0": 0, "1": 0},
-        "checkpoint_path": f"/root/workspace/ILVR/checkpoints/{child_run_id}",
-    }
-    if not (
-        all(payload.get(name) == value for name, value in expected.items())
-        and type(finite_loss) is dict
-        and finite_loss.get("status") == "validated"
-        and finite_loss.get("finite_loss") is True
-    ):
-        return False
     producer_path = path.parent / "initial-producer-evidence.json"
-    if finite_loss.get("path") != str(producer_path):
-        return False
     try:
+        payload = _decode_training_witness(
+            _read_regular_file(path),
+            child_run_id=child_run_id,
+            zero_stage=zero_stage,
+            tuning_method=tuning_method,
+            batch_per_gpu=batch_per_gpu,
+            producer_path=producer_path,
+        )
         producer = _read_regular_file(producer_path)
-    except (OSError, ValueError):
+        producer_payload = json.loads(producer)
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         return False
+    finite_loss = payload["finite_loss_evidence"]
+    assert type(finite_loss) is dict
+    producer_evidence = (
+        producer_payload.get("benchmark_evidence", producer_payload)
+        if type(producer_payload) is dict
+        else None
+    )
     return (
-        finite_loss.get("size") == len(producer)
-        and finite_loss.get("sha256") == hashlib.sha256(producer).hexdigest()
+        type(producer_evidence) is dict
+        and producer_evidence.get("finite_loss") is True
+        and finite_loss["size"] == len(producer)
+        and finite_loss["sha256"] == hashlib.sha256(producer).hexdigest()
     )
 
 
