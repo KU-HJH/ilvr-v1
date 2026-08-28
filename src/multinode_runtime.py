@@ -980,6 +980,352 @@ class OwnedNodeCommand:
     exit_path: Path
 
 
+@dataclass(frozen=True)
+class EvaluationAssignment:
+    """One fixed independent evaluator process and its owned control names."""
+
+    node: str
+    machine_rank: int
+    gpu: int
+    shard_index: int
+    session_name: str
+    ownership_name: str
+    exit_name: str
+
+
+@dataclass(frozen=True)
+class EvaluationPlan:
+    """Immutable user inputs for one four-worker evaluation attempt."""
+
+    run_id: str
+    model_dir: Path
+    test_data_path: Path
+    task_name: str
+    output_dir: Path
+    attempt_id: str = "initial"
+    base_model_dir: Path | None = None
+    cache_dir: Path = _REPOSITORY_ROOT / "cache"
+    max_new_tokens: int = 64
+    temperature: float = 0.0
+    top_p: float = 1.0
+    attempt_timeout_seconds: int = 24 * 60 * 60
+
+    def __post_init__(self) -> None:
+        _require_identifier("run_id", self.run_id)
+        _require_identifier("attempt_id", self.attempt_id)
+        for label, path in (
+            ("model_dir", self.model_dir),
+            ("test_data_path", self.test_data_path),
+            ("output_dir", self.output_dir),
+            ("cache_dir", self.cache_dir),
+        ):
+            if not isinstance(path, Path) or not path.is_absolute() or ".." in path.parts:
+                raise ValueError(f"{label} must be an absolute path without traversal")
+        if self.base_model_dir is not None and (
+            not isinstance(self.base_model_dir, Path)
+            or not self.base_model_dir.is_absolute()
+            or ".." in self.base_model_dir.parts
+        ):
+            raise ValueError("base_model_dir must be an absolute path without traversal")
+        try:
+            relative_output = self.output_dir.relative_to(_RESULT_ROOT)
+        except ValueError as error:
+            raise ValueError("output_dir must be under the canonical result root") from error
+        if not relative_output.parts or relative_output.parts[-1] != self.run_id:
+            raise ValueError("output_dir must belong to the evaluation run ID")
+        if (
+            not isinstance(self.task_name, str)
+            or not self.task_name.strip()
+            or "\0" in self.task_name
+        ):
+            raise ValueError("task_name must be a non-empty string without NUL")
+        if type(self.max_new_tokens) is not int or self.max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+        if (
+            type(self.temperature) not in (int, float)
+            or not math.isfinite(self.temperature)
+            or self.temperature < 0
+        ):
+            raise ValueError("temperature must be finite and nonnegative")
+        if (
+            type(self.top_p) not in (int, float)
+            or not math.isfinite(self.top_p)
+            or not 0 < self.top_p <= 1
+        ):
+            raise ValueError("top_p must be finite and in (0, 1]")
+        if type(self.attempt_timeout_seconds) is not int or self.attempt_timeout_seconds <= 0:
+            raise ValueError("attempt_timeout_seconds must be positive")
+
+    @property
+    def local_model_dir(self) -> Path:
+        return self.output_dir / "inference-model"
+
+
+@dataclass(frozen=True)
+class EvaluationWorkerCommand:
+    assignment: EvaluationAssignment
+    launch: tuple[str, ...]
+    command_digest: str
+    node_spec: OwnedNodeCommand
+
+
+@dataclass(frozen=True)
+class EvaluationCommands:
+    workers: tuple[EvaluationWorkerCommand, ...]
+    model_identity: str
+    shard_jsonls: tuple[Path, ...]
+    shard_manifests: tuple[Path, ...]
+    remote_files_path: Path
+    remote_files_payload: bytes
+    remote_pull: tuple[str, ...]
+    merged_jsonl: Path
+    summary_json: Path
+
+
+def build_evaluation_assignments(
+    *, run_id: str, attempt_id: str = "initial"
+) -> tuple[EvaluationAssignment, ...]:
+    """Assign remote GPUs to shards 0/1 and local GPUs to shards 2/3."""
+    _require_identifier("run_id", run_id)
+    _require_identifier("attempt_id", attempt_id)
+    layout = (
+        ("remote", 0, 0, 0),
+        ("remote", 0, 1, 1),
+        ("local", 1, 0, 2),
+        ("local", 1, 1, 3),
+    )
+    return tuple(
+        EvaluationAssignment(
+            node=node,
+            machine_rank=machine_rank,
+            gpu=gpu,
+            shard_index=shard,
+            session_name=f"ilvr-{run_id}-{attempt_id}-eval-shard{shard}",
+            ownership_name=f"ownership-eval-shard{shard}.json",
+            exit_name=f"exit-eval-shard{shard}.json",
+        )
+        for node, machine_rank, gpu, shard in layout
+    )
+
+
+def _build_evaluation_commands_for_stage(
+    plan: EvaluationPlan,
+    *,
+    stage: str,
+    model_identity: str,
+    commit: str,
+    log_root: Path = _LOG_ROOT,
+) -> EvaluationCommands:
+    from src.multinode_artifacts import (
+        build_evaluation_pull_command,
+        evaluation_result_files_bytes,
+    )
+
+    if stage not in ("stage1", "stage2"):
+        raise ValueError("observed inference stage must be stage1 or stage2")
+    _require_digest("model_identity", model_identity.removeprefix("task6:"))
+    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        raise ValueError("commit must be a lowercase 40-character Git object ID")
+    repository = _REPOSITORY_ROOT
+    evaluator = repository / ("eval.py" if stage == "stage1" else "src/evaluate_deepseed.py")
+    python = repository / "venv/ilvr-venv/bin/python"
+    attempt_directory = log_root / plan.run_id / plan.attempt_id
+    assignments = build_evaluation_assignments(
+        run_id=plan.run_id, attempt_id=plan.attempt_id
+    )
+    workers: list[EvaluationWorkerCommand] = []
+    shard_jsonls = tuple(plan.output_dir / f"shard-{index}.jsonl" for index in range(4))
+    for assignment in assignments:
+        model_dir = plan.model_dir if assignment.node == "remote" else plan.local_model_dir
+        evaluator_command = [
+            str(python),
+            str(evaluator),
+            "--model_dir", str(model_dir),
+            "--test_data_path", str(plan.test_data_path),
+            "--task_name", plan.task_name,
+            "--output_json_path", str(shard_jsonls[assignment.shard_index]),
+            "--cache_dir", str(plan.cache_dir),
+            "--max_new_tokens", str(plan.max_new_tokens),
+            "--temperature", str(plan.temperature),
+            "--top_p", str(plan.top_p),
+        ]
+        if plan.base_model_dir is not None:
+            evaluator_command.extend(("--base_model_dir", str(plan.base_model_dir)))
+        evaluator_command.extend(
+            (
+                "--model-identity", model_identity,
+                "--num-shards", "4",
+                "--shard-index", str(assignment.shard_index),
+            )
+        )
+        environment = {
+            **_MINIMAL_EXEC_ENVIRONMENT,
+            "CUDA_VISIBLE_DEVICES": str(assignment.gpu),
+            "ILVR_REPOSITORY_COMMIT": commit,
+            "PYTHONPATH": f"{repository / 'transformers/src'}:{repository}",
+        }
+        ownership_path = attempt_directory / assignment.ownership_name
+        exit_path = attempt_directory / assignment.exit_name
+        supervisor = [
+            str(python),
+            "-m", "src.multinode", "node-run",
+            "--run-id", plan.run_id,
+            "--attempt-id", plan.attempt_id,
+            "--machine-rank", str(assignment.machine_rank),
+            "--commit", commit,
+            "--ownership-path", str(ownership_path),
+            "--exit-path", str(exit_path),
+        ]
+        for name, value in sorted(environment.items()):
+            supervisor.extend(("--env", f"{name}={value}"))
+        supervisor.extend(("--", *evaluator_command))
+        owned_command = tuple(supervisor)
+        digest = canonical_command_digest(owned_command, environment)
+        isolated = (
+            "/usr/bin/env", "-i",
+            *(f"{name}={value}" for name, value in sorted(environment.items())),
+            *owned_command,
+        )
+        tmux = (
+            "/usr/bin/tmux", "new-session", "-d", "-s",
+            assignment.session_name, "--", *isolated,
+        )
+        launch = tuple(build_remote_exec(tmux)) if assignment.node == "remote" else tmux
+        workers.append(
+            EvaluationWorkerCommand(
+                assignment=assignment,
+                launch=launch,
+                command_digest=digest,
+                node_spec=OwnedNodeCommand(
+                    machine_rank=assignment.machine_rank,
+                    command=owned_command,
+                    environment=tuple(sorted(environment.items())),
+                    ownership_path=ownership_path,
+                    exit_path=exit_path,
+                ),
+            )
+        )
+    shard_manifests = tuple(Path(f"{path}.manifest.json") for path in shard_jsonls)
+    remote_files_path = attempt_directory / "evaluation-pull.files"
+    return EvaluationCommands(
+        workers=tuple(workers),
+        model_identity=model_identity,
+        shard_jsonls=shard_jsonls,
+        shard_manifests=shard_manifests,
+        remote_files_path=remote_files_path,
+        remote_files_payload=evaluation_result_files_bytes(),
+        remote_pull=build_evaluation_pull_command(
+            plan.output_dir, files_from=remote_files_path
+        ),
+        merged_jsonl=plan.output_dir / "merged.jsonl",
+        summary_json=plan.output_dir / "summary.json",
+    )
+
+
+def build_evaluation_commands(
+    plan: EvaluationPlan,
+    *,
+    inference_manifest: object,
+    commit: str,
+) -> EvaluationCommands:
+    """Build four immutable owned workers from a Task 6 validated identity."""
+    from src.multinode_artifacts import (
+        NodeArtifactManifest,
+        inference_model_identity,
+        validate_inference_manifest_identity,
+    )
+
+    if not isinstance(plan, EvaluationPlan):
+        raise TypeError("plan must be an EvaluationPlan")
+    if not isinstance(inference_manifest, NodeArtifactManifest):
+        raise TypeError("inference_manifest must be a NodeArtifactManifest")
+    validate_inference_manifest_identity(
+        inference_manifest, expected_identity=inference_manifest.runtime_identity
+    )
+    return _build_evaluation_commands_for_stage(
+        plan,
+        stage=str(inference_manifest.runtime_identity["stage"]),
+        model_identity=inference_model_identity(inference_manifest),
+        commit=commit,
+    )
+
+
+class EvaluationRunner(Protocol):
+    def prepare_inference(self, plan: EvaluationPlan) -> object: ...
+    def repository_commit(self) -> str: ...
+    def start_worker(self, worker: EvaluationWorkerCommand) -> None: ...
+    def poll_worker(self, worker: EvaluationWorkerCommand) -> int | None: ...
+    def cleanup_worker(self, worker: EvaluationWorkerCommand) -> bool: ...
+    def pull_remote_results(self, commands: EvaluationCommands) -> None: ...
+    def validate_sidecars(self, commands: EvaluationCommands) -> None: ...
+    def merge(self, commands: EvaluationCommands) -> Mapping[str, object]: ...
+    def sleep(self, seconds: float) -> None: ...
+
+
+def run_evaluation(
+    plan: EvaluationPlan,
+    runner: EvaluationRunner,
+    *,
+    poll_interval_seconds: float = 0.25,
+) -> Mapping[str, object]:
+    """Prepare, own, monitor, transfer, validate, and merge four evaluators."""
+    manifest = runner.prepare_inference(plan)
+    commands = build_evaluation_commands(
+        plan, inference_manifest=manifest, commit=runner.repository_commit()
+    )
+    started: list[EvaluationWorkerCommand] = []
+    try:
+        for worker in commands.workers:
+            runner.start_worker(worker)
+            started.append(worker)
+    except BaseException:
+        for worker in started:
+            runner.cleanup_worker(worker)
+        raise
+
+    pending = {worker.assignment.shard_index: worker for worker in commands.workers}
+    exits: dict[int, int] = {}
+    deadline = time.monotonic() + plan.attempt_timeout_seconds
+    while pending:
+        for shard_index, worker in tuple(pending.items()):
+            try:
+                exit_code = runner.poll_worker(worker)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                for peer in pending.values():
+                    runner.cleanup_worker(peer)
+                raise RuntimeError(
+                    "all four evaluation workers require valid owned exit records"
+                ) from error
+            if exit_code is None:
+                continue
+            exits[shard_index] = exit_code
+            del pending[shard_index]
+            if exit_code != 0:
+                for peer in pending.values():
+                    runner.cleanup_worker(peer)
+                raise RuntimeError(
+                    "all four evaluation workers must exit zero before merge"
+                )
+        if pending:
+            if time.monotonic() >= deadline:
+                for worker in pending.values():
+                    runner.cleanup_worker(worker)
+                raise RuntimeError(
+                    "all four evaluation workers must complete before timeout"
+                )
+            runner.sleep(poll_interval_seconds)
+    if exits != {0: 0, 1: 0, 2: 0, 3: 0}:
+        raise RuntimeError("all four evaluation workers must exit zero before merge")
+    runner.pull_remote_results(commands)
+    try:
+        runner.validate_sidecars(commands)
+    except (OSError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "all four evaluation workers require valid successful sidecars"
+        ) from error
+    return runner.merge(commands)
+
+
 def _node_shell_command(
     plan: "LaunchPlan",
     *,
@@ -1878,6 +2224,289 @@ class SubprocessCoordinatorRunner:
         publish_files_list(files_path, entries)
         self._run(build_pull_command(manifest, destination, files_from=files_path))
         validate_transferred_entries(destination, entries)
+
+
+class EvaluationSubprocessRunner:
+    """Execute the fixed four-worker evaluation through injectable subprocesses."""
+
+    def __init__(
+        self,
+        plan: EvaluationPlan,
+        *,
+        commit: str,
+        log_root: str | Path = _LOG_ROOT,
+        command_runner: CommandRunner = _subprocess_command_runner,
+    ) -> None:
+        if not isinstance(plan, EvaluationPlan):
+            raise TypeError("plan must be an EvaluationPlan")
+        if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+            raise ValueError("commit must be a lowercase 40-character Git object ID")
+        self.plan = plan
+        self.commit_value = commit
+        self.log_root = Path(log_root)
+        self.command_runner = command_runner
+        self._manifest: object | None = None
+        self._started: dict[int, EvaluationWorkerCommand] = {}
+
+    def _run(
+        self, command: Sequence[str], *, input_bytes: bytes | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        completed = self.command_runner(
+            command,
+            input_bytes=input_bytes,
+            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"evaluation coordinator command failed ({completed.returncode}): "
+                f"{completed.stderr.strip()}"
+            )
+        return completed
+
+    def _node_command(
+        self, worker: EvaluationWorkerCommand, arguments: Sequence[str]
+    ) -> tuple[str, ...]:
+        if worker.assignment.node == "remote":
+            return tuple(build_remote_exec(arguments))
+        if worker.assignment.node == "local":
+            return tuple(arguments)
+        raise ValueError("evaluation worker node is invalid")
+
+    def _internal_command(
+        self,
+        worker: EvaluationWorkerCommand,
+        subcommand: str,
+        arguments: Sequence[str],
+    ) -> tuple[str, ...]:
+        python = _REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"
+        return self._node_command(
+            worker,
+            (str(python), "-m", "src.multinode", subcommand, *arguments),
+        )
+
+    def repository_commit(self) -> str:
+        return self.commit_value
+
+    def prepare_inference(self, plan: EvaluationPlan) -> object:
+        """Validate the remote Task 6 artifact and make one fresh verified copy."""
+        from src.multinode_artifacts import (
+            NodeArtifactManifest,
+            prepare_inference_copy,
+            reserve_inference_destination,
+            validate_inference_manifest_identity,
+        )
+
+        if plan != self.plan:
+            raise ValueError("runner evaluation plan mismatch")
+        python = _REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"
+        shown = self._run(
+            build_remote_exec(
+                (
+                    str(python),
+                    "-m",
+                    "src.multinode",
+                    "prepared-inference-show",
+                    "--model-dir",
+                    str(plan.model_dir),
+                )
+            )
+        )
+        try:
+            payload = json.loads(shown.stdout)
+        except json.JSONDecodeError as error:
+            raise ValueError("prepared inference manifest returned invalid JSON") from error
+        manifest = NodeArtifactManifest.from_json(payload)
+        validate_inference_manifest_identity(
+            manifest, expected_identity=manifest.runtime_identity
+        )
+        reserve_inference_destination(plan.output_dir)
+        self._manifest = manifest
+        prepare_inference_copy(manifest, plan.local_model_dir, self)
+        self._run(
+            build_remote_exec(
+                (
+                    str(python),
+                    "-m",
+                    "src.multinode",
+                    "prepare-evaluation-output",
+                    "--output-dir",
+                    str(plan.output_dir),
+                    "--run-id",
+                    plan.run_id,
+                )
+            )
+        )
+        return manifest
+
+    def validate_inference_manifest(self, manifest: object) -> None:
+        from src.multinode_artifacts import (
+            NodeArtifactManifest,
+            validate_inference_manifest_identity,
+        )
+
+        if not isinstance(manifest, NodeArtifactManifest):
+            raise TypeError("inference manifest must be a NodeArtifactManifest")
+        if self._manifest is not None and manifest != self._manifest:
+            raise ValueError("inference manifest changed before local copy")
+        validate_inference_manifest_identity(
+            manifest, expected_identity=manifest.runtime_identity
+        )
+
+    def pull_inference_artifacts(self, manifest: object, destination: Path) -> None:
+        from src.multinode_artifacts import (
+            NodeArtifactManifest,
+            build_prepared_inference_pull_command,
+            publish_files_list,
+            select_inference_entries,
+            validate_reserved_inference_destination,
+            validate_transferred_entries,
+        )
+
+        if not isinstance(manifest, NodeArtifactManifest):
+            raise TypeError("inference manifest must be a NodeArtifactManifest")
+        if manifest != self._manifest:
+            raise ValueError("inference manifest changed before transfer")
+        entries = select_inference_entries(manifest)
+        validate_reserved_inference_destination(destination)
+        files_path = (
+            self.log_root
+            / self.plan.run_id
+            / self.plan.attempt_id
+            / "evaluation-inference.files"
+        )
+        publish_files_list(files_path, entries)
+        self._run(
+            build_prepared_inference_pull_command(
+                manifest,
+                self.plan.model_dir,
+                destination,
+                files_from=files_path,
+            )
+        )
+        validate_transferred_entries(destination, entries)
+
+    def start_worker(self, worker: EvaluationWorkerCommand) -> None:
+        shard = worker.assignment.shard_index
+        if shard in self._started:
+            raise ValueError("evaluation worker was already started")
+        self._run(worker.launch)
+        self._started[shard] = worker
+
+    def poll_worker(self, worker: EvaluationWorkerCommand) -> int | None:
+        shard = worker.assignment.shard_index
+        if self._started.get(shard) != worker:
+            raise ValueError("evaluation worker is not the exact started command")
+        spec = worker.node_spec
+        arguments = (
+            "--exit-path", str(spec.exit_path),
+            "--run-id", self.plan.run_id,
+            "--attempt-id", self.plan.attempt_id,
+            "--machine-rank", str(worker.assignment.machine_rank),
+            "--commit", self.commit_value,
+            "--command-digest", worker.command_digest,
+        )
+        completed = self.command_runner(
+            self._internal_command(worker, "exit-show", arguments),
+            input_bytes=None,
+            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+        )
+        if completed.returncode == 3:
+            return None
+        if completed.returncode != 0:
+            raise RuntimeError(f"evaluation exit-show failed: {completed.stderr.strip()}")
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise ValueError("evaluation exit record returned invalid JSON") from error
+        exit_code = payload.get("exit_code") if type(payload) is dict else None
+        if type(exit_code) is not int:
+            raise ValueError("evaluation worker exit code is invalid")
+        return exit_code
+
+    def cleanup_worker(self, worker: EvaluationWorkerCommand) -> bool:
+        """Ask node-side pidfd validation to signal only the exact live owner."""
+        spec = worker.node_spec
+        shown = self.command_runner(
+            self._internal_command(
+                worker,
+                "ownership-show",
+                ("--ownership-path", str(spec.ownership_path)),
+            ),
+            input_bytes=None,
+            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+        )
+        if shown.returncode != 0:
+            return False
+        try:
+            ownership = OwnershipRecord.from_json(json.loads(shown.stdout))
+            validate_ownership(
+                ownership,
+                expected_run_id=self.plan.run_id,
+                expected_attempt_id=self.plan.attempt_id,
+                expected_machine_rank=worker.assignment.machine_rank,
+                expected_pid=ownership.pid,
+                expected_commit=self.commit_value,
+                expected_command_digest=worker.command_digest,
+                observed_start_ticks=ownership.process_start_ticks,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        arguments = [
+            "--ownership-path", str(spec.ownership_path),
+            "--run-id", ownership.run_id,
+            "--attempt-id", ownership.attempt_id,
+            "--machine-rank", str(ownership.machine_rank),
+            "--pid", str(ownership.pid),
+            "--process-start-ticks", str(ownership.process_start_ticks),
+            "--commit", ownership.commit,
+            "--command-digest", ownership.command_digest,
+        ]
+        for name, value in spec.environment:
+            arguments.extend(("--env", f"{name}={value}"))
+        arguments.extend(("--", *spec.command))
+        signaled = self.command_runner(
+            self._internal_command(worker, "signal-owned", arguments),
+            input_bytes=None,
+            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+        )
+        return signaled.returncode == 0
+
+    def pull_remote_results(self, commands: EvaluationCommands) -> None:
+        from src.multinode_runtime import publish_small_file
+
+        publish_small_file(commands.remote_files_path, commands.remote_files_payload)
+        self._run(commands.remote_pull)
+
+    def validate_sidecars(self, commands: EvaluationCommands) -> None:
+        from src.multinode_artifacts import validate_evaluation_sidecars
+
+        validate_evaluation_sidecars(
+            commands.shard_manifests,
+            commands.shard_jsonls,
+            expected_model_identity=commands.model_identity,
+            expected_sample_count=self._expected_sample_count(),
+        )
+
+    def _expected_sample_count(self) -> int:
+        expected_sample_count = 0
+        with self.plan.test_data_path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip():
+                    expected_sample_count += 1
+        return expected_sample_count
+
+    def merge(self, commands: EvaluationCommands) -> Mapping[str, object]:
+        from src.multinode_evaluation import merge_shards
+
+        return merge_shards(
+            commands.shard_manifests,
+            expected_sample_count=self._expected_sample_count(),
+            output_jsonl=commands.merged_jsonl,
+            summary_json=commands.summary_json,
+        )
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
 
 
 class CoordinatorRunner(Protocol):

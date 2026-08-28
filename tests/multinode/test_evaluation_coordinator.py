@@ -1,0 +1,346 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from src.multinode import _main
+from src.multinode_artifacts import (
+    ArtifactEntry,
+    NodeArtifactManifest,
+    build_evaluation_pull_command,
+    evaluation_result_files_bytes,
+    prepare_inference_copy,
+    validate_evaluation_sidecars,
+)
+from src.multinode_evaluation import write_shard_manifest
+from src.multinode_runtime import (
+    EvaluationPlan,
+    build_evaluation_assignments,
+    build_evaluation_commands,
+    run_evaluation,
+)
+
+
+def _identity(*, stage: str = "stage1") -> dict[str, object]:
+    return {
+        "stage": stage,
+        "tuning_method": "lora",
+        "zero_stage": 3,
+        "deepspeed_config_digest": "a" * 64,
+        "world_size": 4,
+        "rank_mapping": {"0": [0, 1], "1": [2, 3]},
+        "global_step": 2,
+        "model_state_layout": "partitioned",
+        "optimizer": True,
+        "scheduler": True,
+        "rng_ranks": [0, 1, 2, 3],
+        "stage_sidecar": f"{stage}_peft_metadata.json",
+        "commit": "b" * 40,
+        "run_id": "trained-model-run",
+    }
+
+
+def _manifest(*, stage: str = "stage1") -> NodeArtifactManifest:
+    names = (
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "config.json",
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "ilvr_token_rows.safetensors",
+        f"{stage}_peft_metadata.json",
+    )
+    return NodeArtifactManifest(
+        schema_version=1,
+        run_id="trained-model-run",
+        node_rank=0,
+        process_ranks=(0, 1, 2, 3),
+        entries=tuple(ArtifactEntry(Path(name), 1, 0) for name in names),
+        runtime_identity=_identity(stage=stage),
+        completion_marker=True,
+        checkpoint_relative=Path("checkpoint-2"),
+    )
+
+
+def _plan() -> EvaluationPlan:
+    return EvaluationPlan(
+        run_id="eval-four-gpu",
+        attempt_id="initial",
+        model_dir=Path("/root/workspace/ILVR/results/trained-model-run/inference"),
+        test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
+        task_name="zebra-cot",
+        output_dir=Path("/root/workspace/ILVR/results/eval-four-gpu"),
+    )
+
+
+def test_evaluation_assigns_remote_zero_one_and_local_two_three():
+    assignments = build_evaluation_assignments(run_id="eval-four-gpu")
+    assert [(a.node, a.gpu, a.shard_index) for a in assignments] == [
+        ("remote", 0, 0),
+        ("remote", 1, 1),
+        ("local", 0, 2),
+        ("local", 1, 3),
+    ]
+    assert len({a.session_name for a in assignments}) == 4
+    assert len({a.ownership_name for a in assignments}) == 4
+
+
+@pytest.mark.parametrize(
+    ("stage", "evaluator"),
+    [("stage1", "/root/workspace/ILVR/eval.py"),
+     ("stage2", "/root/workspace/ILVR/src/evaluate_deepseed.py")],
+)
+def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
+    stage, evaluator
+):
+    commands = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(stage=stage), commit="b" * 40
+    )
+
+    assert len(commands.workers) == 4
+    assert {dict(worker.node_spec.environment)["CUDA_VISIBLE_DEVICES"]
+            for worker in commands.workers} == {"0", "1"}
+    assert all(evaluator in worker.node_spec.command for worker in commands.workers)
+    assert [worker.node_spec.command[-1] for worker in commands.workers] == [
+        "0", "1", "2", "3"
+    ]
+    identities = {
+        worker.node_spec.command[
+            worker.node_spec.command.index("--model-identity") + 1
+        ]
+        for worker in commands.workers
+    }
+    assert len(identities) == 1
+    model_dirs = [
+        worker.node_spec.command[worker.node_spec.command.index("--model_dir") + 1]
+        for worker in commands.workers
+    ]
+    assert model_dirs[:2] == [str(_plan().model_dir)] * 2
+    assert model_dirs[2:] == [str(_plan().local_model_dir)] * 2
+
+
+class FakeEvaluationRunner:
+    def __init__(
+        self,
+        *,
+        exit_codes: dict[int, int] | None = None,
+        invalid_exit_shard: int | None = None,
+        valid=True,
+    ):
+        self.exit_codes = {index: 0 for index in range(4)}
+        self.exit_codes.update(exit_codes or {})
+        self.invalid_exit_shard = invalid_exit_shard
+        self.valid = valid
+        self.events: list[str] = []
+
+    def prepare_inference(self, plan):
+        self.events.append("prepare-inference")
+        return _manifest()
+
+    def repository_commit(self):
+        return "b" * 40
+
+    def start_worker(self, worker):
+        self.events.append(f"start-{worker.assignment.shard_index}")
+
+    def poll_worker(self, worker):
+        shard = worker.assignment.shard_index
+        self.events.append(f"poll-{shard}")
+        if shard == self.invalid_exit_shard:
+            raise ValueError("invalid owned exit record")
+        return self.exit_codes[shard]
+
+    def cleanup_worker(self, worker):
+        self.events.append(f"cleanup-{worker.assignment.shard_index}")
+        return True
+
+    def pull_remote_results(self, commands):
+        self.events.append("pull")
+
+    def validate_sidecars(self, commands):
+        self.events.append("sidecars")
+        if not self.valid:
+            raise ValueError("unsuccessful worker sidecar")
+
+    def merge(self, commands):
+        self.events.append("merge")
+        return {"summary": True, "num_samples": 4}
+
+    def sleep(self, seconds):
+        raise AssertionError("immediate fake exits must not sleep")
+
+
+def test_inference_manifest_is_prepared_before_any_worker_is_created():
+    runner = FakeEvaluationRunner()
+
+    result = run_evaluation(_plan(), runner)
+
+    assert result == {"summary": True, "num_samples": 4}
+    assert runner.events[:5] == [
+        "prepare-inference", "start-0", "start-1", "start-2", "start-3"
+    ]
+    assert runner.events[-3:] == ["pull", "sidecars", "merge"]
+
+
+def test_incomplete_worker_set_is_not_merged_and_only_live_peers_are_cleaned():
+    runner = FakeEvaluationRunner(exit_codes={1: 9})
+
+    with pytest.raises(RuntimeError, match="all four evaluation workers"):
+        run_evaluation(_plan(), runner)
+
+    assert "merge" not in runner.events
+    assert "pull" not in runner.events
+    assert "cleanup-1" not in runner.events
+    assert {event for event in runner.events if event.startswith("cleanup-")} == {
+        "cleanup-2", "cleanup-3"
+    }
+
+
+def test_invalid_sidecar_prevents_merge():
+    runner = FakeEvaluationRunner(valid=False)
+
+    with pytest.raises(RuntimeError, match="all four evaluation workers"):
+        run_evaluation(_plan(), runner)
+
+    assert runner.events[-2:] == ["pull", "sidecars"]
+    assert "merge" not in runner.events
+
+
+def test_invalid_owned_exit_record_stops_only_still_live_exact_peers():
+    runner = FakeEvaluationRunner(invalid_exit_shard=1)
+
+    with pytest.raises(RuntimeError, match="all four evaluation workers"):
+        run_evaluation(_plan(), runner)
+
+    assert "merge" not in runner.events
+    assert {event for event in runner.events if event.startswith("cleanup-")} == {
+        "cleanup-1", "cleanup-2", "cleanup-3"
+    }
+
+
+def test_remote_result_pull_is_one_explicit_nul_list_and_never_recursive():
+    output_dir = Path("/root/workspace/ILVR/results/eval-four-gpu")
+    files_path = Path(
+        "/root/workspace/ILVR/logs/multinode/eval-four-gpu/initial/"
+        "evaluation-pull.files"
+    )
+
+    payload = evaluation_result_files_bytes()
+    command = build_evaluation_pull_command(
+        output_dir, files_from=files_path
+    )
+
+    assert payload == (
+        b"shard-0.jsonl\0shard-0.jsonl.manifest.json\0"
+        b"shard-1.jsonl\0shard-1.jsonl.manifest.json\0"
+    )
+    assert command[:3] == (
+        "/usr/bin/rsync", "--archive", "--ignore-existing"
+    )
+    assert command[command.index("--files-from") + 1] == str(files_path)
+    assert "--from0" in command
+    assert command[-2:] == (
+        "korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/"
+        "results/eval-four-gpu/",
+        "/root/workspace/ILVR/results/eval-four-gpu/",
+    )
+    assert "--recursive" not in command
+
+
+def test_task6_inference_copy_publishes_identity_manifest_for_task8(tmp_path):
+    manifest = _manifest()
+    destination = tmp_path / "evaluation-model"
+
+    class CopyRunner:
+        def validate_inference_manifest(self, observed):
+            assert observed == manifest
+
+        def pull_inference_artifacts(self, observed, target):
+            for entry in observed.entries:
+                path = target / entry.relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x" * entry.byte_size)
+
+    prepare_inference_copy(manifest, destination, CopyRunner())
+
+    published = destination.with_name("evaluation-model.manifest.json")
+    assert json.loads(published.read_text(encoding="utf-8")) == manifest.to_json()
+
+
+def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
+    jsonls = []
+    manifests = []
+    for shard_index in range(4):
+        jsonl = tmp_path / f"shard-{shard_index}.jsonl"
+        jsonl.write_text(
+            json.dumps(
+                {"index": shard_index, "task_name": "task", "match": True}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        manifest = Path(f"{jsonl}.manifest.json")
+        write_shard_manifest(
+            manifest,
+            shard_jsonl=jsonl,
+            dataset_identity={
+                "path": "/root/workspace/ILVR/data/TEST.jsonl",
+                "size": 10,
+                "mtime_ns": 20,
+            },
+            model_identity="task6:" + "a" * 64,
+            shard_index=shard_index,
+            num_shards=4,
+            expected_source_indices=[shard_index],
+            processed_source_indices=([] if shard_index == 1 else [shard_index]),
+            worker_exit_status=0,
+        )
+        jsonls.append(jsonl)
+        manifests.append(manifest)
+
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_evaluation_sidecars(
+            manifests,
+            jsonls,
+            expected_model_identity="task6:" + "a" * 64,
+            expected_sample_count=4,
+        )
+
+
+def test_dry_run_builds_commands_without_constructing_a_live_runner(
+    monkeypatch, capsys
+):
+    import src.multinode_runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "EvaluationSubprocessRunner",
+        lambda *args, **kwargs: pytest.fail("dry-run constructed live runner"),
+    )
+
+    result = _main(
+        [
+            "evaluate",
+            "--run-id", "eval-four-gpu",
+            "--model-dir", "/root/workspace/ILVR/results/model/inference",
+            "--test-data-path", "/root/workspace/ILVR/data/TEST.jsonl",
+            "--task-name", "zebra-cot",
+            "--output-dir", "/root/workspace/ILVR/results/eval-four-gpu",
+            "--dry-run",
+        ]
+    )
+
+    assert result == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload["worker_commands_by_observed_stage"]) == {
+        "stage1", "stage2"
+    }
+    assert payload["remote_result_files"] == [
+        "shard-0.jsonl",
+        "shard-0.jsonl.manifest.json",
+        "shard-1.jsonl",
+        "shard-1.jsonl.manifest.json",
+    ]

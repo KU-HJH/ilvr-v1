@@ -1232,12 +1232,150 @@ def _prepare_inference_main(argv: list[str]) -> int:
     return 0
 
 
+def _prepared_inference_show(argv: list[str]) -> int:
+    """Validate one Task 6 prepared artifact without importing an evaluator."""
+    from src.multinode_artifacts import (
+        NodeArtifactManifest,
+        inference_manifest_path,
+        inference_model_identity,
+        validate_transferred_entries,
+    )
+    from src.multinode_runtime import _read_regular_file
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode prepared-inference-show", allow_abbrev=False
+    )
+    parser.add_argument("--model-dir", required=True)
+    args = parser.parse_args(argv)
+    try:
+        model_dir = Path(args.model_dir)
+        if not model_dir.is_absolute() or ".." in model_dir.parts:
+            raise ValueError("prepared inference model path must be absolute")
+        model_dir.relative_to(_REPOSITORY_ROOT / "results")
+        payload = json.loads(_read_regular_file(inference_manifest_path(model_dir)))
+        manifest = NodeArtifactManifest.from_json(payload)
+        inference_model_identity(manifest)
+        validate_transferred_entries(model_dir, manifest.entries)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    print(json.dumps(manifest.to_json(), sort_keys=True))
+    return 0
+
+
+def _prepare_evaluation_output(argv: list[str]) -> int:
+    from src.multinode_artifacts import reserve_inference_destination
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode prepare-evaluation-output", allow_abbrev=False
+    )
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--run-id", required=True)
+    args = parser.parse_args(argv)
+    try:
+        _validate_identifier("run_id", args.run_id)
+        output = Path(args.output_dir)
+        relative = output.relative_to(_REPOSITORY_ROOT / "results")
+        if not relative.parts or relative.parts[-1] != args.run_id:
+            raise ValueError("evaluation output must belong to the run ID")
+        reserve_inference_destination(output)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    return 0
+
+
+def _evaluate_main(argv: list[str]) -> int:
+    """Coordinate four independent Task 6-validated evaluation workers."""
+    from src.multinode_runtime import (
+        EvaluationPlan,
+        EvaluationSubprocessRunner,
+        _build_evaluation_commands_for_stage,
+        run_evaluation,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode evaluate", allow_abbrev=False
+    )
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", default="initial")
+    parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--test-data-path", required=True)
+    parser.add_argument("--task-name", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--base-model-dir")
+    parser.add_argument("--cache-dir", default=str(_REPOSITORY_ROOT / "cache"))
+    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        plan = EvaluationPlan(
+            run_id=args.run_id,
+            attempt_id=args.attempt_id,
+            model_dir=Path(args.model_dir),
+            test_data_path=Path(args.test_data_path),
+            task_name=args.task_name,
+            output_dir=Path(args.output_dir),
+            base_model_dir=(Path(args.base_model_dir) if args.base_model_dir else None),
+            cache_dir=Path(args.cache_dir),
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )
+        if args.dry_run:
+            dry_identity = f"task6:{'0' * 64}"
+            variants = {
+                stage: _build_evaluation_commands_for_stage(
+                    plan,
+                    stage=stage,
+                    model_identity=dry_identity,
+                    commit="0" * 40,
+                )
+                for stage in ("stage1", "stage2")
+            }
+            first = variants["stage1"]
+            print(
+                json.dumps(
+                    {
+                        "model_identity_source": "validated Task 6 inference manifest",
+                        "plan": _json_ready(plan),
+                        "remote_result_files": [
+                            value.decode("utf-8")
+                            for value in first.remote_files_payload.split(b"\0")
+                            if value
+                        ],
+                        "remote_result_pull": list(first.remote_pull),
+                        "worker_commands_by_observed_stage": {
+                            stage: [list(worker.launch) for worker in commands.workers]
+                            for stage, commands in variants.items()
+                        },
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        source_repository = Path(__file__).resolve().parents[1]
+        commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=source_repository)
+        runner = EvaluationSubprocessRunner(plan, commit=commit)
+        summary = run_evaluation(plan, runner)
+    except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    print(json.dumps(_json_ready(summary), sort_keys=True))
+    return 0
+
+
 def _main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in ("train-stage1", "train-stage2"):
         return _training_main(argv[0].removeprefix("train-"), argv[1:])  # type: ignore[arg-type]
     if argv and argv[0] == "prepare-inference":
         return _prepare_inference_main(argv[1:])
+    if argv and argv[0] == "evaluate":
+        return _evaluate_main(argv[1:])
+    if argv and argv[0] == "prepared-inference-show":
+        return _prepared_inference_show(argv[1:])
+    if argv and argv[0] == "prepare-evaluation-output":
+        return _prepare_evaluation_output(argv[1:])
     if argv and argv[0] == "node-run":
         return _node_run(argv[1:])
     if argv and argv[0] == "node-exit":

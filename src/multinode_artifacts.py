@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -46,6 +47,13 @@ _REMOTE_HOST = "korea@10.1.102.41"
 _RSYNC_SSH = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8"
 _MAX_COMMON_METADATA_BYTES = 4 * 1024 * 1024
 _MAX_LATEST_BYTES = 1024
+INFERENCE_MANIFEST_SUFFIX = ".manifest.json"
+_EVALUATION_REMOTE_FILES = (
+    "shard-0.jsonl",
+    "shard-0.jsonl.manifest.json",
+    "shard-1.jsonl",
+    "shard-1.jsonl.manifest.json",
+)
 _INFERENCE_STATIC_NAMES = frozenset(
     {
         "adapter_config.json",
@@ -1854,6 +1862,173 @@ def files_list_bytes(entries: Sequence[ArtifactEntry]) -> bytes:
     return b"".join(path.encode("utf-8") + b"\0" for path in paths)
 
 
+def inference_manifest_path(model_directory: str | Path) -> Path:
+    """Return the sibling Task 6 identity record for one prepared model tree."""
+    model = Path(model_directory)
+    return model.with_name(f"{model.name}{INFERENCE_MANIFEST_SUFFIX}")
+
+
+def inference_model_identity(manifest: NodeArtifactManifest) -> str:
+    """Derive one explicit evaluator identity from a validated Task 6 manifest."""
+    validate_inference_manifest_identity(
+        manifest, expected_identity=manifest.runtime_identity
+    )
+    payload = json.dumps(
+        manifest.to_json(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"task6:{hashlib.sha256(payload).hexdigest()}"
+
+
+def evaluation_result_files_bytes() -> bytes:
+    """Encode only remote shard 0/1 JSONL and Task 7 sidecars."""
+    return b"".join(name.encode("utf-8") + b"\0" for name in _EVALUATION_REMOTE_FILES)
+
+
+def build_evaluation_pull_command(
+    output_directory: str | Path, *, files_from: str | Path
+) -> tuple[str, ...]:
+    """Build the one fixed, non-recursive remote evaluation result pull."""
+    output = Path(output_directory)
+    try:
+        relative = output.relative_to(_LOCAL_REPOSITORY / "results")
+    except ValueError as error:
+        raise ValueError("evaluation output must be under the canonical result root") from error
+    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise ValueError("evaluation output must belong to a fresh result subtree")
+    _validate_run_id(relative.parts[0])
+    remote = _REMOTE_HOST_REPOSITORY / "results" / relative
+    return (
+        *_rsync_prefix(Path(files_from)),
+        f"{_REMOTE_HOST}:{remote}/",
+        f"{output}/",
+    )
+
+
+def build_prepared_inference_pull_command(
+    manifest: NodeArtifactManifest,
+    source_directory: str | Path,
+    destination: str | Path,
+    *,
+    files_from: str | Path,
+) -> tuple[str, ...]:
+    """Pull only Task 6 allowlisted files from one prepared remote artifact."""
+    validate_inference_manifest_identity(
+        manifest, expected_identity=manifest.runtime_identity
+    )
+    source = Path(source_directory)
+    try:
+        relative = source.relative_to(_LOCAL_REPOSITORY / "results")
+    except ValueError as error:
+        raise ValueError("prepared inference source must be under the result root") from error
+    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise ValueError("prepared inference source path is invalid")
+    remote = _REMOTE_HOST_REPOSITORY / "results" / relative
+    return (
+        *_rsync_prefix(Path(files_from)),
+        f"{_REMOTE_HOST}:{remote}/",
+        f"{Path(destination)}/",
+    )
+
+
+def validate_evaluation_sidecars(
+    manifest_paths: Sequence[str | Path],
+    shard_jsonls: Sequence[str | Path],
+    *,
+    expected_model_identity: str,
+    expected_sample_count: int,
+) -> None:
+    """Require four successful Task 7 sidecars before invoking its merger."""
+    from src.multinode_runtime import _read_regular_file
+
+    manifests = tuple(Path(path) for path in manifest_paths)
+    jsonls = tuple(Path(path) for path in shard_jsonls)
+    if len(manifests) != 4 or len(jsonls) != 4:
+        raise ValueError("all four evaluation workers require sidecars and JSONLs")
+    if type(expected_sample_count) is not int or expected_sample_count < 0:
+        raise ValueError("expected sample count must be a nonnegative integer")
+    common_dataset_identity: object | None = None
+    required = {
+        "schema_version",
+        "result_jsonl",
+        "dataset_identity",
+        "model_identity",
+        "shard_index",
+        "num_shards",
+        "expected_source_indices",
+        "processed_source_indices",
+        "worker_exit_status",
+        "successful",
+    }
+    for shard_index, (manifest_path, jsonl_path) in enumerate(zip(manifests, jsonls)):
+        if manifest_path != Path(f"{jsonl_path}.manifest.json"):
+            raise ValueError("evaluation sidecar path does not own its shard JSONL")
+        try:
+            payload = json.loads(_read_regular_file(manifest_path))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"invalid evaluation sidecar for shard {shard_index}") from error
+        if type(payload) is not dict or set(payload) != required:
+            raise ValueError(f"invalid evaluation sidecar fields for shard {shard_index}")
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != 1
+            or type(payload["shard_index"]) is not int
+            or payload["shard_index"] != shard_index
+            or type(payload["num_shards"]) is not int
+            or payload["num_shards"] != 4
+            or type(payload["worker_exit_status"]) is not int
+            or payload["worker_exit_status"] != 0
+            or payload["successful"] is not True
+        ):
+            raise ValueError(f"unsuccessful worker sidecar for shard {shard_index}")
+        if payload["result_jsonl"] != jsonl_path.name:
+            raise ValueError(f"sidecar JSONL mismatch for shard {shard_index}")
+        if payload["model_identity"] != expected_model_identity:
+            raise ValueError("model identity mismatch across evaluation sidecars")
+        dataset = payload["dataset_identity"]
+        if (
+            type(dataset) is not dict
+            or set(dataset) != {"path", "size", "mtime_ns"}
+            or type(dataset["path"]) is not str
+            or not Path(dataset["path"]).is_absolute()
+            or type(dataset["size"]) is not int
+            or dataset["size"] < 0
+            or type(dataset["mtime_ns"]) is not int
+            or dataset["mtime_ns"] < 0
+        ):
+            raise ValueError(f"invalid dataset identity for shard {shard_index}")
+        if common_dataset_identity is None:
+            common_dataset_identity = dataset
+        elif dataset != common_dataset_identity:
+            raise ValueError("dataset identity mismatch across evaluation sidecars")
+        expected_indices = payload["expected_source_indices"]
+        processed_indices = payload["processed_source_indices"]
+        wanted = list(range(shard_index, expected_sample_count, 4))
+        if (
+            type(expected_indices) is not list
+            or any(type(index) is not int for index in expected_indices)
+            or len(expected_indices) != len(set(expected_indices))
+            or expected_indices != wanted
+        ):
+            raise ValueError(f"invalid expected indices for shard {shard_index}")
+        if (
+            type(processed_indices) is not list
+            or any(type(index) is not int for index in processed_indices)
+            or processed_indices != expected_indices
+        ):
+            raise ValueError(f"incomplete processed indices for shard {shard_index}")
+        _reject_symlink_ancestors(jsonl_path)
+        try:
+            metadata = jsonl_path.lstat()
+        except OSError as error:
+            raise ValueError(f"missing shard JSONL for shard {shard_index}") from error
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"invalid shard JSONL for shard {shard_index}")
+
+
 def publish_node_manifest(
     path: str | Path, manifest: NodeArtifactManifest
 ) -> Path:
@@ -1930,4 +2105,5 @@ def prepare_inference_copy(
     reserve_inference_destination(target)
     validate_reserved_inference_destination(target)
     runner.pull_inference_artifacts(remote_manifest, target)
+    publish_node_manifest(inference_manifest_path(target), remote_manifest)
     return target
