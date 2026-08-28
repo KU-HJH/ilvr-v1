@@ -13,16 +13,17 @@ files for new compatibility evidence.
 
 | Stage | Full | LoRA | DoRA | Official 2-GPU batch |
 |---|---|---|---|---|
-| Stage 1 | ZeRO-1/2/3 | existing legacy path only | ZeRO-1/2/3 | matrix-selected, EGB 16 |
-| Stage 2 | ZeRO-1/2/3 | ZeRO-1/2/3 | ZeRO-1/2/3 | micro 1 / accumulation 8 |
+| Stage 1 | ZeRO-1 / ZeRO-2 / ZeRO-3 | ZeRO-1 / ZeRO-2 / ZeRO-3 | ZeRO-1 / ZeRO-2 / ZeRO-3 | matrix-selected, EGB 16 |
+| Stage 2 | ZeRO-1 / ZeRO-2 / ZeRO-3 | ZeRO-1 / ZeRO-2 / ZeRO-3 | ZeRO-1 / ZeRO-2 / ZeRO-3 | micro 1 / accumulation 8 |
 
 The official evidence environment is exactly two NVIDIA B200 GPUs. Ordinary
 fresh training may use another positive world size, but its result is not an
 official two-GPU matrix row. Stage 1's official effective global batch is 16;
-until the matrix has measured a preferred row, its universally valid fallback
-is `(micro_batch, gradient_accumulation) = (1, 8)`. Stage 2 fixes the local
-micro batch to 1 and uses gradient accumulation 8 for the official setting;
-there is no Stage 2 batch sweep.
+capacity probing begins at per-GPU micro-batch 2. It tries 4 and 8 after
+successful candidates; micro-batch 1 is considered only after micro-batch 2
+has a confirmed CUDA capacity OOM. Stage 2 fixes the local micro batch to 1
+and uses gradient accumulation 8 for the official setting; there is no Stage 2
+batch sweep.
 
 ## Artifact ownership and experiment identity
 
@@ -52,7 +53,9 @@ Before accelerator or DeepSpeed initialization, the runtime captures the ZeRO
 stage, exact canonical configuration digest, and world size. A resume whose
 stage, digest, or world size differs from its numbered checkpoint is rejected
 before DeepSpeed initialization; cross-stage and cross-world-size optimizer
-conversion are unsupported. Keep the complete numbered checkpoint, its runtime
+conversion are unsupported. Optimizer resume requires the same ZeRO stage,
+configuration digest, and world size; optimizer state cannot be shared across
+different ZeRO identities. Keep the complete numbered checkpoint, its runtime
 sidecar, and the same canonical configuration when resuming.
 
 ## Fresh and same-identity resume examples
@@ -62,16 +65,16 @@ only `deepspeed_zero2.json` to `deepspeed_zero1.json` or
 `deepspeed_zero3.json` to select that canonical stage. The generated suffix
 prevents a fresh attempt from colliding with another independent experiment.
 
-### Stage 1 DoRA
+### Stage 1 LoRA
 
 ```bash
 zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
 zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
-experiment_id="stage1-zero2-dora-fresh-example-$run_suffix"
+experiment_id="stage1-zero2-lora-fresh-example-$run_suffix"
 
 ./run_stage1_training.sh \
-  --method dora \
+  --method lora \
   --model Qwen/Qwen2.5-VL-3B-Instruct \
   --data-path "$PWD/data/TRAIN.jsonl" \
   --image-root "$PWD/data" \
@@ -82,12 +85,12 @@ experiment_id="stage1-zero2-dora-fresh-example-$run_suffix"
   --epochs 3 \
   --learning-rate 1e-5 \
   --seed 42 \
-  --deepspeed-config "$PWD/configs/deepspeed_zero2.json" \
+  --deepspeed-config configs/deepspeed_zero2.json \
   --save-strategy steps \
   --save-steps 100
 
 ./run_stage1_training.sh \
-  --method dora \
+  --method lora \
   --model Qwen/Qwen2.5-VL-3B-Instruct \
   --data-path "$PWD/data/TRAIN.jsonl" \
   --image-root "$PWD/data" \
@@ -98,12 +101,11 @@ experiment_id="stage1-zero2-dora-fresh-example-$run_suffix"
   --epochs 3 \
   --learning-rate 1e-5 \
   --seed 42 \
-  --deepspeed-config "$PWD/configs/deepspeed_zero2.json" \
+  --deepspeed-config configs/deepspeed_zero2.json \
   --resume "$zero_checkpoint_root/$experiment_id/checkpoint-100"
 ```
 
-Stage 1 Full and DoRA are the canonical ZeRO methods. Stage 1 LoRA remains
-only on the existing legacy path and is not a new ZeRO compatibility method.
+Stage 1 supports Full, LoRA, and DoRA for all three canonical ZeRO stages.
 
 ### Stage 2 DoRA
 
@@ -143,13 +145,20 @@ checkpoint metadata.
 
 ## Official matrix procedure and evidence
 
-The Stage 1 controller tests the fixed EGB-16 candidates in reverse-size order:
-`(8,1)`, `(4,2)`, `(2,4)`, then `(1,8)`, in ZeRO stage order 3, 2, 1.
+The Stage 1 controller tests the fixed EGB-16 candidates in this order:
+`(2,4)`, `(4,2)`, `(8,1)`, then `(1,8)`, in ZeRO stage order 3, 2, 1. This
+fixed matrix is separate from capacity probing: a capacity probe begins at
+per-GPU micro-batch 2, and it may try micro-batch 1 only after a confirmed CUDA
+capacity OOM at 2.
 Each successful `(stage, method)` has one selected fastest row and only that
 selected row receives the same-identity save-to-resume lifecycle. CUDA allocator
 out-of-memory failures are recorded as `capacity_oom`. NCCL, timeout,
 non-finite, contract, missing-evidence, and other nonzero failures are
 `integration_failure`, not capacity results.
+
+The Stage 1 performance comparison matrix remains scoped to Full and DoRA.
+LoRA is included in the canonical ZeRO compatibility matrix, not the
+Full/DoRA performance comparison.
 
 The aggregate Stage 1 matrix report is:
 

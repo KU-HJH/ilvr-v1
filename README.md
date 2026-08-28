@@ -98,6 +98,17 @@ The dataset follows the JSONL format:
 For canonical ZeRO-1/2/3 configuration selection, artifact ownership, and
 same-identity resume commands, see [the ZeRO stage training guide](docs/zero-stage-training.md).
 
+Canonical ZeRO compatibility is:
+
+| Stage | Supported methods | Canonical DeepSpeed stages |
+|---|---|---|
+| Stage 1 | Full / LoRA / DoRA | ZeRO-1 / ZeRO-2 / ZeRO-3 |
+| Stage 2 | Full / LoRA / DoRA | ZeRO-1 / ZeRO-2 / ZeRO-3 |
+
+Optimizer resume requires the same ZeRO stage, configuration digest, and world
+size as the checkpoint. Optimizer state cannot be shared across different ZeRO
+identities.
+
 We provide a shell script `run_training.sh` to launch distributed training.
 
 ### 1. Configure Script
@@ -132,9 +143,9 @@ bash run_training.sh
 - Gradient Accumulation Steps: 8
 - Latent Size: 8
 
-### Stage 1 full and DoRA training
+### Stage 1 Full and DoRA performance matrix
 
-The Qwen2.5-VL-3B full/DoRA comparison is a sealed four-stage workflow. Run
+The Qwen2.5-VL-3B Full/DoRA comparison is a sealed four-stage workflow. Run
 the commands below in order; do not launch a three-epoch run with a batch size
 copied by hand. On this host the complete CoMT inputs are:
 
@@ -223,7 +234,7 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --output-root outputs/stage1-probes/full \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
-  --start 8 --gradient-accumulation 2 --learning-rate 1e-5 --seed 42
+  --start 2 --gradient-accumulation 2 --learning-rate 1e-5 --seed 42
 
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --method dora --model Qwen/Qwen2.5-VL-3B-Instruct \
@@ -232,7 +243,7 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --output-root outputs/stage1-probes/dora \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
-  --start 8 --gradient-accumulation 2 --learning-rate 1e-5 --seed 42 \
+  --start 2 --gradient-accumulation 2 --learning-rate 1e-5 --seed 42 \
   --dora-rank 32 --dora-alpha 64 --dora-dropout 0.05
 ```
 
@@ -261,9 +272,10 @@ successful prefix, appends a new attempt for the same failed batch, and only
 then continues the ordered search. An `integration_failure` never authorizes a
 lower fallback and is never reported as the first capacity failure.
 
-If the initial batch 8 is classified `capacity_oom`, that classification must
-precede an explicit fallback. Run 4, then—only after another recorded
-`capacity_oom`—2, then 1.
+Capacity probing begins at per-GPU micro-batch 2, then advances to 4 and 8
+after each successful candidate. Micro-batch 1 is considered only when the
+micro-batch-2 attempt has been confirmed as a CUDA capacity OOM; NCCL,
+checkpoint, and other integration failures never authorize that fallback.
 The full fallback command is:
 
 ```bash
@@ -274,7 +286,7 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --output-root outputs/stage1-probes/full \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
-  --start 4 --descending \
+  --fallback 1 \
   --gradient-accumulation 2 --learning-rate 1e-5 --seed 42
 ```
 
@@ -288,12 +300,11 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --output-root outputs/stage1-probes/dora \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
-  --start 4 --descending \
+  --fallback 1 \
   --gradient-accumulation 2 --learning-rate 1e-5 --seed 42 \
   --dora-rank 32 --dora-alpha 64 --dora-dropout 0.05
 ```
 
-For later fallbacks change `--start 4` to `--start 2`, then `--start 1`.
 The launcher verifies the already sealed attempt chain and never lowers a
 batch automatically. For every run:
 
