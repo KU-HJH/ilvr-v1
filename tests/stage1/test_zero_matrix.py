@@ -83,14 +83,14 @@ def attempt(*, micro: int, speed: float | None, status: str = "success"):
     )
 
 
-def test_candidates_are_fixed_egb16_in_reverse_microbatch_order():
+def test_candidates_are_fixed_egb16_in_primary_microbatch_order():
     """Catches accidental matrix expansion, reordering, or batch drift."""
     from src.stage1.zero_matrix import ZERO_MATRIX_CANDIDATES
 
     assert [
         (candidate.micro_batch, candidate.gradient_accumulation_steps)
         for candidate in ZERO_MATRIX_CANDIDATES
-    ] == [(8, 1), (4, 2), (2, 4), (1, 8)]
+    ] == [(2, 4), (4, 2), (8, 1), (1, 8)]
     assert all(candidate.effective_global_batch == 16 for candidate in ZERO_MATRIX_CANDIDATES)
 
 
@@ -325,9 +325,9 @@ def test_select_atomically_publishes_report_with_producer_witnesses(tmp_path):
     from src.stage1.zero_matrix import write_zero_matrix_report
 
     rows = [
-        attempt(micro=8, speed=None, status="capacity_oom"),
-        attempt(micro=4, speed=4.0),
         attempt(micro=2, speed=3.9),
+        attempt(micro=4, speed=4.0),
+        attempt(micro=8, speed=None, status="capacity_oom"),
         attempt(micro=1, speed=3.0),
     ]
     digests = {str(row.evidence_path): str(row.micro_batch) * 64 for row in rows}
@@ -337,7 +337,7 @@ def test_select_atomically_publishes_report_with_producer_witnesses(tmp_path):
 
     assert report_path == tmp_path / "zero-matrix-report.json"
     assert report["selected"]["identity"]["micro_batch"] == 4
-    assert [row["identity"]["micro_batch"] for row in report["rows"]] == [8, 4, 2, 1]
+    assert [row["identity"]["micro_batch"] for row in report["rows"]] == [2, 4, 8, 1]
     assert report["selected"]["evidence_digest"] == "4" * 64
 
 
@@ -346,9 +346,9 @@ def test_report_preserves_prior_stage_method_matrix(tmp_path):
     from src.stage1.zero_matrix import write_zero_matrix_report
 
     full_rows = [
-        attempt(micro=8, speed=3.0),
-        attempt(micro=4, speed=4.0),
         attempt(micro=2, speed=3.5),
+        attempt(micro=4, speed=4.0),
+        attempt(micro=8, speed=3.0),
         attempt(micro=1, speed=2.0),
     ]
     dora_rows = [

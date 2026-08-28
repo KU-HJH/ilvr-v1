@@ -146,10 +146,10 @@ def test_legacy_zero3_evidence_migrates_without_rehashing(monkeypatch):
 
 def test_capacity_candidates_follow_only_the_approved_order():
     """Catches speculative lower batches or retries in the primary search."""
-    assert capacity_candidates(start=8, max_per_gpu=64) == (8, 16, 32, 64)
-    assert fallback_candidates_after_initial_failure(start=8) == (4, 2, 1)
-    with pytest.raises(ValueError, match="initial batch 8"):
-        fallback_candidates_after_initial_failure(start=16)
+    assert capacity_candidates(start=2, max_per_gpu=64) == (2, 4, 8, 16, 32, 64)
+    assert fallback_candidates_after_initial_failure(start=2) == (1,)
+    with pytest.raises(ValueError, match="initial batch 2"):
+        fallback_candidates_after_initial_failure(start=4)
 
 
 def test_canonical_evidence_strings_reject_embedded_nul():
@@ -175,7 +175,7 @@ def test_exact_module_cli_runs_without_repository_pythonpath_override():
             "src.stage1.benchmark",
             "capacity-candidates",
             "--start",
-            "8",
+            "2",
             "--max-per-gpu",
             "64",
         ],
@@ -187,7 +187,7 @@ def test_exact_module_cli_runs_without_repository_pythonpath_override():
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "8 16 32 64"
+    assert completed.stdout.strip() == "2 4 8 16 32 64"
 
 
 @pytest.mark.parametrize(
@@ -465,7 +465,7 @@ def _run_probe(
             "--prerequisite-chain",
             prerequisite_path,
             "--start",
-            "8",
+            "2",
             "--max-per-gpu",
             "64",
             *extra,
@@ -504,7 +504,7 @@ def _probe_attempt_for_batch(output_root, micro_batch):
 
 def test_probe_uses_fresh_processes_unique_paths_and_stops_at_first_failure(tmp_path):
     """Catches mocked isolation, dirty-process reuse, retry, and output collision."""
-    completed, records, output_root, _ = _run_probe(tmp_path, fail_batches="32")
+    completed, records, output_root, _ = _run_probe(tmp_path, fail_batches="8")
 
     assert completed.returncode != 0
     assert "requires-classification" in completed.stderr
@@ -513,10 +513,8 @@ def test_probe_uses_fresh_processes_unique_paths_and_stops_at_first_failure(tmp_
     parsed = [path.read_bytes().split(b"\0")[:-1] for path in launches]
     pids = {parts[0].decode() for parts in parsed}
     assert len(pids) == 3
-    batches = {
-        parts[parts.index(b"--micro-batch") + 1].decode() for parts in parsed
-    }
-    assert batches == {"8", "16", "32"}
+    batches = [parts[parts.index(b"--micro-batch") + 1].decode() for parts in parsed]
+    assert batches == ["2", "4", "8"]
     for parts in parsed:
         assert parts[parts.index(b"--max-steps") + 1] == b"3"
         assert b"--no-final-save" in parts
@@ -526,13 +524,13 @@ def test_probe_uses_fresh_processes_unique_paths_and_stops_at_first_failure(tmp_
     assert len({path.parent.parent.parent for path in attempts}) == 3
     failed = [json.loads(path.read_text()) for path in attempts if json.loads(path.read_text())["exit_code"]]
     assert len(failed) == 1
-    assert failed[0]["micro_batch"] == 32
+    assert failed[0]["micro_batch"] == 8
     assert failed[0]["requires_oom_classification"] is True
 
 
 def test_probe_launches_each_candidate_with_one_canonical_artifact_identity(tmp_path):
     """Catches a probe wiring checkpoint, log, and evidence through one root."""
-    completed, records, _output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    completed, records, _output_root, _ = _run_probe(tmp_path, fail_batches="2")
 
     assert completed.returncode == 42
     parts = next(records.glob("*.argv0")).read_bytes().split(b"\0")[:-1]
@@ -552,14 +550,14 @@ def test_probe_accepts_a_maximum_length_controller_experiment_id(tmp_path):
         "p" + hashlib.sha256(str(tmp_path).encode()).hexdigest() + "a" * 63
     )
     completed, records, _output_root, _ = _run_probe(
-        tmp_path, fail_batches="8", controller_id=controller_id
+        tmp_path, fail_batches="2", controller_id=controller_id
     )
 
     assert completed.returncode == 42, completed.stderr
     parts = next(records.glob("*.argv0")).read_bytes().split(b"\0")[:-1]
     candidate_id = Path(parts[parts.index(b"--output-dir") + 1].decode()).name
     assert len(candidate_id) <= 128
-    controller_prefix, unique_suffix = candidate_id.split("-mb8-", maxsplit=1)
+    controller_prefix, unique_suffix = candidate_id.split("-mb2-", maxsplit=1)
     assert controller_id.startswith(controller_prefix)
     assert unique_suffix
 
@@ -569,7 +567,7 @@ def test_probe_pins_benchmark_python_when_path_and_override_are_wrong(tmp_path):
 
     completed, records, output_root, poison_marker = _run_probe(
         tmp_path,
-        fail_batches="8",
+        fail_batches="2",
         poison_benchmark_python=True,
     )
 
@@ -579,7 +577,7 @@ def test_probe_pins_benchmark_python_when_path_and_override_are_wrong(tmp_path):
     assert len(_probe_attempt_files(output_root)) == 1
 
 
-@pytest.mark.parametrize("failed_batch", [8, 16])
+@pytest.mark.parametrize("failed_batch", [2, 4])
 def test_integration_failure_retries_same_batch_append_only_then_continues(
     tmp_path, failed_batch
 ):
@@ -610,14 +608,14 @@ def test_integration_failure_retries_same_batch_append_only_then_continues(
         for path in benchmark._attempt_files(output_root, "full")
     ]
     expected_batches = (
-        [8, 8, 16, 32, 64]
-        if failed_batch == 8
-        else [8, 16, 16, 32, 64]
+        [2, 2, 4, 8, 16, 32, 64]
+        if failed_batch == 2
+        else [2, 4, 4, 8, 16, 32, 64]
     )
     expected_exits = (
-        [42, 0, 0, 0, 0]
-        if failed_batch == 8
-        else [0, 42, 0, 0, 0]
+        [42, 0, 0, 0, 0, 0, 0]
+        if failed_batch == 2
+        else [0, 42, 0, 0, 0, 0, 0]
     )
     assert [attempt["micro_batch"] for _, attempt in attempts] == expected_batches
     assert [attempt["exit_code"] for _, attempt in attempts] == expected_exits
@@ -626,22 +624,22 @@ def test_integration_failure_retries_same_batch_append_only_then_continues(
     )
     assert selected is not None and selected[1]["micro_batch"] == 64
     assert capacity_failure is None
-    assert len(list(records.glob("*.argv0"))) == 5
+    assert len(list(records.glob("*.argv0"))) == 7
 
 
 def test_integration_failure_never_authorizes_capacity_fallback(tmp_path):
     """Catches a harness failure silently lowering the requested batch."""
 
-    failed, records, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    failed, records, output_root, _ = _run_probe(tmp_path, fail_batches="2")
     assert failed.returncode == 42
-    failed_attempt = _probe_attempt_for_batch(output_root, 8)
+    failed_attempt = _probe_attempt_for_batch(output_root, 2)
 
     import stage1.benchmark as benchmark
 
     benchmark._classify_failure(failed_attempt, "integration_failure")
     before = sorted(records.glob("*.argv0"))
     fallback, _, _, _ = _run_probe(
-        tmp_path, fail_batches="", extra=("--fallback", "4")
+        tmp_path, fail_batches="", extra=("--fallback", "1")
     )
 
     assert fallback.returncode != 0
@@ -649,14 +647,39 @@ def test_integration_failure_never_authorizes_capacity_fallback(tmp_path):
     assert sorted(records.glob("*.argv0")) == before
 
 
+def test_confirmed_initial_capacity_oom_authorizes_only_batch_one_fallback(tmp_path):
+    """Catches batch one launching without a classified initial batch-two CUDA OOM."""
+
+    failed, records, output_root, _ = _run_probe(tmp_path, fail_batches="2")
+    assert failed.returncode == 42
+    failed_attempt = _probe_attempt_for_batch(output_root, 2)
+
+    import stage1.benchmark as benchmark
+
+    benchmark._classify_failure(failed_attempt, "capacity_oom")
+    fallback, records, _, _ = _run_probe(
+        tmp_path, fail_batches="", extra=("--fallback", "1")
+    )
+
+    assert fallback.returncode == 0, fallback.stderr
+    launches = [
+        parts[parts.index(b"--micro-batch") + 1].decode()
+        for parts in (
+            path.read_bytes().split(b"\0")[:-1]
+            for path in sorted(records.glob("*.argv0"))
+        )
+    ]
+    assert launches == ["2", "1"]
+
+
 def test_conflicting_failure_classifications_publish_exactly_once(
     tmp_path, monkeypatch
 ):
     """Catches a concurrent integration/OOM classification overwrite."""
 
-    failed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    failed, _, output_root, _ = _run_probe(tmp_path, fail_batches="2")
     assert failed.returncode == 42
-    failed_attempt = _probe_attempt_for_batch(output_root, 8)
+    failed_attempt = _probe_attempt_for_batch(output_root, 2)
 
     import stage1.benchmark as benchmark
 
@@ -696,9 +719,9 @@ def test_identical_classification_is_invisible_until_atomic_publication(
 ):
     """Catches readers observing an empty/partial final classification inode."""
 
-    failed, _, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    failed, _, output_root, _ = _run_probe(tmp_path, fail_batches="2")
     assert failed.returncode == 42
-    failed_attempt = _probe_attempt_for_batch(output_root, 8)
+    failed_attempt = _probe_attempt_for_batch(output_root, 2)
 
     import stage1.benchmark as benchmark
 
@@ -740,9 +763,9 @@ def test_identical_classification_is_invisible_until_atomic_publication(
 def test_concurrent_probe_controllers_cannot_launch_duplicate_retry(tmp_path):
     """Catches two controllers passing the same candidate gate concurrently."""
 
-    failed, records, output_root, _ = _run_probe(tmp_path, fail_batches="8")
+    failed, records, output_root, _ = _run_probe(tmp_path, fail_batches="2")
     assert failed.returncode == 42
-    failed_attempt = _probe_attempt_for_batch(output_root, 8)
+    failed_attempt = _probe_attempt_for_batch(output_root, 2)
 
     import stage1.benchmark as benchmark
 
@@ -792,7 +815,7 @@ def test_concurrent_probe_controllers_cannot_launch_duplicate_retry(tmp_path):
         benchmark._load_probe_attempt(path)
         for path in benchmark._attempt_files(output_root, "full")
     ]
-    assert [item["micro_batch"] for item in attempts].count(8) == 2
+    assert [item["micro_batch"] for item in attempts].count(2) == 2
 
 
 def test_probe_execution_lock_rejects_named_inode_replacement(tmp_path):
@@ -1187,11 +1210,11 @@ def test_capacity_chain_rejects_duplicate_and_success_after_first_failure():
 
     with pytest.raises(ValueError, match="duplicate"):
         benchmark._validated_capacity_chain(
-            [item(8, 0, 1), item(8, 0, 2)], require_success=True
+            [item(2, 0, 1), item(2, 0, 2)], require_success=True
         )
     with pytest.raises(ValueError, match="after its first failure"):
         benchmark._validated_capacity_chain(
-            [item(8, 0, 1), item(16, 42, 2), item(32, 0, 3)],
+            [item(2, 0, 1), item(4, 42, 2), item(8, 0, 3)],
             require_success=True,
         )
 
@@ -1199,10 +1222,10 @@ def test_capacity_chain_rejects_duplicate_and_success_after_first_failure():
 def _maximum_probe_launch_config(*, max_steps=3):
     return {
         "method": "full",
-        "micro_batch": 8,
+        "micro_batch": 2,
         "world_size": 2,
         "gradient_accumulation_steps": 2,
-        "effective_global_batch": 32,
+        "effective_global_batch": 8,
         "learning_rate": 1e-5,
         "seed": 42,
         "max_steps": max_steps,
@@ -1232,17 +1255,17 @@ def _sealed_maximum_fixture(tmp_path, monkeypatch):
     probe_root = tmp_path / "probe"
     selected_path = (
         probe_root
-        / "attempts/full/micro-batch-8/attempt-selected/evidence/attempt.json"
+        / "attempts/full/micro-batch-2/attempt-selected/evidence/attempt.json"
     )
     long_path = (
         probe_root
-        / "long-smoke/full/micro-batch-8/attempt-long/evidence/attempt.json"
+        / "long-smoke/full/micro-batch-2/attempt-long/evidence/attempt.json"
     )
     selected_launch = _maximum_probe_launch_config(max_steps=3)
     long_launch = _maximum_probe_launch_config(max_steps=10)
     selected = {
-        "method": "full", "micro_batch": 8, "world_size": 2,
-        "gradient_accumulation_steps": 2, "effective_global_batch": 32,
+        "method": "full", "micro_batch": 2, "world_size": 2,
+        "gradient_accumulation_steps": 2, "effective_global_batch": 8,
         "max_steps": 3, "final_save": False, "exit_code": 0,
         "recorded_at_ns": 1, "attempt_digest": "1" * 64,
         "audit_digest": "a" * 64, "data_stat": selected_launch["data_stat"],
@@ -1265,8 +1288,8 @@ def _sealed_maximum_fixture(tmp_path, monkeypatch):
         "data_stat": long_launch["data_stat"],
         "image_root": long_launch["image_root"],
         "output_dir": long_attempt["output_dir"],
-        "micro_batch": 8, "world_size": 2,
-        "gradient_accumulation_steps": 2, "effective_global_batch": 32,
+        "micro_batch": 2, "world_size": 2,
+        "gradient_accumulation_steps": 2, "effective_global_batch": 8,
         "epochs": 3, "learning_rate": 1e-5, "seed": 42,
         "max_steps": 10, "final_save": False,
         "deepspeed_config": long_launch["deepspeed_config"],
@@ -1279,8 +1302,10 @@ def _sealed_maximum_fixture(tmp_path, monkeypatch):
     }
     producer_config["config_digest"] = "b" * 64
     long_evidence = evidence(
+        micro_batch=2,
+        effective_global_batch=8,
         optimizer_steps=10,
-        samples_seen=320,
+        samples_seen=80,
         config_digest=producer_config["config_digest"],
         checkpoint_bytes=0,
     )
@@ -1294,10 +1319,10 @@ def _sealed_maximum_fixture(tmp_path, monkeypatch):
         "kind": "stage1-capacity-maximum",
         "status": "success",
         "method": "full",
-        "selected_micro_batch": 8,
+        "selected_micro_batch": 2,
         "world_size": 2,
         "gradient_accumulation_steps": 2,
-        "effective_global_batch": 32,
+        "effective_global_batch": 8,
         "long_smoke_steps": 10,
         "long_smoke_attempt": str(long_path),
         "selected_attempt": str(selected_path),
@@ -1405,7 +1430,7 @@ def test_maximum_rejects_resealed_top_level_batch_controls_not_from_selected(
 
     maximum_path, maximum, _, _, _ = _sealed_maximum_fixture(tmp_path, monkeypatch)
     maximum["gradient_accumulation_steps"] = 3
-    maximum["effective_global_batch"] = 48
+    maximum["effective_global_batch"] = 12
     _reseal_maximum(maximum_path, maximum)
 
     with pytest.raises(ValueError, match="selected attempt.*batch controls"):
@@ -1657,10 +1682,10 @@ def test_smoke_pair_seals_resume_identity_and_rejects_control_mismatch(monkeypat
     assert len(chain["prerequisite_chain_digest"]) == 64
 
 
-def test_probe_does_not_fallback_without_a_confirmed_initial_eight_oom(tmp_path):
+def test_probe_does_not_fallback_without_a_confirmed_initial_two_oom(tmp_path):
     """Catches an implicit batch reduction after an unclassified failure."""
     completed, records, output_root, _ = _run_probe(
-        tmp_path, fail_batches="8", extra=("--fallback", "4")
+        tmp_path, fail_batches="2", extra=("--fallback", "1")
     )
 
     assert completed.returncode != 0
@@ -2974,12 +2999,19 @@ def test_invalid_distributed_method_environment_fails_collection_without_cuda(tm
         ILVR_DISTRIBUTED_METHOD="invalid-method",
         PYTHONDONTWRITEBYTECODE="1",
         PYTHONPATH=os.pathsep.join(
-            (str(REPO_ROOT), str(REPO_ROOT / "transformers/src"), str(REPO_ROOT / "src"))
+            (
+                str(REPO_ROOT / ".superpowers/sdd/2026-08-28-stage1-stage2-zero123-lora-integration"),
+                str(REPO_ROOT),
+                str(REPO_ROOT / "transformers/src"),
+                str(REPO_ROOT / "src"),
+            )
         ),
     )
     completed = subprocess.run(
         [
-            str(REPO_ROOT / "venv/ilvr-venv/bin/pytest"),
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+            "-m",
+            "pytest",
             "tests/stage1/test_distributed_smoke.py",
             "--collect-only",
             "-q",

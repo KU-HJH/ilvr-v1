@@ -12,7 +12,7 @@ image_root=
 output_root=
 probe_rows=
 prerequisite_chain=${STAGE1_SMOKE_PREREQUISITE:-"$script_dir/outputs/stage1-smoke/prerequisite-chain.json"}
-start=8
+start=2
 max_per_gpu=64
 fallback=
 descending=false
@@ -88,8 +88,8 @@ for integer_name in start max_per_gpu gradient_accumulation seed dora_rank dora_
         exit 2
     fi
 done
-if [[ -z $fallback && $max_per_gpu -lt 8 ]]; then
-    printf 'error: max_per_gpu must be at least the initial batch 8\n' >&2
+if [[ -z $fallback && $max_per_gpu -lt 2 ]]; then
+    printf 'error: max_per_gpu must be at least the initial batch 2\n' >&2
     exit 2
 fi
 if [[ $gradient_accumulation != 2 || $seed != 42 ]]; then
@@ -128,11 +128,11 @@ if [[ $descending == true ]]; then
         printf 'error: --fallback and --start disagree\n' >&2
         exit 2
     fi
-    fallback=$start
+    fallback=1
 fi
 
 if [[ -n $fallback ]]; then
-    case $fallback in 4|2|1) ;; *) printf 'error: fallback must be 4, 2, or 1\n' >&2; exit 2 ;; esac
+    case $fallback in 1) ;; *) printf 'error: fallback must be 1\n' >&2; exit 2 ;; esac
     if ! "$benchmark_python" -m src.stage1.benchmark require-fallback \
         --probe-dir "$output_root" --method "$method" \
         --candidate "$fallback" >/dev/null; then
@@ -141,8 +141,8 @@ if [[ -n $fallback ]]; then
     fi
     candidates=("$fallback")
 else
-    if [[ $start != 8 ]]; then
-        printf 'error: the primary capacity search must start at 8\n' >&2
+    if [[ $start != 2 ]]; then
+        printf 'error: the primary capacity search must start at 2\n' >&2
         exit 2
     fi
     mapfile -t candidates < <(

@@ -146,10 +146,10 @@ def capacity_candidates(start: int, max_per_gpu: int) -> tuple[int, ...]:
 
     start = _require_int("start", start, positive=True)
     max_per_gpu = _require_int("max_per_gpu", max_per_gpu, positive=True)
-    if start != 8:
-        raise ValueError("primary capacity probing must start at batch 8")
+    if start != 2:
+        raise ValueError("primary capacity probing must start at batch 2")
     if max_per_gpu < start:
-        raise ValueError("max_per_gpu must be at least the initial batch 8")
+        raise ValueError("max_per_gpu must be at least the initial batch 2")
     candidates: list[int] = []
     candidate = start
     while candidate <= max_per_gpu:
@@ -159,12 +159,12 @@ def capacity_candidates(start: int, max_per_gpu: int) -> tuple[int, ...]:
 
 
 def fallback_candidates_after_initial_failure(start: int) -> tuple[int, ...]:
-    """Describe the explicit fallback order allowed after batch 8 is a confirmed OOM."""
+    """Describe the only fallback after batch 2 is a confirmed capacity OOM."""
 
     start = _require_int("start", start, positive=True)
-    if start != 8:
-        raise ValueError("fallback is allowed only after the initial batch 8 failure")
-    return (4, 2, 1)
+    if start != 2:
+        raise ValueError("fallback is allowed only after the initial batch 2 failure")
+    return (1,)
 
 
 @dataclass(frozen=True)
@@ -3361,12 +3361,12 @@ def _validated_capacity_chain(
     batches = [attempt["micro_batch"] for _, attempt in capacity_attempts]
     if len(set(batches)) != len(batches):
         raise ValueError("capacity chain contains a duplicate candidate")
-    if batches[0] != 8:
-        raise ValueError("capacity chain must start at batch 8")
+    if batches[0] != 2:
+        raise ValueError("capacity chain must start at batch 2")
     selected = None
     first_failure = None
     if capacity_attempts[0][1]["exit_code"] == 0:
-        expected = 8
+        expected = 2
         for index, item in enumerate(capacity_attempts):
             _, attempt = item
             if attempt["micro_batch"] != expected:
@@ -3381,7 +3381,7 @@ def _validated_capacity_chain(
                 selected = item
             expected *= 2
     else:
-        expected_order = (8, 4, 2, 1)
+        expected_order = (2, 1)
         for index, item in enumerate(capacity_attempts):
             _, attempt = item
             if index >= len(expected_order) or attempt["micro_batch"] != expected_order[index]:
@@ -3407,8 +3407,8 @@ def _require_candidate(probe_dir: Path, method: str, candidate: int) -> str:
     ]
     selected, _ = _validated_capacity_chain(attempts, require_success=False)
     if not attempts:
-        if candidate != 8:
-            raise ValueError("first capacity candidate must be 8")
+        if candidate != 2:
+            raise ValueError("first capacity candidate must be 2")
         return "confirmed-candidate"
     capacity_attempts = [
         (path, attempt)
@@ -3429,14 +3429,14 @@ def _require_candidate(probe_dir: Path, method: str, candidate: int) -> str:
         classification = _failure_classification(last_path)
         if classification == "integration_failure":
             if not capacity_attempts:
-                expected = 8
+                expected = 2
             elif capacity_attempts[0][1]["exit_code"] == 0:
                 if capacity_attempts[-1][1]["exit_code"] != 0:
                     expected = None
                 else:
                     expected = capacity_attempts[-1][1]["micro_batch"] * 2
             elif capacity_attempts[-1][1]["exit_code"] != 0:
-                expected = {8: 4, 4: 2, 2: 1}.get(
+                expected = {2: 1}.get(
                     capacity_attempts[-1][1]["micro_batch"]
                 )
             else:
@@ -3449,9 +3449,9 @@ def _require_candidate(probe_dir: Path, method: str, candidate: int) -> str:
         if classification != "capacity_oom":
             raise ValueError("next candidate requires classification of the prior failure")
         if batches := [item[1]["micro_batch"] for item in capacity_attempts]:
-            expected = {8: 4, 4: 2, 2: 1}.get(batches[-1])
+            expected = {2: 1}.get(batches[-1])
         if (
-            batches[0] != 8
+            batches[0] != 2
             or capacity_attempts[0][1]["exit_code"] == 0
             or candidate != expected
         ):
@@ -3471,14 +3471,14 @@ def _require_initial_oom(probe_dir: Path, method: str) -> Path:
     for path in _attempt_files(probe_dir, method):
         attempt = _load_probe_attempt(path)
         if (
-            attempt["micro_batch"] == 8
+            attempt["micro_batch"] == 2
             and attempt["exit_code"] != 0
             and _confirmed_capacity_oom(path)
         ):
             matches.append(path)
     if len(matches) != 1:
         raise ValueError(
-            "fallback requires exactly one initial batch 8 failure with a confirmed "
+            "fallback requires exactly one initial batch 2 failure with a confirmed "
             "capacity_oom classification"
         )
     return matches[0]
@@ -3486,9 +3486,9 @@ def _require_initial_oom(probe_dir: Path, method: str) -> Path:
 
 def _require_fallback(probe_dir: Path, method: str, candidate: int) -> None:
     candidate = _require_int("fallback", candidate, positive=True)
-    if candidate not in {4, 2, 1}:
-        raise ValueError("fallback must be 4, 2, or 1")
-    required_failures = {4: (8,), 2: (8, 4), 1: (8, 4, 2)}[candidate]
+    if candidate != 1:
+        raise ValueError("fallback must be 1")
+    required_failures = (2,)
     attempts = [
         (path, _load_probe_attempt(path)) for path in _attempt_files(probe_dir, method)
     ]
@@ -4902,7 +4902,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 
     candidates = subparsers.add_parser("capacity-candidates")
-    candidates.add_argument("--start", type=int, default=8)
+    candidates.add_argument("--start", type=int, default=2)
     candidates.add_argument("--max-per-gpu", type=int, required=True)
 
     audit = subparsers.add_parser("audit")

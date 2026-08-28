@@ -57,7 +57,7 @@ def test_zero_matrix_dry_run_orders_stages_methods_and_candidates_without_writes
         (stage, method, micro, accumulation)
         for stage in (3, 2, 1)
         for method in ("full", "dora")
-        for micro, accumulation in ((8, 1), (4, 2), (2, 4), (1, 8))
+        for micro, accumulation in ((2, 4), (4, 2), (8, 1), (1, 8))
     ]
     candidate_plans = [row for row in plans if row["run_kind"] == "candidate"]
     assert all(row["max_steps"] == 3 for row in candidate_plans)

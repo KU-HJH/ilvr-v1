@@ -70,8 +70,8 @@ fi
 
 stages=(3 2 1)
 methods=(full dora)
-micro_batches=(8 4 2 1)
-accumulations=(1 2 4 8)
+micro_batches=(2 4 8 1)
+accumulations=(4 2 1 8)
 counter=0
 
 next_experiment_id() {

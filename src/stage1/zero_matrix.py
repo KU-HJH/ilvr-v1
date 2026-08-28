@@ -47,9 +47,9 @@ class ZeroBatchCandidate:
 
 
 ZERO_MATRIX_CANDIDATES = (
-    ZeroBatchCandidate(8, 1),
-    ZeroBatchCandidate(4, 2),
     ZeroBatchCandidate(2, 4),
+    ZeroBatchCandidate(4, 2),
+    ZeroBatchCandidate(8, 1),
     ZeroBatchCandidate(1, 8),
 )
 
