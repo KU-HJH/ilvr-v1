@@ -99,12 +99,12 @@ Stage 1 Full/LoRA/DoRA는 같은 ZeRO runtime identity와 save/resume 계약을
 사용한다. 기존 Full/DoRA benchmark 비교 schema의 의미를 불필요하게 바꾸지
 않으며, 이번 작업에서 LoRA 성능 최적화 matrix를 실행하지 않는다.
 
-Stage 1 batch probe가 필요한 경우 micro-batch/GPU 2부터 시작한다. 2가
-성공하면 4, 8 순서로 증가시키고, 2가 실제 CUDA capacity OOM으로 실패한
-경우에만 micro-batch 1을 fallback으로 검사한다. effective global batch 16을
-유지하도록 gradient accumulation은 각각 4, 2, 1, 8을 사용한다. NCCL,
-checkpoint 또는 다른 integration failure는 batch 축소의 근거로 사용하지
-않는다.
+Stage 1 capacity probe는 micro-batch/GPU 2부터 시작한다. 2가 성공하면 4, 8
+순서로 증가시키고, 2가 실제 CUDA capacity OOM으로 실패한 경우에만
+micro-batch 1을 fallback으로 검사한다. 별도의 fixed-EGB-16 ZeRO matrix는
+`(micro, accumulation)` 후보를 `(2,4)`, `(4,2)`, `(8,1)`, `(1,8)` 순서로
+검사하여 첫 실제 실행이 micro-batch 2가 되도록 한다. NCCL, checkpoint 또는
+다른 integration failure는 batch 축소의 근거로 사용하지 않는다.
 
 ## Stage 2 보존 사항
 
