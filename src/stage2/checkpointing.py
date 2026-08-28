@@ -999,17 +999,38 @@ def validate_stage2_peft_compatibility(
             raise ValueError(f"missing resolved target: {target}")
         if not isinstance(modules[target], nn.Linear):
             raise ValueError(f"resolved target is not linear: {target}")
-    target_modules = tuple(getattr(adapter_config, "target_modules", ()) or ())
-    if set(target_modules) != set(metadata.resolved_target_module_names):
-        raise ValueError("adapter resolved targets do not match metadata")
+    current_resolved_targets = resolve_stage2_target_module_names(
+        qwen, metadata.requested_target_modules
+    )
+    configured_targets = getattr(adapter_config, "target_modules", None)
+    if (
+        isinstance(configured_targets, str)
+        or not isinstance(configured_targets, (list, tuple, set, frozenset))
+        or not configured_targets
+        or any(
+            not isinstance(pattern, str) or not pattern.strip()
+            for pattern in configured_targets
+        )
+        or len(set(configured_targets)) != len(configured_targets)
+    ):
+        raise ValueError("adapter target selectors must be a unique non-empty sequence")
+    target_modules = tuple(configured_targets)
     suffixes = tuple(
         dict.fromkeys(name.rsplit(".", 1)[-1] for name in target_modules)
     )
     if set(suffixes) != set(metadata.requested_target_modules):
         raise ValueError("adapter requested targets do not match metadata")
-    current_resolved_targets = resolve_stage2_target_module_names(
-        qwen, metadata.requested_target_modules
-    )
+    expected_targets = set(metadata.resolved_target_module_names)
+    configured_matches = {
+        name
+        for name in current_resolved_targets
+        if any(
+            name == pattern or name.endswith(f".{pattern}")
+            for pattern in target_modules
+        )
+    }
+    if configured_matches != expected_targets:
+        raise ValueError("adapter resolved targets do not match metadata")
     if current_resolved_targets != metadata.resolved_target_module_names:
         raise ValueError(
             "resolved target topology mismatch: "

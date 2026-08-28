@@ -5,7 +5,9 @@ import tempfile
 from pathlib import Path
 
 import torch
+from peft import PeftModel
 from transformers import Trainer
+from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 
 from deepspeed_runtime import (
@@ -246,6 +248,25 @@ class Stage2Trainer(Trainer):
             if adjacent.numel():
                 logs["stage2/adjacent_cosine_mean"] = float(adjacent.mean().item())
         super().log(logs, start_time=start_time)
+
+    def _save(self, output_dir=None, state_dict=None):
+        """Save Stage 2 adapters without PEFT's automatic embedding export."""
+
+        model = self.accelerator.unwrap_model(self.model)
+        if not isinstance(model, PeftModel):
+            return super()._save(output_dir, state_dict=state_dict)
+
+        target = Path(output_dir or self.args.output_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(
+            target,
+            state_dict=state_dict,
+            safe_serialization=self.args.save_safetensors,
+            save_embedding_layers=False,
+        )
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(target)
+        torch.save(self.args, target / TRAINING_ARGS_NAME)
 
     def save_model(self, output_dir=None, _internal_call=False):
         super().save_model(output_dir, _internal_call=_internal_call)

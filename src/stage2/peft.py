@@ -219,7 +219,19 @@ def _stage2_adapter_target_names(
         raise ValueError("Stage 2 PEFT tuning requires a PeftModel")
 
     config = model.peft_config["default"]
-    target_names = tuple(config.target_modules)
+    configured_targets = config.target_modules
+    if (
+        isinstance(configured_targets, str)
+        or not isinstance(configured_targets, (list, tuple, set, frozenset))
+        or not configured_targets
+        or any(
+            not isinstance(pattern, str) or not pattern.strip()
+            for pattern in configured_targets
+        )
+        or len(set(configured_targets)) != len(configured_targets)
+    ):
+        raise ValueError("Stage 2 PEFT adapter target selectors are invalid")
+    target_names = tuple(getattr(model.base_model, "targeted_module_names", ()))
     modules = dict(qwen.named_modules())
     unapproved = sorted(
         name
@@ -237,16 +249,35 @@ def _stage2_adapter_target_names(
         and name.rsplit(".", 1)[-1] in requested
         and isinstance(getattr(module, "base_layer", module), torch.nn.Linear)
     }
+    configured_matches = {
+        name
+        for name in modules
+        if any(
+            name == pattern or name.endswith(f".{pattern}")
+            for pattern in configured_targets
+        )
+    }
     if (
         not target_names
         or config.modules_to_save is not None
-        or any(not name.startswith("model.layers.") for name in target_names)
-        or any(name not in modules or not hasattr(modules[name], "lora_A") for name in target_names)
+        or any(
+            not name.startswith("model.layers.")
+            or name not in modules
+            or not hasattr(modules[name], "lora_A")
+            for name in target_names
+        )
     ):
         raise ValueError("Stage 2 PEFT adapter targets must be decoder LoRA modules")
-    if set(target_names) != expected_targets:
+    if (
+        configured_matches != expected_targets
+        or set(target_names) != expected_targets
+    ):
         raise ValueError("loaded adapter targets do not match Stage 2 tuning")
-    return target_names
+    return (
+        tuple(configured_targets)
+        if set(configured_targets) == expected_targets
+        else target_names
+    )
 
 
 def validate_stage2_parameter_boundary(

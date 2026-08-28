@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from accelerate.state import AcceleratorState, GradientState
 from peft import LoraConfig
 from torch import nn
@@ -1124,6 +1124,35 @@ def test_relocated_stage1_base_with_identical_structure_is_compatible(
     assert "relocated" in caplog.text
 
 
+def test_relocated_stage1_base_accepts_compact_saved_target_selectors(tmp_path):
+    """Catches compact adapter selectors being compared to resolved paths."""
+    metadata, original_adapter_config = write_tiny_adapter(tmp_path)
+    adapter_config = deepcopy(original_adapter_config)
+    adapter_config.target_modules = {"q_proj", "v_proj"}
+
+    validate_stage2_peft_compatibility(
+        relocated_base(), TinyTokenizer(), metadata, adapter_config, tmp_path
+    )
+
+
+@pytest.mark.parametrize(
+    "target_modules",
+    ["q_proj", (), ("q_proj", "q_proj"), ("visual.q_proj",), 1],
+)
+def test_stage2_peft_compatibility_rejects_malformed_adapter_target_selectors(
+    tmp_path, target_modules
+):
+    """Catches malformed adapter selectors bypassing resolved-target checks."""
+    metadata, original_adapter_config = write_tiny_adapter(tmp_path)
+    adapter_config = deepcopy(original_adapter_config)
+    adapter_config.target_modules = target_modules
+
+    with pytest.raises(ValueError, match="adapter.*target"):
+        validate_stage2_peft_compatibility(
+            relocated_base(), TinyTokenizer(), metadata, adapter_config, tmp_path
+        )
+
+
 @pytest.mark.parametrize(
     ("mutate", "field"),
     [
@@ -1610,6 +1639,38 @@ def test_stage2_trainer_final_peft_save_is_adapter_only_with_sidecar(
     assert not (tmp_path / "model.safetensors").exists()
     assert not (tmp_path / "pytorch_model.bin").exists()
     assert load_stage2_peft_metadata(tmp_path) == metadata
+
+
+def test_stage2_trainer_peft_save_excludes_resized_base_embeddings(
+    tmp_path, isolated_trainer_deepspeed_state
+):
+    """Catches PEFT auto-saving resized base embeddings with the adapter."""
+    source = tmp_path / "original-base"
+    source.mkdir()
+    base = tiny_stage2_qwen()
+    source_config = deepcopy(base.config)
+    source_config.vocab_size -= 3
+    source_config.save_pretrained(source)
+    tuning = Stage2TuningConfig(
+        method="dora", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+    )
+    metadata = tiny_trainer_metadata(base, tuning)
+    model = build_stage2_tuned_model(base, tuning)
+    model.peft_config["default"].base_model_name_or_path = str(source)
+    trainer = Stage2Trainer(
+        model=model,
+        args=TrainingArguments(
+            output_dir=str(tmp_path), report_to=[], use_cpu=True
+        ),
+        stage2_peft_metadata=metadata,
+        deepspeed_runtime_profile=runtime_profile(),
+    )
+
+    trainer.save_model(tmp_path)
+
+    saved_keys = set(load_file(tmp_path / "adapter_model.safetensors"))
+    assert saved_keys
+    assert all("lora_" in key for key in saved_keys)
 
 
 @pytest.mark.parametrize("explicit_output", [False, True])
