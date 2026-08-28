@@ -68,6 +68,71 @@ dry_run=false
 final_save=true
 legacy_use_lora=false
 
+ilvr_topology_variables=(
+    ILVR_NUM_MACHINES
+    ILVR_NUM_PROCESSES
+    ILVR_MACHINE_RANK
+    ILVR_MAIN_PROCESS_IP
+    ILVR_MAIN_PROCESS_PORT
+    ILVR_SOCKET_IFNAME
+)
+ilvr_multinode=false
+for topology_variable in "${ilvr_topology_variables[@]}"; do
+    if [[ -v $topology_variable ]]; then
+        ilvr_multinode=true
+        break
+    fi
+done
+if [[ $ilvr_multinode == true ]]; then
+    for topology_variable in "${ilvr_topology_variables[@]}"; do
+        if [[ ! -v $topology_variable || -z ${!topology_variable} ]]; then
+            topology_label=$topology_variable
+            if [[ $topology_variable == ILVR_SOCKET_IFNAME ]]; then
+                topology_label=interface
+            fi
+            printf 'error: all distributed variables must be explicitly set and non-empty: %s\n' "$topology_label" >&2
+            exit 2
+        fi
+    done
+    ilvr_num_machines=$ILVR_NUM_MACHINES
+    ilvr_num_processes=$ILVR_NUM_PROCESSES
+    ilvr_machine_rank=$ILVR_MACHINE_RANK
+    ilvr_main_process_ip=$ILVR_MAIN_PROCESS_IP
+    ilvr_main_process_port=$ILVR_MAIN_PROCESS_PORT
+    ilvr_socket_ifname=$ILVR_SOCKET_IFNAME
+    [[ $ilvr_num_machines == 2 ]] || { printf 'error: ILVR_NUM_MACHINES must be exactly 2\n' >&2; exit 2; }
+    [[ $ilvr_num_processes == 4 ]] || { printf 'error: ILVR_NUM_PROCESSES must be exactly 4\n' >&2; exit 2; }
+    [[ $ilvr_machine_rank == 0 || $ilvr_machine_rank == 1 ]] || { printf 'error: ILVR_MACHINE_RANK must be a machine rank of 0 or 1\n' >&2; exit 2; }
+    [[ $ilvr_main_process_ip == 10.1.102.41 ]] || { printf 'error: ILVR_MAIN_PROCESS_IP must be 10.1.102.41\n' >&2; exit 2; }
+    [[ $ilvr_socket_ifname == bond1.102 ]] || { printf 'error: ILVR_SOCKET_IFNAME must be interface bond1.102\n' >&2; exit 2; }
+    if [[ -v STAGE1_NUM_PROCESSES && $STAGE1_NUM_PROCESSES != "$ilvr_num_processes" ]]; then
+        printf 'error: STAGE1_NUM_PROCESSES must match ILVR_NUM_PROCESSES\n' >&2
+        exit 2
+    fi
+else
+    ilvr_num_machines=1
+    ilvr_num_processes=$stage1_num_processes
+    ilvr_machine_rank=0
+    ilvr_main_process_ip=
+    ilvr_main_process_port=29501
+    ilvr_socket_ifname=
+fi
+
+accelerate_topology=(
+    --num_processes "$ilvr_num_processes"
+    --main_process_port "$ilvr_main_process_port"
+)
+if [[ $ilvr_num_machines == 2 ]]; then
+    accelerate_topology+=(
+        --num_machines 2
+        --machine_rank "$ilvr_machine_rank"
+        --main_process_ip "$ilvr_main_process_ip"
+    )
+    export MASTER_ADDR="$ilvr_main_process_ip"
+    export GLOO_SOCKET_IFNAME="$ilvr_socket_ifname"
+    export NCCL_SOCKET_IFNAME="$ilvr_socket_ifname"
+fi
+
 usage() {
     printf '%s\n' \
         "Usage: $0 --method full|lora|dora --model MODEL --data-path FILE" \
@@ -203,7 +268,7 @@ if [[ $dry_run != true ]]; then
         exit 2
     fi
     "$repository_python" -m src.deepspeed_runtime validate \
-        --config "$deepspeed_config" --world-size "$stage1_num_processes" >/dev/null
+        --config "$deepspeed_config" --world-size "$ilvr_num_processes" >/dev/null
     artifact_dirs=("$output_dir" "$(dirname -- "$log_file")")
     for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness"; do
         if [[ -n $result_path ]]; then
@@ -254,8 +319,7 @@ fi
 
 command=(
     "$repository_accelerate" launch
-    --num_processes "$stage1_num_processes"
-    --main_process_port 29501
+    "${accelerate_topology[@]}"
     src/main.py
     --stage stage1
     --model "$model"

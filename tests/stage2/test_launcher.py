@@ -39,6 +39,38 @@ def option_value(tokens: list[str], option: str) -> str:
     return tokens[tokens.index(option) + 1]
 
 
+def assert_four_rank_prefix(tokens, rank, port):
+    """Catches Accelerate receiving a partial or single-node topology."""
+    expected = {
+        "--num_machines": "2",
+        "--num_processes": "4",
+        "--machine_rank": str(rank),
+        "--main_process_ip": "10.1.102.41",
+        "--main_process_port": str(port),
+    }
+    for flag, value in expected.items():
+        assert tokens[tokens.index(flag) + 1] == value
+
+
+def test_stage2_multinode_dry_run_emits_rank_zero_four_process_command():
+    """Catches Stage 2 omitting the rank-zero four-GPU Accelerate contract."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "ILVR_NUM_MACHINES": "2",
+                "ILVR_NUM_PROCESSES": "4",
+                "ILVR_MACHINE_RANK": "0",
+                "ILVR_MAIN_PROCESS_IP": "10.1.102.41",
+                "ILVR_MAIN_PROCESS_PORT": "29622",
+                "ILVR_SOCKET_IFNAME": "bond1.102",
+                "DEEPSPEED_CONFIG": str(REPO_ROOT / "configs/deepspeed_zero2.json"),
+            }
+        )
+    )
+
+    assert_four_rank_prefix(tokens, rank=0, port=29622)
+
+
 def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path):
     """Catches cwd-dependent paths, wrong Stage 2 bindings, or lost CLI arguments."""
     result = run_launcher(
@@ -251,7 +283,9 @@ def test_stage2_launcher_omits_resume_for_fresh_training():
     assert "--resume_from_checkpoint_path" not in tokens
 
 
-@pytest.mark.parametrize("missing_name", REQUIRED_ENV)
+@pytest.mark.parametrize(
+    "missing_name", ("STAGE1_CHECKPOINT", "DATA_PATH", "IMAGE_ROOT", "OUTPUT_DIR")
+)
 def test_stage2_launcher_fails_when_required_environment_is_missing(missing_name):
     """Catches silently falling back to ambiguous training paths."""
     env = {"PATH": os.environ["PATH"], "STAGE2_DRY_RUN": "true", **REQUIRED_ENV}

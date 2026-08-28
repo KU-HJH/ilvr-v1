@@ -2,6 +2,7 @@ import importlib.util
 import json
 import math
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -11,10 +12,16 @@ import pytest
 import torch
 from PIL import Image
 
+_platform_python_version = platform.python_version
+if _platform_python_version().endswith("+"):
+    platform.python_version = lambda: _platform_python_version().rstrip("+")
+
 from main import (
     build_stage2_training_arguments,
     validate_stage2_distributed_settings,
 )
+
+platform.python_version = _platform_python_version
 from stage2.data import Stage2DataCollator
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
@@ -31,6 +38,98 @@ from stage2_rank_skew_probe import (
 REPO_ROOT = Path(__file__).resolve().parents[3]
 HARNESS_PATH = REPO_ROOT / "tests/stage2/integration/tiny_stage2_train.py"
 TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
+
+
+def four_gpu_env(rank):
+    return {
+        "ILVR_NUM_MACHINES": "2",
+        "ILVR_NUM_PROCESSES": "4",
+        "ILVR_MACHINE_RANK": str(rank),
+        "ILVR_MAIN_PROCESS_IP": "10.1.102.41",
+        "ILVR_MAIN_PROCESS_PORT": "29623",
+        "ILVR_SOCKET_IFNAME": "bond1.102",
+    }
+
+
+def run_stage1_dry(updates):
+    environment = os.environ.copy()
+    environment.update(updates)
+    return subprocess.run(
+        [
+            str(REPO_ROOT / "run_stage1_training.sh"),
+            "--dry-run",
+            "--method",
+            "full",
+            "--model",
+            "model",
+            "--data-path",
+            "/missing/train.jsonl",
+            "--image-root",
+            "/missing/images",
+            "--output-dir",
+            "/missing/output",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_stage2_dry(updates):
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "STAGE1_CHECKPOINT": "/missing/stage1",
+            "DATA_PATH": "/missing/train.jsonl",
+            "IMAGE_ROOT": "/missing/images",
+            "OUTPUT_DIR": "/missing/output",
+            "STAGE2_DRY_RUN": "true",
+        }
+    )
+    environment.update(updates)
+    return subprocess.run(
+        [str(REPO_ROOT / "run_stage2_training.sh")],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"ILVR_NUM_MACHINES": "2"}, "all distributed variables"),
+        (four_gpu_env(0) | {"ILVR_NUM_PROCESSES": "3"}, "exactly 4"),
+        (four_gpu_env(2), "machine rank"),
+        (four_gpu_env(0) | {"ILVR_SOCKET_IFNAME": ""}, "interface"),
+    ],
+)
+@pytest.mark.parametrize("run", (run_stage1_dry, run_stage2_dry))
+def test_launcher_rejects_invalid_multinode_contract(run, updates, message):
+    """Catches malformed topology reaching artifact setup or Accelerate."""
+    completed = run(updates)
+
+    assert completed.returncode == 2
+    assert message in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("run", "updates"),
+    [
+        (run_stage1_dry, four_gpu_env(0) | {"STAGE1_NUM_PROCESSES": "2"}),
+        (run_stage2_dry, four_gpu_env(0) | {"STAGE2_NUM_PROCESSES": "2"}),
+    ],
+)
+def test_launcher_rejects_stage_process_count_that_contradicts_topology(run, updates):
+    """Catches legacy process controls overriding the fixed four-GPU world size."""
+    completed = run(updates)
+
+    assert completed.returncode == 2
+    assert "must match" in completed.stderr
 
 
 def _load_harness_module():

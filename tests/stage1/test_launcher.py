@@ -129,7 +129,7 @@ def test_zero_matrix_dry_run_orders_stages_methods_and_candidates_without_writes
 
 def test_batch_probe_keeps_attempt_record_below_its_per_run_result_directory(tmp_path):
     """Catches recreation of a mixed-root attempts/evidence bundle."""
-    from test_benchmark import _run_probe
+    from tests.stage1.test_benchmark import _run_probe
 
     completed, records, output_root, _ = _run_probe(tmp_path, fail_batches="8")
 
@@ -156,6 +156,39 @@ def base_args(output_dir, *, method="dora"):
         "--output-dir",
         output_dir,
     )
+
+
+def assert_four_rank_prefix(tokens, rank, port):
+    """Catches Accelerate receiving a partial or single-node topology."""
+    expected = {
+        "--num_machines": "2",
+        "--num_processes": "4",
+        "--machine_rank": str(rank),
+        "--main_process_ip": "10.1.102.41",
+        "--main_process_port": str(port),
+    }
+    for flag, value in expected.items():
+        assert tokens[tokens.index(flag) + 1] == value
+
+
+def test_stage1_multinode_dry_run_emits_rank_one_four_process_command(tmp_path):
+    """Catches Stage 1 omitting the rank-one four-GPU Accelerate contract."""
+    env = os.environ.copy()
+    env.update(
+        {
+            "ILVR_NUM_MACHINES": "2",
+            "ILVR_NUM_PROCESSES": "4",
+            "ILVR_MACHINE_RANK": "1",
+            "ILVR_MAIN_PROCESS_IP": "10.1.102.41",
+            "ILVR_MAIN_PROCESS_PORT": "29621",
+            "ILVR_SOCKET_IFNAME": "bond1.102",
+        }
+    )
+
+    completed = run_launcher(LAUNCHER, *base_args(tmp_path / "out"), env=env)
+
+    assert completed.returncode == 0, completed.stderr
+    assert_four_rank_prefix(shlex.split(completed.stdout), rank=1, port=29621)
 
 
 def live_args(tmp_path, output_dir, *, method="dora"):

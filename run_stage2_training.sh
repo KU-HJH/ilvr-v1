@@ -39,6 +39,71 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 MAX_SEQUENCE_LENGTH=${MAX_SEQUENCE_LENGTH:-8192}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 
+ilvr_topology_variables=(
+  ILVR_NUM_MACHINES
+  ILVR_NUM_PROCESSES
+  ILVR_MACHINE_RANK
+  ILVR_MAIN_PROCESS_IP
+  ILVR_MAIN_PROCESS_PORT
+  ILVR_SOCKET_IFNAME
+)
+ilvr_multinode=false
+for topology_variable in "${ilvr_topology_variables[@]}"; do
+  if [[ -v $topology_variable ]]; then
+    ilvr_multinode=true
+    break
+  fi
+done
+if [[ "$ilvr_multinode" == true ]]; then
+  for topology_variable in "${ilvr_topology_variables[@]}"; do
+    if [[ ! -v $topology_variable || -z ${!topology_variable} ]]; then
+      topology_label=$topology_variable
+      if [[ "$topology_variable" == ILVR_SOCKET_IFNAME ]]; then
+        topology_label=interface
+      fi
+      printf 'all distributed variables must be explicitly set and non-empty: %s\n' "$topology_label" >&2
+      exit 2
+    fi
+  done
+  ilvr_num_machines=$ILVR_NUM_MACHINES
+  ilvr_num_processes=$ILVR_NUM_PROCESSES
+  ilvr_machine_rank=$ILVR_MACHINE_RANK
+  ilvr_main_process_ip=$ILVR_MAIN_PROCESS_IP
+  ilvr_main_process_port=$ILVR_MAIN_PROCESS_PORT
+  ilvr_socket_ifname=$ILVR_SOCKET_IFNAME
+  [[ "$ilvr_num_machines" == 2 ]] || { printf 'ILVR_NUM_MACHINES must be exactly 2\n' >&2; exit 2; }
+  [[ "$ilvr_num_processes" == 4 ]] || { printf 'ILVR_NUM_PROCESSES must be exactly 4\n' >&2; exit 2; }
+  [[ "$ilvr_machine_rank" == 0 || "$ilvr_machine_rank" == 1 ]] || { printf 'ILVR_MACHINE_RANK must be a machine rank of 0 or 1\n' >&2; exit 2; }
+  [[ "$ilvr_main_process_ip" == 10.1.102.41 ]] || { printf 'ILVR_MAIN_PROCESS_IP must be 10.1.102.41\n' >&2; exit 2; }
+  [[ "$ilvr_socket_ifname" == bond1.102 ]] || { printf 'ILVR_SOCKET_IFNAME must be interface bond1.102\n' >&2; exit 2; }
+  if [[ -v STAGE2_NUM_PROCESSES && "$STAGE2_NUM_PROCESSES" != "$ilvr_num_processes" ]]; then
+    printf 'STAGE2_NUM_PROCESSES must match ILVR_NUM_PROCESSES\n' >&2
+    exit 2
+  fi
+else
+  ilvr_num_machines=1
+  ilvr_num_processes=${STAGE2_NUM_PROCESSES:-2}
+  ilvr_machine_rank=0
+  ilvr_main_process_ip=
+  ilvr_main_process_port=${STAGE2_MAIN_PROCESS_PORT:-29502}
+  ilvr_socket_ifname=
+fi
+
+accelerate_topology=(
+  --num_processes "$ilvr_num_processes"
+  --main_process_port "$ilvr_main_process_port"
+)
+if [[ "$ilvr_num_machines" == 2 ]]; then
+  accelerate_topology+=(
+    --num_machines 2
+    --machine_rank "$ilvr_machine_rank"
+    --main_process_ip "$ilvr_main_process_ip"
+  )
+  export MASTER_ADDR="$ilvr_main_process_ip"
+  export GLOO_SOCKET_IFNAME="$ilvr_socket_ifname"
+  export NCCL_SOCKET_IFNAME="$ilvr_socket_ifname"
+fi
+
 MANAGED_OPTIONS=(
   --stage
   --load_model_path
@@ -237,10 +302,12 @@ if [[ "${STAGE2_DRY_RUN:-false}" != "true" ]]; then
   "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.artifact_paths validate-run \
     --checkpoint "$OUTPUT_DIR" --log "$LOG_FILE" >/dev/null
   if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
-    STAGE2_NUM_PROCESSES=${STAGE2_NUM_PROCESSES:-2}
-    require_positive_integer STAGE2_NUM_PROCESSES "$STAGE2_NUM_PROCESSES"
+    if [[ "$ilvr_multinode" == false ]]; then
+      STAGE2_NUM_PROCESSES=${STAGE2_NUM_PROCESSES:-2}
+      require_positive_integer STAGE2_NUM_PROCESSES "$STAGE2_NUM_PROCESSES"
+    fi
     "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.deepspeed_runtime validate \
-      --config "$DEEPSPEED_CONFIG" --world-size "$STAGE2_NUM_PROCESSES" >/dev/null
+      --config "$DEEPSPEED_CONFIG" --world-size "$ilvr_num_processes" >/dev/null
   fi
   if [[ -z "${RESUME_CHECKPOINT:-}" ]]; then
     mkdir -p -- "$(dirname -- "$OUTPUT_DIR")" "$(dirname -- "$(dirname -- "$LOG_FILE")")"
@@ -261,13 +328,14 @@ if [[ "${STAGE2_DRY_RUN:-false}" != "true" ]]; then
   fi
 fi
 
-if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
-  STAGE2_NUM_PROCESSES=${STAGE2_NUM_PROCESSES:-2}
-  require_positive_integer STAGE2_NUM_PROCESSES "$STAGE2_NUM_PROCESSES"
+if [[ -n "${DEEPSPEED_CONFIG:-}" || "$ilvr_multinode" == true ]]; then
+  if [[ "$ilvr_multinode" == false ]]; then
+    STAGE2_NUM_PROCESSES=${STAGE2_NUM_PROCESSES:-2}
+    require_positive_integer STAGE2_NUM_PROCESSES "$STAGE2_NUM_PROCESSES"
+  fi
   COMMAND=(
     "$REPO_ROOT/venv/ilvr-venv/bin/accelerate" launch
-    --num_processes "$STAGE2_NUM_PROCESSES"
-    --main_process_port "${STAGE2_MAIN_PROCESS_PORT:-29502}"
+    "${accelerate_topology[@]}"
     "$REPO_ROOT/src/main.py"
     "${TRAINING_ARGS[@]}"
   )
