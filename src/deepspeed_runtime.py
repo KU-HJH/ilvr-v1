@@ -97,17 +97,14 @@ def write_deepspeed_runtime_sidecar(
     return path
 
 
-def read_deepspeed_runtime_sidecar(directory: Path) -> DeepSpeedRuntimeProfile:
-    """Read and strictly decode a numbered-checkpoint runtime identity."""
+def decode_deepspeed_runtime_sidecar(
+    raw: bytes, *, path: Path
+) -> DeepSpeedRuntimeProfile:
+    """Strictly decode bytes already bound to one runtime-sidecar inode."""
 
-    path = Path(directory) / DEEPSPEED_RUNTIME_FILENAME
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"missing DeepSpeed runtime identity: {path}")
     try:
-        if path.stat().st_size > _MAX_DEEPSPEED_RUNTIME_BYTES:
-            raise ValueError(f"invalid DeepSpeed runtime identity: {path}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid DeepSpeed runtime identity: {path}") from error
     if not isinstance(payload, dict) or set(payload) != _DEEPSPEED_RUNTIME_FIELDS:
         raise ValueError(f"invalid DeepSpeed runtime identity schema: {path}")
@@ -155,6 +152,21 @@ def read_deepspeed_runtime_sidecar(directory: Path) -> DeepSpeedRuntimeProfile:
         config_digest=config_digest,
         world_size=world_size,
     )
+
+
+def read_deepspeed_runtime_sidecar(directory: Path) -> DeepSpeedRuntimeProfile:
+    """Read and strictly decode a numbered-checkpoint runtime identity."""
+
+    path = Path(directory) / DEEPSPEED_RUNTIME_FILENAME
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"missing DeepSpeed runtime identity: {path}")
+    try:
+        if path.stat().st_size > _MAX_DEEPSPEED_RUNTIME_BYTES:
+            raise ValueError(f"invalid DeepSpeed runtime identity: {path}")
+        raw = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"invalid DeepSpeed runtime identity: {path}") from error
+    return decode_deepspeed_runtime_sidecar(raw, path=path)
 
 
 def validate_deepspeed_resume_identity(

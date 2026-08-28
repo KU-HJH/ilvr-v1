@@ -112,7 +112,7 @@ def write_observed_full_checkpoint(checkpoint, *, values=None, model_rank=2):
         encoding="utf-8",
     )
     (checkpoint / "config.json").write_text(
-        json.dumps({"stage": values["stage"]}) + "\n", encoding="utf-8"
+        json.dumps(standard_qwen_config()) + "\n", encoding="utf-8"
     )
     for name in (
         "preprocessor_config.json",
@@ -267,6 +267,15 @@ def qwen_test_architecture():
     }
 
 
+def standard_qwen_config():
+    return {
+        "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+        "model_type": "qwen2_5_vl",
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.49.0",
+    }
+
+
 def loader_identity(stage, method):
     sidecar = {
         ("stage1", "full"): "stage1_ema_teacher.pt",
@@ -285,7 +294,7 @@ def write_loader_artifact(directory, *, stage, method, sparse_stage2=False):
 
     directory.mkdir(parents=True, exist_ok=True)
     for name, payload in {
-        "config.json": json.dumps({"stage": stage}).encode("utf-8") + b"\n",
+        "config.json": json.dumps(standard_qwen_config()).encode("utf-8") + b"\n",
         "preprocessor_config.json": b"{}\n",
         "tokenizer_config.json": b"{}\n",
         "tokenizer.json": b"{}\n",
@@ -1432,7 +1441,7 @@ def test_full_inference_manifest_parses_index_and_rejects_unlisted_sibling(tmp_p
     checkpoint = tmp_path / "full-artifact"
     checkpoint.mkdir()
     (checkpoint / "config.json").write_text(
-        '{"stage":"stage1"}\n', encoding="utf-8"
+        json.dumps(standard_qwen_config()) + "\n", encoding="utf-8"
     )
     for name in (
         "preprocessor_config.json",
@@ -1806,7 +1815,7 @@ def test_observed_checkpoint_identity_rejects_caller_relabelled_sidecar(tmp_path
     for entry in loader_asset_entries():
         (checkpoint / entry.relative_path).write_bytes(b"{}\n")
     (checkpoint / "config.json").write_text(
-        '{"stage":"stage1"}\n', encoding="utf-8"
+        json.dumps(standard_qwen_config()) + "\n", encoding="utf-8"
     )
 
     with pytest.raises(ValueError, match="Stage 1 PEFT|metadata"):
@@ -1885,6 +1894,66 @@ def test_manifest_inspection_stays_bound_when_checkpoint_path_is_swapped(
         for entry in manifest.entries
         if entry.relative_path == original_shard.relative_to(logical)
     ).byte_size == len(b"old-owned")
+
+
+def test_small_sidecar_read_stays_bound_when_final_component_is_swapped(
+    tmp_path, monkeypatch
+):
+    artifact = tmp_path / "stage2-full"
+    write_loader_artifact(artifact, stage="stage2", method="full")
+    sampler = artifact / "stage2-sampler.json"
+    sampler.write_text("not-json\n", encoding="utf-8")
+    attacker = tmp_path / "attacker-sampler.json"
+    attacker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "seed": 7,
+                "world_size": 4,
+                "dataset_size": 4,
+                "bucket_sizes": {"1": 4},
+                "padded_samples": 0,
+                "global_step": 2,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    displaced = tmp_path / "original-sampler.json"
+    original_lstat = Path.lstat
+    original_open = os.open
+    swapped = False
+    sampler_lstats = 0
+
+    def swap_final_component():
+        nonlocal swapped
+        if swapped:
+            return
+        sampler.rename(displaced)
+        sampler.symlink_to(attacker)
+        swapped = True
+
+    def swapping_lstat(path, *args, **kwargs):
+        nonlocal sampler_lstats
+        metadata = original_lstat(path, *args, **kwargs)
+        if path == sampler:
+            sampler_lstats += 1
+            if sampler_lstats == 2:
+                swap_final_component()
+        return metadata
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == sampler.name and dir_fd is not None:
+            swap_final_component()
+        return descriptor
+
+    monkeypatch.setattr(Path, "lstat", swapping_lstat)
+    monkeypatch.setattr(os, "open", swapping_open)
+
+    with pytest.raises(ValueError, match="sampler.*JSON"):
+        validate_loader_artifact(artifact, loader_identity("stage2", "full"))
+    assert swapped
 
 
 def test_inference_peft_selection_requires_complete_stage_metadata_and_rows():
@@ -2101,15 +2170,28 @@ def test_loader_assets_accept_vocab_and_merges_tokenizer_alternative(tmp_path):
     validate_loader_artifact(artifact, loader_identity("stage1", "full"))
 
 
-def test_loader_artifact_config_must_identify_the_resume_stage(tmp_path):
-    artifact = tmp_path / "stage2-full"
-    write_loader_artifact(artifact, stage="stage2", method="full")
-    (artifact / "config.json").write_text(
-        '{"stage":"stage1"}\n', encoding="utf-8"
+@pytest.mark.parametrize("stage", ("stage1", "stage2"))
+def test_full_loader_matches_real_classifier_with_standard_qwen_config_without_stage(
+    tmp_path, stage
+):
+    from transformers import Qwen2_5_VLConfig
+
+    artifact = tmp_path / f"{stage}-full"
+    write_loader_artifact(artifact, stage=stage, method="full")
+    Qwen2_5_VLConfig().to_json_file(artifact / "config.json")
+    assert "stage" not in json.loads(
+        (artifact / "config.json").read_text(encoding="utf-8")
     )
 
-    with pytest.raises(ValueError, match="config.*stage"):
-        validate_loader_artifact(artifact, loader_identity("stage2", "full"))
+    validate_loader_artifact(artifact, loader_identity(stage, "full"))
+    if stage == "stage1":
+        from stage1.checkpointing import Stage1ArtifactKind, classify_stage1_artifact
+
+        assert classify_stage1_artifact(artifact) is Stage1ArtifactKind.FULL
+    else:
+        from stage2.checkpointing import Stage2ArtifactKind, classify_stage2_artifact
+
+        assert classify_stage2_artifact(artifact) is Stage2ArtifactKind.FULL
 
 
 def test_inference_rejects_weights_without_complete_config_processor_assets():
@@ -2128,16 +2210,22 @@ def test_inference_rejects_weights_without_complete_config_processor_assets():
         select_inference_entries(manifest)
 
 
-def test_full_inference_reuses_loader_config_stage_contract(tmp_path):
-    artifact = tmp_path / "stage1-full"
-    write_loader_artifact(artifact, stage="stage1", method="full")
-    manifest = loader_manifest(artifact, stage="stage1", method="full")
-    (artifact / "config.json").write_text(
-        '{"stage":"stage2"}\n', encoding="utf-8"
-    )
+@pytest.mark.parametrize("stage", ("stage1", "stage2"))
+def test_full_inference_accepts_standard_qwen_config_without_custom_stage(
+    tmp_path, stage
+):
+    from transformers import Qwen2_5_VLConfig
 
-    with pytest.raises(ValueError, match="config.*stage"):
-        build_inference_manifest(artifact, manifest)
+    artifact = tmp_path / f"{stage}-full"
+    write_loader_artifact(artifact, stage=stage, method="full")
+    Qwen2_5_VLConfig().to_json_file(artifact / "config.json")
+    manifest = loader_manifest(artifact, stage=stage, method="full")
+
+    filtered = build_inference_manifest(artifact, manifest)
+
+    assert "config.json" in {
+        entry.relative_path.name for entry in filtered.entries
+    }
 
 
 def test_prepare_inference_help_is_local_and_side_effect_free(tmp_path):

@@ -74,6 +74,8 @@ _INFERENCE_SHARD = re.compile(
     r"(?:model-[0-9]{5}-of-[0-9]{5}\.safetensors|"
     r"pytorch_model-[0-9]{5}-of-[0-9]{5}\.bin)\Z"
 )
+_FULL_SAFE_SHARD = re.compile(r"model-(\d{5})-of-(\d{5})\.safetensors\Z")
+_FULL_BINARY_SHARD = re.compile(r"pytorch_model-(\d{5})-of-(\d{5})\.bin\Z")
 _REQUIRED_LOADER_ASSETS = frozenset(
     {"config.json", "preprocessor_config.json", "tokenizer_config.json"}
 )
@@ -167,19 +169,96 @@ def _open_pinned_checkpoint_directory(
     return checkpoint_descriptor, physical
 
 
-def _read_small_regular(path: Path, *, maximum_size: int, label: str) -> bytes:
+def _pinned_directory_descriptor(path: Path) -> int | None:
+    candidate = Path(path)
+    if candidate.parent == Path("/proc/self/fd") and candidate.name.isdecimal():
+        return int(candidate.name)
+    return None
+
+
+def _pin_directory_for_inspection(path: Path, *, label: str) -> tuple[Path, int | None]:
+    existing = _pinned_directory_descriptor(path)
+    if existing is not None:
+        try:
+            metadata = os.fstat(existing)
+        except OSError as error:
+            raise ValueError(f"{label} descriptor is unavailable") from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"{label} descriptor must identify a directory")
+        return path, None
+
+    descriptor: int | None = None
     try:
-        metadata = path.lstat()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        metadata = os.fstat(descriptor)
     except OSError as error:
-        raise ValueError(f"missing {label}: {path}") from error
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise ValueError(f"{label} must be a regular non-symlink file: {path}")
-    if metadata.st_size > maximum_size:
-        raise ValueError(f"{label} exceeds its bounded size: {path}")
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ValueError(f"{label} must be a non-symlink directory: {path}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise ValueError(f"{label} must identify a directory: {path}")
+    return Path(f"/proc/self/fd/{descriptor}"), descriptor
+
+
+def _read_small_regular(path: Path, *, maximum_size: int, label: str) -> bytes:
+    parent_descriptor = _pinned_directory_descriptor(path.parent)
+    if parent_descriptor is None:
+        raise ValueError(f"{label} must be read from a pinned directory: {path}")
+    descriptor: int | None = None
     try:
-        return path.read_bytes()
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(
+                f"{label} must be a regular non-symlink file: {path}"
+            )
+        if metadata.st_size > maximum_size:
+            raise ValueError(f"{label} exceeds its bounded size: {path}")
+        chunks: list[bytes] = []
+        remaining = maximum_size + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        final_metadata = os.fstat(descriptor)
+        if (
+            len(raw) > maximum_size
+            or len(raw) != metadata.st_size
+            or final_metadata.st_size != metadata.st_size
+        ):
+            raise ValueError(f"{label} changed during its bounded read: {path}")
+        return raw
     except OSError as error:
         raise ValueError(f"cannot read {label}: {path}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _top_level_regular_names(artifact: Path) -> set[str]:
+    descriptor = _pinned_directory_descriptor(artifact)
+    if descriptor is None:
+        raise ValueError("loader artifact inspection requires a pinned directory")
+    try:
+        with os.scandir(descriptor) as children:
+            return {
+                child.name
+                for child in children
+                if stat.S_ISREG(child.stat(follow_symlinks=False).st_mode)
+            }
+    except OSError as error:
+        raise ValueError("cannot inspect pinned loader artifact") from error
 
 
 def _decode_checkpoint_step(
@@ -261,11 +340,7 @@ def _checkpoint_stage_and_method(
     checkpoint: Path, expected: Mapping[str, object]
 ) -> tuple[str, str]:
     artifact = checkpoint
-    artifact_names = {
-        entry.name
-        for entry in artifact.iterdir()
-        if entry.is_file() and not entry.is_symlink()
-    }
+    artifact_names = _top_level_regular_names(artifact)
     _require_loader_asset_names(artifact_names)
     config_raw = _read_small_regular(
         artifact / "config.json",
@@ -276,12 +351,12 @@ def _checkpoint_stage_and_method(
         config = json.loads(config_raw)
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("loader config is invalid JSON") from error
-    if type(config) is not dict or config.get("stage") != expected["stage"]:
-        raise ValueError("loader config stage differs from runtime identity")
+    if type(config) is not dict:
+        raise ValueError("loader config must be a JSON object")
     stage1_metadata = artifact / "stage1_peft_metadata.json"
     stage2_metadata = artifact / "stage2_peft_metadata.json"
-    stage1_present = stage1_metadata.exists() or stage1_metadata.is_symlink()
-    stage2_present = stage2_metadata.exists() or stage2_metadata.is_symlink()
+    stage1_present = stage1_metadata.name in artifact_names
+    stage2_present = stage2_metadata.name in artifact_names
     if stage1_present and stage2_present:
         raise ValueError("checkpoint has ambiguous Stage PEFT metadata")
     source_root = str(Path(__file__).resolve().parent)
@@ -334,16 +409,12 @@ def _checkpoint_stage_and_method(
         raise ValueError("PEFT checkpoint is missing strict Stage metadata")
     stage1_full = artifact / "stage1_ema_teacher.pt"
     stage2_full = artifact / "stage2-sampler.json"
-    stage1_full_present = stage1_full.exists() or stage1_full.is_symlink()
-    stage2_full_present = stage2_full.exists() or stage2_full.is_symlink()
+    stage1_full_present = stage1_full.name in artifact_names
+    stage2_full_present = stage2_full.name in artifact_names
     if stage1_full_present == stage2_full_present:
         raise ValueError("full checkpoint must have exactly one Stage sidecar")
     stage = "stage1" if stage1_full_present else "stage2"
-    if stage == "stage1":
-        metadata = stage1_full.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            raise ValueError("Stage 1 EMA sidecar must be a regular non-symlink file")
-    else:
+    if stage == "stage2":
         sampler_raw = _read_small_regular(
             stage2_full,
             maximum_size=_MAX_COMMON_METADATA_BYTES,
@@ -369,9 +440,7 @@ def _checkpoint_stage_and_method(
         )
         if sampler.world_size != expected["world_size"]:
             raise ValueError("Stage 2 sampler world_size differs from checkpoint")
-    from stage1.checkpointing import _validate_full_serialization
-
-    _validate_full_serialization(artifact, artifact_names)
+    _validate_full_serialization_metadata_only(artifact, artifact_names)
     return stage, "full"
 
 
@@ -385,6 +454,103 @@ def _require_loader_asset_names(names: set[str]) -> None:
         raise ValueError(
             "loader artifact requires tokenizer.json or vocab.json plus merges.txt"
         )
+
+
+def _validate_full_shard_index_metadata_only(
+    artifact: Path,
+    *,
+    index_name: str,
+    shard_pattern: re.Pattern[str],
+    actual_shards: set[str],
+) -> None:
+    raw = _read_small_regular(
+        artifact / index_name,
+        maximum_size=_MAX_COMMON_METADATA_BYTES,
+        label="full-model shard index",
+    )
+    try:
+        payload = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid full-model shard index JSON") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("full-model shard index must be a JSON object")
+    weight_map = payload.get("weight_map")
+    if (
+        not isinstance(weight_map, Mapping)
+        or not weight_map
+        or any(not isinstance(key, str) or not key for key in weight_map)
+    ):
+        raise ValueError("full-model shard index requires a non-empty weight_map")
+    references: set[str] = set()
+    for reference in weight_map.values():
+        if (
+            not isinstance(reference, str)
+            or not reference
+            or Path(reference).name != reference
+            or shard_pattern.fullmatch(reference) is None
+        ):
+            raise ValueError(f"invalid full-model shard reference: {reference!r}")
+        references.add(reference)
+    if references != actual_shards:
+        raise ValueError(
+            "full-model shard set does not match index: "
+            f"missing={sorted(references - actual_shards)}, "
+            f"orphan={sorted(actual_shards - references)}"
+        )
+    positions: list[int] = []
+    totals: set[int] = set()
+    for shard in references:
+        match = shard_pattern.fullmatch(shard)
+        assert match is not None
+        positions.append(int(match.group(1)))
+        totals.add(int(match.group(2)))
+    if (
+        len(totals) != 1
+        or next(iter(totals)) != len(references)
+        or sorted(positions) != list(range(1, len(references) + 1))
+    ):
+        raise ValueError("full-model shard numbering is inconsistent")
+
+
+def _validate_full_serialization_metadata_only(
+    artifact: Path, names: set[str]
+) -> None:
+    """Mirror the real Full classifier without opening any weight payload."""
+    safe_single = "model.safetensors" in names
+    binary_single = "pytorch_model.bin" in names
+    safe_index = "model.safetensors.index.json" in names
+    binary_index = "pytorch_model.bin.index.json" in names
+    safe_shards = {name for name in names if _FULL_SAFE_SHARD.fullmatch(name)}
+    binary_shards = {name for name in names if _FULL_BINARY_SHARD.fullmatch(name)}
+    has_safe = safe_single or safe_index or bool(safe_shards)
+    has_binary = binary_single or binary_index or bool(binary_shards)
+    if has_safe and has_binary:
+        raise ValueError("mixed full-model serialization families")
+    if safe_single:
+        if safe_index or safe_shards:
+            raise ValueError("mixed standalone and sharded full serialization")
+        return
+    if binary_single:
+        if binary_index or binary_shards:
+            raise ValueError("mixed standalone and sharded full serialization")
+        return
+    if safe_index:
+        _validate_full_shard_index_metadata_only(
+            artifact,
+            index_name="model.safetensors.index.json",
+            shard_pattern=_FULL_SAFE_SHARD,
+            actual_shards=safe_shards,
+        )
+        return
+    if binary_index:
+        _validate_full_shard_index_metadata_only(
+            artifact,
+            index_name="pytorch_model.bin.index.json",
+            shard_pattern=_FULL_BINARY_SHARD,
+            actual_shards=binary_shards,
+        )
+        return
+    raise ValueError("full-model shards require their matching parsed index")
 
 
 def _require_peft_payload_names(names: set[str], *, stage: str) -> None:
@@ -446,19 +612,20 @@ def validate_loader_artifact(
 ) -> None:
     """Require the classifier's metadata/marker contract without reading weights."""
     identity = _validate_identity(runtime_identity)
-    checkpoint = Path(checkpoint_directory)
-    is_pinned = (
-        checkpoint.parent == Path("/proc/self/fd") and checkpoint.name.isdecimal()
+    checkpoint, owned_descriptor = _pin_directory_for_inspection(
+        Path(checkpoint_directory), label="loader artifact"
     )
-    if not is_pinned and (checkpoint.is_symlink() or not checkpoint.is_dir()):
-        raise ValueError("loader artifact must be a non-symlink directory")
-    stage, method = _checkpoint_stage_and_method(checkpoint, identity)
-    if (stage, method) != (identity["stage"], identity["tuning_method"]):
-        raise ValueError(
-            "loader artifact stage/method differs from runtime identity: "
-            f"observed={(stage, method)!r}, "
-            f"expected={(identity['stage'], identity['tuning_method'])!r}"
-        )
+    try:
+        stage, method = _checkpoint_stage_and_method(checkpoint, identity)
+        if (stage, method) != (identity["stage"], identity["tuning_method"]):
+            raise ValueError(
+                "loader artifact stage/method differs from runtime identity: "
+                f"observed={(stage, method)!r}, "
+                f"expected={(identity['stage'], identity['tuning_method'])!r}"
+            )
+    finally:
+        if owned_descriptor is not None:
+            os.close(owned_descriptor)
 
 
 def observe_checkpoint_identity(
@@ -466,39 +633,51 @@ def observe_checkpoint_identity(
     trusted_identity: Mapping[str, object],
 ) -> dict[str, object]:
     """Observe bounded producer sidecars and compare them with trusted plan fields."""
-    from src.deepspeed_runtime import read_deepspeed_runtime_sidecar
+    from src.deepspeed_runtime import (
+        DEEPSPEED_RUNTIME_FILENAME,
+        _MAX_DEEPSPEED_RUNTIME_BYTES,
+        decode_deepspeed_runtime_sidecar,
+    )
 
     expected = _validate_identity(trusted_identity)
-    checkpoint = Path(checkpoint_directory)
-    pinned_step = (
-        int(expected["global_step"])
-        if checkpoint.parent == Path("/proc/self/fd")
-        and checkpoint.name.isdecimal()
-        else None
+    checkpoint, owned_descriptor = _pin_directory_for_inspection(
+        Path(checkpoint_directory), label="checkpoint artifact"
     )
-    step = _decode_checkpoint_step(checkpoint, pinned_step=pinned_step)
-    profile = read_deepspeed_runtime_sidecar(checkpoint)
-    if not profile.enabled:
-        raise ValueError("checkpoint DeepSpeed runtime must be enabled")
-    observed = {
-        "zero_stage": profile.zero_stage,
-        "deepspeed_config_digest": profile.config_digest,
-        "world_size": profile.world_size,
-        "global_step": step,
-        "model_state_layout": _observed_model_layout(checkpoint, step),
-    }
-    stage, method = _checkpoint_stage_and_method(checkpoint, expected)
-    observed.update({"stage": stage, "tuning_method": method})
-    for field, value in observed.items():
-        if expected[field] != value:
-            raise ValueError(
-                f"observed checkpoint identity mismatch for {field}: "
-                f"observed={value!r}, expected={expected[field]!r}"
-            )
-    derived = derive_model_state_layout(expected["zero_stage"])
-    if observed["model_state_layout"] != derived:
-        raise ValueError("observed model-state filenames disagree with ZeRO stage")
-    return {**expected, **observed}
+    try:
+        step = _decode_checkpoint_step(
+            checkpoint, pinned_step=int(expected["global_step"])
+        )
+        runtime_path = checkpoint / DEEPSPEED_RUNTIME_FILENAME
+        runtime_raw = _read_small_regular(
+            runtime_path,
+            maximum_size=_MAX_DEEPSPEED_RUNTIME_BYTES,
+            label="DeepSpeed runtime identity",
+        )
+        profile = decode_deepspeed_runtime_sidecar(runtime_raw, path=runtime_path)
+        if not profile.enabled:
+            raise ValueError("checkpoint DeepSpeed runtime must be enabled")
+        observed = {
+            "zero_stage": profile.zero_stage,
+            "deepspeed_config_digest": profile.config_digest,
+            "world_size": profile.world_size,
+            "global_step": step,
+            "model_state_layout": _observed_model_layout(checkpoint, step),
+        }
+        stage, method = _checkpoint_stage_and_method(checkpoint, expected)
+        observed.update({"stage": stage, "tuning_method": method})
+        for field, value in observed.items():
+            if expected[field] != value:
+                raise ValueError(
+                    f"observed checkpoint identity mismatch for {field}: "
+                    f"observed={value!r}, expected={expected[field]!r}"
+                )
+        derived = derive_model_state_layout(expected["zero_stage"])
+        if observed["model_state_layout"] != derived:
+            raise ValueError("observed model-state filenames disagree with ZeRO stage")
+        return {**expected, **observed}
+    finally:
+        if owned_descriptor is not None:
+            os.close(owned_descriptor)
 
 
 def _process_rank(path: Path) -> int | None:

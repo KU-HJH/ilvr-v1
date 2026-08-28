@@ -284,3 +284,58 @@ performed. Source checkpoint trees are not moved or deleted. The fixed-host
 OpenSSH/rsync and real Stage loader behavior remain intentionally deferred to
 the planned hardware integration run. Pre-existing untracked `__pycache__`
 state was preserved and remains uncommitted.
+
+## Fix round 4/5 — standard loader config and final-component snapshots
+
+### Review findings addressed
+
+- Kept `config.json` mandatory and strictly JSON-object-shaped, while removing
+  the invented requirement for `config.json["stage"]`. Stage and tuning method
+  remain bound by strict Stage 1/2 PEFT metadata or the unique Full Stage
+  sidecar, then compared with the immutable runtime identity.
+- Replaced every Task 6 bounded sidecar/config/index pathname read with an
+  `os.open(..., dir_fd=<pinned checkpoint>, O_NOFOLLOW)` operation. File type
+  and size come from `fstat` on that exact descriptor, bytes are read from the
+  same descriptor, and a size change during the bounded read is rejected.
+- Split strict DeepSpeed runtime decoding from filesystem access so the Task 6
+  inspector can decode its descriptor-bound snapshot. Full shard indexes now
+  use a metadata-only mirror of the real Full classifier and never open or
+  decode the referenced weight shards.
+- Replaced custom-stage test configs with ordinary Qwen config payloads. The
+  causal Full tests use `Qwen2_5_VLConfig` without a `stage` field and invoke the
+  real Stage 1 and Stage 2 classifiers to prove classifier equivalence.
+
+### Fix-round TDD evidence
+
+1. RED: the standard-Qwen Full tests failed in both Stage 1 and Stage 2 with
+   `loader config stage differs from runtime identity`. The deterministic
+   final-component test then failed with `DID NOT RAISE ValueError`: after the
+   old `lstat`, replacing `stage2-sampler.json` with an attacker symlink made
+   the pathname read accept the attacker JSON (`1 failed, 118 deselected`).
+2. GREEN: after descriptor-relative no-follow reads and removal of the custom
+   config-stage constraint, the focused causal command reported `5 passed, 114
+   deselected`; the complete artifact suite then reported `119 passed`.
+
+### Final verification and self-review
+
+```text
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD" \
+  ./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_artifacts.py tests/multinode/test_coordinator.py
+
+162 passed in 3.81s
+```
+
+`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/transformers/src:$PWD"
+./venv/ilvr-venv/bin/python -m src.multinode prepare-inference --help`
+returned zero, and `git diff --check` was clean. The strict runtime decoder's
+focused compatibility suite also reported `24 passed`.
+
+Self-review confirmed that weight payloads are never read, hashed, or tensor
+decoded by production artifact inspection. Only bounded identity/config/index
+bytes use the pinned descriptor path; weight entries remain stat/name-only.
+Tests used temporary fixtures and fake/local-only paths, with no SSH, rsync,
+Docker, tmux, process groups, CUDA, GPUs, or source-tree deletion. Real remote
+filesystem and transfer behavior remains deferred to the planned hardware
+integration run. Pre-existing untracked `__pycache__` state remains preserved
+and uncommitted.
