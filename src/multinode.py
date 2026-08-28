@@ -592,6 +592,8 @@ def _ownership_ready(argv: list[str]) -> int:
             master_addr=args.master_addr,
             port=args.main_process_port,
             proc_root=_PROC_ROOT,
+            owner_pidfd=pidfd,
+            expected_owner_start_ticks=ownership.process_start_ticks,
         ):
             raise ValueError("owned rendezvous listener is not ready")
     finally:

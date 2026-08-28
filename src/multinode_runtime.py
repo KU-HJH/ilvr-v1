@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import shlex
+import signal
 import stat
 import subprocess
 import time
@@ -372,20 +373,28 @@ def read_ownership(path: str | Path) -> OwnershipRecord:
 
 
 def _proc_start_ticks(pid: int, *, proc_root: str | Path = "/proc") -> int:
+    return _proc_process_identity(pid, proc_root=proc_root)[1]
+
+
+def _proc_process_identity(
+    pid: int, *, proc_root: str | Path = "/proc"
+) -> tuple[int, int]:
+    """Read one stat snapshot as (parent PID, process start ticks)."""
     stat_text = (Path(proc_root) / str(pid) / "stat").read_text(encoding="utf-8")
     closing_parenthesis = stat_text.rfind(")")
     if closing_parenthesis < 0:
         raise ValueError("process stat has no command terminator")
     trailing_fields = stat_text[closing_parenthesis + 2 :].split()
     if len(trailing_fields) <= 19:
-        raise ValueError("process stat is missing start time")
+        raise ValueError("process stat is missing identity fields")
     try:
+        parent_pid = int(trailing_fields[1])
         start_ticks = int(trailing_fields[19])
     except ValueError as error:
-        raise ValueError("process stat start time is not an integer") from error
-    if start_ticks <= 0:
-        raise ValueError("process stat start time must be positive")
-    return start_ticks
+        raise ValueError("process stat identity is not an integer") from error
+    if parent_pid < 0 or start_ticks <= 0:
+        raise ValueError("process stat identity values are invalid")
+    return parent_pid, start_ticks
 
 
 def _nul_fields(path: Path) -> tuple[str, ...]:
@@ -443,34 +452,90 @@ def validate_owned_process(
     )
 
 
-def _process_tree_pids(owner_pid: int, *, proc_root: str | Path = "/proc") -> set[int]:
+@dataclass(frozen=True)
+class _PinnedProcess:
+    pid: int
+    pidfd: int
+    parent_pid: int
+    start_ticks: int
+    close_pidfd: bool
+
+
+def _process_children(pid: int, *, proc_root: Path) -> tuple[int, ...]:
+    tasks = tuple((proc_root / str(pid) / "task").iterdir())
+    children: set[int] = set()
+    for task in tasks:
+        values = (task / "children").read_text(encoding="ascii").split()
+        for value in values:
+            try:
+                child_pid = int(value)
+            except ValueError as error:
+                raise ValueError("process children list contains a non-PID") from error
+            if child_pid <= 1:
+                raise ValueError("process children list contains an invalid PID")
+            children.add(child_pid)
+    return tuple(sorted(children))
+
+
+def _pin_process_tree(
+    owner_pid: int,
+    *,
+    proc_root: Path,
+    owner_pidfd: int | None,
+    expected_owner_start_ticks: int | None,
+) -> dict[int, _PinnedProcess]:
     if type(owner_pid) is not int or owner_pid <= 1:
         raise ValueError("owner PID must identify a non-init process")
-    root = Path(proc_root)
-    discovered: set[int] = set()
-    pending = [owner_pid]
-    while pending:
-        pid = pending.pop()
-        if pid in discovered:
-            continue
-        discovered.add(pid)
-        try:
-            tasks = tuple((root / str(pid) / "task").iterdir())
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        for task in tasks:
-            try:
-                children = (task / "children").read_text(encoding="ascii").split()
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            for value in children:
+    root_pidfd = os.pidfd_open(owner_pid) if owner_pidfd is None else owner_pidfd
+    pinned: dict[int, _PinnedProcess] = {}
+    try:
+        parent_pid, start_ticks = _proc_process_identity(owner_pid, proc_root=proc_root)
+        if (
+            expected_owner_start_ticks is not None
+            and start_ticks != expected_owner_start_ticks
+        ):
+            raise ValueError("owner process start ticks changed")
+        pinned[owner_pid] = _PinnedProcess(
+            pid=owner_pid,
+            pidfd=root_pidfd,
+            parent_pid=parent_pid,
+            start_ticks=start_ticks,
+            close_pidfd=owner_pidfd is None,
+        )
+        pending = [owner_pid]
+        while pending:
+            parent = pinned[pending.pop(0)]
+            for child_pid in _process_children(parent.pid, proc_root=proc_root):
+                if child_pid in pinned:
+                    if pinned[child_pid].parent_pid != parent.pid:
+                        raise ValueError("pinned process ancestry changed")
+                    continue
+                child_pidfd = os.pidfd_open(child_pid)
                 try:
-                    child = int(value)
-                except ValueError as error:
-                    raise ValueError("process children list contains a non-PID") from error
-                if child > 1 and child not in discovered:
-                    pending.append(child)
-    return discovered
+                    child_parent, child_start = _proc_process_identity(
+                        child_pid, proc_root=proc_root
+                    )
+                    if child_parent != parent.pid:
+                        raise ValueError("descendant parent is not pinned")
+                    pinned[child_pid] = _PinnedProcess(
+                        pid=child_pid,
+                        pidfd=child_pidfd,
+                        parent_pid=child_parent,
+                        start_ticks=child_start,
+                        close_pidfd=True,
+                    )
+                except BaseException:
+                    os.close(child_pidfd)
+                    raise
+                pending.append(child_pid)
+        return pinned
+    except BaseException:
+        for process in pinned.values():
+            if process.close_pidfd:
+                os.close(process.pidfd)
+        if not pinned and owner_pidfd is None:
+            os.close(root_pidfd)
+        raise
 
 
 def _listening_socket_inodes(
@@ -514,6 +579,8 @@ def owned_listener_is_ready(
     master_addr: str,
     port: int,
     proc_root: str | Path = "/proc",
+    owner_pidfd: int | None = None,
+    expected_owner_start_ticks: int | None = None,
 ) -> bool:
     """Prove that the requested LISTEN socket belongs to the owned process tree."""
     if master_addr != "10.1.102.41":
@@ -524,21 +591,40 @@ def owned_listener_is_ready(
     if not listening:
         return False
     root = Path(proc_root)
-    for pid in _process_tree_pids(owner_pid, proc_root=root):
-        fd_directory = root / str(pid) / "fd"
-        try:
-            entries = tuple(fd_directory.iterdir())
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
-            continue
-        for entry in entries:
-            try:
+    pinned: dict[int, _PinnedProcess] = {}
+    try:
+        pinned = _pin_process_tree(
+            owner_pid,
+            proc_root=root,
+            owner_pidfd=owner_pidfd,
+            expected_owner_start_ticks=expected_owner_start_ticks,
+        )
+        found_listener = False
+        for process in pinned.values():
+            entries = tuple((root / str(process.pid) / "fd").iterdir())
+            for entry in entries:
                 target = os.readlink(entry)
-            except (FileNotFoundError, OSError):
-                continue
-            if target.startswith("socket:[") and target.endswith("]"):
-                if target[8:-1] in listening:
-                    return True
-    return False
+                if target.startswith("socket:[") and target.endswith("]"):
+                    found_listener = found_listener or target[8:-1] in listening
+        for process in pinned.values():
+            parent_pid, start_ticks = _proc_process_identity(
+                process.pid, proc_root=root
+            )
+            if (parent_pid, start_ticks) != (
+                process.parent_pid,
+                process.start_ticks,
+            ):
+                return False
+            if process.pid != owner_pid and parent_pid not in pinned:
+                return False
+            signal.pidfd_send_signal(process.pidfd, 0)
+        return found_listener
+    except (OSError, ValueError, ProcessLookupError):
+        return False
+    finally:
+        for process in pinned.values():
+            if process.close_pidfd:
+                os.close(process.pidfd)
 
 
 def validate_resume_path(

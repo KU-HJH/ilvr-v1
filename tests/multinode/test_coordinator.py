@@ -1022,7 +1022,18 @@ def test_live_process_validation_reads_exact_proc_argv_env_and_start_ticks(tmp_p
         )
 
 
-def test_owned_listener_rejects_foreign_socket_and_accepts_descendant(tmp_path):
+def _write_proc_identity(proc_root, *, pid, parent_pid, start_ticks):
+    fields = ["S", str(parent_pid), *("0" for _ in range(17)), str(start_ticks), "0"]
+    (proc_root / str(pid) / "stat").write_text(
+        f"{pid} (owned child) {' '.join(fields)}\n", encoding="ascii"
+    )
+
+
+def test_owned_listener_rejects_foreign_socket_and_accepts_stable_pinned_descendant(
+    tmp_path, monkeypatch
+):
+    import src.multinode_runtime as runtime
+
     owner = 4312
     child = 4313
     (tmp_path / "net").mkdir()
@@ -1036,16 +1047,84 @@ def test_owned_listener_rejects_foreign_socket_and_accepts_descendant(tmp_path):
     )
     (tmp_path / str(owner) / "fd").mkdir()
     (tmp_path / str(child) / "fd").mkdir()
+    _write_proc_identity(tmp_path, pid=owner, parent_pid=1, start_ticks=9981)
+    _write_proc_identity(tmp_path, pid=child, parent_pid=owner, start_ticks=9982)
     header = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
     line = "   0: 00000000:73BF 00000000:0000 0A 0:0 0:0 00:0 0 0 44444\n"
     (tmp_path / "net/tcp").write_text(header + line, encoding="ascii")
     (tmp_path / "net/tcp6").write_text(header, encoding="ascii")
+    pinned = {}
+    liveness = []
+
+    def pin(pid):
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        pinned[descriptor] = pid
+        return descriptor
+
+    monkeypatch.setattr(runtime.os, "pidfd_open", pin)
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        lambda descriptor, signum: liveness.append((pinned[descriptor], signum)),
+    )
 
     assert not owned_listener_is_ready(
         owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
     )
+    liveness.clear()
     (tmp_path / str(child) / "fd/7").symlink_to("socket:[44444]")
     assert owned_listener_is_ready(
+        owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
+    )
+    assert liveness == [(owner, 0), (child, 0)]
+
+
+def test_owned_listener_rejects_descendant_pid_reuse_before_fd_verdict(
+    tmp_path, monkeypatch
+):
+    import src.multinode_runtime as runtime
+
+    owner = 4312
+    child = 4313
+    (tmp_path / "net").mkdir()
+    for pid in (owner, child):
+        (tmp_path / str(pid) / "task" / str(pid)).mkdir(parents=True)
+        (tmp_path / str(pid) / "fd").mkdir()
+    (tmp_path / str(owner) / "task" / str(owner) / "children").write_text(
+        str(child), encoding="ascii"
+    )
+    (tmp_path / str(child) / "task" / str(child) / "children").write_text(
+        "", encoding="ascii"
+    )
+    _write_proc_identity(tmp_path, pid=owner, parent_pid=1, start_ticks=9981)
+    _write_proc_identity(tmp_path, pid=child, parent_pid=owner, start_ticks=9982)
+    header = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+    line = "   0: 00000000:73BF 00000000:0000 0A 0:0 0:0 00:0 0 0 44444\n"
+    (tmp_path / "net/tcp").write_text(header + line, encoding="ascii")
+    (tmp_path / "net/tcp6").write_text(header, encoding="ascii")
+    listener_fd = tmp_path / str(child) / "fd/7"
+    listener_fd.symlink_to("socket:[44444]")
+    pinned = {}
+
+    def pin(pid):
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        pinned[descriptor] = pid
+        return descriptor
+
+    real_readlink = runtime.os.readlink
+
+    def reuse_before_fd_verdict(path):
+        if Path(path) == listener_fd:
+            _write_proc_identity(
+                tmp_path, pid=child, parent_pid=9999, start_ticks=19982
+            )
+        return real_readlink(path)
+
+    monkeypatch.setattr(runtime.os, "pidfd_open", pin)
+    monkeypatch.setattr(runtime.os, "readlink", reuse_before_fd_verdict)
+    monkeypatch.setattr(signal, "pidfd_send_signal", lambda *_args: None)
+
+    assert not owned_listener_is_ready(
         owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
     )
 
