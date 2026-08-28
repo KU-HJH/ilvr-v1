@@ -2,9 +2,18 @@ import dataclasses
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+for _source_root in (
+    _REPOSITORY_ROOT / "transformers" / "src",
+    _REPOSITORY_ROOT / "src",
+):
+    if str(_source_root) not in sys.path:
+        sys.path.insert(0, str(_source_root))
 
 from src.multinode_artifacts import (
     ArtifactEntry,
@@ -29,6 +38,7 @@ from src.multinode_artifacts import (
     validate_transfer_destination,
     validate_reserved_inference_destination,
     validate_checkpoint_directory,
+    validate_loader_artifact,
 )
 from src.multinode_runtime import collect_checkpoint_artifacts
 from src.multinode_runtime import (
@@ -102,8 +112,14 @@ def write_observed_full_checkpoint(checkpoint, *, values=None, model_rank=2):
         encoding="utf-8",
     )
     (checkpoint / "config.json").write_text(
-        '{"stage":"stage1"}\n', encoding="utf-8"
+        json.dumps({"stage": values["stage"]}) + "\n", encoding="utf-8"
     )
+    for name in (
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+    ):
+        (checkpoint / name).write_text("{}\n", encoding="utf-8")
     (checkpoint / "model.safetensors").write_bytes(b"full-model")
     (checkpoint / "stage1_ema_teacher.pt").write_bytes(b"ema")
     return values
@@ -143,6 +159,13 @@ def strict_manifest(node_rank, *, prefix="bf16_", omit=(), changes=None):
                 ("deepspeed-runtime.json", 60),
                 ("stage1_ema_teacher.pt", 70),
                 ("stage1_peft_metadata.json", 80),
+                ("adapter_config.json", 81),
+                ("adapter_model.safetensors", 82),
+                ("ilvr_token_rows.safetensors", 83),
+                ("config.json", 84),
+                ("preprocessor_config.json", 85),
+                ("tokenizer_config.json", 86),
+                ("tokenizer.json", 87),
             )
         )
     omitted = set(omit)
@@ -178,6 +201,216 @@ def stage1_inference_entries(node_rank=0):
         ArtifactEntry(Path("stage1_peft_metadata.json"), 33, node_rank),
         ArtifactEntry(Path("ilvr_token_rows.safetensors"), 34, node_rank),
         ArtifactEntry(Path("preprocessor_config.json"), 35, node_rank),
+        ArtifactEntry(Path("config.json"), 36, node_rank),
+        ArtifactEntry(Path("tokenizer_config.json"), 37, node_rank),
+        ArtifactEntry(Path("tokenizer.json"), 38, node_rank),
+    )
+
+
+def loader_asset_entries(node_rank=0):
+    return (
+        ArtifactEntry(Path("config.json"), 36, node_rank),
+        ArtifactEntry(Path("preprocessor_config.json"), 35, node_rank),
+        ArtifactEntry(Path("tokenizer_config.json"), 37, node_rank),
+        ArtifactEntry(Path("tokenizer.json"), 38, node_rank),
+    )
+
+
+def qwen_test_architecture():
+    return {
+        "architectures": [],
+        "decoder": {
+            "attention_dropout": 0.0,
+            "head_dim": 4,
+            "hidden_act": "silu",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "max_position_embeddings": 32768,
+            "max_window_layers": 80,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 1,
+            "num_key_value_heads": 1,
+            "rope_scaling": {
+                "mrope_section": [1, 1, 0],
+                "rope_type": "default",
+                "type": "default",
+            },
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-5,
+            "sliding_window": 4096,
+            "tie_word_embeddings": False,
+            "use_sliding_window": False,
+            "vocab_size": 128,
+        },
+        "model_type": "qwen2_5_vl",
+        "multimodal_token_ids": {
+            "image_token_id": 80,
+            "video_token_id": 82,
+            "vision_end_token_id": None,
+            "vision_start_token_id": 81,
+        },
+        "vision": {
+            "depth": 1,
+            "fullatt_block_indexes": [0],
+            "hidden_act": "silu",
+            "hidden_size": 8,
+            "in_channels": 3,
+            "intermediate_size": 16,
+            "num_heads": 2,
+            "out_hidden_size": 8,
+            "patch_size": 2,
+            "spatial_merge_size": 1,
+            "temporal_patch_size": 1,
+            "tokens_per_second": 4,
+            "window_size": 2,
+        },
+    }
+
+
+def loader_identity(stage, method):
+    sidecar = {
+        ("stage1", "full"): "stage1_ema_teacher.pt",
+        ("stage1", "lora"): "stage1_peft_metadata.json",
+        ("stage1", "dora"): "stage1_peft_metadata.json",
+        ("stage2", "full"): "stage2-sampler.json",
+        ("stage2", "lora"): "stage2_peft_metadata.json",
+        ("stage2", "dora"): "stage2_peft_metadata.json",
+    }[(stage, method)]
+    return identity(stage=stage, tuning_method=method, stage_sidecar=sidecar)
+
+
+def write_loader_artifact(directory, *, stage, method, sparse_stage2=False):
+    from stage1.checkpointing import Stage1PeftMetadata
+    from stage2.checkpointing import Stage2PeftMetadata
+
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, payload in {
+        "config.json": json.dumps({"stage": stage}).encode("utf-8") + b"\n",
+        "preprocessor_config.json": b"{}\n",
+        "tokenizer_config.json": b"{}\n",
+        "tokenizer.json": b"{}\n",
+    }.items():
+        (directory / name).write_bytes(payload)
+    if method == "full":
+        (directory / "model.safetensors").write_bytes(b"full")
+        if stage == "stage1":
+            (directory / "stage1_ema_teacher.pt").write_bytes(b"ema")
+        else:
+            (directory / "stage2-sampler.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "seed": 7,
+                        "world_size": 4,
+                        "dataset_size": 4,
+                        "bucket_sizes": {"1": 4},
+                        "padded_samples": 0,
+                        "global_step": 2,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        return
+    (directory / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (directory / "adapter_model.safetensors").write_bytes(b"adapter")
+    if stage == "stage1":
+        metadata = Stage1PeftMetadata.from_dict(
+            {
+                "schema_version": 2,
+                "stage": "stage1",
+                "base_model_reference": "tiny/base",
+                "base_model_architecture": qwen_test_architecture(),
+                "base_vocab_size": 125,
+                "pretrained_model_vocab_size": 128,
+                "resized_vocab_size": 128,
+                "latent_token_ids": [125, 126, 127],
+                "latent_token_strings": [
+                    "<|latent_pad|>",
+                    "<|latent_start|>",
+                    "<|latent_end|>",
+                ],
+                "latent_size": 8,
+                "ce_weight": 1.0,
+                "sim_weight": 0.5,
+                "coverage_p": 0.9,
+                "image_pool_k": 8,
+                "tuning_method": method,
+                "rank": 8,
+                "alpha": 16,
+                "dropout": 0.0,
+                "requested_target_suffixes": ["q_proj"],
+                "resolved_target_names": ["model.layers.0.self_attn.q_proj"],
+                "input_row_format": "peft_trainable_tokens_v1",
+                "output_row_format": "ilvr_sparse_output_rows_v1",
+                "output_row_shape": [3, 8],
+                "peft_version": "0.17.1",
+                "repository_format_version": 1,
+            }
+        )
+        (directory / "stage1_peft_metadata.json").write_text(
+            json.dumps(metadata.to_dict()) + "\n", encoding="utf-8"
+        )
+        (directory / "ilvr_token_rows.safetensors").write_bytes(b"rows")
+        return
+    token_row_source = "sparse_adapter" if sparse_stage2 else "base"
+    metadata = Stage2PeftMetadata.from_dict(
+        {
+            "schema_version": 4,
+            "stage": "stage2",
+            "tuning_method": method,
+            "base_model_reference": "tiny/stage1",
+            "base_model_architecture": qwen_test_architecture(),
+            "tokenizer_base_vocab_size": 125,
+            "pretrained_model_vocab_size": 125,
+            "resized_vocab_size": 128,
+            "latent_size": 8,
+            "latent_start_token_id": 126 if sparse_stage2 else 91,
+            "latent_pad_token_id": 125 if sparse_stage2 else 90,
+            "latent_end_token_id": 127 if sparse_stage2 else 92,
+            "supervise_latent_boundaries": True,
+            "lora_r": 8,
+            "lora_alpha": 16,
+            "lora_dropout": 0.0,
+            "requested_target_modules": ["q_proj"],
+            "resolved_target_module_names": ["model.layers.0.self_attn.q_proj"],
+            "peft_version": "0.17.1",
+            "token_row_source": token_row_source,
+            "stage1_adapter_reference": (
+                "tiny/stage1-adapter" if sparse_stage2 else None
+            ),
+        }
+    )
+    (directory / "stage2_peft_metadata.json").write_text(
+        json.dumps(metadata.to_dict()) + "\n", encoding="utf-8"
+    )
+    if sparse_stage2:
+        import torch
+        from safetensors.torch import save_file
+
+        save_file(
+            {
+                "token_ids": torch.tensor([125, 126, 127], dtype=torch.int64),
+                "output_delta": torch.zeros((3, 8), dtype=torch.float32),
+            },
+            directory / "ilvr_token_rows.safetensors",
+            metadata={"format_version": "1", "training_dtype": "float32"},
+        )
+
+
+def loader_manifest(directory, *, stage, method):
+    return NodeArtifactManifest(
+        schema_version=1,
+        run_id=identity()["run_id"],
+        node_rank=0,
+        process_ranks=(0, 1, 2, 3),
+        entries=tuple(
+            ArtifactEntry(path.relative_to(directory), path.stat().st_size, 0)
+            for path in sorted(directory.iterdir())
+            if path.is_file()
+        ),
+        runtime_identity=loader_identity(stage, method),
+        completion_marker=True,
     )
 
 
@@ -592,7 +825,9 @@ def test_pull_selects_only_local_process_ranks_and_common_metadata(tmp_path):
     combined = dataclasses.replace(
         manifest_for((0, 1), extra_entries=(common,)),
         process_ranks=(0, 1, 2, 3),
-        entries=tuple(entry(rank, node_rank=0) for rank in range(4)) + (common,),
+        entries=tuple(entry(rank, node_rank=0) for rank in range(4))
+        + (common,)
+        + stage1_inference_entries(),
     )
 
     selected = select_resume_entries(combined)
@@ -610,9 +845,7 @@ def test_resume_selection_retains_loader_artifacts_and_only_local_ds_shards():
         entries=tuple(
             dataclasses.replace(item, node_rank=0)
             for item in validate_collection(strict_manifests(), world_size=4)
-        )
-        + stage1_inference_entries()
-        + (ArtifactEntry(Path("config.json"), 41, 0),),
+        ),
     )
 
     selected = select_resume_entries(canonical)
@@ -624,6 +857,8 @@ def test_resume_selection_retains_loader_artifacts_and_only_local_ds_shards():
         "ilvr_token_rows.safetensors",
         "config.json",
         "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
         "rng_state_2.pth",
         "rng_state_3.pth",
     } <= names
@@ -1088,6 +1323,14 @@ def test_collection_requires_every_checkpoint_component(omitted, message):
         validate_collection((remote, local), world_size=4)
 
 
+def test_collection_rejects_missing_stage1_adapter_config():
+    remote = strict_manifest(0, omit=("adapter_config.json",))
+    local = strict_manifest(1)
+
+    with pytest.raises(ValueError, match="adapter_config|PEFT"):
+        validate_collection((remote, local), world_size=4)
+
+
 def test_collection_rejects_checkpoint_and_global_step_mismatch():
     remote, local = strict_manifests()
     local = dataclasses.replace(
@@ -1170,9 +1413,7 @@ def test_post_push_requires_exact_fresh_remote_manifest():
 def test_inference_selection_excludes_all_training_state():
     manifest = dataclasses.replace(
         strict_manifest(0),
-        entries=strict_manifest(0).entries
-        + stage1_inference_entries()
-        + (ArtifactEntry(Path("config.json"), 103, 0),),
+        entries=strict_manifest(0).entries,
     )
     selected = select_inference_entries(manifest)
     assert {entry.relative_path.name for entry in selected} == {
@@ -1182,6 +1423,8 @@ def test_inference_selection_excludes_all_training_state():
         "stage1_peft_metadata.json",
         "ilvr_token_rows.safetensors",
         "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
     }
 
 
@@ -1191,6 +1434,13 @@ def test_full_inference_manifest_parses_index_and_rejects_unlisted_sibling(tmp_p
     (checkpoint / "config.json").write_text(
         '{"stage":"stage1"}\n', encoding="utf-8"
     )
+    for name in (
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+    ):
+        (checkpoint / name).write_text("{}\n", encoding="utf-8")
+    (checkpoint / "stage1_ema_teacher.pt").write_bytes(b"ema")
     first = "model-00001-of-00002.safetensors"
     second = "model-00002-of-00002.safetensors"
     (checkpoint / first).write_bytes(b"one")
@@ -1496,9 +1746,12 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
     assert inference_names == {
         "adapter_config.json",
         "adapter_model.safetensors",
+        "config.json",
         "stage1_peft_metadata.json",
         "ilvr_token_rows.safetensors",
         "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
     }
 
 
@@ -1550,6 +1803,11 @@ def test_observed_checkpoint_identity_rejects_caller_relabelled_sidecar(tmp_path
         '{"schema_version":2,"stage":"stage2","tuning_method":"lora"}\n',
         encoding="utf-8",
     )
+    for entry in loader_asset_entries():
+        (checkpoint / entry.relative_path).write_bytes(b"{}\n")
+    (checkpoint / "config.json").write_text(
+        '{"stage":"stage1"}\n', encoding="utf-8"
+    )
 
     with pytest.raises(ValueError, match="Stage 1 PEFT|metadata"):
         observe_checkpoint_identity(checkpoint, identity())
@@ -1575,13 +1833,68 @@ def test_checkpoint_directory_rejects_symlinked_run_ancestor(tmp_path):
         )
 
 
+def test_manifest_inspection_stays_bound_when_checkpoint_path_is_swapped(
+    tmp_path, monkeypatch
+):
+    import src.multinode_artifacts as artifacts_module
+
+    checkpoint_root = tmp_path / "checkpoints"
+    logical = checkpoint_root / full_identity()["run_id"] / "checkpoint-2"
+    logical.mkdir(parents=True)
+    values = write_observed_full_checkpoint(logical)
+    original_shard = (
+        logical / "global_step2/zero_pp_rank_2_mp_rank_00_optim_states.pt"
+    )
+    original_shard.write_bytes(b"old-owned")
+
+    replacement = tmp_path / "replacement" / "checkpoint-2"
+    replacement.mkdir(parents=True)
+    replacement_values = write_observed_full_checkpoint(replacement)
+    runtime_path = replacement / "deepspeed-runtime.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime["config_digest"] = "c" * 64
+    runtime_path.write_text(json.dumps(runtime) + "\n", encoding="utf-8")
+    assert replacement_values["deepspeed_config_digest"] == "a" * 64
+
+    original_observe = artifacts_module.observe_checkpoint_identity
+    swapped = False
+
+    def swap_after_open(checkpoint, trusted_identity):
+        nonlocal swapped
+        if not swapped:
+            displaced = tmp_path / "displaced-checkpoint"
+            logical.rename(displaced)
+            replacement.rename(logical)
+            swapped = True
+        return original_observe(checkpoint, trusted_identity)
+
+    monkeypatch.setattr(
+        artifacts_module, "observe_checkpoint_identity", swap_after_open
+    )
+    manifest = build_node_manifest(
+        logical,
+        node_rank=1,
+        process_ranks=(2, 3),
+        runtime_identity=values,
+        checkpoint_root=checkpoint_root,
+    )
+
+    assert swapped
+    assert next(
+        entry
+        for entry in manifest.entries
+        if entry.relative_path == original_shard.relative_to(logical)
+    ).byte_size == len(b"old-owned")
+
+
 def test_inference_peft_selection_requires_complete_stage_metadata_and_rows():
     incomplete = dataclasses.replace(
         strict_manifest(0),
         entries=(
             ArtifactEntry(Path("adapter_config.json"), 10, 0),
             ArtifactEntry(Path("adapter_model.safetensors"), 11, 0),
-        ),
+        )
+        + loader_asset_entries(),
     )
     with pytest.raises(ValueError, match="metadata|token-row|complete"):
         select_inference_entries(incomplete)
@@ -1592,7 +1905,6 @@ def test_inference_peft_selection_requires_complete_stage_metadata_and_rows():
         + (
             ArtifactEntry(Path("stage1_peft_metadata.json"), 12, 0),
             ArtifactEntry(Path("ilvr_token_rows.safetensors"), 13, 0),
-            ArtifactEntry(Path("preprocessor_config.json"), 14, 0),
         ),
     )
     assert {entry.relative_path.name for entry in select_inference_entries(complete)} == {
@@ -1601,6 +1913,9 @@ def test_inference_peft_selection_requires_complete_stage_metadata_and_rows():
         "stage1_peft_metadata.json",
         "ilvr_token_rows.safetensors",
         "preprocessor_config.json",
+        "config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
     }
 
 
@@ -1617,7 +1932,8 @@ def test_inference_full_selection_rejects_partial_or_mixed_shards():
         entries=(
             ArtifactEntry(Path("model.safetensors.index.json"), 10, 0),
             ArtifactEntry(Path("model-00001-of-00002.safetensors"), 11, 0),
-        ),
+        )
+        + loader_asset_entries(),
     )
     with pytest.raises(ValueError, match="complete|shard"):
         select_inference_entries(partial)
@@ -1627,10 +1943,201 @@ def test_inference_full_selection_rejects_partial_or_mixed_shards():
         entries=(
             ArtifactEntry(Path("model.safetensors"), 10, 0),
             ArtifactEntry(Path("pytorch_model.bin"), 11, 0),
-        ),
+        )
+        + loader_asset_entries(),
     )
     with pytest.raises(ValueError, match="mixed"):
         select_inference_entries(mixed)
+
+
+@pytest.mark.parametrize(
+    ("stage", "method"),
+    (
+        ("stage1", "full"),
+        ("stage1", "lora"),
+        ("stage1", "dora"),
+        ("stage2", "full"),
+        ("stage2", "lora"),
+        ("stage2", "dora"),
+    ),
+)
+def test_resume_requires_real_loader_complete_artifact_for_all_six_rows(
+    tmp_path, stage, method
+):
+    artifact = tmp_path / f"{stage}-{method}"
+    write_loader_artifact(artifact, stage=stage, method=method)
+    manifest = loader_manifest(artifact, stage=stage, method=method)
+
+    validate_loader_artifact(artifact, manifest.runtime_identity)
+    if stage == "stage1":
+        from stage1.checkpointing import (
+            Stage1ArtifactKind,
+            classify_stage1_artifact,
+        )
+
+        observed_kind = classify_stage1_artifact(artifact)
+        expected_kind = (
+            Stage1ArtifactKind.FULL
+            if method == "full"
+            else Stage1ArtifactKind.PEFT
+        )
+    else:
+        from stage2.checkpointing import (
+            Stage2ArtifactKind,
+            classify_stage2_artifact,
+        )
+
+        observed_kind = classify_stage2_artifact(artifact)
+        expected_kind = (
+            Stage2ArtifactKind.FULL
+            if method == "full"
+            else Stage2ArtifactKind.PEFT
+        )
+    assert observed_kind is expected_kind
+    selected = select_resume_entries(manifest)
+
+    names = {entry.relative_path.name for entry in selected}
+    assert {
+        "config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+    } <= names
+
+
+@pytest.mark.parametrize(
+    ("stage", "method"),
+    (
+        ("stage1", "full"),
+        ("stage1", "lora"),
+        ("stage1", "dora"),
+        ("stage2", "full"),
+        ("stage2", "lora"),
+        ("stage2", "dora"),
+    ),
+)
+def test_resume_rejects_missing_processor_marker_for_all_six_rows(
+    tmp_path, stage, method
+):
+    artifact = tmp_path / f"{stage}-{method}"
+    write_loader_artifact(artifact, stage=stage, method=method)
+    (artifact / "preprocessor_config.json").unlink()
+    manifest = loader_manifest(artifact, stage=stage, method=method)
+
+    with pytest.raises(ValueError, match="preprocessor_config"):
+        validate_loader_artifact(artifact, manifest.runtime_identity)
+    with pytest.raises(ValueError, match="preprocessor_config"):
+        select_resume_entries(manifest)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    (
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors",
+    ),
+)
+def test_stage1_lora_resume_rejects_each_required_peft_payload(tmp_path, missing):
+    artifact = tmp_path / "stage1-lora"
+    write_loader_artifact(artifact, stage="stage1", method="lora")
+    (artifact / missing).unlink()
+
+    with pytest.raises(ValueError, match="incomplete|missing|adapter|token-row"):
+        validate_loader_artifact(artifact, loader_identity("stage1", "lora"))
+
+
+@pytest.mark.parametrize("stage", ("stage1", "stage2"))
+def test_peft_loader_rejects_unsupported_legacy_adapter_marker(tmp_path, stage):
+    artifact = tmp_path / f"{stage}-lora"
+    write_loader_artifact(artifact, stage=stage, method="lora")
+    (artifact / "adapter_model.bin").write_bytes(b"legacy")
+
+    with pytest.raises(ValueError, match="unsupported|legacy"):
+        validate_loader_artifact(artifact, loader_identity(stage, "lora"))
+
+
+def test_stage2_sparse_rows_are_required_only_by_strict_metadata(tmp_path):
+    sparse = tmp_path / "stage2-sparse"
+    write_loader_artifact(
+        sparse, stage="stage2", method="lora", sparse_stage2=True
+    )
+    validate_loader_artifact(sparse, loader_identity("stage2", "lora"))
+    (sparse / "ilvr_token_rows.safetensors").unlink()
+    with pytest.raises(ValueError, match="token-row|sparse"):
+        validate_loader_artifact(sparse, loader_identity("stage2", "lora"))
+
+    base = tmp_path / "stage2-base"
+    write_loader_artifact(base, stage="stage2", method="lora")
+    validate_loader_artifact(base, loader_identity("stage2", "lora"))
+
+
+def test_stage2_peft_production_validation_never_reads_weight_bytes(
+    tmp_path, monkeypatch
+):
+    artifact = tmp_path / "stage2-sparse"
+    write_loader_artifact(
+        artifact, stage="stage2", method="lora", sparse_stage2=True
+    )
+    original_read_bytes = Path.read_bytes
+
+    def reject_weight_read(path, *args, **kwargs):
+        if path.suffix in {".pt", ".pth", ".safetensors", ".bin"}:
+            raise AssertionError("checkpoint weights must never be opened")
+        return original_read_bytes(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_weight_read)
+
+    validate_loader_artifact(artifact, loader_identity("stage2", "lora"))
+
+
+def test_loader_assets_accept_vocab_and_merges_tokenizer_alternative(tmp_path):
+    artifact = tmp_path / "stage1-full"
+    write_loader_artifact(artifact, stage="stage1", method="full")
+    (artifact / "tokenizer.json").unlink()
+    (artifact / "vocab.json").write_text("{}\n", encoding="utf-8")
+    (artifact / "merges.txt").write_text("#version: 0.2\n", encoding="utf-8")
+
+    validate_loader_artifact(artifact, loader_identity("stage1", "full"))
+
+
+def test_loader_artifact_config_must_identify_the_resume_stage(tmp_path):
+    artifact = tmp_path / "stage2-full"
+    write_loader_artifact(artifact, stage="stage2", method="full")
+    (artifact / "config.json").write_text(
+        '{"stage":"stage1"}\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="config.*stage"):
+        validate_loader_artifact(artifact, loader_identity("stage2", "full"))
+
+
+def test_inference_rejects_weights_without_complete_config_processor_assets():
+    manifest = dataclasses.replace(
+        strict_manifest(
+            0,
+            changes={
+                "tuning_method": "full",
+                "stage_sidecar": "stage1_ema_teacher.pt",
+            },
+        ),
+        entries=(ArtifactEntry(Path("model.safetensors"), 10, 0),),
+    )
+
+    with pytest.raises(ValueError, match="config.json|processor|tokenizer"):
+        select_inference_entries(manifest)
+
+
+def test_full_inference_reuses_loader_config_stage_contract(tmp_path):
+    artifact = tmp_path / "stage1-full"
+    write_loader_artifact(artifact, stage="stage1", method="full")
+    manifest = loader_manifest(artifact, stage="stage1", method="full")
+    (artifact / "config.json").write_text(
+        '{"stage":"stage2"}\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="config.*stage"):
+        build_inference_manifest(artifact, manifest)
 
 
 def test_prepare_inference_help_is_local_and_side_effect_free(tmp_path):
@@ -1656,3 +2163,75 @@ def test_prepare_inference_help_is_local_and_side_effect_free(tmp_path):
     assert completed.returncode == 0, completed.stderr
     assert "--checkpoint-step" in completed.stdout
     assert not marker.exists()
+
+
+def test_prepare_inference_cli_dispatches_successfully_with_fake_runner(
+    tmp_path, monkeypatch, capsys
+):
+    import src.multinode as multinode_module
+    import src.multinode_runtime as runtime_module
+
+    repository = tmp_path / "repo"
+    destination = (
+        repository
+        / "results"
+        / identity()["run_id"]
+        / "evaluation-model"
+    )
+    observed = {}
+
+    class FakeCliRunner:
+        def __init__(self, plan, *, commands, commit, log_root):
+            observed["plan"] = plan
+            observed["commit"] = commit
+            observed["log_root"] = log_root
+
+    def fake_prepare(
+        runner, *, checkpoint_path, runtime_identity, destination
+    ):
+        observed["runner"] = runner
+        observed["checkpoint_path"] = checkpoint_path
+        observed["runtime_identity"] = runtime_identity
+        observed["destination"] = destination
+        return destination
+
+    monkeypatch.setattr(multinode_module, "_REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(
+        multinode_module, "_command_stdout", lambda *args, **kwargs: "b" * 40
+    )
+    monkeypatch.setattr(
+        multinode_module, "SubprocessCoordinatorRunner", FakeCliRunner
+    )
+    monkeypatch.setattr(
+        runtime_module, "prepare_inference_artifacts", fake_prepare
+    )
+
+    result = multinode_module._main(
+        [
+            "prepare-inference",
+            "--stage",
+            "stage1",
+            "--tuning-method",
+            "lora",
+            "--zero-stage",
+            "3",
+            "--run-id",
+            identity()["run_id"],
+            "--main-process-port",
+            "29631",
+            "--checkpoint-step",
+            "2",
+            "--destination",
+            str(destination),
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "inference_artifact": str(destination)
+    }
+    assert observed["checkpoint_path"] == (
+        repository / "checkpoints" / identity()["run_id"] / "checkpoint-2"
+    )
+    assert observed["runtime_identity"]["model_state_layout"] == "partitioned"
+    assert observed["destination"] == destination

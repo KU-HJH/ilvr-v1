@@ -213,3 +213,74 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src:$PWD/transformers/src:$PWD" \
 
 `python -m src.multinode prepare-inference --help` and `git diff --check`
 both passed in the same final verification command.
+
+## Fix round 3/5 — mandatory loader artifacts and pinned inspection
+
+### Review findings addressed
+
+- Made the complete loader asset family mandatory for collection, resume, and
+  inference: `config.json`, `preprocessor_config.json`,
+  `tokenizer_config.json`, and either `tokenizer.json` or the paired
+  `vocab.json`/`merges.txt` serialization. A weights-only artifact is rejected.
+- Covered all six Stage 1/Stage 2 × Full/LoRA/DoRA rows with tiny fixtures. The
+  production validator mirrors the existing classifiers using exact filenames,
+  complete full serialization/index sibling sets, strict small PEFT metadata,
+  and conditional Stage 2 sparse-row markers without reading weight payloads.
+  The tests separately invoke the real Stage classifiers on the tiny fixtures
+  and prove the same Full/PEFT classification for every row.
+- Required Stage 1 PEFT adapter config, safetensors adapter, strict Stage 1
+  metadata, and sparse token rows. Stage 2 sparse rows are present exactly when
+  its strict metadata declares `sparse_adapter`; unsupported legacy adapter and
+  mixed/unknown weight markers fail closed.
+- Reused the same completeness selection for inference while excluding
+  training state. Full inference still requires one supported standalone family
+  or a parsed index whose exact sibling shard set is complete.
+- Closed the checkpoint-directory swap window. Canonical root/run/checkpoint
+  traversal opens no-follow dirfds, then one pinned checkpoint descriptor stays
+  authoritative for recursive enumeration and all bounded sidecar/config reads.
+  The node inference CLI filters the already validated manifest and does not
+  reopen the checkpoint pathname after releasing that descriptor.
+- Added a successful fake `prepare-inference` CLI dispatch test proving the
+  concrete runner call, canonical checkpoint path, strict identity, and fresh
+  destination are wired without any remote or hardware action.
+
+### Fix-round TDD evidence
+
+1. RED: the initial six-row loader tests failed to import the missing
+   `validate_loader_artifact`; after the interface was added, mandatory marker
+   cases reached `18 passed, 90 deselected`.
+2. RED: the causal pathname replacement test changed the observed runtime
+   digest from the opened checkpoint's value to the attacker's replacement
+   value. GREEN: pinned no-follow inspection remained bound to the opened inode,
+   followed by `109 passed` for the artifact suite at that checkpoint.
+3. RED: weights-only full inference and a mismatched config stage were accepted.
+   GREEN: the bounded config/processor/tokenizer contract and stage binding
+   rejected both.
+4. RED: two legacy `adapter_model.bin` counterexamples passed the metadata-only
+   PEFT mirror. GREEN: both Stage mirrors now reject unsupported/unknown markers.
+5. GREEN: a `Path.read_bytes` guard rejects every `.pt`, `.pth`,
+   `.safetensors`, and `.bin` read while a strict sparse Stage 2 PEFT artifact
+   validates successfully; actual tensor decoding occurs only in the separate
+   tiny-fixture classifier characterization test.
+
+### Final verification and self-review
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_artifacts.py tests/multinode/test_coordinator.py
+
+159 passed in 6.68s
+```
+
+`PYTHONDONTWRITEBYTECODE=1 ./venv/ilvr-venv/bin/python -m src.multinode
+prepare-inference --help` returned zero and listed the bounded stage/method/ZeRO,
+run, port, step, and destination arguments. `git diff --check` was clean.
+
+Self-review confirmed that production inspection reads only bounded JSON/text
+identity metadata and stats/names; it never opens model, adapter, optimizer,
+RNG, or sparse-row payloads. Tests use only fake runners and temporary tiny
+fixtures: no SSH, rsync, Docker, tmux, process group, CUDA, or GPU operation was
+performed. Source checkpoint trees are not moved or deleted. The fixed-host
+OpenSSH/rsync and real Stage loader behavior remain intentionally deferred to
+the planned hardware integration run. Pre-existing untracked `__pycache__`
+state was preserved and remains uncommitted.

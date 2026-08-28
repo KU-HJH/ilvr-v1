@@ -74,6 +74,9 @@ _INFERENCE_SHARD = re.compile(
     r"(?:model-[0-9]{5}-of-[0-9]{5}\.safetensors|"
     r"pytorch_model-[0-9]{5}-of-[0-9]{5}\.bin)\Z"
 )
+_REQUIRED_LOADER_ASSETS = frozenset(
+    {"config.json", "preprocessor_config.json", "tokenizer_config.json"}
+)
 _BASE_CHECKPOINT_METADATA = frozenset(
     {"latest", "trainer_state.json", "scheduler.pt", "deepspeed-runtime.json"}
 )
@@ -111,7 +114,25 @@ def validate_checkpoint_directory(
     global_step: int,
 ) -> Path:
     """Bind the logical path and open every descendant below the fixed root nofollow."""
-    from src.multinode_runtime import _open_trusted_directory
+    descriptor, physical = _open_pinned_checkpoint_directory(
+        checkpoint_directory,
+        checkpoint_root=checkpoint_root,
+        run_id=run_id,
+        global_step=global_step,
+    )
+    os.close(descriptor)
+    return physical
+
+
+def _open_pinned_checkpoint_directory(
+    checkpoint_directory: str | Path,
+    *,
+    checkpoint_root: str | Path,
+    run_id: str,
+    global_step: int,
+) -> tuple[int, Path]:
+    """Open one canonical checkpoint inode and retain its no-follow descriptor."""
+    from src.multinode_runtime import _open_child_directory, _open_trusted_directory
 
     run = _validate_run_id(run_id)
     if type(global_step) is not int or global_step < 0:
@@ -123,9 +144,27 @@ def validate_checkpoint_directory(
         raise ValueError("checkpoint directory must be the exact canonical path")
     physical_root = logical_root.resolve(strict=True)
     physical = physical_root / run / f"checkpoint-{global_step}"
-    descriptor = _open_trusted_directory(physical)
-    os.close(descriptor)
-    return physical
+    root_descriptor = _open_trusted_directory(physical_root)
+    run_descriptor: int | None = None
+    checkpoint_descriptor: int | None = None
+    try:
+        run_descriptor = _open_child_directory(
+            root_descriptor, run, create=False
+        )
+        checkpoint_descriptor = _open_child_directory(
+            run_descriptor, f"checkpoint-{global_step}", create=False
+        )
+    except OSError as error:
+        raise ValueError(
+            "checkpoint run and checkpoint descendants must be no-follow "
+            "non-symlink directories"
+        ) from error
+    finally:
+        if run_descriptor is not None:
+            os.close(run_descriptor)
+        os.close(root_descriptor)
+    assert checkpoint_descriptor is not None
+    return checkpoint_descriptor, physical
 
 
 def _read_small_regular(path: Path, *, maximum_size: int, label: str) -> bytes:
@@ -143,11 +182,18 @@ def _read_small_regular(path: Path, *, maximum_size: int, label: str) -> bytes:
         raise ValueError(f"cannot read {label}: {path}") from error
 
 
-def _decode_checkpoint_step(checkpoint: Path) -> int:
-    match = re.fullmatch(r"checkpoint-(0|[1-9][0-9]*)", checkpoint.name)
-    if match is None:
-        raise ValueError("checkpoint directory must be numbered checkpoint-N")
-    numbered_step = int(match.group(1))
+def _decode_checkpoint_step(
+    checkpoint: Path, *, pinned_step: int | None = None
+) -> int:
+    if pinned_step is None:
+        match = re.fullmatch(r"checkpoint-(0|[1-9][0-9]*)", checkpoint.name)
+        if match is None:
+            raise ValueError("checkpoint directory must be numbered checkpoint-N")
+        numbered_step = int(match.group(1))
+    else:
+        if type(pinned_step) is not int or pinned_step < 0:
+            raise ValueError("pinned checkpoint step must be a nonnegative integer")
+        numbered_step = pinned_step
     latest = _read_small_regular(
         checkpoint / "latest", maximum_size=_MAX_LATEST_BYTES, label="DeepSpeed latest"
     )
@@ -174,14 +220,36 @@ def _decode_checkpoint_step(checkpoint: Path) -> int:
 
 
 def _observed_model_layout(checkpoint: Path, step: int) -> str:
-    tag = checkpoint / f"global_step{step}"
-    if tag.is_symlink() or not tag.is_dir():
-        raise ValueError("checkpoint global_stepN must be a non-symlink directory")
-    names = {
-        entry.name
-        for entry in os.scandir(tag)
-        if entry.is_file(follow_symlinks=False)
-    }
+    tag_name = f"global_step{step}"
+    tag = checkpoint / tag_name
+    descriptor: int | None = None
+    try:
+        if checkpoint.parent == Path("/proc/self/fd") and checkpoint.name.isdecimal():
+            descriptor = os.open(
+                tag_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=int(checkpoint.name),
+            )
+            scan_target: int | Path = descriptor
+        else:
+            if tag.is_symlink() or not tag.is_dir():
+                raise ValueError(
+                    "checkpoint global_stepN must be a non-symlink directory"
+                )
+            scan_target = tag
+        with os.scandir(scan_target) as children:
+            names = {
+                entry.name
+                for entry in children
+                if entry.is_file(follow_symlinks=False)
+            }
+    except OSError as error:
+        raise ValueError(
+            "checkpoint global_stepN must be a no-follow directory"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     has_partitioned = any(_PARTITIONED_MODEL_SHARD.fullmatch(name) for name in names)
     has_replicated = _REPLICATED_MODEL_STATE in names
     if has_partitioned == has_replicated:
@@ -192,8 +260,26 @@ def _observed_model_layout(checkpoint: Path, step: int) -> str:
 def _checkpoint_stage_and_method(
     checkpoint: Path, expected: Mapping[str, object]
 ) -> tuple[str, str]:
-    stage1_metadata = checkpoint / "stage1_peft_metadata.json"
-    stage2_metadata = checkpoint / "stage2_peft_metadata.json"
+    artifact = checkpoint
+    artifact_names = {
+        entry.name
+        for entry in artifact.iterdir()
+        if entry.is_file() and not entry.is_symlink()
+    }
+    _require_loader_asset_names(artifact_names)
+    config_raw = _read_small_regular(
+        artifact / "config.json",
+        maximum_size=_MAX_COMMON_METADATA_BYTES,
+        label="loader config",
+    )
+    try:
+        config = json.loads(config_raw)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("loader config is invalid JSON") from error
+    if type(config) is not dict or config.get("stage") != expected["stage"]:
+        raise ValueError("loader config stage differs from runtime identity")
+    stage1_metadata = artifact / "stage1_peft_metadata.json"
+    stage2_metadata = artifact / "stage2_peft_metadata.json"
     stage1_present = stage1_metadata.exists() or stage1_metadata.is_symlink()
     stage2_present = stage2_metadata.exists() or stage2_metadata.is_symlink()
     if stage1_present and stage2_present:
@@ -202,29 +288,52 @@ def _checkpoint_stage_and_method(
     if source_root not in sys.path:
         sys.path.insert(0, source_root)
     if stage1_present:
-        _read_small_regular(
+        metadata_json = _read_small_regular(
             stage1_metadata,
             maximum_size=_MAX_COMMON_METADATA_BYTES,
             label="Stage 1 PEFT metadata",
         )
-        from stage1.checkpointing import load_stage1_peft_metadata
+        from stage1.checkpointing import (
+            Stage1PeftMetadataSnapshot,
+            decode_stage1_peft_metadata_snapshot,
+        )
 
-        metadata = load_stage1_peft_metadata(checkpoint)
+        metadata = decode_stage1_peft_metadata_snapshot(
+            Stage1PeftMetadataSnapshot(
+                artifact_dir=artifact,
+                metadata_json=metadata_json,
+            )
+        )
+        _require_peft_payload_names(artifact_names, stage="stage1")
         return "stage1", metadata.tuning_method
     if stage2_present:
-        _read_small_regular(
+        metadata_json = _read_small_regular(
             stage2_metadata,
             maximum_size=_MAX_COMMON_METADATA_BYTES,
             label="Stage 2 PEFT metadata",
         )
-        from stage2.checkpointing import load_stage2_peft_metadata
+        from stage2.checkpointing import (
+            Stage2PeftMetadataSnapshot,
+            decode_stage2_peft_metadata_snapshot,
+        )
 
-        metadata = load_stage2_peft_metadata(checkpoint)
+        metadata = decode_stage2_peft_metadata_snapshot(
+            Stage2PeftMetadataSnapshot(
+                artifact_dir=artifact,
+                metadata_json=metadata_json,
+            )
+        )
+        _require_peft_payload_names(artifact_names, stage="stage2")
+        has_sparse = "ilvr_token_rows.safetensors" in artifact_names
+        if (metadata.token_row_source == "sparse_adapter") != has_sparse:
+            raise ValueError(
+                "Stage 2 PEFT sparse token-row marker differs from strict metadata"
+            )
         return "stage2", metadata.tuning_method
     if expected["tuning_method"] != "full":
         raise ValueError("PEFT checkpoint is missing strict Stage metadata")
-    stage1_full = checkpoint / "stage1_ema_teacher.pt"
-    stage2_full = checkpoint / "stage2-sampler.json"
+    stage1_full = artifact / "stage1_ema_teacher.pt"
+    stage2_full = artifact / "stage2-sampler.json"
     stage1_full_present = stage1_full.exists() or stage1_full.is_symlink()
     stage2_full_present = stage2_full.exists() or stage2_full.is_symlink()
     if stage1_full_present == stage2_full_present:
@@ -234,9 +343,6 @@ def _checkpoint_stage_and_method(
         metadata = stage1_full.lstat()
         if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
             raise ValueError("Stage 1 EMA sidecar must be a regular non-symlink file")
-        from stage1.checkpointing import classify_stage1_artifact
-
-        classify_stage1_artifact(checkpoint)
     else:
         sampler_raw = _read_small_regular(
             stage2_full,
@@ -252,15 +358,107 @@ def _checkpoint_stage_and_method(
             or sampler_payload.get("global_step") != expected["global_step"]
         ):
             raise ValueError("Stage 2 sampler global_step differs from checkpoint")
-        from stage2.sampler import read_stage2_sampler_sidecar
+        from stage2.sampler import Stage2SamplerIdentity
 
-        sampler = read_stage2_sampler_sidecar(checkpoint)
+        sampler = Stage2SamplerIdentity.from_dict(
+            {
+                key: value
+                for key, value in sampler_payload.items()
+                if key != "global_step"
+            }
+        )
         if sampler.world_size != expected["world_size"]:
             raise ValueError("Stage 2 sampler world_size differs from checkpoint")
-        from stage2.checkpointing import classify_stage2_artifact
+    from stage1.checkpointing import _validate_full_serialization
 
-        classify_stage2_artifact(checkpoint)
+    _validate_full_serialization(artifact, artifact_names)
     return stage, "full"
+
+
+def _require_loader_asset_names(names: set[str]) -> None:
+    missing = _REQUIRED_LOADER_ASSETS - names
+    if missing:
+        raise ValueError(f"loader artifact is missing required asset: {sorted(missing)[0]}")
+    has_tokenizer_json = "tokenizer.json" in names
+    has_vocab_merges = {"vocab.json", "merges.txt"} <= names
+    if not has_tokenizer_json and not has_vocab_merges:
+        raise ValueError(
+            "loader artifact requires tokenizer.json or vocab.json plus merges.txt"
+        )
+
+
+def _require_peft_payload_names(names: set[str], *, stage: str) -> None:
+    metadata_name = f"{stage}_peft_metadata.json"
+    required = {"adapter_config.json", "adapter_model.safetensors", metadata_name}
+    if stage == "stage1":
+        required.add("ilvr_token_rows.safetensors")
+    missing = required - names
+    if missing:
+        raise ValueError(f"incomplete {stage} PEFT artifact: missing={sorted(missing)}")
+    full_markers = {
+        name
+        for name in names
+        if name
+        in {
+            "model.safetensors",
+            "model.safetensors.index.json",
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+        }
+        or _INFERENCE_SHARD.fullmatch(name)
+    }
+    if full_markers:
+        raise ValueError(
+            f"mixed {stage} PEFT and full serialization markers: "
+            f"{sorted(full_markers)}"
+        )
+    allowed_weight_names = {
+        "adapter_model.safetensors",
+        "ilvr_token_rows.safetensors",
+        "optimizer.pt",
+        "scheduler.pt",
+        "scaler.pt",
+        "rng_state.pth",
+        "training_args.bin",
+    }
+    if stage == "stage1":
+        allowed_weight_names.add("stage1_ema_teacher.pt")
+    unsupported = {
+        name
+        for name in names
+        if (
+            name.endswith((".safetensors", ".bin", ".pt", ".pth"))
+            or name.endswith((".safetensors.index.json", ".bin.index.json"))
+        )
+        and name not in allowed_weight_names
+        and _RNG_STATE.fullmatch(name) is None
+    }
+    if unsupported:
+        raise ValueError(
+            f"unsupported legacy or unknown {stage} PEFT weight marker: "
+            f"{sorted(unsupported)}"
+        )
+
+
+def validate_loader_artifact(
+    checkpoint_directory: str | Path,
+    runtime_identity: Mapping[str, object],
+) -> None:
+    """Require the classifier's metadata/marker contract without reading weights."""
+    identity = _validate_identity(runtime_identity)
+    checkpoint = Path(checkpoint_directory)
+    is_pinned = (
+        checkpoint.parent == Path("/proc/self/fd") and checkpoint.name.isdecimal()
+    )
+    if not is_pinned and (checkpoint.is_symlink() or not checkpoint.is_dir()):
+        raise ValueError("loader artifact must be a non-symlink directory")
+    stage, method = _checkpoint_stage_and_method(checkpoint, identity)
+    if (stage, method) != (identity["stage"], identity["tuning_method"]):
+        raise ValueError(
+            "loader artifact stage/method differs from runtime identity: "
+            f"observed={(stage, method)!r}, "
+            f"expected={(identity['stage'], identity['tuning_method'])!r}"
+        )
 
 
 def observe_checkpoint_identity(
@@ -272,7 +470,13 @@ def observe_checkpoint_identity(
 
     expected = _validate_identity(trusted_identity)
     checkpoint = Path(checkpoint_directory)
-    step = _decode_checkpoint_step(checkpoint)
+    pinned_step = (
+        int(expected["global_step"])
+        if checkpoint.parent == Path("/proc/self/fd")
+        and checkpoint.name.isdecimal()
+        else None
+    )
+    step = _decode_checkpoint_step(checkpoint, pinned_step=pinned_step)
     profile = read_deepspeed_runtime_sidecar(checkpoint)
     if not profile.enabled:
         raise ValueError("checkpoint DeepSpeed runtime must be enabled")
@@ -485,6 +689,54 @@ def _walk_regular_files(root: Path) -> tuple[tuple[Path, os.stat_result], ...]:
     return tuple(found)
 
 
+def _walk_regular_files_fd(
+    root_descriptor: int,
+) -> tuple[tuple[Path, os.stat_result], ...]:
+    """Enumerate one pinned checkpoint using only no-follow dirfd operations."""
+    found: list[tuple[Path, os.stat_result]] = []
+
+    def visit(directory_descriptor: int, relative_directory: Path) -> None:
+        try:
+            children = sorted(
+                os.scandir(directory_descriptor), key=lambda item: item.name
+            )
+        except OSError as error:
+            raise ValueError("cannot inspect pinned artifact directory") from error
+        for child in children:
+            relative = relative_directory / child.name
+            metadata = child.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"artifact tree contains a symlink: {relative}")
+            if stat.S_ISDIR(metadata.st_mode):
+                child_descriptor: int | None = None
+                try:
+                    child_descriptor = os.open(
+                        child.name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        dir_fd=directory_descriptor,
+                    )
+                    visit(child_descriptor, relative)
+                except OSError as error:
+                    raise ValueError(
+                        f"cannot inspect pinned artifact directory: {relative}"
+                    ) from error
+                finally:
+                    if child_descriptor is not None:
+                        os.close(child_descriptor)
+            elif stat.S_ISREG(metadata.st_mode):
+                found.append((_safe_relative_path(relative), metadata))
+            else:
+                raise ValueError(
+                    f"artifact tree entries must be regular files: {relative}"
+                )
+
+    visit(root_descriptor, Path())
+    return tuple(found)
+
+
 def build_node_manifest(
     run_directory: str | Path,
     *,
@@ -510,21 +762,26 @@ def build_node_manifest(
     if ranks != expected_ranks:
         raise ValueError("node manifest must claim only its assigned process ranks")
     checkpoint_relative = Path(f"checkpoint-{trusted_identity['global_step']}")
-    physical_directory = validate_checkpoint_directory(
+    checkpoint_descriptor, _ = _open_pinned_checkpoint_directory(
         directory,
         checkpoint_root=checkpoint_root,
         run_id=str(trusted_identity["run_id"]),
         global_step=int(trusted_identity["global_step"]),
     )
-    entries: list[ArtifactEntry] = []
-    for relative, metadata in _walk_regular_files(physical_directory):
-        item = ArtifactEntry(relative, metadata.st_size, node_rank)
-        if item.process_rank is not None and item.process_rank not in ranks:
-            raise ValueError(
-                f"artifact shard is outside the node's assigned process ranks: {relative}"
-            )
-        entries.append(item)
-    identity = observe_checkpoint_identity(physical_directory, trusted_identity)
+    try:
+        pinned_directory = Path(f"/proc/self/fd/{checkpoint_descriptor}")
+        entries: list[ArtifactEntry] = []
+        for relative, metadata in _walk_regular_files_fd(checkpoint_descriptor):
+            item = ArtifactEntry(relative, metadata.st_size, node_rank)
+            if item.process_rank is not None and item.process_rank not in ranks:
+                raise ValueError(
+                    "artifact shard is outside the node's assigned process ranks: "
+                    f"{relative}"
+                )
+            entries.append(item)
+        identity = observe_checkpoint_identity(pinned_directory, trusted_identity)
+    finally:
+        os.close(checkpoint_descriptor)
     manifest_run_id = _validate_run_id(run_id or str(identity["run_id"]))
     if manifest_run_id != identity["run_id"]:
         raise ValueError("node manifest run ID differs from its canonical ancestor")
@@ -846,7 +1103,18 @@ def validate_collection(
         )
         if occurrences > 1:
             raise ValueError(f"duplicate artifact is not allowlisted common metadata: {path}")
-    return tuple(combined[path] for path in sorted(combined, key=lambda item: item.as_posix()))
+    collected = tuple(
+        combined[path]
+        for path in sorted(combined, key=lambda item: item.as_posix())
+    )
+    canonical = replace(
+        values[0],
+        node_rank=0,
+        process_ranks=(0, 1, 2, 3),
+        entries=tuple(replace(entry, node_rank=0) for entry in collected),
+    )
+    select_inference_entries(canonical)
+    return collected
 
 
 def _lstat_if_present(path: Path) -> os.stat_result | None:
@@ -955,6 +1223,7 @@ def select_resume_entries(
 ) -> tuple[ArtifactEntry, ...]:
     """Select local ranks 2/3 and the small common metadata needed by resume."""
     identity = _validate_identity(manifest.runtime_identity)
+    select_inference_entries(manifest)
     allowed_common = _required_common_paths(identity)
     step_directory = Path(f"global_step{identity['global_step']}")
     return tuple(
@@ -1027,6 +1296,12 @@ def select_inference_entries(
 ) -> tuple[ArtifactEntry, ...]:
     """Select only explicit model/processor artifacts, never training state."""
     identity = _validate_identity(manifest.runtime_identity)
+    top_level_names = {
+        entry.relative_path.name
+        for entry in manifest.entries
+        if entry.relative_path == Path(entry.relative_path.name)
+    }
+    _require_loader_asset_names(top_level_names)
     selected = tuple(
         entry
         for entry in manifest.entries
@@ -1123,36 +1398,15 @@ def build_inference_manifest(
     """Validate one complete loadable artifact and retain only inference files."""
     checkpoint = Path(checkpoint_directory)
     identity = _validate_identity(manifest.runtime_identity)
-    selected = select_inference_entries(manifest)
-    names = {entry.relative_path.name for entry in selected}
-    source_root = str(Path(__file__).resolve().parent)
-    if source_root not in sys.path:
-        sys.path.insert(0, source_root)
-    if "adapter_model.safetensors" in names:
-        stage, method = _checkpoint_stage_and_method(checkpoint, identity)
-        if (stage, method) != (identity["stage"], identity["tuning_method"]):
-            raise ValueError("inference PEFT metadata differs from checkpoint identity")
-        if stage == "stage1":
-            from stage1.checkpointing import classify_stage1_artifact
+    validate_loader_artifact(checkpoint, identity)
+    return filter_inference_manifest(manifest)
 
-            classify_stage1_artifact(checkpoint)
-        else:
-            from stage2.checkpointing import load_stage2_peft_metadata
 
-            metadata = load_stage2_peft_metadata(checkpoint)
-            has_sparse = "ilvr_token_rows.safetensors" in names
-            if (metadata.token_row_source == "sparse_adapter") != has_sparse:
-                raise ValueError("Stage 2 inference sparse token-row set is incomplete")
-    else:
-        if identity["stage"] == "stage1":
-            from stage1.checkpointing import classify_stage1_artifact
-
-            classify_stage1_artifact(checkpoint)
-        else:
-            from stage2.checkpointing import classify_stage2_artifact
-
-            classify_stage2_artifact(checkpoint)
-    return replace(manifest, entries=selected)
+def filter_inference_manifest(
+    manifest: NodeArtifactManifest,
+) -> NodeArtifactManifest:
+    """Filter a manifest whose loader contract was already pinned and validated."""
+    return replace(manifest, entries=select_inference_entries(manifest))
 
 
 def validate_inference_manifest_identity(

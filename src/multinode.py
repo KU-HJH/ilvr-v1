@@ -800,7 +800,7 @@ def _artifact_destination_check(argv: list[str]) -> int:
 
 
 def _artifact_inference_manifest(argv: list[str]) -> int:
-    from src.multinode_artifacts import build_inference_manifest, build_node_manifest
+    from src.multinode_artifacts import filter_inference_manifest, build_node_manifest
 
     parser = argparse.ArgumentParser(
         prog="python -m src.multinode artifact-inference-manifest"
@@ -827,7 +827,9 @@ def _artifact_inference_manifest(argv: list[str]) -> int:
             checkpoint_root=args.checkpoint_root,
             canonical_owner=True,
         )
-        filtered = build_inference_manifest(args.run_directory, manifest)
+        # build_node_manifest validated the complete loader contract while its
+        # canonical checkpoint dirfd was pinned. Filtering uses only that proof.
+        filtered = filter_inference_manifest(manifest)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(filtered.to_json(), sort_keys=True))
