@@ -187,7 +187,9 @@ def validate_deepspeed_resume_identity(
             )
 
 
-def validate_supported_deepspeed_policy(payload: Mapping[str, object]) -> None:
+def validate_supported_deepspeed_policy(
+    payload: Mapping[str, object], *, stage2_peft_zero3: bool = False
+) -> None:
     """Reject unsupported precision, batching, and offload policies."""
     if payload.get("bf16") != {"enabled": True}:
         raise ValueError("canonical DeepSpeed configs require bf16 enabled")
@@ -205,8 +207,23 @@ def validate_supported_deepspeed_policy(payload: Mapping[str, object]) -> None:
         value = zero.get(field)
         if value is not None and not isinstance(value, Mapping):
             raise ValueError(f"{field} must be a JSON object")
-        if value is not None and value.get("device", "none") != "none":
-            raise ValueError(f"{field} is unsupported for canonical GPU runs")
+    if stage2_peft_zero3:
+        if (
+            zero.get("stage") != 3
+            or zero.get("stage3_prefetch_bucket_size") != 0
+            or zero.get("offload_optimizer") != {"device": "none"}
+            or zero.get("offload_param")
+            != {"device": "cpu", "pin_memory": False}
+        ):
+            raise ValueError(
+                "Stage 2 PEFT ZeRO-3 requires zero prefetch, CPU parameter "
+                "offload without pinning, and no optimizer offload"
+            )
+    else:
+        for field in ("offload_optimizer", "offload_param"):
+            value = zero.get(field)
+            if value is not None and value.get("device", "none") != "none":
+                raise ValueError(f"{field} is unsupported for canonical GPU runs")
 
 
 def load_deepspeed_runtime_profile(
@@ -239,7 +256,12 @@ def load_deepspeed_runtime_profile(
     ]
     if mesh > 1 and mesh != world_size:
         raise ValueError(f"DeepSpeed mesh requires world size {mesh}, got {world_size}")
-    validate_supported_deepspeed_policy(payload)
+    dedicated_stage2_peft_zero3 = path == canonical_deepspeed_config_path(3).with_name(
+        "deepspeed_zero3_stage2_peft.json"
+    ).resolve(strict=False)
+    validate_supported_deepspeed_policy(
+        payload, stage2_peft_zero3=dedicated_stage2_peft_zero3
+    )
     return DeepSpeedRuntimeProfile(
         True, zero_stage, path, hashlib.sha256(raw).hexdigest(), world_size
     )

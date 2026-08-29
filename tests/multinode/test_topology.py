@@ -2,13 +2,18 @@ import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
 
+import src.deepspeed_runtime as deepspeed_runtime
 import src.multinode as multinode
-from src.deepspeed_runtime import canonical_deepspeed_config_path
+from src.deepspeed_runtime import (
+    canonical_deepspeed_config_path,
+    load_deepspeed_runtime_profile,
+)
 from src.multinode import (
     ClusterSpec,
     LaunchPlan,
@@ -92,8 +97,15 @@ def test_stage2_peft_zero3_selects_dedicated_gpu_only_config(tuning_method):
     )
     expected = json.loads(json.dumps(canonical))
     expected["zero_optimization"]["stage3_prefetch_bucket_size"] = 0
+    expected["zero_optimization"]["offload_param"] = {
+        "device": "cpu",
+        "pin_memory": False,
+    }
     assert dedicated == expected
-    assert dedicated["zero_optimization"]["offload_param"] == {"device": "none"}
+    assert dedicated["zero_optimization"]["offload_param"] == {
+        "device": "cpu",
+        "pin_memory": False,
+    }
     assert dedicated["zero_optimization"]["offload_optimizer"] == {
         "device": "none"
     }
@@ -111,6 +123,56 @@ def test_stage2_peft_zero3_selects_dedicated_gpu_only_config(tuning_method):
         run_id=f"stage1-{tuning_method}-zero3-four-gpu",
         main_process_port=29632,
     ).deepspeed_config == canonical_deepspeed_config(3)
+
+
+def test_dedicated_stage2_peft_zero3_allows_only_exact_cpu_param_offload(
+    tmp_path, monkeypatch
+):
+    """Catches CPU parameter offload leaking beyond the selected PEFT policy."""
+    canonical_path = tmp_path / "deepspeed_zero3.json"
+    dedicated_path = tmp_path / "deepspeed_zero3_stage2_peft.json"
+    canonical = json.loads(
+        canonical_deepspeed_config_path(3).read_text(encoding="utf-8")
+    )
+    desired = deepcopy(canonical)
+    desired["zero_optimization"]["stage3_prefetch_bucket_size"] = 0
+    desired["zero_optimization"]["offload_param"] = {
+        "device": "cpu",
+        "pin_memory": False,
+    }
+    canonical_path.write_text(json.dumps(canonical), encoding="utf-8")
+    dedicated_path.write_text(json.dumps(desired), encoding="utf-8")
+    monkeypatch.setattr(
+        deepspeed_runtime,
+        "canonical_deepspeed_config_path",
+        lambda zero_stage: canonical_path,
+    )
+
+    profile = load_deepspeed_runtime_profile(dedicated_path, world_size=4)
+    assert (profile.enabled, profile.zero_stage, profile.config_path) == (
+        True,
+        3,
+        dedicated_path,
+    )
+
+    mutations = []
+    for field, value in (
+        ("stage3_prefetch_bucket_size", 1),
+        ("offload_optimizer", {"device": "cpu"}),
+        ("offload_param", {"device": "cpu", "pin_memory": True}),
+        ("offload_param", {"device": "none"}),
+    ):
+        mutated = deepcopy(desired)
+        mutated["zero_optimization"][field] = value
+        mutations.append(mutated)
+    for mutated in mutations:
+        dedicated_path.write_text(json.dumps(mutated), encoding="utf-8")
+        with pytest.raises(ValueError, match="Stage 2 PEFT ZeRO-3"):
+            load_deepspeed_runtime_profile(dedicated_path, world_size=4)
+
+    canonical_path.write_text(json.dumps(desired), encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported for canonical GPU runs"):
+        load_deepspeed_runtime_profile(canonical_path, world_size=4)
 
 
 def test_stage2_peft_zero3_rejects_gradient_checkpointing():

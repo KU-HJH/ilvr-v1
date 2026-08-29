@@ -6,7 +6,7 @@
   "zero_optimization": {
     "stage": 3,
     "offload_optimizer": {"device": "none"},
-    "offload_param": {"device": "none"},
+    "offload_param": {"device": "cpu", "pin_memory": false},
     "overlap_comm": true,
     "contiguous_gradients": true,
     "reduce_bucket_size": 500000000,
