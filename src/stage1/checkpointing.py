@@ -1104,6 +1104,7 @@ def _save_stage1_peft_supplements(
     output_dir: Path,
     metadata: Stage1PeftMetadata,
 ) -> None:
+    resolve_qwen2_5_vl_model(model).config.save_pretrained(output_dir)
     save_sparse_token_rows(model, Path(output_dir))
     save_stage1_peft_metadata(Path(output_dir), metadata)
 

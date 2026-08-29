@@ -558,14 +558,21 @@ def test_metadata_rejects_json_scalar_type_confusion(field, value):
         Stage1PeftMetadata.from_dict(payload)
 
 
-def test_dora_artifact_is_adapter_only_and_complete(
-    tmp_path, stage1_dora_bundle
-):
+@pytest.mark.parametrize("method", ("lora", "dora"))
+def test_peft_artifact_is_adapter_only_and_loader_complete(tmp_path, method):
+    tuning = stage1_tuning(method)
+    base = tiny_original_qwen()
+    metadata = sample_metadata(base, tuning)
+    base.resize_token_embeddings(RESIZED_VOCAB_SIZE)
+    base.config.latent_token_id = LATENT_TOKEN_IDS[0]
+    base.config.latent_start_id = LATENT_TOKEN_IDS[1]
+    base.config.latent_end_id = LATENT_TOKEN_IDS[2]
+    model = build_stage1_tuned_model(base, tuning, LATENT_TOKEN_IDS)
     save_stage1_peft_artifact(
-        stage1_dora_bundle.model,
-        stage1_dora_bundle.processor,
+        model,
+        TinyStage1Processor(),
         tmp_path,
-        stage1_dora_bundle.metadata,
+        metadata,
     )
 
     assert classify_stage1_artifact(tmp_path) is Stage1ArtifactKind.PEFT
@@ -573,6 +580,9 @@ def test_dora_artifact_is_adapter_only_and_complete(
     assert (tmp_path / "adapter_model.safetensors").is_file()
     assert (tmp_path / "ilvr_token_rows.safetensors").is_file()
     assert (tmp_path / STAGE1_PEFT_METADATA_FILENAME).is_file()
+    saved_config = Qwen2_5_VLConfig.from_pretrained(tmp_path)
+    assert saved_config.latent_token_id == LATENT_TOKEN_IDS[0]
+    assert load_stage1_peft_metadata(tmp_path).tuning_method == method
     assert (tmp_path / "tokenizer.json").is_file()
     assert (tmp_path / "preprocessor_config.json").is_file()
     assert not (tmp_path / "model.safetensors").exists()

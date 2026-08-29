@@ -17,6 +17,7 @@ from deepspeed_runtime import (
     validate_deepspeed_resume_identity,
     write_deepspeed_runtime_sidecar,
 )
+from peft_common import resolve_qwen2_5_vl_model
 from .checkpointing import save_stage2_peft_metadata
 from .sampler import (
     LatentBlockBalancedSampler,
@@ -301,6 +302,7 @@ class Stage2Trainer(Trainer):
             safe_serialization=self.args.save_safetensors,
             save_embedding_layers=False,
         )
+        resolve_qwen2_5_vl_model(model).config.save_pretrained(target)
         if self.processing_class is not None:
             self.processing_class.save_pretrained(target)
         torch.save(self.args, target / TRAINING_ARGS_NAME)

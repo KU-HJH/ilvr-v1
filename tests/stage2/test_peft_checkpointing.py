@@ -1636,6 +1636,9 @@ def test_stage2_trainer_final_peft_save_is_adapter_only_with_sidecar(
     assert (tmp_path / "adapter_config.json").is_file()
     assert (tmp_path / "adapter_model.safetensors").is_file()
     assert (tmp_path / STAGE2_PEFT_METADATA_FILENAME).is_file()
+    assert json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))[
+        "stage"
+    ] == "stage2"
     assert not (tmp_path / "model.safetensors").exists()
     assert not (tmp_path / "pytorch_model.bin").exists()
     assert load_stage2_peft_metadata(tmp_path) == metadata
