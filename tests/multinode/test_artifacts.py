@@ -847,13 +847,16 @@ def test_push_never_overwrites_and_is_scoped_to_the_run():
     assert "--files-from" in command
     assert "--from0" in command
     assert "--checksum" not in command
+    assert command[command.index("--rsync-path") + 1] == (
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
+    )
     assert command[-2] == (
         "/root/workspace/ILVR/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert command[-1] == (
         "korea@10.1.102.41:"
-        "/home/korea/Workspace/hjh/workspace/ILVR/checkpoints/"
+        "/root/workspace/ILVR/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert not any("venv" in argument or "/data/" in argument for argument in command)

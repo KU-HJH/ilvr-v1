@@ -1410,14 +1410,18 @@ def build_push_command(
         / manifest.checkpoint_relative
     )
     destination = (
-        _REMOTE_HOST_REPOSITORY
+        _LOCAL_REPOSITORY
         / "checkpoints"
         / manifest.run_id
         / manifest.checkpoint_relative
     )
     list_path = Path(files_from) if files_from is not None else _files_from_path(manifest, "push")
+    prefix = _rsync_prefix(list_path)
     return (
-        *_rsync_prefix(list_path),
+        *prefix[:-1],
+        "--rsync-path",
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "--",
         f"{source}/",
         f"{_REMOTE_HOST}:{destination}/",
     )
