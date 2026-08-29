@@ -1,6 +1,8 @@
 from PIL import Image
 import os
 
+from stage2.data import resolve_image_root_path
+
 TRAIN_IMAGE_ROOT = "/mnt/public/users/dongshuai/LVR/ILVR_PUB/COMT"
 TEST_IMAGE_ROOT  = ""
 
@@ -26,8 +28,9 @@ def interleaved_latent_cot_preprocess_function(sample, *, image_root=None):
     # Process user content (Input images)
     user_content = []
     for image_rel in _to_list(sample.get('image_input', [])):
-        full_image_path = _resolve_path(image_root, image_rel)
-        _assert_exists(full_image_path)
+        full_image_path = resolve_image_root_path(
+            image_rel, image_root, image_role="original"
+        )
         user_content.append({"type": "image", "image": full_image_path})
     user_content.append({"type": "text", "text": sample.get("text_input", "")})
 
@@ -45,8 +48,9 @@ def interleaved_latent_cot_preprocess_function(sample, *, image_root=None):
             helper_rel = step.get('helper_image', None)
             if not helper_rel:
                 raise ValueError(f"Latent step is missing 'helper_image': {step}")
-            helper_path = _resolve_path(image_root, helper_rel)
-            _assert_exists(helper_path)
+            helper_path = resolve_image_root_path(
+                helper_rel, image_root, image_role="helper"
+            )
             assistant_content.append({"type": "image", "image": helper_path})
         else:
             raise ValueError(f"Unknown step type: {stype}")

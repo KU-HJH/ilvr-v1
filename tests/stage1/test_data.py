@@ -255,6 +255,112 @@ def test_prepare_missing_image_error_includes_source_index_and_expected_path(tmp
     assert error.value.__cause__ is not None
 
 
+@pytest.mark.parametrize(
+    "image_input",
+    ("images_comt/creation/input.png", "creation/input.png"),
+)
+def test_prepare_resolves_canonical_and_root_relative_stage1_images(
+    tmp_path, image_input
+):
+    image_root = tmp_path / "images_comt"
+    image = image_root / "creation/input.png"
+    helper = image_root / "creation/helper.png"
+    image.parent.mkdir(parents=True)
+    Image.new("RGB", (2, 2)).save(image)
+    Image.new("RGB", (2, 2)).save(helper)
+    data_path = tmp_path / "subset.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {
+                "image_input": image_input,
+                "text_input": "question",
+                "sequence_plan": [
+                    {
+                        "type": "latent",
+                        "helper_image": "images_comt/creation/helper.png",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    [example] = prepare_stage1_comt_examples(data_path, image_root)
+
+    assert example.original_image_paths == (str(image),)
+    assert example.helper_image_paths == (str(helper),)
+
+
+def test_prepare_strips_stage1_image_root_name_only_once(tmp_path):
+    image_root = tmp_path / "images_comt"
+    image = image_root / "creation/input.png"
+    image.parent.mkdir(parents=True)
+    Image.new("RGB", (2, 2)).save(image)
+    data_path = tmp_path / "double-prefix.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {
+                "image_input": "images_comt/images_comt/creation/input.png",
+                "text_input": "question",
+                "sequence_plan": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileNotFoundError, match="source_index=0"):
+        prepare_stage1_comt_examples(data_path, image_root)
+
+
+@pytest.mark.parametrize(
+    "image_input",
+    ("/tmp/absolute.png", "../escape.png", "creation/control\n.png"),
+)
+def test_prepare_rejects_unsafe_stage1_image_paths(tmp_path, image_input):
+    image_root = tmp_path / "images_comt"
+    image_root.mkdir()
+    data_path = tmp_path / "unsafe.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {
+                "image_input": image_input,
+                "text_input": "question",
+                "sequence_plan": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="safe relative path"):
+        prepare_stage1_comt_examples(data_path, image_root)
+
+
+def test_prepare_rejects_stage1_image_symlink_escape(tmp_path):
+    image_root = tmp_path / "images_comt"
+    image_root.mkdir()
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (2, 2)).save(outside)
+    (image_root / "escape.png").symlink_to(outside)
+    data_path = tmp_path / "symlink.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {
+                "image_input": "escape.png",
+                "text_input": "question",
+                "sequence_plan": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="remain inside image_root"):
+        prepare_stage1_comt_examples(data_path, image_root)
+
+
 @pytest.mark.parametrize("role", ["original", "helper"])
 def test_collator_corrupt_image_error_includes_source_index_and_role(tmp_path, role):
     """Catches unreadable image materialization escaping without sample ownership."""

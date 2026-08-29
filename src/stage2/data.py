@@ -35,6 +35,38 @@ def load_jsonl_examples(path: Path) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def resolve_image_root_path(
+    raw_path: str,
+    image_root: Path,
+    *,
+    image_role: str,
+) -> str:
+    """Resolve one safe image-root-relative path, stripping the root name once."""
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(f"{image_role} image path must be a non-empty string")
+
+    resolved_root = Path(image_root).resolve(strict=True)
+    candidate = Path(raw_path)
+    if (
+        candidate.is_absolute()
+        or not candidate.parts
+        or any(part in ("", ".", "..") for part in candidate.parts)
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw_path)
+    ):
+        raise ValueError(f"{image_role} image must use a safe relative path")
+    if candidate.parts[0] == resolved_root.name:
+        candidate = Path(*candidate.parts[1:])
+    if not candidate.parts:
+        raise ValueError(f"{image_role} image must use a safe relative path")
+
+    resolved = (resolved_root / candidate).resolve(strict=False)
+    if resolved == resolved_root or not resolved.is_relative_to(resolved_root):
+        raise ValueError(f"resolved {image_role} image must remain inside image_root")
+    if not resolved.is_file():
+        raise FileNotFoundError(f"missing {image_role} image: {resolved}")
+    return str(resolved)
+
+
 def resolve_original_images(sample: dict, image_root: Path) -> tuple[str, ...]:
     """Resolve and verify only the original image inputs in a CoMT sample."""
     raw_images = sample.get("image_input")
@@ -45,28 +77,14 @@ def resolve_original_images(sample: dict, image_root: Path) -> tuple[str, ...]:
     if not all(isinstance(raw_image, str) and raw_image for raw_image in raw_images):
         raise ValueError("image_input entries must be non-empty strings")
 
-    resolved_root = Path(image_root).resolve(strict=True)
-    paths: list[str] = []
-    for raw_image in raw_images:
-        candidate = Path(raw_image)
-        if (
-            candidate.is_absolute()
-            or not candidate.parts
-            or any(part in ("", ".", "..") for part in candidate.parts)
-            or any(ord(character) < 32 or ord(character) == 127 for character in raw_image)
-        ):
-            raise ValueError("image_input must use a safe relative path")
-        if candidate.parts[0] == resolved_root.name:
-            candidate = Path(*candidate.parts[1:])
-        if not candidate.parts:
-            raise ValueError("image_input must use a safe relative path")
-        resolved = (resolved_root / candidate).resolve(strict=False)
-        if resolved == resolved_root or not resolved.is_relative_to(resolved_root):
-            raise ValueError("resolved image_input must remain inside image_root")
-        if not resolved.is_file():
-            raise FileNotFoundError(f"missing original image: {resolved}")
-        paths.append(str(resolved))
-    return tuple(paths)
+    return tuple(
+        resolve_image_root_path(
+            raw_image,
+            image_root,
+            image_role="original",
+        )
+        for raw_image in raw_images
+    )
 
 
 def _assistant_text(sequence_plan: list, latent_size: int) -> tuple[str, int]:
