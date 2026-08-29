@@ -2109,6 +2109,8 @@ class SubprocessCoordinatorRunner:
         machine_rank: int,
         checkpoint_path: Path,
         runtime_identity: Mapping[str, object],
+        *,
+        canonical_owner: bool = False,
     ) -> object:
         """Collect one bounded node-local lstat manifest through the node CLI."""
         from src.multinode_artifacts import (
@@ -2132,7 +2134,9 @@ class SubprocessCoordinatorRunner:
         )
         if checkpoint_path != expected_checkpoint:
             raise ValueError("artifact manifest path is not the canonical checkpoint")
-        ranks = (0, 1) if machine_rank == 0 else (2, 3)
+        ranks = (0, 1, 2, 3) if canonical_owner else (
+            (0, 1) if machine_rank == 0 else (2, 3)
+        )
         arguments = [
             "--run-directory",
             str(checkpoint_path),
@@ -2153,6 +2157,8 @@ class SubprocessCoordinatorRunner:
         ]
         for rank in ranks:
             arguments.extend(("--process-rank", str(rank)))
+        if canonical_owner:
+            arguments.append("--canonical-owner")
         completed = self._run(
             self._internal_command(machine_rank, "artifact-manifest", arguments)
         )
@@ -2999,7 +3005,7 @@ def redistribute_resume_checkpoint(
         runner.validate_resume_destination(missing, target)
         runner.pull_resume_artifacts(manifest, missing, target)
     observed = getattr(runner, "read_artifact_manifest")(
-        1, checkpoint, checkpoint_identity
+        1, checkpoint, checkpoint_identity, canonical_owner=True
     )
     observed_required, observed_missing = resume_entry_delta(manifest, observed)
     if observed_missing or observed_required != required:

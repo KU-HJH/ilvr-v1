@@ -873,7 +873,7 @@ def test_pull_selects_only_local_process_ranks_and_common_metadata(tmp_path):
     )
 
     selected = select_resume_entries(combined)
-    assert {item.process_rank for item in selected} == {None, 2, 3}
+    assert {item.process_rank for item in selected} == {None, 0, 1, 2, 3}
     command = build_pull_command(combined, tmp_path / "checkpoint-copy")
     assert command[command.index("--rsync-path") + 1] == (
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
@@ -909,7 +909,7 @@ def test_resume_selection_retains_loader_artifacts_and_only_local_ds_shards():
         "rng_state_2.pth",
         "rng_state_3.pth",
     } <= names
-    assert not any(item.process_rank in (0, 1) for item in selected)
+    assert {item.process_rank for item in selected} == {None, 0, 1, 2, 3}
 
 
 @pytest.mark.parametrize(
@@ -1550,14 +1550,19 @@ class FakeProductionTransferRunner(FakeTransferRunner):
             entries=select_inference_entries(self.canonical),
         )
 
-    def read_artifact_manifest(self, machine_rank, checkpoint_path, runtime_identity):
+    def read_artifact_manifest(
+        self, machine_rank, checkpoint_path, runtime_identity, *, canonical_owner=False
+    ):
         assert machine_rank == 1
         self.events.append("local-post-manifest" if self.pulled else "local-manifest")
         if not self.pulled:
+            assert not canonical_owner
             return strict_manifest(1)
+        assert canonical_owner
         selected = select_resume_entries(self.canonical)
         return dataclasses.replace(
             strict_manifest(1),
+            process_ranks=(0, 1, 2, 3),
             entries=tuple(dataclasses.replace(item, node_rank=1) for item in selected),
         )
 
@@ -1586,7 +1591,7 @@ def test_production_resume_redistribution_uses_same_immediate_canonical_path():
         destination=checkpoint,
     )
 
-    assert {entry.process_rank for entry in entries} == {None, 2, 3}
+    assert {entry.process_rank for entry in entries} == {None, 0, 1, 2, 3}
     assert runner.events == [
         "remote-canonical-manifest",
         "local-manifest",
@@ -1797,6 +1802,7 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
     selected_resume = select_resume_entries(canonical)
     hydrated_local = dataclasses.replace(
         local,
+        process_ranks=(0, 1, 2, 3),
         entries=tuple(dataclasses.replace(item, node_rank=1) for item in selected_resume),
     )
     inference_manifest = dataclasses.replace(
@@ -1833,7 +1839,7 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
                 payload = inference_manifest
             elif "prepared-inference-show" in display:
                 payload = inference_manifest
-            elif "--canonical-owner" in display:
+            elif "--canonical-owner" in display and argv[0] == "/usr/bin/ssh":
                 payload = canonical
             else:
                 payload = hydrated_local if resume_pulled else local
@@ -1878,8 +1884,8 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         for path in canonical_checkpoint.rglob("*")
         if path.is_file()
     }
-    assert "rng_state_2.pth" in resume_names
-    assert not any("rank_0_" in name for name in resume_names)
+    assert {f"rng_state_{rank}.pth" for rank in range(4)} <= resume_names
+    assert any("rank_0_" in name for name in resume_names)
     inference_names = {
         path.relative_to(inference_destination).as_posix()
         for path in inference_destination.rglob("*")

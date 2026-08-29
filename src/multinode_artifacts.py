@@ -1138,7 +1138,7 @@ def _validate_manifest(manifest: NodeArtifactManifest, *, world_size: int) -> No
     if type(manifest.node_rank) is not int or manifest.node_rank not in (0, 1):
         raise ValueError("artifact manifest node rank is invalid")
     expected = (0, 1) if manifest.node_rank == 0 else (2, 3)
-    canonical_expected = (0, 1, 2, 3) if manifest.node_rank == 0 else expected
+    canonical_expected = (0, 1, 2, 3)
     if manifest.process_ranks not in (expected, canonical_expected):
         raise ValueError("node manifest process ranks do not match assigned process ranks")
     if any(type(rank) is not int for rank in manifest.process_ranks):
@@ -1430,31 +1430,10 @@ def build_push_command(
 def select_resume_entries(
     manifest: NodeArtifactManifest,
 ) -> tuple[ArtifactEntry, ...]:
-    """Select local ranks 2/3 and the small common metadata needed by resume."""
-    identity = _validate_identity(manifest.runtime_identity)
+    """Select the complete canonical checkpoint required by every resume node."""
+    _validate_identity(manifest.runtime_identity)
     select_inference_entries(manifest)
-    allowed_common = _required_common_paths(identity)
-    step_directory = Path(f"global_step{identity['global_step']}")
-    return tuple(
-        entry
-        for entry in manifest.entries
-        if (
-            entry.relative_path in allowed_common
-            or entry.process_rank in (2, 3)
-            or (
-                entry.relative_path == Path(entry.relative_path.name)
-                and (
-                    entry.relative_path.name in _INFERENCE_STATIC_NAMES
-                    or _INFERENCE_SHARD.fullmatch(entry.relative_path.name)
-                )
-            )
-            or (
-                identity["model_state_layout"] == "replicated"
-                and entry.relative_path
-                == step_directory / _REPLICATED_MODEL_STATE
-            )
-        )
-    )
+    return manifest.entries
 
 
 def select_collection_push_entries(
@@ -1478,8 +1457,13 @@ def resume_entry_delta(
     _validate_manifest(local_manifest, world_size=4)
     if canonical_manifest.process_ranks != (0, 1, 2, 3):
         raise ValueError("resume source must be the canonical four-rank manifest")
-    if local_manifest.node_rank != 1 or local_manifest.process_ranks != (2, 3):
-        raise ValueError("resume destination must be the local rank-2/3 manifest")
+    if local_manifest.node_rank != 1 or local_manifest.process_ranks not in (
+        (2, 3),
+        (0, 1, 2, 3),
+    ):
+        raise ValueError(
+            "resume destination must be the local rank-2/3 manifest or complete replica"
+        )
     if (
         canonical_manifest.run_id != local_manifest.run_id
         or _validate_identity(canonical_manifest.runtime_identity)
