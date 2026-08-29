@@ -3177,9 +3177,21 @@ def stop_owned_attempts(*, run_id: str, machine_rank: int) -> dict[str, object]:
     requested_run_id = _require_identifier("run_id", run_id)
     if type(machine_rank) is not int or machine_rank not in (0, 1):
         raise ValueError("machine_rank must be 0 or 1")
+    ownership_names = {
+        0: (
+            "ownership-rank0.json",
+            "ownership-eval-shard0.json",
+            "ownership-eval-shard1.json",
+        ),
+        1: (
+            "ownership-rank1.json",
+            "ownership-eval-shard2.json",
+            "ownership-eval-shard3.json",
+        ),
+    }[machine_rank]
     root_descriptor = _open_trusted_directory(_LOG_ROOT)
     run_descriptor: int | None = None
-    records: list[OwnershipRecord] = []
+    records: list[tuple[str, OwnershipRecord]] = []
     try:
         run_descriptor = _open_child_directory(
             root_descriptor, requested_run_id, create=False
@@ -3204,48 +3216,53 @@ def stop_owned_attempts(*, run_id: str, machine_rank: int) -> dict[str, object]:
                     & (stat.S_IWGRP | stat.S_IWOTH)
                 ):
                     raise ValueError("owned attempt control directory is not private")
-                try:
-                    record = _read_ownership_at(
-                        attempt_descriptor,
-                        f"ownership-rank{machine_rank}.json",
+                for ownership_name in ownership_names:
+                    try:
+                        record = _read_ownership_at(
+                            attempt_descriptor, ownership_name
+                        )
+                    except FileNotFoundError:
+                        continue
+                    validate_ownership(
+                        record,
+                        expected_run_id=requested_run_id,
+                        expected_attempt_id=attempt_name,
+                        expected_machine_rank=machine_rank,
+                        expected_pid=record.pid,
+                        expected_commit=record.commit,
+                        expected_command_digest=record.command_digest,
+                        observed_start_ticks=record.process_start_ticks,
                     )
-                except FileNotFoundError:
-                    continue
+                    records.append((attempt_name, record))
             finally:
                 os.close(attempt_descriptor)
-            validate_ownership(
-                record,
-                expected_run_id=requested_run_id,
-                expected_attempt_id=attempt_name,
-                expected_machine_rank=machine_rank,
-                expected_pid=record.pid,
-                expected_commit=record.commit,
-                expected_command_digest=record.command_digest,
-                observed_start_ticks=record.process_start_ticks,
-            )
-            records.append(record)
     finally:
         if run_descriptor is not None:
             os.close(run_descriptor)
         os.close(root_descriptor)
 
-    stopped: list[str] = []
-    already_exited: list[str] = []
-    for record in records:
-        if stop_exact_owned_local_process(
+    outcomes: dict[str, list[bool]] = {}
+    for attempt_name, record in records:
+        stopped = stop_exact_owned_local_process(
             record,
             expected_run_id=requested_run_id,
             expected_attempt_id=record.attempt_id,
             expected_machine_rank=machine_rank,
-        ):
-            stopped.append(record.attempt_id)
-        else:
-            already_exited.append(record.attempt_id)
+        )
+        outcomes.setdefault(attempt_name, []).append(stopped)
     return {
         "run_id": requested_run_id,
         "machine_rank": machine_rank,
-        "stopped_attempts": stopped,
-        "already_exited_attempts": already_exited,
+        "stopped_attempts": [
+            attempt_name
+            for attempt_name, attempt_outcomes in outcomes.items()
+            if any(attempt_outcomes)
+        ],
+        "already_exited_attempts": [
+            attempt_name
+            for attempt_name, attempt_outcomes in outcomes.items()
+            if not any(attempt_outcomes)
+        ],
     }
 
 

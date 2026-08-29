@@ -145,3 +145,42 @@ ZeRO configs from this feature worktree. This commit must be integrated into
 the clean canonical checkout on both nodes before Task 12 preflight. Hardware,
 container, tmux, SSH, rsync, and real pidfd behavior remain intentionally
 unexecuted here and are Task 12 live-validation concerns.
+
+## Fix round 1/5: evaluation ownership cleanup
+
+Reviewer finding: the public `stop-owned` path read only
+`ownership-rank{rank}.json`, while evaluation workers publish
+`ownership-eval-shard0.json` through `ownership-eval-shard3.json`. Therefore an
+evaluation run could report successful cleanup while signaling no evaluator.
+
+The fix keeps enumeration closed and rank-specific. For each safe canonical
+attempt directory, rank 0 probes exactly the training record plus evaluation
+shards 0 and 1; rank 1 probes exactly the training record plus evaluation
+shards 2 and 3. It does not glob, scan arbitrary ownership-like names, derive a
+PID from a filename, or act on a tmux session name. Every present candidate is
+decoded, fd-relative stat-checked, and statically validated across the whole
+run before the first live operation. Each live record then goes through the
+existing command/environment/start-time validation and `pidfd_send_signal`
+path. The CLI continues to report one stopped/already-exited outcome per
+attempt even when that attempt owns multiple evaluation shards.
+
+TDD causals cover both rank-0 evaluation shards, rank-1 selection in the
+presence of valid rank-0 shard records, one foreign shard record preventing
+all signaling, and a real evaluation record reaching `pidfd_send_signal`
+while raw `os.kill` and subprocess/session fallback are test failures. The
+first red command exposed two test-fixture setup errors because the helper did
+not yet permit multiple records in one attempt; after correcting only that
+helper, the same four tests failed for the intended missing-enumeration reason:
+`4 failed`. After the production change, the four causals reported `4 passed`.
+
+Focused coordinator/CLI verification:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src:$PWD/tests/stage2" \
+./venv/ilvr-venv/bin/pytest tests/multinode/test_coordinator.py \
+  -k 'stop_owned or exact_owned_local_stop' -q
+```
+
+Result: `8 passed, 53 deselected in 2.84s`. No external action was executed;
+the pre-existing untracked bytecode caches were preserved.

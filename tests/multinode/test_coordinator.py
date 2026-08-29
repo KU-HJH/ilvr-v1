@@ -429,6 +429,7 @@ def _write_stop_ownership(
     attempt_id: str,
     rank: int,
     pid: int,
+    ownership_name: str | None = None,
 ) -> OwnershipRecord:
     command = ("/root/workspace/ILVR/venv/ilvr-venv/bin/python", "worker")
     environment = {"ILVR_REPOSITORY_COMMIT": "a" * 40}
@@ -443,12 +444,179 @@ def _write_stop_ownership(
         environment=environment,
     )
     attempt = control_root / run_id / attempt_id
-    attempt.mkdir(parents=True, mode=0o700)
-    (attempt / f"ownership-rank{rank}.json").write_text(
+    attempt.mkdir(parents=True, mode=0o700, exist_ok=True)
+    (attempt / (ownership_name or f"ownership-rank{rank}.json")).write_text(
         json.dumps(ownership.to_json()) + "\n",
         encoding="utf-8",
     )
     return ownership
+
+
+def test_stop_owned_stops_both_canonical_evaluation_shards_for_remote_rank(
+    tmp_path, monkeypatch
+):
+    control_root = tmp_path / "logs" / "multinode"
+    run_id = "eval-four-gpu"
+    for shard, pid in ((0, 4400), (1, 4401)):
+        _write_stop_ownership(
+            control_root,
+            run_id=run_id,
+            attempt_id="initial",
+            rank=0,
+            pid=pid,
+            ownership_name=f"ownership-eval-shard{shard}.json",
+        )
+    monkeypatch.setattr(runtime_module, "_LOG_ROOT", control_root)
+    stopped = []
+
+    def stop_process(ownership, **expected):
+        assert expected == {
+            "expected_run_id": run_id,
+            "expected_attempt_id": "initial",
+            "expected_machine_rank": 0,
+        }
+        stopped.append(ownership.pid)
+        return True
+
+    monkeypatch.setattr(
+        runtime_module, "stop_exact_owned_local_process", stop_process
+    )
+
+    assert runtime_module.stop_owned_attempts(
+        run_id=run_id, machine_rank=0
+    ) == {
+        "run_id": run_id,
+        "machine_rank": 0,
+        "stopped_attempts": ["initial"],
+        "already_exited_attempts": [],
+    }
+    assert stopped == [4400, 4401]
+
+
+def test_stop_owned_reads_only_evaluation_shards_assigned_to_requested_rank(
+    tmp_path, monkeypatch
+):
+    control_root = tmp_path / "logs" / "multinode"
+    run_id = "eval-four-gpu"
+    for shard, rank in ((0, 0), (1, 0), (2, 1), (3, 1)):
+        _write_stop_ownership(
+            control_root,
+            run_id=run_id,
+            attempt_id="initial",
+            rank=rank,
+            pid=4500 + shard,
+            ownership_name=f"ownership-eval-shard{shard}.json",
+        )
+    monkeypatch.setattr(runtime_module, "_LOG_ROOT", control_root)
+    stopped = []
+    monkeypatch.setattr(
+        runtime_module,
+        "stop_exact_owned_local_process",
+        lambda ownership, **expected: stopped.append(ownership.pid) or True,
+    )
+
+    summary = runtime_module.stop_owned_attempts(
+        run_id=run_id, machine_rank=1
+    )
+
+    assert summary["stopped_attempts"] == ["initial"]
+    assert stopped == [4502, 4503]
+
+
+def test_stop_owned_tampered_evaluation_record_prevents_all_signaling(
+    tmp_path, monkeypatch
+):
+    control_root = tmp_path / "logs" / "multinode"
+    run_id = "eval-four-gpu"
+    _write_stop_ownership(
+        control_root,
+        run_id=run_id,
+        attempt_id="initial",
+        rank=1,
+        pid=4602,
+        ownership_name="ownership-eval-shard2.json",
+    )
+    foreign = _write_stop_ownership(
+        control_root,
+        run_id="foreign-evaluation",
+        attempt_id="initial",
+        rank=1,
+        pid=4603,
+        ownership_name="ownership-eval-shard3.json",
+    )
+    tampered = (
+        control_root / run_id / "initial" / "ownership-eval-shard3.json"
+    )
+    tampered.write_text(json.dumps(foreign.to_json()) + "\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_module, "_LOG_ROOT", control_root)
+    stopped = []
+    monkeypatch.setattr(
+        runtime_module,
+        "stop_exact_owned_local_process",
+        lambda ownership, **expected: stopped.append(ownership.pid) or True,
+    )
+
+    with pytest.raises(ValueError, match="run ID"):
+        runtime_module.stop_owned_attempts(run_id=run_id, machine_rank=1)
+    assert stopped == []
+
+
+def test_stop_owned_evaluation_uses_pidfd_without_pid_or_session_fallback(
+    tmp_path, monkeypatch
+):
+    control_root = tmp_path / "logs" / "multinode"
+    run_id = "eval-four-gpu"
+    ownership = _write_stop_ownership(
+        control_root,
+        run_id=run_id,
+        attempt_id="initial",
+        rank=1,
+        pid=4702,
+        ownership_name="ownership-eval-shard2.json",
+    )
+    monkeypatch.setattr(runtime_module, "_LOG_ROOT", control_root)
+    pidfd = os.open("/dev/null", os.O_RDONLY)
+    monkeypatch.setattr(runtime_module.os, "pidfd_open", lambda pid: pidfd)
+    monkeypatch.setattr(
+        runtime_module,
+        "_proc_start_ticks",
+        lambda pid, **kwargs: ownership.process_start_ticks,
+    )
+
+    def live_fields(path):
+        if path.name == "cmdline":
+            return (
+                "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+                "worker",
+            )
+        return ("ILVR_REPOSITORY_COMMIT=" + "a" * 40,)
+
+    monkeypatch.setattr(runtime_module, "_nul_fields", live_fields)
+    signals = []
+    monkeypatch.setattr(
+        runtime_module.signal,
+        "pidfd_send_signal",
+        lambda descriptor, signum: signals.append((descriptor, signum)),
+    )
+    monkeypatch.setattr(
+        runtime_module.os,
+        "kill",
+        lambda *_args: pytest.fail("raw PID signaling is forbidden"),
+    )
+    monkeypatch.setattr(
+        runtime_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "session-name termination is forbidden"
+        ),
+    )
+
+    summary = runtime_module.stop_owned_attempts(
+        run_id=run_id, machine_rank=1
+    )
+
+    assert summary["stopped_attempts"] == ["initial"]
+    assert signals == [(pidfd, signal.SIGTERM)]
 
 
 def test_stop_owned_enumerates_multiple_attempts_and_tolerates_exact_exits(
