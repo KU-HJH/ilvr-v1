@@ -923,6 +923,37 @@ def test_stage2_forwards_only_allowlisted_environment_and_safe_arguments():
     assert "STAGE2_DRY_RUN" not in effective
 
 
+def test_stage2_workers_use_fixed_expandable_cuda_allocator(monkeypatch):
+    """Catches ambient allocator settings reintroducing ZeRO-3 fragmentation."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:32")
+    environment = validated_stage2_environment(
+        {
+            "STAGE1_CHECKPOINT": "/models/stage1",
+            "DATA_PATH": "/data/train.jsonl",
+            "IMAGE_ROOT": "/data/images",
+            "TUNING_METHOD": "lora",
+            "PYTORCH_CUDA_ALLOC_CONF": "garbage_collection_threshold:0.5",
+        },
+        output_dir="/root/workspace/ILVR/checkpoints/stage2-lora-zero3-four-gpu",
+        log_file=(
+            "/root/workspace/ILVR/logs/zero-stage-compatibility/"
+            "stage2-lora-zero3-four-gpu/train.log"
+        ),
+        deepspeed_config="/root/workspace/ILVR/configs/deepspeed_zero3.json",
+    )
+
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in environment
+    commands = build_owned_tmux_commands(
+        plan(stage="stage2", method="lora"),
+        commit="a" * 40,
+        stage_environment=environment,
+    )
+    for spec in commands.node_specs:
+        assert dict(spec.environment)["PYTORCH_CUDA_ALLOC_CONF"] == (
+            "expandable_segments:True"
+        )
+
+
 def test_stage2_coordinator_owns_a_fresh_producer_evidence_path():
     """Catches Stage 2 returning to Task 5's intentionally incomplete state."""
     launch_plan = plan(stage="stage2", method="dora")

@@ -50,6 +50,9 @@ _MINIMAL_EXEC_ENVIRONMENT = {
     ),
     "PYTHONUNBUFFERED": "1",
 }
+_STAGE2_FIXED_EXEC_ENVIRONMENT = {
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+}
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
@@ -1658,6 +1661,7 @@ def build_owned_tmux_commands(
     for machine_rank in (plan.cluster.remote_rank, plan.cluster.local_rank):
         environment = {
             **_MINIMAL_EXEC_ENVIRONMENT,
+            **(_STAGE2_FIXED_EXEC_ENVIRONMENT if plan.stage == "stage2" else {}),
             **base_environment,
             **_distributed_environment(plan, machine_rank),
             "PYTHONPATH": f"{repository}:{repository / 'src'}",
