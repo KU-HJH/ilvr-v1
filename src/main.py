@@ -156,12 +156,15 @@ def _stage2_gradient_checkpointing_kwargs(
 ) -> dict[str, bool] | None:
     if not gradient_checkpointing:
         return None
-    use_reentrant = (
+    if (
         tuning_method in ("lora", "dora")
         and deepspeed_runtime_profile.enabled
         and deepspeed_runtime_profile.zero_stage == 3
-    )
-    return {"use_reentrant": use_reentrant}
+    ):
+        raise ValueError(
+            "Stage 2 PEFT ZeRO-3 requires gradient checkpointing disabled"
+        )
+    return {"use_reentrant": False}
 
 
 def configure_stage2_model_backend(

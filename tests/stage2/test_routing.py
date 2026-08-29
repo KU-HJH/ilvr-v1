@@ -704,8 +704,8 @@ def test_stage2_training_arguments_omit_checkpoint_kwargs_when_disabled():
     assert training_args.gradient_checkpointing_kwargs is None
 
 
-def test_stage2_peft_zero3_uses_reentrant_gradient_checkpointing():
-    """Catches ZeRO-3 partitions invalidating PEFT non-reentrant recomputation."""
+def test_stage2_peft_zero3_rejects_gradient_checkpointing():
+    """Catches the disproven repeated reentrant rollout path being selected."""
     args = stage2_args(
         tuning_method="lora",
         deepspeed_config=str(
@@ -717,17 +717,15 @@ def test_stage2_peft_zero3_uses_reentrant_gradient_checkpointing():
 
     model = tiny_stage2_qwen()
     profile = main.bind_deepspeed_runtime_profile(args)
-    main.configure_stage2_model_backend(
-        model,
-        gradient_checkpointing=True,
-        tuning_method="lora",
-        deepspeed_runtime_profile=profile,
-    )
-    assert model.model._gradient_checkpointing_func.keywords == {
-        "use_reentrant": True
-    }
-    training_args = build_stage2_training_arguments(args)
-    assert training_args.gradient_checkpointing_kwargs == {"use_reentrant": True}
+    with pytest.raises(ValueError, match="requires gradient checkpointing disabled"):
+        main.configure_stage2_model_backend(
+            model,
+            gradient_checkpointing=True,
+            tuning_method="lora",
+            deepspeed_runtime_profile=profile,
+        )
+    with pytest.raises(ValueError, match="requires gradient checkpointing disabled"):
+        build_stage2_training_arguments(args)
 
 
 class RecordingTrainer:

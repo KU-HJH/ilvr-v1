@@ -131,9 +131,11 @@ class LaunchPlan:
             raise ValueError("required_free_bytes must be 100 GiB for training")
         if self.attempt_timeout_seconds != _ATTEMPT_TIMEOUT_SECONDS:
             raise ValueError("attempt_timeout_seconds must be the fixed 24-hour bound")
-        expected_config = canonical_deepspeed_config(self.zero_stage)
+        expected_config = selected_deepspeed_config(
+            self.stage, self.tuning_method, self.zero_stage
+        )
         if self.deepspeed_config != expected_config:
-            raise ValueError("deepspeed_config must be the canonical ZeRO config")
+            raise ValueError("deepspeed_config must match the selected ZeRO policy")
         if (
             not isinstance(self.deepspeed_config_digest, str)
             or len(self.deepspeed_config_digest) != 64
@@ -214,6 +216,16 @@ def build_lifecycle_plans(
     digests = config_digests or {1: "0" * 64, 2: "0" * 64, 3: "0" * 64}
     if set(digests) != {1, 2, 3}:
         raise ValueError("config digests must cover ZeRO stages 1, 2, and 3")
+    stage2_peft_zero3_digest = (
+        "0" * 64
+        if config_digests is None
+        else load_deepspeed_runtime_profile(
+            canonical_deepspeed_config_path(3).with_name(
+                "deepspeed_zero3_stage2_peft.json"
+            ),
+            world_size=4,
+        ).config_digest
+    )
 
     plans: list[LifecyclePlan] = []
     for case, port in zip(build_lifecycle_matrix(), ports, strict=True):
@@ -229,8 +241,16 @@ def build_lifecycle_plans(
                 run_id=child_run_id,
                 main_process_port=port,
                 world_size=4,
-                deepspeed_config=canonical_deepspeed_config(case.zero_stage),
-                deepspeed_config_digest=digests[case.zero_stage],
+                deepspeed_config=selected_deepspeed_config(
+                    case.stage, case.method, case.zero_stage
+                ),
+                deepspeed_config_digest=(
+                    stage2_peft_zero3_digest
+                    if case.stage == "stage2"
+                    and case.method in ("lora", "dora")
+                    and case.zero_stage == 3
+                    else digests[case.zero_stage]
+                ),
                 cluster=ClusterSpec.default(),
                 attempt_id=phase,
             )
@@ -282,6 +302,38 @@ def canonical_deepspeed_config(zero_stage: int) -> Path:
     return _REPOSITORY_ROOT / "configs" / expected_name
 
 
+def selected_deepspeed_config(
+    stage: Literal["stage1", "stage2"],
+    tuning_method: Literal["full", "lora", "dora"],
+    zero_stage: Literal[1, 2, 3],
+) -> Path:
+    """Select the one dedicated GPU-only policy for Stage 2 PEFT ZeRO-3."""
+    if stage not in ("stage1", "stage2"):
+        raise ValueError("stage must be 'stage1' or 'stage2'")
+    if tuning_method not in ("full", "lora", "dora"):
+        raise ValueError("tuning_method must be 'full', 'lora', or 'dora'")
+    canonical = canonical_deepspeed_config(zero_stage)
+    if stage == "stage2" and tuning_method in ("lora", "dora") and zero_stage == 3:
+        return canonical.with_name("deepspeed_zero3_stage2_peft.json")
+    return canonical
+
+
+def validate_stage2_checkpointing_policy(
+    *, tuning_method: str, zero_stage: int, gradient_checkpointing: str
+) -> None:
+    """Fail before launch when the unsupported PEFT ZeRO-3 GC path is requested."""
+    if gradient_checkpointing not in ("true", "false"):
+        raise ValueError("GRADIENT_CHECKPOINTING must be true or false")
+    if (
+        tuning_method in ("lora", "dora")
+        and zero_stage == 3
+        and gradient_checkpointing == "true"
+    ):
+        raise ValueError(
+            "Stage 2 PEFT ZeRO-3 requires GRADIENT_CHECKPOINTING=false"
+        )
+
+
 def build_launch_plan(
     *,
     stage: Literal["stage1", "stage2"],
@@ -293,9 +345,14 @@ def build_launch_plan(
 ) -> LaunchPlan:
     """Validate and build the fixed four-process training launch plan."""
     cluster = ClusterSpec.default()
-    config_path = canonical_deepspeed_config(zero_stage)
+    config_path = selected_deepspeed_config(stage, tuning_method, zero_stage)
+    source_config_path = (
+        canonical_deepspeed_config_path(zero_stage)
+        if config_path.name == f"deepspeed_zero{zero_stage}.json"
+        else canonical_deepspeed_config_path(zero_stage).with_name(config_path.name)
+    )
     profile = load_deepspeed_runtime_profile(
-        canonical_deepspeed_config_path(zero_stage), world_size=cluster.num_processes
+        source_config_path, world_size=cluster.num_processes
     )
     if profile.zero_stage != zero_stage:
         raise ValueError(
@@ -809,8 +866,11 @@ def _node_info(args: argparse.Namespace) -> NodeSnapshot:
     repository = Path(args.repository)
     if repository != _REPOSITORY_ROOT:
         raise ValueError("node-info repository must be /root/workspace/ILVR")
-    if Path(args.deepspeed_config) != canonical_deepspeed_config(args.zero_stage):
-        raise ValueError("node-info config must be the canonical DeepSpeed config")
+    expected_config = selected_deepspeed_config(
+        args.stage, args.tuning_method, args.zero_stage
+    )
+    if Path(args.deepspeed_config) != expected_config:
+        raise ValueError("node-info config must match the selected DeepSpeed policy")
     validate_node_config_digest(
         args.deepspeed_config,
         zero_stage=args.zero_stage,
@@ -1620,6 +1680,13 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             tuning_method = os.environ.get("TUNING_METHOD", "full")
             if tuning_method not in ("full", "lora", "dora"):
                 raise ValueError("TUNING_METHOD must be full, lora, or dora")
+            validate_stage2_checkpointing_policy(
+                tuning_method=tuning_method,
+                zero_stage=args.zero_stage,
+                gradient_checkpointing=os.environ.get(
+                    "GRADIENT_CHECKPOINTING", "false"
+                ),
+            )
             output_dir = _REPOSITORY_ROOT / "checkpoints" / args.run_id
             log_file = (
                 _REPOSITORY_ROOT
@@ -1637,7 +1704,11 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 os.environ,
                 output_dir=str(output_dir),
                 log_file=str(log_file),
-                deepspeed_config=str(canonical_deepspeed_config(args.zero_stage)),
+                deepspeed_config=str(
+                    selected_deepspeed_config(
+                        stage, tuning_method, args.zero_stage
+                    )
+                ),
                 benchmark_evidence_path=str(producer_evidence),
             )
             resume_requested = "RESUME_CHECKPOINT" in stage_environment

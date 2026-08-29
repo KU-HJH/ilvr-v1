@@ -50,6 +50,33 @@ def test_preflight_accepts_symmetric_clean_nodes():
     assert report.commit == "a" * 40
 
 
+def test_stage2_peft_zero3_preflight_uses_dedicated_config_on_both_nodes():
+    """Catches node-info validating a different config than the GPU workers."""
+    launch_plan = build_launch_plan(
+        stage="stage2",
+        tuning_method="lora",
+        zero_stage=3,
+        run_id="stage2-lora-zero3-dedicated",
+        main_process_port=29633,
+    )
+    commands = build_preflight_commands(
+        launch_plan,
+        input_paths=("/input",),
+        artifact_roots=("/root/workspace/ILVR/checkpoints",),
+        remote_run_paths=("/root/workspace/ILVR/checkpoints/remote",),
+        local_run_paths=("/root/workspace/ILVR/checkpoints/local",),
+        remote_tmux_sessions=("ilvr-remote",),
+        local_tmux_sessions=("ilvr-local",),
+    )
+
+    expected = "/root/workspace/ILVR/configs/deepspeed_zero3_stage2_peft.json"
+    assert commands.local_node_info[
+        commands.local_node_info.index("--deepspeed-config") + 1
+    ] == expected
+    remote = shlex.split(shlex.split(commands.remote_node_info[-1])[-1])
+    assert remote[remote.index("--deepspeed-config") + 1] == expected
+
+
 def test_canonical_git_query_tolerates_different_repository_owner(monkeypatch):
     """Catches node-info omitting the canonical Git safe-directory argument."""
     monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import src.multinode as multinode
 from src.deepspeed_runtime import canonical_deepspeed_config_path
 from src.multinode import (
     ClusterSpec,
@@ -65,6 +66,61 @@ def test_canonical_config_is_validated_for_the_four_process_world(zero_stage):
     assert plan.zero_stage == zero_stage
     assert plan.world_size == 4
     assert canonical_deepspeed_config(zero_stage) == plan.deepspeed_config
+
+
+@pytest.mark.parametrize("tuning_method", ("lora", "dora"))
+def test_stage2_peft_zero3_selects_dedicated_gpu_only_config(tuning_method):
+    """Catches Stage 2 PEFT inheriting the canonical ZeRO-3 prefetch bucket."""
+    plan = build_launch_plan(
+        stage="stage2",
+        tuning_method=tuning_method,
+        zero_stage=3,
+        run_id=f"stage2-{tuning_method}-zero3-four-gpu",
+        main_process_port=29630,
+    )
+
+    assert plan.deepspeed_config == Path(
+        "/root/workspace/ILVR/configs/deepspeed_zero3_stage2_peft.json"
+    )
+    canonical = json.loads(
+        canonical_deepspeed_config_path(3).read_text(encoding="utf-8")
+    )
+    dedicated = json.loads(
+        canonical_deepspeed_config_path(3)
+        .with_name(plan.deepspeed_config.name)
+        .read_text(encoding="utf-8")
+    )
+    expected = json.loads(json.dumps(canonical))
+    expected["zero_optimization"]["stage3_prefetch_bucket_size"] = 0
+    assert dedicated == expected
+    assert dedicated["zero_optimization"]["offload_param"] == {"device": "none"}
+    assert dedicated["zero_optimization"]["offload_optimizer"] == {
+        "device": "none"
+    }
+    assert build_launch_plan(
+        stage="stage2",
+        tuning_method="full",
+        zero_stage=3,
+        run_id="stage2-full-zero3-four-gpu",
+        main_process_port=29631,
+    ).deepspeed_config == canonical_deepspeed_config(3)
+    assert build_launch_plan(
+        stage="stage1",
+        tuning_method=tuning_method,
+        zero_stage=3,
+        run_id=f"stage1-{tuning_method}-zero3-four-gpu",
+        main_process_port=29632,
+    ).deepspeed_config == canonical_deepspeed_config(3)
+
+
+def test_stage2_peft_zero3_rejects_gradient_checkpointing():
+    """Catches the disproven reentrant path reaching a GPU worker."""
+    with pytest.raises(ValueError, match="requires GRADIENT_CHECKPOINTING=false"):
+        multinode.validate_stage2_checkpointing_policy(
+            tuning_method="lora",
+            zero_stage=3,
+            gradient_checkpointing="true",
+        )
 
 
 def test_node_local_config_must_match_the_launch_plan_digest(tmp_path):
