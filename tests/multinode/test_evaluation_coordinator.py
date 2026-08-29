@@ -413,6 +413,13 @@ def test_production_runner_transfer_publishes_exact_list_before_fake_rsync(
 
     def fake_command(command, *, input_bytes=None, timeout_seconds=None):
         calls.append(tuple(command))
+        if "--rsync-path" not in command:
+            return subprocess.CompletedProcess(
+                command,
+                12,
+                stdout="",
+                stderr="host-mounted result is not traversable",
+            )
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     commands = build_evaluation_commands(
@@ -429,6 +436,9 @@ def test_production_runner_transfer_publishes_exact_list_before_fake_rsync(
     assert files_path.read_bytes() == evaluation_result_files_bytes()
     assert calls == [commands.remote_pull]
     assert "--secluded-args" in calls[0]
+    assert calls[0][calls[0].index("--rsync-path") + 1] == (
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
+    )
 
 
 def test_production_runner_cleanup_uses_exact_owned_signal_command():
@@ -584,7 +594,7 @@ def test_cleanup_exception_does_not_mask_launch_timeout_or_skip_later_workers():
     )
 
 
-def test_remote_result_pull_is_one_explicit_nul_list_and_never_recursive():
+def test_remote_result_pull_is_fixed_container_rsync_with_explicit_nul_list():
     output_dir = Path("/root/workspace/ILVR/results/eval-four-gpu")
     files_path = Path(
         "/root/workspace/ILVR/logs/multinode/eval-four-gpu/initial/"
@@ -610,9 +620,10 @@ def test_remote_result_pull_is_one_explicit_nul_list_and_never_recursive():
         "--from0",
         "--rsh",
         "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8",
+        "--rsync-path",
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/"
-        "results/eval-four-gpu/",
+        "korea@10.1.102.41:/root/workspace/ILVR/results/eval-four-gpu/",
         "/root/workspace/ILVR/results/eval-four-gpu/",
     )
     assert "--recursive" not in command

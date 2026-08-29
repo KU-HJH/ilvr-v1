@@ -1909,9 +1909,13 @@ def build_evaluation_pull_command(
         raise ValueError("evaluation output must be under the canonical result root") from error
     validate_coordinator_relative_path(relative, label="evaluation output")
     _validate_run_id(relative.parts[0])
-    remote = _REMOTE_HOST_REPOSITORY / "results" / relative
+    remote = _LOCAL_REPOSITORY / "results" / relative
+    prefix = _rsync_prefix(Path(files_from))
     return (
-        *_rsync_prefix(Path(files_from)),
+        *prefix[:-1],
+        "--rsync-path",
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "--",
         f"{_REMOTE_HOST}:{remote}/",
         f"{output}/",
     )
