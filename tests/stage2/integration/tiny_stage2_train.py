@@ -8,8 +8,13 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import subprocess
 from types import SimpleNamespace
+
+_platform_python_version = platform.python_version
+if _platform_python_version().endswith("+"):
+    platform.python_version = lambda: _platform_python_version().rstrip("+")
 
 import peft
 import torch
@@ -36,6 +41,8 @@ from stage2.peft import (
 )
 from stage2.trainer import Stage2Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
+
+platform.python_version = _platform_python_version
 
 
 class TinyStage2Dataset(Dataset):

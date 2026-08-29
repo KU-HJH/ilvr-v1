@@ -10,8 +10,13 @@ import argparse
 import json
 import math
 import os
+import platform
 from pathlib import Path
 from types import SimpleNamespace
+
+_platform_python_version = platform.python_version
+if _platform_python_version().endswith("+"):
+    platform.python_version = lambda: _platform_python_version().rstrip("+")
 
 import torch
 import torch.distributed as dist
@@ -30,6 +35,8 @@ from stage1.checkpointing import (
 from stage1.composition import build_stage1_training_components
 from tests.stage1.test_integration import _tiny_dependencies
 from utils_deepseed import parse_args as parse_training_args
+
+platform.python_version = _platform_python_version
 
 
 SUPPORTED_DIAGNOSTIC_METHODS = ("full", "lora", "dora")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shlex
 import shutil
@@ -155,6 +156,37 @@ def test_lifecycle_worker_environment_resolves_canonical_venv_deepspeed():
         assert canonical_command_digest(
             node.command, dict(node.environment)
         ) == plan.initial_commands.command_digests[node.machine_rank]
+
+
+@pytest.mark.parametrize(
+    "relative_harness",
+    (
+        "tests/stage1/zero_compat_diagnostic.py",
+        "tests/stage2/integration/tiny_stage2_train.py",
+    ),
+)
+def test_lifecycle_harness_imports_with_python_build_marker(relative_harness):
+    """Catches packaging rejecting the host's process-local Python suffix."""
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": f"{REPO_ROOT / 'transformers/src'}:{REPO_ROOT}:{REPO_ROOT / 'src'}",
+    }
+
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+            str(REPO_ROOT / relative_harness),
+            "--help",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_lifecycle_plans_bind_safe_child_ids_ports_and_two_ordered_phase_jobs(tmp_path):
