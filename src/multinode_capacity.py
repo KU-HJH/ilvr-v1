@@ -250,7 +250,7 @@ class SubprocessCapacityRunner:
         command = build_remote_exec(
             (
                 "env",
-                f"PYTHONPATH={_REPOSITORY_ROOT}",
+                f"PYTHONPATH={_REPOSITORY_ROOT}:{_REPOSITORY_ROOT / 'src'}",
                 str(python),
                 "-m",
                 "src.multinode",

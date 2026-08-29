@@ -1771,7 +1771,11 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
     assert mirror(manifest, destination) == manifest
 
     python = "/root/workspace/ILVR/venv/ilvr-venv/bin/python"
-    fixed_prefix = ("/usr/bin/env", "PYTHONPATH=/root/workspace/ILVR", python)
+    fixed_prefix = (
+        "/usr/bin/env",
+        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
+        python,
+    )
     assert calls[0] == tuple(runtime_module.build_remote_exec(
         (
             *fixed_prefix,

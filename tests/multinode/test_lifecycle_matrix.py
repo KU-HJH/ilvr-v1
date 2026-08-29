@@ -474,7 +474,7 @@ def test_remote_phase_evidence_uses_only_the_fixed_bounded_node_cli(tmp_path):
     ]
     assert len(remote) == 8
     assert shlex.split(remote[7]) == [
-        "env", "PYTHONPATH=/root/workspace/ILVR",
+        "env", "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
         "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
         "-m", "src.multinode", "lifecycle-evidence-show",
         "--run-id", plan.child_run_id, "--phase", "initial",

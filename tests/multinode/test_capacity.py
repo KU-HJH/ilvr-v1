@@ -485,7 +485,7 @@ def test_subprocess_runner_rejects_remote_evidence_outside_exact_child(tmp_path)
         ]
         assert shlex.split(remote_argv[5]) == [
             "env",
-            "PYTHONPATH=/root/workspace/ILVR",
+            "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
             "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
             "-m",
             "src.multinode",

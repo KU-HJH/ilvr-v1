@@ -1204,7 +1204,7 @@ def _build_evaluation_commands_for_stage(
             **_MINIMAL_EXEC_ENVIRONMENT,
             "CUDA_VISIBLE_DEVICES": str(assignment.gpu),
             "ILVR_REPOSITORY_COMMIT": commit,
-            "PYTHONPATH": f"{repository / 'transformers/src'}:{repository}",
+            "PYTHONPATH": f"{repository}:{repository / 'src'}",
         }
         ownership_path = attempt_directory / assignment.ownership_name
         exit_path = attempt_directory / assignment.exit_name
@@ -1493,7 +1493,7 @@ def build_owned_lifecycle_harness_commands(
             "MASTER_ADDR": plan.cluster.master_addr,
             "GLOO_SOCKET_IFNAME": plan.cluster.socket_ifname,
             "NCCL_SOCKET_IFNAME": plan.cluster.socket_ifname,
-            "PYTHONPATH": f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}",
+            "PYTHONPATH": f"{repository}:{repository / 'src'}",
             "ILVR_REPOSITORY_COMMIT": commit,
         }
         harness_command = (
@@ -1655,7 +1655,7 @@ def build_owned_tmux_commands(
             **_MINIMAL_EXEC_ENVIRONMENT,
             **base_environment,
             **_distributed_environment(plan, machine_rank),
-            "PYTHONPATH": str(repository),
+            "PYTHONPATH": f"{repository}:{repository / 'src'}",
             "ILVR_REPOSITORY_COMMIT": commit,
         }
         supervisor, digest, node_spec = _node_shell_command(
@@ -2077,7 +2077,7 @@ class SubprocessCoordinatorRunner:
             build_remote_exec(
                 (
                     "env",
-                    f"PYTHONPATH={repository}",
+                    f"PYTHONPATH={repository}:{repository / 'src'}",
                     str(repository / "venv/ilvr-venv/bin/python"),
                     "-m",
                     "src.multinode",
@@ -2515,7 +2515,7 @@ class SubprocessCoordinatorRunner:
             return tuple(build_remote_exec(
                 (
                     "/usr/bin/env",
-                    f"PYTHONPATH={repository}",
+                    f"PYTHONPATH={repository}:{repository / 'src'}",
                     str(python),
                     "-m",
                     "src.multinode",
@@ -3605,7 +3605,7 @@ def _repository_module_command(
     repository = _REPOSITORY_ROOT
     return (
         "/usr/bin/env",
-        f"PYTHONPATH={repository}",
+        f"PYTHONPATH={repository}:{repository / 'src'}",
         str(repository / "venv/ilvr-venv/bin/python"),
         "-m",
         "src.multinode",
@@ -3852,7 +3852,7 @@ def _node_info_command(
 ) -> list[str]:
     command = [
         "env",
-        f"PYTHONPATH={repository}",
+        f"PYTHONPATH={repository}:{repository / 'src'}",
         str(repository / "venv" / "ilvr-venv" / "bin" / "python"),
         "-m",
         "src.multinode",

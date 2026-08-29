@@ -357,7 +357,7 @@ def test_training_supervisors_import_from_the_canonical_repository():
 
     for spec in commands.node_specs:
         environment = dict(spec.environment)
-        assert environment["PYTHONPATH"] == repository
+        assert environment["PYTHONPATH"] == f"{repository}:{repository}/src"
         completed = subprocess.run(
             (*spec.command[:3], "--help"),
             cwd="/",
@@ -1079,6 +1079,82 @@ def test_stage2_training_witness_revalidates_finite_gradient_and_rank_evidence(
     assert reference["process_ranks"] == [0, 1, 2, 3]
 
 
+def test_stage2_witness_decoder_imports_under_production_module_path(tmp_path):
+    run_id = "stage2-full-zero1-production-import"
+    checkpoint = tmp_path / "checkpoints" / run_id / "checkpoint-1"
+    checkpoint.mkdir(parents=True)
+    evidence = tmp_path / "producer.json"
+    evidence.write_text(
+        json.dumps(
+            build_stage2_producer_evidence(
+                run_id=run_id,
+                method="full",
+                zero_stage=1,
+                checkpoint_path=checkpoint,
+                artifact_kind="full",
+                rank_records=[
+                    {
+                        "rank": rank,
+                        "global_step": 1,
+                        "optimizer_step": 1,
+                        "loss": 0.25 + rank,
+                        "gradient_norm": 1.0 + rank,
+                        "worker_error": None,
+                    }
+                    for rank in range(4)
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    script = """
+from pathlib import Path
+import sys
+from src.multinode import build_launch_plan
+from src.multinode_runtime import _finite_loss_reference
+from stage2.checkpointing import classify_stage2_artifact
+
+assert callable(classify_stage2_artifact)
+
+plan = build_launch_plan(
+    stage="stage2",
+    tuning_method="full",
+    zero_stage=1,
+    run_id="stage2-full-zero1-production-import",
+    main_process_port=29631,
+)
+_finite_loss_reference(
+    Path(sys.argv[1]),
+    plan=plan,
+    checkpoint_root=Path(sys.argv[2]),
+)
+"""
+
+    completed = subprocess.run(
+        (
+            REPO_ROOT / "venv/ilvr-venv/bin/python",
+            "-c",
+            script,
+            evidence,
+            checkpoint.parent,
+        ),
+        cwd=REPO_ROOT,
+        env={
+            "HOME": "/root",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": str(REPO_ROOT / "venv/ilvr-venv/bin"),
+            "PYTHONPATH": f"{REPO_ROOT}:{REPO_ROOT / 'src'}",
+            "PYTHONUNBUFFERED": "1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_witness_rejects_a_missing_checkpoint_reference(tmp_path):
     with pytest.raises(ValueError, match="checkpoint"):
         write_training_witness(
@@ -1545,7 +1621,7 @@ def test_subprocess_runner_transfers_only_attempt_plan_with_size_and_sha(tmp_pat
         inner = shlex.split(remote[-1])
         assert inner[:6] == [
             "/usr/bin/env",
-            "PYTHONPATH=/root/workspace/ILVR",
+            "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
             "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
             "-m",
             "src.multinode",

@@ -194,7 +194,7 @@ def test_local_collection_never_uses_ssh_or_docker():
     assert len(calls) == 1
     assert calls[0][:3] == [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR",
+        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
         "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
     ]
     assert "/usr/bin/ssh" not in calls[0]
@@ -230,7 +230,7 @@ def test_preflight_dry_run_prints_commands_without_probing(monkeypatch, capsys):
     assert payload["plan"]["world_size"] == 4
     assert payload["local_node_info"][:6] == [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR",
+        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
         "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
         "-m",
         "src.multinode",
@@ -301,7 +301,7 @@ def test_preflight_commands_use_the_canonical_repo_venv_and_config():
 
     expected_prefix = [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR",
+        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
         "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
         "-m",
         "src.multinode",
@@ -319,7 +319,7 @@ def test_preflight_commands_use_the_canonical_repo_venv_and_config():
     assert remote_docker[:3] == ["/usr/bin/docker", "exec", "llm_kd"]
     assert shlex.split(remote_docker[-1])[:2] == [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR",
+        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
     ]
 
 
@@ -371,7 +371,7 @@ def test_dry_run_prints_the_same_three_executable_commands(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert set(payload) == {"container_inspect", "local_node_info", "plan", "remote_node_info"}
     assert payload["local_node_info"][:6] == [
-        "env", "PYTHONPATH=/root/workspace/ILVR",
+        "env", "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
         "/root/workspace/ILVR/venv/ilvr-venv/bin/python", "-m", "src.multinode", "node-info",
     ]
 
