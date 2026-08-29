@@ -90,6 +90,14 @@ class TinyStage2Processor:
             + "\n",
             encoding="utf-8",
         )
+        (directory / "preprocessor_config.json").write_text(
+            '{"processor_class":"TinyStage2Processor"}\n',
+            encoding="utf-8",
+        )
+        (directory / "tokenizer_config.json").write_text(
+            '{"tokenizer_class":"TinyStage2Tokenizer"}\n',
+            encoding="utf-8",
+        )
 
     def apply_chat_template(self, conversation, *, tokenize, add_generation_prompt):
         assert tokenize is False

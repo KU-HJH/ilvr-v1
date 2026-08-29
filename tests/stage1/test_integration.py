@@ -123,6 +123,10 @@ class TinyIntegrationTokenizer:
             json.dumps({"vocab": self.vocab}, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        (directory / "tokenizer_config.json").write_text(
+            '{"tokenizer_class":"TinyIntegrationTokenizer"}\n',
+            encoding="utf-8",
+        )
 
     @classmethod
     def from_pretrained(cls, directory):

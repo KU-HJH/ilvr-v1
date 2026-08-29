@@ -192,6 +192,43 @@ def test_lifecycle_harness_imports_with_python_build_marker(relative_harness):
     assert completed.returncode == 0, completed.stderr
 
 
+def test_lifecycle_harness_processors_save_required_loader_assets(tmp_path):
+    """Catches four-rank artifact collection rejecting a tiny checkpoint."""
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": f"{REPO_ROOT / 'transformers/src'}:{REPO_ROOT}:{REPO_ROOT / 'src'}",
+    }
+    for name, save_expression in (
+        (
+            "stage1",
+            "from tests.stage1.zero_compat_diagnostic import _tiny_dependencies; "
+            "_tiny_dependencies().load_processor('/nonexistent').save_pretrained({path!r})",
+        ),
+        (
+            "stage2",
+            "from tests.stage2.integration.tiny_stage2_train import TinyStage2Processor; "
+            "TinyStage2Processor().save_pretrained({path!r})",
+        ),
+    ):
+        destination = tmp_path / name
+        completed = subprocess.run(
+            [
+                str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+                "-c",
+                save_expression.format(path=str(destination)),
+            ],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert (destination / "preprocessor_config.json").is_file()
+        assert (destination / "tokenizer_config.json").is_file()
+
+
 def test_lifecycle_plans_bind_safe_child_ids_ports_and_two_ordered_phase_jobs(tmp_path):
     """Catches either phase changing the shared child identity or port."""
     result_root = tmp_path / "results"
