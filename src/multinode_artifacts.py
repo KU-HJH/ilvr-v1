@@ -1934,9 +1934,13 @@ def build_prepared_inference_pull_command(
     except ValueError as error:
         raise ValueError("prepared inference source must be under the result root") from error
     validate_coordinator_relative_path(relative, label="prepared inference source")
-    remote = _REMOTE_HOST_REPOSITORY / "results" / relative
+    remote = _LOCAL_REPOSITORY / "results" / relative
+    prefix = _rsync_prefix(Path(files_from))
     return (
-        *_rsync_prefix(Path(files_from)),
+        *prefix[:-1],
+        "--rsync-path",
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "--",
         f"{_REMOTE_HOST}:{remote}/",
         f"{Path(destination)}/",
     )
@@ -1976,9 +1980,13 @@ def build_prepared_inference_push_command(
     source = Path(source_directory)
     prepared_inference_mirror_files_bytes(manifest, source)
     relative = source.relative_to(_LOCAL_REPOSITORY / "results")
-    remote_parent = _REMOTE_HOST_REPOSITORY / "results" / relative.parent
+    remote_parent = _LOCAL_REPOSITORY / "results" / relative.parent
+    prefix = _rsync_prefix(Path(files_from))
     return (
-        *_rsync_prefix(Path(files_from)),
+        *prefix[:-1],
+        "--rsync-path",
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "--",
         f"{source.parent}/",
         f"{_REMOTE_HOST}:{remote_parent}/",
     )

@@ -13,6 +13,7 @@ from src.multinode_artifacts import (
     NodeArtifactManifest,
     build_evaluation_pull_command,
     build_prepared_inference_pull_command,
+    build_prepared_inference_push_command,
     evaluation_result_files_bytes,
     prepare_inference_copy,
     validate_evaluation_sidecars,
@@ -660,10 +661,39 @@ def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
         "--from0",
         "--rsh",
         "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8",
+        "--rsync-path",
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/"
+        "korea@10.1.102.41:/root/workspace/ILVR/"
         "results/trained-model-run/inference/",
         "/root/workspace/ILVR/results/eval-four-gpu/inference-model/",
+    )
+
+
+def test_prepared_inference_push_has_exact_container_rsync_argv():
+    files_path = Path("/root/workspace/ILVR/logs/prepared-push.files")
+
+    command = build_prepared_inference_push_command(
+        _manifest(),
+        Path("/root/workspace/ILVR/results/trained-model-run/inference"),
+        files_from=files_path,
+    )
+
+    assert command == (
+        "/usr/bin/rsync",
+        "--archive",
+        "--ignore-existing",
+        "--secluded-args",
+        "--files-from",
+        str(files_path),
+        "--from0",
+        "--rsh",
+        "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8",
+        "--rsync-path",
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "--",
+        "/root/workspace/ILVR/results/trained-model-run/",
+        "korea@10.1.102.41:/root/workspace/ILVR/results/trained-model-run/",
     )
 
 

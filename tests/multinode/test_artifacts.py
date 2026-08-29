@@ -1750,6 +1750,13 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
     def fake_command(command, *, input_bytes=None, timeout_seconds=None):
         calls.append(tuple(command))
         display = " ".join(command)
+        if command[0] == "/usr/bin/rsync" and "--rsync-path" not in command:
+            return subprocess.CompletedProcess(
+                command,
+                3,
+                stdout="",
+                stderr="remote container result parent is not host-traversable",
+            )
         if "prepared-inference-show" in display:
             stdout = json.dumps(manifest.to_json())
         else:
