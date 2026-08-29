@@ -1533,6 +1533,72 @@ def test_node_run_rejects_foreign_control_paths_before_creating_logs(
     assert not foreign.exists()
 
 
+@pytest.mark.parametrize(
+    ("shard_index", "machine_rank"), ((0, 0), (1, 0), (2, 1), (3, 1))
+)
+def test_node_run_maps_evaluation_shards_to_unique_canonical_controls(
+    tmp_path, monkeypatch, shard_index, machine_rank
+):
+    repository = tmp_path / "repository"
+    attempt = repository / "logs/multinode/eval-four-gpu/initial"
+    ownership = attempt / f"ownership-eval-shard{shard_index}.json"
+    exit_path = attempt / f"exit-eval-shard{shard_index}.json"
+    monkeypatch.setattr("src.multinode._REPOSITORY_ROOT", repository)
+
+    stdout, stderr = multinode_module._node_run_control_paths(
+        run_id="eval-four-gpu",
+        attempt_id="initial",
+        machine_rank=machine_rank,
+        ownership_path=str(ownership),
+        exit_path=str(exit_path),
+        evaluation_shard_index=shard_index,
+    )
+
+    assert stdout == attempt / f"stdout-eval-shard{shard_index}.log"
+    assert stderr == attempt / f"stderr-eval-shard{shard_index}.log"
+
+
+@pytest.mark.parametrize(
+    ("shard_index", "machine_rank"), ((0, 1), (1, 1), (2, 0), (3, 0))
+)
+def test_node_run_rejects_evaluation_shard_assigned_to_wrong_machine(
+    tmp_path, monkeypatch, shard_index, machine_rank
+):
+    repository = tmp_path / "repository"
+    attempt = repository / "logs/multinode/eval-four-gpu/initial"
+    monkeypatch.setattr("src.multinode._REPOSITORY_ROOT", repository)
+
+    with pytest.raises(ValueError, match="shard.*machine rank"):
+        multinode_module._node_run_control_paths(
+            run_id="eval-four-gpu",
+            attempt_id="initial",
+            machine_rank=machine_rank,
+            ownership_path=str(
+                attempt / f"ownership-eval-shard{shard_index}.json"
+            ),
+            exit_path=str(attempt / f"exit-eval-shard{shard_index}.json"),
+            evaluation_shard_index=shard_index,
+        )
+
+
+def test_node_run_rejects_arbitrary_evaluation_shard_control_path(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    attempt = repository / "logs/multinode/eval-four-gpu/initial"
+    monkeypatch.setattr("src.multinode._REPOSITORY_ROOT", repository)
+
+    with pytest.raises(ValueError, match="canonical attempt directory"):
+        multinode_module._node_run_control_paths(
+            run_id="eval-four-gpu",
+            attempt_id="initial",
+            machine_rank=0,
+            ownership_path=str(attempt / "ownership-operator-chosen.json"),
+            exit_path=str(attempt / "exit-operator-chosen.json"),
+            evaluation_shard_index=0,
+        )
+
+
 def test_node_run_never_overwrites_an_existing_rank_log(tmp_path, monkeypatch):
     repository = tmp_path / "repository"
     run_id = "stage2-full-zero1-collision"

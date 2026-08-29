@@ -926,6 +926,7 @@ def _node_run_control_paths(
     machine_rank: int,
     ownership_path: str,
     exit_path: str,
+    evaluation_shard_index: int | None = None,
 ) -> tuple[Path, Path]:
     """Bind child logs to the immutable canonical run/rank identity."""
     _validate_identifier("run_id", run_id)
@@ -933,13 +934,25 @@ def _node_run_control_paths(
     attempt_directory = (
         _REPOSITORY_ROOT / "logs" / "multinode" / run_id / attempt_id
     )
-    expected_ownership = attempt_directory / f"ownership-rank{machine_rank}.json"
-    expected_exit = attempt_directory / f"exit-rank{machine_rank}.json"
+    if evaluation_shard_index is None:
+        control_identity = f"rank{machine_rank}"
+    else:
+        if (
+            type(evaluation_shard_index) is not int
+            or evaluation_shard_index not in range(4)
+        ):
+            raise ValueError("evaluation shard index must be 0, 1, 2, or 3")
+        expected_machine_rank = 0 if evaluation_shard_index < 2 else 1
+        if machine_rank != expected_machine_rank:
+            raise ValueError("evaluation shard does not belong to the machine rank")
+        control_identity = f"eval-shard{evaluation_shard_index}"
+    expected_ownership = attempt_directory / f"ownership-{control_identity}.json"
+    expected_exit = attempt_directory / f"exit-{control_identity}.json"
     if Path(ownership_path) != expected_ownership or Path(exit_path) != expected_exit:
         raise ValueError("node-run control paths must use the canonical attempt directory")
     return (
-        attempt_directory / f"stdout-rank{machine_rank}.log",
-        attempt_directory / f"stderr-rank{machine_rank}.log",
+        attempt_directory / f"stdout-{control_identity}.log",
+        attempt_directory / f"stderr-{control_identity}.log",
     )
 
 
@@ -976,6 +989,7 @@ def _node_run(argv: list[str]) -> int:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--machine-rank", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--evaluation-shard-index", type=int, choices=range(4))
     parser.add_argument("--commit", required=True)
     parser.add_argument("--ownership-path", required=True)
     parser.add_argument("--exit-path", required=True)
@@ -990,6 +1004,7 @@ def _node_run(argv: list[str]) -> int:
         machine_rank=args.machine_rank,
         ownership_path=args.ownership_path,
         exit_path=args.exit_path,
+        evaluation_shard_index=args.evaluation_shard_index,
     )
     environment = _environment_assignments(args.env)
     if dict(os.environ) != environment:

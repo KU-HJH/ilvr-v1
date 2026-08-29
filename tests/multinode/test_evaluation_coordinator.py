@@ -138,6 +138,22 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
     assert model_dirs[2:] == [str(_plan().local_model_dir)] * 2
 
 
+def test_worker_supervisors_bind_exact_evaluation_shard_identity():
+    commands = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(stage="stage2"), commit="b" * 40
+    )
+
+    for worker in commands.workers:
+        command = worker.node_spec.command
+        shard = worker.assignment.shard_index
+        option = command.index("--evaluation-shard-index")
+        assert command[option + 1] == str(shard)
+        assert worker.node_spec.ownership_path.name == (
+            f"ownership-eval-shard{shard}.json"
+        )
+        assert worker.node_spec.exit_path.name == f"exit-eval-shard{shard}.json"
+
+
 class FakeEvaluationRunner:
     def __init__(
         self,
@@ -453,6 +469,7 @@ def test_production_runner_cleanup_uses_exact_owned_signal_command():
     assert "ownership-show" in " ".join(calls[0])
     assert "signal-owned" in " ".join(calls[1])
     assert str(ownership.pid) in calls[1][-1]
+    assert "--evaluation-shard-index" in " ".join(calls[1])
 
 
 def test_production_runner_reports_exact_owned_signal_failure():

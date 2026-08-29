@@ -1214,6 +1214,7 @@ def _build_evaluation_commands_for_stage(
             "--run-id", plan.run_id,
             "--attempt-id", plan.attempt_id,
             "--machine-rank", str(assignment.machine_rank),
+            "--evaluation-shard-index", str(assignment.shard_index),
             "--commit", commit,
             "--ownership-path", str(ownership_path),
             "--exit-path", str(exit_path),
