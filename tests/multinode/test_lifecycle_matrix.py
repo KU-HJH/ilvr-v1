@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 
 import pytest
@@ -20,6 +21,7 @@ from src.multinode_evidence import (
 from src.multinode_runtime import (
     SubprocessCoordinatorRunner,
     build_owned_lifecycle_harness_commands,
+    canonical_command_digest,
 )
 
 
@@ -135,6 +137,24 @@ def test_owned_harness_builder_rejects_arbitrary_path_or_arguments():
             commit="a" * 40,
             phase="lifecycle",
         )
+
+
+def test_lifecycle_worker_environment_resolves_canonical_venv_deepspeed():
+    """Catches Accelerate failing because its sealed PATH cannot find DeepSpeed."""
+    plan = build_lifecycle_plans(
+        parent_run_id="four-gpu-matrix",
+        first_port=29700,
+        result_root=Path("/root/workspace/ILVR/results"),
+        python_executable="/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        commit="a" * 40,
+    )[0]
+
+    for node in plan.initial_commands.node_specs:
+        resolved = shutil.which("deepspeed", path=dict(node.environment)["PATH"])
+        assert resolved == "/root/workspace/ILVR/venv/ilvr-venv/bin/deepspeed"
+        assert canonical_command_digest(
+            node.command, dict(node.environment)
+        ) == plan.initial_commands.command_digests[node.machine_rank]
 
 
 def test_lifecycle_plans_bind_safe_child_ids_ports_and_two_ordered_phase_jobs(tmp_path):

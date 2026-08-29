@@ -43,7 +43,10 @@ _MINIMAL_EXEC_ENVIRONMENT = {
     "HOME": "/root",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
-    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PATH": (
+        "/root/workspace/ILVR/venv/ilvr-venv/bin:"
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ),
     "PYTHONUNBUFFERED": "1",
 }
 
