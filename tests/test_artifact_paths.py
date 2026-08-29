@@ -26,8 +26,14 @@ def test_run_paths_share_one_experiment_identifier():
     paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
 
     assert paths.checkpoint_dir == Path(
-        "/root/workspace/ILVR/"
-        "checkpoints/zero-stage-compatibility/stage1-zero2-dora-mb4-ga2-candidate"
+        "/root/workspace/ILVR/checkpoints/stage1-zero2-dora-mb4-ga2-candidate"
+    )
+    assert paths.result_dir == Path(
+        "/root/workspace/ILVR/results/stage1-zero2-dora-mb4-ga2-candidate"
+    )
+    assert paths.log_dir == Path(
+        "/root/workspace/ILVR/logs/zero-stage-compatibility/"
+        "stage1-zero2-dora-mb4-ga2-candidate"
     )
     assert paths.result_dir.name == paths.checkpoint_dir.name
     assert paths.log_dir.name == paths.checkpoint_dir.name
@@ -51,7 +57,7 @@ def test_worktree_local_outputs_are_not_canonical():
 def test_canonical_checkpoint_path_preserves_repository_symlink_spelling():
     """Catches validation returning the checkpoint symlink's storage target."""
     canonical = Path(
-        "/root/workspace/ILVR/checkpoints/zero-stage-compatibility/example-run"
+        "/root/workspace/ILVR/checkpoints/example-run"
     )
 
     assert require_canonical_artifact_path(canonical, kind="checkpoint") == canonical
@@ -67,6 +73,32 @@ def test_generated_checkpoint_result_and_log_share_experiment_id(stage1_args):
     )
 
     assert validate_generated_artifact_paths(stage1_args) == paths
+
+
+def test_multinode_direct_artifact_tuple_rejects_legacy_nested_checkpoint(
+    stage1_args,
+):
+    run_id = "multinode-four-gpu-stage2-full-zero1"
+    paths = resolve_run_artifact_paths(run_id)
+    stage1_args.save_model_path = str(Path("/root/workspace/ILVR/checkpoints") / run_id)
+    stage1_args.log_file = str(
+        Path("/root/workspace/ILVR/logs/zero-stage-compatibility")
+        / run_id
+        / "initial-train.log"
+    )
+    stage1_args.benchmark_evidence_path = str(
+        Path("/root/workspace/ILVR/results")
+        / run_id
+        / "initial-producer-evidence.json"
+    )
+
+    assert validate_generated_artifact_paths(stage1_args) == paths
+
+    stage1_args.save_model_path = str(
+        Path("/root/workspace/ILVR/checkpoints/zero-stage-compatibility") / run_id
+    )
+    with pytest.raises(ValueError, match="share one experiment ID"):
+        validate_generated_artifact_paths(stage1_args)
 
 
 def test_generated_paths_reject_different_canonical_experiment_ids(stage1_args):

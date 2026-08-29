@@ -2958,16 +2958,10 @@ def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
     for index, item in enumerate(command):
         _require_string(f"command[{index}]", item)
     output_dir = Path(str(attempt["output_dir"]))
-    canonical_output = (
-        output_dir.parent.name == "zero-stage-compatibility"
-        and output_dir.parent.parent.name == "checkpoints"
-    )
+    canonical_output = output_dir.parent == CANONICAL_CHECKPOINT_ROOT
     if canonical_output:
-        repository = output_dir.parents[2]
-        log_path = (
-            repository / "logs" / "zero-stage-compatibility" / output_dir.name / "train.log"
-        )
-        result_dir = repository / "results" / "zero-stage-compatibility" / output_dir.name
+        log_path = CANONICAL_LOG_ROOT / output_dir.name / "train.log"
+        result_dir = CANONICAL_RESULT_ROOT / output_dir.name
     else:
         log_path = Path(str(attempt["stdout_path"])).with_name("train.log")
         result_dir = output_dir.parent / "evidence"

@@ -114,8 +114,8 @@ if [[ $method == dora ]] && ! awk -v value="$dora_dropout" 'BEGIN { number = val
 fi
 
 probe_experiment_id=${output_root##*/}
-canonical_checkpoint_root='/root/workspace/ILVR/checkpoints/zero-stage-compatibility'
-canonical_result_root='/root/workspace/ILVR/results/zero-stage-compatibility'
+canonical_checkpoint_root='/root/workspace/ILVR/checkpoints'
+canonical_result_root='/root/workspace/ILVR/results'
 canonical_log_root='/root/workspace/ILVR/logs/zero-stage-compatibility'
 "$repository_python" -m src.artifact_paths resolve --experiment-id "$probe_experiment_id" >/dev/null
 if [[ $(readlink -m -- "$output_root") != "$canonical_result_root/$probe_experiment_id" ]]; then

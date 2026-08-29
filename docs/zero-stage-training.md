@@ -27,8 +27,8 @@ they are not throughput, capacity, or peak-memory measurements.
 Every newly generated artifact belongs beneath one of these exact roots:
 
 ```text
-/root/workspace/ILVR/checkpoints/zero-stage-compatibility
-/root/workspace/ILVR/results/zero-stage-compatibility
+/root/workspace/ILVR/checkpoints
+/root/workspace/ILVR/results
 /root/workspace/ILVR/logs/zero-stage-compatibility
 ```
 
@@ -65,8 +65,8 @@ prevents a fresh attempt from colliding with another independent experiment.
 ### Stage 1 LoRA
 
 ```bash
-zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints
+zero_result_root=/root/workspace/ILVR/results
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-lora-fresh-example-$run_suffix"
@@ -108,8 +108,8 @@ Stage 1 supports Full, LoRA, and DoRA for all three canonical ZeRO stages.
 ### Stage 2 DoRA
 
 ```bash
-zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints
+zero_result_root=/root/workspace/ILVR/results
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero2-dora-fresh-example-$run_suffix"

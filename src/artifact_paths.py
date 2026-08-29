@@ -11,12 +11,8 @@ from typing import Literal
 CANONICAL_REPOSITORY_ROOT = Path(
     "/root/workspace/ILVR"
 )
-CANONICAL_CHECKPOINT_ROOT = (
-    CANONICAL_REPOSITORY_ROOT / "checkpoints" / "zero-stage-compatibility"
-)
-CANONICAL_RESULT_ROOT = (
-    CANONICAL_REPOSITORY_ROOT / "results" / "zero-stage-compatibility"
-)
+CANONICAL_CHECKPOINT_ROOT = CANONICAL_REPOSITORY_ROOT / "checkpoints"
+CANONICAL_RESULT_ROOT = CANONICAL_REPOSITORY_ROOT / "results"
 CANONICAL_LOG_ROOT = CANONICAL_REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
 EXPERIMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 
