@@ -99,6 +99,14 @@ class TinyStage2Processor:
             '{"tokenizer_class":"TinyStage2Tokenizer"}\n',
             encoding="utf-8",
         )
+        (directory / "tokenizer.json").write_text(
+            json.dumps(
+                {"vocab": {"<|im_start|>": 31, "assistant": 32}},
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def apply_chat_template(self, conversation, *, tokenize, add_generation_prompt):
         assert tokenize is False

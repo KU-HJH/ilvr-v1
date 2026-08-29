@@ -24,6 +24,8 @@ from src.multinode_runtime import (
     build_owned_lifecycle_harness_commands,
     canonical_command_digest,
 )
+from src.multinode_artifacts import build_inference_manifest
+from tests.multinode.test_artifacts import loader_manifest, write_loader_artifact
 
 
 EXPECTED_IDENTITIES = [
@@ -227,6 +229,62 @@ def test_lifecycle_harness_processors_save_required_loader_assets(tmp_path):
         assert completed.returncode == 0, completed.stderr
         assert (destination / "preprocessor_config.json").is_file()
         assert (destination / "tokenizer_config.json").is_file()
+        assert (destination / "tokenizer.json").is_file()
+
+
+@pytest.mark.parametrize("method", ("full", "lora", "dora"))
+def test_stage2_tiny_processor_assets_pass_loader_and_manifest_selection(
+    tmp_path, method
+):
+    """Catches any Stage 2 lifecycle method publishing an unloadable artifact."""
+    destination = tmp_path / method
+    write_loader_artifact(destination, stage="stage2", method=method)
+    for name in (
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+    ):
+        (destination / name).unlink()
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": (
+            f"{REPO_ROOT / 'transformers/src'}:{REPO_ROOT}:{REPO_ROOT / 'src'}"
+        ),
+    }
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+            "-c",
+            (
+                "from tests.stage2.integration.tiny_stage2_train "
+                "import TinyStage2Processor; "
+                f"TinyStage2Processor().save_pretrained({str(destination)!r})"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    manifest = build_inference_manifest(
+        destination,
+        loader_manifest(destination, stage="stage2", method=method),
+    )
+    selected = {entry.relative_path.name for entry in manifest.entries}
+    assert {
+        "config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+    } <= selected
+    expected_weight = (
+        "model.safetensors" if method == "full" else "adapter_model.safetensors"
+    )
+    assert expected_weight in selected
 
 
 def test_lifecycle_plans_bind_safe_child_ids_ports_and_two_ordered_phase_jobs(tmp_path):
