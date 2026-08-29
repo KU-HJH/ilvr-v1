@@ -36,6 +36,7 @@ _OWNERSHIP_SCHEMA_VERSION = 1
 _WITNESS_SCHEMA_VERSION = 1
 _INCOMPLETE_SCHEMA_VERSION = 1
 _CONTROL_TIMEOUT_SECONDS = 30
+_ARTIFACT_TRANSFER_TIMEOUT_SECONDS = 60 * 60
 _MAX_TRANSFER_BYTES = 1024 * 1024
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -1769,6 +1770,21 @@ class SubprocessCoordinatorRunner:
             )
         return completed
 
+    def _run_artifact_transfer(
+        self, command: Sequence[str]
+    ) -> subprocess.CompletedProcess[str]:
+        completed = self.command_runner(
+            command,
+            input_bytes=None,
+            timeout_seconds=_ARTIFACT_TRANSFER_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"coordinator artifact transfer failed ({completed.returncode}): "
+                f"{completed.stderr.strip()}"
+            )
+        return completed
+
     def _node_spec(self, machine_rank: int) -> OwnedNodeCommand:
         if machine_rank not in (0, 1):
             raise ValueError("machine_rank must be 0 or 1")
@@ -2351,7 +2367,9 @@ class SubprocessCoordinatorRunner:
             / "artifact-push-rank1.files"
         )
         publish_files_list(files_path, entries)  # type: ignore[arg-type]
-        self._run(build_push_command(manifest, files_from=files_path))
+        self._run_artifact_transfer(
+            build_push_command(manifest, files_from=files_path)
+        )
 
     def validate_resume_destination(
         self, entries: Sequence[object], destination: Path
@@ -2413,7 +2431,9 @@ class SubprocessCoordinatorRunner:
             / "artifact-resume-rank1.files"
         )
         publish_files_list(files_path, entries)  # type: ignore[arg-type]
-        self._run(build_pull_command(manifest, physical, files_from=files_path))
+        self._run_artifact_transfer(
+            build_pull_command(manifest, physical, files_from=files_path)
+        )
         validate_transferred_entry_subset(physical, entries)  # type: ignore[arg-type]
 
     def validate_inference_manifest(self, manifest: object) -> None:
@@ -2455,7 +2475,9 @@ class SubprocessCoordinatorRunner:
             / "artifact-inference.files"
         )
         publish_files_list(files_path, entries)
-        self._run(build_pull_command(manifest, destination, files_from=files_path))
+        self._run_artifact_transfer(
+            build_pull_command(manifest, destination, files_from=files_path)
+        )
         validate_transferred_entries(destination, entries)
 
     def mirror_prepared_inference(
@@ -2507,9 +2529,11 @@ class SubprocessCoordinatorRunner:
             "prepare-inference-destination",
             ("--destination", str(destination)),
         ))
-        self._run(build_prepared_inference_push_command(
-            manifest, destination, files_from=files_path
-        ))
+        self._run_artifact_transfer(
+            build_prepared_inference_push_command(
+                manifest, destination, files_from=files_path
+            )
+        )
         shown = self._run(remote_repository_command(
             "prepared-inference-show",
             ("--model-dir", str(destination)),
@@ -2562,6 +2586,21 @@ class EvaluationSubprocessRunner:
         if completed.returncode != 0:
             raise RuntimeError(
                 f"evaluation coordinator command failed ({completed.returncode}): "
+                f"{completed.stderr.strip()}"
+            )
+        return completed
+
+    def _run_artifact_transfer(
+        self, command: Sequence[str]
+    ) -> subprocess.CompletedProcess[str]:
+        completed = self.command_runner(
+            command,
+            input_bytes=None,
+            timeout_seconds=_ARTIFACT_TRANSFER_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"evaluation artifact transfer failed ({completed.returncode}): "
                 f"{completed.stderr.strip()}"
             )
         return completed
@@ -2696,7 +2735,7 @@ class EvaluationSubprocessRunner:
             / "evaluation-inference.files"
         )
         publish_files_list(files_path, entries)
-        self._run(
+        self._run_artifact_transfer(
             build_prepared_inference_pull_command(
                 manifest,
                 self.plan.model_dir,

@@ -1200,7 +1200,41 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
     assert b"global_step2/bf16_zero_pp_rank_2_mp_rank_00_optim_states.pt" in transferred
     assert b"rng_state_3.pth" in transferred
     assert b"" in transferred
-    assert all(call[2] == 30 for call in calls)
+    assert all(
+        call[2] == (3600 if call[0][0] == "/usr/bin/rsync" else 30)
+        for call in calls
+    )
+
+
+def test_checkpoint_transfer_has_long_bounded_timeout_and_propagates_timeout(
+    tmp_path,
+):
+    plan = launch_plan()
+    manifest = strict_manifest(1)
+    calls = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        calls.append((tuple(command), timeout_seconds))
+        if command[0] == "/usr/bin/rsync":
+            assert timeout_seconds > 30
+            raise subprocess.TimeoutExpired(command, timeout_seconds)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    runner = SubprocessCoordinatorRunner(
+        plan,
+        commands=build_owned_tmux_commands(plan, commit="b" * 40),
+        commit="b" * 40,
+        log_root=tmp_path / "logs",
+        command_runner=fake_command,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        runner.push_artifacts(manifest, manifest.entries[:1])
+
+    assert raised.value.timeout == 3600
+    assert len(calls) == 1
+    assert calls[0][0][0] == "/usr/bin/rsync"
+    assert calls[0][1] == 3600
 
 
 def test_artifact_manifest_cli_emits_only_small_json_metadata(tmp_path):
