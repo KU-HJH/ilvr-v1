@@ -1654,6 +1654,7 @@ def build_owned_tmux_commands(
             **_MINIMAL_EXEC_ENVIRONMENT,
             **base_environment,
             **_distributed_environment(plan, machine_rank),
+            "PYTHONPATH": str(repository),
             "ILVR_REPOSITORY_COMMIT": commit,
         }
         supervisor, digest, node_spec = _node_shell_command(
@@ -1679,7 +1680,11 @@ def build_owned_tmux_commands(
         digests.append(digest)
         node_specs.append(node_spec)
     return OwnedTmuxCommands(
-        remote=tuple(build_remote_exec(node_commands[0])),
+        remote=tuple(
+            build_remote_exec(
+                node_commands[0], working_directory=repository
+            )
+        ),
         local=node_commands[1],
         command_digests=(digests[0], digests[1]),
         node_specs=(node_specs[0], node_specs[1]),

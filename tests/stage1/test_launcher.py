@@ -188,7 +188,12 @@ def test_stage1_multinode_dry_run_emits_rank_one_four_process_command(tmp_path):
     completed = run_launcher(LAUNCHER, *base_args(tmp_path / "out"), env=env)
 
     assert completed.returncode == 0, completed.stderr
-    assert_four_rank_prefix(shlex.split(completed.stdout), rank=1, port=29621)
+    command = shlex.split(completed.stdout)
+    assert_four_rank_prefix(command, rank=1, port=29621)
+    assert command[command.index("--deepspeed_multinode_launcher") + 1] == "standard"
+    assert command[command.index("--deepspeed_config_file") + 1] == str(
+        REPO_ROOT / "configs/deepspeed_zero3.json"
+    )
 
 
 def live_args(tmp_path, output_dir, *, method="dora"):

@@ -350,6 +350,28 @@ def test_tmux_commands_use_fixed_sessions_and_quote_shell_metacharacters():
     )
 
 
+def test_training_supervisors_import_from_the_canonical_repository():
+    """Catches production rank 0 exiting before ownership from container cwd ``/``."""
+    commands = build_owned_tmux_commands(plan(), commit="a" * 40)
+    repository = "/root/workspace/ILVR"
+
+    for spec in commands.node_specs:
+        environment = dict(spec.environment)
+        assert environment["PYTHONPATH"] == repository
+        completed = subprocess.run(
+            (*spec.command[:3], "--help"),
+            cwd="/",
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    remote = shlex.split(commands.remote[6])
+    assert remote[remote.index("--workdir") + 1] == repository
+
+
 def test_coordinator_starts_remote_rank_zero_before_local_rank_one(fake_runner):
     start_rank0_then_rank1(plan(), fake_runner, ready_timeout_seconds=30)
     assert fake_runner.events[:3] == [

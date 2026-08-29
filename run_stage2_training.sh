@@ -345,9 +345,18 @@ if [[ -n "${DEEPSPEED_CONFIG:-}" || "$ilvr_multinode" == true ]]; then
     STAGE2_NUM_PROCESSES=${STAGE2_NUM_PROCESSES:-2}
     require_positive_integer STAGE2_NUM_PROCESSES "$STAGE2_NUM_PROCESSES"
   fi
+  ACCELERATE_DEEPSPEED_ARGS=()
+  if [[ "$ilvr_num_machines" == 2 ]]; then
+    ACCELERATE_DEEPSPEED_ARGS=(
+      --use_deepspeed
+      --deepspeed_multinode_launcher standard
+      --deepspeed_config_file "$DEEPSPEED_CONFIG"
+    )
+  fi
   COMMAND=(
     "$REPO_ROOT/venv/ilvr-venv/bin/accelerate" launch
     "${accelerate_topology[@]}"
+    "${ACCELERATE_DEEPSPEED_ARGS[@]}"
     "$REPO_ROOT/src/main.py"
     "${TRAINING_ARGS[@]}"
   )

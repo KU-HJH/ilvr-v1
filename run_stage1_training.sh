@@ -322,9 +322,19 @@ if [[ $dry_run != true ]]; then
     fi
 fi
 
+accelerate_deepspeed=()
+if [[ $ilvr_num_machines == 2 ]]; then
+    accelerate_deepspeed=(
+        --use_deepspeed
+        --deepspeed_multinode_launcher standard
+        --deepspeed_config_file "$deepspeed_config"
+    )
+fi
+
 command=(
     "$repository_accelerate" launch
     "${accelerate_topology[@]}"
+    "${accelerate_deepspeed[@]}"
     src/main.py
     --stage stage1
     --model "$model"

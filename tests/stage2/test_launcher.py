@@ -69,6 +69,10 @@ def test_stage2_multinode_dry_run_emits_rank_zero_four_process_command():
     )
 
     assert_four_rank_prefix(tokens, rank=0, port=29622)
+    assert tokens[tokens.index("--deepspeed_multinode_launcher") + 1] == "standard"
+    assert tokens[tokens.index("--deepspeed_config_file") + 1] == str(
+        REPO_ROOT / "configs/deepspeed_zero2.json"
+    )
 
 
 def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path):
