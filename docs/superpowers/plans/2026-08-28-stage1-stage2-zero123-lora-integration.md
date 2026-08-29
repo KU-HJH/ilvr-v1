@@ -601,7 +601,7 @@ zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 witness_paths=()
 for zero_stage in 1 2 3; do
   for method in full lora dora; do
-    suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+    suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
     experiment_id="stage1-zero${zero_stage}-${method}-tiny-lifecycle-${suffix}"
     mkdir -p -- "$zero_log_root"
     mkdir -- "$zero_log_root/$experiment_id"
@@ -645,7 +645,7 @@ zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 witness_paths=()
 for zero_stage in 1 2 3; do
   for method in full lora dora; do
-    suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+    suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
     experiment_id="stage2-zero${zero_stage}-${method}-tiny-lifecycle-${suffix}"
     mkdir -p -- "$zero_log_root"
     mkdir -- "$zero_log_root/$experiment_id"

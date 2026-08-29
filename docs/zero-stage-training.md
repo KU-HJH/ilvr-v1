@@ -68,7 +68,7 @@ prevents a fresh attempt from colliding with another independent experiment.
 zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
 zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-lora-fresh-example-$run_suffix"
 
 ./run_stage1_training.sh \
@@ -111,7 +111,7 @@ Stage 1 supports Full, LoRA, and DoRA for all three canonical ZeRO stages.
 zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
 zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero2-dora-fresh-example-$run_suffix"
 
 STAGE1_CHECKPOINT="$zero_checkpoint_root/stage1-dora-final" \

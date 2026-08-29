@@ -61,7 +61,7 @@ preflight; `--dry-run` only prints the immutable commands.
 
 ```bash
 cd /root/workspace/ILVR
-preflight_id="preflight-stage1-lora-zero3-$(date -u +%Y%m%dt%H%M%Sz)-$$"
+preflight_id="preflight-stage1-lora-zero3-$(date -u +%Y%m%d-%H%M%S)-$$"
 ./venv/ilvr-venv/bin/python -m src.multinode preflight \
   --stage stage1 \
   --tuning-method lora \
@@ -92,7 +92,7 @@ capacity controller.
 
 ```bash
 cd /root/workspace/ILVR
-run_stamp="$(date -u +%Y%m%dt%H%M%Sz)-$$"
+run_stamp="$(date -u +%Y%m%d-%H%M%S)-$$"
 
 run_stage1_cell() {
   local run_id=$1 method=$2 zero_stage=$3 port=$4
@@ -157,7 +157,7 @@ exact numbered checkpoint.
 
 ```bash
 cd /root/workspace/ILVR
-run_stamp="$(date -u +%Y%m%dt%H%M%Sz)-$$"
+run_stamp="$(date -u +%Y%m%d-%H%M%S)-$$"
 
 run_stage2_cell() {
   local run_id=$1 method=$2 zero_stage=$3 port=$4
@@ -232,7 +232,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
 Both checks must identify the same artifact. Then run:
 
 ```bash
-eval_id="eval-four-worker-$(date -u +%Y%m%dt%H%M%Sz)-$$"
+eval_id="eval-four-worker-$(date -u +%Y%m%d-%H%M%S)-$$"
 ./run_multinode_evaluation.sh \
   --run-id "$eval_id" \
   --model-dir "$prepared_model_dir" \
@@ -265,7 +265,7 @@ repeated `--main-process-port` values: batches 2, 4, 8, then the conditional
 batch-1 fallback.
 
 ```bash
-capacity_suite="capacity-four-gpu-$(date -u +%Y%m%dt%H%M%Sz)-$$"
+capacity_suite="capacity-four-gpu-$(date -u +%Y%m%d-%H%M%S)-$$"
 capacity_root="/root/workspace/ILVR/results/$capacity_suite"
 mkdir -m 700 "$capacity_root" "$capacity_root/capacity" "$capacity_root/stage2-batch1"
 
@@ -337,7 +337,7 @@ It runs all 18 cells sequentially. Every cell proves initial step 0→2,
 non-shared checkpoint redistribution, and resume step 2→3 on all four ranks.
 
 ```bash
-matrix_id="tiny-matrix-$(date -u +%Y%m%dt%H%M%Sz)-$$"
+matrix_id="tiny-matrix-$(date -u +%Y%m%d-%H%M%S)-$$"
 ./run_multinode_lifecycle_matrix.sh \
   --run-id "$matrix_id" \
   --first-port 30200
@@ -357,7 +357,7 @@ root. Its output is a new atomic bundle directory. Pass
 or Markdown filenames and do not create the bundle in advance.
 
 ```bash
-validation_id="validation-four-gpu-$(date -u +%Y%m%dt%H%M%Sz)-$$"
+validation_id="validation-four-gpu-$(date -u +%Y%m%d-%H%M%S)-$$"
 validation_parent="/root/workspace/ILVR/results/$validation_id"
 test ! -e "$validation_parent"
 ./venv/ilvr-venv/bin/python -m src.multinode validate-results \

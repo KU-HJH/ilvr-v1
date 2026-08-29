@@ -1095,7 +1095,7 @@ git commit -m "test: define four-rank ZeRO lifecycle matrix"
 Document the fixed host/container/root/ranks/interface, one-time provisioning boundary, explicit port requirement, ZeRO selection, no-overwrite behavior, remote-rank-first flow, and these executable examples using shell-generated run IDs:
 
 ```bash
-run_id="stage1-lora-zero3-$(date -u +%Y%m%dT%H%M%SZ)"
+run_id="stage1-lora-zero3-$(date -u +%Y%m%d-%H%M%S)"
 ./run_multinode_stage1_training.sh \
   --run-id "$run_id" --zero-stage 3 --main-process-port 29801 \
   --method lora \
@@ -1108,7 +1108,7 @@ run_id="stage1-lora-zero3-$(date -u +%Y%m%dT%H%M%SZ)"
 Use these remaining examples with distinct ports:
 
 ```bash
-run_id="stage2-dora-zero2-$(date -u +%Y%m%dT%H%M%SZ)"
+run_id="stage2-dora-zero2-$(date -u +%Y%m%d-%H%M%S)"
 STAGE1_CHECKPOINT=/root/workspace/ILVR/checkpoints/comt_ckpt \
 DATA_PATH=/root/workspace/ILVR/data/TRAIN.jsonl \
 IMAGE_ROOT=/root/workspace/ILVR/data/images_comt \
@@ -1133,7 +1133,7 @@ prepared_model_dir="/root/workspace/ILVR/results/$run_id/prepared-checkpoint-10"
   --run-id "$run_id" --main-process-port 29802 \
   --checkpoint-step 10 --destination "$prepared_model_dir"
 
-eval_id="eval-four-worker-$(date -u +%Y%m%dT%H%M%SZ)"
+eval_id="eval-four-worker-$(date -u +%Y%m%d-%H%M%S)"
 ./run_multinode_evaluation.sh \
   --run-id "$eval_id" \
   --model-dir "$prepared_model_dir" \
@@ -1141,11 +1141,11 @@ eval_id="eval-four-worker-$(date -u +%Y%m%dT%H%M%SZ)"
   --task-name zebra-cot \
   --output-dir "/root/workspace/ILVR/results/$eval_id"
 
-matrix_id="tiny-matrix-$(date -u +%Y%m%dT%H%M%SZ)"
+matrix_id="tiny-matrix-$(date -u +%Y%m%d-%H%M%S)"
 ./run_multinode_lifecycle_matrix.sh \
   --run-id "$matrix_id" --first-port 29804
 
-capacity_id="stage1-capacity-lora-zero3-$(date -u +%Y%m%dT%H%M%SZ)"
+capacity_id="stage1-capacity-lora-zero3-$(date -u +%Y%m%d-%H%M%S)"
 ./run_multinode_stage1_batch_probe.sh \
   --run-id "$capacity_id" --zero-stage 3 --tuning-method lora \
   --main-process-port 29822 \
@@ -1166,7 +1166,7 @@ termination are forbidden. The final validator example must pass one absent
 bundle below a fresh parent and identify both files inside it:
 
 ```bash
-validation_id="validation-four-gpu-$(date -u +%Y%m%dT%H%M%SZ)"
+validation_id="validation-four-gpu-$(date -u +%Y%m%d-%H%M%S)"
 validation_parent="/root/workspace/ILVR/results/$validation_id"
 test ! -e "$validation_parent"
 ./venv/ilvr-venv/bin/python -m src.multinode validate-results \
@@ -1348,7 +1348,7 @@ Expected: both nodes can parse the same first sample and resolve every reference
 - [ ] **Step 5: Run preflight and the 18 tiny lifecycles detached**
 
 ```bash
-hardware_id="multinode-four-gpu-$(date -u +%Y%m%dT%H%M%SZ)"
+hardware_id="multinode-four-gpu-$(date -u +%Y%m%d-%H%M%S)"
 hardware_result_root="/root/workspace/ILVR/results/$hardware_id"
 hardware_log_root="/root/workspace/ILVR/logs/$hardware_id"
 mkdir "$hardware_result_root" "$hardware_log_root"

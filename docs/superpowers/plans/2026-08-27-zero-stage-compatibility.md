@@ -1581,7 +1581,7 @@ The launcher loops stages `3 2 1`, methods `full dora`, and the four fixed candi
 zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
 zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-$counter"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-$counter"
 experiment_id="stage1-zero${zero_stage}-${method}-mb${micro_batch}-ga${gradient_accumulation}-candidate-$run_suffix"
 checkpoint_dir="$zero_checkpoint_root/$experiment_id"
 result_dir="$zero_result_root/$experiment_id"
@@ -1814,7 +1814,7 @@ Use these exact ZeRO-2 examples in the guide; changing only the canonical config
 ```bash
 zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-dora-fresh-example-$run_suffix"
 
 ./run_stage1_training.sh \
@@ -1852,7 +1852,7 @@ experiment_id="stage1-zero2-dora-fresh-example-$run_suffix"
 ```bash
 zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero2-dora-fresh-example-$run_suffix"
 
 STAGE1_CHECKPOINT="$zero_checkpoint_root/stage1-dora-final" \
@@ -1971,7 +1971,7 @@ zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
 zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero1-full-tiny-lifecycle-$run_suffix"
 mkdir -p -- "$zero_log_root"
 mkdir -- "$zero_log_root/$experiment_id"
@@ -1983,7 +1983,7 @@ CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
   >"$zero_log_root/$experiment_id/stdout.log" \
   2>"$zero_log_root/$experiment_id/stderr.log"
 
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero1-dora-tiny-lifecycle-$run_suffix"
 mkdir -- "$zero_log_root/$experiment_id"
 CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
@@ -2001,7 +2001,7 @@ Expected: each command exits 0; its checkpoint, witness, and logs share the expe
 
 ```bash
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-full-tiny-lifecycle-$run_suffix"
 mkdir -p -- "$zero_log_root"
 mkdir -- "$zero_log_root/$experiment_id"
@@ -2013,7 +2013,7 @@ CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
   >"$zero_log_root/$experiment_id/stdout.log" \
   2>"$zero_log_root/$experiment_id/stderr.log"
 
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-dora-tiny-lifecycle-$run_suffix"
 mkdir -- "$zero_log_root/$experiment_id"
 CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
@@ -2033,7 +2033,7 @@ Verify only their small recorded identity/result documents. If they lack the new
 
 ```bash
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero1-dora-tiny-lifecycle-$run_suffix"
 mkdir -p -- "$zero_log_root"
 mkdir -- "$zero_log_root/$experiment_id"
@@ -2046,7 +2046,7 @@ CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
   >"$zero_log_root/$experiment_id/stdout.log" \
   2>"$zero_log_root/$experiment_id/stderr.log"
 
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero2-dora-tiny-lifecycle-$run_suffix"
 mkdir -- "$zero_log_root/$experiment_id"
 CUDA_VISIBLE_DEVICES=0,1 ./venv/ilvr-venv/bin/torchrun \
@@ -2069,7 +2069,7 @@ Run exactly these three commands, skipping an exact successful witness found in 
 : "${STAGE1_CHECKPOINT:?set STAGE1_CHECKPOINT to the validated Stage 1 DoRA handoff}"
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 for zero_stage in 1 2 3; do
-  run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+  run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
   experiment_id="stage2-zero${zero_stage}-dora-mb1-ga8-rank-skew-$run_suffix"
   mkdir -p -- "$zero_log_root"
   mkdir -- "$zero_log_root/$experiment_id"
@@ -2187,7 +2187,7 @@ Run:
 zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 matrix_result_id=stage1-zero-matrix
-run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
+run_suffix="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 controller_log_id="stage1-zero-matrix-controller-$run_suffix"
 mkdir -p -- "$zero_log_root"
 mkdir -- "$zero_log_root/$controller_log_id"
