@@ -1989,12 +1989,13 @@ class SubprocessCoordinatorRunner:
             "--command-digest",
             commands.command_digests[machine_rank],
         )
-        completed = self.command_runner(
-            self._internal_command(machine_rank, "exit-show", arguments),
-            input_bytes=None,
-            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
-        )
-        if completed.returncode == 0:
+        exit_command = self._internal_command(machine_rank, "exit-show", arguments)
+
+        def decode_exit(completed: subprocess.CompletedProcess[str]) -> int | None:
+            if completed.returncode == 3:
+                return None
+            if completed.returncode != 0:
+                raise RuntimeError(f"exit-show failed: {completed.stderr.strip()}")
             try:
                 payload = json.loads(completed.stdout)
             except json.JSONDecodeError as error:
@@ -2003,14 +2004,27 @@ class SubprocessCoordinatorRunner:
             if type(exit_code) is not int:
                 raise ValueError("owned exit code is invalid")
             return exit_code
-        if completed.returncode != 3:
-            raise RuntimeError(f"exit-show failed: {completed.stderr.strip()}")
+
+        completed = self.command_runner(
+            exit_command,
+            input_bytes=None,
+            timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+        )
+        exit_code = decode_exit(completed)
+        if exit_code is not None:
+            return exit_code
         try:
             ownership = self.read_ownership(machine_rank)
         except (RuntimeError, ValueError):
             if machine_rank not in self._seen_ownership:
                 return None
-            return 125
+            completed = self.command_runner(
+                exit_command,
+                input_bytes=None,
+                timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+            )
+            retry_exit_code = decode_exit(completed)
+            return 125 if retry_exit_code is None else retry_exit_code
         try:
             self.command_digest(ownership)
         except (RuntimeError, ValueError):

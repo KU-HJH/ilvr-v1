@@ -892,7 +892,9 @@ def test_stage2_forwards_only_allowlisted_environment_and_safe_arguments():
         stage_environment=environment,
     )
     effective = dict(commands.node_specs[0].environment)
-    assert effective["PATH"].startswith("/usr/local/sbin:")
+    assert effective["PATH"].startswith(
+        "/root/workspace/ILVR/venv/ilvr-venv/bin:/usr/local/sbin:"
+    )
     assert effective["HOME"] == "/root"
     assert "UNRELATED_SECRET" not in effective
     assert "STAGE2_DRY_RUN" not in effective
@@ -1391,6 +1393,69 @@ def test_subprocess_runner_transfers_only_attempt_plan_with_size_and_sha(tmp_pat
             "src.multinode",
             subcommand,
         ]
+
+
+def test_poll_exit_rechecks_record_after_observed_supervisor_disappears(tmp_path):
+    """Catches an exit publication race being misreported as code 125."""
+    launch_plan = plan()
+    commands = build_owned_tmux_commands(launch_plan, commit="a" * 40)
+    spec = commands.node_specs[1]
+    ownership = OwnershipRecord.create(
+        run_id=launch_plan.run_id,
+        attempt_id=launch_plan.attempt_id,
+        machine_rank=1,
+        pid=4313,
+        process_start_ticks=9982,
+        commit="a" * 40,
+        command=spec.command,
+        environment=dict(spec.environment),
+    )
+    exit_polls = 0
+    ownership_polls = 0
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        nonlocal exit_polls, ownership_polls
+        display = " ".join(command)
+        if "exit-show" in display:
+            exit_polls += 1
+            if exit_polls == 3:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout='{"exit_code": 0}', stderr=""
+                )
+            return subprocess.CompletedProcess(command, 3, stdout="", stderr="")
+        if "ownership-show" in display:
+            ownership_polls += 1
+            if ownership_polls == 1:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=json.dumps(ownership.to_json()), stderr=""
+                )
+            return subprocess.CompletedProcess(command, 3, stdout="", stderr="gone")
+        if "owned-process-info" in display:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "command": list(spec.command),
+                        "environment": dict(spec.environment),
+                        "process_start_ticks": ownership.process_start_ticks,
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(command)
+
+    runner = SubprocessCoordinatorRunner(
+        launch_plan,
+        commands=commands,
+        commit="a" * 40,
+        log_root=tmp_path,
+        command_runner=fake_command,
+    )
+
+    assert runner.poll_exit(1) is None
+    assert runner.poll_exit(1) == 0
+    assert exit_polls == 3
 
 
 def test_cleanup_does_not_signal_when_live_ownership_cannot_be_proven(tmp_path):
