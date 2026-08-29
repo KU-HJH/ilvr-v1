@@ -27,6 +27,7 @@ from src.multinode_runtime import (
     OwnedTmuxCommands,
     OwnershipRecord,
     SubprocessCoordinatorRunner,
+    _open_trusted_directory,
     _nul_fields,
     _proc_start_ticks,
     build_owned_tmux_commands,
@@ -918,6 +919,55 @@ def _environment_assignments(values: list[str]) -> dict[str, str]:
     return environment
 
 
+def _node_run_control_paths(
+    *,
+    run_id: str,
+    attempt_id: str,
+    machine_rank: int,
+    ownership_path: str,
+    exit_path: str,
+) -> tuple[Path, Path]:
+    """Bind child logs to the immutable canonical run/rank identity."""
+    _validate_identifier("run_id", run_id)
+    _validate_identifier("attempt_id", attempt_id)
+    attempt_directory = (
+        _REPOSITORY_ROOT / "logs" / "multinode" / run_id / attempt_id
+    )
+    expected_ownership = attempt_directory / f"ownership-rank{machine_rank}.json"
+    expected_exit = attempt_directory / f"exit-rank{machine_rank}.json"
+    if Path(ownership_path) != expected_ownership or Path(exit_path) != expected_exit:
+        raise ValueError("node-run control paths must use the canonical attempt directory")
+    return (
+        attempt_directory / f"stdout-rank{machine_rank}.log",
+        attempt_directory / f"stderr-rank{machine_rank}.log",
+    )
+
+
+def _open_owned_child_log(path: Path):
+    """Open one fresh rank log through a trusted parent without following links."""
+    parent_descriptor = _open_trusted_directory(path.parent)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        os.fchmod(descriptor, 0o600)
+        stream = os.fdopen(descriptor, "wb", buffering=0)
+        descriptor = None
+        return stream
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
 def _node_run(argv: list[str]) -> int:
     if "--" not in argv:
         raise ValueError("node-run requires -- followed by the Stage launcher command")
@@ -934,6 +984,13 @@ def _node_run(argv: list[str]) -> int:
     command = tuple(argv[separator + 1 :])
     if not command or not Path(command[0]).is_absolute():
         raise ValueError("owned Stage command must use an absolute executable")
+    stdout_path, stderr_path = _node_run_control_paths(
+        run_id=args.run_id,
+        attempt_id=args.attempt_id,
+        machine_rank=args.machine_rank,
+        ownership_path=args.ownership_path,
+        exit_path=args.exit_path,
+    )
     environment = _environment_assignments(args.env)
     if dict(os.environ) != environment:
         raise ValueError("node-run environment differs from the complete launch environment")
@@ -955,46 +1012,51 @@ def _node_run(argv: list[str]) -> int:
         command=supervisor_command,
         environment=environment,
     )
-    write_ownership(args.ownership_path, ownership)
-    child_pidfd: int | None = None
-    pending_signals: list[int] = []
+    with _open_owned_child_log(stdout_path) as child_stdout, _open_owned_child_log(
+        stderr_path
+    ) as child_stderr:
+        write_ownership(args.ownership_path, ownership)
+        child_pidfd: int | None = None
+        pending_signals: list[int] = []
 
-    def forward_signal(signum: int, _frame: object) -> None:
-        if child_pidfd is None:
-            pending_signals.append(signum)
-            return
-        try:
-            signal.pidfd_send_signal(child_pidfd, signum)
-        except ProcessLookupError:
-            pass
-
-    handled_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
-    previous_handlers = {
-        signum: signal.signal(signum, forward_signal) for signum in handled_signals
-    }
-    exit_code: int
-    try:
-        child = subprocess.Popen(
-            command,
-            env=environment,
-            close_fds=True,
-            start_new_session=False,
-        )
-        child_pidfd = os.pidfd_open(child.pid)
-        for signum in pending_signals:
+        def forward_signal(signum: int, _frame: object) -> None:
+            if child_pidfd is None:
+                pending_signals.append(signum)
+                return
             try:
                 signal.pidfd_send_signal(child_pidfd, signum)
             except ProcessLookupError:
-                break
-        pending_signals.clear()
-        exit_code = child.wait()
-    finally:
-        if child_pidfd is not None:
-            descriptor = child_pidfd
-            child_pidfd = None
-            os.close(descriptor)
-        for signum, previous in previous_handlers.items():
-            signal.signal(signum, previous)
+                pass
+
+        handled_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        previous_handlers = {
+            signum: signal.signal(signum, forward_signal) for signum in handled_signals
+        }
+        exit_code: int
+        try:
+            child = subprocess.Popen(
+                command,
+                env=environment,
+                close_fds=True,
+                start_new_session=False,
+                stdout=child_stdout,
+                stderr=child_stderr,
+            )
+            child_pidfd = os.pidfd_open(child.pid)
+            for signum in pending_signals:
+                try:
+                    signal.pidfd_send_signal(child_pidfd, signum)
+                except ProcessLookupError:
+                    break
+            pending_signals.clear()
+            exit_code = child.wait()
+        finally:
+            if child_pidfd is not None:
+                descriptor = child_pidfd
+                child_pidfd = None
+                os.close(descriptor)
+            for signum, previous in previous_handlers.items():
+                signal.signal(signum, previous)
     _publish_exit_record(
         ownership=ownership,
         exit_path=Path(args.exit_path),

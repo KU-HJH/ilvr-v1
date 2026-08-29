@@ -1284,8 +1284,11 @@ def test_wrapper_rejects_different_run_resume_before_any_remote_call():
 def test_node_run_supervises_child_with_pidfd_and_records_exact_exit(
     tmp_path, monkeypatch
 ):
-    ownership_path = tmp_path / "logs/run/initial/ownership-rank0.json"
-    exit_path = tmp_path / "logs/run/initial/exit-rank0.json"
+    repository = tmp_path / "repository"
+    attempt = repository / "logs/multinode/stage1-lora-zero3-four-gpu/initial"
+    attempt.mkdir(parents=True)
+    ownership_path = attempt / "ownership-rank0.json"
+    exit_path = attempt / "exit-rank0.json"
     observed = {}
     handlers = {}
     child_pidfd = os.open("/dev/null", os.O_RDONLY)
@@ -1300,6 +1303,12 @@ def test_node_run_supervises_child_with_pidfd_and_records_exact_exit(
     def fake_popen(command, **kwargs):
         observed["child_command"] = tuple(command)
         observed["child_environment"] = kwargs["env"]
+        observed["stdout_path"] = Path(
+            os.readlink(f"/proc/self/fd/{kwargs['stdout'].fileno()}")
+        )
+        observed["stderr_path"] = Path(
+            os.readlink(f"/proc/self/fd/{kwargs['stderr'].fileno()}")
+        )
         observed["ownership"] = json.loads(ownership_path.read_text(encoding="utf-8"))
         return FakeChild()
 
@@ -1330,6 +1339,7 @@ def test_node_run_supervises_child_with_pidfd_and_records_exact_exit(
     )
 
     monkeypatch.setattr("src.multinode.os.getpid", lambda: 4312)
+    monkeypatch.setattr("src.multinode._REPOSITORY_ROOT", repository)
     monkeypatch.setattr("src.multinode._proc_start_ticks", lambda pid: 9981)
     monkeypatch.setattr("src.multinode.sys.orig_argv", list(supervisor_argv))
     monkeypatch.setattr("src.multinode.subprocess.Popen", fake_popen)
@@ -1355,6 +1365,8 @@ def test_node_run_supervises_child_with_pidfd_and_records_exact_exit(
 
     assert observed["child_command"][-1] == "literal;$(touch BAD)"
     assert observed["child_environment"] == {"ILVR_MACHINE_RANK": "0"}
+    assert observed["stdout_path"] == attempt / "stdout-rank0.log"
+    assert observed["stderr_path"] == attempt / "stderr-rank0.log"
     assert observed["ownership"]["pid"] == 4312
     assert observed["ownership"]["process_start_ticks"] == 9981
     assert observed["ownership"]["command_digest"] == canonical_command_digest(
@@ -1363,6 +1375,130 @@ def test_node_run_supervises_child_with_pidfd_and_records_exact_exit(
     assert forwarded == [(child_pidfd, signal.SIGTERM)]
     assert json.loads(exit_path.read_text(encoding="utf-8"))["exit_code"] == 7
     assert stat.S_IMODE(ownership_path.stat().st_mode) == 0o600
+
+
+def test_node_run_retains_pre_training_traceback_without_a_shell(tmp_path, monkeypatch):
+    """Catches Accelerate/import failures disappearing with the tmux pane."""
+    repository = tmp_path / "repository"
+    run_id = "stage2-full-zero1-traceback"
+    attempt = repository / "logs/multinode" / run_id / "initial"
+    attempt.mkdir(parents=True)
+    ownership_path = attempt / "ownership-rank1.json"
+    exit_path = attempt / "exit-rank1.json"
+    environment = {"PATH": os.environ["PATH"]}
+    command = (
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+        "-c",
+        "raise RuntimeError('pre-src-main-causal')",
+    )
+    supervisor_argv = (
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+        "-m",
+        "src.multinode",
+        "node-run",
+        "--run-id",
+        run_id,
+        "--attempt-id",
+        "initial",
+        "--machine-rank",
+        "1",
+        "--commit",
+        "b" * 40,
+        "--ownership-path",
+        str(ownership_path),
+        "--exit-path",
+        str(exit_path),
+        "--env",
+        f"PATH={environment['PATH']}",
+        "--",
+        *command,
+    )
+    monkeypatch.setattr("src.multinode._REPOSITORY_ROOT", repository)
+    monkeypatch.setattr("src.multinode.sys.orig_argv", list(supervisor_argv))
+    monkeypatch.setattr("src.multinode.os.environ", environment)
+
+    from src.multinode import _node_run
+
+    assert _node_run(list(supervisor_argv[4:])) == 1
+    assert (attempt / "stdout-rank1.log").read_bytes() == b""
+    stderr = (attempt / "stderr-rank1.log").read_text(encoding="utf-8")
+    assert "RuntimeError: pre-src-main-causal" in stderr
+    assert stat.S_IMODE((attempt / "stderr-rank1.log").stat().st_mode) == 0o600
+    assert json.loads(exit_path.read_text(encoding="utf-8"))["exit_code"] == 1
+
+
+def test_node_run_rejects_foreign_control_paths_before_creating_logs(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    foreign = tmp_path / "foreign"
+    argv = [
+        "--run-id",
+        "stage2-full-zero1-traceback",
+        "--attempt-id",
+        "initial",
+        "--machine-rank",
+        "0",
+        "--commit",
+        "c" * 40,
+        "--ownership-path",
+        str(foreign / "ownership-rank0.json"),
+        "--exit-path",
+        str(foreign / "exit-rank0.json"),
+        "--",
+        "/usr/bin/false",
+    ]
+    monkeypatch.setattr("src.multinode._REPOSITORY_ROOT", repository)
+
+    from src.multinode import _node_run
+
+    with pytest.raises(ValueError, match="canonical attempt directory"):
+        _node_run(argv)
+    assert not foreign.exists()
+
+
+def test_node_run_never_overwrites_an_existing_rank_log(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    run_id = "stage2-full-zero1-collision"
+    attempt = repository / "logs/multinode" / run_id / "initial"
+    attempt.mkdir(parents=True)
+    stdout_path = attempt / "stdout-rank0.log"
+    stdout_path.write_bytes(b"preserve-existing-log")
+    ownership_path = attempt / "ownership-rank0.json"
+    exit_path = attempt / "exit-rank0.json"
+    environment = {"PATH": os.environ["PATH"]}
+    supervisor_argv = (
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+        "-m",
+        "src.multinode",
+        "node-run",
+        "--run-id",
+        run_id,
+        "--attempt-id",
+        "initial",
+        "--machine-rank",
+        "0",
+        "--commit",
+        "d" * 40,
+        "--ownership-path",
+        str(ownership_path),
+        "--exit-path",
+        str(exit_path),
+        "--env",
+        f"PATH={environment['PATH']}",
+        "--",
+        "/usr/bin/false",
+    )
+    monkeypatch.setattr("src.multinode._REPOSITORY_ROOT", repository)
+    monkeypatch.setattr("src.multinode.sys.orig_argv", list(supervisor_argv))
+    monkeypatch.setattr("src.multinode.os.environ", environment)
+
+    from src.multinode import _node_run
+
+    with pytest.raises(FileExistsError):
+        _node_run(list(supervisor_argv[4:]))
+    assert stdout_path.read_bytes() == b"preserve-existing-log"
+    assert not ownership_path.exists()
 
 
 class FakeCommandRunner:
