@@ -79,7 +79,6 @@ def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPa
         "benchmark_run_config",
         "benchmark_evidence_path",
         "benchmark_smoke_resume_witness",
-        "training_evidence_path",
     ):
         value = getattr(args, attribute, None)
         if value is not None:
@@ -88,6 +87,13 @@ def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPa
                 raise ValueError(
                     f"{attribute} must use result experiment ID {experiment_id}"
                 )
+    training_evidence = getattr(args, "training_evidence_path", None)
+    if training_evidence is not None:
+        result = require_canonical_artifact_path(training_evidence, kind="result")
+        if result.parent.name != experiment_id:
+            raise ValueError(
+                f"training_evidence_path must use result experiment ID {experiment_id}"
+            )
     return paths
 
 
