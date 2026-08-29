@@ -875,7 +875,12 @@ def test_pull_selects_only_local_process_ranks_and_common_metadata(tmp_path):
     selected = select_resume_entries(combined)
     assert {item.process_rank for item in selected} == {None, 2, 3}
     command = build_pull_command(combined, tmp_path / "checkpoint-copy")
-    assert command[-2].startswith("korea@10.1.102.41:")
+    assert command[command.index("--rsync-path") + 1] == (
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
+    )
+    assert command[-2].startswith(
+        "korea@10.1.102.41:/root/workspace/ILVR/checkpoints/"
+    )
     assert command[-1] == f"{tmp_path}/checkpoint-copy/"
     assert "--checksum" not in command
 

@@ -1644,7 +1644,7 @@ def build_pull_command(
     """Build a canonical-owner-to-local rsync argv for resume artifacts."""
     _validate_run_id(manifest.run_id)
     source = (
-        _REMOTE_HOST_REPOSITORY
+        _LOCAL_REPOSITORY
         / "checkpoints"
         / manifest.run_id
         / manifest.checkpoint_relative
@@ -1659,8 +1659,12 @@ def build_pull_command(
         if files_from is not None
         else _files_from_path(manifest, "pull")
     )
+    prefix = _rsync_prefix(list_path)
     return (
-        *_rsync_prefix(list_path),
+        *prefix[:-1],
+        "--rsync-path",
+        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "--",
         f"{_REMOTE_HOST}:{source}/",
         f"{local_destination}/",
     )
