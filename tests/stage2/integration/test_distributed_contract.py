@@ -100,6 +100,37 @@ def test_stage2_producer_evidence_requires_observed_finite_values_on_all_ranks(
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("schema_version", True),
+        ("world_size", 4.0),
+        ("process_ranks", [0.0, 1, 2, 3]),
+        ("global_step", 3.0),
+        ("finite_gradient", 1),
+    ),
+)
+def test_stage2_producer_decoder_rejects_top_level_bool_float_aliases(
+    tmp_path, field, replacement
+):
+    checkpoint = tmp_path / "checkpoints" / "stage2-run" / "checkpoint-3"
+    checkpoint.mkdir(parents=True)
+    payload = build_stage2_producer_evidence(
+        run_id="stage2-run", method="dora", zero_stage=3,
+        checkpoint_path=checkpoint, artifact_kind="peft",
+        rank_records=[_producer_rank(rank) for rank in range(4)],
+    )
+    payload[field] = replacement
+
+    with pytest.raises(ValueError, match="Stage 2 producer"):
+        decode_stage2_producer_evidence(
+            json.dumps(payload).encode("utf-8"),
+            expected_run_id="stage2-run", expected_method="dora",
+            expected_zero_stage=3, expected_checkpoint=checkpoint,
+            expected_global_step=3,
+        )
+
+
 def test_stage2_producer_publication_propagates_either_node_writer_failure(tmp_path):
     """Catches ranks claiming success when either machine-local leader fails."""
     checkpoint = tmp_path / "checkpoints" / "stage2-run" / "checkpoint-3"

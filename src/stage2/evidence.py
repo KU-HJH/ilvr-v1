@@ -56,6 +56,30 @@ def _finite_number(value: object) -> bool:
     )
 
 
+def _validate_decoded_types(payload: dict[str, object]) -> None:
+    """Reject JSON scalar aliases before equality-based reconstruction."""
+    if (
+        type(payload["schema_version"]) is not int
+        or type(payload["kind"]) is not str
+        or type(payload["run_id"]) is not str
+        or type(payload["stage"]) is not str
+        or type(payload["method"]) is not str
+        or type(payload["zero_stage"]) is not int
+        or type(payload["world_size"]) is not int
+        or type(payload["process_ranks"]) is not list
+        or any(type(rank) is not int for rank in payload["process_ranks"])
+        or type(payload["global_step"]) is not int
+        or type(payload["optimizer_step"]) is not int
+        or type(payload["checkpoint_path"]) is not str
+        or type(payload["artifact_kind"]) is not str
+        or type(payload["finite_loss"]) is not bool
+        or type(payload["finite_gradient"]) is not bool
+        or type(payload["worker_errors"]) is not list
+        or type(payload["ranks"]) is not list
+    ):
+        raise ValueError("Stage 2 producer evidence types are invalid")
+
+
 def _validate_identity(
     *,
     run_id: object,
@@ -177,6 +201,7 @@ def decode_stage2_producer_evidence(
         raise ValueError("Stage 2 producer evidence is invalid JSON") from error
     if type(payload) is not dict or set(payload) != _EVIDENCE_FIELDS:
         raise ValueError("Stage 2 producer evidence fields are invalid")
+    _validate_decoded_types(payload)
     rebuilt = build_stage2_producer_evidence(
         run_id=payload["run_id"],
         method=payload["method"],

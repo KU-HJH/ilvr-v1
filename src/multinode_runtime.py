@@ -2026,11 +2026,22 @@ class SubprocessCoordinatorRunner:
         )
         if machine_rank == self.plan.cluster.local_rank:
             return _read_regular_file(path, maximum_size=1024 * 1024)
+        repository = _REPOSITORY_ROOT
         completed = self._run(
-            self._internal_command(
-                machine_rank,
-                "lifecycle-evidence-show",
-                ("--run-id", self.plan.run_id, "--phase", phase),
+            build_remote_exec(
+                (
+                    "env",
+                    f"PYTHONPATH={repository}",
+                    str(repository / "venv/ilvr-venv/bin/python"),
+                    "-m",
+                    "src.multinode",
+                    "lifecycle-evidence-show",
+                    "--run-id",
+                    self.plan.run_id,
+                    "--phase",
+                    phase,
+                ),
+                working_directory=repository,
             )
         )
         raw = completed.stdout.encode("utf-8")
@@ -3244,10 +3255,19 @@ class PreflightCommands:
     local_node_info: tuple[str, ...]
 
 
-def build_remote_exec(argv: Sequence[str]) -> list[str]:
+def build_remote_exec(
+    argv: Sequence[str], *, working_directory: str | Path | None = None
+) -> list[str]:
     """Build the fixed, noninteractive remote container command safely."""
+    docker = ["/usr/bin/docker", "exec"]
+    if working_directory is not None:
+        directory = Path(working_directory)
+        if directory != _REPOSITORY_ROOT:
+            raise ValueError("remote container working directory must be canonical")
+        docker.extend(("--workdir", str(directory)))
+    docker.extend((_REMOTE_CONTAINER, "/usr/bin/bash", "-lc", shlex.join(argv)))
     remote_command = shlex.join(
-        ("/usr/bin/docker", "exec", _REMOTE_CONTAINER, "/usr/bin/bash", "-lc", shlex.join(argv))
+        docker
     )
     return [
         "/usr/bin/ssh",

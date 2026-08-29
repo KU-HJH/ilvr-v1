@@ -520,3 +520,173 @@ stored in the repository or result tree.
   leaves the foreign file intact.
 - `git diff --check` passed. Pre-existing untracked `__pycache__` paths were
   preserved. No real SSH, GPU, or training command was run.
+
+## Fix round 3: strict types, pinned checkpoint root, atomic rollback capture
+
+The round-2 review found five remaining contract gaps. This round used focused
+causal tests for each one and made only the corresponding evidence decoder,
+validator publication/snapshot, and fixed remote-read command changes.
+
+### RED evidence
+
+The two raw-evidence decoders and result validator were first exercised with
+boolean/float aliases in top-level identities, rank lists, finite flags, and a
+nested matrix case exit code:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_lifecycle_matrix.py::test_lifecycle_phase_decoder_rejects_top_level_bool_float_aliases \
+  tests/stage2/integration/test_distributed_contract.py::test_stage2_producer_decoder_rejects_top_level_bool_float_aliases \
+  tests/multinode/test_result_validation.py::test_validate_results_rejects_bool_or_float_identity_types
+```
+
+```text
+11 failed, 4 passed in 2.50s
+```
+
+All 11 failures were equality-compatible JSON aliases accepted by the old
+decoders. Exact `type(...) is ...` checks were added before reconstruction,
+including both completion-case and raw-case exit-code containers and values.
+
+The checkpoint-root regression retargeted the documented logical symlink after
+its first resolution. Before the fix, later run snapshots followed the new
+target:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_result_validation.py::test_validate_results_pins_checkpoint_root_once_before_symlink_retarget
+```
+
+```text
+1 failed in 3.05s
+```
+
+Two publication causals then reproduced the rollback bugs. One swapped a
+same-byte foreign inode immediately after the old identity `stat`; the old
+rollback unlinked that foreign file. The other failed the first parent-directory
+`fsync` after the manifest link; the linked manifest remained because ownership
+had not yet returned to the caller.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_result_validation.py::test_rollback_does_not_unlink_foreign_swap_after_identity_check \
+  tests/multinode/test_result_validation.py::test_parent_fsync_failure_after_link_rolls_back_created_output
+```
+
+```text
+2 failed in 2.92s
+```
+
+Finally, the fake runner inspected the complete production remote argv. It
+showed that the bounded lifecycle evidence read lacked a fixed container
+working directory and explicit repository `PYTHONPATH`:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_lifecycle_matrix.py::test_remote_phase_evidence_uses_only_the_fixed_bounded_node_cli
+```
+
+```text
+1 failed in 0.07s
+```
+
+### GREEN evidence
+
+The strict-type selection passed 16/16 after exact top-level and nested type
+checks. The checkpoint retarget test passed 1/1 after resolving the fixed
+logical root once, retaining that physical root descriptor across the whole
+validation transaction, and opening all 27 run directories fd-relative.
+
+Publication now returns ownership immediately after the exclusive link. Temp
+cleanup and parent sync happen only after the caller stores that ownership.
+Rollback retains the already trusted parent fd and uses Linux
+`renameat2(RENAME_NOREPLACE)` to atomically capture the current destination
+before inspecting its inode. An owned capture is removed; a foreign capture is
+restored without replacing any concurrently created destination. This is a
+rename-capture protocol, not a claim that Linux provides conditional pathname
+unlink. The five focused existing/new publication tests passed:
+
+```text
+5 passed in 2.99s
+```
+
+The remote lifecycle evidence command now has exactly this nested boundary:
+
+```text
+/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/bash -lc \
+  "env PYTHONPATH=/root/workspace/ILVR \
+   /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode \
+   lifecycle-evidence-show --run-id <fixed-child-id> --phase <initial|resume>"
+```
+
+The exact argv causal and the unchanged generic remote quoting test passed 2/2.
+
+Final focused Task 10 suites:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_lifecycle_matrix.py \
+  tests/multinode/test_result_validation.py \
+  tests/stage1/test_distributed_smoke.py \
+  tests/stage2/integration/test_distributed_contract.py
+```
+
+```text
+127 passed, 6 skipped in 10.55s
+```
+
+The skips remain only the opt-in real distributed/GPU executions. Affected
+Task 5/6/capacity/preflight suites passed:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_coordinator.py \
+  tests/multinode/test_artifacts.py \
+  tests/multinode/test_capacity.py \
+  tests/multinode/test_preflight.py
+```
+
+```text
+237 passed in 4.27s
+```
+
+The affected Stage 2 checkpoint suite, with the repository's documented
+trailing-`+` interpreter normalization, passed `139 passed in 4.73s`.
+
+Wrapper syntax/help and in-memory dry-run inspection also passed:
+
+```text
+wrapper: syntax/help ok; 18 plans; ports 29700..29717;
+initial/redistribute/resume; no result root
+```
+
+### Round-3 self-review
+
+- Raw lifecycle and Stage 2 producer decoders reject boolean/float aliases
+  before equality-based reconstruction; rank record builders retain their exact
+  nested integer and finite-number checks.
+- Completion-case and raw case exit maps require exact containers, exact keys,
+  exact lengths, and exact integer exit values.
+- The checkpoint physical root is resolved and opened once before any evidence
+  snapshot and remains pinned until validation finishes; every run/checkpoint
+  descendant is traversed only relative to retained no-follow descriptors.
+- Publication ownership includes the created device/inode and retained parent
+  descriptor before any parent sync can fail. Rollback never uses the old
+  stat-then-unlink decision and preserves foreign replacements.
+- The only changed remote command is the fixed lifecycle evidence read. Other
+  existing remote commands retain their established argv, as confirmed by the
+  affected preflight/coordinator suites.
+- `git diff --check` passed. Pre-existing untracked `__pycache__` paths were
+  preserved. No SSH, Docker, GPU, tmux, rsync, or real training command ran.

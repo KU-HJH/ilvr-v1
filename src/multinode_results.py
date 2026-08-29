@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from contextvars import ContextVar
+import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -39,6 +41,7 @@ _MAX_SMALL_BYTES = 1024 * 1024
 _MAX_SNAPSHOT_ENTRIES = 4096
 _CANONICAL_RESULT_ROOT = Path("/root/workspace/ILVR/results")
 _CANONICAL_CHECKPOINT_ROOT = Path("/root/workspace/ILVR/checkpoints")
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,27 @@ def _snapshot_tree(
         root_descriptor = _open_trusted_directory(root)
     except (OSError, ValueError) as error:
         raise ValueError(f"invalid {description} root") from error
+    try:
+        return _snapshot_open_tree(
+            root_descriptor,
+            root,
+            description=description,
+            capture_bytes=capture_bytes,
+            maximum_depth=maximum_depth,
+        )
+    finally:
+        os.close(root_descriptor)
+
+
+def _snapshot_open_tree(
+    root_descriptor: int,
+    root: Path,
+    *,
+    description: str,
+    capture_bytes: bool,
+    maximum_depth: int = 5,
+) -> _SnapshotState:
+    """Snapshot below one already pinned directory without closing its fd."""
     state = _SnapshotState.empty()
     count = 0
 
@@ -164,37 +188,29 @@ def _snapshot_tree(
                 raise ValueError(f"unsupported child in {description}: {name}")
         state.entries[path] = direct
 
-    try:
-        walk(root_descriptor, root, 0)
-    finally:
-        os.close(root_descriptor)
+    walk(root_descriptor, root, 0)
     return state
 
 
 def _snapshot_checkpoint_run(
-    run_id: str, *, description: str
+    checkpoint_root_descriptor: int, run_id: str, *, description: str
 ) -> _SnapshotState:
-    """Snapshot below the one allowed fixed logical checkpoint-root symlink."""
+    """Open a run fd-relative below the one transaction-pinned physical root."""
     run = _safe_id(run_id, "checkpoint snapshot run ID")
     try:
-        physical_root = _CANONICAL_CHECKPOINT_ROOT.resolve(strict=True)
+        run_descriptor = os.open(run, _DIRECTORY_FLAGS, dir_fd=checkpoint_root_descriptor)
     except OSError as error:
-        raise ValueError("canonical checkpoint root is invalid") from error
+        raise ValueError(f"invalid {description} root") from error
     logical_run = _CANONICAL_CHECKPOINT_ROOT / run
-    physical_run = physical_root / run
-    physical = _snapshot_tree(
-        physical_run, description=description, capture_bytes=False
-    )
-
-    def logical(path: Path) -> Path:
-        relative = path.relative_to(physical_run)
-        return logical_run / relative
-
-    return _SnapshotState(
-        files={logical(path): value for path, value in physical.files.items()},
-        directories={logical(path) for path in physical.directories},
-        entries={logical(path): value for path, value in physical.entries.items()},
-    )
+    try:
+        return _snapshot_open_tree(
+            run_descriptor,
+            logical_run,
+            description=description,
+            capture_bytes=False,
+        )
+    finally:
+        os.close(run_descriptor)
 
 
 @dataclass(frozen=True)
@@ -379,11 +395,15 @@ def _validate_matrix(matrix_root: Path) -> int:
             or summary["main_process_port"] != completion["first_port"] + index
             or type(summary["witness"]) is not str or summary["witness"] != witness_name
             or type(summary["exit_codes"]) is not dict
+            or set(summary["exit_codes"]) != {"initial", "resume"}
+            or any(
+                type(values) is not list or len(values) != 2
+                for values in summary["exit_codes"].values()
+            )
             or summary["exit_codes"] != expected_completion_exits
             or any(
                 type(code) is not int
                 for values in summary["exit_codes"].values()
-                if type(values) is list
                 for code in values
             )
         ):
@@ -420,6 +440,16 @@ def _validate_matrix(matrix_root: Path) -> int:
             or type(witness["redistributed_entries"]) is not int
             or witness["redistributed_entries"] <= 0
             or type(witness["exit_codes"]) is not dict
+            or set(witness["exit_codes"]) != {"initial", "resume"}
+            or any(
+                type(values) is not dict or set(values) != {"0", "1"}
+                for values in witness["exit_codes"].values()
+            )
+            or any(
+                type(code) is not int
+                for values in witness["exit_codes"].values()
+                for code in values.values()
+            )
             or witness["exit_codes"] != expected_phase_exits
         ):
             raise ValueError("matrix case witness identity is invalid")
@@ -888,60 +918,72 @@ def validate_results(
     matrix_root = Path(matrix_root)
     evaluation_root = Path(evaluation_root)
     capacity_root = Path(capacity_root)
-    snapshot = _SnapshotState.empty()
-    matrix_snapshot = _snapshot_tree(matrix_root, description="matrix evidence")
-    evaluation_snapshot = _snapshot_tree(
-        evaluation_root, description="evaluation evidence"
-    )
-    capacity_snapshot = _snapshot_tree(
-        capacity_root, description="capacity evidence"
-    )
-    snapshot.merge(matrix_snapshot)
-    snapshot.merge(evaluation_snapshot)
-    snapshot.merge(capacity_snapshot)
-
-    completion_file = matrix_snapshot.files.get(matrix_root / "matrix-complete.json")
-    if completion_file is None or completion_file.raw is None:
-        raise ValueError("matrix completion is missing from the pinned snapshot")
-    completion = _decode_json(
-        completion_file.raw, description="matrix completion snapshot"
-    )
-    if type(completion) is not dict:
-        raise ValueError("matrix completion snapshot must be an object")
-    parent = _safe_id(completion.get("run_id"), "matrix run ID")
-    for stage, method, zero_stage in _MATRIX_IDENTITIES:
-        child = f"{parent}-{stage}-{method}-zero{zero_stage}"
-        snapshot.merge(_snapshot_tree(
-            _CANONICAL_RESULT_ROOT / child,
-            description=f"matrix raw evidence {child}",
-        ))
-        snapshot.merge(_snapshot_checkpoint_run(
-            child, description=f"matrix checkpoint metadata {child}"
-        ))
-
-    stage2_root = capacity_root / "stage2-batch1"
-    stage2_entries = capacity_snapshot.entries.get(stage2_root)
-    if stage2_entries is None:
-        raise ValueError("Stage 2 batch-1 snapshot is missing")
-    for run_id, kind in stage2_entries.items():
-        _safe_id(run_id, "Stage 2 batch-1 run ID")
-        if kind != "directory":
-            raise ValueError("Stage 2 batch-1 snapshot child is invalid")
-        snapshot.merge(_snapshot_checkpoint_run(
-            run_id, description=f"Stage 2 checkpoint metadata {run_id}"
-        ))
-
-    token = _ACTIVE_SNAPSHOT.set(snapshot)
     try:
-        stage1, stage2 = _validate_capacity(capacity_root)
-        return ValidationReport(
-            matrix_cases=_validate_matrix(matrix_root),
-            evaluation_samples=_validate_evaluation(evaluation_root),
-            stage1_recommendations=stage1,
-            stage2_recommendations=stage2,
+        physical_checkpoint_root = _CANONICAL_CHECKPOINT_ROOT.resolve(strict=True)
+        checkpoint_root_descriptor = _open_trusted_directory(physical_checkpoint_root)
+    except (OSError, ValueError) as error:
+        raise ValueError("invalid canonical checkpoint root") from error
+    try:
+        snapshot = _SnapshotState.empty()
+        matrix_snapshot = _snapshot_tree(matrix_root, description="matrix evidence")
+        evaluation_snapshot = _snapshot_tree(
+            evaluation_root, description="evaluation evidence"
         )
+        capacity_snapshot = _snapshot_tree(
+            capacity_root, description="capacity evidence"
+        )
+        snapshot.merge(matrix_snapshot)
+        snapshot.merge(evaluation_snapshot)
+        snapshot.merge(capacity_snapshot)
+
+        completion_file = matrix_snapshot.files.get(matrix_root / "matrix-complete.json")
+        if completion_file is None or completion_file.raw is None:
+            raise ValueError("matrix completion is missing from the pinned snapshot")
+        completion = _decode_json(
+            completion_file.raw, description="matrix completion snapshot"
+        )
+        if type(completion) is not dict:
+            raise ValueError("matrix completion snapshot must be an object")
+        parent = _safe_id(completion.get("run_id"), "matrix run ID")
+        for stage, method, zero_stage in _MATRIX_IDENTITIES:
+            child = f"{parent}-{stage}-{method}-zero{zero_stage}"
+            snapshot.merge(_snapshot_tree(
+                _CANONICAL_RESULT_ROOT / child,
+                description=f"matrix raw evidence {child}",
+            ))
+            snapshot.merge(_snapshot_checkpoint_run(
+                checkpoint_root_descriptor,
+                child,
+                description=f"matrix checkpoint metadata {child}",
+            ))
+
+        stage2_root = capacity_root / "stage2-batch1"
+        stage2_entries = capacity_snapshot.entries.get(stage2_root)
+        if stage2_entries is None:
+            raise ValueError("Stage 2 batch-1 snapshot is missing")
+        for run_id, kind in stage2_entries.items():
+            _safe_id(run_id, "Stage 2 batch-1 run ID")
+            if kind != "directory":
+                raise ValueError("Stage 2 batch-1 snapshot child is invalid")
+            snapshot.merge(_snapshot_checkpoint_run(
+                checkpoint_root_descriptor,
+                run_id,
+                description=f"Stage 2 checkpoint metadata {run_id}",
+            ))
+
+        token = _ACTIVE_SNAPSHOT.set(snapshot)
+        try:
+            stage1, stage2 = _validate_capacity(capacity_root)
+            return ValidationReport(
+                matrix_cases=_validate_matrix(matrix_root),
+                evaluation_samples=_validate_evaluation(evaluation_root),
+                stage1_recommendations=stage1,
+                stage2_recommendations=stage2,
+            )
+        finally:
+            _ACTIVE_SNAPSHOT.reset(token)
     finally:
-        _ACTIVE_SNAPSHOT.reset(token)
+        os.close(checkpoint_root_descriptor)
 
 
 def _report_payload(report: ValidationReport) -> dict[str, object]:
@@ -983,16 +1025,50 @@ class _PublishedOutput:
     path: Path
     device: int
     inode: int
+    parent_descriptor: int
+    temporary_name: str
+
+
+def _rename_noreplace(
+    source_descriptor: int,
+    source_name: str,
+    destination_descriptor: int,
+    destination_name: str,
+) -> None:
+    """Use Linux renameat2 so rollback never overwrites a concurrent name."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_descriptor,
+        os.fsencode(source_name),
+        destination_descriptor,
+        os.fsencode(destination_name),
+        1,  # RENAME_NOREPLACE
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), source_name)
 
 
 def _publish_output_bytes_no_replace(
     path: str | Path, payload: bytes
 ) -> _PublishedOutput:
-    """Atomically link prepared bytes and retain the created inode identity."""
+    """Link prepared bytes and immediately return retained publication ownership."""
     destination = Path(path)
     parent = _open_trusted_directory(destination.parent, create=True)
     temporary = f".{destination.name}.{secrets.token_hex(12)}.tmp"
     descriptor: int | None = None
+    linked = False
     try:
         descriptor = os.open(
             temporary,
@@ -1019,38 +1095,76 @@ def _publish_output_bytes_no_replace(
             raise FileExistsError(
                 f"refusing to replace validation output: {destination}"
             ) from error
-        os.fsync(parent)
-        return _PublishedOutput(destination, identity.st_dev, identity.st_ino)
+        linked = True
+        return _PublishedOutput(
+            destination, identity.st_dev, identity.st_ino, parent, temporary
+        )
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        try:
-            os.unlink(temporary, dir_fd=parent)
-        except FileNotFoundError:
-            pass
-        os.close(parent)
+        if not linked:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+            os.close(parent)
+
+
+def _finish_published(output: _PublishedOutput) -> None:
+    """Remove the preparation link and durably sync an already-owned output."""
+    os.unlink(output.temporary_name, dir_fd=output.parent_descriptor)
+    os.fsync(output.parent_descriptor)
+
+
+def _close_published(output: _PublishedOutput | None) -> None:
+    if output is not None:
+        os.close(output.parent_descriptor)
 
 
 def _rollback_published(output: _PublishedOutput | None) -> None:
-    """Unlink only the same inode this invocation linked into the destination."""
+    """Atomically capture the destination, then remove only the owned inode."""
     if output is None:
         return
+    capture = f".{output.path.name}.{secrets.token_hex(12)}.rollback"
     try:
-        descriptor = _open_trusted_directory(output.path.parent)
+        # This observation is only a fast diagnostic; it never authorizes unlink.
+        # The following no-replace rename atomically captures the current name.
         try:
-            observed = os.stat(
-                output.path.name, dir_fd=descriptor, follow_symlinks=False
+            os.stat(
+                output.path.name,
+                dir_fd=output.parent_descriptor,
+                follow_symlinks=False,
             )
-            if (
-                not stat.S_ISREG(observed.st_mode)
-                or observed.st_dev != output.device
-                or observed.st_ino != output.inode
-            ):
-                return
-            os.unlink(output.path.name, dir_fd=descriptor)
-        finally:
-            os.close(descriptor)
-    except (OSError, ValueError):
+        except FileNotFoundError:
+            return
+        _rename_noreplace(
+            output.parent_descriptor,
+            output.path.name,
+            output.parent_descriptor,
+            capture,
+        )
+        observed = os.stat(
+            capture, dir_fd=output.parent_descriptor, follow_symlinks=False
+        )
+        if (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_dev == output.device
+            and observed.st_ino == output.inode
+        ):
+            os.unlink(capture, dir_fd=output.parent_descriptor)
+        else:
+            try:
+                _rename_noreplace(
+                    output.parent_descriptor,
+                    capture,
+                    output.parent_descriptor,
+                    output.path.name,
+                )
+            except FileExistsError:
+                # Preserve both foreign objects rather than delete either one.
+                pass
+        os.fsync(output.parent_descriptor)
+    except OSError:
         return
 
 
@@ -1074,11 +1188,16 @@ def publish_validation_outputs(
     summary_created: _PublishedOutput | None = None
     try:
         manifest_created = _publish_output_bytes_no_replace(manifest, manifest_bytes)
+        _finish_published(manifest_created)
         summary_created = _publish_output_bytes_no_replace(summary, summary_bytes)
+        _finish_published(summary_created)
     except BaseException:
         _rollback_published(summary_created)
         _rollback_published(manifest_created)
         raise
+    finally:
+        _close_published(summary_created)
+        _close_published(manifest_created)
 
 
 def validate_results_main(argv: Sequence[str]) -> int:

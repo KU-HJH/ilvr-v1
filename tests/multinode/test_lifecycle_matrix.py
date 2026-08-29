@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shlex
 import subprocess
 
 import pytest
@@ -12,7 +13,10 @@ from src.multinode import (
     build_lifecycle_plans,
     run_lifecycle_matrix,
 )
-from src.multinode_evidence import build_lifecycle_phase_evidence
+from src.multinode_evidence import (
+    build_lifecycle_phase_evidence,
+    decode_lifecycle_phase_evidence,
+)
 from src.multinode_runtime import (
     SubprocessCoordinatorRunner,
     build_owned_lifecycle_harness_commands,
@@ -188,6 +192,37 @@ def _phase_bytes(plan, phase, *, gradient):
     ), sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("schema_version", True),
+        ("world_size", 4.0),
+        ("process_ranks", [False, 1, 2, 3]),
+        ("global_step", 2.0),
+        ("finite_loss", 1),
+    ),
+)
+def test_lifecycle_phase_decoder_rejects_top_level_bool_float_aliases(
+    tmp_path, field, replacement
+):
+    plan = build_lifecycle_plans(
+        parent_run_id="matrix-parent", first_port=29700,
+        result_root=tmp_path / "results", python_executable="/repo/python",
+        commit="a" * 40,
+        config_digests={1: "a" * 64, 2: "a" * 64, 3: "a" * 64},
+    )[0]
+    payload = json.loads(_phase_bytes(plan, "initial", gradient=1.0))
+    payload[field] = replacement
+
+    with pytest.raises(ValueError, match="lifecycle phase"):
+        decode_lifecycle_phase_evidence(
+            json.dumps(payload).encode("utf-8"),
+            phase="initial", stage="stage1", method="full", zero_stage=1,
+            config_digest="a" * 64, experiment_id=plan.child_run_id,
+            checkpoint_path=plan.checkpoint_path,
+        )
+
+
 def test_resume_never_starts_when_checkpoint_redistribution_fails(tmp_path, monkeypatch):
     """Catches local ranks 2/3 loading before their loader artifacts arrive."""
     plan = build_lifecycle_plans(
@@ -277,11 +312,23 @@ def test_remote_phase_evidence_uses_only_the_fixed_bounded_node_cli(tmp_path):
         command_runner=command_runner,
     )
     assert runner.read_lifecycle_phase_evidence(0, "initial") == expected
-    display = " ".join(calls[0][0])
-    assert "lifecycle-evidence-show" in display
-    assert f"--run-id {plan.child_run_id}" in display
-    assert "--phase initial" in display
-    assert "--path" not in display and "--witness" not in display
+    assert calls[0][0][:6] == (
+        "/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+        "korea@10.1.102.41",
+    )
+    assert len(calls[0][0]) == 7
+    remote = shlex.split(calls[0][0][6])
+    assert remote[:7] == [
+        "/usr/bin/docker", "exec", "--workdir", "/root/workspace/ILVR",
+        "llm_kd", "/usr/bin/bash", "-lc",
+    ]
+    assert len(remote) == 8
+    assert shlex.split(remote[7]) == [
+        "env", "PYTHONPATH=/root/workspace/ILVR",
+        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "-m", "src.multinode", "lifecycle-evidence-show",
+        "--run-id", plan.child_run_id, "--phase", "initial",
+    ]
     assert calls[0][2] == 30
 
 

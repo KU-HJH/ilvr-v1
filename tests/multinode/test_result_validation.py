@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import stat
 
 import pytest
 
@@ -308,6 +310,8 @@ def test_descriptor_bound_reader_rejects_final_component_swap(tmp_path):
         ("completion-zero", True),
         ("case-machine-ranks", [0.0, 1]),
         ("case-attempt-from-step", False),
+        ("completion-case-exit-code", False),
+        ("case-exit-code", False),
         ("sidecar-source-indices", [False]),
     ),
 )
@@ -327,6 +331,14 @@ def test_validate_results_rejects_bool_or_float_identity_types(
         path = matrix / "matrix-parent-stage1-full-zero1.json"
         payload = json.loads(path.read_text())
         payload["attempts"][0]["from_step"] = replacement
+    elif target == "completion-case-exit-code":
+        path = matrix / "matrix-complete.json"
+        payload = json.loads(path.read_text())
+        payload["cases"][0]["exit_codes"]["initial"][0] = replacement
+    elif target == "case-exit-code":
+        path = matrix / "matrix-parent-stage1-full-zero1.json"
+        payload = json.loads(path.read_text())
+        payload["exit_codes"]["initial"]["0"] = replacement
     else:
         path = evaluation / "shard-0.jsonl.manifest.json"
         payload = json.loads(path.read_text())
@@ -421,6 +433,36 @@ def test_validate_results_allows_only_the_fixed_checkpoint_root_symlink(tmp_path
     assert report.matrix_cases == 18
 
 
+def test_validate_results_pins_checkpoint_root_once_before_symlink_retarget(
+    tmp_path, monkeypatch
+):
+    """Catches later run snapshots following a retargeted logical root."""
+    matrix, evaluation, capacity = _valid_roots(tmp_path)
+    logical = results_module._CANONICAL_CHECKPOINT_ROOT
+    physical_a = tmp_path / "physical-checkpoints-a"
+    physical_b = tmp_path / "physical-checkpoints-b"
+    logical.rename(physical_a)
+    physical_b.mkdir()
+    logical.symlink_to(physical_a, target_is_directory=True)
+    real_resolve = Path.resolve
+    root_resolves = 0
+
+    def resolve_then_retarget(self, strict=False):
+        nonlocal root_resolves
+        resolved = real_resolve(self, strict=strict)
+        if self == logical:
+            root_resolves += 1
+            if root_resolves == 1:
+                logical.unlink()
+                logical.symlink_to(physical_b, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", resolve_then_retarget)
+    report = validate_results(matrix, evaluation, capacity)
+    assert report.matrix_cases == 18
+    assert root_resolves == 1
+
+
 def test_publish_validation_outputs_writes_matching_tables_exclusively(tmp_path):
     report = validate_results(*_valid_roots(tmp_path))
     manifest = tmp_path / "report.json"
@@ -481,4 +523,69 @@ def test_rollback_preserves_same_byte_foreign_inode_after_destination_swap(
         publish_validation_outputs(report, manifest, summary)
     assert manifest.exists()
     assert manifest.read_bytes() == displaced.read_bytes()
+    assert not summary.exists()
+
+
+def test_rollback_does_not_unlink_foreign_swap_after_identity_check(
+    tmp_path, monkeypatch
+):
+    report = validate_results(*_valid_roots(tmp_path))
+    manifest = tmp_path / "report.json"
+    summary = tmp_path / "report.md"
+    displaced = tmp_path / "displaced-owned.json"
+    original_publish = results_module._publish_output_bytes_no_replace
+    real_stat = results_module.os.stat
+    swap_triggered = False
+
+    def fail_summary(path, payload):
+        if Path(path) == summary:
+            raise OSError("simulated Markdown publication failure")
+        return original_publish(path, payload)
+
+    def swap_after_owned_stat(path, *args, **kwargs):
+        nonlocal swap_triggered
+        observed = real_stat(path, *args, **kwargs)
+        if (
+            not swap_triggered
+            and path == manifest.name
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+        ):
+            foreign_bytes = manifest.read_bytes()
+            manifest.rename(displaced)
+            manifest.write_bytes(foreign_bytes)
+            swap_triggered = True
+        return observed
+
+    monkeypatch.setattr(results_module, "_publish_output_bytes_no_replace", fail_summary)
+    monkeypatch.setattr(results_module.os, "stat", swap_after_owned_stat)
+    with pytest.raises(OSError, match="Markdown"):
+        publish_validation_outputs(report, manifest, summary)
+    assert swap_triggered is True
+    assert manifest.exists()
+    assert manifest.read_bytes() == displaced.read_bytes()
+    assert not summary.exists()
+
+
+def test_parent_fsync_failure_after_link_rolls_back_created_output(
+    tmp_path, monkeypatch
+):
+    report = validate_results(*_valid_roots(tmp_path))
+    manifest = tmp_path / "report.json"
+    summary = tmp_path / "report.md"
+    real_fsync = results_module.os.fsync
+    failed = False
+
+    def fail_first_parent_fsync(descriptor):
+        nonlocal failed
+        if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError("simulated parent fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(results_module.os, "fsync", fail_first_parent_fsync)
+    with pytest.raises(OSError, match="parent fsync"):
+        publish_validation_outputs(report, manifest, summary)
+    assert failed is True
+    assert not manifest.exists()
     assert not summary.exists()
