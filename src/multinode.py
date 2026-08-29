@@ -470,8 +470,7 @@ def run_lifecycle_matrix(
         )
     if os.path.lexists(completion_path):
         raise FileExistsError(f"matrix completion must be fresh: {completion_path}")
-    source_repository = Path(__file__).resolve().parents[1]
-    commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=source_repository)
+    commit = _repository_git_stdout(("rev-parse", "HEAD"))
     digests = {
         stage: load_deepspeed_runtime_profile(
             canonical_deepspeed_config_path(stage), world_size=4
@@ -785,9 +784,9 @@ def _node_info(args: argparse.Namespace) -> NodeSnapshot:
         expected_digest=args.deepspeed_config_digest,
     )
 
-    commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=repository)
-    tracked_clean = not _command_stdout(
-        ("git", "status", "--porcelain", "--untracked-files=no"), cwd=repository
+    commit = _repository_git_stdout(("rev-parse", "HEAD"))
+    tracked_clean = not _repository_git_stdout(
+        ("status", "--porcelain", "--untracked-files=no")
     )
     interface = _interface_name()
     input_paths = tuple(Path(path) for path in args.input_path)
@@ -857,6 +856,21 @@ def _command_stdout(command: tuple[str, ...], *, cwd: Path) -> str:
     if completed.returncode != 0:
         raise RuntimeError(f"command failed: {' '.join(command)}")
     return completed.stdout.strip()
+
+
+def _repository_git_stdout(arguments: tuple[str, ...]) -> str:
+    """Run Git only against the fixed canonical repository."""
+    return _command_stdout(
+        (
+            "git",
+            "-c",
+            f"safe.directory={_REPOSITORY_ROOT}",
+            "-C",
+            str(_REPOSITORY_ROOT),
+            *arguments,
+        ),
+        cwd=_REPOSITORY_ROOT,
+    )
 
 
 def _interface_name() -> str:
@@ -1541,8 +1555,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             main_process_port=args.main_process_port,
             attempt_id=args.attempt_id,
         )
-        source_repository = Path(__file__).resolve().parents[1]
-        commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=source_repository)
+        commit = _repository_git_stdout(("rev-parse", "HEAD"))
         commands = build_owned_tmux_commands(
             plan,
             commit=commit,
@@ -1762,8 +1775,7 @@ def _prepare_inference_main(argv: list[str]) -> int:
             raise ValueError(
                 "inference destination must belong to the run result tree"
             ) from error
-        source_repository = Path(__file__).resolve().parents[1]
-        commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=source_repository)
+        commit = _repository_git_stdout(("rev-parse", "HEAD"))
         runner = SubprocessCoordinatorRunner(
             plan,
             commands=None,
@@ -1947,8 +1959,7 @@ def _evaluate_main(argv: list[str]) -> int:
                 )
             )
             return 0
-        source_repository = Path(__file__).resolve().parents[1]
-        commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=source_repository)
+        commit = _repository_git_stdout(("rev-parse", "HEAD"))
         runner = EvaluationSubprocessRunner(plan, commit=commit)
         summary = run_evaluation(plan, runner)
     except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:

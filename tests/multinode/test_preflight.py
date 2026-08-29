@@ -1,11 +1,13 @@
 import dataclasses
 import json
+import re
 import shlex
 from pathlib import Path
 import subprocess
 
 import pytest
 
+import src.multinode as multinode
 from src.multinode import build_launch_plan
 from src.multinode_runtime import (
     NodeSnapshot,
@@ -46,6 +48,15 @@ def test_preflight_accepts_symmetric_clean_nodes():
 
     assert report.world_size == 4
     assert report.commit == "a" * 40
+
+
+def test_canonical_git_query_tolerates_different_repository_owner(monkeypatch):
+    """Catches node-info omitting the canonical Git safe-directory argument."""
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+
+    commit = multinode._repository_git_stdout(("rev-parse", "HEAD"))
+
+    assert re.fullmatch(r"[0-9a-f]{40}", commit)
 
 
 def test_preflight_rejects_commit_mismatch_before_launch():
