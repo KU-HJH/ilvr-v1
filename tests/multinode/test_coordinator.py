@@ -1377,6 +1377,20 @@ def test_subprocess_runner_transfers_only_attempt_plan_with_size_and_sha(tmp_pat
     assert str(runner.serialized_plan.size) in transfer_display
     assert runner.serialized_plan.sha256 in transfer_display
     assert not any("rsync" in token or "scp" in token for token in transfer_command[0])
+    for call, subcommand in zip(
+        command_runner.calls, ("prepare-attempt", "receive-plan"), strict=True
+    ):
+        remote = shlex.split(call[0][6])
+        assert remote[remote.index("--workdir") + 1] == "/root/workspace/ILVR"
+        inner = shlex.split(remote[-1])
+        assert inner[:6] == [
+            "/usr/bin/env",
+            "PYTHONPATH=/root/workspace/ILVR",
+            "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+            "-m",
+            "src.multinode",
+            subcommand,
+        ]
 
 
 def test_cleanup_does_not_signal_when_live_ownership_cannot_be_proven(tmp_path):

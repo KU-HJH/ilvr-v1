@@ -1785,17 +1785,11 @@ class SubprocessCoordinatorRunner:
     def _internal_command(
         self, machine_rank: int, subcommand: str, arguments: Sequence[str]
     ) -> tuple[str, ...]:
-        python = (
-            self.plan.cluster.remote_repo_root
-            / "venv"
-            / "ilvr-venv"
-            / "bin"
-            / "python"
-        )
-        return self._node_command(
-            machine_rank,
-            (str(python), "-m", "src.multinode", subcommand, *arguments),
-        )
+        if machine_rank == self.plan.cluster.remote_rank:
+            return _remote_repository_module_command(subcommand, arguments)
+        if machine_rank == self.plan.cluster.local_rank:
+            return _local_repository_module_command(subcommand, arguments)
+        raise ValueError("machine_rank must be 0 or 1")
 
     def _process_snapshot(self, ownership: OwnershipRecord) -> dict[str, object]:
         arguments = ["--pid", str(ownership.pid)]
@@ -1818,40 +1812,31 @@ class SubprocessCoordinatorRunner:
         serialized = serialize_launch_plan(plan, log_root=self.log_root)
         if serialized.size > 1024 * 1024:
             raise ValueError("launch plan exceeds the one-MiB transfer limit")
-        repository_python = (
-            plan.cluster.remote_repo_root / "venv" / "ilvr-venv" / "bin" / "python"
-        )
         self._run(
-            build_remote_exec(
+            _remote_repository_module_command(
+                "prepare-attempt",
                 (
-                    str(repository_python),
-                    "-m",
-                    "src.multinode",
-                    "prepare-attempt",
                     "--log-root",
                     str(self.log_root),
                     "--run-id",
                     plan.run_id,
                     "--attempt-id",
                     plan.attempt_id,
-                )
+                ),
             )
         )
         remote_path = self.log_root / plan.run_id / plan.attempt_id / "launch-plan.json"
         self._run(
-            _build_remote_stdin_exec(
+            _remote_repository_module_stdin_command(
+                "receive-plan",
                 (
-                    str(repository_python),
-                    "-m",
-                    "src.multinode",
-                    "receive-plan",
                     "--path",
                     str(remote_path),
                     "--size",
                     str(serialized.size),
                     "--sha256",
                     serialized.sha256,
-                )
+                ),
             ),
             input_bytes=_read_regular_file(serialized.path),
         )
@@ -1867,17 +1852,7 @@ class SubprocessCoordinatorRunner:
             raise ValueError("runner plan does not match readiness plan")
         commands = self._launch_commands()
         spec = commands.node_specs[0]
-        command = [
-            str(
-                plan.cluster.remote_repo_root
-                / "venv"
-                / "ilvr-venv"
-                / "bin"
-                / "python"
-            ),
-            "-m",
-            "src.multinode",
-            "ownership-ready",
+        arguments = [
             "--ownership-path",
             str(spec.ownership_path),
             "--run-id",
@@ -1896,10 +1871,10 @@ class SubprocessCoordinatorRunner:
             str(plan.main_process_port),
         ]
         for name, value in spec.environment:
-            command.extend(("--env", f"{name}={value}"))
-        command.extend(("--", *spec.command))
+            arguments.extend(("--env", f"{name}={value}"))
+        arguments.extend(("--", *spec.command))
         completed = self.command_runner(
-            build_remote_exec(command),
+            _remote_repository_module_command("ownership-ready", arguments),
             input_bytes=None,
             timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
         )
@@ -2303,18 +2278,7 @@ class SubprocessCoordinatorRunner:
         ).encode("utf-8")
         if len(encoded) > _MAX_TRANSFER_BYTES:
             raise ValueError("artifact destination request exceeds the size limit")
-        python = (
-            self.plan.cluster.remote_repo_root
-            / "venv"
-            / "ilvr-venv"
-            / "bin"
-            / "python"
-        )
-        command = (
-            str(python),
-            "-m",
-            "src.multinode",
-            "artifact-destination-check",
+        arguments = (
             "--run-directory",
             str(destination),
             "--run-id",
@@ -2322,7 +2286,12 @@ class SubprocessCoordinatorRunner:
             "--checkpoint-root",
             str(self.checkpoint_root),
         )
-        self._run(_build_remote_stdin_exec(command), input_bytes=encoded)
+        self._run(
+            _remote_repository_module_stdin_command(
+                "artifact-destination-check", arguments
+            ),
+            input_bytes=encoded,
+        )
 
     def push_artifacts(
         self, manifest: object, entries: Sequence[object]
@@ -2576,11 +2545,11 @@ class EvaluationSubprocessRunner:
         subcommand: str,
         arguments: Sequence[str],
     ) -> tuple[str, ...]:
-        python = _REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"
-        return self._node_command(
-            worker,
-            (str(python), "-m", "src.multinode", subcommand, *arguments),
-        )
+        if worker.assignment.node == "remote":
+            return _remote_repository_module_command(subcommand, arguments)
+        if worker.assignment.node == "local":
+            return _local_repository_module_command(subcommand, arguments)
+        raise ValueError("evaluation worker node is invalid")
 
     def repository_commit(self) -> str:
         return self.commit_value
@@ -2594,21 +2563,17 @@ class EvaluationSubprocessRunner:
             run_id=self.plan.run_id,
             attempt_id=self.plan.attempt_id,
         )
-        python = _REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"
         self._run(
-            build_remote_exec(
+            _remote_repository_module_command(
+                "prepare-attempt",
                 (
-                    str(python),
-                    "-m",
-                    "src.multinode",
-                    "prepare-attempt",
                     "--log-root",
                     str(self.log_root),
                     "--run-id",
                     self.plan.run_id,
                     "--attempt-id",
                     self.plan.attempt_id,
-                )
+                ),
             )
         )
         self._controls_prepared = True
@@ -2624,17 +2589,13 @@ class EvaluationSubprocessRunner:
 
         if plan != self.plan:
             raise ValueError("runner evaluation plan mismatch")
-        python = _REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"
         shown = self._run(
-            build_remote_exec(
+            _remote_repository_module_command(
+                "prepared-inference-show",
                 (
-                    str(python),
-                    "-m",
-                    "src.multinode",
-                    "prepared-inference-show",
                     "--model-dir",
                     str(plan.model_dir),
-                )
+                ),
             )
         )
         try:
@@ -2650,17 +2611,14 @@ class EvaluationSubprocessRunner:
         self._manifest = manifest
         prepare_inference_copy(manifest, plan.local_model_dir, self)
         self._run(
-            build_remote_exec(
+            _remote_repository_module_command(
+                "prepare-evaluation-output",
                 (
-                    str(python),
-                    "-m",
-                    "src.multinode",
-                    "prepare-evaluation-output",
                     "--output-dir",
                     str(plan.output_dir),
                     "--run-id",
                     plan.run_id,
-                )
+                ),
             )
         )
         return manifest
@@ -3565,11 +3523,57 @@ def build_remote_exec(
     ]
 
 
-def _build_remote_stdin_exec(argv: Sequence[str]) -> list[str]:
-    """Build the fixed remote container boundary with stdin attached."""
-    remote_command = shlex.join(
-        ("/usr/bin/docker", "exec", "-i", _REMOTE_CONTAINER, "/usr/bin/bash", "-lc", shlex.join(argv))
+def _repository_module_command(
+    subcommand: str, arguments: Sequence[str] = ()
+) -> tuple[str, ...]:
+    """Build an import-stable command for the fixed canonical repository."""
+    repository = _REPOSITORY_ROOT
+    return (
+        "/usr/bin/env",
+        f"PYTHONPATH={repository}",
+        str(repository / "venv/ilvr-venv/bin/python"),
+        "-m",
+        "src.multinode",
+        subcommand,
+        *arguments,
     )
+
+
+def _local_repository_module_command(
+    subcommand: str, arguments: Sequence[str] = ()
+) -> tuple[str, ...]:
+    repository_command = _repository_module_command(subcommand, arguments)
+    return (
+        repository_command[0],
+        "-C",
+        str(_REPOSITORY_ROOT),
+        *repository_command[1:],
+    )
+
+
+def _remote_repository_module_command(
+    subcommand: str, arguments: Sequence[str] = ()
+) -> tuple[str, ...]:
+    return tuple(
+        build_remote_exec(
+            _repository_module_command(subcommand, arguments),
+            working_directory=_REPOSITORY_ROOT,
+        )
+    )
+
+
+def _build_remote_stdin_exec(
+    argv: Sequence[str], *, working_directory: str | Path | None = None
+) -> list[str]:
+    """Build the fixed remote container boundary with stdin attached."""
+    docker = ["/usr/bin/docker", "exec", "-i"]
+    if working_directory is not None:
+        directory = Path(working_directory)
+        if directory != _REPOSITORY_ROOT:
+            raise ValueError("remote container working directory must be canonical")
+        docker.extend(("--workdir", str(directory)))
+    docker.extend((_REMOTE_CONTAINER, "/usr/bin/bash", "-lc", shlex.join(argv)))
+    remote_command = shlex.join(docker)
     return [
         "/usr/bin/ssh",
         "-o",
@@ -3579,6 +3583,17 @@ def _build_remote_stdin_exec(argv: Sequence[str]) -> list[str]:
         _REMOTE_HOST,
         remote_command,
     ]
+
+
+def _remote_repository_module_stdin_command(
+    subcommand: str, arguments: Sequence[str] = ()
+) -> tuple[str, ...]:
+    return tuple(
+        _build_remote_stdin_exec(
+            _repository_module_command(subcommand, arguments),
+            working_directory=_REPOSITORY_ROOT,
+        )
+    )
 
 
 def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot) -> PreflightReport:
