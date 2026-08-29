@@ -612,6 +612,33 @@ def test_exception_after_successful_rename_never_cleans_final_bundle(
     ] == 18
 
 
+def test_oserror_after_successful_rename_preserves_bundle_and_reports_ambiguity(
+    tmp_path, monkeypatch
+):
+    report = validate_results(*_valid_roots(tmp_path))
+    bundle = tmp_path / "validation-report"
+    real_rename = results_module._rename_noreplace
+
+    def rename_then_error(*args):
+        real_rename(*args)
+        raise OSError("simulated post-rename error")
+
+    monkeypatch.setattr(results_module, "_rename_noreplace", rename_then_error)
+    with pytest.raises(OSError, match="publication.*ambiguous") as caught:
+        publish_validation_outputs(report, bundle)
+
+    assert isinstance(
+        caught.value, results_module.ReportBundlePublicationAmbiguityError
+    )
+    assert {path.name for path in bundle.iterdir()} == {
+        "validation-manifest.json",
+        "validation-summary.md",
+    }
+    assert json.loads((bundle / "validation-manifest.json").read_text())[
+        "matrix_cases"
+    ] == 18
+
+
 def test_foreign_independent_output_names_are_not_part_of_bundle_protocol(tmp_path):
     report = validate_results(*_valid_roots(tmp_path))
     foreign_manifest = tmp_path / "validation-manifest.json"

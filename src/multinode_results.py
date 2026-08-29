@@ -1027,6 +1027,10 @@ class ReportBundleDurabilityError(OSError):
     """A complete bundle is visible but its parent sync did not complete."""
 
 
+class ReportBundlePublicationAmbiguityError(OSError):
+    """A rename error left the report bundle publication outcome ambiguous."""
+
+
 def _rename_noreplace(
     source_descriptor: int,
     source_name: str,
@@ -1094,6 +1098,117 @@ def _cleanup_private_report_staging(
     os.rmdir(staging_name, dir_fd=parent_descriptor)
 
 
+def _directory_identity_matches(
+    metadata: os.stat_result, *, device: int, inode: int
+) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_dev == device
+        and metadata.st_ino == inode
+    )
+
+
+def _namespace_metadata(
+    parent_descriptor: int, name: str
+) -> os.stat_result | None:
+    try:
+        return os.stat(
+            name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _cleanup_exact_report_staging(
+    parent_descriptor: int,
+    staging_name: str,
+    *,
+    device: int,
+    inode: int,
+) -> bool:
+    """Clean only when the staging name still opens the exact owned inode."""
+    try:
+        descriptor = os.open(
+            staging_name, _DIRECTORY_FLAGS, dir_fd=parent_descriptor
+        )
+    except FileNotFoundError:
+        return False
+    try:
+        observed = os.fstat(descriptor)
+        named = _namespace_metadata(parent_descriptor, staging_name)
+        if (
+            named is None
+            or not _directory_identity_matches(
+                observed, device=device, inode=inode
+            )
+            or not _directory_identity_matches(named, device=device, inode=inode)
+        ):
+            return False
+        _cleanup_private_report_staging(
+            parent_descriptor, descriptor, staging_name
+        )
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _handle_report_rename_error(
+    error: OSError,
+    *,
+    bundle: Path,
+    parent_descriptor: int,
+    staging_name: str,
+    staging_device: int,
+    staging_inode: int,
+) -> None:
+    """Clean a definite failed rename or preserve every ambiguous namespace."""
+    try:
+        staging_metadata = _namespace_metadata(parent_descriptor, staging_name)
+        final_metadata = _namespace_metadata(parent_descriptor, bundle.name)
+    except OSError as classification_error:
+        raise ReportBundlePublicationAmbiguityError(
+            f"validation report bundle publication is ambiguous at {bundle}; "
+            "namespace classification failed and no cleanup was attempted"
+        ) from classification_error
+
+    if staging_metadata is not None and _directory_identity_matches(
+        staging_metadata, device=staging_device, inode=staging_inode
+    ):
+        try:
+            cleaned = _cleanup_exact_report_staging(
+                parent_descriptor,
+                staging_name,
+                device=staging_device,
+                inode=staging_inode,
+            )
+        except OSError as cleanup_error:
+            raise ReportBundlePublicationAmbiguityError(
+                f"validation report bundle publication is ambiguous at {bundle}; "
+                "exact staging cleanup did not complete"
+            ) from cleanup_error
+        if not cleaned:
+            raise ReportBundlePublicationAmbiguityError(
+                f"validation report bundle publication is ambiguous at {bundle}; "
+                "the staging namespace changed during classification"
+            ) from error
+        if isinstance(error, FileExistsError):
+            raise FileExistsError(
+                f"refusing to replace validation report bundle: {bundle}"
+            ) from error
+        raise error
+
+    if staging_metadata is None and final_metadata is not None:
+        detail = "the staging name disappeared and the final name exists"
+    elif staging_metadata is None:
+        detail = "both the staging and final names are absent"
+    else:
+        detail = "the staging name no longer identifies the owned directory"
+    raise ReportBundlePublicationAmbiguityError(
+        f"validation report bundle publication is ambiguous at {bundle}; "
+        f"{detail}, so no cleanup was attempted"
+    ) from error
+
+
 def publish_validation_outputs(
     report: ValidationReport, output_root: str | Path
 ) -> None:
@@ -1156,18 +1271,15 @@ def publish_validation_outputs(
                 parent_descriptor,
                 bundle.name,
             )
-        except FileExistsError as error:
-            _cleanup_private_report_staging(
-                parent_descriptor, staging_descriptor, staging_name
+        except OSError as error:
+            _handle_report_rename_error(
+                error,
+                bundle=bundle,
+                parent_descriptor=parent_descriptor,
+                staging_name=staging_name,
+                staging_device=staging_metadata.st_dev,
+                staging_inode=staging_metadata.st_ino,
             )
-            raise FileExistsError(
-                f"refusing to replace validation report bundle: {bundle}"
-            ) from error
-        except OSError:
-            _cleanup_private_report_staging(
-                parent_descriptor, staging_descriptor, staging_name
-            )
-            raise
         try:
             os.fsync(parent_descriptor)
         except OSError as error:

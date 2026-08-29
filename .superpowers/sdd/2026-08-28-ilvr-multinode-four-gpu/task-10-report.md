@@ -798,3 +798,81 @@ operator path is `$hardware_result_root/validation-report/`, containing the
 two fixed report files. `git diff --check` passed. Pre-existing untracked
 `__pycache__` paths were preserved. No SSH, Docker, GPU, tmux, rsync, or real
 training command ran.
+
+## Fix round 5: ambiguous no-replace rename outcome
+
+An `OSError` raised by the no-replace rename wrapper is no longer treated as
+proof that the rename failed. The publisher retains the exact device/inode of
+its private staging directory and, after a rename exception, inspects the
+staging and final names only through the already trusted parent descriptor.
+Cleanup requires reopening the staging name and matching both that descriptor
+and the current staging-name metadata to the exact owned inode. The descriptor
+retained across the rename attempt is never used for exception cleanup because
+it may identify the successfully published final bundle.
+
+If the exact staging directory remains at the staging name, the rename
+definitely did not consume it and only that owned staging directory is cleaned.
+This preserves an existing foreign final bundle on collision. If staging has
+disappeared and the final name exists, the publisher raises
+`ReportBundlePublicationAmbiguityError` and performs no cleanup, preserving the
+complete bundle. Missing or changed names and namespace-inspection failures are
+likewise reported as non-destructive ambiguous publication outcomes.
+
+### RED evidence
+
+The causal test invokes the real no-replace rename and then makes its wrapper
+raise `OSError`:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_result_validation.py::test_oserror_after_successful_rename_preserves_bundle_and_reports_ambiguity
+```
+
+Observed output (exit 1):
+
+```text
+Expected regex: 'publication.*ambiguous'
+Actual message: "[Errno 2] No such file or directory: '.validation-report.<token>.staging'"
+1 failed in 3.00s
+```
+
+The old OSError branch had unlinked both files through the retained directory
+descriptor after it became the final bundle descriptor, then masked the
+injected error while trying to remove the vanished staging name.
+
+### GREEN evidence
+
+The causal, collision, asynchronous-interruption, and preparation-failure
+selection passed:
+
+```text
+5 passed in 3.17s
+```
+
+The complete result-validation file passed:
+
+```text
+31 passed in 3.50s
+```
+
+Final focused Task 10 suites:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_lifecycle_matrix.py \
+  tests/multinode/test_result_validation.py \
+  tests/stage1/test_distributed_smoke.py \
+  tests/stage2/integration/test_distributed_contract.py
+```
+
+```text
+132 passed, 6 skipped in 10.42s
+```
+
+The skips remain only the opt-in real distributed/GPU executions. Existing
+untracked `__pycache__` paths were preserved. No SSH, Docker, GPU, tmux, rsync,
+or real training command ran.
