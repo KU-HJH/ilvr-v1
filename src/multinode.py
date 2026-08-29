@@ -2263,6 +2263,12 @@ def _main(argv: list[str] | None = None) -> int:
     node_info_parser.add_argument("--machine-rank", type=int, required=True)
     node_info_parser.add_argument("--repository", required=True)
     node_info_parser.add_argument("--main-process-port", type=int, required=True)
+    node_info_parser.add_argument(
+        "--stage", choices=("stage1", "stage2"), required=True
+    )
+    node_info_parser.add_argument(
+        "--tuning-method", choices=("full", "lora", "dora"), required=True
+    )
     node_info_parser.add_argument("--deepspeed-config", required=True)
     node_info_parser.add_argument("--deepspeed-config-digest", required=True)
     node_info_parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)

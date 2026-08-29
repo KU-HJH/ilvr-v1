@@ -77,6 +77,39 @@ def test_stage2_peft_zero3_preflight_uses_dedicated_config_on_both_nodes():
     assert remote[remote.index("--deepspeed-config") + 1] == expected
 
 
+def test_stage2_peft_zero3_node_info_decodes_selected_policy(monkeypatch):
+    """Catches selected-policy fields disappearing at the node-info parser boundary."""
+    launch_plan = build_launch_plan(
+        stage="stage2",
+        tuning_method="lora",
+        zero_stage=3,
+        run_id="stage2-lora-zero3-node-info",
+        main_process_port=29634,
+    )
+    commands = build_preflight_commands(
+        launch_plan,
+        input_paths=("/input",),
+        artifact_roots=("/root/workspace/ILVR/checkpoints",),
+        remote_run_paths=("/root/workspace/ILVR/checkpoints/remote",),
+        local_run_paths=("/root/workspace/ILVR/checkpoints/local",),
+        remote_tmux_sessions=("ilvr-remote",),
+        local_tmux_sessions=("ilvr-local",),
+    )
+    decoded = {}
+
+    def observe(args):
+        decoded.update(vars(args))
+        return snapshot("local", 1)
+
+    monkeypatch.setattr(multinode, "_node_info", observe)
+    node_argv = list(commands.local_node_info)
+    node_argv = node_argv[node_argv.index("node-info") :]
+
+    assert multinode._main(node_argv) == 0
+    assert decoded["stage"] == "stage2"
+    assert decoded["tuning_method"] == "lora"
+
+
 def test_canonical_git_query_tolerates_different_repository_owner(monkeypatch):
     """Catches node-info omitting the canonical Git safe-directory argument."""
     monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
