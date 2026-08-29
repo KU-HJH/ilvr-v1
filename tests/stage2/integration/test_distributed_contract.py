@@ -871,22 +871,19 @@ def test_recording_collator_uses_production_b_greater_than_one_failure(tmp_path)
     assert recorder.local_batch_sizes == [2]
 
 
-def test_rank_local_fixtures_have_distinct_valid_production_batches(tmp_path):
-    """Catches launched ranks concurrently truncating the same original image."""
+def test_rank_local_fixtures_share_valid_node_cache(tmp_path):
+    """Catches smoke ranks rebuilding identical preprocessing per process."""
     harness = _load_harness_module()
+    cache_root = tmp_path / "cache"
     examples = [
         harness.build_rank_local_tiny_prepared_example(
-            tmp_path, environ={"RANK": str(rank)}
+            tmp_path, environ={"RANK": str(rank)}, cache_root=cache_root
         )
         for rank in (0, 1)
     ]
 
     image_paths = [Path(example.original_image_paths[0]) for example in examples]
-    assert image_paths == [
-        tmp_path / "tiny-data" / "rank-0" / "input.png",
-        tmp_path / "tiny-data" / "rank-1" / "input.png",
-    ]
-    assert image_paths[0] != image_paths[1]
+    assert image_paths == [cache_root / "input.png"] * 2
 
     batches = []
     for image_path, example in zip(image_paths, examples, strict=True):
@@ -911,6 +908,79 @@ def test_rank_local_fixtures_have_distinct_valid_production_batches(tmp_path):
 
     for key in batches[0]:
         assert torch.equal(batches[0][key], batches[1][key])
+
+
+def test_tiny_prepared_cache_miss_publishes_one_complete_entry(tmp_path):
+    harness = _load_harness_module()
+    cache_root = tmp_path / "cache"
+
+    prepared = harness.build_rank_local_tiny_prepared_example(
+        tmp_path, environ={"RANK": "0"}, cache_root=cache_root
+    )
+
+    assert prepared.original_image_paths == (str(cache_root / "input.png"),)
+    assert (cache_root / "input.png").is_file()
+    payload = json.loads(
+        (cache_root / "prepared-example.json").read_text(encoding="utf-8")
+    )
+    assert payload["schema_version"] == 1
+    assert len(payload["input_sha256"]) == 64
+    assert payload["example"]["latent_block_count"] == 1
+
+
+def test_tiny_prepared_cache_hit_skips_image_and_example_creation(
+    tmp_path, monkeypatch
+):
+    harness = _load_harness_module()
+    cache_root = tmp_path / "cache"
+    expected = harness.build_rank_local_tiny_prepared_example(
+        tmp_path, environ={"RANK": "0"}, cache_root=cache_root
+    )
+
+    def reject(*args, **kwargs):
+        raise AssertionError((args, kwargs))
+
+    monkeypatch.setattr(harness.Image, "new", reject)
+    monkeypatch.setattr(harness, "prepare_stage2_example", reject)
+
+    assert harness.build_rank_local_tiny_prepared_example(
+        tmp_path, environ={"RANK": "1"}, cache_root=cache_root
+    ) == expected
+
+
+@pytest.mark.parametrize("corruption", ("json", "digest", "image"))
+def test_tiny_prepared_cache_corruption_rebuilds(
+    tmp_path, monkeypatch, corruption
+):
+    harness = _load_harness_module()
+    cache_root = tmp_path / "cache"
+    harness.build_rank_local_tiny_prepared_example(
+        tmp_path, environ={"RANK": "0"}, cache_root=cache_root
+    )
+    manifest = cache_root / "prepared-example.json"
+    if corruption == "json":
+        manifest.write_text("{", encoding="utf-8")
+    elif corruption == "digest":
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["input_sha256"] = "0" * 64
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        (cache_root / "input.png").write_bytes(b"corrupt")
+
+    original = harness.prepare_stage2_example
+    rebuilds = []
+
+    def rebuild(sample, *, image_root, latent_size):
+        rebuilds.append(image_root)
+        return original(sample, image_root=image_root, latent_size=latent_size)
+
+    monkeypatch.setattr(harness, "prepare_stage2_example", rebuild)
+    prepared = harness.build_rank_local_tiny_prepared_example(
+        tmp_path, environ={"RANK": "1"}, cache_root=cache_root
+    )
+
+    assert rebuilds == [cache_root]
+    assert prepared.original_image_paths == (str(cache_root / "input.png"),)
 
 
 @pytest.mark.parametrize("raw_rank", ["", "worker-1", "-1"])

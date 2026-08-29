@@ -3,6 +3,7 @@
 import os
 import math
 import tempfile
+import weakref
 from pathlib import Path
 
 import torch
@@ -18,6 +19,7 @@ from deepspeed_runtime import (
     write_deepspeed_runtime_sidecar,
 )
 from peft_common import resolve_qwen2_5_vl_model
+from stage1.trainer import collect_deepspeed_pre_step_norm
 from .checkpointing import save_stage2_peft_metadata
 from .sampler import (
     LatentBlockBalancedSampler,
@@ -35,9 +37,40 @@ class _ObservedOptimizerStep(TrainerCallback):
     def __init__(self, owner):
         self.owner = owner
 
+    def on_train_begin(self, args, state, control, **kwargs):
+        del args, state, kwargs
+        self.owner._install_deepspeed_gradient_adapter()
+        return control
+
     def on_step_end(self, args, state, control, **kwargs):
         del args, control, kwargs
         self.owner._observed_optimizer_step = int(state.global_step)
+
+
+class _Stage2DeepSpeedGradientAdapter:
+    """Observe the pinned ZeRO norm immediately before its real step."""
+
+    def __init__(self, trainer, engine, original_step):
+        self._trainer = weakref.ref(trainer)
+        self.engine = engine
+        self.original_step = original_step
+
+    def __call__(self, *args, **kwargs):
+        trainer = self._trainer()
+        if trainer is None:
+            raise RuntimeError("Stage 2 trainer disappeared before DeepSpeed step")
+        boundary = self.engine.is_gradient_accumulation_boundary()
+        if type(boundary) is not bool:
+            raise RuntimeError("Stage 2 DeepSpeed accumulation boundary is invalid")
+        if boundary:
+            zero_stage = trainer.deepspeed_runtime_profile.zero_stage
+            if zero_stage is None:
+                raise RuntimeError("Stage 2 DeepSpeed profile has no ZeRO stage")
+            norm = collect_deepspeed_pre_step_norm(
+                self.engine.optimizer, zero_stage=zero_stage
+            )
+            trainer._representative_gradient_norm = float(norm.cpu().item())
+        return self.original_step(*args, **kwargs)
 
 
 class Stage2Trainer(Trainer):
@@ -77,10 +110,34 @@ class Stage2Trainer(Trainer):
         self._stage2_train_sampler: LatentBlockBalancedSampler | None = None
         self._representative_gradient_norm: float | None = None
         self._observed_optimizer_step: int | None = None
+        self._stage2_deepspeed_gradient_adapter = None
         callbacks = list(kwargs.pop("callbacks", ()) or ())
         callbacks.append(_ObservedOptimizerStep(self))
         kwargs["callbacks"] = callbacks
         super().__init__(*args, **kwargs)
+
+    def _install_deepspeed_gradient_adapter(self) -> None:
+        from accelerate.utils import DistributedType
+
+        if getattr(self.accelerator, "distributed_type", None) != DistributedType.DEEPSPEED:
+            return
+        wrapper = getattr(self.accelerator, "deepspeed_engine_wrapped", None)
+        engine = getattr(wrapper, "engine", None)
+        if engine is None or getattr(self, "model_wrapped", None) is not engine:
+            raise RuntimeError("Stage 2 prepared DeepSpeed engine is unavailable")
+        existing = self._stage2_deepspeed_gradient_adapter
+        if existing is not None:
+            if existing.engine is not engine:
+                raise RuntimeError("Stage 2 DeepSpeed engine changed after preparation")
+            return
+        if any(
+            not callable(getattr(engine, name, None))
+            for name in ("step", "is_gradient_accumulation_boundary")
+        ):
+            raise RuntimeError("Stage 2 DeepSpeed step boundary is unavailable")
+        adapter = _Stage2DeepSpeedGradientAdapter(self, engine, engine.step)
+        engine.step = adapter
+        self._stage2_deepspeed_gradient_adapter = adapter
 
     def _record_representative_gradient_norm(self, model) -> None:
         squared_norm = 0.0

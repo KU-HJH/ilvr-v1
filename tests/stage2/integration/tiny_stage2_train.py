@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import hashlib
 import json
 import math
 import os
@@ -32,7 +33,7 @@ from artifact_paths import resolve_run_artifact_paths
 from main import build_stage2_training_arguments
 from deepspeed_runtime import load_deepspeed_runtime_profile
 from stage2.checkpointing import build_stage2_peft_metadata
-from stage2.data import Stage2DataCollator, prepare_stage2_example
+from stage2.data import Stage2DataCollator, Stage2PreparedExample, prepare_stage2_example
 from stage2.peft import (
     ALLOWED_STAGE2_TARGET_SUFFIXES,
     Stage2TuningConfig,
@@ -129,21 +130,38 @@ class TinyStage2Processor:
         }
 
 
+_TINY_STAGE2_CACHE_ROOT = Path(
+    "/root/workspace/ILVR/.cache/multinode/stage2-tiny-prepared-example-v1"
+)
+_TINY_STAGE2_CACHE_SCHEMA_VERSION = 1
+_TINY_STAGE2_LATENT_SIZE = 2
+_TINY_STAGE2_IMAGE = {
+    "mode": "RGB",
+    "size": [2, 2],
+    "color": [17, 31, 47],
+}
+_TINY_STAGE2_SAMPLE = {
+    "image_input": "input.png",
+    "text_input": "question",
+    "sequence_plan": [
+        {"type": "text", "content": "A"},
+        {"type": "latent", "helper_image": "helper-not-loaded.png"},
+        {"type": "text", "content": "B"},
+    ],
+}
+
+
 def build_tiny_prepared_example(image_root: Path):
     image_root.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (2, 2), color=(17, 31, 47)).save(image_root / "input.png")
+    Image.new(
+        _TINY_STAGE2_IMAGE["mode"],
+        tuple(_TINY_STAGE2_IMAGE["size"]),
+        color=tuple(_TINY_STAGE2_IMAGE["color"]),
+    ).save(image_root / "input.png")
     return prepare_stage2_example(
-        {
-            "image_input": "input.png",
-            "text_input": "question",
-            "sequence_plan": [
-                {"type": "text", "content": "A"},
-                {"type": "latent", "helper_image": "helper-not-loaded.png"},
-                {"type": "text", "content": "B"},
-            ],
-        },
+        _TINY_STAGE2_SAMPLE,
         image_root=image_root,
-        latent_size=2,
+        latent_size=_TINY_STAGE2_LATENT_SIZE,
     )
 
 
@@ -159,11 +177,183 @@ def resolve_launcher_rank(environ=None) -> int:
     return rank
 
 
-def build_rank_local_tiny_prepared_example(output_dir: Path, *, environ=None):
-    rank = resolve_launcher_rank(environ)
-    return build_tiny_prepared_example(
-        output_dir / "tiny-data" / f"rank-{rank}"
-    )
+def _tiny_cache_input_digest() -> str:
+    payload = {
+        "image": _TINY_STAGE2_IMAGE,
+        "latent_size": _TINY_STAGE2_LATENT_SIZE,
+        "sample": _TINY_STAGE2_SAMPLE,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _expected_cached_conversation(image_path: Path) -> list[dict]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": str(image_path)},
+                {"type": "text", "text": "question"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "A<|latent_start|><|latent_pad|><|latent_pad|>"
+                        "<|latent_end|>B"
+                    ),
+                }
+            ],
+        },
+    ]
+
+
+def _load_tiny_prepared_cache(cache_root: Path) -> Stage2PreparedExample | None:
+    manifest = cache_root / "prepared-example.json"
+    image_path = cache_root / "input.png"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        if type(payload) is not dict or set(payload) != {
+            "schema_version",
+            "input_sha256",
+            "image_sha256",
+            "example",
+        }:
+            return None
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != _TINY_STAGE2_CACHE_SCHEMA_VERSION
+            or type(payload["input_sha256"]) is not str
+            or payload["input_sha256"] != _tiny_cache_input_digest()
+            or type(payload["image_sha256"]) is not str
+            or len(payload["image_sha256"]) != 64
+            or not image_path.is_file()
+            or _sha256_file(image_path) != payload["image_sha256"]
+        ):
+            return None
+        example = payload["example"]
+        if type(example) is not dict or set(example) != {
+            "conversation",
+            "original_image_paths",
+            "latent_block_count",
+        }:
+            return None
+        conversation = example["conversation"]
+        paths = example["original_image_paths"]
+        latent_count = example["latent_block_count"]
+        if (
+            type(conversation) is not list
+            or conversation != _expected_cached_conversation(image_path)
+            or type(paths) is not list
+            or paths != [str(image_path)]
+            or not all(type(path) is str for path in paths)
+            or type(latent_count) is not int
+            or latent_count != 1
+        ):
+            return None
+        return Stage2PreparedExample(
+            conversation=conversation,
+            original_image_paths=tuple(paths),
+            latent_block_count=latent_count,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def _rebuild_tiny_prepared_cache(cache_root: Path) -> Stage2PreparedExample:
+    cache_root.mkdir(parents=True, exist_ok=True)
+    image_path = cache_root / "input.png"
+    image_temporary = cache_root / f".input.png.{os.getpid()}.tmp"
+    manifest = cache_root / "prepared-example.json"
+    manifest_temporary = cache_root / f".prepared-example.{os.getpid()}.tmp"
+    try:
+        with image_temporary.open("xb") as handle:
+            image = Image.new(
+                _TINY_STAGE2_IMAGE["mode"],
+                tuple(_TINY_STAGE2_IMAGE["size"]),
+                color=tuple(_TINY_STAGE2_IMAGE["color"]),
+            )
+            image.save(handle, format="PNG")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(image_temporary, image_path)
+        prepared = prepare_stage2_example(
+            _TINY_STAGE2_SAMPLE,
+            image_root=cache_root,
+            latent_size=_TINY_STAGE2_LATENT_SIZE,
+        )
+        payload = {
+            "schema_version": _TINY_STAGE2_CACHE_SCHEMA_VERSION,
+            "input_sha256": _tiny_cache_input_digest(),
+            "image_sha256": _sha256_file(image_path),
+            "example": {
+                "conversation": prepared.conversation,
+                "original_image_paths": list(prepared.original_image_paths),
+                "latent_block_count": prepared.latent_block_count,
+            },
+        }
+        encoded = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        with manifest_temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(manifest_temporary, manifest)
+        return prepared
+    finally:
+        for temporary in (image_temporary, manifest_temporary):
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def build_rank_local_tiny_prepared_example(
+    output_dir: Path,
+    *,
+    environ=None,
+    cache_root: Path = _TINY_STAGE2_CACHE_ROOT,
+):
+    del output_dir
+    resolve_launcher_rank(environ)
+    root = Path(cache_root)
+    local_error: Exception | None = None
+    if _is_machine_local_leader():
+        try:
+            if _load_tiny_prepared_cache(root) is None:
+                _rebuild_tiny_prepared_cache(root)
+        except Exception as error:
+            local_error = error
+    failed_ranks = _distributed_failure_count(int(local_error is not None))
+    if failed_ranks:
+        if local_error is not None:
+            raise local_error
+        raise RuntimeError("Stage 2 tiny cache publication failed on the node leader")
+    _synchronize_ranks()
+    prepared = _load_tiny_prepared_cache(root)
+    if prepared is None:
+        raise ValueError("Stage 2 tiny cache is invalid after node-local publication")
+    return prepared
 
 
 class RecordingStage2Collator:

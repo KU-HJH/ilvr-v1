@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import stage2.trainer as stage2_trainer_module
 from safetensors.torch import load_file, save_file
 from accelerate.state import AcceleratorState, GradientState
 from peft import LoraConfig
@@ -1611,6 +1612,47 @@ def test_stage2_resume_rejects_runtime_before_parent_train(tmp_path, monkeypatch
         trainer.train(resume_from_checkpoint=str(checkpoint))
 
     assert parent_calls == []
+
+
+def test_stage2_deepspeed_gradient_adapter_records_only_at_step_boundary(
+    monkeypatch,
+):
+    observed = []
+    optimizer = object()
+    at_boundary = False
+    engine = SimpleNamespace(
+        optimizer=optimizer,
+        is_gradient_accumulation_boundary=lambda: at_boundary,
+    )
+
+    class FakeTrainer:
+        deepspeed_runtime_profile = SimpleNamespace(zero_stage=2)
+        _representative_gradient_norm = None
+
+    trainer = FakeTrainer()
+
+    def collect(candidate, *, zero_stage):
+        observed.append((candidate, zero_stage))
+        return torch.tensor(3.25)
+
+    monkeypatch.setattr("stage2.trainer.collect_deepspeed_pre_step_norm", collect)
+    original_calls = []
+    adapter = stage2_trainer_module._Stage2DeepSpeedGradientAdapter(
+        trainer,
+        engine,
+        lambda: original_calls.append("step") or "stepped",
+    )
+
+    assert adapter() == "stepped"
+    assert observed == []
+    assert trainer._representative_gradient_norm is None
+    assert original_calls == ["step"]
+
+    at_boundary = True
+    assert adapter() == "stepped"
+    assert observed == [(optimizer, 2)]
+    assert trainer._representative_gradient_norm == 3.25
+    assert original_calls == ["step", "step"]
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
