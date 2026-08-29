@@ -84,6 +84,9 @@ def test_matrix_plans_exact_initial_and_resume_harness_jobs_per_cell(tmp_path):
                 assert child[child.index("--main_process_port") + 1] == str(
                     plan.main_process_port
                 )
+                assert child[child.index("--deepspeed_multinode_launcher") + 1] == (
+                    "standard"
+                )
                 assert expected_harness in child
                 harness_index = child.index(expected_harness)
                 harness_args = child[harness_index + 1 :]

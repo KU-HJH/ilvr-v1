@@ -1511,6 +1511,8 @@ def build_owned_lifecycle_harness_commands(
             "--mixed_precision",
             "bf16",
             "--use_deepspeed",
+            "--deepspeed_multinode_launcher",
+            "standard",
             "--deepspeed_config_file",
             str(plan.deepspeed_config),
             str(selected_harness),
