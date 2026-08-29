@@ -500,6 +500,36 @@ def test_manifest_records_size_and_rank_without_weight_hash(tmp_path, monkeypatc
     ).process_rank == 2
 
 
+def test_noncanonical_node_manifest_accepts_only_its_deepspeed_shards(tmp_path):
+    """Catches requiring rank-0 common metadata on the rank-1 filesystem."""
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint = checkpoint_root / identity()["run_id"] / "checkpoint-2"
+    step = checkpoint / "global_step2"
+    step.mkdir(parents=True)
+    for rank in (2, 3):
+        (step / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt").write_bytes(
+            f"optimizer-{rank}".encode()
+        )
+        (step / f"zero_pp_rank_{rank}_mp_rank_00_model_states.pt").write_bytes(
+            f"model-{rank}".encode()
+        )
+        (checkpoint / f"rng_state_{rank}.pth").write_bytes(
+            f"rng-{rank}".encode()
+        )
+
+    manifest = build_node_manifest(
+        checkpoint,
+        node_rank=1,
+        process_ranks=(2, 3),
+        run_id=identity()["run_id"],
+        runtime_identity=identity(),
+        checkpoint_root=checkpoint_root,
+    )
+
+    assert manifest.runtime_identity == identity()
+    assert {entry.process_rank for entry in manifest.entries} == {2, 3}
+
+
 def test_manifest_rejects_symlink_and_nonregular_file(tmp_path):
     checkpoint_root = tmp_path / "checkpoints"
     checkpoint = checkpoint_root / identity()["run_id"] / "checkpoint-2"
@@ -1945,15 +1975,15 @@ def test_manifest_inspection_stays_bound_when_checkpoint_path_is_swapped(
     checkpoint_root = tmp_path / "checkpoints"
     logical = checkpoint_root / full_identity()["run_id"] / "checkpoint-2"
     logical.mkdir(parents=True)
-    values = write_observed_full_checkpoint(logical)
+    values = write_observed_full_checkpoint(logical, model_rank=0)
     original_shard = (
-        logical / "global_step2/zero_pp_rank_2_mp_rank_00_optim_states.pt"
+        logical / "global_step2/zero_pp_rank_0_mp_rank_00_optim_states.pt"
     )
     original_shard.write_bytes(b"old-owned")
 
     replacement = tmp_path / "replacement" / "checkpoint-2"
     replacement.mkdir(parents=True)
-    replacement_values = write_observed_full_checkpoint(replacement)
+    replacement_values = write_observed_full_checkpoint(replacement, model_rank=0)
     runtime_path = replacement / "deepspeed-runtime.json"
     runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
     runtime["config_digest"] = "c" * 64
@@ -1977,8 +2007,8 @@ def test_manifest_inspection_stays_bound_when_checkpoint_path_is_swapped(
     )
     manifest = build_node_manifest(
         logical,
-        node_rank=1,
-        process_ranks=(2, 3),
+        node_rank=0,
+        process_ranks=(0, 1),
         runtime_identity=values,
         checkpoint_root=checkpoint_root,
     )

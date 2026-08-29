@@ -979,7 +979,11 @@ def build_node_manifest(
                     f"{relative}"
                 )
             entries.append(item)
-        identity = observe_checkpoint_identity(pinned_directory, trusted_identity)
+        identity = (
+            observe_checkpoint_identity(pinned_directory, trusted_identity)
+            if node_rank == 0 or canonical_owner
+            else trusted_identity
+        )
     finally:
         os.close(checkpoint_descriptor)
     manifest_run_id = _validate_run_id(run_id or str(identity["run_id"]))
