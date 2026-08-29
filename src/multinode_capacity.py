@@ -18,6 +18,7 @@ from typing import Literal, Protocol, Sequence
 from src.multinode_runtime import (
     _open_trusted_directory,
     _read_regular_file,
+    _remote_repository_module_command,
     build_remote_exec,
     publish_small_file,
     validate_stage1_arguments,
@@ -235,6 +236,44 @@ class SubprocessCapacityRunner:
         self.training_runner = training_runner
         self.control_runner = control_runner
         self.log_root = Path(log_root)
+
+    def prepare_parent(self) -> Path:
+        """Reserve one fresh exact capacity-cell parent on both nodes."""
+        root = self.result_root
+        if not root.is_absolute() or ".." in root.parts:
+            raise ValueError("capacity result root must be a canonical result root")
+        try:
+            root.relative_to(_RESULT_ROOT)
+        except ValueError as error:
+            raise ValueError(
+                "capacity result root must be inside the canonical result root"
+            ) from error
+        destination = root / self.parent_run_id
+        from src.multinode_artifacts import reserve_inference_destination
+
+        reserve_inference_destination(destination)
+        command = _remote_repository_module_command(
+            "prepare-evaluation-output",
+            (
+                "--output-dir",
+                str(destination),
+                "--run-id",
+                self.parent_run_id,
+            ),
+        )
+        completed = self.control_runner(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "remote capacity parent reservation failed "
+                f"({completed.returncode}): {completed.stderr.strip()}"
+            )
+        return destination
 
     def _open_log(self, directory_descriptor: int, name: str):
         descriptor = os.open(
@@ -804,6 +843,8 @@ def capacity_stage1_main(argv: Sequence[str]) -> int:
                 result_root=result_root,
             )
         )
+        if runner is not None:
+            runner.prepare_parent()
         payload = run_capacity_probe(
             run_id=args.run_id,
             zero_stage=args.zero_stage,
@@ -815,7 +856,13 @@ def capacity_stage1_main(argv: Sequence[str]) -> int:
             python_executable=sys.executable,
             dry_run=args.dry_run,
         )
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         parser.error(str(error))
     print(json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True))
     if args.dry_run:

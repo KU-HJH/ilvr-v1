@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import src.multinode_artifacts as artifacts_module
 from src.multinode_capacity import (
     capacity_candidates,
     classify_failure,
@@ -17,6 +18,105 @@ from src.multinode_capacity import (
     fallback_candidates,
     run_capacity_probe,
 )
+
+
+def test_capacity_parent_is_reserved_locally_then_remotely_before_child(
+    monkeypatch,
+):
+    result_root = Path(
+        "/root/workspace/ILVR/results/task12-capacity/capacity"
+    )
+    parent_run_id = "capacity-parent"
+    destination = result_root / parent_run_id
+    events = []
+    monkeypatch.setattr(
+        artifacts_module,
+        "reserve_inference_destination",
+        lambda path: events.append(("local", Path(path))) or Path(path),
+    )
+
+    def control_runner(command, *, capture_output, text, check, timeout):
+        events.append(("remote", tuple(command)))
+        assert timeout == 30
+        remote_argv = shlex.split(command[6])
+        assert remote_argv[:7] == [
+            "/usr/bin/docker",
+            "exec",
+            "--workdir",
+            "/root/workspace/ILVR",
+            "llm_kd",
+            "/usr/bin/bash",
+            "-lc",
+        ]
+        assert shlex.split(remote_argv[7]) == [
+            "/usr/bin/env",
+            "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
+            "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+            "-m",
+            "src.multinode",
+            "prepare-evaluation-output",
+            "--output-dir",
+            str(destination),
+            "--run-id",
+            parent_run_id,
+        ]
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    runner = SubprocessCapacityRunner(
+        parent_run_id=parent_run_id,
+        result_root=result_root,
+        control_runner=control_runner,
+    )
+
+    assert runner.prepare_parent() == destination
+    assert [event[0] for event in events] == ["local", "remote"]
+
+
+def test_capacity_remote_parent_reservation_failure_prevents_child_launch(
+    monkeypatch,
+):
+    launched = []
+    monkeypatch.setattr(
+        artifacts_module,
+        "reserve_inference_destination",
+        lambda path: Path(path),
+    )
+    runner = SubprocessCapacityRunner(
+        parent_run_id="capacity-parent",
+        result_root=Path(
+            "/root/workspace/ILVR/results/task12-capacity/capacity"
+        ),
+        training_runner=lambda *_args, **_kwargs: launched.append(True),
+        control_runner=lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 5, stdout="", stderr="remote reservation refused"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="remote capacity parent.*refused"):
+        runner.prepare_parent()
+    assert launched == []
+
+
+def test_capacity_parent_rejects_unsafe_result_root_before_reservation(
+    tmp_path, monkeypatch
+):
+    reserved = []
+    monkeypatch.setattr(
+        artifacts_module,
+        "reserve_inference_destination",
+        lambda path: reserved.append(Path(path)),
+    )
+    runner = SubprocessCapacityRunner(
+        parent_run_id="capacity-parent",
+        result_root=tmp_path / "outside-results",
+        control_runner=lambda *_args, **_kwargs: pytest.fail(
+            "unsafe path reached remote reservation"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="canonical result root"):
+        runner.prepare_parent()
+    assert reserved == []
 
 
 def test_primary_candidates_start_at_two_and_increase():
