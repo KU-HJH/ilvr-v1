@@ -1395,7 +1395,17 @@ def test_subprocess_runner_transfers_only_attempt_plan_with_size_and_sha(tmp_pat
         ]
 
 
-def test_poll_exit_rechecks_record_after_observed_supervisor_disappears(tmp_path):
+@pytest.mark.parametrize(
+    ("retry_payload", "expected_exit"),
+    (
+        ('{"exit_code": 0}', 0),
+        (None, 125),
+        ('{"exit_code": "tampered"}', 125),
+    ),
+)
+def test_poll_exit_rechecks_record_after_observed_supervisor_disappears(
+    tmp_path, retry_payload, expected_exit
+):
     """Catches an exit publication race being misreported as code 125."""
     launch_plan = plan()
     commands = build_owned_tmux_commands(launch_plan, commit="a" * 40)
@@ -1411,26 +1421,28 @@ def test_poll_exit_rechecks_record_after_observed_supervisor_disappears(tmp_path
         environment=dict(spec.environment),
     )
     exit_polls = 0
-    ownership_polls = 0
+    process_polls = 0
 
     def fake_command(command, *, input_bytes=None, timeout_seconds=None):
-        nonlocal exit_polls, ownership_polls
+        nonlocal exit_polls, process_polls
         display = " ".join(command)
         if "exit-show" in display:
             exit_polls += 1
-            if exit_polls == 3:
+            if exit_polls == 3 and retry_payload is not None:
                 return subprocess.CompletedProcess(
-                    command, 0, stdout='{"exit_code": 0}', stderr=""
+                    command, 0, stdout=retry_payload, stderr=""
                 )
             return subprocess.CompletedProcess(command, 3, stdout="", stderr="")
         if "ownership-show" in display:
-            ownership_polls += 1
-            if ownership_polls == 1:
-                return subprocess.CompletedProcess(
-                    command, 0, stdout=json.dumps(ownership.to_json()), stderr=""
-                )
-            return subprocess.CompletedProcess(command, 3, stdout="", stderr="gone")
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps(ownership.to_json()), stderr=""
+            )
         if "owned-process-info" in display:
+            process_polls += 1
+            if process_polls == 2:
+                return subprocess.CompletedProcess(
+                    command, 3, stdout="", stderr="gone"
+                )
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -1454,7 +1466,7 @@ def test_poll_exit_rechecks_record_after_observed_supervisor_disappears(tmp_path
     )
 
     assert runner.poll_exit(1) is None
-    assert runner.poll_exit(1) == 0
+    assert runner.poll_exit(1) == expected_exit
     assert exit_polls == 3
 
 

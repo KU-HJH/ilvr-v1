@@ -2005,6 +2005,18 @@ class SubprocessCoordinatorRunner:
                 raise ValueError("owned exit code is invalid")
             return exit_code
 
+        def retry_exit_after_process_disappears() -> int:
+            completed = self.command_runner(
+                exit_command,
+                input_bytes=None,
+                timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
+            )
+            try:
+                retry_exit_code = decode_exit(completed)
+            except (RuntimeError, ValueError):
+                return 125
+            return 125 if retry_exit_code is None else retry_exit_code
+
         completed = self.command_runner(
             exit_command,
             input_bytes=None,
@@ -2018,17 +2030,11 @@ class SubprocessCoordinatorRunner:
         except (RuntimeError, ValueError):
             if machine_rank not in self._seen_ownership:
                 return None
-            completed = self.command_runner(
-                exit_command,
-                input_bytes=None,
-                timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
-            )
-            retry_exit_code = decode_exit(completed)
-            return 125 if retry_exit_code is None else retry_exit_code
+            return retry_exit_after_process_disappears()
         try:
             self.command_digest(ownership)
         except (RuntimeError, ValueError):
-            return 125
+            return retry_exit_after_process_disappears()
         return None
 
     def read_lifecycle_phase_evidence(
