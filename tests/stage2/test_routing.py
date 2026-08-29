@@ -704,6 +704,32 @@ def test_stage2_training_arguments_omit_checkpoint_kwargs_when_disabled():
     assert training_args.gradient_checkpointing_kwargs is None
 
 
+def test_stage2_peft_zero3_uses_reentrant_gradient_checkpointing():
+    """Catches ZeRO-3 partitions invalidating PEFT non-reentrant recomputation."""
+    args = stage2_args(
+        tuning_method="lora",
+        deepspeed_config=str(
+            Path(main.__file__).resolve().parents[1]
+            / "configs"
+            / "deepspeed_zero3.json"
+        ),
+    )
+
+    model = tiny_stage2_qwen()
+    profile = main.bind_deepspeed_runtime_profile(args)
+    main.configure_stage2_model_backend(
+        model,
+        gradient_checkpointing=True,
+        tuning_method="lora",
+        deepspeed_runtime_profile=profile,
+    )
+    assert model.model._gradient_checkpointing_func.keywords == {
+        "use_reentrant": True
+    }
+    training_args = build_stage2_training_arguments(args)
+    assert training_args.gradient_checkpointing_kwargs == {"use_reentrant": True}
+
+
 class RecordingTrainer:
     instance = None
     world_process_zero = True

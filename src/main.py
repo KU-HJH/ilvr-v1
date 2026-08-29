@@ -91,9 +91,6 @@ from stage2.peft import (
 platform.python_version = _platform_python_version
 
 
-_STAGE2_GRADIENT_CHECKPOINTING_KWARGS = {"use_reentrant": False}
-
-
 @dataclass(frozen=True)
 class TrainingPath:
     trainer_class: type
@@ -154,12 +151,41 @@ def build_stage2_source_provenance_kwargs(args) -> Mapping[str, object]:
     )
 
 
-def configure_stage2_model_backend(model, *, gradient_checkpointing: bool) -> None:
+def _stage2_gradient_checkpointing_kwargs(
+    *, gradient_checkpointing: bool, tuning_method: str, deepspeed_runtime_profile
+) -> dict[str, bool] | None:
+    if not gradient_checkpointing:
+        return None
+    use_reentrant = (
+        tuning_method in ("lora", "dora")
+        and deepspeed_runtime_profile.enabled
+        and deepspeed_runtime_profile.zero_stage == 3
+    )
+    return {"use_reentrant": use_reentrant}
+
+
+def configure_stage2_model_backend(
+    model,
+    *,
+    gradient_checkpointing: bool,
+    tuning_method: str = "full",
+    deepspeed_runtime_profile=None,
+) -> None:
     """Apply Stage 2 cache/checkpoint settings outside the latent recurrence."""
     model.config.use_cache = False
     if gradient_checkpointing:
+        if deepspeed_runtime_profile is None:
+            from deepspeed_runtime import DeepSpeedRuntimeProfile
+
+            deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
+                False, None, None, None, 1
+            )
         model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs=dict(_STAGE2_GRADIENT_CHECKPOINTING_KWARGS)
+            gradient_checkpointing_kwargs=_stage2_gradient_checkpointing_kwargs(
+                gradient_checkpointing=True,
+                tuning_method=tuning_method,
+                deepspeed_runtime_profile=deepspeed_runtime_profile,
+            )
         )
     else:
         model.gradient_checkpointing_disable()
@@ -271,6 +297,8 @@ def build_stage2_training_components(
     configure_stage2_model_backend(
         base_model,
         gradient_checkpointing=args.gradient_checkpointing,
+        tuning_method=decision.tuning.method,
+        deepspeed_runtime_profile=bind_deepspeed_runtime_profile(args),
     )
     base_model.visual.requires_grad_(False)
     fresh_resolved_target_names = (
@@ -400,6 +428,11 @@ def build_stage2_training_components(
 
 def build_stage2_training_arguments(args) -> SFTConfig:
     validate_stage2_distributed_settings(args.per_device_train_batch_size)
+    checkpointing_kwargs = _stage2_gradient_checkpointing_kwargs(
+        gradient_checkpointing=args.gradient_checkpointing,
+        tuning_method=args.tuning_method,
+        deepspeed_runtime_profile=bind_deepspeed_runtime_profile(args),
+    )
     return SFTConfig(
         output_dir=args.save_model_path,
         num_train_epochs=args.epochs,
@@ -421,11 +454,7 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         max_seq_length=args.max_seq_length_train,
         max_steps=args.max_steps,
         gradient_checkpointing=args.gradient_checkpointing,
-        gradient_checkpointing_kwargs=(
-            dict(_STAGE2_GRADIENT_CHECKPOINTING_KWARGS)
-            if args.gradient_checkpointing
-            else None
-        ),
+        gradient_checkpointing_kwargs=checkpointing_kwargs,
         deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False,
     )
