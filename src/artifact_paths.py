@@ -83,7 +83,11 @@ def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPa
         value = getattr(args, attribute, None)
         if value is not None:
             result = require_canonical_artifact_path(value, kind="result")
-            if result.parent != paths.result_dir:
+            if attribute == "benchmark_evidence_path":
+                owned_by_experiment = result.parent.name == experiment_id
+            else:
+                owned_by_experiment = result.parent == paths.result_dir
+            if not owned_by_experiment:
                 raise ValueError(
                     f"{attribute} must use result experiment ID {experiment_id}"
                 )

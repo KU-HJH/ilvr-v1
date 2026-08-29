@@ -97,6 +97,27 @@ def test_owned_training_evidence_supports_nested_capacity_result_root(stage1_arg
         validate_generated_artifact_paths(stage1_args)
 
 
+def test_owned_stage2_evidence_supports_nested_batch1_result_root(stage1_args):
+    run_id = "multinode-four-gpu-stage2-batch1-full-zero1"
+    paths = resolve_run_artifact_paths(run_id)
+    stage1_args.save_model_path = str(paths.checkpoint_dir)
+    stage1_args.log_file = str(paths.log_dir / "initial-train.log")
+    stage1_args.benchmark_evidence_path = str(
+        Path("/root/workspace/ILVR/results/hardware/capacity/stage2-batch1")
+        / run_id
+        / "initial-producer-evidence.json"
+    )
+
+    assert validate_generated_artifact_paths(stage1_args) == paths
+
+    stage1_args.benchmark_evidence_path = str(
+        Path("/root/workspace/ILVR/results/hardware/capacity/stage2-batch1/wrong-run")
+        / "initial-producer-evidence.json"
+    )
+    with pytest.raises(ValueError, match="experiment ID"):
+        validate_generated_artifact_paths(stage1_args)
+
+
 def test_multinode_direct_artifact_tuple_rejects_legacy_nested_checkpoint(
     stage1_args,
 ):
