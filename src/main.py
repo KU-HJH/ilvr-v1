@@ -22,6 +22,7 @@ def _preflight_direct_main(argv: list[str]) -> object:
     parser.add_argument("--benchmark_run_config")
     parser.add_argument("--benchmark_evidence_path")
     parser.add_argument("--benchmark_smoke_resume_witness")
+    parser.add_argument("--training_evidence_path")
     parser.add_argument("--deepspeed_config")
     args, _unknown = parser.parse_known_args(argv)
     if args.log_file is None:

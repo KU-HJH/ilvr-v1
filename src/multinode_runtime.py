@@ -787,6 +787,7 @@ _STAGE1_COORDINATOR_OPTIONS = {
     "--manifest",
     "--producer-evidence",
     "--smoke-resume-witness",
+    "--training-evidence",
 }
 
 
@@ -1581,16 +1582,16 @@ def build_owned_tmux_commands(
         base_environment: dict[str, str] = {}
         forwarded = validate_stage1_arguments(stage_arguments)
         stage_owned_arguments: tuple[str, ...] = ()
+        finite_loss_evidence_path = (
+            Path(result_root)
+            / plan.run_id
+            / f"{plan.attempt_id}-producer-evidence.json"
+        )
         if any(
             argument == "--benchmark-run-config"
             or argument.startswith("--benchmark-run-config=")
             for argument in forwarded
         ):
-            finite_loss_evidence_path = (
-                Path(result_root)
-                / plan.run_id
-                / f"{plan.attempt_id}-producer-evidence.json"
-            )
             stage_owned_arguments = (
                 "--producer-evidence",
                 str(finite_loss_evidence_path),
@@ -1608,7 +1609,10 @@ def build_owned_tmux_commands(
                     ),
                 )
         else:
-            finite_loss_evidence_path = None
+            stage_owned_arguments = (
+                "--training-evidence",
+                str(finite_loss_evidence_path),
+            )
         stage_command = (
             "/usr/bin/bash",
             str(repository / "run_stage1_training.sh"),
@@ -2094,6 +2098,36 @@ class SubprocessCoordinatorRunner:
         raw = completed.stdout.encode("utf-8")
         if not raw or len(raw) > 1024 * 1024:
             raise ValueError("remote lifecycle evidence size is invalid")
+        return raw
+
+    def read_stage1_training_evidence(self, path: Path) -> bytes:
+        """Read the fixed remote ordinary Stage 1 producer after owned exit zero."""
+        expected = self._launch_commands().finite_loss_evidence_path
+        if self.plan.stage != "stage1" or expected is None or path != expected:
+            raise ValueError("Stage 1 training evidence path differs from the launch")
+        repository = _REPOSITORY_ROOT
+        completed = self._run(
+            build_remote_exec(
+                (
+                    "env",
+                    f"PYTHONPATH={repository}:{repository / 'src'}",
+                    str(repository / "venv/ilvr-venv/bin/python"),
+                    "-m",
+                    "src.multinode",
+                    "stage1-training-evidence-show",
+                    "--path",
+                    str(path),
+                    "--run-id",
+                    self.plan.run_id,
+                    "--attempt-id",
+                    self.plan.attempt_id,
+                ),
+                working_directory=repository,
+            )
+        )
+        raw = completed.stdout.encode("utf-8")
+        if not raw or len(raw) > 1024 * 1024:
+            raise ValueError("remote Stage 1 training evidence size is invalid")
         return raw
 
     def cleanup_owned(self, machine_rank: int, *, timeout_seconds: float) -> bool:
@@ -3359,6 +3393,7 @@ def _finite_loss_reference(
     *,
     plan: "LaunchPlan" | None = None,
     checkpoint_root: Path | None = None,
+    expected_global_step: int | None = None,
 ) -> dict[str, object]:
     if path is None:
         raise ValueError("finite loss evidence is required for a successful attempt")
@@ -3408,6 +3443,34 @@ def _finite_loss_reference(
             "finite_loss": True,
             "finite_gradient": True,
             "process_ranks": [0, 1, 2, 3],
+        }
+    if (
+        plan is not None
+        and plan.stage == "stage1"
+        and type(payload) is dict
+        and payload.get("kind") == "stage1-training-evidence"
+    ):
+        if checkpoint_root is None or expected_global_step is None:
+            raise ValueError("Stage 1 training evidence requires exact checkpoint step")
+        from stage1.training_evidence import decode_stage1_training_evidence
+
+        decoded = decode_stage1_training_evidence(
+            raw,
+            expected_run_id=plan.run_id,
+            expected_method=plan.tuning_method,
+            expected_zero_stage=plan.zero_stage,
+            expected_world_size=plan.world_size,
+            expected_checkpoint=(
+                checkpoint_root / f"checkpoint-{expected_global_step}"
+            ),
+            expected_global_step=expected_global_step,
+        )
+        return {
+            "status": "validated",
+            "path": str(path),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size": len(raw),
+            "finite_loss": decoded["finite_loss"],
         }
     evidence = payload.get("benchmark_evidence", payload) if type(payload) is dict else None
     if type(evidence) is not dict or evidence.get("finite_loss") is not True:
@@ -3471,6 +3534,7 @@ def write_training_witness(
     checkpoint_path: str | Path,
     batch_per_gpu: int,
     finite_loss_evidence_path: str | Path | None = None,
+    expected_global_step: int | None = None,
 ) -> Path:
     """Exclusively publish one attempt witness without inventing loss evidence."""
     if dict(exit_codes) != {0: 0, 1: 0}:
@@ -3500,6 +3564,7 @@ def write_training_witness(
         else None,
         plan=plan,
         checkpoint_root=checkpoint,
+        expected_global_step=expected_global_step,
     )
     run_directory = _trusted_absolute_path(result_root) / plan.run_id
     path = run_directory / f"{plan.attempt_id}-train-witness.json"

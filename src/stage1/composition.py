@@ -720,6 +720,33 @@ def run_stage1(
             raise RuntimeError("Stage 1 final save timing must be finite and non-negative")
         logging.info("Stage 1 final save time: %.3fs", save_seconds)
 
+    training_evidence_path = getattr(args, "training_evidence_path", None)
+    if training_evidence_path is not None:
+        metrics = getattr(train_result, "metrics", None)
+        metrics = metrics if isinstance(metrics, dict) else {}
+        loss = metrics.get("train_loss")
+        state = getattr(components.trainer, "state", None)
+        global_step = getattr(state, "global_step", None)
+        if profile.zero_stage is None:
+            raise ValueError("ordinary Stage 1 evidence requires DeepSpeed")
+        evidence = {
+            "run_id": Path(args.save_model_path).name,
+            "method": args.tuning_method,
+            "zero_stage": profile.zero_stage,
+            "world_size": profile.world_size,
+            "global_step": global_step,
+            "checkpoint_path": Path(args.save_model_path) / f"checkpoint-{global_step}",
+            "loss": loss,
+        }
+        from stage1.training_evidence import (
+            build_stage1_training_evidence,
+            publish_stage1_training_evidence,
+        )
+
+        build_stage1_training_evidence(**evidence)
+        if components.trainer.is_world_process_zero():
+            publish_stage1_training_evidence(training_evidence_path, **evidence)
+
     if not producing:
         return
 

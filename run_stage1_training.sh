@@ -64,6 +64,7 @@ max_steps=${STAGE1_MAX_STEPS:-}
 benchmark_run_config=${STAGE1_BENCHMARK_RUN_CONFIG:-}
 benchmark_evidence_path=${STAGE1_BENCHMARK_EVIDENCE_PATH:-}
 benchmark_smoke_resume_witness=${STAGE1_BENCHMARK_SMOKE_RESUME_WITNESS:-}
+training_evidence_path=
 dry_run=false
 final_save=true
 legacy_use_lora=false
@@ -174,6 +175,7 @@ while (( $# )); do
         --benchmark-run-config) require_value "$@"; benchmark_run_config=$2; shift 2 ;;
         --producer-evidence) require_value "$@"; benchmark_evidence_path=$2; shift 2 ;;
         --smoke-resume-witness) require_value "$@"; benchmark_smoke_resume_witness=$2; shift 2 ;;
+        --training-evidence) require_value "$@"; training_evidence_path=$2; shift 2 ;;
         --final-save) final_save=true; shift ;;
         --no-final-save) final_save=false; shift ;;
         --use_lora) legacy_use_lora=true; shift ;;
@@ -253,6 +255,7 @@ if [[ $dry_run != true ]]; then
     [[ -z $benchmark_run_config ]] || artifact_preflight+=(--benchmark-run-config "$benchmark_run_config")
     [[ -z $benchmark_evidence_path ]] || artifact_preflight+=(--benchmark-evidence-path "$benchmark_evidence_path")
     [[ -z $benchmark_smoke_resume_witness ]] || artifact_preflight+=(--benchmark-smoke-resume-witness "$benchmark_smoke_resume_witness")
+    [[ -z $training_evidence_path ]] || artifact_preflight+=(--training-evidence-path "$training_evidence_path")
     "${artifact_preflight[@]}" >/dev/null
     if [[ $manifest_mode == true ]]; then
         resolved_manifest=$(readlink -f -- "$manifest_path") || {
@@ -275,7 +278,7 @@ if [[ $dry_run != true ]]; then
     "$repository_python" -m src.deepspeed_runtime validate \
         --config "$deepspeed_config" --world-size "$ilvr_num_processes" >/dev/null
     artifact_dirs=("$output_dir" "$(dirname -- "$log_file")")
-    for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness"; do
+    for result_path in "$benchmark_run_config" "$benchmark_evidence_path" "$benchmark_smoke_resume_witness" "$training_evidence_path"; do
         if [[ -n $result_path ]]; then
             artifact_dirs+=("$(dirname -- "$result_path")")
             break
@@ -388,6 +391,13 @@ if [[ -n $benchmark_smoke_resume_witness ]]; then
         exit 2
     fi
     command+=(--benchmark_smoke_resume_witness "$benchmark_smoke_resume_witness")
+fi
+if [[ -n $training_evidence_path ]]; then
+    if [[ -n $benchmark_run_config || -n $benchmark_evidence_path ]]; then
+        printf 'error: ordinary training evidence cannot be combined with benchmark evidence\n' >&2
+        exit 2
+    fi
+    command+=(--training_evidence_path "$training_evidence_path")
 fi
 if [[ $final_save == true ]]; then
     command+=(--final_save)

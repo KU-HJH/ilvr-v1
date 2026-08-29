@@ -750,6 +750,38 @@ def _lifecycle_evidence_show(argv: list[str]) -> int:
     return 0
 
 
+def _stage1_training_evidence_show(argv: list[str]) -> int:
+    """Emit one bounded canonical ordinary Stage 1 producer from remote rank zero."""
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode stage1-training-evidence-show",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--path", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", required=True)
+    args = parser.parse_args(argv)
+    try:
+        _validate_identifier("run_id", args.run_id)
+        _validate_identifier("attempt_id", args.attempt_id)
+        path = Path(args.path)
+        result_root = _REPOSITORY_ROOT / "results"
+        if (
+            not path.is_absolute()
+            or ".." in path.parts
+            or path.parent.name != args.run_id
+            or path.name != f"{args.attempt_id}-producer-evidence.json"
+        ):
+            raise ValueError("Stage 1 training evidence path identity is invalid")
+        path.relative_to(result_root)
+        from src.multinode_runtime import _read_regular_file
+
+        raw = _read_regular_file(path, maximum_size=1024 * 1024)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    sys.stdout.buffer.write(raw)
+    return 0
+
+
 def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stage", choices=("stage1", "stage2"), required=True)
     parser.add_argument(
@@ -1783,6 +1815,20 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         if step_value is None or not step_value.isdecimal() or int(step_value) <= 0:
             raise ValueError(f"{step_option} must identify the final checkpoint step")
         final_step = int(step_value)
+        ordinary_stage1 = (
+            stage == "stage1"
+            and _argument_value(forwarded, "--benchmark-run-config") is None
+        )
+        if ordinary_stage1:
+            evidence_path = commands.finite_loss_evidence_path
+            if evidence_path is None:
+                raise ValueError("ordinary Stage 1 producer path is missing")
+            from src.multinode_runtime import publish_small_file
+
+            publish_small_file(
+                evidence_path,
+                runner.read_stage1_training_evidence(evidence_path),
+            )
         checkpoint_path = checkpoint_run_path / f"checkpoint-{final_step}"
         artifact_identity = _checkpoint_artifact_identity(
             plan,
@@ -1809,6 +1855,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 checkpoint_path=checkpoint_run_path,
                 batch_per_gpu=batch_per_gpu,
                 finite_loss_evidence_path=commands.finite_loss_evidence_path,
+                expected_global_step=final_step,
             )
         except ValueError as error:
             incomplete = write_incomplete_attempt(
@@ -2063,6 +2110,8 @@ def _main(argv: list[str] | None = None) -> int:
         return _capacity_evidence_main(argv[1:])
     if argv and argv[0] == "lifecycle-evidence-show":
         return _lifecycle_evidence_show(argv[1:])
+    if argv and argv[0] == "stage1-training-evidence-show":
+        return _stage1_training_evidence_show(argv[1:])
     if argv and argv[0] in ("train-stage1", "train-stage2"):
         return _training_main(argv[0].removeprefix("train-"), argv[1:])  # type: ignore[arg-type]
     if argv and argv[0] == "prepare-inference":

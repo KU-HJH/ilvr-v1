@@ -36,6 +36,7 @@ from src.multinode_runtime import (
     write_training_witness,
 )
 from stage2.evidence import build_stage2_producer_evidence
+from stage1.training_evidence import publish_stage1_training_evidence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -957,6 +958,31 @@ def test_stage2_coordinator_owns_a_fresh_producer_evidence_path():
     ] == str(producer)
 
 
+def test_ordinary_stage1_coordinator_owns_training_evidence_path_and_argv():
+    launch_plan = plan(stage="stage1", method="full")
+    producer = Path(
+        "/root/workspace/ILVR/results/stage1-full-zero3-four-gpu/"
+        "initial-producer-evidence.json"
+    )
+
+    commands = build_owned_tmux_commands(
+        launch_plan,
+        commit="a" * 40,
+        stage_arguments=(
+            "--method", "full",
+            "--model", "/models/qwen",
+            "--data-path", "/data/train.jsonl",
+            "--image-root", "/data/images",
+            "--max-steps", "1",
+        ),
+    )
+
+    assert commands.finite_loss_evidence_path == producer
+    for node_spec in commands.node_specs:
+        command = list(node_spec.command)
+        assert command[command.index("--training-evidence") + 1] == str(producer)
+
+
 def test_stage1_rejects_any_environment_override():
     with pytest.raises(ValueError, match="does not accept"):
         build_owned_tmux_commands(
@@ -1027,6 +1053,52 @@ def test_witness_never_invents_missing_finite_loss_evidence(tmp_path):
             batch_per_gpu=2,
             finite_loss_evidence_path=producer,
         )
+
+
+def test_stage1_witness_consumes_exact_ordinary_training_evidence(tmp_path):
+    launch_plan = plan(stage="stage1", method="full")
+    checkpoint_root = tmp_path / "checkpoints" / launch_plan.run_id
+    checkpoint = checkpoint_root / "checkpoint-1"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
+    producer = (
+        tmp_path / "producer" / launch_plan.run_id
+        / "initial-producer-evidence.json"
+    )
+    publish_stage1_training_evidence(
+        producer,
+        run_id=launch_plan.run_id,
+        method="full",
+        zero_stage=3,
+        world_size=4,
+        global_step=1,
+        checkpoint_path=checkpoint,
+        loss=0.25,
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        write_training_witness(
+            launch_plan,
+            result_root=tmp_path / "wrong-results",
+            exit_codes={0: 0, 1: 0},
+            checkpoint_path=checkpoint_root,
+            batch_per_gpu=2,
+            finite_loss_evidence_path=producer,
+            expected_global_step=2,
+        )
+    assert not (tmp_path / "wrong-results" / launch_plan.run_id).exists()
+
+    witness = write_training_witness(
+        launch_plan,
+        result_root=tmp_path / "results",
+        exit_codes={0: 0, 1: 0},
+        checkpoint_path=checkpoint_root,
+        batch_per_gpu=2,
+        finite_loss_evidence_path=producer,
+        expected_global_step=1,
+    )
+
+    assert json.loads(witness.read_text())["finite_loss_evidence"]["finite_loss"] is True
 
 
 def test_stage2_training_witness_revalidates_finite_gradient_and_rank_evidence(

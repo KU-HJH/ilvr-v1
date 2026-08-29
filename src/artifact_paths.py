@@ -79,6 +79,7 @@ def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPa
         "benchmark_run_config",
         "benchmark_evidence_path",
         "benchmark_smoke_resume_witness",
+        "training_evidence_path",
     ):
         value = getattr(args, attribute, None)
         if value is not None:
@@ -108,6 +109,7 @@ def _main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--benchmark-run-config")
     run_parser.add_argument("--benchmark-evidence-path")
     run_parser.add_argument("--benchmark-smoke-resume-witness")
+    run_parser.add_argument("--training-evidence-path")
     args = parser.parse_args(argv)
     try:
         if args.command == "resolve":
@@ -122,6 +124,7 @@ def _main(argv: list[str] | None = None) -> int:
                     benchmark_run_config=args.benchmark_run_config,
                     benchmark_evidence_path=args.benchmark_evidence_path,
                     benchmark_smoke_resume_witness=args.benchmark_smoke_resume_witness,
+                    training_evidence_path=args.training_evidence_path,
                 )
             )
             print(_json_paths(paths))

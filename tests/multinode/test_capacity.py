@@ -817,8 +817,14 @@ def test_stage1_coordinator_writes_witness_for_run_owned_checkpoint_root(
         "validate_preflight",
         lambda *args, **kwargs: SimpleNamespace(commit="c" * 40),
     )
+    remote_evidence = b'{"finite_loss":true,"source":"remote-rank0"}\n'
+    fake_runner = SimpleNamespace(
+        read_stage1_training_evidence=lambda path: remote_evidence
+    )
     monkeypatch.setattr(
-        multinode_module, "SubprocessCoordinatorRunner", lambda *args, **kwargs: object()
+        multinode_module,
+        "SubprocessCoordinatorRunner",
+        lambda *args, **kwargs: fake_runner,
     )
     monkeypatch.setattr(multinode_module, "start_rank0_then_rank1", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -842,7 +848,7 @@ def test_stage1_coordinator_writes_witness_for_run_owned_checkpoint_root(
         if checkpoint_path.name != launch_plan.run_id:
             raise ValueError("training witness checkpoint must be owned by the run ID")
         witness = Path(result_root) / launch_plan.run_id / "initial-train-witness.json"
-        witness.parent.mkdir(parents=True)
+        witness.parent.mkdir(parents=True, exist_ok=True)
         witness.write_text("{}", encoding="utf-8")
         return witness
 
@@ -872,4 +878,5 @@ def test_stage1_coordinator_writes_witness_for_run_owned_checkpoint_root(
     assert json.loads(capsys.readouterr().out)["training_witness"].endswith(
         "initial-train-witness.json"
     )
+    assert commands.finite_loss_evidence_path.read_bytes() == remote_evidence
     assert (checkpoint_root / child_run_id / "checkpoint-2").is_dir()

@@ -2,6 +2,7 @@ from dataclasses import replace
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from peft_common import capture_qwen2_5_vl_architecture
 from deepspeed_runtime import (
+    DeepSpeedRuntimeProfile,
     bind_deepspeed_runtime_profile,
     canonical_deepspeed_config_path,
 )
@@ -1037,6 +1039,70 @@ def test_run_stage1_trains_once_and_only_final_saves_when_requested(
     assert trainer.events == expected
     assert observed_profiles == [args.deepspeed_runtime_profile]
     assert "Stage 1 Trainer time: 3.500s" in caplog.text
+
+
+@pytest.mark.parametrize("loss", [0.375, float("nan")])
+def test_run_stage1_publishes_only_observed_finite_ordinary_evidence(
+    tmp_path, loss
+):
+    run_id = "capacity-full-zero1-r4-batch2"
+    output = tmp_path / "checkpoints" / run_id
+    checkpoint = output / "checkpoint-1"
+    checkpoint.mkdir(parents=True)
+    evidence_path = tmp_path / "results" / run_id / "initial-producer-evidence.json"
+
+    class EvidenceTrainer(RecordingTrainer):
+        def __init__(self):
+            super().__init__(args=SimpleNamespace())
+            self.state = SimpleNamespace(global_step=1)
+
+        def train(self, *, resume_from_checkpoint):
+            super().train(resume_from_checkpoint=resume_from_checkpoint)
+            return SimpleNamespace(metrics={"train_loss": loss})
+
+    trainer = EvidenceTrainer()
+    bundle = SimpleNamespace(
+        trainer=trainer,
+        processor=RecordingProcessor(),
+        resume_decision=Stage1ResumeDecision(None, None, False),
+    )
+    profile = DeepSpeedRuntimeProfile(
+        enabled=True,
+        zero_stage=1,
+        config_path=REPO_ROOT / "configs/deepspeed_zero1.json",
+        config_digest="a" * 64,
+        world_size=4,
+    )
+    args = SimpleNamespace(
+        final_save=False,
+        save_model_path=str(output),
+        training_evidence_path=str(evidence_path),
+        tuning_method="full",
+        benchmark_run_config=None,
+        benchmark_evidence_path=None,
+        deepspeed_runtime_profile=profile,
+    )
+
+    if math.isfinite(loss):
+        run_stage1(
+            args,
+            component_builder=lambda selected: bundle,
+            deepspeed_runtime_profile=profile,
+            monotonic=iter((1.0, 2.0)).__next__,
+        )
+        payload = json.loads(evidence_path.read_text())
+        assert payload["loss"] == loss
+        assert payload["global_step"] == 1
+        assert payload["checkpoint_path"] == str(checkpoint)
+    else:
+        with pytest.raises(ValueError, match="finite loss"):
+            run_stage1(
+                args,
+                component_builder=lambda selected: bundle,
+                deepspeed_runtime_profile=profile,
+                monotonic=iter((1.0, 2.0)).__next__,
+            )
+        assert not evidence_path.exists()
 
 
 def test_run_stage1_atomically_emits_small_producer_evidence_without_model_load(
