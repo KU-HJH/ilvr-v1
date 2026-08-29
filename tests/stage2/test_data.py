@@ -12,6 +12,7 @@ from stage2.data import (
     filter_stage2_examples,
     load_jsonl_examples,
     prepare_stage2_example,
+    resolve_original_images,
 )
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds, LatentStructureError
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
@@ -153,6 +154,59 @@ def test_rejects_missing_original_image(valid_sample, tmp_path):
 
     with pytest.raises(FileNotFoundError, match="missing original image"):
         build_stage2_conversation(valid_sample, image_root=tmp_path, latent_size=2)
+
+
+@pytest.mark.parametrize(
+    "image_input",
+    ("images_comt/creation/10003.png", "creation/10003.png"),
+)
+def test_original_image_resolver_accepts_canonical_and_root_relative_paths(
+    tmp_path, image_input
+):
+    image_root = tmp_path / "images_comt"
+    image = image_root / "creation/10003.png"
+    image.parent.mkdir(parents=True)
+    Image.new("RGB", (2, 2)).save(image)
+
+    assert resolve_original_images(
+        {"image_input": image_input}, image_root
+    ) == (str(image),)
+
+
+def test_original_image_resolver_strips_the_root_name_only_once(tmp_path):
+    image_root = tmp_path / "images_comt"
+    image = image_root / "creation/10003.png"
+    image.parent.mkdir(parents=True)
+    Image.new("RGB", (2, 2)).save(image)
+
+    with pytest.raises(FileNotFoundError, match="missing original image"):
+        resolve_original_images(
+            {"image_input": "images_comt/images_comt/creation/10003.png"},
+            image_root,
+        )
+
+
+@pytest.mark.parametrize(
+    "image_input",
+    ("/tmp/absolute.png", "../escape.png", "creation/control\n.png"),
+)
+def test_original_image_resolver_rejects_unsafe_paths(tmp_path, image_input):
+    image_root = tmp_path / "images_comt"
+    image_root.mkdir()
+
+    with pytest.raises(ValueError, match="safe relative path"):
+        resolve_original_images({"image_input": image_input}, image_root)
+
+
+def test_original_image_resolver_rejects_a_symlink_escape(tmp_path):
+    image_root = tmp_path / "images_comt"
+    image_root.mkdir()
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (2, 2)).save(outside)
+    (image_root / "escape.png").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="remain inside image_root"):
+        resolve_original_images({"image_input": "escape.png"}, image_root)
 
 
 def test_prepare_example_preserves_original_image_paths_and_latent_count(tmp_path):
