@@ -132,11 +132,14 @@ def write_matrix_witnesses(root: Path) -> Path:
 
 def write_evaluation_witness(root: Path) -> Path:
     evaluation = root / "evaluation"
+    merged_rows = []
     for index in range(4):
+        row = {"index": index, "task_name": "tiny", "match": True,
+               "inference_time_sec": 0.25}
         jsonl = evaluation / f"shard-{index}.jsonl"
         jsonl.parent.mkdir(parents=True, exist_ok=True)
-        jsonl.write_text(json.dumps({"index": index, "task_name": "tiny",
-                                     "match": True, "inference_time_sec": 0.25}) + "\n")
+        jsonl.write_text(json.dumps(row) + "\n")
+        merged_rows.append(row)
         _write_json(evaluation / f"shard-{index}.jsonl.manifest.json", {
             "schema_version": 1, "result_jsonl": f"shard-{index}.jsonl",
             "dataset_identity": {"path": "/root/workspace/ILVR/data/test.jsonl",
@@ -146,6 +149,9 @@ def write_evaluation_witness(root: Path) -> Path:
             "processed_source_indices": [index], "worker_exit_status": 0,
             "successful": True,
         })
+    (evaluation / "merged.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in merged_rows)
+    )
     _write_json(evaluation / "summary.json", {
         "summary": True, "num_samples": 4, "average_inference_time_sec": 0.25,
         "total_inference_time_sec": 1.0, "accuracy": 1.0, "success": 4,
@@ -279,10 +285,30 @@ def test_validate_results_rejects_recommendation_without_successful_child(tmp_pa
 
 def test_validate_results_rereads_shard_rows_and_accuracy(tmp_path):
     matrix, evaluation, capacity = _valid_roots(tmp_path)
-    (evaluation / "shard-2.jsonl").write_text(
-        json.dumps({"index": 2, "task_name": "tiny", "match": False}) + "\n"
+    changed = {"index": 2, "task_name": "tiny", "match": False}
+    (evaluation / "shard-2.jsonl").write_text(json.dumps(changed) + "\n")
+    merged = [
+        json.loads(line)
+        for line in (evaluation / "merged.jsonl").read_text().splitlines()
+    ]
+    merged[2] = changed
+    (evaluation / "merged.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in merged)
     )
     with pytest.raises(ValueError, match="accuracy"):
+        validate_results(matrix, evaluation, capacity)
+
+
+def test_validate_results_rejects_merged_rows_that_differ_from_ordered_shards(
+    tmp_path,
+):
+    matrix, evaluation, capacity = _valid_roots(tmp_path)
+    rows = [json.loads(line) for line in (evaluation / "merged.jsonl").read_text().splitlines()]
+    (evaluation / "merged.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in reversed(rows))
+    )
+
+    with pytest.raises(ValueError, match="merged"):
         validate_results(matrix, evaluation, capacity)
 
 
@@ -480,8 +506,12 @@ def test_publish_validation_outputs_writes_matching_tables_exclusively(tmp_path)
     assert "| Method | ZeRO 1 | ZeRO 2 | ZeRO 3 |" in markdown
     assert "| dora | 2 | 2 | 2 |" in markdown
     assert "| dora | 1 | 1 | 1 |" in markdown
-    with pytest.raises(FileExistsError):
+    with pytest.raises(
+        results_module.ReportBundlePublicationAmbiguityError,
+        match="orphan staging path",
+    ):
         publish_validation_outputs(report, bundle)
+    assert len(list(tmp_path.glob(".validation-report.*.staging"))) == 1
 
 
 @pytest.mark.parametrize("failure", ("write", "fsync"))
@@ -524,12 +554,86 @@ def test_final_bundle_rename_collision_preserves_foreign_bundle(tmp_path):
     foreign = bundle / "foreign.txt"
     foreign.write_bytes(b"owned by another publisher")
 
-    with pytest.raises(FileExistsError):
+    with pytest.raises(
+        results_module.ReportBundlePublicationAmbiguityError,
+        match="orphan staging path",
+    ) as caught:
         publish_validation_outputs(report, bundle)
 
     assert foreign.read_bytes() == b"owned by another publisher"
     assert set(bundle.iterdir()) == {foreign}
-    assert list(tmp_path.glob(".*validation-report*")) == []
+    staging = list(tmp_path.glob(".validation-report.*.staging"))
+    assert len(staging) == 1
+    assert str(bundle) in str(caught.value)
+    assert str(staging[0]) in str(caught.value)
+    assert {path.name for path in staging[0].iterdir()} == {
+        "validation-manifest.json",
+        "validation-summary.md",
+    }
+
+
+def test_rename_exception_after_same_uid_staging_swap_preserves_both_namespaces(
+    tmp_path, monkeypatch
+):
+    """Catches retained-dirfd cleanup mutating owned contents after a name swap."""
+    report = validate_results(*_valid_roots(tmp_path))
+    bundle = tmp_path / "validation-report"
+    bundle.mkdir()
+    (bundle / "foreign-final.txt").write_bytes(b"foreign final")
+    moved_owned = tmp_path / "moved-owned-staging"
+    staging_path = None
+
+    def swap_staging_then_fail(
+        source_descriptor,
+        source_name,
+        destination_descriptor,
+        destination_name,
+    ):
+        nonlocal staging_path
+        staging_path = tmp_path / source_name
+        os.rename(
+            source_name,
+            moved_owned.name,
+            src_dir_fd=source_descriptor,
+            dst_dir_fd=destination_descriptor,
+        )
+        os.mkdir(source_name, mode=0o700, dir_fd=source_descriptor)
+        foreign_staging_descriptor = os.open(
+            source_name,
+            os.O_RDONLY | os.O_DIRECTORY,
+            dir_fd=source_descriptor,
+        )
+        try:
+            foreign_descriptor = os.open(
+                "foreign-staging.txt",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=foreign_staging_descriptor,
+            )
+            try:
+                os.write(foreign_descriptor, b"foreign staging")
+            finally:
+                os.close(foreign_descriptor)
+        finally:
+            os.close(foreign_staging_descriptor)
+        raise FileExistsError("simulated rename collision after namespace swap")
+
+    monkeypatch.setattr(results_module, "_rename_noreplace", swap_staging_then_fail)
+    with pytest.raises(
+        results_module.ReportBundlePublicationAmbiguityError,
+        match="orphan staging path",
+    ) as caught:
+        publish_validation_outputs(report, bundle)
+
+    assert staging_path is not None
+    assert str(bundle) in str(caught.value)
+    assert str(staging_path) in str(caught.value)
+    assert (staging_path / "foreign-staging.txt").read_bytes() == b"foreign staging"
+    assert (bundle / "foreign-final.txt").read_bytes() == b"foreign final"
+    assert {path.name for path in moved_owned.iterdir()} == {
+        "validation-manifest.json",
+        "validation-summary.md",
+    }
 
 
 def test_staging_open_failure_removes_only_private_empty_directory(
@@ -600,9 +704,14 @@ def test_exception_after_successful_rename_never_cleans_final_bundle(
         raise KeyboardInterrupt("simulated post-rename interruption")
 
     monkeypatch.setattr(results_module, "_rename_noreplace", rename_then_interrupt)
-    with pytest.raises(KeyboardInterrupt, match="post-rename interruption"):
+    with pytest.raises(
+        results_module.ReportBundlePublicationAmbiguityError,
+        match="orphan staging path",
+    ) as caught:
         publish_validation_outputs(report, bundle)
 
+    assert isinstance(caught.value.__cause__, KeyboardInterrupt)
+    assert str(bundle) in str(caught.value)
     assert {path.name for path in bundle.iterdir()} == {
         "validation-manifest.json",
         "validation-summary.md",

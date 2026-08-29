@@ -94,6 +94,15 @@ def test_evaluation_assigns_remote_zero_one_and_local_two_three():
     assert len({a.ownership_name for a in assignments}) == 4
 
 
+def test_local_inference_staging_is_a_sibling_of_the_final_evaluation_result():
+    plan = _plan()
+
+    assert plan.local_model_dir == Path(
+        "/root/workspace/ILVR/results/eval-four-gpu-inference-model"
+    )
+    assert plan.local_model_dir.parent == plan.output_dir.parent
+
+
 @pytest.mark.parametrize(
     ("stage", "evaluator"),
     [("stage1", "/root/workspace/ILVR/eval.py"),

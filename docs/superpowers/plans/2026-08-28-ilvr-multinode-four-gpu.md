@@ -1102,8 +1102,7 @@ run_id="stage1-lora-zero3-$(date -u +%Y%m%dT%H%M%SZ)"
   --model /root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct \
   --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
   --image-root /root/workspace/ILVR/data/images_comt \
-  --output-dir "/root/workspace/ILVR/checkpoints/$run_id" \
-  --micro-batch 2 --max-steps 10
+  --micro-batch 2 --save-strategy steps --save-steps 10 --max-steps 10
 ```
 
 Use these remaining examples with distinct ports:
@@ -1113,27 +1112,31 @@ run_id="stage2-dora-zero2-$(date -u +%Y%m%dT%H%M%SZ)"
 STAGE1_CHECKPOINT=/root/workspace/ILVR/checkpoints/comt_ckpt \
 DATA_PATH=/root/workspace/ILVR/data/TRAIN.jsonl \
 IMAGE_ROOT=/root/workspace/ILVR/data/images_comt \
-OUTPUT_DIR="/root/workspace/ILVR/checkpoints/$run_id" \
 TUNING_METHOD=dora \
 ./run_multinode_stage2_training.sh \
   --run-id "$run_id" --zero-stage 2 --main-process-port 29802 \
-  -- --max_steps 10
+  --max_steps 10 --save_steps 10
 
 STAGE1_CHECKPOINT=/root/workspace/ILVR/checkpoints/comt_ckpt \
 DATA_PATH=/root/workspace/ILVR/data/TRAIN.jsonl \
 IMAGE_ROOT=/root/workspace/ILVR/data/images_comt \
-OUTPUT_DIR="/root/workspace/ILVR/checkpoints/$run_id" \
 RESUME_CHECKPOINT="/root/workspace/ILVR/checkpoints/$run_id/checkpoint-10" \
 TUNING_METHOD=dora \
 ./run_multinode_stage2_training.sh \
   --run-id "$run_id" --attempt-id resume-step10-to11 \
   --zero-stage 2 --main-process-port 29803 \
-  -- --max_steps 11
+  --max_steps 11 --save_steps 11
+
+prepared_model_dir="/root/workspace/ILVR/results/$run_id/prepared-checkpoint-10"
+./venv/ilvr-venv/bin/python -m src.multinode prepare-inference \
+  --stage stage2 --tuning-method dora --zero-stage 2 \
+  --run-id "$run_id" --main-process-port 29802 \
+  --checkpoint-step 10 --destination "$prepared_model_dir"
 
 eval_id="eval-four-worker-$(date -u +%Y%m%dT%H%M%SZ)"
 ./run_multinode_evaluation.sh \
   --run-id "$eval_id" \
-  --model-dir /root/workspace/ILVR/checkpoints/comt_ckpt \
+  --model-dir "$prepared_model_dir" \
   --test-data-path /root/workspace/ILVR/data/TEST.jsonl \
   --task-name zebra-cot \
   --output-dir "/root/workspace/ILVR/results/$eval_id"
@@ -1144,18 +1147,41 @@ matrix_id="tiny-matrix-$(date -u +%Y%m%dT%H%M%SZ)"
 
 capacity_id="stage1-capacity-lora-zero3-$(date -u +%Y%m%dT%H%M%SZ)"
 ./run_multinode_stage1_batch_probe.sh \
-  --run-id "$capacity_id" --zero-stage 3 --main-process-port 29806 \
-  --method lora \
+  --run-id "$capacity_id" --zero-stage 3 --tuning-method lora \
+  --main-process-port 29822 \
+  --main-process-port 29823 \
+  --main-process-port 29824 \
+  --main-process-port 29825 \
   --model /root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct \
-  --data-path /root/workspace/ILVR/data/multinode-capacity-subset.jsonl \
-  --image-root /root/workspace/ILVR/data/images_comt
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data/images_comt \
+  --save-strategy steps --save-steps 1 --max-steps 1
 ```
 
-The matrix owns the consecutive range beginning at 29804, so document that 29805 is reserved by that run rather than available for a concurrent launch. Add the exact `tmux list-sessions`, ownership JSON inspection, and `python -m src.multinode stop-owned --run-id RUN_ID --machine-rank RANK` cleanup commands; state that manual `kill`, `pkill`, and session-name-only termination are forbidden.
+The matrix owns all 18 consecutive ports `29804..29821`, not only its first
+two ports. Add the exact `tmux list-sessions`, ownership JSON inspection, and
+`python -m src.multinode stop-owned --run-id RUN_ID --machine-rank RANK`
+cleanup commands; state that manual `kill`, `pkill`, and session-name-only
+termination are forbidden. The final validator example must pass one absent
+bundle below a fresh parent and identify both files inside it:
+
+```bash
+validation_id="validation-four-gpu-$(date -u +%Y%m%dT%H%M%SZ)"
+validation_parent="/root/workspace/ILVR/results/$validation_id"
+test ! -e "$validation_parent"
+./venv/ilvr-venv/bin/python -m src.multinode validate-results \
+  --matrix-root "/root/workspace/ILVR/results/$matrix_id" \
+  --evaluation-root "/root/workspace/ILVR/results/$eval_id" \
+  --capacity-root "$capacity_root" \
+  --output-root "$validation_parent/validation-report"
+test -f "$validation_parent/validation-report/validation-manifest.json"
+test -f "$validation_parent/validation-report/validation-summary.md"
+```
 
 - [ ] **Step 2: Run the focused implementation suite once**
 
 ```bash
+PYTHONDONTWRITEBYTECODE=1 \
 PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src:$PWD/tests/stage2" \
   ./venv/ilvr-venv/bin/pytest \
   tests/multinode \
@@ -1188,7 +1214,7 @@ git commit -m "docs: explain ILVR four-GPU multi-node operation"
 **Files:**
 - Create during execution: `/root/workspace/ILVR/results/<hardware-id>/`
 - Create during execution: `/root/workspace/ILVR/logs/<hardware-id>/`
-- Create during execution: `/root/workspace/ILVR/checkpoints/<hardware-id>/`
+- Create during execution: `/root/workspace/ILVR/checkpoints/<hardware-id>-*/`
 - Update after execution: `docs/multinode-training.md`
 
 **Interfaces:**
@@ -1325,8 +1351,7 @@ Expected: both nodes can parse the same first sample and resolve every reference
 hardware_id="multinode-four-gpu-$(date -u +%Y%m%dT%H%M%SZ)"
 hardware_result_root="/root/workspace/ILVR/results/$hardware_id"
 hardware_log_root="/root/workspace/ILVR/logs/$hardware_id"
-hardware_checkpoint_root="/root/workspace/ILVR/checkpoints/$hardware_id"
-mkdir "$hardware_result_root" "$hardware_log_root" "$hardware_checkpoint_root"
+mkdir "$hardware_result_root" "$hardware_log_root"
 matrix_id="${hardware_id}-matrix"
 tmux new-session -d -s "$matrix_id" -- bash -lc \
   "cd /root/workspace/ILVR && ./run_multinode_lifecycle_matrix.sh \
@@ -1342,28 +1367,55 @@ test -f "$hardware_result_root/$matrix_id/matrix-complete.json"
 
 Expected: 18 valid witnesses, each reporting world size 4, two initial steps, resumed global step 3, finite losses, correct ZeRO/method identity, and ranks 0-3.
 
-- [ ] **Step 6: Run one real four-worker evaluation subset**
+- [ ] **Step 6: Train and prepare one real Stage 2 evaluation artifact, then evaluate**
 
 ```bash
+eval_model_run_id="${hardware_id}-stage2-eval-full-zero1"
+STAGE1_CHECKPOINT=/root/workspace/ILVR/checkpoints/comt_ckpt \
+DATA_PATH=/root/workspace/ILVR/data/multinode-capacity-subset.jsonl \
+IMAGE_ROOT=/root/workspace/ILVR/data/images_comt \
+TUNING_METHOD=full \
+./run_multinode_stage2_training.sh \
+  --run-id "$eval_model_run_id" \
+  --zero-stage 1 \
+  --main-process-port 29918 \
+  --max_steps 1 \
+  --save_steps 1
+
+prepared_model_dir="/root/workspace/ILVR/results/$eval_model_run_id/prepared-eval-model"
+./venv/ilvr-venv/bin/python -m src.multinode prepare-inference \
+  --stage stage2 \
+  --tuning-method full \
+  --zero-stage 1 \
+  --run-id "$eval_model_run_id" \
+  --main-process-port 29918 \
+  --checkpoint-step 1 \
+  --destination "$prepared_model_dir"
+
 eval_id="${hardware_id}-eval"
 ./run_multinode_evaluation.sh \
   --run-id "$eval_id" \
-  --model-dir /root/workspace/ILVR/checkpoints/comt_ckpt \
+  --model-dir "$prepared_model_dir" \
   --test-data-path /root/workspace/ILVR/data/multinode-eval-subset.jsonl \
   --task-name zebra-cot \
   --output-dir "$hardware_result_root/$eval_id" \
   --max-new-tokens 64
 ```
 
-Expected: shard indices 0-3, every source index exactly once, one merged JSONL in source order, and one summary JSON.
+Expected: the Stage 2 source witness proves checkpoint 1 with finite loss and
+gradient; the same prepared inference-only artifact and identity manifest
+validate at `$prepared_model_dir` on both node-local filesystems before any
+evaluator starts; then shard indices 0-3 cover every source index exactly once
+and produce one merged JSONL in source order plus one summary JSON.
 
 - [ ] **Step 7: Probe Stage 1 capacity and confirm Stage 2 batch 1**
 
 Run the nine Stage 1 capacity probes. Each probe owns four distinct ports and uses fresh child run IDs for candidates 2, 4, and 8; candidate 1 is permitted only by the OOM rule and uses the fourth port:
 
 ```bash
-capacity_root="$hardware_result_root/capacity"
-mkdir "$capacity_root"
+capacity_evidence_root="$hardware_result_root/capacity-evidence"
+capacity_root="$capacity_evidence_root/capacity"
+mkdir "$capacity_evidence_root" "$capacity_root"
 methods=(full lora dora)
 zero_stages=(1 2 3)
 case_index=0
@@ -1383,6 +1435,8 @@ for method in "${methods[@]}"; do
       --model /root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct \
       --data-path /root/workspace/ILVR/data/multinode-capacity-subset.jsonl \
       --image-root /root/workspace/ILVR/data/images_comt \
+      --save-strategy steps \
+      --save-steps 1 \
       --max-steps 1
     case_index=$((case_index + 1))
   done
@@ -1394,7 +1448,7 @@ Expected: exactly nine `capacity.json` reports; every report records `attempts[0
 Run the nine Stage 2 one-step confirmations at the fixed batch/GPU 1:
 
 ```bash
-stage2_root="$hardware_result_root/stage2-batch1"
+stage2_root="$capacity_evidence_root/stage2-batch1"
 mkdir "$stage2_root"
 case_index=0
 for method in "${methods[@]}"; do
@@ -1403,14 +1457,14 @@ for method in "${methods[@]}"; do
     STAGE1_CHECKPOINT=/root/workspace/ILVR/checkpoints/comt_ckpt \
     DATA_PATH=/root/workspace/ILVR/data/multinode-capacity-subset.jsonl \
     IMAGE_ROOT=/root/workspace/ILVR/data/images_comt \
-    OUTPUT_DIR="$hardware_checkpoint_root/$run_id" \
     TUNING_METHOD="$method" \
     ./run_multinode_stage2_training.sh \
       --run-id "$run_id" \
       --result-root "$stage2_root" \
       --zero-stage "$zero_stage" \
       --main-process-port "$((30100 + case_index))" \
-      -- --max_steps 1
+      --max_steps 1 \
+      --save_steps 1
     case_index=$((case_index + 1))
   done
 done
@@ -1423,11 +1477,13 @@ Expected: nine `initial-train-witness.json` files with `batch_per_gpu == 1`, wor
 Run the single validator and require exclusive report creation:
 
 ```bash
-report_bundle="$hardware_result_root/validation-report"
+validation_parent="/root/workspace/ILVR/results/${hardware_id}-validation"
+test ! -e "$validation_parent"
+report_bundle="$validation_parent/validation-report"
 ./venv/ilvr-venv/bin/python -m src.multinode validate-results \
   --matrix-root "$hardware_result_root/$matrix_id" \
   --evaluation-root "$hardware_result_root/$eval_id" \
-  --capacity-root "$hardware_result_root" \
+  --capacity-root "$capacity_evidence_root" \
   --output-root "$report_bundle"
 if tmux list-sessions -F '#{session_name}' 2>/dev/null | \
   rg -q "^ilvr-${hardware_id}-"; then

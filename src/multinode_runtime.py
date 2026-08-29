@@ -908,6 +908,7 @@ _STAGE2_VALUE_OPTIONS = {
     "--helper_group_L",
     "--latent_num_segments_train",
     "--save_strategy",
+    "--save_steps",
     "--max_train_samples",
     "--max_steps",
     "--seed",
@@ -949,13 +950,29 @@ _STAGE2_COORDINATOR_OPTIONS = {
 
 
 def validate_stage2_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
-    return _validate_allowlisted_arguments(
+    validated = _validate_allowlisted_arguments(
         arguments,
         value_options=_STAGE2_VALUE_OPTIONS,
         boolean_options=_STAGE2_BOOLEAN_OPTIONS,
         owned_options=_STAGE2_COORDINATOR_OPTIONS,
         label="Stage 2",
     )
+    save_steps: list[str] = []
+    index = 0
+    while index < len(validated):
+        option, separator, inline_value = validated[index].partition("=")
+        if option in _STAGE2_BOOLEAN_OPTIONS:
+            index += 1
+            continue
+        value = inline_value if separator else validated[index + 1]
+        if option == "--save_steps":
+            save_steps.append(value)
+        index += 1 if separator else 2
+    if len(save_steps) > 1:
+        raise ValueError("--save_steps may be provided exactly once")
+    if save_steps and re.fullmatch(r"[1-9][0-9]*", save_steps[0]) is None:
+        raise ValueError("--save_steps must be a canonical positive integer")
+    return validated
 
 
 def _distributed_environment(plan: "LaunchPlan", machine_rank: int) -> dict[str, str]:
@@ -1079,7 +1096,7 @@ class EvaluationPlan:
 
     @property
     def local_model_dir(self) -> Path:
-        return self.output_dir / "inference-model"
+        return self.output_dir.with_name(f"{self.output_dir.name}-inference-model")
 
 
 @dataclass(frozen=True)
@@ -1705,7 +1722,7 @@ class SubprocessCoordinatorRunner:
         self,
         plan: "LaunchPlan",
         *,
-        commands: OwnedTmuxCommands,
+        commands: OwnedTmuxCommands | None,
         commit: str,
         log_root: str | Path = _LOG_ROOT,
         checkpoint_root: str | Path = _CHECKPOINT_ROOT,
@@ -1745,10 +1762,16 @@ class SubprocessCoordinatorRunner:
     def _node_spec(self, machine_rank: int) -> OwnedNodeCommand:
         if machine_rank not in (0, 1):
             raise ValueError("machine_rank must be 0 or 1")
-        spec = self.commands.node_specs[machine_rank]
+        commands = self._launch_commands()
+        spec = commands.node_specs[machine_rank]
         if spec.machine_rank != machine_rank:
             raise ValueError("owned node command rank mismatch")
         return spec
+
+    def _launch_commands(self) -> OwnedTmuxCommands:
+        if self.commands is None:
+            raise RuntimeError("transfer-only coordinator cannot launch workers")
+        return self.commands
 
     def _node_command(
         self, machine_rank: int, arguments: Sequence[str]
@@ -1835,14 +1858,15 @@ class SubprocessCoordinatorRunner:
         self.serialized_plan = serialized
 
     def start_remote(self, command: Sequence[str]) -> None:
-        if tuple(command) != self.commands.remote:
+        if tuple(command) != self._launch_commands().remote:
             raise ValueError("remote tmux command differs from the immutable launch")
         self._run(command)
 
     def rank0_is_ready(self, plan: "LaunchPlan") -> bool:
         if plan != self.plan:
             raise ValueError("runner plan does not match readiness plan")
-        spec = self.commands.node_specs[0]
+        commands = self._launch_commands()
+        spec = commands.node_specs[0]
         command = [
             str(
                 plan.cluster.remote_repo_root
@@ -1865,7 +1889,7 @@ class SubprocessCoordinatorRunner:
             "--commit",
             self.commit_value,
             "--command-digest",
-            self.commands.command_digests[0],
+            commands.command_digests[0],
             "--master-addr",
             plan.cluster.master_addr,
             "--main-process-port",
@@ -1882,7 +1906,7 @@ class SubprocessCoordinatorRunner:
         return completed.returncode == 0
 
     def start_local(self, command: Sequence[str]) -> None:
-        if tuple(command) != self.commands.local:
+        if tuple(command) != self._launch_commands().local:
             raise ValueError("local tmux command differs from the immutable launch")
         self._run(command)
 
@@ -1970,6 +1994,7 @@ class SubprocessCoordinatorRunner:
 
     def poll_exit(self, machine_rank: int) -> int | None:
         spec = self._node_spec(machine_rank)
+        commands = self._launch_commands()
         arguments = (
             "--exit-path",
             str(spec.exit_path),
@@ -1982,7 +2007,7 @@ class SubprocessCoordinatorRunner:
             "--commit",
             self.commit_value,
             "--command-digest",
-            self.commands.command_digests[machine_rank],
+            commands.command_digests[machine_rank],
         )
         completed = self.command_runner(
             self._internal_command(machine_rank, "exit-show", arguments),
@@ -2063,7 +2088,9 @@ class SubprocessCoordinatorRunner:
                 expected_machine_rank=machine_rank,
                 expected_pid=ownership.pid,
                 expected_commit=self.commit_value,
-                expected_command_digest=self.commands.command_digests[machine_rank],
+                expected_command_digest=(
+                    self._launch_commands().command_digests[machine_rank]
+                ),
                 observed_start_ticks=self.process_start_ticks(ownership),
                 observed_command_digest=self.command_digest(ownership),
                 observed_commit=self.commit(ownership),
@@ -2425,6 +2452,73 @@ class SubprocessCoordinatorRunner:
         publish_files_list(files_path, entries)
         self._run(build_pull_command(manifest, destination, files_from=files_path))
         validate_transferred_entries(destination, entries)
+
+    def mirror_prepared_inference(
+        self, manifest: object, destination: Path
+    ) -> object:
+        """Publish and revalidate the identical prepared artifact remotely."""
+        from src.multinode_artifacts import (
+            NodeArtifactManifest,
+            build_prepared_inference_push_command,
+            prepared_inference_mirror_files_bytes,
+            validate_inference_manifest_identity,
+        )
+
+        if not isinstance(manifest, NodeArtifactManifest):
+            raise TypeError("inference manifest must be a NodeArtifactManifest")
+        validate_inference_manifest_identity(
+            manifest, expected_identity=manifest.runtime_identity
+        )
+        files_path = (
+            self.log_root
+            / self.plan.run_id
+            / self.plan.attempt_id
+            / "artifact-inference-mirror.files"
+        )
+        publish_small_file(
+            files_path,
+            prepared_inference_mirror_files_bytes(manifest, destination),
+        )
+        repository = self.plan.cluster.remote_repo_root
+        python = repository / "venv" / "ilvr-venv" / "bin" / "python"
+
+        def remote_repository_command(
+            subcommand: str, arguments: Sequence[str]
+        ) -> tuple[str, ...]:
+            return tuple(build_remote_exec(
+                (
+                    "/usr/bin/env",
+                    f"PYTHONPATH={repository}",
+                    str(python),
+                    "-m",
+                    "src.multinode",
+                    subcommand,
+                    *arguments,
+                ),
+                working_directory=repository,
+            ))
+
+        self._run(remote_repository_command(
+            "prepare-inference-destination",
+            ("--destination", str(destination)),
+        ))
+        self._run(build_prepared_inference_push_command(
+            manifest, destination, files_from=files_path
+        ))
+        shown = self._run(remote_repository_command(
+            "prepared-inference-show",
+            ("--model-dir", str(destination)),
+        ))
+        try:
+            remote_manifest = NodeArtifactManifest.from_json(json.loads(shown.stdout))
+        except json.JSONDecodeError as error:
+            raise ValueError("remote prepared inference manifest is invalid JSON") from error
+        validate_inference_manifest_identity(
+            remote_manifest, expected_identity=manifest.runtime_identity
+        )
+        if remote_manifest != manifest:
+            raise ValueError("remote prepared inference manifest differs from local")
+        return remote_manifest
 
 
 class EvaluationSubprocessRunner:
@@ -2960,7 +3054,13 @@ def prepare_inference_artifacts(
     validate_inference_manifest_identity(
         inference_manifest, expected_identity=runtime_identity
     )
-    return prepare_inference_copy(inference_manifest, destination, runner)
+    prepared = prepare_inference_copy(inference_manifest, destination, runner)
+    mirrored = getattr(runner, "mirror_prepared_inference")(
+        inference_manifest, prepared
+    )
+    if mirrored != inference_manifest:
+        raise ValueError("remote prepared inference identity differs from local")
+    return prepared
 
 
 def stop_owned_peer(record: OwnershipRecord, runner: OwnedProcessRunner) -> None:
@@ -2979,6 +3079,174 @@ def stop_owned_peer(record: OwnershipRecord, runner: OwnedProcessRunner) -> None
         observed_commit=runner.commit(current),
     )
     runner.signal(current)
+
+
+def _decode_process_environment(process_directory: Path) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for assignment in _nul_fields(process_directory / "environ"):
+        name, separator, value = assignment.partition("=")
+        if not separator or name in environment:
+            raise ValueError("live ownership environment is malformed")
+        environment[name] = value
+    return environment
+
+
+def stop_exact_owned_local_process(
+    record: OwnershipRecord,
+    *,
+    expected_run_id: str,
+    expected_attempt_id: str,
+    expected_machine_rank: int,
+    proc_root: str | Path = "/proc",
+) -> bool:
+    """Signal one still-live exact owner through a validated pidfd only."""
+    if not isinstance(record, OwnershipRecord):
+        raise TypeError("record must be an OwnershipRecord")
+    try:
+        pidfd = os.pidfd_open(record.pid)
+    except ProcessLookupError:
+        return False
+    try:
+        process_directory = Path(proc_root) / str(record.pid)
+        try:
+            observed_start_ticks = _proc_start_ticks(
+                record.pid, proc_root=proc_root
+            )
+            observed_command = _nul_fields(process_directory / "cmdline")
+            observed_environment = _decode_process_environment(process_directory)
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        observed_digest = canonical_command_digest(
+            observed_command, observed_environment
+        )
+        validate_ownership(
+            record,
+            expected_run_id=expected_run_id,
+            expected_attempt_id=expected_attempt_id,
+            expected_machine_rank=expected_machine_rank,
+            expected_pid=record.pid,
+            expected_commit=record.commit,
+            expected_command_digest=record.command_digest,
+            observed_start_ticks=observed_start_ticks,
+            observed_command_digest=observed_digest,
+            observed_commit=observed_environment.get("ILVR_REPOSITORY_COMMIT"),
+        )
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            return False
+        return True
+    finally:
+        os.close(pidfd)
+
+
+def _read_ownership_at(attempt_descriptor: int, name: str) -> OwnershipRecord:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=attempt_descriptor,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError("ownership record is not a private owned regular file")
+        if metadata.st_size > _MAX_TRANSFER_BYTES:
+            raise ValueError("ownership record exceeds the size limit")
+        chunks: list[bytes] = []
+        remaining = _MAX_TRANSFER_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > _MAX_TRANSFER_BYTES:
+            raise ValueError("ownership record exceeds the size limit")
+        return OwnershipRecord.from_json(json.loads(raw))
+    finally:
+        os.close(descriptor)
+
+
+def stop_owned_attempts(*, run_id: str, machine_rank: int) -> dict[str, object]:
+    """Stop every exact live attempt in one canonical node-local run namespace."""
+    requested_run_id = _require_identifier("run_id", run_id)
+    if type(machine_rank) is not int or machine_rank not in (0, 1):
+        raise ValueError("machine_rank must be 0 or 1")
+    root_descriptor = _open_trusted_directory(_LOG_ROOT)
+    run_descriptor: int | None = None
+    records: list[OwnershipRecord] = []
+    try:
+        run_descriptor = _open_child_directory(
+            root_descriptor, requested_run_id, create=False
+        )
+        run_metadata = os.fstat(run_descriptor)
+        if (
+            run_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(run_metadata.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError("owned run control directory is not private")
+        attempt_names = sorted(os.listdir(run_descriptor))
+        for attempt_name in attempt_names:
+            _require_identifier("attempt_id", attempt_name)
+            attempt_descriptor = _open_child_directory(
+                run_descriptor, attempt_name, create=False
+            )
+            try:
+                attempt_metadata = os.fstat(attempt_descriptor)
+                if (
+                    attempt_metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(attempt_metadata.st_mode)
+                    & (stat.S_IWGRP | stat.S_IWOTH)
+                ):
+                    raise ValueError("owned attempt control directory is not private")
+                try:
+                    record = _read_ownership_at(
+                        attempt_descriptor,
+                        f"ownership-rank{machine_rank}.json",
+                    )
+                except FileNotFoundError:
+                    continue
+            finally:
+                os.close(attempt_descriptor)
+            validate_ownership(
+                record,
+                expected_run_id=requested_run_id,
+                expected_attempt_id=attempt_name,
+                expected_machine_rank=machine_rank,
+                expected_pid=record.pid,
+                expected_commit=record.commit,
+                expected_command_digest=record.command_digest,
+                observed_start_ticks=record.process_start_ticks,
+            )
+            records.append(record)
+    finally:
+        if run_descriptor is not None:
+            os.close(run_descriptor)
+        os.close(root_descriptor)
+
+    stopped: list[str] = []
+    already_exited: list[str] = []
+    for record in records:
+        if stop_exact_owned_local_process(
+            record,
+            expected_run_id=requested_run_id,
+            expected_attempt_id=record.attempt_id,
+            expected_machine_rank=machine_rank,
+        ):
+            stopped.append(record.attempt_id)
+        else:
+            already_exited.append(record.attempt_id)
+    return {
+        "run_id": requested_run_id,
+        "machine_rank": machine_rank,
+        "stopped_attempts": stopped,
+        "already_exited_attempts": already_exited,
+    }
 
 
 def monitor_owned_jobs(

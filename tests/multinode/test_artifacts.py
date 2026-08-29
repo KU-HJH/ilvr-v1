@@ -1527,6 +1527,10 @@ class FakeProductionTransferRunner(FakeTransferRunner):
         super().pull_resume_artifacts(manifest, entries, destination)
         self.pulled = True
 
+    def mirror_prepared_inference(self, manifest, destination):
+        self.events.append("remote-inference-mirror")
+        return manifest
+
 
 def test_production_resume_redistribution_uses_same_immediate_canonical_path():
     runner = FakeProductionTransferRunner()
@@ -1584,6 +1588,7 @@ def test_inference_preparation_is_callable_before_evaluation(tmp_path):
         "remote-inference-manifest",
         "inference-manifest",
         "inference-pull",
+        "remote-inference-mirror",
     ]
 
 
@@ -1643,6 +1648,87 @@ def test_collection_rejects_post_rsync_manifest_mismatch(tmp_path):
     assert runner.events[-2:] == ["push", "post-push-manifest"]
 
 
+def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
+    tmp_path, monkeypatch
+):
+    import src.multinode_artifacts as artifacts_module
+    import src.multinode_runtime as runtime_module
+
+    repository = tmp_path / "repo"
+    destination = (
+        repository / "results" / identity()["run_id"] / "evaluation-model"
+    )
+    destination.mkdir(parents=True)
+    manifest = dataclasses.replace(
+        strict_manifest(0),
+        process_ranks=(0, 1, 2, 3),
+        entries=stage1_inference_entries(),
+    )
+    publish_node_manifest(
+        artifacts_module.inference_manifest_path(destination), manifest
+    )
+    monkeypatch.setattr(artifacts_module, "_LOCAL_REPOSITORY", repository)
+    calls = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        calls.append(tuple(command))
+        display = " ".join(command)
+        if "prepared-inference-show" in display:
+            stdout = json.dumps(manifest.to_json())
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    plan = launch_plan()
+    log_root = tmp_path / "logs"
+    runner = SubprocessCoordinatorRunner(
+        plan,
+        commands=build_owned_tmux_commands(plan, commit="b" * 40),
+        commit="b" * 40,
+        log_root=log_root,
+        command_runner=fake_command,
+    )
+    mirror = getattr(runner, "mirror_prepared_inference", None)
+    assert mirror is not None
+
+    assert mirror(manifest, destination) == manifest
+
+    python = "/root/workspace/ILVR/venv/ilvr-venv/bin/python"
+    fixed_prefix = ("/usr/bin/env", "PYTHONPATH=/root/workspace/ILVR", python)
+    assert calls[0] == tuple(runtime_module.build_remote_exec(
+        (
+            *fixed_prefix,
+            "-m", "src.multinode", "prepare-inference-destination",
+            "--destination", str(destination),
+        ),
+        working_directory="/root/workspace/ILVR",
+    ))
+    files_path = (
+        log_root / plan.run_id / plan.attempt_id
+        / "artifact-inference-mirror.files"
+    )
+    build_push = getattr(
+        artifacts_module, "build_prepared_inference_push_command", None
+    )
+    assert build_push is not None
+    assert calls[1] == build_push(
+        manifest, destination, files_from=files_path
+    )
+    assert calls[2] == tuple(runtime_module.build_remote_exec(
+        (
+            *fixed_prefix,
+            "-m", "src.multinode", "prepared-inference-show",
+            "--model-dir", str(destination),
+        ),
+        working_directory="/root/workspace/ILVR",
+    ))
+    names = set(files_path.read_bytes().split(b"\0")) - {b""}
+    assert names == {
+        f"evaluation-model/{entry.relative_path.as_posix()}".encode()
+        for entry in manifest.entries
+    } | {b"evaluation-model.manifest.json"}
+
+
 def test_subprocess_runner_executes_resume_and_inference_file_lists(
     tmp_path, monkeypatch
 ):
@@ -1688,6 +1774,10 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         calls.append(argv)
         if argv[0] == "/usr/bin/rsync":
             files_path = Path(argv[argv.index("--files-from") + 1])
+            if argv[-1].startswith("korea@10.1.102.41:"):
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="", stderr=""
+                )
             destination = Path(argv[-1].removesuffix("/"))
             for encoded in files_path.read_bytes().split(b"\0"):
                 if not encoded:
@@ -1702,6 +1792,8 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         else:
             display = " ".join(argv)
             if "artifact-inference-manifest" in display:
+                payload = inference_manifest
+            elif "prepared-inference-show" in display:
                 payload = inference_manifest
             elif "--canonical-owner" in display:
                 payload = canonical
@@ -1731,7 +1823,9 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         requested_identity=identity(),
         destination=canonical_checkpoint,
     )
-    inference_destination = tmp_path / "results" / "evaluation-model"
+    inference_destination = (
+        repository / "results" / plan.run_id / "evaluation-model"
+    )
     prepare_inference_artifacts(
         runner,
         checkpoint_path=canonical_checkpoint,
@@ -1740,7 +1834,7 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
     )
 
     rsync_calls = [call for call in calls if call[0] == "/usr/bin/rsync"]
-    assert len(rsync_calls) == 2
+    assert len(rsync_calls) == 3
     resume_names = {
         path.relative_to(canonical_checkpoint).as_posix()
         for path in canonical_checkpoint.rglob("*")
@@ -2254,8 +2348,13 @@ def test_prepare_inference_help_is_local_and_side_effect_free(tmp_path):
     assert not marker.exists()
 
 
-def test_prepare_inference_cli_dispatches_successfully_with_fake_runner(
-    tmp_path, monkeypatch, capsys
+@pytest.mark.parametrize(
+    ("stage", "method", "zero_stage", "layout"),
+    (("stage1", "lora", "3", "partitioned"),
+     ("stage2", "full", "1", "replicated")),
+)
+def test_prepare_inference_cli_dispatches_without_building_training_commands(
+    tmp_path, monkeypatch, capsys, stage, method, zero_stage, layout
 ):
     import src.multinode as multinode_module
     import src.multinode_runtime as runtime_module
@@ -2272,6 +2371,7 @@ def test_prepare_inference_cli_dispatches_successfully_with_fake_runner(
     class FakeCliRunner:
         def __init__(self, plan, *, commands, commit, log_root):
             observed["plan"] = plan
+            observed["commands"] = commands
             observed["commit"] = commit
             observed["log_root"] = log_root
 
@@ -2299,11 +2399,11 @@ def test_prepare_inference_cli_dispatches_successfully_with_fake_runner(
         [
             "prepare-inference",
             "--stage",
-            "stage1",
+            stage,
             "--tuning-method",
-            "lora",
+            method,
             "--zero-stage",
-            "3",
+            zero_stage,
             "--run-id",
             identity()["run_id"],
             "--main-process-port",
@@ -2322,5 +2422,6 @@ def test_prepare_inference_cli_dispatches_successfully_with_fake_runner(
     assert observed["checkpoint_path"] == (
         repository / "checkpoints" / identity()["run_id"] / "checkpoint-2"
     )
-    assert observed["runtime_identity"]["model_state_layout"] == "partitioned"
+    assert observed["commands"] is None
+    assert observed["runtime_identity"]["model_state_layout"] == layout
     assert observed["destination"] == destination

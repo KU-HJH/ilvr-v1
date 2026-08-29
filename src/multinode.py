@@ -1047,6 +1047,27 @@ def _ownership_show(argv: list[str]) -> int:
     return 0
 
 
+def _stop_owned_main(argv: list[str]) -> int:
+    """Stop all exact live attempts for one run on this machine rank."""
+    from src.multinode_runtime import stop_owned_attempts
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode stop-owned", allow_abbrev=False
+    )
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--machine-rank", type=int, choices=(0, 1), required=True)
+    args = parser.parse_args(argv)
+    try:
+        summary = stop_owned_attempts(
+            run_id=args.run_id,
+            machine_rank=args.machine_rank,
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    print(json.dumps(summary, sort_keys=True))
+    return 0
+
+
 def _owned_process_info(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m src.multinode owned-process-info"
@@ -1743,10 +1764,9 @@ def _prepare_inference_main(argv: list[str]) -> int:
             ) from error
         source_repository = Path(__file__).resolve().parents[1]
         commit = _command_stdout(("git", "rev-parse", "HEAD"), cwd=source_repository)
-        commands = build_owned_tmux_commands(plan, commit=commit)
         runner = SubprocessCoordinatorRunner(
             plan,
-            commands=commands,
+            commands=None,
             commit=commit,
             log_root=_REPOSITORY_ROOT / "logs" / "multinode",
         )
@@ -1799,6 +1819,39 @@ def _prepared_inference_show(argv: list[str]) -> int:
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(manifest.to_json(), sort_keys=True))
+    return 0
+
+
+def _prepare_inference_destination_main(argv: list[str]) -> int:
+    """Reserve the identical fresh remote result path before a bounded push."""
+    from src.multinode_artifacts import (
+        inference_manifest_path,
+        reserve_inference_destination,
+        validate_coordinator_relative_path,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.multinode prepare-inference-destination",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--destination", required=True)
+    args = parser.parse_args(argv)
+    try:
+        destination = Path(args.destination)
+        relative = destination.relative_to(_REPOSITORY_ROOT / "results")
+        if len(relative.parts) < 2:
+            raise ValueError("prepared inference destination must belong to a run")
+        validate_coordinator_relative_path(
+            relative, label="prepared inference destination"
+        )
+        _validate_identifier("run_id", relative.parts[0])
+        if os.path.lexists(inference_manifest_path(destination)):
+            raise FileExistsError(
+                "prepared inference identity manifest already exists"
+            )
+        reserve_inference_destination(destination)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     return 0
 
 
@@ -1930,6 +1983,8 @@ def _main(argv: list[str] | None = None) -> int:
         return _evaluate_main(argv[1:])
     if argv and argv[0] == "prepared-inference-show":
         return _prepared_inference_show(argv[1:])
+    if argv and argv[0] == "prepare-inference-destination":
+        return _prepare_inference_destination_main(argv[1:])
     if argv and argv[0] == "prepare-evaluation-output":
         return _prepare_evaluation_output(argv[1:])
     if argv and argv[0] == "node-run":
@@ -1938,6 +1993,8 @@ def _main(argv: list[str] | None = None) -> int:
         return _write_exit_record(argv[1:])
     if argv and argv[0] == "ownership-show":
         return _ownership_show(argv[1:])
+    if argv and argv[0] == "stop-owned":
+        return _stop_owned_main(argv[1:])
     if argv and argv[0] == "owned-process-info":
         try:
             return _owned_process_info(argv[1:])

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+import src.multinode as multinode_module
+import src.multinode_runtime as runtime_module
 from src.multinode import build_launch_plan
 from src.multinode_runtime import (
     OwnershipRecord,
@@ -27,6 +29,7 @@ from src.multinode_runtime import (
     validate_owned_process,
     validate_ownership,
     validate_stage1_arguments,
+    validate_stage2_arguments,
     validated_stage2_environment,
     write_ownership,
     write_incomplete_attempt,
@@ -398,6 +401,206 @@ def test_peer_stop_requires_exact_ownership(fake_runner):
     with pytest.raises(ValueError, match="start time"):
         stop_owned_peer(record(start_ticks=9981), fake_runner)
     assert "signal" not in fake_runner.events
+
+
+def test_stage2_multinode_forwards_explicit_save_step_for_final_checkpoint():
+    assert validate_stage2_arguments(
+        ("--max_steps", "1", "--save_steps", "1")
+    ) == ("--max_steps", "1", "--save_steps", "1")
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "1.5", "true", "01"))
+def test_stage2_multinode_rejects_noncanonical_save_step(value):
+    with pytest.raises(ValueError, match="save_steps.*positive integer"):
+        validate_stage2_arguments(("--max_steps", "1", "--save_steps", value))
+
+
+def test_stage2_multinode_rejects_duplicate_save_step():
+    with pytest.raises(ValueError, match="save_steps.*exactly once"):
+        validate_stage2_arguments(
+            ("--max_steps", "1", "--save_steps", "1", "--save_steps=1")
+        )
+
+
+def _write_stop_ownership(
+    control_root: Path,
+    *,
+    run_id: str,
+    attempt_id: str,
+    rank: int,
+    pid: int,
+) -> OwnershipRecord:
+    command = ("/root/workspace/ILVR/venv/ilvr-venv/bin/python", "worker")
+    environment = {"ILVR_REPOSITORY_COMMIT": "a" * 40}
+    ownership = OwnershipRecord.create(
+        run_id=run_id,
+        attempt_id=attempt_id,
+        machine_rank=rank,
+        pid=pid,
+        process_start_ticks=9000 + pid,
+        commit="a" * 40,
+        command=command,
+        environment=environment,
+    )
+    attempt = control_root / run_id / attempt_id
+    attempt.mkdir(parents=True, mode=0o700)
+    (attempt / f"ownership-rank{rank}.json").write_text(
+        json.dumps(ownership.to_json()) + "\n",
+        encoding="utf-8",
+    )
+    return ownership
+
+
+def test_stop_owned_enumerates_multiple_attempts_and_tolerates_exact_exits(
+    tmp_path, monkeypatch
+):
+    control_root = tmp_path / "logs" / "multinode"
+    run_id = "stage1-lora-zero3-four-gpu"
+    for attempt_id, pid in (("initial", 4301), ("resume-one", 4302), ("finished", 4303)):
+        _write_stop_ownership(
+            control_root,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            rank=1,
+            pid=pid,
+        )
+    monkeypatch.setattr(runtime_module, "_LOG_ROOT", control_root)
+
+    def stop_process(ownership, **expected):
+        assert expected == {
+            "expected_run_id": run_id,
+            "expected_attempt_id": ownership.attempt_id,
+            "expected_machine_rank": 1,
+        }
+        return ownership.attempt_id != "finished"
+
+    monkeypatch.setattr(
+        runtime_module,
+        "stop_exact_owned_local_process",
+        stop_process,
+        raising=False,
+    )
+    stop_owned_attempts = getattr(runtime_module, "stop_owned_attempts", None)
+    assert stop_owned_attempts is not None
+
+    assert stop_owned_attempts(run_id=run_id, machine_rank=1) == {
+        "run_id": run_id,
+        "machine_rank": 1,
+        "stopped_attempts": ["initial", "resume-one"],
+        "already_exited_attempts": ["finished"],
+    }
+
+
+def test_stop_owned_rejects_foreign_record_before_signaling_any_attempt(
+    tmp_path, monkeypatch
+):
+    control_root = tmp_path / "logs" / "multinode"
+    run_id = "stage1-lora-zero3-four-gpu"
+    _write_stop_ownership(
+        control_root,
+        run_id=run_id,
+        attempt_id="initial",
+        rank=1,
+        pid=4301,
+    )
+    foreign = _write_stop_ownership(
+        control_root,
+        run_id="foreign-stage1-run",
+        attempt_id="resume-one",
+        rank=1,
+        pid=4302,
+    )
+    foreign_path = (
+        control_root / run_id / "resume-one" / "ownership-rank1.json"
+    )
+    foreign_path.parent.mkdir(parents=True, mode=0o700)
+    foreign_path.write_text(json.dumps(foreign.to_json()) + "\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_module, "_LOG_ROOT", control_root)
+    signaled = []
+    monkeypatch.setattr(
+        runtime_module,
+        "stop_exact_owned_local_process",
+        lambda ownership, **expected: signaled.append(ownership) or True,
+        raising=False,
+    )
+    stop_owned_attempts = getattr(runtime_module, "stop_owned_attempts", None)
+    assert stop_owned_attempts is not None
+
+    with pytest.raises(ValueError, match="run ID"):
+        stop_owned_attempts(run_id=run_id, machine_rank=1)
+    assert signaled == []
+
+
+def test_exact_owned_local_stop_rejects_tampered_live_command_before_pidfd_signal(
+    monkeypatch
+):
+    command = ("/root/workspace/ILVR/venv/ilvr-venv/bin/python", "worker")
+    environment = {"ILVR_REPOSITORY_COMMIT": "a" * 40}
+    ownership = OwnershipRecord.create(
+        run_id="stage1-lora-zero3-four-gpu",
+        attempt_id="initial",
+        machine_rank=1,
+        pid=4301,
+        process_start_ticks=9981,
+        commit="a" * 40,
+        command=command,
+        environment=environment,
+    )
+    monkeypatch.setattr(runtime_module.os, "pidfd_open", lambda pid: 91)
+    monkeypatch.setattr(runtime_module, "_proc_start_ticks", lambda pid, **kwargs: 9981)
+
+    def nul_fields(path):
+        if path.name == "cmdline":
+            return (command[0], "foreign-worker")
+        return ("ILVR_REPOSITORY_COMMIT=" + "a" * 40,)
+
+    monkeypatch.setattr(runtime_module, "_nul_fields", nul_fields)
+    signals = []
+    monkeypatch.setattr(
+        runtime_module.signal,
+        "pidfd_send_signal",
+        lambda pidfd, signum: signals.append((pidfd, signum)),
+    )
+    real_close = runtime_module.os.close
+    monkeypatch.setattr(
+        runtime_module.os,
+        "close",
+        lambda descriptor: None if descriptor == 91 else real_close(descriptor),
+    )
+    stop_process = getattr(runtime_module, "stop_exact_owned_local_process", None)
+    assert stop_process is not None
+
+    with pytest.raises(ValueError, match="live ownership command digest"):
+        stop_process(
+            ownership,
+            expected_run_id=ownership.run_id,
+            expected_attempt_id=ownership.attempt_id,
+            expected_machine_rank=1,
+        )
+    assert signals == []
+
+
+def test_stop_owned_cli_has_exact_public_run_and_rank_interface(
+    monkeypatch, capsys
+):
+    run_id = "stage1-lora-zero3-four-gpu"
+    summary = {
+        "run_id": run_id,
+        "machine_rank": 1,
+        "stopped_attempts": ["initial", "resume-one"],
+        "already_exited_attempts": [],
+    }
+    monkeypatch.setattr(
+        runtime_module,
+        "stop_owned_attempts",
+        lambda **kwargs: summary,
+        raising=False,
+    )
+
+    assert multinode_module._main(
+        ["stop-owned", "--run-id", run_id, "--machine-rank", "1"]
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == summary
 
 
 def test_monitor_stops_live_peer_only_after_exact_revalidation(fake_runner):

@@ -1946,6 +1946,48 @@ def build_prepared_inference_pull_command(
     )
 
 
+def prepared_inference_mirror_files_bytes(
+    manifest: NodeArtifactManifest, source_directory: str | Path
+) -> bytes:
+    """Encode one prepared model and its sibling identity manifest exactly."""
+    validate_inference_manifest_identity(
+        manifest, expected_identity=manifest.runtime_identity
+    )
+    source = Path(source_directory)
+    try:
+        relative = source.relative_to(_LOCAL_REPOSITORY / "results")
+    except ValueError as error:
+        raise ValueError(
+            "prepared inference source must be under the result root"
+        ) from error
+    validate_coordinator_relative_path(relative, label="prepared inference source")
+    _validate_run_id(relative.parts[0])
+    paths = {
+        (Path(source.name) / entry.relative_path).as_posix()
+        for entry in select_inference_entries(manifest)
+    }
+    paths.add(inference_manifest_path(source).name)
+    return b"".join(path.encode("utf-8") + b"\0" for path in sorted(paths))
+
+
+def build_prepared_inference_push_command(
+    manifest: NodeArtifactManifest,
+    source_directory: str | Path,
+    *,
+    files_from: str | Path,
+) -> tuple[str, ...]:
+    """Push one exact prepared artifact to the identical remote result path."""
+    source = Path(source_directory)
+    prepared_inference_mirror_files_bytes(manifest, source)
+    relative = source.relative_to(_LOCAL_REPOSITORY / "results")
+    remote_parent = _REMOTE_HOST_REPOSITORY / "results" / relative.parent
+    return (
+        *_rsync_prefix(Path(files_from)),
+        f"{source.parent}/",
+        f"{_REMOTE_HOST}:{remote_parent}/",
+    )
+
+
 def validate_evaluation_sidecars(
     manifest_paths: Sequence[str | Path],
     shard_jsonls: Sequence[str | Path],
