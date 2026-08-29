@@ -21,6 +21,7 @@ from src.multinode_runtime import (
     _canonical_json_bytes,
     _open_trusted_directory,
     _read_regular_file,
+    _trusted_absolute_path,
 )
 
 
@@ -42,6 +43,8 @@ _MAX_SNAPSHOT_ENTRIES = 4096
 _CANONICAL_RESULT_ROOT = Path("/root/workspace/ILVR/results")
 _CANONICAL_CHECKPOINT_ROOT = Path("/root/workspace/ILVR/checkpoints")
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_REPORT_MANIFEST_NAME = "validation-manifest.json"
+_REPORT_SUMMARY_NAME = "validation-summary.md"
 
 
 @dataclass(frozen=True)
@@ -1020,13 +1023,8 @@ def _report_markdown(report: ValidationReport) -> str:
     ])
 
 
-@dataclass(frozen=True)
-class _PublishedOutput:
-    path: Path
-    device: int
-    inode: int
-    parent_descriptor: int
-    temporary_name: str
+class ReportBundleDurabilityError(OSError):
+    """A complete bundle is visible but its parent sync did not complete."""
 
 
 def _rename_noreplace(
@@ -1035,7 +1033,7 @@ def _rename_noreplace(
     destination_descriptor: int,
     destination_name: str,
 ) -> None:
-    """Use Linux renameat2 so rollback never overwrites a concurrent name."""
+    """Atomically rename one name only when the destination is absent."""
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
@@ -1060,144 +1058,128 @@ def _rename_noreplace(
         raise OSError(error_number, os.strerror(error_number), source_name)
 
 
-def _publish_output_bytes_no_replace(
-    path: str | Path, payload: bytes
-) -> _PublishedOutput:
-    """Link prepared bytes and immediately return retained publication ownership."""
-    destination = Path(path)
-    parent = _open_trusted_directory(destination.parent, create=True)
-    temporary = f".{destination.name}.{secrets.token_hex(12)}.tmp"
-    descriptor: int | None = None
-    linked = False
+def _write_report_bundle_file(
+    staging_descriptor: int, name: str, payload: bytes
+) -> None:
+    """Create, freeze, and fsync one fixed file inside a private staging dir."""
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=staging_descriptor,
+    )
     try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=parent,
-        )
         view = memoryview(payload)
         while view:
             written = os.write(descriptor, view)
             if written <= 0:
                 raise OSError("short write while publishing validation output")
             view = view[written:]
+        os.fchmod(descriptor, 0o400)
         os.fsync(descriptor)
-        identity = os.fstat(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        try:
-            os.link(
-                temporary, destination.name,
-                src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False,
-            )
-        except FileExistsError as error:
-            raise FileExistsError(
-                f"refusing to replace validation output: {destination}"
-            ) from error
-        linked = True
-        return _PublishedOutput(
-            destination, identity.st_dev, identity.st_ino, parent, temporary
-        )
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if not linked:
-            try:
-                os.unlink(temporary, dir_fd=parent)
-            except FileNotFoundError:
-                pass
-            os.close(parent)
+        os.close(descriptor)
 
 
-def _finish_published(output: _PublishedOutput) -> None:
-    """Remove the preparation link and durably sync an already-owned output."""
-    os.unlink(output.temporary_name, dir_fd=output.parent_descriptor)
-    os.fsync(output.parent_descriptor)
-
-
-def _close_published(output: _PublishedOutput | None) -> None:
-    if output is not None:
-        os.close(output.parent_descriptor)
-
-
-def _rollback_published(output: _PublishedOutput | None) -> None:
-    """Atomically capture the destination, then remove only the owned inode."""
-    if output is None:
-        return
-    capture = f".{output.path.name}.{secrets.token_hex(12)}.rollback"
-    try:
-        # This observation is only a fast diagnostic; it never authorizes unlink.
-        # The following no-replace rename atomically captures the current name.
+def _cleanup_private_report_staging(
+    parent_descriptor: int, staging_descriptor: int, staging_name: str
+) -> None:
+    """Remove only fixed children from this invocation's private directory."""
+    os.fchmod(staging_descriptor, 0o700)
+    for name in (_REPORT_MANIFEST_NAME, _REPORT_SUMMARY_NAME):
         try:
-            os.stat(
-                output.path.name,
-                dir_fd=output.parent_descriptor,
-                follow_symlinks=False,
-            )
+            os.unlink(name, dir_fd=staging_descriptor)
         except FileNotFoundError:
-            return
-        _rename_noreplace(
-            output.parent_descriptor,
-            output.path.name,
-            output.parent_descriptor,
-            capture,
-        )
-        observed = os.stat(
-            capture, dir_fd=output.parent_descriptor, follow_symlinks=False
-        )
-        if (
-            stat.S_ISREG(observed.st_mode)
-            and observed.st_dev == output.device
-            and observed.st_ino == output.inode
-        ):
-            os.unlink(capture, dir_fd=output.parent_descriptor)
-        else:
-            try:
-                _rename_noreplace(
-                    output.parent_descriptor,
-                    capture,
-                    output.parent_descriptor,
-                    output.path.name,
-                )
-            except FileExistsError:
-                # Preserve both foreign objects rather than delete either one.
-                pass
-        os.fsync(output.parent_descriptor)
-    except OSError:
-        return
+            pass
+    os.rmdir(staging_name, dir_fd=parent_descriptor)
 
 
 def publish_validation_outputs(
-    report: ValidationReport, output_manifest: str | Path, output_summary: str | Path
+    report: ValidationReport, output_root: str | Path
 ) -> None:
-    """Prepare both outputs, precheck both absent, publish exclusively, roll back."""
+    """Publish both reports through one immutable no-replace directory rename."""
     if not isinstance(report, ValidationReport):
         raise TypeError("report must be a ValidationReport")
-    manifest = Path(output_manifest)
-    summary = Path(output_summary)
-    if manifest == summary:
-        raise ValueError("output manifest and summary must differ")
+    bundle = _trusted_absolute_path(output_root)
+    if not bundle.name or bundle.name in (".", ".."):
+        raise ValueError("validation output root must name a bundle directory")
     manifest_bytes = _canonical_json_bytes(_report_payload(report)) + b"\n"
     summary_bytes = _report_markdown(report).encode("utf-8")
-    if os.path.lexists(manifest):
-        raise FileExistsError(manifest)
-    if os.path.lexists(summary):
-        raise FileExistsError(summary)
-    manifest_created: _PublishedOutput | None = None
-    summary_created: _PublishedOutput | None = None
+    parent_descriptor = _open_trusted_directory(bundle.parent, create=True)
+    parent_metadata = os.fstat(parent_descriptor)
+    if (
+        parent_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_metadata.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        os.close(parent_descriptor)
+        raise ValueError("validation output parent is not a private trusted directory")
+    staging_name = f".{bundle.name}.{secrets.token_hex(12)}.staging"
+    staging_descriptor: int | None = None
+    staging_created = False
     try:
-        manifest_created = _publish_output_bytes_no_replace(manifest, manifest_bytes)
-        _finish_published(manifest_created)
-        summary_created = _publish_output_bytes_no_replace(summary, summary_bytes)
-        _finish_published(summary_created)
+        os.mkdir(staging_name, mode=0o700, dir_fd=parent_descriptor)
+        staging_created = True
+        staging_descriptor = os.open(
+            staging_name, _DIRECTORY_FLAGS, dir_fd=parent_descriptor
+        )
+        staging_metadata = os.fstat(staging_descriptor)
+        if (
+            staging_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(staging_metadata.st_mode) != 0o700
+        ):
+            raise ValueError("validation report staging directory is not private")
+        _write_report_bundle_file(
+            staging_descriptor, _REPORT_MANIFEST_NAME, manifest_bytes
+        )
+        _write_report_bundle_file(
+            staging_descriptor, _REPORT_SUMMARY_NAME, summary_bytes
+        )
+        os.fchmod(staging_descriptor, 0o500)
+        os.fsync(staging_descriptor)
     except BaseException:
-        _rollback_published(summary_created)
-        _rollback_published(manifest_created)
+        if staging_descriptor is not None:
+            _cleanup_private_report_staging(
+                parent_descriptor, staging_descriptor, staging_name
+            )
+            os.close(staging_descriptor)
+        elif staging_created:
+            os.rmdir(staging_name, dir_fd=parent_descriptor)
+        os.close(parent_descriptor)
         raise
+
+    assert staging_descriptor is not None
+    try:
+        try:
+            _rename_noreplace(
+                parent_descriptor,
+                staging_name,
+                parent_descriptor,
+                bundle.name,
+            )
+        except FileExistsError as error:
+            _cleanup_private_report_staging(
+                parent_descriptor, staging_descriptor, staging_name
+            )
+            raise FileExistsError(
+                f"refusing to replace validation report bundle: {bundle}"
+            ) from error
+        except OSError:
+            _cleanup_private_report_staging(
+                parent_descriptor, staging_descriptor, staging_name
+            )
+            raise
+        try:
+            os.fsync(parent_descriptor)
+        except OSError as error:
+            raise ReportBundleDurabilityError(
+                f"validation report bundle is complete at {bundle}, but parent "
+                "directory durability is ambiguous"
+            ) from error
     finally:
-        _close_published(summary_created)
-        _close_published(manifest_created)
+        # Closing retained descriptors is always safe. Cleanup is deliberately
+        # absent here: rename completion may be ambiguous during async unwind.
+        os.close(staging_descriptor)
+        os.close(parent_descriptor)
 
 
 def validate_results_main(argv: Sequence[str]) -> int:
@@ -1209,14 +1191,13 @@ def validate_results_main(argv: Sequence[str]) -> int:
     parser.add_argument("--matrix-root", required=True)
     parser.add_argument("--evaluation-root", required=True)
     parser.add_argument("--capacity-root", required=True)
-    parser.add_argument("--output-manifest", required=True)
-    parser.add_argument("--output-summary", required=True)
+    parser.add_argument("--output-root", required=True)
     args = parser.parse_args(argv)
     try:
         report = validate_results(
             Path(args.matrix_root), Path(args.evaluation_root), Path(args.capacity_root)
         )
-        publish_validation_outputs(report, args.output_manifest, args.output_summary)
+        publish_validation_outputs(report, args.output_root)
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(_report_payload(report), allow_nan=False, sort_keys=True))

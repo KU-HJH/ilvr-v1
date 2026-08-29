@@ -1047,7 +1047,7 @@ class ValidationReport:
     stage2_recommendations: Mapping[str, int]
 ```
 
-Require all 18 `(stage, method, zero_stage)` witnesses, four unique evaluation shard indices and source indices, nine Stage 1 capacity reports whose `attempts[0].batch_per_gpu` is 2 and whose recommendation comes from `recommended_batch_per_gpu`, and nine Stage 2 witnesses with batch/GPU 1. Reject non-finite loss or gradient, wrong world size, incomplete ranks, missing numbered step-2 checkpoint/resume step 3, mismatched checkpoint identity/method artifact, and any worker error. Add `python -m src.multinode validate-results` with required `--matrix-root`, `--evaluation-root`, `--capacity-root`, `--output-manifest`, and `--output-summary` flags. Create both outputs exclusively: JSON contains the complete report and Markdown contains matching 3×3 Stage 1/2 recommendation tables.
+Require all 18 `(stage, method, zero_stage)` witnesses, four unique evaluation shard indices and source indices, nine Stage 1 capacity reports whose `attempts[0].batch_per_gpu` is 2 and whose recommendation comes from `recommended_batch_per_gpu`, and nine Stage 2 witnesses with batch/GPU 1. Reject non-finite loss or gradient, wrong world size, incomplete ranks, missing numbered step-2 checkpoint/resume step 3, mismatched checkpoint identity/method artifact, and any worker error. Add `python -m src.multinode validate-results` with required `--matrix-root`, `--evaluation-root`, `--capacity-root`, and `--output-root` flags. The output root must be an absent report bundle directory published by one atomic no-replace rename and contain `validation-manifest.json` plus `validation-summary.md`; JSON contains the complete report and Markdown contains matching 3×3 Stage 1/2 recommendation tables.
 
 - [ ] **Step 6: Run focused matrix tests and dry run**
 
@@ -1423,13 +1423,12 @@ Expected: nine `initial-train-witness.json` files with `batch_per_gpu == 1`, wor
 Run the single validator and require exclusive report creation:
 
 ```bash
-report_root="$hardware_result_root"
+report_bundle="$hardware_result_root/validation-report"
 ./venv/ilvr-venv/bin/python -m src.multinode validate-results \
   --matrix-root "$hardware_result_root/$matrix_id" \
   --evaluation-root "$hardware_result_root/$eval_id" \
   --capacity-root "$hardware_result_root" \
-  --output-manifest "$report_root/validation-manifest.json" \
-  --output-summary "$report_root/validation-summary.md"
+  --output-root "$report_bundle"
 if tmux list-sessions -F '#{session_name}' 2>/dev/null | \
   rg -q "^ilvr-${hardware_id}-"; then
   echo 'owned ILVR tmux session remains' >&2
@@ -1437,7 +1436,7 @@ if tmux list-sessions -F '#{session_name}' 2>/dev/null | \
 fi
 ```
 
-Expected: validator exits 0 after reading 18 matrix witnesses, four evaluation sidecars, nine Stage 1 capacity reports, and nine Stage 2 batch-1 witnesses. Update `docs/multinode-training.md` by copying the measured 3×3 recommendation tables from `validation-summary.md`, and report exact checkpoint, result, and log paths.
+Expected: validator exits 0 after reading 18 matrix witnesses, four evaluation sidecars, nine Stage 1 capacity reports, and nine Stage 2 batch-1 witnesses. The absent `$report_bundle` is published once and contains both `validation-manifest.json` and `validation-summary.md`. Update `docs/multinode-training.md` by copying the measured 3×3 recommendation tables from `$report_bundle/validation-summary.md`, and report exact checkpoint, result, and log paths.
 
 - [ ] **Step 9: Commit only the final documentation update**
 

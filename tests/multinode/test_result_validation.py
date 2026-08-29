@@ -12,7 +12,11 @@ import pytest
 import src.multinode_evidence as lifecycle_evidence_module
 import src.multinode_results as results_module
 from src.multinode_evidence import build_lifecycle_phase_evidence
-from src.multinode_results import publish_validation_outputs, validate_results
+from src.multinode_results import (
+    ValidationReport,
+    publish_validation_outputs,
+    validate_results,
+)
 from stage2.evidence import build_stage2_producer_evidence
 
 
@@ -465,9 +469,10 @@ def test_validate_results_pins_checkpoint_root_once_before_symlink_retarget(
 
 def test_publish_validation_outputs_writes_matching_tables_exclusively(tmp_path):
     report = validate_results(*_valid_roots(tmp_path))
-    manifest = tmp_path / "report.json"
-    summary = tmp_path / "report.md"
-    publish_validation_outputs(report, manifest, summary)
+    bundle = tmp_path / "validation-report"
+    publish_validation_outputs(report, bundle)
+    manifest = bundle / "validation-manifest.json"
+    summary = bundle / "validation-summary.md"
     payload = json.loads(manifest.read_text())
     markdown = summary.read_text()
     assert payload["stage1_recommendations"]["dora-zero3"] == 2
@@ -476,116 +481,187 @@ def test_publish_validation_outputs_writes_matching_tables_exclusively(tmp_path)
     assert "| dora | 2 | 2 | 2 |" in markdown
     assert "| dora | 1 | 1 | 1 |" in markdown
     with pytest.raises(FileExistsError):
-        publish_validation_outputs(report, manifest, tmp_path / "other.md")
+        publish_validation_outputs(report, bundle)
 
 
-def test_publish_validation_outputs_rolls_back_json_if_markdown_publish_fails(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("failure", ("write", "fsync"))
+def test_second_bundle_file_failure_leaves_final_bundle_absent(
+    tmp_path, monkeypatch, failure
 ):
     report = validate_results(*_valid_roots(tmp_path))
-    manifest = tmp_path / "report.json"
-    summary = tmp_path / "report.md"
-    original_publish = results_module._publish_output_bytes_no_replace
-
-    def failing_publish(path, payload):
-        if Path(path) == summary:
-            raise OSError("simulated Markdown publication failure")
-        return original_publish(path, payload)
-
-    monkeypatch.setattr(results_module, "_publish_output_bytes_no_replace", failing_publish)
-    with pytest.raises(OSError, match="Markdown"):
-        publish_validation_outputs(report, manifest, summary)
-    assert not manifest.exists()
-    assert not summary.exists()
-
-
-def test_rollback_preserves_same_byte_foreign_inode_after_destination_swap(
-    tmp_path, monkeypatch
-):
-    report = validate_results(*_valid_roots(tmp_path))
-    manifest = tmp_path / "report.json"
-    summary = tmp_path / "report.md"
-    displaced = tmp_path / "displaced-owned.json"
-    original_publish = results_module._publish_output_bytes_no_replace
-
-    def swap_then_fail(path, payload):
-        if Path(path) == summary:
-            foreign_bytes = manifest.read_bytes()
-            manifest.rename(displaced)
-            manifest.write_bytes(foreign_bytes)
-            raise OSError("simulated swapped Markdown failure")
-        return original_publish(path, payload)
-
-    monkeypatch.setattr(
-        results_module, "_publish_output_bytes_no_replace", swap_then_fail
-    )
-    with pytest.raises(OSError, match="swapped Markdown"):
-        publish_validation_outputs(report, manifest, summary)
-    assert manifest.exists()
-    assert manifest.read_bytes() == displaced.read_bytes()
-    assert not summary.exists()
-
-
-def test_rollback_does_not_unlink_foreign_swap_after_identity_check(
-    tmp_path, monkeypatch
-):
-    report = validate_results(*_valid_roots(tmp_path))
-    manifest = tmp_path / "report.json"
-    summary = tmp_path / "report.md"
-    displaced = tmp_path / "displaced-owned.json"
-    original_publish = results_module._publish_output_bytes_no_replace
-    real_stat = results_module.os.stat
-    swap_triggered = False
-
-    def fail_summary(path, payload):
-        if Path(path) == summary:
-            raise OSError("simulated Markdown publication failure")
-        return original_publish(path, payload)
-
-    def swap_after_owned_stat(path, *args, **kwargs):
-        nonlocal swap_triggered
-        observed = real_stat(path, *args, **kwargs)
-        if (
-            not swap_triggered
-            and path == manifest.name
-            and kwargs.get("dir_fd") is not None
-            and kwargs.get("follow_symlinks") is False
-        ):
-            foreign_bytes = manifest.read_bytes()
-            manifest.rename(displaced)
-            manifest.write_bytes(foreign_bytes)
-            swap_triggered = True
-        return observed
-
-    monkeypatch.setattr(results_module, "_publish_output_bytes_no_replace", fail_summary)
-    monkeypatch.setattr(results_module.os, "stat", swap_after_owned_stat)
-    with pytest.raises(OSError, match="Markdown"):
-        publish_validation_outputs(report, manifest, summary)
-    assert swap_triggered is True
-    assert manifest.exists()
-    assert manifest.read_bytes() == displaced.read_bytes()
-    assert not summary.exists()
-
-
-def test_parent_fsync_failure_after_link_rolls_back_created_output(
-    tmp_path, monkeypatch
-):
-    report = validate_results(*_valid_roots(tmp_path))
-    manifest = tmp_path / "report.json"
-    summary = tmp_path / "report.md"
+    bundle = tmp_path / "validation-report"
+    real_write = results_module.os.write
     real_fsync = results_module.os.fsync
-    failed = False
+    regular_fsyncs = 0
 
-    def fail_first_parent_fsync(descriptor):
-        nonlocal failed
-        if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            failed = True
-            raise OSError("simulated parent fsync failure")
+    def fail_summary_write(descriptor, payload):
+        if bytes(payload).startswith(b"# ILVR Four-GPU Validation Summary"):
+            raise OSError("simulated summary write failure")
+        return real_write(descriptor, payload)
+
+    def fail_summary_fsync(descriptor):
+        nonlocal regular_fsyncs
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            regular_fsyncs += 1
+            if regular_fsyncs == 2:
+                raise OSError("simulated summary fsync failure")
         return real_fsync(descriptor)
 
-    monkeypatch.setattr(results_module.os, "fsync", fail_first_parent_fsync)
-    with pytest.raises(OSError, match="parent fsync"):
-        publish_validation_outputs(report, manifest, summary)
-    assert failed is True
-    assert not manifest.exists()
-    assert not summary.exists()
+    if failure == "write":
+        monkeypatch.setattr(results_module.os, "write", fail_summary_write)
+    else:
+        monkeypatch.setattr(results_module.os, "fsync", fail_summary_fsync)
+    with pytest.raises(OSError, match=f"summary {failure} failure"):
+        publish_validation_outputs(report, bundle)
+    assert not bundle.exists()
+    assert list(tmp_path.glob(".*validation-report*")) == []
+
+
+def test_final_bundle_rename_collision_preserves_foreign_bundle(tmp_path):
+    report = validate_results(*_valid_roots(tmp_path))
+    bundle = tmp_path / "validation-report"
+    bundle.mkdir()
+    foreign = bundle / "foreign.txt"
+    foreign.write_bytes(b"owned by another publisher")
+
+    with pytest.raises(FileExistsError):
+        publish_validation_outputs(report, bundle)
+
+    assert foreign.read_bytes() == b"owned by another publisher"
+    assert set(bundle.iterdir()) == {foreign}
+    assert list(tmp_path.glob(".*validation-report*")) == []
+
+
+def test_staging_open_failure_removes_only_private_empty_directory(
+    tmp_path, monkeypatch
+):
+    report = validate_results(*_valid_roots(tmp_path))
+    bundle = tmp_path / "validation-report"
+    real_open = results_module.os.open
+
+    def fail_staging_open(path, flags, *args, **kwargs):
+        if isinstance(path, str) and path.endswith(".staging"):
+            raise OSError("simulated staging directory open failure")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(results_module.os, "open", fail_staging_open)
+    with pytest.raises(OSError, match="staging directory open failure"):
+        publish_validation_outputs(report, bundle)
+
+    assert not bundle.exists()
+    assert list(tmp_path.glob(".*validation-report*")) == []
+
+
+def test_parent_fsync_failure_leaves_complete_bundle_without_rollback(
+    tmp_path, monkeypatch
+):
+    report = validate_results(*_valid_roots(tmp_path))
+    bundle = tmp_path / "validation-report"
+    real_fsync = results_module.os.fsync
+    directory_fsyncs = 0
+
+    def fail_parent_fsync(descriptor):
+        nonlocal directory_fsyncs
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_fsyncs += 1
+            if directory_fsyncs == 2:
+                raise OSError("simulated parent fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(results_module.os, "fsync", fail_parent_fsync)
+    with pytest.raises(OSError, match="durability.*ambiguous"):
+        publish_validation_outputs(report, bundle)
+
+    assert directory_fsyncs == 2
+    assert {path.name for path in bundle.iterdir()} == {
+        "validation-manifest.json",
+        "validation-summary.md",
+    }
+    assert json.loads((bundle / "validation-manifest.json").read_text())[
+        "matrix_cases"
+    ] == 18
+    assert "# ILVR Four-GPU Validation Summary" in (
+        bundle / "validation-summary.md"
+    ).read_text()
+    assert list(tmp_path.glob("*.rollback")) == []
+    assert list(tmp_path.glob(".*rollback*")) == []
+    assert list(tmp_path.glob(".*capture*")) == []
+
+
+def test_exception_after_successful_rename_never_cleans_final_bundle(
+    tmp_path, monkeypatch
+):
+    report = validate_results(*_valid_roots(tmp_path))
+    bundle = tmp_path / "validation-report"
+    real_rename = results_module._rename_noreplace
+
+    def rename_then_interrupt(*args):
+        real_rename(*args)
+        raise KeyboardInterrupt("simulated post-rename interruption")
+
+    monkeypatch.setattr(results_module, "_rename_noreplace", rename_then_interrupt)
+    with pytest.raises(KeyboardInterrupt, match="post-rename interruption"):
+        publish_validation_outputs(report, bundle)
+
+    assert {path.name for path in bundle.iterdir()} == {
+        "validation-manifest.json",
+        "validation-summary.md",
+    }
+    assert json.loads((bundle / "validation-manifest.json").read_text())[
+        "matrix_cases"
+    ] == 18
+
+
+def test_foreign_independent_output_names_are_not_part_of_bundle_protocol(tmp_path):
+    report = validate_results(*_valid_roots(tmp_path))
+    foreign_manifest = tmp_path / "validation-manifest.json"
+    foreign_summary = tmp_path / "validation-summary.md"
+    foreign_manifest.write_bytes(b"foreign manifest")
+    foreign_summary.write_bytes(b"foreign summary")
+    bundle = tmp_path / "validation-report"
+
+    publish_validation_outputs(report, bundle)
+
+    assert foreign_manifest.read_bytes() == b"foreign manifest"
+    assert foreign_summary.read_bytes() == b"foreign summary"
+    assert json.loads((bundle / "validation-manifest.json").read_text())[
+        "matrix_cases"
+    ] == 18
+    assert {foreign_manifest.name, foreign_summary.name, bundle.name} <= {
+        path.name for path in tmp_path.iterdir()
+    }
+    assert list(tmp_path.glob(".*validation-report*")) == []
+
+
+def test_validate_results_cli_publishes_only_output_root_bundle(
+    tmp_path, monkeypatch, capsys
+):
+    report = ValidationReport(
+        matrix_cases=18,
+        evaluation_samples=4,
+        stage1_recommendations={
+            f"{method}-zero{zero_stage}": 2
+            for method in METHODS
+            for zero_stage in ZERO_STAGES
+        },
+        stage2_recommendations={
+            f"{method}-zero{zero_stage}": 1
+            for method in METHODS
+            for zero_stage in ZERO_STAGES
+        },
+    )
+    monkeypatch.setattr(results_module, "validate_results", lambda *args: report)
+    bundle = tmp_path / "validation-report"
+
+    assert results_module.validate_results_main([
+        "--matrix-root", str(tmp_path / "matrix"),
+        "--evaluation-root", str(tmp_path / "evaluation"),
+        "--capacity-root", str(tmp_path / "capacity"),
+        "--output-root", str(bundle),
+    ]) == 0
+
+    assert json.loads(capsys.readouterr().out)["matrix_cases"] == 18
+    assert {path.name for path in bundle.iterdir()} == {
+        "validation-manifest.json",
+        "validation-summary.md",
+    }

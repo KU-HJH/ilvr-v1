@@ -690,3 +690,111 @@ initial/redistribute/resume; no result root
   affected preflight/coordinator suites.
 - `git diff --check` passed. Pre-existing untracked `__pycache__` paths were
   preserved. No SSH, Docker, GPU, tmux, rsync, or real training command ran.
+
+## Fix round 4: one atomic immutable report bundle
+
+This section supersedes every earlier description of independently publishing
+and rolling back JSON and Markdown output names. The validator now accepts one
+`--output-root` naming an absent bundle directory. It prepares the fixed
+`validation-manifest.json` and `validation-summary.md` files inside one
+exclusively created mode-private sibling staging directory, fsyncs each regular
+file and the staging directory, freezes the files/directory read-only, and
+performs one Linux `renameat2(RENAME_NOREPLACE)` into the final name. It then
+fsyncs the parent directory.
+
+No destructive action occurs after the final rename. If parent fsync fails,
+the caller receives `ReportBundleDurabilityError` explaining that durability
+is ambiguous, while the complete two-file bundle remains visible. Failures
+before rename remove only the fixed files inside the retained private staging
+directory and that private directory itself. There are no rollback, capture,
+or independent-output publication names in the production protocol.
+
+### RED evidence
+
+The new bundle publication and CLI causals were run before changing production:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_result_validation.py \
+  -k 'publish_validation_outputs_writes_matching_tables_exclusively or second_bundle_file_failure or final_bundle_rename_collision or parent_fsync_failure_leaves_complete_bundle or foreign_independent_output_names or validate_results_cli_publishes_only_output_root_bundle'
+```
+
+Observed output (exit 1):
+
+```text
+7 failed, 21 deselected in 3.29s
+```
+
+Six publisher tests failed because the old function still required separate
+manifest and summary paths. The CLI test failed because it still required
+`--output-manifest` and `--output-summary`. These were the intended missing
+bundle-interface failures.
+
+A mutation check then covered failure immediately after exclusive staging
+directory creation but before its descriptor opens:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_result_validation.py::test_staging_open_failure_removes_only_private_empty_directory
+```
+
+Observed RED (exit 1): the private `.validation-report.<token>.staging`
+directory remained. Recording staging creation separately from descriptor
+acquisition closed that pre-rename cleanup gap.
+
+The final mutation check injected an exception immediately after the real
+no-replace rename succeeded:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q \
+  tests/multinode/test_result_validation.py::test_exception_after_successful_rename_never_cleans_final_bundle
+```
+
+Observed RED (exit 1): the old flag-based `finally` unlinked both files through
+the retained directory descriptor and then masked the injected
+`KeyboardInterrupt` with `FileNotFoundError`. Cleanup is now confined to
+preparation exceptions and `renameat2` results that definitively report
+failure. Ambiguous unwind after the syscall only closes retained descriptors.
+
+### GREEN evidence
+
+The complete result-validator test file now passes:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q tests/multinode/test_result_validation.py
+```
+
+```text
+30 passed in 3.53s
+```
+
+The causals prove that a second-file write or fsync failure leaves the final
+bundle absent; a final rename collision preserves the foreign directory and
+its bytes; parent-fsync failure leaves both complete readable files and never
+rolls back; foreign sibling `validation-manifest.json` and
+`validation-summary.md` files are not consulted, moved, or removed; and no
+hidden staging/rollback/capture name remains after the tested success or
+failure paths. A staging-open failure likewise cleans its one private empty
+directory, and an exception immediately after successful rename retains both
+complete final files.
+
+CLI help now exposes only the bundle path:
+
+```text
+--matrix-root MATRIX_ROOT --evaluation-root EVALUATION_ROOT
+--capacity-root CAPACITY_ROOT --output-root OUTPUT_ROOT
+```
+
+Task 10 and Task 12 plan references use the same interface. The Task 12
+operator path is `$hardware_result_root/validation-report/`, containing the
+two fixed report files. `git diff --check` passed. Pre-existing untracked
+`__pycache__` paths were preserved. No SSH, Docker, GPU, tmux, rsync, or real
+training command ran.
