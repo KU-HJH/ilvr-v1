@@ -329,6 +329,7 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
 def _run_main_with_fake_sample(
     module, monkeypatch, tmp_path, *, num_shards, shard_index=0, fail_index=None
 ):
+    (tmp_path / "image.png").write_bytes(b"image")
     dataset = tmp_path / "test.jsonl"
     dataset.write_text(
         "".join(
@@ -380,6 +381,69 @@ def _run_main_with_fake_sample(
 
     monkeypatch.setattr(module, "run_one_example", run_one)
     return dataset, output, module.main()
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_entrypoint_resolves_dataset_relative_image_before_run_one(
+    module_name, monkeypatch, tmp_path
+):
+    module = _import_entry_point(module_name, monkeypatch)
+    dataset_root = tmp_path / "dataset"
+    image = dataset_root / "images_comt/creation/12003.png"
+    image.parent.mkdir(parents=True)
+    Image.new("RGB", (2, 2), color="white").save(image)
+    dataset = dataset_root / "subset.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "text_input": "question",
+                "image_input": ["images_comt/creation/12003.png"],
+                "original_final_answer": "42",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "output.jsonl"
+    monkeypatch.setattr(
+        module,
+        "get_eval_args",
+        lambda: SimpleNamespace(
+            model_dir="relative-model",
+            base_model_dir=None,
+            test_data_path=str(dataset),
+            task_name="zebra-cot",
+            output_json_path=str(output),
+            cache_dir="cache",
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            num_shards=1,
+            shard_index=0,
+            model_identity=None,
+        ),
+    )
+    monkeypatch.setattr(
+        module, "load_evaluation_artifacts", lambda **_kwargs: (object(), object())
+    )
+    observed = []
+
+    def run_one(_model, _processor, sample, _gen_kwargs):
+        observed.append(sample["image_input"])
+        result = {
+            "raw_output": "raw answer",
+            "assistant_only": "answer",
+            "extracted_final_answer": "42",
+        }
+        if module_name == "eval":
+            result["inference_time"] = 0.25
+        return result
+
+    monkeypatch.setattr(module, "run_one_example", run_one)
+
+    module.main()
+
+    assert observed == [[str(image.resolve())]]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

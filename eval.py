@@ -6,6 +6,7 @@ import argparse
 import logging
 import time
 import sys
+from pathlib import Path
 from typing import List, Dict, Any, Union
 
 import torch
@@ -33,6 +34,7 @@ from stage2.peft import (
 from multinode_evaluation import (
     dataset_identity,
     iter_owned_samples,
+    resolve_evaluation_image_paths,
     resolve_model_identity,
     shard_manifest_path,
     write_shard_manifest,
@@ -50,10 +52,6 @@ ACTION_MAP = {
 }
 
 BASE_MODEL_ID = ""  
-
-BASE_DATASET_DIR = ''
-
-
 
 def get_eval_args():
     parser = argparse.ArgumentParser()
@@ -169,18 +167,10 @@ def _resolve_image_paths(image_input: Union[str, List[str]]) -> List[str]:
         return []
 
     if isinstance(image_input, str):
-        p = image_input
-        if not os.path.isabs(p):
-            p = os.path.join(BASE_DATASET_DIR, p)
-        return [p]
+        return [image_input]
 
     if isinstance(image_input, list):
-        outs = []
-        for p in image_input:
-            if not os.path.isabs(p):
-                p = os.path.join(BASE_DATASET_DIR, p)
-            outs.append(p)
-        return outs
+        return list(image_input)
 
     return []
 
@@ -468,6 +458,11 @@ def main():
             "shards indexed 0-3"
         )
 
+    dataset_path = Path(args.test_data_path).resolve(strict=True)
+    if not dataset_path.is_file():
+        raise ValueError("evaluation test data must be a file")
+    dataset_root = dataset_path.parent
+
     logging.info(f"Loading model from: {args.model_dir}")
     model, processor = load_evaluation_artifacts(
         model_dir=args.model_dir,
@@ -477,7 +472,7 @@ def main():
 
     # Load test data
     data = []
-    with open(args.test_data_path, "r", encoding="utf-8") as f:
+    with dataset_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -514,7 +509,13 @@ def main():
     for local_index, (i, sample) in enumerate(owned_samples):
         processed_indices.append(i)
         try:
-            pred = run_one_example(model, processor, sample, gen_kwargs)
+            evaluation_sample = dict(sample)
+            evaluation_sample["image_input"] = resolve_evaluation_image_paths(
+                sample.get("image_input", []), dataset_root
+            )
+            pred = run_one_example(
+                model, processor, evaluation_sample, gen_kwargs
+            )
             sample_infer_time = pred.get("inference_time", None)
             if sample_infer_time is not None:
                 total_inference_time += sample_infer_time

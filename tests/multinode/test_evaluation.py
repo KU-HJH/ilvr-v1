@@ -5,11 +5,57 @@ from pathlib import Path
 
 import pytest
 
+import src.multinode_evaluation as evaluation_module
 from src.multinode_evaluation import (
     iter_owned_samples,
     merge_shards,
     write_shard_manifest,
 )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ("images_comt/creation/12003.png", "creation/12003.png"),
+)
+def test_evaluation_image_paths_resolve_beneath_dataset_root(
+    tmp_path, relative_path
+):
+    image = tmp_path / relative_path
+    image.parent.mkdir(parents=True, exist_ok=True)
+    image.write_bytes(b"image")
+
+    assert evaluation_module.resolve_evaluation_image_paths(
+        [relative_path], tmp_path
+    ) == [str(image.resolve())]
+
+
+def test_evaluation_image_paths_report_missing_file(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Image not found"):
+        evaluation_module.resolve_evaluation_image_paths(
+            "images_comt/creation/missing.png", tmp_path
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    ("../escape.png", "/tmp/absolute.png", "images_comt/control\n.png"),
+)
+def test_evaluation_image_paths_reject_unsafe_input(tmp_path, unsafe_path):
+    with pytest.raises(ValueError, match="safe relative"):
+        evaluation_module.resolve_evaluation_image_paths(unsafe_path, tmp_path)
+
+
+def test_evaluation_image_paths_reject_symlink_escape(tmp_path):
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"outside")
+    (dataset_root / "linked.png").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="beneath dataset root"):
+        evaluation_module.resolve_evaluation_image_paths(
+            "linked.png", dataset_root
+        )
 
 
 def test_four_shards_cover_every_source_index_once():

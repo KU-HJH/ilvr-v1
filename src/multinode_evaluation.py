@@ -41,6 +41,52 @@ def dataset_identity(dataset_path: str | os.PathLike[str]) -> dict[str, Any]:
     }
 
 
+def resolve_evaluation_image_paths(
+    image_input: object, dataset_root: str | os.PathLike[str]
+) -> list[str]:
+    """Resolve one sample's safe relative image paths beneath its dataset root."""
+    root = Path(dataset_root)
+    if not root.is_absolute():
+        raise ValueError("dataset root must be absolute")
+    root = root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("dataset root must be a directory")
+    if image_input is None:
+        values: list[object] = []
+    elif isinstance(image_input, str):
+        values = [image_input]
+    elif isinstance(image_input, list):
+        values = list(image_input)
+    else:
+        raise ValueError("image_input must contain safe relative paths")
+
+    resolved_paths: list[str] = []
+    for value in values:
+        if (
+            not isinstance(value, str)
+            or not value
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in value
+            )
+        ):
+            raise ValueError("image_input must contain safe relative paths")
+        relative = Path(value)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("image_input must contain safe relative paths")
+        candidate = root / relative
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise FileNotFoundError(f"Image not found: {value}") from error
+        if not resolved.is_relative_to(root):
+            raise ValueError("evaluation image must remain beneath dataset root")
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Image not found: {value}")
+        resolved_paths.append(str(resolved))
+    return resolved_paths
+
+
 def resolve_model_identity(
     model_dir: str | os.PathLike[str], explicit_identity: str | None
 ) -> str:
