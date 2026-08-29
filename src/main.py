@@ -2,8 +2,13 @@ import argparse
 import logging
 import math
 import os
+import platform
 import sys
 from pathlib import Path
+
+_platform_python_version = platform.python_version
+if _platform_python_version().endswith("+"):
+    platform.python_version = lambda: _platform_python_version().rstrip("+")
 
 from artifact_paths import resolve_run_artifact_paths, validate_generated_artifact_paths
 from deepspeed_runtime import bind_deepspeed_runtime_profile
@@ -81,6 +86,8 @@ from stage2.peft import (
     resolve_stage2_target_module_names,
     validate_stage2_parameter_boundary,
 )
+
+platform.python_version = _platform_python_version
 
 
 _STAGE2_GRADIENT_CHECKPOINTING_KWARGS = {"use_reentrant": False}

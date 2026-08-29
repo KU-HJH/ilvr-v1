@@ -75,6 +75,36 @@ def test_stage2_multinode_dry_run_emits_rank_zero_four_process_command():
     )
 
 
+def test_production_entrypoint_imports_with_build_marker_then_restores_platform():
+    """Catches datasets rejecting 3.11.15+ or normalization leaking after imports."""
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": f"{REPO_ROOT / 'transformers/src'}:{REPO_ROOT / 'src'}",
+    }
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+            "-c",
+            (
+                "import platform; "
+                "original = platform.python_version; "
+                "assert original().endswith('+'), original(); "
+                "import main; "
+                "assert platform.python_version is original; "
+                "assert platform.python_version().endswith('+')"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path):
     """Catches cwd-dependent paths, wrong Stage 2 bindings, or lost CLI arguments."""
     result = run_launcher(
