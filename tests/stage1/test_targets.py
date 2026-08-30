@@ -42,6 +42,18 @@ class LiteralTokenizer:
         return {"input_ids": torch.tensor([[self._ids[text]]], dtype=torch.long)}
 
 
+class MultiTokenAssistantTokenizer(LiteralTokenizer):
+    def __call__(self, text, *, return_tensors):
+        if text == "<|im_start|>assistant\n":
+            assert return_tensors == "pt"
+            return {
+                "input_ids": torch.tensor(
+                    [[ASSISTANT_TOKEN_ID, 51]], dtype=torch.long
+                )
+            }
+        return super().__call__(text, return_tensors=return_tensors)
+
+
 class IdentityAttention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -215,6 +227,44 @@ GOLDEN_MULTIBLOCK = LiteralSample(
 )
 
 
+THREE_BLOCK_HISTORY = LiteralSample(
+    source_index=31,
+    input_ids=(
+        10,
+        99,
+        11,
+        50,
+        20,
+        91,
+        90,
+        90,
+        92,
+        21,
+        91,
+        90,
+        90,
+        92,
+        22,
+        91,
+        90,
+        90,
+        92,
+        30,
+    ),
+    spans=(
+        Stage1LatentSpan(start=5, end=8, latent_positions=(6, 7)),
+        Stage1LatentSpan(start=10, end=13, latent_positions=(11, 12)),
+        Stage1LatentSpan(start=15, end=18, latent_positions=(16, 17)),
+    ),
+    original_feature=(0.0, 2.0),
+    helper_features=(
+        ((10.0, 0.0), (20.0, 0.0)),
+        ((0.0, 9.0), (0.0, 12.0)),
+        ((1.0, 1.0),),
+    ),
+)
+
+
 @dataclass
 class TargetCase:
     teacher: CompleteQwenTeacher
@@ -352,6 +402,165 @@ def test_teacher_runs_one_language_and_one_helper_visual_call_for_multiple_block
     assert case.teacher.helper_visual_call_count == 1
     assert not result.latent_values.requires_grad
     assert not case.teacher.training
+
+
+def test_text_history_starts_after_the_longest_assistant_marker():
+    """Catches a short marker prefix leaking remaining control tokens."""
+    builder = Stage1TeacherTargetBuilder(MultiTokenAssistantTokenizer())
+    sample_ids = torch.tensor(
+        [10, ASSISTANT_TOKEN_ID, 51, 20, 91, 90, 92], dtype=torch.long
+    )
+    sample = Stage1SampleMetadata(
+        source_index=37,
+        source_id="multi-token-assistant-marker",
+        original_grid_range=(0, 0),
+        helper_grid_range=(0, 1),
+        latent_spans=(
+            Stage1LatentSpan(start=4, end=6, latent_positions=(5,)),
+        ),
+        helper_to_block=(0,),
+        unpadded_length=7,
+    )
+
+    assistant_start, assistant_end = builder._assistant_bounds(sample_ids, sample)
+
+    assert (assistant_start, assistant_end) == (1, 3)
+    assert builder._assistant_text_spans(
+        sample_ids, sample, assistant_end
+    ) == ([3],)
+
+
+def test_previous_textual_states_matches_repository_queries():
+    """Catches the optional all-history path replacing repository behavior."""
+
+    class PreviousQueryBuilder(Stage1TeacherTargetBuilder):
+        def __init__(self, textual_states):
+            super().__init__(
+                tokenizer=LiteralTokenizer(),
+                coverage_p=1.0,
+                image_pool_k=2,
+                helper_group_L=0,
+                textual_states=textual_states,
+            )
+            self.queries = []
+
+        def _select(self, candidates, query, max_count):
+            selected_counts = (2, 1, 1)
+            block_index = len(self.queries)
+            self.queries.append(query.detach().clone())
+            return candidates[: min(selected_counts[block_index], max_count)]
+
+    case = make_case((THREE_BLOCK_HISTORY,))
+    builder = PreviousQueryBuilder(textual_states="previous")
+
+    result = builder.build(case.teacher, case.inputs, case.metadata)
+
+    torch.testing.assert_close(
+        torch.cat(builder.queries, dim=0),
+        torch.tensor(
+            [
+                [0.875, 0.875],
+                [61.0 / 12.0, 13.0 / 12.0],
+                [5.0 / 12.0, 37.0 / 12.0],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        result.latent_values,
+        torch.tensor(
+            [
+                [10.0, 0.0],
+                [20.0, 0.0],
+                [0.0, 9.0],
+                [1.0, 1.0],
+            ]
+        ),
+    )
+    assert case.teacher.language_forward_count == 1
+    assert case.teacher.original_visual_call_count == 1
+    assert case.teacher.helper_visual_call_count == 1
+
+
+def test_all_textual_states_averages_all_text_and_prior_latent_rows_in_order():
+    """Catches chat markers, local-only text, or previous-block-only latents."""
+
+    class QueryRecordingBuilder(Stage1TeacherTargetBuilder):
+        def __init__(self, textual_states):
+            super().__init__(
+                tokenizer=LiteralTokenizer(),
+                coverage_p=1.0,
+                image_pool_k=2,
+                helper_group_L=0,
+                textual_states=textual_states,
+            )
+            self.query_components = []
+            self.queries = []
+
+        def _reasoning_query(
+            self, global_intent, textual_history, latent_history=None
+        ):
+            parts = [global_intent, textual_history]
+            if latent_history is not None:
+                parts.append(latent_history)
+            self.query_components.append(torch.cat(parts, dim=0).detach().clone())
+            return super()._reasoning_query(
+                global_intent, textual_history, latent_history
+            )
+
+        def _select(self, candidates, query, max_count):
+            selected_counts = (2, 1, 1)
+            block_index = len(self.queries)
+            self.queries.append(query.detach().clone())
+            return candidates[: min(selected_counts[block_index], max_count)]
+
+    case = make_case((THREE_BLOCK_HISTORY,))
+    builder = QueryRecordingBuilder(textual_states="all")
+
+    result = builder.build(case.teacher, case.inputs, case.metadata)
+
+    assert [tuple(query.shape) for query in builder.queries] == [(1, 2)] * 3
+    torch.testing.assert_close(
+        builder.query_components[0],
+        torch.tensor(
+            [
+                [0.25, 1.25],
+                [2.0, 0.0],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        builder.queries[2],
+        torch.tensor([[3.75, 55.0 / 36.0]]),
+    )
+    assert [tuple(parts.shape) for parts in builder.query_components] == [
+        (2, 2),
+        (3, 2),
+        (3, 2),
+    ]
+    torch.testing.assert_close(
+        builder.query_components[2],
+        torch.tensor(
+            [
+                [0.25, 1.25],
+                [1.0, 1.0 / 3.0],
+                [10.0, 3.0],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        result.latent_values,
+        torch.tensor(
+            [
+                [10.0, 0.0],
+                [20.0, 0.0],
+                [0.0, 9.0],
+                [1.0, 1.0],
+            ]
+        ),
+    )
+    assert case.teacher.language_forward_count == 1
+    assert case.teacher.original_visual_call_count == 1
+    assert case.teacher.helper_visual_call_count == 1
 
 
 def test_b1_matches_hand_derived_legacy_target_mask_and_downstream_inputs(

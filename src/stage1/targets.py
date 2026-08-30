@@ -30,17 +30,21 @@ class Stage1TeacherTargetBuilder:
         coverage_p: float = 0.9,
         image_pool_k: int = 8,
         helper_group_L: int | None = 256,
+        textual_states: str = "previous",
     ) -> None:
         if not math.isfinite(coverage_p) or not 0.0 < coverage_p <= 1.0:
             raise ValueError("coverage_p must be finite and in (0, 1]")
         if image_pool_k <= 0:
             raise ValueError("image_pool_k must be positive")
+        if textual_states not in ("all", "previous"):
+            raise ValueError("textual_states must be 'all' or 'previous'")
         self.tokenizer = tokenizer
         self.coverage_p = float(coverage_p)
         self.image_pool_k = int(image_pool_k)
         self.helper_group_L = (
             self.image_pool_k if helper_group_L is None else int(helper_group_L)
         )
+        self.textual_states = textual_states
         self._assistant_patterns = self._token_patterns(
             ("<|im_start|>assistant", "<|im_start|>assistant\n")
         )
@@ -145,7 +149,13 @@ class Stage1TeacherTargetBuilder:
             sample_input_embeddings = input_embeddings[
                 sample_index, : sample.unpadded_length
             ]
-            assistant_start = self._assistant_start(sample_ids, sample)
+            if self.textual_states == "all":
+                assistant_start, assistant_end = self._assistant_bounds(
+                    sample_ids, sample
+                )
+            else:
+                assistant_start = self._assistant_start(sample_ids, sample)
+                assistant_end = assistant_start
             user_query = self._user_query(
                 teacher=teacher,
                 sample=sample,
@@ -159,32 +169,57 @@ class Stage1TeacherTargetBuilder:
                 original_counts=original_counts,
             )
             text_spans = self._assistant_text_spans(
-                sample_ids, sample, assistant_start
+                sample_ids,
+                sample,
+                assistant_end if self.textual_states == "all" else assistant_start,
             )
             candidates_by_block = self._sample_helper_candidates(
                 helper_images, sample
             )
 
+            text_history_sum = None
+            text_history_count = 0
+            latent_history_sum = None
+            latent_history_count = 0
             previous_selected_mean = None
             block_counts = []
             for block_index, span in enumerate(sample.latent_spans):
-                query_parts = [user_query]
                 if text_spans[block_index]:
                     text_indices = torch.tensor(
                         text_spans[block_index],
                         device=sample_hidden_last.device,
                         dtype=torch.long,
                     )
-                    query_parts.append(
-                        sample_hidden_last.index_select(0, text_indices).mean(
-                            dim=0, keepdim=True
+                    text_values = sample_hidden_last.index_select(0, text_indices)
+                    if self.textual_states == "all":
+                        current_text_sum = text_values.sum(dim=0, keepdim=True)
+                        text_history_sum = (
+                            current_text_sum
+                            if text_history_sum is None
+                            else text_history_sum + current_text_sum
                         )
+                        text_history_count += int(text_values.shape[0])
+                if self.textual_states == "all":
+                    textual_history = (
+                        text_history_sum / text_history_count
+                        if text_history_count
+                        else None
                     )
-                if previous_selected_mean is not None:
-                    query_parts.append(previous_selected_mean)
-                query = torch.stack(
-                    [part.squeeze(0) for part in query_parts], dim=0
-                ).mean(dim=0, keepdim=True)
+                    latent_history = (
+                        latent_history_sum / latent_history_count
+                        if latent_history_count
+                        else None
+                    )
+                else:
+                    textual_history = (
+                        text_values.mean(dim=0, keepdim=True)
+                        if text_spans[block_index]
+                        else None
+                    )
+                    latent_history = previous_selected_mean
+                query = self._reasoning_query(
+                    user_query, textual_history, latent_history
+                )
 
                 candidates = candidates_by_block[block_index]
                 selected = self._select(
@@ -201,6 +236,14 @@ class Stage1TeacherTargetBuilder:
                         list(span.latent_positions[:selected_count]),
                     ] = True
                     previous_selected_mean = selected.mean(dim=0, keepdim=True)
+                    if self.textual_states == "all":
+                        current_latent_sum = selected.sum(dim=0, keepdim=True)
+                        latent_history_sum = (
+                            current_latent_sum
+                            if latent_history_sum is None
+                            else latent_history_sum + current_latent_sum
+                        )
+                        latent_history_count += selected_count
             selected_counts.append(tuple(block_counts))
 
         if packed:
@@ -318,6 +361,32 @@ class Stage1TeacherTargetBuilder:
             images.append(features[offset : offset + count])
             offset += count
         return tuple(images)
+
+    def _assistant_bounds(
+        self, sample_ids: torch.Tensor, sample: Stage1SampleMetadata
+    ) -> tuple[int, int]:
+        best_match = None
+        for cpu_pattern in self._assistant_patterns:
+            pattern = cpu_pattern.to(sample_ids.device)
+            for start in range(sample_ids.numel() - pattern.numel() + 1):
+                if torch.equal(sample_ids[start : start + pattern.numel()], pattern):
+                    if start > 0:
+                        candidate = (start, start + int(pattern.numel()))
+                        if (
+                            best_match is None
+                            or candidate[0] < best_match[0]
+                            or (
+                                candidate[0] == best_match[0]
+                                and candidate[1] > best_match[1]
+                            )
+                        ):
+                            best_match = candidate
+                    break
+        if best_match is not None:
+            return best_match
+        raise ValueError(
+            f"source_index={sample.source_index}: assistant marker must follow the user prefix"
+        )
 
     def _assistant_start(
         self, sample_ids: torch.Tensor, sample: Stage1SampleMetadata
@@ -519,6 +588,15 @@ class Stage1TeacherTargetBuilder:
             spans.append(indices)
             previous = span.end + 1
         return tuple(spans)
+
+    @staticmethod
+    def _reasoning_query(global_intent, textual_history=None, latent_history=None):
+        parts = [global_intent]
+        if textual_history is not None:
+            parts.append(textual_history)
+        if latent_history is not None:
+            parts.append(latent_history)
+        return torch.cat(parts, dim=0).mean(dim=0, keepdim=True)
 
     def _sample_helper_candidates(self, helper_images, sample):
         grid_start, grid_end = sample.helper_grid_range
