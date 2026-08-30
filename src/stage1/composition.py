@@ -568,6 +568,7 @@ def build_stage1_training_components(
         coverage_p=args.coverage_p,
         image_pool_k=args.image_pool_k,
         helper_group_L=args.helper_group_L,
+        textual_states=args.textual_states,
         ce_weight=args.ce_weight,
         deepspeed_runtime_profile=profile,
         ema_method=tuning.method,

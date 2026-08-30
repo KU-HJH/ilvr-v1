@@ -48,6 +48,19 @@ def test_stage1_legacy_use_lora_resolves_only_to_lora():
     assert tuning.method == "lora"
 
 
+def test_textual_states_parser_defaults_accepts_all_and_rejects_invalid_values():
+    """Catches textual history mode being dropped or accepted outside its contract."""
+    assert parse_args(["--stage", "stage1"]).textual_states == "previous"
+    assert (
+        parse_args(
+            ["--stage", "stage1", "--textual_states", "all"]
+        ).textual_states
+        == "all"
+    )
+    with pytest.raises(SystemExit):
+        parse_args(["--stage", "stage1", "--textual_states", "invalid"])
+
+
 def test_stage1_explicit_target_order_is_preserved_after_normalization():
     """Catches an explicit Stage 1 PEFT target order being replaced by defaults."""
     tuning = resolve_stage1_tuning_config(

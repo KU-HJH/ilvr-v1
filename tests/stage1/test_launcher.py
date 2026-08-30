@@ -301,6 +301,7 @@ def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_
         "--seed": "42",
         "--attention_implementation": "flash_attention_2",
         "--save_strategy": "no",
+        "--textual_states": "previous",
         "--lora_r": "32",
         "--lora_alpha": "64",
         "--lora_dropout": "0.05",
@@ -315,6 +316,20 @@ def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_
     assert deepspeed == REPO_ROOT / "configs/deepspeed_zero3.json"
     assert "--final_save" in command
     assert "--gradient_checkpointing" in command
+
+
+def test_launcher_forwards_explicit_textual_states(tmp_path):
+    """Catches the launcher ignoring an explicit textual history mode."""
+    completed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "output"),
+        "--textual_states",
+        "all",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = shlex.split(completed.stdout)
+    assert command[command.index("--textual_states") + 1] == "all"
 
 
 def test_dry_run_derives_canonical_log_from_checkpoint_experiment_id():

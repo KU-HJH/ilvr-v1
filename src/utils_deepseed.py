@@ -42,6 +42,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--coverage_p", type=float, default=0.9)
     parser.add_argument("--image_pool_k", type=int, default=8)  
     parser.add_argument("--latent_ce_ratio", type=float, default=0.0, help="stage2")
+    parser.add_argument(
+        "--textual_states",
+        choices=("all", "previous"),
+        default="previous",
+    )
     parser.add_argument("--use_lora", action="store_true", help="")
     parser.add_argument("--lora_r", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=64)
