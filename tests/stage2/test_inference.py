@@ -304,6 +304,12 @@ def test_inference_rejects_batch_greater_than_one():
         )
 
 
+def test_generation_config_defaults_to_official_evaluation_output_limit():
+    config = Stage2GenerationConfig()
+
+    assert config.max_new_tokens == 4096
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

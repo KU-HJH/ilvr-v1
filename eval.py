@@ -14,9 +14,17 @@ from PIL import Image
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
     AutoProcessor,
+    LogitsProcessorList,
 )
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+from peft_common import resolve_qwen2_5_vl_model
+from stage1.checkpointing import (
+    STAGE1_PEFT_METADATA_FILENAME,
+    Stage1ArtifactKind,
+    classify_stage1_artifact,
+    load_stage1_peft_artifact,
+)
 from stage2.checkpointing import (
     Stage2ArtifactKind,
     inspect_stage2_artifact,
@@ -53,6 +61,42 @@ ACTION_MAP = {
 
 BASE_MODEL_ID = ""  
 
+
+class Stage1LatentTemplateLogitsProcessor:
+    """Force exactly ``latent_size`` pad tokens inside a Stage 1 latent block."""
+
+    def __init__(self, start_id: int, end_id: int, pad_id: int, latent_size: int):
+        self.start_id = int(start_id)
+        self.end_id = int(end_id)
+        self.pad_id = int(pad_id)
+        self.latent_size = int(latent_size)
+
+    def __call__(self, input_ids, scores):
+        for batch_index in range(input_ids.size(0)):
+            sequence = input_ids[batch_index]
+            starts = (sequence == self.start_id).nonzero().squeeze(-1)
+            ends = (sequence == self.end_id).nonzero().squeeze(-1)
+            last_start = int(starts[-1].item()) if starts.numel() else -1
+            last_end = int(ends[-1].item()) if ends.numel() else -1
+            if last_start == -1 or last_end >= last_start:
+                scores[batch_index, self.pad_id] = -float("inf")
+                scores[batch_index, self.end_id] = -float("inf")
+                continue
+            position = last_start + 1
+            pad_count = 0
+            while (
+                position < sequence.size(0)
+                and int(sequence[position].item()) == self.pad_id
+            ):
+                pad_count += 1
+                position += 1
+            scores[batch_index, :] = -float("inf")
+            forced_token = (
+                self.pad_id if pad_count < self.latent_size else self.end_id
+            )
+            scores[batch_index, forced_token] = 0.0
+        return scores
+
 def get_eval_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", type=str, required=True,
@@ -67,7 +111,7 @@ def get_eval_args():
                         help="Path to save per-sample evaluation results.")
     parser.add_argument("--cache_dir", type=str, default="./cache",
                         help="Hugging Face cache directory.")
-    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--num-shards", type=int, default=1)
@@ -133,7 +177,30 @@ def load_model(model_dir: str, cache_dir: str):
 def load_evaluation_artifacts(
     *, model_dir: str, base_model_dir: str | None, cache_dir: str
 ):
-    """Load either one full Stage 2 artifact or a Stage 1 base plus adapter."""
+    """Load one full artifact or a validated Stage 1/2 PEFT artifact."""
+    artifact_path = Path(model_dir)
+    if (
+        artifact_path.is_dir()
+        and (artifact_path / STAGE1_PEFT_METADATA_FILENAME).is_file()
+    ):
+        artifact_kind = classify_stage1_artifact(artifact_path)
+        if artifact_kind is not Stage1ArtifactKind.PEFT:
+            raise ValueError("Stage 1 metadata requires a PEFT artifact")
+        if base_model_dir is None:
+            raise ValueError(
+                "base_model_dir is required for a Stage 1 PEFT artifact"
+            )
+        processor = AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
+        model = load_stage1_peft_artifact(
+            load_model(base_model_dir, cache_dir),
+            processor,
+            artifact_path,
+            requested_base_model_reference=base_model_dir,
+            is_trainable=False,
+        )
+        model.eval()
+        return model, processor
+
     artifact_inspection = inspect_stage2_artifact(model_dir)
     if artifact_inspection.artifact_kind is Stage2ArtifactKind.FULL:
         if base_model_dir is not None:
@@ -369,12 +436,12 @@ def run_one_example(
         padding=True,
     )
 
-    stage2_model = resolve_stage2_qwen_model(model)
+    qwen_model = resolve_qwen2_5_vl_model(model)
     effective_device = getattr(model, "device", None)
     if effective_device is None:
-        effective_device = getattr(stage2_model, "device", None)
+        effective_device = getattr(qwen_model, "device", None)
     if effective_device is None:
-        raise ValueError("Unable to determine the Stage 2 evaluation device")
+        raise ValueError("Unable to determine the evaluation device")
 
     # Move tensor inputs to the outer runtime wrapper's device when available.
     inputs = {
@@ -385,20 +452,38 @@ def run_one_example(
 
     input_ids = inputs["input_ids"]
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-        raise NotImplementedError("Stage 2 evaluation currently supports batch_size=1 only")
+        raise NotImplementedError("evaluation currently supports batch_size=1 only")
     attention_mask = inputs.get("attention_mask")
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
-    latent_size = getattr(stage2_model.config, "latent_size", None)
+    latent_size = getattr(qwen_model.config, "latent_size", None)
     if not isinstance(latent_size, int) or isinstance(latent_size, bool) or latent_size <= 0:
-        raise ValueError("Stage 2 checkpoint config must contain a positive latent_size")
-    token_ids = resolve_latent_token_ids(processor.tokenizer, stage2_model.config)
-    generation_config = build_stage2_generation_config(
-        model_config=stage2_model.config,
-        model_generation_config=getattr(stage2_model, "generation_config", None),
-        tokenizer=processor.tokenizer,
-        generation_kwargs=gen_kwargs,
-    )
+        raise ValueError("checkpoint config must contain a positive latent_size")
+    token_ids = resolve_latent_token_ids(processor.tokenizer, qwen_model.config)
+    stage = getattr(qwen_model.config, "stage", None)
+    if stage == "stage1":
+        logits_processor = LogitsProcessorList(
+            [
+                Stage1LatentTemplateLogitsProcessor(
+                    token_ids.start_token_id,
+                    token_ids.end_token_id,
+                    token_ids.pad_token_id,
+                    latent_size,
+                )
+            ]
+        )
+    elif stage == "stage2":
+        stage2_model = resolve_stage2_qwen_model(model)
+        generation_config = build_stage2_generation_config(
+            model_config=stage2_model.config,
+            model_generation_config=getattr(
+                stage2_model, "generation_config", None
+            ),
+            tokenizer=processor.tokenizer,
+            generation_kwargs=gen_kwargs,
+        )
+    else:
+        raise ValueError(f"unsupported evaluation stage: {stage!r}")
 
     # ---- Start inference timing (generation only) ----
     if torch.cuda.is_available():
@@ -406,17 +491,25 @@ def run_one_example(
     start_time = time.perf_counter()
 
     with torch.inference_mode():
-        generation_result = Stage2InferenceController().generate(
-            model=stage2_model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_ids=token_ids,
-            generation_config=generation_config,
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            return_latent_states=False,
-        )
-    out_ids = generation_result.sequences
+        if stage == "stage1":
+            out_ids = model.generate(
+                **inputs,
+                **gen_kwargs,
+                logits_processor=logits_processor,
+                tokenizer=processor.tokenizer,
+            )
+        else:
+            generation_result = Stage2InferenceController().generate(
+                model=stage2_model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_ids=token_ids,
+                generation_config=generation_config,
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                return_latent_states=False,
+            )
+            out_ids = generation_result.sequences
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -611,6 +704,11 @@ def main():
             model_identity=resolve_model_identity(
                 args.model_dir, args.model_identity
             ),
+            generation_config={
+                "max_new_tokens": args.max_new_tokens,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+            },
             shard_index=args.shard_index,
             num_shards=args.num_shards,
             expected_source_indices=[index for index, _sample in owned_samples],

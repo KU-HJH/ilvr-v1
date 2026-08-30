@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 NUM_EVALUATION_SHARDS = 4
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
+LEGACY_MANIFEST_SCHEMA_VERSION = 1
 
 
 def _is_int(value: object) -> bool:
@@ -124,12 +126,41 @@ def _validate_dataset_identity(value: object) -> dict[str, Any]:
     return value
 
 
+def _validate_generation_config(value: object) -> dict[str, Any]:
+    required = {"max_new_tokens", "temperature", "top_p"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("invalid generation config")
+    max_new_tokens = value["max_new_tokens"]
+    temperature = value["temperature"]
+    top_p = value["top_p"]
+    if not _is_int(max_new_tokens) or max_new_tokens <= 0:
+        raise ValueError("invalid generation config max_new_tokens")
+    if (
+        type(temperature) not in (int, float)
+        or not math.isfinite(temperature)
+        or temperature < 0
+    ):
+        raise ValueError("invalid generation config temperature")
+    if (
+        type(top_p) not in (int, float)
+        or not math.isfinite(top_p)
+        or not 0 < top_p <= 1
+    ):
+        raise ValueError("invalid generation config top_p")
+    return {
+        "max_new_tokens": max_new_tokens,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+    }
+
+
 def write_shard_manifest(
     manifest_path: str | os.PathLike[str],
     *,
     shard_jsonl: str | os.PathLike[str],
     dataset_identity: Mapping[str, Any],
     model_identity: str,
+    generation_config: Mapping[str, Any],
     shard_index: int,
     num_shards: int,
     expected_source_indices: Sequence[int],
@@ -152,6 +183,7 @@ def write_shard_manifest(
         raise ValueError("worker exit status must be a non-negative integer")
 
     identity = _validate_dataset_identity(dict(dataset_identity))
+    generation = _validate_generation_config(dict(generation_config))
     expected = _validate_index_list(
         list(expected_source_indices), "expected source indices"
     )
@@ -163,6 +195,7 @@ def write_shard_manifest(
         "result_jsonl": shard_jsonl.name,
         "dataset_identity": identity,
         "model_identity": model_identity,
+        "generation_config": generation,
         "shard_index": shard_index,
         "num_shards": num_shards,
         "expected_source_indices": expected,
@@ -201,13 +234,15 @@ def _validate_manifest(
         "worker_exit_status",
         "successful",
     }
+    schema_version = manifest.get("schema_version")
+    if not _is_int(schema_version):
+        raise ValueError(f"unsupported shard manifest schema in {path}")
+    if schema_version == MANIFEST_SCHEMA_VERSION:
+        required_fields.add("generation_config")
+    elif schema_version != LEGACY_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"unsupported shard manifest schema in {path}")
     if set(manifest) != required_fields:
         raise ValueError(f"invalid shard manifest fields in {path}")
-    if (
-        not _is_int(manifest["schema_version"])
-        or manifest["schema_version"] != MANIFEST_SCHEMA_VERSION
-    ):
-        raise ValueError(f"unsupported shard manifest schema in {path}")
     if manifest["num_shards"] != NUM_EVALUATION_SHARDS or not _is_int(
         manifest["num_shards"]
     ):
@@ -227,6 +262,10 @@ def _validate_manifest(
         "model_identity"
     ].strip():
         raise ValueError(f"invalid model identity in {path}")
+    if schema_version == MANIFEST_SCHEMA_VERSION:
+        manifest["generation_config"] = _validate_generation_config(
+            manifest["generation_config"]
+        )
     exit_status = manifest["worker_exit_status"]
     if not _is_int(exit_status) or exit_status < 0:
         raise ValueError(f"invalid worker exit status in {path}")
@@ -339,6 +378,8 @@ def merge_shards(
     manifests: dict[int, tuple[dict[str, Any], Path]] = {}
     common_dataset_identity = None
     common_model_identity = None
+    common_generation_config = None
+    generation_config_initialized = False
     for manifest_path in manifest_paths:
         manifest, jsonl_path = _validate_manifest(
             manifest_path, expected_sample_count
@@ -354,6 +395,12 @@ def merge_shards(
             common_model_identity = manifest["model_identity"]
         elif manifest["model_identity"] != common_model_identity:
             raise ValueError("model identity mismatch across shards")
+        generation_config = manifest.get("generation_config")
+        if not generation_config_initialized:
+            common_generation_config = generation_config
+            generation_config_initialized = True
+        elif generation_config != common_generation_config:
+            raise ValueError("generation config mismatch across shards")
         manifests[shard_index] = (manifest, jsonl_path)
     if set(manifests) != set(range(NUM_EVALUATION_SHARDS)):
         raise ValueError("merge requires shard indices 0-3 exactly once")
@@ -424,5 +471,7 @@ def merge_shards(
         ),
         "success": successes,
     }
+    if common_generation_config is not None:
+        summary["generation_config"] = common_generation_config
     _publish_outputs(rows, summary, Path(output_jsonl), Path(summary_json))
     return summary

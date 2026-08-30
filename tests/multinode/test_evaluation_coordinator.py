@@ -76,7 +76,10 @@ def _plan() -> EvaluationPlan:
     return EvaluationPlan(
         run_id="eval-four-gpu",
         attempt_id="initial",
-        model_dir=Path("/root/workspace/ILVR/results/trained-model-run/inference"),
+        model_dir=Path(
+            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "trained-model-run/prepared-model"
+        ),
         test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
         task_name="zebra-cot",
         output_dir=Path("/root/workspace/ILVR/results/eval-four-gpu"),
@@ -95,13 +98,38 @@ def test_evaluation_assigns_remote_zero_one_and_local_two_three():
     assert len({a.ownership_name for a in assignments}) == 4
 
 
-def test_local_inference_staging_is_a_sibling_of_the_final_evaluation_result():
+def test_local_inference_staging_is_checkpoint_owned():
     plan = _plan()
 
     assert plan.local_model_dir == Path(
-        "/root/workspace/ILVR/results/eval-four-gpu-inference-model"
+        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+        "eval-four-gpu/local-model"
     )
-    assert plan.local_model_dir.parent == plan.output_dir.parent
+
+
+def test_evaluation_model_artifacts_are_checkpoint_owned():
+    plan = EvaluationPlan(
+        run_id="eval-four-gpu",
+        model_dir=Path(
+            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "trained-model-run/prepared-model"
+        ),
+        test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
+        task_name="zebra-cot",
+        output_dir=Path("/root/workspace/ILVR/results/eval-four-gpu"),
+    )
+
+    assert plan.local_model_dir == Path(
+        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+        "eval-four-gpu/local-model"
+    )
+    with pytest.raises(ValueError, match="checkpoint"):
+        dataclasses.replace(
+            plan,
+            model_dir=Path(
+                "/root/workspace/ILVR/results/trained-model-run/prepared-model"
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -136,6 +164,12 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
     ]
     assert model_dirs[:2] == [str(_plan().model_dir)] * 2
     assert model_dirs[2:] == [str(_plan().local_model_dir)] * 2
+    assert {
+        worker.node_spec.command[
+            worker.node_spec.command.index("--max_new_tokens") + 1
+        ]
+        for worker in commands.workers
+    } == {"4096"}
 
 
 def test_worker_supervisors_bind_exact_evaluation_shard_identity():
@@ -357,8 +391,16 @@ def test_production_inference_preparation_reserves_controls_before_copy(
     )
     monkeypatch.setattr(
         artifacts_module,
+        "resolve_local_checkpoint_destination",
+        lambda path: events.append("resolve-model")
+        or Path("/physical-checkpoints/eval-four-gpu/local-model"),
+    )
+    monkeypatch.setattr(
+        artifacts_module,
         "prepare_inference_copy",
-        lambda manifest, destination, runner: events.append("copy") or Path(destination),
+        lambda manifest, destination, runner: (
+            events.append(f"copy:{destination}") or Path(destination)
+        ),
     )
     runner = EvaluationSubprocessRunner(
         _plan(),
@@ -374,7 +416,8 @@ def test_production_inference_preparation_reserves_controls_before_copy(
         "local-control",
         "remote-control",
         "reserve-output",
-        "copy",
+        "resolve-model",
+        "copy:/physical-checkpoints/eval-four-gpu/local-model",
         "remote-output",
     ]
 
@@ -647,7 +690,8 @@ def test_unsafe_result_component_is_rejected_before_runner_creation(
         EvaluationPlan(
             run_id="eval-four-gpu",
             model_dir=Path(
-                "/root/workspace/ILVR/results/trained-model-run/inference"
+                "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+                "trained-model-run/prepared-model"
             ),
             test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
             task_name="zebra-cot",
@@ -663,8 +707,14 @@ def test_prepared_inference_backtick_source_is_rejected_before_rsync():
     with pytest.raises(ValueError, match="safe component"):
         build_prepared_inference_pull_command(
             _manifest(),
-            Path("/root/workspace/ILVR/results/bad`touch-owned`/inference"),
-            Path("/root/workspace/ILVR/results/eval-four-gpu/inference-model"),
+            Path(
+                "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+                "bad`touch-owned`/prepared-model"
+            ),
+            Path(
+                "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+                "eval-four-gpu/local-model"
+            ),
             files_from=Path("/root/workspace/ILVR/logs/evaluation.files"),
         )
 
@@ -674,8 +724,14 @@ def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
 
     command = build_prepared_inference_pull_command(
         _manifest(),
-        Path("/root/workspace/ILVR/results/trained-model-run/inference"),
-        Path("/root/workspace/ILVR/results/eval-four-gpu/inference-model"),
+        Path(
+            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "trained-model-run/prepared-model"
+        ),
+        Path(
+            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "eval-four-gpu/local-model"
+        ),
         files_from=files_path,
     )
 
@@ -693,9 +749,43 @@ def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
         "korea@10.1.102.41:/root/workspace/ILVR/"
-        "results/trained-model-run/inference/",
-        "/root/workspace/ILVR/results/eval-four-gpu/inference-model/",
+        "checkpoints/evaluation-staging/trained-model-run/prepared-model/",
+        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+        "eval-four-gpu/local-model/",
     )
+
+
+def test_prepared_inference_pull_accepts_resolved_local_checkpoint_destination(
+    tmp_path, monkeypatch
+):
+    import src.multinode_artifacts as artifacts_module
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    storage = tmp_path / "checkpoint-storage"
+    storage.mkdir()
+    (repository / "checkpoints").symlink_to(storage, target_is_directory=True)
+    source = (
+        repository
+        / "checkpoints"
+        / "evaluation-staging"
+        / "trained-model-run"
+        / "prepared-model"
+    )
+    physical_destination = (
+        storage / "evaluation-staging" / "eval-four-gpu" / "local-model"
+    )
+    monkeypatch.setattr(artifacts_module, "_LOCAL_REPOSITORY", repository)
+
+    command = build_prepared_inference_pull_command(
+        _manifest(),
+        source,
+        physical_destination,
+        files_from=tmp_path / "evaluation.files",
+    )
+
+    assert command[-2] == f"korea@10.1.102.41:{source}/"
+    assert command[-1] == f"{physical_destination}/"
 
 
 def test_prepared_inference_push_has_exact_container_rsync_argv():
@@ -703,7 +793,10 @@ def test_prepared_inference_push_has_exact_container_rsync_argv():
 
     command = build_prepared_inference_push_command(
         _manifest(),
-        Path("/root/workspace/ILVR/results/trained-model-run/inference"),
+        Path(
+            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "trained-model-run/prepared-model"
+        ),
         files_from=files_path,
     )
 
@@ -720,8 +813,10 @@ def test_prepared_inference_push_has_exact_container_rsync_argv():
         "--rsync-path",
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "/root/workspace/ILVR/results/trained-model-run/",
-        "korea@10.1.102.41:/root/workspace/ILVR/results/trained-model-run/",
+        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+        "trained-model-run/",
+        "korea@10.1.102.41:/root/workspace/ILVR/checkpoints/"
+        "evaluation-staging/trained-model-run/",
     )
 
 
@@ -767,6 +862,11 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
                 "mtime_ns": 20,
             },
             model_identity="task6:" + "a" * 64,
+            generation_config={
+                "max_new_tokens": 4096,
+                "temperature": 0.0,
+                "top_p": 1.0,
+            },
             shard_index=shard_index,
             num_shards=4,
             expected_source_indices=[shard_index],
@@ -782,6 +882,11 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
             jsonls,
             expected_model_identity="task6:" + "a" * 64,
             expected_sample_count=4,
+            expected_generation_config={
+                "max_new_tokens": 4096,
+                "temperature": 0.0,
+                "top_p": 1.0,
+            },
         )
 
 
@@ -800,7 +905,9 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
         [
             "evaluate",
             "--run-id", "eval-four-gpu",
-            "--model-dir", "/root/workspace/ILVR/results/model/inference",
+            "--model-dir",
+            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "model/prepared-model",
             "--test-data-path", "/root/workspace/ILVR/data/TEST.jsonl",
             "--task-name", "zebra-cot",
             "--output-dir", "/root/workspace/ILVR/results/eval-four-gpu",

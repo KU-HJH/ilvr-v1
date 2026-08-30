@@ -91,12 +91,17 @@ def _write_fake_shards(
     row_overrides: dict[int, dict] | None = None,
     successful=(True, True, True, True),
     processed_indices=None,
+    generation_configs=None,
 ):
     manifests = []
     raw_rows = raw_rows or {}
     row_overrides = row_overrides or {}
     if processed_indices is None:
         processed_indices = indices
+    if generation_configs is None:
+        generation_configs = (
+            {"max_new_tokens": 4096, "temperature": 0.0, "top_p": 1.0},
+        ) * 4
     for shard_index in range(4):
         shard_jsonl = tmp_path / f"shard-{shard_index}.jsonl"
         if shard_index in raw_rows:
@@ -129,6 +134,7 @@ def _write_fake_shards(
                 "mtime_ns": 123456789,
             },
             model_identity=model_ids[shard_index],
+            generation_config=generation_configs[shard_index],
             shard_index=shard_index,
             num_shards=4,
             expected_source_indices=list(indices[shard_index]),
@@ -169,6 +175,11 @@ def test_merge_sorts_rows_and_computes_accuracy_once(tmp_path):
         "total_inference_time_sec": 3.5,
         "accuracy": 4 / 7,
         "success": 4,
+        "generation_config": {
+            "max_new_tokens": 4096,
+            "temperature": 0.0,
+            "top_p": 1.0,
+        },
     }
     assert json.loads((tmp_path / "summary.json").read_text()) == summary
 
@@ -179,6 +190,31 @@ def test_merge_rejects_duplicate_source_index(tmp_path):
     )
     with pytest.raises(ValueError, match="duplicate source index 4"):
         _merge(tmp_path, shards, expected_sample_count=7)
+
+
+def test_merge_rejects_generation_config_mismatch(tmp_path):
+    configs = [
+        {"max_new_tokens": 4096, "temperature": 0.0, "top_p": 1.0}
+        for _ in range(4)
+    ]
+    configs[3] = {"max_new_tokens": 64, "temperature": 0.0, "top_p": 1.0}
+    shards = _write_fake_shards(tmp_path, generation_configs=configs)
+
+    with pytest.raises(ValueError, match="generation config"):
+        _merge(tmp_path, shards, expected_sample_count=4)
+
+
+def test_merge_keeps_schema_one_sidecar_compatibility(tmp_path):
+    shards = _write_fake_shards(tmp_path)
+    for path in shards:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 1
+        manifest.pop("generation_config", None)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    summary = _merge(tmp_path, shards, expected_sample_count=4)
+
+    assert "generation_config" not in summary
 
 
 @pytest.mark.parametrize(

@@ -254,8 +254,8 @@ def _validate_method(method: str) -> Stage1EmaMethod:
 
 def _validate_decay(decay: float) -> float:
     value = float(decay)
-    if not math.isfinite(value) or not 0.0 <= value < 1.0:
-        raise ValueError("EMA decay must be finite and in [0, 1)")
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError("EMA decay must be finite and in [0, 1]")
     return value
 
 
@@ -382,7 +382,7 @@ def _decode_ema_state(
     except ValueError as error:
         raise RuntimeError("invalid EMA state method") from error
     decay = state["decay"]
-    if type(decay) is not float or not math.isfinite(decay) or not 0.0 <= decay < 1.0:
+    if type(decay) is not float or not math.isfinite(decay) or not 0.0 <= decay <= 1.0:
         raise RuntimeError("invalid EMA state decay")
 
     names = state["parameter_names"]
@@ -486,6 +486,8 @@ class Stage1EmaTeacher:
 
     @torch.no_grad()
     def update(self, student: nn.Module) -> None:
+        if self.decay == 1.0:
+            return
         student_named, teacher_named = self._validated_parameters(student)
         for pair in self._pairs:
             source = student_named[pair.name]

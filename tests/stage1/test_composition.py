@@ -1078,6 +1078,10 @@ def test_run_stage1_publishes_only_observed_finite_ordinary_evidence(
         save_model_path=str(output),
         training_evidence_path=str(evidence_path),
         tuning_method="full",
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=2,
+        ema_tau=1.0,
+        seed=42,
         benchmark_run_config=None,
         benchmark_evidence_path=None,
         deepspeed_runtime_profile=profile,
@@ -1094,6 +1098,8 @@ def test_run_stage1_publishes_only_observed_finite_ordinary_evidence(
         assert payload["loss"] == loss
         assert payload["global_step"] == 1
         assert payload["checkpoint_path"] == str(checkpoint)
+        assert payload["effective_global_batch"] == 16
+        assert payload["teacher_update_mode"] == "frozen"
     else:
         with pytest.raises(ValueError, match="finite loss"):
             run_stage1(

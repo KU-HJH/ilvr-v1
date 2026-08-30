@@ -205,15 +205,17 @@ TUNING_METHOD=dora \
 ## Four-worker evaluation
 
 Evaluation accepts only a Task 6 prepared inference artifact below the
-canonical result root, not a raw checkpoint directory. `prepare-inference`
+canonical checkpoint evaluation-staging root, not a raw checkpoint directory.
+`prepare-inference`
 filters a completed canonical checkpoint to the inference allowlist, creates
-the same fresh result path locally and remotely, transfers that exact list plus
-its identity manifest without overwrite, and revalidates the remote artifact.
+the same fresh checkpoint staging path locally and remotely, transfers that
+exact list plus its identity manifest without overwrite, and revalidates the
+remote artifact.
 It starts no evaluator worker.
 
 ```bash
 source_run_id="stage2-full-zero1-$run_stamp"
-prepared_model_dir="/root/workspace/ILVR/results/$source_run_id/prepared-checkpoint-10"
+prepared_model_dir="/root/workspace/ILVR/checkpoints/evaluation-staging/$source_run_id/prepared-checkpoint-10"
 ./venv/ilvr-venv/bin/python -m src.multinode prepare-inference \
   --stage stage2 \
   --tuning-method full \
@@ -239,17 +241,17 @@ eval_id="eval-four-worker-$(date -u +%Y%m%d-%H%M%S)-$$"
   --test-data-path /root/workspace/ILVR/data/TEST.jsonl \
   --task-name zebra-cot \
   --output-dir "/root/workspace/ILVR/results/$eval_id" \
-  --max-new-tokens 64
+  --max-new-tokens 4096
 ```
 
 The wrapper owns four independent workers: remote GPUs produce shards 0 and
 1, local GPUs produce shards 2 and 3, and the coordinator pulls only the two
 remote shard JSONLs and sidecars without overwriting local data. Success
 requires all sidecars, complete source-index coverage, no worker errors, a
-merged JSONL, and the summary JSON. The fresh local inference copy is retained
-outside that strict result tree at
-`/root/workspace/ILVR/results/${eval_id}-inference-model`, with its sibling
-identity manifest; do not remove it as part of evaluation cleanup.
+merged JSONL, and the summary JSON. The fresh local inference copy and its
+sibling identity manifest are retained at
+`/root/workspace/ILVR/checkpoints/evaluation-staging/${eval_id}/local-model`;
+do not place either artifact under `results/`.
 
 ## Stage 1 capacity probes and Stage 2 batch-1 confirmations
 

@@ -877,8 +877,16 @@ def test_monitor_poll_exception_attempts_independent_cleanup_for_both_nodes(
 
 def test_stage1_allowlist_rejects_coordinator_owned_and_unknown_flags():
     assert validate_stage1_arguments(
-        ("--method", "lora", "--model", "literal;$(touch BAD)")
-    ) == ("--method", "lora", "--model", "literal;$(touch BAD)")
+        (
+            "--method", "lora",
+            "--model", "literal;$(touch BAD)",
+            "--ema-tau", "1.0",
+        )
+    ) == (
+        "--method", "lora",
+        "--model", "literal;$(touch BAD)",
+        "--ema-tau", "1.0",
+    )
     with pytest.raises(ValueError, match="coordinator-owned"):
         validate_stage1_arguments(("--deepspeed-config", "/tmp/foreign.json"))
     with pytest.raises(ValueError, match="not an approved Stage 1"):
@@ -1102,6 +1110,10 @@ def test_stage1_witness_consumes_exact_ordinary_training_evidence(tmp_path):
         method="full",
         zero_stage=3,
         world_size=4,
+        micro_batch=2,
+        gradient_accumulation_steps=2,
+        ema_tau=0.999,
+        seed=42,
         global_step=1,
         checkpoint_path=checkpoint,
         loss=0.25,

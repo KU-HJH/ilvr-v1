@@ -737,7 +737,8 @@ class CustomTrainerStage1(SFTTrainer):
         if not successful:
             return
         student = model if isinstance(model, nn.Module) else self.model
-        self.ema_teacher.update(student)
+        if self.ema_teacher.decay != 1.0:
+            self.ema_teacher.update(student)
         self._successful_optimizer_steps += 1
 
     def optimizer_step(self, *args, optimizer=None, **kwargs):

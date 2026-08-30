@@ -16,7 +16,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 class Stage2GenerationConfig:
     """Sampling and sequence limits for Stage 2 generation."""
 
-    max_new_tokens: int = 64
+    max_new_tokens: int = 4096
     max_sequence_length: int | None = None
     temperature: float = 0.0
     top_p: float = 1.0
@@ -90,7 +90,7 @@ def build_stage2_generation_config(
         max_sequence_length = getattr(model_config, "max_position_embeddings", None)
 
     return Stage2GenerationConfig(
-        max_new_tokens=int(generation_kwargs.get("max_new_tokens", 64)),
+        max_new_tokens=int(generation_kwargs.get("max_new_tokens", 4096)),
         max_sequence_length=max_sequence_length,
         temperature=(
             float(generation_kwargs.get("temperature", 0.0)) if do_sample else 0.0

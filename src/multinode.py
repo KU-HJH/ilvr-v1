@@ -64,6 +64,10 @@ _CONTROL_TIMEOUT_SECONDS = 30
 _PROC_ROOT = Path("/proc")
 
 
+def _evaluation_staging_root() -> Path:
+    return _REPOSITORY_ROOT / "checkpoints" / "evaluation-staging"
+
+
 @dataclass(frozen=True)
 class ClusterSpec:
     """The approved, non-discoverable two-node ILVR topology."""
@@ -1881,11 +1885,6 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         )
         if exit_codes != {0: 0, 1: 0}:
             raise RuntimeError(f"multi-node training failed: exit_codes={exit_codes}")
-        step_option = "--max-steps" if stage == "stage1" else "--max_steps"
-        step_value = _argument_value(forwarded, step_option)
-        if step_value is None or not step_value.isdecimal() or int(step_value) <= 0:
-            raise ValueError(f"{step_option} must identify the final checkpoint step")
-        final_step = int(step_value)
         ordinary_stage1 = (
             stage == "stage1"
             and _argument_value(forwarded, "--benchmark-run-config") is None
@@ -1895,11 +1894,65 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             if evidence_path is None:
                 raise ValueError("ordinary Stage 1 producer path is missing")
             from src.multinode_runtime import publish_small_file
+            from src.stage1.training_evidence import decode_stage1_training_evidence
 
+            raw_evidence = runner.read_stage1_training_evidence(evidence_path)
+            step_value = _argument_value(forwarded, "--max-steps")
+            if step_value is None:
+                evidence_payload = json.loads(raw_evidence)
+                evidence_step = (
+                    evidence_payload.get("global_step")
+                    if type(evidence_payload) is dict
+                    else None
+                )
+                if type(evidence_step) is not int or evidence_step <= 0:
+                    raise ValueError(
+                        "Stage 1 training evidence must identify the final checkpoint step"
+                    )
+                final_step = evidence_step
+            elif not step_value.isdecimal() or int(step_value) <= 0:
+                raise ValueError(
+                    "--max-steps must identify the final checkpoint step"
+                )
+            else:
+                final_step = int(step_value)
+            decode_stage1_training_evidence(
+                raw_evidence,
+                expected_run_id=plan.run_id,
+                expected_method=plan.tuning_method,
+                expected_zero_stage=plan.zero_stage,
+                expected_world_size=plan.world_size,
+                expected_checkpoint=(
+                    checkpoint_run_path / f"checkpoint-{final_step}"
+                ),
+                expected_global_step=final_step,
+                expected_micro_batch=int(
+                    _argument_value(forwarded, "--micro-batch") or "8"
+                ),
+                expected_gradient_accumulation_steps=int(
+                    _argument_value(forwarded, "--gradient-accumulation") or "2"
+                ),
+                expected_ema_tau=float(
+                    _argument_value(forwarded, "--ema-tau") or "0.999"
+                ),
+                expected_seed=int(_argument_value(forwarded, "--seed") or "42"),
+            )
             publish_small_file(
                 evidence_path,
-                runner.read_stage1_training_evidence(evidence_path),
+                raw_evidence,
             )
+        else:
+            step_option = "--max-steps" if stage == "stage1" else "--max_steps"
+            step_value = _argument_value(forwarded, step_option)
+            if (
+                step_value is None
+                or not step_value.isdecimal()
+                or int(step_value) <= 0
+            ):
+                raise ValueError(
+                    f"{step_option} must identify the final checkpoint step"
+                )
+            final_step = int(step_value)
         checkpoint_path = checkpoint_run_path / f"checkpoint-{final_step}"
         artifact_identity = _checkpoint_artifact_identity(
             plan,
@@ -1961,14 +2014,15 @@ def _prepare_inference_main(argv: list[str]) -> int:
             raise ValueError("checkpoint step must be nonnegative")
         plan = _plan_from_args(args)
         destination = Path(args.destination)
-        result_root = _REPOSITORY_ROOT / "results"
+        staging_root = _evaluation_staging_root()
         if not destination.is_absolute() or ".." in destination.parts:
             raise ValueError("inference destination must be an absolute trusted path")
         try:
-            destination.relative_to(result_root / plan.run_id)
+            destination.relative_to(staging_root / plan.run_id)
         except ValueError as error:
             raise ValueError(
-                "inference destination must belong to the run result tree"
+                "inference destination must belong to the run checkpoint "
+                "evaluation-staging tree"
             ) from error
         commit = _repository_git_stdout(("rev-parse", "HEAD"))
         runner = SubprocessCoordinatorRunner(
@@ -2005,6 +2059,7 @@ def _prepared_inference_show(argv: list[str]) -> int:
         NodeArtifactManifest,
         inference_manifest_path,
         inference_model_identity,
+        resolve_local_checkpoint_destination,
         validate_transferred_entries,
     )
     from src.multinode_runtime import _read_regular_file
@@ -2018,11 +2073,20 @@ def _prepared_inference_show(argv: list[str]) -> int:
         model_dir = Path(args.model_dir)
         if not model_dir.is_absolute() or ".." in model_dir.parts:
             raise ValueError("prepared inference model path must be absolute")
-        model_dir.relative_to(_REPOSITORY_ROOT / "results")
-        payload = json.loads(_read_regular_file(inference_manifest_path(model_dir)))
+        try:
+            model_dir.relative_to(_evaluation_staging_root())
+        except ValueError as error:
+            raise ValueError(
+                "prepared inference model must be under the checkpoint "
+                "evaluation-staging root"
+            ) from error
+        physical_model_dir = resolve_local_checkpoint_destination(model_dir)
+        payload = json.loads(
+            _read_regular_file(inference_manifest_path(physical_model_dir))
+        )
         manifest = NodeArtifactManifest.from_json(payload)
         inference_model_identity(manifest)
-        validate_transferred_entries(model_dir, manifest.entries)
+        validate_transferred_entries(physical_model_dir, manifest.entries)
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(manifest.to_json(), sort_keys=True))
@@ -2030,10 +2094,10 @@ def _prepared_inference_show(argv: list[str]) -> int:
 
 
 def _prepare_inference_destination_main(argv: list[str]) -> int:
-    """Reserve the identical fresh remote result path before a bounded push."""
+    """Reserve the identical fresh remote checkpoint path before a bounded push."""
     from src.multinode_artifacts import (
         inference_manifest_path,
-        reserve_inference_destination,
+        reserve_checkpoint_destination,
         validate_coordinator_relative_path,
     )
 
@@ -2045,7 +2109,13 @@ def _prepare_inference_destination_main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     try:
         destination = Path(args.destination)
-        relative = destination.relative_to(_REPOSITORY_ROOT / "results")
+        try:
+            relative = destination.relative_to(_evaluation_staging_root())
+        except ValueError as error:
+            raise ValueError(
+                "prepared inference destination must be under the checkpoint "
+                "evaluation-staging root"
+            ) from error
         if len(relative.parts) < 2:
             raise ValueError("prepared inference destination must belong to a run")
         validate_coordinator_relative_path(
@@ -2056,7 +2126,7 @@ def _prepare_inference_destination_main(argv: list[str]) -> int:
             raise FileExistsError(
                 "prepared inference identity manifest already exists"
             )
-        reserve_inference_destination(destination)
+        reserve_checkpoint_destination(destination)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     return 0
@@ -2103,7 +2173,7 @@ def _evaluate_main(argv: list[str]) -> int:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--base-model-dir")
     parser.add_argument("--cache-dir", default=str(_REPOSITORY_ROOT / "cache"))
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--dry-run", action="store_true")

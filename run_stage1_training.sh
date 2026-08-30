@@ -52,6 +52,7 @@ micro_batch=${STAGE1_MICRO_BATCH:-8}
 epochs=${STAGE1_EPOCHS:-3}
 learning_rate=${STAGE1_LEARNING_RATE:-1e-5}
 gradient_accumulation=${STAGE1_GRADIENT_ACCUMULATION:-2}
+ema_tau=${STAGE1_EMA_TAU:-0.999}
 seed=${STAGE1_SEED:-42}
 deepspeed_config=${STAGE1_DEEPSPEED_CONFIG:-"$script_dir/configs/deepspeed_zero3.json"}
 stage1_num_processes=${STAGE1_NUM_PROCESSES:-2}
@@ -164,6 +165,7 @@ while (( $# )); do
         --epochs) require_value "$@"; epochs=$2; shift 2 ;;
         --learning-rate) require_value "$@"; learning_rate=$2; shift 2 ;;
         --gradient-accumulation) require_value "$@"; gradient_accumulation=$2; shift 2 ;;
+        --ema-tau) require_value "$@"; ema_tau=$2; shift 2 ;;
         --seed) require_value "$@"; seed=$2; shift 2 ;;
         --deepspeed-config) require_value "$@"; deepspeed_config=$2; shift 2 ;;
         --attention-implementation) require_value "$@"; attention_implementation=$2; shift 2 ;;
@@ -236,6 +238,13 @@ for scalar_name in epochs learning_rate; do
         exit 2
     fi
 done
+
+if [[ ! $ema_tau =~ ^\+?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))([eE][+-]?[0-9]+)?$ ]] || \
+    ! awk -v value="$ema_tau" \
+        'BEGIN { number = value + 0; exit !(number >= 0 && number <= 1) }'; then
+    printf 'error: ema_tau must be a finite number in [0, 1]\n' >&2
+    exit 2
+fi
 
 experiment_id=${output_dir##*/}
 canonical_log_root='/root/workspace/ILVR/logs/zero-stage-compatibility'
@@ -349,6 +358,7 @@ command=(
     --epochs "$epochs"
     --learning_rate "$learning_rate"
     --gradient_accumulation_steps "$gradient_accumulation"
+    --ema_tau "$ema_tau"
     --seed "$seed"
     --deepspeed_config "$deepspeed_config"
     --attention_implementation "$attention_implementation"

@@ -769,7 +769,7 @@ def test_task12_capacity_invocation_shape_dry_runs_without_publication():
     assert not parent_result.exists()
 
 
-def test_stage1_coordinator_writes_witness_for_run_owned_checkpoint_root(
+def test_stage1_coordinator_uses_training_evidence_step_without_max_steps(
     tmp_path, monkeypatch, capsys
 ):
     import src.multinode as multinode_module
@@ -817,7 +817,35 @@ def test_stage1_coordinator_writes_witness_for_run_owned_checkpoint_root(
         "validate_preflight",
         lambda *args, **kwargs: SimpleNamespace(commit="c" * 40),
     )
-    remote_evidence = b'{"finite_loss":true,"source":"remote-rank0"}\n'
+    checkpoint = checkpoint_root / child_run_id / "checkpoint-2"
+    checkpoint.mkdir(parents=True)
+    remote_evidence = (
+        json.dumps(
+            {
+                "schema_version": 2,
+                "kind": "stage1-training-evidence",
+                "run_id": child_run_id,
+                "stage": "stage1",
+                "method": "lora",
+                "zero_stage": 3,
+                "world_size": 4,
+                "process_ranks": [0, 1, 2, 3],
+                "micro_batch": 2,
+                "gradient_accumulation_steps": 2,
+                "effective_global_batch": 16,
+                "ema_tau": 0.999,
+                "teacher_update_mode": "moving",
+                "seed": 42,
+                "global_step": 2,
+                "checkpoint_path": str(checkpoint),
+                "loss": 0.25,
+                "finite_loss": True,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
     fake_runner = SimpleNamespace(
         read_stage1_training_evidence=lambda path: remote_evidence
     )
@@ -832,7 +860,7 @@ def test_stage1_coordinator_writes_witness_for_run_owned_checkpoint_root(
     )
 
     def collect(*args, checkpoint_path, **kwargs):
-        checkpoint_path.mkdir(parents=True)
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
         (checkpoint_path / "model.safetensors").write_bytes(b"weights")
 
     monkeypatch.setattr(multinode_module, "collect_checkpoint_artifacts", collect)
@@ -867,8 +895,8 @@ def test_stage1_coordinator_writes_witness_for_run_owned_checkpoint_root(
             str(result_root),
             "--method",
             "lora",
-            "--max-steps",
-            "2",
+            "--epochs",
+            "3",
             "--micro-batch",
             "2",
         ]

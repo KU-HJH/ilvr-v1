@@ -1127,7 +1127,7 @@ TUNING_METHOD=dora \
   --zero-stage 2 --main-process-port 29803 \
   --max_steps 11 --save_steps 11
 
-prepared_model_dir="/root/workspace/ILVR/results/$run_id/prepared-checkpoint-10"
+prepared_model_dir="/root/workspace/ILVR/checkpoints/evaluation-staging/$run_id/prepared-checkpoint-10"
 ./venv/ilvr-venv/bin/python -m src.multinode prepare-inference \
   --stage stage2 --tuning-method dora --zero-stage 2 \
   --run-id "$run_id" --main-process-port 29802 \
@@ -1382,7 +1382,7 @@ TUNING_METHOD=full \
   --max_steps 1 \
   --save_steps 1
 
-prepared_model_dir="/root/workspace/ILVR/results/$eval_model_run_id/prepared-eval-model"
+prepared_model_dir="/root/workspace/ILVR/checkpoints/evaluation-staging/$eval_model_run_id/prepared-eval-model"
 ./venv/ilvr-venv/bin/python -m src.multinode prepare-inference \
   --stage stage2 \
   --tuning-method full \

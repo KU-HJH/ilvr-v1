@@ -55,6 +55,35 @@ _EVALUATION_REMOTE_FILES = (
     "shard-1.jsonl",
     "shard-1.jsonl.manifest.json",
 )
+
+
+def _prepared_inference_relative_path(
+    path: str | Path, *, label: str, allow_resolved: bool = False
+) -> Path:
+    staging_root = _LOCAL_REPOSITORY / "checkpoints" / "evaluation-staging"
+    candidate = Path(path)
+    roots = [staging_root]
+    if allow_resolved:
+        roots.append(
+            (_LOCAL_REPOSITORY / "checkpoints").resolve(strict=True)
+            / "evaluation-staging"
+        )
+    relative = None
+    for root in roots:
+        try:
+            relative = candidate.relative_to(root)
+            break
+        except ValueError:
+            continue
+    if relative is None:
+        raise ValueError(
+            f"{label} must be under the checkpoint evaluation-staging root"
+        )
+    validate_coordinator_relative_path(relative, label=label)
+    if len(relative.parts) < 2:
+        raise ValueError(f"{label} must belong to a run")
+    _validate_run_id(relative.parts[0])
+    return relative
 _INFERENCE_STATIC_NAMES = frozenset(
     {
         "adapter_config.json",
@@ -1933,12 +1962,17 @@ def build_prepared_inference_pull_command(
         manifest, expected_identity=manifest.runtime_identity
     )
     source = Path(source_directory)
-    try:
-        relative = source.relative_to(_LOCAL_REPOSITORY / "results")
-    except ValueError as error:
-        raise ValueError("prepared inference source must be under the result root") from error
-    validate_coordinator_relative_path(relative, label="prepared inference source")
-    remote = _LOCAL_REPOSITORY / "results" / relative
+    relative = _prepared_inference_relative_path(
+        source, label="prepared inference source"
+    )
+    _prepared_inference_relative_path(
+        destination,
+        label="prepared inference destination",
+        allow_resolved=True,
+    )
+    remote = (
+        _LOCAL_REPOSITORY / "checkpoints" / "evaluation-staging" / relative
+    )
     prefix = _rsync_prefix(Path(files_from))
     return (
         *prefix[:-1],
@@ -1958,14 +1992,9 @@ def prepared_inference_mirror_files_bytes(
         manifest, expected_identity=manifest.runtime_identity
     )
     source = Path(source_directory)
-    try:
-        relative = source.relative_to(_LOCAL_REPOSITORY / "results")
-    except ValueError as error:
-        raise ValueError(
-            "prepared inference source must be under the result root"
-        ) from error
-    validate_coordinator_relative_path(relative, label="prepared inference source")
-    _validate_run_id(relative.parts[0])
+    _prepared_inference_relative_path(
+        source, label="prepared inference source"
+    )
     paths = {
         (Path(source.name) / entry.relative_path).as_posix()
         for entry in select_inference_entries(manifest)
@@ -1980,11 +2009,18 @@ def build_prepared_inference_push_command(
     *,
     files_from: str | Path,
 ) -> tuple[str, ...]:
-    """Push one exact prepared artifact to the identical remote result path."""
+    """Push one exact prepared artifact to the identical remote checkpoint path."""
     source = Path(source_directory)
     prepared_inference_mirror_files_bytes(manifest, source)
-    relative = source.relative_to(_LOCAL_REPOSITORY / "results")
-    remote_parent = _LOCAL_REPOSITORY / "results" / relative.parent
+    relative = _prepared_inference_relative_path(
+        source, label="prepared inference source"
+    )
+    remote_parent = (
+        _LOCAL_REPOSITORY
+        / "checkpoints"
+        / "evaluation-staging"
+        / relative.parent
+    )
     prefix = _rsync_prefix(Path(files_from))
     return (
         *prefix[:-1],
@@ -2002,6 +2038,7 @@ def validate_evaluation_sidecars(
     *,
     expected_model_identity: str,
     expected_sample_count: int,
+    expected_generation_config: Mapping[str, object],
 ) -> None:
     """Require four successful Task 7 sidecars before invoking its merger."""
     from src.multinode_runtime import _read_regular_file
@@ -2012,12 +2049,18 @@ def validate_evaluation_sidecars(
         raise ValueError("all four evaluation workers require sidecars and JSONLs")
     if type(expected_sample_count) is not int or expected_sample_count < 0:
         raise ValueError("expected sample count must be a nonnegative integer")
+    from src.multinode_evaluation import _validate_generation_config
+
     common_dataset_identity: object | None = None
+    generation_config = _validate_generation_config(
+        dict(expected_generation_config)
+    )
     required = {
         "schema_version",
         "result_jsonl",
         "dataset_identity",
         "model_identity",
+        "generation_config",
         "shard_index",
         "num_shards",
         "expected_source_indices",
@@ -2036,7 +2079,7 @@ def validate_evaluation_sidecars(
             raise ValueError(f"invalid evaluation sidecar fields for shard {shard_index}")
         if (
             type(payload["schema_version"]) is not int
-            or payload["schema_version"] != 1
+            or payload["schema_version"] != 2
             or type(payload["shard_index"]) is not int
             or payload["shard_index"] != shard_index
             or type(payload["num_shards"]) is not int
@@ -2050,6 +2093,11 @@ def validate_evaluation_sidecars(
             raise ValueError(f"sidecar JSONL mismatch for shard {shard_index}")
         if payload["model_identity"] != expected_model_identity:
             raise ValueError("model identity mismatch across evaluation sidecars")
+        if (
+            _validate_generation_config(payload["generation_config"])
+            != generation_config
+        ):
+            raise ValueError("generation config mismatch across evaluation sidecars")
         dataset = payload["dataset_identity"]
         if (
             type(dataset) is not dict

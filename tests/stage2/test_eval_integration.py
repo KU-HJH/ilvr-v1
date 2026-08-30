@@ -37,6 +37,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 )
 from tests.stage2.test_stage1_checkpoint_handoff import (
     tiny_tag_free_original_qwen,
+    write_stage1_dora_artifact,
     write_sparse_stage2_artifact,
 )
 
@@ -135,6 +136,27 @@ class ModelWhoseGenerateRaises:
 
     def generate(self, **kwargs):
         raise AssertionError("legacy model.generate was called")
+
+
+class RecordingStage1Model:
+    device = torch.device("cpu")
+
+    def __init__(self):
+        self.config = SimpleNamespace(
+            stage="stage1",
+            latent_size=2,
+            latent_pad_token_id=90,
+            latent_start_token_id=91,
+            latent_end_token_id=92,
+        )
+        self.generation_config = SimpleNamespace(eos_token_id=3)
+        self.model = ToyCausalLanguageModel(4)
+        self.lm_head = nn.Linear(4, 128, bias=False)
+        self.calls = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return torch.tensor([[10, 11, 21, 22]])
 
 
 class RecordingController:
@@ -324,6 +346,7 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
     assert args.num_shards == 1
     assert args.shard_index == 0
     assert args.model_identity is None
+    assert args.max_new_tokens == 4096
 
 
 def _run_main_with_fake_sample(
@@ -521,6 +544,11 @@ def test_four_shard_worker_uses_global_indices_and_writes_success_sidecar(
         "mtime_ns": dataset_stat.st_mtime_ns,
     }
     assert manifest["model_identity"] == f"direct:{Path('relative-model').absolute()}"
+    assert manifest["generation_config"] == {
+        "max_new_tokens": 8,
+        "temperature": 0.0,
+        "top_p": 1.0,
+    }
     assert manifest["expected_source_indices"] == [1, 5]
     assert manifest["processed_source_indices"] == [1, 5]
     assert manifest["worker_exit_status"] == 0
@@ -633,6 +661,73 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
     assert processor_sources == [str(artifact_dir)]
     assert model_sources == [str(base_dir)]
     assert resolve_stage2_qwen_model(model).config.stage == "stage2"
+
+
+def test_stage1_eval_loads_validated_stage1_dora_adapter(monkeypatch, tmp_path):
+    """Stage 1 PEFT evaluation uses its validated loader and original base."""
+    module = _import_entry_point("eval", monkeypatch)
+    artifact_dir = tmp_path / "stage1-dora"
+    processor, _metadata = write_stage1_dora_artifact(artifact_dir)
+    base_model = tiny_tag_free_original_qwen()
+    processor_sources = []
+    model_sources = []
+
+    monkeypatch.setattr(
+        module.AutoProcessor,
+        "from_pretrained",
+        lambda source, **_kwargs: processor_sources.append(source) or processor,
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **_kwargs: model_sources.append(source) or base_model,
+    )
+
+    model, loaded_processor = module.load_evaluation_artifacts(
+        model_dir=str(artifact_dir),
+        base_model_dir="tiny/original-qwen",
+        cache_dir="cache",
+    )
+
+    assert isinstance(model, PeftModel)
+    assert loaded_processor is processor
+    assert processor_sources == [str(artifact_dir)]
+    assert model_sources == ["tiny/original-qwen"]
+
+
+def test_stage1_eval_uses_stage1_generation_instead_of_stage2_controller(
+    monkeypatch,
+):
+    module = _import_entry_point("eval", monkeypatch)
+    model = RecordingStage1Model()
+    processor = FakeProcessor()
+    monkeypatch.setattr(
+        module,
+        "Stage2InferenceController",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("Stage 2 controller was constructed for Stage 1")
+        ),
+    )
+
+    result = module.run_one_example(
+        model,
+        processor,
+        {"text_input": "question"},
+        {
+            "max_new_tokens": 5,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "do_sample": False,
+        },
+    )
+
+    assert len(model.calls) == 1
+    call = model.calls[0]
+    assert torch.equal(call["input_ids"], processor.input_ids)
+    assert torch.equal(call["attention_mask"], processor.attention_mask)
+    assert call["max_new_tokens"] == 5
+    assert len(call["logits_processor"]) == 1
+    assert result["extracted_final_answer"] == "42"
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

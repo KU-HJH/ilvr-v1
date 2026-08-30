@@ -405,6 +405,34 @@ def test_stage1_launcher_routes_canonical_lora(tmp_path):
     )
 
 
+def test_stage1_launcher_forwards_exact_frozen_teacher_decay(tmp_path):
+    """Catches the frozen-teacher control being dropped before src/main.py."""
+    completed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "frozen-teacher-output"),
+        "--ema-tau",
+        "1.0",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = shlex.split(completed.stdout.strip())
+    assert command[command.index("--ema_tau") + 1] == "1.0"
+
+
+@pytest.mark.parametrize("ema_tau", ("-0.1", "1.000001", "nan", "inf"))
+def test_stage1_launcher_rejects_invalid_teacher_decay(tmp_path, ema_tau):
+    """Catches invalid EMA controls reaching a distributed worker launch."""
+    completed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "invalid-ema-output"),
+        "--ema-tau",
+        ema_tau,
+    )
+
+    assert completed.returncode == 2
+    assert "ema_tau must be a finite number in [0, 1]" in completed.stderr
+
+
 def test_dry_run_derives_canonical_log_from_checkpoint_experiment_id():
     """Catches omitted logs falling back below a checkpoint or the worktree."""
     paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")

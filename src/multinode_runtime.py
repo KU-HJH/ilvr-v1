@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping, Protocol, Sequence
 
+from src.artifact_paths import CANONICAL_EVALUATION_STAGING_ROOT
 from src.deepspeed_runtime import load_deepspeed_runtime_profile
 
 if TYPE_CHECKING:
@@ -29,6 +30,7 @@ _REMOTE_CONTAINER = "llm_kd"
 _REQUIRED_FREE_BYTES = 100 * 1024**3
 _REPOSITORY_ROOT = Path("/root/workspace/ILVR")
 _CHECKPOINT_ROOT = _REPOSITORY_ROOT / "checkpoints"
+_EVALUATION_STAGING_ROOT = CANONICAL_EVALUATION_STAGING_ROOT
 _RESULT_ROOT = _REPOSITORY_ROOT / "results"
 _LOG_ROOT = _REPOSITORY_ROOT / "logs" / "multinode"
 _STAGE_LOG_ROOT = _REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
@@ -774,6 +776,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--epochs",
     "--learning-rate",
     "--gradient-accumulation",
+    "--ema-tau",
     "--seed",
     "--attention-implementation",
     "--save-strategy",
@@ -1037,7 +1040,7 @@ class EvaluationPlan:
     attempt_id: str = "initial"
     base_model_dir: Path | None = None
     cache_dir: Path = _REPOSITORY_ROOT / "cache"
-    max_new_tokens: int = 64
+    max_new_tokens: int = 4096
     temperature: float = 0.0
     top_p: float = 1.0
     attempt_timeout_seconds: int = 24 * 60 * 60
@@ -1071,10 +1074,13 @@ class EvaluationPlan:
             relative_output, label="evaluation output"
         )
         try:
-            relative_model = self.model_dir.relative_to(_RESULT_ROOT)
+            relative_model = self.model_dir.relative_to(
+                _EVALUATION_STAGING_ROOT
+            )
         except ValueError as error:
             raise ValueError(
-                "model_dir must be a Task 6 artifact under the canonical result root"
+                "model_dir must be a Task 6 artifact under the canonical "
+                "checkpoint evaluation-staging root"
             ) from error
         validate_coordinator_relative_path(
             relative_model, label="prepared inference model"
@@ -1104,7 +1110,7 @@ class EvaluationPlan:
 
     @property
     def local_model_dir(self) -> Path:
-        return self.output_dir.with_name(f"{self.output_dir.name}-inference-model")
+        return _EVALUATION_STAGING_ROOT / self.run_id / "local-model"
 
 
 @dataclass(frozen=True)
@@ -2698,6 +2704,7 @@ class EvaluationSubprocessRunner:
             NodeArtifactManifest,
             prepare_inference_copy,
             reserve_inference_destination,
+            resolve_local_checkpoint_destination,
             validate_inference_manifest_identity,
         )
 
@@ -2723,7 +2730,10 @@ class EvaluationSubprocessRunner:
         self.prepare_control_namespaces()
         reserve_inference_destination(plan.output_dir)
         self._manifest = manifest
-        prepare_inference_copy(manifest, plan.local_model_dir, self)
+        physical_local_model = resolve_local_checkpoint_destination(
+            plan.local_model_dir
+        )
+        prepare_inference_copy(manifest, physical_local_model, self)
         self._run(
             _remote_repository_module_command(
                 "prepare-evaluation-output",
@@ -2891,6 +2901,11 @@ class EvaluationSubprocessRunner:
             commands.shard_jsonls,
             expected_model_identity=commands.model_identity,
             expected_sample_count=self._expected_sample_count(),
+            expected_generation_config={
+                "max_new_tokens": self.plan.max_new_tokens,
+                "temperature": self.plan.temperature,
+                "top_p": self.plan.top_p,
+            },
         )
 
     def _expected_sample_count(self) -> int:
@@ -3112,6 +3127,7 @@ def prepare_inference_artifacts(
     """Prepare one fresh inference-only copy before an evaluator is started."""
     from src.multinode_artifacts import (
         prepare_inference_copy,
+        resolve_local_checkpoint_destination,
         validate_canonical_checkpoint_manifest,
         validate_inference_manifest_identity,
     )
@@ -3126,13 +3142,19 @@ def prepare_inference_artifacts(
     validate_inference_manifest_identity(
         inference_manifest, expected_identity=runtime_identity
     )
-    prepared = prepare_inference_copy(inference_manifest, destination, runner)
+    logical_destination = Path(destination)
+    physical_destination = resolve_local_checkpoint_destination(
+        logical_destination
+    )
+    prepare_inference_copy(
+        inference_manifest, physical_destination, runner
+    )
     mirrored = getattr(runner, "mirror_prepared_inference")(
-        inference_manifest, prepared
+        inference_manifest, logical_destination
     )
     if mirrored != inference_manifest:
         raise ValueError("remote prepared inference identity differs from local")
-    return prepared
+    return logical_destination
 
 
 def stop_owned_peer(record: OwnershipRecord, runner: OwnedProcessRunner) -> None:

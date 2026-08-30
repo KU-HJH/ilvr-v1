@@ -147,9 +147,10 @@ class CountingStudent(nn.Module):
 
 
 class RecordingEma:
-    def __init__(self, model=None, events=None):
+    def __init__(self, model=None, events=None, decay=0.999):
         self.model = model if model is not None else nn.Identity()
         self.events = events
+        self.decay = float(decay)
         self.update_count = 0
         self.values_at_update = []
 
@@ -577,6 +578,27 @@ def test_optimizer_step_validates_gradients_then_updates_ema_after_success():
         trainer.ema_teacher.values_at_update[0],
         trainer.model.language_scale.detach(),
     )
+
+
+def test_successful_optimizer_step_skips_frozen_teacher_update(monkeypatch):
+    """Catches frozen teachers entering the per-step update call path."""
+    mask = torch.tensor([[False, True, False]])
+    trainer = make_trainer(
+        CountingStudent(),
+        CountingTargetBuilder(torch.tensor([[1.0]]), mask, ((1,),)),
+    )
+    trainer.ema_teacher = Stage1EmaTeacher(
+        trainer.model, decay=1.0, method="full"
+    )
+    monkeypatch.setattr(
+        trainer.ema_teacher,
+        "update",
+        lambda _: pytest.fail("frozen EMA teacher entered update"),
+    )
+
+    trainer._finish_optimizer_step(trainer.model, successful=True)
+
+    assert trainer._successful_optimizer_steps == 1
 
 
 def test_nonfinite_gradient_prevents_optimizer_and_ema_step():

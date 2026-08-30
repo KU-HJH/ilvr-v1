@@ -56,7 +56,7 @@ def get_eval_args():
     parser.add_argument("--task_name", type=str, required=True, help="Task name for bookkeeping.")
     parser.add_argument("--output_json_path", type=str, default="evaluation_results.jsonl", help="Where to save per-sample results.")
     parser.add_argument("--cache_dir", type=str, default="./cache", help="HF cache dir.")
-    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--num-shards", type=int, default=1)
@@ -456,6 +456,11 @@ def main():
             model_identity=resolve_model_identity(
                 args.model_dir, args.model_identity
             ),
+            generation_config={
+                "max_new_tokens": args.max_new_tokens,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+            },
             shard_index=args.shard_index,
             num_shards=args.num_shards,
             expected_source_indices=[index for index, _sample in owned_samples],

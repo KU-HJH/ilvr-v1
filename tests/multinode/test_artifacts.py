@@ -1635,7 +1635,17 @@ def test_production_resume_redistribution_uses_same_immediate_canonical_path():
     ]
 
 
-def test_inference_preparation_is_callable_before_evaluation(tmp_path):
+def test_inference_preparation_is_callable_before_evaluation(
+    tmp_path, monkeypatch
+):
+    import src.multinode_artifacts as artifacts_module
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    storage = tmp_path / "checkpoint-storage"
+    storage.mkdir()
+    (repository / "checkpoints").symlink_to(storage, target_is_directory=True)
+    monkeypatch.setattr(artifacts_module, "_LOCAL_REPOSITORY", repository)
     runner = FakeProductionTransferRunner()
     runner.canonical = dataclasses.replace(
         runner.canonical,
@@ -1647,7 +1657,13 @@ def test_inference_preparation_is_callable_before_evaluation(tmp_path):
             not in {entry.relative_path for entry in runner.canonical.entries}
         ),
     )
-    destination = tmp_path / "evaluation-model"
+    destination = (
+        repository
+        / "checkpoints"
+        / "evaluation-staging"
+        / identity()["run_id"]
+        / "prepared-model"
+    )
 
     prepared = prepare_inference_artifacts(
         runner,
@@ -1667,6 +1683,57 @@ def test_inference_preparation_is_callable_before_evaluation(tmp_path):
         "inference-pull",
         "remote-inference-mirror",
     ]
+
+
+def test_inference_preparation_writes_through_canonical_checkpoint_link(
+    tmp_path, monkeypatch
+):
+    import src.multinode_artifacts as artifacts_module
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    storage = tmp_path / "checkpoint-storage"
+    storage.mkdir()
+    (repository / "checkpoints").symlink_to(storage, target_is_directory=True)
+    runner = FakeProductionTransferRunner()
+    runner.canonical = dataclasses.replace(
+        runner.canonical,
+        entries=runner.canonical.entries
+        + tuple(
+            item
+            for item in stage1_inference_entries()
+            if item.relative_path
+            not in {entry.relative_path for entry in runner.canonical.entries}
+        ),
+    )
+    destination = (
+        repository
+        / "checkpoints"
+        / "evaluation-staging"
+        / identity()["run_id"]
+        / "prepared-model"
+    )
+    monkeypatch.setattr(artifacts_module, "_LOCAL_REPOSITORY", repository)
+
+    prepared = prepare_inference_artifacts(
+        runner,
+        checkpoint_path=(
+            repository
+            / "checkpoints"
+            / identity()["run_id"]
+            / "checkpoint-2"
+        ),
+        runtime_identity=identity(),
+        destination=destination,
+    )
+
+    assert prepared == destination
+    assert (
+        storage
+        / "evaluation-staging"
+        / identity()["run_id"]
+        / "prepared-model"
+    ).is_dir()
 
 
 def test_inference_preparation_binds_filtered_remote_manifest_identity(tmp_path):
@@ -1733,7 +1800,11 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
 
     repository = tmp_path / "repo"
     destination = (
-        repository / "results" / identity()["run_id"] / "evaluation-model"
+        repository
+        / "checkpoints"
+        / "evaluation-staging"
+        / identity()["run_id"]
+        / "prepared-model"
     )
     destination.mkdir(parents=True)
     manifest = dataclasses.replace(
@@ -1812,9 +1883,9 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
     ))
     names = set(files_path.read_bytes().split(b"\0")) - {b""}
     assert names == {
-        f"evaluation-model/{entry.relative_path.as_posix()}".encode()
+        f"prepared-model/{entry.relative_path.as_posix()}".encode()
         for entry in manifest.entries
-    } | {b"evaluation-model.manifest.json"}
+    } | {b"prepared-model.manifest.json"}
 
 
 def test_subprocess_runner_executes_resume_and_inference_file_lists(
@@ -1913,7 +1984,11 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         destination=canonical_checkpoint,
     )
     inference_destination = (
-        repository / "results" / plan.run_id / "evaluation-model"
+        repository
+        / "checkpoints"
+        / "evaluation-staging"
+        / plan.run_id
+        / "prepared-model"
     )
     prepare_inference_artifacts(
         runner,
@@ -2437,6 +2512,137 @@ def test_prepare_inference_help_is_local_and_side_effect_free(tmp_path):
     assert not marker.exists()
 
 
+def test_prepared_inference_destination_rejects_result_tree(
+    tmp_path, monkeypatch, capsys
+):
+    import src.multinode as multinode_module
+
+    repository = tmp_path / "repo"
+    destination = repository / "results" / "trained-model-run" / "prepared-model"
+    monkeypatch.setattr(multinode_module, "_REPOSITORY_ROOT", repository)
+
+    with pytest.raises(SystemExit):
+        multinode_module._main(
+            [
+                "prepare-inference-destination",
+                "--destination",
+                str(destination),
+            ]
+        )
+
+    assert "checkpoint evaluation-staging" in capsys.readouterr().err
+    assert not destination.exists()
+
+
+def test_prepared_inference_destination_resolves_the_canonical_checkpoint_link(
+    tmp_path, monkeypatch
+):
+    import src.multinode as multinode_module
+    import src.multinode_artifacts as artifacts_module
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    storage = tmp_path / "checkpoint-storage"
+    storage.mkdir()
+    (repository / "checkpoints").symlink_to(storage, target_is_directory=True)
+    destination = (
+        repository
+        / "checkpoints"
+        / "evaluation-staging"
+        / identity()["run_id"]
+        / "prepared-model"
+    )
+    monkeypatch.setattr(multinode_module, "_REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(artifacts_module, "_LOCAL_REPOSITORY", repository)
+
+    result = multinode_module._main(
+        ["prepare-inference-destination", "--destination", str(destination)]
+    )
+
+    assert result == 0
+    assert (
+        storage
+        / "evaluation-staging"
+        / identity()["run_id"]
+        / "prepared-model"
+    ).is_dir()
+
+
+def test_prepared_inference_show_rejects_result_tree_before_read(
+    tmp_path, monkeypatch, capsys
+):
+    import src.multinode as multinode_module
+    import src.multinode_runtime as runtime_module
+
+    repository = tmp_path / "repo"
+    model_dir = repository / "results" / "trained-model-run" / "prepared-model"
+    read_called = False
+
+    def fake_read(*args, **kwargs):
+        nonlocal read_called
+        read_called = True
+        return "{}"
+
+    monkeypatch.setattr(multinode_module, "_REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(runtime_module, "_read_regular_file", fake_read)
+
+    with pytest.raises(SystemExit):
+        multinode_module._main(
+            ["prepared-inference-show", "--model-dir", str(model_dir)]
+        )
+
+    assert "checkpoint evaluation-staging" in capsys.readouterr().err
+    assert not read_called
+
+
+def test_prepared_inference_show_allows_only_the_canonical_checkpoint_link(
+    tmp_path, monkeypatch, capsys
+):
+    import src.multinode as multinode_module
+    import src.multinode_artifacts as artifacts_module
+
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    storage = tmp_path / "checkpoint-storage"
+    storage.mkdir()
+    (repository / "checkpoints").symlink_to(storage, target_is_directory=True)
+    logical_model = (
+        repository
+        / "checkpoints"
+        / "evaluation-staging"
+        / identity()["run_id"]
+        / "prepared-model"
+    )
+    physical_model = (
+        storage
+        / "evaluation-staging"
+        / identity()["run_id"]
+        / "prepared-model"
+    )
+    physical_model.mkdir(parents=True)
+    manifest = dataclasses.replace(
+        strict_manifest(0),
+        process_ranks=(0, 1, 2, 3),
+        entries=stage1_inference_entries(),
+    )
+    for entry in manifest.entries:
+        path = physical_model / entry.relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * entry.byte_size)
+    publish_node_manifest(
+        artifacts_module.inference_manifest_path(physical_model), manifest
+    )
+    monkeypatch.setattr(multinode_module, "_REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(artifacts_module, "_LOCAL_REPOSITORY", repository)
+
+    result = multinode_module._main(
+        ["prepared-inference-show", "--model-dir", str(logical_model)]
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out) == manifest.to_json()
+
+
 @pytest.mark.parametrize(
     ("stage", "method", "zero_stage", "layout"),
     (("stage1", "lora", "3", "partitioned"),
@@ -2451,9 +2657,10 @@ def test_prepare_inference_cli_dispatches_without_building_training_commands(
     repository = tmp_path / "repo"
     destination = (
         repository
-        / "results"
+        / "checkpoints"
+        / "evaluation-staging"
         / identity()["run_id"]
-        / "evaluation-model"
+        / "prepared-model"
     )
     observed = {}
 

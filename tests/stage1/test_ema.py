@@ -195,10 +195,25 @@ def test_peft_ema_updates_only_adapter_and_token_rows(dora_student, method):
         torch.testing.assert_close(teacher[name], initial + increment)
 
 
-@pytest.mark.parametrize("decay", [-0.1, 1.0, float("inf"), float("nan")])
+@pytest.mark.parametrize("decay", [-0.1, 1.000001, float("inf"), float("nan")])
 def test_ema_rejects_invalid_decay(full_student, decay):
     with pytest.raises(ValueError, match="EMA decay"):
         Stage1EmaTeacher(full_student, decay=decay, method="full")
+
+
+def test_decay_one_keeps_teacher_at_initial_state_when_student_becomes_nonfinite(
+    dora_student,
+):
+    """Catches frozen mode running EMA arithmetic or gathering student state."""
+    ema = Stage1EmaTeacher(dora_student, decay=1.0, method="dora")
+    initial_teacher = clone_named_parameters(ema.model)
+    with torch.no_grad():
+        for parameter in dora_student.parameters():
+            parameter.fill_(float("nan"))
+
+    ema.update(dora_student)
+
+    assert_named_parameters_equal(ema.model, initial_teacher)
 
 
 def test_ema_rejects_unsupported_method(full_student):
@@ -529,6 +544,20 @@ def test_ema_state_dict_round_trip_restores_model_and_decay(full_student):
     assert_named_parameters_equal(restored.model, clone_named_parameters(ema.model))
     assert restored.model.training is False
     assert all(parameter.requires_grad is False for parameter in restored.model.parameters())
+
+
+def test_decay_one_round_trips_as_frozen_state(full_student):
+    """Catches resume rejecting or silently changing the frozen teacher mode."""
+    frozen = Stage1EmaTeacher(full_student, decay=1.0, method="full")
+    state = frozen.state_dict()
+    restored = Stage1EmaTeacher(full_student, decay=0.9, method="full")
+
+    restored.load_state_dict(state)
+
+    assert restored.decay == 1.0
+    assert_named_parameters_equal(
+        restored.model, clone_named_parameters(frozen.model)
+    )
 
 
 @pytest.mark.parametrize(
