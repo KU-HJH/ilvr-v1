@@ -436,6 +436,72 @@ def test_ce_gives_equal_sample_weight_despite_unequal_target_token_lengths():
     )
 
 
+def test_batched_ce_chunks_fp32_work_and_matches_full_reference(monkeypatch):
+    torch.manual_seed(17)
+    logits = torch.randn(2, 7, 11, requires_grad=True)
+    labels = torch.tensor(
+        [
+            [-100, 1, 2, -100, 4, 5, 6],
+            [-100, 3, -100, -100, 7, -100, 8],
+        ]
+    )
+    reference_logits = logits.detach().clone().requires_grad_(True)
+    reference_sample_losses = []
+    for sample_index in range(labels.shape[0]):
+        sample_labels = labels[sample_index, 1:]
+        reference_sample_losses.append(
+            F.cross_entropy(
+                reference_logits[sample_index, :-1].float(),
+                sample_labels,
+                reduction="sum",
+                ignore_index=-100,
+            )
+            / sample_labels.ne(-100).sum()
+        )
+    reference_loss = torch.stack(reference_sample_losses).mean()
+    reference_loss.backward()
+
+    checkpoint_calls = []
+    real_checkpoint = torch.utils.checkpoint.checkpoint
+
+    def recording_checkpoint(function, *args, **kwargs):
+        checkpoint_calls.append(tuple(args[0].shape))
+        return real_checkpoint(function, *args, **kwargs)
+
+    cross_entropy_shapes = []
+    real_cross_entropy = F.cross_entropy
+
+    def recording_cross_entropy(input_tensor, target, *args, **kwargs):
+        cross_entropy_shapes.append(tuple(input_tensor.shape))
+        return real_cross_entropy(input_tensor, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        stage1_trainer_module, "_STAGE1_CE_TOKEN_CHUNK_SIZE", 2, raising=False
+    )
+    monkeypatch.setattr(
+        stage1_trainer_module,
+        "activation_checkpoint",
+        recording_checkpoint,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        stage1_trainer_module.F, "cross_entropy", recording_cross_entropy
+    )
+
+    actual_loss = stage1_trainer_module.CustomTrainerStage1._equal_sample_ce_loss(
+        SimpleNamespace(logits=logits), labels, None
+    )
+    actual_loss.backward()
+
+    assert checkpoint_calls == [(2, 11)] * 6
+    assert cross_entropy_shapes
+    assert all(len(shape) == 2 and shape[0] <= 2 for shape in cross_entropy_shapes)
+    torch.testing.assert_close(actual_loss, reference_loss, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(
+        logits.grad, reference_logits.grad, rtol=1e-6, atol=1e-7
+    )
+
+
 def test_trainer_runs_one_student_forward_for_batched_examples(stage1_trainer, batch_b2):
     """Catches simulating a batch by invoking the student once per sample."""
     loss = stage1_trainer.compute_loss(stage1_trainer.model, clone_batch(batch_b2))

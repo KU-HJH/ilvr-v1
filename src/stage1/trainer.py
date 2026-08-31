@@ -13,6 +13,7 @@ from typing import Callable, Mapping
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from transformers import TrainerCallback
 from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
@@ -39,6 +40,18 @@ _SUPPORTED_ACCELERATE_VERSION = "1.10.1"
 _SUPPORTED_DEEPSPEED_VERSION = "0.18.0"
 _STAGE1_EMA_TEACHER_STATE_SCHEMA_VERSION = 1
 _STAGE1_EMA_TEACHER_STATE_KIND = "stage1_ema_teacher"
+_STAGE1_CE_TOKEN_CHUNK_SIZE = 1024
+
+
+def _checkpointed_stage1_ce_sum(
+    logits: torch.Tensor, labels: torch.Tensor
+) -> torch.Tensor:
+    return F.cross_entropy(
+        logits.float(),
+        labels,
+        reduction="sum",
+        ignore_index=-100,
+    )
 
 
 def collect_deepspeed_pre_step_norm(
@@ -403,22 +416,32 @@ class CustomTrainerStage1(SFTTrainer):
         if tuple(logits.shape[:2]) != tuple(labels.shape):
             raise ValueError("Stage 1 logits and labels must share shape [B, T]")
 
-        shift_logits = logits[:, :-1, :].contiguous().float()
-        shift_labels = labels[:, 1:].contiguous().to(shift_logits.device)
+        shift_logits = logits[:, :-1, :]
+        shift_labels = labels[:, 1:].to(shift_logits.device)
         valid_tokens = shift_labels.ne(-100)
         valid_counts = valid_tokens.sum(dim=1)
         if bool(valid_counts.eq(0).any().item()):
             raise RuntimeError(
                 "each Stage 1 sample must contain a supervised target token"
             )
-        token_losses = F.cross_entropy(
-            shift_logits.transpose(1, 2),
-            shift_labels,
-            reduction="none",
-            ignore_index=-100,
-        )
-        sample_losses = token_losses.sum(dim=1) / valid_counts
-        return sample_losses.mean()
+        sample_losses = []
+        for sample_index in range(labels.shape[0]):
+            chunk_sums = []
+            for start in range(0, shift_logits.shape[1], _STAGE1_CE_TOKEN_CHUNK_SIZE):
+                stop = min(start + _STAGE1_CE_TOKEN_CHUNK_SIZE, shift_logits.shape[1])
+                chunk_sums.append(
+                    activation_checkpoint(
+                        _checkpointed_stage1_ce_sum,
+                        shift_logits[sample_index, start:stop],
+                        shift_labels[sample_index, start:stop],
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                )
+            sample_losses.append(
+                torch.stack(chunk_sums).sum() / valid_counts[sample_index]
+            )
+        return torch.stack(sample_losses).mean()
 
     @staticmethod
     def _validate_targets(
