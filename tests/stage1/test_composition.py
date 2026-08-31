@@ -203,6 +203,14 @@ def test_disabled_stage1_gradient_checkpointing_has_no_backend_kwargs(
     assert training_args.gradient_checkpointing_kwargs is None
 
 
+def test_stage1_uses_original_ilvr_max_sequence_length(tmp_path):
+    training_args = build_stage1_training_arguments(
+        stage1_args(tmp_path, "--max_seq_length_train", "8192")
+    )
+
+    assert training_args.max_seq_length == 32768
+
+
 def _write_benchmark_audit(tmp_path, args, indices=(7, 3)):
     data = Path(args.data_path).resolve()
     images = Path(args.image_root).resolve()

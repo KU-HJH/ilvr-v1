@@ -371,7 +371,7 @@ def build_stage1_training_arguments(args) -> SFTConfig:
         remove_unused_columns=False,
         dataset_text_field="",
         dataset_kwargs={"skip_prepare_dataset": True},
-        max_seq_length=args.max_seq_length_train,
+        max_seq_length=32768,
         max_steps=args.max_steps,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
