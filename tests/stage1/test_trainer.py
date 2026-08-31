@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -144,6 +145,31 @@ class CountingStudent(nn.Module):
             hidden_states=hidden_states,
             inputs_embeds=inputs_embeds,
         )
+
+
+class UnequalTargetLengthStudent(nn.Module):
+    """Causal-LM probe whose two samples have different target lengths."""
+
+    def __init__(self):
+        super().__init__()
+        self.language_scale = nn.Parameter(torch.tensor(1.0))
+
+    @property
+    def device(self):
+        return self.language_scale.device
+
+    def forward(self, **kwargs):
+        input_ids = kwargs["input_ids"]
+        labels = kwargs["labels"]
+        feature = input_ids.to(dtype=self.language_scale.dtype)
+        logits = torch.stack(
+            (torch.zeros_like(feature), self.language_scale * feature), dim=-1
+        )
+        loss = F.cross_entropy(
+            logits[:, :-1, :].reshape(-1, 2),
+            labels[:, 1:].reshape(-1),
+        )
+        return SimpleNamespace(loss=loss, logits=logits)
 
 
 class RecordingEma:
@@ -361,6 +387,46 @@ def stage1_trainer(batch_b2):
 def test_compatibility_import_points_to_authoritative_stage1_module():
     """Catches the row-zero legacy trainer remaining authoritative."""
     assert CustomTrainerStage1.__module__ == "stage1.trainer"
+
+
+def test_ce_gives_equal_sample_weight_despite_unequal_target_token_lengths():
+    """Catches reducing CE over all valid tokens across the batch."""
+    mask = torch.tensor(
+        [
+            [False, True, False, False],
+            [False, True, False, False],
+        ]
+    )
+    batch = make_batch(mask)
+    batch["input_ids"] = torch.tensor(
+        [
+            [1, 0, 0, 0],
+            [0, 0, 0, 0],
+        ]
+    )
+    batch["labels"] = torch.tensor(
+        [
+            [-100, 0, -100, -100],
+            [-100, 0, 0, 0],
+        ]
+    )
+    trainer = make_trainer(
+        UnequalTargetLengthStudent(),
+        CountingTargetBuilder(
+            torch.tensor([[1.0], [1.0]]), mask, ((1,), (1,))
+        ),
+        sim_weight=0.0,
+    )
+
+    loss = trainer.compute_loss(trainer.model, batch)
+    loss.backward()
+
+    expected_loss = (math.log1p(math.exp(1.0)) + math.log(2.0)) / 2.0
+    expected_gradient = (1.0 / (1.0 + math.exp(-1.0))) / 2.0
+    assert loss.item() == pytest.approx(expected_loss)
+    assert trainer.model.language_scale.grad.item() == pytest.approx(
+        expected_gradient
+    )
 
 
 def test_trainer_runs_one_student_forward_for_batched_examples(stage1_trainer, batch_b2):

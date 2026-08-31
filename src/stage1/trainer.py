@@ -352,9 +352,12 @@ class CustomTrainerStage1(SFTTrainer):
         model_inputs["image_out_mask"] = targets.latent_mask
 
         outputs = model(**model_inputs)
-        ce_loss = getattr(outputs, "loss", None)
-        if not isinstance(ce_loss, torch.Tensor) or ce_loss.numel() != 1:
+        model_ce_loss = getattr(outputs, "loss", None)
+        if not isinstance(model_ce_loss, torch.Tensor) or model_ce_loss.numel() != 1:
             raise RuntimeError("Stage 1 student forward must return a scalar loss")
+        ce_loss = self._equal_sample_ce_loss(
+            outputs, model_inputs.get("labels"), model_ce_loss
+        )
         alignment_loss = self._alignment_loss(outputs, targets)
         loss = self.ce_weight * ce_loss + self.sim_weight * alignment_loss
         if not bool(torch.isfinite(loss.detach()).all().item()):
@@ -376,6 +379,36 @@ class CustomTrainerStage1(SFTTrainer):
         else:
             self._latest_stage1_diagnostics = None
         return (loss, outputs) if return_outputs else loss
+
+    @staticmethod
+    def _equal_sample_ce_loss(outputs, labels, model_ce_loss) -> torch.Tensor:
+        if not isinstance(labels, torch.Tensor) or labels.ndim != 2:
+            raise TypeError("Stage 1 labels must be a rank-2 tensor")
+        if labels.shape[0] == 1:
+            return model_ce_loss
+
+        logits = getattr(outputs, "logits", None)
+        if not isinstance(logits, torch.Tensor) or logits.ndim != 3:
+            raise RuntimeError("Stage 1 student forward must return rank-3 logits")
+        if tuple(logits.shape[:2]) != tuple(labels.shape):
+            raise ValueError("Stage 1 logits and labels must share shape [B, T]")
+
+        shift_logits = logits[:, :-1, :].contiguous().float()
+        shift_labels = labels[:, 1:].contiguous().to(shift_logits.device)
+        valid_tokens = shift_labels.ne(-100)
+        valid_counts = valid_tokens.sum(dim=1)
+        if bool(valid_counts.eq(0).any().item()):
+            raise RuntimeError(
+                "each Stage 1 sample must contain a supervised target token"
+            )
+        token_losses = F.cross_entropy(
+            shift_logits.transpose(1, 2),
+            shift_labels,
+            reduction="none",
+            ignore_index=-100,
+        )
+        sample_losses = token_losses.sum(dim=1) / valid_counts
+        return sample_losses.mean()
 
     @staticmethod
     def _validate_targets(
