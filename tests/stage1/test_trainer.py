@@ -153,6 +153,7 @@ class UnequalTargetLengthStudent(nn.Module):
     def __init__(self):
         super().__init__()
         self.language_scale = nn.Parameter(torch.tensor(1.0))
+        self.last_forward_had_labels = None
 
     @property
     def device(self):
@@ -160,14 +161,19 @@ class UnequalTargetLengthStudent(nn.Module):
 
     def forward(self, **kwargs):
         input_ids = kwargs["input_ids"]
-        labels = kwargs["labels"]
+        labels = kwargs.get("labels")
+        self.last_forward_had_labels = labels is not None
         feature = input_ids.to(dtype=self.language_scale.dtype)
         logits = torch.stack(
             (torch.zeros_like(feature), self.language_scale * feature), dim=-1
         )
-        loss = F.cross_entropy(
-            logits[:, :-1, :].reshape(-1, 2),
-            labels[:, 1:].reshape(-1),
+        loss = (
+            F.cross_entropy(
+                logits[:, :-1, :].reshape(-1, 2),
+                labels[:, 1:].reshape(-1),
+            )
+            if labels is not None
+            else None
         )
         return SimpleNamespace(loss=loss, logits=logits)
 
@@ -390,7 +396,7 @@ def test_compatibility_import_points_to_authoritative_stage1_module():
 
 
 def test_ce_gives_equal_sample_weight_despite_unequal_target_token_lengths():
-    """Catches reducing CE over all valid tokens across the batch."""
+    """Catches duplicate native CE or token-weighted batched reduction."""
     mask = torch.tensor(
         [
             [False, True, False, False],
@@ -421,6 +427,7 @@ def test_ce_gives_equal_sample_weight_despite_unequal_target_token_lengths():
     loss = trainer.compute_loss(trainer.model, batch)
     loss.backward()
 
+    assert trainer.model.last_forward_had_labels is False
     expected_loss = (math.log1p(math.exp(1.0)) + math.log(2.0)) / 2.0
     expected_gradient = (1.0 / (1.0 + math.exp(-1.0))) / 2.0
     assert loss.item() == pytest.approx(expected_loss)

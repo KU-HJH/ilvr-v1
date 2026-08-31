@@ -351,13 +351,23 @@ class CustomTrainerStage1(SFTTrainer):
         model_inputs["latent_hidden_states"] = targets.latent_values.detach()
         model_inputs["image_out_mask"] = targets.latent_mask
 
-        outputs = model(**model_inputs)
+        labels = model_inputs.get("labels")
+        if not isinstance(labels, torch.Tensor) or labels.ndim != 2:
+            raise TypeError("Stage 1 labels must be a rank-2 tensor")
+        forward_inputs = model_inputs
+        if labels.shape[0] > 1:
+            forward_inputs = dict(model_inputs)
+            forward_inputs.pop("labels")
+
+        outputs = model(**forward_inputs)
         model_ce_loss = getattr(outputs, "loss", None)
-        if not isinstance(model_ce_loss, torch.Tensor) or model_ce_loss.numel() != 1:
+        if labels.shape[0] == 1 and (
+            not isinstance(model_ce_loss, torch.Tensor)
+            or model_ce_loss.numel() != 1
+        ):
             raise RuntimeError("Stage 1 student forward must return a scalar loss")
-        ce_loss = self._equal_sample_ce_loss(
-            outputs, model_inputs.get("labels"), model_ce_loss
-        )
+        ce_loss = self._equal_sample_ce_loss(outputs, labels, model_ce_loss)
+        outputs.loss = ce_loss
         alignment_loss = self._alignment_loss(outputs, targets)
         loss = self.ce_weight * ce_loss + self.sim_weight * alignment_loss
         if not bool(torch.isfinite(loss.detach()).all().item()):
