@@ -3,8 +3,10 @@ from dataclasses import replace
 
 from PIL import Image
 import pytest
+import torch
 
 from .helpers import (
+    DeterministicStage1Processor,
     PlaceholderConsumingStage1Processor,
     TOKENS,
     make_stage1_collator,
@@ -424,7 +426,7 @@ def test_collator_corrupt_image_error_includes_source_index_and_role(tmp_path, r
 def test_collator_rejects_processor_grid_count_drift(processor_kwargs, message):
     """Catches processor output rows being silently assigned to the wrong sample."""
     examples = [
-        prepared_example(source_index=5, original_images=1, helper_images=1, blocks=1),
+        prepared_example(source_index=5, original_images=2, helper_images=2, blocks=2),
         prepared_example(source_index=6, original_images=1, helper_images=1, blocks=1),
     ]
 
@@ -448,3 +450,134 @@ def test_collator_rejects_tensor_shape_drift_with_sample_context():
     assert "source_index=29" in str(error.value)
     assert "observed" in str(error.value)
     assert "expected" in str(error.value)
+
+
+class _GroupingSensitiveProcessor(DeterministicStage1Processor):
+    """Processor spy whose packed calls deliberately differ from B=1 calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.call_row_counts = []
+
+    def __call__(self, *, text, images, padding, truncation, return_tensors):
+        self.call_row_counts.append(len(text))
+        batch = super().__call__(
+            text=text,
+            images=images,
+            padding=padding,
+            truncation=truncation,
+            return_tensors=return_tensors,
+        )
+        pixel_rows = []
+        grid_rows = []
+        for image_group in images:
+            for image in image_group:
+                value = float(image.getpixel((0, 0))[0])
+                pixel_rows.extend(((value, value + 0.5),) * (1 + int(value) % 3))
+                grid_rows.append((1, int(value) % 3 + 1, 1))
+        batch["pixel_values"] = torch.tensor(pixel_rows, dtype=torch.float32)
+        batch["image_grid_thw"] = torch.tensor(grid_rows, dtype=torch.long).reshape(-1, 3)
+        if len(text) > 1:
+            # A real processor may have batch-sensitive vision behavior.  Make
+            # this visible without corrupting the latent sentinel structure.
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            batch["input_ids"] = torch.cat(
+                (torch.full((len(text), 1), 88, dtype=input_ids.dtype), input_ids), dim=1
+            )
+            batch["attention_mask"] = torch.cat(
+                (torch.ones((len(text), 1), dtype=attention_mask.dtype), attention_mask),
+                dim=1,
+            )
+            batch["pixel_values"] += 1000
+            batch["image_grid_thw"] += 1000
+        return batch
+
+
+def _unpadded_row(batch, row_index, key):
+    mask = batch["attention_mask"][row_index].bool()
+    return batch[key][row_index][mask]
+
+
+def test_collator_processes_every_mode_samplewise_before_packing():
+    """Catches a processor changing source rows when it sees a two-row call."""
+    processor = _GroupingSensitiveProcessor()
+    collator = Stage1DataCollator(processor, TOKENS, latent_size=3)
+    examples = [
+        prepared_example(
+            source_index=51,
+            original_images=1,
+            helper_images=1,
+            blocks=1,
+            trailing_words=1,
+        ),
+        prepared_example(
+            source_index=52,
+            original_images=2,
+            helper_images=2,
+            blocks=2,
+            trailing_words=4,
+        ),
+    ]
+
+    packed = collator(examples)
+
+    assert processor.call_row_counts == [1, 1, 1, 1, 1, 1]
+    assert [
+        sample.original_pixel_range for sample in packed["stage1_batch_metadata"].samples
+    ] == [(0, 2), (2, 7)]
+    assert [
+        sample.helper_pixel_range for sample in packed["stage1_batch_metadata"].samples
+    ] == [(0, 3), (3, 7)]
+    assert [
+        sample.original_grid_range for sample in packed["stage1_batch_metadata"].samples
+    ] == [(0, 1), (1, 3)]
+    assert [
+        sample.helper_grid_range for sample in packed["stage1_batch_metadata"].samples
+    ] == [(0, 1), (1, 3)]
+
+
+def test_collator_packed_equals_independent_b1_processor_results():
+    """Catches packed preprocessing changing tokens, masks, pixels, or grids."""
+    examples = [
+        prepared_example(
+            source_index=61,
+            original_images=1,
+            helper_images=1,
+            blocks=1,
+            trailing_words=1,
+        ),
+        prepared_example(
+            source_index=62,
+            original_images=2,
+            helper_images=2,
+            blocks=2,
+            trailing_words=5,
+        ),
+    ]
+    singleton_batches = [
+        Stage1DataCollator(_GroupingSensitiveProcessor(), TOKENS, latent_size=3)([example])
+        for example in examples
+    ]
+    packed = Stage1DataCollator(_GroupingSensitiveProcessor(), TOKENS, latent_size=3)(examples)
+
+    for row_index, singleton in enumerate(singleton_batches):
+        for key in ("input_ids", "attention_mask", "labels", "image_out_mask"):
+            torch.testing.assert_close(
+                _unpadded_row(packed, row_index, key),
+                _unpadded_row(singleton, 0, key),
+            )
+        metadata = packed["stage1_batch_metadata"].samples[row_index]
+        singleton_metadata = singleton["stage1_batch_metadata"].samples[0]
+        for packed_key, singleton_key, pixel_range, grid_range in (
+            ("pixel_values", "pixel_values", metadata.original_pixel_range, metadata.original_grid_range),
+            ("pixel_values_latent", "pixel_values_latent", metadata.helper_pixel_range, metadata.helper_grid_range),
+            ("image_grid_thw", "image_grid_thw", metadata.original_pixel_range, metadata.original_grid_range),
+            ("image_grid_thw_latent", "image_grid_thw_latent", metadata.helper_pixel_range, metadata.helper_grid_range),
+        ):
+            active_range = pixel_range if "pixel_values" in packed_key else grid_range
+            torch.testing.assert_close(
+                packed[packed_key][slice(*active_range)], singleton[singleton_key]
+            )
+        assert metadata.unpadded_length == singleton_metadata.unpadded_length
+        assert metadata.latent_spans == singleton_metadata.latent_spans

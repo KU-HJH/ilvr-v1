@@ -123,6 +123,8 @@ class Stage1SampleMetadata:
     rank_local_sample_ordinal: int | None = None
     rank_local_microbatch_ordinal: int | None = None
     row_ordinal_within_microbatch: int | None = None
+    original_pixel_range: tuple[int, int] = (0, 0)
+    helper_pixel_range: tuple[int, int] = (0, 0)
 
 
 @dataclass(frozen=True)

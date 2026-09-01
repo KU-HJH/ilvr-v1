@@ -120,6 +120,57 @@ def _find_subsequence_starts(sequence: torch.Tensor, pattern: torch.Tensor) -> l
     ]
 
 
+def _collate_processed_rows(rows: Sequence[dict[str, object]]) -> dict[str, object]:
+    """Right-pad row tokens and concatenate row-owned vision tensors in order."""
+    if not rows:
+        raise ValueError("Stage 1 packing requires at least one processed row")
+
+    token_keys = ("input_ids", "attention_mask", "labels", "image_out_mask")
+    token_rows = {
+        key: [row[key] for row in rows]
+        for key in token_keys
+    }
+    if any(
+        not all(isinstance(value, torch.Tensor) and value.ndim == 1 for value in values)
+        for values in token_rows.values()
+    ):
+        raise ValueError("Stage 1 packing observed non-vector row tokens; expected one unpadded vector per row")
+    pad_token_ids = [row["pad_token_id"] for row in rows]
+    if not all(isinstance(value, int) for value in pad_token_ids) or len(set(pad_token_ids)) != 1:
+        raise ValueError("Stage 1 packing observed inconsistent pad token IDs across rows")
+
+    width = max(value.numel() for value in token_rows["input_ids"])
+    input_rows = token_rows["input_ids"]
+    input_ids = input_rows[0].new_full((len(rows), width), pad_token_ids[0])
+    attention_mask = token_rows["attention_mask"][0].new_zeros((len(rows), width))
+    labels = token_rows["labels"][0].new_full((len(rows), width), -100)
+    image_out_mask = token_rows["image_out_mask"][0].new_zeros((len(rows), width))
+    for row_index in range(len(rows)):
+        row_width = input_rows[row_index].numel()
+        input_ids[row_index, :row_width] = input_rows[row_index]
+        attention_mask[row_index, :row_width] = token_rows["attention_mask"][row_index]
+        labels[row_index, :row_width] = token_rows["labels"][row_index]
+        image_out_mask[row_index, :row_width] = token_rows["image_out_mask"][row_index]
+
+    def concatenate(key: str) -> torch.Tensor:
+        values = [row[key] for row in rows]
+        if not all(isinstance(value, torch.Tensor) and value.ndim >= 1 for value in values):
+            raise ValueError(f"Stage 1 packing observed invalid {key}; expected tensors with a row dimension")
+        nonempty = [value for value in values if value.shape[0]]
+        return torch.cat(nonempty, dim=0) if nonempty else values[0]
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+        "image_out_mask": image_out_mask,
+        "pixel_values": concatenate("pixel_values"),
+        "image_grid_thw": concatenate("image_grid_thw"),
+        "pixel_values_latent": concatenate("pixel_values_latent"),
+        "image_grid_thw_latent": concatenate("image_grid_thw_latent"),
+    }
+
+
 class Stage1DataCollator:
     """Collate Stage 1 samples without inferring ownership across batch rows."""
 
@@ -147,38 +198,79 @@ class Stage1DataCollator:
             raise ValueError("Stage 1 collator requires at least one example")
         self._validate_sample_identity(examples)
 
-        batch = self._process_full_conversations(examples)
-        original = self._process_original_images(examples)
-        helper = self._process_helper_images(examples)
-        batch["pixel_values"] = original["pixel_values"]
-        batch["image_grid_thw"] = original["image_grid_thw"]
-        input_ids, attention_mask, latent_spans, unpadded_lengths = (
-            self._replace_helper_tokens_with_latent_blocks(examples, batch)
-        )
-        batch["input_ids"] = input_ids
-        batch["attention_mask"] = attention_mask
-        labels = self._build_labels(examples, input_ids, attention_mask)
-        latent_mask = torch.zeros_like(input_ids)
-        for row_index, row_spans in enumerate(latent_spans):
-            for span in row_spans:
-                latent_mask[row_index, list(span.latent_positions)] = 1
-        batch["labels"] = labels
-        batch["image_out_mask"] = latent_mask
+        processed_rows = []
+        latent_spans = []
+        unpadded_lengths = []
+        original_pixel_counts = []
+        helper_pixel_counts = []
+        original_grid_counts = []
+        helper_grid_counts = []
+        for example in examples:
+            singleton = (example,)
+            full = self._process_full_conversations(singleton)
+            original = self._process_original_images(singleton)
+            helper = self._process_helper_images(singleton)
+            self._validate_grid_rows(
+                singleton,
+                original["image_grid_thw"],
+                (len(example.original_image_paths),),
+                "original",
+            )
+            self._validate_grid_rows(
+                singleton,
+                helper["image_grid_thw"],
+                (len(example.helper_image_paths),),
+                "helper",
+            )
+            input_ids, attention_mask, row_spans, row_lengths = (
+                self._replace_helper_tokens_with_latent_blocks(singleton, full)
+            )
+            labels = self._build_labels(singleton, input_ids, attention_mask)
+            latent_mask = torch.zeros_like(input_ids)
+            for span in row_spans[0]:
+                latent_mask[0, list(span.latent_positions)] = 1
+            processed_rows.append(
+                {
+                    "input_ids": input_ids[0],
+                    "attention_mask": attention_mask[0],
+                    "labels": labels[0],
+                    "image_out_mask": latent_mask[0],
+                    "pad_token_id": self._processor_pad_token_id(),
+                    "pixel_values": original["pixel_values"],
+                    "image_grid_thw": original["image_grid_thw"],
+                    "pixel_values_latent": helper["pixel_values"],
+                    "image_grid_thw_latent": helper["image_grid_thw"],
+                }
+            )
+            latent_spans.append(row_spans[0])
+            unpadded_lengths.append(row_lengths[0])
+            original_pixel_counts.append(self._tensor_row_count(example, original, "original"))
+            helper_pixel_counts.append(self._tensor_row_count(example, helper, "helper"))
+            original_grid_counts.append(self._grid_row_count(example, original, "original"))
+            helper_grid_counts.append(self._grid_row_count(example, helper, "helper"))
+
+        batch = _collate_processed_rows(processed_rows)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
+        latent_mask = batch["image_out_mask"]
 
         metadata = self._build_metadata(
             examples,
             batch,
-            helper,
-            latent_spans,
-            unpadded_lengths,
+            tuple(latent_spans),
+            tuple(unpadded_lengths),
+            tuple(original_pixel_counts),
+            tuple(helper_pixel_counts),
+            tuple(original_grid_counts),
+            tuple(helper_grid_counts),
         )
         self._validate_tensor_shapes(
             examples, metadata, input_ids, attention_mask, labels, latent_mask
         )
+        self._validate_samplewise_ownership(examples, metadata, attention_mask)
         return {
             **batch,
-            "pixel_values_latent": helper["pixel_values"],
-            "image_grid_thw_latent": helper["image_grid_thw"],
             "stage1_batch_metadata": metadata,
         }
 
@@ -301,27 +393,18 @@ class Stage1DataCollator:
     def _process_helper_images(
         self, examples: Sequence[PreparedStage1Example]
     ) -> dict[str, torch.Tensor]:
-        helper_count = sum(len(example.helper_image_paths) for example in examples)
-        if helper_count:
-            conversations = remove_user_images(
-                [example.conversation for example in examples]
+        conversations = remove_user_images([example.conversation for example in examples])
+        texts = self._render_conversations(conversations)
+        images = self._materialize_role_images(examples, "helper")
+        batch = dict(
+            self.processor(
+                text=texts,
+                images=images,
+                padding=True,
+                truncation=False,
+                return_tensors="pt",
             )
-            texts = self._render_conversations(conversations)
-            images = self._materialize_role_images(examples, "helper")
-            batch = dict(
-                self.processor(
-                    text=texts,
-                    images=images,
-                    padding=True,
-                    truncation=False,
-                    return_tensors="pt",
-                )
-            )
-        else:
-            batch = {
-                "pixel_values": torch.empty((0, 0)),
-                "image_grid_thw": torch.empty((0, 3), dtype=torch.long),
-            }
+        )
         self._require_processor_keys(examples[0], batch, "helper")
         return batch
 
@@ -382,8 +465,7 @@ class Stage1DataCollator:
             unpadded_lengths.append(row.numel())
 
         width = max(unpadded_lengths)
-        pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
-        pad_token_id = 0 if pad_token_id is None else int(pad_token_id)
+        pad_token_id = self._processor_pad_token_id()
         padded = input_ids.new_full((len(rows), width), pad_token_id)
         mask = attention_mask.new_zeros((len(rows), width))
         for row_index, row in enumerate(rows):
@@ -471,25 +553,23 @@ class Stage1DataCollator:
         self,
         examples,
         original,
-        helper,
         latent_spans,
         unpadded_lengths,
+        original_pixel_counts,
+        helper_pixel_counts,
+        original_grid_counts,
+        helper_grid_counts,
     ):
-        original_counts = tuple(len(example.original_image_paths) for example in examples)
-        helper_counts = tuple(len(example.helper_image_paths) for example in examples)
-        self._validate_grid_rows(
-            examples, original["image_grid_thw"], original_counts, "original"
-        )
-        self._validate_grid_rows(
-            examples, helper["image_grid_thw"], helper_counts, "helper"
-        )
-
         original_offset = 0
         helper_offset = 0
+        original_pixel_offset = 0
+        helper_pixel_offset = 0
         samples = []
         for row_index, example in enumerate(examples):
-            original_end = original_offset + original_counts[row_index]
-            helper_end = helper_offset + helper_counts[row_index]
+            original_end = original_offset + original_grid_counts[row_index]
+            helper_end = helper_offset + helper_grid_counts[row_index]
+            original_pixel_end = original_pixel_offset + original_pixel_counts[row_index]
+            helper_pixel_end = helper_pixel_offset + helper_pixel_counts[row_index]
             samples.append(
                 Stage1SampleMetadata(
                     source_index=example.source_index,
@@ -497,7 +577,7 @@ class Stage1DataCollator:
                     original_grid_range=(original_offset, original_end),
                     helper_grid_range=(helper_offset, helper_end),
                     latent_spans=latent_spans[row_index],
-                    helper_to_block=tuple(range(helper_counts[row_index])),
+                    helper_to_block=tuple(range(helper_grid_counts[row_index])),
                     unpadded_length=unpadded_lengths[row_index],
                     epoch=None if example.occurrence is None else example.occurrence.epoch,
                     view_slot=None
@@ -519,15 +599,63 @@ class Stage1DataCollator:
                     row_ordinal_within_microbatch=None
                     if example.occurrence is None
                     else example.occurrence.row_ordinal_within_microbatch,
+                    original_pixel_range=(original_pixel_offset, original_pixel_end),
+                    helper_pixel_range=(helper_pixel_offset, helper_pixel_end),
                 )
             )
             original_offset = original_end
             helper_offset = helper_end
+            original_pixel_offset = original_pixel_end
+            helper_pixel_offset = helper_pixel_end
         return Stage1BatchMetadata(
             samples=tuple(samples),
             batch_size=len(samples),
             sequence_length=int(original["input_ids"].shape[1]),
         )
+
+    @staticmethod
+    def _tensor_row_count(example, batch, kind):
+        values = batch["pixel_values"]
+        if not isinstance(values, torch.Tensor) or values.ndim < 1:
+            raise ValueError(
+                f"source_index={example.source_index}: observed {kind} pixel_values "
+                f"with shape {getattr(values, 'shape', None)}; expected a tensor with a row dimension"
+            )
+        return int(values.shape[0])
+
+    @staticmethod
+    def _grid_row_count(example, batch, kind):
+        values = batch["image_grid_thw"]
+        if not isinstance(values, torch.Tensor) or values.ndim < 1:
+            raise ValueError(
+                f"source_index={example.source_index}: observed {kind} image_grid_thw "
+                f"with shape {getattr(values, 'shape', None)}; expected a tensor with a row dimension"
+            )
+        return int(values.shape[0])
+
+    def _processor_pad_token_id(self) -> int:
+        pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+        return 0 if pad_token_id is None else int(pad_token_id)
+
+    @staticmethod
+    def _validate_samplewise_ownership(examples, metadata, attention_mask):
+        for row_index, (example, sample) in enumerate(zip(examples, metadata.samples)):
+            observed_length = int(attention_mask[row_index].sum().item())
+            if observed_length != sample.unpadded_length:
+                raise ValueError(
+                    f"source_index={example.source_index}: observed attention length "
+                    f"{observed_length}; expected unpadded length {sample.unpadded_length}"
+                )
+            for block_index, span in enumerate(sample.latent_spans):
+                if not (
+                    0 <= span.start < span.end < sample.unpadded_length
+                    and all(span.start < position < span.end for position in span.latent_positions)
+                ):
+                    raise ValueError(
+                        f"source_index={example.source_index}: observed latent span "
+                        f"{block_index} outside the unpadded prefix; expected every "
+                        "latent boundary and position to be row-local"
+                    )
 
     @staticmethod
     def _validate_grid_rows(examples, image_grid_thw, counts, kind):
