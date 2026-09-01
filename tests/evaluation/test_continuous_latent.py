@@ -112,9 +112,9 @@ def test_post_end_logits_use_complete_post_recurrence_scaffold():
     """Catches evidence taken before continuous latent replacements finish."""
     model = scripted_model(
         latent_size=2,
-        emitted_ids=[TOKENS.start_token_id, 3],
+        emitted_ids=[TOKENS.start_token_id, 11, 3],
     )
-    model.lm_head = RecordingScriptedHead([TOKENS.start_token_id, 3])
+    model.lm_head = RecordingScriptedHead([TOKENS.start_token_id, 11, 3])
 
     result = ContinuousLatentController().generate(
         model=model,
@@ -125,16 +125,50 @@ def test_post_end_logits_use_complete_post_recurrence_scaffold():
             max_new_tokens=5, eos_token_id=3
         ),
         return_post_end_logits=True,
+        return_latent_states=True,
     )
 
-    complete_embeds, _, complete_positions = model.model.calls[3]
+    end_position = int(
+        (result.sequences[0] == TOKENS.end_token_id).nonzero(as_tuple=False).item()
+    )
+    scaffold_ids = result.sequences[:, : end_position + 1]
+    latent_positions = tuple(
+        range(end_position - model.config.latent_size, end_position)
+    )
+    complete_scaffolds = [
+        (embeds, positions)
+        for embeds, mask, positions in model.model.calls
+        if embeds.shape[:2] == scaffold_ids.shape
+        and torch.equal(mask, torch.ones_like(scaffold_ids))
+        and torch.equal(
+            positions,
+            torch.arange(scaffold_ids.shape[1])
+            .view(1, 1, -1)
+            .expand(3, 1, -1),
+        )
+        and all(
+            torch.equal(embeds[:, position], latent_state)
+            for position, latent_state in zip(
+                latent_positions, result.latent_states_by_block[0], strict=True
+            )
+        )
+    ]
+    assert complete_scaffolds
+    complete_embeds, complete_positions = complete_scaffolds[0]
     expected_hidden = (
         complete_embeds.cumsum(dim=1) * model.model.scale
         + complete_positions[0].unsqueeze(-1).to(complete_embeds.dtype)
     )[:, -1, :]
-    torch.testing.assert_close(model.lm_head.hidden_inputs[1], expected_hidden)
+    evidence_index = next(
+        index
+        for index, logits in enumerate(model.lm_head.outputs)
+        if logits.argmax(dim=-1).item() == 11
+    )
     torch.testing.assert_close(
-        result.post_end_logits_by_block[0], model.lm_head.outputs[1]
+        model.lm_head.hidden_inputs[evidence_index], expected_hidden
+    )
+    torch.testing.assert_close(
+        result.post_end_logits_by_block[0], model.lm_head.outputs[evidence_index]
     )
 
 

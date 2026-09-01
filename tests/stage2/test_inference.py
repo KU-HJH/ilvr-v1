@@ -65,16 +65,57 @@ def test_stage2_generation_result_retains_legacy_two_field_construction():
 
 def test_stage2_controller_retains_its_original_generate_signature():
     """Catches neutral-only evidence arguments leaking into Stage 2's API."""
-    assert tuple(inspect.signature(Stage2InferenceController.generate).parameters) == (
-        "self",
-        "model",
-        "input_ids",
-        "attention_mask",
-        "token_ids",
-        "generation_config",
-        "pixel_values",
-        "image_grid_thw",
-        "return_latent_states",
+    signature = inspect.signature(Stage2InferenceController.generate)
+
+    assert tuple(
+        (name, parameter.kind, parameter.default)
+        for name, parameter in signature.parameters.items()
+    ) == (
+        (
+            "self",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.empty,
+        ),
+        (
+            "model",
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.empty,
+        ),
+        (
+            "input_ids",
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.empty,
+        ),
+        (
+            "attention_mask",
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.empty,
+        ),
+        (
+            "token_ids",
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.empty,
+        ),
+        (
+            "generation_config",
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.empty,
+        ),
+        (
+            "pixel_values",
+            inspect.Parameter.KEYWORD_ONLY,
+            None,
+        ),
+        (
+            "image_grid_thw",
+            inspect.Parameter.KEYWORD_ONLY,
+            None,
+        ),
+        (
+            "return_latent_states",
+            inspect.Parameter.KEYWORD_ONLY,
+            False,
+        ),
     )
 
 
