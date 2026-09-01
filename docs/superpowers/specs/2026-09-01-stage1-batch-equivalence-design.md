@@ -1,7 +1,7 @@
 # Stage 1 True-Batch Equivalence Design
 
 **Date:** 2026-09-01  
-**Status:** Design proposal v6, frozen for critique
+**Status:** Design proposal v7, frozen for critique
 **Repository:** `XD111ds/ILVR`  
 **Supersedes:** only the batch-equivalence portions of
 `2026-08-26-ilvr-stage1-dora-batched-training-design.md`
@@ -23,10 +23,11 @@ an optimizer update must agree between the two paths:
 The trainable language decoder remains a true B=2 operation. Frozen visual
 features and EMA-teacher targets are computed sample by sample before that
 decoder call because an actual 3B probe disproved their batch invariance. The
-only permitted differences are floating-point effects caused by executing the
-same decoder mathematics through different true batch shapes on GPU. Bitwise
-decoder equality is not a goal because it would require serial B=1 decoder
-forwards and remove the requested batching benefit.
+only permitted differences are GPU floating-point effects from decoder
+forward, backward, and reduction execution, including the separately measured
+same-shape repeatability floor. Bitwise decoder equality is not a goal because
+it would require serial B=1 decoder forwards and remove the requested batching
+benefit.
 
 ## 2. Fixed Experiment Contract
 
@@ -385,9 +386,10 @@ or loss weighting.
 ### 8.4 EMA trajectory observation
 
 After the common first update, student and EMA states are outcomes of the
-batch-shape treatment. Later teacher target values or discrete selections may
+paired executions. Later teacher target values or discrete selections may
 therefore diverge even though every controllable input remains equal. Treating
-that divergence as a launch failure would censor the effect being measured.
+that divergence as a launch failure would censor the trajectory difference
+being measured.
 
 For steps 2 through 648, both main runs record compact per-step traces of
 selected counts and indices, selection-score margins, component losses,
@@ -404,6 +406,14 @@ counters remain exact controls through step 648. The B=2 continuation checks
 these compact controls against the completed B=1 trace step by step and aborts
 on a mismatch. Only model-derived teacher decisions and numerical trajectory
 values are observational after the common first update.
+
+The one-step A/A replay establishes local repeatability only. This design does
+not run a third 648-step B=1 replay or multiple paired seeds, so it cannot
+separate amplified long-horizon hardware/kernel nondeterminism from a general
+microbatch-grouping effect. Final trajectory and accuracy differences are
+reported as one controlled paired observation, not as an estimated causal
+effect or a generalizable performance delta. That limitation is an explicit
+cost waiver, not evidence that long-horizon A/A variance is zero.
 
 ## 9. Launch Gate and Artifacts
 
@@ -489,6 +499,8 @@ infrastructure is outside this design.
 - changing EMA tau or teacher-update semantics;
 - requiring identical moving-teacher trajectories after the common first
   update;
+- estimating a general batch-grouping effect across full-run A/A replicates or
+  multiple seeds;
 - Stage 2 batch-size work;
 - a new benchmark framework, retry framework, or experiment database;
 - proceeding past step 64 before the staged equivalence gate passes.
@@ -503,5 +515,7 @@ common-state first update differs only within the bounded GPU
 forward/backward witness and against a measured A/A repeatability baseline.
 Completion also includes observing the resulting EMA trajectory through all
 648 steps, identifying any first teacher-selection divergence, and reporting
-the paired official evaluations. It does not claim identical post-update
-teachers, bitwise-identical checkpoints, or identical accuracy.
+the paired official evaluations as a single paired observation. It does not
+claim identical post-update teachers, bitwise-identical checkpoints, identical
+accuracy, or a causal/generalizable endpoint effect without a full-horizon
+A/A or multi-seed baseline.
