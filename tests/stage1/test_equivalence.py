@@ -685,6 +685,7 @@ def manifest_runtime_inputs(tmp_path, resolved_manifest_mapping):
         "run_stage1_training.sh": b"#!/bin/sh\necho train\n",
         "run_multinode_evaluation.sh": b"#!/bin/sh\necho eval\n",
         "qwen/modeling.py": b"MODEL = 1\n",
+        "qwen/README.txt": b"not runtime Python\n",
         "model/config.json": b'{"model":"tiny"}\n',
         "model/tokenizer.json": b"{}\n",
         "model/weights.bin": b"weights\n",
@@ -740,7 +741,7 @@ def manifest_runtime_inputs(tmp_path, resolved_manifest_mapping):
         "semantic_values": semantic_values,
         "repository_root": repository,
         "git_commit": commit,
-        "qwen_source_path": repository / "qwen",
+        "qwen_source_path": repository / "qwen/modeling.py",
         "model_path": repository / "model",
         "processor_path": repository / "model",
         "model_config_path": repository / "model/config.json",
@@ -854,6 +855,31 @@ def test_manifest_materializer_rejects_deleted_tracked_runtime_source(
     (manifest_runtime_inputs["repository_root"] / "src/core.py").unlink()
 
     with pytest.raises(ValueError, match="deleted|closure|dirty"):
+        materialize_stage1_resolved_manifest(**manifest_runtime_inputs)
+
+
+def test_manifest_materializer_rejects_missing_explicit_qwen_source(
+    manifest_runtime_inputs,
+):
+    """Catches a missing loaded Qwen file falling through to an empty prefix closure."""
+    manifest_runtime_inputs["qwen_source_path"] = (
+        manifest_runtime_inputs["repository_root"] / "qwen/missing.py"
+    )
+
+    with pytest.raises(ValueError, match="Qwen source.*Python file"):
+        materialize_stage1_resolved_manifest(**manifest_runtime_inputs)
+
+
+@pytest.mark.parametrize("relative_path", ("qwen", "qwen/README.txt"))
+def test_manifest_materializer_rejects_non_python_file_or_directory_qwen_source(
+    manifest_runtime_inputs, relative_path
+):
+    """Catches directory-prefix or non-Python membership replacing one loaded Qwen file."""
+    manifest_runtime_inputs["qwen_source_path"] = (
+        manifest_runtime_inputs["repository_root"] / relative_path
+    )
+
+    with pytest.raises(ValueError, match="Qwen source.*Python file"):
         materialize_stage1_resolved_manifest(**manifest_runtime_inputs)
 
 

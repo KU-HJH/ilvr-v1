@@ -903,11 +903,14 @@ def _fixed_runtime_source_files(
             f"recorded={recorded_git_commit}, HEAD={head}"
         )
     qwen_path, qwen_logical = _repository_path(repository, qwen_source_path)
+    if not qwen_path.is_file() or qwen_path.suffix != ".py":
+        raise ValueError("loaded Qwen source must be an existing Python file")
     fixed_entries = {
         "eval.py",
         "run_stage1_training.sh",
         "run_multinode_evaluation.sh",
     }
+    required_entries = fixed_entries | {qwen_logical}
     tree_arguments = [
         "-C",
         str(repository),
@@ -927,16 +930,11 @@ def _fixed_runtime_source_files(
             return True
         if logical.startswith("src/") and Path(logical).suffix in {".py", ".sh"}:
             return True
-        if qwen_path.is_file():
-            return logical == qwen_logical
-        return logical.startswith(f"{qwen_logical.rstrip('/')}/") and Path(logical).suffix in {
-            ".py",
-            ".sh",
-        }
+        return logical == qwen_logical
 
     recorded = {logical for logical in recorded_candidates if belongs_to_closure(logical)}
-    if not fixed_entries <= recorded:
-        missing = sorted(fixed_entries - recorded)
+    if not required_entries <= recorded:
+        missing = sorted(required_entries - recorded)
         raise ValueError(f"recorded commit lacks fixed runtime source files: {missing}")
     current: set[str] = set()
     source_root = repository / "src"
@@ -949,14 +947,7 @@ def _fixed_runtime_source_files(
     for logical in fixed_entries:
         if (repository / logical).is_file():
             current.add(logical)
-    if qwen_path.is_file():
-        current.add(qwen_logical)
-    elif qwen_path.is_dir():
-        current.update(
-            candidate.relative_to(repository).as_posix()
-            for candidate in qwen_path.rglob("*")
-            if candidate.is_file() and candidate.suffix in {".py", ".sh"}
-        )
+    current.add(qwen_logical)
     if current != recorded:
         missing = sorted(recorded - current)
         extra = sorted(current - recorded)
