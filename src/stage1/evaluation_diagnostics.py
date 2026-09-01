@@ -329,11 +329,38 @@ def _require_results_output_path(value: str) -> Path:
     return output
 
 
+def derive_execution_log_path(output_json: str | Path) -> Path:
+    """Derive the only permitted log destination from a results run directory."""
+    output = Path(output_json).expanduser().resolve()
+    results_root = (Path.cwd() / "results").resolve()
+    try:
+        relative = output.relative_to(results_root)
+    except ValueError as error:
+        raise ValueError("output-json must be beneath results/<run-id>/") from error
+    if len(relative.parts) < 2:
+        raise ValueError("output-json must be beneath results/<run-id>/")
+    return (Path.cwd() / "logs" / relative.parts[0] / f"{output.stem}.log").resolve()
+
+
 def _write_json(output: Path, evidence: Mapping[str, object]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
         json.dump(_json_safe(evidence), handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
+
+
+def _write_execution_log(path: Path, *, mode: str, output: Path, status: str, detail: str = "") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join((
+            f"mode={mode}",
+            f"output_json={output}",
+            f"status={status}",
+            f"detail={detail}",
+            "",
+        )),
+        encoding="utf-8",
+    )
 
 
 def _load_probe_runtime(model_dir: str, base_model_dir: str, cache_dir: str):
@@ -503,14 +530,17 @@ def independent_no_cache_forced_prefix(model, prepared, token_ids, forced_ids, *
     }
 
 
-def _prepared_for_index(model, processor, dataset_rows, dataset_root: Path, index: int):
-    sample = dataset_rows[index]
+def _prepared_for_sample(model, processor, sample, dataset_root: Path):
     images = _images_for_sample(sample, dataset_root)
     prepared = prepare_evaluation_input(processor, sample, images)
     device = _model_device(model)
     tensors = {name: tensor.to(device) for name, tensor in prepared.tensors.items()}
     tensors.setdefault("attention_mask", torch.ones_like(tensors["input_ids"]))
     return tensors
+
+
+def _prepared_for_index(model, processor, dataset_rows, dataset_root: Path, index: int):
+    return _prepared_for_sample(model, processor, dataset_rows[index], dataset_root)
 
 
 def run_recurrence_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: str, cache_dir: str) -> dict[str, object]:
@@ -544,14 +574,111 @@ def run_recurrence_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: 
     return {"diagnostic": "stage1-forced-prefix-recurrence", "cases": reports}
 
 
-def _boundary_trainable_parameters(model) -> dict[str, torch.nn.Parameter]:
-    selected = {}
-    for name, parameter in model.named_parameters():
-        if parameter.requires_grad and (
-            "output_delta" in name or "token_adapter" in name or "lora_magnitude_vector" in name
-        ):
-            selected[name] = parameter
-    return selected
+def validated_test_source_rows(
+    dataset_path: Path, dataset_rows: Sequence[Mapping[str, object]], source_indices: Sequence[int]
+) -> tuple[dict[str, object], ...]:
+    """Bind the fixed boundary IDs to the actual TEST ordering, never offsets alone."""
+    canonical_test_path = (Path.cwd() / "data" / "TEST.jsonl").resolve()
+    if dataset_path.resolve() != canonical_test_path:
+        raise ValueError("boundary-probe requires the canonical data/TEST.jsonl split")
+    indexed: dict[int, Mapping[str, object]] = {}
+    for source_index, row in enumerate(dataset_rows):
+        if not isinstance(row, Mapping):
+            raise TypeError(f"TEST row {source_index} must be a mapping")
+        declared_index = row.get("index", source_index)
+        if _require_exact_int(declared_index, name="TEST row source index") != source_index:
+            raise ValueError(
+                f"TEST row source index mismatch at row {source_index}: {declared_index!r}"
+            )
+        indexed[source_index] = row
+    requested = tuple(source_indices)
+    if len(requested) != len(set(requested)):
+        raise ValueError("boundary source indices must be unique")
+    missing = [index for index in requested if index not in indexed]
+    if missing:
+        raise ValueError(f"boundary TEST source indices are missing: {missing}")
+    return tuple(
+        {"source_index": index, "sample": indexed[index]}
+        for index in requested
+    )
+
+
+def _assistant_cue_patterns(tokenizer) -> tuple[tuple[int, ...], ...]:
+    patterns = []
+    for cue in ("<|im_start|>assistant\n", "<|im_start|>assistant"):
+        encoded = tokenizer(cue, add_special_tokens=False)["input_ids"]
+        if isinstance(encoded, torch.Tensor):
+            encoded = encoded.tolist()
+        if encoded and isinstance(encoded[0], list):
+            encoded = encoded[0]
+        pattern = tuple(_require_exact_int(int(token_id), name="assistant cue token") for token_id in encoded)
+        if pattern and pattern not in patterns:
+            patterns.append(pattern)
+    if not patterns:
+        raise ValueError("tokenizer did not produce an assistant cue")
+    return tuple(patterns)
+
+
+def validate_assistant_cue_scaffold(prepared: Mapping[str, torch.Tensor], tokenizer) -> None:
+    """Require the prompt to terminate at the tokenized assistant cue before forcing latent start."""
+    input_ids = prepared.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError("assistant cue scaffold requires one input_ids row")
+    ids = tuple(_require_exact_int(int(token_id), name="prompt token") for token_id in input_ids[0].tolist())
+    if not any(len(ids) >= len(pattern) and ids[-len(pattern):] == pattern for pattern in _assistant_cue_patterns(tokenizer)):
+        raise ValueError("prompt does not end with the tokenized assistant cue before latent_start")
+
+
+def boundary_target_parameters(model, token_ids) -> dict[str, object]:
+    """Find the exact Stage 1 sparse latent rows and every trainable DoRA tensor."""
+    named = {
+        name: parameter for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    latent_matches = [
+        (name, parameter) for name, parameter in named.items()
+        if name.endswith("lm_head.output_delta") or name == "lm_head.output_delta"
+    ]
+    if len(latent_matches) != 1:
+        raise ValueError("boundary-probe requires exactly one trainable latent rows parameter")
+    latent_name, latent_parameter = latent_matches[0]
+    latent_ids = (
+        _require_exact_int(token_ids.pad_token_id, name="latent pad token id"),
+        _require_exact_int(token_ids.start_token_id, name="latent start token id"),
+        _require_exact_int(token_ids.end_token_id, name="latent end token id"),
+    )
+    if latent_parameter.ndim != 2 or latent_parameter.shape[0] != len(latent_ids):
+        raise ValueError("trainable latent rows must be the exact three sparse output rows")
+    components = ("lora_A", "lora_B", "lora_magnitude_vector")
+    dora_parameters = {
+        name: parameter for name, parameter in named.items()
+        if any(component in name for component in components)
+    }
+    missing_components = [
+        component for component in components
+        if not any(component in name for name in dora_parameters)
+    ]
+    if missing_components:
+        raise ValueError(
+            "boundary-probe requires all trainable DoRA tensors: "
+            + ", ".join(missing_components)
+        )
+    rows = [
+        {
+            "token_id": token_id,
+            "row_index": row_index,
+            "parameter_name": latent_name,
+            "parameter": latent_parameter,
+        }
+        for row_index, token_id in enumerate(latent_ids)
+    ]
+    return {
+        "latent_rows": rows,
+        "latent_parameter": latent_parameter,
+        "latent_parameter_name": latent_name,
+        "dora_parameters": dora_parameters,
+        "parameters": {latent_name: latent_parameter, **dora_parameters},
+    }
 
 
 def _manual_boundary_loss(model, prepared, token_ids, forced_ids):
@@ -615,6 +742,64 @@ def _gradient_summary(parameters: Mapping[str, torch.nn.Parameter]) -> dict[str,
     return result
 
 
+def _tensor_gradient_evidence(gradient: torch.Tensor | None, *, name: str) -> dict[str, object] | None:
+    if gradient is None:
+        return None
+    finite = _require_finite_tensor(gradient, name=f"gradient {name}")
+    return {
+        "l2": _finite_float(torch.linalg.vector_norm(finite.detach().float().reshape(-1)).item(), name=f"gradient {name}"),
+        "nonzero_elements": int(torch.count_nonzero(finite).item()),
+    }
+
+
+def _boundary_gradient_evidence(targets: Mapping[str, object]) -> dict[str, object]:
+    rows = []
+    for row in targets["latent_rows"]:
+        parameter = row["parameter"]
+        assert isinstance(parameter, torch.nn.Parameter)
+        row_index = _require_exact_int(row["row_index"], name="latent row index")
+        gradient = None if parameter.grad is None else parameter.grad[row_index]
+        rows.append({
+            "token_id": _require_exact_int(row["token_id"], name="latent token id"),
+            "row_index": row_index,
+            "parameter_name": row["parameter_name"],
+            "gradient": _tensor_gradient_evidence(gradient, name=str(row["parameter_name"])),
+        })
+    dora = targets["dora_parameters"]
+    assert isinstance(dora, Mapping)
+    return {"latent_rows": rows, "dora_parameters": _gradient_summary(dora)}
+
+
+def _boundary_delta_evidence(
+    targets: Mapping[str, object], before: Mapping[str, torch.Tensor], after: Mapping[str, torch.Tensor]
+) -> dict[str, object]:
+    rows = []
+    for row in targets["latent_rows"]:
+        name = row["parameter_name"]
+        assert isinstance(name, str)
+        row_index = _require_exact_int(row["row_index"], name="latent row index")
+        initial = before[name][row_index]
+        final = after[name][row_index]
+        delta = final.detach().to(torch.float64) - initial.detach().to(torch.float64)
+        rows.append({
+            "token_id": _require_exact_int(row["token_id"], name="latent token id"),
+            "row_index": row_index,
+            "parameter_name": name,
+            "changed_elements": int(torch.count_nonzero(delta).item()),
+            "l2_delta": _finite_float(torch.linalg.vector_norm(delta.reshape(-1)).item(), name="latent row delta"),
+            "symmetric_relative_l2": symmetric_relative_l2(initial, final),
+        })
+    dora = targets["dora_parameters"]
+    assert isinstance(dora, Mapping)
+    return {
+        "latent_rows": rows,
+        "dora_parameters": parameter_delta_summary(
+            {name: before[name] for name in dora},
+            {name: after[name] for name in dora},
+        ),
+    }
+
+
 def _parse_boundary_indices(value: str) -> tuple[int, ...]:
     try:
         parsed = tuple(_require_exact_int(int(part), name="source index") for part in value.split(","))
@@ -631,11 +816,10 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
     model, processor = _load_probe_runtime(model_dir, base_model_dir, cache_dir)
     dataset_path = Path(dataset_jsonl).resolve(strict=True)
     dataset = _read_jsonl(dataset_path)
-    if max(source_indices) >= len(dataset):
-        raise ValueError("boundary source index is outside dataset-jsonl")
+    source_rows = validated_test_source_rows(dataset_path, dataset, source_indices)
     token_ids = resolve_latent_token_ids(processor.tokenizer, model.config)
     ordinary = _ordinary_token_id(processor.tokenizer, token_ids)
-    trainable = _boundary_trainable_parameters(model)
+    targets = boundary_target_parameters(model, token_ids)
     all_trainable = {
         name: parameter for name, parameter in model.named_parameters()
         if parameter.requires_grad
@@ -646,8 +830,12 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
     model.train()
     cases: list[dict[str, object]] = []
     try:
-        for index in source_indices:
-            prepared = _prepared_for_index(model, processor, dataset, dataset_path.parent, index)
+        for source_row in source_rows:
+            index = _require_exact_int(source_row["source_index"], name="source index")
+            sample = source_row["sample"]
+            assert isinstance(sample, Mapping)
+            prepared = _prepared_for_sample(model, processor, sample, dataset_path.parent)
+            validate_assistant_cue_scaffold(prepared, processor.tokenizer)
             for case_name, forced_ids in (
                 ("assistant_cue_then_latent", (token_ids.start_token_id,)),
                 ("assistant_cue_text_then_latent", (ordinary, token_ids.start_token_id)),
@@ -660,8 +848,13 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
                 optimizer.zero_grad(set_to_none=True)
                 loss, boundary = _manual_boundary_loss(model, prepared, token_ids, forced_ids)
                 loss.backward()
-                gradients_before_clipping = _gradient_summary(trainable)
-                before = {name: parameter.detach().clone() for name, parameter in trainable.items()}
+                gradients_before_clipping = _boundary_gradient_evidence(targets)
+                selected_parameters = targets["parameters"]
+                assert isinstance(selected_parameters, Mapping)
+                before = {
+                    name: parameter.detach().clone()
+                    for name, parameter in selected_parameters.items()
+                }
                 restore = {name: parameter.detach().clone() for name, parameter in all_trainable.items()}
                 global_norm_before_clipping = torch.nn.utils.clip_grad_norm_(
                     tuple(all_trainable.values()), 1.0
@@ -669,7 +862,10 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
                 if not math.isfinite(float(global_norm_before_clipping)):
                     raise ValueError("global gradient norm must be finite")
                 optimizer.step()
-                after = {name: parameter.detach().clone() for name, parameter in trainable.items()}
+                after = {
+                    name: parameter.detach().clone()
+                    for name, parameter in selected_parameters.items()
+                }
                 cases.append({
                     "source_index": index,
                     "case": case_name,
@@ -688,7 +884,7 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
                     "per_position_ce": boundary["per_position_ce"],
                     "gradients_before_clipping": gradients_before_clipping,
                     "global_norm_before_clipping": _finite_float(float(global_norm_before_clipping), name="global gradient norm"),
-                    "parameter_deltas": parameter_delta_summary(before, after),
+                    "parameter_deltas": _boundary_delta_evidence(targets, before, after),
                 })
                 with torch.no_grad():
                     for name, parameter in all_trainable.items():
@@ -699,8 +895,12 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
     # These are intentionally real bounded generations. They are invoked only
     # by the explicit diagnostic CLI, never during import or reducer tests.
     stop_observations = []
-    for index in source_indices:
-        prepared = _prepared_for_index(model, processor, dataset, dataset_path.parent, index)
+    for source_row in source_rows:
+        index = _require_exact_int(source_row["source_index"], name="source index")
+        sample = source_row["sample"]
+        assert isinstance(sample, Mapping)
+        prepared = _prepared_for_sample(model, processor, sample, dataset_path.parent)
+        validate_assistant_cue_scaffold(prepared, processor.tokenizer)
         for budget in BOUNDARY_BUDGETS:
             original_head = model.lm_head
             model.lm_head = _ForcedPrefixHead(original_head, (token_ids.start_token_id,))
@@ -745,14 +945,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     output = _require_results_output_path(args.output_json)
-    dataset_path = Path(args.dataset_jsonl).resolve(strict=True)
-    if args.mode == "rescore":
-        evidence = rescore_historical_rows(_read_jsonl(Path(args.input_jsonl).resolve(strict=True)), _read_jsonl(dataset_path))
-    elif args.mode == "recurrence-probe":
-        evidence = run_recurrence_probe(model_dir=args.model_dir, base_model_dir=args.base_model_dir, dataset_jsonl=str(dataset_path), cache_dir=args.cache_dir)
-    else:
-        evidence = run_boundary_probe(model_dir=args.model_dir, base_model_dir=args.base_model_dir, dataset_jsonl=str(dataset_path), cache_dir=args.cache_dir, source_indices=_parse_boundary_indices(args.source_indices))
-    _write_json(output, evidence)
+    log_path = derive_execution_log_path(output)
+    try:
+        dataset_path = Path(args.dataset_jsonl).resolve(strict=True)
+        if args.mode == "rescore":
+            evidence = rescore_historical_rows(_read_jsonl(Path(args.input_jsonl).resolve(strict=True)), _read_jsonl(dataset_path))
+        elif args.mode == "recurrence-probe":
+            evidence = run_recurrence_probe(model_dir=args.model_dir, base_model_dir=args.base_model_dir, dataset_jsonl=str(dataset_path), cache_dir=args.cache_dir)
+        else:
+            evidence = run_boundary_probe(model_dir=args.model_dir, base_model_dir=args.base_model_dir, dataset_jsonl=str(dataset_path), cache_dir=args.cache_dir, source_indices=_parse_boundary_indices(args.source_indices))
+        _write_json(output, evidence)
+    except Exception as error:
+        _write_execution_log(log_path, mode=args.mode, output=output, status="failure", detail=f"{type(error).__name__}: {error}")
+        raise
+    _write_execution_log(log_path, mode=args.mode, output=output, status="success")
     return 0
 
 
