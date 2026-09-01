@@ -1,7 +1,7 @@
 # Stage 1 True-Batch Controlled Comparison Design
 
 **Date:** 2026-09-01  
-**Status:** Design commitment v20, approved 2026-09-01
+**Status:** Design commitment v26 approved 2026-09-01
 **Repository:** `XD111ds/ILVR`  
 **Supersedes:** only the batch-equivalence portions of
 `2026-08-26-ilvr-stage1-dora-batched-training-design.md`
@@ -1226,3 +1226,218 @@ Explicit approval of design commitment v20 accepts these limits and authorizes
 the implementation plan and staged experiments in this exact order. It does
 not authorize threshold relaxation, extra full-run replicates, or broader
 infrastructure without a new design decision.
+
+## 15. Design Commitment v26 Amendment (Approved 2026-09-01)
+
+This amendment supersedes every v20 statement that would launch an epoch run,
+leave Stage 1 evaluation unchanged, or treat the existing `15.75%` result as a
+valid paper-aligned Stage 1 accuracy. All unaffected v20 batch-equivalence
+controls remain in force.
+
+### Agreed problem and scope
+
+The immediate task is to determine the quality of the existing frozen-EMA
+DoRA B=1 checkpoint without another epoch, repair Stage 1 evaluation to match
+the ILVR inference rule, and finish the controls required for true B>1 to
+behave like B=1. This amendment authorizes evaluation/scorer work, bounded
+diagnostic optimizer steps, and B1/B2 equivalence probes only. It does not
+authorize a new epoch run, a latent-head topology change, Stage 2 training, or
+a claim that a one-step diagnostic generalizes to a complete trajectory.
+
+### Confirmed evidence entering the commitment
+
+- The current and historical B=1 collators produce bitwise-equal model inputs
+  on an actual sample. Current and historical B=1 teacher targets are exact on
+  tested one-block and six-block samples. Latent-pad labels are masked from CE;
+  text and latent boundary tokens remain supervised. No B=1 data, target
+  selection, label-mask, or loss-formula discrepancy has been found.
+- The paper specifies continuous latent inference: after
+  `<|latent_start|>`, the previous hidden state becomes the next input
+  embedding, `e_(t+1) = h_t`, for K steps. It also reports Stage 1 accuracy.
+  The current `eval.py` instead uses vanilla `generate()` and static
+  `<|latent_pad|>` embeddings. The historical evaluator constructed a latent
+  logits processor but did not pass it to `generate()`. Neither runtime is the
+  paper rule.
+- The current answer cleaner can delete a necessary trailing LaTeX brace.
+  Rows 7 and 22 of the failed run are observed false negatives under this
+  bug. TEST rows 57 and 93 have blank gold labels, and the scorer currently
+  permits blank normalized gold to compare equal to a blank prediction.
+- The failed checkpoint has a separate boundary failure. On the fixed first
+  eight TEST samples, a direct actual-3B continuous-controller probe entered
+  zero latent blocks. Fifty-six of 400 saved predictions terminate exactly at
+  a visual-cue colon. On sample 0, `<|latent_start|>` is rank 4924 while EOS is
+  rank 1. A prior head/body swap probe showed that both decoder adapters and
+  latent rows contribute; an output-row-only repair is falsified.
+- Current B>1 is not B=1-equivalent: alignment reduction, stochastic grouping,
+  schedule length, frozen visual execution, and EMA-teacher execution can all
+  change by microbatch grouping. The partial equivalence branch fixes only a
+  subset and does not yet fix the trainer/student visual/loss path.
+
+The paper and current source are the normative references. The historical
+repository evaluator is retained as provenance, not copied as correct
+inference behavior. The contradictory Stage 1 evaluation guide must be
+corrected as part of implementation.
+
+### Final design and exact order
+
+#### 1. Freeze and repair the scorer contract
+
+The answer grammar is fixed before new outputs are inspected:
+
+- preserve balanced LaTeX braces and the exact extracted answer span;
+- do not add general symbolic-math equivalence;
+- never allow missing/blank gold to match any prediction;
+- report `correct / 400` as the all-source coverage-penalized accuracy and
+  `correct / 398` as valid-label accuracy, always with `invalid_gold=2` and
+  the invalid source indices/reasons;
+- prove gold-field-free prompt construction by mutating/removing
+  `original_final_answer` and requiring identical prompt token IDs and image
+  tensors;
+- persist prompt identity/length, generated suffix token IDs, raw decoded
+  output, extracted answer, latent-start/block counts, stop reason, and parse
+  or invalid-gold status.
+
+A hand-written golden scorer set covers balanced fractions, doubled slashes,
+empty predictions, empty gold, malformed braces, and special-token
+boundaries. Existing result JSONL is rescored without generation and retained
+as a historical static-path diagnostic.
+
+#### 2. Add paper-aligned Stage 1 continuous inference
+
+Stage 1 artifacts continue to load through the Stage 1 full/PEFT loaders. The
+checkpoint `stage` tag is never rewritten, and the Stage 2-only resolver is
+not weakened. The existing `LatentRolloutEngine` recurrence kernel is factored
+behind a narrow stage-neutral controller interface, while stage-specific
+artifact validation remains separate.
+
+Before dataset evaluation, two actual-3B forced-prefix cases (leading latent
+and text-then-latent) compare the controller with an independently written
+no-cache implementation of `e_(t+1) = h_t`. Discrete scaffold, masks,
+positions, and token IDs must be exact. Every latent state and post-end logit
+must have symmetric relative L2 at most `1e-6` and cosine at least `0.999999`.
+A recurrence-clamped/static-pad control must alter only the latent feedback
+input; its effect is reported, not assigned an arbitrary quality threshold.
+
+#### 3. Re-evaluate the existing failed checkpoint once
+
+After the scorer and forced-prefix gates pass, run exactly one deterministic
+paper-aligned 400-row evaluation of the existing failed B=1 checkpoint using
+the existing four-shard route, `max_new_tokens=4096`, temperature 0, and top-p
+1. No new training precedes this run. The report contains both denominator
+conventions, latent-entry/block counts, stop reasons, parser changes, and the
+bounded comparison with the rescored historical static-path output. Because
+the old artifact omitted raw token IDs, it is not claimed as a perfect paired
+runtime experiment.
+
+#### 4. Diagnose the boundary failure without claiming generalization
+
+On fixed heterogeneous actual-3B known-boundary prefixes, capture
+`latent_start` and EOS logits/ranks, per-position CE, gradients, trainable
+latent-row and DoRA parameter deltas, and the same quantities after one fresh
+optimizer step. Also test 2--4 cue-colon cases with the original and expanded
+token budgets to distinguish EOS termination from length truncation. These
+are local causal/plumbing diagnostics only. They neither authorize an epoch
+nor prove that the current head/objective generalizes. Any head/interface
+change requires a new approved design based on these results.
+
+#### 5. Complete and test B>1 equivalence
+
+Retain the requested true batched decoder, but make all controllable inputs
+sample-equivalent to independent B=1 execution:
+
+- canonical padded sample schedule and identical optimizer boundaries;
+- samplewise frozen visual and EMA-teacher execution;
+- unified per-sample CE and alignment reductions;
+- sample-keyed DoRA dropout and alignment noise;
+- exact per-sample metadata, target selection, masks, and ordering.
+
+The actual-3B common-state test uses a heterogeneous B=2 pair with different
+sequence/latent-block timing. It compares each row against independently reset
+B=1 execution and checks discrete inputs exactly, sample logits/losses,
+gradients, parameters, optimizer state, and scheduler state under the existing
+v20 numerical thresholds. Frozen EMA (`tau=1`) is the normative two-step
+grouping gate for the requested configuration. Moving EMA is either reset to
+one independently constructed common `S1/E1` state before the second-step
+comparison or reported only as a feedback trajectory witness; natural
+post-step divergence is not mislabeled a common-state failure.
+
+Focused tests plus the smallest actual-3B integration probes are run once.
+The branch's existing 493 passing CPU tests are partial evidence only; they do
+not satisfy this completion gate.
+
+#### 6. Stop before epoch training
+
+After Sections 1--5, report the corrected existing-checkpoint accuracy,
+boundary diagnostics, exact verified scope of B1/B>1 equivalence, GPU time,
+and remaining uncertainty. A fresh one-epoch DoRA frozen-EMA run requires a
+separate explicit go/no-go from the user.
+
+### Changes from proposal v21
+
+- A shared latent input/output head is no longer proposed. Hybrid swaps
+  falsified an output-row-only repair, so the current head is preserved until
+  boundary diagnostics justify a new design.
+- Evaluation correction now precedes batching work. The paper, unlike both
+  repository evaluators, requires continuous hidden-state recurrence and
+  reports Stage 1 accuracy.
+- The underpowered 8/16-sample prevalence stop rule was removed. One bounded
+  full-400 evaluation is unconditional after correctness gates pass.
+- Empty-gold handling, denominator names, raw token evidence, prompt lineage,
+  and bounded parser semantics are explicit.
+- Moving-EMA step 2 is no longer treated as common-state equality after each
+  arm has already diverged.
+- No epoch run is authorized by this commitment.
+
+### First nail and status
+
+The first proposed explanation was that static-pad evaluation caused the
+15.75% collapse. Its cheapest natural-entry test has run and **falsified that
+as a sufficient explanation**: the failed checkpoint entered zero latent
+blocks on fixed TEST indices 0--7, so recurrence was unreachable there.
+Nevertheless, source and paper comparison independently prove the evaluator
+is wrong and must be repaired.
+
+The next implementation first nail is the actual-3B forced-prefix manual
+recurrence comparison in Section 2. It has not run because the controller has
+not yet been implemented. The B1/B2 common-state update gate also has not run
+because the trainer equivalence work is incomplete.
+
+### Material divergences and resolved disagreements
+
+- Fresh reviews initially disagreed on whether Stage 1 accuracy is only a
+  proxy. The paper resolves this: Stage 1 accuracy is explicitly reported and
+  inference uses continuous recurrence. The local guide saying Stage 1 lacks
+  an independent evaluator is stale implementation guidance, not the method
+  contract.
+- Reviews agreed recurrence correctness, natural latent entry, and downstream
+  score impact are separate claims. The full-400 run directly measures the
+  population result instead of inferring it from a small sentinel.
+- Reviews agreed the one-step boundary probe is diagnostic only. It is not a
+  pass/fail proof of architecture adequacy or future accuracy.
+- The two accuracy denominators are both retained rather than silently
+  changing `/400` to `/398`.
+- B=1 remains the batching reference only for verified Stage 1 training
+  semantics; its historical 15.75% endpoint is not treated as a correctness
+  oracle.
+
+### Unvalidated premises and explicit risk limits
+
+- The stage-neutral controller may expose a PEFT unwrapping, MRoPE, vision
+  embedding, or no-cache discrepancy; the independent forced-prefix probe is
+  allowed to fail and stop evaluation.
+- Correct recurrence may barely change this checkpoint because natural latent
+  entry has already failed on 0/8 observed rows.
+- The corrected score remains retrospective: TEST was previously inspected,
+  114/400 prompts have exact text duplicates in TRAIN with different images,
+  and two source rows have invalid gold. No untouched-holdout claim is made.
+- The 3B local experiments are not directly compared to the official 7B
+  checkpoint as model-quality equals.
+- One optimizer step cannot validate convergence, generalization, or a full
+  frozen-EMA trajectory.
+- A true B=2 decoder can retain small kernel/reduction numerical differences
+  even when every controllable semantic matches B=1; claims remain within the
+  declared common-state tolerances.
+
+Approval of design commitment v26 authorizes only the bounded work in Sections
+1--5 and the stop/report in Section 6. It does not authorize a head redesign,
+Stage 2 work, or any epoch training.
