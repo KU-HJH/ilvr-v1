@@ -7,7 +7,6 @@ from torch import nn
 from evaluation.continuous_latent import (
     ContinuousLatentController,
     ContinuousLatentGenerationConfig,
-    GenerationLimitError,
 )
 from stage2.peft import resolve_stage2_qwen_model
 from tests.stage2.helpers import ToyCausalLanguageModel, tiny_stage2_qwen
@@ -45,6 +44,20 @@ class RecordingScriptedHead(ScriptedHead):
         self.hidden_inputs.append(hidden.clone())
         logits = super().forward(hidden)
         self.outputs.append(logits.clone())
+        return logits
+
+
+class PenaltySensitiveHead(nn.Module):
+    def __init__(self, repeated_score, alternative_score, vocab_size=128):
+        super().__init__()
+        self.repeated_score = repeated_score
+        self.alternative_score = alternative_score
+        self.vocab_size = vocab_size
+
+    def forward(self, hidden):
+        logits = hidden.new_full((*hidden.shape[:-1], self.vocab_size), -torch.inf)
+        logits[..., 4] = self.repeated_score
+        logits[..., 5] = self.alternative_score
         return logits
 
 
@@ -200,20 +213,100 @@ def test_stage2_resolver_remains_strict_for_stage1_contract_model():
         resolve_stage2_qwen_model(stage1_model)
 
 
-def test_sequence_cap_raises_generation_limit_error_before_partial_block_rollout():
-    """Catches returning a partial scaffold when a latent block exceeds the cap."""
+@pytest.mark.parametrize(
+    ("repeated_score", "alternative_score"),
+    [(10.0, 9.8), (-9.0, -9.2)],
+)
+def test_repetition_penalty_matches_hf_sign_sensitive_selection(
+    repeated_score, alternative_score
+):
+    """Dropping either HF penalty sign branch must select repeated token 4."""
+    model = scripted_model(latent_size=2, emitted_ids=[])
+    model.lm_head = PenaltySensitiveHead(repeated_score, alternative_score)
+
+    result = ContinuousLatentController().generate(
+        model=model,
+        input_ids=torch.tensor([[4]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=ContinuousLatentGenerationConfig(
+            max_new_tokens=1,
+            repetition_penalty=1.05,
+        ),
+    )
+
+    assert result.generated_suffix_ids == (5,)
+
+
+@pytest.mark.parametrize(
+    ("max_new_tokens", "expected_suffix", "completed_blocks"),
+    [
+        (1, [91], 0),
+        (2, [91, 90], 0),
+        (3, [91, 90, 90], 0),
+        (4, [91, 90, 90, 92], 1),
+    ],
+)
+def test_max_new_tokens_is_a_strict_cap_at_every_latent_boundary(
+    max_new_tokens, expected_suffix, completed_blocks
+):
+    """Completing a started block beyond the HF token budget must fail."""
     model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
 
-    with pytest.raises(GenerationLimitError, match="latent block would exceed"):
-        ContinuousLatentController().generate(
-            model=model,
-            input_ids=torch.tensor([[1]]),
-            attention_mask=torch.ones(1, 1, dtype=torch.long),
-            token_ids=TOKENS,
-            generation_config=ContinuousLatentGenerationConfig(
-                max_new_tokens=1,
-                max_sequence_length=4,
-            ),
-        )
+    result = ContinuousLatentController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=ContinuousLatentGenerationConfig(
+            max_new_tokens=max_new_tokens,
+        ),
+        return_latent_states=True,
+    )
 
-    assert len(model.model.calls) == 1
+    assert list(result.generated_suffix_ids) == expected_suffix
+    assert len(result.generated_suffix_ids) <= max_new_tokens
+    assert result.latent_start_count == 1
+    assert result.latent_block_count == completed_blocks
+    assert len(result.latent_states_by_block) == completed_blocks
+    assert result.stop_reason == "max_new_tokens"
+    if completed_blocks == 0:
+        assert len(model.model.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("remaining_capacity", "expected_suffix", "completed_blocks"),
+    [
+        (1, [91], 0),
+        (2, [91, 90], 0),
+        (3, [91, 90, 90], 0),
+        (4, [91, 90, 90, 92], 1),
+    ],
+)
+def test_sequence_length_is_a_strict_cap_at_every_latent_boundary(
+    remaining_capacity, expected_suffix, completed_blocks
+):
+    """Returning an error or overlong complete block at the total cap must fail."""
+    model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
+    input_ids = torch.tensor([[1]])
+
+    result = ContinuousLatentController().generate(
+        model=model,
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        token_ids=TOKENS,
+        generation_config=ContinuousLatentGenerationConfig(
+            max_new_tokens=16,
+            max_sequence_length=input_ids.shape[1] + remaining_capacity,
+        ),
+        return_latent_states=True,
+    )
+
+    assert list(result.generated_suffix_ids) == expected_suffix
+    assert result.sequences.shape[1] == 1 + remaining_capacity
+    assert result.latent_start_count == 1
+    assert result.latent_block_count == completed_blocks
+    assert len(result.latent_states_by_block) == completed_blocks
+    assert result.stop_reason == "max_sequence_length"
+    if completed_blocks == 0:
+        assert len(model.model.calls) == 1

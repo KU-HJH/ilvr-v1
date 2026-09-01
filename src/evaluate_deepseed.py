@@ -65,6 +65,7 @@ def get_eval_args():
     parser.add_argument("--cache_dir", type=str, default="./cache", help="HF cache dir.")
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--max_sequence_length", type=int, default=32768)
+    parser.add_argument("--repetition_penalty", type=float, default=1.05)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--num-shards", type=int, default=1)
@@ -306,6 +307,7 @@ def main():
     gen_kwargs = dict(
         max_new_tokens=args.max_new_tokens,
         max_sequence_length=args.max_sequence_length,
+        repetition_penalty=args.repetition_penalty,
         temperature=args.temperature,
         top_p=args.top_p,
         do_sample=(args.temperature > 0)
@@ -455,6 +457,7 @@ def main():
             generation_config={
                 "max_new_tokens": args.max_new_tokens,
                 "max_sequence_length": args.max_sequence_length,
+                "repetition_penalty": args.repetition_penalty,
                 "temperature": args.temperature,
                 "top_p": args.top_p,
             },

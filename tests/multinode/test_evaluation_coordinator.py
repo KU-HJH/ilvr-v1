@@ -176,6 +176,12 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
         ]
         for worker in commands.workers
     } == {"32768"}
+    assert {
+        worker.node_spec.command[
+            worker.node_spec.command.index("--repetition_penalty") + 1
+        ]
+        for worker in commands.workers
+    } == {"1.05"}
 
 
 def test_worker_supervisors_bind_exact_evaluation_shard_identity():
@@ -871,6 +877,7 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
             generation_config={
                 "max_new_tokens": 4096,
                 "max_sequence_length": 32768,
+                "repetition_penalty": 1.05,
                 "temperature": 0.0,
                 "top_p": 1.0,
             },
@@ -892,6 +899,7 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
             expected_generation_config={
                 "max_new_tokens": 4096,
                 "max_sequence_length": 32768,
+                "repetition_penalty": 1.05,
                 "temperature": 0.0,
                 "top_p": 1.0,
             },
@@ -941,3 +949,8 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
                 assert command[option + 1] == "32768"
             else:
                 assert "--max_sequence_length 32768" in command[-1]
+            if "--repetition_penalty" in command:
+                option = command.index("--repetition_penalty")
+                assert command[option + 1] == "1.05"
+            else:
+                assert "--repetition_penalty 1.05" in command[-1]

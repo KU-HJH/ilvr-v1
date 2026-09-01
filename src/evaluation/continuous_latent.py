@@ -8,6 +8,7 @@ from functools import partial
 from typing import Protocol, runtime_checkable
 
 import torch
+from transformers import RepetitionPenaltyLogitsProcessor
 
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentSpan,
@@ -41,6 +42,7 @@ class ContinuousLatentGenerationConfig:
 
     max_new_tokens: int = 4096
     max_sequence_length: int | None = None
+    repetition_penalty: float = 1.05
     temperature: float = 0.0
     top_p: float = 1.0
     eos_token_id: int | list[int] | tuple[int, ...] | None = None
@@ -54,6 +56,13 @@ class ContinuousLatentGenerationConfig:
             or self.max_sequence_length <= 0
         ):
             raise ValueError("max_sequence_length must be a positive integer")
+        if (
+            isinstance(self.repetition_penalty, bool)
+            or not isinstance(self.repetition_penalty, (int, float))
+            or not math.isfinite(self.repetition_penalty)
+            or self.repetition_penalty <= 0
+        ):
+            raise ValueError("repetition_penalty must be finite and positive")
         if not math.isfinite(self.temperature) or self.temperature < 0:
             raise ValueError("temperature must be finite and non-negative")
         if not 0 < self.top_p <= 1:
@@ -107,6 +116,12 @@ def build_continuous_generation_config(
     return ContinuousLatentGenerationConfig(
         max_new_tokens=int(generation_kwargs.get("max_new_tokens", 4096)),
         max_sequence_length=max_sequence_length,
+        repetition_penalty=float(
+            generation_kwargs.get(
+                "repetition_penalty",
+                getattr(model_generation_config, "repetition_penalty", 1.05),
+            )
+        ),
         temperature=(
             float(generation_kwargs.get("temperature", 0.0)) if do_sample else 0.0
         ),
@@ -163,8 +178,19 @@ class ContinuousLatentController:
         latent_start_count = 0
         generated = 0
         stop_reason = "max_new_tokens"
+        repetition_processor = RepetitionPenaltyLogitsProcessor(
+            generation_config.repetition_penalty
+        )
 
-        while generated < generation_config.max_new_tokens:
+        while True:
+            remaining_capacity, boundary_stop_reason = _remaining_capacity(
+                sequence_length=sequences.shape[1],
+                generated=generated,
+                config=generation_config,
+            )
+            if remaining_capacity <= 0:
+                stop_reason = boundary_stop_reason
+                break
             position_ids, _ = model.get_rope_index(
                 sequences, image_grid_thw=image_grid_thw, attention_mask=mask
             )
@@ -177,27 +203,11 @@ class ContinuousLatentController:
                 generate_mode=True,
             )
             logits = model.lm_head(outputs.last_hidden_state[:, -1, :]).clone()
+            logits = repetition_processor(sequences, logits)
             logits[..., token_ids.pad_token_id] = -torch.inf
             logits[..., token_ids.end_token_id] = -torch.inf
             next_id = _select_text_token(logits, generation_config)
             next_token_id = int(next_id.item())
-
-            if next_token_id == token_ids.start_token_id:
-                completed_length = sequences.shape[1] + model.config.latent_size + 2
-                if (
-                    generation_config.max_sequence_length is not None
-                    and completed_length > generation_config.max_sequence_length
-                ):
-                    raise GenerationLimitError(
-                        "latent block would exceed max_sequence_length"
-                    )
-            elif (
-                generation_config.max_sequence_length is not None
-                and sequences.shape[1] + 1 > generation_config.max_sequence_length
-            ):
-                raise GenerationLimitError(
-                    "generated token would exceed max_sequence_length"
-                )
 
             next_ids = next_id[:, None]
             sequences = torch.cat((sequences, next_ids), dim=1)
@@ -216,11 +226,18 @@ class ContinuousLatentController:
                     dtype=sequences.dtype,
                     device=sequences.device,
                 )
-                sequences = torch.cat((sequences, suffix), dim=1)
-                mask = torch.cat((mask, torch.ones_like(suffix)), dim=1)
-                inputs_embeds = torch.cat(
-                    (inputs_embeds, model.get_input_embeddings()(suffix)), dim=1
-                )
+                suffix_capacity = remaining_capacity - 1
+                suffix = suffix[:, :suffix_capacity]
+                if suffix.shape[1] > 0:
+                    sequences = torch.cat((sequences, suffix), dim=1)
+                    mask = torch.cat((mask, torch.ones_like(suffix)), dim=1)
+                    inputs_embeds = torch.cat(
+                        (inputs_embeds, model.get_input_embeddings()(suffix)), dim=1
+                    )
+                    generated += suffix.shape[1]
+                if suffix.shape[1] < model.config.latent_size + 1:
+                    stop_reason = boundary_stop_reason
+                    break
                 full_position_ids, _ = model.get_rope_index(
                     sequences, image_grid_thw=image_grid_thw, attention_mask=mask
                 )
@@ -252,11 +269,19 @@ class ContinuousLatentController:
                         model.lm_head(post_end_outputs.last_hidden_state[:, -1, :])
                     )
                 latent_blocks.append(rollout.latent_states)
-                generated += model.config.latent_size + 1
+                if generated == generation_config.max_new_tokens or (
+                    generation_config.max_sequence_length is not None
+                    and sequences.shape[1] == generation_config.max_sequence_length
+                ):
+                    stop_reason = boundary_stop_reason
+                    break
                 continue
 
             if next_token_id in generation_config.eos_token_ids:
                 stop_reason = "eos"
+                break
+            if remaining_capacity == 1:
+                stop_reason = boundary_stop_reason
                 break
 
         return ContinuousLatentGenerationResult(
@@ -310,3 +335,19 @@ def _select_text_token(
         )
         probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
     return torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+
+
+def _remaining_capacity(
+    *,
+    sequence_length: int,
+    generated: int,
+    config: ContinuousLatentGenerationConfig,
+) -> tuple[int, str]:
+    """Return the strict token budget and the cap that will end generation."""
+    remaining_new_tokens = config.max_new_tokens - generated
+    if config.max_sequence_length is None:
+        return remaining_new_tokens, "max_new_tokens"
+    remaining_sequence_tokens = config.max_sequence_length - sequence_length
+    if remaining_new_tokens <= remaining_sequence_tokens:
+        return remaining_new_tokens, "max_new_tokens"
+    return remaining_sequence_tokens, "max_sequence_length"

@@ -368,6 +368,7 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
     assert args.model_identity is None
     assert args.max_new_tokens == 4096
     assert args.max_sequence_length == 32768
+    assert args.repetition_penalty == 1.05
 
 
 def _run_main_with_fake_sample(
@@ -402,6 +403,7 @@ def _run_main_with_fake_sample(
             cache_dir="cache",
             max_new_tokens=8,
             max_sequence_length=32768,
+            repetition_penalty=1.05,
             temperature=0.0,
             top_p=1.0,
             num_shards=num_shards,
@@ -413,6 +415,7 @@ def _run_main_with_fake_sample(
 
     def run_one(_model, _processor, sample, _gen_kwargs):
         assert _gen_kwargs["max_sequence_length"] == 32768
+        assert _gen_kwargs["repetition_penalty"] == 1.05
         index = int(sample["text_input"].rsplit("-", 1)[1])
         if index == fail_index:
             raise RuntimeError("causal sample failure")
@@ -469,6 +472,7 @@ def test_eval_entrypoint_resolves_dataset_relative_image_before_run_one(
             cache_dir="cache",
             max_new_tokens=8,
             max_sequence_length=32768,
+            repetition_penalty=1.05,
             temperature=0.0,
             top_p=1.0,
             num_shards=1,
@@ -618,6 +622,7 @@ def test_standard_tasks_score_assistant_content_and_record_parse_fields(
             cache_dir="cache",
             max_new_tokens=8,
             max_sequence_length=32768,
+            repetition_penalty=1.05,
             temperature=0.0,
             top_p=1.0,
             num_shards=1,
@@ -689,6 +694,7 @@ def test_inference_error_rows_preserve_invalid_gold_for_summary(
             cache_dir="cache",
             max_new_tokens=8,
             max_sequence_length=32768,
+            repetition_penalty=1.05,
             temperature=0.0,
             top_p=1.0,
             num_shards=1,
@@ -759,6 +765,7 @@ def test_four_shard_worker_uses_global_indices_and_writes_success_sidecar(
     assert manifest["generation_config"] == {
         "max_new_tokens": 8,
         "max_sequence_length": 32768,
+        "repetition_penalty": 1.05,
         "temperature": 0.0,
         "top_p": 1.0,
     }
@@ -812,6 +819,7 @@ def test_empty_four_shard_worker_still_publishes_mergeable_success_sidecar(
             cache_dir="cache",
             max_new_tokens=8,
             max_sequence_length=32768,
+            repetition_penalty=1.05,
             temperature=0.0,
             top_p=1.0,
             num_shards=4,
@@ -1557,6 +1565,7 @@ def test_eval_uses_controller_with_original_visual_inputs_and_preserves_decoding
             "do_sample": True,
             "eos_token_id": 8,
             "max_sequence_length": 64,
+            "repetition_penalty": 1.05,
         },
     )
 
@@ -1575,6 +1584,7 @@ def test_eval_uses_controller_with_original_visual_inputs_and_preserves_decoding
     assert call["generation_config"].top_p == 0.75
     assert call["generation_config"].eos_token_id == 8
     assert call["generation_config"].max_sequence_length == 64
+    assert call["generation_config"].repetition_penalty == 1.05
     assert call["return_latent_states"] is False
     assert len(processor.images) == 1
     assert processor.images[0].mode == "RGB"
@@ -1717,16 +1727,19 @@ def test_eval_preserves_multiple_eos_ids(module_name, source, monkeypatch):
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
 def test_eval_derives_model_sequence_cap_for_real_controller(module_name, monkeypatch):
-    """Dropping the model-derived cap would let this latent block overflow."""
+    """The model-derived cap must truncate the latent scaffold without overflow."""
     module = _import_entry_point(module_name, monkeypatch)
 
-    with pytest.raises(ValueError, match="latent block would exceed"):
-        module.run_one_example(
-            RealControllerCapModel(),
-            FakeProcessor(include_visual_inputs=False),
-            {"text_input": "question"},
-            {"max_new_tokens": 1, "temperature": 0.0, "top_p": 1.0},
-        )
+    result = module.run_one_example(
+        RealControllerCapModel(),
+        FakeProcessor(include_visual_inputs=False),
+        {"text_input": "question"},
+        {"max_new_tokens": 16, "temperature": 0.0, "top_p": 1.0},
+    )
+
+    assert result["generated_suffix_token_ids"] == [91, 90, 90]
+    assert result["latent_block_count"] == 0
+    assert result["stop_reason"] == "max_sequence_length"
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

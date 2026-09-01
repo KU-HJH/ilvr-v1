@@ -22,7 +22,7 @@
 - Report both coverage-penalized `correct / 400` and valid-label `correct / 398`, including invalid indices and reasons.
 - Persist prompt identity/length, generated suffix IDs, raw decode, extracted answer, latent counts, stop reason, and parse/invalid status per row.
 - The actual-3B recurrence gate requires exact discrete scaffold/mask/position/token equality, symmetric relative L2 `<= 1e-6`, and cosine `>= 0.999999` for every latent state and post-end logit.
-- Run exactly one deterministic paper-aligned full-400 evaluation of `checkpoints/stage1-dora-z1-ema-frozen-b1-ga4-e1-egb16-20260901-090240/checkpoint-215` with four shards, `max_new_tokens=4096`, explicit total `max_sequence_length=32768`, temperature `0`, and top-p `1`.
+- Run exactly one deterministic paper-aligned full-400 evaluation of `checkpoints/stage1-dora-z1-ema-frozen-b1-ga4-e1-egb16-20260901-090240/checkpoint-215` with four shards, `max_new_tokens=4096`, explicit total `max_sequence_length=32768`, `repetition_penalty=1.05`, temperature `0`, and top-p `1`.
 - Store new model-bearing staging only under `checkpoints/evaluation-staging/<run-id>/`, results under `results/<run-id>/`, and logs under `logs/<run-id>/` or the existing multinode log namespace.
 - Do not train an epoch, redesign the latent head, or begin Stage 2 work.
 
@@ -142,7 +142,7 @@ git commit -m "fix: make Stage 1 answer scoring coverage-safe"
 - Modify: `tests/stage2/test_inference.py`
 
 **Interfaces:**
-- Produces `ContinuousLatentGenerationConfig(max_new_tokens=4096, max_sequence_length=None, temperature=0.0, top_p=1.0, eos_token_id=None)`.
+- Produces `ContinuousLatentGenerationConfig(max_new_tokens=4096, max_sequence_length=None, repetition_penalty=1.05, temperature=0.0, top_p=1.0, eos_token_id=None)`.
 - Produces `ContinuousLatentGenerationResult(sequences, latent_states_by_block, generated_suffix_ids, latent_start_count, latent_block_count, stop_reason, post_end_logits_by_block)`.
 - Produces `build_continuous_generation_config(...) -> ContinuousLatentGenerationConfig`.
 - Produces `ContinuousLatentController.generate(...) -> ContinuousLatentGenerationResult`.
@@ -187,7 +187,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD:$PWD/src:$PWD/transformers/src" \
 
 - [ ] **Step 3: Move only the generic recurrence implementation**
 
-Copy the existing validated no-cache loop into `evaluation.continuous_latent` and rename stage-specific identifiers. Continue to call the existing `model.stage2_rollout_engine.rollout(...)`; every local Stage 1 and Stage 2 Qwen instance installs that kernel in its constructor. Do not edit `LatentRolloutEngine` arithmetic. Count a block only after its complete start/pad/end scaffold and recurrence finish. Successful results use stop reasons `eos` or `max_new_tokens`. A sequence cap violation raises `GenerationLimitError` and returns no result.
+Copy the existing validated no-cache loop into `evaluation.continuous_latent` and rename stage-specific identifiers. Continue to call the existing `model.stage2_rollout_engine.rollout(...)`; every local Stage 1 and Stage 2 Qwen instance installs that kernel in its constructor. Do not edit `LatentRolloutEngine` arithmetic. Count a block only after its complete start/pad/end scaffold and recurrence finish. Apply the reference checkpoint's sign-sensitive repetition penalty to the full token history before structural-token masking. Both token limits are strict: if a cap cuts a latent scaffold, return only the structural prefix that fits and do not run recurrence for that incomplete block. Successful results use stop reasons `eos`, `max_new_tokens`, or `max_sequence_length`.
 
 The controller and independent probe implement this exact sequence:
 
@@ -476,6 +476,7 @@ Reuse the already validated model-bearing artifact at `checkpoints/evaluation-st
   --cache-dir "$PWD/cache" \
   --max-new-tokens 4096 \
   --max-sequence-length 32768 \
+  --repetition-penalty 1.05 \
   --temperature 0 \
   --top-p 1
 ```

@@ -89,7 +89,7 @@ logging / checkpoints         every 20 steps / epoch boundaries 216,432,648
 DeepSpeed config SHA-256      c0922c8640778ae928c503f5bcacb070f2efaf34b7122431d9b4c2989e25debd
 evaluation dataset            data/TEST.jsonl
 evaluation dataset SHA-256    6a1dccf32bb5196d09941adfd8ea79e29b58c34316f286673b557ed29dc69618
-evaluation generation         4 shards, max_new_tokens=4096, temperature=0, top_p=1
+evaluation generation         4 shards, max_new_tokens=4096, max_sequence_length=32768, repetition_penalty=1.05, temperature=0, top_p=1
 ```
 
 The comparison does not use an earlier B=2 checkpoint as a B=1 control. Both
@@ -1322,8 +1322,9 @@ input; its effect is reported, not assigned an arbitrary quality threshold.
 
 After the scorer and forced-prefix gates pass, run exactly one deterministic
 paper-aligned 400-row evaluation of the existing failed B=1 checkpoint using
-the existing four-shard route, `max_new_tokens=4096`, temperature 0, and top-p
-1. No new training precedes this run. The report contains both denominator
+the existing four-shard route, `max_new_tokens=4096`,
+`max_sequence_length=32768`, `repetition_penalty=1.05`, temperature 0, and
+top-p 1. No new training precedes this run. The report contains both denominator
 conventions, latent-entry/block counts, stop reasons, parser changes, and the
 bounded comparison with the rescored historical static-path output. Because
 the old artifact omitted raw token IDs, it is not claimed as a perfect paired
@@ -1467,3 +1468,39 @@ worker command, and the merged generation configuration.
 This amendment changes no recurrence arithmetic, score rule, training
 configuration, or epoch authorization. The user's approval of v27 applies only
 to this explicit evaluation cap and its auditable propagation.
+
+## Design commitment v29 amendment: reference generation parity
+
+The reference evaluator delegates token selection to Hugging Face
+`model.generate`. Its effective deterministic settings include
+`max_new_tokens=4096`, `repetition_penalty=1.05`, temperature `0`, top-p `1`,
+one beam, and the checkpoint EOS IDs. Replacing that call with the continuous
+latent controller omitted the sign-sensitive repetition processor. The
+controller now applies the Hugging Face-equivalent processor to every
+unforced selection using the complete current token history, before masking
+latent pad/end IDs outside a block.
+
+Both limits are strict token-count caps. `max_new_tokens=4096` counts every
+generated text or structural token. `max_sequence_length=32768` counts the
+prompt plus every generated token. If either limit intersects a latent
+scaffold, the result contains only the forced prefix that fits: start, then as
+many pads and the end token as capacity permits. An incomplete block does not
+run continuous recurrence, contributes no completed block or latent states,
+and reports the cap that stopped it. If both limits bind at the same boundary,
+`max_new_tokens` is the canonical stop reason. A complete scaffold that exactly
+fits still runs recurrence and counts as one completed block.
+
+Both evaluator CLIs default to `repetition_penalty=1.05`; the four-worker
+coordinator passes it explicitly; and manifest schema 4 records and validates
+it. Schemas 1--3 remain readable with their historical fields. The full-400
+launch must explicitly state `--max-new-tokens 4096`,
+`--max-sequence-length 32768`, and `--repetition-penalty 1.05`.
+
+The v29 first nail was a controller-level comparison covering positive and
+negative repeated logits plus every structural boundary under each cap. The
+pre-change tests selected the wrong token and either exceeded or rejected the
+limits; the bounded implementation passes those cases and the evaluator,
+coordinator, and manifest regression suite. This amendment changes no training
+weights, recurrence arithmetic for complete blocks, scoring rule, or epoch
+authorization. The pending full-400 evaluation remains unlaunched until code
+review and final verification complete.

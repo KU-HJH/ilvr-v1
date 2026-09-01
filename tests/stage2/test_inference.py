@@ -241,7 +241,7 @@ def test_inference_forces_exactly_k_latents_and_supports_multiple_blocks():
     assert model.visual_calls == 1
 
 
-def test_started_block_finishes_past_nominal_budget_without_vocabulary_sampling():
+def test_started_block_stops_at_strict_nominal_budget_without_rollout():
     model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
 
     result = Stage2InferenceController().generate(
@@ -252,7 +252,9 @@ def test_started_block_finishes_past_nominal_budget_without_vocabulary_sampling(
         generation_config=Stage2GenerationConfig(max_new_tokens=1),
     )
 
-    assert result.sequences[0, -4:].tolist() == [91, 90, 90, 92]
+    assert result.generated_suffix_ids == (91,)
+    assert result.latent_block_count == 0
+    assert result.stop_reason == "max_new_tokens"
     assert model.lm_head.calls == 1
 
 
@@ -311,7 +313,7 @@ def test_nucleus_sampling_can_enter_latent_mode_through_latent_start():
         attention_mask=torch.ones(1, 1, dtype=torch.long),
         token_ids=TOKENS,
         generation_config=Stage2GenerationConfig(
-            max_new_tokens=1,
+            max_new_tokens=4,
             temperature=1.0,
             top_p=0.5,
         ),
@@ -340,38 +342,43 @@ def test_inference_stops_on_either_member_of_multiple_eos_ids(emitted_eos):
     assert model.lm_head.calls == 1
 
 
-def test_latent_block_rejects_hard_sequence_cap_before_rollout():
+def test_latent_block_returns_only_structural_prefix_at_sequence_cap():
     model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
 
-    with pytest.raises(ValueError, match="latent block would exceed max_sequence_length"):
-        Stage2InferenceController().generate(
-            model=model,
-            input_ids=torch.tensor([[1]]),
-            attention_mask=torch.ones(1, 1, dtype=torch.long),
-            token_ids=TOKENS,
-            generation_config=Stage2GenerationConfig(
-                max_new_tokens=1,
-                max_sequence_length=4,
-            ),
-        )
+    result = Stage2InferenceController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=Stage2GenerationConfig(
+            max_new_tokens=16,
+            max_sequence_length=4,
+        ),
+    )
 
+    assert result.generated_suffix_ids == (91, 90, 90)
+    assert result.latent_block_count == 0
+    assert result.stop_reason == "max_sequence_length"
     assert len(model.model.calls) == 1
 
 
-def test_ordinary_text_rejects_hard_sequence_cap():
+def test_ordinary_text_returns_without_sampling_at_sequence_cap():
     model = scripted_model(latent_size=2, emitted_ids=[4])
 
-    with pytest.raises(ValueError, match="max_sequence_length"):
-        Stage2InferenceController().generate(
-            model=model,
-            input_ids=torch.tensor([[1, 2]]),
-            attention_mask=torch.ones(1, 2, dtype=torch.long),
-            token_ids=TOKENS,
-            generation_config=Stage2GenerationConfig(
-                max_new_tokens=1,
-                max_sequence_length=2,
-            ),
-        )
+    result = Stage2InferenceController().generate(
+        model=model,
+        input_ids=torch.tensor([[1, 2]]),
+        attention_mask=torch.ones(1, 2, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=Stage2GenerationConfig(
+            max_new_tokens=1,
+            max_sequence_length=2,
+        ),
+    )
+
+    assert result.generated_suffix_ids == ()
+    assert result.stop_reason == "max_sequence_length"
+    assert len(model.model.calls) == 0
 
 
 def test_inference_rejects_batch_greater_than_one():
@@ -389,6 +396,7 @@ def test_generation_config_defaults_to_official_evaluation_output_limit():
     config = Stage2GenerationConfig()
 
     assert config.max_new_tokens == 4096
+    assert config.repetition_penalty == 1.05
 
 
 @pytest.mark.parametrize(
@@ -396,6 +404,8 @@ def test_generation_config_defaults_to_official_evaluation_output_limit():
     [
         {"max_new_tokens": -1},
         {"max_sequence_length": 0},
+        {"repetition_penalty": 0.0},
+        {"repetition_penalty": float("nan")},
         {"temperature": -0.1},
         {"temperature": float("nan")},
         {"temperature": float("inf")},
@@ -593,7 +603,7 @@ def test_peft_training_and_inference_share_latent_states_and_full_mrope_position
         input_ids=context,
         attention_mask=torch.ones_like(context),
         token_ids=TOKENS,
-        generation_config=Stage2GenerationConfig(max_new_tokens=1),
+        generation_config=Stage2GenerationConfig(max_new_tokens=4),
         image_grid_thw=image_grid_thw,
         pixel_values=pixel_values,
         return_latent_states=True,

@@ -415,6 +415,10 @@ start token has been emitted, the complete block is always appended, even if
 this exceeds the nominal `max_new_tokens` budget by up to `K + 1` structural
 tokens. A hard model sequence-length overflow remains an explicit error.
 
+This historical limit policy is superseded for evaluation by design commitment
+v29 in `2026-09-01-stage1-batch-equivalence-design.md`: both caps are strict,
+and a truncated scaffold is returned without running an incomplete recurrence.
+
 The initial controller supports `B=1` only. It does not implement beam search,
 arbitrary Hugging Face generation features, or KV caching.
 

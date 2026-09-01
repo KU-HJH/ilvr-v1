@@ -1042,6 +1042,7 @@ class EvaluationPlan:
     cache_dir: Path = _REPOSITORY_ROOT / "cache"
     max_new_tokens: int = 4096
     max_sequence_length: int = 32768
+    repetition_penalty: float = 1.05
     temperature: float = 0.0
     top_p: float = 1.0
     attempt_timeout_seconds: int = 24 * 60 * 60
@@ -1099,6 +1100,12 @@ class EvaluationPlan:
             or self.max_sequence_length <= 0
         ):
             raise ValueError("max_sequence_length must be positive")
+        if (
+            type(self.repetition_penalty) not in (int, float)
+            or not math.isfinite(self.repetition_penalty)
+            or self.repetition_penalty <= 0
+        ):
+            raise ValueError("repetition_penalty must be finite and positive")
         if (
             type(self.temperature) not in (int, float)
             or not math.isfinite(self.temperature)
@@ -1205,6 +1212,7 @@ def _build_evaluation_commands_for_stage(
             "--cache_dir", str(plan.cache_dir),
             "--max_new_tokens", str(plan.max_new_tokens),
             "--max_sequence_length", str(plan.max_sequence_length),
+            "--repetition_penalty", str(plan.repetition_penalty),
             "--temperature", str(plan.temperature),
             "--top_p", str(plan.top_p),
         ]
@@ -2911,6 +2919,7 @@ class EvaluationSubprocessRunner:
             expected_generation_config={
                 "max_new_tokens": self.plan.max_new_tokens,
                 "max_sequence_length": self.plan.max_sequence_length,
+                "repetition_penalty": self.plan.repetition_penalty,
                 "temperature": self.plan.temperature,
                 "top_p": self.plan.top_p,
             },

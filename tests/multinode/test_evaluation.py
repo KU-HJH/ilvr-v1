@@ -103,6 +103,7 @@ def _write_fake_shards(
             {
                 "max_new_tokens": 4096,
                 "max_sequence_length": 32768,
+                "repetition_penalty": 1.05,
                 "temperature": 0.0,
                 "top_p": 1.0,
             },
@@ -190,6 +191,7 @@ def test_merge_sorts_rows_and_computes_accuracy_once(tmp_path):
         "generation_config": {
             "max_new_tokens": 4096,
             "max_sequence_length": 32768,
+            "repetition_penalty": 1.05,
             "temperature": 0.0,
             "top_p": 1.0,
         },
@@ -243,6 +245,7 @@ def test_merge_preserves_gold_denominators_and_invalid_gold_records(tmp_path):
         "generation_config": {
             "max_new_tokens": 4096,
             "max_sequence_length": 32768,
+            "repetition_penalty": 1.05,
             "temperature": 0.0,
             "top_p": 1.0,
         },
@@ -262,6 +265,7 @@ def test_merge_rejects_generation_config_mismatch(tmp_path):
         {
             "max_new_tokens": 4096,
             "max_sequence_length": 32768,
+            "repetition_penalty": 1.05,
             "temperature": 0.0,
             "top_p": 1.0,
         }
@@ -270,6 +274,7 @@ def test_merge_rejects_generation_config_mismatch(tmp_path):
     configs[3] = {
         "max_new_tokens": 4096,
         "max_sequence_length": 65536,
+        "repetition_penalty": 1.05,
         "temperature": 0.0,
         "top_p": 1.0,
     }
@@ -299,12 +304,32 @@ def test_merge_keeps_schema_two_generation_config_compatibility(tmp_path):
         manifest = json.loads(path.read_text(encoding="utf-8"))
         manifest["schema_version"] = 2
         manifest["generation_config"].pop("max_sequence_length")
+        manifest["generation_config"].pop("repetition_penalty")
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
     summary = _merge(tmp_path, shards, expected_sample_count=4)
 
     assert summary["generation_config"] == {
         "max_new_tokens": 4096,
+        "temperature": 0.0,
+        "top_p": 1.0,
+    }
+
+
+def test_merge_keeps_schema_three_sequence_cap_compatibility(tmp_path):
+    """Reading a pre-penalty sidecar must not require rewriting history."""
+    shards = _write_fake_shards(tmp_path)
+    for path in shards:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 3
+        manifest["generation_config"].pop("repetition_penalty")
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    summary = _merge(tmp_path, shards, expected_sample_count=4)
+
+    assert summary["generation_config"] == {
+        "max_new_tokens": 4096,
+        "max_sequence_length": 32768,
         "temperature": 0.0,
         "top_p": 1.0,
     }

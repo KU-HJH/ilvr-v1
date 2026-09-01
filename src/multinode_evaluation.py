@@ -10,7 +10,8 @@ from evaluation.scoring import EvaluationScoreSummary
 
 
 NUM_EVALUATION_SHARDS = 4
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
+SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION = 3
 GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION = 2
 LEGACY_MANIFEST_SCHEMA_VERSION = 1
 
@@ -130,15 +131,21 @@ def _validate_dataset_identity(value: object) -> dict[str, Any]:
 
 
 def _validate_generation_config(
-    value: object, *, require_sequence_length: bool = True
+    value: object,
+    *,
+    require_sequence_length: bool = True,
+    require_repetition_penalty: bool = True,
 ) -> dict[str, Any]:
     required = {"max_new_tokens", "temperature", "top_p"}
     if require_sequence_length:
         required.add("max_sequence_length")
+    if require_repetition_penalty:
+        required.add("repetition_penalty")
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("invalid generation config")
     max_new_tokens = value["max_new_tokens"]
     max_sequence_length = value.get("max_sequence_length")
+    repetition_penalty = value.get("repetition_penalty")
     temperature = value["temperature"]
     top_p = value["top_p"]
     if not _is_int(max_new_tokens) or max_new_tokens <= 0:
@@ -147,6 +154,12 @@ def _validate_generation_config(
         not _is_int(max_sequence_length) or max_sequence_length <= 0
     ):
         raise ValueError("invalid generation config max_sequence_length")
+    if require_repetition_penalty and (
+        type(repetition_penalty) not in (int, float)
+        or not math.isfinite(repetition_penalty)
+        or repetition_penalty <= 0
+    ):
+        raise ValueError("invalid generation config repetition_penalty")
     if (
         type(temperature) not in (int, float)
         or not math.isfinite(temperature)
@@ -166,6 +179,8 @@ def _validate_generation_config(
     }
     if require_sequence_length:
         normalized["max_sequence_length"] = max_sequence_length
+    if require_repetition_penalty:
+        normalized["repetition_penalty"] = float(repetition_penalty)
     return normalized
 
 
@@ -254,6 +269,7 @@ def _validate_manifest(
         raise ValueError(f"unsupported shard manifest schema in {path}")
     if schema_version in (
         MANIFEST_SCHEMA_VERSION,
+        SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION,
         GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION,
     ):
         required_fields.add("generation_config")
@@ -282,11 +298,16 @@ def _validate_manifest(
         raise ValueError(f"invalid model identity in {path}")
     if schema_version in (
         MANIFEST_SCHEMA_VERSION,
+        SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION,
         GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION,
     ):
         manifest["generation_config"] = _validate_generation_config(
             manifest["generation_config"],
-            require_sequence_length=(schema_version == MANIFEST_SCHEMA_VERSION),
+            require_sequence_length=(
+                schema_version
+                in (MANIFEST_SCHEMA_VERSION, SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION)
+            ),
+            require_repetition_penalty=(schema_version == MANIFEST_SCHEMA_VERSION),
         )
     exit_status = manifest["worker_exit_status"]
     if not _is_int(exit_status) or exit_status < 0:
