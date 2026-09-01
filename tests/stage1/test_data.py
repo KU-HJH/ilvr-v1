@@ -11,6 +11,7 @@ from .helpers import (
     prepared_example,
 )
 from stage1.data import Stage1DataCollator, prepare_stage1_comt_examples
+from stage1.equivalence import Stage1SampleOccurrence
 
 
 @pytest.fixture
@@ -46,6 +47,31 @@ def test_collator_records_per_sample_ownership_and_row_identity(stage1_collator)
     assert batch["image_out_mask"].shape == batch["input_ids"].shape
     assert batch["pixel_values_latent"].shape[0] == 3
     assert batch["image_grid_thw_latent"].shape[0] == 3
+
+
+def test_collator_allows_padded_source_repeats_when_canonical_slots_are_distinct(
+    stage1_collator,
+):
+    """Catches canonical padding being rejected merely because it repeats a source row."""
+    first = prepared_example(source_index=0, original_images=1, helper_images=1, blocks=1)
+    occurrences = (
+        Stage1SampleOccurrence(0, 3450, 2, 3450, 0, 2, 0, 0, 0),
+        Stage1SampleOccurrence(0, 3451, 6, 3451, 1, 2, 1, 0, 1),
+    )
+    batch = stage1_collator(
+        [replace(first, occurrence=occurrences[0]), replace(first, occurrence=occurrences[1], source_index=1)]
+    )
+
+    assert [sample.canonical_slot_id for sample in batch["stage1_batch_metadata"].samples] == [3450, 3451]
+
+
+def test_collator_rejects_duplicate_canonical_slot_in_equivalence_batch(stage1_collator):
+    """Catches two scheduled rows claiming the same canonical occurrence identity."""
+    occurrence = Stage1SampleOccurrence(0, 0, 2, 0, 0, 2, 0, 0, 0)
+    first = prepared_example(source_index=0, original_images=1, helper_images=1, blocks=1)
+
+    with pytest.raises(ValueError, match="duplicate canonical_slot_id"):
+        stage1_collator([replace(first, occurrence=occurrence), replace(first, occurrence=occurrence)])
 
 
 def test_collator_tokenizes_all_placeholders_but_publishes_role_owned_pixels():

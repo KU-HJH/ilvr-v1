@@ -21,6 +21,65 @@ DEFAULT_STAGE1_TARGET_SUFFIXES = (
     "up_proj",
     "down_proj",
 )
+STAGE1_CANONICAL_VIEW_LENGTH = 3456
+
+
+@dataclass(frozen=True)
+class Stage1SampleOccurrence:
+    """Immutable identity of one source-row occurrence in the canonical view."""
+
+    epoch: int
+    view_slot: int
+    permutation_offset: int
+    canonical_slot_id: int
+    source_index: int
+    rank: int
+    rank_local_sample_ordinal: int
+    rank_local_microbatch_ordinal: int
+    row_ordinal_within_microbatch: int
+
+    def __post_init__(self) -> None:
+        fields = (
+            self.epoch,
+            self.view_slot,
+            self.permutation_offset,
+            self.canonical_slot_id,
+            self.source_index,
+            self.rank,
+            self.rank_local_sample_ordinal,
+            self.rank_local_microbatch_ordinal,
+            self.row_ordinal_within_microbatch,
+        )
+        if any(type(value) is not int for value in fields):
+            raise ValueError("Stage 1 occurrence fields must be integers")
+        if self.epoch < 0 or not 0 <= self.view_slot < STAGE1_CANONICAL_VIEW_LENGTH:
+            raise ValueError("Stage 1 occurrence has an invalid epoch or view_slot")
+        if not 0 <= self.permutation_offset < STAGE1_CANONICAL_VIEW_LENGTH:
+            raise ValueError("Stage 1 occurrence has an invalid permutation_offset")
+        if self.canonical_slot_id != self.epoch * STAGE1_CANONICAL_VIEW_LENGTH + self.view_slot:
+            raise ValueError("Stage 1 occurrence canonical_slot_id does not match epoch/view_slot")
+        if self.source_index < 0 or not 0 <= self.rank < 4:
+            raise ValueError("Stage 1 occurrence has an invalid source_index or rank")
+        if self.permutation_offset % 4 != self.rank:
+            raise ValueError("Stage 1 occurrence permutation_offset does not match rank")
+        if (
+            self.rank_local_sample_ordinal < 0
+            or self.rank_local_microbatch_ordinal < 0
+            or self.row_ordinal_within_microbatch < 0
+        ):
+            raise ValueError("Stage 1 occurrence has a negative rank-local ordinal")
+        b1_grouping = (
+            self.rank_local_sample_ordinal == self.rank_local_microbatch_ordinal
+            and self.row_ordinal_within_microbatch == 0
+        )
+        b2_grouping = (
+            self.rank_local_sample_ordinal
+            == 2 * self.rank_local_microbatch_ordinal
+            + self.row_ordinal_within_microbatch
+            and self.row_ordinal_within_microbatch < 2
+        )
+        if not (b1_grouping or b2_grouping):
+            raise ValueError("Stage 1 occurrence has an invalid rank-local grouping")
 
 
 @dataclass(frozen=True)
@@ -43,6 +102,14 @@ class Stage1SampleMetadata:
     latent_spans: tuple[Stage1LatentSpan, ...]
     helper_to_block: tuple[int, ...]
     unpadded_length: int
+    epoch: int | None = None
+    view_slot: int | None = None
+    permutation_offset: int | None = None
+    canonical_slot_id: int | None = None
+    rank: int | None = None
+    rank_local_sample_ordinal: int | None = None
+    rank_local_microbatch_ordinal: int | None = None
+    row_ordinal_within_microbatch: int | None = None
 
 
 @dataclass(frozen=True)

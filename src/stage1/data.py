@@ -13,6 +13,7 @@ import torch
 from stage1.types import (
     Stage1BatchMetadata,
     Stage1LatentSpan,
+    Stage1SampleOccurrence,
     Stage1SampleMetadata,
 )
 from task_deepseed import interleaved_latent_cot_preprocess_function
@@ -35,6 +36,7 @@ class PreparedStage1Example:
     conversation: list[dict]
     original_image_paths: tuple[str | Image.Image, ...]
     helper_image_paths: tuple[str | Image.Image, ...]
+    occurrence: Stage1SampleOccurrence | None = None
 
 
 def prepare_stage1_comt_examples(
@@ -143,7 +145,7 @@ class Stage1DataCollator:
         examples = tuple(examples)
         if not examples:
             raise ValueError("Stage 1 collator requires at least one example")
-        self._validate_source_indices(examples)
+        self._validate_sample_identity(examples)
 
         batch = self._process_full_conversations(examples)
         original = self._process_original_images(examples)
@@ -179,6 +181,32 @@ class Stage1DataCollator:
             "image_grid_thw_latent": helper["image_grid_thw"],
             "stage1_batch_metadata": metadata,
         }
+
+    @staticmethod
+    def _validate_sample_identity(examples: Sequence[PreparedStage1Example]) -> None:
+        occurrences = tuple(example.occurrence for example in examples)
+        if all(occurrence is None for occurrence in occurrences):
+            Stage1DataCollator._validate_source_indices(examples)
+            return
+        if any(occurrence is None for occurrence in occurrences):
+            raise ValueError(
+                "Stage 1 collator observed a mixed ordinary/equivalence batch; "
+                "expected every row to have complete occurrence identity"
+            )
+        seen_slots = set()
+        for example, occurrence in zip(examples, occurrences):
+            assert occurrence is not None
+            if example.source_index != occurrence.source_index:
+                raise ValueError(
+                    f"source_index={example.source_index}: observed occurrence source_index "
+                    f"{occurrence.source_index}; expected matching source provenance"
+                )
+            if occurrence.canonical_slot_id in seen_slots:
+                raise ValueError(
+                    "Stage 1 collator observed duplicate canonical_slot_id; "
+                    "expected unique equivalence occurrences within a batch"
+                )
+            seen_slots.add(occurrence.canonical_slot_id)
 
     @staticmethod
     def _validate_source_indices(examples: Sequence[PreparedStage1Example]) -> None:
@@ -471,6 +499,26 @@ class Stage1DataCollator:
                     latent_spans=latent_spans[row_index],
                     helper_to_block=tuple(range(helper_counts[row_index])),
                     unpadded_length=unpadded_lengths[row_index],
+                    epoch=None if example.occurrence is None else example.occurrence.epoch,
+                    view_slot=None
+                    if example.occurrence is None
+                    else example.occurrence.view_slot,
+                    permutation_offset=None
+                    if example.occurrence is None
+                    else example.occurrence.permutation_offset,
+                    canonical_slot_id=None
+                    if example.occurrence is None
+                    else example.occurrence.canonical_slot_id,
+                    rank=None if example.occurrence is None else example.occurrence.rank,
+                    rank_local_sample_ordinal=None
+                    if example.occurrence is None
+                    else example.occurrence.rank_local_sample_ordinal,
+                    rank_local_microbatch_ordinal=None
+                    if example.occurrence is None
+                    else example.occurrence.rank_local_microbatch_ordinal,
+                    row_ordinal_within_microbatch=None
+                    if example.occurrence is None
+                    else example.occurrence.row_ordinal_within_microbatch,
                 )
             )
             original_offset = original_end
