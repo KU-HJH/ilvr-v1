@@ -220,7 +220,7 @@ def test_stage2_resolver_remains_strict_for_stage1_contract_model():
 def test_repetition_penalty_matches_hf_sign_sensitive_selection(
     repeated_score, alternative_score
 ):
-    """Dropping either HF penalty sign branch must select repeated token 4."""
+    """Dropping either HF penalty sign branch would select repeated token 4."""
     model = scripted_model(latent_size=2, emitted_ids=[])
     model.lm_head = PenaltySensitiveHead(repeated_score, alternative_score)
 
@@ -272,6 +272,29 @@ def test_max_new_tokens_is_a_strict_cap_at_every_latent_boundary(
     assert result.stop_reason == "max_new_tokens"
     if completed_blocks == 0:
         assert len(model.model.calls) == 1
+
+
+def test_equal_token_caps_report_max_new_tokens_after_exact_fit_block():
+    """The documented tie priority needs a direct runtime witness."""
+    model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
+    input_ids = torch.tensor([[1]])
+
+    result = ContinuousLatentController().generate(
+        model=model,
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        token_ids=TOKENS,
+        generation_config=ContinuousLatentGenerationConfig(
+            max_new_tokens=4,
+            max_sequence_length=5,
+        ),
+        return_latent_states=True,
+    )
+
+    assert result.generated_suffix_ids == (91, 90, 90, 92)
+    assert result.latent_block_count == 1
+    assert len(result.latent_states_by_block) == 1
+    assert result.stop_reason == "max_new_tokens"
 
 
 @pytest.mark.parametrize(
