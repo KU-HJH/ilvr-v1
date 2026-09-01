@@ -1,4 +1,6 @@
 import math
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +23,32 @@ from stage1.evaluation_diagnostics import (
     validated_test_source_rows,
     validate_assistant_cue_scaffold,
 )
+
+
+def test_diagnostic_entrypoint_imports_with_build_marker_outside_pytest_normalization():
+    """Catches diagnostics importing datasets with the host's trailing-plus version."""
+    repo_root = Path(__file__).resolve().parents[2]
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": f"{repo_root}:{repo_root / 'src'}:{repo_root / 'transformers/src'}",
+    }
+    completed = subprocess.run(
+        [
+            str(repo_root / "venv/ilvr-venv/bin/python"),
+            "-m",
+            "stage1.evaluation_diagnostics",
+            "--help",
+        ],
+        cwd=repo_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "recurrence-probe" in completed.stdout
 
 
 def test_tensor_reducers_report_hand_checked_values_and_reject_nonfinite_inputs():
