@@ -119,14 +119,13 @@ class Stage1TeacherTargetBuilder:
         selected_counts: list[tuple[int, ...]] = []
         selected_candidate_indices: list[tuple[tuple[int, ...], ...]] = []
         selection_margins: list[tuple[float | str, ...]] = []
-        hidden_size = 0
         for sample_index, sample in enumerate(metadata.samples):
             (
                 sample_values,
                 block_counts,
                 block_indices,
                 block_margins,
-                hidden_size,
+                sample_empty_values,
             ) = (
                 self._build_sample(
                     teacher=teacher,
@@ -165,6 +164,7 @@ class Stage1TeacherTargetBuilder:
                 )
             )
             packed.extend(sample_values)
+            packed.append(sample_empty_values)
             selected_counts.append(block_counts)
             selected_candidate_indices.append(block_indices)
             selection_margins.append(block_margins)
@@ -175,10 +175,7 @@ class Stage1TeacherTargetBuilder:
                         list(span.latent_positions[:selected_count]),
                     ] = True
 
-        if packed:
-            latent_values = torch.cat(packed, dim=0)
-        else:
-            latent_values = original_pixels.new_empty((0, hidden_size))
+        latent_values = torch.cat(packed, dim=0)
         expected_count = int(latent_mask.sum().item())
         if latent_values.shape[0] != expected_count:
             raise RuntimeError(
@@ -287,7 +284,7 @@ class Stage1TeacherTargetBuilder:
             tuple(block_counts),
             tuple(block_indices),
             tuple(block_margins),
-            int(row_hidden_last.shape[-1]),
+            row_hidden_last[:0],
         )
 
     @staticmethod
@@ -363,6 +360,10 @@ class Stage1TeacherTargetBuilder:
             raise ValueError("teacher hidden states must have shape [B, T, H]")
         if hidden_pre.shape != hidden_last.shape:
             raise ValueError("teacher pre-final and final hidden states must share shape")
+        if not bool(torch.isfinite(hidden_pre).all().item()) or not bool(
+            torch.isfinite(hidden_last).all().item()
+        ):
+            raise FloatingPointError("teacher hidden states must be finite")
         return hidden_pre, hidden_last
 
     @staticmethod
@@ -386,6 +387,8 @@ class Stage1TeacherTargetBuilder:
     def _split_visual_features(self, features, grid_thw, teacher):
         if not isinstance(features, torch.Tensor) or features.ndim != 2:
             raise ValueError("teacher helper visual features must have shape [N, H]")
+        if not bool(torch.isfinite(features).all().item()):
+            raise FloatingPointError("teacher helper visual features must be finite")
         counts = self._visual_token_counts(grid_thw, teacher)
         if sum(counts) != features.shape[0]:
             raise ValueError(
@@ -655,7 +658,15 @@ class Stage1TeacherTargetBuilder:
         similarities = F.cosine_similarity(
             candidates, query.expand_as(candidates), dim=-1
         )
+        if not bool(torch.isfinite(similarities).all().item()):
+            raise FloatingPointError(
+                "teacher candidate similarities must be finite"
+            )
         probabilities = torch.softmax(similarities, dim=0)
+        if not bool(torch.isfinite(probabilities).all().item()):
+            raise FloatingPointError(
+                "teacher selection probabilities must be finite"
+            )
         sorted_indices = torch.argsort(
             probabilities, descending=True, stable=True
         )
@@ -678,6 +689,8 @@ class Stage1TeacherTargetBuilder:
                     - sorted_probabilities[selected_count].to(torch.float64)
                 ).item()
             )
+            if not math.isfinite(margin):
+                raise FloatingPointError("teacher selection margin must be finite")
         else:
             margin = "all_selected"
         return (

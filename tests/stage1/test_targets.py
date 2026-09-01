@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -80,10 +81,11 @@ class CountingVisual(nn.Module):
         self.helper_call_count = 0
         self.original_batches = []
         self.helper_batches = []
+        self.output_dtype = torch.float32
 
     @property
     def dtype(self):
-        return torch.float32
+        return self.output_dtype
 
     def forward(self, pixel_values, *, grid_thw):
         assert not torch.is_grad_enabled()
@@ -104,7 +106,7 @@ class CountingVisual(nn.Module):
             )
         else:
             raise AssertionError("visual inputs must not mix original and helper views")
-        return pixel_values[:, 1:].to(torch.float32)
+        return pixel_values[:, 1:].to(self.output_dtype)
 
 
 class CompleteQwenTeacher(nn.Module):
@@ -193,6 +195,24 @@ class CompleteQwenTeacher(nn.Module):
             stage2_latent_states=None,
             stage2_diagnostics=None,
         )
+
+
+class BFloat16QwenTeacher(CompleteQwenTeacher):
+    def __init__(self):
+        super().__init__()
+        self.model.to(dtype=torch.bfloat16)
+        self.embedding.to(dtype=torch.bfloat16)
+        self.visual.output_dtype = torch.bfloat16
+
+
+class NonfiniteHiddenTeacher(CompleteQwenTeacher):
+    def forward(self, **kwargs):
+        outputs = super().forward(**kwargs)
+        hidden_pre, hidden_last = outputs.hidden_states
+        hidden_last = hidden_last.clone()
+        hidden_last[0, 0, 0] = torch.nan
+        outputs.hidden_states = (hidden_pre, hidden_last)
+        return outputs
 
 
 @dataclass(frozen=True)
@@ -442,6 +462,53 @@ def test_equal_similarity_tie_selects_lower_row_local_candidate_index():
     assert result.selected_candidate_indices == (((0,),),)
     assert result.selection_margins == ((0.0,),)
     assert isinstance(result.selection_margins[0][0], float)
+    assert math.isfinite(result.selection_margins[0][0])
+
+
+def test_nonfinite_teacher_hidden_state_fails_before_target_selection(target_builder):
+    """Catches NaN language outputs flowing into queries and packed targets."""
+    case = make_case((ONE_BLOCK,))
+    case.teacher = NonfiniteHiddenTeacher()
+
+    with pytest.raises(FloatingPointError, match="teacher hidden states must be finite"):
+        target_builder.build(case.teacher, case.inputs, case.metadata)
+
+    assert case.teacher.helper_visual_call_count == 0
+
+
+@pytest.mark.parametrize("bad_value", [torch.nan, torch.inf, -torch.inf])
+def test_nonfinite_candidate_similarity_fails_before_sorting(
+    target_builder, bad_value
+):
+    """Catches nonfinite similarities reaching softmax or stable sorting."""
+    candidates = torch.tensor([[bad_value, 0.0], [1.0, 0.0]])
+    query = torch.tensor([[1.0, 0.0]])
+
+    with pytest.raises(
+        FloatingPointError, match="teacher candidate similarities must be finite"
+    ):
+        target_builder._select(candidates, query, max_count=1)
+
+
+def test_nonfinite_selection_probability_fails_before_margin(monkeypatch, target_builder):
+    """Catches NaN probabilities becoming a NaN diagnostic margin."""
+    real_softmax = torch.softmax
+
+    def nonfinite_vector_softmax(values, *args, **kwargs):
+        if values.ndim == 1:
+            return torch.full_like(values, torch.nan)
+        return real_softmax(values, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "softmax", nonfinite_vector_softmax)
+
+    with pytest.raises(
+        FloatingPointError, match="teacher selection probabilities must be finite"
+    ):
+        target_builder._select(
+            torch.tensor([[1.0, 0.0], [-1.0, 0.0]]),
+            torch.tensor([[1.0, 0.0]]),
+            max_count=1,
+        )
 
 
 def test_selection_margin_tags_all_candidates_selected():
@@ -474,6 +541,55 @@ def test_zero_helper_row_builds_empty_targets_without_visual_helper_call(target_
     assert result.selection_margins == ((),)
     assert case.teacher.language_forward_count == 1
     assert case.teacher.helper_visual_call_count == 0
+
+
+def test_mixed_bfloat16_helper_and_zero_helper_rows_match_independent_results(
+    target_builder,
+):
+    """Catches empty targets inheriting FP32 processor pixels instead of teacher dtype."""
+    samples = (ONE_BLOCK, ZERO_HELPERS)
+    batched_case = make_case(samples)
+    batched_case.teacher = BFloat16QwenTeacher()
+    batched = target_builder.build(
+        batched_case.teacher, batched_case.inputs, batched_case.metadata
+    )
+    independent = []
+    for sample in samples:
+        case = make_case((sample,))
+        case.teacher = BFloat16QwenTeacher()
+        independent.append(
+            target_builder.build(case.teacher, case.inputs, case.metadata)
+        )
+
+    assert [result.latent_values.dtype for result in independent] == [
+        torch.bfloat16,
+        torch.bfloat16,
+    ]
+    assert batched.latent_values.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        batched.latent_values,
+        torch.cat([result.latent_values for result in independent]),
+    )
+    assert batched.latent_mask.tolist() == torch.cat(
+        [
+            torch.nn.functional.pad(
+                result.latent_mask,
+                (0, batched.latent_mask.shape[1] - result.latent_mask.shape[1]),
+            )
+            for result in independent
+        ]
+    ).tolist()
+    assert batched.selected_counts == tuple(
+        result.selected_counts[0] for result in independent
+    )
+    assert batched.selected_candidate_indices == tuple(
+        result.selected_candidate_indices[0] for result in independent
+    )
+    assert batched.selection_margins == tuple(
+        result.selection_margins[0] for result in independent
+    )
+    assert batched_case.teacher.language_forward_count == 2
+    assert batched_case.teacher.helper_visual_call_count == 1
 
 
 def test_b1_matches_hand_derived_legacy_target_mask_and_downstream_inputs(
