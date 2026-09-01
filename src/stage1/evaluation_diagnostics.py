@@ -339,7 +339,9 @@ def derive_execution_log_path(output_json: str | Path) -> Path:
         raise ValueError("output-json must be beneath results/<run-id>/") from error
     if len(relative.parts) < 2:
         raise ValueError("output-json must be beneath results/<run-id>/")
-    return (Path.cwd() / "logs" / relative.parts[0] / f"{output.stem}.log").resolve()
+    return (
+        Path.cwd() / "logs" / relative.parent / f"{output.stem}.log"
+    ).resolve()
 
 
 def _write_json(output: Path, evidence: Mapping[str, object]) -> None:

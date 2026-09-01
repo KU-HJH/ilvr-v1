@@ -136,6 +136,12 @@ def test_cli_enforces_required_contract_writes_result_and_deterministic_log(tmp_
     assert derive_execution_log_path(output) == tmp_path / "logs" / "unit-run" / "rescore.log"
     assert "status=success" in derive_execution_log_path(output).read_text(encoding="utf-8")
 
+    nested_left = results / "left" / "report.json"
+    nested_right = results / "right" / "report.json"
+    assert derive_execution_log_path(nested_left) == tmp_path / "logs" / "unit-run" / "left" / "report.log"
+    assert derive_execution_log_path(nested_right) == tmp_path / "logs" / "unit-run" / "right" / "report.log"
+    assert derive_execution_log_path(nested_left) != derive_execution_log_path(nested_right)
+
     with pytest.raises(SystemExit) as missing:
         main(["rescore"])
     assert missing.value.code == 2
