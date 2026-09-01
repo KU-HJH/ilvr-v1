@@ -16,6 +16,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterator, Literal, Sequence
+from weakref import ReferenceType, ref
 
 import torch
 
@@ -640,66 +641,14 @@ def stage1_sample_seed(
     )
 
 
-class _Stage1InvocationState:
-    """Private mutable counts shared by one context and its checkpoint managers."""
-
-    __slots__ = ("__original", "__recompute")
-
-    def __init__(self) -> None:
-        self.__original: dict[str, int] = {}
-        self.__recompute: dict[str, int] = {}
-
-    def _record(self, site_name: str, *, recompute: bool) -> None:
-        counts = self.__recompute if recompute else self.__original
-        phase = "recompute" if recompute else "original"
-        if counts.get(site_name, 0) >= 1:
-            raise RuntimeError(
-                f"second {phase} invocation for Stage 1 stochastic site {site_name}"
-            )
-        counts[site_name] = 1
-
-    def _validate(self, expected_sites: tuple[str, ...]) -> None:
-        invalid_original = tuple(
-            site for site in expected_sites if self.__original.get(site, 0) != 1
-        )
-        if invalid_original:
-            raise RuntimeError(
-                "Stage 1 stochastic sites require original count exactly one: "
-                + ", ".join(invalid_original)
-            )
-        invalid_recompute = tuple(
-            site for site, count in self.__recompute.items() if count not in (0, 1)
-        )
-        if invalid_recompute:
-            raise RuntimeError(
-                "Stage 1 stochastic sites permit at most one recompute: "
-                + ", ".join(invalid_recompute)
-            )
-
-    def _clear(self) -> None:
-        self.__original.clear()
-        self.__recompute.clear()
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class Stage1StochasticContext:
-    """One microbatch's immutable RNG identity plus bounded invocation state."""
+    """One microbatch's immutable sample-keyed RNG identity."""
 
     base_seed: int
     optimizer_global_step: int
     rows: tuple[tuple[int, int], ...]
     expected_sites: tuple[str, ...]
-    phase: Literal["outside_checkpoint", "original", "recompute"] = field(
-        default="outside_checkpoint", init=False
-    )
-    _invocation_state: _Stage1InvocationState = field(
-        default_factory=_Stage1InvocationState,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _active: bool = field(default=False, init=False, repr=False)
-    _closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -735,29 +684,101 @@ class Stage1StochasticContext:
         object.__setattr__(self, "rows", rows)
         object.__setattr__(self, "expected_sites", sites)
 
+
+class _Stage1ActiveStochasticContext:
+    """Private phase and counts for one active immutable context spec."""
+
+    __slots__ = ("_spec", "_phase", "_active", "__original", "__recompute")
+
+    def __init__(self, spec: Stage1StochasticContext) -> None:
+        self._spec = spec
+        self._phase: Literal["outside_checkpoint", "original", "recompute"] = (
+            "outside_checkpoint"
+        )
+        self._active = True
+        self.__original: dict[str, int] = {}
+        self.__recompute: dict[str, int] = {}
+
     def _record_invocation(self, site_name: str) -> None:
-        if site_name not in self.expected_sites:
+        if site_name not in self._spec.expected_sites:
             raise RuntimeError(f"unregistered Stage 1 stochastic site: {site_name}")
-        recompute = self.phase == "recompute"
-        self._invocation_state._record(site_name, recompute=recompute)
+        recompute = self._phase == "recompute"
+        counts = self.__recompute if recompute else self.__original
+        phase = "recompute" if recompute else "original"
+        if counts.get(site_name, 0) >= 1:
+            raise RuntimeError(
+                f"second {phase} invocation for Stage 1 stochastic site {site_name}"
+            )
+        counts[site_name] = 1
 
     def _validate_invocations(self) -> None:
-        self._invocation_state._validate(self.expected_sites)
+        invalid_original = tuple(
+            site
+            for site in self._spec.expected_sites
+            if self.__original.get(site, 0) != 1
+        )
+        if invalid_original:
+            raise RuntimeError(
+                "Stage 1 stochastic sites require original count exactly one: "
+                + ", ".join(invalid_original)
+            )
+        invalid_recompute = tuple(
+            site
+            for site, count in self.__recompute.items()
+            if count not in (0, 1)
+        )
+        if invalid_recompute:
+            raise RuntimeError(
+                "Stage 1 stochastic sites permit at most one recompute: "
+                + ", ".join(invalid_recompute)
+            )
 
     def _clear_invocations(self) -> None:
-        self._invocation_state._clear()
+        self.__original.clear()
+        self.__recompute.clear()
 
 
-_STAGE1_STOCHASTIC_CONTEXT: ContextVar[Stage1StochasticContext | None] = (
+class _Stage1ContextIdentitySet:
+    """Weak lifecycle membership keyed by context object identity."""
+
+    __slots__ = ("_references",)
+
+    def __init__(self) -> None:
+        self._references: dict[
+            int, ReferenceType[Stage1StochasticContext]
+        ] = {}
+
+    def __contains__(self, context: Stage1StochasticContext) -> bool:
+        reference = self._references.get(id(context))
+        return reference is not None and reference() is context
+
+    def add(self, context: Stage1StochasticContext) -> None:
+        identity = id(context)
+
+        def discard_dead(reference: ReferenceType[Stage1StochasticContext]) -> None:
+            if self._references.get(identity) is reference:
+                del self._references[identity]
+
+        self._references[identity] = ref(context, discard_dead)
+
+    def discard(self, context: Stage1StochasticContext) -> None:
+        reference = self._references.get(id(context))
+        if reference is not None and reference() is context:
+            del self._references[id(context)]
+
+
+_STAGE1_STOCHASTIC_CONTEXT: ContextVar[_Stage1ActiveStochasticContext | None] = (
     ContextVar("stage1_stochastic_context", default=None)
 )
+_STAGE1_ACTIVE_CONTEXT_SPECS = _Stage1ContextIdentitySet()
+_STAGE1_CLOSED_CONTEXT_SPECS = _Stage1ContextIdentitySet()
 
 
-def _require_stage1_stochastic_context() -> Stage1StochasticContext:
-    context = _STAGE1_STOCHASTIC_CONTEXT.get()
-    if context is None or not context._active or context._closed:
+def _require_stage1_stochastic_context() -> _Stage1ActiveStochasticContext:
+    active_context = _STAGE1_STOCHASTIC_CONTEXT.get()
+    if active_context is None or not active_context._active:
         raise RuntimeError("missing Stage 1 stochastic context")
-    return context
+    return active_context
 
 
 @contextmanager
@@ -765,55 +786,60 @@ def activate_stage1_stochastic_context(context: Stage1StochasticContext):
     """Own one parent ContextVar token through forward and backward."""
     if not isinstance(context, Stage1StochasticContext):
         raise TypeError("context must be a Stage1StochasticContext")
-    if context._closed:
+    if context in _STAGE1_CLOSED_CONTEXT_SPECS:
         raise RuntimeError("stale Stage 1 stochastic context cannot be reactivated")
-    if context._active or _STAGE1_STOCHASTIC_CONTEXT.get() is not None:
+    if (
+        context in _STAGE1_ACTIVE_CONTEXT_SPECS
+        or _STAGE1_STOCHASTIC_CONTEXT.get() is not None
+    ):
         raise RuntimeError("nested Stage 1 stochastic contexts are unsupported")
-    object.__setattr__(context, "_active", True)
-    token = _STAGE1_STOCHASTIC_CONTEXT.set(context)
+    active_context = _Stage1ActiveStochasticContext(context)
+    _STAGE1_ACTIVE_CONTEXT_SPECS.add(context)
+    token = _STAGE1_STOCHASTIC_CONTEXT.set(active_context)
     try:
         yield context
     except BaseException:
         raise
     else:
-        context._validate_invocations()
+        active_context._validate_invocations()
     finally:
-        object.__setattr__(context, "phase", "outside_checkpoint")
-        context._clear_invocations()
-        object.__setattr__(context, "_active", False)
-        object.__setattr__(context, "_closed", True)
+        active_context._phase = "outside_checkpoint"
+        active_context._clear_invocations()
+        active_context._active = False
         _STAGE1_STOCHASTIC_CONTEXT.reset(token)
+        _STAGE1_ACTIVE_CONTEXT_SPECS.discard(context)
+        _STAGE1_CLOSED_CONTEXT_SPECS.add(context)
 
 
 @contextmanager
 def _stage1_checkpoint_phase(
-    context: Stage1StochasticContext,
+    active_context: _Stage1ActiveStochasticContext,
     phase: Literal["original", "recompute"],
 ):
     current = _STAGE1_STOCHASTIC_CONTEXT.get()
     nested_token = None
     if current is None:
-        if not context._active or context._closed:
+        if not active_context._active:
             raise RuntimeError("stale Stage 1 checkpoint stochastic context")
-        nested_token = _STAGE1_STOCHASTIC_CONTEXT.set(context)
-    elif current is not context:
+        nested_token = _STAGE1_STOCHASTIC_CONTEXT.set(active_context)
+    elif current is not active_context:
         raise RuntimeError("Stage 1 checkpoint stochastic context identity changed")
-    previous = context.phase
-    object.__setattr__(context, "phase", phase)
+    previous = active_context._phase
+    active_context._phase = phase
     try:
         yield
     finally:
-        object.__setattr__(context, "phase", previous)
+        active_context._phase = previous
         if nested_token is not None:
             _STAGE1_STOCHASTIC_CONTEXT.reset(nested_token)
 
 
 def stage1_checkpoint_context_fn():
     """Return non-reentrant checkpoint managers sharing the parent context."""
-    context = _require_stage1_stochastic_context()
+    active_context = _require_stage1_stochastic_context()
     return (
-        _stage1_checkpoint_phase(context, "original"),
-        _stage1_checkpoint_phase(context, "recompute"),
+        _stage1_checkpoint_phase(active_context, "original"),
+        _stage1_checkpoint_phase(active_context, "recompute"),
     )
 
 
@@ -835,7 +861,8 @@ class SampleStableStage1Dropout(torch.nn.Module):
             return x
         if self.p == 0.0 and _STAGE1_STOCHASTIC_CONTEXT.get() is None:
             return x
-        context = _require_stage1_stochastic_context()
+        active_context = _require_stage1_stochastic_context()
+        context = active_context._spec
         if not isinstance(x, torch.Tensor) or x.ndim != 3:
             raise ValueError("Stage 1 sample-stable dropout requires [B,T,H]")
         if x.layout != torch.strided:
@@ -849,7 +876,7 @@ class SampleStableStage1Dropout(torch.nn.Module):
             raise ValueError("Stage 1 sample-stable dropout requires nonempty T,H")
         if any(valid_length > width for _, valid_length in context.rows):
             raise ValueError("Stage 1 stochastic valid length exceeds T")
-        context._record_invocation(self.site_name)
+        active_context._record_invocation(self.site_name)
         if self.p == 0.0:
             return x
         mask = torch.ones_like(x)

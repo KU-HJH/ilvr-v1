@@ -1,4 +1,5 @@
 import ast
+from collections.abc import MutableMapping
 import copy
 import hashlib
 import json
@@ -602,7 +603,8 @@ def test_checkpoint_recompute_regenerates_same_dropout_and_rejects_second_call(
         checkpointed.sum().backward()
         assert len(seen) == 2
         torch.testing.assert_close(seen[0], seen[1], rtol=0, atol=0)
-        assert context.phase == "outside_checkpoint"
+        with pytest.raises(AttributeError):
+            context.phase
         # Creating another pair proves recompute restored its nested token and
         # left the training-step parent token active in this original context.
         _, recompute_context = stage1_checkpoint_context_fn()
@@ -612,7 +614,7 @@ def test_checkpoint_recompute_regenerates_same_dropout_and_rejects_second_call(
 
 
 def test_stochastic_context_does_not_expose_mutable_invocation_bookkeeping():
-    """Catches callers prepopulating or clearing counts through the public API."""
+    """Catches the immutable public spec retaining a path to mutable counts."""
     context = Stage1StochasticContext(
         base_seed=42,
         optimizer_global_step=17,
@@ -623,26 +625,66 @@ def test_stochastic_context_does_not_expose_mutable_invocation_bookkeeping():
     dropout.train()
     values = torch.ones((1, 5, 4))
 
-    for public_name in (
-        "__dict__",
-        "original_invocations",
-        "recompute_invocations",
-        "record_invocation",
-        "validate_invocations",
-    ):
-        with pytest.raises(AttributeError):
-            getattr(context, public_name)
+    assert set(type(context).__slots__) == {
+        "base_seed",
+        "optimizer_global_step",
+        "rows",
+        "expected_sites",
+        "__weakref__",
+    }
+
+    def assert_immutable_identity_tree(value):
+        assert not isinstance(value, MutableMapping)
+        if type(value) is tuple:
+            for child in value:
+                assert_immutable_identity_tree(child)
+        else:
+            assert type(value) in (int, str)
+
+    for slot_name in type(context).__slots__:
+        if slot_name != "__weakref__":
+            assert_immutable_identity_tree(getattr(context, slot_name))
 
     with activate_stage1_stochastic_context(context):
         dropout(values)
         with pytest.raises(AttributeError):
-            context.original_invocations.clear()
+            context._invocation_state._Stage1InvocationState__original.clear()
         with pytest.raises(RuntimeError, match="second.*original"):
             dropout(values)
 
 
+def test_stochastic_context_rejects_nested_but_not_equal_fresh_spec():
+    """Catches lifecycle tracking conflating nested use with equal spec values."""
+    outer = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    equal_fresh = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25)
+    dropout.train()
+    values = torch.ones((1, 5, 4))
+    assert outer == equal_fresh
+
+    with activate_stage1_stochastic_context(outer):
+        dropout(values)
+        with pytest.raises(RuntimeError, match="nested"):
+            with activate_stage1_stochastic_context(equal_fresh):
+                pass
+
+    with activate_stage1_stochastic_context(equal_fresh):
+        dropout(values)
+
+
 def _assert_checkpoint_failure_left_no_stochastic_context(context):
-    assert context.phase == "outside_checkpoint"
+    with pytest.raises(AttributeError):
+        context.phase
     with pytest.raises(RuntimeError, match="missing.*stochastic context"):
         stage1_checkpoint_context_fn()
     with pytest.raises(RuntimeError, match="stale"):
