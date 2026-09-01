@@ -681,6 +681,17 @@ def _restore_boundary_checkpointing_state(
             module._gradient_checkpointing_func = function
 
 
+def enable_boundary_gradient_checkpointing(model) -> None:
+    """Enable non-reentrant checkpointing on the exact manual-forward base."""
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    if not bool(getattr(getattr(model, "model", None), "gradient_checkpointing", False)):
+        raise ValueError(
+            "boundary-probe requires gradient checkpointing on its language base"
+        )
+
+
 def boundary_target_parameters(model, token_ids) -> dict[str, object]:
     """Find the exact Stage 1 sparse latent rows and every trainable DoRA tensor."""
     named = {
@@ -908,9 +919,7 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
             name: parameter.detach().clone() for name, parameter in all_trainable.items()
         }
         model.train()
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        enable_boundary_gradient_checkpointing(model)
         for source_row in source_rows:
             index = _require_exact_int(source_row["source_index"], name="source index")
             sample = source_row["sample"]

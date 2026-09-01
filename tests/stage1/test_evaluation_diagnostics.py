@@ -393,14 +393,17 @@ class _BoundaryRuntimeModel(nn.Module):
         self.adapter.decoy_lora_A_suffix = nn.Parameter(torch.zeros(2))
         self.gradient_checkpointing = False
         self._gradient_checkpointing_func = object()
-        self.checkpointable = nn.Module()
-        self.checkpointable.gradient_checkpointing = True
-        self.checkpointable._gradient_checkpointing_func = object()
+        self.model = nn.Module()
+        self.model.gradient_checkpointing = True
+        self.model._gradient_checkpointing_func = object()
         self.gradient_checkpoint_calls = []
+        self.leave_language_base_frozen = False
 
     def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs):
         self.gradient_checkpoint_calls.append(dict(gradient_checkpointing_kwargs))
         for module in self.modules():
+            if self.leave_language_base_frozen and module is self.model:
+                continue
             if hasattr(module, "gradient_checkpointing"):
                 module.gradient_checkpointing = True
                 module._gradient_checkpointing_func = dict(gradient_checkpointing_kwargs)
@@ -410,12 +413,17 @@ class _BoundaryProcessor:
     tokenizer = _CueTokenizer()
 
 
-def _configure_boundary_runtime(tmp_path, monkeypatch, *, fail_after_step=False):
+def _configure_boundary_runtime(
+    tmp_path, monkeypatch, *, fail_after_step=False, leave_language_base_frozen=False,
+):
     monkeypatch.chdir(tmp_path)
     dataset_path = tmp_path / "data" / "TEST.jsonl"
     dataset_path.parent.mkdir()
     dataset_path.write_text("\n", encoding="utf-8")
     model = _BoundaryRuntimeModel()
+    model.leave_language_base_frozen = leave_language_base_frozen
+    if leave_language_base_frozen:
+        model.model.gradient_checkpointing = False
     model.eval()
     for index, parameter in enumerate(model.parameters()):
         parameter.data.fill_(float(index + 1))
@@ -429,6 +437,7 @@ def _configure_boundary_runtime(tmp_path, monkeypatch, *, fail_after_step=False)
     prepared = {"input_ids": torch.tensor([[31, 32]]), "attention_mask": torch.ones(1, 2, dtype=torch.long)}
     observed_starts = []
     observed_checkpointing = []
+    observed_language_checkpointing = []
     original_checkpointing = [
         (module, module.gradient_checkpointing, module._gradient_checkpointing_func)
         for module in model.modules() if hasattr(module, "gradient_checkpointing")
@@ -442,6 +451,7 @@ def _configure_boundary_runtime(tmp_path, monkeypatch, *, fail_after_step=False)
 
     def fake_loss(active_model, *_args):
         observed_starts.append(active_model.lm_head.output_delta.detach().clone())
+        observed_language_checkpointing.append(active_model.model.gradient_checkpointing)
         observed_checkpointing.append([
             (module.gradient_checkpointing, module._gradient_checkpointing_func)
             for module in active_model.modules() if hasattr(module, "gradient_checkpointing")
@@ -465,6 +475,7 @@ def _configure_boundary_runtime(tmp_path, monkeypatch, *, fail_after_step=False)
     return (
         model, dataset_path, original_values, original_flags, original_gradients,
         original_checkpointing, observed_starts, observed_checkpointing,
+        observed_language_checkpointing,
     )
 
 
@@ -485,7 +496,7 @@ def test_boundary_runtime_restores_state_and_starts_each_case_from_common_values
     """Catches temporary boundary updates leaking into callers or later cases."""
     (
         model, dataset_path, values, flags, gradients, checkpointing,
-        observed_starts, observed_checkpointing,
+        observed_starts, observed_checkpointing, observed_language_checkpointing,
     ) = _configure_boundary_runtime(tmp_path, monkeypatch)
 
     report = diagnostics.run_boundary_probe(
@@ -503,6 +514,7 @@ def test_boundary_runtime_restores_state_and_starts_each_case_from_common_values
     assert len(observed_starts) == 8
     assert all(torch.equal(value, values["lm_head.output_delta"]) for value in observed_starts)
     assert model.gradient_checkpoint_calls == [{"use_reentrant": False}]
+    assert all(observed_language_checkpointing)
     assert all(all(enabled for enabled, _func in state) for state in observed_checkpointing)
     assert all(
         all(func == {"use_reentrant": False} for _enabled, func in state)
@@ -515,7 +527,7 @@ def test_boundary_runtime_restores_state_after_exception_following_optimizer_ste
     """Catches a post-step diagnostic failure leaking temporary boundary state."""
     (
         model, dataset_path, values, flags, gradients, checkpointing,
-        _observed_starts, observed_checkpointing,
+        _observed_starts, observed_checkpointing, _observed_language_checkpointing,
     ) = _configure_boundary_runtime(tmp_path, monkeypatch, fail_after_step=True)
 
     with pytest.raises(RuntimeError, match="injected after optimizer.step"):
@@ -527,4 +539,24 @@ def test_boundary_runtime_restores_state_after_exception_following_optimizer_ste
     assert model.gradient_checkpoint_calls == [{"use_reentrant": False}]
     assert len(observed_checkpointing) == 1
     assert all(enabled for enabled, _func in observed_checkpointing[0])
+    _assert_boundary_runtime_restored(model, values, flags, gradients, checkpointing)
+
+
+def test_boundary_rejects_wrapper_checkpoint_enablement_without_language_base(tmp_path, monkeypatch):
+    """Catches checkpointing a wrapper while manual forwards still use its disabled base."""
+    (
+        model, dataset_path, values, flags, gradients, checkpointing,
+        observed_starts, _observed_checkpointing, _observed_language_checkpointing,
+    ) = _configure_boundary_runtime(
+        tmp_path, monkeypatch, leave_language_base_frozen=True
+    )
+
+    with pytest.raises(ValueError, match="language base"):
+        diagnostics.run_boundary_probe(
+            model_dir="unused", base_model_dir="unused", dataset_jsonl=str(dataset_path),
+            cache_dir="unused", source_indices=(0, 1, 2, 7),
+        )
+
+    assert model.gradient_checkpoint_calls == [{"use_reentrant": False}]
+    assert observed_starts == []
     _assert_boundary_runtime_restored(model, values, flags, gradients, checkpointing)
