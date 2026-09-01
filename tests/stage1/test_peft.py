@@ -15,6 +15,11 @@ from stage1 import (
     build_stage1_tuned_model,
     validate_stage1_trainable_boundary,
 )
+from stage1.equivalence import SampleStableStage1Dropout
+from stage1.peft import (
+    install_stage1_sample_stable_dropout,
+    validate_stage1_stochastic_inventory,
+)
 from stage1.token_rows import SparseOutputTokenRows
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
@@ -62,12 +67,12 @@ def tiny_qwen() -> Qwen2_5_VLForConditionalGeneration:
     return Qwen2_5_VLForConditionalGeneration(config)
 
 
-def tuning(method: str, *, targets=None) -> Stage1TuningConfig:
+def tuning(method: str, *, targets=None, dropout=0.0) -> Stage1TuningConfig:
     return Stage1TuningConfig(
         method=method,
         rank=4,
         alpha=8,
-        dropout=0.0,
+        dropout=dropout,
         target_suffixes=targets
         or ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     )
@@ -123,6 +128,91 @@ def test_dora_targets_decoder_and_exact_latent_rows(tiny_qwen, latent_token_ids)
     assert report.categories["latent_output_parameters"] == 24
     assert any("lora_magnitude_vector" in name for name in report.trainable_names)
     assert all("visual" not in name.split(".") for name in report.trainable_names)
+
+
+def test_real_peft_dropout_replacement_uses_exact_decoder_site_paths(
+    tiny_qwen, latent_token_ids
+):
+    """Catches replacing non-target modules or deriving unstable adapter site names."""
+    configured = tuning("dora", dropout=0.25)
+
+    model = build_stage1_tuned_model(tiny_qwen, configured, latent_token_ids)
+    expected_sites = (
+        "base_model.model.model.layers.0.mlp.down_proj.lora_dropout.default",
+        "base_model.model.model.layers.0.mlp.gate_proj.lora_dropout.default",
+        "base_model.model.model.layers.0.mlp.up_proj.lora_dropout.default",
+        "base_model.model.model.layers.0.self_attn.k_proj.lora_dropout.default",
+        "base_model.model.model.layers.0.self_attn.o_proj.lora_dropout.default",
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_dropout.default",
+        "base_model.model.model.layers.0.self_attn.v_proj.lora_dropout.default",
+    )
+
+    assert install_stage1_sample_stable_dropout(model) == expected_sites
+    assert tuple(model.stage1_stochastic_sites) == expected_sites
+    modules = dict(model.named_modules())
+    for site in expected_sites:
+        module = modules[site]
+        assert isinstance(module, SampleStableStage1Dropout)
+        assert module.site_name == site
+        assert module.p == 0.25
+    assert not any(
+        isinstance(module, SampleStableStage1Dropout)
+        for name, module in model.named_modules()
+        if "visual" in name.split(".")
+    )
+    validate_stage1_stochastic_inventory(model, expected_sites)
+
+
+def test_stochastic_inventory_rejects_enabled_unregistered_dropout(
+    tiny_qwen, latent_token_ids
+):
+    """Catches a training-mode dropout bypassing sample-stable registration."""
+    model = build_stage1_tuned_model(
+        tiny_qwen, tuning("dora", dropout=0.25), latent_token_ids
+    )
+    sites = tuple(model.stage1_stochastic_sites)
+    model.rogue_dropout = nn.Dropout(0.1)
+    model.train()
+
+    with pytest.raises(RuntimeError, match="enabled unregistered.*dropout"):
+        validate_stage1_stochastic_inventory(model, sites)
+
+
+def test_stochastic_inventory_rejects_unregistered_and_duplicate_stable_sites(
+    tiny_qwen, latent_token_ids
+):
+    """Catches a sample-stable module whose runtime path is absent or ambiguous."""
+    model = build_stage1_tuned_model(
+        tiny_qwen, tuning("dora", dropout=0.25), latent_token_ids
+    )
+    sites = tuple(model.stage1_stochastic_sites)
+    model.unregistered_stable_dropout = SampleStableStage1Dropout(
+        "unregistered.site", 0.1
+    )
+    model.train()
+    with pytest.raises(RuntimeError, match="unregistered.*sample-stable"):
+        validate_stage1_stochastic_inventory(model, sites)
+
+    del model.unregistered_stable_dropout
+    model.duplicate_stable_dropout = SampleStableStage1Dropout(sites[0], 0.25)
+    with pytest.raises(RuntimeError, match="duplicate.*site"):
+        validate_stage1_stochastic_inventory(model, sites)
+
+
+def test_stochastic_inventory_rejects_enabled_loaded_qwen_dropout(
+    tiny_qwen, latent_token_ids
+):
+    """Catches a loaded custom-Qwen functional dropout path becoming enabled."""
+    model = build_stage1_tuned_model(
+        tiny_qwen, tuning("dora", dropout=0.25), latent_token_ids
+    )
+    sites = tuple(model.stage1_stochastic_sites)
+    qwen = resolve_qwen2_5_vl_model(model)
+    qwen.config.attention_dropout = 0.1
+    qwen.model.layers[0].self_attn.attention_dropout = 0.1
+
+    with pytest.raises(RuntimeError, match="Qwen.*dropout"):
+        validate_stage1_stochastic_inventory(model, sites)
 
 
 def test_dora_registers_exact_zero3_externals_on_magnitude_consumers(

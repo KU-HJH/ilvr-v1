@@ -15,6 +15,7 @@ from typing import Callable
 
 import peft
 import torch
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from transformers import AutoProcessor, Qwen2_5_VLConfig
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
@@ -45,8 +46,11 @@ from stage1.peft import (
     Stage1ParameterReport,
     _resolve_linear_decoder_targets,
     build_stage1_tuned_model,
+    install_stage1_sample_stable_dropout,
+    validate_stage1_stochastic_inventory,
     validate_stage1_trainable_boundary,
 )
+from stage1.equivalence import stage1_checkpoint_context_fn
 from stage1.trainer import CustomTrainerStage1
 from stage1.types import Stage1TuningConfig, resolve_stage1_tuning_config
 
@@ -84,6 +88,8 @@ class Stage1CompositionDependencies:
     preflight_peft: Callable
     load_peft_model: Callable
     build_tuned_model: Callable
+    install_sample_stable_dropout: Callable
+    validate_stochastic_inventory: Callable
     validate_boundary: Callable
     prepare_dataset: Callable
     collator_factory: Callable
@@ -146,6 +152,8 @@ DEFAULT_STAGE1_DEPENDENCIES = Stage1CompositionDependencies(
     preflight_peft=preflight_stage1_peft_artifact,
     load_peft_model=load_stage1_peft_artifact,
     build_tuned_model=build_stage1_tuned_model,
+    install_sample_stable_dropout=install_stage1_sample_stable_dropout,
+    validate_stochastic_inventory=validate_stage1_stochastic_inventory,
     validate_boundary=validate_stage1_trainable_boundary,
     prepare_dataset=prepare_stage1_comt_examples,
     collator_factory=Stage1DataCollator,
@@ -347,9 +355,11 @@ def build_stage1_training_arguments(args) -> SFTConfig:
     gradient_checkpointing_kwargs = None
     if args.gradient_checkpointing:
         tuning = resolve_stage1_tuning_config(args)
-        gradient_checkpointing_kwargs = {
-            "use_reentrant": tuning.method != "full"
-        }
+        gradient_checkpointing_kwargs = {"use_reentrant": False}
+        if tuning.method != "full":
+            gradient_checkpointing_kwargs["context_fn"] = (
+                stage1_checkpoint_context_fn
+            )
 
     return SFTConfig(
         output_dir=args.save_model_path,
@@ -375,10 +385,39 @@ def build_stage1_training_arguments(args) -> SFTConfig:
         max_steps=args.max_steps,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
+        dataloader_num_workers=0,
         deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False,
         seed=args.seed,
     )
+
+
+def validate_stage1_checkpoint_context(model: torch.nn.Module) -> None:
+    """Require every resolved checkpoint hook to carry the exact Stage 1 pair."""
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("Stage 1 checkpoint context validation requires an nn.Module")
+    enabled = []
+    expected_keywords = {
+        "use_reentrant": False,
+        "context_fn": stage1_checkpoint_context_fn,
+    }
+    for name, module in model.named_modules():
+        if not bool(getattr(module, "gradient_checkpointing", False)):
+            continue
+        enabled.append(name or "<root>")
+        resolved = getattr(module, "_gradient_checkpointing_func", None)
+        if (
+            getattr(resolved, "func", None) is not activation_checkpoint
+            or getattr(resolved, "keywords", None) != expected_keywords
+        ):
+            raise RuntimeError(
+                "Stage 1 PEFT requires the exact non-reentrant checkpoint context "
+                f"pair at {name or '<root>'}"
+            )
+    if not enabled:
+        raise RuntimeError(
+            "Stage 1 PEFT requires the exact checkpoint context on an enabled module"
+        )
 
 
 def build_stage1_training_components(
@@ -548,6 +587,20 @@ def build_stage1_training_components(
             preflight=preflight,
         )
 
+    stochastic_sites: tuple[str, ...] = ()
+    if tuning.method != "full":
+        stochastic_sites = tuple(
+            dependencies.install_sample_stable_dropout(model)
+        )
+        dependencies.validate_stochastic_inventory(model, stochastic_sites)
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={
+                    "use_reentrant": False,
+                    "context_fn": stage1_checkpoint_context_fn,
+                }
+            )
+
     model.visual.requires_grad_(False)
     parameter_report = dependencies.validate_boundary(
         model, tuning, latent_ids, zero_stage=profile.zero_stage
@@ -576,6 +629,8 @@ def build_stage1_training_components(
             getattr(args, "benchmark_evidence_path", None)
         ),
     )
+    if tuning.method != "full" and args.gradient_checkpointing:
+        validate_stage1_checkpoint_context(getattr(trainer, "model", model))
     return Stage1TrainingComponents(
         model=model,
         processor=processor,
@@ -947,4 +1002,5 @@ __all__ = [
     "build_stage1_training_arguments",
     "build_stage1_training_components",
     "run_stage1",
+    "validate_stage1_checkpoint_context",
 ]

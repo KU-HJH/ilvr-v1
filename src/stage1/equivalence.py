@@ -11,7 +11,9 @@ import re
 import subprocess
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterator, Literal, Sequence
 
@@ -136,10 +138,13 @@ def _validate_schedule_parameters(
     return updates_per_epoch
 
 
-def _epoch_permutation(seed: int, epoch: int) -> list[int]:
+def canonical_epoch_permutation(seed: int, epoch: int) -> list[int]:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed + epoch)
     return torch.randperm(STAGE1_CANONICAL_VIEW_LENGTH, generator=generator).tolist()
+
+
+_epoch_permutation = canonical_epoch_permutation
 
 
 def _occurrence(
@@ -480,6 +485,11 @@ _MANIFEST_SCHEMA: dict[str, object] = {
         "attention": "str",
         "gradient_checkpointing": "bool",
         "gradient_checkpointing_use_reentrant": "bool",
+        "cudnn_deterministic": "bool",
+        "cudnn_benchmark": "bool",
+        "cuda_matmul_allow_tf32": "bool",
+        "cudnn_allow_tf32": "bool",
+        "float32_matmul_precision": "str",
     },
     "stochastic": {
         "rng_schema": "str",
@@ -565,6 +575,281 @@ def canonical_json_bytes(value: object) -> bytes:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+
+
+_STAGE1_FIXED_BACKEND_SETTINGS: Mapping[str, object] = {
+    "cudnn_deterministic": True,
+    "cudnn_benchmark": False,
+    "cuda_matmul_allow_tf32": False,
+    "cudnn_allow_tf32": False,
+    "float32_matmul_precision": "highest",
+}
+STAGE1_SAMPLE_RNG_SCHEMA = "stage1-sample-rng-v1"
+
+
+def read_stage1_backend_settings() -> dict[str, object]:
+    """Read the five process-global backend settings sealed by the manifest."""
+    return {
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+    }
+
+
+def configure_stage1_backend_settings() -> dict[str, object]:
+    """Configure and witness the approved controlled-comparison backend state."""
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    observed = read_stage1_backend_settings()
+    if observed != _STAGE1_FIXED_BACKEND_SETTINGS:
+        raise RuntimeError("failed to configure fixed Stage 1 backend settings")
+    return observed
+
+
+def stage1_sample_seed(
+    base_seed: int,
+    optimizer_global_step: int,
+    canonical_slot_id: int,
+    stable_site_name: str,
+) -> int:
+    """Derive one schema-v1 row/site seed without mutable RNG state."""
+    for name, value in (
+        ("base_seed", base_seed),
+        ("optimizer_global_step", optimizer_global_step),
+        ("canonical_slot_id", canonical_slot_id),
+    ):
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    if type(stable_site_name) is not str or not stable_site_name:
+        raise ValueError("stable_site_name must be a nonempty string")
+    payload = canonical_json_bytes(
+        {
+            "base_seed": base_seed,
+            "optimizer_global_step": optimizer_global_step,
+            "canonical_slot_id": canonical_slot_id,
+            "stable_site_name": stable_site_name,
+        }
+    )
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little") & (
+        (1 << 63) - 1
+    )
+
+
+@dataclass(frozen=True)
+class Stage1StochasticContext:
+    """One microbatch's immutable RNG identity plus bounded invocation state."""
+
+    base_seed: int
+    optimizer_global_step: int
+    rows: tuple[tuple[int, int], ...]
+    expected_sites: tuple[str, ...]
+    phase: Literal["outside_checkpoint", "original", "recompute"] = field(
+        default="outside_checkpoint", init=False
+    )
+    original_invocations: dict[str, int] = field(default_factory=dict, init=False)
+    recompute_invocations: dict[str, int] = field(default_factory=dict, init=False)
+    _active: bool = field(default=False, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("base_seed", self.base_seed),
+            ("optimizer_global_step", self.optimizer_global_step),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        try:
+            rows = tuple(tuple(row) for row in self.rows)
+        except TypeError as error:
+            raise ValueError("Stage 1 stochastic rows must be pairs") from error
+        if not rows:
+            raise ValueError("Stage 1 stochastic context rows must not be empty")
+        if any(len(row) != 2 for row in rows):
+            raise ValueError("Stage 1 stochastic rows must be (slot, valid_length) pairs")
+        for slot, valid_length in rows:
+            if type(slot) is not int or slot < 0:
+                raise ValueError("canonical slot IDs must be nonnegative integers")
+            if type(valid_length) is not int or valid_length <= 0:
+                raise ValueError("valid lengths must be positive integers")
+        slots = tuple(slot for slot, _ in rows)
+        if len(slots) != len(set(slots)):
+            raise ValueError("Stage 1 stochastic rows require unique canonical slot IDs")
+        try:
+            sites = tuple(self.expected_sites)
+        except TypeError as error:
+            raise ValueError("expected stochastic sites must be a sequence") from error
+        if not sites or any(type(site) is not str or not site for site in sites):
+            raise ValueError("expected stochastic sites must be nonempty strings")
+        if len(sites) != len(set(sites)):
+            raise ValueError("duplicate stochastic site names are forbidden")
+        object.__setattr__(self, "rows", rows)
+        object.__setattr__(self, "expected_sites", sites)
+
+    def record_invocation(self, site_name: str) -> None:
+        if site_name not in self.expected_sites:
+            raise RuntimeError(f"unregistered Stage 1 stochastic site: {site_name}")
+        recompute = self.phase == "recompute"
+        counts = self.recompute_invocations if recompute else self.original_invocations
+        phase = "recompute" if recompute else "original"
+        if counts.get(site_name, 0) >= 1:
+            raise RuntimeError(
+                f"second {phase} invocation for Stage 1 stochastic site {site_name}"
+            )
+        counts[site_name] = 1
+
+    def validate_invocations(self) -> None:
+        invalid_original = tuple(
+            site
+            for site in self.expected_sites
+            if self.original_invocations.get(site, 0) != 1
+        )
+        if invalid_original:
+            raise RuntimeError(
+                "Stage 1 stochastic sites require original count exactly one: "
+                + ", ".join(invalid_original)
+            )
+        invalid_recompute = tuple(
+            site
+            for site, count in self.recompute_invocations.items()
+            if count not in (0, 1)
+        )
+        if invalid_recompute:
+            raise RuntimeError(
+                "Stage 1 stochastic sites permit at most one recompute: "
+                + ", ".join(invalid_recompute)
+            )
+
+
+_STAGE1_STOCHASTIC_CONTEXT: ContextVar[Stage1StochasticContext | None] = (
+    ContextVar("stage1_stochastic_context", default=None)
+)
+
+
+def _require_stage1_stochastic_context() -> Stage1StochasticContext:
+    context = _STAGE1_STOCHASTIC_CONTEXT.get()
+    if context is None or not context._active or context._closed:
+        raise RuntimeError("missing Stage 1 stochastic context")
+    return context
+
+
+@contextmanager
+def activate_stage1_stochastic_context(context: Stage1StochasticContext):
+    """Own one parent ContextVar token through forward and backward."""
+    if not isinstance(context, Stage1StochasticContext):
+        raise TypeError("context must be a Stage1StochasticContext")
+    if context._closed:
+        raise RuntimeError("stale Stage 1 stochastic context cannot be reactivated")
+    if context._active or _STAGE1_STOCHASTIC_CONTEXT.get() is not None:
+        raise RuntimeError("nested Stage 1 stochastic contexts are unsupported")
+    object.__setattr__(context, "_active", True)
+    token = _STAGE1_STOCHASTIC_CONTEXT.set(context)
+    try:
+        yield context
+    except BaseException:
+        raise
+    else:
+        context.validate_invocations()
+    finally:
+        object.__setattr__(context, "phase", "outside_checkpoint")
+        context.original_invocations.clear()
+        context.recompute_invocations.clear()
+        object.__setattr__(context, "_active", False)
+        object.__setattr__(context, "_closed", True)
+        _STAGE1_STOCHASTIC_CONTEXT.reset(token)
+
+
+@contextmanager
+def _stage1_checkpoint_phase(
+    context: Stage1StochasticContext,
+    phase: Literal["original", "recompute"],
+):
+    current = _STAGE1_STOCHASTIC_CONTEXT.get()
+    nested_token = None
+    if current is None:
+        if not context._active or context._closed:
+            raise RuntimeError("stale Stage 1 checkpoint stochastic context")
+        nested_token = _STAGE1_STOCHASTIC_CONTEXT.set(context)
+    elif current is not context:
+        raise RuntimeError("Stage 1 checkpoint stochastic context identity changed")
+    previous = context.phase
+    object.__setattr__(context, "phase", phase)
+    try:
+        yield
+    finally:
+        object.__setattr__(context, "phase", previous)
+        if nested_token is not None:
+            _STAGE1_STOCHASTIC_CONTEXT.reset(nested_token)
+
+
+def stage1_checkpoint_context_fn():
+    """Return non-reentrant checkpoint managers sharing the parent context."""
+    context = _require_stage1_stochastic_context()
+    return (
+        _stage1_checkpoint_phase(context, "original"),
+        _stage1_checkpoint_phase(context, "recompute"),
+    )
+
+
+class SampleStableStage1Dropout(torch.nn.Module):
+    def __init__(self, site_name: str, p: float) -> None:
+        super().__init__()
+        if type(site_name) is not str or not site_name:
+            raise ValueError("dropout site_name must be a nonempty string")
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise TypeError("dropout probability must be numeric")
+        p = float(p)
+        if not math.isfinite(p) or not 0.0 <= p < 1.0:
+            raise ValueError("dropout probability must be finite and in [0, 1)")
+        self.site_name = site_name
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return x
+        if self.p == 0.0 and _STAGE1_STOCHASTIC_CONTEXT.get() is None:
+            return x
+        context = _require_stage1_stochastic_context()
+        if not isinstance(x, torch.Tensor) or x.ndim != 3:
+            raise ValueError("Stage 1 sample-stable dropout requires [B,T,H]")
+        if not x.is_floating_point():
+            raise TypeError("Stage 1 sample-stable dropout requires floating activations")
+        batch, width, hidden = x.shape
+        if batch != len(context.rows):
+            raise ValueError("Stage 1 stochastic context row count must match B")
+        if width <= 0 or hidden <= 0:
+            raise ValueError("Stage 1 sample-stable dropout requires nonempty T,H")
+        if any(valid_length > width for _, valid_length in context.rows):
+            raise ValueError("Stage 1 stochastic valid length exceeds T")
+        context.record_invocation(self.site_name)
+        if self.p == 0.0:
+            return x
+        mask = torch.ones_like(x)
+        scale = 1.0 / (1.0 - self.p)
+        for row_index, (canonical_slot_id, valid_length) in enumerate(context.rows):
+            generator = torch.Generator(device=x.device)
+            generator.manual_seed(
+                stage1_sample_seed(
+                    context.base_seed,
+                    context.optimizer_global_step,
+                    canonical_slot_id,
+                    self.site_name,
+                )
+            )
+            draws = torch.rand(
+                (valid_length, hidden),
+                dtype=torch.float32,
+                device=x.device,
+                generator=generator,
+            )
+            mask[row_index, :valid_length, :] = (
+                draws.ge(self.p).to(dtype=x.dtype) * scale
+            )
+        return x * mask
 
 
 def canonical_tensor_sha256(tensor: torch.Tensor) -> str:
@@ -769,6 +1054,13 @@ def validate_resolved_manifest(payload: Mapping[str, object] | str | bytes) -> d
         raise ValueError("manifest batch has invalid gradient accumulation for grouping arm")
     if batch["rank_local_microbatch_grouping"] != expected_groupings[microbatch]:
         raise ValueError("manifest batch has invalid rank-local microbatch grouping")
+    stochastic = decoded["stochastic"]
+    assert isinstance(stochastic, dict)
+    if stochastic["rng_schema"] != STAGE1_SAMPLE_RNG_SCHEMA:
+        raise ValueError(
+            "manifest has unsupported Stage 1 sample RNG schema: "
+            f"{stochastic['rng_schema']!r}"
+        )
     initialization = decoded["initialization"]
     assert isinstance(initialization, dict)
     for collection_name in ("trainable_parameters", "ema_parameters"):
@@ -1080,6 +1372,12 @@ def materialize_stage1_resolved_manifest(
     This boundary always replaces identity, batch, DeepSpeed, and initialization data
     with values derived from the concrete runtime inputs supplied separately.
     """
+    backend_settings = read_stage1_backend_settings()
+    if backend_settings != _STAGE1_FIXED_BACKEND_SETTINGS:
+        raise RuntimeError(
+            "Stage 1 backend settings do not match the fixed comparison values: "
+            f"observed={backend_settings}"
+        )
     repository = Path(repository_root).absolute()
     runtime_sources = _fixed_runtime_source_files(
         repository,
@@ -1121,6 +1419,10 @@ def materialize_stage1_resolved_manifest(
         raise ValueError("manifest materializer requires B * GA = 4")
     payload = _decode_manifest(semantic_values)
     payload["schema_version"] = "stage1-resolved-manifest-v1"
+    stochastic = payload.get("stochastic")
+    if type(stochastic) is not dict:
+        raise TypeError("semantic_values/stochastic must be an object")
+    stochastic["rng_schema"] = STAGE1_SAMPLE_RNG_SCHEMA
     payload["model"] = {
         "model_path": model_logical,
         "processor_path": processor_logical,
@@ -1163,6 +1465,10 @@ def materialize_stage1_resolved_manifest(
         "source_digest": hashlib.sha256(deepspeed.read_bytes()).hexdigest(),
         "settings": settings,
     }
+    precision = payload.get("precision")
+    if type(precision) is not dict:
+        raise TypeError("semantic_values/precision must be an object")
+    precision.update(backend_settings)
     evaluation = payload.get("evaluation")
     if type(evaluation) is not dict:
         raise TypeError("semantic_values/evaluation must be an object")

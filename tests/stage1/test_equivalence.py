@@ -1,13 +1,16 @@
+import ast
 import copy
 import hashlib
 import json
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from itertools import islice
+from pathlib import Path
 import subprocess
 
 import pytest
 import torch
 from accelerate.data_loader import BatchSamplerShard
+from torch.utils.checkpoint import checkpoint
 
 from stage1.data import PreparedStage1Example
 from stage1.equivalence import (
@@ -17,20 +20,61 @@ from stage1.equivalence import (
     Stage1CanonicalDataset,
     Stage1ResolvedManifest,
     Stage1SampleOccurrence,
+    Stage1StochasticContext,
+    SampleStableStage1Dropout,
+    activate_stage1_stochastic_context,
     canonical_json_bytes,
     canonical_tensor_sha256,
     compare_stage1_manifests,
+    configure_stage1_backend_settings,
     expected_stage1_assignment,
     materialize_stage1_resolved_manifest,
     materialize_stage1_schedule,
     normalized_manifest_bytes,
+    read_stage1_backend_settings,
     runtime_source_sha256,
+    stage1_checkpoint_context_fn,
+    stage1_sample_seed,
     validate_stage1_schedule,
 )
 
 
 _SHA_A = "a" * 64
 _SHA_B = "b" * 64
+_FIXED_BACKEND_SETTINGS = {
+    "cudnn_deterministic": True,
+    "cudnn_benchmark": False,
+    "cuda_matmul_allow_tf32": False,
+    "cudnn_allow_tf32": False,
+    "float32_matmul_precision": "highest",
+}
+
+
+def _raw_backend_settings():
+    return {
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+    }
+
+
+def _set_raw_backend_settings(settings):
+    torch.backends.cudnn.deterministic = settings["cudnn_deterministic"]
+    torch.backends.cudnn.benchmark = settings["cudnn_benchmark"]
+    torch.backends.cuda.matmul.allow_tf32 = settings["cuda_matmul_allow_tf32"]
+    torch.backends.cudnn.allow_tf32 = settings["cudnn_allow_tf32"]
+    torch.set_float32_matmul_precision(settings["float32_matmul_precision"])
+
+
+@pytest.fixture(autouse=True)
+def restore_backend_settings_after_test():
+    before = _raw_backend_settings()
+    try:
+        yield
+    finally:
+        _set_raw_backend_settings(before)
 
 
 @pytest.fixture
@@ -132,9 +176,14 @@ def resolved_manifest_mapping():
             "attention": "flash_attention_2",
             "gradient_checkpointing": True,
             "gradient_checkpointing_use_reentrant": False,
+            "cudnn_deterministic": True,
+            "cudnn_benchmark": False,
+            "cuda_matmul_allow_tf32": False,
+            "cudnn_allow_tf32": False,
+            "float32_matmul_precision": "highest",
         },
         "stochastic": {
-            "rng_schema": "sample-occurrence-v1",
+            "rng_schema": "stage1-sample-rng-v1",
             "site_allowlist": ["dora_dropout", "alignment_target_noise"],
             "dropout_schema": "sample-keyed-dora-v1",
             "noise_schema": "sample-keyed-alignment-v1",
@@ -412,6 +461,338 @@ def test_canonical_tensor_hash_accepts_finite_scalar_parameter():
     )
 
 
+def test_stage1_sample_seed_has_literal_schema_digest_and_key_separation():
+    """Catches process hash(), field omission, or non-little-endian seed decoding."""
+    assert stage1_sample_seed(42, 17, 3450, "site.a") == 480346063979829922
+    assert stage1_sample_seed(42, 17, 0, "site.a") == 2497506465054421059
+    assert stage1_sample_seed(42, 18, 3450, "site.a") != 480346063979829922
+    assert stage1_sample_seed(42, 17, 3450, "site.b") != 480346063979829922
+
+
+def test_stage1_backend_helpers_observe_configure_and_restore_fixed_settings():
+    """Catches manifest backend fields being constants disconnected from runtime state."""
+    noncanonical = {
+        "cudnn_deterministic": False,
+        "cudnn_benchmark": True,
+        "cuda_matmul_allow_tf32": True,
+        "cudnn_allow_tf32": True,
+        "float32_matmul_precision": "high",
+    }
+    _set_raw_backend_settings(noncanonical)
+
+    assert read_stage1_backend_settings() == noncanonical
+    assert configure_stage1_backend_settings() == _FIXED_BACKEND_SETTINGS
+    assert _raw_backend_settings() == _FIXED_BACKEND_SETTINGS
+
+
+@pytest.fixture(scope="module")
+def cuda_device():
+    if not torch.cuda.is_available():
+        pytest.skip("sample-stable Stage 1 dropout requires a CUDA witness")
+    return torch.device("cuda", 0)
+
+
+_DROPOUT_SITE = "base_model.model.model.layers.0.self_attn.q_proj.lora_dropout.default"
+
+
+def _independent_dropout_mask(*, slot, length, width, hidden, p, device):
+    payload = json.dumps(
+        {
+            "base_seed": 42,
+            "optimizer_global_step": 17,
+            "canonical_slot_id": slot,
+            "stable_site_name": _DROPOUT_SITE,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
+    seed &= (1 << 63) - 1
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    mask = torch.ones((width, hidden), device=device)
+    draws = torch.rand(
+        (length, hidden),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    mask[:length] = draws.ge(p).float() / (1.0 - p)
+    return mask
+
+
+def _run_dropout_rows(*, batch_sizes, lengths, device):
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25).to(device)
+    dropout.train()
+    slots = (9, 3450)
+    results = []
+    cursor = 0
+    for batch_size in batch_sizes:
+        row_lengths = lengths[cursor : cursor + batch_size]
+        row_slots = slots[cursor : cursor + batch_size]
+        width = max(row_lengths)
+        values = torch.ones((batch_size, width, 4), device=device)
+        context = Stage1StochasticContext(
+            base_seed=42,
+            optimizer_global_step=17,
+            rows=tuple(zip(row_slots, row_lengths)),
+            expected_sites=(_DROPOUT_SITE,),
+        )
+        with activate_stage1_stochastic_context(context):
+            output = dropout(values)
+        results.extend(output.unbind(0))
+        cursor += batch_size
+    return tuple(results)
+
+
+def test_sample_dropout_is_grouping_and_right_padding_invariant(cuda_device):
+    """Catches batch grouping or a neighbor's padding shifting a row RNG stream."""
+    separate = _run_dropout_rows(
+        batch_sizes=(1, 1), lengths=(5, 8), device=cuda_device
+    )
+    packed = _run_dropout_rows(
+        batch_sizes=(2,), lengths=(5, 8), device=cuda_device
+    )
+
+    torch.testing.assert_close(packed[0][:5], separate[0][:5], rtol=0, atol=0)
+    torch.testing.assert_close(packed[1][:8], separate[1][:8], rtol=0, atol=0)
+    assert torch.equal(packed[0][5:], torch.ones_like(packed[0][5:]))
+    torch.testing.assert_close(
+        packed[0],
+        _independent_dropout_mask(
+            slot=9,
+            length=5,
+            width=8,
+            hidden=4,
+            p=0.25,
+            device=cuda_device,
+        ),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_checkpoint_recompute_regenerates_same_dropout_and_rejects_second_call(
+    cuda_device,
+):
+    """Catches checkpoint recompute consuming RNG or accepting a duplicate site call."""
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25).to(cuda_device)
+    dropout.train()
+    values = torch.ones((1, 6, 4), device=cuda_device, requires_grad=True)
+    seen = []
+    context = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 6),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+
+    def block(tensor):
+        dropped = dropout(tensor)
+        seen.append(dropped.detach().clone())
+        return dropped * dropped
+
+    with activate_stage1_stochastic_context(context):
+        checkpointed = checkpoint(
+            block,
+            values,
+            use_reentrant=False,
+            context_fn=stage1_checkpoint_context_fn,
+        )
+        checkpointed.sum().backward()
+        assert len(seen) == 2
+        torch.testing.assert_close(seen[0], seen[1], rtol=0, atol=0)
+        assert context.phase == "outside_checkpoint"
+        # Creating another pair proves recompute restored its nested token and
+        # left the training-step parent token active in this original context.
+        _, recompute_context = stage1_checkpoint_context_fn()
+        with recompute_context:
+            with pytest.raises(RuntimeError, match="second.*recompute"):
+                dropout(values)
+
+
+def test_sample_dropout_rejects_missing_stale_shape_and_site_context():
+    """Catches silent global-RNG fallback or inferred row/layout ownership."""
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25)
+    dropout.train()
+    values = torch.ones((1, 5, 4))
+
+    with pytest.raises(RuntimeError, match="missing.*stochastic context"):
+        dropout(values)
+
+    stale_context = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    with activate_stage1_stochastic_context(stale_context):
+        dropout(values)
+    with pytest.raises(RuntimeError, match="missing.*stochastic context"):
+        dropout(values)
+    with pytest.raises(RuntimeError, match="stale"):
+        with activate_stage1_stochastic_context(stale_context):
+            pass
+
+    wrong_rank = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    with pytest.raises(ValueError, match=r"\[B,T,H\]"):
+        with activate_stage1_stochastic_context(wrong_rank):
+            dropout(torch.ones((5, 4)))
+
+    wrong_rows = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5), (10, 5)),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    with pytest.raises(ValueError, match="row count"):
+        with activate_stage1_stochastic_context(wrong_rows):
+            dropout(values)
+
+    wrong_length = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 6),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    with pytest.raises(ValueError, match="valid length"):
+        with activate_stage1_stochastic_context(wrong_length):
+            dropout(values)
+
+    wrong_site = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=("different.site",),
+    )
+    with pytest.raises(RuntimeError, match="unregistered.*site"):
+        with activate_stage1_stochastic_context(wrong_site):
+            dropout(values)
+
+
+def test_zero_probability_dropout_preserves_identity_and_context_counts():
+    """Catches zero-dropout PEFT behavior changing or bypassing topology counts."""
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.0)
+    dropout.train()
+    values = torch.randn((1, 5, 4))
+
+    assert dropout(values) is values
+    context = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    with activate_stage1_stochastic_context(context):
+        assert dropout(values) is values
+
+
+def test_stochastic_context_rejects_duplicate_sites_and_missing_original_call():
+    """Catches ambiguous site identity or a supported topology silently going unused."""
+    with pytest.raises(ValueError, match="duplicate.*site"):
+        Stage1StochasticContext(
+            base_seed=42,
+            optimizer_global_step=17,
+            rows=((9, 5),),
+            expected_sites=(_DROPOUT_SITE, _DROPOUT_SITE),
+        )
+
+    context = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE, "missing.site"),
+    )
+    with pytest.raises(FrozenInstanceError):
+        context.rows = ((10, 5),)
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25)
+    dropout.train()
+    with pytest.raises(RuntimeError, match="original count exactly one"):
+        with activate_stage1_stochastic_context(context):
+            dropout(torch.ones((1, 5, 4)))
+
+
+def test_padded_duplicate_receives_different_sample_dropout_seed():
+    """Catches a padded occurrence reusing source-row rather than slot identity."""
+    original = stage1_sample_seed(42, 17, 0, _DROPOUT_SITE)
+    padded_duplicate = stage1_sample_seed(42, 17, 3450, _DROPOUT_SITE)
+
+    assert original != padded_duplicate
+
+
+def test_stage1_stochastic_inventory_identifies_only_registered_and_deferred_sources():
+    """Catches a new direct random API entering Stage 1 without source ownership."""
+    random_apis = {
+        "rand",
+        "rand_like",
+        "randn",
+        "randn_like",
+        "randint",
+        "randperm",
+        "normal",
+        "bernoulli",
+        "multinomial",
+        "poisson",
+        "dropout",
+    }
+    observed = set()
+    for path in sorted((Path("src") / "stage1").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in random_apis
+            ):
+                continue
+            owners = []
+            parent = node
+            while parent in parents:
+                parent = parents[parent]
+                if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    owners.append(parent.name)
+                elif isinstance(parent, ast.ClassDef):
+                    owners.append(parent.name)
+                    break
+            observed.add(
+                (
+                    path.relative_to(Path("src")).as_posix(),
+                    ".".join(reversed(owners)),
+                    ast.unparse(node.func),
+                )
+            )
+
+    assert observed == {
+        (
+            "stage1/equivalence.py",
+            "canonical_epoch_permutation",
+            "torch.randperm",
+        ),
+        (
+            "stage1/equivalence.py",
+            "SampleStableStage1Dropout.forward",
+            "torch.rand",
+        ),
+        # Task 7 must replace this exact interim legacy source with
+        # alignment_noise_bank before the final three-source inventory gate.
+        (
+            "stage1/trainer.py",
+            "CustomTrainerStage1._alignment_loss",
+            "torch.randn_like",
+        ),
+    }
+
+
 @pytest.mark.parametrize(
     ("tensor", "expected"),
     (
@@ -454,8 +835,16 @@ def test_manifest_round_trip_is_closed_and_has_literal_digest(resolved_manifest_
 
     assert manifest.to_mapping() == resolved_manifest_mapping
     assert manifest.digest == (
-        "fdd29bd042ab227dfe5a79a0c2e41101f8e0aab489aa95d83af702190f545a7d"
+        "1807d864c942ef2d01400f186a4a263bf78f7c7709b43c9ecf1f00ce4745c5c4"
     )
+
+
+def test_manifest_rejects_non_stage1_sample_rng_schema(resolved_manifest_mapping):
+    """Catches a caller sealing a mutable-stream or stale occurrence RNG identity."""
+    resolved_manifest_mapping["stochastic"]["rng_schema"] = "sample-occurrence-v1"
+
+    with pytest.raises(ValueError, match="RNG schema"):
+        Stage1ResolvedManifest.from_mapping(resolved_manifest_mapping)
 
 
 @pytest.mark.parametrize(
@@ -579,7 +968,6 @@ def test_cross_arm_manifest_accepts_exact_batch_and_artifact_differences(
     (
         "/optimizer/learning_rate",
         "/ema/tau",
-        "/stochastic/rng_schema",
         "/data/train_sha256",
         "/code/runtime_source_digest",
         "/deepspeed/settings/zero_optimization/stage",
@@ -678,6 +1066,7 @@ def test_manifest_runtime_source_hashes_sorted_relative_paths_and_rejects_dirty_
 
 @pytest.fixture
 def manifest_runtime_inputs(tmp_path, resolved_manifest_mapping):
+    configure_stage1_backend_settings()
     repository = tmp_path / "runtime-repository"
     files = {
         "src/core.py": b"VALUE = 1\n",
@@ -797,6 +1186,9 @@ def test_manifest_materializer_derives_runtime_identities_instead_of_trusting_ma
         "effective_global_batch_size": 16,
         "rank_local_microbatch_grouping": [[0, 0], [0, 1], [1, 0], [1, 1]],
     }
+    assert {
+        key: payload["precision"][key] for key in _FIXED_BACKEND_SETTINGS
+    } == _FIXED_BACKEND_SETTINGS
     assert payload["deepspeed"]["source_digest"] == (
         "ac9adfe99efe8c21745014ee696b490be1e680379077babefc9111186dac68ec"
     )
@@ -812,6 +1204,54 @@ def test_manifest_materializer_derives_runtime_identities_instead_of_trusting_ma
     )
     assert payload["evaluation"]["dataset_sha256"] == payload["data"]["test_sha256"]
     assert payload["code"]["software_versions"]["pytorch"] != "fabricated"
+
+
+def test_manifest_materializer_overwrites_fabricated_backend_settings(
+    manifest_runtime_inputs,
+):
+    """Catches semantic_values being trusted for observed backend state."""
+    manifest_runtime_inputs["semantic_values"]["precision"].update(
+        {
+            "cudnn_deterministic": False,
+            "cudnn_benchmark": True,
+            "cuda_matmul_allow_tf32": True,
+            "cudnn_allow_tf32": True,
+            "float32_matmul_precision": "high",
+        }
+    )
+
+    payload = materialize_stage1_resolved_manifest(
+        **manifest_runtime_inputs
+    ).to_mapping()
+
+    assert {
+        key: payload["precision"][key] for key in _FIXED_BACKEND_SETTINGS
+    } == _FIXED_BACKEND_SETTINGS
+
+
+def test_manifest_materializer_derives_fixed_sample_rng_schema(
+    manifest_runtime_inputs,
+):
+    """Catches semantic_values selecting the stochastic seed identity."""
+    manifest_runtime_inputs["semantic_values"]["stochastic"]["rng_schema"] = (
+        "caller-selected-schema"
+    )
+
+    payload = materialize_stage1_resolved_manifest(
+        **manifest_runtime_inputs
+    ).to_mapping()
+
+    assert payload["stochastic"]["rng_schema"] == "stage1-sample-rng-v1"
+
+
+def test_manifest_materializer_rejects_observed_backend_drift(
+    manifest_runtime_inputs,
+):
+    """Catches a launch sealing a manifest before fixed backends are configured."""
+    torch.backends.cudnn.allow_tf32 = True
+
+    with pytest.raises(RuntimeError, match="backend settings"):
+        materialize_stage1_resolved_manifest(**manifest_runtime_inputs)
 
 
 def test_manifest_materializer_binds_fixed_source_closure_to_recorded_commit(
@@ -1032,6 +1472,9 @@ MANIFEST_REQUIRED_POINTERS = (
         for field in (
             "training_dtype", "loss_reduction_dtype", "attention",
             "gradient_checkpointing", "gradient_checkpointing_use_reentrant",
+            "cudnn_deterministic", "cudnn_benchmark",
+            "cuda_matmul_allow_tf32", "cudnn_allow_tf32",
+            "float32_matmul_precision",
         )
     ),
     *(

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -23,6 +26,20 @@ _ADAPTER_NAME = "default"
 _EMBEDDING_TARGET = "model.embed_tokens"
 _ATTENTION_TARGET_SUFFIXES = frozenset({"q_proj", "k_proj", "v_proj", "o_proj"})
 _MLP_TARGET_SUFFIXES = frozenset({"gate_proj", "up_proj", "down_proj"})
+_QWEN_RANDOM_APIS = frozenset(
+    {
+        "rand",
+        "rand_like",
+        "randn",
+        "randn_like",
+        "randint",
+        "randperm",
+        "normal",
+        "bernoulli",
+        "multinomial",
+        "poisson",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -615,6 +632,7 @@ def build_stage1_tuned_model(
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(base_model, config)
+    install_stage1_sample_stable_dropout(model)
     attach_sparse_output_token_rows(resolve_qwen2_5_vl_model(model), ids)
     validate_stage1_trainable_boundary(
         model, tuning, ids, zero_stage=zero_stage
@@ -622,8 +640,208 @@ def build_stage1_tuned_model(
     return model
 
 
+def install_stage1_sample_stable_dropout(model: nn.Module) -> tuple[str, ...]:
+    """Replace only resolved Stage 1 decoder-adapter dropout modules."""
+    from stage1.equivalence import SampleStableStage1Dropout
+
+    if not isinstance(model, PeftModel):
+        raise TypeError("Stage 1 sample-stable dropout requires a PEFT model")
+    base_model = getattr(model, "base_model", None)
+    targeted = getattr(base_model, "targeted_module_names", None)
+    if isinstance(targeted, str) or not isinstance(targeted, (set, list, tuple)):
+        raise RuntimeError("Stage 1 PEFT targeted_module_names are unavailable")
+    target_names = tuple(targeted)
+    if not target_names:
+        raise RuntimeError("Stage 1 PEFT has no targeted decoder modules")
+    if any(type(name) is not str or not name for name in target_names):
+        raise RuntimeError("Stage 1 PEFT target names must be nonempty strings")
+    if len(target_names) != len(set(target_names)):
+        raise RuntimeError("duplicate Stage 1 PEFT target names are forbidden")
+    allowed_suffixes = _ATTENTION_TARGET_SUFFIXES | _MLP_TARGET_SUFFIXES
+    invalid_targets = tuple(
+        name
+        for name in target_names
+        if not name.startswith("model.layers.")
+        or name.rsplit(".", 1)[-1] not in allowed_suffixes
+    )
+    if invalid_targets:
+        raise RuntimeError(
+            "Stage 1 sample-stable dropout targets must be decoder projections: "
+            + ", ".join(sorted(invalid_targets))
+        )
+
+    wrapped_model = getattr(base_model, "model", None)
+    if not isinstance(wrapped_model, nn.Module):
+        raise RuntimeError("Stage 1 PEFT wrapped model is unavailable")
+    config = getattr(model, "peft_config", None)
+    adapter_config = config.get(_ADAPTER_NAME) if isinstance(config, Mapping) else None
+    configured_p = getattr(adapter_config, "lora_dropout", None)
+    if isinstance(configured_p, bool) or not isinstance(configured_p, (int, float)):
+        raise RuntimeError("Stage 1 PEFT dropout probability is unavailable")
+    configured_p = float(configured_p)
+
+    modules = dict(model.named_modules())
+    sites: list[str] = []
+    for target_name in sorted(target_names):
+        try:
+            target = wrapped_model.get_submodule(target_name)
+        except (AttributeError, KeyError) as error:
+            raise RuntimeError(
+                f"Stage 1 PEFT target module is missing: {target_name}"
+            ) from error
+        qualified_target = f"base_model.model.{target_name}"
+        if modules.get(qualified_target) is not target:
+            raise RuntimeError(
+                f"Stage 1 PEFT target has no unique qualified path: {target_name}"
+            )
+        dropout_modules = getattr(target, "lora_dropout", None)
+        if not isinstance(dropout_modules, nn.ModuleDict) or set(dropout_modules) != {
+            _ADAPTER_NAME
+        }:
+            raise RuntimeError(
+                f"Stage 1 PEFT target has invalid lora_dropout topology: {target_name}"
+            )
+        site_name = f"{qualified_target}.lora_dropout.{_ADAPTER_NAME}"
+        current = dropout_modules[_ADAPTER_NAME]
+        if isinstance(current, SampleStableStage1Dropout):
+            if current.site_name != site_name or current.p != configured_p:
+                raise RuntimeError(
+                    f"Stage 1 sample-stable dropout identity changed: {site_name}"
+                )
+        else:
+            if isinstance(current, nn.Dropout):
+                observed_p = float(current.p)
+            elif isinstance(current, nn.Identity):
+                observed_p = 0.0
+            else:
+                raise RuntimeError(
+                    f"unsupported Stage 1 PEFT dropout module at {site_name}: "
+                    f"{type(current).__name__}"
+                )
+            if observed_p != configured_p:
+                raise RuntimeError(
+                    f"Stage 1 PEFT dropout probability mismatch at {site_name}"
+                )
+            dropout_modules[_ADAPTER_NAME] = SampleStableStage1Dropout(
+                site_name, configured_p
+            )
+        sites.append(site_name)
+
+    result = tuple(sites)
+    if len(result) != len(set(result)):
+        raise RuntimeError("duplicate Stage 1 stochastic site names are forbidden")
+    model.stage1_stochastic_sites = result
+    return result
+
+
+def _iter_mapping_values(value, *, prefix: str = ""):
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            location = f"{prefix}.{key}" if prefix else str(key)
+            yield location, child
+            yield from _iter_mapping_values(child, prefix=location)
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            yield from _iter_mapping_values(child, prefix=f"{prefix}[{index}]")
+
+
+def _validate_loaded_qwen_stochastic_source(qwen: nn.Module) -> None:
+    source_name = inspect.getsourcefile(type(qwen))
+    if source_name is None:
+        raise RuntimeError("loaded custom Qwen source path is unavailable")
+    source = Path(source_name).resolve()
+    if source.name != "modeling_qwen2_5_vl.py" or not source.is_file():
+        raise RuntimeError(f"unexpected loaded custom Qwen source: {source}")
+    try:
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    except (OSError, UnicodeError, SyntaxError) as error:
+        raise RuntimeError("loaded custom Qwen source cannot be audited") from error
+    random_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr in _QWEN_RANDOM_APIS:
+            random_calls.append((node.lineno, ast.unparse(node.func)))
+    if random_calls:
+        details = ", ".join(f"{api}@{line}" for line, api in random_calls)
+        raise RuntimeError(f"loaded custom Qwen source contains random calls: {details}")
+
+    config = getattr(qwen, "config", None)
+    to_dict = getattr(config, "to_dict", None)
+    if not callable(to_dict):
+        raise RuntimeError("loaded custom Qwen config cannot be audited")
+    enabled_config = []
+    for location, value in _iter_mapping_values(to_dict()):
+        leaf = location.rsplit(".", 1)[-1].lower()
+        if "dropout" not in leaf or value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(f"loaded Qwen dropout config is invalid: {location}")
+        if float(value) != 0.0:
+            enabled_config.append(location)
+    enabled_runtime = []
+    for name, module in qwen.named_modules():
+        for attribute, value in vars(module).items():
+            if "dropout" not in attribute.lower() or value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if float(value) != 0.0:
+                enabled_runtime.append(f"{name or '<root>'}.{attribute}")
+    enabled = tuple(sorted(set(enabled_config + enabled_runtime)))
+    if enabled:
+        raise RuntimeError("loaded Qwen dropout is enabled: " + ", ".join(enabled))
+
+
+def validate_stage1_stochastic_inventory(
+    model: nn.Module, expected_sites: Sequence[str]
+) -> None:
+    """Fail closed on unregistered training dropout and Qwen random paths."""
+    from stage1.equivalence import SampleStableStage1Dropout
+
+    if not isinstance(model, nn.Module):
+        raise TypeError("Stage 1 stochastic inventory requires an nn.Module")
+    if isinstance(expected_sites, str):
+        raise TypeError("expected stochastic sites must be a sequence")
+    sites = tuple(expected_sites)
+    if not sites or any(type(site) is not str or not site for site in sites):
+        raise ValueError("expected stochastic sites must be nonempty strings")
+    if len(sites) != len(set(sites)):
+        raise RuntimeError("duplicate expected stochastic site names are forbidden")
+    if sites != tuple(sorted(sites)):
+        raise RuntimeError("expected stochastic site names must be sorted")
+
+    stable_by_site: dict[str, list[str]] = {}
+    for path, module in model.named_modules(remove_duplicate=False):
+        if isinstance(module, SampleStableStage1Dropout):
+            stable_by_site.setdefault(module.site_name, []).append(path)
+        elif (
+            isinstance(module, nn.Dropout)
+            and module.training
+            and float(module.p) > 0.0
+        ):
+            raise RuntimeError(f"enabled unregistered nn.Dropout at {path}")
+    for site, paths in stable_by_site.items():
+        if len(paths) != 1:
+            raise RuntimeError(f"duplicate sample-stable dropout site {site}")
+        if site not in sites:
+            raise RuntimeError(f"unregistered sample-stable dropout site {site}")
+        if paths[0] != site:
+            raise RuntimeError(
+                f"sample-stable dropout site/path mismatch: {site} != {paths[0]}"
+            )
+    missing = tuple(site for site in sites if site not in stable_by_site)
+    if missing:
+        raise RuntimeError(
+            "missing registered sample-stable dropout sites: " + ", ".join(missing)
+        )
+    _validate_loaded_qwen_stochastic_source(resolve_qwen2_5_vl_model(model))
+
+
 __all__ = [
     "Stage1ParameterReport",
     "build_stage1_tuned_model",
+    "install_stage1_sample_stable_dropout",
+    "validate_stage1_stochastic_inventory",
     "validate_stage1_trainable_boundary",
 ]

@@ -1,4 +1,5 @@
 from dataclasses import replace
+from functools import partial
 import hashlib
 import json
 import logging
@@ -12,6 +13,7 @@ import pytest
 import torch
 from accelerate.state import AcceleratorState, GradientState, PartialState
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from transformers import Qwen2_5_VLConfig
 from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
@@ -40,7 +42,9 @@ from stage1.composition import (
     build_stage1_training_arguments,
     build_stage1_training_components,
     run_stage1,
+    validate_stage1_checkpoint_context,
 )
+from stage1.equivalence import stage1_checkpoint_context_fn
 from stage1.ema import STAGE1_EMA_TEACHER_STATE_FILENAME
 from utils_deepseed import parse_args
 from stage1.benchmark import config_digest
@@ -108,10 +112,18 @@ class RecordingModel(nn.Module):
         self.visual = nn.Linear(1, 1)
         self.language = nn.Linear(1, 1)
         self.resize_calls = []
+        self.gradient_checkpoint_calls = []
 
     def resize_token_embeddings(self, size):
         self.resize_calls.append(size)
         self.config.vocab_size = size
+
+    def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs):
+        self.gradient_checkpoint_calls.append(dict(gradient_checkpointing_kwargs))
+        self.gradient_checkpointing = True
+        self._gradient_checkpointing_func = partial(
+            checkpoint, **gradient_checkpointing_kwargs
+        )
 
 
 class RecordingTrainer:
@@ -176,11 +188,23 @@ def stage1_args(tmp_path, *extra, method="dora"):
     ("method", "expected_kwargs"),
     [
         ("full", {"use_reentrant": False}),
-        ("lora", {"use_reentrant": True}),
-        ("dora", {"use_reentrant": True}),
+        (
+            "lora",
+            {
+                "use_reentrant": False,
+                "context_fn": stage1_checkpoint_context_fn,
+            },
+        ),
+        (
+            "dora",
+            {
+                "use_reentrant": False,
+                "context_fn": stage1_checkpoint_context_fn,
+            },
+        ),
     ],
 )
-def test_stage1_peft_uses_zero3_safe_reentrant_gradient_checkpointing(
+def test_stage1_peft_uses_sample_stable_nonreentrant_gradient_checkpointing(
     tmp_path, method, expected_kwargs
 ):
     training_args = build_stage1_training_arguments(
@@ -189,6 +213,13 @@ def test_stage1_peft_uses_zero3_safe_reentrant_gradient_checkpointing(
 
     assert training_args.gradient_checkpointing is True
     assert training_args.gradient_checkpointing_kwargs == expected_kwargs
+
+
+def test_stage1_training_arguments_pin_single_process_data_loading(tmp_path):
+    """Catches worker scheduling adding an untracked stochastic process boundary."""
+    training_args = build_stage1_training_arguments(stage1_args(tmp_path))
+
+    assert training_args.dataloader_num_workers == 0
 
 
 @pytest.mark.parametrize("method", ["full", "lora", "dora"])
@@ -491,6 +522,10 @@ def fake_dependencies(
         load_model=load_model,
         preflight_peft=preflight_peft,
         build_tuned_model=build_tuned,
+        install_sample_stable_dropout=lambda selected_model: (
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_dropout.default",
+        ),
+        validate_stochastic_inventory=lambda selected_model, expected_sites: None,
         validate_boundary=validate_boundary,
         prepare_dataset=prepare_dataset,
         collator_factory=collator_factory,
@@ -509,6 +544,36 @@ def fake_dependencies(
         decode_peft_metadata=lambda snapshot: metadata,
         load_peft_model=load_peft_model,
     ), processor, model, parameter_report
+
+
+def test_peft_composition_installs_and_asserts_resolved_checkpoint_context(tmp_path):
+    """Catches relying on SFTConfig without resolving the model checkpoint hook."""
+    args = stage1_args(tmp_path, "--gradient_checkpointing", method="dora")
+    events = []
+    deps, _, model, _ = fake_dependencies(events)
+
+    bundle = build_stage1_training_components(args, dependencies=deps)
+
+    expected = {
+        "use_reentrant": False,
+        "context_fn": stage1_checkpoint_context_fn,
+    }
+    assert model.gradient_checkpoint_calls == [expected]
+    validate_stage1_checkpoint_context(bundle.trainer.kwargs["model"])
+
+
+def test_checkpoint_context_assertion_rejects_wrong_resolved_pair():
+    """Catches reentrant or foreign context functions surviving model preparation."""
+    model = RecordingModel(SimpleNamespace(vocab_size=12))
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={
+            "use_reentrant": True,
+            "context_fn": lambda: (),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="exact.*checkpoint"):
+        validate_stage1_checkpoint_context(model)
 
 
 @pytest.mark.parametrize("explicit", [True, False])
