@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
+import math
+import re
+import subprocess
+import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Iterator, Sequence
+from pathlib import Path
+from typing import Iterator, Literal, Sequence
 
 import torch
 
@@ -356,4 +365,510 @@ def validate_stage1_schedule(schedule: Stage1MaterializedSchedule) -> Stage1Sche
         updates_per_epoch=schedule.updates_per_epoch,
         total_updates=schedule.total_updates,
         occurrences_per_rank_update=4,
+    )
+
+
+CROSS_ARM_V1_POINTERS = (
+    "/batch/per_device_train_batch_size",
+    "/batch/gradient_accumulation_steps",
+    "/batch/rank_local_microbatch_grouping",
+    "/artifacts/run_id",
+    "/artifacts/checkpoints",
+    "/artifacts/results",
+    "/artifacts/logs",
+)
+SAME_ARM_V1_POINTERS = (
+    "/artifacts/run_id",
+    "/artifacts/checkpoints",
+    "/artifacts/results",
+    "/artifacts/logs",
+    "/diagnostics/bounded_optimizer_steps",
+)
+MANIFEST_PROFILES = {
+    "cross_arm_v1": frozenset(CROSS_ARM_V1_POINTERS),
+    "same_arm_v1": frozenset(SAME_ARM_V1_POINTERS),
+}
+
+_MANIFEST_SCHEMA: dict[str, object] = {
+    "schema_version": "schema_version",
+    "model": {
+        "model_path": "path",
+        "processor_path": "path",
+        "model_revision": "str",
+        "processor_revision": "str",
+        "model_files_sha256": "sha256",
+        "processor_files_sha256": "sha256",
+        "config_sha256": "sha256",
+    },
+    "code": {
+        "git_commit": "git_commit",
+        "runtime_source_digest": "sha256",
+        "software_versions": {
+            "python": "str",
+            "pytorch": "str",
+            "transformers": "str",
+            "peft": "str",
+            "deepspeed": "str",
+            "cuda": "str",
+            "flash_attention": "str",
+        },
+    },
+    "data": {
+        "train_jsonl_path": "path",
+        "train_sha256": "sha256",
+        "test_jsonl_path": "path",
+        "test_sha256": "sha256",
+        "image_root": "path",
+        "image_files_sha256": "sha256",
+        "source_rows": "int",
+        "canonical_epoch_slots": "int",
+        "padding_rule": "str",
+        "ordering_rule": "str",
+    },
+    "batch": {
+        "world_size": "int",
+        "per_device_train_batch_size": "int",
+        "gradient_accumulation_steps": "int",
+        "effective_global_batch_size": "int",
+        "rank_local_microbatch_grouping": ("list", ("list", "int")),
+    },
+    "schedule": {
+        "epochs": "int",
+        "seed": "int",
+        "permutation_rule": "str",
+        "optimizer_steps_per_epoch": "int",
+        "total_optimizer_steps": "int",
+        "logging_steps": "int",
+        "checkpoint_steps": ("list", "int"),
+    },
+    "tuning": {
+        "method": "str",
+        "dora": {
+            "rank": "int",
+            "alpha": "number",
+            "target_modules": ("list", "str"),
+            "dropout": "number",
+        },
+        "losses": {"ce_weight": "number", "similarity_weight": "number"},
+        "targets": {
+            "coverage_probability": "number",
+            "image_pool_size": "int",
+            "helper_group_size": "int",
+            "latent_size": "int",
+            "alignment_noise": "number",
+        },
+        "maximum_sequence_length": "int",
+    },
+    "optimizer": {
+        "name": "str",
+        "learning_rate": "number",
+        "betas": ("list", "number"),
+        "epsilon": "number",
+        "weight_decay": "number",
+        "max_grad_norm": "number",
+    },
+    "scheduler": {
+        "name": "str",
+        "warmup_optimizer_steps": "int",
+        "total_optimizer_steps": "int",
+    },
+    "ema": {"tau": "number", "initialization": "str", "update_rule": "str"},
+    "precision": {
+        "training_dtype": "str",
+        "loss_reduction_dtype": "str",
+        "attention": "str",
+        "gradient_checkpointing": "bool",
+        "gradient_checkpointing_use_reentrant": "bool",
+    },
+    "stochastic": {
+        "rng_schema": "str",
+        "site_allowlist": ("list", "str"),
+        "dropout_schema": "str",
+        "noise_schema": "str",
+    },
+    "deepspeed": {
+        "source_digest": "sha256",
+        "settings": {
+            "bf16": {"enabled": "bool"},
+            "zero_optimization": {
+                "stage": "int",
+                "overlap_comm": "bool",
+                "contiguous_gradients": "bool",
+                "reduce_bucket_size": "int",
+            },
+            "gradient_clipping": "number",
+            "steps_per_print": "int",
+            "wall_clock_breakdown": "bool",
+        },
+    },
+    "evaluation": {
+        "dataset_path": "path",
+        "dataset_sha256": "sha256",
+        "shard_count": "int",
+        "max_new_tokens": "int",
+        "temperature": "number",
+        "top_p": "number",
+        "scorer_identity": "str",
+    },
+    "diagnostics": {
+        "bounded_optimizer_steps": "bounded_steps",
+        "evidence_schema": "str",
+    },
+    "artifacts": {
+        "run_id": "str",
+        "checkpoints": "path",
+        "results": "path",
+        "logs": "path",
+    },
+    "initialization": {
+        "trainable_parameters": (
+            "list",
+            {"name": "str", "dtype": "str", "shape": ("list", "int"), "sha256": "sha256"},
+        ),
+        "ema_parameters": (
+            "list",
+            {"name": "str", "dtype": "str", "shape": ("list", "int"), "sha256": "sha256"},
+        ),
+    },
+}
+_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+_GIT_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+
+
+def _validate_json_value(value: object, *, location: str = "$") -> None:
+    if value is None or type(value) in (str, bool, int):
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{location} must contain only finite JSON numbers")
+        return
+    if type(value) is list:
+        for index, item in enumerate(value):
+            _validate_json_value(item, location=f"{location}[{index}]")
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{location} JSON object keys must be strings")
+            _validate_json_value(item, location=f"{location}/{key}")
+        return
+    raise TypeError(f"{location} contains unsupported JSON type {type(value).__name__}")
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    """Encode one finite JSON value using the experiment's canonical rules."""
+    _validate_json_value(value)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def canonical_tensor_sha256(tensor: torch.Tensor) -> str:
+    """Hash tensor metadata and contiguous little-endian CPU bytes."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("canonical tensor hash requires a torch.Tensor")
+    if tensor.layout is not torch.strided:
+        raise ValueError("canonical tensor hash requires a strided tensor")
+    if tensor.is_quantized:
+        raise ValueError("canonical tensor hash does not support quantized tensors")
+    if tensor.device.type == "meta":
+        raise ValueError("canonical tensor hash requires materialized tensor values")
+    cpu_tensor = tensor.detach().cpu().contiguous()
+    if (cpu_tensor.is_floating_point() or cpu_tensor.is_complex()) and not bool(
+        torch.isfinite(cpu_tensor).all()
+    ):
+        raise ValueError("canonical tensor hash requires finite tensor values")
+    payload = cpu_tensor.view(torch.uint8).numpy().tobytes()
+    if sys.byteorder == "big" and cpu_tensor.element_size() > 1:
+        component_size = (
+            cpu_tensor.element_size() // 2
+            if cpu_tensor.is_complex()
+            else cpu_tensor.element_size()
+        )
+        payload = b"".join(
+            payload[offset : offset + component_size][::-1]
+            for offset in range(0, len(payload), component_size)
+        )
+    metadata = canonical_json_bytes(
+        {"dtype": str(cpu_tensor.dtype), "shape": list(cpu_tensor.shape)}
+    )
+    return hashlib.sha256(metadata + payload).hexdigest()
+
+
+def _git_output(*arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", *arguments],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise ValueError("runtime sources must belong to a Git repository") from error
+    return completed.stdout.strip()
+
+
+def runtime_source_sha256(paths: Sequence[str | Path]) -> str:
+    """Hash sorted repository-relative runtime source identities and bytes."""
+    if not paths:
+        raise ValueError("runtime source paths must not be empty")
+    files: set[Path] = set()
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_dir():
+            files.update(
+                candidate.resolve()
+                for candidate in path.rglob("*")
+                if candidate.is_file() and candidate.suffix in {".py", ".sh"}
+            )
+        elif path.is_file():
+            files.add(path.resolve())
+        else:
+            raise ValueError(f"runtime source path is not a file or directory: {path}")
+    if not files:
+        raise ValueError("runtime source paths contain no Python or shell files")
+    roots = {
+        Path(_git_output("-C", str(path.parent), "rev-parse", "--show-toplevel"))
+        .resolve()
+        for path in files
+    }
+    if len(roots) != 1:
+        raise ValueError("runtime sources must belong to one Git repository")
+    repository = roots.pop()
+    identities = sorted((path.relative_to(repository).as_posix(), path) for path in files)
+    relative_paths = [identity for identity, _ in identities]
+    dirty = _git_output(
+        "-C",
+        str(repository),
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+        "--",
+        *relative_paths,
+    )
+    if dirty:
+        raise ValueError(f"dirty tracked runtime source: {dirty.splitlines()[0]}")
+    digest = hashlib.sha256()
+    for identity, path in identities:
+        digest.update(identity.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _decode_manifest(value: Mapping[str, object] | str | bytes) -> dict[str, object]:
+    if isinstance(value, (str, bytes)):
+        try:
+            text = value.decode("utf-8") if isinstance(value, bytes) else value
+            decoded = json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("invalid resolved manifest JSON") from error
+    elif isinstance(value, Mapping):
+        decoded = copy.deepcopy(dict(value))
+    else:
+        raise TypeError("resolved manifest must be a mapping or JSON string")
+    if type(decoded) is not dict:
+        raise ValueError("resolved manifest must be a JSON object")
+    return decoded
+
+
+def _validate_scalar(value: object, kind: str, location: str) -> None:
+    if kind == "schema_version":
+        if value != "stage1-resolved-manifest-v1" or type(value) is not str:
+            raise ValueError(f"{location} has unsupported schema_version")
+    elif kind == "str":
+        if type(value) is not str or not value:
+            raise TypeError(f"{location} must have non-empty string type")
+    elif kind == "path":
+        if type(value) is not str or not value:
+            raise TypeError(f"{location} must have repository-relative path string type")
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"{location} must be a repository-relative logical path")
+    elif kind == "sha256":
+        if type(value) is not str or _HEX_64.fullmatch(value) is None:
+            raise ValueError(f"{location} must be a lowercase SHA-256 string")
+    elif kind == "git_commit":
+        if type(value) is not str or _GIT_COMMIT.fullmatch(value) is None:
+            raise ValueError(f"{location} must be a lowercase Git commit digest")
+    elif kind == "bool":
+        if type(value) is not bool:
+            raise TypeError(f"{location} must have boolean type")
+    elif kind == "int":
+        if type(value) is not int:
+            raise TypeError(f"{location} must have integer type")
+    elif kind == "number":
+        if type(value) not in (int, float):
+            raise TypeError(f"{location} must have numeric type")
+        if not math.isfinite(value):
+            raise ValueError(f"{location} must be finite")
+    elif kind == "bounded_steps":
+        if value is not None and (type(value) is not int or value != 1):
+            raise ValueError(f"{location} bounded optimizer steps must be null or integer 1")
+    else:  # pragma: no cover - internal schema construction error
+        raise RuntimeError(f"unknown manifest schema descriptor: {kind}")
+
+
+def _validate_schema(value: object, schema: object, location: str) -> None:
+    if isinstance(schema, str):
+        _validate_scalar(value, schema, location)
+        return
+    if isinstance(schema, tuple):
+        _, item_schema = schema
+        if type(value) is not list:
+            raise TypeError(f"{location} must have array type")
+        for index, item in enumerate(value):
+            _validate_schema(item, item_schema, f"{location}/{index}")
+        return
+    if not isinstance(schema, dict):  # pragma: no cover - internal schema construction error
+        raise RuntimeError(f"invalid manifest schema at {location}")
+    if type(value) is not dict:
+        raise TypeError(f"{location} must have object type")
+    required = set(schema)
+    actual = set(value)
+    missing = sorted(required - actual)
+    extra = sorted(actual - required)
+    if missing:
+        raise ValueError(f"{location} missing required keys: {missing}")
+    if extra:
+        raise ValueError(f"{location} has extra keys: {extra}")
+    for key, child_schema in schema.items():
+        _validate_schema(value[key], child_schema, f"{location}/{key}")
+
+
+def validate_resolved_manifest(payload: Mapping[str, object] | str | bytes) -> dict[str, object]:
+    """Decode and validate one complete Stage 1 resolved manifest."""
+    decoded = _decode_manifest(payload)
+    _validate_json_value(decoded)
+    _validate_schema(decoded, _MANIFEST_SCHEMA, "$")
+    batch = decoded["batch"]
+    assert isinstance(batch, dict)
+    microbatch = batch["per_device_train_batch_size"]
+    accumulation = batch["gradient_accumulation_steps"]
+    expected_groupings = {
+        1: [[0, 0], [1, 0], [2, 0], [3, 0]],
+        2: [[0, 0], [0, 1], [1, 0], [1, 1]],
+    }
+    if microbatch not in expected_groupings:
+        raise ValueError("manifest batch has unsupported microbatch grouping arm")
+    if accumulation != 4 // microbatch:
+        raise ValueError("manifest batch has invalid gradient accumulation for grouping arm")
+    if batch["rank_local_microbatch_grouping"] != expected_groupings[microbatch]:
+        raise ValueError("manifest batch has invalid rank-local microbatch grouping")
+    initialization = decoded["initialization"]
+    assert isinstance(initialization, dict)
+    for collection_name in ("trainable_parameters", "ema_parameters"):
+        identities = initialization[collection_name]
+        assert isinstance(identities, list)
+        names = [identity["name"] for identity in identities]
+        if names != sorted(names) or len(names) != len(set(names)):
+            raise ValueError(
+                f"manifest initialization {collection_name} must use unique sorted names"
+            )
+    return decoded
+
+
+def _replace_existing_json_pointer(
+    payload: dict[str, object], pointer: str, replacement: object
+) -> None:
+    parts = pointer.removeprefix("/").split("/")
+    target: object = payload
+    for part in parts[:-1]:
+        if type(target) is not dict or part not in target:
+            raise ValueError(f"manifest profile pointer is absent: {pointer}")
+        target = target[part]
+    if type(target) is not dict or parts[-1] not in target:
+        raise ValueError(f"manifest profile pointer is absent: {pointer}")
+    target[parts[-1]] = replacement
+
+
+def normalized_manifest_bytes(
+    payload: Mapping[str, object] | str | bytes, profile: str
+) -> bytes:
+    if profile not in MANIFEST_PROFILES:
+        raise ValueError(f"unknown manifest profile: {profile}")
+    normalized = copy.deepcopy(validate_resolved_manifest(payload))
+    for pointer in MANIFEST_PROFILES[profile]:
+        _replace_existing_json_pointer(normalized, pointer, "<approved-difference>")
+    return canonical_json_bytes(normalized)
+
+
+@dataclass(frozen=True)
+class Stage1ResolvedManifest:
+    """An immutable canonical representation of a validated resolved manifest."""
+
+    _canonical_bytes: bytes
+
+    @classmethod
+    def from_mapping(
+        cls, payload: Mapping[str, object] | str | bytes
+    ) -> Stage1ResolvedManifest:
+        return cls(canonical_json_bytes(validate_resolved_manifest(payload)))
+
+    def to_mapping(self) -> dict[str, object]:
+        decoded = json.loads(self._canonical_bytes)
+        assert isinstance(decoded, dict)
+        return decoded
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self._canonical_bytes).hexdigest()
+
+    def normalized_digest(self, profile: str) -> str:
+        return hashlib.sha256(
+            normalized_manifest_bytes(self.to_mapping(), profile)
+        ).hexdigest()
+
+
+@dataclass(frozen=True)
+class Stage1ManifestComparison:
+    profile: Literal["cross_arm_v1", "same_arm_v1"]
+    equal: bool
+    left_digest: str
+    right_digest: str
+    left_normalized_digest: str
+    right_normalized_digest: str
+
+
+def compare_stage1_manifests(
+    left: Stage1ResolvedManifest | Mapping[str, object] | str | bytes,
+    right: Stage1ResolvedManifest | Mapping[str, object] | str | bytes,
+    *,
+    profile: Literal["cross_arm_v1", "same_arm_v1"],
+) -> Stage1ManifestComparison:
+    """Require two manifests to differ only at one profile's approved pointers."""
+    if profile not in MANIFEST_PROFILES:
+        raise ValueError(f"unknown manifest profile: {profile}")
+    left_manifest = (
+        left if isinstance(left, Stage1ResolvedManifest) else Stage1ResolvedManifest.from_mapping(left)
+    )
+    right_manifest = (
+        right if isinstance(right, Stage1ResolvedManifest) else Stage1ResolvedManifest.from_mapping(right)
+    )
+    left_normalized = normalized_manifest_bytes(left_manifest.to_mapping(), profile)
+    right_normalized = normalized_manifest_bytes(right_manifest.to_mapping(), profile)
+    left_normalized_digest = hashlib.sha256(left_normalized).hexdigest()
+    right_normalized_digest = hashlib.sha256(right_normalized).hexdigest()
+    if left_normalized != right_normalized:
+        raise ValueError(f"Stage 1 manifests contain non-whitelisted differences for {profile}")
+    return Stage1ManifestComparison(
+        profile=profile,
+        equal=True,
+        left_digest=left_manifest.digest,
+        right_digest=right_manifest.digest,
+        left_normalized_digest=left_normalized_digest,
+        right_normalized_digest=right_normalized_digest,
     )
