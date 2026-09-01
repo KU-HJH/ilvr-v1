@@ -8,7 +8,11 @@ from typing import Iterator, Sequence
 import torch
 
 from stage1.data import PreparedStage1Example
-from stage1.types import STAGE1_CANONICAL_VIEW_LENGTH, Stage1SampleOccurrence
+from stage1.types import (
+    STAGE1_CANONICAL_SOURCE_ROWS,
+    STAGE1_CANONICAL_VIEW_LENGTH,
+    Stage1SampleOccurrence,
+)
 
 
 @dataclass(frozen=True)
@@ -29,12 +33,16 @@ class Stage1CanonicalDataset:
     ) -> None:
         self.source_rows = tuple(source_rows)
         self.padded_length = padded_length
-        if not self.source_rows:
-            raise ValueError("Stage 1 canonical dataset requires at least one source row")
         if padded_length != STAGE1_CANONICAL_VIEW_LENGTH:
             raise ValueError("Stage 1 canonical dataset padded_length must be 3456")
-        if len(self.source_rows) > padded_length:
-            raise ValueError("Stage 1 canonical dataset source rows exceed 3456 slots")
+        if len(self.source_rows) != STAGE1_CANONICAL_SOURCE_ROWS:
+            raise ValueError("Stage 1 canonical dataset requires exactly 3450 source rows")
+        if any(
+            row.source_index != index for index, row in enumerate(self.source_rows)
+        ):
+            raise ValueError(
+                "Stage 1 canonical dataset requires zero-based source_index ordering"
+            )
 
     def __len__(self) -> int:
         return self.padded_length
@@ -42,7 +50,7 @@ class Stage1CanonicalDataset:
     def source_index_for_slot(self, slot: int) -> int:
         if type(slot) is not int or not 0 <= slot < len(self):
             raise IndexError(f"canonical slot must be in [0, {len(self)})")
-        return self.source_rows[slot % len(self.source_rows)].source_index
+        return self.source_rows[slot % STAGE1_CANONICAL_SOURCE_ROWS].source_index
 
     def __getitem__(self, index: Stage1ScheduledIndex) -> PreparedStage1Example:
         if not isinstance(index, Stage1ScheduledIndex):
@@ -51,7 +59,7 @@ class Stage1CanonicalDataset:
         if self.source_index_for_slot(occurrence.view_slot) != occurrence.source_index:
             raise ValueError("scheduled occurrence source_index does not match canonical slot")
         return replace(
-            self.source_rows[occurrence.view_slot % len(self.source_rows)],
+            self.source_rows[occurrence.view_slot % STAGE1_CANONICAL_SOURCE_ROWS],
             occurrence=occurrence,
         )
 
@@ -95,20 +103,25 @@ def _validate_schedule_parameters(
     epochs: int,
     micro_batch_size: int,
     gradient_accumulation_steps: int,
+    seed: int = 42,
     start_global_step: int = 0,
 ) -> int:
     if world_size != 4:
         raise ValueError("Stage 1 canonical schedule requires world_size=4")
-    if type(epochs) is not int or epochs <= 0:
-        raise ValueError("Stage 1 canonical schedule requires positive integer epochs")
+    if type(seed) is not int or seed != 42:
+        raise ValueError("Stage 1 canonical schedule requires seed=42")
+    if epochs != 3:
+        raise ValueError("Stage 1 canonical schedule requires exactly 3 epochs")
     if type(micro_batch_size) is not int or micro_batch_size not in (1, 2):
         raise ValueError("Stage 1 canonical schedule micro_batch_size must be 1 or 2")
     if type(gradient_accumulation_steps) is not int or gradient_accumulation_steps <= 0:
         raise ValueError("Stage 1 canonical schedule requires positive gradient accumulation")
     if micro_batch_size * gradient_accumulation_steps != 4:
         raise ValueError("Stage 1 canonical schedule requires B * GA = 4")
-    updates_per_epoch = STAGE1_CANONICAL_VIEW_LENGTH // (4 * micro_batch_size * gradient_accumulation_steps)
-    if type(start_global_step) is not int or not 0 <= start_global_step <= epochs * updates_per_epoch:
+    updates_per_epoch = STAGE1_CANONICAL_VIEW_LENGTH // (
+        4 * micro_batch_size * gradient_accumulation_steps
+    )
+    if type(start_global_step) is not int or not 0 <= start_global_step <= 648:
         raise ValueError("Stage 1 canonical schedule has an invalid start_global_step")
     return updates_per_epoch
 
@@ -140,7 +153,7 @@ def _occurrence(
         view_slot=view_slot,
         permutation_offset=permutation_offset,
         canonical_slot_id=epoch * STAGE1_CANONICAL_VIEW_LENGTH + view_slot,
-        source_index=view_slot % 3450,
+        source_index=view_slot % STAGE1_CANONICAL_SOURCE_ROWS,
         rank=rank,
         rank_local_sample_ordinal=rank_local_sample_ordinal,
         rank_local_microbatch_ordinal=microbatch,
@@ -154,12 +167,12 @@ def expected_stage1_assignment(
     """Return the seed-42 canonical assignment for one rank and update."""
     _validate_schedule_parameters(
         world_size=4,
-        epochs=1,
+        epochs=3,
         micro_batch_size=micro_batch_size,
         gradient_accumulation_steps=4 // micro_batch_size,
     )
-    if not 0 <= rank < 4 or not 0 <= update_in_epoch < 216:
-        raise ValueError("Stage 1 expected assignment has an invalid rank or update")
+    if not 0 <= epoch < 3 or not 0 <= rank < 4 or not 0 <= update_in_epoch < 216:
+        raise ValueError("Stage 1 expected assignment has an invalid epoch, rank, or update")
     permutation = _epoch_permutation(42, epoch)
     return tuple(
         _occurrence(
@@ -200,6 +213,7 @@ class Stage1CanonicalBatchSampler:
             epochs=epochs,
             micro_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            seed=seed,
             start_global_step=start_global_step,
         )
         self.batch_size = micro_batch_size
@@ -293,8 +307,24 @@ def materialize_stage1_schedule(
 
 def validate_stage1_schedule(schedule: Stage1MaterializedSchedule) -> Stage1ScheduleSummary:
     """Validate that a materialized rank-local schedule has complete unique identity."""
-    if len(schedule.updates) > schedule.total_updates:
-        raise ValueError("Stage 1 schedule has more updates than its declared total")
+    if schedule.updates_per_epoch != 216 or schedule.total_updates != 648:
+        raise ValueError("Stage 1 schedule has noncanonical declared update counts")
+    if schedule.seed != 42 or not 0 <= schedule.rank < 4:
+        raise ValueError("Stage 1 schedule has noncanonical seed or rank")
+    if schedule.micro_batch_size not in (1, 2):
+        raise ValueError("Stage 1 schedule has noncanonical microbatch size")
+    if not 0 <= schedule.start_global_step <= schedule.total_updates:
+        raise ValueError("Stage 1 schedule has an invalid start_global_step")
+    expected_source_indices = tuple(
+        range(STAGE1_CANONICAL_SOURCE_ROWS)
+    ) + tuple(range(6))
+    if schedule.source_indices != expected_source_indices:
+        raise ValueError("Stage 1 schedule has noncanonical source_index mapping")
+    expected_update_count = schedule.total_updates - schedule.start_global_step
+    if len(schedule.updates) != expected_update_count:
+        raise ValueError(
+            "Stage 1 schedule must contain exactly total_updates - start_global_step updates"
+        )
     seen = set()
     for offset, update in enumerate(schedule.updates):
         if len(update.samples) != 4:

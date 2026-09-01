@@ -1,10 +1,15 @@
 from dataclasses import replace
+from itertools import islice
 
 import pytest
+from accelerate.data_loader import BatchSamplerShard
 
 from stage1.data import PreparedStage1Example
 from stage1.equivalence import (
+    Stage1CanonicalBatchSampler,
     Stage1CanonicalDataset,
+    Stage1SampleOccurrence,
+    expected_stage1_assignment,
     materialize_stage1_schedule,
     validate_stage1_schedule,
 )
@@ -78,7 +83,7 @@ def test_canonical_dataset_propagates_scheduled_occurrence(rows_3450):
         rank=2,
         world_size=4,
         seed=42,
-        epochs=1,
+        epochs=3,
         micro_batch_size=2,
         gradient_accumulation_steps=2,
     )
@@ -98,16 +103,104 @@ def test_schedule_validation_rejects_source_provenance_drift(rows_3450):
         rank=2,
         world_size=4,
         seed=42,
-        epochs=1,
+        epochs=3,
         micro_batch_size=1,
         gradient_accumulation_steps=4,
     )
-    occurrence = schedule.update(0).samples[0]
-    bad_update = replace(
-        schedule.update(0),
-        samples=(replace(occurrence, source_index=999), *schedule.update(0).samples[1:]),
+    bad_schedule = replace(
+        schedule,
+        source_indices=(999, *schedule.source_indices[1:]),
     )
-    bad_schedule = replace(schedule, updates=(bad_update, *schedule.updates[1:]))
 
     with pytest.raises(ValueError, match="source_index"):
         validate_stage1_schedule(bad_schedule)
+
+
+@pytest.mark.parametrize("start_global_step", (0, 3))
+def test_schedule_validation_rejects_truncated_full_or_resumed_schedule(
+    rows_3450, start_global_step
+):
+    """Catches validation accepting a partial canonical horizon as complete."""
+    schedule = materialize_stage1_schedule(
+        rows_3450,
+        rank=2,
+        world_size=4,
+        seed=42,
+        epochs=3,
+        micro_batch_size=1,
+        gradient_accumulation_steps=4,
+        start_global_step=start_global_step,
+    )
+
+    with pytest.raises(ValueError, match="exactly"):
+        validate_stage1_schedule(replace(schedule, updates=schedule.updates[:-1]))
+
+
+def test_canonical_schedule_rejects_noncanonical_seed_and_source_rows(rows_3450):
+    """Catches mutable seed or source-row ordering from redefining the fixed protocol."""
+    with pytest.raises(ValueError, match="seed=42"):
+        materialize_stage1_schedule(
+            rows_3450,
+            rank=2,
+            world_size=4,
+            seed=99,
+            epochs=3,
+            micro_batch_size=1,
+            gradient_accumulation_steps=4,
+        )
+    with pytest.raises(ValueError, match="exactly 3450"):
+        Stage1CanonicalDataset(rows_3450[:-1])
+    reordered = list(rows_3450)
+    reordered[0] = replace(reordered[0], source_index=1)
+    with pytest.raises(ValueError, match="zero-based source_index"):
+        Stage1CanonicalDataset(reordered)
+    with pytest.raises(ValueError, match="invalid epoch"):
+        expected_stage1_assignment(
+            epoch=3,
+            update_in_epoch=0,
+            rank=0,
+            micro_batch_size=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        (0, 0, 0, 0, 0, 0, 3, 3, 0),
+        (0, 3450, 0, 3450, 1, 0, 0, 0, 0),
+    ),
+)
+def test_occurrence_rejects_offset_ordinal_and_source_slot_mismatches(values):
+    """Catches occurrence identity that is locally shaped but not protocol-canonical."""
+    with pytest.raises(ValueError, match="canonical"):
+        Stage1SampleOccurrence(*values)
+
+
+@pytest.mark.parametrize(("micro_batch", "ga"), ((1, 4), (2, 2)))
+def test_accelerate_shard_selects_each_rank_global_batches_once(
+    rows_3450, micro_batch, ga
+):
+    """Catches an Accelerate shard changing the prescribed rank-local row order."""
+    sampler = Stage1CanonicalBatchSampler(
+        Stage1CanonicalDataset(rows_3450),
+        world_size=4,
+        seed=42,
+        epochs=3,
+        micro_batch_size=micro_batch,
+        gradient_accumulation_steps=ga,
+    )
+
+    rank_two = BatchSamplerShard(
+        sampler,
+        num_processes=4,
+        process_index=2,
+        split_batches=False,
+        even_batches=False,
+    )
+    selected = list(islice(rank_two, ga))
+
+    assert rank_two.split_batches is False
+    assert rank_two.even_batches is False
+    assert [
+        index.occurrence.permutation_offset for batch in selected for index in batch
+    ] == [2, 6, 10, 14]

@@ -22,6 +22,7 @@ DEFAULT_STAGE1_TARGET_SUFFIXES = (
     "down_proj",
 )
 STAGE1_CANONICAL_VIEW_LENGTH = 3456
+STAGE1_CANONICAL_SOURCE_ROWS = 3450
 
 
 @dataclass(frozen=True)
@@ -58,10 +59,22 @@ class Stage1SampleOccurrence:
             raise ValueError("Stage 1 occurrence has an invalid permutation_offset")
         if self.canonical_slot_id != self.epoch * STAGE1_CANONICAL_VIEW_LENGTH + self.view_slot:
             raise ValueError("Stage 1 occurrence canonical_slot_id does not match epoch/view_slot")
-        if self.source_index < 0 or not 0 <= self.rank < 4:
+        if not 0 <= self.source_index < STAGE1_CANONICAL_SOURCE_ROWS:
+            raise ValueError("Stage 1 occurrence source_index is not canonical for view_slot")
+        if self.source_index != self.view_slot % STAGE1_CANONICAL_SOURCE_ROWS:
+            raise ValueError("Stage 1 occurrence source_index is not canonical for view_slot")
+        if not 0 <= self.rank < 4:
             raise ValueError("Stage 1 occurrence has an invalid source_index or rank")
         if self.permutation_offset % 4 != self.rank:
             raise ValueError("Stage 1 occurrence permutation_offset does not match rank")
+        if not 0 <= self.rank_local_sample_ordinal < 4:
+            raise ValueError("Stage 1 occurrence rank-local sample ordinal is not canonical")
+        if self.permutation_offset % 16 != (
+            4 * self.rank_local_sample_ordinal + self.rank
+        ):
+            raise ValueError(
+                "Stage 1 occurrence permutation_offset/rank-local ordinal is not canonical"
+            )
         if (
             self.rank_local_sample_ordinal < 0
             or self.rank_local_microbatch_ordinal < 0
