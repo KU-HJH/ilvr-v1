@@ -144,6 +144,8 @@ class Stage1TeacherTargets:
     latent_mask: torch.Tensor
     selected_counts: tuple[tuple[int, ...], ...]
     diagnostics: Mapping[str, torch.Tensor]
+    selected_candidate_indices: tuple[tuple[tuple[int, ...], ...], ...] = ()
+    selection_margins: tuple[tuple[float | str, ...], ...] = ()
 
 
 @dataclass(frozen=True)

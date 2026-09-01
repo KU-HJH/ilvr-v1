@@ -78,6 +78,8 @@ class CountingVisual(nn.Module):
         super().__init__()
         self.original_call_count = 0
         self.helper_call_count = 0
+        self.original_batches = []
+        self.helper_batches = []
 
     @property
     def dtype(self):
@@ -92,8 +94,14 @@ class CountingVisual(nn.Module):
         tag = pixel_values[:, 0]
         if torch.all(tag == 0):
             self.original_call_count += 1
+            self.original_batches.append(
+                (pixel_values.detach().clone(), grid_thw.detach().clone())
+            )
         elif torch.all(tag == 1):
             self.helper_call_count += 1
+            self.helper_batches.append(
+                (pixel_values.detach().clone(), grid_thw.detach().clone())
+            )
         else:
             raise AssertionError("visual inputs must not mix original and helper views")
         return pixel_values[:, 1:].to(torch.float32)
@@ -113,6 +121,8 @@ class CompleteQwenTeacher(nn.Module):
         self.embedding = nn.Embedding(128, 2)
         self.visual = CountingVisual()
         self.language_forward_count = 0
+        self.language_batch_sizes = []
+        self.language_sequence_lengths = []
         with torch.no_grad():
             self.embedding.weight.zero_()
             literal_rows = {
@@ -157,6 +167,8 @@ class CompleteQwenTeacher(nn.Module):
         assert output_hidden_states is True
         assert return_dict is True
         self.language_forward_count += 1
+        self.language_batch_sizes.append(int(input_ids.shape[0]))
+        self.language_sequence_lengths.append(int(input_ids.shape[1]))
 
         inputs_embeds = self.embedding(input_ids).detach().clone()
         image_features = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -214,6 +226,22 @@ GOLDEN_MULTIBLOCK = LiteralSample(
     ),
 )
 
+TIED_CANDIDATES = LiteralSample(
+    source_index=17,
+    input_ids=(12, 99, 13, 50, 30, 91, 90, 92, 31),
+    spans=(Stage1LatentSpan(start=5, end=7, latent_positions=(6,)),),
+    original_feature=(1.0, 1.0),
+    helper_features=(((1.0, 0.0), (1.0, 0.0), (-1.0, 0.0)),),
+)
+
+ZERO_HELPERS = LiteralSample(
+    source_index=19,
+    input_ids=(12, 99, 13, 50, 30),
+    spans=(),
+    original_feature=(1.0, 1.0),
+    helper_features=(),
+)
+
 
 @dataclass
 class TargetCase:
@@ -236,6 +264,8 @@ def make_case(
     sample_metadata = []
     original_offset = 0
     helper_offset = 0
+    original_pixel_offset = 0
+    helper_pixel_offset = 0
 
     for sample_index, sample in enumerate(samples):
         length = len(sample.input_ids)
@@ -243,12 +273,16 @@ def make_case(
         attention_mask[sample_index, :length] = 1
         labels[sample_index, 4:length] = input_ids[sample_index, 4:length]
 
+        original_pixel_start = original_pixel_offset
         original_pixels.append((0.0, *sample.original_feature))
+        original_pixel_offset += 1
         original_grids.append((1, 1, 1))
         helper_start = helper_offset
+        helper_pixel_start = helper_pixel_offset
         scale = first_helper_scale if sample_index == 0 else 1.0
         for image in sample.helper_features:
             helper_pixels.extend((1.0, x * scale, y * scale) for x, y in image)
+            helper_pixel_offset += len(image)
             helper_grids.append((1, len(image), 1))
             helper_offset += 1
         sample_metadata.append(
@@ -260,6 +294,8 @@ def make_case(
                 latent_spans=sample.spans,
                 helper_to_block=tuple(range(len(sample.helper_features))),
                 unpadded_length=length,
+                original_pixel_range=(original_pixel_start, original_pixel_offset),
+                helper_pixel_range=(helper_pixel_start, helper_pixel_offset),
             )
         )
         original_offset += 1
@@ -276,7 +312,11 @@ def make_case(
         "image_out_mask": torch.zeros_like(input_ids),
         "pixel_values": torch.tensor(original_pixels, dtype=torch.float32),
         "image_grid_thw": torch.tensor(original_grids, dtype=torch.long),
-        "pixel_values_latent": torch.tensor(helper_pixels, dtype=torch.float32),
+        "pixel_values_latent": (
+            torch.tensor(helper_pixels, dtype=torch.float32)
+            if helper_pixels
+            else torch.empty((0, 0), dtype=torch.float32)
+        ),
         "image_grid_thw_latent": torch.tensor(helper_grids, dtype=torch.long),
     }
     return TargetCase(teacher=CompleteQwenTeacher(), inputs=inputs, metadata=metadata)
@@ -298,6 +338,19 @@ def test_batched_targets_equal_row_major_independent_results(target_builder):
     batched = target_builder.build(
         batched_case.teacher, batched_case.inputs, batched_case.metadata
     )
+    assert batched_case.teacher.language_forward_count == 2
+    assert batched_case.teacher.original_visual_call_count == 2
+    assert batched_case.teacher.helper_visual_call_count == 2
+    assert batched_case.teacher.language_batch_sizes == [1, 1]
+    assert batched_case.teacher.language_sequence_lengths == [10, 15]
+    assert [
+        int(pixels.shape[0])
+        for pixels, unused_grid in batched_case.teacher.visual.helper_batches
+    ] == [2, 7]
+    assert [
+        int(pixels.shape[0])
+        for pixels, unused_grid in batched_case.teacher.visual.original_batches
+    ] == [1, 1]
     independent = []
     for sample in (ONE_BLOCK, GOLDEN_MULTIBLOCK):
         case = make_case((sample,))
@@ -308,6 +361,25 @@ def test_batched_targets_equal_row_major_independent_results(target_builder):
     torch.testing.assert_close(
         batched.latent_values,
         torch.cat([result.latent_values for result in independent], dim=0),
+    )
+    assert batched.latent_mask.tolist() == torch.cat(
+        [
+            torch.nn.functional.pad(
+                result.latent_mask,
+                (0, batched.latent_mask.shape[1] - result.latent_mask.shape[1]),
+            )
+            for result in independent
+        ],
+        dim=0,
+    ).tolist()
+    assert batched.selected_counts == tuple(
+        result.selected_counts[0] for result in independent
+    )
+    assert batched.selected_candidate_indices == tuple(
+        result.selected_candidate_indices[0] for result in independent
+    )
+    assert batched.selection_margins == tuple(
+        result.selection_margins[0] for result in independent
     )
     assert batched.selected_counts == ((1,), (1, 1))
     assert batched.latent_mask.tolist() == [
@@ -352,6 +424,56 @@ def test_teacher_runs_one_language_and_one_helper_visual_call_for_multiple_block
     assert case.teacher.helper_visual_call_count == 1
     assert not result.latent_values.requires_grad
     assert not case.teacher.training
+
+
+def test_equal_similarity_tie_selects_lower_row_local_candidate_index():
+    """Catches unstable sorting choosing a later candidate for an exact tie."""
+    builder = Stage1TeacherTargetBuilder(
+        tokenizer=LiteralTokenizer(),
+        coverage_p=0.3,
+        image_pool_k=2,
+        helper_group_L=0,
+    )
+    case = make_case((TIED_CANDIDATES,))
+
+    result = builder.build(case.teacher, case.inputs, case.metadata)
+
+    torch.testing.assert_close(result.latent_values, torch.tensor([[1.0, 0.0]]))
+    assert result.selected_candidate_indices == (((0,),),)
+    assert result.selection_margins == ((0.0,),)
+    assert isinstance(result.selection_margins[0][0], float)
+
+
+def test_selection_margin_tags_all_candidates_selected():
+    """Catches an infinite or fabricated numeric margin when nothing is excluded."""
+    builder = Stage1TeacherTargetBuilder(
+        tokenizer=LiteralTokenizer(),
+        coverage_p=1.0,
+        image_pool_k=2,
+        helper_group_L=0,
+    )
+    case = make_case((ONE_BLOCK,))
+
+    result = builder.build(case.teacher, case.inputs, case.metadata)
+
+    assert result.selected_candidate_indices == (((0, 1),),)
+    assert result.selection_margins == (("all_selected",),)
+
+
+def test_zero_helper_row_builds_empty_targets_without_visual_helper_call(target_builder):
+    """Catches empty Task 4 helper tensors reaching an invalid visual invocation."""
+    case = make_case((ZERO_HELPERS,))
+    assert tuple(case.inputs["pixel_values_latent"].shape) == (0, 0)
+
+    result = target_builder.build(case.teacher, case.inputs, case.metadata)
+
+    assert result.latent_values.shape == (0, 2)
+    assert not result.latent_mask.any()
+    assert result.selected_counts == ((),)
+    assert result.selected_candidate_indices == ((),)
+    assert result.selection_margins == ((),)
+    assert case.teacher.language_forward_count == 1
+    assert case.teacher.helper_visual_call_count == 0
 
 
 def test_b1_matches_hand_derived_legacy_target_mask_and_downstream_inputs(

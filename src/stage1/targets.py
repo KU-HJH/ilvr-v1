@@ -21,7 +21,7 @@ class _UnsupportedAttentionInterface(Exception):
 
 
 class Stage1TeacherTargetBuilder:
-    """Build sample-isolated helper-image targets from one batched teacher pass."""
+    """Build sample-isolated helper-image targets from row-owned teacher passes."""
 
     def __init__(
         self,
@@ -112,101 +112,73 @@ class Stage1TeacherTargetBuilder:
         )
         helper_grid = helper_grid.to(device)
 
-        text_outputs = teacher(
-            input_ids=teacher_ids,
-            attention_mask=teacher_attention,
-            pixel_values=original_pixels,
-            image_grid_thw=original_grid,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        helper_features = teacher.visual(helper_pixels, grid_thw=helper_grid)
-        hidden_pre, hidden_last = self._hidden_states(text_outputs, metadata)
-        input_embeddings = self._language_input_embeddings(
-            teacher, text_outputs, teacher_ids
-        )
-        helper_images = self._split_visual_features(
-            helper_features, helper_grid, teacher
-        )
-        original_counts = self._visual_token_counts(original_grid, teacher)
         image_token_id = self._teacher_image_token_id(teacher)
 
         latent_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
         packed: list[torch.Tensor] = []
         selected_counts: list[tuple[int, ...]] = []
+        selected_candidate_indices: list[tuple[tuple[int, ...], ...]] = []
+        selection_margins: list[tuple[float | str, ...]] = []
+        hidden_size = 0
         for sample_index, sample in enumerate(metadata.samples):
-            sample_ids = teacher_ids[sample_index, : sample.unpadded_length]
-            sample_hidden_pre = hidden_pre[
-                sample_index, : sample.unpadded_length
-            ]
-            sample_hidden_last = hidden_last[
-                sample_index, : sample.unpadded_length
-            ]
-            sample_input_embeddings = input_embeddings[
-                sample_index, : sample.unpadded_length
-            ]
-            assistant_start = self._assistant_start(sample_ids, sample)
-            user_query = self._user_query(
-                teacher=teacher,
-                sample=sample,
-                sample_ids=sample_ids,
-                hidden_pre=sample_hidden_pre,
-                hidden_last=sample_hidden_last,
-                input_embeddings=sample_input_embeddings,
-                assistant_start=assistant_start,
-                image_token_id=image_token_id,
-                original_grid=original_grid,
-                original_counts=original_counts,
-            )
-            text_spans = self._assistant_text_spans(
-                sample_ids, sample, assistant_start
-            )
-            candidates_by_block = self._sample_helper_candidates(
-                helper_images, sample
-            )
-
-            previous_selected_mean = None
-            block_counts = []
-            for block_index, span in enumerate(sample.latent_spans):
-                query_parts = [user_query]
-                if text_spans[block_index]:
-                    text_indices = torch.tensor(
-                        text_spans[block_index],
-                        device=sample_hidden_last.device,
-                        dtype=torch.long,
-                    )
-                    query_parts.append(
-                        sample_hidden_last.index_select(0, text_indices).mean(
-                            dim=0, keepdim=True
-                        )
-                    )
-                if previous_selected_mean is not None:
-                    query_parts.append(previous_selected_mean)
-                query = torch.stack(
-                    [part.squeeze(0) for part in query_parts], dim=0
-                ).mean(dim=0, keepdim=True)
-
-                candidates = candidates_by_block[block_index]
-                selected = self._select(
-                    candidates,
-                    query,
-                    max_count=len(span.latent_positions),
+            (
+                sample_values,
+                block_counts,
+                block_indices,
+                block_margins,
+                hidden_size,
+            ) = (
+                self._build_sample(
+                    teacher=teacher,
+                    sample=sample,
+                    sample_ids=teacher_ids[
+                        sample_index : sample_index + 1, : sample.unpadded_length
+                    ],
+                    sample_attention=teacher_attention[
+                        sample_index : sample_index + 1, : sample.unpadded_length
+                    ],
+                    original_pixels=self._owned_slice(
+                        original_pixels,
+                        sample.original_pixel_range,
+                        sample,
+                        "original pixel",
+                    ),
+                    original_grid=self._owned_slice(
+                        original_grid,
+                        sample.original_grid_range,
+                        sample,
+                        "original grid",
+                    ),
+                    helper_pixels=self._owned_slice(
+                        helper_pixels,
+                        sample.helper_pixel_range,
+                        sample,
+                        "helper pixel",
+                    ),
+                    helper_grid=self._owned_slice(
+                        helper_grid,
+                        sample.helper_grid_range,
+                        sample,
+                        "helper grid",
+                    ),
+                    image_token_id=image_token_id,
                 )
-                packed.append(selected)
-                selected_count = int(selected.shape[0])
-                block_counts.append(selected_count)
+            )
+            packed.extend(sample_values)
+            selected_counts.append(block_counts)
+            selected_candidate_indices.append(block_indices)
+            selection_margins.append(block_margins)
+            for span, selected_count in zip(sample.latent_spans, block_counts):
                 if selected_count:
                     latent_mask[
                         sample_index,
                         list(span.latent_positions[:selected_count]),
                     ] = True
-                    previous_selected_mean = selected.mean(dim=0, keepdim=True)
-            selected_counts.append(tuple(block_counts))
 
         if packed:
             latent_values = torch.cat(packed, dim=0)
         else:
-            latent_values = helper_features.new_empty((0, hidden_last.shape[-1]))
+            latent_values = original_pixels.new_empty((0, hidden_size))
         expected_count = int(latent_mask.sum().item())
         if latent_values.shape[0] != expected_count:
             raise RuntimeError(
@@ -217,7 +189,115 @@ class Stage1TeacherTargetBuilder:
             latent_mask=latent_mask,
             selected_counts=tuple(selected_counts),
             diagnostics=self._diagnostics(latent_values),
+            selected_candidate_indices=tuple(selected_candidate_indices),
+            selection_margins=tuple(selection_margins),
         )
+
+    def _build_sample(
+        self,
+        *,
+        teacher,
+        sample,
+        sample_ids,
+        sample_attention,
+        original_pixels,
+        original_grid,
+        helper_pixels,
+        helper_grid,
+        image_token_id,
+    ):
+        text_outputs = teacher(
+            input_ids=sample_ids,
+            attention_mask=sample_attention,
+            pixel_values=original_pixels,
+            image_grid_thw=original_grid,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden_pre, hidden_last = self._hidden_states(
+            text_outputs, (1, sample.unpadded_length)
+        )
+        input_embeddings = self._language_input_embeddings(
+            teacher, text_outputs, sample_ids
+        )
+        if helper_grid.shape[0]:
+            helper_features = teacher.visual(helper_pixels, grid_thw=helper_grid)
+            helper_images = self._split_visual_features(
+                helper_features, helper_grid, teacher
+            )
+        else:
+            helper_images = ()
+
+        row_ids = sample_ids[0]
+        row_hidden_pre = hidden_pre[0]
+        row_hidden_last = hidden_last[0]
+        assistant_start = self._assistant_start(row_ids, sample)
+        user_query = self._user_query(
+            teacher=teacher,
+            sample=sample,
+            sample_ids=row_ids,
+            hidden_pre=row_hidden_pre,
+            hidden_last=row_hidden_last,
+            input_embeddings=input_embeddings[0],
+            assistant_start=assistant_start,
+            image_token_id=image_token_id,
+            original_grid=original_grid,
+            original_counts=self._visual_token_counts(original_grid, teacher),
+        )
+        text_spans = self._assistant_text_spans(row_ids, sample, assistant_start)
+        candidates_by_block = self._sample_helper_candidates(helper_images, sample)
+
+        packed = []
+        block_counts = []
+        block_indices = []
+        block_margins = []
+        previous_selected_mean = None
+        for block_index, span in enumerate(sample.latent_spans):
+            query_parts = [user_query]
+            if text_spans[block_index]:
+                text_indices = torch.tensor(
+                    text_spans[block_index],
+                    device=row_hidden_last.device,
+                    dtype=torch.long,
+                )
+                query_parts.append(
+                    row_hidden_last.index_select(0, text_indices).mean(
+                        dim=0, keepdim=True
+                    )
+                )
+            if previous_selected_mean is not None:
+                query_parts.append(previous_selected_mean)
+            query = torch.stack(
+                [part.squeeze(0) for part in query_parts], dim=0
+            ).mean(dim=0, keepdim=True)
+
+            selected, indices, margin = self._select(
+                candidates_by_block[block_index],
+                query,
+                max_count=len(span.latent_positions),
+            )
+            packed.append(selected)
+            block_counts.append(int(selected.shape[0]))
+            block_indices.append(indices)
+            block_margins.append(margin)
+            if selected.shape[0]:
+                previous_selected_mean = selected.mean(dim=0, keepdim=True)
+        return (
+            packed,
+            tuple(block_counts),
+            tuple(block_indices),
+            tuple(block_margins),
+            int(row_hidden_last.shape[-1]),
+        )
+
+    @staticmethod
+    def _owned_slice(tensor, owned_range, sample, role):
+        start, end = owned_range
+        if not 0 <= start <= end <= tensor.shape[0]:
+            raise ValueError(
+                f"source_index={sample.source_index}: invalid {role} range"
+            )
+        return tensor[start:end]
 
     @staticmethod
     def _require_tensor(batch: MutableMapping[str, object], key: str) -> torch.Tensor:
@@ -267,7 +347,7 @@ class Stage1TeacherTargetBuilder:
             raise ValueError("Stage 1 metadata sample count must match batch_size")
 
     @staticmethod
-    def _hidden_states(text_outputs, metadata):
+    def _hidden_states(text_outputs, expected_prefix):
         hidden_states = getattr(text_outputs, "hidden_states", None)
         if isinstance(hidden_states, (tuple, list)):
             if not hidden_states:
@@ -279,7 +359,6 @@ class Stage1TeacherTargetBuilder:
             hidden_pre = hidden_states
         else:
             raise TypeError("teacher language forward must return hidden states")
-        expected_prefix = (metadata.batch_size, metadata.sequence_length)
         if hidden_last.ndim != 3 or tuple(hidden_last.shape[:2]) != expected_prefix:
             raise ValueError("teacher hidden states must have shape [B, T, H]")
         if hidden_pre.shape != hidden_last.shape:
@@ -488,12 +567,7 @@ class Stage1TeacherTargetBuilder:
         original_counts,
     ):
         image_values = input_embeddings[sample_ids == image_token_id]
-        grid_start, grid_end = sample.original_grid_range
-        if not 0 <= grid_start <= grid_end <= original_grid.shape[0]:
-            raise ValueError(
-                f"source_index={sample.source_index}: invalid original grid range"
-            )
-        counts = original_counts[grid_start:grid_end]
+        counts = original_counts
         if sum(counts) != image_values.shape[0] or not counts:
             return None
         grouped = []
@@ -521,20 +595,14 @@ class Stage1TeacherTargetBuilder:
         return tuple(spans)
 
     def _sample_helper_candidates(self, helper_images, sample):
-        grid_start, grid_end = sample.helper_grid_range
-        if not 0 <= grid_start <= grid_end <= len(helper_images):
-            raise ValueError(
-                f"source_index={sample.source_index}: invalid helper grid range"
-            )
-        owned_images = helper_images[grid_start:grid_end]
-        if len(owned_images) != len(sample.helper_to_block):
+        if len(helper_images) != len(sample.helper_to_block):
             raise ValueError(
                 f"source_index={sample.source_index}: helper ownership count mismatch"
             )
         by_block: list[list[torch.Tensor]] = [
             [] for _ in sample.latent_spans
         ]
-        for image, block_index in zip(owned_images, sample.helper_to_block):
+        for image, block_index in zip(helper_images, sample.helper_to_block):
             if not 0 <= block_index < len(by_block):
                 raise ValueError(
                     f"source_index={sample.source_index}: invalid helper-to-block mapping"
@@ -583,14 +651,15 @@ class Stage1TeacherTargetBuilder:
 
     def _select(self, candidates, query, max_count):
         if candidates.shape[0] == 0 or max_count <= 0:
-            return candidates[:0]
+            return candidates[:0], (), "all_selected"
         similarities = F.cosine_similarity(
             candidates, query.expand_as(candidates), dim=-1
         )
         probabilities = torch.softmax(similarities, dim=0)
-        sorted_probabilities, sorted_indices = torch.sort(
-            probabilities, descending=True
+        sorted_indices = torch.argsort(
+            probabilities, descending=True, stable=True
         )
+        sorted_probabilities = probabilities.index_select(0, sorted_indices)
         cumulative = torch.cumsum(sorted_probabilities, dim=0)
         positions = torch.nonzero(
             cumulative >= self.coverage_p, as_tuple=False
@@ -601,7 +670,21 @@ class Stage1TeacherTargetBuilder:
             else int(probabilities.numel())
         )
         selected_count = min(coverage_count, int(max_count))
-        return candidates.index_select(0, sorted_indices[:selected_count])
+        selected_indices = sorted_indices[:selected_count]
+        if selected_count < int(probabilities.numel()):
+            margin = float(
+                (
+                    sorted_probabilities[selected_count - 1].to(torch.float64)
+                    - sorted_probabilities[selected_count].to(torch.float64)
+                ).item()
+            )
+        else:
+            margin = "all_selected"
+        return (
+            candidates.index_select(0, selected_indices),
+            tuple(int(index) for index in selected_indices.tolist()),
+            margin,
+        )
 
     @staticmethod
     def _diagnostics(latent_values):
