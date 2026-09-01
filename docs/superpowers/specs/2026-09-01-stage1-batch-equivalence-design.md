@@ -1,7 +1,7 @@
 # Stage 1 True-Batch Equivalence Design
 
 **Date:** 2026-09-01  
-**Status:** Design proposal v4, frozen for critique
+**Status:** Design proposal v5, frozen for critique
 **Repository:** `XD111ds/ILVR`  
 **Supersedes:** only the batch-equivalence portions of
 `2026-08-26-ilvr-stage1-dora-batched-training-design.md`
@@ -308,6 +308,12 @@ deltas.
 FP32 deterministic fixtures use `torch.testing.assert_close` with
 `rtol=1e-6` and `atol=1e-7`. Exact integer, boolean, sample-identity,
 selected-index, and step state uses equality.
+
+For each batch configuration separately, the tiny witness also compares an
+uninterrupted four-step run with a two-step stop/resume run continued to step
+four. Canonical sample identity, stochastic draws, student, EMA, optimizer,
+scheduler, and global-step state must match exactly. This isolates staged
+resume correctness before it can confound the B=1/B=2 comparison.
 
 ### 8.3 Real 3B, four-GPU 64-step staged witness
 
