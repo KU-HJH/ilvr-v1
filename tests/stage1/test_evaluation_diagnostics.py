@@ -390,22 +390,31 @@ class _BoundaryRuntimeModel(nn.Module):
         self.adapter.lora_A = nn.Parameter(torch.zeros(2, 2))
         self.adapter.lora_B = nn.Parameter(torch.zeros(2, 2))
         self.adapter.lora_magnitude_vector = nn.Parameter(torch.zeros(2))
+        self.adapter.decoy_lora_A_suffix = nn.Parameter(torch.zeros(2))
 
 
 class _BoundaryProcessor:
     tokenizer = _CueTokenizer()
 
 
-def test_boundary_runtime_emits_per_row_gradients_and_deltas_with_mocked_generation(tmp_path, monkeypatch):
-    """Catches boundary execution that bypasses cue validation or aggregates latent rows."""
+def _configure_boundary_runtime(tmp_path, monkeypatch, *, fail_after_step=False):
     monkeypatch.chdir(tmp_path)
     dataset_path = tmp_path / "data" / "TEST.jsonl"
     dataset_path.parent.mkdir()
     dataset_path.write_text("\n", encoding="utf-8")
     model = _BoundaryRuntimeModel()
+    model.eval()
+    for index, parameter in enumerate(model.parameters()):
+        parameter.data.fill_(float(index + 1))
+        parameter.requires_grad_(index % 2 == 0)
+        parameter.grad = torch.full_like(parameter, float(index + 1) / 10)
+    original_values = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    original_flags = {name: parameter.requires_grad for name, parameter in model.named_parameters()}
+    original_gradients = {name: parameter.grad.detach().clone() for name, parameter in model.named_parameters()}
     token_ids = SimpleNamespace(pad_token_id=90, start_token_id=91, end_token_id=92)
     rows = [{"index": index, "text_input": str(index)} for index in range(8)]
     prepared = {"input_ids": torch.tensor([[31, 32]]), "attention_mask": torch.ones(1, 2, dtype=torch.long)}
+    observed_starts = []
 
     monkeypatch.setattr(diagnostics, "_load_probe_runtime", lambda *_args, **_kwargs: (model, _BoundaryProcessor()))
     monkeypatch.setattr(diagnostics, "_read_jsonl", lambda _path: rows)
@@ -414,7 +423,8 @@ def test_boundary_runtime_emits_per_row_gradients_and_deltas_with_mocked_generat
     monkeypatch.setattr(diagnostics, "_prepared_for_sample", lambda *_args: prepared)
 
     def fake_loss(active_model, *_args):
-        loss = sum(parameter.sum() for parameter in active_model.parameters())
+        observed_starts.append(active_model.lm_head.output_delta.detach().clone())
+        loss = sum(parameter.sum() for parameter in active_model.parameters() if parameter.requires_grad)
         logits = torch.zeros(1, 100)
         return loss, {"latent_start": logits, "eos": logits, "per_position_ce": {2: 1.0}}
 
@@ -424,6 +434,29 @@ def test_boundary_runtime_emits_per_row_gradients_and_deltas_with_mocked_generat
 
     monkeypatch.setattr(diagnostics, "_manual_boundary_loss", fake_loss)
     monkeypatch.setattr(diagnostics, "ContinuousLatentController", FakeController)
+    if fail_after_step:
+        def fail_delta_evidence(*_args, **_kwargs):
+            raise RuntimeError("injected after optimizer.step")
+
+        monkeypatch.setattr(diagnostics, "_boundary_delta_evidence", fail_delta_evidence)
+
+    return model, dataset_path, original_values, original_flags, original_gradients, observed_starts
+
+
+def _assert_boundary_runtime_restored(model, values, flags, gradients):
+    assert model.training is False
+    for name, parameter in model.named_parameters():
+        assert parameter.requires_grad is flags[name]
+        assert torch.equal(parameter, values[name])
+        assert parameter.grad is not None
+        assert torch.equal(parameter.grad, gradients[name])
+
+
+def test_boundary_runtime_restores_state_and_starts_each_case_from_common_values(tmp_path, monkeypatch):
+    """Catches temporary boundary updates leaking into callers or later cases."""
+    model, dataset_path, values, flags, gradients, observed_starts = _configure_boundary_runtime(
+        tmp_path, monkeypatch
+    )
 
     report = diagnostics.run_boundary_probe(
         model_dir="unused", base_model_dir="unused", dataset_jsonl=str(dataset_path),
@@ -437,3 +470,21 @@ def test_boundary_runtime_emits_per_row_gradients_and_deltas_with_mocked_generat
     }
     assert len(first["parameter_deltas"]["latent_rows"]) == 3
     assert len(report["budget_stop_observations"]) == 8
+    assert len(observed_starts) == 8
+    assert all(torch.equal(value, values["lm_head.output_delta"]) for value in observed_starts)
+    _assert_boundary_runtime_restored(model, values, flags, gradients)
+
+
+def test_boundary_runtime_restores_state_after_exception_following_optimizer_step(tmp_path, monkeypatch):
+    """Catches a post-step diagnostic failure leaking temporary boundary state."""
+    model, dataset_path, values, flags, gradients, _observed_starts = _configure_boundary_runtime(
+        tmp_path, monkeypatch, fail_after_step=True
+    )
+
+    with pytest.raises(RuntimeError, match="injected after optimizer.step"):
+        diagnostics.run_boundary_probe(
+            model_dir="unused", base_model_dir="unused", dataset_jsonl=str(dataset_path),
+            cache_dir="unused", source_indices=(0, 1, 2, 7),
+        )
+
+    _assert_boundary_runtime_restored(model, values, flags, gradients)

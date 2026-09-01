@@ -641,13 +641,19 @@ def validate_assistant_cue_scaffold(prepared: Mapping[str, torch.Tensor], tokeni
 
 def enable_boundary_measurement_parameters(model) -> None:
     """Make only the in-memory boundary measurement targets differentiable."""
-    components = ("lora_A", "lora_B", "lora_magnitude_vector")
     for name, parameter in model.named_parameters():
         parameter.requires_grad_(
             name.endswith("lm_head.output_delta")
             or name == "lm_head.output_delta"
-            or any(component in name for component in components)
+            or _is_dora_measurement_parameter(name)
         )
+
+
+def _is_dora_measurement_parameter(name: str) -> bool:
+    return any(
+        f".{component}." in f".{name}."
+        for component in ("lora_A", "lora_B", "lora_magnitude_vector")
+    )
 
 
 def boundary_target_parameters(model, token_ids) -> dict[str, object]:
@@ -673,7 +679,7 @@ def boundary_target_parameters(model, token_ids) -> dict[str, object]:
     components = ("lora_A", "lora_B", "lora_magnitude_vector")
     dora_parameters = {
         name: parameter for name, parameter in named.items()
-        if any(component in name for component in components)
+        if _is_dora_measurement_parameter(name)
     }
     missing_components = [
         component for component in components
@@ -840,18 +846,42 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
     source_rows = validated_test_source_rows(dataset_path, dataset, source_indices)
     token_ids = resolve_latent_token_ids(processor.tokenizer, model.config)
     ordinary = _ordinary_token_id(processor.tokenizer, token_ids)
-    enable_boundary_measurement_parameters(model)
-    targets = boundary_target_parameters(model, token_ids)
-    all_trainable = {
-        name: parameter for name, parameter in model.named_parameters()
-        if parameter.requires_grad
+    all_parameters = dict(model.named_parameters())
+    original_requires_grad = {
+        name: parameter.requires_grad for name, parameter in all_parameters.items()
     }
-    if not all_trainable:
-        raise ValueError("boundary-probe requires trainable Stage 1 parameters")
+    original_gradients = {
+        name: None if parameter.grad is None else parameter.grad.detach().clone()
+        for name, parameter in all_parameters.items()
+    }
     original_training = model.training
-    model.train()
     cases: list[dict[str, object]] = []
+    all_trainable: dict[str, torch.nn.Parameter] = {}
+    restore: dict[str, torch.Tensor] = {}
+
+    def restore_values() -> None:
+        with torch.no_grad():
+            for name, parameter in all_trainable.items():
+                parameter.copy_(restore[name])
+
+    def restore_gradients() -> None:
+        for name, parameter in all_parameters.items():
+            gradient = original_gradients[name]
+            parameter.grad = None if gradient is None else gradient.detach().clone()
+
     try:
+        enable_boundary_measurement_parameters(model)
+        targets = boundary_target_parameters(model, token_ids)
+        all_trainable = {
+            name: parameter for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        if not all_trainable:
+            raise ValueError("boundary-probe requires trainable Stage 1 parameters")
+        restore = {
+            name: parameter.detach().clone() for name, parameter in all_trainable.items()
+        }
+        model.train()
         for source_row in source_rows:
             index = _require_exact_int(source_row["source_index"], name="source index")
             sample = source_row["sample"]
@@ -863,55 +893,61 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
                 ("assistant_cue_text_then_latent", (ordinary, token_ids.start_token_id)),
             ):
                 # Each case is a one-step measurement, not a short training run.
+                restore_values()
+                restore_gradients()
                 optimizer = torch.optim.AdamW(
                     tuple(all_trainable.values()),
                     lr=1e-5, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01,
                 )
-                optimizer.zero_grad(set_to_none=True)
-                loss, boundary = _manual_boundary_loss(model, prepared, token_ids, forced_ids)
-                loss.backward()
-                gradients_before_clipping = _boundary_gradient_evidence(targets)
-                selected_parameters = targets["parameters"]
-                assert isinstance(selected_parameters, Mapping)
-                before = {
-                    name: parameter.detach().clone()
-                    for name, parameter in selected_parameters.items()
-                }
-                restore = {name: parameter.detach().clone() for name, parameter in all_trainable.items()}
-                global_norm_before_clipping = torch.nn.utils.clip_grad_norm_(
-                    tuple(all_trainable.values()), 1.0
-                )
-                if not math.isfinite(float(global_norm_before_clipping)):
-                    raise ValueError("global gradient norm must be finite")
-                optimizer.step()
-                after = {
-                    name: parameter.detach().clone()
-                    for name, parameter in selected_parameters.items()
-                }
-                cases.append({
-                    "source_index": index,
-                    "case": case_name,
-                    "forced_prefix_ids": list(forced_ids),
-                    "loss": _finite_float(loss.item(), name="boundary loss"),
-                    "latent_start": {
-                        "token_id": token_ids.start_token_id,
-                        "rank": token_rank(boundary["latent_start"][0], token_ids.start_token_id),
-                        "logit": _finite_float(boundary["latent_start"][0, token_ids.start_token_id].item(), name="latent-start logit"),
-                    },
-                    "eos": {
-                        "token_id": token_ids.end_token_id,
-                        "rank": token_rank(boundary["eos"][0], token_ids.end_token_id),
-                        "logit": _finite_float(boundary["eos"][0, token_ids.end_token_id].item(), name="EOS logit"),
-                    },
-                    "per_position_ce": boundary["per_position_ce"],
-                    "gradients_before_clipping": gradients_before_clipping,
-                    "global_norm_before_clipping": _finite_float(float(global_norm_before_clipping), name="global gradient norm"),
-                    "parameter_deltas": _boundary_delta_evidence(targets, before, after),
-                })
-                with torch.no_grad():
-                    for name, parameter in all_trainable.items():
-                        parameter.copy_(restore[name])
+                try:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss, boundary = _manual_boundary_loss(model, prepared, token_ids, forced_ids)
+                    loss.backward()
+                    gradients_before_clipping = _boundary_gradient_evidence(targets)
+                    selected_parameters = targets["parameters"]
+                    assert isinstance(selected_parameters, Mapping)
+                    before = {
+                        name: parameter.detach().clone()
+                        for name, parameter in selected_parameters.items()
+                    }
+                    global_norm_before_clipping = torch.nn.utils.clip_grad_norm_(
+                        tuple(all_trainable.values()), 1.0
+                    )
+                    if not math.isfinite(float(global_norm_before_clipping)):
+                        raise ValueError("global gradient norm must be finite")
+                    optimizer.step()
+                    after = {
+                        name: parameter.detach().clone()
+                        for name, parameter in selected_parameters.items()
+                    }
+                    cases.append({
+                        "source_index": index,
+                        "case": case_name,
+                        "forced_prefix_ids": list(forced_ids),
+                        "loss": _finite_float(loss.item(), name="boundary loss"),
+                        "latent_start": {
+                            "token_id": token_ids.start_token_id,
+                            "rank": token_rank(boundary["latent_start"][0], token_ids.start_token_id),
+                            "logit": _finite_float(boundary["latent_start"][0, token_ids.start_token_id].item(), name="latent-start logit"),
+                        },
+                        "eos": {
+                            "token_id": token_ids.end_token_id,
+                            "rank": token_rank(boundary["eos"][0], token_ids.end_token_id),
+                            "logit": _finite_float(boundary["eos"][0, token_ids.end_token_id].item(), name="EOS logit"),
+                        },
+                        "per_position_ce": boundary["per_position_ce"],
+                        "gradients_before_clipping": gradients_before_clipping,
+                        "global_norm_before_clipping": _finite_float(float(global_norm_before_clipping), name="global gradient norm"),
+                        "parameter_deltas": _boundary_delta_evidence(targets, before, after),
+                    })
+                finally:
+                    restore_values()
+                    restore_gradients()
     finally:
+        restore_values()
+        restore_gradients()
+        for name, parameter in all_parameters.items():
+            parameter.requires_grad_(original_requires_grad[name])
         model.train(original_training)
 
     # These are intentionally real bounded generations. They are invoked only
