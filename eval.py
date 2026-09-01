@@ -47,7 +47,12 @@ from multinode_evaluation import (
     shard_manifest_path,
     write_shard_manifest,
 )
-from evaluation.scoring import EvaluationScoreSummary, extract_final_answer, score_answer
+from evaluation.scoring import (
+    EvaluationScoreSummary,
+    extract_final_answer,
+    parse_gold_answer,
+    score_answer,
+)
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -597,12 +602,28 @@ def main():
             logging.error(f"[{i}] Evaluation failed: {e}")
             if sharded:
                 worker_failed = True
-            results.append({
+            error_result = {
                 "index": i,
                 "task_name": args.task_name,
                 "error": str(e),
                 "inference_time_sec": None,
-            })
+            }
+            if args.task_name != "vsp-spatial-planning-cot":
+                gold = sample.get("original_final_answer")
+                gold_parse = parse_gold_answer(gold)
+                invalid_gold_reason = (
+                    gold_parse.detail if gold_parse.status == "invalid_gold" else
+                    gold_parse.status if gold_parse.status != "parsed" else None
+                )
+                error_result.update({
+                    "gold_final_answer": gold,
+                    "gold_parse_status": gold_parse.status,
+                    "gold_parse_detail": gold_parse.detail,
+                    "gold_normalized": gold_parse.normalized,
+                    "invalid_gold_reason": invalid_gold_reason,
+                    "match": False,
+                })
+            results.append(error_result)
 
     metric_total = worker_total if sharded else total
     score_summary = (

@@ -184,7 +184,10 @@ def extract_final_answer(text: str) -> AnswerParseResult:
             elif source[position] == "}":
                 depth -= 1
                 if depth == 0:
-                    return _parsed(_clean_answer_span(source[start:position]))
+                    span = _clean_answer_span(source[start:position])
+                    return _parsed(
+                        span, "parsed" if span else "empty_prediction"
+                    )
         return _parsed("", "malformed", "unclosed_box")
 
     for marker in (_FINAL_MARKER, _ANSWER_MARKER):

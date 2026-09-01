@@ -605,6 +605,86 @@ def test_standard_tasks_score_assistant_content_and_record_parse_fields(
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_inference_error_rows_preserve_invalid_gold_for_summary(
+    module_name, monkeypatch, tmp_path
+):
+    """Dropping gold validity when inference fails must fail this test."""
+    module = _import_entry_point(module_name, monkeypatch)
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text(
+        "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                {
+                    "text_input": "failure",
+                    "image_input": [],
+                    "original_final_answer": None,
+                },
+                {
+                    "text_input": "success",
+                    "image_input": [],
+                    "original_final_answer": "42",
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "output.jsonl"
+    monkeypatch.setattr(
+        module,
+        "get_eval_args",
+        lambda: SimpleNamespace(
+            model_dir="model",
+            base_model_dir=None,
+            test_data_path=str(dataset),
+            task_name="zebra-cot",
+            output_json_path=str(output),
+            cache_dir="cache",
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            num_shards=1,
+            shard_index=0,
+            model_identity=None,
+        ),
+    )
+    monkeypatch.setattr(
+        module, "load_evaluation_artifacts", lambda **_kwargs: (object(), object())
+    )
+
+    def run_one(_model, _processor, sample, _gen_kwargs):
+        if sample["text_input"] == "failure":
+            raise RuntimeError("causal inference failure")
+        result = {
+            "raw_output": "raw output",
+            "assistant_only": "42",
+            "extracted_final_answer": "42",
+        }
+        if module_name == "eval":
+            result["inference_time"] = 0.25
+        return result
+
+    monkeypatch.setattr(module, "run_one_example", run_one)
+    module.main()
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    failed = next(row for row in rows if row.get("index") == 0)
+    assert failed["error"] == "causal inference failure"
+    assert failed["gold_final_answer"] is None
+    assert failed["gold_parse_status"] == "invalid_gold"
+    assert failed["gold_parse_detail"] == "missing"
+    assert failed["gold_normalized"] == ""
+    assert failed["invalid_gold_reason"] == "missing"
+
+    if module_name == "eval":
+        summary = rows[-1]
+        assert summary["valid_gold_count"] == 1
+        assert summary["invalid_gold"] == [0]
+        assert summary["coverage_accuracy"] == pytest.approx(1 / 2)
+        assert summary["valid_gold_accuracy"] == 1.0
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
 def test_four_shard_worker_uses_global_indices_and_writes_success_sidecar(
     module_name, monkeypatch, tmp_path
 ):

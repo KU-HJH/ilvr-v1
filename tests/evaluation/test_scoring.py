@@ -40,6 +40,17 @@ def test_blank_or_missing_gold_never_matches_blank_prediction():
         assert score.invalid_gold_reason in {"missing", "blank"}
 
 
+def test_empty_boxed_gold_is_invalid_blank_and_never_matches():
+    """Classifying a balanced empty box as valid gold must fail this test."""
+    score = score_answer("", r"\boxed{}")
+
+    assert score.prediction.status == "empty_prediction"
+    assert score.gold.status == "invalid_gold"
+    assert score.gold.detail == "blank"
+    assert score.invalid_gold_reason == "blank"
+    assert score.match is False
+
+
 def test_normalization_does_not_apply_symbolic_equivalence():
     """Adding general math equivalence must fail this exact-match test."""
     score = score_answer("1/2", "0.5")
