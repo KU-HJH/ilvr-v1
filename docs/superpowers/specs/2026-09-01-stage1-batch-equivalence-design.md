@@ -1,7 +1,7 @@
 # Stage 1 True-Batch Equivalence Design
 
 **Date:** 2026-09-01  
-**Status:** Design proposal v5, frozen for critique
+**Status:** Design proposal v6, frozen for critique
 **Repository:** `XD111ds/ILVR`  
 **Supersedes:** only the batch-equivalence portions of
 `2026-08-26-ilvr-stage1-dora-batched-training-design.md`
@@ -315,7 +315,7 @@ four. Canonical sample identity, stochastic draws, student, EMA, optimizer,
 scheduler, and global-step state must match exactly. This isolates staged
 resume correctness before it can confound the B=1/B=2 comparison.
 
-### 8.3 Real 3B, four-GPU 64-step staged witness
+### 8.3 Real 3B, four-GPU staged control audit
 
 The approved multi-node route starts the fresh B=1 and B=2 jobs sequentially
 in the `llm_kd` container on `10.1.102.41` and the local node, using four GPUs
@@ -326,7 +326,14 @@ scheduler horizon. This is about one tenth of the paired training compute, and
 the successful work is not discarded: both runs resume from those exact
 checkpoints after the comparison passes.
 
-The witness compares:
+After the main B=1 run pauses, one B=1 replay executes only its first optimizer
+step from the same immutable initial state and the same 648-step scheduler. It
+is the sole A/A run. Apart from its run/output identity and diagnostic stop at
+step 1, its resolved manifest equals the main B=1 run. This one-step replay
+measures real four-GPU kernel and collective repeatability without adding a
+third 64-step experiment.
+
+The launch-gating control audit compares:
 
 - exact resolved manifests outside the explicit four-field whitelist;
 - exact canonical global slot/source identities;
@@ -334,57 +341,82 @@ The witness compares:
   original/helper pixel tensors, and image grids at every step;
 - exact per-slot stochastic keys and valid-position DoRA-mask/alignment-noise
   hashes at every step;
-- exact selected counts and candidate indices at every step from 1 through 64;
-- finite per-component loss traces at every step;
-- samplewise student visual embeddings and EMA teacher target rows at anchor
-  steps 1, 2, and 64 before decoder packing;
-- exact decoder position IDs at the same anchor steps;
-- flattened pre-clip trainable gradients at anchor steps 1, 2, and 64;
-- trainable student, EMA, and logical Adam first-/second-moment deltas at the
-  same anchor steps;
+- exact first-step selected counts and candidate indices;
+- samplewise first-step student visual embeddings and initial EMA teacher
+  target rows before decoder packing;
+- exact first-step decoder position IDs;
+- first-step flattened pre-clip trainable gradients and trainable student,
+  EMA, and logical Adam first-/second-moment deltas;
 - exact optimizer, scheduler, global-step, and EMA-update counters;
 - measured wall time per optimizer step and peak allocated/reserved GPU memory.
 
-Samplewise frozen-visual embeddings and first-step EMA teacher target rows
-execute through the same unpadded B=1-shaped calls from identical state and
-must satisfy `rtol=1e-6` and `atol=1e-6`. Later target rows may inherit only
-the already-bounded student/EMA update difference and use the decoder numerical
-boundary below. Selected counts and candidate indices must agree exactly at
-all 64 steps.
+The main B=1 first step and its A/A replay must match their floating tensors
+with `rtol=1e-6` and `atol=1e-7`; exact identities and discrete states use
+equality. If this repeatability baseline fails, the A/B numerical difference
+cannot be attributed to microbatch grouping and continuation is blocked.
 
-For nonzero later target, trainable-decoder, gradient, update, EMA-delta, and
-optimizer-state tensors at each recorded anchor, BF16 numerical acceptance
-requires both:
+Samplewise frozen-visual embeddings and first-step EMA teacher target rows in
+B=1 versus B=2 execute through the same unpadded B=1-shaped calls from
+identical state and must satisfy `rtol=1e-6` and `atol=1e-6`. First-step
+selected counts and candidate indices must agree exactly.
+
+For nonzero first-step trainable-decoder, gradient, update, EMA-delta, and
+optimizer-state tensors, BF16 numerical acceptance requires both:
 
 ```text
 symmetric relative L2 error <= 2.0e-2
 cosine similarity           >= 0.9998
 ```
 
-Scalar CE, alignment, and total losses must additionally have absolute
-difference at most `1.0e-2` at every step. Exact-zero tensors must agree
-exactly. Maximum absolute error and the worst named tensor are always reported
-but are not used alone because their scale is not comparable across
-parameters. Backward accumulation and reduction order is part of the permitted
-GPU batch-shape numerical boundary, not silently treated as exact arithmetic.
+First-step scalar CE, alignment, and total losses must additionally have
+absolute difference at most `1.0e-2`. Exact-zero tensors must agree exactly.
+Maximum absolute error and the worst named tensor are always reported but are
+not used alone because their scale is not comparable across parameters.
+Backward accumulation and reduction order is part of the permitted GPU
+batch-shape numerical boundary, not silently treated as exact arithmetic.
 
 The numerical boundary is based on the observed `0.0162` relative-L2 true
 decoder floor after exact samplewise visual inputs. It is not widened if the
 gradient or update witness fails. These thresholds bound decoder batch-shape
-effects; they do not permit a changed sample, target selection, visual input,
-teacher target, update count, RNG draw, or loss weighting.
+effects at a common initial state; they do not permit a changed sample, initial
+target selection, visual input, initial teacher target, update count, RNG draw,
+or loss weighting.
+
+### 8.4 EMA trajectory observation
+
+After the common first update, student and EMA states are outcomes of the
+batch-shape treatment. Later teacher target values or discrete selections may
+therefore diverge even though every controllable input remains equal. Treating
+that divergence as a launch failure would censor the effect being measured.
+
+For steps 2 through 648, both main runs record compact per-step traces of
+selected counts and indices, selection-score margins, component losses,
+gradient norms, student/EMA parameter norms, timing, and memory. Full tensors
+for teacher targets, gradients, student/EMA deltas, and optimizer state are
+compared at steps 2, 64, and 648 as observations using the same relative-L2 and
+cosine metrics, but no post-step-1 numerical or discrete equality threshold is
+a launch criterion. The report identifies the first target-selection
+divergence and its margin when one occurs.
+
+Canonical slot/source identities, unpadded input hashes, stochastic keys and
+valid-position stochastic-tensor hashes, and optimizer/scheduler/update
+counters remain exact controls through step 648. The B=2 continuation checks
+these compact controls against the completed B=1 trace step by step and aborts
+on a mismatch. Only model-derived teacher decisions and numerical trajectory
+values are observational after the common first update.
 
 ## 9. Launch Gate and Artifacts
 
 The paired runs may proceed beyond step 64 only after all focused tests, the
-tiny witness, and the staged real comparison pass. A failure is a result, not
-a reason to retry with looser thresholds; neither run resumes. On a pass, the
-same B=1/GA=4 and B=2/GA=2 runs resume from their step-64 checkpoints and finish
-three epochs. Both are then evaluated with one resolved official evaluation
-manifest and the same fixed test set. Accuracy and exact per-example
-predictions are reported side by side; full-run accuracy equality is an
-observed comparison, not a launch threshold, because permitted GPU numerical
-differences can compound.
+tiny witness, the one-step A/A replay, and the staged control audit pass. A
+control or first-step numerical failure is a result, not a reason to retry with
+looser thresholds; neither main run resumes. Later EMA trajectory divergence
+is reported but does not fail the gate. On a pass, the same B=1/GA=4 and
+B=2/GA=2 runs resume from their step-64 checkpoints and finish three epochs.
+Both are then evaluated with one resolved official evaluation manifest and the
+same fixed test set. Accuracy and exact per-example predictions are reported
+side by side; full-run accuracy equality is an observed comparison, not a
+launch threshold, because permitted GPU numerical differences can compound.
 
 Artifacts follow repository policy:
 
@@ -437,9 +469,10 @@ Fail before full training for:
 - an unregistered active training-mode stochastic module;
 - missing stochastic context while sample-stable dropout is active;
 - mismatch between checkpoint RNG schema and requested run;
-- any discrete teacher target-selection difference in the real witness;
+- an A/A repeatability failure;
+- a B=1/B=2 first-step target-selection or numerical threshold failure;
 - nonfinite loss, gradient, parameter delta, EMA delta, or optimizer moment;
-- any exact-state mismatch or numerical threshold failure.
+- any controllable exact-state mismatch.
 
 After a runtime failure, retain the log, identify one root cause, add one
 causal regression test, and retry with a fresh run ID. Broad retry or recovery
@@ -454,6 +487,8 @@ infrastructure is outside this design.
 - changing DoRA rank, alpha, dropout, target modules, or learning rate;
 - removing ILVR alignment noise;
 - changing EMA tau or teacher-update semantics;
+- requiring identical moving-teacher trajectories after the common first
+  update;
 - Stage 2 batch-size work;
 - a new benchmark framework, retry framework, or experiment database;
 - proceeding past step 64 before the staged equivalence gate passes.
@@ -462,11 +497,11 @@ infrastructure is outside this design.
 
 Completion means the repository can produce fresh evidence that B=1/GA=4 and
 true B=2/GA=2 use identical manifests outside the approved batch/output
-whitelist and receive the same samplewise frozen visual inputs, teacher
-targets, stochastic draws, objectives, schedules, and update boundaries for
-64 real 3B optimizer updates, including the moving-EMA feedback trajectory.
-The trainable decoder remains truly batched and may differ only within the
-bounded GPU forward/backward witness. Completion also includes resuming the
-same paired runs through three epochs and their side-by-side official
-evaluation; it does not claim bitwise-identical checkpoints or identical
-accuracy.
+whitelist and receive the same controllable sample inputs, stochastic draws,
+objectives, schedules, and update boundaries through the staged audit. Their
+common-state first update differs only within the bounded GPU
+forward/backward witness and against a measured A/A repeatability baseline.
+Completion also includes observing the resulting EMA trajectory through all
+648 steps, identifying any first teacher-selection divergence, and reporting
+the paired official evaluations. It does not claim identical post-update
+teachers, bitwise-identical checkpoints, or identical accuracy.
