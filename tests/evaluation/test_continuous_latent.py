@@ -35,6 +35,19 @@ class ScriptedHead(nn.Module):
         return logits
 
 
+class RecordingScriptedHead(ScriptedHead):
+    def __init__(self, token_ids, vocab_size=128):
+        super().__init__(token_ids, vocab_size)
+        self.hidden_inputs = []
+        self.outputs = []
+
+    def forward(self, hidden):
+        self.hidden_inputs.append(hidden.clone())
+        logits = super().forward(hidden)
+        self.outputs.append(logits.clone())
+        return logits
+
+
 class ScriptedContinuousLatentModel(nn.Module):
     def __init__(self, *, emitted_ids, latent_size, stage):
         super().__init__()
@@ -93,6 +106,36 @@ def test_neutral_controller_records_complete_latent_block_evidence():
     )
     assert result.stop_reason == "eos"
     assert len(result.post_end_logits_by_block) == 1
+
+
+def test_post_end_logits_use_complete_post_recurrence_scaffold():
+    """Catches evidence taken before continuous latent replacements finish."""
+    model = scripted_model(
+        latent_size=2,
+        emitted_ids=[TOKENS.start_token_id, 3],
+    )
+    model.lm_head = RecordingScriptedHead([TOKENS.start_token_id, 3])
+
+    result = ContinuousLatentController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=ContinuousLatentGenerationConfig(
+            max_new_tokens=5, eos_token_id=3
+        ),
+        return_post_end_logits=True,
+    )
+
+    complete_embeds, _, complete_positions = model.model.calls[3]
+    expected_hidden = (
+        complete_embeds.cumsum(dim=1) * model.model.scale
+        + complete_positions[0].unsqueeze(-1).to(complete_embeds.dtype)
+    )[:, -1, :]
+    torch.testing.assert_close(model.lm_head.hidden_inputs[1], expected_hidden)
+    torch.testing.assert_close(
+        result.post_end_logits_by_block[0], model.lm_head.outputs[1]
+    )
 
 
 @pytest.mark.parametrize("stage", ["stage1", "stage2"])

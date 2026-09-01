@@ -120,11 +120,11 @@ class ContinuousLatentGenerationResult:
 
     sequences: torch.LongTensor
     latent_states_by_block: tuple[tuple[torch.Tensor, ...], ...]
-    generated_suffix_ids: tuple[int, ...]
-    latent_start_count: int
-    latent_block_count: int
-    stop_reason: str
-    post_end_logits_by_block: tuple[torch.Tensor, ...]
+    generated_suffix_ids: tuple[int, ...] = ()
+    latent_start_count: int = 0
+    latent_block_count: int = 0
+    stop_reason: str = "max_new_tokens"
+    post_end_logits_by_block: tuple[torch.Tensor, ...] = ()
 
 
 class ContinuousLatentController:

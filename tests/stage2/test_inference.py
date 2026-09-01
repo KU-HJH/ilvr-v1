@@ -1,4 +1,5 @@
 import copy
+import inspect
 import json
 from types import SimpleNamespace
 
@@ -50,6 +51,31 @@ def test_stage2_generation_exports_remain_neutral_contract_aliases():
     assert Stage2GenerationConfig is ContinuousLatentGenerationConfig
     assert Stage2GenerationResult is ContinuousLatentGenerationResult
     assert build_stage2_generation_config is build_continuous_generation_config
+
+
+def test_stage2_generation_result_retains_legacy_two_field_construction():
+    """Catches required neutral evidence fields breaking Stage 2 result callers."""
+    sequences = torch.tensor([[1, 2]])
+
+    result = Stage2GenerationResult(sequences, ())
+
+    assert result.sequences is sequences
+    assert result.latent_states_by_block == ()
+
+
+def test_stage2_controller_retains_its_original_generate_signature():
+    """Catches neutral-only evidence arguments leaking into Stage 2's API."""
+    assert tuple(inspect.signature(Stage2InferenceController.generate).parameters) == (
+        "self",
+        "model",
+        "input_ids",
+        "attention_mask",
+        "token_ids",
+        "generation_config",
+        "pixel_values",
+        "image_grid_thw",
+        "return_latent_states",
+    )
 
 
 def settings(method: str) -> Stage2TuningConfig:
