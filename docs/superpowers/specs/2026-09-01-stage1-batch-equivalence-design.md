@@ -1,7 +1,7 @@
 # Stage 1 True-Batch Equivalence Design
 
 **Date:** 2026-09-01  
-**Status:** Design proposal v2, frozen for critique
+**Status:** Design proposal v3, frozen for critique
 **Repository:** `XD111ds/ILVR`  
 **Supersedes:** only the batch-equivalence portions of
 `2026-08-26-ilvr-stage1-dora-batched-training-design.md`
@@ -56,7 +56,7 @@ precision                     BF16 training, FP32 loss reductions
 ```
 
 The comparison does not use an earlier B=2 checkpoint as a B=1 control. Both
-one-step witnesses start from the same immutable initial model and tuning
+short real witnesses start from the same immutable initial model and tuning
 state.
 
 Before either witness or full run starts, the launcher materializes a resolved
@@ -94,6 +94,14 @@ prove equivalence for a different experiment rather than the requested one.
 
 This provides strict gradient equality but is not true batching and forfeits
 the memory and throughput behavior under investigation.
+
+### 3.4 Rejected: gate on only the first optimizer step
+
+At the first step both paths use the same initial EMA teacher, so that check
+cannot exercise the moving-teacher feedback loop. A true decoder batch-shape
+difference in the first student update enters the EMA teacher and can alter the
+next step's discrete target selection. The real witness therefore includes the
+second optimizer step.
 
 ## 4. Canonical Sample Schedule
 
@@ -300,19 +308,21 @@ FP32 deterministic fixtures use `torch.testing.assert_close` with
 `rtol=1e-6` and `atol=1e-7`. Exact integer, boolean, sample-identity,
 selected-index, and step state uses equality.
 
-### 8.3 Real 3B, four-GPU one-step witness
+### 8.3 Real 3B, four-GPU two-step EMA-feedback witness
 
-The approved multi-node route runs two fresh, sequential one-step jobs in the
+The approved multi-node route runs two fresh, sequential two-step jobs in the
 `llm_kd` container on `10.1.102.41` and the local node, using four GPUs total.
-Both jobs start from the same base model and seed and use distinct run IDs.
+Both jobs start from the same base model and seed and use distinct run IDs. The
+second step is mandatory: it is the first step whose targets come from an EMA
+teacher updated from a potentially different B=1 or B=2 student update.
 
 The witness compares:
 
 - exact resolved manifests outside the explicit four-field whitelist;
 - exact canonical global slot/source identities;
 - samplewise student visual embeddings before decoder packing;
-- samplewise EMA teacher target rows before decoder packing;
-- exact selected counts and candidate indices;
+- samplewise EMA teacher target rows before decoder packing, reported by step;
+- exact selected counts and candidate indices at both steps;
 - exact optimizer, scheduler, global-step, and EMA-update counters;
 - finite per-component losses;
 - flattened pre-clip trainable gradients;
@@ -320,12 +330,15 @@ The witness compares:
 - EMA update deltas;
 - logical Adam first- and second-moment state.
 
-Samplewise frozen-visual embeddings and EMA teacher target rows execute through
-the same unpadded B=1-shaped calls and must satisfy `rtol=1e-6` and
-`atol=1e-6`. Selected counts and candidate indices must agree exactly.
+Samplewise frozen-visual embeddings and first-step EMA teacher target rows
+execute through the same unpadded B=1-shaped calls from identical state and
+must satisfy `rtol=1e-6` and `atol=1e-6`. Second-step target rows may inherit
+only the already-bounded first student/EMA update difference and use the
+decoder numerical boundary below. Selected counts and candidate indices must
+agree exactly at both steps.
 
-For nonzero trainable-decoder, gradient, update, EMA-delta, and optimizer-state
-tensors, BF16 numerical acceptance requires both:
+For nonzero second-step target, trainable-decoder, gradient, update, EMA-delta,
+and optimizer-state tensors, BF16 numerical acceptance requires both:
 
 ```text
 symmetric relative L2 error <= 2.0e-2
@@ -346,7 +359,7 @@ teacher target, update count, RNG draw, or loss weighting.
 ## 9. Launch Gate and Artifacts
 
 The paired full runs may start only after all focused tests, the tiny witness,
-and both real one-step jobs pass. A failed real witness is a result, not a
+and both real two-step jobs pass. A failed real witness is a result, not a
 reason to retry with looser thresholds. On a pass, fresh B=1/GA=4 and B=2/GA=2
 runs train sequentially for three epochs from the same immutable initial state.
 Both are then evaluated with one resolved official evaluation manifest and the
@@ -416,7 +429,7 @@ infrastructure is outside this design.
 - changing EMA tau or teacher-update semantics;
 - Stage 2 batch-size work;
 - a new benchmark framework, retry framework, or experiment database;
-- starting a three-epoch run before the one-step equivalence gate passes.
+- starting a three-epoch run before the two-step EMA-feedback gate passes.
 
 ## 13. Completion Claim
 
@@ -424,7 +437,8 @@ Completion means the repository can produce fresh evidence that B=1/GA=4 and
 true B=2/GA=2 use identical manifests outside the approved batch/output
 whitelist and receive the same samplewise frozen visual inputs, teacher
 targets, stochastic draws, objectives, schedules, and update boundaries for
-one real 3B optimizer update. The trainable decoder remains truly batched and
-may differ only within the bounded BF16 witness. Completion also includes the
-fresh paired three-epoch runs and their side-by-side official evaluation; it
-does not claim bitwise-identical checkpoints or identical accuracy.
+two real 3B optimizer updates, including one moving-EMA feedback step. The
+trainable decoder remains truly batched and may differ only within the bounded
+BF16 witness. Completion also includes the fresh paired three-epoch runs and
+their side-by-side official evaluation; it does not claim bitwise-identical
+checkpoints or identical accuracy.
