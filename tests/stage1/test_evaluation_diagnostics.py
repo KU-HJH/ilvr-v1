@@ -322,6 +322,26 @@ def test_boundary_validates_test_source_identity_cue_and_all_trainable_targets(t
         boundary_target_parameters(_BoundaryTargets(include_magnitude=False), token_ids)
 
 
+def test_boundary_reenables_only_sparse_and_dora_measurement_targets():
+    """Catches the inference loader leaving every boundary target frozen."""
+    model = _BoundaryTargets()
+    model.frozen_base = nn.Parameter(torch.zeros(1))
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    diagnostics.enable_boundary_measurement_parameters(model)
+
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert trainable == {
+        "lm_head.output_delta",
+        "adapter.lora_A",
+        "adapter.lora_B",
+        "adapter.lora_magnitude_vector",
+    }
+
+
 class _ReferenceLanguageModel(nn.Module):
     def forward(self, *, inputs_embeds, **_kwargs):
         return SimpleNamespace(last_hidden_state=inputs_embeds.cumsum(dim=1))

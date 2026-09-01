@@ -639,6 +639,17 @@ def validate_assistant_cue_scaffold(prepared: Mapping[str, torch.Tensor], tokeni
         raise ValueError("prompt does not end with the tokenized assistant cue before latent_start")
 
 
+def enable_boundary_measurement_parameters(model) -> None:
+    """Make only the in-memory boundary measurement targets differentiable."""
+    components = ("lora_A", "lora_B", "lora_magnitude_vector")
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(
+            name.endswith("lm_head.output_delta")
+            or name == "lm_head.output_delta"
+            or any(component in name for component in components)
+        )
+
+
 def boundary_target_parameters(model, token_ids) -> dict[str, object]:
     """Find the exact Stage 1 sparse latent rows and every trainable DoRA tensor."""
     named = {
@@ -829,6 +840,7 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
     source_rows = validated_test_source_rows(dataset_path, dataset, source_indices)
     token_ids = resolve_latent_token_ids(processor.tokenizer, model.config)
     ordinary = _ordinary_token_id(processor.tokenizer, token_ids)
+    enable_boundary_measurement_parameters(model)
     targets = boundary_target_parameters(model, token_ids)
     all_trainable = {
         name: parameter for name, parameter in model.named_parameters()
