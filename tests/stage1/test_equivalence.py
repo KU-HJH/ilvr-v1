@@ -611,6 +611,119 @@ def test_checkpoint_recompute_regenerates_same_dropout_and_rejects_second_call(
                 dropout(values)
 
 
+def test_stochastic_context_does_not_expose_mutable_invocation_bookkeeping():
+    """Catches callers prepopulating or clearing counts through the public API."""
+    context = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25)
+    dropout.train()
+    values = torch.ones((1, 5, 4))
+
+    for public_name in (
+        "__dict__",
+        "original_invocations",
+        "recompute_invocations",
+        "record_invocation",
+        "validate_invocations",
+    ):
+        with pytest.raises(AttributeError):
+            getattr(context, public_name)
+
+    with activate_stage1_stochastic_context(context):
+        dropout(values)
+        with pytest.raises(AttributeError):
+            context.original_invocations.clear()
+        with pytest.raises(RuntimeError, match="second.*original"):
+            dropout(values)
+
+
+def _assert_checkpoint_failure_left_no_stochastic_context(context):
+    assert context.phase == "outside_checkpoint"
+    with pytest.raises(RuntimeError, match="missing.*stochastic context"):
+        stage1_checkpoint_context_fn()
+    with pytest.raises(RuntimeError, match="stale"):
+        with activate_stage1_stochastic_context(context):
+            pass
+
+    fresh_context = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=18,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    fresh_dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25)
+    fresh_dropout.train()
+    with activate_stage1_stochastic_context(fresh_context):
+        fresh_dropout(torch.ones((1, 5, 4)))
+
+
+def test_nonreentrant_checkpoint_original_exception_cleans_stochastic_context():
+    """Catches an original-forward exception leaking its token, phase, or counts."""
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25)
+    dropout.train()
+    values = torch.ones((1, 5, 4), requires_grad=True)
+    context = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+
+    def failing_block(tensor):
+        dropout(tensor)
+        raise RuntimeError("original checkpoint failure")
+
+    with pytest.raises(RuntimeError, match="original checkpoint failure"):
+        with activate_stage1_stochastic_context(context):
+            checkpoint(
+                failing_block,
+                values,
+                use_reentrant=False,
+                context_fn=stage1_checkpoint_context_fn,
+            )
+
+    _assert_checkpoint_failure_left_no_stochastic_context(context)
+
+
+def test_nonreentrant_checkpoint_recompute_exception_cleans_stochastic_context():
+    """Catches a recompute exception leaking its nested token, phase, or counts."""
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25)
+    dropout.train()
+    values = torch.ones((1, 5, 4), requires_grad=True)
+    calls = []
+    context = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+
+    def failing_recompute_block(tensor):
+        dropped = dropout(tensor)
+        calls.append(dropped.detach().clone())
+        if len(calls) == 2:
+            raise RuntimeError("recompute checkpoint failure")
+        return dropped * dropped
+
+    with pytest.raises(RuntimeError, match="recompute checkpoint failure"):
+        with activate_stage1_stochastic_context(context):
+            checkpointed = checkpoint(
+                failing_recompute_block,
+                values,
+                use_reentrant=False,
+                context_fn=stage1_checkpoint_context_fn,
+            )
+            checkpointed.sum().backward()
+
+    assert len(calls) == 2
+    torch.testing.assert_close(calls[0], calls[1], rtol=0, atol=0)
+    _assert_checkpoint_failure_left_no_stochastic_context(context)
+
+
 def test_sample_dropout_rejects_missing_stale_shape_and_site_context():
     """Catches silent global-RNG fallback or inferred row/layout ownership."""
     dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25)
@@ -673,6 +786,29 @@ def test_sample_dropout_rejects_missing_stale_shape_and_site_context():
     with pytest.raises(RuntimeError, match="unregistered.*site"):
         with activate_stage1_stochastic_context(wrong_site):
             dropout(values)
+
+
+def test_sample_dropout_rejects_sparse_layout_before_invocation_accounting():
+    """Catches a rank-three sparse activation consuming the site's one call."""
+    dropout = SampleStableStage1Dropout(_DROPOUT_SITE, 0.25)
+    dropout.train()
+    context = Stage1StochasticContext(
+        base_seed=42,
+        optimizer_global_step=17,
+        rows=((9, 5),),
+        expected_sites=(_DROPOUT_SITE,),
+    )
+    sparse = torch.sparse_coo_tensor(
+        torch.tensor([[0], [0], [0]]),
+        torch.tensor([1.0]),
+        size=(1, 5, 4),
+    )
+    dense = torch.ones((1, 5, 4))
+
+    with activate_stage1_stochastic_context(context):
+        with pytest.raises(ValueError, match="strided"):
+            dropout(sparse)
+        dropout(dense)
 
 
 def test_zero_probability_dropout_preserves_identity_and_context_counts():

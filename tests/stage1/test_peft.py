@@ -163,6 +163,43 @@ def test_real_peft_dropout_replacement_uses_exact_decoder_site_paths(
     validate_stage1_stochastic_inventory(model, expected_sites)
 
 
+def test_zero_dropout_dora_preserves_peft_identity_fast_path(
+    tiny_qwen, latent_token_ids
+):
+    """Catches p=0 replacement forcing DoRA to recompute its base linear result."""
+    model = build_stage1_tuned_model(
+        tiny_qwen, tuning("dora", dropout=0.0), latent_token_ids
+    )
+    qwen = resolve_qwen2_5_vl_model(model)
+    target = qwen.model.layers[0].self_attn.q_proj
+    installed_dropout = target.lora_dropout["default"]
+    base_calls = []
+    handle = target.get_base_layer().register_forward_hook(
+        lambda module, inputs, output: base_calls.append(output)
+    )
+    values = torch.randn((2, 3, target.in_features))
+    model.train()
+    try:
+        installed_output = target(values)
+        installed_calls = len(base_calls)
+        base_calls.clear()
+        target.lora_dropout["default"] = nn.Identity()
+        identity_output = target(values)
+        identity_calls = len(base_calls)
+    finally:
+        handle.remove()
+
+    assert isinstance(installed_dropout, nn.Identity)
+    assert install_stage1_sample_stable_dropout(model) == ()
+    assert tuple(model.stage1_stochastic_sites) == ()
+    assert installed_calls == identity_calls == 1
+    torch.testing.assert_close(installed_output, identity_output, rtol=0, atol=0)
+    validate_stage1_stochastic_inventory(model, ())
+    model.rogue_dropout = nn.Dropout(0.1)
+    with pytest.raises(RuntimeError, match="enabled unregistered.*dropout"):
+        validate_stage1_stochastic_inventory(model, ())
+
+
 def test_stochastic_inventory_rejects_enabled_unregistered_dropout(
     tiny_qwen, latent_token_ids
 ):

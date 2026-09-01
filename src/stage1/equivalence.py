@@ -640,7 +640,48 @@ def stage1_sample_seed(
     )
 
 
-@dataclass(frozen=True)
+class _Stage1InvocationState:
+    """Private mutable counts shared by one context and its checkpoint managers."""
+
+    __slots__ = ("__original", "__recompute")
+
+    def __init__(self) -> None:
+        self.__original: dict[str, int] = {}
+        self.__recompute: dict[str, int] = {}
+
+    def _record(self, site_name: str, *, recompute: bool) -> None:
+        counts = self.__recompute if recompute else self.__original
+        phase = "recompute" if recompute else "original"
+        if counts.get(site_name, 0) >= 1:
+            raise RuntimeError(
+                f"second {phase} invocation for Stage 1 stochastic site {site_name}"
+            )
+        counts[site_name] = 1
+
+    def _validate(self, expected_sites: tuple[str, ...]) -> None:
+        invalid_original = tuple(
+            site for site in expected_sites if self.__original.get(site, 0) != 1
+        )
+        if invalid_original:
+            raise RuntimeError(
+                "Stage 1 stochastic sites require original count exactly one: "
+                + ", ".join(invalid_original)
+            )
+        invalid_recompute = tuple(
+            site for site, count in self.__recompute.items() if count not in (0, 1)
+        )
+        if invalid_recompute:
+            raise RuntimeError(
+                "Stage 1 stochastic sites permit at most one recompute: "
+                + ", ".join(invalid_recompute)
+            )
+
+    def _clear(self) -> None:
+        self.__original.clear()
+        self.__recompute.clear()
+
+
+@dataclass(frozen=True, slots=True)
 class Stage1StochasticContext:
     """One microbatch's immutable RNG identity plus bounded invocation state."""
 
@@ -651,8 +692,12 @@ class Stage1StochasticContext:
     phase: Literal["outside_checkpoint", "original", "recompute"] = field(
         default="outside_checkpoint", init=False
     )
-    original_invocations: dict[str, int] = field(default_factory=dict, init=False)
-    recompute_invocations: dict[str, int] = field(default_factory=dict, init=False)
+    _invocation_state: _Stage1InvocationState = field(
+        default_factory=_Stage1InvocationState,
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _active: bool = field(default=False, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
@@ -690,39 +735,17 @@ class Stage1StochasticContext:
         object.__setattr__(self, "rows", rows)
         object.__setattr__(self, "expected_sites", sites)
 
-    def record_invocation(self, site_name: str) -> None:
+    def _record_invocation(self, site_name: str) -> None:
         if site_name not in self.expected_sites:
             raise RuntimeError(f"unregistered Stage 1 stochastic site: {site_name}")
         recompute = self.phase == "recompute"
-        counts = self.recompute_invocations if recompute else self.original_invocations
-        phase = "recompute" if recompute else "original"
-        if counts.get(site_name, 0) >= 1:
-            raise RuntimeError(
-                f"second {phase} invocation for Stage 1 stochastic site {site_name}"
-            )
-        counts[site_name] = 1
+        self._invocation_state._record(site_name, recompute=recompute)
 
-    def validate_invocations(self) -> None:
-        invalid_original = tuple(
-            site
-            for site in self.expected_sites
-            if self.original_invocations.get(site, 0) != 1
-        )
-        if invalid_original:
-            raise RuntimeError(
-                "Stage 1 stochastic sites require original count exactly one: "
-                + ", ".join(invalid_original)
-            )
-        invalid_recompute = tuple(
-            site
-            for site, count in self.recompute_invocations.items()
-            if count not in (0, 1)
-        )
-        if invalid_recompute:
-            raise RuntimeError(
-                "Stage 1 stochastic sites permit at most one recompute: "
-                + ", ".join(invalid_recompute)
-            )
+    def _validate_invocations(self) -> None:
+        self._invocation_state._validate(self.expected_sites)
+
+    def _clear_invocations(self) -> None:
+        self._invocation_state._clear()
 
 
 _STAGE1_STOCHASTIC_CONTEXT: ContextVar[Stage1StochasticContext | None] = (
@@ -753,11 +776,10 @@ def activate_stage1_stochastic_context(context: Stage1StochasticContext):
     except BaseException:
         raise
     else:
-        context.validate_invocations()
+        context._validate_invocations()
     finally:
         object.__setattr__(context, "phase", "outside_checkpoint")
-        context.original_invocations.clear()
-        context.recompute_invocations.clear()
+        context._clear_invocations()
         object.__setattr__(context, "_active", False)
         object.__setattr__(context, "_closed", True)
         _STAGE1_STOCHASTIC_CONTEXT.reset(token)
@@ -816,6 +838,8 @@ class SampleStableStage1Dropout(torch.nn.Module):
         context = _require_stage1_stochastic_context()
         if not isinstance(x, torch.Tensor) or x.ndim != 3:
             raise ValueError("Stage 1 sample-stable dropout requires [B,T,H]")
+        if x.layout != torch.strided:
+            raise ValueError("Stage 1 sample-stable dropout requires strided activations")
         if not x.is_floating_point():
             raise TypeError("Stage 1 sample-stable dropout requires floating activations")
         batch, width, hidden = x.shape
@@ -825,7 +849,7 @@ class SampleStableStage1Dropout(torch.nn.Module):
             raise ValueError("Stage 1 sample-stable dropout requires nonempty T,H")
         if any(valid_length > width for _, valid_length in context.rows):
             raise ValueError("Stage 1 stochastic valid length exceeds T")
-        context.record_invocation(self.site_name)
+        context._record_invocation(self.site_name)
         if self.p == 0.0:
             return x
         mask = torch.ones_like(x)

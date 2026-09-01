@@ -703,6 +703,25 @@ def install_stage1_sample_stable_dropout(model: nn.Module) -> tuple[str, ...]:
             )
         site_name = f"{qualified_target}.lora_dropout.{_ADAPTER_NAME}"
         current = dropout_modules[_ADAPTER_NAME]
+        if configured_p == 0.0:
+            if isinstance(current, SampleStableStage1Dropout):
+                if current.site_name != site_name or current.p != 0.0:
+                    raise RuntimeError(
+                        f"Stage 1 sample-stable dropout identity changed: {site_name}"
+                    )
+                dropout_modules[_ADAPTER_NAME] = nn.Identity()
+            elif isinstance(current, nn.Dropout):
+                if float(current.p) != 0.0:
+                    raise RuntimeError(
+                        f"Stage 1 PEFT dropout probability mismatch at {site_name}"
+                    )
+                dropout_modules[_ADAPTER_NAME] = nn.Identity()
+            elif not isinstance(current, nn.Identity):
+                raise RuntimeError(
+                    f"unsupported Stage 1 PEFT dropout module at {site_name}: "
+                    f"{type(current).__name__}"
+                )
+            continue
         if isinstance(current, SampleStableStage1Dropout):
             if current.site_name != site_name or current.p != configured_p:
                 raise RuntimeError(
@@ -711,8 +730,6 @@ def install_stage1_sample_stable_dropout(model: nn.Module) -> tuple[str, ...]:
         else:
             if isinstance(current, nn.Dropout):
                 observed_p = float(current.p)
-            elif isinstance(current, nn.Identity):
-                observed_p = 0.0
             else:
                 raise RuntimeError(
                     f"unsupported Stage 1 PEFT dropout module at {site_name}: "
@@ -804,8 +821,8 @@ def validate_stage1_stochastic_inventory(
     if isinstance(expected_sites, str):
         raise TypeError("expected stochastic sites must be a sequence")
     sites = tuple(expected_sites)
-    if not sites or any(type(site) is not str or not site for site in sites):
-        raise ValueError("expected stochastic sites must be nonempty strings")
+    if any(type(site) is not str or not site for site in sites):
+        raise ValueError("expected stochastic sites must contain nonempty strings")
     if len(sites) != len(set(sites)):
         raise RuntimeError("duplicate expected stochastic site names are forbidden")
     if sites != tuple(sorted(sites)):
