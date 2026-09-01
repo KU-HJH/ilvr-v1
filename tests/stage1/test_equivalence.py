@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 from dataclasses import replace
 from itertools import islice
 import subprocess
@@ -20,7 +21,9 @@ from stage1.equivalence import (
     canonical_tensor_sha256,
     compare_stage1_manifests,
     expected_stage1_assignment,
+    materialize_stage1_resolved_manifest,
     materialize_stage1_schedule,
+    normalized_manifest_bytes,
     runtime_source_sha256,
     validate_stage1_schedule,
 )
@@ -400,6 +403,15 @@ def test_canonical_tensor_hash_has_literal_dtype_shape_and_little_endian_identit
     )
 
 
+def test_canonical_tensor_hash_accepts_finite_scalar_parameter():
+    """Catches dtype-byte views rejecting rank-zero trainable parameters."""
+    tensor = torch.tensor(1.5, dtype=torch.float32)
+
+    assert canonical_tensor_sha256(tensor) == (
+        "f30b2bed8d34527c8c9541fb867942e85c6eaf81b07b73430f0303b6ec3bdc1c"
+    )
+
+
 @pytest.mark.parametrize(
     ("tensor", "expected"),
     (
@@ -662,3 +674,509 @@ def test_manifest_runtime_source_hashes_sorted_relative_paths_and_rejects_dirty_
     first.write_bytes(b"print('dirty')\n")
     with pytest.raises(ValueError, match="dirty tracked runtime source"):
         runtime_source_sha256([first, second])
+
+
+@pytest.fixture
+def manifest_runtime_inputs(tmp_path, resolved_manifest_mapping):
+    repository = tmp_path / "runtime-repository"
+    files = {
+        "src/core.py": b"VALUE = 1\n",
+        "eval.py": b"print('eval')\n",
+        "run_stage1_training.sh": b"#!/bin/sh\necho train\n",
+        "run_multinode_evaluation.sh": b"#!/bin/sh\necho eval\n",
+        "qwen/modeling.py": b"MODEL = 1\n",
+        "model/config.json": b'{"model":"tiny"}\n',
+        "model/tokenizer.json": b"{}\n",
+        "model/weights.bin": b"weights\n",
+        "data/TRAIN.jsonl": b'{"train":1}\n',
+        "data/TEST.jsonl": b'{"test":1}\n',
+        "data/images/a.png": b"image-a\n",
+        "configs/deepspeed.json": (
+            b'{"train_micro_batch_size_per_gpu":"auto","train_batch_size":"auto",'
+            b'"gradient_accumulation_steps":"auto","bf16":{"enabled":true},'
+            b'"zero_optimization":{"stage":1,"overlap_comm":true,'
+            b'"contiguous_gradients":true,"reduce_bucket_size":500000000},'
+            b'"gradient_clipping":1.0,"steps_per_print":10,'
+            b'"wall_clock_breakdown":false}\n'
+        ),
+    }
+    for relative_path, content in files.items():
+        path = repository / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repository), "-c", "user.name=Test",
+            "-c", "user.email=test@example.com", "commit", "-qm", "fixture",
+        ],
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    semantic_values = copy.deepcopy(resolved_manifest_mapping)
+    semantic_values["model"] = {
+        key: "fabricated"
+        for key in semantic_values["model"]
+    }
+    semantic_values["code"]["git_commit"] = "f" * 40
+    semantic_values["code"]["runtime_source_digest"] = "f" * 64
+    semantic_values["code"]["software_versions"] = {
+        key: "fabricated"
+        for key in semantic_values["code"]["software_versions"]
+    }
+    for key in ("train_sha256", "test_sha256", "image_files_sha256"):
+        semantic_values["data"][key] = "f" * 64
+    semantic_values["deepspeed"]["source_digest"] = "f" * 64
+    semantic_values["initialization"] = {
+        "trainable_parameters": [], "ema_parameters": []
+    }
+    return {
+        "semantic_values": semantic_values,
+        "repository_root": repository,
+        "git_commit": commit,
+        "qwen_source_path": repository / "qwen",
+        "model_path": repository / "model",
+        "processor_path": repository / "model",
+        "model_config_path": repository / "model/config.json",
+        "model_revision": "model-revision",
+        "processor_revision": "processor-revision",
+        "train_jsonl_path": repository / "data/TRAIN.jsonl",
+        "test_jsonl_path": repository / "data/TEST.jsonl",
+        "image_root": repository / "data/images",
+        "referenced_image_paths": [repository / "data/images/a.png"],
+        "deepspeed_config_path": repository / "configs/deepspeed.json",
+        "world_size": 4,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 2,
+        "trainable_parameters": {
+            "adapter.z": torch.tensor([2.0]),
+            "adapter.a": torch.tensor(1.5),
+        },
+        "ema_parameters": {
+            "adapter.z": torch.tensor([2.0]),
+            "adapter.a": torch.tensor(1.5),
+        },
+    }
+
+
+def test_manifest_materializer_derives_runtime_identities_instead_of_trusting_mapping(
+    manifest_runtime_inputs,
+):
+    """Catches schema-valid fabricated identity strings being sealed as runtime truth."""
+    payload = materialize_stage1_resolved_manifest(**manifest_runtime_inputs).to_mapping()
+
+    assert payload["model"] == {
+        "model_path": "model",
+        "processor_path": "model",
+        "model_revision": "model-revision",
+        "processor_revision": "processor-revision",
+        "model_files_sha256": "5a2ecbd170dc12a285e956dfacaa0302fece68324c6795a1a149cc94d9fd710f",
+        "processor_files_sha256": "5a2ecbd170dc12a285e956dfacaa0302fece68324c6795a1a149cc94d9fd710f",
+        "config_sha256": "0b01122dba8fdc9845d4c7bd9509b3684e47545b8684e7ce9c8df5ccfa714984",
+    }
+    assert payload["data"]["train_sha256"] == (
+        "3d44981f1b4cae2b8e7a51e8b041e4c269a71e41fca6f11b5fc68c82cb39e115"
+    )
+    assert payload["data"]["test_sha256"] == (
+        "76ee56ae9188eecf6269efd1d512d2fb3711524325959737507ea87047355a64"
+    )
+    assert payload["data"]["image_files_sha256"] == (
+        "68e99a243f571f27c35618aa0ac1f54732810b9edf76d38b3604487778386938"
+    )
+    assert payload["batch"] == {
+        "world_size": 4,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 2,
+        "effective_global_batch_size": 16,
+        "rank_local_microbatch_grouping": [[0, 0], [0, 1], [1, 0], [1, 1]],
+    }
+    assert payload["deepspeed"]["source_digest"] == (
+        "ac9adfe99efe8c21745014ee696b490be1e680379077babefc9111186dac68ec"
+    )
+    assert "train_micro_batch_size_per_gpu" not in payload["deepspeed"]["settings"]
+    assert [item["name"] for item in payload["initialization"]["trainable_parameters"]] == [
+        "adapter.a", "adapter.z"
+    ]
+    assert payload["initialization"]["trainable_parameters"][0]["sha256"] == (
+        "f30b2bed8d34527c8c9541fb867942e85c6eaf81b07b73430f0303b6ec3bdc1c"
+    )
+    assert payload["initialization"]["trainable_parameters"][1]["sha256"] == (
+        "504d91fad0e0c894e56d89102dac38a3754a718b06fe4f493d3a80ab8aa1eafc"
+    )
+    assert payload["evaluation"]["dataset_sha256"] == payload["data"]["test_sha256"]
+    assert payload["code"]["software_versions"]["pytorch"] != "fabricated"
+
+
+def test_manifest_materializer_binds_fixed_source_closure_to_recorded_commit(
+    manifest_runtime_inputs,
+):
+    """Catches production source identity omitting required scripts or Qwen source files."""
+    payload = materialize_stage1_resolved_manifest(**manifest_runtime_inputs).to_mapping()
+
+    assert payload["code"]["git_commit"] == manifest_runtime_inputs["git_commit"]
+    assert payload["code"]["runtime_source_digest"] == (
+        "7b541743f0eb21b5b3cab7498afb841c4a73223ce790623072c3498a1c2c38ac"
+    )
+    surprise = manifest_runtime_inputs["repository_root"] / "src/surprise.py"
+    surprise.write_bytes(b"SURPRISE = True\n")
+    with pytest.raises(ValueError, match="fixed runtime source closure"):
+        materialize_stage1_resolved_manifest(**manifest_runtime_inputs)
+
+
+def test_manifest_materializer_rejects_recorded_commit_mismatch(manifest_runtime_inputs):
+    """Catches clean runtime bytes from a different HEAD being bound to an old commit."""
+    repository = manifest_runtime_inputs["repository_root"]
+    note = repository / "note.txt"
+    note.write_text("next commit\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "note.txt"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repository), "-c", "user.name=Test",
+            "-c", "user.email=test@example.com", "commit", "-qm", "next",
+        ],
+        check=True,
+    )
+
+    with pytest.raises(ValueError, match="recorded git_commit.*HEAD"):
+        materialize_stage1_resolved_manifest(**manifest_runtime_inputs)
+
+
+def test_manifest_materializer_rejects_deleted_tracked_runtime_source(
+    manifest_runtime_inputs,
+):
+    """Catches a deleted recorded source file disappearing from current-path discovery."""
+    (manifest_runtime_inputs["repository_root"] / "src/core.py").unlink()
+
+    with pytest.raises(ValueError, match="deleted|closure|dirty"):
+        materialize_stage1_resolved_manifest(**manifest_runtime_inputs)
+
+
+def test_manifest_materializer_rejects_noninteger_resolved_deepspeed_batch(
+    manifest_runtime_inputs,
+):
+    """Catches float-equal DeepSpeed batch values bypassing exact integer resolution."""
+    path = manifest_runtime_inputs["deepspeed_config_path"]
+    source = json.loads(path.read_text(encoding="utf-8"))
+    source["train_micro_batch_size_per_gpu"] = 2.0
+    path.write_text(json.dumps(source), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="train_micro_batch_size_per_gpu"):
+        materialize_stage1_resolved_manifest(**manifest_runtime_inputs)
+
+
+def test_manifest_materializer_rejects_noncanonical_world_size(
+    manifest_runtime_inputs,
+):
+    """Catches a schema-valid effective batch being derived for a nonprotocol world size."""
+    manifest_runtime_inputs["world_size"] = 2
+
+    with pytest.raises(ValueError, match="world_size=4"):
+        materialize_stage1_resolved_manifest(**manifest_runtime_inputs)
+
+
+# Independent schema oracle: this table is deliberately maintained without reading
+# the production _MANIFEST_SCHEMA so a missing production entry fails these tests.
+MANIFEST_OBJECT_POINTERS = (
+    "/",
+    "/model",
+    "/code",
+    "/code/software_versions",
+    "/data",
+    "/batch",
+    "/schedule",
+    "/tuning",
+    "/tuning/dora",
+    "/tuning/losses",
+    "/tuning/targets",
+    "/optimizer",
+    "/scheduler",
+    "/ema",
+    "/precision",
+    "/stochastic",
+    "/deepspeed",
+    "/deepspeed/settings",
+    "/deepspeed/settings/bf16",
+    "/deepspeed/settings/zero_optimization",
+    "/evaluation",
+    "/diagnostics",
+    "/artifacts",
+    "/initialization",
+    "/initialization/trainable_parameters/0",
+    "/initialization/ema_parameters/0",
+)
+CROSS_ARM_POINTER_ORACLE = (
+    "/batch/per_device_train_batch_size",
+    "/batch/gradient_accumulation_steps",
+    "/batch/rank_local_microbatch_grouping",
+    "/artifacts/run_id",
+    "/artifacts/checkpoints",
+    "/artifacts/results",
+    "/artifacts/logs",
+)
+SAME_ARM_POINTER_ORACLE = (
+    "/artifacts/run_id",
+    "/artifacts/checkpoints",
+    "/artifacts/results",
+    "/artifacts/logs",
+    "/diagnostics/bounded_optimizer_steps",
+)
+MANIFEST_ARRAY_ITEM_POINTERS = (
+    "/batch/rank_local_microbatch_grouping/0",
+    "/batch/rank_local_microbatch_grouping/0/0",
+    "/schedule/checkpoint_steps/0",
+    "/tuning/dora/target_modules/0",
+    "/optimizer/betas/0",
+    "/stochastic/site_allowlist/0",
+    "/initialization/trainable_parameters/0",
+    "/initialization/trainable_parameters/0/shape/0",
+    "/initialization/ema_parameters/0",
+    "/initialization/ema_parameters/0/shape/0",
+)
+MANIFEST_REQUIRED_POINTERS = (
+    "/schema_version",
+    "/model", "/code", "/data", "/batch", "/schedule", "/tuning",
+    "/optimizer", "/scheduler", "/ema", "/precision", "/stochastic",
+    "/deepspeed", "/evaluation", "/diagnostics", "/artifacts", "/initialization",
+    *(
+        f"/model/{field}"
+        for field in (
+            "model_path", "processor_path", "model_revision", "processor_revision",
+            "model_files_sha256", "processor_files_sha256", "config_sha256",
+        )
+    ),
+    "/code/git_commit", "/code/runtime_source_digest", "/code/software_versions",
+    *(
+        f"/code/software_versions/{field}"
+        for field in (
+            "python", "pytorch", "transformers", "peft", "deepspeed", "cuda",
+            "flash_attention",
+        )
+    ),
+    *(
+        f"/data/{field}"
+        for field in (
+            "train_jsonl_path", "train_sha256", "test_jsonl_path", "test_sha256",
+            "image_root", "image_files_sha256", "source_rows",
+            "canonical_epoch_slots", "padding_rule", "ordering_rule",
+        )
+    ),
+    *(
+        f"/batch/{field}"
+        for field in (
+            "world_size", "per_device_train_batch_size",
+            "gradient_accumulation_steps", "effective_global_batch_size",
+            "rank_local_microbatch_grouping",
+        )
+    ),
+    *(
+        f"/schedule/{field}"
+        for field in (
+            "epochs", "seed", "permutation_rule", "optimizer_steps_per_epoch",
+            "total_optimizer_steps", "logging_steps", "checkpoint_steps",
+        )
+    ),
+    "/tuning/method", "/tuning/dora", "/tuning/losses", "/tuning/targets",
+    "/tuning/maximum_sequence_length",
+    *(f"/tuning/dora/{field}" for field in ("rank", "alpha", "target_modules", "dropout")),
+    *(f"/tuning/losses/{field}" for field in ("ce_weight", "similarity_weight")),
+    *(
+        f"/tuning/targets/{field}"
+        for field in (
+            "coverage_probability", "image_pool_size", "helper_group_size",
+            "latent_size", "alignment_noise",
+        )
+    ),
+    *(
+        f"/optimizer/{field}"
+        for field in (
+            "name", "learning_rate", "betas", "epsilon", "weight_decay",
+            "max_grad_norm",
+        )
+    ),
+    *(f"/scheduler/{field}" for field in ("name", "warmup_optimizer_steps", "total_optimizer_steps")),
+    *(f"/ema/{field}" for field in ("tau", "initialization", "update_rule")),
+    *(
+        f"/precision/{field}"
+        for field in (
+            "training_dtype", "loss_reduction_dtype", "attention",
+            "gradient_checkpointing", "gradient_checkpointing_use_reentrant",
+        )
+    ),
+    *(
+        f"/stochastic/{field}"
+        for field in ("rng_schema", "site_allowlist", "dropout_schema", "noise_schema")
+    ),
+    "/deepspeed/source_digest", "/deepspeed/settings",
+    "/deepspeed/settings/bf16", "/deepspeed/settings/zero_optimization",
+    "/deepspeed/settings/gradient_clipping", "/deepspeed/settings/steps_per_print",
+    "/deepspeed/settings/wall_clock_breakdown",
+    "/deepspeed/settings/bf16/enabled",
+    *(
+        f"/deepspeed/settings/zero_optimization/{field}"
+        for field in ("stage", "overlap_comm", "contiguous_gradients", "reduce_bucket_size")
+    ),
+    *(
+        f"/evaluation/{field}"
+        for field in (
+            "dataset_path", "dataset_sha256", "shard_count", "max_new_tokens",
+            "temperature", "top_p", "scorer_identity",
+        )
+    ),
+    "/diagnostics/bounded_optimizer_steps", "/diagnostics/evidence_schema",
+    *(f"/artifacts/{field}" for field in ("run_id", "checkpoints", "results", "logs")),
+    "/initialization/trainable_parameters", "/initialization/ema_parameters",
+    *(
+        f"/initialization/trainable_parameters/0/{field}"
+        for field in ("name", "dtype", "shape", "sha256")
+    ),
+    *(
+        f"/initialization/ema_parameters/0/{field}"
+        for field in ("name", "dtype", "shape", "sha256")
+    ),
+)
+
+
+def _manifest_pointer_parent(payload, pointer):
+    parts = pointer.removeprefix("/").split("/")
+    target = payload
+    for part in parts[:-1]:
+        target = target[int(part)] if isinstance(target, list) else target[part]
+    return target, parts[-1]
+
+
+def _manifest_pointer_value(payload, pointer):
+    if pointer == "/":
+        return payload
+    parent, leaf = _manifest_pointer_parent(payload, pointer)
+    return parent[int(leaf)] if isinstance(parent, list) else parent[leaf]
+
+
+@pytest.mark.parametrize("pointer", MANIFEST_REQUIRED_POINTERS)
+def test_manifest_closed_schema_rejects_every_required_node_deletion(
+    resolved_manifest_mapping, pointer
+):
+    """Catches any independently specified owned node becoming optional."""
+    parent, leaf = _manifest_pointer_parent(resolved_manifest_mapping, pointer)
+    if isinstance(parent, list):
+        del parent[int(leaf)]
+    else:
+        del parent[leaf]
+
+    with pytest.raises((TypeError, ValueError), match="missing|exactly|must|grouping"):
+        Stage1ResolvedManifest.from_mapping(resolved_manifest_mapping)
+
+
+@pytest.mark.parametrize("pointer", MANIFEST_OBJECT_POINTERS)
+def test_manifest_closed_schema_rejects_extra_key_at_every_owned_object(
+    resolved_manifest_mapping, pointer
+):
+    """Catches any owned object silently becoming an arbitrary grouping bucket."""
+    target = _manifest_pointer_value(resolved_manifest_mapping, pointer)
+    target["review_extra_key"] = "forbidden"
+
+    with pytest.raises(ValueError, match="extra"):
+        Stage1ResolvedManifest.from_mapping(resolved_manifest_mapping)
+
+
+@pytest.mark.parametrize(
+    "pointer",
+    tuple(
+        pointer
+        for pointer in MANIFEST_REQUIRED_POINTERS
+        if pointer != "/diagnostics/bounded_optimizer_steps"
+    ),
+)
+def test_manifest_closed_schema_rejects_null_for_every_nonnullable_node(
+    resolved_manifest_mapping, pointer
+):
+    """Catches absent-versus-null substitution at every nonnullable owned node."""
+    parent, leaf = _manifest_pointer_parent(resolved_manifest_mapping, pointer)
+    if isinstance(parent, list):
+        parent[int(leaf)] = None
+    else:
+        parent[leaf] = None
+
+    with pytest.raises((TypeError, ValueError), match="type|must|schema_version"):
+        Stage1ResolvedManifest.from_mapping(resolved_manifest_mapping)
+
+
+def test_manifest_closed_schema_rejects_wrong_type_for_nullable_bounded_steps(
+    resolved_manifest_mapping,
+):
+    """Catches the one nullable field accepting values beyond null or integer one."""
+    resolved_manifest_mapping["diagnostics"]["bounded_optimizer_steps"] = "1"
+
+    with pytest.raises(ValueError, match="null or integer 1"):
+        Stage1ResolvedManifest.from_mapping(resolved_manifest_mapping)
+
+
+@pytest.mark.parametrize("pointer", MANIFEST_ARRAY_ITEM_POINTERS)
+def test_manifest_closed_schema_rejects_null_for_every_array_item_schema(
+    resolved_manifest_mapping, pointer
+):
+    """Catches list element schemas accepting null or the wrong structural kind."""
+    parent, leaf = _manifest_pointer_parent(resolved_manifest_mapping, pointer)
+    if isinstance(parent, list):
+        parent[int(leaf)] = None
+    else:
+        parent[leaf] = None
+
+    with pytest.raises((TypeError, ValueError), match="type|must|grouping"):
+        Stage1ResolvedManifest.from_mapping(resolved_manifest_mapping)
+
+
+@pytest.mark.parametrize("pointer", CROSS_ARM_POINTER_ORACLE)
+def test_cross_arm_profile_exercises_each_permitted_pointer_independently(
+    resolved_manifest_mapping, pointer
+):
+    """Catches one of the seven cross-arm pointers being omitted from normalization."""
+    right = copy.deepcopy(resolved_manifest_mapping)
+    if pointer.startswith("/batch/"):
+        right["batch"].update(
+            {
+                "per_device_train_batch_size": 2,
+                "gradient_accumulation_steps": 2,
+                "rank_local_microbatch_grouping": [[0, 0], [0, 1], [1, 0], [1, 1]],
+            }
+        )
+    else:
+        parent, leaf = _manifest_pointer_parent(right, pointer)
+        parent[leaf] = f"changed-{leaf}"
+
+    assert _manifest_pointer_value(resolved_manifest_mapping, pointer) != (
+        _manifest_pointer_value(right, pointer)
+    )
+    assert compare_stage1_manifests(
+        resolved_manifest_mapping, right, profile="cross_arm_v1"
+    ).equal
+    normalized = json.loads(
+        normalized_manifest_bytes(resolved_manifest_mapping, "cross_arm_v1")
+    )
+    assert _manifest_pointer_value(normalized, pointer) == "<approved-difference>"
+
+
+@pytest.mark.parametrize("pointer", SAME_ARM_POINTER_ORACLE)
+def test_same_arm_profile_exercises_each_permitted_pointer_independently(
+    resolved_manifest_mapping, pointer
+):
+    """Catches one of the five same-arm pointers being omitted from normalization."""
+    right = copy.deepcopy(resolved_manifest_mapping)
+    parent, leaf = _manifest_pointer_parent(right, pointer)
+    parent[leaf] = 1 if pointer.startswith("/diagnostics/") else f"changed-{leaf}"
+
+    assert _manifest_pointer_value(resolved_manifest_mapping, pointer) != (
+        _manifest_pointer_value(right, pointer)
+    )
+    assert compare_stage1_manifests(
+        resolved_manifest_mapping, right, profile="same_arm_v1"
+    ).equal
+    normalized = json.loads(
+        normalized_manifest_bytes(resolved_manifest_mapping, "same_arm_v1")
+    )
+    assert _manifest_pointer_value(normalized, pointer) == "<approved-difference>"

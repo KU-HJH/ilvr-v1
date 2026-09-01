@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.metadata
 import json
 import math
 import re
@@ -581,7 +582,7 @@ def canonical_tensor_sha256(tensor: torch.Tensor) -> str:
         torch.isfinite(cpu_tensor).all()
     ):
         raise ValueError("canonical tensor hash requires finite tensor values")
-    payload = cpu_tensor.view(torch.uint8).numpy().tobytes()
+    payload = cpu_tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
     if sys.byteorder == "big" and cpu_tensor.element_size() > 1:
         component_size = (
             cpu_tensor.element_size() // 2
@@ -831,6 +832,356 @@ class Stage1ResolvedManifest:
         return hashlib.sha256(
             normalized_manifest_bytes(self.to_mapping(), profile)
         ).hexdigest()
+
+
+def _repository_path(repository: Path, path: str | Path) -> tuple[Path, str]:
+    repository = repository.absolute()
+    candidate = Path(path)
+    candidate = candidate.absolute() if candidate.is_absolute() else (repository / candidate).absolute()
+    try:
+        logical = candidate.relative_to(repository).as_posix()
+    except ValueError as error:
+        raise ValueError(f"runtime input must be repository-relative: {path}") from error
+    return candidate, logical
+
+
+def _file_tree_sha256(path: Path) -> str:
+    if path.is_file():
+        files = [(path.name, path)]
+    elif path.is_dir():
+        files = sorted(
+            (candidate.relative_to(path).as_posix(), candidate)
+            for candidate in path.rglob("*")
+            if candidate.is_file()
+        )
+    else:
+        raise ValueError(f"identity path is not a file or directory: {path}")
+    if not files:
+        raise ValueError(f"identity path contains no files: {path}")
+    digest = hashlib.sha256()
+    for identity, candidate in files:
+        digest.update(identity.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(candidate.read_bytes())
+    return digest.hexdigest()
+
+
+def _referenced_files_sha256(
+    repository: Path, paths: Sequence[str | Path]
+) -> str:
+    if not paths:
+        raise ValueError("referenced image paths must not be empty")
+    identities: list[tuple[str, Path]] = []
+    for path in paths:
+        candidate, logical = _repository_path(repository, path)
+        if not candidate.is_file():
+            raise ValueError(f"referenced image is not a file: {path}")
+        identities.append((logical, candidate))
+    if len({logical for logical, _ in identities}) != len(identities):
+        raise ValueError("referenced image paths must be unique")
+    digest = hashlib.sha256()
+    for logical, candidate in sorted(identities):
+        digest.update(logical.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(candidate.read_bytes())
+    return digest.hexdigest()
+
+
+def _fixed_runtime_source_files(
+    repository: Path, *, recorded_git_commit: str, qwen_source_path: str | Path
+) -> list[Path]:
+    repository = repository.absolute()
+    git_root = Path(
+        _git_output("-C", str(repository), "rev-parse", "--show-toplevel")
+    ).absolute()
+    if git_root != repository:
+        raise ValueError("repository_root must be the Git worktree root")
+    head = _git_output("-C", str(repository), "rev-parse", "HEAD")
+    if head != recorded_git_commit:
+        raise ValueError(
+            f"recorded git_commit does not equal repository HEAD: "
+            f"recorded={recorded_git_commit}, HEAD={head}"
+        )
+    qwen_path, qwen_logical = _repository_path(repository, qwen_source_path)
+    fixed_entries = {
+        "eval.py",
+        "run_stage1_training.sh",
+        "run_multinode_evaluation.sh",
+    }
+    tree_arguments = [
+        "-C",
+        str(repository),
+        "ls-tree",
+        "-r",
+        "--name-only",
+        recorded_git_commit,
+        "--",
+        "src",
+        *sorted(fixed_entries),
+        qwen_logical,
+    ]
+    recorded_candidates = set(_git_output(*tree_arguments).splitlines())
+
+    def belongs_to_closure(logical: str) -> bool:
+        if logical in fixed_entries:
+            return True
+        if logical.startswith("src/") and Path(logical).suffix in {".py", ".sh"}:
+            return True
+        if qwen_path.is_file():
+            return logical == qwen_logical
+        return logical.startswith(f"{qwen_logical.rstrip('/')}/") and Path(logical).suffix in {
+            ".py",
+            ".sh",
+        }
+
+    recorded = {logical for logical in recorded_candidates if belongs_to_closure(logical)}
+    if not fixed_entries <= recorded:
+        missing = sorted(fixed_entries - recorded)
+        raise ValueError(f"recorded commit lacks fixed runtime source files: {missing}")
+    current: set[str] = set()
+    source_root = repository / "src"
+    if source_root.is_dir():
+        current.update(
+            candidate.relative_to(repository).as_posix()
+            for candidate in source_root.rglob("*")
+            if candidate.is_file() and candidate.suffix in {".py", ".sh"}
+        )
+    for logical in fixed_entries:
+        if (repository / logical).is_file():
+            current.add(logical)
+    if qwen_path.is_file():
+        current.add(qwen_logical)
+    elif qwen_path.is_dir():
+        current.update(
+            candidate.relative_to(repository).as_posix()
+            for candidate in qwen_path.rglob("*")
+            if candidate.is_file() and candidate.suffix in {".py", ".sh"}
+        )
+    if current != recorded:
+        missing = sorted(recorded - current)
+        extra = sorted(current - recorded)
+        raise ValueError(
+            f"fixed runtime source closure mismatch: missing={missing}, extra={extra}"
+        )
+    dirty = _git_output(
+        "-C",
+        str(repository),
+        "diff",
+        "--name-only",
+        recorded_git_commit,
+        "--",
+        *sorted(recorded),
+    )
+    if dirty:
+        raise ValueError(f"dirty or deleted tracked runtime source: {dirty.splitlines()[0]}")
+    return [repository / logical for logical in sorted(recorded)]
+
+
+def _resolved_software_versions() -> dict[str, str]:
+    def distribution_version(*names: str) -> str:
+        for name in names:
+            try:
+                return importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                continue
+        return "unavailable"
+
+    return {
+        "python": ".".join(str(value) for value in sys.version_info[:3]),
+        "pytorch": str(torch.__version__),
+        "transformers": distribution_version("transformers"),
+        "peft": distribution_version("peft"),
+        "deepspeed": distribution_version("deepspeed"),
+        "cuda": str(torch.version.cuda or "unavailable"),
+        "flash_attention": distribution_version("flash_attn", "flash-attn"),
+    }
+
+
+def _load_resolved_deepspeed_settings(
+    path: Path,
+    *,
+    world_size: int,
+    microbatch: int,
+    gradient_accumulation_steps: int,
+) -> dict[str, object]:
+    try:
+        source = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_pairs
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid DeepSpeed source JSON: {path}") from error
+    required = {
+        "train_micro_batch_size_per_gpu",
+        "train_batch_size",
+        "gradient_accumulation_steps",
+        "bf16",
+        "zero_optimization",
+        "gradient_clipping",
+        "steps_per_print",
+        "wall_clock_breakdown",
+    }
+    if type(source) is not dict or set(source) != required:
+        raise ValueError("DeepSpeed source must use the exact resolved settings schema")
+    expected_batch = {
+        "train_micro_batch_size_per_gpu": microbatch,
+        "train_batch_size": world_size * microbatch * gradient_accumulation_steps,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+    }
+    for key, expected in expected_batch.items():
+        actual = source[key]
+        if actual != "auto" and (type(actual) is not int or actual != expected):
+            raise ValueError(f"DeepSpeed {key} does not resolve to the manifest batch")
+    return {
+        "bf16": copy.deepcopy(source["bf16"]),
+        "zero_optimization": copy.deepcopy(source["zero_optimization"]),
+        "gradient_clipping": source["gradient_clipping"],
+        "steps_per_print": source["steps_per_print"],
+        "wall_clock_breakdown": source["wall_clock_breakdown"],
+    }
+
+
+def _tensor_identities(parameters: Mapping[str, torch.Tensor]) -> list[dict[str, object]]:
+    if not isinstance(parameters, Mapping):
+        raise TypeError("parameter identities require a name-to-tensor mapping")
+    identities = []
+    for name in sorted(parameters):
+        tensor = parameters[name]
+        if type(name) is not str or not name:
+            raise TypeError("parameter identity names must be non-empty strings")
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"parameter identity is not a tensor: {name}")
+        identities.append(
+            {
+                "name": name,
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "sha256": canonical_tensor_sha256(tensor),
+            }
+        )
+    return identities
+
+
+def materialize_stage1_resolved_manifest(
+    *,
+    semantic_values: Mapping[str, object],
+    repository_root: str | Path,
+    git_commit: str,
+    qwen_source_path: str | Path,
+    model_path: str | Path,
+    processor_path: str | Path,
+    model_config_path: str | Path,
+    model_revision: str,
+    processor_revision: str,
+    train_jsonl_path: str | Path,
+    test_jsonl_path: str | Path,
+    image_root: str | Path,
+    referenced_image_paths: Sequence[str | Path],
+    deepspeed_config_path: str | Path,
+    world_size: int,
+    per_device_train_batch_size: int,
+    gradient_accumulation_steps: int,
+    trainable_parameters: Mapping[str, torch.Tensor],
+    ema_parameters: Mapping[str, torch.Tensor],
+) -> Stage1ResolvedManifest:
+    """Derive immutable identities while validating caller-resolved semantics.
+
+    ``semantic_values`` owns non-identity hyperparameters and artifact destinations.
+    This boundary always replaces identity, batch, DeepSpeed, and initialization data
+    with values derived from the concrete runtime inputs supplied separately.
+    """
+    repository = Path(repository_root).absolute()
+    runtime_sources = _fixed_runtime_source_files(
+        repository,
+        recorded_git_commit=git_commit,
+        qwen_source_path=qwen_source_path,
+    )
+    model, model_logical = _repository_path(repository, model_path)
+    processor, processor_logical = _repository_path(repository, processor_path)
+    config, _ = _repository_path(repository, model_config_path)
+    train_jsonl, train_logical = _repository_path(repository, train_jsonl_path)
+    test_jsonl, test_logical = _repository_path(repository, test_jsonl_path)
+    images, images_logical = _repository_path(repository, image_root)
+    deepspeed, _ = _repository_path(repository, deepspeed_config_path)
+    for name, path in (
+        ("model config", config),
+        ("train JSONL", train_jsonl),
+        ("test JSONL", test_jsonl),
+        ("DeepSpeed config", deepspeed),
+    ):
+        if not path.is_file():
+            raise ValueError(f"{name} is not a file: {path}")
+    if not images.is_dir():
+        raise ValueError(f"image root is not a directory: {images}")
+    if type(world_size) is not int or world_size != 4:
+        raise ValueError("manifest materializer requires world_size=4")
+    settings = _load_resolved_deepspeed_settings(
+        deepspeed,
+        world_size=world_size,
+        microbatch=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
+    groupings = {
+        1: [[0, 0], [1, 0], [2, 0], [3, 0]],
+        2: [[0, 0], [0, 1], [1, 0], [1, 1]],
+    }
+    if per_device_train_batch_size not in groupings:
+        raise ValueError("manifest materializer requires microbatch 1 or 2")
+    if gradient_accumulation_steps != 4 // per_device_train_batch_size:
+        raise ValueError("manifest materializer requires B * GA = 4")
+    payload = _decode_manifest(semantic_values)
+    payload["schema_version"] = "stage1-resolved-manifest-v1"
+    payload["model"] = {
+        "model_path": model_logical,
+        "processor_path": processor_logical,
+        "model_revision": model_revision,
+        "processor_revision": processor_revision,
+        "model_files_sha256": _file_tree_sha256(model),
+        "processor_files_sha256": _file_tree_sha256(processor),
+        "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+    }
+    payload["code"] = {
+        "git_commit": git_commit,
+        "runtime_source_digest": runtime_source_sha256(runtime_sources),
+        "software_versions": _resolved_software_versions(),
+    }
+    data = payload.get("data")
+    if type(data) is not dict:
+        raise TypeError("semantic_values/data must be an object")
+    data.update(
+        {
+            "train_jsonl_path": train_logical,
+            "train_sha256": hashlib.sha256(train_jsonl.read_bytes()).hexdigest(),
+            "test_jsonl_path": test_logical,
+            "test_sha256": hashlib.sha256(test_jsonl.read_bytes()).hexdigest(),
+            "image_root": images_logical,
+            "image_files_sha256": _referenced_files_sha256(
+                repository, referenced_image_paths
+            ),
+        }
+    )
+    payload["batch"] = {
+        "world_size": world_size,
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "effective_global_batch_size": (
+            world_size * per_device_train_batch_size * gradient_accumulation_steps
+        ),
+        "rank_local_microbatch_grouping": groupings[per_device_train_batch_size],
+    }
+    payload["deepspeed"] = {
+        "source_digest": hashlib.sha256(deepspeed.read_bytes()).hexdigest(),
+        "settings": settings,
+    }
+    evaluation = payload.get("evaluation")
+    if type(evaluation) is not dict:
+        raise TypeError("semantic_values/evaluation must be an object")
+    evaluation["dataset_path"] = test_logical
+    evaluation["dataset_sha256"] = data["test_sha256"]
+    payload["initialization"] = {
+        "trainable_parameters": _tensor_identities(trainable_parameters),
+        "ema_parameters": _tensor_identities(ema_parameters),
+    }
+    return Stage1ResolvedManifest.from_mapping(payload)
 
 
 @dataclass(frozen=True)
