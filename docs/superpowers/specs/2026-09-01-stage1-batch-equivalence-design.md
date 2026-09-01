@@ -1,7 +1,7 @@
 # Stage 1 True-Batch Equivalence Design
 
 **Date:** 2026-09-01  
-**Status:** Design proposal v3, frozen for critique
+**Status:** Design proposal v4, frozen for critique
 **Repository:** `XD111ds/ILVR`  
 **Supersedes:** only the batch-equivalence portions of
 `2026-08-26-ilvr-stage1-dora-batched-training-design.md`
@@ -56,8 +56,7 @@ precision                     BF16 training, FP32 loss reductions
 ```
 
 The comparison does not use an earlier B=2 checkpoint as a B=1 control. Both
-short real witnesses start from the same immutable initial model and tuning
-state.
+fresh paired runs start from the same immutable initial model and tuning state.
 
 Before either witness or full run starts, the launcher materializes a resolved
 experiment manifest. The B=1 and B=2 manifests must be identical except for
@@ -95,13 +94,15 @@ prove equivalence for a different experiment rather than the requested one.
 This provides strict gradient equality but is not true batching and forfeits
 the memory and throughput behavior under investigation.
 
-### 3.4 Rejected: gate on only the first optimizer step
+### 3.4 Rejected: a separate one- or two-step real-model gate
 
 At the first step both paths use the same initial EMA teacher, so that check
 cannot exercise the moving-teacher feedback loop. A true decoder batch-shape
 difference in the first student update enters the EMA teacher and can alter the
-next step's discrete target selection. The real witness therefore includes the
-second optimizer step.
+next step's discrete target selection. Two steps exercise only the first such
+opportunity and do not bound continued feedback. A separate short job would
+also duplicate work. The real witness is therefore the first 64 steps of the
+actual paired runs, paused once for comparison and resumed only on a pass.
 
 ## 4. Canonical Sample Schedule
 
@@ -308,37 +309,46 @@ FP32 deterministic fixtures use `torch.testing.assert_close` with
 `rtol=1e-6` and `atol=1e-7`. Exact integer, boolean, sample-identity,
 selected-index, and step state uses equality.
 
-### 8.3 Real 3B, four-GPU two-step EMA-feedback witness
+### 8.3 Real 3B, four-GPU 64-step staged witness
 
-The approved multi-node route runs two fresh, sequential two-step jobs in the
-`llm_kd` container on `10.1.102.41` and the local node, using four GPUs total.
-Both jobs start from the same base model and seed and use distinct run IDs. The
-second step is mandatory: it is the first step whose targets come from an EMA
-teacher updated from a potentially different B=1 or B=2 student update.
+The approved multi-node route starts the fresh B=1 and B=2 jobs sequentially
+in the `llm_kd` container on `10.1.102.41` and the local node, using four GPUs
+total. Both are configured from the outset for the final 648 optimizer steps,
+including the same 648-step scheduler. A diagnostic stop callback saves and
+pauses each run after optimizer step 64 without changing `max_steps` or the
+scheduler horizon. This is about one tenth of the paired training compute, and
+the successful work is not discarded: both runs resume from those exact
+checkpoints after the comparison passes.
 
 The witness compares:
 
 - exact resolved manifests outside the explicit four-field whitelist;
 - exact canonical global slot/source identities;
-- samplewise student visual embeddings before decoder packing;
-- samplewise EMA teacher target rows before decoder packing, reported by step;
-- exact selected counts and candidate indices at both steps;
+- exact per-slot hashes of unpadded input IDs, labels, attention masks,
+  original/helper pixel tensors, and image grids at every step;
+- exact per-slot stochastic keys and valid-position DoRA-mask/alignment-noise
+  hashes at every step;
+- exact selected counts and candidate indices at every step from 1 through 64;
+- finite per-component loss traces at every step;
+- samplewise student visual embeddings and EMA teacher target rows at anchor
+  steps 1, 2, and 64 before decoder packing;
+- exact decoder position IDs at the same anchor steps;
+- flattened pre-clip trainable gradients at anchor steps 1, 2, and 64;
+- trainable student, EMA, and logical Adam first-/second-moment deltas at the
+  same anchor steps;
 - exact optimizer, scheduler, global-step, and EMA-update counters;
-- finite per-component losses;
-- flattened pre-clip trainable gradients;
-- trainable student update deltas;
-- EMA update deltas;
-- logical Adam first- and second-moment state.
+- measured wall time per optimizer step and peak allocated/reserved GPU memory.
 
 Samplewise frozen-visual embeddings and first-step EMA teacher target rows
 execute through the same unpadded B=1-shaped calls from identical state and
-must satisfy `rtol=1e-6` and `atol=1e-6`. Second-step target rows may inherit
-only the already-bounded first student/EMA update difference and use the
-decoder numerical boundary below. Selected counts and candidate indices must
-agree exactly at both steps.
+must satisfy `rtol=1e-6` and `atol=1e-6`. Later target rows may inherit only
+the already-bounded student/EMA update difference and use the decoder numerical
+boundary below. Selected counts and candidate indices must agree exactly at
+all 64 steps.
 
-For nonzero second-step target, trainable-decoder, gradient, update, EMA-delta,
-and optimizer-state tensors, BF16 numerical acceptance requires both:
+For nonzero later target, trainable-decoder, gradient, update, EMA-delta, and
+optimizer-state tensors at each recorded anchor, BF16 numerical acceptance
+requires both:
 
 ```text
 symmetric relative L2 error <= 2.0e-2
@@ -346,9 +356,11 @@ cosine similarity           >= 0.9998
 ```
 
 Scalar CE, alignment, and total losses must additionally have absolute
-difference at most `1.0e-2`. Exact-zero tensors must agree exactly. Maximum
-absolute error and the worst named tensor are always reported but are not used
-alone because their scale is not comparable across parameters.
+difference at most `1.0e-2` at every step. Exact-zero tensors must agree
+exactly. Maximum absolute error and the worst named tensor are always reported
+but are not used alone because their scale is not comparable across
+parameters. Backward accumulation and reduction order is part of the permitted
+GPU batch-shape numerical boundary, not silently treated as exact arithmetic.
 
 The numerical boundary is based on the observed `0.0162` relative-L2 true
 decoder floor after exact samplewise visual inputs. It is not widened if the
@@ -358,14 +370,15 @@ teacher target, update count, RNG draw, or loss weighting.
 
 ## 9. Launch Gate and Artifacts
 
-The paired full runs may start only after all focused tests, the tiny witness,
-and both real two-step jobs pass. A failed real witness is a result, not a
-reason to retry with looser thresholds. On a pass, fresh B=1/GA=4 and B=2/GA=2
-runs train sequentially for three epochs from the same immutable initial state.
-Both are then evaluated with one resolved official evaluation manifest and the
-same fixed test set. Accuracy and exact per-example predictions are reported
-side by side; full-run accuracy equality is an observed comparison, not a
-launch threshold, because permitted BF16 decoder differences can compound.
+The paired runs may proceed beyond step 64 only after all focused tests, the
+tiny witness, and the staged real comparison pass. A failure is a result, not
+a reason to retry with looser thresholds; neither run resumes. On a pass, the
+same B=1/GA=4 and B=2/GA=2 runs resume from their step-64 checkpoints and finish
+three epochs. Both are then evaluated with one resolved official evaluation
+manifest and the same fixed test set. Accuracy and exact per-example
+predictions are reported side by side; full-run accuracy equality is an
+observed comparison, not a launch threshold, because permitted GPU numerical
+differences can compound.
 
 Artifacts follow repository policy:
 
@@ -374,6 +387,11 @@ checkpoints/<run-id>/   model, optimizer, scheduler, EMA, RNG state
 results/<run-id>/       equivalence evidence and comparisons
 logs/<run-id>/          execution logs
 ```
+
+Anchor gradient, optimizer, student, EMA, or other model-derived comparison
+tensors are model-bearing artifacts and remain under the corresponding
+`checkpoints/<run-id>/equivalence/` directory. `results/` contains only their
+derived metrics and discrete traces.
 
 No model-bearing file is written elsewhere in the repository. Verification
 uses fresh run IDs and never overwrites the completed 36% evaluation or prior
@@ -390,6 +408,9 @@ src/stage1/peft.py           adapter-dropout replacement and stable site names
 src/stage1/types.py          equivalence metadata/diagnostic contracts
 src/stage1/checkpointing.py  RNG schema and resume compatibility metadata
 src/stage1/composition.py    schedule construction and launch validation
+src/stage1/training_evidence.py  staged witness evidence
+src/main.py                  bounded diagnostic-stop argument
+src/multinode.py             reuse of the existing launch/resume route
 tests/stage1/...             focused unit and tiny integration witnesses
 ```
 
@@ -429,7 +450,7 @@ infrastructure is outside this design.
 - changing EMA tau or teacher-update semantics;
 - Stage 2 batch-size work;
 - a new benchmark framework, retry framework, or experiment database;
-- starting a three-epoch run before the two-step EMA-feedback gate passes.
+- proceeding past step 64 before the staged equivalence gate passes.
 
 ## 13. Completion Claim
 
@@ -437,8 +458,9 @@ Completion means the repository can produce fresh evidence that B=1/GA=4 and
 true B=2/GA=2 use identical manifests outside the approved batch/output
 whitelist and receive the same samplewise frozen visual inputs, teacher
 targets, stochastic draws, objectives, schedules, and update boundaries for
-two real 3B optimizer updates, including one moving-EMA feedback step. The
-trainable decoder remains truly batched and may differ only within the bounded
-BF16 witness. Completion also includes the fresh paired three-epoch runs and
-their side-by-side official evaluation; it does not claim bitwise-identical
-checkpoints or identical accuracy.
+64 real 3B optimizer updates, including the moving-EMA feedback trajectory.
+The trainable decoder remains truly batched and may differ only within the
+bounded GPU forward/backward witness. Completion also includes resuming the
+same paired runs through three epochs and their side-by-side official
+evaluation; it does not claim bitwise-identical checkpoints or identical
+accuracy.
