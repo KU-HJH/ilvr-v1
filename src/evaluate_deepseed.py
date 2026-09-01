@@ -40,6 +40,7 @@ from evaluation.scoring import (
     parse_gold_answer,
     score_answer,
 )
+from evaluation.runtime import prepare_evaluation_input
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -193,30 +194,9 @@ def extract_assistant_content(text: str) -> str:
 
 
 def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    text_input = sample.get("text_input", "")
     img_list = _resolve_image_paths(sample.get("image_input", []))
     images = open_images(img_list) if img_list else None
-
-
-    content = []
-    if images:
-        for _ in images:
-            content.append({"type": "image"})
-    content.append({"type": "text", "text": text_input})
-    conversations = [
-        {"role": "user",   "content": content}
-    ]
-
-    prompt = processor.apply_chat_template(
-        conversations, tokenize=False, add_generation_prompt=True
-    )
-
-    inputs = processor(
-        text=[prompt],
-        images=images,   
-        return_tensors="pt",
-        padding=True
-    )
+    prepared = prepare_evaluation_input(processor, sample, images)
 
     stage2_model = resolve_stage2_qwen_model(model)
     effective_device = getattr(model, "device", None)
@@ -226,8 +206,7 @@ def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[s
         raise ValueError("Unable to determine the Stage 2 evaluation device")
     inputs = {
         k: v.to(effective_device)
-        for k, v in inputs.items()
-        if isinstance(v, torch.Tensor)
+        for k, v in prepared.tensors.items()
     }
 
     input_ids = inputs["input_ids"]
@@ -260,13 +239,29 @@ def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[s
         )
     out_ids = generation_result.sequences
     out_text = processor.batch_decode(out_ids, skip_special_tokens=False)[0].strip()
+    suffix_ids = out_ids[:, prepared.prompt_token_length:]
+    assistant_text = processor.batch_decode(
+        suffix_ids, skip_special_tokens=False
+    )[0].strip()
 
     # Extract the answer from the assistant's segment only — running the
     # regex over the full decoded text (prompt included) can match text in
     # the user prompt and keeps trailing special tokens like <|im_end|>.
-    assistant_only = extract_assistant_content(out_text)
+    assistant_only = extract_assistant_content(assistant_text)
     extracted = extract_final_answer(assistant_only).extracted
-    return {"raw_output": out_text, "assistant_only": assistant_only, "extracted_final_answer": extracted}
+    return {
+        "prompt_identity": prepared.prompt_identity,
+        "prompt_token_length": prepared.prompt_token_length,
+        "generated_suffix_token_ids": [
+            int(token_id) for token_id in suffix_ids[0].tolist()
+        ],
+        "raw_output": out_text,
+        "assistant_only": assistant_only,
+        "extracted_final_answer": extracted,
+        "latent_start_count": int(generation_result.latent_start_count),
+        "latent_block_count": int(generation_result.latent_block_count),
+        "stop_reason": generation_result.stop_reason,
+    }
 
 def main():
     args = get_eval_args()
@@ -368,7 +363,13 @@ def main():
                 results.append({
                     "index": i,
                     "task_name": args.task_name,
-
+                    "prompt_identity": pred.get("prompt_identity"),
+                    "prompt_token_length": pred.get("prompt_token_length"),
+                    "generated_suffix_token_ids": pred.get(
+                        "generated_suffix_token_ids", []
+                    ),
+                    "raw_output": pred.get("raw_output"),
+                    "assistant_only": assistant_only,
                     "prediction": assistant_only,
                     "extracted_final_answer": answer_score.prediction.extracted,
                     "prediction_parse_status": answer_score.prediction.status,
@@ -379,6 +380,9 @@ def main():
                     "gold_parse_detail": answer_score.gold.detail,
                     "gold_normalized": answer_score.gold.normalized,
                     "invalid_gold_reason": answer_score.invalid_gold_reason,
+                    "latent_start_count": pred.get("latent_start_count"),
+                    "latent_block_count": pred.get("latent_block_count"),
+                    "stop_reason": pred.get("stop_reason"),
                     "match": bool(ok)
                 })
 
@@ -404,11 +408,22 @@ def main():
                     gold_parse.status if gold_parse.status != "parsed" else None
                 )
                 error_result.update({
+                    "prompt_identity": None,
+                    "prompt_token_length": None,
+                    "generated_suffix_token_ids": [],
+                    "raw_output": None,
+                    "assistant_only": None,
+                    "prediction": None,
+                    "extracted_final_answer": None,
+                    "prediction_parse_status": "inference_error",
                     "gold_final_answer": gold,
                     "gold_parse_status": gold_parse.status,
                     "gold_parse_detail": gold_parse.detail,
                     "gold_normalized": gold_parse.normalized,
                     "invalid_gold_reason": invalid_gold_reason,
+                    "latent_start_count": None,
+                    "latent_block_count": None,
+                    "stop_reason": None,
                     "match": False,
                 })
             results.append(error_result)

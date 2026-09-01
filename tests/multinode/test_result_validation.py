@@ -134,8 +134,13 @@ def write_evaluation_witness(root: Path) -> Path:
     evaluation = root / "evaluation"
     merged_rows = []
     for index in range(4):
-        row = {"index": index, "task_name": "tiny", "match": True,
-               "inference_time_sec": 0.25}
+        row = {
+            "index": index,
+            "task_name": "tiny",
+            "match": index != 1,
+            "inference_time_sec": 0.25,
+            "invalid_gold_reason": "blank" if index == 1 else None,
+        }
         jsonl = evaluation / f"shard-{index}.jsonl"
         jsonl.parent.mkdir(parents=True, exist_ok=True)
         jsonl.write_text(json.dumps(row) + "\n")
@@ -154,7 +159,11 @@ def write_evaluation_witness(root: Path) -> Path:
     )
     _write_json(evaluation / "summary.json", {
         "summary": True, "num_samples": 4, "average_inference_time_sec": 0.25,
-        "total_inference_time_sec": 1.0, "accuracy": 1.0, "success": 4,
+        "total_inference_time_sec": 1.0, "accuracy": 0.75, "success": 3,
+        "correct": 3, "source_count": 4, "valid_gold_count": 3,
+        "invalid_gold_count": 1,
+        "invalid_gold": [{"index": 1, "reason": "blank"}],
+        "coverage_accuracy": 0.75, "valid_gold_accuracy": 1.0,
     })
     return evaluation
 

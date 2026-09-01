@@ -175,6 +175,13 @@ def test_merge_sorts_rows_and_computes_accuracy_once(tmp_path):
         "total_inference_time_sec": 3.5,
         "accuracy": 4 / 7,
         "success": 4,
+        "correct": 4,
+        "source_count": 7,
+        "valid_gold_count": 7,
+        "invalid_gold_count": 0,
+        "invalid_gold": [],
+        "coverage_accuracy": 4 / 7,
+        "valid_gold_accuracy": 4 / 7,
         "generation_config": {
             "max_new_tokens": 4096,
             "temperature": 0.0,
@@ -182,6 +189,57 @@ def test_merge_sorts_rows_and_computes_accuracy_once(tmp_path):
         },
     }
     assert json.loads((tmp_path / "summary.json").read_text()) == summary
+
+
+def test_merge_preserves_gold_denominators_and_invalid_gold_records(tmp_path):
+    """Gold validity must remain auditable after four shards are combined."""
+    invalid = {57, 93}
+    matching = set()
+    for index in range(400):
+        if index not in invalid and len(matching) < 65:
+            matching.add(index)
+    indices = tuple(tuple(range(shard, 400, 4)) for shard in range(4))
+    overrides = {
+        index: {
+            "index": index,
+            "task_name": "zebra-cot",
+            "match": index in matching,
+            "inference_time_sec": 0.5,
+            "invalid_gold_reason": "blank" if index in invalid else None,
+        }
+        for index in range(400)
+    }
+    shards = _write_fake_shards(
+        tmp_path,
+        indices=indices,
+        row_overrides=overrides,
+    )
+
+    summary = _merge(tmp_path, shards, expected_sample_count=400)
+
+    assert summary == {
+        "summary": True,
+        "num_samples": 400,
+        "average_inference_time_sec": 0.5,
+        "total_inference_time_sec": 200.0,
+        "accuracy": 0.1625,
+        "success": 65,
+        "correct": 65,
+        "source_count": 400,
+        "valid_gold_count": 398,
+        "invalid_gold_count": 2,
+        "invalid_gold": [
+            {"index": 57, "reason": "blank"},
+            {"index": 93, "reason": "blank"},
+        ],
+        "coverage_accuracy": 0.1625,
+        "valid_gold_accuracy": 65 / 398,
+        "generation_config": {
+            "max_new_tokens": 4096,
+            "temperature": 0.0,
+            "top_p": 1.0,
+        },
+    }
 
 
 def test_merge_rejects_duplicate_source_index(tmp_path):

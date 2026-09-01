@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from evaluation.scoring import EvaluationScoreSummary
+
 
 NUM_EVALUATION_SHARDS = 4
 MANIFEST_SCHEMA_VERSION = 2
@@ -446,7 +448,10 @@ def merge_shards(
         ]:
             raise ValueError(f"processed indices incomplete for shard {shard_index}")
     rows = [rows_by_index[index] for index in range(expected_sample_count)]
-    successes = sum(row["match"] for row in rows)
+    score_summary = EvaluationScoreSummary.from_rows(
+        rows, expected_sample_count
+    )
+    successes = score_summary.correct
     inference_times = [
         row.get("inference_time_sec")
         for row in rows
@@ -464,12 +469,15 @@ def merge_shards(
             else 0.0
         ),
         "total_inference_time_sec": total_inference_time,
-        "accuracy": (
-            successes / expected_sample_count
-            if expected_sample_count > 0
-            else 0.0
-        ),
+        "accuracy": score_summary.coverage_accuracy,
         "success": successes,
+        "correct": score_summary.correct,
+        "source_count": score_summary.source_count,
+        "valid_gold_count": score_summary.valid_gold_count,
+        "invalid_gold_count": score_summary.invalid_gold_count,
+        "invalid_gold": score_summary.invalid_gold,
+        "coverage_accuracy": score_summary.coverage_accuracy,
+        "valid_gold_accuracy": score_summary.valid_gold_accuracy,
     }
     if common_generation_config is not None:
         summary["generation_config"] = common_generation_config

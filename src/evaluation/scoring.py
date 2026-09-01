@@ -58,7 +58,7 @@ class EvaluationScoreSummary:
     source_count: int
     valid_gold_count: int
     invalid_gold_count: int
-    invalid_gold: list[int]
+    invalid_gold: list[dict[str, object]]
     coverage_accuracy: float
     valid_gold_accuracy: float
 
@@ -79,6 +79,16 @@ class EvaluationScoreSummary:
             raise ValueError("correct cannot exceed valid_gold_count")
         if len(self.invalid_gold) != self.invalid_gold_count:
             raise ValueError("invalid_gold must list each invalid gold row")
+        if not all(
+            isinstance(record, dict)
+            and set(record) == {"index", "reason"}
+            and isinstance(record["index"], int)
+            and not isinstance(record["index"], bool)
+            and isinstance(record["reason"], str)
+            and record["reason"]
+            for record in self.invalid_gold
+        ):
+            raise ValueError("invalid gold rows require an index and reason")
         if not all(math.isfinite(value) for value in (
             self.coverage_accuracy,
             self.valid_gold_accuracy,
@@ -99,12 +109,21 @@ class EvaluationScoreSummary:
             raise ValueError("row count must equal source_count")
 
         invalid_gold = [
-            row.get("index")
+            {
+                "index": row.get("index"),
+                "reason": row.get("invalid_gold_reason"),
+            }
             for row in materialized_rows
             if row.get("invalid_gold_reason") is not None
         ]
-        if not all(isinstance(index, int) and not isinstance(index, bool) for index in invalid_gold):
-            raise ValueError("invalid gold rows require integer indices")
+        if not all(
+            isinstance(record["index"], int)
+            and not isinstance(record["index"], bool)
+            and isinstance(record["reason"], str)
+            and record["reason"]
+            for record in invalid_gold
+        ):
+            raise ValueError("invalid gold rows require an index and reason")
 
         invalid_gold_count = len(invalid_gold)
         valid_gold_count = source_count - invalid_gold_count

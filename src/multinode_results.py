@@ -540,6 +540,8 @@ def _validate_matrix(matrix_root: Path) -> int:
 _SUMMARY_FIELDS = {
     "summary", "num_samples", "average_inference_time_sec",
     "total_inference_time_sec", "accuracy", "success",
+    "correct", "source_count", "valid_gold_count", "invalid_gold_count",
+    "invalid_gold", "coverage_accuracy", "valid_gold_accuracy",
 }
 _SIDECAR_FIELDS = {
     "schema_version", "result_jsonl", "dataset_identity", "model_identity",
@@ -589,8 +591,17 @@ def _validate_evaluation(root: Path) -> int:
     if (
         summary["summary"] is not True or type(summary["num_samples"]) is not int
         or summary["num_samples"] < 0 or type(summary["success"]) is not int
+        or type(summary["correct"]) is not int or summary["correct"] < 0
+        or type(summary["source_count"]) is not int or summary["source_count"] < 0
+        or type(summary["valid_gold_count"]) is not int
+        or summary["valid_gold_count"] < 0
+        or type(summary["invalid_gold_count"]) is not int
+        or summary["invalid_gold_count"] < 0
+        or type(summary["invalid_gold"]) is not list
         or not _finite(summary["accuracy"]) or not _finite(summary["total_inference_time_sec"])
         or not _finite(summary["average_inference_time_sec"])
+        or not _finite(summary["coverage_accuracy"])
+        or not _finite(summary["valid_gold_accuracy"])
     ):
         raise ValueError("evaluation summary is invalid")
     sample_count = summary["num_samples"]
@@ -657,7 +668,15 @@ def _validate_evaluation(root: Path) -> int:
         raise ValueError("evaluation merged coverage or order is invalid")
     if merged_rows != [rows_by_index[index] for index in range(sample_count)]:
         raise ValueError("evaluation merged rows differ from the ordered shards")
-    successes = sum(int(rows_by_index[index]["match"]) for index in range(sample_count))
+    from evaluation.scoring import EvaluationScoreSummary
+
+    try:
+        score_summary = EvaluationScoreSummary.from_rows(
+            [rows_by_index[index] for index in range(sample_count)], sample_count
+        )
+    except ValueError as error:
+        raise ValueError("evaluation gold accounting is invalid") from error
+    successes = score_summary.correct
     total = sum(inference_times, 0.0)
     accuracy = successes / sample_count if sample_count else 0.0
     average = total / sample_count if sample_count else 0.0
@@ -665,8 +684,15 @@ def _validate_evaluation(root: Path) -> int:
         summary["success"] != successes or summary["accuracy"] != accuracy
         or summary["total_inference_time_sec"] != total
         or summary["average_inference_time_sec"] != average
+        or summary["correct"] != score_summary.correct
+        or summary["source_count"] != score_summary.source_count
+        or summary["valid_gold_count"] != score_summary.valid_gold_count
+        or summary["invalid_gold_count"] != score_summary.invalid_gold_count
+        or summary["invalid_gold"] != score_summary.invalid_gold
+        or summary["coverage_accuracy"] != score_summary.coverage_accuracy
+        or summary["valid_gold_accuracy"] != score_summary.valid_gold_accuracy
     ):
-        raise ValueError("evaluation accuracy or timing is inconsistent")
+        raise ValueError("evaluation accuracy, gold accounting, or timing is inconsistent")
     return sample_count
 
 

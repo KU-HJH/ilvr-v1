@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import torch
 
@@ -15,6 +15,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 )
 
 
+@runtime_checkable
 class ContinuousLatentModelProtocol(Protocol):
     """The model operations required by continuous-latent generation."""
 

@@ -76,7 +76,10 @@ def test_summary_has_distinct_coverage_and_valid_gold_denominators():
     assert summary.source_count == 400
     assert summary.valid_gold_count == 398
     assert summary.invalid_gold_count == 2
-    assert summary.invalid_gold == [57, 93]
+    assert summary.invalid_gold == [
+        {"index": 57, "reason": "blank"},
+        {"index": 93, "reason": "blank"},
+    ]
     assert summary.coverage_accuracy == pytest.approx(198 / 400)
     assert summary.valid_gold_accuracy == pytest.approx(198 / 398)
     assert summary.coverage_accuracy != summary.valid_gold_accuracy

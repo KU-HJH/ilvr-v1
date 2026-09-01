@@ -70,6 +70,7 @@ class FakeProcessor:
         self.include_visual_inputs = include_visual_inputs
         self.images = None
         self.decoded_ids = None
+        self.decoded_id_batches = []
         self.input_ids = torch.tensor([[10, 11]])
         self.attention_mask = torch.tensor([[1, 1]])
         self.pixel_values = torch.tensor([[1.5, 2.5]])
@@ -100,6 +101,7 @@ class FakeProcessor:
     def batch_decode(self, ids, *, skip_special_tokens):
         assert skip_special_tokens is False
         self.decoded_ids = ids
+        self.decoded_id_batches.append(ids)
         return [
             "<|im_start|>user question<|im_end|>"
             "<|im_start|>assistant Final answer: 42<|im_end|>"
@@ -152,11 +154,23 @@ class RecordingStage1Model:
         self.generation_config = SimpleNamespace(eos_token_id=3)
         self.model = ToyCausalLanguageModel(4)
         self.lm_head = nn.Linear(4, 128, bias=False)
-        self.calls = []
+        self.stage2_rollout_engine = LatentRolloutEngine()
 
-    def generate(self, **kwargs):
-        self.calls.append(kwargs)
-        return torch.tensor([[10, 11, 21, 22]])
+    def prepare_stage2_base_inputs_embeds(
+        self, *, input_ids, pixel_values, image_grid_thw
+    ):
+        return self.model.embed_tokens(input_ids)
+
+    def get_rope_index(self, input_ids, image_grid_thw=None, attention_mask=None):
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+        positions = positions.view(1, 1, -1).expand(3, input_ids.shape[0], -1)
+        return positions, torch.zeros(input_ids.shape[0], 1, device=input_ids.device)
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def generate(self, **_kwargs):
+        raise AssertionError("legacy model.generate was called")
 
 
 class RecordingController:
@@ -166,7 +180,13 @@ class RecordingController:
 
     def generate(self, **kwargs):
         self.calls.append(kwargs)
-        return SimpleNamespace(sequences=self.sequences)
+        return SimpleNamespace(
+            sequences=self.sequences,
+            generated_suffix_ids=(21, 22),
+            latent_start_count=1,
+            latent_block_count=1,
+            stop_reason="eos",
+        )
 
 
 class DeepSpeedShapedWrapper:
@@ -397,6 +417,12 @@ def _run_main_with_fake_sample(
             "raw_output": "raw answer",
             "assistant_only": "Final answer: 42",
             "extracted_final_answer": "42",
+            "prompt_identity": "p" * 64,
+            "prompt_token_length": 2,
+            "generated_suffix_token_ids": [21, 22],
+            "latent_start_count": 1,
+            "latent_block_count": 1,
+            "stop_reason": "eos",
         }
         if module.__name__ == "eval":
             result["inference_time"] = 1.25
@@ -484,6 +510,11 @@ def test_default_single_worker_records_shared_answer_scoring(
             "index": 0,
             "task_name": "zebra-cot",
             "image_input": ["image.png"],
+            "prompt_identity": "p" * 64,
+            "prompt_token_length": 2,
+            "generated_suffix_token_ids": [21, 22],
+            "raw_output": "raw answer",
+            "assistant_only": "Final answer: 42",
             "prediction": "Final answer: 42",
             "extracted_final_answer": "42",
             "prediction_parse_status": "parsed",
@@ -494,6 +525,9 @@ def test_default_single_worker_records_shared_answer_scoring(
             "gold_parse_detail": None,
             "gold_normalized": "42",
             "invalid_gold_reason": None,
+            "latent_start_count": 1,
+            "latent_block_count": 1,
+            "stop_reason": "eos",
             "match": True,
             "inference_time_sec": 1.25,
         }
@@ -519,6 +553,11 @@ def test_default_single_worker_records_shared_answer_scoring(
         row = {
             "index": 0,
             "task_name": "zebra-cot",
+            "prompt_identity": "p" * 64,
+            "prompt_token_length": 2,
+            "generated_suffix_token_ids": [21, 22],
+            "raw_output": "raw answer",
+            "assistant_only": "Final answer: 42",
             "prediction": "Final answer: 42",
             "extracted_final_answer": "42",
             "prediction_parse_status": "parsed",
@@ -529,6 +568,9 @@ def test_default_single_worker_records_shared_answer_scoring(
             "gold_parse_detail": None,
             "gold_normalized": "42",
             "invalid_gold_reason": None,
+            "latent_start_count": 1,
+            "latent_block_count": 1,
+            "stop_reason": "eos",
             "match": True,
         }
         rows = [dict(row, index=index) for index in range(6)]
@@ -679,7 +721,7 @@ def test_inference_error_rows_preserve_invalid_gold_for_summary(
     if module_name == "eval":
         summary = rows[-1]
         assert summary["valid_gold_count"] == 1
-        assert summary["invalid_gold"] == [0]
+        assert summary["invalid_gold"] == [{"index": 0, "reason": "missing"}]
         assert summary["coverage_accuracy"] == pytest.approx(1 / 2)
         assert summary["valid_gold_accuracy"] == 1.0
 
@@ -859,18 +901,22 @@ def test_stage1_eval_loads_validated_stage1_dora_adapter(monkeypatch, tmp_path):
     assert model_sources == ["tiny/original-qwen"]
 
 
-def test_stage1_eval_uses_stage1_generation_instead_of_stage2_controller(
+def test_stage1_eval_uses_continuous_latent_controller_without_model_generate(
     monkeypatch,
 ):
     module = _import_entry_point("eval", monkeypatch)
     model = RecordingStage1Model()
     processor = FakeProcessor()
+    controller = RecordingController()
     monkeypatch.setattr(
         module,
         "Stage2InferenceController",
         lambda: (_ for _ in ()).throw(
             AssertionError("Stage 2 controller was constructed for Stage 1")
         ),
+    )
+    monkeypatch.setattr(
+        module, "ContinuousLatentController", lambda: controller, raising=False
     )
 
     result = module.run_one_example(
@@ -885,13 +931,54 @@ def test_stage1_eval_uses_stage1_generation_instead_of_stage2_controller(
         },
     )
 
-    assert len(model.calls) == 1
-    call = model.calls[0]
+    assert len(controller.calls) == 1
+    call = controller.calls[0]
+    assert call["model"] is model
     assert torch.equal(call["input_ids"], processor.input_ids)
     assert torch.equal(call["attention_mask"], processor.attention_mask)
-    assert call["max_new_tokens"] == 5
-    assert len(call["logits_processor"]) == 1
+    assert call["generation_config"].max_new_tokens == 5
+    assert call["return_latent_states"] is False
     assert result["extracted_final_answer"] == "42"
+    assert result["generated_suffix_token_ids"] == [21, 22]
+    assert result["latent_start_count"] == 1
+    assert result["latent_block_count"] == 1
+    assert result["stop_reason"] == "eos"
+
+
+def test_prompt_preparation_excludes_gold_from_tensors_and_identity(tmp_path):
+    """Changing or removing gold must not alter the model's prompt lineage."""
+    from evaluation.runtime import prepare_evaluation_input
+
+    image = tmp_path / "prompt.png"
+    Image.new("RGB", (2, 2), color="white").save(image)
+    processor = FakeProcessor()
+    images = [Image.open(image).convert("RGB")]
+    base = {
+        "text_input": "question",
+        "image_input": [str(image)],
+        "original_final_answer": "42",
+    }
+    mutated = dict(base, original_final_answer="SECRET-GOLD")
+    removed = {key: value for key, value in base.items() if key != "original_final_answer"}
+
+    prepared = [
+        prepare_evaluation_input(processor, sample, images)
+        for sample in (base, mutated, removed)
+    ]
+
+    assert all(
+        torch.equal(item.tensors["input_ids"], prepared[0].tensors["input_ids"])
+        for item in prepared
+    )
+    assert all(
+        torch.equal(
+            item.tensors["pixel_values"], prepared[0].tensors["pixel_values"]
+        )
+        for item in prepared
+    )
+    assert {item.prompt_identity for item in prepared} == {
+        prepared[0].prompt_identity
+    }
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
@@ -1483,14 +1570,27 @@ def test_eval_uses_controller_with_original_visual_inputs_and_preserves_decoding
     assert call["return_latent_states"] is False
     assert len(processor.images) == 1
     assert processor.images[0].mode == "RGB"
-    assert torch.equal(processor.decoded_ids, controller.sequences)
+    assert len(processor.decoded_id_batches) == 2
+    assert torch.equal(processor.decoded_id_batches[0], controller.sequences)
+    assert torch.equal(
+        processor.decoded_id_batches[1], controller.sequences[:, 2:]
+    )
     assert result["assistant_only"] == "Final answer: 42"
     assert result["extracted_final_answer"] == "42"
-    assert set(result) == (
-        {"raw_output", "assistant_only", "extracted_final_answer", "inference_time"}
-        if module_name == "eval"
-        else {"raw_output", "assistant_only", "extracted_final_answer"}
-    )
+    expected_result_fields = {
+        "prompt_identity",
+        "prompt_token_length",
+        "generated_suffix_token_ids",
+        "raw_output",
+        "assistant_only",
+        "extracted_final_answer",
+        "latent_start_count",
+        "latent_block_count",
+        "stop_reason",
+    }
+    if module_name == "eval":
+        expected_result_fields.add("inference_time")
+    assert set(result) == expected_result_fields
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

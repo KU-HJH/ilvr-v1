@@ -14,7 +14,6 @@ from PIL import Image
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
     AutoProcessor,
-    LogitsProcessorList,
 )
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
@@ -53,6 +52,12 @@ from evaluation.scoring import (
     parse_gold_answer,
     score_answer,
 )
+from evaluation.continuous_latent import (
+    ContinuousLatentController,
+    ContinuousLatentModelProtocol,
+    build_continuous_generation_config,
+)
+from evaluation.runtime import prepare_evaluation_input
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -339,29 +344,7 @@ def run_one_example(
     img_list = _resolve_image_paths(sample.get("image_input", []))
     images = open_images(img_list) if img_list else None
 
-    # Align with training: put image entries into user.content, then append text
-    content = []
-    if images:
-        for _ in images:
-            content.append({"type": "image"})
-    content.append({"type": "text", "text": text_input})
-
-    conversations = [
-        {"role": "user", "content": content}
-    ]
-
-    prompt = processor.apply_chat_template(
-        conversations,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    inputs = processor(
-        text=[prompt],
-        images=images,
-        return_tensors="pt",
-        padding=True,
-    )
+    prepared = prepare_evaluation_input(processor, sample, images)
 
     qwen_model = resolve_qwen2_5_vl_model(model)
     effective_device = getattr(model, "device", None)
@@ -373,8 +356,7 @@ def run_one_example(
     # Move tensor inputs to the outer runtime wrapper's device when available.
     inputs = {
         k: v.to(effective_device)
-        for k, v in inputs.items()
-        if isinstance(v, torch.Tensor)
+        for k, v in prepared.tensors.items()
     }
 
     input_ids = inputs["input_ids"]
@@ -384,20 +366,24 @@ def run_one_example(
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
     latent_size = getattr(qwen_model.config, "latent_size", None)
-    if not isinstance(latent_size, int) or isinstance(latent_size, bool) or latent_size <= 0:
+    if (
+        not isinstance(latent_size, int)
+        or isinstance(latent_size, bool)
+        or latent_size <= 0
+    ):
         raise ValueError("checkpoint config must contain a positive latent_size")
     token_ids = resolve_latent_token_ids(processor.tokenizer, qwen_model.config)
     stage = getattr(qwen_model.config, "stage", None)
     if stage == "stage1":
-        logits_processor = LogitsProcessorList(
-            [
-                Stage1LatentTemplateLogitsProcessor(
-                    token_ids.start_token_id,
-                    token_ids.end_token_id,
-                    token_ids.pad_token_id,
-                    latent_size,
-                )
-            ]
+        if not isinstance(qwen_model, ContinuousLatentModelProtocol):
+            raise TypeError(
+                "Stage 1 evaluation model does not satisfy the continuous latent interface"
+            )
+        generation_config = build_continuous_generation_config(
+            model_config=qwen_model.config,
+            model_generation_config=getattr(qwen_model, "generation_config", None),
+            tokenizer=processor.tokenizer,
+            generation_kwargs=gen_kwargs,
         )
     elif stage == "stage2":
         stage2_model = resolve_stage2_qwen_model(model)
@@ -419,12 +405,17 @@ def run_one_example(
 
     with torch.inference_mode():
         if stage == "stage1":
-            out_ids = model.generate(
-                **inputs,
-                **gen_kwargs,
-                logits_processor=logits_processor,
-                tokenizer=processor.tokenizer,
+            generation_result = ContinuousLatentController().generate(
+                model=qwen_model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_ids=token_ids,
+                generation_config=generation_config,
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                return_latent_states=False,
             )
+            out_ids = generation_result.sequences
         else:
             generation_result = Stage2InferenceController().generate(
                 model=stage2_model,
@@ -447,16 +438,28 @@ def run_one_example(
     out_text = processor.batch_decode(
         out_ids, skip_special_tokens=False
     )[0].strip()
+    suffix_ids = out_ids[:, prepared.prompt_token_length:]
+    assistant_text = processor.batch_decode(
+        suffix_ids, skip_special_tokens=False
+    )[0].strip()
 
     # Extract the answer from the assistant's segment only — running the
     # regex over the full decoded text (prompt included) can match text in
     # the user prompt and keeps trailing special tokens like <|im_end|>.
-    assistant_only = extract_assistant_content(out_text)
+    assistant_only = extract_assistant_content(assistant_text)
     extracted = extract_final_answer(assistant_only).extracted
     return {
+        "prompt_identity": prepared.prompt_identity,
+        "prompt_token_length": prepared.prompt_token_length,
+        "generated_suffix_token_ids": [
+            int(token_id) for token_id in suffix_ids[0].tolist()
+        ],
         "raw_output": out_text,
         "assistant_only": assistant_only,
         "extracted_final_answer": extracted,
+        "latent_start_count": int(generation_result.latent_start_count),
+        "latent_block_count": int(generation_result.latent_block_count),
+        "stop_reason": generation_result.stop_reason,
         "inference_time": inference_time,
     }
 
@@ -576,6 +579,13 @@ def main():
                     "index": i,
                     "task_name": args.task_name,
                     "image_input": sample.get("image_input", []),
+                    "prompt_identity": pred.get("prompt_identity"),
+                    "prompt_token_length": pred.get("prompt_token_length"),
+                    "generated_suffix_token_ids": pred.get(
+                        "generated_suffix_token_ids", []
+                    ),
+                    "raw_output": pred.get("raw_output"),
+                    "assistant_only": assistant_only,
                     "prediction": assistant_only,
                     "extracted_final_answer": answer_score.prediction.extracted,
                     "prediction_parse_status": answer_score.prediction.status,
@@ -586,6 +596,9 @@ def main():
                     "gold_parse_detail": answer_score.gold.detail,
                     "gold_normalized": answer_score.gold.normalized,
                     "invalid_gold_reason": answer_score.invalid_gold_reason,
+                    "latent_start_count": pred.get("latent_start_count"),
+                    "latent_block_count": pred.get("latent_block_count"),
+                    "stop_reason": pred.get("stop_reason"),
                     "match": bool(ok),
                     "inference_time_sec": sample_infer_time,
                 })
@@ -616,11 +629,22 @@ def main():
                     gold_parse.status if gold_parse.status != "parsed" else None
                 )
                 error_result.update({
+                    "prompt_identity": None,
+                    "prompt_token_length": None,
+                    "generated_suffix_token_ids": [],
+                    "raw_output": None,
+                    "assistant_only": None,
+                    "prediction": None,
+                    "extracted_final_answer": None,
+                    "prediction_parse_status": "inference_error",
                     "gold_final_answer": gold,
                     "gold_parse_status": gold_parse.status,
                     "gold_parse_detail": gold_parse.detail,
                     "gold_normalized": gold_parse.normalized,
                     "invalid_gold_reason": invalid_gold_reason,
+                    "latent_start_count": None,
+                    "latent_block_count": None,
+                    "stop_reason": None,
                     "match": False,
                 })
             results.append(error_result)
