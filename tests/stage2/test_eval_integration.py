@@ -395,7 +395,7 @@ def _run_main_with_fake_sample(
             raise RuntimeError("causal sample failure")
         result = {
             "raw_output": "raw answer",
-            "assistant_only": "answer",
+            "assistant_only": "Final answer: 42",
             "extracted_final_answer": "42",
         }
         if module.__name__ == "eval":
@@ -470,10 +470,10 @@ def test_eval_entrypoint_resolves_dataset_relative_image_before_run_one(
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
-def test_default_single_worker_preserves_existing_output_bytes(
+def test_default_single_worker_records_shared_answer_scoring(
     module_name, monkeypatch, tmp_path
 ):
-    """Adding sharding must not alter existing JSONL or summary bytes."""
+    """Omitting parse fields or a denominator must fail this output contract."""
     module = _import_entry_point(module_name, monkeypatch)
     _dataset, output, result = _run_main_with_fake_sample(
         module, monkeypatch, tmp_path, num_shards=1
@@ -484,9 +484,16 @@ def test_default_single_worker_preserves_existing_output_bytes(
             "index": 0,
             "task_name": "zebra-cot",
             "image_input": ["image.png"],
-            "prediction": "answer",
+            "prediction": "Final answer: 42",
             "extracted_final_answer": "42",
+            "prediction_parse_status": "parsed",
+            "prediction_parse_detail": None,
+            "prediction_normalized": "42",
             "gold_final_answer": "42",
+            "gold_parse_status": "parsed",
+            "gold_parse_detail": None,
+            "gold_normalized": "42",
+            "invalid_gold_reason": None,
             "match": True,
             "inference_time_sec": 1.25,
         }
@@ -499,15 +506,29 @@ def test_default_single_worker_preserves_existing_output_bytes(
                 "total_inference_time_sec": 7.5,
                 "accuracy": 1.0,
                 "success": 6,
+                "correct": 6,
+                "source_count": 6,
+                "valid_gold_count": 6,
+                "invalid_gold_count": 0,
+                "invalid_gold": [],
+                "coverage_accuracy": 1.0,
+                "valid_gold_accuracy": 1.0,
             }
         )
     else:
         row = {
             "index": 0,
             "task_name": "zebra-cot",
-            "prediction": "answer",
+            "prediction": "Final answer: 42",
             "extracted_final_answer": "42",
+            "prediction_parse_status": "parsed",
+            "prediction_parse_detail": None,
+            "prediction_normalized": "42",
             "gold_final_answer": "42",
+            "gold_parse_status": "parsed",
+            "gold_parse_detail": None,
+            "gold_normalized": "42",
+            "invalid_gold_reason": None,
             "match": True,
         }
         rows = [dict(row, index=index) for index in range(6)]
@@ -518,6 +539,69 @@ def test_default_single_worker_preserves_existing_output_bytes(
     assert result is None
     assert output.read_text(encoding="utf-8") == expected
     assert not Path(f"{output}.manifest.json").exists()
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_standard_tasks_score_assistant_content_and_record_parse_fields(
+    module_name, monkeypatch, tmp_path
+):
+    """Scoring a stale extracted field instead of assistant output must fail."""
+    module = _import_entry_point(module_name, monkeypatch)
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "text_input": "question",
+                "image_input": [],
+                "original_final_answer": "42",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "output.jsonl"
+    monkeypatch.setattr(
+        module,
+        "get_eval_args",
+        lambda: SimpleNamespace(
+            model_dir="model",
+            base_model_dir=None,
+            test_data_path=str(dataset),
+            task_name="zebra-cot",
+            output_json_path=str(output),
+            cache_dir="cache",
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            num_shards=1,
+            shard_index=0,
+            model_identity=None,
+        ),
+    )
+    monkeypatch.setattr(
+        module, "load_evaluation_artifacts", lambda **_kwargs: (object(), object())
+    )
+
+    def run_one(_model, _processor, _sample, _gen_kwargs):
+        result = {
+            "raw_output": "raw output",
+            "assistant_only": "not 42",
+            "extracted_final_answer": "42",
+        }
+        if module_name == "eval":
+            result["inference_time"] = 0.25
+        return result
+
+    monkeypatch.setattr(module, "run_one_example", run_one)
+    module.main()
+
+    row = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    assert row["match"] is False
+    assert row["prediction_parse_status"] == "parsed"
+    assert row["prediction_normalized"] == "not 42"
+    assert row["gold_parse_status"] == "parsed"
+    assert row["gold_normalized"] == "42"
+    assert row["invalid_gold_reason"] is None
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

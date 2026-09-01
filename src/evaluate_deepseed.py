@@ -34,6 +34,7 @@ from multinode_evaluation import (
     shard_manifest_path,
     write_shard_manifest,
 )
+from evaluation.scoring import EvaluationScoreSummary, extract_final_answer, score_answer
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -149,46 +150,6 @@ def open_images(paths: List[str]) -> List[Image.Image]:
     return imgs
 
 
-# ---- Several fallback rules for parsing the final answer ----
-_yes_set = {"yes", "true", "a"}
-_no_set  = {"no", "false", "b"}
-
-def _clean_answer_span(cand: str) -> str:
-    # Keep only the first line, drop special tokens, then peel surrounding
-    # markdown/quotes/brackets and trailing punctuation (e.g. "**2**", "2.")
-    cand = re.split(r"[\n\r]", (cand or "").strip())[0]
-    cand = _strip_special_tokens(cand)
-    cand = re.sub(r"^[\s\*_`'\"“‘(\[{【]+", "", cand)
-    cand = re.sub(r"[\s\*_`'\"”’)\]}】.。,，!！?？;；:：]+$", "", cand)
-    return cand.strip()
-
-def extract_final_answer(text: str) -> str:
-
-    s = _strip_special_tokens(text or "").strip()
-
-    # 1) \boxed{...} (take the last one)
-    boxed = re.findall(r"\\boxed\{([^{}]*)\}", s)
-    if boxed:
-        return _clean_answer_span(boxed[-1])
-
-    # 2) "final answer (is)(:) XXX" / "answer (is)(:) XXX" — take the LAST
-    #    occurrence, since the conclusion appears at the end of the response
-    patterns = [
-        r"final\s*answer\s*(?:is)?\s*[:：]?\s*(.+)",
-        r"answer\s*(?:is)?\s*[:：]\s*(.+)"
-    ]
-    for pat in patterns:
-        matches = list(re.finditer(pat, s, flags=re.IGNORECASE))
-        if matches:
-            cand = _clean_answer_span(matches[-1].group(1))
-            if cand:
-                return cand
-    tokens = re.findall(r"[A-Za-z]+", s.lower())
-    only = [t for t in tokens if t in (_yes_set | _no_set)]
-    if len(only) == 1:
-        return only[0].capitalize() if only[0] in {"yes", "no"} else only[0]
-    return _clean_answer_span(s)
-
 def _strip_special_tokens(s: str) -> str:
     # Common end/special tokens, extend if necessary
     end_markers = [
@@ -225,23 +186,6 @@ def extract_assistant_content(text: str) -> str:
 
     return _strip_special_tokens(s)
 
-
-def normalize_for_match(ans: str) -> str:
-    a = _clean_answer_span(ans)
-    low = a.lower()
-    if low in _yes_set:
-        return "Yes"
-    if low in _no_set:
-        return "No"
-    # Numeric tolerance: "2", "2.0", " 2 " all normalize to the same value
-    try:
-        f = float(a.replace(",", ""))
-        if f == int(f):
-            return str(int(f))
-        return str(f)
-    except (ValueError, OverflowError):
-        pass
-    return low
 
 def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[str, Any]) -> Dict[str, Any]:
     text_input = sample.get("text_input", "")
@@ -316,7 +260,7 @@ def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[s
     # regex over the full decoded text (prompt included) can match text in
     # the user prompt and keeps trailing special tokens like <|im_end|>.
     assistant_only = extract_assistant_content(out_text)
-    extracted = extract_final_answer(assistant_only)
+    extracted = extract_final_answer(assistant_only).extracted
     return {"raw_output": out_text, "assistant_only": assistant_only, "extracted_final_answer": extracted}
 
 def main():
@@ -411,10 +355,9 @@ def main():
                 })
 
             else:  # Standard tasks
-                gold = sample.get("original_final_answer", "")
-                pred_norm = normalize_for_match(pred["extracted_final_answer"])
-                gold_norm = normalize_for_match(gold)
-                ok = (pred_norm == gold_norm)
+                gold = sample.get("original_final_answer")
+                answer_score = score_answer(assistant_only, gold)
+                ok = answer_score.match
                 if ok: success += 1
                 
                 results.append({
@@ -422,8 +365,15 @@ def main():
                     "task_name": args.task_name,
 
                     "prediction": assistant_only,
-                    "extracted_final_answer": pred["extracted_final_answer"],
+                    "extracted_final_answer": answer_score.prediction.extracted,
+                    "prediction_parse_status": answer_score.prediction.status,
+                    "prediction_parse_detail": answer_score.prediction.detail,
+                    "prediction_normalized": answer_score.prediction.normalized,
                     "gold_final_answer": gold,
+                    "gold_parse_status": answer_score.gold.status,
+                    "gold_parse_detail": answer_score.gold.detail,
+                    "gold_normalized": answer_score.gold.normalized,
+                    "invalid_gold_reason": answer_score.invalid_gold_reason,
                     "match": bool(ok)
                 })
 
@@ -443,7 +393,15 @@ def main():
             })
 
     metric_total = worker_total if sharded else total
-    acc = success / metric_total if metric_total > 0 else 0.0
+    score_summary = (
+        EvaluationScoreSummary.from_rows(results, metric_total)
+        if args.task_name != "vsp-spatial-planning-cot"
+        else None
+    )
+    acc = (
+        score_summary.coverage_accuracy if score_summary is not None
+        else success / metric_total if metric_total > 0 else 0.0
+    )
     with open(args.output_json_path, "w", encoding="utf-8") as fout:
         for r in results:
             fout.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -471,6 +429,12 @@ def main():
     report_total = worker_total if sharded else total
     logging.info(f"Evaluation finished: success {success}/{report_total}; accuracy={acc:.4f}")
     print(f"Accuracy = {acc:.4f}  ({success}/{report_total})")
+    if score_summary is not None:
+        print(
+            "Valid-gold accuracy = "
+            f"{score_summary.valid_gold_accuracy:.4f} "
+            f"({score_summary.correct}/{score_summary.valid_gold_count})"
+        )
     if sharded:
         return 1 if worker_failed else 0
     

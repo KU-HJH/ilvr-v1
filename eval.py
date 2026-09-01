@@ -47,6 +47,7 @@ from multinode_evaluation import (
     shard_manifest_path,
     write_shard_manifest,
 )
+from evaluation.scoring import EvaluationScoreSummary, extract_final_answer, score_answer
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -260,64 +261,6 @@ def open_images(paths: List[str]) -> List[Image.Image]:
     return imgs
 
 
-# ---- Fallback rules for parsing the final answer ----
-_yes_set = {"yes", "true", "a"}
-_no_set = {"no", "false", "b"}
-
-
-def _clean_answer_span(cand: str) -> str:
-    """
-    Keep only the first line, drop special tokens, then peel surrounding
-    markdown/quotes/brackets and trailing punctuation (e.g. "**2**", "2.").
-    """
-    cand = re.split(r"[\n\r]", (cand or "").strip())[0]
-    cand = _strip_special_tokens(cand)
-    cand = re.sub(r"^[\s\*_`'\"“‘(\[{【]+", "", cand)
-    cand = re.sub(r"[\s\*_`'\"”’)\]}】.。,，!！?？;；:：]+$", "", cand)
-    return cand.strip()
-
-
-def extract_final_answer(text: str) -> str:
-    """
-    Extract the final answer from the model output and return a simplified string.
-
-    Priority rules:
-      1) \\boxed{...} (take the last one)
-      2) Match 'final answer (is): XXX' (case-insensitive, colon optional)
-      3) Match 'answer is: XXX' or 'answer: XXX'
-      4) If the output contains exactly one of yes/no/true/false/a/b
-         (case-insensitive), return it directly
-      5) Otherwise, fall back to the cleaned full text (useful for debugging)
-
-    For patterns 2/3 the LAST occurrence is used, since the conclusion
-    normally appears at the end of the response.
-    """
-    s = _strip_special_tokens(text or "").strip()
-
-    boxed = re.findall(r"\\boxed\{([^{}]*)\}", s)
-    if boxed:
-        return _clean_answer_span(boxed[-1])
-
-    patterns = [
-        r"final\s*answer\s*(?:is)?\s*[:：]?\s*(.+)",
-        r"answer\s*(?:is)?\s*[:：]\s*(.+)",
-    ]
-
-    for pat in patterns:
-        matches = list(re.finditer(pat, s, flags=re.IGNORECASE))
-        if matches:
-            cand = _clean_answer_span(matches[-1].group(1))
-            if cand:
-                return cand
-
-    tokens = re.findall(r"[A-Za-z]+", s.lower())
-    only = [t for t in tokens if t in (_yes_set | _no_set)]
-    if len(only) == 1:
-        return only[0].capitalize() if only[0] in {"yes", "no"} else only[0]
-
-    return _clean_answer_span(s)
-
-
 def _strip_special_tokens(s: str) -> str:
     """
     Remove common special or end-of-sequence markers from decoded text.
@@ -375,27 +318,6 @@ def extract_assistant_content(text: str) -> str:
 
     # If nothing matches, return cleaned full text
     return _strip_special_tokens(s)
-
-
-def normalize_for_match(ans: str) -> str:
-    """
-    Normalize answers for matching: yes/no style tasks, numeric answers
-    ("2" vs "2.0"), and case-insensitive text comparison.
-    """
-    a = _clean_answer_span(ans)
-    low = a.lower()
-    if low in _yes_set:
-        return "Yes"
-    if low in _no_set:
-        return "No"
-    try:
-        f = float(a.replace(",", ""))
-        if f == int(f):
-            return str(int(f))
-        return str(f)
-    except (ValueError, OverflowError):
-        pass
-    return low
 
 
 def run_one_example(
@@ -525,7 +447,7 @@ def run_one_example(
     # regex over the full decoded text (prompt included) can match text in
     # the user prompt and keeps trailing special tokens like <|im_end|>.
     assistant_only = extract_assistant_content(out_text)
-    extracted = extract_final_answer(assistant_only)
+    extracted = extract_final_answer(assistant_only).extracted
     return {
         "raw_output": out_text,
         "assistant_only": assistant_only,
@@ -639,10 +561,9 @@ def main():
 
             else:
                 # Default zebra-cot branch
-                gold = sample.get("original_final_answer", "")
-                pred_norm = normalize_for_match(pred["extracted_final_answer"])
-                gold_norm = normalize_for_match(gold)
-                ok = (pred_norm == gold_norm)
+                gold = sample.get("original_final_answer")
+                answer_score = score_answer(assistant_only, gold)
+                ok = answer_score.match
                 if ok:
                     success += 1
 
@@ -651,8 +572,15 @@ def main():
                     "task_name": args.task_name,
                     "image_input": sample.get("image_input", []),
                     "prediction": assistant_only,
-                    "extracted_final_answer": pred["extracted_final_answer"],
+                    "extracted_final_answer": answer_score.prediction.extracted,
+                    "prediction_parse_status": answer_score.prediction.status,
+                    "prediction_parse_detail": answer_score.prediction.detail,
+                    "prediction_normalized": answer_score.prediction.normalized,
                     "gold_final_answer": gold,
+                    "gold_parse_status": answer_score.gold.status,
+                    "gold_parse_detail": answer_score.gold.detail,
+                    "gold_normalized": answer_score.gold.normalized,
+                    "invalid_gold_reason": answer_score.invalid_gold_reason,
                     "match": bool(ok),
                     "inference_time_sec": sample_infer_time,
                 })
@@ -677,7 +605,15 @@ def main():
             })
 
     metric_total = worker_total if sharded else total
-    acc = success / metric_total if metric_total > 0 else 0.0
+    score_summary = (
+        EvaluationScoreSummary.from_rows(results, metric_total)
+        if args.task_name != "vsp-spatial-planning-cot"
+        else None
+    )
+    acc = (
+        score_summary.coverage_accuracy if score_summary is not None
+        else success / metric_total if metric_total > 0 else 0.0
+    )
     avg_inference_time = (
         total_inference_time / metric_total if metric_total > 0 else 0.0
     )
@@ -687,14 +623,25 @@ def main():
             fout.write(json.dumps(r, ensure_ascii=False) + "\n")
         if not sharded:
             # Write a summary line as the last entry
-            fout.write(json.dumps({
+            summary = {
                 "summary": True,
                 "num_samples": total,
                 "average_inference_time_sec": avg_inference_time,
                 "total_inference_time_sec": total_inference_time,
                 "accuracy": acc,
                 "success": success,
-            }, ensure_ascii=False) + "\n")
+            }
+            if score_summary is not None:
+                summary.update({
+                    "correct": score_summary.correct,
+                    "source_count": score_summary.source_count,
+                    "valid_gold_count": score_summary.valid_gold_count,
+                    "invalid_gold_count": score_summary.invalid_gold_count,
+                    "invalid_gold": score_summary.invalid_gold,
+                    "coverage_accuracy": score_summary.coverage_accuracy,
+                    "valid_gold_accuracy": score_summary.valid_gold_accuracy,
+                })
+            fout.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
     if sharded:
         write_shard_manifest(
