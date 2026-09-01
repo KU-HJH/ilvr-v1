@@ -222,6 +222,8 @@ class Stage1DataCollator:
                 (len(example.helper_image_paths),),
                 "helper",
             )
+            self._validate_pixel_grid_cardinality(singleton, original, "original")
+            self._validate_pixel_grid_cardinality(singleton, helper, "helper")
             input_ids, attention_mask, row_spans, row_lengths = (
                 self._replace_helper_tokens_with_latent_blocks(singleton, full)
             )
@@ -396,15 +398,21 @@ class Stage1DataCollator:
         conversations = remove_user_images([example.conversation for example in examples])
         texts = self._render_conversations(conversations)
         images = self._materialize_role_images(examples, "helper")
+        processor_images = images if any(images) else None
         batch = dict(
             self.processor(
                 text=texts,
-                images=images,
+                images=processor_images,
                 padding=True,
                 truncation=False,
                 return_tensors="pt",
             )
         )
+        if processor_images is None:
+            if batch.get("pixel_values") is None:
+                batch["pixel_values"] = torch.empty((0, 0))
+            if batch.get("image_grid_thw") is None:
+                batch["image_grid_thw"] = torch.empty((0, 3), dtype=torch.long)
         self._require_processor_keys(examples[0], batch, "helper")
         return batch
 
@@ -636,6 +644,34 @@ class Stage1DataCollator:
     def _processor_pad_token_id(self) -> int:
         pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
         return 0 if pad_token_id is None else int(pad_token_id)
+
+    @staticmethod
+    def _validate_pixel_grid_cardinality(examples, batch, kind):
+        [example] = examples
+        pixel_values = batch["pixel_values"]
+        image_grid_thw = batch["image_grid_thw"]
+        if not isinstance(pixel_values, torch.Tensor) or pixel_values.ndim < 1:
+            raise ValueError(
+                f"source_index={example.source_index}: observed {kind} pixel_values "
+                f"with shape {getattr(pixel_values, 'shape', None)}; expected a tensor "
+                "with a row dimension"
+            )
+        if (
+            not isinstance(image_grid_thw, torch.Tensor)
+            or image_grid_thw.ndim != 2
+            or image_grid_thw.shape[1] != 3
+        ):
+            raise ValueError(
+                f"source_index={example.source_index}: observed {kind} image_grid_thw "
+                f"with shape {getattr(image_grid_thw, 'shape', None)}; expected [N, 3]"
+            )
+        expected = int(image_grid_thw.prod(dim=1).sum().item())
+        observed = int(pixel_values.shape[0])
+        if observed != expected:
+            raise ValueError(
+                f"source_index={example.source_index}: observed {observed} {kind} "
+                f"pixel_values rows; expected {expected} from singleton image_grid_thw"
+            )
 
     @staticmethod
     def _validate_samplewise_ownership(examples, metadata, attention_mask):

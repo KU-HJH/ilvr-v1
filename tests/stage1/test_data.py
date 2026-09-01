@@ -581,3 +581,90 @@ def test_collator_packed_equals_independent_b1_processor_results():
             )
         assert metadata.unpadded_length == singleton_metadata.unpadded_length
         assert metadata.latent_spans == singleton_metadata.latent_spans
+
+
+class _RejectEmptyHelperImagesProcessor(DeterministicStage1Processor):
+    """Faithful text-only boundary: `None` is valid, `[[]]` is not."""
+
+    def __init__(self):
+        super().__init__()
+        self.images_arguments = []
+
+    def __call__(self, *, text, images, padding, truncation, return_tensors):
+        self.images_arguments.append(images)
+        if images == [[]]:
+            raise ValueError("invalid empty image list")
+        if images is None:
+            return {}
+        return super().__call__(
+            text=text,
+            images=images,
+            padding=padding,
+            truncation=truncation,
+            return_tensors=return_tensors,
+        )
+
+
+def test_collator_uses_text_only_helper_call_for_zero_helper_row():
+    """Catches passing Qwen an invalid `[[]]` instead of text-only `None`."""
+    processor = _RejectEmptyHelperImagesProcessor()
+    collator = Stage1DataCollator(processor, TOKENS, latent_size=3)
+
+    batch = collator(
+        [prepared_example(source_index=71, original_images=1, helper_images=0, blocks=0)]
+    )
+
+    assert len(processor.images_arguments) == 3
+    assert all(images is not None for images in processor.images_arguments[:2])
+    assert processor.images_arguments[2] is None
+    [metadata] = batch["stage1_batch_metadata"].samples
+    assert metadata.original_pixel_range == (0, 1)
+    assert metadata.helper_pixel_range == (0, 0)
+    assert metadata.original_grid_range == (0, 1)
+    assert metadata.helper_grid_range == (0, 0)
+    assert tuple(batch["pixel_values_latent"].shape) == (0, 0)
+    assert tuple(batch["image_grid_thw_latent"].shape) == (0, 3)
+
+
+class _ShortPixelRowsProcessor(DeterministicStage1Processor):
+    """Supplies a literal complete grid with a deliberately truncated pixel tensor."""
+
+    original_grid = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    original_pixels = torch.tensor([[101.0], [102.0], [103.0]])
+
+    def __init__(self, role):
+        super().__init__()
+        self.role = role
+
+    def __call__(self, *, text, images, padding, truncation, return_tensors):
+        batch = super().__call__(
+            text=text,
+            images=images,
+            padding=padding,
+            truncation=truncation,
+            return_tensors=return_tensors,
+        )
+        image_value = images[0][0].getpixel((0, 0))[0] if images and len(images[0]) == 1 else None
+        if (self.role == "original" and image_value is not None and image_value < 100) or (
+            self.role == "helper" and image_value is not None and image_value >= 100
+        ):
+            batch["image_grid_thw"] = self.original_grid.clone()
+            batch["pixel_values"] = self.original_pixels.clone()
+        return batch
+
+
+@pytest.mark.parametrize("role", ("original", "helper"))
+def test_collator_rejects_singleton_grid_pixel_cardinality_drift(role):
+    """Catches packing a three-row tensor for the literal four-pixel image grid."""
+    processor = _ShortPixelRowsProcessor(role)
+    collator = Stage1DataCollator(processor, TOKENS, latent_size=3)
+    example = prepared_example(source_index=72, original_images=1, helper_images=1, blocks=1)
+
+    assert processor.original_grid.tolist() == [[1, 2, 2]]
+    assert processor.original_pixels.squeeze(1).tolist() == [101.0, 102.0, 103.0]
+    with pytest.raises(ValueError, match=f"{role} pixel_values rows") as error:
+        collator([example])
+
+    assert "source_index=72" in str(error.value)
+    assert "observed" in str(error.value)
+    assert "expected" in str(error.value)
