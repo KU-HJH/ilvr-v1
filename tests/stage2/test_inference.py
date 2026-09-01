@@ -6,6 +6,11 @@ import pytest
 import torch
 from torch import nn
 
+from evaluation.continuous_latent import (
+    ContinuousLatentGenerationConfig,
+    ContinuousLatentGenerationResult,
+    build_continuous_generation_config,
+)
 from .helpers import (
     ToyCausalLanguageModel,
     activate_stage2_adapter_deltas,
@@ -18,7 +23,9 @@ from stage2.checkpointing import (
 )
 from stage2.inference import (
     Stage2GenerationConfig,
+    Stage2GenerationResult,
     Stage2InferenceController,
+    build_stage2_generation_config,
 )
 from stage2.peft import (
     ALLOWED_STAGE2_TARGET_SUFFIXES,
@@ -36,6 +43,13 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 
 
 TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
+
+
+def test_stage2_generation_exports_remain_neutral_contract_aliases():
+    """Catches Stage 2 compatibility exports drifting from neutral generation."""
+    assert Stage2GenerationConfig is ContinuousLatentGenerationConfig
+    assert Stage2GenerationResult is ContinuousLatentGenerationResult
+    assert build_stage2_generation_config is build_continuous_generation_config
 
 
 def settings(method: str) -> Stage2TuningConfig:
