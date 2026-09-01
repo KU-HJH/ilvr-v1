@@ -367,6 +367,7 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
     assert args.shard_index == 0
     assert args.model_identity is None
     assert args.max_new_tokens == 4096
+    assert args.max_sequence_length == 32768
 
 
 def _run_main_with_fake_sample(
@@ -400,6 +401,7 @@ def _run_main_with_fake_sample(
             output_json_path=str(output),
             cache_dir="cache",
             max_new_tokens=8,
+            max_sequence_length=32768,
             temperature=0.0,
             top_p=1.0,
             num_shards=num_shards,
@@ -410,6 +412,7 @@ def _run_main_with_fake_sample(
     monkeypatch.setattr(module, "load_evaluation_artifacts", lambda **_kwargs: (object(), object()))
 
     def run_one(_model, _processor, sample, _gen_kwargs):
+        assert _gen_kwargs["max_sequence_length"] == 32768
         index = int(sample["text_input"].rsplit("-", 1)[1])
         if index == fail_index:
             raise RuntimeError("causal sample failure")
@@ -465,6 +468,7 @@ def test_eval_entrypoint_resolves_dataset_relative_image_before_run_one(
             output_json_path=str(output),
             cache_dir="cache",
             max_new_tokens=8,
+            max_sequence_length=32768,
             temperature=0.0,
             top_p=1.0,
             num_shards=1,
@@ -613,6 +617,7 @@ def test_standard_tasks_score_assistant_content_and_record_parse_fields(
             output_json_path=str(output),
             cache_dir="cache",
             max_new_tokens=8,
+            max_sequence_length=32768,
             temperature=0.0,
             top_p=1.0,
             num_shards=1,
@@ -683,6 +688,7 @@ def test_inference_error_rows_preserve_invalid_gold_for_summary(
             output_json_path=str(output),
             cache_dir="cache",
             max_new_tokens=8,
+            max_sequence_length=32768,
             temperature=0.0,
             top_p=1.0,
             num_shards=1,
@@ -752,6 +758,7 @@ def test_four_shard_worker_uses_global_indices_and_writes_success_sidecar(
     assert manifest["model_identity"] == f"direct:{Path('relative-model').absolute()}"
     assert manifest["generation_config"] == {
         "max_new_tokens": 8,
+        "max_sequence_length": 32768,
         "temperature": 0.0,
         "top_p": 1.0,
     }
@@ -804,6 +811,7 @@ def test_empty_four_shard_worker_still_publishes_mergeable_success_sidecar(
             output_json_path=str(output),
             cache_dir="cache",
             max_new_tokens=8,
+            max_sequence_length=32768,
             temperature=0.0,
             top_p=1.0,
             num_shards=4,

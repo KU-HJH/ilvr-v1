@@ -1041,6 +1041,7 @@ class EvaluationPlan:
     base_model_dir: Path | None = None
     cache_dir: Path = _REPOSITORY_ROOT / "cache"
     max_new_tokens: int = 4096
+    max_sequence_length: int = 32768
     temperature: float = 0.0
     top_p: float = 1.0
     attempt_timeout_seconds: int = 24 * 60 * 60
@@ -1093,6 +1094,11 @@ class EvaluationPlan:
             raise ValueError("task_name must be a non-empty string without NUL")
         if type(self.max_new_tokens) is not int or self.max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
+        if (
+            type(self.max_sequence_length) is not int
+            or self.max_sequence_length <= 0
+        ):
+            raise ValueError("max_sequence_length must be positive")
         if (
             type(self.temperature) not in (int, float)
             or not math.isfinite(self.temperature)
@@ -1198,6 +1204,7 @@ def _build_evaluation_commands_for_stage(
             "--output_json_path", str(shard_jsonls[assignment.shard_index]),
             "--cache_dir", str(plan.cache_dir),
             "--max_new_tokens", str(plan.max_new_tokens),
+            "--max_sequence_length", str(plan.max_sequence_length),
             "--temperature", str(plan.temperature),
             "--top_p", str(plan.top_p),
         ]
@@ -2903,6 +2910,7 @@ class EvaluationSubprocessRunner:
             expected_sample_count=self._expected_sample_count(),
             expected_generation_config={
                 "max_new_tokens": self.plan.max_new_tokens,
+                "max_sequence_length": self.plan.max_sequence_length,
                 "temperature": self.plan.temperature,
                 "top_p": self.plan.top_p,
             },

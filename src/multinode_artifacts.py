@@ -2049,7 +2049,10 @@ def validate_evaluation_sidecars(
         raise ValueError("all four evaluation workers require sidecars and JSONLs")
     if type(expected_sample_count) is not int or expected_sample_count < 0:
         raise ValueError("expected sample count must be a nonnegative integer")
-    from src.multinode_evaluation import _validate_generation_config
+    from src.multinode_evaluation import (
+        MANIFEST_SCHEMA_VERSION,
+        _validate_generation_config,
+    )
 
     common_dataset_identity: object | None = None
     generation_config = _validate_generation_config(
@@ -2079,7 +2082,7 @@ def validate_evaluation_sidecars(
             raise ValueError(f"invalid evaluation sidecar fields for shard {shard_index}")
         if (
             type(payload["schema_version"]) is not int
-            or payload["schema_version"] != 2
+            or payload["schema_version"] != MANIFEST_SCHEMA_VERSION
             or type(payload["shard_index"]) is not int
             or payload["shard_index"] != shard_index
             or type(payload["num_shards"]) is not int

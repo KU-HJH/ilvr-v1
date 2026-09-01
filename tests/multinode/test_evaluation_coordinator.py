@@ -170,6 +170,12 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
         ]
         for worker in commands.workers
     } == {"4096"}
+    assert {
+        worker.node_spec.command[
+            worker.node_spec.command.index("--max_sequence_length") + 1
+        ]
+        for worker in commands.workers
+    } == {"32768"}
 
 
 def test_worker_supervisors_bind_exact_evaluation_shard_identity():
@@ -864,6 +870,7 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
             model_identity="task6:" + "a" * 64,
             generation_config={
                 "max_new_tokens": 4096,
+                "max_sequence_length": 32768,
                 "temperature": 0.0,
                 "top_p": 1.0,
             },
@@ -884,6 +891,7 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
             expected_sample_count=4,
             expected_generation_config={
                 "max_new_tokens": 4096,
+                "max_sequence_length": 32768,
                 "temperature": 0.0,
                 "top_p": 1.0,
             },
@@ -926,3 +934,10 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
         "shard-1.jsonl",
         "shard-1.jsonl.manifest.json",
     ]
+    for commands in payload["worker_commands_by_observed_stage"].values():
+        for command in commands:
+            if "--max_sequence_length" in command:
+                option = command.index("--max_sequence_length")
+                assert command[option + 1] == "32768"
+            else:
+                assert "--max_sequence_length 32768" in command[-1]

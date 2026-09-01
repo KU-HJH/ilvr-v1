@@ -100,7 +100,12 @@ def _write_fake_shards(
         processed_indices = indices
     if generation_configs is None:
         generation_configs = (
-            {"max_new_tokens": 4096, "temperature": 0.0, "top_p": 1.0},
+            {
+                "max_new_tokens": 4096,
+                "max_sequence_length": 32768,
+                "temperature": 0.0,
+                "top_p": 1.0,
+            },
         ) * 4
     for shard_index in range(4):
         shard_jsonl = tmp_path / f"shard-{shard_index}.jsonl"
@@ -184,6 +189,7 @@ def test_merge_sorts_rows_and_computes_accuracy_once(tmp_path):
         "valid_gold_accuracy": 4 / 7,
         "generation_config": {
             "max_new_tokens": 4096,
+            "max_sequence_length": 32768,
             "temperature": 0.0,
             "top_p": 1.0,
         },
@@ -236,6 +242,7 @@ def test_merge_preserves_gold_denominators_and_invalid_gold_records(tmp_path):
         "valid_gold_accuracy": 65 / 398,
         "generation_config": {
             "max_new_tokens": 4096,
+            "max_sequence_length": 32768,
             "temperature": 0.0,
             "top_p": 1.0,
         },
@@ -252,10 +259,20 @@ def test_merge_rejects_duplicate_source_index(tmp_path):
 
 def test_merge_rejects_generation_config_mismatch(tmp_path):
     configs = [
-        {"max_new_tokens": 4096, "temperature": 0.0, "top_p": 1.0}
+        {
+            "max_new_tokens": 4096,
+            "max_sequence_length": 32768,
+            "temperature": 0.0,
+            "top_p": 1.0,
+        }
         for _ in range(4)
     ]
-    configs[3] = {"max_new_tokens": 64, "temperature": 0.0, "top_p": 1.0}
+    configs[3] = {
+        "max_new_tokens": 4096,
+        "max_sequence_length": 65536,
+        "temperature": 0.0,
+        "top_p": 1.0,
+    }
     shards = _write_fake_shards(tmp_path, generation_configs=configs)
 
     with pytest.raises(ValueError, match="generation config"):
@@ -273,6 +290,24 @@ def test_merge_keeps_schema_one_sidecar_compatibility(tmp_path):
     summary = _merge(tmp_path, shards, expected_sample_count=4)
 
     assert "generation_config" not in summary
+
+
+def test_merge_keeps_schema_two_generation_config_compatibility(tmp_path):
+    """Reading a pre-sequence-cap sidecar must not require rewriting history."""
+    shards = _write_fake_shards(tmp_path)
+    for path in shards:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 2
+        manifest["generation_config"].pop("max_sequence_length")
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    summary = _merge(tmp_path, shards, expected_sample_count=4)
+
+    assert summary["generation_config"] == {
+        "max_new_tokens": 4096,
+        "temperature": 0.0,
+        "top_p": 1.0,
+    }
 
 
 @pytest.mark.parametrize(

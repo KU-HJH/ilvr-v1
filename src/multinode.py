@@ -2174,6 +2174,7 @@ def _evaluate_main(argv: list[str]) -> int:
     parser.add_argument("--base-model-dir")
     parser.add_argument("--cache-dir", default=str(_REPOSITORY_ROOT / "cache"))
     parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument("--max-sequence-length", type=int, default=32768)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--dry-run", action="store_true")
@@ -2189,6 +2190,7 @@ def _evaluate_main(argv: list[str]) -> int:
             base_model_dir=(Path(args.base_model_dir) if args.base_model_dir else None),
             cache_dir=Path(args.cache_dir),
             max_new_tokens=args.max_new_tokens,
+            max_sequence_length=args.max_sequence_length,
             temperature=args.temperature,
             top_p=args.top_p,
         )

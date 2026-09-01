@@ -1441,3 +1441,29 @@ because the trainer equivalence work is incomplete.
 Approval of design commitment v26 authorizes only the bounded work in Sections
 1--5 and the stop/report in Section 6. It does not authorize a head redesign,
 Stage 2 work, or any epoch training.
+
+## Design commitment v27 amendment: explicit evaluation sequence cap
+
+The user explicitly requires the pending full-400 evaluation to use a total
+sequence-length cap of `32768`. This is distinct from and concurrent with
+`max_new_tokens=4096`: prompt tokens, generated text tokens, and inserted
+latent scaffold tokens together may not exceed `32768`.
+
+The evaluation entry points default to `max_sequence_length=32768`; the fixed
+four-shard coordinator passes that value explicitly to every worker; and the
+new shard-manifest schema records and validates it across all four workers.
+Historical schema-1 and schema-2 manifests remain readable, but only the new
+schema proves the explicit sequence cap. The full-400 launch command must also
+state `--max-sequence-length 32768` rather than relying on a default.
+
+The design-proposal v27 `hate` root was silent propagation failure: setting a
+coordinator value without reaching each worker/controller or its manifest
+would leave the model-config fallback (`128000`) active while the run appeared
+correctly configured. Its first nail was a focused dry-run and worker/manifest
+test. Before implementation those tests failed at all three boundaries; after
+the bounded TDD change they require `32768` in the controller kwargs, every
+worker command, and the merged generation configuration.
+
+This amendment changes no recurrence arithmetic, score rule, training
+configuration, or epoch authorization. The user's approval of v27 applies only
+to this explicit evaluation cap and its auditable propagation.

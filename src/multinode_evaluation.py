@@ -10,7 +10,8 @@ from evaluation.scoring import EvaluationScoreSummary
 
 
 NUM_EVALUATION_SHARDS = 4
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
+GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION = 2
 LEGACY_MANIFEST_SCHEMA_VERSION = 1
 
 
@@ -128,15 +129,24 @@ def _validate_dataset_identity(value: object) -> dict[str, Any]:
     return value
 
 
-def _validate_generation_config(value: object) -> dict[str, Any]:
+def _validate_generation_config(
+    value: object, *, require_sequence_length: bool = True
+) -> dict[str, Any]:
     required = {"max_new_tokens", "temperature", "top_p"}
+    if require_sequence_length:
+        required.add("max_sequence_length")
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("invalid generation config")
     max_new_tokens = value["max_new_tokens"]
+    max_sequence_length = value.get("max_sequence_length")
     temperature = value["temperature"]
     top_p = value["top_p"]
     if not _is_int(max_new_tokens) or max_new_tokens <= 0:
         raise ValueError("invalid generation config max_new_tokens")
+    if require_sequence_length and (
+        not _is_int(max_sequence_length) or max_sequence_length <= 0
+    ):
+        raise ValueError("invalid generation config max_sequence_length")
     if (
         type(temperature) not in (int, float)
         or not math.isfinite(temperature)
@@ -149,11 +159,14 @@ def _validate_generation_config(value: object) -> dict[str, Any]:
         or not 0 < top_p <= 1
     ):
         raise ValueError("invalid generation config top_p")
-    return {
+    normalized = {
         "max_new_tokens": max_new_tokens,
         "temperature": float(temperature),
         "top_p": float(top_p),
     }
+    if require_sequence_length:
+        normalized["max_sequence_length"] = max_sequence_length
+    return normalized
 
 
 def write_shard_manifest(
@@ -239,7 +252,10 @@ def _validate_manifest(
     schema_version = manifest.get("schema_version")
     if not _is_int(schema_version):
         raise ValueError(f"unsupported shard manifest schema in {path}")
-    if schema_version == MANIFEST_SCHEMA_VERSION:
+    if schema_version in (
+        MANIFEST_SCHEMA_VERSION,
+        GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION,
+    ):
         required_fields.add("generation_config")
     elif schema_version != LEGACY_MANIFEST_SCHEMA_VERSION:
         raise ValueError(f"unsupported shard manifest schema in {path}")
@@ -264,9 +280,13 @@ def _validate_manifest(
         "model_identity"
     ].strip():
         raise ValueError(f"invalid model identity in {path}")
-    if schema_version == MANIFEST_SCHEMA_VERSION:
+    if schema_version in (
+        MANIFEST_SCHEMA_VERSION,
+        GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION,
+    ):
         manifest["generation_config"] = _validate_generation_config(
-            manifest["generation_config"]
+            manifest["generation_config"],
+            require_sequence_length=(schema_version == MANIFEST_SCHEMA_VERSION),
         )
     exit_status = manifest["worker_exit_status"]
     if not _is_int(exit_status) or exit_status < 0:

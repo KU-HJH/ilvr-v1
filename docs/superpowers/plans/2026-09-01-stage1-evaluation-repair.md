@@ -22,7 +22,7 @@
 - Report both coverage-penalized `correct / 400` and valid-label `correct / 398`, including invalid indices and reasons.
 - Persist prompt identity/length, generated suffix IDs, raw decode, extracted answer, latent counts, stop reason, and parse/invalid status per row.
 - The actual-3B recurrence gate requires exact discrete scaffold/mask/position/token equality, symmetric relative L2 `<= 1e-6`, and cosine `>= 0.999999` for every latent state and post-end logit.
-- Run exactly one deterministic paper-aligned full-400 evaluation of `checkpoints/stage1-dora-z1-ema-frozen-b1-ga4-e1-egb16-20260901-090240/checkpoint-215` with four shards, `max_new_tokens=4096`, temperature `0`, and top-p `1`.
+- Run exactly one deterministic paper-aligned full-400 evaluation of `checkpoints/stage1-dora-z1-ema-frozen-b1-ga4-e1-egb16-20260901-090240/checkpoint-215` with four shards, `max_new_tokens=4096`, explicit total `max_sequence_length=32768`, temperature `0`, and top-p `1`.
 - Store new model-bearing staging only under `checkpoints/evaluation-staging/<run-id>/`, results under `results/<run-id>/`, and logs under `logs/<run-id>/` or the existing multinode log namespace.
 - Do not train an epoch, redesign the latent head, or begin Stage 2 work.
 
@@ -475,6 +475,7 @@ Reuse the already validated model-bearing artifact at `checkpoints/evaluation-st
   --output-dir "$PWD/results/$EVAL_RUN_ID" \
   --cache-dir "$PWD/cache" \
   --max-new-tokens 4096 \
+  --max-sequence-length 32768 \
   --temperature 0 \
   --top-p 1
 ```
