@@ -6,6 +6,11 @@
 **Supersedes:** only the batch-equivalence portions of
 `2026-08-26-ilvr-stage1-dora-batched-training-design.md`
 
+**Clerical correction (2026-09-01):** The ZeRO-1 digest below was corrected
+to the directly observed SHA-256 of the already-approved
+`configs/deepspeed_zero1.json` bytes. The selected path and configuration
+bytes did not change.
+
 ## 1. Goal
 
 Make Stage 1 `B=2, gradient_accumulation=2` match every controllable training
@@ -81,7 +86,7 @@ attention                     FlashAttention 2
 precision                     BF16 training, FP32 loss reductions
 gradient checkpointing        enabled, non-reentrant for DoRA
 logging / checkpoints         every 20 steps / epoch boundaries 216,432,648
-DeepSpeed config SHA-256      c0922c8640778ae928c5bcacb070f2efaf34b7122431d9b4c2989e25debd
+DeepSpeed config SHA-256      c0922c8640778ae928c503f5bcacb070f2efaf34b7122431d9b4c2989e25debd
 evaluation dataset            data/TEST.jsonl
 evaluation dataset SHA-256    6a1dccf32bb5196d09941adfd8ea79e29b58c34316f286673b557ed29dc69618
 evaluation generation         4 shards, max_new_tokens=4096, temperature=0, top_p=1
