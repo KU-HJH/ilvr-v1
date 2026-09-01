@@ -1,7 +1,7 @@
 # Stage 1 True-Batch Controlled Comparison Design
 
 **Date:** 2026-09-01  
-**Status:** Design commitment v20, pending explicit approval
+**Status:** Design commitment v20, approved 2026-09-01
 **Repository:** `XD111ds/ILVR`  
 **Supersedes:** only the batch-equivalence portions of
 `2026-08-26-ilvr-stage1-dora-batched-training-design.md`
