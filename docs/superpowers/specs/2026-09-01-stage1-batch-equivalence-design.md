@@ -1,7 +1,7 @@
 # Stage 1 True-Batch Equivalence Design
 
 **Date:** 2026-09-01  
-**Status:** Design proposal v7, frozen for critique
+**Status:** Design proposal v8, frozen for critique
 **Repository:** `XD111ds/ILVR`  
 **Supersedes:** only the batch-equivalence portions of
 `2026-08-26-ilvr-stage1-dora-batched-training-design.md`
@@ -95,15 +95,15 @@ prove equivalence for a different experiment rather than the requested one.
 This provides strict gradient equality but is not true batching and forfeits
 the memory and throughput behavior under investigation.
 
-### 3.4 Rejected: a separate one- or two-step real-model gate
+### 3.4 Rejected: separate paired short jobs before the main runs
 
 At the first step both paths use the same initial EMA teacher, so that check
 cannot exercise the moving-teacher feedback loop. A true decoder batch-shape
 difference in the first student update enters the EMA teacher and can alter the
-next step's discrete target selection. Two steps exercise only the first such
-opportunity and do not bound continued feedback. A separate short job would
-also duplicate work. The real witness is therefore the first 64 steps of the
-actual paired runs, paused once for comparison and resumed only on a pass.
+next step's discrete target selection. A separate short B=1/B=2 pair would
+duplicate work without bounding continued feedback. The actual main runs
+provide the common-state first-step witness and the complete trajectory. Only
+one extra B=1 first-step replay is retained to establish the local A/A floor.
 
 ## 4. Canonical Sample Schedule
 
@@ -310,29 +310,23 @@ FP32 deterministic fixtures use `torch.testing.assert_close` with
 `rtol=1e-6` and `atol=1e-7`. Exact integer, boolean, sample-identity,
 selected-index, and step state uses equality.
 
-For each batch configuration separately, the tiny witness also compares an
-uninterrupted four-step run with a two-step stop/resume run continued to step
-four. Canonical sample identity, stochastic draws, student, EMA, optimizer,
-scheduler, and global-step state must match exactly. This isolates staged
-resume correctness before it can confound the B=1/B=2 comparison.
-
-### 8.3 Real 3B, four-GPU staged control audit
+### 8.3 Real 3B, four-GPU online control audit
 
 The approved multi-node route starts the fresh B=1 and B=2 jobs sequentially
 in the `llm_kd` container on `10.1.102.41` and the local node, using four GPUs
-total. Both are configured from the outset for the final 648 optimizer steps,
-including the same 648-step scheduler. A diagnostic stop callback saves and
-pauses each run after optimizer step 64 without changing `max_steps` or the
-scheduler horizon. This is about one tenth of the paired training compute, and
-the successful work is not discarded: both runs resume from those exact
-checkpoints after the comparison passes.
+total. The fresh B=1 reference runs uninterrupted for all 648 optimizer steps
+and records the compact control trace plus the requested tensor anchors. One
+B=1 replay then executes only its first optimizer step from the same immutable
+initial state and the same 648-step scheduler. It is the sole A/A run. Apart
+from run/output identity and its bounded one-step exit, its resolved manifest
+equals the B=1 reference. This measures real four-GPU kernel and collective
+repeatability without another full training run.
 
-After the main B=1 run pauses, one B=1 replay executes only its first optimizer
-step from the same immutable initial state and the same 648-step scheduler. It
-is the sole A/A run. Apart from its run/output identity and diagnostic stop at
-step 1, its resolved manifest equals the main B=1 run. This one-step replay
-measures real four-GPU kernel and collective repeatability without adding a
-third 64-step experiment.
+Only after that A/A check passes does the fresh B=2 candidate start. Its first
+optimizer step is the common-state A/B witness. On a pass, the same process
+continues uninterrupted through step 648 while comparing compact exact-control
+records online against the completed B=1 trace. There is no planned checkpoint
+pause, resume, discarded warm-up, or separate B=1/B=2 short pair.
 
 The launch-gating control audit compares:
 
@@ -354,7 +348,8 @@ The launch-gating control audit compares:
 The main B=1 first step and its A/A replay must match their floating tensors
 with `rtol=1e-6` and `atol=1e-7`; exact identities and discrete states use
 equality. If this repeatability baseline fails, the A/B numerical difference
-cannot be attributed to microbatch grouping and continuation is blocked.
+cannot be attributed to microbatch grouping and the B=2 main run is not
+launched.
 
 Samplewise frozen-visual embeddings and first-step EMA teacher target rows in
 B=1 versus B=2 execute through the same unpadded B=1-shaped calls from
@@ -417,16 +412,17 @@ cost waiver, not evidence that long-horizon A/A variance is zero.
 
 ## 9. Launch Gate and Artifacts
 
-The paired runs may proceed beyond step 64 only after all focused tests, the
-tiny witness, the one-step A/A replay, and the staged control audit pass. A
-control or first-step numerical failure is a result, not a reason to retry with
-looser thresholds; neither main run resumes. Later EMA trajectory divergence
-is reported but does not fail the gate. On a pass, the same B=1/GA=4 and
-B=2/GA=2 runs resume from their step-64 checkpoints and finish three epochs.
-Both are then evaluated with one resolved official evaluation manifest and the
-same fixed test set. Accuracy and exact per-example predictions are reported
-side by side; full-run accuracy equality is an observed comparison, not a
-launch threshold, because permitted GPU numerical differences can compound.
+The B=1 reference may start only after the focused tests and tiny witness pass.
+The B=2 candidate may start only after the B=1 run completes and its one-step
+A/A replay passes. After the B=2 first step, a control or numerical threshold
+failure stops that run and is reported without retrying at looser thresholds.
+On a pass, B=2 continues uninterrupted; later EMA trajectory divergence is
+reported but does not fail the run, while any exact controllable-state mismatch
+does. Both completed models are then evaluated with one resolved official
+evaluation manifest and the same fixed test set. Accuracy and exact
+per-example predictions are reported side by side; full-run accuracy equality
+is an observed comparison, not a launch threshold, because permitted GPU
+numerical differences can compound.
 
 Artifacts follow repository policy:
 
@@ -456,9 +452,9 @@ src/stage1/peft.py           adapter-dropout replacement and stable site names
 src/stage1/types.py          equivalence metadata/diagnostic contracts
 src/stage1/checkpointing.py  RNG schema and resume compatibility metadata
 src/stage1/composition.py    schedule construction and launch validation
-src/stage1/training_evidence.py  staged witness evidence
-src/main.py                  bounded diagnostic-stop argument
-src/multinode.py             reuse of the existing launch/resume route
+src/stage1/training_evidence.py  control/trajectory evidence
+src/main.py                  bounded equivalence-diagnostic arguments
+src/multinode.py             reuse of the existing launch/evaluation route
 tests/stage1/...             focused unit and tiny integration witnesses
 ```
 
@@ -471,7 +467,7 @@ DeepSpeed implementation is changed.
 
 ## 11. Error Handling
 
-Fail before full training for:
+Fail before or during candidate training for:
 
 - non-divisible canonical epoch or rank-local accumulation schedule;
 - missing or duplicate canonical slot IDs within a microbatch;
@@ -503,14 +499,14 @@ infrastructure is outside this design.
   multiple seeds;
 - Stage 2 batch-size work;
 - a new benchmark framework, retry framework, or experiment database;
-- proceeding past step 64 before the staged equivalence gate passes.
+- starting B=2 before the completed B=1 trace and one-step A/A check pass.
 
 ## 13. Completion Claim
 
 Completion means the repository can produce fresh evidence that B=1/GA=4 and
 true B=2/GA=2 use identical manifests outside the approved batch/output
 whitelist and receive the same controllable sample inputs, stochastic draws,
-objectives, schedules, and update boundaries through the staged audit. Their
+objectives, schedules, and update boundaries through the online audit. Their
 common-state first update differs only within the bounded GPU
 forward/backward witness and against a measured A/A repeatability baseline.
 Completion also includes observing the resulting EMA trajectory through all
