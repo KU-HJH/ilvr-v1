@@ -39,6 +39,7 @@ RELATIVE_L2_LIMIT = 1e-6
 COSINE_LIMIT = 0.999999
 BOUNDARY_SOURCE_INDICES = (0, 1, 2, 7)
 BOUNDARY_BUDGETS = (4096, 8192)
+_MISSING = object()
 
 
 def _require_exact_int(value: object, *, name: str) -> int:
@@ -656,6 +657,30 @@ def _is_dora_measurement_parameter(name: str) -> bool:
     )
 
 
+def _boundary_checkpointing_state(model) -> tuple[tuple[object, bool, object], ...]:
+    return tuple(
+        (
+            module,
+            bool(module.gradient_checkpointing),
+            getattr(module, "_gradient_checkpointing_func", _MISSING),
+        )
+        for module in model.modules()
+        if hasattr(module, "gradient_checkpointing")
+    )
+
+
+def _restore_boundary_checkpointing_state(
+    state: Sequence[tuple[object, bool, object]],
+) -> None:
+    for module, enabled, function in state:
+        module.gradient_checkpointing = enabled
+        if function is _MISSING:
+            if hasattr(module, "_gradient_checkpointing_func"):
+                delattr(module, "_gradient_checkpointing_func")
+        else:
+            module._gradient_checkpointing_func = function
+
+
 def boundary_target_parameters(model, token_ids) -> dict[str, object]:
     """Find the exact Stage 1 sparse latent rows and every trainable DoRA tensor."""
     named = {
@@ -855,6 +880,7 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
         for name, parameter in all_parameters.items()
     }
     original_training = model.training
+    original_checkpointing = _boundary_checkpointing_state(model)
     cases: list[dict[str, object]] = []
     all_trainable: dict[str, torch.nn.Parameter] = {}
     restore: dict[str, torch.Tensor] = {}
@@ -882,6 +908,9 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
             name: parameter.detach().clone() for name, parameter in all_trainable.items()
         }
         model.train()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
         for source_row in source_rows:
             index = _require_exact_int(source_row["source_index"], name="source index")
             sample = source_row["sample"]
@@ -948,6 +977,7 @@ def run_boundary_probe(*, model_dir: str, base_model_dir: str, dataset_jsonl: st
         restore_gradients()
         for name, parameter in all_parameters.items():
             parameter.requires_grad_(original_requires_grad[name])
+        _restore_boundary_checkpointing_state(original_checkpointing)
         model.train(original_training)
 
     # These are intentionally real bounded generations. They are invoked only
