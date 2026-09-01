@@ -51,6 +51,89 @@ def test_diagnostic_entrypoint_imports_with_build_marker_outside_pytest_normaliz
     assert "recurrence-probe" in completed.stdout
 
 
+def test_diagnostic_entrypoint_leaves_an_extra_build_marker_invalid():
+    """Catches normalizing an independently invalid trailing-plus version."""
+    repo_root = Path(__file__).resolve().parents[2]
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": f"{repo_root}:{repo_root / 'src'}:{repo_root / 'transformers/src'}",
+    }
+    completed = subprocess.run(
+        [
+            str(repo_root / "venv/ilvr-venv/bin/python"),
+            "-c",
+            """
+import platform
+from packaging.version import InvalidVersion
+
+platform.python_version = lambda: "3.11.15++"
+try:
+    import stage1.evaluation_diagnostics
+except InvalidVersion as error:
+    assert str(error) == "Invalid version: '3.11.15+'"
+else:
+    raise AssertionError("an extra build marker was accepted")
+""",
+        ],
+        cwd=repo_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_diagnostic_entrypoint_restores_platform_after_heavy_import_failure():
+    """Catches a failed heavy import leaking the patched platform callable."""
+    repo_root = Path(__file__).resolve().parents[2]
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": f"{repo_root}:{repo_root / 'src'}:{repo_root / 'transformers/src'}",
+    }
+    completed = subprocess.run(
+        [
+            str(repo_root / "venv/ilvr-venv/bin/python"),
+            "-c",
+            """
+import builtins
+import platform
+
+original = platform.python_version
+real_import = builtins.__import__
+
+def fail_torch_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "torch":
+        raise RuntimeError("simulated heavy import failure")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = fail_torch_import
+try:
+    import stage1.evaluation_diagnostics
+except RuntimeError as error:
+    assert str(error) == "simulated heavy import failure"
+else:
+    raise AssertionError("the simulated heavy import unexpectedly succeeded")
+finally:
+    builtins.__import__ = real_import
+
+assert platform.python_version is original
+assert platform.python_version().endswith("+")
+""",
+        ],
+        cwd=repo_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_tensor_reducers_report_hand_checked_values_and_reject_nonfinite_inputs():
     """Catches a reducer that hides non-finite evidence or mis-ranks a token."""
     vector = torch.tensor([3.0, 4.0])

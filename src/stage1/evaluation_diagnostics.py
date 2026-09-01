@@ -18,20 +18,21 @@ from typing import Any
 
 _platform_python_version = platform.python_version
 if _platform_python_version().endswith("+"):
-    platform.python_version = lambda: _platform_python_version().rstrip("+")
+    platform.python_version = lambda: _platform_python_version().removesuffix("+")
 
-import torch
-import torch.nn.functional as F
+try:
+    import torch
+    import torch.nn.functional as F
 
-from evaluation.continuous_latent import (
-    ContinuousLatentController,
-    ContinuousLatentGenerationConfig,
-)
-from evaluation.runtime import prepare_evaluation_input
-from evaluation.scoring import EvaluationScoreSummary, score_answer
-from stage2.checkpointing import resolve_latent_token_ids
-
-platform.python_version = _platform_python_version
+    from evaluation.continuous_latent import (
+        ContinuousLatentController,
+        ContinuousLatentGenerationConfig,
+    )
+    from evaluation.runtime import prepare_evaluation_input
+    from evaluation.scoring import EvaluationScoreSummary, score_answer
+    from stage2.checkpointing import resolve_latent_token_ids
+finally:
+    platform.python_version = _platform_python_version
 
 
 RELATIVE_L2_LIMIT = 1e-6
