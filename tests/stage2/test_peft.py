@@ -331,8 +331,14 @@ def test_loaded_inference_adapter_is_frozen_and_matches_tuning(tmp_path):
     )
 
     assert report.trainable_parameters == 0
-    assert report.resolved_target_names == tuple(
-        loaded.peft_config["default"].target_modules
+    assert report.resolved_target_names == (
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.v_proj",
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.mlp.gate_proj",
+        "model.layers.0.mlp.up_proj",
+        "model.layers.0.mlp.down_proj",
     )
 
 
