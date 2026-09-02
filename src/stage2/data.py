@@ -256,11 +256,38 @@ class Stage2LengthStats:
     latent_block_distribution: dict[int, int]
 
 
+def summarize_stage2_lengths(*, lengths, latent_block_counts, max_length):
+    """Summarize one already-measured sequence length per prepared example."""
+    lengths = tuple(lengths)
+    latent_block_counts = tuple(latent_block_counts)
+    if not lengths:
+        raise ValueError("cannot compute Stage 2 length statistics for an empty dataset")
+    if len(lengths) != len(latent_block_counts):
+        raise ValueError("lengths and latent block counts must have the same cardinality")
+
+    values = torch.tensor(lengths, dtype=torch.float64)
+    retained = sum(length <= max_length for length in lengths)
+    filtered = len(lengths) - retained
+    return Stage2LengthStats(
+        total=len(lengths),
+        retained=retained,
+        filtered=filtered,
+        filtered_percentage=100.0 * filtered / len(lengths),
+        minimum=min(lengths),
+        median=float(values.quantile(0.50)),
+        p90=float(values.quantile(0.90)),
+        p95=float(values.quantile(0.95)),
+        p99=float(values.quantile(0.99)),
+        maximum=max(lengths),
+        latent_block_distribution=dict(sorted(Counter(latent_block_counts).items())),
+    )
+
+
 def filter_stage2_examples(*, examples, measure_length, max_length):
     """Keep complete samples at or under ``max_length`` and summarize all samples."""
     kept = []
     lengths: list[int] = []
-    block_counts: Counter[int] = Counter()
+    latent_block_counts: list[int] = []
     for example in examples:
         length = int(measure_length(example))
         lengths.append(length)
@@ -277,27 +304,14 @@ def filter_stage2_examples(*, examples, measure_length, max_length):
                 )
             )
         )
-        block_counts[block_count] += 1
+        latent_block_counts.append(block_count)
         if length <= max_length:
             kept.append(example)
 
-    if not lengths:
-        raise ValueError("cannot compute Stage 2 length statistics for an empty dataset")
-
-    values = torch.tensor(lengths, dtype=torch.float64)
-    filtered = len(lengths) - len(kept)
-    stats = Stage2LengthStats(
-        total=len(lengths),
-        retained=len(kept),
-        filtered=filtered,
-        filtered_percentage=100.0 * filtered / len(lengths),
-        minimum=min(lengths),
-        median=float(values.quantile(0.50)),
-        p90=float(values.quantile(0.90)),
-        p95=float(values.quantile(0.95)),
-        p99=float(values.quantile(0.99)),
-        maximum=max(lengths),
-        latent_block_distribution=dict(sorted(block_counts.items())),
+    stats = summarize_stage2_lengths(
+        lengths=lengths,
+        latent_block_counts=latent_block_counts,
+        max_length=max_length,
     )
     logger.info("Stage 2 length statistics: %s", asdict(stats))
     return kept, stats
