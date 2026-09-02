@@ -26,6 +26,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)
+    parser.add_argument("--stage2_diagnostics_interval", type=int, default=0)
     parser.add_argument("--save_steps", type=int, default=612)
     parser.add_argument("--compress_strategy", type=str, default='average', choices=['average'])
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -139,6 +140,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("per_device_train_batch_size must be at least 1")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
+    if args.stage2_diagnostics_interval < 0:
+        raise ValueError("Stage 2 diagnostics interval must be non-negative")
     if args.stage == "stage2":
         if args.use_lora:
             raise ValueError(

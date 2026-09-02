@@ -56,6 +56,8 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         REQUIRED_ENV["LOG_FILE"],
         "--latent_size",
         "8",
+        "--stage2_diagnostics_interval",
+        "0",
         "--supervise_latent_boundaries",
         "--learning_rate",
         "1e-5",
@@ -87,6 +89,7 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         run_launcher(
             env_overrides={
                 "LATENT_SIZE": "12",
+                "STAGE2_DIAGNOSTICS_INTERVAL": "4",
                 "SUPERVISE_LATENT_BOUNDARIES": "false",
                 "LEARNING_RATE": "2e-5",
                 "GRADIENT_ACCUMULATION_STEPS": "16",
@@ -99,9 +102,11 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         )
     )
 
-    assert arguments[-18:] == [
+    assert arguments[-20:] == [
         "--latent_size",
         "12",
+        "--stage2_diagnostics_interval",
+        "4",
         "--no-supervise_latent_boundaries",
         "--learning_rate",
         "2e-5",
@@ -154,6 +159,20 @@ def test_stage2_launcher_rejects_non_positive_integer_settings():
         assert f"{name} must be a positive integer" in result.stderr
 
 
+@pytest.mark.parametrize("value", ("-1", "1.5", "often"))
+def test_stage2_launcher_rejects_invalid_diagnostics_interval(value):
+    """Catches malformed diagnostic cadences reaching Python startup."""
+    result = run_launcher(
+        env_overrides={"STAGE2_DIAGNOSTICS_INTERVAL": value}
+    )
+
+    assert result.returncode == 2
+    assert (
+        "STAGE2_DIAGNOSTICS_INTERVAL must be a non-negative integer"
+        in result.stderr
+    )
+
+
 def test_stage2_launcher_rejects_invalid_learning_rate():
     """Catches a malformed or zero learning rate before training starts."""
     for value in ("fast", "0", "-1", "1e999", "1e-9999", "nan", "inf", "-inf"):
@@ -171,6 +190,7 @@ MANAGED_OPTIONS = (
     "--save_model_path",
     "--log_file",
     "--latent_size",
+    "--stage2_diagnostics_interval",
     "--supervise_latent_boundaries",
     "--no-supervise_latent_boundaries",
     "--learning_rate",

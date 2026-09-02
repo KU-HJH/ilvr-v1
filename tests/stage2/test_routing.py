@@ -43,9 +43,11 @@ from stage2.sampler import LatentBlockBalancedSampler
 class DiagnosticStage2Model:
     def __init__(self):
         self.last_inputs = None
+        self.diagnostics_requests = []
 
     def __call__(self, **inputs):
         self.last_inputs = inputs
+        self.diagnostics_requests.append(inputs["collect_stage2_diagnostics"])
         return SimpleNamespace(
             loss=torch.tensor(2.0, requires_grad=True),
             stage2_diagnostics={
@@ -60,9 +62,16 @@ class DiagnosticStage2Model:
         )
 
 
+def stage2_trainer_for_compute_loss(*, diagnostics_interval):
+    trainer = object.__new__(Stage2Trainer)
+    trainer.stage2_diagnostics_interval = diagnostics_interval
+    trainer._stage2_microbatch_index = 0
+    return trainer
+
+
 def test_stage2_trainer_collects_detached_model_native_diagnostics():
     """Catches generic Trainer calls silently disabling Stage 2 observability."""
-    trainer = object.__new__(Stage2Trainer)
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=1)
     model = DiagnosticStage2Model()
 
     loss, outputs = trainer.compute_loss(
@@ -86,7 +95,7 @@ def test_stage2_trainer_collects_detached_model_native_diagnostics():
 
 def test_stage2_trainer_requests_loss_only_when_outputs_are_not_returned():
     """Catches ordinary training projecting full logits unnecessarily."""
-    trainer = object.__new__(Stage2Trainer)
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
     model = DiagnosticStage2Model()
 
     loss = trainer.compute_loss(
@@ -95,6 +104,28 @@ def test_stage2_trainer_requests_loss_only_when_outputs_are_not_returned():
 
     assert loss.item() == 2.0
     assert model.last_inputs["stage2_loss_only"] is True
+
+
+def test_stage2_trainer_diagnostics_interval_schedules_microbatches():
+    """Catches diagnostics running every batch or drifting from a zero-based cadence."""
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=2)
+    model = DiagnosticStage2Model()
+
+    for _ in range(5):
+        trainer.compute_loss(model, {"input_ids": torch.ones(1, 3)})
+
+    assert model.diagnostics_requests == [True, False, True, False, True]
+
+
+def test_stage2_trainer_diagnostics_interval_zero_disables_diagnostics():
+    """Catches the opt-in default still requesting diagnostic tensor work."""
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
+    model = DiagnosticStage2Model()
+
+    for _ in range(3):
+        trainer.compute_loss(model, {"input_ids": torch.ones(1, 3)})
+
+    assert model.diagnostics_requests == [False, False, False]
 
 
 def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(
@@ -136,7 +167,7 @@ def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(
 
 def test_stage2_trainer_rejects_helper_image_tensors_before_model_call():
     """Catches Stage 1 helper-image tensors leaking past the Trainer boundary."""
-    trainer = object.__new__(Stage2Trainer)
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
     model = DiagnosticStage2Model()
 
     with pytest.raises(ValueError, match="helper-image tensors leaked"):
@@ -233,6 +264,25 @@ def test_boundary_supervision_is_one_default_true_boolean():
         .supervise_latent_boundaries
         is False
     )
+
+
+def test_stage2_diagnostics_interval_defaults_to_disabled():
+    """Catches Stage 2 diagnostics becoming an implicit training cost."""
+    assert parse_args(["--stage", "stage2"]).stage2_diagnostics_interval == 0
+
+
+@pytest.mark.parametrize("interval", [-1, -2])
+def test_stage2_rejects_negative_diagnostics_interval(interval):
+    """Catches negative diagnostic cadences reaching the trainer."""
+    with pytest.raises(ValueError, match="diagnostics interval"):
+        parse_args(
+            [
+                "--stage",
+                "stage2",
+                "--stage2_diagnostics_interval",
+                str(interval),
+            ]
+        )
 
 
 def test_fresh_stage2_tuning_defaults_to_full():
@@ -462,6 +512,7 @@ def stage2_args(**overrides):
         lora_alpha=8,
         lora_dropout=0.0,
         lora_target_modules="q_proj,v_proj",
+        stage2_diagnostics_interval=0,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -760,6 +811,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         log_file=str(tmp_path / "train.log"),
         cache_dir=str(tmp_path / "cache"),
         save_final_model=True,
+        stage2_diagnostics_interval=3,
     )
     processor = RecordingSavedProcessor()
     model = object()
@@ -797,6 +849,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         "processing_class": processor,
         "stage2_peft_metadata": "preserved-sidecar",
         "deepspeed_runtime_profile": args.deepspeed_runtime_profile,
+        "stage2_diagnostics_interval": 3,
     }
     assert trainer.resume_path == "stage2/checkpoint-4"
     assert trainer.saved_path == "out"

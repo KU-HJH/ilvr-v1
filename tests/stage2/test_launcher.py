@@ -13,7 +13,6 @@ REQUIRED_ENV = {
     "DATA_PATH": "/datasets/train data.jsonl",
     "IMAGE_ROOT": "/datasets/images root",
     "OUTPUT_DIR": "/outputs/stage 2",
-    "LOG_FILE": "/logs/stage 2.log",
 }
 
 
@@ -37,6 +36,11 @@ def dry_run_tokens(result):
 
 def option_value(tokens: list[str], option: str) -> str:
     return tokens[tokens.index(option) + 1]
+
+
+CANONICAL_DEFAULT_LOG = (
+    "/root/workspace/ILVR/logs/zero-stage-compatibility/stage 2/train.log"
+)
 
 
 def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path):
@@ -69,9 +73,11 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "--save_model_path",
         REQUIRED_ENV["OUTPUT_DIR"],
         "--log_file",
-        REQUIRED_ENV["LOG_FILE"],
+        CANONICAL_DEFAULT_LOG,
         "--latent_size",
         "8",
+        "--stage2_diagnostics_interval",
+        "0",
         "--supervise_latent_boundaries",
         "--learning_rate",
         "1e-5",

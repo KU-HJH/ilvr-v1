@@ -31,6 +31,7 @@ LORA_ALPHA=${LORA_ALPHA-64}
 LORA_DROPOUT=${LORA_DROPOUT-0.05}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
 LATENT_SIZE=${LATENT_SIZE:-8}
+STAGE2_DIAGNOSTICS_INTERVAL=${STAGE2_DIAGNOSTICS_INTERVAL:-0}
 SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-8}
@@ -47,6 +48,7 @@ MANAGED_OPTIONS=(
   --save_model_path
   --log_file
   --latent_size
+  --stage2_diagnostics_interval
   --supervise_latent_boundaries
   --no-supervise_latent_boundaries
   --learning_rate
@@ -91,7 +93,17 @@ require_positive_integer() {
   fi
 }
 
+require_non_negative_integer() {
+  local name=$1
+  local value=$2
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s must be a non-negative integer\n' "$name" >&2
+    exit 2
+  fi
+}
+
 require_positive_integer LATENT_SIZE "$LATENT_SIZE"
+require_non_negative_integer STAGE2_DIAGNOSTICS_INTERVAL "$STAGE2_DIAGNOSTICS_INTERVAL"
 require_positive_integer GRADIENT_ACCUMULATION_STEPS "$GRADIENT_ACCUMULATION_STEPS"
 require_positive_integer MAX_SEQUENCE_LENGTH "$MAX_SEQUENCE_LENGTH"
 require_positive_integer LORA_R "$LORA_R"
@@ -220,6 +232,7 @@ TRAINING_ARGS=(
   --save_model_path "$OUTPUT_DIR"
   --log_file "$LOG_FILE"
   --latent_size "$LATENT_SIZE"
+  --stage2_diagnostics_interval "$STAGE2_DIAGNOSTICS_INTERVAL"
   "${BOUNDARY_ARGS[@]}"
   --learning_rate "$LEARNING_RATE"
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"

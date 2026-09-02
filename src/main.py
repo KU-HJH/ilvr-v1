@@ -516,6 +516,7 @@ def run_stage2(args):
         processing_class=components.processor,
         stage2_peft_metadata=components.peft_metadata,
         deepspeed_runtime_profile=profile,
+        stage2_diagnostics_interval=args.stage2_diagnostics_interval,
     )
     trainer.train(resume_from_checkpoint=components.trainer_resume_path)
     if args.save_final_model:

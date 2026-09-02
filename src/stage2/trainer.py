@@ -35,6 +35,7 @@ class Stage2Trainer(Trainer):
         *args,
         deepspeed_runtime_profile: DeepSpeedRuntimeProfile | None = None,
         stage2_peft_metadata=None,
+        stage2_diagnostics_interval: int = 0,
         **kwargs,
     ):
         if deepspeed_runtime_profile is None:
@@ -62,6 +63,8 @@ class Stage2Trainer(Trainer):
         self.stage2_peft_metadata = stage2_peft_metadata
         self.stage2_sampler_identity: Stage2SamplerIdentity | None = None
         self._stage2_train_sampler: LatentBlockBalancedSampler | None = None
+        self.stage2_diagnostics_interval = stage2_diagnostics_interval
+        self._stage2_microbatch_index = 0
         super().__init__(*args, **kwargs)
 
     def _publish_deepspeed_runtime_identity(
@@ -211,6 +214,11 @@ class Stage2Trainer(Trainer):
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
+        interval = self.stage2_diagnostics_interval
+        collect_diagnostics = (
+            interval > 0 and self._stage2_microbatch_index % interval == 0
+        )
+        self._stage2_microbatch_index += 1
         forbidden = {"pixel_values_latent", "image_grid_thw_latent"} & inputs.keys()
         if forbidden:
             raise ValueError(
@@ -219,7 +227,7 @@ class Stage2Trainer(Trainer):
         outputs = model(
             **inputs,
             stage2_loss_only=not return_outputs,
-            collect_stage2_diagnostics=True,
+            collect_stage2_diagnostics=collect_diagnostics,
         )
         diagnostics = getattr(outputs, "stage2_diagnostics", None)
         self._latest_stage2_diagnostics = (
