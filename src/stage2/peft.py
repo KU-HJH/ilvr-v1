@@ -219,7 +219,10 @@ def _stage2_adapter_target_names(
         raise ValueError("Stage 2 PEFT tuning requires a PeftModel")
 
     config = model.peft_config["default"]
-    target_names = tuple(config.target_modules)
+    configured_targets = config.target_modules
+    target_names = tuple(
+        getattr(model.base_model, "targeted_module_names", ())
+    )
     modules = dict(qwen.named_modules())
     unapproved = sorted(
         name
@@ -237,6 +240,27 @@ def _stage2_adapter_target_names(
         and name.rsplit(".", 1)[-1] in requested
         and isinstance(getattr(module, "base_layer", module), torch.nn.Linear)
     }
+    valid_patterns = (
+        not isinstance(configured_targets, str)
+        and isinstance(configured_targets, (list, set, tuple))
+        and bool(configured_targets)
+        and all(
+            isinstance(target, str) and target for target in configured_targets
+        )
+        and len(configured_targets) == len(set(configured_targets))
+    )
+    configured_matches = (
+        {
+            name
+            for name in modules
+            if any(
+                name == pattern or name.endswith(f".{pattern}")
+                for pattern in configured_targets
+            )
+        }
+        if valid_patterns
+        else set()
+    )
     if (
         not target_names
         or config.modules_to_save is not None
@@ -244,7 +268,7 @@ def _stage2_adapter_target_names(
         or any(name not in modules or not hasattr(modules[name], "lora_A") for name in target_names)
     ):
         raise ValueError("Stage 2 PEFT adapter targets must be decoder LoRA modules")
-    if set(target_names) != expected_targets:
+    if configured_matches != expected_targets or set(target_names) != expected_targets:
         raise ValueError("loaded adapter targets do not match Stage 2 tuning")
     return target_names
 

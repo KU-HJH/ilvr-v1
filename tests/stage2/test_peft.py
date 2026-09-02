@@ -1,3 +1,4 @@
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -154,6 +155,23 @@ def test_stage2_peft_targets_only_decoder_modules(method, use_dora):
     assert config.modules_to_save is None
     assert all(name.startswith("model.layers.") for name in config.target_modules)
     assert not any("visual" in name for name in config.target_modules)
+
+
+def test_stage2_peft_accepts_optimized_target_selectors_for_multilayer_decoder():
+    """Catches treating PEFT's compact target selectors as resolved module names."""
+    base = tiny_stage2_qwen()
+    base.model.layers = nn.ModuleList(
+        [deepcopy(base.model.layers[0]) for _ in range(3)]
+    )
+    base.config.num_hidden_layers = 3
+
+    wrapped = build_stage2_tuned_model(base, settings("dora"))
+    report = validate_stage2_parameter_boundary(wrapped, settings("dora"))
+
+    assert len(report.resolved_target_names) == 21
+    assert all(
+        name.startswith("model.layers.") for name in report.resolved_target_names
+    )
 
 
 def test_wrapper_resolver_handles_deepspeed_then_peft():
