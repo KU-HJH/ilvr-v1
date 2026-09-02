@@ -85,6 +85,14 @@ def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPa
                 raise ValueError(
                     f"{attribute} must use result experiment ID {experiment_id}"
                 )
+    manifest = getattr(args, "stage2_length_manifest", None)
+    if manifest is not None:
+        manifest_path = require_canonical_artifact_path(manifest, kind="result")
+        expected_manifest = paths.result_dir / "stage2-length-manifest.json"
+        if manifest_path != expected_manifest:
+            raise ValueError(
+                "stage2_length_manifest must use the run stage2-length-manifest.json"
+            )
     return paths
 
 
@@ -106,6 +114,7 @@ def _main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--benchmark-run-config")
     run_parser.add_argument("--benchmark-evidence-path")
     run_parser.add_argument("--benchmark-smoke-resume-witness")
+    run_parser.add_argument("--stage2-length-manifest")
     args = parser.parse_args(argv)
     try:
         if args.command == "resolve":
@@ -120,6 +129,7 @@ def _main(argv: list[str] | None = None) -> int:
                     benchmark_run_config=args.benchmark_run_config,
                     benchmark_evidence_path=args.benchmark_evidence_path,
                     benchmark_smoke_resume_witness=args.benchmark_smoke_resume_witness,
+                    stage2_length_manifest=args.stage2_length_manifest,
                 )
             )
             print(_json_paths(paths))

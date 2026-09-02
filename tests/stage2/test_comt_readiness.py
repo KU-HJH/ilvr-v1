@@ -50,6 +50,8 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         REQUIRED_ENV["DATA_PATH"],
         "--image_root",
         REQUIRED_ENV["IMAGE_ROOT"],
+        "--dataloader_num_workers",
+        "0",
         "--save_model_path",
         REQUIRED_ENV["OUTPUT_DIR"],
         "--log_file",
@@ -80,7 +82,23 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         "0.05",
         "--lora_target_modules",
         "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        "--stage2_length_manifest",
+        "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json",
+        "--stage2_length_manifest_sha256",
+        "0" * 64,
     ]
+
+
+def test_stage2_launcher_dry_run_owns_length_manifest_and_dataloader_num_workers():
+    """Catches a dry run omitting the rank-shared manifest or worker contract."""
+    arguments = resolved_launcher_arguments(
+        run_launcher(env_overrides={"DATALOADER_NUM_WORKERS": "2"})
+    )
+
+    manifest = "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json"
+    assert arguments[arguments.index("--stage2_length_manifest") + 1] == manifest
+    assert arguments[arguments.index("--stage2_length_manifest_sha256") + 1] == "0" * 64
+    assert arguments[arguments.index("--dataloader_num_workers") + 1] == "2"
 
 
 def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
@@ -102,7 +120,7 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         )
     )
 
-    assert arguments[-20:] == [
+    assert arguments[arguments.index("--latent_size") :] == [
         "--latent_size",
         "12",
         "--stage2_diagnostics_interval",
@@ -123,6 +141,10 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         "/outputs/checkpoint 20",
         "--deepspeed_config",
         "/configs/zero 3.json",
+        "--stage2_length_manifest",
+        "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json",
+        "--stage2_length_manifest_sha256",
+        "0" * 64,
     ]
 
 
@@ -253,7 +275,8 @@ def test_stage2_launcher_preserves_unmanaged_passthrough_and_quoting():
     )
 
     arguments = resolved_launcher_arguments(result)
-    assert arguments[-4:] == [
+    passthrough_start = arguments.index("--max_steps")
+    assert arguments[passthrough_start : passthrough_start + 4] == [
         "--max_steps",
         "7",
         "--evaluation_output_path",

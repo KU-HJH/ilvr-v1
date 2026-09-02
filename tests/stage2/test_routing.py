@@ -12,6 +12,7 @@ from transformers import Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 import main
+import stage2.length_manifest as length_manifest_module
 from .helpers import tiny_stage2_qwen
 from main import (
     CustomTrainerStage1,
@@ -513,9 +514,72 @@ def stage2_args(**overrides):
         lora_dropout=0.0,
         lora_target_modules="q_proj,v_proj",
         stage2_diagnostics_interval=0,
+        stage2_length_manifest=None,
+        stage2_length_manifest_sha256=None,
+        dataloader_num_workers=0,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--stage2_length_manifest", "manifest.json"], "must be provided together"),
+        (["--stage2_length_manifest_sha256", "a" * 64], "must be provided together"),
+        (["--dataloader_num_workers", "-1"], "must be non-negative"),
+    ],
+)
+def test_stage2_cli_rejects_incomplete_length_manifest_or_negative_dataloader_num_workers(argv, message):
+    """Catches Stage 2 accepting an unverifiable manifest or invalid workers."""
+    with pytest.raises(ValueError, match=message):
+        parse_args(["--stage", "stage2", *argv])
+
+
+def test_stage2_length_manifest_rejects_wrong_sha_or_configuration(
+    monkeypatch, tmp_path
+):
+    """Catches ranks accepting a different sealed file or a conflicting length policy."""
+    import hashlib
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"sealed manifest")
+    data_path = tmp_path / "data.jsonl"
+    data_path.write_bytes(b"[]\n")
+    manifest = SimpleNamespace(
+        data_sha256=hashlib.sha256(data_path.read_bytes()).hexdigest(),
+        processor_sha256="processor-digest",
+        latent_size=2,
+        supervise_latent_boundaries=True,
+        max_sequence_length=8,
+    )
+    monkeypatch.setattr(
+        length_manifest_module, "read_stage2_length_manifest", lambda path: manifest
+    )
+    monkeypatch.setattr(
+        length_manifest_module, "_processor_sha256", lambda processor: "processor-digest"
+    )
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        length_manifest_module.validate_stage2_length_manifest(
+            path=manifest_path,
+            expected_sha256="0" * 64,
+            data_path=data_path,
+            processor=object(),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=8,
+        )
+    with pytest.raises(ValueError, match="configuration"):
+        length_manifest_module.validate_stage2_length_manifest(
+            path=manifest_path,
+            expected_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            data_path=data_path,
+            processor=object(),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=9,
+        )
 
 
 def _stub_stage2_data_pipeline(monkeypatch, calls):
@@ -655,6 +719,60 @@ def test_stage2_components_compose_full_or_adapter_models_from_decision(
         )
 
 
+def test_stage2_components_select_length_manifest_indices_without_remeasuring_images(
+    monkeypatch, tmp_path
+):
+    """Catches each rank repeating image-aware length filtering after a sealed audit."""
+    calls = SimpleNamespace(prepared=[], filtered=None, sources=[])
+    processor = CompositionProcessor()
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    decision = Stage2LoadDecision(
+        base_model_source="stage1/base",
+        processor_source="stage1/processor",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=Stage2TuningConfig(
+            method="full", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+        ),
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"sealed manifest")
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", lambda source: processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **kwargs: model,
+    )
+    _stub_stage2_data_pipeline(monkeypatch, calls)
+    monkeypatch.setattr(
+        main,
+        "build_prepared_example_length_measure",
+        lambda processor: pytest.fail("manifest path must not remeasure image-aware lengths"),
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_stage2_length_manifest",
+        lambda **kwargs: SimpleNamespace(retained_indices=(2, 0)),
+        raising=False,
+    )
+
+    components = build_stage2_training_components(
+        stage2_args(
+            stage2_length_manifest=str(manifest_path),
+            stage2_length_manifest_sha256=__import__("hashlib").sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+        )
+    )
+
+    assert calls.filtered is None
+    assert components.train_dataset == [3, 1]
+
+
 def test_stage2_peft_resume_validates_stage1_before_mutation_and_preserves_sidecar(
     monkeypatch, tmp_path
 ):
@@ -757,6 +875,19 @@ def test_stage2_training_arguments_create_fresh_optimizer_configuration():
     assert training_args.max_steps == 13
     assert training_args.gradient_checkpointing is True
     assert training_args.gradient_checkpointing_kwargs == {"use_reentrant": False}
+
+
+@pytest.mark.parametrize("worker_count", (0, 2))
+def test_stage2_training_arguments_set_requested_dataloader_workers(worker_count):
+    """Catches Stage 2 silently falling back to an implicit data-loader worker count."""
+    training_args = build_stage2_training_arguments(
+        stage2_args(dataloader_num_workers=worker_count)
+    )
+
+    assert training_args.dataloader_num_workers == worker_count
+    assert training_args.dataloader_prefetch_factor == (
+        None if worker_count == 0 else 2
+    )
 
 
 def test_stage2_training_arguments_omit_checkpoint_kwargs_when_disabled():

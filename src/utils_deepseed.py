@@ -74,6 +74,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max_seq_length_train", type=int, default=8192,
         help="Stage-2")  # 改默认 8192
+    parser.add_argument("--stage2_length_manifest")
+    parser.add_argument("--stage2_length_manifest_sha256")
+    parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument(
         "--supervise_latent_boundaries",
         action=argparse.BooleanOptionalAction,
@@ -143,6 +146,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
     if args.stage == "stage2":
+        manifest_fields = (
+            args.stage2_length_manifest,
+            args.stage2_length_manifest_sha256,
+        )
+        if any(manifest_fields) and not all(manifest_fields):
+            raise ValueError(
+                "--stage2_length_manifest and --stage2_length_manifest_sha256 must be provided together"
+            )
+        if args.dataloader_num_workers < 0:
+            raise ValueError("Stage 2 dataloader_num_workers must be non-negative")
         if args.use_lora:
             raise ValueError(
                 "Stage 2 does not accept --use_lora; use --tuning_method lora"

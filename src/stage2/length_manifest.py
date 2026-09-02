@@ -136,6 +136,40 @@ def _processor_sha256(processor) -> str:
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def validate_stage2_length_manifest(
+    *,
+    path: str | Path,
+    expected_sha256: str,
+    data_path: str | Path,
+    processor,
+    latent_size: int,
+    supervise_latent_boundaries: bool,
+    max_sequence_length: int,
+) -> Stage2LengthManifest:
+    """Require one sealed manifest to bind the current Stage 2 inputs."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"manifest path must be a regular file: {path}")
+    manifest_bytes = path.read_bytes()
+    actual_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("Stage 2 length manifest SHA-256 does not match")
+    manifest = read_stage2_length_manifest(path)
+    if path.read_bytes() != manifest_bytes:
+        raise ValueError("Stage 2 length manifest changed while being read")
+    if hashlib.sha256(Path(data_path).read_bytes()).hexdigest() != manifest.data_sha256:
+        raise ValueError("Stage 2 length manifest data SHA-256 does not match")
+    if _processor_sha256(processor) != manifest.processor_sha256:
+        raise ValueError("Stage 2 length manifest processor identity does not match")
+    if (
+        manifest.latent_size,
+        manifest.supervise_latent_boundaries,
+        manifest.max_sequence_length,
+    ) != (latent_size, supervise_latent_boundaries, max_sequence_length):
+        raise ValueError("Stage 2 length manifest configuration does not match")
+    return manifest
+
+
 def _require_int(name: str, value, *, minimum: int | None = None) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
@@ -457,3 +491,40 @@ def write_stage2_length_manifest(
         if existing != manifest:
             raise ValueError(f"path already contains a different Stage 2 length manifest: {path}")
     return path
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Build and exclusively publish the one pre-distributed length manifest."""
+    import argparse
+
+    from transformers import AutoProcessor
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-path", required=True)
+    parser.add_argument("--image-root", required=True)
+    parser.add_argument("--processor-source", required=True)
+    parser.add_argument("--latent-size", required=True, type=int)
+    parser.add_argument(
+        "--supervise-latent-boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--max-sequence-length", required=True, type=int)
+    parser.add_argument("--manifest-path", required=True)
+    args = parser.parse_args(argv)
+    processor = AutoProcessor.from_pretrained(args.processor_source)
+    manifest = build_stage2_length_manifest(
+        data_path=args.data_path,
+        image_root=args.image_root,
+        processor=processor,
+        processor_source=args.processor_source,
+        latent_size=args.latent_size,
+        supervise_latent_boundaries=args.supervise_latent_boundaries,
+        max_sequence_length=args.max_sequence_length,
+    )
+    write_stage2_length_manifest(args.manifest_path, manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

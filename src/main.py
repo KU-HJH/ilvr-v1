@@ -72,6 +72,7 @@ from stage2.data import (
     load_jsonl_examples,
     prepare_stage2_example,
 )
+from stage2.length_manifest import validate_stage2_length_manifest
 from stage2.trainer import Stage2Trainer
 from stage2.peft import (
     build_stage2_tuned_model,
@@ -200,6 +201,25 @@ def build_stage2_training_components(
         validate_stage2_sparse_processor(
             processor.tokenizer, decision.peft_metadata
         )
+    manifest_path = getattr(args, "stage2_length_manifest", None)
+    manifest_sha256 = getattr(args, "stage2_length_manifest_sha256", None)
+    if bool(manifest_path) != bool(manifest_sha256):
+        raise ValueError(
+            "--stage2_length_manifest and --stage2_length_manifest_sha256 must be provided together"
+        )
+    manifest = (
+        validate_stage2_length_manifest(
+            path=manifest_path,
+            expected_sha256=manifest_sha256,
+            data_path=args.data_path,
+            processor=processor,
+            latent_size=decision.latent_size,
+            supervise_latent_boundaries=decision.supervise_latent_boundaries,
+            max_sequence_length=args.max_seq_length_train,
+        )
+        if manifest_path is not None
+        else None
+    )
     stage1_preflight = None
     stage1_metadata = None
     if decision.stage1_adapter_source is not None:
@@ -366,11 +386,14 @@ def build_stage2_training_components(
         )
         for item in selected_examples
     ]
-    kept, _length_stats = filter_stage2_examples(
-        examples=prepared,
-        measure_length=build_prepared_example_length_measure(processor),
-        max_length=args.max_seq_length_train,
-    )
+    if manifest is None:
+        kept, _length_stats = filter_stage2_examples(
+            examples=prepared,
+            measure_length=build_prepared_example_length_measure(processor),
+            max_length=args.max_seq_length_train,
+        )
+    else:
+        kept = [prepared[index] for index in manifest.retained_indices]
     collator = Stage2DataCollator(
         processor,
         token_ids,
@@ -390,6 +413,12 @@ def build_stage2_training_components(
 
 def build_stage2_training_arguments(args) -> SFTConfig:
     validate_stage2_distributed_settings(args.per_device_train_batch_size)
+    dataloader_num_workers = getattr(args, "dataloader_num_workers", 0)
+    if dataloader_num_workers < 0:
+        raise ValueError("Stage 2 dataloader_num_workers must be non-negative")
+    dataloader_kwargs = {"dataloader_num_workers": dataloader_num_workers}
+    if dataloader_num_workers > 0:
+        dataloader_kwargs["dataloader_prefetch_factor"] = 2
     return SFTConfig(
         output_dir=args.save_model_path,
         num_train_epochs=args.epochs,
@@ -418,6 +447,7 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         ),
         deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False,
+        **dataloader_kwargs,
     )
 
 # ==============================================================

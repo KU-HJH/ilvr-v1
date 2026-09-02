@@ -60,6 +60,22 @@ def test_generated_checkpoint_result_and_log_share_experiment_id(stage1_args):
     assert validate_generated_artifact_paths(stage1_args) == paths
 
 
+def test_generated_paths_accept_only_the_run_stage2_length_manifest(stage1_args):
+    """Catches a Stage 2 manifest being published outside its run result directory."""
+    paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
+    stage1_args.save_model_path = str(paths.checkpoint_dir)
+    stage1_args.log_file = str(paths.log_dir / "train.log")
+    stage1_args.stage2_length_manifest = str(
+        paths.result_dir / "stage2-length-manifest.json"
+    )
+
+    assert validate_generated_artifact_paths(stage1_args) == paths
+
+    stage1_args.stage2_length_manifest = str(paths.result_dir / "other.json")
+    with pytest.raises(ValueError, match="stage2_length_manifest"):
+        validate_generated_artifact_paths(stage1_args)
+
+
 def test_generated_paths_reject_different_canonical_experiment_ids(stage1_args):
     """Catches launcher preflight accepting separate canonical run directories."""
     checkpoint = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
