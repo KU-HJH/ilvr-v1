@@ -1,6 +1,8 @@
+import hashlib
 import json
 import os
 from dataclasses import FrozenInstanceError, asdict
+from pathlib import Path
 
 import pytest
 import torch
@@ -63,6 +65,17 @@ class ManifestProcessor:
         self.measure_calls += 1
         length = 10 if "long answer" in kwargs["text"][0] else 8
         return {"input_ids": torch.zeros((1, length), dtype=torch.long)}
+
+
+class ImageMutatingProcessor(ManifestProcessor):
+    def __init__(self, image_path):
+        super().__init__()
+        self.image_path = image_path
+
+    def __call__(self, **kwargs):
+        result = super().__call__(**kwargs)
+        Image.new("RGB", (7, 9), color="green").save(self.image_path)
+        return result
 
 
 @pytest.fixture
@@ -259,3 +272,63 @@ def test_manifest_dataclass_is_frozen(manifest_inputs, processor):
     with pytest.raises(FrozenInstanceError):
         manifest.max_sequence_length = 10
     assert isinstance(manifest, Stage2LengthManifest)
+
+
+def test_manifest_nested_distribution_is_immutable(manifest_inputs, processor):
+    """Catches mutation through the frozen stats dataclass's nested mapping."""
+    manifest = build_manifest(manifest_inputs, processor)
+
+    with pytest.raises(TypeError, match="immutable"):
+        manifest.stats.latent_block_distribution[9] = 1
+
+
+def test_manifest_writer_revalidates_before_creating_file(
+    tmp_path, manifest_inputs, processor
+):
+    """Catches serialization of an in-memory manifest whose invariants were bypassed."""
+    manifest = build_manifest(manifest_inputs, processor)
+    dict.__setitem__(manifest.stats.latent_block_distribution, 9, 1)
+    path = tmp_path / "must-not-exist.json"
+
+    with pytest.raises(ValueError, match="stats do not match"):
+        write_stage2_length_manifest(path, manifest)
+
+    assert not path.exists()
+
+
+def test_manifest_parses_the_same_dataset_byte_snapshot_it_hashes(
+    monkeypatch, manifest_inputs
+):
+    """Catches reopening changed JSONL contents after hashing an earlier snapshot."""
+    data_path, rows = manifest_inputs
+    original_bytes = data_path.read_bytes()
+    changed_rows = [dict(rows[0]), rows[1]]
+    changed_rows[0]["sequence_plan"] = [
+        {"type": "text", "content": "long answer"}
+    ]
+    changed_bytes = "".join(
+        json.dumps(row, sort_keys=True) + "\n" for row in changed_rows
+    ).encode("utf-8")
+    original_read_bytes = Path.read_bytes
+
+    def read_then_change(path):
+        snapshot = original_read_bytes(path)
+        if path == data_path:
+            data_path.write_bytes(changed_bytes)
+        return snapshot
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_change)
+
+    manifest = build_manifest(manifest_inputs, ManifestProcessor())
+
+    assert manifest.data_sha256 == hashlib.sha256(original_bytes).hexdigest()
+    assert manifest.lengths == (8, 10)
+
+
+def test_manifest_rejects_image_changes_during_length_measurement(manifest_inputs):
+    """Catches image identity describing a different file state than measurement used."""
+    data_path, _ = manifest_inputs
+    processor = ImageMutatingProcessor(data_path.parent / "first.png")
+
+    with pytest.raises(ValueError, match="changed during length measurement"):
+        build_manifest(manifest_inputs, processor)

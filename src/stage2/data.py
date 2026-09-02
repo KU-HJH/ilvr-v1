@@ -20,6 +20,25 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 logger = logging.getLogger(__name__)
 
 
+class _ImmutableDict(dict):
+    """A JSON-object-compatible dictionary that rejects ordinary mutation."""
+
+    def _reject_mutation(self, *args, **kwargs):
+        raise TypeError("immutable dictionary cannot be modified")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __ior__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 @dataclass(frozen=True)
 class Stage2PreparedExample:
     """A validated CoMT sample ready for processor tokenization."""
@@ -29,10 +48,14 @@ class Stage2PreparedExample:
     latent_block_count: int
 
 
+def parse_jsonl_examples(contents: str) -> list[dict]:
+    """Parse non-empty JSON Lines records from one text snapshot."""
+    return [json.loads(line) for line in contents.splitlines() if line.strip()]
+
+
 def load_jsonl_examples(path: Path) -> list[dict]:
     """Load non-empty JSON Lines records without altering their contents."""
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+    return parse_jsonl_examples(path.read_text(encoding="utf-8"))
 
 
 def resolve_original_images(sample: dict, image_root: Path) -> tuple[str, ...]:
@@ -254,6 +277,13 @@ class Stage2LengthStats:
     p99: float
     maximum: int
     latent_block_distribution: dict[int, int]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "latent_block_distribution",
+            _ImmutableDict(self.latent_block_distribution),
+        )
 
 
 def summarize_stage2_lengths(*, lengths, latent_block_counts, max_length):

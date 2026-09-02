@@ -15,7 +15,7 @@ from PIL import Image
 from stage2.data import (
     Stage2LengthStats,
     build_prepared_example_length_measure,
-    load_jsonl_examples,
+    parse_jsonl_examples,
     prepare_stage2_example,
     summarize_stage2_lengths,
 )
@@ -250,13 +250,19 @@ def _image_identity(path: str) -> Stage2ImageIdentity:
     resolved = Path(path).resolve(strict=True)
     if not resolved.is_file():
         raise ValueError(f"image is not a regular file: {resolved}")
-    stat = resolved.stat()
+    stat_before = resolved.stat()
     with Image.open(resolved) as image:
         width, height = image.size
+    stat_after = resolved.stat()
+    if (stat_before.st_size, stat_before.st_mtime_ns) != (
+        stat_after.st_size,
+        stat_after.st_mtime_ns,
+    ):
+        raise ValueError(f"image changed while recording identity: {resolved}")
     return Stage2ImageIdentity(
         path=str(resolved),
-        size=stat.st_size,
-        mtime_ns=stat.st_mtime_ns,
+        size=stat_after.st_size,
+        mtime_ns=stat_after.st_mtime_ns,
         width=width,
         height=height,
     )
@@ -282,8 +288,9 @@ def build_stage2_length_manifest(
 
     data_path = Path(data_path)
     image_root = Path(image_root)
-    data_sha256 = hashlib.sha256(data_path.read_bytes()).hexdigest()
-    raw_examples = load_jsonl_examples(data_path)
+    data_bytes = data_path.read_bytes()
+    data_sha256 = hashlib.sha256(data_bytes).hexdigest()
+    raw_examples = parse_jsonl_examples(data_bytes.decode("utf-8"))
     measure_length = build_prepared_example_length_measure(processor)
     lengths = []
     latent_block_counts = []
@@ -294,9 +301,17 @@ def build_stage2_length_manifest(
             image_root=image_root,
             latent_size=latent_size,
         )
+        images_before = tuple(
+            _image_identity(path) for path in prepared.original_image_paths
+        )
         lengths.append(measure_length(prepared))
+        images_after = tuple(
+            _image_identity(path) for path in prepared.original_image_paths
+        )
+        if images_after != images_before:
+            raise ValueError("image changed during length measurement")
         latent_block_counts.append(prepared.latent_block_count)
-        images.extend(_image_identity(path) for path in prepared.original_image_paths)
+        images.extend(images_before)
 
     lengths_tuple = tuple(lengths)
     latent_block_counts_tuple = tuple(latent_block_counts)
@@ -431,6 +446,7 @@ def write_stage2_length_manifest(
     """Publish exclusively, accepting only an identical prior publication."""
     if not isinstance(manifest, Stage2LengthManifest):
         raise TypeError("manifest must be Stage2LengthManifest")
+    manifest.__post_init__()
     path = Path(path)
     serialized = _canonical_json(_manifest_payload(manifest)) + "\n"
     try:
