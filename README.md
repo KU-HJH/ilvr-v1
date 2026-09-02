@@ -692,8 +692,10 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src \
 A representative run requires the already sealed Stage 2 length manifest and
 its SHA-256, plus the exact model/tuning configuration. The probe selects the
 retained examples closest to the joint p50 and p95 length/block-count targets,
-benchmarks DataLoader worker counts 0, 2, and 4, then retains three warm-up and
-ten measured optimizer steps per representative:
+then retains three warm-up and ten measured optimizer steps per representative.
+Benchmark DataLoader worker counts 0, 2, and 4 separately with
+`benchmark_worker_counts`, choose the fastest capacity-safe count, and pass that
+fixed choice to the GPU profile; the profile does not tune workers at runtime:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src \
@@ -708,17 +710,19 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src \
   --latent-size 8 --tuning-method dora \
   --lora-r 32 --lora-alpha 64 --lora-dropout 0.05 \
   --attention-implementation flash_attention_2 \
-  --gradient-checkpointing
+  --gradient-checkpointing \
+  --dataloader-num-workers 2
 ```
 
 Results are published exclusively to
 `results/zero-stage-compatibility/<unique-run-id>/stage2-efficiency.json` and
 logs to the matching directory under `logs/`. The strict schema-v1 field
-`segmented_kv_authorized` is true only when the median recurrence-prefix decoder
-time divided by the median total optimizer-step time is at least `0.30`.
-Only a representative B200 run authorizes segmented-KV follow-up work; a tiny
-self-test or a run on different hardware validates instrumentation but does not
-satisfy that premise.
+`prefix_threshold_met` records whether median recurrence-prefix decoder time
+divided by median end-to-end step time is at least `0.30`. The separate
+`segmented_kv_authorized` field can be true only when that threshold is met by a
+validated p50/p95 representative B200 run using a fixed worker count. A tiny
+self-test or a run on different hardware validates instrumentation but can
+never authorize segmented-KV follow-up work.
 
 #### Verification status
 

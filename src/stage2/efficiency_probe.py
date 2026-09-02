@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 import argparse
 import hashlib
 import json
@@ -10,13 +10,16 @@ import logging
 import math
 import os
 from pathlib import Path
-import resource
 import statistics
 import time
 from typing import Mapping
 
 import torch
+from torch.nn import functional as F
+from torch.overrides import TorchFunctionMode
 from torch.utils.data import DataLoader
+
+from artifact_paths import resolve_run_artifact_paths
 
 
 EFFICIENCY_SCHEMA_VERSION = 1
@@ -62,6 +65,12 @@ class Stage2EfficiencySample:
     final_decoder_ms: float = 0.0
     visual_ms: float = 0.0
     lm_head_ms: float = 0.0
+    shifted_ce_loss_ms: float = 0.0
+    forward_loss_ms: float = 0.0
+    backward_ms: float = 0.0
+    optimizer_ms: float = 0.0
+    step_overhead_ms: float = 0.0
+    forward_other_ms: float = 0.0
     loss: float = 0.0
     gradient_norm: float = 0.0
     prefix_input_length_sum: int = 0
@@ -83,9 +92,16 @@ class Stage2EfficiencyEvidence:
     final_decoder_ms: float
     visual_ms: float
     lm_head_ms: float
+    shifted_ce_loss_ms: float
+    forward_loss_ms: float
+    backward_ms: float
+    optimizer_ms: float
+    step_overhead_ms: float
+    forward_other_ms: float
     loss: float
     gradient_norm: float
     prefix_input_length_sum: int
+    prefix_threshold_met: bool
     segmented_kv_authorized: bool
 
     def __post_init__(self) -> None:
@@ -103,6 +119,12 @@ class Stage2EfficiencyEvidence:
             "final_decoder_ms",
             "visual_ms",
             "lm_head_ms",
+            "shifted_ce_loss_ms",
+            "forward_loss_ms",
+            "backward_ms",
+            "optimizer_ms",
+            "step_overhead_ms",
+            "forward_other_ms",
             "loss",
             "gradient_norm",
         ):
@@ -116,12 +138,17 @@ class Stage2EfficiencyEvidence:
             abs_tol=0.0,
         ):
             raise ValueError("prefix_decoder_share does not match component medians")
+        expected_threshold = self.prefix_decoder_share >= SEGMENTED_KV_GATE
+        if not isinstance(self.prefix_threshold_met, bool):
+            raise ValueError("prefix_threshold_met must be a boolean")
+        if self.prefix_threshold_met != expected_threshold:
+            raise ValueError(
+                "prefix threshold classification does not match the fixed gate"
+            )
         if not isinstance(self.segmented_kv_authorized, bool):
             raise ValueError("segmented_kv_authorized must be a boolean")
-        if self.segmented_kv_authorized != (
-            self.prefix_decoder_share >= SEGMENTED_KV_GATE
-        ):
-            raise ValueError("segmented KV authorization does not match the fixed gate")
+        if self.segmented_kv_authorized and not self.prefix_threshold_met:
+            raise ValueError("segmented KV authorization requires the prefix threshold")
 
 
 @dataclass(frozen=True)
@@ -131,6 +158,7 @@ class Stage2WorkerEvidence:
     median_collation_ms: float
     peak_host_rss_bytes: int
     within_host_capacity: bool
+    worker_pids: tuple[int, ...] = ()
 
 
 def _linear_quantile(values: tuple[int, ...], probability: float) -> float:
@@ -200,6 +228,12 @@ def _validate_sample(sample: Stage2EfficiencySample) -> None:
         "final_decoder_ms",
         "visual_ms",
         "lm_head_ms",
+        "shifted_ce_loss_ms",
+        "forward_loss_ms",
+        "backward_ms",
+        "optimizer_ms",
+        "step_overhead_ms",
+        "forward_other_ms",
         "loss",
         "gradient_norm",
     ):
@@ -236,39 +270,68 @@ def summarize_samples(
         final_decoder_ms=median("final_decoder_ms"),
         visual_ms=median("visual_ms"),
         lm_head_ms=median("lm_head_ms"),
+        shifted_ce_loss_ms=median("shifted_ce_loss_ms"),
+        forward_loss_ms=median("forward_loss_ms"),
+        backward_ms=median("backward_ms"),
+        optimizer_ms=median("optimizer_ms"),
+        step_overhead_ms=median("step_overhead_ms"),
+        forward_other_ms=median("forward_other_ms"),
         loss=median("loss"),
         gradient_norm=median("gradient_norm"),
         prefix_input_length_sum=int(
             statistics.median(sample.prefix_input_length_sum for sample in samples)
         ),
-        segmented_kv_authorized=prefix_share >= SEGMENTED_KV_GATE,
+        prefix_threshold_met=prefix_share >= SEGMENTED_KV_GATE,
+        segmented_kv_authorized=False,
     )
 
 
-def _host_total_bytes() -> int:
-    return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+def _representative_b200_metadata_is_valid(metadata: Mapping[str, object]) -> bool:
+    return (
+        metadata.get("probe_kind") == "stage2_no_cache"
+        and "B200" in str(metadata.get("device_name", "")).upper()
+        and metadata.get("manifest_validated") is True
+        and metadata.get("representative_quantiles") == ["p50", "p95"]
+        and metadata.get("warmup_count_per_representative") == WARMUP_COUNT
+        and metadata.get("measured_count_per_representative") == MEASURED_COUNT
+        and metadata.get("profile_uses_fixed_worker_count") is True
+    )
 
 
-def _peak_host_rss_bytes() -> int:
-    peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    return peak if os.uname().sysname == "Darwin" else peak * 1024
+def authorize_segmented_kv(
+    evidence: Stage2EfficiencyEvidence, metadata: Mapping[str, object]
+) -> Stage2EfficiencyEvidence:
+    """Apply the project gate only to validated representative B200 evidence."""
+    if not isinstance(evidence, Stage2EfficiencyEvidence):
+        raise TypeError("evidence must be Stage2EfficiencyEvidence")
+    if not isinstance(metadata, Mapping):
+        raise TypeError("metadata must be a mapping")
+    return replace(
+        evidence,
+        segmented_kv_authorized=(
+            evidence.prefix_threshold_met
+            and _representative_b200_metadata_is_valid(metadata)
+        ),
+    )
 
 
-def _consume_batches(loader: DataLoader, count: int) -> None:
-    if count == 0:
-        return
-    iterator = iter(loader)
+def _process_rss_bytes(pid: int) -> int:
     try:
-        for _ in range(count):
-            try:
-                next(iterator)
-            except StopIteration:
-                iterator = iter(loader)
-                next(iterator)
-    finally:
-        shutdown = getattr(iterator, "_shutdown_workers", None)
-        if callable(shutdown):
-            shutdown()
+        resident_pages = int(Path(f"/proc/{pid}/statm").read_text().split()[1])
+    except (FileNotFoundError, IndexError, PermissionError, ValueError):
+        return 0
+    return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+
+
+def _aggregate_process_rss_bytes(pids: tuple[int, ...]) -> int:
+    return sum(_process_rss_bytes(pid) for pid in pids)
+
+
+def _available_host_memory_bytes() -> int:
+    for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) * 1024
+    raise RuntimeError("host memory capacity is unavailable")
 
 
 def benchmark_worker_counts(
@@ -278,6 +341,7 @@ def benchmark_worker_counts(
     worker_counts: tuple[int, ...] = (0, 2, 4),
     warmup_batches: int = 2,
     measured_batches: int = 20,
+    loader_factory=DataLoader,
 ) -> tuple[Stage2WorkerEvidence, ...]:
     """Time identical sequential Stage 2 batches for each requested worker count."""
     if not dataset:
@@ -291,33 +355,52 @@ def benchmark_worker_counts(
         kwargs = {"num_workers": worker_count}
         if worker_count > 0:
             kwargs["prefetch_factor"] = 2
-        loader = DataLoader(
+            kwargs["persistent_workers"] = True
+        retained_indices = [
+            index % len(dataset) for index in range(warmup_batches)
+        ] + list(range(retained_batch_count))
+        capacity_bytes = _available_host_memory_bytes() + _process_rss_bytes(
+            os.getpid()
+        )
+        loader = loader_factory(
             dataset,
             batch_size=1,
-            shuffle=False,
+            sampler=retained_indices,
             collate_fn=collate_fn,
             **kwargs,
         )
-        _consume_batches(loader, warmup_batches)
         durations = []
         iterator = iter(loader)
+        worker_pids = tuple(
+            worker.pid for worker in getattr(iterator, "_workers", ())
+        )
+        measured_pids = (os.getpid(), *worker_pids)
+        peak_rss = _aggregate_process_rss_bytes(measured_pids)
         try:
+            for _ in range(warmup_batches):
+                next(iterator)
+                peak_rss = max(
+                    peak_rss, _aggregate_process_rss_bytes(measured_pids)
+                )
             for _ in range(retained_batch_count):
                 started = time.perf_counter_ns()
                 next(iterator)
                 durations.append((time.perf_counter_ns() - started) / 1_000_000.0)
+                peak_rss = max(
+                    peak_rss, _aggregate_process_rss_bytes(measured_pids)
+                )
         finally:
             shutdown = getattr(iterator, "_shutdown_workers", None)
             if callable(shutdown):
                 shutdown()
-        peak_rss = _peak_host_rss_bytes()
         evidence.append(
             Stage2WorkerEvidence(
                 worker_count=worker_count,
                 measured_batches=retained_batch_count,
                 median_collation_ms=float(statistics.median(durations)),
                 peak_host_rss_bytes=peak_rss,
-                within_host_capacity=peak_rss <= _host_total_bytes(),
+                within_host_capacity=peak_rss <= capacity_bytes,
+                worker_pids=worker_pids,
             )
         )
     return tuple(evidence)
@@ -332,6 +415,29 @@ def select_fastest_worker_count(evidence) -> int:
         eligible,
         key=lambda item: (item.median_collation_ms, item.worker_count),
     ).worker_count
+
+
+def build_representative_dataloader(
+    *, example, collate_fn, worker_count: int, batch_count: int
+) -> DataLoader:
+    """Build the fixed-worker loader used by one representative GPU profile."""
+    _non_negative_int("worker_count", worker_count)
+    if (
+        isinstance(batch_count, bool)
+        or not isinstance(batch_count, int)
+        or batch_count < 1
+    ):
+        raise ValueError("batch_count must be a positive integer")
+    kwargs = {"num_workers": worker_count}
+    if worker_count > 0:
+        kwargs.update(prefetch_factor=2, persistent_workers=True)
+    return DataLoader(
+        [example] * batch_count,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collate_fn,
+        **kwargs,
+    )
 
 
 def _module_input_length(args, kwargs) -> int | None:
@@ -353,6 +459,25 @@ def _gradient_norm_tensor(optimizer) -> torch.Tensor:
     if not gradients:
         raise ValueError("training step produced no gradients")
     return torch.sqrt(sum(gradient.square().sum() for gradient in gradients))
+
+
+class _CrossEntropyCudaTimer(TorchFunctionMode):
+    """Record exact CUDA regions spent inside shifted cross entropy."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func is not F.cross_entropy:
+            return func(*args, **(kwargs or {}))
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = func(*args, **(kwargs or {}))
+        end.record()
+        self.calls.append((start, end))
+        return result
 
 
 def measure_cuda_training_step(
@@ -427,26 +552,39 @@ def measure_cuda_training_step(
                 module.register_forward_hook(post_hook(label), with_kwargs=True)
             )
 
+        torch.cuda.reset_peak_memory_stats(device)
+        step_started_ns = time.perf_counter_ns()
         collate_started = time.perf_counter_ns()
         batch = collate_fn()
         collation_ms = (time.perf_counter_ns() - collate_started) / 1_000_000.0
         optimizer.zero_grad(set_to_none=True)
-        torch.cuda.reset_peak_memory_stats(device)
-        step_start = torch.cuda.Event(enable_timing=True)
-        step_end = torch.cuda.Event(enable_timing=True)
-        step_start.record()
-        loss = loss_fn(batch)
+        forward_start = torch.cuda.Event(enable_timing=True)
+        forward_end = torch.cuda.Event(enable_timing=True)
+        backward_start = torch.cuda.Event(enable_timing=True)
+        backward_end = torch.cuda.Event(enable_timing=True)
+        optimizer_start = torch.cuda.Event(enable_timing=True)
+        optimizer_end = torch.cuda.Event(enable_timing=True)
+        cross_entropy_timer = _CrossEntropyCudaTimer()
+        forward_start.record()
+        with cross_entropy_timer:
+            loss = loss_fn(batch)
+        forward_end.record()
         if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
             raise ValueError("trainer loss path must return one scalar tensor")
+        backward_start.record()
         loss.backward()
-        gradient_norm = _gradient_norm_tensor(optimizer)
+        backward_end.record()
+        optimizer_start.record()
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
-        step_end.record()
+        optimizer_end.record()
         torch.cuda.synchronize(device)
+        step_ms = (time.perf_counter_ns() - step_started_ns) / 1_000_000.0
+        peak_bytes = int(torch.cuda.max_memory_allocated(device))
 
         loss_value = float(loss.detach().item())
+        gradient_norm = _gradient_norm_tensor(optimizer)
         gradient_norm_value = float(gradient_norm.item())
         _finite("loss", loss_value)
         _finite("gradient_norm", gradient_norm_value)
@@ -467,14 +605,43 @@ def measure_cuda_training_step(
             for label, pairs in calls.items()
             if label != "decoder"
         }
+        shifted_ce_loss_ms = sum(
+            start.elapsed_time(end) for start, end in cross_entropy_timer.calls
+        )
+        if not cross_entropy_timer.calls:
+            raise ValueError("training loss path did not call shifted cross entropy")
+        forward_loss_ms = forward_start.elapsed_time(forward_end)
+        backward_ms = backward_start.elapsed_time(backward_end)
+        optimizer_ms = optimizer_start.elapsed_time(optimizer_end)
+        forward_components_ms = (
+            sum(decoder_ms)
+            + component_ms["visual"]
+            + component_ms["lm_head"]
+            + shifted_ce_loss_ms
+        )
+        forward_other_ms = max(0.0, forward_loss_ms - forward_components_ms)
+        step_overhead_ms = max(
+            0.0,
+            step_ms
+            - collation_ms
+            - forward_loss_ms
+            - backward_ms
+            - optimizer_ms,
+        )
         result = Stage2EfficiencySample(
-            step_ms=step_start.elapsed_time(step_end),
+            step_ms=step_ms,
             prefix_decoder_ms=sum(decoder_ms[:-1]),
             final_decoder_ms=decoder_ms[-1],
             visual_ms=component_ms["visual"],
             lm_head_ms=component_ms["lm_head"],
+            shifted_ce_loss_ms=shifted_ce_loss_ms,
+            forward_loss_ms=forward_loss_ms,
+            backward_ms=backward_ms,
+            optimizer_ms=optimizer_ms,
+            step_overhead_ms=step_overhead_ms,
+            forward_other_ms=forward_other_ms,
             collation_ms=collation_ms,
-            peak_bytes=int(torch.cuda.max_memory_allocated(device)),
+            peak_bytes=peak_bytes,
             loss=loss_value,
             gradient_norm=gradient_norm_value,
             decoder_input_lengths=tuple(decoder_input_lengths),
@@ -501,7 +668,11 @@ class _CudaSelfTestModel(torch.nn.Module):
         self.model(encoded[:, :1])
         self.model(encoded[:, :2])
         final = self.model(encoded)
-        return self.lm_head(final).float().square().mean()
+        logits = self.lm_head(final).float()
+        labels = torch.zeros(
+            logits.shape[:-1], dtype=torch.long, device=logits.device
+        )
+        return F.cross_entropy(logits.flatten(0, -2), labels.flatten())
 
 
 def _artifact_paths(
@@ -654,8 +825,9 @@ def run_stage2_probe(args) -> Path:
     from stage2.length_manifest import read_stage2_length_manifest
     from stage2.peft import resolve_stage2_qwen_model
 
-    result_root = Path(args.result_root)
-    log_root = Path(args.log_root)
+    canonical_paths = resolve_run_artifact_paths(args.experiment_id)
+    result_root = canonical_paths.result_dir.parent
+    log_root = canonical_paths.log_dir.parent
     result_path, log_path = _artifact_paths(
         result_root=result_root,
         log_root=log_root,
@@ -668,13 +840,10 @@ def run_stage2_probe(args) -> Path:
     manifest = read_stage2_length_manifest(manifest_path)
     representatives = select_representative_examples(manifest)
 
-    initial_args = _stage2_probe_namespace(args, worker_count=0)
-    components = build_stage2_training_components(initial_args)
-    worker_evidence = benchmark_worker_counts(
-        dataset=components.train_dataset,
-        collate_fn=components.data_collator,
+    worker_count = args.dataloader_num_workers
+    components = build_stage2_training_components(
+        _stage2_probe_namespace(args, worker_count=worker_count)
     )
-    worker_count = select_fastest_worker_count(worker_evidence)
     training_args = build_stage2_training_arguments(
         _stage2_probe_namespace(args, worker_count=worker_count)
     )
@@ -698,23 +867,33 @@ def run_stage2_probe(args) -> Path:
         for representative in representatives:
             retained_offset = manifest.retained_indices.index(representative.raw_index)
             example = components.train_dataset[retained_offset]
+            loader = build_representative_dataloader(
+                example=example,
+                collate_fn=components.data_collator,
+                worker_count=worker_count,
+                batch_count=WARMUP_COUNT + MEASURED_COUNT,
+            )
+            iterator = iter(loader)
 
             def measure() -> Stage2EfficiencySample:
                 return measure_cuda_training_step(
                     decoder=qwen.model,
                     visual=qwen.visual,
                     lm_head=qwen.lm_head,
-                    collate_fn=lambda: trainer._prepare_inputs(
-                        components.data_collator([example])
-                    ),
+                    collate_fn=lambda: trainer._prepare_inputs(next(iterator)),
                     loss_fn=lambda batch: trainer.compute_loss(trainer.model, batch),
                     optimizer=trainer.optimizer,
                     scheduler=trainer.lr_scheduler,
                 )
 
-            for _ in range(WARMUP_COUNT):
-                measure()
-            samples = tuple(measure() for _ in range(MEASURED_COUNT))
+            try:
+                for _ in range(WARMUP_COUNT):
+                    measure()
+                samples = tuple(measure() for _ in range(MEASURED_COUNT))
+            finally:
+                shutdown = getattr(iterator, "_shutdown_workers", None)
+                if callable(shutdown):
+                    shutdown()
             evidence = summarize_samples(samples)
             all_samples.extend(samples)
             representative_payloads.append(
@@ -746,12 +925,17 @@ def run_stage2_probe(args) -> Path:
             "tuning_method": args.tuning_method,
             "warmup_count_per_representative": WARMUP_COUNT,
             "measured_count_per_representative": MEASURED_COUNT,
+            "manifest_validated": True,
+            "representative_quantiles": [
+                representative.quantile for representative in representatives
+            ],
+            "profile_uses_fixed_worker_count": True,
             "manifest_path": str(manifest_path.resolve()),
             "manifest_sha256": actual_sha256,
             "selected_worker_count": worker_count,
-            "worker_evidence": [asdict(item) for item in worker_evidence],
             "representatives": representative_payloads,
         }
+        overall = authorize_segmented_kv(overall, metadata)
         _log_evidence(logger, "overall", overall)
         written = write_efficiency_result(
             result_root=result_root,
@@ -770,10 +954,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="Measure the optimized Stage 2 no-cache path and apply its KV gate"
     )
     parser.add_argument("--experiment-id", required=True)
-    parser.add_argument(
-        "--result-root", default="results/zero-stage-compatibility"
-    )
-    parser.add_argument("--log-root", default="logs/zero-stage-compatibility")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--model-source")
     parser.add_argument("--stage1-adapter")
@@ -807,6 +987,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--dataloader-num-workers", type=int, choices=(0, 2, 4))
     parser.add_argument("--cache-dir", default="./cache")
     parser.add_argument(
         "--local-files-only", action=argparse.BooleanOptionalAction, default=True
@@ -816,11 +997,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    canonical_paths = resolve_run_artifact_paths(args.experiment_id)
     if args.self_test:
         path = run_cuda_self_test(
             experiment_id=args.experiment_id,
-            result_root=Path(args.result_root),
-            log_root=Path(args.log_root),
+            result_root=canonical_paths.result_dir.parent,
+            log_root=canonical_paths.log_dir.parent,
         )
     else:
         required = {
@@ -830,6 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
             "--stage2-length-manifest": args.stage2_length_manifest,
             "--stage2-length-manifest-sha256": args.stage2_length_manifest_sha256,
             "--tuning-method": args.tuning_method,
+            "--dataloader-num-workers": args.dataloader_num_workers,
         }
         missing = [name for name, value in required.items() if value is None]
         if missing:
@@ -872,12 +1055,21 @@ def write_efficiency_result(
         raise TypeError("evidence must be Stage2EfficiencyEvidence")
     if not isinstance(metadata, Mapping):
         raise TypeError("metadata must be a mapping")
+    expected_authorization = authorize_segmented_kv(evidence, metadata)
+    if (
+        evidence.segmented_kv_authorized
+        != expected_authorization.segmented_kv_authorized
+    ):
+        raise ValueError(
+            "segmented KV authorization requires representative B200 metadata"
+        )
     result_dir = Path(result_root) / experiment_id
     result_dir.mkdir(parents=True, exist_ok=True)
     path = result_dir / "stage2-efficiency.json"
     payload = {
         "schema_version": EFFICIENCY_SCHEMA_VERSION,
         "experiment_id": experiment_id,
+        "prefix_threshold_met": evidence.prefix_threshold_met,
         "segmented_kv_authorized": evidence.segmented_kv_authorized,
         "evidence": asdict(evidence),
         "metadata": dict(metadata),
@@ -917,6 +1109,7 @@ def read_efficiency_result(path: str | Path) -> dict:
     expected = {
         "schema_version",
         "experiment_id",
+        "prefix_threshold_met",
         "segmented_kv_authorized",
         "evidence",
         "metadata",
@@ -929,8 +1122,9 @@ def read_efficiency_result(path: str | Path) -> dict:
     if payload["schema_version"] != EFFICIENCY_SCHEMA_VERSION:
         raise ValueError("unsupported efficiency result schema_version")
     _validate_experiment_id(payload["experiment_id"])
-    if not isinstance(payload["segmented_kv_authorized"], bool):
-        raise ValueError("segmented_kv_authorized must be a boolean")
+    for name in ("prefix_threshold_met", "segmented_kv_authorized"):
+        if not isinstance(payload[name], bool):
+            raise ValueError(f"{name} must be a boolean")
     if not isinstance(payload["evidence"], dict) or not isinstance(
         payload["metadata"], dict
     ):
@@ -939,12 +1133,15 @@ def read_efficiency_result(path: str | Path) -> dict:
     if set(payload["evidence"]) != evidence_fields:
         raise ValueError("evidence fields do not match schema version 1")
     evidence = Stage2EfficiencyEvidence(**payload["evidence"])
-    expected_authorization = evidence.prefix_decoder_share >= SEGMENTED_KV_GATE
+    expected_authorization = authorize_segmented_kv(evidence, payload["metadata"])
     if (
-        evidence.segmented_kv_authorized != expected_authorization
-        or payload["segmented_kv_authorized"] != expected_authorization
+        payload["prefix_threshold_met"] != evidence.prefix_threshold_met
+        or payload["segmented_kv_authorized"]
+        != expected_authorization.segmented_kv_authorized
+        or evidence.segmented_kv_authorized
+        != expected_authorization.segmented_kv_authorized
     ):
-        raise ValueError("segmented KV authorization does not match the fixed gate")
+        raise ValueError("segmented KV authorization does not match project gates")
     return payload
 
 
