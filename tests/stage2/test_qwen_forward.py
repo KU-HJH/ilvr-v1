@@ -17,7 +17,11 @@ from stage2.peft import (
     build_stage2_tuned_model,
     resolve_stage2_qwen_model,
 )
-from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentRolloutEngine
+from transformers.models.qwen2_5_vl import stage2_latent_rollout
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
+    LatentRolloutEngine,
+    LatentSpan,
+)
 
 
 class OutputAwareToyCausalLanguageModel(ToyCausalLanguageModel):
@@ -130,6 +134,114 @@ class RecordingRolloutEngine:
     def rollout(self, **kwargs):
         self.calls += 1
         return self.delegate.rollout(**kwargs)
+
+
+def _reference_full_copy_rollout(
+    *,
+    language_model,
+    base_inputs_embeds,
+    attention_mask,
+    full_position_ids,
+    latent_spans,
+):
+    """Independent oracle for the original full-sequence-copy recurrence."""
+    current = base_inputs_embeds
+    states = []
+    prefix_lengths = []
+    for span in latent_spans:
+        for position in span.latent_positions:
+            outputs = language_model(
+                inputs_embeds=current[:, :position],
+                attention_mask=attention_mask[:, :position],
+                position_ids=full_position_ids[..., :position],
+                use_cache=False,
+                return_dict=True,
+            )
+            latent = outputs.last_hidden_state[:, -1, :]
+            states.append(latent)
+            prefix_lengths.append(position)
+            current = torch.cat(
+                (current[:, :position], latent.unsqueeze(1), current[:, position + 1 :]),
+                dim=1,
+            )
+    return current, tuple(states), tuple(prefix_lengths)
+
+
+def test_prefix_sized_rollout_matches_full_copy_oracle():
+    """Catches prefix assembly changing the no-cache recurrence or its gradients."""
+    torch.manual_seed(23)
+    input_ids = torch.arange(11).unsqueeze(0)
+    reference_embedding = nn.Embedding(32, 4)
+    candidate_embedding = deepcopy(reference_embedding)
+    reference_decoder = ToyCausalLanguageModel(4)
+    candidate_decoder = deepcopy(reference_decoder)
+    attention_mask = torch.ones_like(input_ids)
+    full_position_ids = torch.arange(11).view(1, 1, 11).expand(3, -1, -1)
+    latent_spans = (
+        LatentSpan(1, (2, 3), 4),
+        LatentSpan(6, (7, 8), 9),
+    )
+
+    reference_base = reference_embedding(input_ids)
+    candidate_base = candidate_embedding(input_ids)
+    reference_final, reference_states, reference_prefix_lengths = _reference_full_copy_rollout(
+        language_model=reference_decoder,
+        base_inputs_embeds=reference_base,
+        attention_mask=attention_mask,
+        full_position_ids=full_position_ids,
+        latent_spans=latent_spans,
+    )
+    candidate = LatentRolloutEngine().rollout(
+        language_model=candidate_decoder,
+        base_inputs_embeds=candidate_base,
+        attention_mask=attention_mask,
+        full_position_ids=full_position_ids,
+        latent_spans=latent_spans,
+    )
+
+    assembled = stage2_latent_rollout._assemble_latent_inputs(
+        candidate_base,
+        list(zip((2, 3, 7, 8), candidate.latent_states, strict=True)),
+        stop=candidate_base.shape[1],
+    )
+    torch.testing.assert_close(assembled, candidate.final_inputs_embeds, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(
+        candidate.final_inputs_embeds, reference_final, atol=1e-6, rtol=1e-5
+    )
+    assert candidate.prefix_lengths == reference_prefix_lengths == (2, 3, 7, 8)
+    for candidate_state, reference_state in zip(
+        candidate.latent_states, reference_states, strict=True
+    ):
+        torch.testing.assert_close(candidate_state, reference_state, atol=1e-6, rtol=1e-5)
+
+    reference_outputs = reference_decoder(
+        inputs_embeds=reference_final,
+        attention_mask=attention_mask,
+        position_ids=full_position_ids,
+        use_cache=False,
+        return_dict=True,
+    )
+    candidate_outputs = candidate_decoder(
+        inputs_embeds=candidate.final_inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=full_position_ids,
+        use_cache=False,
+        return_dict=True,
+    )
+    reference_loss = reference_outputs.last_hidden_state.square().mean()
+    candidate_loss = candidate_outputs.last_hidden_state.square().mean()
+    torch.testing.assert_close(candidate_loss, reference_loss, atol=1e-6, rtol=1e-5)
+    candidate_loss.backward()
+    reference_loss.backward()
+
+    assert [inputs.shape[1] for inputs, *_ in candidate_decoder.calls] == [2, 3, 7, 8, 11]
+    assert [inputs.shape[1] for inputs, *_ in reference_decoder.calls] == [2, 3, 7, 8, 11]
+    torch.testing.assert_close(
+        candidate_embedding.weight.grad, reference_embedding.weight.grad, atol=1e-6, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        candidate_decoder.scale.grad, reference_decoder.scale.grad, atol=1e-6, rtol=1e-5
+    )
 
 
 @pytest.mark.parametrize("method", ["full", "lora", "dora"])
