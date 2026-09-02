@@ -14,17 +14,22 @@ import stage2.efficiency_probe as efficiency_probe_module
 from stage2.efficiency_probe import (
     SEGMENTED_KV_GATE,
     Stage2EfficiencySample,
+    Stage2RecurrenceWorkExample,
     authorize_segmented_kv,
     benchmark_worker_counts,
+    build_recurrence_work_examples,
     build_parser,
     build_representative_dataloader,
     measure_cuda_training_step,
     read_efficiency_result,
+    recurrence_work_metadata,
     select_fastest_worker_count,
+    select_recurrence_work_examples,
     select_representative_examples,
     summarize_samples,
     write_efficiency_result,
 )
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 
 def manifest(*, lengths, block_counts, retained_indices):
@@ -85,6 +90,149 @@ def test_representative_selection_rejects_empty_or_inconsistent_manifest():
         select_representative_examples(
             manifest(lengths=(10, 20), block_counts=(1,), retained_indices=(0,))
         )
+
+
+def test_representatives_use_sequence_plus_every_latent_position():
+    """Catches selecting recurrence work from latent-block counts alone."""
+
+    def recurrence_row(*, raw_index, sequence_length, latent_positions):
+        return Stage2RecurrenceWorkExample(
+            raw_index=raw_index,
+            sequence_length=sequence_length,
+            latent_positions=latent_positions,
+            scaffold_sha256="0" * 64,
+        )
+
+    rows = (
+        recurrence_row(raw_index=9, sequence_length=10, latent_positions=(2, 3)),
+        recurrence_row(raw_index=4, sequence_length=20, latent_positions=(5, 8)),
+        recurrence_row(raw_index=7, sequence_length=30, latent_positions=(10, 20)),
+    )
+
+    selected = select_recurrence_work_examples(rows)
+
+    assert [row.recurrence_work for row in selected] == [33, 60, 60]
+    assert selected[-1].raw_index == 7
+
+
+def test_representative_tie_breaks_on_raw_index():
+    """Catches equal recurrence-work candidates changing raw-row identity."""
+    rows = (
+        Stage2RecurrenceWorkExample(8, 10, (5,), "0" * 64),
+        Stage2RecurrenceWorkExample(2, 12, (3,), "1" * 64),
+    )
+
+    assert select_recurrence_work_examples(rows)[0].raw_index == 2
+
+
+def test_recurrence_metadata_uses_parsed_scaffolds_and_exact_positions():
+    """Catches emitted work evidence losing scaffold identity or latent positions."""
+    scaffolds = {
+        4: (10, 101, 100, 100, 102, 11, 12, 13),
+        6: (20, 101, 100, 100, 102, 21, 101, 100, 100, 102),
+        9: (30, 101, 100, 100, 102, 31, 101, 100, 100, 102, 32, 33),
+    }
+
+    def collate(examples):
+        raw_index = examples[0]
+        return {"input_ids": torch.tensor([scaffolds[raw_index]], dtype=torch.long)}
+
+    rows = build_recurrence_work_examples(
+        manifest=SimpleNamespace(retained_indices=(4, 6, 9)),
+        prepared_examples=(None, None, None, None, 4, None, 6, None, None, 9),
+        collate_fn=collate,
+        token_ids=LatentTokenIds(
+            pad_token_id=100, start_token_id=101, end_token_id=102
+        ),
+        latent_size=2,
+    )
+    selected = select_recurrence_work_examples(rows)
+
+    assert [(row.raw_index, row.sequence_length, row.latent_positions) for row in rows] == [
+        (4, 8, (2, 3)),
+        (6, 10, (2, 3, 7, 8)),
+        (9, 12, (2, 3, 7, 8)),
+    ]
+    assert [row.scaffold_sha256 for row in rows] == [
+        "89ffee713bdf56cd6c5ab4d82741db426ebc4002758f5fd0ac7ff3ed195b8109",
+        "ed1636e2c470f71aa536b90c595d610725d71da550887c7aa4924c6eb9a7827c",
+        "9d368461a38d73a6cfd615888eb8cc142b173fb32c4339f7ff27fbf4308e309b",
+    ]
+    assert recurrence_work_metadata(selected) == [
+        {
+            "raw_index": 6,
+            "sequence_length": 10,
+            "latent_positions": [2, 3, 7, 8],
+            "scaffold_sha256": "ed1636e2c470f71aa536b90c595d610725d71da550887c7aa4924c6eb9a7827c",
+            "recurrence_work": 30,
+        },
+        {
+            "raw_index": 9,
+            "sequence_length": 12,
+            "latent_positions": [2, 3, 7, 8],
+            "scaffold_sha256": "9d368461a38d73a6cfd615888eb8cc142b173fb32c4339f7ff27fbf4308e309b",
+            "recurrence_work": 32,
+        },
+        {
+            "raw_index": 9,
+            "sequence_length": 12,
+            "latent_positions": [2, 3, 7, 8],
+            "scaffold_sha256": "9d368461a38d73a6cfd615888eb8cc142b173fb32c4339f7ff27fbf4308e309b",
+            "recurrence_work": 32,
+        },
+    ]
+
+
+def test_probe_seals_recurrence_records_before_model_loading(monkeypatch, tmp_path):
+    """Catches weight loading occurring before the selected scaffolds are sealed."""
+    events = []
+    manifest_path = tmp_path / "sealed-manifest.json"
+    manifest_path.write_text("sealed", encoding="utf-8")
+    monkeypatch.setattr(
+        efficiency_probe_module,
+        "resolve_run_artifact_paths",
+        lambda _experiment_id: SimpleNamespace(
+            result_dir=tmp_path / "results" / "probe",
+            log_dir=tmp_path / "logs" / "probe",
+        ),
+    )
+    monkeypatch.setattr(
+        efficiency_probe_module,
+        "_seal_recurrence_work_examples",
+        lambda _args: events.append("parsed")
+        or (
+            Stage2RecurrenceWorkExample(1, 4, (2,), "0" * 64),
+        ),
+    )
+
+    def load_components(_args, *, worker_count):
+        assert worker_count == 0
+        events.append("model_loaded")
+        raise RuntimeError("stop after ordering witness")
+
+    monkeypatch.setattr(
+        efficiency_probe_module,
+        "_load_stage2_probe_components",
+        load_components,
+    )
+    monkeypatch.setattr(
+        "stage2.length_manifest.read_stage2_length_manifest",
+        lambda _path: SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="ordering witness"):
+        efficiency_probe_module.run_stage2_probe(
+            SimpleNamespace(
+                experiment_id="probe",
+                stage2_length_manifest=str(manifest_path),
+                stage2_length_manifest_sha256=(
+                    "c9d0036bed6744bcdf692fc980d8717d7e5f5a4f4e8266b4a84982602fb1cd09"
+                ),
+                dataloader_num_workers=0,
+            )
+        )
+
+    assert events == ["parsed", "model_loaded"]
 
 
 def test_aggregation_uses_component_medians_then_computes_prefix_share():

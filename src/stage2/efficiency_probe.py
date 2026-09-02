@@ -20,6 +20,7 @@ from torch.overrides import TorchFunctionMode
 from torch.utils.data import DataLoader
 
 from artifact_paths import resolve_run_artifact_paths
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import parse_latent_spans
 
 
 EFFICIENCY_SCHEMA_VERSION = 1
@@ -75,6 +76,18 @@ class Stage2RepresentativeExample:
     latent_block_count: int
     target_length: float
     target_block_count: float
+
+
+@dataclass(frozen=True)
+class Stage2RecurrenceWorkExample:
+    raw_index: int
+    sequence_length: int
+    latent_positions: tuple[int, ...]
+    scaffold_sha256: str
+
+    @property
+    def recurrence_work(self) -> int:
+        return self.sequence_length + sum(self.latent_positions)
 
 
 @dataclass(frozen=True)
@@ -240,6 +253,84 @@ def select_representative_examples(manifest) -> tuple[Stage2RepresentativeExampl
             )
         )
     return tuple(selected)
+
+
+def select_recurrence_work_examples(
+    examples: tuple[Stage2RecurrenceWorkExample, ...],
+) -> tuple[Stage2RecurrenceWorkExample, ...]:
+    """Select linear p50/p95 and maximum recurrence-work representatives."""
+    examples = tuple(examples)
+    if not examples:
+        raise ValueError("cannot select recurrence work from zero examples")
+    values = tuple(row.recurrence_work for row in examples)
+    targets = (_linear_quantile(values, 0.50), _linear_quantile(values, 0.95))
+    chosen = [
+        min(
+            examples,
+            key=lambda row: (abs(row.recurrence_work - target), row.raw_index),
+        )
+        for target in targets
+    ]
+    chosen.append(min(examples, key=lambda row: (-row.recurrence_work, row.raw_index)))
+    return tuple(chosen)
+
+
+def build_recurrence_work_examples(
+    *, manifest, prepared_examples, collate_fn, token_ids, latent_size: int
+) -> tuple[Stage2RecurrenceWorkExample, ...]:
+    """Seal actual token scaffolds for every retained Stage 2 raw row."""
+    retained_indices = tuple(manifest.retained_indices)
+    if not retained_indices:
+        raise ValueError("manifest has no retained example")
+    if any(
+        isinstance(raw_index, bool)
+        or not isinstance(raw_index, int)
+        or raw_index < 0
+        or raw_index >= len(prepared_examples)
+        for raw_index in retained_indices
+    ):
+        raise ValueError("manifest retained index is invalid")
+    rows = []
+    for raw_index in retained_indices:
+        batch = collate_fn([prepared_examples[raw_index]])
+        input_ids = batch.get("input_ids") if isinstance(batch, Mapping) else None
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+            raise ValueError("Stage 2 collator must return rank-2 input_ids")
+        if input_ids.shape[0] != 1:
+            raise ValueError("Stage 2 recurrence work requires batch_size=1")
+        scaffold = input_ids[0].detach().cpu().to(dtype=torch.int64).contiguous()
+        spans = parse_latent_spans(
+            scaffold, token_ids=token_ids, latent_size=latent_size
+        )
+        rows.append(
+            Stage2RecurrenceWorkExample(
+                raw_index=raw_index,
+                sequence_length=int(scaffold.numel()),
+                latent_positions=tuple(
+                    position
+                    for span in spans
+                    for position in span.latent_positions
+                ),
+                scaffold_sha256=hashlib.sha256(scaffold.numpy().tobytes()).hexdigest(),
+            )
+        )
+    return tuple(rows)
+
+
+def recurrence_work_metadata(
+    examples: tuple[Stage2RecurrenceWorkExample, ...],
+) -> list[dict[str, object]]:
+    """Make the sealed recurrence-work inputs explicit in immutable evidence."""
+    return [
+        {
+            "raw_index": row.raw_index,
+            "sequence_length": row.sequence_length,
+            "latent_positions": list(row.latent_positions),
+            "scaffold_sha256": row.scaffold_sha256,
+            "recurrence_work": row.recurrence_work,
+        }
+        for row in examples
+    ]
 
 
 def _validate_sample(sample: Stage2EfficiencySample) -> None:
@@ -845,9 +936,95 @@ def _stage2_probe_namespace(args, *, worker_count: int):
     )
 
 
+def _seal_recurrence_work_examples(
+    args,
+) -> tuple[Stage2RecurrenceWorkExample, ...]:
+    """Validate and parse retained scaffolds before constructing model weights."""
+    from main import (
+        _default_stage2_source_dependencies,
+        build_stage2_source_provenance_kwargs,
+    )
+    from stage2.checkpointing import (
+        resolve_latent_token_ids,
+        resolve_stage2_load_decision,
+        validate_stage2_sparse_processor,
+    )
+    from stage2.data import Stage2DataCollator
+    from stage2.length_manifest import validate_stage2_length_manifest
+
+    probe_args = _stage2_probe_namespace(
+        args, worker_count=args.dataloader_num_workers
+    )
+    source_dependencies = _default_stage2_source_dependencies()
+    source_provenance_kwargs = build_stage2_source_provenance_kwargs(probe_args)
+    decision = resolve_stage2_load_decision(
+        load_model_path=probe_args.load_model_path,
+        stage1_adapter_path=probe_args.stage1_adapter_path,
+        resume_from_checkpoint_path=probe_args.resume_from_checkpoint_path,
+        load_config=source_dependencies.load_config,
+        discover_adapter_config=source_dependencies.find_adapter_config,
+        source_provenance_kwargs=source_provenance_kwargs,
+        latent_size=probe_args.latent_size,
+        supervise_latent_boundaries=probe_args.supervise_latent_boundaries,
+        tuning_method=probe_args.tuning_method,
+        tuning_method_explicit=probe_args.tuning_method_explicit,
+        lora_r=probe_args.lora_r,
+        lora_alpha=probe_args.lora_alpha,
+        lora_dropout=probe_args.lora_dropout,
+        lora_target_modules=probe_args.lora_target_modules,
+    )
+    sparse_resume = (
+        decision.peft_metadata is not None
+        and decision.peft_metadata.token_row_source == "sparse_adapter"
+    )
+    sparse_source_kwargs = source_provenance_kwargs if sparse_resume else {}
+    processor = source_dependencies.load_processor(
+        decision.processor_source, **sparse_source_kwargs
+    )
+    if sparse_resume:
+        validate_stage2_sparse_processor(processor.tokenizer, decision.peft_metadata)
+    base_config = source_dependencies.load_config(
+        decision.base_model_source, **sparse_source_kwargs
+    )
+    token_ids = resolve_latent_token_ids(processor.tokenizer, base_config)
+    snapshot = validate_stage2_length_manifest(
+        path=probe_args.stage2_length_manifest,
+        expected_sha256=probe_args.stage2_length_manifest_sha256,
+        data_path=probe_args.data_path,
+        image_root=probe_args.image_root,
+        processor=processor,
+        latent_size=decision.latent_size,
+        supervise_latent_boundaries=decision.supervise_latent_boundaries,
+        max_sequence_length=probe_args.max_seq_length_train,
+    )
+    collator = Stage2DataCollator(
+        processor,
+        token_ids,
+        decision.latent_size,
+        decision.supervise_latent_boundaries,
+    )
+    return build_recurrence_work_examples(
+        manifest=snapshot.manifest,
+        prepared_examples=snapshot.prepared_examples,
+        collate_fn=collator,
+        token_ids=token_ids,
+        latent_size=decision.latent_size,
+    )
+
+
+def _load_stage2_probe_components(args, *, worker_count: int):
+    """Construct the production loss path only after recurrence sealing succeeds."""
+    from main import build_stage2_training_arguments, build_stage2_training_components
+
+    probe_args = _stage2_probe_namespace(args, worker_count=worker_count)
+    return (
+        build_stage2_training_components(probe_args),
+        build_stage2_training_arguments(probe_args),
+    )
+
+
 def run_stage2_probe(args) -> Path:
     """Measure retained representatives through the production Stage 2 loss path."""
-    from main import build_stage2_training_arguments, build_stage2_training_components
     from stage2.length_manifest import read_stage2_length_manifest
     from stage2.peft import resolve_stage2_qwen_model
 
@@ -864,14 +1041,12 @@ def run_stage2_probe(args) -> Path:
     if actual_sha256 != args.stage2_length_manifest_sha256:
         raise ValueError("Stage 2 length manifest SHA-256 does not match")
     manifest = read_stage2_length_manifest(manifest_path)
-    representatives = select_representative_examples(manifest)
+    recurrence_examples = _seal_recurrence_work_examples(args)
+    representatives = select_recurrence_work_examples(recurrence_examples)
 
     worker_count = args.dataloader_num_workers
-    components = build_stage2_training_components(
-        _stage2_probe_namespace(args, worker_count=worker_count)
-    )
-    training_args = build_stage2_training_arguments(
-        _stage2_probe_namespace(args, worker_count=worker_count)
+    components, training_args = _load_stage2_probe_components(
+        args, worker_count=worker_count
     )
     trainer = components.trainer_class(
         model=components.model,
@@ -890,7 +1065,10 @@ def run_stage2_probe(args) -> Path:
     representative_payloads = []
     all_samples = []
     try:
-        for representative in representatives:
+        for label, representative in zip(
+            ("recurrence_work_p50", "recurrence_work_p95", "max_recurrence_work"),
+            representatives,
+        ):
             retained_offset = manifest.retained_indices.index(representative.raw_index)
             example = components.train_dataset[retained_offset]
             loader = build_representative_dataloader(
@@ -924,7 +1102,8 @@ def run_stage2_probe(args) -> Path:
             all_samples.extend(samples)
             representative_payloads.append(
                 {
-                    **asdict(representative),
+                    "selection": label,
+                    **recurrence_work_metadata((representative,))[0],
                     "evidence": asdict(evidence),
                     "samples": [asdict(sample) for sample in samples],
                 }
@@ -932,10 +1111,10 @@ def run_stage2_probe(args) -> Path:
             for index, sample in enumerate(samples):
                 _log_evidence(
                     logger,
-                    f"representative={representative.quantile} sample={index}",
+                    f"representative={label} sample={index}",
                     sample,
                 )
-            _log_evidence(logger, f"representative={representative.quantile}", evidence)
+            _log_evidence(logger, f"representative={label}", evidence)
         overall = summarize_samples(all_samples)
         metadata = {
             **_device_metadata(),
@@ -953,12 +1132,17 @@ def run_stage2_probe(args) -> Path:
             "measured_count_per_representative": MEASURED_COUNT,
             "manifest_validated": True,
             "representative_quantiles": [
-                representative.quantile for representative in representatives
+                "recurrence_work_p50",
+                "recurrence_work_p95",
+                "max_recurrence_work",
             ],
             "profile_uses_fixed_worker_count": True,
             "manifest_path": str(manifest_path.resolve()),
             "manifest_sha256": actual_sha256,
             "selected_worker_count": worker_count,
+            "recurrence_work_representatives": recurrence_work_metadata(
+                representatives
+            ),
             "representatives": representative_payloads,
         }
         overall = authorize_segmented_kv(overall, metadata)
