@@ -726,6 +726,7 @@ def _stage2_args(**overrides):
         "max_seq_length_train": 32,
         "max_steps": 2,
         "gradient_checkpointing": False,
+        "tuning_method": "full",
         "deepspeed_config": None,
     }
     values.update(overrides)

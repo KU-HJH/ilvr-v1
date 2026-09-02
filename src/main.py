@@ -79,7 +79,6 @@ from stage2.data import (
     load_jsonl_examples,
     prepare_stage2_example,
 )
-from stage2.trainer import Stage2Trainer
 from stage2.evidence import observe_stage2_checkpoint_artifact
 from stage2.peft import (
     build_stage2_tuned_model,
@@ -103,6 +102,8 @@ def select_training_path(stage: str) -> TrainingPath:
 
         return TrainingPath(CustomTrainerStage1, collate_fn_stage1)
     if stage == "stage2":
+        from stage2.trainer import Stage2Trainer
+
         return TrainingPath(Stage2Trainer, Stage2DataCollator)
     raise ValueError(f"Unsupported training stage: {stage}")
 
@@ -113,7 +114,7 @@ class Stage2TrainingComponents:
     processor: object
     train_dataset: object
     data_collator: Stage2DataCollator
-    trainer_class: type[Stage2Trainer]
+    trainer_class: type
     trainer_resume_path: str | None
     peft_metadata: Stage2PeftMetadata | None
 
@@ -207,6 +208,8 @@ def validate_stage2_distributed_settings(
 def build_stage2_training_components(
     args, *, source_dependencies: Stage2SourceDependencies | None = None
 ) -> Stage2TrainingComponents:
+    from stage2.trainer import Stage2Trainer
+
     source_dependencies = (
         source_dependencies or _default_stage2_source_dependencies()
     )
@@ -658,12 +661,16 @@ def main_train():
 
 
 def __getattr__(name):
-    """Retain the historical public trainer import without eager Stage 1 load."""
+    """Retain historical public trainer imports without eager cross-stage load."""
 
     if name == "CustomTrainerStage1":
         from stage1.trainer import CustomTrainerStage1
 
         return CustomTrainerStage1
+    if name == "Stage2Trainer":
+        from stage2.trainer import Stage2Trainer
+
+        return Stage2Trainer
     raise AttributeError(name)
 
 if __name__ == "__main__":

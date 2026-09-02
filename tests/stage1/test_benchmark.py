@@ -999,12 +999,12 @@ def test_pre_fix_probe_argv_compatibility_rejects_noncanonical_aliases(
     elif alias_kind == "outside":
         alias = str(Path("..") / tmp_path.name / canonical)
     else:
-        alias_path = tmp_path / f"probe-{alias_kind}.jsonl"
+        alias_path = expected.with_name(f"probe-{alias_kind}.jsonl")
         if alias_kind == "symlink":
             alias_path.symlink_to(expected)
         else:
             os.link(expected, alias_path)
-        alias = alias_path.name
+        alias = str(alias_path.relative_to(CANONICAL_REPOSITORY_ROOT))
     _rewrite_probe_attempt_argv(attempt_path, {"--data-path": alias})
 
     with pytest.raises(ValueError, match="materialized audited probe"):

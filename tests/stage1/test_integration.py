@@ -213,7 +213,9 @@ class TinyLifecycleCollator:
                 source_index=int(source_index),
                 source_id=f"tiny-{source_index}",
                 original_grid_range=(index, index + 1),
+                original_pixel_range=(index * 4, (index + 1) * 4),
                 helper_grid_range=(index, index + 1),
+                helper_pixel_range=(index, index + 1),
                 latent_spans=(
                     Stage1LatentSpan(start=5, end=8, latent_positions=(6, 7)),
                 ),
@@ -535,7 +537,7 @@ def test_tiny_stage1_b2_train_save_resume_end_to_end(tmp_path, method):
 
     assert run.student_batch_sizes == [2, 2, 2, 2]
     assert run.original_visual_calls == run.micro_batches
-    assert run.helper_visual_calls == run.micro_batches
+    assert run.helper_visual_calls == run.micro_batches * 2
     assert torch.isfinite(torch.tensor(run.losses)).all()
     assert run.checkpoint_1.is_dir()
 
