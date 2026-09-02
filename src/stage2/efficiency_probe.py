@@ -26,6 +26,14 @@ EFFICIENCY_SCHEMA_VERSION = 1
 SEGMENTED_KV_GATE = 0.30
 WARMUP_COUNT = 3
 MEASURED_COUNT = 10
+WALL_PARTITION_ABS_TOL_MS = 1e-6
+WALL_PARTITION_FIELDS = (
+    "collation_ms",
+    "forward_loss_ms",
+    "backward_ms",
+    "optimizer_ms",
+    "step_overhead_ms",
+)
 
 
 def _finite(name: str, value: float, *, allow_zero: bool = True) -> float:
@@ -44,6 +52,19 @@ def _non_negative_int(name: str, value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return value
+
+
+def _validate_wall_partition(value) -> None:
+    partition_ms = math.fsum(getattr(value, name) for name in WALL_PARTITION_FIELDS)
+    if not math.isclose(
+        partition_ms,
+        value.step_ms,
+        rel_tol=0.0,
+        abs_tol=WALL_PARTITION_ABS_TOL_MS,
+    ):
+        raise ValueError(
+            "top-level timings must form a same-clock wall partition of step_ms"
+        )
 
 
 @dataclass(frozen=True)
@@ -129,6 +150,7 @@ class Stage2EfficiencyEvidence:
             "gradient_norm",
         ):
             _finite(name, getattr(self, name))
+        _validate_wall_partition(self)
         _non_negative_int("peak_bytes", self.peak_bytes)
         _non_negative_int("prefix_input_length_sum", self.prefix_input_length_sum)
         if not math.isclose(
@@ -238,6 +260,7 @@ def _validate_sample(sample: Stage2EfficiencySample) -> None:
         "gradient_norm",
     ):
         _finite(name, getattr(sample, name))
+    _validate_wall_partition(sample)
     _non_negative_int("peak_bytes", sample.peak_bytes)
     _non_negative_int("prefix_input_length_sum", sample.prefix_input_length_sum)
     for input_length in sample.decoder_input_lengths:
@@ -247,7 +270,7 @@ def _validate_sample(sample: Stage2EfficiencySample) -> None:
 def summarize_samples(
     samples: list[Stage2EfficiencySample] | tuple[Stage2EfficiencySample, ...],
 ) -> Stage2EfficiencyEvidence:
-    """Validate measured samples and aggregate every scalar with its median."""
+    """Aggregate nested medians and the partition at the median wall step."""
     samples = tuple(samples)
     if not samples:
         raise ValueError("cannot summarize zero samples")
@@ -257,7 +280,20 @@ def summarize_samples(
     def median(name: str) -> float:
         return float(statistics.median(getattr(sample, name) for sample in samples))
 
-    step_ms = median("step_ms")
+    ordered_by_step = sorted(samples, key=lambda sample: sample.step_ms)
+    middle = len(ordered_by_step) // 2
+    partition_sources = (
+        (ordered_by_step[middle],)
+        if len(ordered_by_step) % 2
+        else (ordered_by_step[middle - 1], ordered_by_step[middle])
+    )
+
+    def partition_median(name: str) -> float:
+        return math.fsum(getattr(sample, name) for sample in partition_sources) / len(
+            partition_sources
+        )
+
+    step_ms = float(statistics.median(sample.step_ms for sample in samples))
     prefix_decoder_ms = median("prefix_decoder_ms")
     prefix_share = prefix_decoder_ms / step_ms
     return Stage2EfficiencyEvidence(
@@ -266,15 +302,15 @@ def summarize_samples(
         prefix_decoder_ms=prefix_decoder_ms,
         prefix_decoder_share=prefix_share,
         peak_bytes=int(statistics.median(sample.peak_bytes for sample in samples)),
-        collation_ms=median("collation_ms"),
+        collation_ms=partition_median("collation_ms"),
         final_decoder_ms=median("final_decoder_ms"),
         visual_ms=median("visual_ms"),
         lm_head_ms=median("lm_head_ms"),
         shifted_ce_loss_ms=median("shifted_ce_loss_ms"),
-        forward_loss_ms=median("forward_loss_ms"),
-        backward_ms=median("backward_ms"),
-        optimizer_ms=median("optimizer_ms"),
-        step_overhead_ms=median("step_overhead_ms"),
+        forward_loss_ms=partition_median("forward_loss_ms"),
+        backward_ms=partition_median("backward_ms"),
+        optimizer_ms=partition_median("optimizer_ms"),
+        step_overhead_ms=partition_median("step_overhead_ms"),
         forward_other_ms=median("forward_other_ms"),
         loss=median("loss"),
         gradient_norm=median("gradient_norm"),
@@ -556,31 +592,32 @@ def measure_cuda_training_step(
         step_started_ns = time.perf_counter_ns()
         collate_started = time.perf_counter_ns()
         batch = collate_fn()
-        collation_ms = (time.perf_counter_ns() - collate_started) / 1_000_000.0
+        collate_ended_ns = time.perf_counter_ns()
+        collation_ns = collate_ended_ns - collate_started
+        collation_ms = collation_ns / 1_000_000.0
         optimizer.zero_grad(set_to_none=True)
         forward_start = torch.cuda.Event(enable_timing=True)
         forward_end = torch.cuda.Event(enable_timing=True)
-        backward_start = torch.cuda.Event(enable_timing=True)
-        backward_end = torch.cuda.Event(enable_timing=True)
-        optimizer_start = torch.cuda.Event(enable_timing=True)
-        optimizer_end = torch.cuda.Event(enable_timing=True)
         cross_entropy_timer = _CrossEntropyCudaTimer()
+        forward_started_ns = time.perf_counter_ns()
         forward_start.record()
         with cross_entropy_timer:
             loss = loss_fn(batch)
         forward_end.record()
+        forward_ended_ns = time.perf_counter_ns()
         if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
             raise ValueError("trainer loss path must return one scalar tensor")
-        backward_start.record()
+        backward_started_ns = time.perf_counter_ns()
         loss.backward()
-        backward_end.record()
-        optimizer_start.record()
+        backward_ended_ns = time.perf_counter_ns()
+        optimizer_started_ns = time.perf_counter_ns()
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
-        optimizer_end.record()
+        optimizer_ended_ns = time.perf_counter_ns()
         torch.cuda.synchronize(device)
-        step_ms = (time.perf_counter_ns() - step_started_ns) / 1_000_000.0
+        step_ended_ns = time.perf_counter_ns()
+        step_ms = (step_ended_ns - step_started_ns) / 1_000_000.0
         peak_bytes = int(torch.cuda.max_memory_allocated(device))
 
         loss_value = float(loss.detach().item())
@@ -610,24 +647,27 @@ def measure_cuda_training_step(
         )
         if not cross_entropy_timer.calls:
             raise ValueError("training loss path did not call shifted cross entropy")
-        forward_loss_ms = forward_start.elapsed_time(forward_end)
-        backward_ms = backward_start.elapsed_time(backward_end)
-        optimizer_ms = optimizer_start.elapsed_time(optimizer_end)
+        forward_loss_cuda_ms = forward_start.elapsed_time(forward_end)
         forward_components_ms = (
             sum(decoder_ms)
             + component_ms["visual"]
             + component_ms["lm_head"]
             + shifted_ce_loss_ms
         )
-        forward_other_ms = max(0.0, forward_loss_ms - forward_components_ms)
-        step_overhead_ms = max(
-            0.0,
-            step_ms
-            - collation_ms
-            - forward_loss_ms
-            - backward_ms
-            - optimizer_ms,
+        forward_other_ms = max(0.0, forward_loss_cuda_ms - forward_components_ms)
+        forward_loss_ms = (forward_ended_ns - forward_started_ns) / 1_000_000.0
+        backward_ms = (backward_ended_ns - backward_started_ns) / 1_000_000.0
+        optimizer_ms = (optimizer_ended_ns - optimizer_started_ns) / 1_000_000.0
+        partitioned_ns = (
+            collation_ns
+            + (forward_ended_ns - forward_started_ns)
+            + (backward_ended_ns - backward_started_ns)
+            + (optimizer_ended_ns - optimizer_started_ns)
         )
+        step_overhead_ns = (step_ended_ns - step_started_ns) - partitioned_ns
+        if step_overhead_ns < 0:
+            raise RuntimeError("wall-clock timing regions overlap")
+        step_overhead_ms = step_overhead_ns / 1_000_000.0
         result = Stage2EfficiencySample(
             step_ms=step_ms,
             prefix_decoder_ms=sum(decoder_ms[:-1]),
@@ -1055,6 +1095,7 @@ def write_efficiency_result(
         raise TypeError("evidence must be Stage2EfficiencyEvidence")
     if not isinstance(metadata, Mapping):
         raise TypeError("metadata must be a mapping")
+    _validate_wall_partition(evidence)
     expected_authorization = authorize_segmented_kv(evidence, metadata)
     if (
         evidence.segmented_kv_authorized
@@ -1133,6 +1174,7 @@ def read_efficiency_result(path: str | Path) -> dict:
     if set(payload["evidence"]) != evidence_fields:
         raise ValueError("evidence fields do not match schema version 1")
     evidence = Stage2EfficiencyEvidence(**payload["evidence"])
+    _validate_wall_partition(evidence)
     expected_authorization = authorize_segmented_kv(evidence, payload["metadata"])
     if (
         payload["prefix_threshold_met"] != evidence.prefix_threshold_met
