@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
+import sys
 from typing import Any, Mapping
 
 import torch
-
-from stage1.equivalence import canonical_json_bytes, canonical_tensor_sha256
 
 
 _PROMPT_IDENTITY_FIELDS = (
@@ -31,11 +31,52 @@ class PreparedEvaluationInput:
 
 def _prompt_identity(tensors: Mapping[str, torch.Tensor]) -> str:
     ordered_digests = [
-        [field_name, canonical_tensor_sha256(tensors[field_name])]
+        [field_name, _canonical_tensor_sha256(tensors[field_name])]
         for field_name in _PROMPT_IDENTITY_FIELDS
         if field_name in tensors
     ]
-    return hashlib.sha256(canonical_json_bytes(ordered_digests)).hexdigest()
+    return hashlib.sha256(_canonical_json_bytes(ordered_digests)).hexdigest()
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _canonical_tensor_sha256(tensor: torch.Tensor) -> str:
+    """Hash prompt tensor metadata and contiguous little-endian CPU bytes."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("canonical tensor hash requires a torch.Tensor")
+    if tensor.layout is not torch.strided:
+        raise ValueError("canonical tensor hash requires a strided tensor")
+    if tensor.is_quantized:
+        raise ValueError("canonical tensor hash does not support quantized tensors")
+    if tensor.device.type == "meta":
+        raise ValueError("canonical tensor hash requires materialized tensor values")
+    cpu_tensor = tensor.detach().cpu().contiguous()
+    if (cpu_tensor.is_floating_point() or cpu_tensor.is_complex()) and not bool(
+        torch.isfinite(cpu_tensor).all()
+    ):
+        raise ValueError("canonical tensor hash requires finite tensor values")
+    payload = cpu_tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+    if sys.byteorder == "big" and cpu_tensor.element_size() > 1:
+        component_size = (
+            cpu_tensor.element_size() // 2
+            if cpu_tensor.is_complex()
+            else cpu_tensor.element_size()
+        )
+        payload = b"".join(
+            payload[offset : offset + component_size][::-1]
+            for offset in range(0, len(payload), component_size)
+        )
+    metadata = _canonical_json_bytes(
+        {"dtype": str(cpu_tensor.dtype), "shape": list(cpu_tensor.shape)}
+    )
+    return hashlib.sha256(metadata + payload).hexdigest()
 
 
 def prepare_evaluation_input(

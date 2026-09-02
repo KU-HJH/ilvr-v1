@@ -1,7 +1,9 @@
 import copy
 import importlib
 import json
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -995,6 +997,31 @@ def test_prompt_preparation_excludes_gold_from_tensors_and_identity(tmp_path):
     assert {item.prompt_identity for item in prepared} == {
         prepared[0].prompt_identity
     }
+
+
+def test_evaluation_runtime_import_does_not_load_stage1_training_dependencies():
+    """A patched Python version string must not fail before evaluator startup."""
+    repo = Path(__file__).resolve().parents[2]
+    program = (
+        "import sys\n"
+        "import evaluation.runtime\n"
+        "assert 'datasets' not in sys.modules\n"
+        "assert 'stage1.data' not in sys.modules\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{repo}:{repo / 'src'}:{repo / 'transformers/src'}",
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
