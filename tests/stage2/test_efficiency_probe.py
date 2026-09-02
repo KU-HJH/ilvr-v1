@@ -15,6 +15,7 @@ from stage2.efficiency_probe import (
     SEGMENTED_KV_GATE,
     Stage2EfficiencySample,
     Stage2RecurrenceWorkExample,
+    compute_trainer_loss_with_accelerator_autocast,
     authorize_segmented_kv,
     benchmark_worker_counts,
     build_recurrence_work_examples,
@@ -274,6 +275,40 @@ def test_compatible_profile_metadata_records_single_process_effective_batch(
         "gradient_accumulation_steps": 1,
         "effective_batch_size": 1,
     }
+
+
+def test_production_loss_uses_trainers_accelerator_autocast_context():
+    """Catches direct probe loss calls bypassing Trainer BF16 autocast."""
+    events = []
+
+    class Autocast:
+        active = False
+
+        def __enter__(self):
+            self.active = True
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.active = False
+            events.append("exit")
+
+    autocast = Autocast()
+
+    def compute_loss(_model, batch):
+        assert autocast.active
+        events.append("loss")
+        return batch["loss"]
+
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(autocast=lambda: autocast),
+        model=object(),
+        compute_loss=compute_loss,
+    )
+
+    assert compute_trainer_loss_with_accelerator_autocast(
+        trainer, {"loss": "bf16-loss"}
+    ) == "bf16-loss"
+    assert events == ["enter", "loss", "exit"]
 
 
 def test_aggregation_uses_component_medians_then_computes_prefix_share():

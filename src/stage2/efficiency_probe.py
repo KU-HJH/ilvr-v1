@@ -1058,6 +1058,12 @@ def compatible_no_cache_profile_metadata(args) -> dict[str, int | float | bool |
     }
 
 
+def compute_trainer_loss_with_accelerator_autocast(trainer, batch):
+    """Run the production probe loss path under Trainer's configured AMP mode."""
+    with trainer.accelerator.autocast():
+        return trainer.compute_loss(trainer.model, batch)
+
+
 def run_stage2_probe(args) -> Path:
     """Measure retained representatives through the production Stage 2 loss path."""
     profile_metadata = compatible_no_cache_profile_metadata(args)
@@ -1121,7 +1127,9 @@ def run_stage2_probe(args) -> Path:
                     visual=qwen.visual,
                     lm_head=qwen.lm_head,
                     collate_fn=lambda: trainer._prepare_inputs(next(iterator)),
-                    loss_fn=lambda batch: trainer.compute_loss(trainer.model, batch),
+                    loss_fn=lambda batch: compute_trainer_loss_with_accelerator_autocast(
+                        trainer, batch
+                    ),
                     optimizer=trainer.optimizer,
                     scheduler=trainer.lr_scheduler,
                 )
