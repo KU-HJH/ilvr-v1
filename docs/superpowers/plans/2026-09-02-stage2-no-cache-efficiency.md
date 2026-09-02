@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove exact, measurable waste from the existing Stage 2 no-cache training path and decide from a representative B200 profile whether a segmented KV experiment is justified.
+**Goal:** Remove exact, measurable waste from the existing Stage 2 no-cache training path and measure on the active target training server whether a separately reviewed segmented KV experiment may be justified.
 
-**Architecture:** Keep the current no-cache recurrence as the semantic oracle. Add three isolated model/trainer fast paths, replace per-rank image-aware length filtering with one launcher-produced manifest, then profile the combined path. This plan ends at a hard gate: segmented KV work is authorized only when repeated-prefix decoder work remains at least 30% of median end-to-end step time.
+**Architecture:** Keep the current no-cache recurrence as the semantic oracle. Add three isolated model/trainer fast paths, replace per-rank image-aware length filtering with one launcher-produced manifest, then profile the combined path. This plan records whether repeated-prefix decoder work remains at least 30% of median end-to-end step time, while schema v1 keeps segmented KV authorization fail-closed pending separate review.
 
 **Tech Stack:** Python 3.11, PyTorch 2.7.1+cu128, local Transformers 4.50.0.dev0, TRL Trainer, PEFT, DeepSpeed, pytest, Bash.
 
@@ -494,7 +494,7 @@ git commit -m "perf(stage2): share one length manifest across ranks"
 
 ---
 
-### Task 6: Focused B200 efficiency probe and hard KV gate
+### Task 6: Focused active-target-server efficiency probe and hard KV gate
 
 **Files:**
 - Create: `src/stage2/efficiency_probe.py`
@@ -503,7 +503,7 @@ git commit -m "perf(stage2): share one length manifest across ranks"
 
 **Interfaces:**
 - Consumes: an already validated Stage 2 manifest, model/run arguments, representative quantiles, warmup count three, measured count ten.
-- Produces: `results/<experiment-id>/stage2-efficiency.json` and a matching log; JSON field `segmented_kv_authorized` is true only when prefix decoder time share is at least `0.30`.
+- Produces: `results/<experiment-id>/stage2-efficiency.json` and a matching log; `prefix_threshold_met` records whether prefix decoder time share is at least `0.30`, while schema-v1 `segmented_kv_authorized` remains false.
 
 - [ ] **Step 1: Add failing selection, aggregation, and gate tests**
 
@@ -561,7 +561,7 @@ Expected: tests PASS and the smoke result contains finite timing and memory valu
 
 Construct the actual Stage 2 `DataLoader` with worker counts `0`, `2`, and `4`; after two warm-up batches, time twenty collated batches or one full retained epoch when it has fewer than twenty entries. Select the fastest count that stays within host-memory capacity. Then run the GPU probe with that fixed count on the actual full/LoRA/DoRA configuration selected by the user. Use FlashAttention 2 and the best feasible no-cache checkpointing choice as separate labeled runs; do not compare different examples or effective batch sizes.
 
-Expected: one immutable result JSON and one log per run ID. Record whether `segmented_kv_authorized` is true.
+Expected: one immutable result JSON and one log per run ID. Record `prefix_threshold_met`; verify that schema-v1 `segmented_kv_authorized` remains false.
 
 - [ ] **Step 7: Commit the probe and documentation**
 

@@ -721,7 +721,8 @@ logs to the matching directory under `logs/`. The strict schema-v1 field
 divided by median end-to-end step time is at least `0.30`. The separate
 `segmented_kv_authorized` field is unconditionally false in the current schema:
 the probe is not production-equivalent profiling and cannot authorize
-segmented-KV follow-up work, even for threshold-met p50/p95 B200 metadata. A
+segmented-KV follow-up work, even for threshold-met p50/p95 metadata from the
+active target server. A
 future separately reviewed plan and implementation must open that gate.
 
 #### Verification status
@@ -729,12 +730,14 @@ future separately reviewed plan and implementation must open that gate.
 - **Implementation and smoke:** one real Stage 1 checkpoint/CoMT sample
   completed one Stage 2 optimizer step with finite loss
   (`0.00010741489677457139`).
-- **FlashAttention:** a tiny one-layer Stage 2 model passed eager versus
-  FlashAttention 2 latent/logit parity once on an NVIDIA B200 using bfloat16,
+- **Historical FlashAttention evidence (previous B200 server):** a tiny one-layer
+  Stage 2 model passed eager versus FlashAttention 2 latent/logit parity once
+  using bfloat16,
   PyTorch 2.7.1+cu128, and FlashAttention 2.8.3.
-- **DeepSpeed:** a reviewed tiny-model two-B200 ZeRO-3 run passed consolidated
-  save/load and optimizer/scheduler resume from global step 1 to 2, with every
-  observed rank-local batch equal to 1 for the pre-PEFT full-tuning path.
+- **Historical DeepSpeed evidence (previous B200 server):** a reviewed tiny-model
+  two-GPU ZeRO-3 run passed consolidated save/load and optimizer/scheduler resume
+  from global step 1 to 2, with every observed rank-local batch equal to 1 for
+  the pre-PEFT full-tuning path.
 - **LoRA/DoRA CPU:** the production-based tiny harness passed adapter-only
   save, fresh-base trainable reload, and Trainer resume from global step 1 to 2
   for both methods, including optimizer/scheduler and frozen-boundary checks.

@@ -206,7 +206,7 @@ def test_aggregation_rejects_mixed_clock_or_clamped_wall_partition():
 
 
 def test_prefix_gate_is_fixed_at_thirty_percent():
-    """Catches the numeric threshold drifting or authorizing without B200 evidence."""
+    """Catches the numeric threshold drifting or authorizing without evidence."""
     assert SEGMENTED_KV_GATE == 0.30
     below = summarize_samples(
         [sample(step_ms=100.0, prefix_decoder_ms=29.9, peak_bytes=10)]
@@ -221,10 +221,10 @@ def test_prefix_gate_is_fixed_at_thirty_percent():
     assert boundary.segmented_kv_authorized is False
 
 
-def representative_b200_metadata(**overrides):
+def representative_target_metadata(**overrides):
     metadata = {
         "probe_kind": "stage2_no_cache",
-        "device_name": "NVIDIA B200",
+        "device_name": "active target GPU",
         "manifest_validated": True,
         "representative_quantiles": ["p50", "p95"],
         "warmup_count_per_representative": 3,
@@ -236,27 +236,27 @@ def representative_b200_metadata(**overrides):
 
 
 def test_project_authorization_rejects_nonrepresentative_metadata():
-    """Catches H100, self-test, or incomplete metadata authorizing KV work."""
+    """Catches self-test or incomplete metadata authorizing KV work."""
     threshold_met = summarize_samples(
         [sample(step_ms=100.0, prefix_decoder_ms=40.0)]
     )
 
     assert authorize_segmented_kv(
-        threshold_met, representative_b200_metadata(device_name="NVIDIA H100 NVL")
+        threshold_met, representative_target_metadata(device_name="")
     ).segmented_kv_authorized is False
     assert authorize_segmented_kv(
-        threshold_met, representative_b200_metadata(probe_kind="tiny_cuda_self_test")
+        threshold_met, representative_target_metadata(probe_kind="tiny_cuda_self_test")
     ).segmented_kv_authorized is False
     assert authorize_segmented_kv(
-        threshold_met, representative_b200_metadata(manifest_validated=False)
+        threshold_met, representative_target_metadata(manifest_validated=False)
     ).segmented_kv_authorized is False
     assert authorize_segmented_kv(
         summarize_samples([sample(step_ms=100.0, prefix_decoder_ms=29.9)]),
-        representative_b200_metadata(),
+        representative_target_metadata(),
     ).segmented_kv_authorized is False
 
 
-def test_project_authorization_is_fail_closed_for_qualifying_b200_metadata():
+def test_project_authorization_is_fail_closed_for_qualifying_target_metadata():
     """Catches non-production probe metadata reopening the segmented-KV gate."""
     threshold_met = summarize_samples(
         [sample(step_ms=100.0, prefix_decoder_ms=40.0)]
@@ -264,7 +264,7 @@ def test_project_authorization_is_fail_closed_for_qualifying_b200_metadata():
 
     assert threshold_met.prefix_threshold_met is True
     assert authorize_segmented_kv(
-        threshold_met, representative_b200_metadata()
+        threshold_met, representative_target_metadata()
     ).segmented_kv_authorized is False
 
 
@@ -353,7 +353,7 @@ def test_result_writer_rejects_true_authorization_even_with_qualifying_metadata(
             result_root=tmp_path,
             experiment_id="forged-writer",
             evidence=evidence,
-            metadata=representative_b200_metadata(),
+            metadata=representative_target_metadata(),
         )
 
     assert not (tmp_path / "forged-writer" / "stage2-efficiency.json").exists()
@@ -375,7 +375,7 @@ def test_result_reader_rejects_true_authorization_even_with_qualifying_metadata(
         "prefix_threshold_met": True,
         "segmented_kv_authorized": True,
         "evidence": evidence_payload,
-        "metadata": representative_b200_metadata(),
+        "metadata": representative_target_metadata(),
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
 

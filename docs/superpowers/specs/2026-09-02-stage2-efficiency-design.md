@@ -1,7 +1,7 @@
 # Stage 2 Training Efficiency Design
 
 **Date:** 2026-09-02
-**Status:** Approved design commitment v2; awaiting written-spec review
+**Status:** Approved design commitment v3; active-server correction, mechanism unchanged
 **Scope:** Make Stage 2 training faster and less memory-intensive without changing the existing Stage 2 mechanism or training objective.
 
 ## 1. Non-negotiable Stage 2 semantics
@@ -49,10 +49,10 @@ Use CUDA synchronization around timed GPU regions, three warm-up steps, and ten 
 The load-bearing objection is that a dropout-free, checkpointing-free KV path may still be slower or use more memory than the best no-cache path because the final full forward and distributed collectives remain mandatory. The first nail is therefore:
 
 1. Optimize and re-profile the no-cache path.
-2. Proceed to a KV implementation only if repeated-prefix decoder work is at least 30% of median end-to-end step time on the representative B200 profile.
+2. Record whether repeated-prefix decoder work is at least 30% of median end-to-end step time on a representative profile from the active target training server, including its exact GPU identity.
 3. Stop the KV work if a minimal segmented causal-composability probe fails the FP32 oracle checks.
 
-This first nail has not been run. Running it before approval would have required new profiling/prototype code and B200 runtime. The implementation plan will authorize and order it before any KV backend work.
+This first nail has not been run. The available checkpoint is test-only and cannot provide representative production evidence. The current schema therefore records the threshold result but keeps KV authorization closed; a separately reviewed plan must authorize any KV backend work.
 
 ## 4. Exact no-cache optimizations
 
@@ -168,7 +168,7 @@ For every trainable gradient tensor with a nonzero reference norm:
 
 Zero-reference gradient tensors must remain all-close at `atol = 2e-2`, `rtol = 0`.
 
-Test full tuning, LoRA, and DoRA first on a tiny single-device model. Widen to FlashAttention 2, the selected DeepSpeed/ZeRO configuration, distributed sampler alignment, and resume only after the cheapest representative B200 falsification run passes.
+Test full tuning, LoRA, and DoRA first on a tiny single-device model. Widen to FlashAttention 2, the selected DeepSpeed/ZeRO configuration, distributed sampler alignment, and resume only after the cheapest representative active-target-server falsification run passes.
 
 ## 7. Performance adoption gate
 

@@ -8,9 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 
-CANONICAL_REPOSITORY_ROOT = Path(
-    "/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR"
-)
+CANONICAL_REPOSITORY_ROOT = Path("/root/workspace/ILVR")
 CANONICAL_CHECKPOINT_ROOT = (
     CANONICAL_REPOSITORY_ROOT / "checkpoints" / "zero-stage-compatibility"
 )
@@ -56,10 +54,16 @@ def require_canonical_artifact_path(
     }
     if path is None:
         raise ValueError(f"path must be below the canonical {kind} root: {roots[kind]}")
-    candidate = Path(path).expanduser().resolve(strict=False)
-    root = roots[kind].resolve(strict=False)
-    if candidate == root or not candidate.is_relative_to(root):
-        raise ValueError(f"path must be below the canonical {kind} root: {root}")
+    candidate = Path(path).expanduser().absolute()
+    canonical_root = roots[kind].absolute()
+    resolved_candidate = candidate.resolve(strict=False)
+    resolved_root = canonical_root.resolve(strict=False)
+    if resolved_candidate == resolved_root or not resolved_candidate.is_relative_to(
+        resolved_root
+    ):
+        raise ValueError(
+            f"path must be below the canonical {kind} root: {canonical_root}"
+        )
     return candidate
 
 
