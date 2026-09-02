@@ -132,6 +132,100 @@ class RecordingRolloutEngine:
         return self.delegate.rollout(**kwargs)
 
 
+@pytest.mark.parametrize("method", ["full", "lora", "dora"])
+def test_stage2_loss_only_matches_full_loss_and_all_trainable_gradients(method):
+    """Catches selective LM-head projection changing any trainable gradient."""
+    torch.manual_seed(17)
+    full = build_stage2_tuned_model(tiny_stage2_qwen(), settings(method)).train()
+    selective = deepcopy(full).train()
+    selective_qwen = resolve_stage2_qwen_model(selective)
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
+    labels = input_ids.clone()
+    labels[:, :2] = -100
+    labels[input_ids == 90] = -100
+    seen = []
+    handle = selective_qwen.lm_head.register_forward_pre_hook(
+        lambda _module, args: seen.append(tuple(args[0].shape))
+    )
+
+    full_output = full(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+    )
+    selective_output = selective(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        stage2_loss_only=True,
+    )
+    handle.remove()
+    full_output.loss.backward()
+    selective_output.loss.backward()
+
+    active = int((labels[:, 1:] != -100).sum())
+    assert seen == [(active, selective_qwen.config.hidden_size)]
+    assert selective_output.logits is None
+    torch.testing.assert_close(
+        selective_output.loss, full_output.loss, atol=1e-6, rtol=1e-5
+    )
+    for (full_name, full_parameter), (fast_name, fast_parameter) in zip(
+        full.named_parameters(), selective.named_parameters(), strict=True
+    ):
+        assert full_name == fast_name
+        if full_parameter.requires_grad:
+            torch.testing.assert_close(
+                fast_parameter.grad,
+                full_parameter.grad,
+                atol=1e-6,
+                rtol=1e-5,
+            )
+
+
+@pytest.mark.parametrize(
+    ("labels", "return_dict", "message"),
+    [
+        (None, True, "Stage 2 loss-only forward requires labels"),
+        (
+            torch.full((1, 7), -100, dtype=torch.long),
+            True,
+            "Stage 2 loss-only forward requires at least one supervised label",
+        ),
+        (
+            torch.tensor([[-100, -100, -100, -100, 92, 2, 3]]),
+            False,
+            "Stage 2 loss-only forward requires return_dict=True",
+        ),
+    ],
+)
+def test_stage2_loss_only_rejects_invalid_contracts(labels, return_dict, message):
+    """Catches loss-only calls returning undefined or ambiguous output contracts."""
+    model = tiny_stage2_qwen()
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
+
+    with pytest.raises(ValueError, match=message):
+        model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            labels=labels,
+            return_dict=return_dict,
+            stage2_loss_only=True,
+        )
+
+
+def test_stage2_loss_only_default_call_retains_full_logits():
+    """Catches the optimized projection becoming the ordinary forward default."""
+    model = tiny_stage2_qwen()
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+    )
+
+    assert outputs.logits.shape == (1, input_ids.shape[1], model.config.vocab_size)
+
+
 def test_stage2_freezes_full_visual_module_at_composition():
     model = tiny_stage2_qwen()
 

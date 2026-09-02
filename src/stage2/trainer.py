@@ -216,7 +216,11 @@ class Stage2Trainer(Trainer):
             raise ValueError(
                 f"helper-image tensors leaked into Stage 2: {sorted(forbidden)}"
             )
-        outputs = model(**inputs, collect_stage2_diagnostics=True)
+        outputs = model(
+            **inputs,
+            stage2_loss_only=not return_outputs,
+            collect_stage2_diagnostics=True,
+        )
         diagnostics = getattr(outputs, "stage2_diagnostics", None)
         self._latest_stage2_diagnostics = (
             None

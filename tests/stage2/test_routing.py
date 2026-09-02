@@ -72,6 +72,7 @@ def test_stage2_trainer_collects_detached_model_native_diagnostics():
     assert loss.item() == 2.0
     assert outputs.loss is loss
     assert model.last_inputs["collect_stage2_diagnostics"] is True
+    assert model.last_inputs["stage2_loss_only"] is False
     assert set(trainer._latest_stage2_diagnostics) == {
         "block_count",
         "latent_l2_norms",
@@ -81,6 +82,19 @@ def test_stage2_trainer_collects_detached_model_native_diagnostics():
         not value.requires_grad
         for value in trainer._latest_stage2_diagnostics.values()
     )
+
+
+def test_stage2_trainer_requests_loss_only_when_outputs_are_not_returned():
+    """Catches ordinary training projecting full logits unnecessarily."""
+    trainer = object.__new__(Stage2Trainer)
+    model = DiagnosticStage2Model()
+
+    loss = trainer.compute_loss(
+        model, {"input_ids": torch.ones(1, 3)}, return_outputs=False
+    )
+
+    assert loss.item() == 2.0
+    assert model.last_inputs["stage2_loss_only"] is True
 
 
 def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(

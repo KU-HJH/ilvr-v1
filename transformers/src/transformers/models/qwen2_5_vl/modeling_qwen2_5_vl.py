@@ -1986,11 +1986,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         return_stage2_latent_states: bool,
         collect_stage2_diagnostics: bool,
         retain_stage2_latent_grads: bool,
+        stage2_loss_only: bool,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         if input_ids is None:
             raise ValueError("Stage 2 forward requires input_ids")
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise NotImplementedError("Stage 2 forward currently supports batch_size=1 only")
+        if stage2_loss_only and labels is None:
+            raise ValueError("Stage 2 loss-only forward requires labels")
+        if stage2_loss_only and not return_dict:
+            raise ValueError("Stage 2 loss-only forward requires return_dict=True")
 
         base_inputs_embeds = self.prepare_stage2_base_inputs_embeds(
             input_ids=input_ids,
@@ -2040,14 +2045,30 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_hidden_states=output_hidden_states,
             return_dict=True,
         )
-        logits = self.lm_head(final_outputs.last_hidden_state)
-
-        loss = None
-        if labels is not None:
-            logits = logits.float()
-            shift_logits = logits[..., :-1, :].contiguous().view(-1, self.config.vocab_size)
-            shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
-            loss = CrossEntropyLoss()(shift_logits, shift_labels)
+        if stage2_loss_only:
+            shift_labels = labels[..., 1:].contiguous().view(-1).to(
+                final_outputs.last_hidden_state.device
+            )
+            active = shift_labels != -100
+            if not active.any():
+                raise ValueError(
+                    "Stage 2 loss-only forward requires at least one supervised label"
+                )
+            shifted_hidden = final_outputs.last_hidden_state[..., :-1, :].contiguous().view(
+                -1, final_outputs.last_hidden_state.shape[-1]
+            )
+            active_logits = self.lm_head(shifted_hidden[active]).float()
+            loss = CrossEntropyLoss()(active_logits, shift_labels[active])
+            logits = None
+        else:
+            logits = self.lm_head(final_outputs.last_hidden_state)
+            loss = None
+            if labels is not None:
+                shift_logits = logits.float()[..., :-1, :].contiguous().view(
+                    -1, self.config.vocab_size
+                )
+                shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
+                loss = CrossEntropyLoss()(shift_logits, shift_labels)
 
         diagnostics = None
         if rollout.diagnostics is not None:
@@ -2118,6 +2139,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         return_stage2_latent_states: bool = False,
         collect_stage2_diagnostics: bool = False,
         retain_stage2_latent_grads: bool = False,
+        stage2_loss_only: bool = False,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2159,6 +2181,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 return_stage2_latent_states=return_stage2_latent_states,
                 collect_stage2_diagnostics=collect_stage2_diagnostics,
                 retain_stage2_latent_grads=retain_stage2_latent_grads,
+                stage2_loss_only=stage2_loss_only,
             )
 
         # ===================================================================
