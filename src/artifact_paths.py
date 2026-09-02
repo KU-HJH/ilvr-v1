@@ -64,7 +64,7 @@ def require_canonical_artifact_path(
         raise ValueError(
             f"path must be below the canonical {kind} root: {canonical_root}"
         )
-    return candidate
+    return canonical_root / resolved_candidate.relative_to(resolved_root)
 
 
 def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPaths:

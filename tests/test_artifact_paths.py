@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import src.artifact_paths as artifact_paths
 from src.artifact_paths import (
     resolve_run_artifact_paths,
     require_canonical_artifact_path,
@@ -55,6 +56,45 @@ def test_canonical_checkpoint_path_preserves_repository_symlink_spelling():
     )
 
     assert require_canonical_artifact_path(canonical, kind="checkpoint") == canonical
+
+
+def test_canonical_path_normalizes_descendant_symlink_alias(tmp_path, monkeypatch):
+    """Catches a run alias silently targeting another canonical experiment."""
+    storage_root = tmp_path / "checkpoint-storage"
+    resolved_root = storage_root / "zero-stage-compatibility"
+    actual_run = resolved_root / "actual-run"
+    actual_run.mkdir(parents=True)
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    (repository_root / "checkpoints").symlink_to(
+        storage_root, target_is_directory=True
+    )
+    canonical_root = repository_root / "checkpoints" / "zero-stage-compatibility"
+    (canonical_root / "alias-run").symlink_to(actual_run, target_is_directory=True)
+    monkeypatch.setattr(
+        artifact_paths, "CANONICAL_CHECKPOINT_ROOT", canonical_root
+    )
+
+    requested = canonical_root / "alias-run" / "model.safetensors"
+
+    assert require_canonical_artifact_path(requested, kind="checkpoint") == (
+        canonical_root / "actual-run" / "model.safetensors"
+    )
+
+
+def test_canonical_path_normalizes_parent_segments(tmp_path, monkeypatch):
+    """Catches lexical parent segments surviving canonical validation."""
+    canonical_root = tmp_path / "checkpoints" / "zero-stage-compatibility"
+    (canonical_root / "actual-run").mkdir(parents=True)
+    monkeypatch.setattr(
+        artifact_paths, "CANONICAL_CHECKPOINT_ROOT", canonical_root
+    )
+
+    requested = canonical_root / "discarded-run" / ".." / "actual-run" / "model"
+
+    assert require_canonical_artifact_path(requested, kind="checkpoint") == (
+        canonical_root / "actual-run" / "model"
+    )
 
 
 def test_generated_checkpoint_result_and_log_share_experiment_id(stage1_args):

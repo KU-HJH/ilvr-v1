@@ -581,7 +581,7 @@ git commit -m "perf(stage2): add representative efficiency gate"
 
 **Interfaces:**
 - Consumes: Tasks 1-6 and fresh test/probe output.
-- Produces: a verified no-cache optimization result and either an explicit stop or authorization to invoke `superpowers:writing-plans` for a separate segmented-KV experiment plan.
+- Produces: a verified no-cache optimization result, an informational threshold classification, and an explicit stop. It does not authorize or invoke segmented-KV planning.
 
 - [ ] **Step 1: Run the focused Stage 2 suite once**
 
@@ -606,7 +606,7 @@ Expected: exit code zero.
 
 - [ ] **Step 3: Decide from the predeclared gate**
 
-Read the newest optimized no-cache evidence. If `prefix_decoder_share < 0.30`, stop and report that segmented KV is not justified. If it is at least `0.30`, invoke `superpowers:writing-plans` to create the separate conditional segmented-KV plan without changing the threshold.
+Read the newest optimized no-cache evidence, record whether `prefix_decoder_share` is below or at least `0.30`, and stop unconditionally. A threshold-met result may inform a future proposal, but this plan neither invokes nor authorizes segmented-KV planning or implementation.
 
 - [ ] **Step 4: Commit only the recorded plan result when evidence exists**
 

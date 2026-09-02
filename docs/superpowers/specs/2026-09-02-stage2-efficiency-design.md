@@ -30,7 +30,7 @@ Safe but incomplete. It removes known exact waste while leaving the dominant rep
 
 ### C. Exact no-cache optimizations followed by a gated KV experiment
 
-Selected. Exact changes are implemented and measured first. A segmented KV backend is built only if the optimized no-cache profile proves that redundant prefix work is a large enough bottleneck. It remains default-off and cannot replace the oracle without correctness and performance evidence.
+Selected only for the exact no-cache optimization and measurement phases. Schema v1 treats the threshold as informational and does not authorize building a segmented KV backend. Any such backend requires a new, separately reviewed and explicitly approved design.
 
 ## 3. Measurement baseline and first nail
 
@@ -50,7 +50,7 @@ The load-bearing objection is that a dropout-free, checkpointing-free KV path ma
 
 1. Optimize and re-profile the no-cache path.
 2. Record whether repeated-prefix decoder work is at least 30% of median end-to-end step time on a representative profile from the active target training server, including its exact GPU identity.
-3. Stop the KV work if a minimal segmented causal-composability probe fails the FP32 oracle checks.
+3. Require any future, separately approved KV design to stop if a minimal segmented causal-composability probe fails the FP32 oracle checks.
 
 This first nail has not been run. The available checkpoint is test-only and cannot provide representative production evidence. The current schema therefore records the threshold result but keeps KV authorization closed; a separately reviewed plan must authorize any KV backend work.
 
@@ -98,7 +98,9 @@ The launcher validates or creates this manifest once, then passes its path to ev
 
 Expose a fixed dataloader worker count through the launcher. Benchmark `0`, `2`, and `4` workers on the representative samples and select the fastest value that does not increase peak host memory beyond available capacity. Do not add runtime auto-tuning.
 
-## 5. Conditional segmented KV backend
+## 5. Deferred segmented KV design notes (not authorized by v3)
+
+This section records constraints for evaluating a possible future design. It is not an implementation authorization, and no threshold result may activate it under schema v1.
 
 ### 5.1 Selection and preflight
 
@@ -212,7 +214,7 @@ Unvalidated premises remain:
 - segment shape changes may create BF16 drift beyond the declared limits;
 - DeepSpeed/ZeRO collectives may erase the token-compute speedup.
 
-There is no waiver for changing Stage 2 semantics. Approval authorizes measurement and a default-off deterministic prototype only; it does not authorize adopting a backend that misses an invariant or gate.
+There is no waiver for changing Stage 2 semantics. Approval authorizes exact no-cache optimization and measurement only; it does not authorize a KV prototype or backend. Any future KV work requires a new design commitment and explicit approval.
 
 ## 10. Explicit non-goals
 
