@@ -70,6 +70,8 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         REQUIRED_ENV["DATA_PATH"],
         "--image_root",
         REQUIRED_ENV["IMAGE_ROOT"],
+        "--dataloader_num_workers",
+        "0",
         "--save_model_path",
         REQUIRED_ENV["OUTPUT_DIR"],
         "--log_file",
@@ -104,6 +106,10 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "1",
         "--evaluation_output_path",
         "/reports/stage 2.json",
+        "--stage2_length_manifest",
+        "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json",
+        "--stage2_length_manifest_sha256",
+        "0000000000000000000000000000000000000000000000000000000000000000",
     ]
 
 
