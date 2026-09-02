@@ -1023,8 +1023,44 @@ def _load_stage2_probe_components(args, *, worker_count: int):
     )
 
 
+def compatible_no_cache_profile_metadata(args) -> dict[str, int | float | bool | str]:
+    """Validate and describe the fixed single-process Task 1 profile."""
+    lora_dropout = getattr(args, "lora_dropout", None)
+    if (
+        isinstance(lora_dropout, bool)
+        or not isinstance(lora_dropout, (int, float))
+        or not math.isfinite(lora_dropout)
+        or float(lora_dropout) != 0.0
+    ):
+        raise ValueError("compatible no-cache profile requires lora_dropout == 0.0")
+    if getattr(args, "gradient_checkpointing", None) is not False:
+        raise ValueError(
+            "compatible no-cache profile requires gradient_checkpointing == false"
+        )
+    try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError as error:
+        raise ValueError("compatible no-cache profile requires integer WORLD_SIZE") from error
+    if world_size != 1:
+        raise ValueError("compatible no-cache profile requires WORLD_SIZE == 1")
+    per_device_train_batch_size = 1
+    gradient_accumulation_steps = 1
+    return {
+        "profile_scope": "single_process",
+        "world_size": world_size,
+        "lora_dropout": float(lora_dropout),
+        "gradient_checkpointing": False,
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "effective_batch_size": (
+            world_size * per_device_train_batch_size * gradient_accumulation_steps
+        ),
+    }
+
+
 def run_stage2_probe(args) -> Path:
     """Measure retained representatives through the production Stage 2 loss path."""
+    profile_metadata = compatible_no_cache_profile_metadata(args)
     from stage2.length_manifest import read_stage2_length_manifest
     from stage2.peft import resolve_stage2_qwen_model
 
@@ -1126,7 +1162,7 @@ def run_stage2_probe(args) -> Path:
                 else str(Path(args.stage1_adapter).resolve())
             ),
             "attention_implementation": args.attention_implementation,
-            "gradient_checkpointing": args.gradient_checkpointing,
+            **profile_metadata,
             "tuning_method": args.tuning_method,
             "warmup_count_per_representative": WARMUP_COUNT,
             "measured_count_per_representative": MEASURED_COUNT,

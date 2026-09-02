@@ -20,6 +20,7 @@ from stage2.efficiency_probe import (
     build_recurrence_work_examples,
     build_parser,
     build_representative_dataloader,
+    compatible_no_cache_profile_metadata,
     measure_cuda_training_step,
     read_efficiency_result,
     recurrence_work_metadata,
@@ -229,10 +230,50 @@ def test_probe_seals_recurrence_records_before_model_loading(monkeypatch, tmp_pa
                     "c9d0036bed6744bcdf692fc980d8717d7e5f5a4f4e8266b4a84982602fb1cd09"
                 ),
                 dataloader_num_workers=0,
+                lora_dropout=0.0,
+                gradient_checkpointing=False,
             )
         )
 
     assert events == ["parsed", "model_loaded"]
+
+
+def test_compatible_profile_rejects_bad_settings_before_scaffold_or_model_work(
+    monkeypatch,
+):
+    """Catches a compatible-profile result being emitted from bad invocation flags."""
+    calls = []
+    monkeypatch.setattr(
+        efficiency_probe_module,
+        "_seal_recurrence_work_examples",
+        lambda _args: calls.append("sealed"),
+    )
+
+    with pytest.raises(ValueError, match="lora_dropout"):
+        efficiency_probe_module.run_stage2_probe(
+            SimpleNamespace(lora_dropout=0.1, gradient_checkpointing=False)
+        )
+
+    assert calls == []
+
+
+def test_compatible_profile_metadata_records_single_process_effective_batch(
+    monkeypatch,
+):
+    """Catches un-auditable profile settings or an incorrect effective batch."""
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+
+    assert compatible_no_cache_profile_metadata(
+        SimpleNamespace(lora_dropout=0.0, gradient_checkpointing=False)
+    ) == {
+        "profile_scope": "single_process",
+        "world_size": 1,
+        "lora_dropout": 0.0,
+        "gradient_checkpointing": False,
+        "per_device_train_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "effective_batch_size": 1,
+    }
 
 
 def test_aggregation_uses_component_medians_then_computes_prefix_share():
