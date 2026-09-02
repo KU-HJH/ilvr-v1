@@ -677,6 +677,49 @@ total samples, 3,379 retained, and 71 filtered (2.057971%). Lengths had minimum
 tokens. The latent-block distribution was 924/239/561/1,227/286/213 samples
 for one through six blocks, respectively.
 
+#### Stage 2 no-cache efficiency gate
+
+The focused probe measures the existing no-cache recurrence and mandatory final
+full forward; it does not implement or prototype KV caching. Validate the CUDA
+measurement path with an immutable tiny smoke result and matching log:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src \
+  ./venv/ilvr-venv/bin/python -m stage2.efficiency_probe \
+  --self-test --experiment-id stage2-efficiency-self-test
+```
+
+A representative run requires the already sealed Stage 2 length manifest and
+its SHA-256, plus the exact model/tuning configuration. The probe selects the
+retained examples closest to the joint p50 and p95 length/block-count targets,
+benchmarks DataLoader worker counts 0, 2, and 4, then retains three warm-up and
+ten measured optimizer steps per representative:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src \
+  ./venv/ilvr-venv/bin/python -m stage2.efficiency_probe \
+  --experiment-id <unique-run-id> \
+  --model-source <stage1-base-model-or-full-checkpoint> \
+  --stage1-adapter <stage1-dora-checkpoint> \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
+  --stage2-length-manifest results/zero-stage-compatibility/<manifest-run>/stage2-length-manifest.json \
+  --stage2-length-manifest-sha256 <sha256> \
+  --latent-size 8 --tuning-method dora \
+  --lora-r 32 --lora-alpha 64 --lora-dropout 0.05 \
+  --attention-implementation flash_attention_2 \
+  --gradient-checkpointing
+```
+
+Results are published exclusively to
+`results/zero-stage-compatibility/<unique-run-id>/stage2-efficiency.json` and
+logs to the matching directory under `logs/`. The strict schema-v1 field
+`segmented_kv_authorized` is true only when the median recurrence-prefix decoder
+time divided by the median total optimizer-step time is at least `0.30`.
+Only a representative B200 run authorizes segmented-KV follow-up work; a tiny
+self-test or a run on different hardware validates instrumentation but does not
+satisfy that premise.
+
 #### Verification status
 
 - **Implementation and smoke:** one real Stage 1 checkpoint/CoMT sample
