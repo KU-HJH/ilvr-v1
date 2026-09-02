@@ -719,10 +719,10 @@ Results are published exclusively to
 logs to the matching directory under `logs/`. The strict schema-v1 field
 `prefix_threshold_met` records whether median recurrence-prefix decoder time
 divided by median end-to-end step time is at least `0.30`. The separate
-`segmented_kv_authorized` field can be true only when that threshold is met by a
-validated p50/p95 representative B200 run using a fixed worker count. A tiny
-self-test or a run on different hardware validates instrumentation but can
-never authorize segmented-KV follow-up work.
+`segmented_kv_authorized` field is unconditionally false in the current schema:
+the probe is not production-equivalent profiling and cannot authorize
+segmented-KV follow-up work, even for threshold-met p50/p95 B200 metadata. A
+future separately reviewed plan and implementation must open that gate.
 
 #### Verification status
 

@@ -235,7 +235,7 @@ def representative_b200_metadata(**overrides):
     return metadata
 
 
-def test_project_authorization_requires_threshold_and_representative_b200_metadata():
+def test_project_authorization_rejects_nonrepresentative_metadata():
     """Catches H100, self-test, or incomplete metadata authorizing KV work."""
     threshold_met = summarize_samples(
         [sample(step_ms=100.0, prefix_decoder_ms=40.0)]
@@ -251,11 +251,20 @@ def test_project_authorization_requires_threshold_and_representative_b200_metada
         threshold_met, representative_b200_metadata(manifest_validated=False)
     ).segmented_kv_authorized is False
     assert authorize_segmented_kv(
-        threshold_met, representative_b200_metadata()
-    ).segmented_kv_authorized is True
-    assert authorize_segmented_kv(
         summarize_samples([sample(step_ms=100.0, prefix_decoder_ms=29.9)]),
         representative_b200_metadata(),
+    ).segmented_kv_authorized is False
+
+
+def test_project_authorization_is_fail_closed_for_qualifying_b200_metadata():
+    """Catches non-production probe metadata reopening the segmented-KV gate."""
+    threshold_met = summarize_samples(
+        [sample(step_ms=100.0, prefix_decoder_ms=40.0)]
+    )
+
+    assert threshold_met.prefix_threshold_met is True
+    assert authorize_segmented_kv(
+        threshold_met, representative_b200_metadata()
     ).segmented_kv_authorized is False
 
 
@@ -328,6 +337,50 @@ def test_result_writer_is_strict_canonical_and_immutable(tmp_path):
             evidence=invalid_evidence,
             metadata=metadata,
         )
+
+
+def test_result_writer_rejects_true_authorization_even_with_qualifying_metadata(
+    tmp_path,
+):
+    """Catches a forged evidence object persisting authorization as true."""
+    evidence = summarize_samples(
+        [sample(step_ms=100.0, prefix_decoder_ms=40.0)]
+    )
+    object.__setattr__(evidence, "segmented_kv_authorized", True)
+
+    with pytest.raises(ValueError, match="segmented_kv_authorized must be false"):
+        write_efficiency_result(
+            result_root=tmp_path,
+            experiment_id="forged-writer",
+            evidence=evidence,
+            metadata=representative_b200_metadata(),
+        )
+
+    assert not (tmp_path / "forged-writer" / "stage2-efficiency.json").exists()
+
+
+def test_result_reader_rejects_true_authorization_even_with_qualifying_metadata(
+    tmp_path,
+):
+    """Catches a forged schema-v1 payload being accepted as authorization."""
+    path = tmp_path / "stage2-efficiency.json"
+    evidence = summarize_samples(
+        [sample(step_ms=100.0, prefix_decoder_ms=40.0)]
+    )
+    evidence_payload = vars(evidence).copy()
+    evidence_payload["segmented_kv_authorized"] = True
+    payload = {
+        "schema_version": 1,
+        "experiment_id": "forged-reader",
+        "prefix_threshold_met": True,
+        "segmented_kv_authorized": True,
+        "evidence": evidence_payload,
+        "metadata": representative_b200_metadata(),
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="segmented_kv_authorized must be false"):
+        read_efficiency_result(path)
 
 
 def test_result_reader_rejects_unknown_fields_and_non_finite_numbers(tmp_path):

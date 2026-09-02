@@ -2064,7 +2064,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             logits = self.lm_head(final_outputs.last_hidden_state)
             loss = None
             if labels is not None:
-                shift_logits = logits.float()[..., :-1, :].contiguous().view(
+                logits = logits.float()
+                shift_logits = logits[..., :-1, :].contiguous().view(
                     -1, self.config.vocab_size
                 )
                 shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)

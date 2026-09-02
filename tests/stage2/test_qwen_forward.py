@@ -338,6 +338,36 @@ def test_stage2_loss_only_default_call_retains_full_logits():
     assert outputs.logits.shape == (1, input_ids.shape[1], model.config.vocab_size)
 
 
+def test_stage2_bfloat16_labels_preserve_full_fp32_logits_contract():
+    """Catches labels casting only shifted logits while returning BF16 full logits."""
+    model = tiny_stage2_qwen().to(dtype=torch.bfloat16)
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
+    labels = input_ids.clone()
+    labels[:, :2] = -100
+    labels[input_ids == 90] = -100
+
+    ordinary = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        stage2_loss_only=False,
+    )
+    loss_only = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        stage2_loss_only=True,
+    )
+
+    assert ordinary.logits.shape == (
+        1,
+        input_ids.shape[1],
+        model.config.vocab_size,
+    )
+    assert ordinary.logits.dtype == torch.float32
+    assert loss_only.logits is None
+
+
 def test_stage2_freezes_full_visual_module_at_composition():
     model = tiny_stage2_qwen()
 

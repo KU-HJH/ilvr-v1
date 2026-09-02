@@ -1,8 +1,8 @@
-"""Focused Stage 2 no-cache runtime evidence and segmented-KV authorization gate."""
+"""Focused Stage 2 no-cache runtime evidence with fail-closed KV authorization."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields
 import argparse
 import hashlib
 import json
@@ -169,8 +169,10 @@ class Stage2EfficiencyEvidence:
             )
         if not isinstance(self.segmented_kv_authorized, bool):
             raise ValueError("segmented_kv_authorized must be a boolean")
-        if self.segmented_kv_authorized and not self.prefix_threshold_met:
-            raise ValueError("segmented KV authorization requires the prefix threshold")
+        if self.segmented_kv_authorized:
+            raise ValueError(
+                "segmented_kv_authorized must be false in schema version 1"
+            )
 
 
 @dataclass(frozen=True)
@@ -322,33 +324,17 @@ def summarize_samples(
     )
 
 
-def _representative_b200_metadata_is_valid(metadata: Mapping[str, object]) -> bool:
-    return (
-        metadata.get("probe_kind") == "stage2_no_cache"
-        and "B200" in str(metadata.get("device_name", "")).upper()
-        and metadata.get("manifest_validated") is True
-        and metadata.get("representative_quantiles") == ["p50", "p95"]
-        and metadata.get("warmup_count_per_representative") == WARMUP_COUNT
-        and metadata.get("measured_count_per_representative") == MEASURED_COUNT
-        and metadata.get("profile_uses_fixed_worker_count") is True
-    )
-
-
 def authorize_segmented_kv(
     evidence: Stage2EfficiencyEvidence, metadata: Mapping[str, object]
 ) -> Stage2EfficiencyEvidence:
-    """Apply the project gate only to validated representative B200 evidence."""
+    """Keep schema-v1 authorization closed pending production-equivalent profiling."""
     if not isinstance(evidence, Stage2EfficiencyEvidence):
         raise TypeError("evidence must be Stage2EfficiencyEvidence")
     if not isinstance(metadata, Mapping):
         raise TypeError("metadata must be a mapping")
-    return replace(
-        evidence,
-        segmented_kv_authorized=(
-            evidence.prefix_threshold_met
-            and _representative_b200_metadata_is_valid(metadata)
-        ),
-    )
+    if evidence.segmented_kv_authorized:
+        raise ValueError("segmented_kv_authorized must be false in schema version 1")
+    return evidence
 
 
 def _process_rss_bytes(pid: int) -> int:
@@ -991,7 +977,7 @@ def run_stage2_probe(args) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Measure the optimized Stage 2 no-cache path and apply its KV gate"
+        description="Measure Stage 2 no-cache timing with fail-closed KV authorization"
     )
     parser.add_argument("--experiment-id", required=True)
     parser.add_argument("--self-test", action="store_true")
@@ -1096,14 +1082,7 @@ def write_efficiency_result(
     if not isinstance(metadata, Mapping):
         raise TypeError("metadata must be a mapping")
     _validate_wall_partition(evidence)
-    expected_authorization = authorize_segmented_kv(evidence, metadata)
-    if (
-        evidence.segmented_kv_authorized
-        != expected_authorization.segmented_kv_authorized
-    ):
-        raise ValueError(
-            "segmented KV authorization requires representative B200 metadata"
-        )
+    authorize_segmented_kv(evidence, metadata)
     result_dir = Path(result_root) / experiment_id
     result_dir.mkdir(parents=True, exist_ok=True)
     path = result_dir / "stage2-efficiency.json"
@@ -1131,7 +1110,7 @@ def _reject_duplicate_keys(pairs):
 
 
 def read_efficiency_result(path: str | Path) -> dict:
-    """Read a strict schema-v1 probe result for downstream authorization."""
+    """Read a strict, fail-closed schema-v1 probe result."""
     path = Path(path)
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"efficiency result must be a regular file: {path}")
@@ -1166,6 +1145,8 @@ def read_efficiency_result(path: str | Path) -> dict:
     for name in ("prefix_threshold_met", "segmented_kv_authorized"):
         if not isinstance(payload[name], bool):
             raise ValueError(f"{name} must be a boolean")
+    if payload["segmented_kv_authorized"]:
+        raise ValueError("segmented_kv_authorized must be false in schema version 1")
     if not isinstance(payload["evidence"], dict) or not isinstance(
         payload["metadata"], dict
     ):
@@ -1175,13 +1156,10 @@ def read_efficiency_result(path: str | Path) -> dict:
         raise ValueError("evidence fields do not match schema version 1")
     evidence = Stage2EfficiencyEvidence(**payload["evidence"])
     _validate_wall_partition(evidence)
-    expected_authorization = authorize_segmented_kv(evidence, payload["metadata"])
+    authorize_segmented_kv(evidence, payload["metadata"])
     if (
         payload["prefix_threshold_met"] != evidence.prefix_threshold_met
-        or payload["segmented_kv_authorized"]
-        != expected_authorization.segmented_kv_authorized
-        or evidence.segmented_kv_authorized
-        != expected_authorization.segmented_kv_authorized
+        or payload["segmented_kv_authorized"] != evidence.segmented_kv_authorized
     ):
         raise ValueError("segmented KV authorization does not match project gates")
     return payload

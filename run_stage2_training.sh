@@ -11,7 +11,7 @@ export TOKENIZERS_PARALLELISM=false
 : "${OUTPUT_DIR:?set OUTPUT_DIR}"
 
 experiment_id=${OUTPUT_DIR##*/}
-canonical_log_root='/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility'
+canonical_log_root='/root/workspace/ILVR/logs/zero-stage-compatibility'
 result_dir="/root/workspace/ILVR/results/zero-stage-compatibility/$experiment_id"
 length_manifest="$result_dir/stage2-length-manifest.json"
 processor_source=${RESUME_CHECKPOINT:-$STAGE1_CHECKPOINT}
