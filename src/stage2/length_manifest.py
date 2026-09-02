@@ -14,6 +14,7 @@ from PIL import Image
 
 from stage2.data import (
     Stage2LengthStats,
+    Stage2PreparedExample,
     build_prepared_example_length_measure,
     parse_jsonl_examples,
     prepare_stage2_example,
@@ -136,40 +137,6 @@ def _processor_sha256(processor) -> str:
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
-def validate_stage2_length_manifest(
-    *,
-    path: str | Path,
-    expected_sha256: str,
-    data_path: str | Path,
-    processor,
-    latent_size: int,
-    supervise_latent_boundaries: bool,
-    max_sequence_length: int,
-) -> Stage2LengthManifest:
-    """Require one sealed manifest to bind the current Stage 2 inputs."""
-    path = Path(path)
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"manifest path must be a regular file: {path}")
-    manifest_bytes = path.read_bytes()
-    actual_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise ValueError("Stage 2 length manifest SHA-256 does not match")
-    manifest = read_stage2_length_manifest(path)
-    if path.read_bytes() != manifest_bytes:
-        raise ValueError("Stage 2 length manifest changed while being read")
-    if hashlib.sha256(Path(data_path).read_bytes()).hexdigest() != manifest.data_sha256:
-        raise ValueError("Stage 2 length manifest data SHA-256 does not match")
-    if _processor_sha256(processor) != manifest.processor_sha256:
-        raise ValueError("Stage 2 length manifest processor identity does not match")
-    if (
-        manifest.latent_size,
-        manifest.supervise_latent_boundaries,
-        manifest.max_sequence_length,
-    ) != (latent_size, supervise_latent_boundaries, max_sequence_length):
-        raise ValueError("Stage 2 length manifest configuration does not match")
-    return manifest
-
-
 def _require_int(name: str, value, *, minimum: int | None = None) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
@@ -280,6 +247,15 @@ class Stage2LengthManifest:
             raise ValueError("stats do not match manifest lengths and latent block counts")
 
 
+@dataclass(frozen=True)
+class Stage2LengthManifestSnapshot:
+    """One validated manifest together with the exact rows ranks will consume."""
+
+    manifest: Stage2LengthManifest
+    raw_examples: tuple[dict, ...]
+    prepared_examples: tuple[Stage2PreparedExample, ...]
+
+
 def _image_identity(path: str) -> Stage2ImageIdentity:
     resolved = Path(path).resolve(strict=True)
     if not resolved.is_file():
@@ -299,6 +275,64 @@ def _image_identity(path: str) -> Stage2ImageIdentity:
         mtime_ns=stat_after.st_mtime_ns,
         width=width,
         height=height,
+    )
+
+
+def validate_stage2_length_manifest(
+    *,
+    path: str | Path,
+    expected_sha256: str,
+    data_path: str | Path,
+    image_root: str | Path,
+    processor,
+    latent_size: int,
+    supervise_latent_boundaries: bool,
+    max_sequence_length: int,
+) -> Stage2LengthManifestSnapshot:
+    """Bind a strict manifest to one parsed dataset snapshot and current images."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"manifest path must be a regular file: {path}")
+    manifest_bytes = path.read_bytes()
+    actual_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("Stage 2 length manifest SHA-256 does not match")
+    manifest = read_stage2_length_manifest(path)
+    if path.read_bytes() != manifest_bytes:
+        raise ValueError("Stage 2 length manifest changed while being read")
+    data_bytes = Path(data_path).read_bytes()
+    if hashlib.sha256(data_bytes).hexdigest() != manifest.data_sha256:
+        raise ValueError("Stage 2 length manifest data SHA-256 does not match")
+    if _processor_sha256(processor) != manifest.processor_sha256:
+        raise ValueError("Stage 2 length manifest processor identity does not match")
+    if (
+        manifest.latent_size,
+        manifest.supervise_latent_boundaries,
+        manifest.max_sequence_length,
+    ) != (latent_size, supervise_latent_boundaries, max_sequence_length):
+        raise ValueError("Stage 2 length manifest configuration does not match")
+    raw_examples = tuple(parse_jsonl_examples(data_bytes.decode("utf-8")))
+    if len(manifest.lengths) != len(raw_examples):
+        raise ValueError("Stage 2 length manifest cardinality does not match dataset")
+    prepared_examples = tuple(
+        prepare_stage2_example(
+            raw_example,
+            image_root=Path(image_root),
+            latent_size=latent_size,
+        )
+        for raw_example in raw_examples
+    )
+    images = tuple(
+        _image_identity(path)
+        for prepared in prepared_examples
+        for path in prepared.original_image_paths
+    )
+    if images != manifest.images:
+        raise ValueError("Stage 2 length manifest image identities do not match")
+    return Stage2LengthManifestSnapshot(
+        manifest=manifest,
+        raw_examples=raw_examples,
+        prepared_examples=prepared_examples,
     )
 
 

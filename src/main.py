@@ -207,11 +207,12 @@ def build_stage2_training_components(
         raise ValueError(
             "--stage2_length_manifest and --stage2_length_manifest_sha256 must be provided together"
         )
-    manifest = (
+    manifest_snapshot = (
         validate_stage2_length_manifest(
             path=manifest_path,
             expected_sha256=manifest_sha256,
             data_path=args.data_path,
+            image_root=args.image_root,
             processor=processor,
             latent_size=decision.latent_size,
             supervise_latent_boundaries=decision.supervise_latent_boundaries,
@@ -372,28 +373,37 @@ def build_stage2_training_components(
             ),
         )
 
-    raw_examples = load_jsonl_examples(Path(args.data_path))
-    selected_examples = (
-        raw_examples
-        if args.max_train_samples is None
-        else raw_examples[: args.max_train_samples]
-    )
-    prepared = [
-        prepare_stage2_example(
-            item,
-            image_root=Path(args.image_root),
-            latent_size=decision.latent_size,
+    if manifest_snapshot is None:
+        raw_examples = load_jsonl_examples(Path(args.data_path))
+        selected_examples = (
+            raw_examples
+            if args.max_train_samples is None
+            else raw_examples[: args.max_train_samples]
         )
-        for item in selected_examples
-    ]
-    if manifest is None:
+        prepared = [
+            prepare_stage2_example(
+                item,
+                image_root=Path(args.image_root),
+                latent_size=decision.latent_size,
+            )
+            for item in selected_examples
+        ]
         kept, _length_stats = filter_stage2_examples(
             examples=prepared,
             measure_length=build_prepared_example_length_measure(processor),
             max_length=args.max_seq_length_train,
         )
     else:
-        kept = [prepared[index] for index in manifest.retained_indices]
+        prepared = (
+            manifest_snapshot.prepared_examples
+            if args.max_train_samples is None
+            else manifest_snapshot.prepared_examples[: args.max_train_samples]
+        )
+        kept = [
+            prepared[index]
+            for index in manifest_snapshot.manifest.retained_indices
+            if index < len(prepared)
+        ]
     collator = Stage2DataCollator(
         processor,
         token_ids,

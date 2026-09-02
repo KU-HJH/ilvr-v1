@@ -1,7 +1,7 @@
 import hashlib
 import json
 import os
-from dataclasses import FrozenInstanceError, asdict
+from dataclasses import FrozenInstanceError, asdict, replace
 from pathlib import Path
 
 import pytest
@@ -12,8 +12,10 @@ from stage2.length_manifest import (
     Stage2LengthManifest,
     build_stage2_length_manifest,
     read_stage2_length_manifest,
+    validate_stage2_length_manifest,
     write_stage2_length_manifest,
 )
+from stage2.data import summarize_stage2_lengths
 
 
 class StableToken:
@@ -141,6 +143,135 @@ def test_manifest_selects_exact_raw_indices_and_round_trips(
     assert read_stage2_length_manifest(path) == manifest
     assert write_stage2_length_manifest(path, manifest) == path
     assert path.read_bytes() == first_bytes
+
+
+def test_manifest_consumption_rejects_missing_or_changed_dataset(tmp_path, manifest_inputs):
+    """Catches ranks accepting an absent manifest or training bytes outside its digest."""
+    data_path, _ = manifest_inputs
+    manifest = build_manifest(manifest_inputs, ManifestProcessor())
+    path = write_stage2_length_manifest(tmp_path / "manifest.json", manifest)
+    original_bytes = data_path.read_bytes()
+
+    with pytest.raises(ValueError, match="regular file"):
+        validate_stage2_length_manifest(
+            path=tmp_path / "missing.json",
+            expected_sha256="0" * 64,
+            data_path=data_path,
+            image_root=data_path.parent,
+            processor=ManifestProcessor(),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=8,
+        )
+
+    data_path.write_bytes(original_bytes + b"\n")
+    with pytest.raises(ValueError, match="data SHA-256"):
+        validate_stage2_length_manifest(
+            path=path,
+            expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            data_path=data_path,
+            image_root=data_path.parent,
+            processor=ManifestProcessor(),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=8,
+        )
+
+
+def test_manifest_consumption_rejects_processor_and_image_changes(
+    tmp_path, manifest_inputs
+):
+    """Catches stale processor or image identities reaching rank-local preparation."""
+    data_path, _ = manifest_inputs
+    manifest = build_manifest(manifest_inputs, ManifestProcessor())
+    path = write_stage2_length_manifest(tmp_path / "manifest.json", manifest)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    changed_processor = ManifestProcessor()
+    changed_processor.chat_template = "different"
+
+    with pytest.raises(ValueError, match="processor identity"):
+        validate_stage2_length_manifest(
+            path=path,
+            expected_sha256=digest,
+            data_path=data_path,
+            image_root=data_path.parent,
+            processor=changed_processor,
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=8,
+        )
+
+    Image.new("RGB", (7, 9), color="green").save(data_path.parent / "first.png")
+    with pytest.raises(ValueError, match="image identities"):
+        validate_stage2_length_manifest(
+            path=path,
+            expected_sha256=digest,
+            data_path=data_path,
+            image_root=data_path.parent,
+            processor=ManifestProcessor(),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=8,
+        )
+
+
+def test_manifest_consumption_returns_the_hashed_data_snapshot_despite_dataset_toctou(
+    tmp_path, manifest_inputs
+):
+    """Catches re-opening the JSONL after validating a digest from different bytes."""
+    data_path, rows = manifest_inputs
+    processor = ManifestProcessor()
+    manifest = build_manifest(manifest_inputs, processor)
+    path = write_stage2_length_manifest(tmp_path / "manifest.json", manifest)
+
+    snapshot = validate_stage2_length_manifest(
+        path=path,
+        expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        data_path=data_path,
+        image_root=data_path.parent,
+        processor=processor,
+        latent_size=2,
+        supervise_latent_boundaries=True,
+        max_sequence_length=8,
+    )
+
+    data_path.write_text('{"changed": true}\n', encoding="utf-8")
+
+    assert snapshot.raw_examples == tuple(rows)
+    assert len(snapshot.prepared_examples) == len(rows)
+
+
+def test_manifest_consumption_rejects_dataset_cardinality_mismatch(
+    tmp_path, manifest_inputs
+):
+    """Catches a manifest whose internally valid length list names fewer raw rows."""
+    data_path, _ = manifest_inputs
+    processor = ManifestProcessor()
+    original = build_manifest(manifest_inputs, processor)
+    manifest = replace(
+        original,
+        lengths=(original.lengths[0],),
+        latent_block_counts=(original.latent_block_counts[0],),
+        retained_indices=(0,),
+        stats=summarize_stage2_lengths(
+            lengths=(original.lengths[0],),
+            latent_block_counts=(original.latent_block_counts[0],),
+            max_length=original.max_sequence_length,
+        ),
+    )
+    path = write_stage2_length_manifest(tmp_path / "short-manifest.json", manifest)
+
+    with pytest.raises(ValueError, match="cardinality"):
+        validate_stage2_length_manifest(
+            path=path,
+            expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            data_path=data_path,
+            image_root=data_path.parent,
+            processor=processor,
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=8,
+        )
 
 
 def test_manifest_dataset_digest_binds_raw_order(manifest_inputs):

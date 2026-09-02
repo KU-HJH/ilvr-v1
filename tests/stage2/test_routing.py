@@ -565,6 +565,7 @@ def test_stage2_length_manifest_rejects_wrong_sha_or_configuration(
             path=manifest_path,
             expected_sha256="0" * 64,
             data_path=data_path,
+            image_root=tmp_path,
             processor=object(),
             latent_size=2,
             supervise_latent_boundaries=True,
@@ -575,6 +576,7 @@ def test_stage2_length_manifest_rejects_wrong_sha_or_configuration(
             path=manifest_path,
             expected_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
             data_path=data_path,
+            image_root=tmp_path,
             processor=object(),
             latent_size=2,
             supervise_latent_boundaries=True,
@@ -756,7 +758,11 @@ def test_stage2_components_select_length_manifest_indices_without_remeasuring_im
     monkeypatch.setattr(
         main,
         "validate_stage2_length_manifest",
-        lambda **kwargs: SimpleNamespace(retained_indices=(2, 0)),
+        lambda **kwargs: SimpleNamespace(
+            manifest=SimpleNamespace(retained_indices=(2, 0)),
+            raw_examples=(1, 2, 3),
+            prepared_examples=(1, 2, 3),
+        ),
         raising=False,
     )
 
@@ -771,6 +777,67 @@ def test_stage2_components_select_length_manifest_indices_without_remeasuring_im
 
     assert calls.filtered is None
     assert components.train_dataset == [3, 1]
+
+
+@pytest.mark.parametrize(
+    ("sample_limit", "expected_examples"),
+    [(2, [1]), (3, [1, 3])],
+)
+def test_stage2_manifest_indices_respect_max_train_samples(
+    monkeypatch, tmp_path, sample_limit, expected_examples
+):
+    """Catches retained raw indices outside a requested prefix indexing the prepared data."""
+    calls = SimpleNamespace(prepared=[], filtered=None, sources=[])
+    processor = CompositionProcessor()
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    decision = Stage2LoadDecision(
+        base_model_source="stage1/base",
+        processor_source="stage1/processor",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=Stage2TuningConfig(
+            method="full", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+        ),
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"sealed manifest")
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", lambda source: processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **kwargs: model,
+    )
+    monkeypatch.setattr(
+        main,
+        "load_jsonl_examples",
+        lambda path: pytest.fail("manifest path must consume its sealed data snapshot"),
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_stage2_length_manifest",
+        lambda **kwargs: SimpleNamespace(
+            manifest=SimpleNamespace(retained_indices=(0, 2)),
+            raw_examples=(1, 2, 3),
+            prepared_examples=(1, 2, 3),
+        ),
+        raising=False,
+    )
+
+    components = build_stage2_training_components(
+        stage2_args(
+            max_train_samples=sample_limit,
+            stage2_length_manifest=str(manifest_path),
+            stage2_length_manifest_sha256=__import__("hashlib").sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+        )
+    )
+
+    assert components.train_dataset == expected_examples
 
 
 def test_stage2_peft_resume_validates_stage1_before_mutation_and_preserves_sidecar(
