@@ -992,23 +992,28 @@ def test_pre_fix_probe_argv_compatibility_rejects_noncanonical_aliases(
         json.loads(attempt_path.read_text())["launch_config"]["train_data_path"]
     )
     canonical = str(expected.relative_to(CANONICAL_REPOSITORY_ROOT))
-    if alias_kind == "dot":
-        alias = f"./{canonical}"
-    elif alias_kind == "parent":
-        alias = str(Path(canonical).parent / "nested" / ".." / expected.name)
-    elif alias_kind == "outside":
-        alias = str(Path("..") / tmp_path.name / canonical)
-    else:
-        alias_path = expected.with_name(f"probe-{alias_kind}.jsonl")
-        if alias_kind == "symlink":
-            alias_path.symlink_to(expected)
+    alias_path = None
+    try:
+        if alias_kind == "dot":
+            alias = f"./{canonical}"
+        elif alias_kind == "parent":
+            alias = str(Path(canonical).parent / "nested" / ".." / expected.name)
+        elif alias_kind == "outside":
+            alias = str(Path("..") / tmp_path.name / canonical)
         else:
-            os.link(expected, alias_path)
-        alias = str(alias_path.relative_to(CANONICAL_REPOSITORY_ROOT))
-    _rewrite_probe_attempt_argv(attempt_path, {"--data-path": alias})
+            alias_path = expected.with_name(f"probe-{alias_kind}.jsonl")
+            if alias_kind == "symlink":
+                alias_path.symlink_to(expected)
+            else:
+                os.link(expected, alias_path)
+            alias = str(alias_path.relative_to(CANONICAL_REPOSITORY_ROOT))
+        _rewrite_probe_attempt_argv(attempt_path, {"--data-path": alias})
 
-    with pytest.raises(ValueError, match="materialized audited probe"):
-        benchmark._load_probe_attempt(attempt_path)
+        with pytest.raises(ValueError, match="materialized audited probe"):
+            benchmark._load_probe_attempt(attempt_path)
+    finally:
+        if alias_path is not None:
+            alias_path.unlink(missing_ok=True)
 
 
 def test_probe_argv_compatibility_rejects_relative_expected_outside_repository(
