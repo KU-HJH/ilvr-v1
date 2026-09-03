@@ -165,6 +165,38 @@ def test_lifecycle_worker_environment_resolves_canonical_venv_deepspeed():
         ) == plan.initial_commands.command_digests[node.machine_rank]
 
 
+def test_lifecycle_worker_environment_imports_worktree_transformers():
+    """Catches the shared venv editable path selecting another checkout."""
+    plan = build_lifecycle_plans(
+        parent_run_id="four-gpu-matrix",
+        first_port=29700,
+        result_root=REPO_ROOT / "results",
+        python_executable=str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+        commit="a" * 40,
+    )[0]
+    environment = dict(plan.initial_commands.node_specs[0].environment)
+
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+            "-c",
+            (
+                "from pathlib import Path; import transformers; "
+                "print(Path(transformers.__file__).resolve())"
+            ),
+        ],
+        cwd="/",
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    imported = Path(completed.stdout.strip())
+    assert imported.is_relative_to((REPO_ROOT / "transformers/src").resolve())
+
+
 @pytest.mark.parametrize(
     "relative_harness",
     (

@@ -1229,7 +1229,9 @@ def _build_evaluation_commands_for_stage(
             **_MINIMAL_EXEC_ENVIRONMENT,
             "CUDA_VISIBLE_DEVICES": str(assignment.gpu),
             "ILVR_REPOSITORY_COMMIT": commit,
-            "PYTHONPATH": f"{repository}:{repository / 'src'}",
+            "PYTHONPATH": (
+                f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}"
+            ),
         }
         ownership_path = attempt_directory / assignment.ownership_name
         exit_path = attempt_directory / assignment.exit_name
@@ -1519,7 +1521,9 @@ def build_owned_lifecycle_harness_commands(
             "MASTER_ADDR": plan.cluster.master_addr,
             "GLOO_SOCKET_IFNAME": plan.cluster.socket_ifname,
             "NCCL_SOCKET_IFNAME": plan.cluster.socket_ifname,
-            "PYTHONPATH": f"{repository}:{repository / 'src'}",
+            "PYTHONPATH": (
+                f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}"
+            ),
             "ILVR_REPOSITORY_COMMIT": commit,
         }
         harness_command = (

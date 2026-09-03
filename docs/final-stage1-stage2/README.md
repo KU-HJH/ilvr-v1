@@ -73,8 +73,9 @@ directory contains numbered training checkpoints and, when enabled, a final
 artifact. Complete checkpoints retain optimizer, scheduler, global-step,
 rank-local RNG, DeepSpeed, and Stage 1 sidecar state needed for strict resume.
 
-For PEFT, the Stage 1 metadata sidecar is `stage1_peft_metadata.json`; full
-training preserves the Stage 1 EMA teacher state in `stage1_ema_teacher.pt`.
+Stage 1 Full checkpoints require `stage1_ema_teacher.pt`. Stage 1 LoRA and
+DoRA checkpoints require both `stage1_ema_teacher.pt` and
+`stage1_peft_metadata.json`.
 
 ## Stage 1 single-node launch
 
@@ -176,9 +177,9 @@ checkpoint inventory.
 Stage 2 consumes a validated Stage 1 artifact and trains the interleaved latent
 rollout path. The launcher creates an immutable run-local
 `results/<run-id>/stage2-length-manifest.json`, passes its SHA-256 into training,
-and stores model/training state below `checkpoints/<run-id>/`. Stage 2 PEFT
-artifacts use `stage2_peft_metadata.json`; the Stage 2 sampler state is retained
-for full-model runs.
+and stores model/training state below `checkpoints/<run-id>/`. Stage 2 Full
+checkpoints require `stage2-sampler.json`. Stage 2 LoRA and DoRA checkpoints
+require both `stage2-sampler.json` and `stage2_peft_metadata.json`.
 
 ## Stage 2 single-node launch
 
@@ -286,8 +287,7 @@ STAGE1_NUM_PROCESSES=2 ./run_stage1_training.sh \
   --image-root "$PWD/data" \
   --output-dir "$PWD/checkpoints/$run_id" \
   --learning-rate 2.5e-5 \
-  --deepspeed-config "$PWD/configs/deepspeed_zero1.json" \
-  --log-file "$PWD/logs/zero-stage-compatibility/$run_id/train.log"
+  --deepspeed-config "$PWD/configs/deepspeed_zero1.json"
 ```
 
 Stage 2 single-node resume repeats the original launcher environment and adds
@@ -301,7 +301,6 @@ RESUME_CHECKPOINT="$PWD/checkpoints/$run_id/checkpoint-N" \
 DATA_PATH="$PWD/data/TRAIN.jsonl" \
 IMAGE_ROOT="$PWD/data" \
 OUTPUT_DIR="$PWD/checkpoints/$run_id" \
-LOG_FILE="$PWD/logs/zero-stage-compatibility/$run_id/train.log" \
 TUNING_METHOD=dora \
 DEEPSPEED_CONFIG="$PWD/configs/deepspeed_zero2.json" \
 LEARNING_RATE=5e-5 \
@@ -311,6 +310,10 @@ ATTENTION_IMPLEMENTATION=flash_attention_2 \
 STAGE2_NUM_PROCESSES=2 \
 ./run_stage2_training.sh
 ```
+
+When `--log-file`/`STAGE1_LOG_FILE` or `LOG_FILE` is omitted during resume, each
+launcher creates a distinct `resume-<timestamp>-<pid>.log` below the existing
+run's log directory. Do not reuse its original `train.log`.
 
 ## Evaluation
 
@@ -346,9 +349,16 @@ Never copy an evaluation model into `results/`.
 - A resume source must be a complete numbered checkpoint with the original ZeRO
   stage and world size, optimizer/scheduler/global step, rank-local RNG state,
   and required Stage 1 or Stage 2 sidecars.
-- Stage 1 Full checkpoints require EMA teacher state; Stage 1 PEFT and Stage 2
-  PEFT checkpoints require their strict metadata sidecars. Stage 2 full runs
-  preserve their sampler sidecar.
+- The exact Stage/method sidecar matrix is:
+
+  | Stage | Method | Required Stage-specific sidecars |
+  |---|---|---|
+  | Stage 1 | Full | `stage1_ema_teacher.pt` |
+  | Stage 1 | LoRA | `stage1_ema_teacher.pt`, `stage1_peft_metadata.json` |
+  | Stage 1 | DoRA | `stage1_ema_teacher.pt`, `stage1_peft_metadata.json` |
+  | Stage 2 | Full | `stage2-sampler.json` |
+  | Stage 2 | LoRA | `stage2-sampler.json`, `stage2_peft_metadata.json` |
+  | Stage 2 | DoRA | `stage2-sampler.json`, `stage2_peft_metadata.json` |
 - An evaluation-prepared copy is for inference/evaluation, not resume, unless it
   independently satisfies the complete numbered-checkpoint contract.
 - Stage 1 reaches Stage 2 only through `STAGE1_CHECKPOINT`; Stage 2 resume uses
