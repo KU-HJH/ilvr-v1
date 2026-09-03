@@ -65,15 +65,26 @@ def test_diagnostic_entrypoint_leaves_an_extra_build_marker_invalid():
             "-c",
             """
 import platform
-from packaging.version import InvalidVersion
+import builtins
+from packaging.version import InvalidVersion, Version
 
 platform.python_version = lambda: "3.11.15++"
+real_import = builtins.__import__
+
+def observe_torch_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "torch":
+        Version(platform.python_version())
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = observe_torch_import
 try:
     import stage1.evaluation_diagnostics
 except InvalidVersion as error:
     assert str(error) == "Invalid version: '3.11.15+'"
 else:
     raise AssertionError("an extra build marker was accepted")
+finally:
+    builtins.__import__ = real_import
 """,
         ],
         cwd=repo_root,
@@ -102,7 +113,10 @@ def test_diagnostic_entrypoint_restores_platform_after_heavy_import_failure():
 import builtins
 import platform
 
-original = platform.python_version
+def original():
+    return "3.11.15+"
+
+platform.python_version = original
 real_import = builtins.__import__
 
 def fail_torch_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -121,7 +135,7 @@ finally:
     builtins.__import__ = real_import
 
 assert platform.python_version is original
-assert platform.python_version().endswith("+")
+assert platform.python_version() == "3.11.15+"
 """,
         ],
         cwd=repo_root,
