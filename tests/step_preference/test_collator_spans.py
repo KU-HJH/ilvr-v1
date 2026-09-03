@@ -9,6 +9,7 @@ from step_preference.spans import (
     ReasoningStepPlan,
     ReasoningStepSpan,
 )
+from step_preference.negatives import StepNegative
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 
@@ -292,6 +293,85 @@ def make_mapped_collator(processor, *, enabled):
         supervise_latent_boundaries=True,
         step_preference_enabled=enabled,
     )
+
+
+def test_stage2b_collator_joins_exact_step_and_tokenizes_each_valid_rejection_as_one_chat(
+    mapped_example,
+):
+    """Catches loose joins or separately tokenized prefix/completion fragments."""
+    processor = SinglePassQwenProcessor()
+    negative = StepNegative(
+        sample_id="sample-7",
+        step_id=0,
+        chosen_text="BC",
+        rejected_visual_text="XY",
+        rejected_textual_text="ZQ",
+        valid_visual_negative=True,
+        valid_textual_negative=True,
+        reference_chosen_score=-0.2,
+        reference_visual_rejected_score=-0.8,
+        reference_textual_rejected_score=-0.7,
+    )
+    collator = Stage2DataCollator(
+        processor=processor,
+        token_ids=TOKENS,
+        latent_size=2,
+        supervise_latent_boundaries=True,
+        step_preference_enabled=True,
+        negative_store={("sample-7", 0): negative},
+    )
+
+    batch = collator([mapped_example])
+
+    step = batch["step_preference"]["steps"][0]
+    assert step["negative"] is negative
+    assert step["span"] == batch["reasoning_step_spans"][0]
+    assert step["visual_rejected"]["completion_token_positions"]
+    assert step["textual_rejected"]["completion_token_positions"]
+    assert processor.image_processing_calls == 3
+    processed_texts = [call["text"][0] for call in processor.processor_calls]
+    assert processed_texts[1] == (
+        "<|im_start|>user\n<|image_pad|>question<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        f"A{LATENT_START}{LATENT_PAD * 2}{LATENT_END}XY<|im_end|>\n"
+    )
+    assert processed_texts[2].endswith(
+        f"A{LATENT_START}{LATENT_PAD * 2}{LATENT_END}ZQ<|im_end|>\n"
+    )
+
+
+def test_stage2b_collator_keeps_invalid_pairs_for_entropy_without_rejected_tokenization(
+    mapped_example,
+):
+    """Catches invalid DPO pairs removing a structural entropy step or adding a branch."""
+    processor = SinglePassQwenProcessor()
+    negative = StepNegative(
+        sample_id="sample-7",
+        step_id=0,
+        chosen_text="BC",
+        rejected_visual_text=None,
+        rejected_textual_text=None,
+        valid_visual_negative=False,
+        valid_textual_negative=False,
+        reference_chosen_score=-0.2,
+        reference_visual_rejected_score=None,
+        reference_textual_rejected_score=None,
+    )
+    collator = Stage2DataCollator(
+        processor=processor,
+        token_ids=TOKENS,
+        latent_size=2,
+        supervise_latent_boundaries=True,
+        step_preference_enabled=True,
+        negative_store={("sample-7", 0): negative},
+    )
+
+    batch = collator([mapped_example])
+
+    assert len(batch["step_preference"]["steps"]) == 1
+    assert batch["step_preference"]["steps"][0]["visual_rejected"] is None
+    assert batch["step_preference"]["steps"][0]["textual_rejected"] is None
+    assert processor.image_processing_calls == 1
 
 
 def test_disabled_collator_matches_captured_prechange_batch_exactly(mapped_example):

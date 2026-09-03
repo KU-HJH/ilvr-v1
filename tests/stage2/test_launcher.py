@@ -330,6 +330,74 @@ def test_stage2_launcher_omits_resume_for_fresh_training():
     assert "--resume_from_checkpoint_path" not in tokens
 
 
+def test_stage2_launcher_propagates_opt_in_stage2b_environment_without_resume_state():
+    """Catches dropped objective settings or Stage 2A initialization becoming resume."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
+                "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
+                "STEP_DPO_BETA": "0.2",
+                "STEP_DPO_WEIGHT": "1.5",
+                "STEP_ENTROPY_WEIGHT": "0.4",
+                "STEP_ENTROPY_MARGIN": "0.3",
+                "STAGE2A_RATIO": "0.6",
+                "STAGE2_TOTAL_STEPS": "10",
+                "STAGE2A_CHECKPOINT_PATH": "/models/stage 2a",
+            }
+        )
+    )
+
+    assert "--step_preference_enabled" in tokens
+    assert option_value(tokens, "--step_preference_mode") == "stage2b"
+    assert option_value(tokens, "--step_negative_path") == "/results/negatives.jsonl"
+    assert option_value(tokens, "--step_negative_manifest") == "/results/manifest.json"
+    assert option_value(tokens, "--step_dpo_beta") == "0.2"
+    assert option_value(tokens, "--step_dpo_weight") == "1.5"
+    assert option_value(tokens, "--step_entropy_weight") == "0.4"
+    assert option_value(tokens, "--step_entropy_margin") == "0.3"
+    assert option_value(tokens, "--stage2a_ratio") == "0.6"
+    assert option_value(tokens, "--stage2_total_steps") == "10"
+    assert option_value(tokens, "--stage2a_checkpoint_path") == "/models/stage 2a"
+    assert "--resume_from_checkpoint_path" not in tokens
+    assert "--tuning_method" not in tokens
+
+
+def test_stage2_launcher_false_step_preference_keeps_disabled_tokens_identical():
+    """Catches an explicitly false environment value adding inactive CLI tokens."""
+    assert dry_run_tokens(
+        run_launcher(env_overrides={"STEP_PREFERENCE_ENABLED": "false"})
+    ) == dry_run_tokens(run_launcher())
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"STEP_PREFERENCE_ENABLED": "maybe"}, "must be true or false"),
+        (
+            {"STEP_PREFERENCE_ENABLED": "true", "STEP_PREFERENCE_MODE": "stage2b"},
+            "requires STAGE2A_CHECKPOINT_PATH",
+        ),
+        (
+            {
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STAGE2A_CHECKPOINT_PATH": "/models/a",
+            },
+            "requires STEP_NEGATIVE_PATH",
+        ),
+    ],
+)
+def test_stage2_launcher_rejects_invalid_opt_in_environment(updates, message):
+    """Catches malformed or incomplete Stage 2B settings before launch."""
+    result = run_launcher(env_overrides=updates)
+
+    assert result.returncode == 2
+    assert message in result.stderr
+
+
 @pytest.mark.parametrize(
     "missing_name", ("STAGE1_CHECKPOINT", "DATA_PATH", "IMAGE_ROOT", "OUTPUT_DIR")
 )

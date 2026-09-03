@@ -6,6 +6,7 @@ from stage2.checkpointing import (
     Stage2LoadDecision,
     configure_stage2_metadata,
     resolve_latent_token_ids,
+    resolve_stage2b_initialization_decision,
     resolve_stage2_load_decision,
 )
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
@@ -53,6 +54,30 @@ def test_fresh_stage2_resets_trainer_state():
     assert decision.trainer_resume_path is None
     assert decision.latent_size == 4
     assert decision.supervise_latent_boundaries is False
+
+
+def test_stage2b_initialization_reuses_resume_resolution_but_clears_trainer_state():
+    """Catches Stage 2A optimizer/Trainer state crossing the fresh objective boundary."""
+    decision = resolve_stage2b_initialization_decision(
+        load_model_path="stage1/original",
+        stage2a_checkpoint_path="stage2a/checkpoint-20",
+        load_config=lambda _: SimpleNamespace(
+            stage="stage2", latent_size=4, supervise_latent_boundaries=False
+        ),
+        load_peft_metadata=no_stage2_peft_metadata,
+        latent_size=4,
+        supervise_latent_boundaries=False,
+    )
+
+    assert decision == Stage2LoadDecision(
+        base_model_source="stage2a/checkpoint-20",
+        processor_source="stage2a/checkpoint-20",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=decision.tuning,
+        latent_size=4,
+        supervise_latent_boundaries=False,
+    )
 
 
 def test_resume_requires_stage2_and_uses_single_source_for_all_state():

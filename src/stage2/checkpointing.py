@@ -6,7 +6,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -1544,3 +1544,16 @@ def resolve_stage2_load_decision(
         metadata.supervise_latent_boundaries,
         metadata,
     )
+
+
+def resolve_stage2b_initialization_decision(
+    *, stage2a_checkpoint_path: str, **stage2_resume_kwargs
+) -> Stage2LoadDecision:
+    """Resolve Stage 2A as a resume artifact, then discard only trainer state."""
+    if not isinstance(stage2a_checkpoint_path, str) or not stage2a_checkpoint_path:
+        raise ValueError("stage2a_checkpoint_path must be a non-empty path")
+    decision = resolve_stage2_load_decision(
+        resume_from_checkpoint_path=stage2a_checkpoint_path,
+        **stage2_resume_kwargs,
+    )
+    return replace(decision, trainer_resume_path=None)

@@ -17,9 +17,39 @@ from step_preference.ablation import (
     build_additive_step_attention_mask,
 )
 from step_preference.spans import ReasoningStepSpan, expand_qwen_image_placeholders
+from stage2.checkpointing import (
+    SPARSE_TOKEN_ROWS_FILENAME,
+    STAGE2_PEFT_METADATA_FILENAME,
+    Stage2ArtifactKind,
+    decode_stage2_peft_metadata_snapshot,
+    inspect_stage2_artifact,
+)
 
 
 NEGATIVE_MANIFEST_SCHEMA_VERSION = 2
+_PROCESSOR_FILES = frozenset(
+    {
+        "added_tokens.json",
+        "chat_template.json",
+        "merges.txt",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "video_preprocessor_config.json",
+        "vocab.json",
+    }
+)
+_FULL_CONFIG_FILES = frozenset({"config.json", "generation_config.json"})
+_FULL_WEIGHT_FILES = frozenset(
+    {
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -518,6 +548,143 @@ class CheckpointFile:
         _require_sha256("checkpoint file SHA-256", self.sha256)
 
 
+def _read_weight_index(checkpoint: Path, name: str) -> tuple[str, ...]:
+    path = checkpoint / name
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid full-checkpoint weight index: {path}") from error
+    weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"full-checkpoint weight index has no weight_map: {path}")
+    shard_names = set()
+    for shard_name in weight_map.values():
+        candidate = Path(shard_name) if isinstance(shard_name, str) else Path()
+        if (
+            not isinstance(shard_name, str)
+            or not shard_name
+            or candidate.is_absolute()
+            or len(candidate.parts) != 1
+            or candidate.name != shard_name
+        ):
+            raise ValueError("weight index contains an unsafe shard path")
+        shard_names.add(shard_name)
+    return tuple(sorted(shard_names))
+
+
+def _loader_relative_paths(
+    checkpoint: Path,
+    artifact_kind: Stage2ArtifactKind,
+    *,
+    include_processor: bool = True,
+) -> tuple[str, ...]:
+    names = {
+        entry.name
+        for entry in checkpoint.iterdir()
+        if entry.is_file() and not entry.is_symlink()
+    }
+    processor = names & _PROCESSOR_FILES if include_processor else set()
+    if artifact_kind is Stage2ArtifactKind.PEFT:
+        model_names = {
+            STAGE2_PEFT_METADATA_FILENAME,
+            "adapter_config.json",
+            "adapter_model.safetensors",
+        }
+        if SPARSE_TOKEN_ROWS_FILENAME in names:
+            model_names.add(SPARSE_TOKEN_ROWS_FILENAME)
+        missing = model_names - names
+        if missing:
+            raise ValueError(f"Stage 2A PEFT loader files are missing: {sorted(missing)}")
+    else:
+        model_names = names & (_FULL_CONFIG_FILES | _FULL_WEIGHT_FILES)
+        if "config.json" not in model_names:
+            raise ValueError("full Stage 2A loader requires config.json")
+        for index_name in (
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+        ):
+            if index_name in model_names:
+                model_names.update(_read_weight_index(checkpoint, index_name))
+        missing = model_names - names
+        if missing:
+            raise ValueError(f"full Stage 2A weight shards are missing: {sorted(missing)}")
+        if not model_names & _FULL_WEIGHT_FILES:
+            raise ValueError("full Stage 2A loader requires model weights")
+    return tuple(sorted(processor | model_names))
+
+
+def _sha256_file(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
+def _checkpoint_records(
+    checkpoint: Path, relative_paths: Iterable[str]
+) -> tuple[CheckpointFile, ...]:
+    records = []
+    for relative_path in sorted(relative_paths):
+        path = checkpoint / relative_path
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"checkpoint loader input must be a regular file: {path}")
+        size, digest = _sha256_file(path)
+        records.append(
+            CheckpointFile(relative_path, size, digest, str(checkpoint))
+        )
+    return tuple(records)
+
+
+def _tokenizer_identity(records: Iterable[CheckpointFile]) -> str:
+    payload = [
+        {
+            "relative_path": entry.relative_path,
+            "sha256": entry.sha256,
+            "size": entry.size,
+        }
+        for entry in records
+        if entry.relative_path in _PROCESSOR_FILES
+    ]
+    if not payload:
+        raise ValueError("Stage 2A checkpoint contains no processor/tokenizer files")
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def inspect_stage2a_checkpoint_identity(
+    checkpoint_path: str | Path,
+) -> tuple[tuple[CheckpointFile, ...], str]:
+    """Recompute the exact local files used by Stage 2A model/processor loading."""
+    checkpoint = Path(checkpoint_path)
+    if checkpoint.is_symlink() or not checkpoint.is_dir():
+        raise ValueError("Stage 2A checkpoint path must be a regular directory")
+    checkpoint = checkpoint.resolve(strict=True)
+    inspection = inspect_stage2_artifact(checkpoint)
+    checkpoint_paths = _loader_relative_paths(checkpoint, inspection.artifact_kind)
+    records = _checkpoint_records(checkpoint, checkpoint_paths)
+    tokenizer_identity = _tokenizer_identity(records)
+    if inspection.artifact_kind is Stage2ArtifactKind.PEFT:
+        snapshot = inspection.peft_metadata_snapshot
+        if snapshot is None:
+            raise ValueError("Stage 2A PEFT inspection lost its metadata")
+        metadata = decode_stage2_peft_metadata_snapshot(snapshot)
+        base = Path(metadata.base_model_reference).expanduser()
+        if base.is_symlink() or not base.is_dir():
+            raise ValueError("PEFT base-model reference must be a local regular directory")
+        base = base.resolve(strict=True)
+        base_inspection = inspect_stage2_artifact(base)
+        if base_inspection.artifact_kind is not Stage2ArtifactKind.FULL:
+            raise ValueError("PEFT base-model reference must identify a full local model")
+        base_paths = _loader_relative_paths(
+            base, Stage2ArtifactKind.FULL, include_processor=False
+        )
+        records += _checkpoint_records(base, base_paths)
+    return records, tokenizer_identity
+
+
 @dataclass(frozen=True)
 class StepNegative:
     """One chosen completion and its independently valid visual/textual negatives."""
@@ -618,6 +785,11 @@ class NegativeManifest:
         object.__setattr__(
             self, "generation_settings", _normalize_generation_settings(self.generation_settings)
         )
+
+    @property
+    def generation_settings_dict(self) -> dict[str, object]:
+        """Return a detached JSON-object view for strict consumer validation."""
+        return _thaw_json(self.generation_settings)
 
 
 def filter_negative(
@@ -775,6 +947,11 @@ def _manifest_from_bytes(raw: bytes) -> NegativeManifest:
         generation_settings=payload["generation_settings"],
         negative_sha256=payload["negative_sha256"],
     )
+
+
+def read_negative_manifest(path: str | Path) -> NegativeManifest:
+    """Read one strict schema-2 manifest from a regular non-symlink file."""
+    return _manifest_from_bytes(_read_regular_file(path, "negative manifest"))
 
 
 def _read_regular_file(path: str | Path, label: str) -> bytes:

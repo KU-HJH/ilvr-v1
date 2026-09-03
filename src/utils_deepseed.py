@@ -13,6 +13,7 @@ from transformers import LogitsProcessor
 from stage2.peft import normalize_stage2_target_modules
 from peft_common import normalize_decoder_target_suffixes
 from artifact_paths import resolve_run_artifact_paths
+from step_preference.config import StepPreferenceConfig
 
 from transformers import LogitsProcessor
 import torch
@@ -27,6 +28,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)
     parser.add_argument("--stage2_diagnostics_interval", type=int, default=0)
+    parser.add_argument("--step_preference_enabled", action="store_true")
+    parser.add_argument(
+        "--step_preference_mode", choices=("stage2a", "stage2b"), default="stage2a"
+    )
+    parser.add_argument("--step_negative_path")
+    parser.add_argument("--step_negative_manifest")
+    parser.add_argument("--step_dpo_beta", type=float, default=0.1)
+    parser.add_argument("--step_dpo_weight", type=float, default=1.0)
+    parser.add_argument("--step_entropy_weight", type=float, default=0.1)
+    parser.add_argument("--step_entropy_margin", type=float, default=0.1)
+    parser.add_argument("--stage2a_ratio", type=float, default=0.5)
+    parser.add_argument("--stage2_total_steps", type=int)
+    parser.add_argument("--stage2a_checkpoint_path")
     parser.add_argument("--save_steps", type=int, default=612)
     parser.add_argument("--compress_strategy", type=str, default='average', choices=['average'])
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -146,6 +160,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("gradient_accumulation_steps must be at least 1")
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
+    args.step_preference_config = StepPreferenceConfig.from_args(args)
     if args.stage == "stage2":
         manifest_fields = (
             args.stage2_length_manifest,
@@ -166,12 +181,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             raise ValueError(
                 "--stage1_adapter_path and --resume_from_checkpoint_path are mutually exclusive"
             )
-        if args.tuning_method is None and args.resume_from_checkpoint_path is None:
+        if (
+            args.tuning_method is None
+            and args.resume_from_checkpoint_path is None
+            and not args.step_preference_config.is_stage2b
+        ):
             args.tuning_method = "full"
         normalize_stage2_target_modules(args.lora_target_modules)
         if args.per_device_train_batch_size != 1:
             raise ValueError("Stage 2 requires per_device_train_batch_size=1")
     elif args.stage == "stage1":
+        if args.step_preference_enabled:
+            raise ValueError("step preference training is only valid for Stage 2")
         if args.use_lora and args.tuning_method_explicit:
             raise ValueError("--use_lora and --tuning_method cannot be combined")
         if args.tuning_method_explicit and args.tuning_method not in (

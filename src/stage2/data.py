@@ -23,6 +23,7 @@ from step_preference.spans import (
     expand_qwen_image_placeholders,
     map_reasoning_step_spans,
 )
+from step_preference.negatives import StepNegative, tokenize_step_completion
 
 
 logger = logging.getLogger(__name__)
@@ -162,11 +163,14 @@ def prepare_stage2_example(
     *,
     image_root: Path,
     latent_size: int,
+    require_reasoning_units: bool = False,
 ) -> Stage2PreparedExample:
     """Build a conversation together with validated original-image metadata."""
     conversation = build_stage2_conversation(sample, image_root=image_root, latent_size=latent_size)
     _, plan_char_spans, reasoning_steps = build_assistant_plan(
-        sample["sequence_plan"], latent_size, require_reasoning_units=False
+        sample["sequence_plan"],
+        latent_size,
+        require_reasoning_units=require_reasoning_units,
     )
     return Stage2PreparedExample(
         conversation=conversation,
@@ -239,12 +243,16 @@ class Stage2DataCollator:
         latent_size,
         supervise_latent_boundaries,
         step_preference_enabled=False,
+        negative_store=None,
     ):
         self.processor = processor
         self.token_ids = token_ids
         self.latent_size = latent_size
         self.supervise_latent_boundaries = supervise_latent_boundaries
         self.step_preference_enabled = step_preference_enabled
+        if negative_store is not None and not step_preference_enabled:
+            raise ValueError("a negative store requires step preference metadata")
+        self.negative_store = negative_store
         self.assistant_pattern = processor.tokenizer(
             "<|im_start|>assistant", add_special_tokens=False, return_tensors="pt"
         )["input_ids"][0]
@@ -257,9 +265,10 @@ class Stage2DataCollator:
         text = self.processor.apply_chat_template(
             example.conversation, tokenize=False, add_generation_prompt=False
         )
+        original_images = _load_original_images(example.original_image_paths)
         batch = self.processor(
             text=[text],
-            images=[_load_original_images(example.original_image_paths)],
+            images=[original_images],
             padding=True,
             truncation=False,
             return_tensors="pt",
@@ -324,6 +333,60 @@ class Stage2DataCollator:
                 "expanded_rendered_text": expanded_text,
                 "offset_mapping": offset_mapping,
             }
+            if self.negative_store is not None:
+                assistant_text = example.conversation[1]["content"][0]["text"]
+                joined_steps = []
+                for plan_step, token_span in zip(
+                    example.reasoning_steps, reasoning_step_spans
+                ):
+                    key = (example.sample_id, plan_step.step_id)
+                    try:
+                        negative = self.negative_store[key]
+                    except KeyError as error:
+                        raise ValueError(f"missing negative join key: {key}") from error
+                    if not isinstance(negative, StepNegative):
+                        raise ValueError(f"invalid negative row for join key: {key}")
+                    chosen_text = assistant_text[
+                        plan_step.target_text.start : plan_step.target_text.end
+                    ]
+                    if negative.chosen_text != chosen_text:
+                        raise ValueError(
+                            f"negative chosen text does not match source step: {key}"
+                        )
+                    assistant_prefix = assistant_text[: plan_step.target_text.start]
+
+                    def encode_rejected(text_value):
+                        encoded = tokenize_step_completion(
+                            self.processor,
+                            conversation=example.conversation,
+                            images=original_images,
+                            assistant_prefix=assistant_prefix,
+                            completion_text=text_value,
+                        )
+                        return {
+                            "model_inputs": dict(encoded.model_inputs),
+                            "completion_token_positions": encoded.completion_token_positions,
+                            "completion_token_ids": encoded.completion_token_ids,
+                            "rendered_text": encoded.rendered_text,
+                        }
+
+                    joined_steps.append(
+                        {
+                            "span": token_span,
+                            "negative": negative,
+                            "visual_rejected": (
+                                encode_rejected(negative.rejected_visual_text)
+                                if negative.valid_visual_negative
+                                else None
+                            ),
+                            "textual_rejected": (
+                                encode_rejected(negative.rejected_textual_text)
+                                if negative.valid_textual_negative
+                                else None
+                            ),
+                        }
+                    )
+                batch["step_preference"]["steps"] = tuple(joined_steps)
         return batch
 
 

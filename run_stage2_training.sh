@@ -44,6 +44,71 @@ MAX_SEQUENCE_LENGTH=${MAX_SEQUENCE_LENGTH:-8192}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 
+STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
+STEP_PREFERENCE_ARGS=()
+stage2b_checkpoint_initialization=false
+case "$STEP_PREFERENCE_ENABLED" in
+  true)
+    STEP_PREFERENCE_MODE=${STEP_PREFERENCE_MODE:-stage2a}
+    STEP_DPO_BETA=${STEP_DPO_BETA:-0.1}
+    STEP_DPO_WEIGHT=${STEP_DPO_WEIGHT:-1.0}
+    STEP_ENTROPY_WEIGHT=${STEP_ENTROPY_WEIGHT:-0.1}
+    STEP_ENTROPY_MARGIN=${STEP_ENTROPY_MARGIN:-0.1}
+    STAGE2A_RATIO=${STAGE2A_RATIO:-0.5}
+    case "$STEP_PREFERENCE_MODE" in
+      stage2a|stage2b) ;;
+      *)
+        printf 'STEP_PREFERENCE_MODE must be stage2a or stage2b\n' >&2
+        exit 2
+        ;;
+    esac
+    STEP_PREFERENCE_ARGS=(
+      --step_preference_enabled
+      --step_preference_mode "$STEP_PREFERENCE_MODE"
+      --step_dpo_beta "$STEP_DPO_BETA"
+      --step_dpo_weight "$STEP_DPO_WEIGHT"
+      --step_entropy_weight "$STEP_ENTROPY_WEIGHT"
+      --step_entropy_margin "$STEP_ENTROPY_MARGIN"
+      --stage2a_ratio "$STAGE2A_RATIO"
+    )
+    if [[ -n "${STAGE2_TOTAL_STEPS:-}" ]]; then
+      STEP_PREFERENCE_ARGS+=(--stage2_total_steps "$STAGE2_TOTAL_STEPS")
+    fi
+    if [[ "$STEP_PREFERENCE_MODE" == stage2b ]]; then
+      [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]] || {
+        printf 'Stage 2B requires STAGE2A_CHECKPOINT_PATH\n' >&2
+        exit 2
+      }
+      [[ -n "${STEP_NEGATIVE_PATH:-}" ]] || {
+        printf 'Stage 2B requires STEP_NEGATIVE_PATH\n' >&2
+        exit 2
+      }
+      [[ -n "${STEP_NEGATIVE_MANIFEST:-}" ]] || {
+        printf 'Stage 2B requires STEP_NEGATIVE_MANIFEST\n' >&2
+        exit 2
+      }
+      if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+        printf 'Stage 2B Stage 2A initialization and RESUME_CHECKPOINT are mutually exclusive\n' >&2
+        exit 2
+      fi
+      stage2b_checkpoint_initialization=true
+      processor_source=$STAGE2A_CHECKPOINT_PATH
+      STEP_PREFERENCE_ARGS+=(
+        --step_negative_path "$STEP_NEGATIVE_PATH"
+        --step_negative_manifest "$STEP_NEGATIVE_MANIFEST"
+        --stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH"
+      )
+    elif [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]]; then
+      STEP_PREFERENCE_ARGS+=(--stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH")
+    fi
+    ;;
+  false) ;;
+  *)
+    printf 'STEP_PREFERENCE_ENABLED must be true or false\n' >&2
+    exit 2
+    ;;
+esac
+
 ilvr_topology_variables=(
   ILVR_NUM_MACHINES
   ILVR_NUM_PROCESSES
@@ -124,6 +189,17 @@ MANAGED_OPTIONS=(
   --log_file
   --latent_size
   --stage2_diagnostics_interval
+  --step_preference_enabled
+  --step_preference_mode
+  --step_negative_path
+  --step_negative_manifest
+  --step_dpo_beta
+  --step_dpo_weight
+  --step_entropy_weight
+  --step_entropy_margin
+  --stage2a_ratio
+  --stage2_total_steps
+  --stage2a_checkpoint_path
   --supervise_latent_boundaries
   --no-supervise_latent_boundaries
   --learning_rate
@@ -294,7 +370,7 @@ if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
 fi
 
 TUNING_ARGS=()
-if [[ -z "${RESUME_CHECKPOINT:-}" || "$TUNING_METHOD_EXPLICIT" == true ]]; then
+if [[ "$TUNING_METHOD_EXPLICIT" == true || ( -z "${RESUME_CHECKPOINT:-}" && "$stage2b_checkpoint_initialization" == false ) ]]; then
   TUNING_ARGS+=(
     --tuning_method "$TUNING_METHOD"
     --lora_r "$LORA_R"
@@ -325,6 +401,7 @@ TRAINING_ARGS=(
   --log_file "$LOG_FILE"
   --latent_size "$LATENT_SIZE"
   --stage2_diagnostics_interval "$STAGE2_DIAGNOSTICS_INTERVAL"
+  "${STEP_PREFERENCE_ARGS[@]}"
   "${BOUNDARY_ARGS[@]}"
   --learning_rate "$LEARNING_RATE"
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"

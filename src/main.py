@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import logging
 import math
 import os
@@ -69,6 +70,7 @@ from stage2.checkpointing import (
     prepare_stage2_sparse_token_base,
     resolve_latent_token_ids,
     resolve_stage2_load_decision,
+    resolve_stage2b_initialization_decision,
     validate_stage2_peft_compatibility,
     validate_stage2_sparse_processor,
 )
@@ -87,6 +89,13 @@ from stage2.peft import (
     resolve_stage2_target_module_names,
     validate_stage2_parameter_boundary,
 )
+from step_preference.config import StepPreferenceConfig
+from step_preference.negatives import (
+    inspect_stage2a_checkpoint_identity,
+    load_negative_store,
+    read_negative_manifest,
+)
+from step_preference.spans import reject_duplicate_sample_ids
 
 platform.python_version = _platform_python_version
 
@@ -118,6 +127,7 @@ class Stage2TrainingComponents:
     trainer_class: type
     trainer_resume_path: str | None
     peft_metadata: Stage2PeftMetadata | None
+    step_preference_config: StepPreferenceConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -211,14 +221,18 @@ def build_stage2_training_components(
 ) -> Stage2TrainingComponents:
     from stage2.trainer import Stage2Trainer
 
+    step_preference_config = getattr(args, "step_preference_config", None)
+    if step_preference_config is None:
+        step_preference_config = StepPreferenceConfig.from_args(args)
+    if not isinstance(step_preference_config, StepPreferenceConfig):
+        raise TypeError("step_preference_config must be a StepPreferenceConfig")
     source_dependencies = (
         source_dependencies or _default_stage2_source_dependencies()
     )
     source_provenance_kwargs = build_stage2_source_provenance_kwargs(args)
-    decision = resolve_stage2_load_decision(
+    decision_kwargs = dict(
         load_model_path=args.load_model_path,
         stage1_adapter_path=getattr(args, "stage1_adapter_path", None),
-        resume_from_checkpoint_path=args.resume_from_checkpoint_path,
         load_config=source_dependencies.load_config,
         discover_adapter_config=source_dependencies.find_adapter_config,
         source_provenance_kwargs=source_provenance_kwargs,
@@ -231,6 +245,16 @@ def build_stage2_training_components(
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
     )
+    if step_preference_config.is_stage2b:
+        decision = resolve_stage2b_initialization_decision(
+            stage2a_checkpoint_path=step_preference_config.stage2a_checkpoint_path,
+            **decision_kwargs,
+        )
+    else:
+        decision = resolve_stage2_load_decision(
+            resume_from_checkpoint_path=args.resume_from_checkpoint_path,
+            **decision_kwargs,
+        )
     sparse_resume = (
         decision.peft_metadata is not None
         and decision.peft_metadata.token_row_source == "sparse_adapter"
@@ -425,14 +449,25 @@ def build_stage2_training_components(
             if args.max_train_samples is None
             else raw_examples[: args.max_train_samples]
         )
-        prepared = [
-            prepare_stage2_example(
-                item,
-                image_root=Path(args.image_root),
-                latent_size=decision.latent_size,
-            )
-            for item in selected_examples
-        ]
+        if step_preference_config.is_stage2b:
+            prepared = [
+                prepare_stage2_example(
+                    item,
+                    image_root=Path(args.image_root),
+                    latent_size=decision.latent_size,
+                    require_reasoning_units=True,
+                )
+                for item in selected_examples
+            ]
+        else:
+            prepared = [
+                prepare_stage2_example(
+                    item,
+                    image_root=Path(args.image_root),
+                    latent_size=decision.latent_size,
+                )
+                for item in selected_examples
+            ]
         kept, _length_stats = filter_stage2_examples(
             examples=prepared,
             measure_length=build_prepared_example_length_measure(processor),
@@ -449,11 +484,76 @@ def build_stage2_training_components(
             for index in manifest_snapshot.manifest.retained_indices
             if index < len(prepared)
         ]
+        selected_examples = tuple(manifest_snapshot.raw_examples[: len(prepared)])
+        if step_preference_config.is_stage2b:
+            prepared = tuple(
+                prepare_stage2_example(
+                    item,
+                    image_root=Path(args.image_root),
+                    latent_size=decision.latent_size,
+                    require_reasoning_units=True,
+                )
+                for item in selected_examples
+            )
+            kept = [
+                prepared[index]
+                for index in manifest_snapshot.manifest.retained_indices
+                if index < len(prepared)
+            ]
+
+    negative_store = None
+    if step_preference_config.is_stage2b:
+        reject_duplicate_sample_ids(example.sample_id for example in prepared)
+        manifest = read_negative_manifest(step_preference_config.negative_manifest)
+        checkpoint_files, tokenizer_identity = inspect_stage2a_checkpoint_identity(
+            step_preference_config.stage2a_checkpoint_path
+        )
+        generation_settings = manifest.generation_settings_dict
+        if generation_settings.get("min_tokens") != step_preference_config.min_tokens:
+            raise ValueError("negative manifest min_tokens does not match Stage 2B")
+        if (
+            generation_settings.get("max_new_tokens")
+            != step_preference_config.max_new_tokens
+        ):
+            raise ValueError("negative manifest max_new_tokens does not match Stage 2B")
+        source_path = Path(args.data_path)
+        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        expected_keys = tuple(
+            (example.sample_id, step.step_id)
+            for example in prepared
+            for step in example.reasoning_steps
+        )
+        negative_store = load_negative_store(
+            negative_path=step_preference_config.negative_path,
+            manifest_path=step_preference_config.negative_manifest,
+            source_path=source_path,
+            expected_source_sha256=source_sha256,
+            expected_selected_row_indices=tuple(range(len(prepared))),
+            expected_stage2a_checkpoint_path=(
+                step_preference_config.stage2a_checkpoint_path
+            ),
+            expected_checkpoint_files=checkpoint_files,
+            expected_tokenizer_config_identity=tokenizer_identity,
+            expected_latent_size=decision.latent_size,
+            expected_generation_settings=generation_settings,
+            expected_keys=expected_keys,
+        )
+        for example in prepared:
+            assistant_text = example.conversation[1]["content"][0]["text"]
+            for step in example.reasoning_steps:
+                key = (example.sample_id, step.step_id)
+                chosen = assistant_text[step.target_text.start : step.target_text.end]
+                if negative_store[key].chosen_text != chosen:
+                    raise ValueError(
+                        f"negative chosen text does not match source step: {key}"
+                    )
     collator = Stage2DataCollator(
         processor,
         token_ids,
         decision.latent_size,
         decision.supervise_latent_boundaries,
+        step_preference_enabled=step_preference_config.is_stage2b,
+        negative_store=negative_store,
     )
     return Stage2TrainingComponents(
         model=model,
@@ -463,6 +563,7 @@ def build_stage2_training_components(
         trainer_class=Stage2Trainer,
         trainer_resume_path=decision.trainer_resume_path,
         peft_metadata=peft_metadata,
+        step_preference_config=step_preference_config,
     )
 
 
@@ -479,6 +580,10 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         tuning_method=args.tuning_method,
         deepspeed_runtime_profile=bind_deepspeed_runtime_profile(args),
     )
+    step_preference_config = getattr(args, "step_preference_config", None)
+    if step_preference_config is None:
+        step_preference_config = StepPreferenceConfig.from_args(args)
+    phase_steps = step_preference_config.phase_steps
     return SFTConfig(
         output_dir=args.save_model_path,
         num_train_epochs=args.epochs,
@@ -498,7 +603,7 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         dataset_text_field="",
         dataset_kwargs={"skip_prepare_dataset": True},
         max_seq_length=args.max_seq_length_train,
-        max_steps=args.max_steps,
+        max_steps=args.max_steps if phase_steps is None else phase_steps,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs=checkpointing_kwargs,
         deepspeed=args.deepspeed_config,
@@ -643,7 +748,7 @@ def run_stage2(args):
         args, world_size=int(os.environ.get("WORLD_SIZE", "1"))
     )
     components = build_stage2_training_components(args)
-    trainer = components.trainer_class(
+    trainer_kwargs = dict(
         model=components.model,
         args=build_stage2_training_arguments(args),
         train_dataset=components.train_dataset,
@@ -653,6 +758,12 @@ def run_stage2(args):
         deepspeed_runtime_profile=profile,
         stage2_diagnostics_interval=args.stage2_diagnostics_interval,
     )
+    if (
+        components.step_preference_config is not None
+        and components.step_preference_config.is_stage2b
+    ):
+        trainer_kwargs["step_preference_config"] = components.step_preference_config
+    trainer = components.trainer_class(**trainer_kwargs)
     train_result = trainer.train(
         resume_from_checkpoint=components.trainer_resume_path
     )
