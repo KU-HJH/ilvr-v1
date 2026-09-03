@@ -1,5 +1,6 @@
 import hashlib
 import json
+import pickle
 
 import pytest
 from PIL import Image
@@ -152,3 +153,21 @@ def test_prepare_example_keeps_identity_and_plan_metadata_without_changing_assis
     assert prepared.conversation[1]["content"][0]["text"] == (
         "A<|latent_start|><|latent_pad|><|latent_end|>B"
     )
+
+
+def test_prepared_sequence_plan_snapshot_is_pickle_safe_and_immutable(tmp_path):
+    """Catches worker-queue serialization failures from an unpickleable snapshot."""
+    Image.new("RGB", (2, 2)).save(tmp_path / "input.png")
+    sample = {
+        "image_input": ["input.png"],
+        "text_input": "question",
+        "sequence_plan": [{"type": "text", "content": "answer"}],
+    }
+
+    restored = pickle.loads(
+        pickle.dumps(prepare_stage2_example(sample, image_root=tmp_path, latent_size=1))
+    )
+
+    assert restored.sequence_plan == ({"type": "text", "content": "answer"},)
+    with pytest.raises(TypeError, match="immutable dictionary"):
+        restored.sequence_plan[0]["content"] = "changed"

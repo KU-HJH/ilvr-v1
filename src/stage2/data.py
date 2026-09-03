@@ -6,7 +6,6 @@ from dataclasses import asdict, dataclass
 import json
 import logging
 from pathlib import Path
-from types import MappingProxyType
 
 import torch
 from PIL import Image
@@ -45,6 +44,9 @@ class _ImmutableDict(dict):
     def __deepcopy__(self, memo):
         return self
 
+    def __reduce__(self):
+        return type(self), (dict(self),)
+
 
 @dataclass(frozen=True)
 class Stage2PreparedExample:
@@ -54,7 +56,7 @@ class Stage2PreparedExample:
     original_image_paths: tuple[str, ...]
     latent_block_count: int
     sample_id: str = ""
-    sequence_plan: tuple[dict, ...] = ()
+    sequence_plan: tuple[_ImmutableDict, ...] = ()
     plan_char_spans: tuple[PlanCharSpan, ...] = ()
     reasoning_steps: tuple[ReasoningStepPlan, ...] = ()
 
@@ -169,7 +171,7 @@ def prepare_stage2_example(
         original_image_paths=resolve_original_images(sample, image_root),
         latent_block_count=sum(span.step_type == "latent" for span in plan_char_spans),
         sample_id=canonical_sample_id(sample),
-        sequence_plan=tuple(MappingProxyType(dict(step)) for step in sample["sequence_plan"]),
+        sequence_plan=tuple(_ImmutableDict(step) for step in sample["sequence_plan"]),
         plan_char_spans=plan_char_spans,
         reasoning_steps=reasoning_steps,
     )
