@@ -174,6 +174,75 @@ def test_qwen_flex_decoder_matches_dense_tree_mask_with_copied_positions():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
+def test_qwen_flex_decoder_matches_eager_in_bfloat16_autocast():
+    """Catches RoPE-upcast Q/K reaching FlexAttention with a BF16 value tensor."""
+    torch.manual_seed(109)
+    # Production loads the checkpoint in FP32 and relies on BF16 autocast.
+    # Keeping the weights FP32 reproduces RoPE promoting Q/K back to FP32 while
+    # the value projection remains BF16.
+    dense_model = _tiny_flex_qwen(attn_implementation="eager").cuda().float().train()
+    flex_model = copy.deepcopy(dense_model)
+    plan = _one_block_tree_plan()
+    visible = dense_visibility(plan).cuda()
+    dense_mask = torch.where(
+        visible,
+        0.0,
+        torch.finfo(torch.bfloat16).min,
+    )[None, None]
+    block_mask = build_flex_block_mask(plan, torch.device("cuda"))
+    logical_positions = (
+        plan.logical_position_sources.view(1, 1, -1).expand(3, 1, -1).clone().cuda()
+    )
+    embeds = torch.linspace(
+        -0.5,
+        0.5,
+        steps=plan.padded_length * dense_model.config.hidden_size,
+        device="cuda",
+        dtype=torch.float32,
+    ).view(1, plan.padded_length, dense_model.config.hidden_size)
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        dense_out = dense_model.model(
+            inputs_embeds=embeds,
+            attention_mask=dense_mask,
+            position_ids=logical_positions,
+            use_cache=False,
+            return_dict=True,
+        )
+        flex_out = flex_model.model(
+            inputs_embeds=embeds.clone(),
+            attention_mask=block_mask,
+            position_ids=logical_positions,
+            use_cache=False,
+            return_dict=True,
+        )
+    torch.testing.assert_close(
+        flex_out.last_hidden_state.float(),
+        dense_out.last_hidden_state.float(),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    dense_out.last_hidden_state.float().square().mean().backward()
+    flex_out.last_hidden_state.float().square().mean().backward()
+    for dense_layer, flex_layer in zip(
+        dense_model.model.layers, flex_model.model.layers, strict=True
+    ):
+        dense_parameters = dict(dense_layer.named_parameters())
+        flex_parameters = dict(flex_layer.named_parameters())
+        for parameter_name in (
+            "self_attn.q_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.down_proj.weight",
+        ):
+            torch.testing.assert_close(
+                flex_parameters[parameter_name].grad.float(),
+                dense_parameters[parameter_name].grad.float(),
+                rtol=1e-2,
+                atol=1e-2,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
 def test_qwen_flex_decoder_rejects_existing_cache_when_cache_output_is_disabled():
     """Catches a BlockMask decoder call silently ignoring an existing KV cache."""
     model = _tiny_flex_qwen(attn_implementation="eager").cuda().float().eval()
