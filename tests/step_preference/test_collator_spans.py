@@ -104,6 +104,42 @@ def test_map_reasoning_step_spans_rejects_a_token_crossing_a_plan_boundary():
         )
 
 
+def test_map_reasoning_step_spans_rejects_start_to_pad_crossing_for_unmapped_latent():
+    """Catches skipping the inner start/pad boundary of an incomplete latent unit."""
+    assistant = f"{LATENT_START}{LATENT_PAD}{LATENT_END}"
+
+    with pytest.raises(ValueError, match="crosses a plan boundary"):
+        spans.map_reasoning_step_spans(
+            rendered_text=f"xx{assistant}yy",
+            assistant_text=assistant,
+            plan_char_spans=(PlanCharSpan(0, "latent", 0, 44),),
+            reasoning_steps=(),
+            offset_mapping=torch.tensor(
+                [[[0, 2], [2, 19], [19, 32], [32, 46], [46, 48]]]
+            ),
+            input_ids=torch.tensor([[10, 91, 90, 92, 11]]),
+            latent_pad_token_id=90,
+        )
+
+
+def test_map_reasoning_step_spans_rejects_pad_to_end_crossing_for_unmapped_latent():
+    """Catches skipping the inner pad/end boundary of an incomplete latent unit."""
+    assistant = f"{LATENT_START}{LATENT_PAD}{LATENT_END}"
+
+    with pytest.raises(ValueError, match="crosses a plan boundary"):
+        spans.map_reasoning_step_spans(
+            rendered_text=f"xx{assistant}yy",
+            assistant_text=assistant,
+            plan_char_spans=(PlanCharSpan(0, "latent", 0, 44),),
+            reasoning_steps=(),
+            offset_mapping=torch.tensor(
+                [[[0, 2], [2, 18], [18, 33], [33, 46], [46, 48]]]
+            ),
+            input_ids=torch.tensor([[10, 91, 90, 92, 11]]),
+            latent_pad_token_id=90,
+        )
+
+
 class CharacterOffsetTokenizer:
     """Small deterministic fast-tokenizer boundary for collator contract tests."""
 
@@ -185,8 +221,17 @@ class SinglePassQwenProcessor:
     def __init__(self):
         self.tokenizer = CharacterOffsetTokenizer()
         self.image_processing_calls = 0
+        self.chat_template_calls = []
+        self.processor_calls = []
 
     def apply_chat_template(self, conversation, *, tokenize, add_generation_prompt):
+        self.chat_template_calls.append(
+            {
+                "conversation": conversation,
+                "tokenize": tokenize,
+                "add_generation_prompt": add_generation_prompt,
+            }
+        )
         assert tokenize is False
         assert add_generation_prompt is False
         assistant = conversation[1]["content"][0]["text"]
@@ -196,6 +241,15 @@ class SinglePassQwenProcessor:
         )
 
     def __call__(self, *, text, images, padding, truncation, return_tensors):
+        self.processor_calls.append(
+            {
+                "text": text,
+                "images": images,
+                "padding": padding,
+                "truncation": truncation,
+                "return_tensors": return_tensors,
+            }
+        )
         assert len(images) == 1 and len(images[0]) == 1
         self.image_processing_calls += 1
         # One 4x4 grid with merge_size=2 produces exactly four image placeholders.
@@ -240,8 +294,8 @@ def make_mapped_collator(processor, *, enabled):
     )
 
 
-def test_disabled_collator_keeps_the_prechange_keys_and_tensors(mapped_example):
-    """Catches opt-in metadata or offset tokenization leaking into Stage 2A batches."""
+def test_disabled_collator_matches_captured_prechange_batch_exactly(mapped_example):
+    """Catches any shared branch regression hidden by comparing new paths together."""
     processor = SinglePassQwenProcessor()
 
     batch = make_mapped_collator(processor, enabled=False)([mapped_example])
@@ -253,9 +307,116 @@ def test_disabled_collator_keeps_the_prechange_keys_and_tensors(mapped_example):
         "image_grid_thw",
         "labels",
     }
+    assert torch.equal(
+        batch["input_ids"],
+        torch.tensor(
+            [[
+                31,
+                217,
+                215,
+                201,
+                214,
+                110,
+                70,
+                70,
+                70,
+                70,
+                213,
+                217,
+                201,
+                215,
+                216,
+                205,
+                211,
+                210,
+                32,
+                110,
+                31,
+                197,
+                215,
+                215,
+                205,
+                215,
+                216,
+                197,
+                210,
+                216,
+                110,
+                165,
+                91,
+                90,
+                90,
+                92,
+                166,
+                167,
+                32,
+                110,
+            ]]
+        ),
+    )
+    assert torch.equal(batch["attention_mask"], torch.ones((1, 40), dtype=torch.long))
+    assert torch.equal(
+        batch["labels"],
+        torch.tensor(
+            [[-100] * 30 + [110, 165, 91, -100, -100, 92, 166, 167, 32, 110]]
+        ),
+    )
+    assert torch.equal(
+        batch["pixel_values"],
+        torch.tensor([[[[0, 1], [2, 3]], [[4, 5], [6, 7]], [[8, 9], [10, 11]]]]),
+    )
+    assert torch.equal(batch["image_grid_thw"], torch.tensor([[1, 4, 4]]))
     assert processor.image_processing_calls == 1
-    assert all(not call["return_offsets_mapping"] for call in processor.tokenizer.calls)
-    assert torch.equal(batch["pixel_values"], torch.arange(12).reshape(1, 3, 2, 2))
+    assert processor.chat_template_calls == [
+        {
+            "conversation": mapped_example.conversation,
+            "tokenize": False,
+            "add_generation_prompt": False,
+        }
+    ]
+    assert len(processor.processor_calls) == 1
+    processor_call = processor.processor_calls[0]
+    assert set(processor_call) == {
+        "text",
+        "images",
+        "padding",
+        "truncation",
+        "return_tensors",
+    }
+    assert processor_call["text"] == [
+        "<|im_start|>user\n<|image_pad|>question<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        f"A{LATENT_START}{LATENT_PAD * 2}{LATENT_END}BC<|im_end|>\n"
+    ]
+    assert processor_call["padding"] is True
+    assert processor_call["truncation"] is False
+    assert processor_call["return_tensors"] == "pt"
+    assert len(processor_call["images"]) == 1
+    assert len(processor_call["images"][0]) == 1
+    assert isinstance(processor_call["images"][0][0], Image.Image)
+    assert processor.tokenizer.calls == [
+        {
+            "text": "<|im_start|>assistant",
+            "add_special_tokens": False,
+            "padding": False,
+            "truncation": False,
+            "return_tensors": "pt",
+            "return_offsets_mapping": False,
+        },
+        {
+            "text": [
+                "<|im_start|>user\n"
+                f"{IMAGE_PAD * 4}question<|im_end|>\n"
+                "<|im_start|>assistant\n"
+                f"A{LATENT_START}{LATENT_PAD * 2}{LATENT_END}BC<|im_end|>\n"
+            ],
+            "add_special_tokens": True,
+            "padding": True,
+            "truncation": False,
+            "return_tensors": "pt",
+            "return_offsets_mapping": False,
+        },
+    ]
 
 
 def test_enabled_collator_maps_expanded_full_string_without_changing_normal_tensors(

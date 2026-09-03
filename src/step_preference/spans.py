@@ -117,9 +117,6 @@ def map_reasoning_step_spans(
     latent_pad_token_id: int,
 ) -> tuple[ReasoningStepSpan, ...]:
     """Map assistant character plans onto half-open full-sequence token spans."""
-    if not reasoning_steps:
-        return ()
-
     offsets = (
         offset_mapping.tolist() if hasattr(offset_mapping, "tolist") else offset_mapping
     )
@@ -140,8 +137,10 @@ def map_reasoning_step_spans(
         for span in plan_char_spans
         for boundary in (span.start, span.end)
     }
-    for step in reasoning_steps:
-        latent_text = assistant_text[step.latent.start : step.latent.end]
+    for span in plan_char_spans:
+        if span.step_type != "latent":
+            continue
+        latent_text = assistant_text[span.start : span.end]
         if not (
             latent_text.startswith(LATENT_START_TOKEN)
             and latent_text.endswith(LATENT_END_TOKEN)
@@ -149,14 +148,17 @@ def map_reasoning_step_spans(
             raise ValueError(
                 "latent plan span does not contain a complete latent control block"
             )
-        boundaries.add(assistant_start + step.latent.start + len(LATENT_START_TOKEN))
-        boundaries.add(assistant_start + step.latent.end - len(LATENT_END_TOKEN))
+        boundaries.add(assistant_start + span.start + len(LATENT_START_TOKEN))
+        boundaries.add(assistant_start + span.end - len(LATENT_END_TOKEN))
 
     for token_index, (start, end) in enumerate(offsets):
         if start == end:
             continue
         if any(start < boundary < end for boundary in boundaries):
             raise ValueError(f"token {token_index} crosses a plan boundary")
+
+    if not reasoning_steps:
+        return ()
 
     def token_interval(char_start: int, char_end: int) -> tuple[int, int]:
         selected = [
