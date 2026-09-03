@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
 import hashlib
 import json
@@ -9,8 +10,418 @@ import math
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+import torch
+
+from step_preference.ablation import (
+    StepAblationSpec,
+    build_additive_step_attention_mask,
+)
+from step_preference.spans import ReasoningStepSpan, expand_qwen_image_placeholders
+
 
 NEGATIVE_MANIFEST_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class GreedyStepCompletion:
+    """Text and non-control token IDs produced by one ablated greedy branch."""
+
+    text: str
+    token_ids: tuple[int, ...]
+    stop_reason: str
+
+
+@dataclass(frozen=True)
+class StepCompletionEncoding:
+    """One complete rendered scoring sequence and its completion targets."""
+
+    model_inputs: Mapping[str, torch.Tensor]
+    completion_token_positions: tuple[int, ...]
+    completion_token_ids: tuple[int, ...]
+    rendered_text: str
+
+
+_MODEL_INPUT_KEYS = (
+    "input_ids",
+    "attention_mask",
+    "pixel_values",
+    "image_grid_thw",
+    "pixel_values_videos",
+    "video_grid_thw",
+)
+
+
+def _require_eval_model(model) -> None:
+    if getattr(model, "training", None) is not False:
+        raise ValueError("frozen reference model must be in eval mode")
+
+
+def _require_positive_int(name: str, value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _token_id_set(name: str, values) -> frozenset[int]:
+    if values is None:
+        return frozenset()
+    if isinstance(values, int) and not isinstance(values, bool):
+        values = (values,)
+    try:
+        result = frozenset(values)
+    except TypeError as error:
+        raise ValueError(f"{name} must contain integer token IDs") from error
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in result
+    ):
+        raise ValueError(f"{name} must contain nonnegative integer token IDs")
+    return result
+
+
+def _model_dtype(model) -> torch.dtype:
+    dtype = getattr(model, "dtype", None)
+    if isinstance(dtype, torch.dtype) and dtype.is_floating_point:
+        return dtype
+    parameter = next(model.parameters(), None)
+    if parameter is None or not parameter.dtype.is_floating_point:
+        raise ValueError("model must expose a floating compute dtype")
+    return parameter.dtype
+
+
+def _one_sample_inputs(model_inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if not isinstance(model_inputs, Mapping):
+        raise ValueError("model_inputs must be a mapping")
+    if "input_ids" not in model_inputs:
+        raise ValueError("model_inputs must contain input_ids")
+    inputs = {
+        name: model_inputs[name]
+        for name in _MODEL_INPUT_KEYS
+        if name in model_inputs and model_inputs[name] is not None
+    }
+    input_ids = inputs["input_ids"]
+    if (
+        not isinstance(input_ids, torch.Tensor)
+        or input_ids.ndim != 2
+        or input_ids.shape[0] != 1
+    ):
+        raise ValueError("input_ids must have shape [1, sequence_length]")
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        inputs["attention_mask"] = torch.ones_like(input_ids)
+    elif (
+        not isinstance(attention_mask, torch.Tensor)
+        or tuple(attention_mask.shape) != tuple(input_ids.shape)
+    ):
+        raise ValueError("attention_mask must match input_ids")
+    return inputs
+
+
+def _decode_completion(tokenizer, token_ids: Sequence[int]) -> str:
+    return tokenizer.decode(
+        list(token_ids),
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
+
+def greedy_generate_step_negative(
+    model,
+    *,
+    full_model_inputs: Mapping[str, torch.Tensor],
+    step_span: ReasoningStepSpan,
+    modality: str,
+    tokenizer,
+    max_new_tokens: int,
+    attn_implementation: str,
+    eos_token_ids: int | Sequence[int] | None = None,
+    control_token_ids: Sequence[int] | None = None,
+    dummy_token_id: int | None = None,
+) -> GreedyStepCompletion:
+    """Greedily decode one reasoning step with exactly one modality edge hidden.
+
+    The full validated trajectory is sliced immediately before ``T_k``.  One
+    terminal dummy token keeps the Qwen Stage 2 full-sequence validator intact;
+    logits are selected from the physical row immediately before that dummy.
+    Causality therefore makes the dummy invisible, and it advances by one
+    position after every generated token.
+    """
+    _require_eval_model(model)
+    _require_positive_int("max_new_tokens", max_new_tokens)
+    if not isinstance(step_span, ReasoningStepSpan):
+        raise ValueError("step_span must be a ReasoningStepSpan")
+    if modality not in ("visual", "textual"):
+        raise ValueError("modality must be 'visual' or 'textual'")
+
+    inputs = _one_sample_inputs(full_model_inputs)
+    full_ids = inputs["input_ids"]
+    full_attention = inputs["attention_mask"]
+    prefix_end = step_span.target_text_start
+    if prefix_end < 1 or prefix_end > full_ids.shape[1]:
+        raise ValueError("target step has no scoreable clean-prefix query row")
+    source_start, source_end = (
+        (step_span.latent_start, step_span.latent_end)
+        if modality == "visual"
+        else (step_span.prev_text_start, step_span.prev_text_end)
+    )
+    if source_start < 0 or source_end <= source_start or source_end > prefix_end:
+        raise ValueError("ablation source must be a nonempty span in the clean prefix")
+
+    eos_ids = _token_id_set(
+        "eos_token_ids",
+        eos_token_ids
+        if eos_token_ids is not None
+        else getattr(tokenizer, "eos_token_id", None),
+    )
+    controls = _token_id_set(
+        "control_token_ids",
+        control_token_ids
+        if control_token_ids is not None
+        else getattr(tokenizer, "all_special_ids", ()),
+    ) - eos_ids
+    if dummy_token_id is None:
+        dummy_token_id = getattr(tokenizer, "pad_token_id", None)
+        if dummy_token_id is None:
+            dummy_token_id = next(iter(eos_ids), None)
+    if (
+        isinstance(dummy_token_id, bool)
+        or not isinstance(dummy_token_id, int)
+        or dummy_token_id < 0
+    ):
+        raise ValueError("dummy_token_id must be a nonnegative integer")
+
+    prefix_ids = full_ids[:, :prefix_end]
+    prefix_attention = full_attention[:, :prefix_end]
+    generated: list[int] = []
+    stop_reason = "max_new_tokens"
+    model_dtype = _model_dtype(model)
+    device = full_ids.device
+    for _ in range(max_new_tokens):
+        suffix = torch.tensor(
+            [generated + [dummy_token_id]], dtype=full_ids.dtype, device=device
+        )
+        current_ids = torch.cat((prefix_ids, suffix), dim=1)
+        current_attention = torch.cat(
+            (
+                prefix_attention,
+                torch.ones(
+                    (1, suffix.shape[1]),
+                    dtype=full_attention.dtype,
+                    device=device,
+                ),
+            ),
+            dim=1,
+        )
+        dummy_position = current_ids.shape[1] - 1
+        query_position = dummy_position - 1
+        spec = StepAblationSpec(
+            modality=modality,
+            target_start=dummy_position,
+            target_end=dummy_position + 1,
+            source_start=source_start,
+            source_end=source_end,
+        )
+        final_mask = build_additive_step_attention_mask(
+            current_attention,
+            spec,
+            dtype=model_dtype,
+            device=device,
+            attn_implementation=attn_implementation,
+        )
+        call_inputs = {
+            name: value
+            for name, value in inputs.items()
+            if name not in ("input_ids", "attention_mask")
+        }
+        call_inputs.update(input_ids=current_ids, attention_mask=current_attention)
+        with torch.inference_mode():
+            outputs = model(
+                **call_inputs,
+                use_cache=False,
+                stage2_final_attention_mask=final_mask,
+                stage2_logit_positions=torch.tensor(
+                    [query_position], dtype=torch.long, device=device
+                ),
+                stage2_selective_logits_only=True,
+            )
+        logits = getattr(outputs, "stage2_selected_logits", None)
+        if not isinstance(logits, torch.Tensor) or tuple(logits.shape[:2]) != (1, 1):
+            raise ValueError("Stage 2 model did not return one selected logit row")
+        next_token = int(torch.argmax(logits[0, 0].float()).item())
+        if next_token in eos_ids:
+            stop_reason = "eos"
+            break
+        if next_token in controls:
+            stop_reason = "control"
+            break
+        generated.append(next_token)
+
+    return GreedyStepCompletion(
+        text=_decode_completion(tokenizer, generated),
+        token_ids=tuple(generated),
+        stop_reason=stop_reason,
+    )
+
+
+def _assistant_text_conversation(conversation, assistant_text: str):
+    copied = deepcopy(conversation)
+    if (
+        not isinstance(copied, list)
+        or len(copied) != 2
+        or not isinstance(copied[1], dict)
+        or copied[1].get("role") != "assistant"
+        or not isinstance(copied[1].get("content"), list)
+        or len(copied[1]["content"]) != 1
+        or copied[1]["content"][0].get("type") != "text"
+    ):
+        raise ValueError("conversation must contain one final assistant text part")
+    copied[1]["content"][0]["text"] = assistant_text
+    return copied
+
+
+def _special_token_ids(tokenizer) -> frozenset[int]:
+    values = list(getattr(tokenizer, "all_special_ids", ()) or ())
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        values.extend(
+            eos_token_id
+            if isinstance(eos_token_id, (list, tuple))
+            else [eos_token_id]
+        )
+    return _token_id_set("tokenizer special token IDs", values)
+
+
+def tokenize_step_completion(
+    processor,
+    *,
+    conversation,
+    images,
+    assistant_prefix: str,
+    completion_text: str,
+) -> StepCompletionEncoding:
+    """Render/tokenize clean prefix, completion, and assistant terminator together."""
+    if not isinstance(assistant_prefix, str):
+        raise ValueError("assistant_prefix must be a string")
+    if not isinstance(completion_text, str) or not completion_text:
+        raise ValueError("completion_text must be a non-empty string")
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None or not getattr(tokenizer, "is_fast", False):
+        raise ValueError("completion scoring requires a fast tokenizer")
+
+    assistant_text = assistant_prefix + completion_text
+    rendered = processor.apply_chat_template(
+        _assistant_text_conversation(conversation, assistant_text),
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    batch = processor(
+        text=[rendered],
+        images=[images],
+        padding=True,
+        truncation=False,
+        return_tensors="pt",
+    )
+    expanded = rendered
+    if "image_grid_thw" in batch:
+        expanded = expand_qwen_image_placeholders(
+            rendered,
+            image_grid_thw=batch["image_grid_thw"],
+            image_token=processor.image_token,
+            merge_size=processor.image_processor.merge_size,
+        )
+    offset_batch = tokenizer(
+        [expanded],
+        padding=True,
+        truncation=False,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+    )
+    offset_mapping = offset_batch.pop("offset_mapping")
+    for name, value in offset_batch.items():
+        if name not in batch or not torch.equal(value, batch[name]):
+            raise ValueError(f"offset tokenization does not match processor tensor: {name}")
+
+    assistant_start = expanded.rfind(assistant_text)
+    if assistant_start < 0:
+        raise ValueError("assistant completion is absent from rendered chat")
+    completion_start = assistant_start + len(assistant_prefix)
+    completion_end = completion_start + len(completion_text)
+    offsets = offset_mapping.tolist()
+    input_ids = batch["input_ids"]
+    if len(offsets) != 1 or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise NotImplementedError("completion tokenization supports batch_size=1 only")
+    excluded_ids = _special_token_ids(tokenizer)
+    selected: list[int] = []
+    for position, pair in enumerate(offsets[0]):
+        start, end = (int(pair[0]), int(pair[1]))
+        if start == end:
+            continue
+        if start < completion_end < end:
+            raise ValueError("a token crosses the completion/terminator boundary")
+        if end > completion_start and start < completion_end:
+            token_id = int(input_ids[0, position])
+            if token_id not in excluded_ids:
+                selected.append(position)
+    if not selected:
+        raise ValueError("completion text has no scoreable tokens")
+
+    model_inputs = {
+        name: value for name, value in batch.items() if name in _MODEL_INPUT_KEYS
+    }
+    return StepCompletionEncoding(
+        model_inputs=model_inputs,
+        completion_token_positions=tuple(selected),
+        completion_token_ids=tuple(int(input_ids[0, position]) for position in selected),
+        rendered_text=expanded,
+    )
+
+
+def score_step_completion(
+    model,
+    *,
+    model_inputs: Mapping[str, torch.Tensor],
+    completion_token_positions: Sequence[int],
+) -> float:
+    """Mean frozen-reference log probability for completion text under clean context."""
+    _require_eval_model(model)
+    inputs = _one_sample_inputs(model_inputs)
+    positions = tuple(completion_token_positions)
+    if (
+        not positions
+        or any(
+            isinstance(position, bool) or not isinstance(position, int)
+            for position in positions
+        )
+        or tuple(sorted(set(positions))) != positions
+        or positions[0] < 1
+        or positions[-1] >= inputs["input_ids"].shape[1]
+    ):
+        raise ValueError(
+            "completion_token_positions must be unique increasing causal positions"
+        )
+    device = inputs["input_ids"].device
+    query_positions = torch.tensor(
+        [position - 1 for position in positions], dtype=torch.long, device=device
+    )
+    with torch.inference_mode():
+        outputs = model(
+            **inputs,
+            use_cache=False,
+            stage2_final_attention_mask=None,
+            stage2_logit_positions=query_positions,
+            stage2_selective_logits_only=True,
+        )
+        logits = getattr(outputs, "stage2_selected_logits", None)
+        if not isinstance(logits, torch.Tensor) or logits.shape[1] != len(positions):
+            raise ValueError("Stage 2 model returned the wrong selected scoring logits")
+        target_ids = inputs["input_ids"][:, list(positions)].to(logits.device)
+        token_log_probs = torch.log_softmax(logits.float(), dim=-1).gather(
+            -1, target_ids.unsqueeze(-1)
+        )
+        score = token_log_probs.mean()
+    if not bool(torch.isfinite(score)):
+        raise ValueError("reference completion score is not finite")
+    return float(score.item())
 
 
 def _canonical_json(value) -> str:
@@ -167,7 +578,10 @@ class NegativeManifest:
             if index <= previous:
                 raise ValueError("selected_row_indices must be strictly increasing")
             previous = index
-        if not isinstance(self.stage2a_checkpoint_path, str) or not self.stage2a_checkpoint_path:
+        if (
+            not isinstance(self.stage2a_checkpoint_path, str)
+            or not self.stage2a_checkpoint_path
+        ):
             raise ValueError("stage2a_checkpoint_path must be a non-empty string")
         if not isinstance(self.checkpoint_files, tuple) or not all(
             isinstance(entry, CheckpointFile) for entry in self.checkpoint_files
@@ -176,7 +590,10 @@ class NegativeManifest:
         relative_paths = [entry.relative_path for entry in self.checkpoint_files]
         if len(relative_paths) != len(set(relative_paths)):
             raise ValueError("checkpoint_files contains duplicate relative paths")
-        if not isinstance(self.tokenizer_config_identity, str) or not self.tokenizer_config_identity:
+        if (
+            not isinstance(self.tokenizer_config_identity, str)
+            or not self.tokenizer_config_identity
+        ):
             raise ValueError("tokenizer_config_identity must be a non-empty string")
         _require_int("latent_size", self.latent_size, minimum=1)
         object.__setattr__(
@@ -185,7 +602,11 @@ class NegativeManifest:
 
 
 def filter_negative(
-    *, chosen_text: str, rejected_text: str | None, scoreable_token_ids: Sequence[int], min_tokens: int
+    *,
+    chosen_text: str,
+    rejected_text: str | None,
+    scoreable_token_ids: Sequence[int],
+    min_tokens: int,
 ) -> bool:
     """Whether a generated completion can form a valid preference negative."""
     if not isinstance(chosen_text, str):
