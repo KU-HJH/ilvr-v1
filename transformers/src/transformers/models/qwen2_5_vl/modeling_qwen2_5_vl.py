@@ -1999,6 +1999,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             raise ValueError("Stage 2 forward requires input_ids")
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise NotImplementedError("Stage 2 forward currently supports batch_size=1 only")
+        if stage2_loss_only and stage2_selective_logits_only:
+            raise ValueError(
+                "stage2_loss_only and stage2_selective_logits_only are mutually exclusive"
+            )
         if stage2_loss_only and labels is None:
             raise ValueError("Stage 2 loss-only forward requires labels")
         if stage2_loss_only and not return_dict:

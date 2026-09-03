@@ -141,7 +141,7 @@ def test_stage2_selective_logits_select_hidden_rows_before_lm_head_and_keep_grad
     model = tiny_stage2_qwen().eval()
     input_ids = _stage2_tokens()
     attention_mask = torch.ones_like(input_ids)
-    selected_positions = torch.tensor([1, 4, 6])
+    selected_positions = torch.tensor([6, 1, 4])
     with torch.no_grad():
         full = model(input_ids=input_ids, attention_mask=attention_mask)
 
@@ -179,12 +179,15 @@ def test_stage2_selective_logits_select_hidden_rows_before_lm_head_and_keep_grad
 @pytest.mark.parametrize(
     ("positions", "message"),
     [
+        (torch.tensor([], dtype=torch.long), "nonempty 1-D integer"),
+        (torch.tensor([[2, 3]]), "nonempty 1-D integer"),
+        (torch.tensor([2.0, 3.0]), "nonempty 1-D integer"),
         (torch.tensor([2, 2]), "unique"),
         (torch.tensor([-1]), "range"),
         (torch.tensor([8]), "range"),
     ],
 )
-def test_stage2_rejects_duplicate_or_out_of_range_logit_positions(positions, message):
+def test_stage2_rejects_invalid_logit_positions(positions, message):
     """Catches ambiguous or invalid hidden-row selection."""
     model = tiny_stage2_qwen()
     input_ids = _stage2_tokens()
@@ -224,6 +227,39 @@ def test_stage2_selective_only_rejects_full_ce_labels():
             stage2_logit_positions=torch.tensor([4]),
             stage2_selective_logits_only=True,
         )
+
+
+@pytest.mark.parametrize("with_labels", [False, True])
+def test_stage2_loss_only_and_selective_only_are_mutually_exclusive_before_projection(
+    with_labels,
+):
+    """Catches contradictory projection modes doing decoder or LM-head work."""
+    model = tiny_stage2_qwen()
+    input_ids = _stage2_tokens()
+    decoder_calls = []
+    lm_head_calls = []
+    decoder_handle = model.model.register_forward_pre_hook(
+        lambda _module, _args: decoder_calls.append(1)
+    )
+    lm_head_handle = model.lm_head.register_forward_pre_hook(
+        lambda _module, _args: lm_head_calls.append(1)
+    )
+    try:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                labels=input_ids if with_labels else None,
+                stage2_loss_only=True,
+                stage2_logit_positions=torch.tensor([4]),
+                stage2_selective_logits_only=True,
+            )
+    finally:
+        decoder_handle.remove()
+        lm_head_handle.remove()
+
+    assert decoder_calls == []
+    assert lm_head_calls == []
 
 
 @pytest.mark.parametrize(
