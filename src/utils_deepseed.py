@@ -29,6 +29,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--latent_size", type=int, default=8)
     parser.add_argument("--stage2_diagnostics_interval", type=int, default=0)
     parser.add_argument("--step_preference_enabled", action="store_true")
+    parser.add_argument("--step_preference_packing", action="store_true")
     parser.add_argument(
         "--step_preference_mode", choices=("stage2a", "stage2b"), default="stage2a"
     )
@@ -164,6 +165,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
     args.step_preference_config = StepPreferenceConfig.from_args(args)
+    if args.step_preference_config.packing_enabled and args.gradient_checkpointing:
+        raise ValueError("step preference packing requires gradient checkpointing disabled")
     if args.stage2b_preflight_only and not args.step_preference_config.is_stage2b:
         raise ValueError("--stage2b_preflight_only requires Stage 2B")
     if args.stage == "stage2":

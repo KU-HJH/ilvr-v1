@@ -62,10 +62,13 @@ class StepPreferenceConfig:
     stage2a_checkpoint_path: str | None = None
     attention_implementation: str = "sdpa"
     resume_from_checkpoint_path: str | None = None
+    packing_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled must be a boolean")
+        if not isinstance(self.packing_enabled, bool):
+            raise ValueError("packing_enabled must be a boolean")
         if self.mode not in ("stage2a", "stage2b"):
             raise ValueError("step preference mode must be stage2a or stage2b")
         beta = _finite("step_dpo_beta", self.beta)
@@ -115,6 +118,8 @@ class StepPreferenceConfig:
                     "--stage2a_checkpoint_path and --resume_from_checkpoint_path "
                     "are mutually exclusive for Stage 2B"
                 )
+        elif self.packing_enabled:
+            raise ValueError("step preference packing is only valid for Stage 2B")
 
     @property
     def is_stage2b(self) -> bool:
@@ -148,4 +153,5 @@ class StepPreferenceConfig:
             resume_from_checkpoint_path=getattr(
                 args, "resume_from_checkpoint_path", None
             ),
+            packing_enabled=getattr(args, "step_preference_packing", False),
         )

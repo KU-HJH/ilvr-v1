@@ -45,8 +45,19 @@ DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
-STEP_PREFERENCE_ARGS=()
 stage2b_checkpoint_initialization=false
+case "${STEP_PREFERENCE_PACKING-}" in
+  ""|0|false|False) step_preference_packing=false ;;
+  1|true|True) step_preference_packing=true ;;
+  *)
+    printf 'STEP_PREFERENCE_PACKING must be 0, 1, false, or true\n' >&2
+    exit 2
+    ;;
+esac
+STEP_PREFERENCE_ARGS=()
+if [[ "$step_preference_packing" == true ]]; then
+  STEP_PREFERENCE_ARGS+=(--step_preference_packing)
+fi
 case "$STEP_PREFERENCE_ENABLED" in
   true)
     STEP_PREFERENCE_MODE=${STEP_PREFERENCE_MODE:-stage2a}
@@ -62,7 +73,7 @@ case "$STEP_PREFERENCE_ENABLED" in
         exit 2
         ;;
     esac
-    STEP_PREFERENCE_ARGS=(
+    STEP_PREFERENCE_ARGS+=(
       --step_preference_enabled
       --step_preference_mode "$STEP_PREFERENCE_MODE"
       --step_dpo_beta "$STEP_DPO_BETA"
@@ -190,6 +201,7 @@ MANAGED_OPTIONS=(
   --latent_size
   --stage2_diagnostics_interval
   --step_preference_enabled
+  --step_preference_packing
   --step_preference_mode
   --step_negative_path
   --step_negative_manifest

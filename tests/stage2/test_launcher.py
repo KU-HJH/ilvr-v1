@@ -367,6 +367,57 @@ def test_stage2_launcher_propagates_opt_in_stage2b_environment_without_resume_st
     assert "--tuning_method" not in tokens
 
 
+@pytest.mark.parametrize("value", ("1", "true", "True"))
+def test_stage2_launcher_propagates_explicit_packing_opt_in(value):
+    """Catches a valid packed Stage 2B request being dropped by the launcher."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
+                "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
+                "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+                "STEP_PREFERENCE_PACKING": value,
+            }
+        )
+    )
+    assert "--step_preference_packing" in tokens
+
+
+@pytest.mark.parametrize("value", ("", "0", "false", "False"))
+def test_stage2_launcher_omits_disabled_packing(value):
+    """Catches false-like packing values accidentally enabling the packed path."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
+                "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
+                "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+                "STEP_PREFERENCE_PACKING": value,
+            }
+        )
+    )
+    assert "--step_preference_packing" not in tokens
+
+
+def test_stage2_launcher_rejects_unknown_packing_value():
+    """Catches ambiguous packing environment values reaching Python."""
+    result = run_launcher(env_overrides={"STEP_PREFERENCE_PACKING": "yes"})
+    assert result.returncode == 2
+    assert "STEP_PREFERENCE_PACKING" in result.stderr
+
+
+def test_stage2_launcher_does_not_silently_ignore_packing_without_stage2b():
+    """Catches a true packing request disappearing when Stage 2B is not enabled."""
+    tokens = dry_run_tokens(
+        run_launcher(env_overrides={"STEP_PREFERENCE_PACKING": "true"})
+    )
+    assert "--step_preference_packing" in tokens
+
+
 def test_stage2_launcher_false_step_preference_keeps_disabled_tokens_identical():
     """Catches an explicitly false environment value adding inactive CLI tokens."""
     assert dry_run_tokens(

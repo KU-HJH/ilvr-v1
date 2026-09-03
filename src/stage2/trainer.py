@@ -40,6 +40,7 @@ from step_preference.ablation import (
 from step_preference.config import StepPreferenceConfig
 from step_preference.dpo_loss import aggregate_step_dpo
 from step_preference.negatives import StepNegative
+from step_preference.packing import build_packed_tree_plan
 from step_preference.spans import ReasoningStepSpan
 
 
@@ -408,8 +409,10 @@ class Stage2Trainer(Trainer):
             totals = {}
             self._step_preference_metric_totals = totals
             self._step_preference_metric_batches = 0
-        for name in _STEP_PREFERENCE_LOG_NAMES:
-            value = values[name]
+        missing = set(_STEP_PREFERENCE_LOG_NAMES) - set(values)
+        if missing:
+            raise ValueError(f"Stage 2B metrics are missing {sorted(missing)}")
+        for name, value in values.items():
             if isinstance(value, torch.Tensor):
                 if value.numel() != 1:
                     raise ValueError(f"Stage 2B metric {name} must be scalar")
@@ -420,6 +423,269 @@ class Stage2Trainer(Trainer):
                 raise ValueError(f"Stage 2B metric {name} must be finite")
             totals[name] = totals.get(name, 0.0) + value
         self._step_preference_metric_batches += 1
+
+    def _reduce_stage2b_objective(
+        self,
+        *,
+        clean_ce,
+        chosen_scores,
+        visual_rejected_scores,
+        textual_rejected_scores,
+        reference_chosen,
+        reference_visual_rejected,
+        reference_textual_rejected,
+        valid_visual,
+        valid_textual,
+        visual_entropy_losses,
+        textual_entropy_losses,
+        clean_entropy_values,
+        visual_entropy_values,
+        textual_entropy_values,
+        branch_forwards,
+        scored_tokens,
+        extra_metrics=None,
+    ):
+        """Reduce pre-scored branches with the normative Stage 2B objective."""
+        config = self.step_preference_config
+        zero = clean_ce * 0.0
+        if chosen_scores:
+            dpo = aggregate_step_dpo(
+                clean_ce=clean_ce,
+                policy_chosen=torch.stack(chosen_scores),
+                policy_visual_rejected=torch.stack(visual_rejected_scores),
+                policy_textual_rejected=torch.stack(textual_rejected_scores),
+                reference_chosen=torch.stack(reference_chosen),
+                reference_visual_rejected=torch.stack(reference_visual_rejected),
+                reference_textual_rejected=torch.stack(reference_textual_rejected),
+                valid_visual=torch.tensor(
+                    valid_visual, dtype=torch.bool, device=clean_ce.device
+                ),
+                valid_textual=torch.tensor(
+                    valid_textual, dtype=torch.bool, device=clean_ce.device
+                ),
+                beta=config.beta,
+            )
+            visual_entropy_tokens = torch.cat(visual_entropy_losses)
+            textual_entropy_tokens = torch.cat(textual_entropy_losses)
+            entropy_loss = torch.cat(
+                (visual_entropy_tokens, textual_entropy_tokens)
+            ).mean()
+            visual_entropy_loss = visual_entropy_tokens.mean()
+            textual_entropy_loss = textual_entropy_tokens.mean()
+            clean_entropy = torch.cat(clean_entropy_values).mean()
+            visual_off_entropy = torch.cat(visual_entropy_values).mean()
+            textual_off_entropy = torch.cat(textual_entropy_values).mean()
+        else:
+            dpo = SimpleNamespace(
+                loss=zero,
+                visual_loss=zero,
+                textual_loss=zero,
+                visual_margin=zero,
+                textual_margin=zero,
+                visual_pair_count=0,
+                textual_pair_count=0,
+            )
+            entropy_loss = zero
+            visual_entropy_loss = zero
+            textual_entropy_loss = zero
+            clean_entropy = zero
+            visual_off_entropy = zero
+            textual_off_entropy = zero
+
+        total_loss = (
+            clean_ce
+            + config.lambda_dpo * dpo.loss
+            + config.lambda_entropy * entropy_loss
+        )
+        if not bool(torch.isfinite(total_loss)):
+            raise ValueError("Stage 2B total loss must be finite")
+        metrics = {
+            "loss/total": total_loss,
+            "loss/ce": clean_ce,
+            "loss/dpo_visual": dpo.visual_loss,
+            "loss/dpo_text": dpo.textual_loss,
+            "loss/entropy_visual": visual_entropy_loss,
+            "loss/entropy_text": textual_entropy_loss,
+            "stats/dpo_margin_visual": dpo.visual_margin,
+            "stats/dpo_margin_text": dpo.textual_margin,
+            "stats/entropy_clean": clean_entropy,
+            "stats/entropy_visual_off": visual_off_entropy,
+            "stats/entropy_text_off": textual_off_entropy,
+            "stats/valid_visual_pairs": dpo.visual_pair_count,
+            "stats/valid_textual_pairs": dpo.textual_pair_count,
+            "stats/branch_forwards": branch_forwards,
+            "stats/scored_tokens": scored_tokens,
+        }
+        if extra_metrics:
+            metrics.update(extra_metrics)
+        self._accumulate_step_preference_metrics(metrics)
+        return total_loss
+
+    def _compute_stage2b_packed_loss(
+        self,
+        model,
+        *,
+        clean_inputs,
+        reasoning_spans,
+        steps,
+        validated_steps,
+        collect_diagnostics,
+        return_outputs,
+    ):
+        input_ids = clean_inputs["input_ids"]
+        attention_mask = clean_inputs["attention_mask"]
+        plan = build_packed_tree_plan(
+            clean_input_ids=input_ids,
+            attention_mask=attention_mask,
+            reasoning_spans=reasoning_spans,
+            joined_steps=steps,
+        )
+        packed_inputs = plan.to_model_inputs(input_ids.device)
+        selected_positions = plan.selected_positions().to(input_ids.device)
+        call = dict(clean_inputs)
+        call.update(
+            use_cache=False,
+            stage2_loss_only=not return_outputs,
+            collect_stage2_diagnostics=collect_diagnostics,
+            stage2_packed_inputs=packed_inputs,
+            stage2_logit_positions=selected_positions,
+        )
+        outputs = model(**call)
+        clean_ce = getattr(outputs, "loss", None)
+        if (
+            not isinstance(clean_ce, torch.Tensor)
+            or clean_ce.numel() != 1
+            or not bool(torch.isfinite(clean_ce))
+        ):
+            raise ValueError("Stage 2B clean CE must be a finite scalar")
+        diagnostics = getattr(outputs, "stage2_diagnostics", None)
+        self._latest_stage2_diagnostics = (
+            None
+            if diagnostics is None
+            else {name: value.detach() for name, value in diagnostics.items()}
+        )
+        selected = _selected_logits(outputs, selected_positions.numel())
+        root_count = len(plan.root_selected_positions)
+        branch_logits = {}
+        offset = root_count
+        for branch in plan.branches:
+            count = len(branch.selected_positions)
+            branch_logits[branch.name] = selected[:, offset : offset + count]
+            offset += count
+        if offset != selected.shape[1]:
+            raise ValueError("packed Stage 2B selected-logit layout is inconsistent")
+
+        chosen_scores = []
+        visual_rejected_scores = []
+        textual_rejected_scores = []
+        reference_chosen = []
+        reference_visual_rejected = []
+        reference_textual_rejected = []
+        valid_visual = []
+        valid_textual = []
+        visual_entropy_losses = []
+        textual_entropy_losses = []
+        clean_entropy_values = []
+        visual_entropy_values = []
+        textual_entropy_values = []
+        root_offset = 0
+        zero = clean_ce * 0.0
+        for span, negative, _item in validated_steps:
+            token_count = span.target_text_end - span.target_text_start
+            clean_logits = selected[:, root_offset : root_offset + token_count]
+            root_offset += token_count
+            target_ids = input_ids[:, span.target_text_start : span.target_text_end]
+            chosen_scores.append(_mean_selected_logp(clean_logits, target_ids))
+            clean_entropy = _selected_entropies(clean_logits)
+            modality_entropies = {}
+            for modality in ("visual", "textual"):
+                branch = plan.branch(f"step-{span.step_id}-{modality}-off")
+                modality_entropies[modality] = _selected_entropies(
+                    branch_logits[branch.name]
+                )
+            visual_entropy_losses.append(
+                F.relu(
+                    clean_entropy
+                    + self.step_preference_config.entropy_margin
+                    - modality_entropies["visual"]
+                )
+            )
+            textual_entropy_losses.append(
+                F.relu(
+                    clean_entropy
+                    + self.step_preference_config.entropy_margin
+                    - modality_entropies["textual"]
+                )
+            )
+            clean_entropy_values.extend((clean_entropy, clean_entropy))
+            visual_entropy_values.append(modality_entropies["visual"])
+            textual_entropy_values.append(modality_entropies["textual"])
+            valid_visual.append(negative.valid_visual_negative)
+            valid_textual.append(negative.valid_textual_negative)
+            for modality, destination in (
+                ("visual", visual_rejected_scores),
+                ("textual", textual_rejected_scores),
+            ):
+                if getattr(negative, f"valid_{modality}_negative"):
+                    branch = plan.branch(
+                        f"step-{span.step_id}-{modality}-rejected"
+                    )
+                    logits = branch_logits[branch.name]
+                    targets = torch.tensor(
+                        branch.target_token_ids,
+                        dtype=torch.long,
+                        device=logits.device,
+                    ).unsqueeze(0)
+                    destination.append(_mean_selected_logp(logits, targets))
+                else:
+                    destination.append(zero)
+            reference_chosen.append(
+                clean_ce.new_tensor(negative.reference_chosen_score).detach()
+            )
+            reference_visual_rejected.append(
+                clean_ce.new_tensor(
+                    negative.reference_visual_rejected_score
+                    if negative.reference_visual_rejected_score is not None
+                    else 0.0
+                ).detach()
+            )
+            reference_textual_rejected.append(
+                clean_ce.new_tensor(
+                    negative.reference_textual_rejected_score
+                    if negative.reference_textual_rejected_score is not None
+                    else 0.0
+                ).detach()
+            )
+
+        block_mask = packed_inputs["block_mask"]
+        sparsity = getattr(block_mask, "sparsity", None)
+        sparsity_value = float(sparsity()) if callable(sparsity) else 0.0
+        total_loss = self._reduce_stage2b_objective(
+            clean_ce=clean_ce,
+            chosen_scores=chosen_scores,
+            visual_rejected_scores=visual_rejected_scores,
+            textual_rejected_scores=textual_rejected_scores,
+            reference_chosen=reference_chosen,
+            reference_visual_rejected=reference_visual_rejected,
+            reference_textual_rejected=reference_textual_rejected,
+            valid_visual=valid_visual,
+            valid_textual=valid_textual,
+            visual_entropy_losses=visual_entropy_losses,
+            textual_entropy_losses=textual_entropy_losses,
+            clean_entropy_values=clean_entropy_values,
+            visual_entropy_values=visual_entropy_values,
+            textual_entropy_values=textual_entropy_values,
+            branch_forwards=1,
+            scored_tokens=selected_positions.numel(),
+            extra_metrics={
+                "stats/packed_tokens": plan.padded_length,
+                "stats/packed_mask_sparsity": sparsity_value,
+            },
+        )
+        if return_outputs:
+            outputs.loss = total_loss
+            return total_loss, outputs
+        return total_loss
 
     def _compute_stage2b_loss(
         self, model, inputs, *, collect_diagnostics: bool, return_outputs: bool
@@ -488,6 +754,17 @@ class Stage2Trainer(Trainer):
                         f"Stage 2B {modality} rejected branch validity does not match"
                     )
             validated_steps.append((span, negative, item))
+
+        if config.packing_enabled:
+            return self._compute_stage2b_packed_loss(
+                model,
+                clean_inputs=clean_inputs,
+                reasoning_spans=reasoning_spans,
+                steps=steps,
+                validated_steps=validated_steps,
+                collect_diagnostics=collect_diagnostics,
+                return_outputs=return_outputs,
+            )
 
         clean_call = dict(clean_inputs)
         clean_call.update(
@@ -685,75 +962,23 @@ class Stage2Trainer(Trainer):
                 ).detach()
             )
 
-        if validated_steps:
-            dpo = aggregate_step_dpo(
-                clean_ce=clean_ce,
-                policy_chosen=torch.stack(chosen_scores),
-                policy_visual_rejected=torch.stack(visual_rejected_scores),
-                policy_textual_rejected=torch.stack(textual_rejected_scores),
-                reference_chosen=torch.stack(reference_chosen),
-                reference_visual_rejected=torch.stack(reference_visual_rejected),
-                reference_textual_rejected=torch.stack(reference_textual_rejected),
-                valid_visual=torch.tensor(
-                    valid_visual, dtype=torch.bool, device=clean_ce.device
-                ),
-                valid_textual=torch.tensor(
-                    valid_textual, dtype=torch.bool, device=clean_ce.device
-                ),
-                beta=config.beta,
-            )
-            visual_entropy_tokens = torch.cat(visual_entropy_losses)
-            textual_entropy_tokens = torch.cat(textual_entropy_losses)
-            entropy_loss = torch.cat(
-                (visual_entropy_tokens, textual_entropy_tokens)
-            ).mean()
-            visual_entropy_loss = visual_entropy_tokens.mean()
-            textual_entropy_loss = textual_entropy_tokens.mean()
-            clean_entropy = torch.cat(clean_entropy_values).mean()
-            visual_off_entropy = torch.cat(visual_entropy_values).mean()
-            textual_off_entropy = torch.cat(textual_entropy_values).mean()
-        else:
-            dpo = SimpleNamespace(
-                loss=zero,
-                visual_loss=zero,
-                textual_loss=zero,
-                visual_margin=zero,
-                textual_margin=zero,
-                visual_pair_count=0,
-                textual_pair_count=0,
-            )
-            entropy_loss = zero
-            visual_entropy_loss = zero
-            textual_entropy_loss = zero
-            clean_entropy = zero
-            visual_off_entropy = zero
-            textual_off_entropy = zero
-
-        total_loss = (
-            clean_ce
-            + config.lambda_dpo * dpo.loss
-            + config.lambda_entropy * entropy_loss
-        )
-        if not bool(torch.isfinite(total_loss)):
-            raise ValueError("Stage 2B total loss must be finite")
-        self._accumulate_step_preference_metrics(
-            {
-                "loss/total": total_loss,
-                "loss/ce": clean_ce,
-                "loss/dpo_visual": dpo.visual_loss,
-                "loss/dpo_text": dpo.textual_loss,
-                "loss/entropy_visual": visual_entropy_loss,
-                "loss/entropy_text": textual_entropy_loss,
-                "stats/dpo_margin_visual": dpo.visual_margin,
-                "stats/dpo_margin_text": dpo.textual_margin,
-                "stats/entropy_clean": clean_entropy,
-                "stats/entropy_visual_off": visual_off_entropy,
-                "stats/entropy_text_off": textual_off_entropy,
-                "stats/valid_visual_pairs": dpo.visual_pair_count,
-                "stats/valid_textual_pairs": dpo.textual_pair_count,
-                "stats/branch_forwards": branch_forwards,
-                "stats/scored_tokens": scored_tokens,
-            }
+        total_loss = self._reduce_stage2b_objective(
+            clean_ce=clean_ce,
+            chosen_scores=chosen_scores,
+            visual_rejected_scores=visual_rejected_scores,
+            textual_rejected_scores=textual_rejected_scores,
+            reference_chosen=reference_chosen,
+            reference_visual_rejected=reference_visual_rejected,
+            reference_textual_rejected=reference_textual_rejected,
+            valid_visual=valid_visual,
+            valid_textual=valid_textual,
+            visual_entropy_losses=visual_entropy_losses,
+            textual_entropy_losses=textual_entropy_losses,
+            clean_entropy_values=clean_entropy_values,
+            visual_entropy_values=visual_entropy_values,
+            textual_entropy_values=textual_entropy_values,
+            branch_forwards=branch_forwards,
+            scored_tokens=scored_tokens,
         )
         if return_outputs:
             clean_outputs.loss = total_loss
@@ -821,7 +1046,7 @@ class Stage2Trainer(Trainer):
             logs.update(
                 {
                     name: totals[name] / metric_batches
-                    for name in _STEP_PREFERENCE_LOG_NAMES
+                    for name in totals
                 }
             )
             self._step_preference_metric_totals = {}

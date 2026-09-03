@@ -37,6 +37,7 @@ def test_step_preference_config_is_immutable_and_exposes_normative_defaults():
     assert config.stage2a_checkpoint_path is None
     assert config.negative_path is None
     assert config.negative_manifest is None
+    assert config.packing_enabled is False
     with pytest.raises(FrozenInstanceError):
         config.mode = "stage2b"
 
@@ -56,6 +57,27 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
     assert args.stage2a_ratio == 0.5
     assert args.stage2_total_steps is None
     assert args.stage2a_checkpoint_path is None
+    assert args.step_preference_packing is False
+
+
+def test_step_preference_packing_is_an_explicit_stage2b_only_opt_in():
+    """Catches packed execution leaking into disabled or Stage 2A training."""
+    required = [
+        "--stage", "stage2", "--step_preference_enabled",
+        "--step_preference_mode", "stage2b",
+        "--stage2a_checkpoint_path", "checkpoint",
+        "--step_negative_path", "negatives.jsonl",
+        "--step_negative_manifest", "manifest.json",
+        "--step_preference_packing",
+    ]
+
+    args = parse_args(required)
+    assert args.step_preference_config.packing_enabled is True
+
+    with pytest.raises(ValueError, match="packing.*Stage 2B"):
+        StepPreferenceConfig(packing_enabled=True)
+    with pytest.raises(ValueError, match="packing.*gradient checkpointing"):
+        parse_args(required + ["--gradient_checkpointing"])
 
 
 def test_stage2b_requires_checkpoint_and_both_negative_paths():

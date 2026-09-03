@@ -53,12 +53,20 @@ def _negative(step_id, *, visual, textual):
 
 
 def _rejected(marker):
+    if marker == 21:
+        input_ids = torch.tensor([[3, 4, marker, 0, 0, 6, 0, 0]])
+        completion_positions = (3,)
+    else:
+        input_ids = torch.tensor([[3, 4, 5, 0, 0, 6, marker, 0]])
+        completion_positions = (7,)
     return {
         "model_inputs": {
-            "input_ids": torch.tensor([[marker, 0]]),
-            "attention_mask": torch.ones(1, 2, dtype=torch.long),
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
         },
-        "completion_token_positions": (1,),
+        "completion_token_positions": completion_positions,
+        "completion_token_ids": (0,),
+        "rendered_text": f"rejected-{marker}",
     }
 
 
@@ -118,6 +126,27 @@ class _Policy:
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
         positions = kwargs.get("stage2_logit_positions")
+        if kwargs.get("stage2_packed_inputs") is not None:
+            coefficients = (
+                (0.6,) * 4
+                + (0.1,) * 2
+                + (0.2,) * 2
+                + (-0.2,)
+                + (0.3,) * 2
+                + (0.4,) * 2
+                + (-0.4,)
+                + (-0.6,)
+            )
+            assert len(coefficients) == len(positions)
+            logits = torch.cat(
+                [self._logits((0,), coefficient) for coefficient in coefficients],
+                dim=1,
+            )
+            return SimpleNamespace(
+                loss=(self.weight - 0.25).square() + 0.75,
+                stage2_selected_logits=logits,
+                stage2_diagnostics=None,
+            )
         if "labels" in kwargs:
             return SimpleNamespace(
                 loss=(self.weight - 0.25).square() + 0.75,
@@ -130,9 +159,9 @@ class _Policy:
             coefficient = (0.1, 0.2, 0.3, 0.4)[self.ablation_index]
             self.ablation_index += 1
         else:
-            coefficient = {21: -0.2, 22: -0.4, 23: -0.6}[
-                int(kwargs["input_ids"][0, 0])
-            ]
+            ids = kwargs["input_ids"][0].tolist()
+            marker = next(value for value in (21, 22, 23) if value in ids)
+            coefficient = {21: -0.2, 22: -0.4, 23: -0.6}[marker]
         return SimpleNamespace(
             loss=None,
             stage2_selected_logits=self._logits(positions, coefficient),
@@ -236,6 +265,42 @@ def test_stage2b_runs_the_naive_graph_and_uses_global_pair_and_token_denominator
     assert model.weight.grad is not None
     assert math.isfinite(float(model.weight.grad))
     assert float(model.weight.grad) != 0.0
+
+
+def test_packed_stage2b_uses_one_policy_call_and_same_objective(monkeypatch):
+    """Catches packed routing that repeats branches or changes the Stage 2B reduction."""
+    monkeypatch.setattr(
+        "step_preference.packing.build_flex_block_mask",
+        lambda _plan, _device: "block-mask-sentinel",
+    )
+    naive_trainer = _trainer(_config())
+    naive_model = _Policy()
+    naive_loss = naive_trainer.compute_loss(naive_model, _batch())
+
+    packed_trainer = _trainer(_config(packing_enabled=True))
+    packed_model = _Policy()
+    packed_loss = packed_trainer.compute_loss(packed_model, _batch())
+
+    torch.testing.assert_close(packed_loss, naive_loss, rtol=0, atol=0)
+    assert len(packed_model.calls) == 1
+    call = packed_model.calls[0]
+    assert call["stage2_packed_inputs"]["block_mask"] == "block-mask-sentinel"
+    assert call["stage2_logit_positions"].numel() == 15
+    metrics = packed_trainer._step_preference_metric_totals
+    assert metrics["stats/branch_forwards"] == 1.0
+    assert metrics["stats/packed_tokens"] == 128.0
+    assert math.isfinite(metrics["stats/packed_mask_sparsity"])
+    for name in (
+        "loss/total",
+        "loss/ce",
+        "loss/dpo_visual",
+        "loss/dpo_text",
+        "loss/entropy_visual",
+        "loss/entropy_text",
+    ):
+        assert metrics[name] == pytest.approx(
+            naive_trainer._step_preference_metric_totals[name]
+        )
 
 
 def test_disabled_compute_loss_preserves_the_exact_existing_model_call():
