@@ -20,6 +20,25 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 logger = logging.getLogger(__name__)
 
 
+class _ImmutableDict(dict):
+    """A JSON-object-compatible dictionary that rejects ordinary mutation."""
+
+    def _reject_mutation(self, *args, **kwargs):
+        raise TypeError("immutable dictionary cannot be modified")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __ior__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 @dataclass(frozen=True)
 class Stage2PreparedExample:
     """A validated CoMT sample ready for processor tokenization."""
@@ -29,10 +48,14 @@ class Stage2PreparedExample:
     latent_block_count: int
 
 
+def parse_jsonl_examples(contents: str) -> list[dict]:
+    """Parse non-empty JSON Lines records from one text snapshot."""
+    return [json.loads(line) for line in contents.splitlines() if line.strip()]
+
+
 def load_jsonl_examples(path: Path) -> list[dict]:
     """Load non-empty JSON Lines records without altering their contents."""
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+    return parse_jsonl_examples(path.read_text(encoding="utf-8"))
 
 
 def resolve_image_root_path(
@@ -290,12 +313,46 @@ class Stage2LengthStats:
     maximum: int
     latent_block_distribution: dict[int, int]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "latent_block_distribution",
+            _ImmutableDict(self.latent_block_distribution),
+        )
+
+
+def summarize_stage2_lengths(*, lengths, latent_block_counts, max_length):
+    """Summarize one already-measured sequence length per prepared example."""
+    lengths = tuple(lengths)
+    latent_block_counts = tuple(latent_block_counts)
+    if not lengths:
+        raise ValueError("cannot compute Stage 2 length statistics for an empty dataset")
+    if len(lengths) != len(latent_block_counts):
+        raise ValueError("lengths and latent block counts must have the same cardinality")
+
+    values = torch.tensor(lengths, dtype=torch.float64)
+    retained = sum(length <= max_length for length in lengths)
+    filtered = len(lengths) - retained
+    return Stage2LengthStats(
+        total=len(lengths),
+        retained=retained,
+        filtered=filtered,
+        filtered_percentage=100.0 * filtered / len(lengths),
+        minimum=min(lengths),
+        median=float(values.quantile(0.50)),
+        p90=float(values.quantile(0.90)),
+        p95=float(values.quantile(0.95)),
+        p99=float(values.quantile(0.99)),
+        maximum=max(lengths),
+        latent_block_distribution=dict(sorted(Counter(latent_block_counts).items())),
+    )
+
 
 def filter_stage2_examples(*, examples, measure_length, max_length):
     """Keep complete samples at or under ``max_length`` and summarize all samples."""
     kept = []
     lengths: list[int] = []
-    block_counts: Counter[int] = Counter()
+    latent_block_counts: list[int] = []
     for example in examples:
         length = int(measure_length(example))
         lengths.append(length)
@@ -312,27 +369,14 @@ def filter_stage2_examples(*, examples, measure_length, max_length):
                 )
             )
         )
-        block_counts[block_count] += 1
+        latent_block_counts.append(block_count)
         if length <= max_length:
             kept.append(example)
 
-    if not lengths:
-        raise ValueError("cannot compute Stage 2 length statistics for an empty dataset")
-
-    values = torch.tensor(lengths, dtype=torch.float64)
-    filtered = len(lengths) - len(kept)
-    stats = Stage2LengthStats(
-        total=len(lengths),
-        retained=len(kept),
-        filtered=filtered,
-        filtered_percentage=100.0 * filtered / len(lengths),
-        minimum=min(lengths),
-        median=float(values.quantile(0.50)),
-        p90=float(values.quantile(0.90)),
-        p95=float(values.quantile(0.95)),
-        p99=float(values.quantile(0.99)),
-        maximum=max(lengths),
-        latent_block_distribution=dict(sorted(block_counts.items())),
+    stats = summarize_stage2_lengths(
+        lengths=lengths,
+        latent_block_counts=latent_block_counts,
+        max_length=max_length,
     )
     logger.info("Stage 2 length statistics: %s", asdict(stats))
     return kept, stats

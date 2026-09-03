@@ -50,12 +50,16 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         REQUIRED_ENV["DATA_PATH"],
         "--image_root",
         REQUIRED_ENV["IMAGE_ROOT"],
+        "--dataloader_num_workers",
+        "0",
         "--save_model_path",
         REQUIRED_ENV["OUTPUT_DIR"],
         "--log_file",
         REQUIRED_ENV["LOG_FILE"],
         "--latent_size",
         "8",
+        "--stage2_diagnostics_interval",
+        "0",
         "--supervise_latent_boundaries",
         "--learning_rate",
         "1e-5",
@@ -78,7 +82,23 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         "0.05",
         "--lora_target_modules",
         "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        "--stage2_length_manifest",
+        "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json",
+        "--stage2_length_manifest_sha256",
+        "0" * 64,
     ]
+
+
+def test_stage2_launcher_dry_run_owns_length_manifest_and_dataloader_num_workers():
+    """Catches a dry run omitting the rank-shared manifest or worker contract."""
+    arguments = resolved_launcher_arguments(
+        run_launcher(env_overrides={"DATALOADER_NUM_WORKERS": "2"})
+    )
+
+    manifest = "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json"
+    assert arguments[arguments.index("--stage2_length_manifest") + 1] == manifest
+    assert arguments[arguments.index("--stage2_length_manifest_sha256") + 1] == "0" * 64
+    assert arguments[arguments.index("--dataloader_num_workers") + 1] == "2"
 
 
 def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
@@ -87,6 +107,7 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         run_launcher(
             env_overrides={
                 "LATENT_SIZE": "12",
+                "STAGE2_DIAGNOSTICS_INTERVAL": "4",
                 "SUPERVISE_LATENT_BOUNDARIES": "false",
                 "LEARNING_RATE": "2e-5",
                 "GRADIENT_ACCUMULATION_STEPS": "16",
@@ -99,9 +120,11 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         )
     )
 
-    assert arguments[-18:] == [
+    assert arguments[arguments.index("--latent_size") :] == [
         "--latent_size",
         "12",
+        "--stage2_diagnostics_interval",
+        "4",
         "--no-supervise_latent_boundaries",
         "--learning_rate",
         "2e-5",
@@ -118,6 +141,10 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         "/outputs/checkpoint 20",
         "--deepspeed_config",
         "/configs/zero 3.json",
+        "--stage2_length_manifest",
+        "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json",
+        "--stage2_length_manifest_sha256",
+        "0" * 64,
     ]
 
 
@@ -154,6 +181,20 @@ def test_stage2_launcher_rejects_non_positive_integer_settings():
         assert f"{name} must be a positive integer" in result.stderr
 
 
+@pytest.mark.parametrize("value", ("-1", "1.5", "often"))
+def test_stage2_launcher_rejects_invalid_diagnostics_interval(value):
+    """Catches malformed diagnostic cadences reaching Python startup."""
+    result = run_launcher(
+        env_overrides={"STAGE2_DIAGNOSTICS_INTERVAL": value}
+    )
+
+    assert result.returncode == 2
+    assert (
+        "STAGE2_DIAGNOSTICS_INTERVAL must be a non-negative integer"
+        in result.stderr
+    )
+
+
 def test_stage2_launcher_rejects_invalid_learning_rate():
     """Catches a malformed or zero learning rate before training starts."""
     for value in ("fast", "0", "-1", "1e999", "1e-9999", "nan", "inf", "-inf"):
@@ -171,6 +212,7 @@ MANAGED_OPTIONS = (
     "--save_model_path",
     "--log_file",
     "--latent_size",
+    "--stage2_diagnostics_interval",
     "--supervise_latent_boundaries",
     "--no-supervise_latent_boundaries",
     "--learning_rate",
@@ -233,7 +275,8 @@ def test_stage2_launcher_preserves_unmanaged_passthrough_and_quoting():
     )
 
     arguments = resolved_launcher_arguments(result)
-    assert arguments[-4:] == [
+    passthrough_start = arguments.index("--max_steps")
+    assert arguments[passthrough_start : passthrough_start + 4] == [
         "--max_steps",
         "7",
         "--evaluation_output_path",

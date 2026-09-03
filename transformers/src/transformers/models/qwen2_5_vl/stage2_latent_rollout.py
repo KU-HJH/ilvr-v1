@@ -143,11 +143,22 @@ class LatentRolloutResult:
     diagnostics: LatentRolloutDiagnostics | None = None
 
 
-def _replace_embedding(embeds: torch.Tensor, position: int, value: torch.Tensor) -> torch.Tensor:
-    return torch.cat(
-        (embeds[:, :position], value.unsqueeze(1), embeds[:, position + 1 :]),
-        dim=1,
-    )
+def _assemble_latent_inputs(
+    base: torch.Tensor,
+    replacements: list[tuple[int, torch.Tensor]],
+    *,
+    stop: int,
+) -> torch.Tensor:
+    pieces = []
+    cursor = 0
+    for position, state in replacements:
+        if position >= stop:
+            break
+        pieces.append(base[:, cursor:position])
+        pieces.append(state.unsqueeze(1))
+        cursor = position + 1
+    pieces.append(base[:, cursor:stop])
+    return torch.cat(pieces, dim=1)
 
 
 def _build_diagnostics(
@@ -193,13 +204,15 @@ class LatentRolloutEngine:
         if full_position_ids.ndim != 3 or full_position_ids.shape[-2:] != sequence_shape:
             raise ValueError("full_position_ids must match the embedding batch and sequence dimensions")
 
-        current = base_inputs_embeds
         states = []
         prefix_lengths = []
+        replacements = []
         for span in latent_spans:
             for position in span.latent_positions:
                 outputs = language_model(
-                    inputs_embeds=current[:, :position],
+                    inputs_embeds=_assemble_latent_inputs(
+                        base_inputs_embeds, replacements, stop=position
+                    ),
                     attention_mask=attention_mask[:, :position],
                     position_ids=full_position_ids[..., :position],
                     use_cache=False,
@@ -210,7 +223,10 @@ class LatentRolloutEngine:
                     latent.retain_grad()
                 states.append(latent)
                 prefix_lengths.append(position)
-                current = _replace_embedding(current, position, latent)
+                replacements.append((position, latent))
+        final_inputs_embeds = _assemble_latent_inputs(
+            base_inputs_embeds, replacements, stop=base_inputs_embeds.shape[1]
+        )
         diagnostics = None
         if collect_diagnostics:
             diagnostics = _build_diagnostics(
@@ -219,4 +235,4 @@ class LatentRolloutEngine:
                 batch_size=base_inputs_embeds.shape[0],
                 device=base_inputs_embeds.device,
             )
-        return LatentRolloutResult(current, tuple(states), tuple(prefix_lengths), diagnostics)
+        return LatentRolloutResult(final_inputs_embeds, tuple(states), tuple(prefix_lengths), diagnostics)
