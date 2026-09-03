@@ -412,7 +412,7 @@ def run_production_bf16_equivalence(
 def _to_device(value, device: torch.device):
     if isinstance(value, torch.Tensor):
         return value.to(device)
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {key: _to_device(item, device) for key, item in value.items()}
     if isinstance(value, tuple):
         return tuple(_to_device(item, device) for item in value)

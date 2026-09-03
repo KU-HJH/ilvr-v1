@@ -1,4 +1,5 @@
 import math
+from collections import UserDict
 from pathlib import Path
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import torch
 
 from step_preference.equivalence import (
     EquivalenceResult,
+    _to_device,
     compare_gradients,
     compare_scalar_metrics,
     relative_l2_error,
@@ -57,6 +59,14 @@ def test_evidence_writer_refuses_to_overwrite(tmp_path):
     write_evidence_exclusive(path, {"schema_version": 1, "status": "pass"})
     with pytest.raises(ValueError, match="already exists"):
         write_evidence_exclusive(path, {"schema_version": 1, "status": "fail"})
+
+
+def test_device_transfer_handles_mapping_wrappers_from_the_real_collator():
+    """Catches BatchFeature-like mappings leaving tensors on the CPU."""
+    wrapped = UserDict({"input_ids": torch.tensor([[1, 2]])})
+    moved = _to_device(wrapped, torch.device("meta"))
+    assert isinstance(moved, dict)
+    assert moved["input_ids"].device.type == "meta"
 
 
 def test_equivalence_cli_refuses_existing_output_before_loading(tmp_path):
