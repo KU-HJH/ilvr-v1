@@ -1,6 +1,6 @@
 # Step-wise Modality DPO Design
 
-**Status:** design proposal v1, pending commitment critique and final approval  
+**Status:** design commitment v1, pending final human approval
 **Date:** 2026-09-03  
 **Target branch/worktree:** `ours1` / `.worktrees/ours1`  
 **Source brief:** `documents/TODO-ours1.md` in the primary ILVR checkout
@@ -113,6 +113,12 @@ Configuration rejects a ratio outside `(0, 1)`, a total budget below two
 steps, or a split that gives either phase zero steps. The existing-checkpoint
 smoke path uses an explicitly labelled, small Stage 2B budget and does not
 present that run as a full budget-split experiment.
+
+This contract preserves optimizer-step count, not training FLOPs, tokens, wall
+time, or energy. The naive Stage 2B objective intentionally performs more
+forwards per optimizer step. Verification records branch-forward and
+scored-token counts so the fixed step budget is not misreported as a fixed
+compute budget.
 
 Stage 2B receives a distinct `stage2a_checkpoint_path`. This is intentionally
 different from `resume_from_checkpoint_path`: the former initializes model
@@ -480,6 +486,10 @@ The smoke run checks that at least one visual or textual DPO pair survives. If
 none survives greedy filtering in the initially selected rows, the subset is
 expanded once rather than weakening the filters.
 
+Survival establishes only that the code produced a non-identical, non-empty
+pair. It does not establish that the generated continuation is semantically
+worse than the source target.
+
 The final milestone record is
 `results/<run-id>/phase-a-verification.json`; logs are written to
 `logs/<run-id>/`. It records exact commands, exit status, test counts, finite
@@ -541,7 +551,34 @@ noise, helper-image perturbation, global modality ablation, calibrated DPO,
 SimPO, adaptive margins, per-step modality weights, online negative
 regeneration, a new judge, or generalized failure recovery.
 
-## 13. Known premises pending implementation evidence
+## 13. Critique resolution and interpretation limit
+
+The final critique identified one unresolved methodological disagreement:
+attention-ablated continuations may be coherent, equally valid, or better than
+the source `T_k`, while the configured DPO dataset labels the source as chosen
+and the generated continuation as rejected. Filters 1–3 do not independently
+establish a preference ordering, and the repository has no step-level
+correctness checker. Adding a judge or human-labelled preference dataset is
+outside the approved first-version scope.
+
+Accordingly, this implementation uses the source target as chosen **by
+construction** and must not claim that milestone 1 proves negative inferiority,
+causal attribution, or improved reasoning quality. It proves that the requested
+objective and interventions are implemented and executable. Any scientific
+claim about those labels requires a later independent step-level audit or
+evaluation.
+
+The design's load-bearing implementation assumption is that the current Qwen
+final decoder path honors the shifted additive 4-D edge mask. The cheapest
+falsification is a deterministic tiny-Qwen runtime probe showing that the first
+target-token distribution and subsequent target rows respond to the requested
+mask, while unrelated earlier logits and logical position IDs remain equal.
+This first-nail probe has not been run because it requires the new mask boundary
+and is therefore implementation-like work behind final design approval. It is
+the first implementation test; failure returns the work to design rather than
+being patched around.
+
+## 14. Known premises pending implementation evidence
 
 - The current Qwen eager/SDPA decoder must preserve arbitrary additive 4-D
   masks through every decoder layer.
@@ -553,6 +590,8 @@ regeneration, a new judge, or generalized failure recovery.
   reasonably small real-data subset.
 - A tree-packed FlexAttention path compatible with the vendored Qwen multimodal
   RoPE can produce an actual time or memory improvement on this hardware.
+- Source-target preference over each ablated continuation is an explicit weak
+  label assumption, not an independently established fact.
 
 These are not treated as established merely because the design is internally
 consistent. Milestone-specific runtime tests must supply the evidence.
