@@ -388,6 +388,7 @@ def _stage1_args(
     save_steps,
     resume=None,
     legacy_lora=False,
+    textual_states="previous",
 ):
     data_path = tmp_path / "TRAIN.jsonl"
     data_path.write_text("{}\n", encoding="utf-8")
@@ -410,6 +411,7 @@ def _stage1_args(
         "--lora_alpha", "8",
         "--lora_dropout", "0",
         "--sim_weight", "0.5",
+        "--textual_states", textual_states,
         "--seed", "47",
         "--use_cpu",
     ]
@@ -420,6 +422,26 @@ def _stage1_args(
     if resume is not None:
         argv.extend(("--resume_from_checkpoint_path", str(resume)))
     return parse_args(argv)
+
+
+def test_textual_states_reaches_actual_target_builder(tmp_path):
+    """Catches composition not delivering the parsed mode to the real target builder."""
+    components = build_stage1_training_components(
+        _stage1_args(
+            tmp_path,
+            method="full",
+            output_dir=tmp_path / "output",
+            batch_size=1,
+            gradient_accumulation_steps=1,
+            max_steps=1,
+            save_steps=1,
+            textual_states="all",
+        ),
+        dependencies=_tiny_dependencies(),
+    )
+
+    assert type(components.trainer) is CustomTrainerStage1
+    assert components.trainer.target_builder.textual_states == "all"
 
 
 def tiny_stage1_run(

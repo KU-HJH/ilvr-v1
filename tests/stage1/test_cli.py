@@ -48,6 +48,15 @@ def test_stage1_legacy_use_lora_resolves_only_to_lora():
     assert tuning.method == "lora"
 
 
+def test_textual_states_parser_defaults_accepts_all_and_rejects_invalid_values():
+    assert parse_args(["--stage", "stage1"]).textual_states == "previous"
+    assert parse_args(
+        ["--stage", "stage1", "--textual_states", "all"]
+    ).textual_states == "all"
+    with pytest.raises(SystemExit):
+        parse_args(["--stage", "stage1", "--textual_states", "invalid"])
+
+
 def test_stage1_explicit_lora_is_a_canonical_tuning_method():
     """Catches explicit Stage 1 LoRA being rejected despite its PEFT support."""
     args = parse_args(["--stage", "stage1", "--tuning_method", "lora"])

@@ -225,6 +225,7 @@ class CustomTrainerStage1(SFTTrainer):
         image_pool_k: int = 8,
         ce_weight: float = 1.0,
         helper_group_L: int | None = 256,
+        textual_states: str = "previous",
         ema_method: str | None = None,
         target_builder: Stage1TeacherTargetBuilder | None = None,
         ema_teacher: Stage1EmaTeacher | None = None,
@@ -247,6 +248,7 @@ class CustomTrainerStage1(SFTTrainer):
         self.coverage_p = float(coverage_p)
         self.image_pool_k = int(image_pool_k)
         self.helper_group_L = helper_group_L
+        self.textual_states = textual_states
         self.collect_stage1_diagnostics = bool(collect_stage1_diagnostics)
         self._latest_stage1_diagnostics = None
         self._representative_gradient_norm: float | None = None
@@ -277,6 +279,7 @@ class CustomTrainerStage1(SFTTrainer):
                 coverage_p=self.coverage_p,
                 image_pool_k=self.image_pool_k,
                 helper_group_L=self.helper_group_L,
+                textual_states=self.textual_states,
             )
         self.target_builder = target_builder
 

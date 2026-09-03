@@ -714,6 +714,17 @@ def test_real_explicit_resume_rejects_malformed_metadata_before_large_load(
     assert not any(event[0] in {"processor", "model"} for event in events)
 
 
+def test_textual_states_reaches_stage1_trainer(tmp_path):
+    """Catches composition dropping the selected textual history mode."""
+    events = []
+    deps, _, _, _ = fake_dependencies(events, metadata=object())
+    args = stage1_args(tmp_path, "--textual_states", "all")
+
+    bundle = build_stage1_training_components(args, dependencies=deps)
+
+    assert bundle.trainer.kwargs["textual_states"] == "all"
+
+
 def test_fresh_dora_composition_adds_tokens_once_and_propagates_runtime_args(tmp_path):
     """Catches repeated token remapping and hidden Stage 1 Trainer constants."""
     events = []

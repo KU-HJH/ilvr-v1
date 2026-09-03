@@ -59,6 +59,7 @@ stage1_num_processes=${STAGE1_NUM_PROCESSES:-2}
 attention_implementation=${STAGE1_ATTENTION_IMPLEMENTATION:-flash_attention_2}
 save_strategy=${STAGE1_SAVE_STRATEGY:-no}
 save_steps=${STAGE1_SAVE_STEPS:-612}
+textual_states=${STAGE1_TEXTUAL_STATES:-previous}
 resume_path=${STAGE1_RESUME_PATH:-}
 log_file=${STAGE1_LOG_FILE:-}
 max_steps=${STAGE1_MAX_STEPS:-}
@@ -171,6 +172,7 @@ while (( $# )); do
         --attention-implementation) require_value "$@"; attention_implementation=$2; shift 2 ;;
         --save-strategy) require_value "$@"; save_strategy=$2; shift 2 ;;
         --save-steps) require_value "$@"; save_steps=$2; shift 2 ;;
+        --textual_states) require_value "$@"; textual_states=$2; shift 2 ;;
         --resume) require_value "$@"; resume_path=$2; shift 2 ;;
         --log-file) require_value "$@"; log_file=$2; shift 2 ;;
         --max-steps) require_value "$@"; max_steps=$2; shift 2 ;;
@@ -207,6 +209,10 @@ fi
 case $save_strategy in
     no|steps|epoch) ;;
     *) printf 'error: --save-strategy must be no, steps, or epoch\n' >&2; exit 2 ;;
+esac
+case $textual_states in
+    all|previous) ;;
+    *) printf 'error: --textual_states must be all or previous\n' >&2; exit 2 ;;
 esac
 case $attention_implementation in
     eager|sdpa|flash_attention_2) ;;
@@ -364,6 +370,7 @@ command=(
     --attention_implementation "$attention_implementation"
     --save_strategy "$save_strategy"
     --save_steps "$save_steps"
+    --textual_states "$textual_states"
     --gradient_checkpointing
 )
 
