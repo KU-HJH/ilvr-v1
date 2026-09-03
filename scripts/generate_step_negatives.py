@@ -75,6 +75,8 @@ class LoadedStage2ASnapshot:
     processor: object
     checkpoint_files: tuple[CheckpointFile, ...]
     tokenizer_config_identity: str
+    resolved_device: str
+    torch_dtype: str
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -122,14 +124,17 @@ def _read_weight_index(checkpoint: Path, name: str) -> tuple[str, ...]:
 
 
 def _loader_relative_paths(
-    checkpoint: Path, artifact_kind: Stage2ArtifactKind
+    checkpoint: Path,
+    artifact_kind: Stage2ArtifactKind,
+    *,
+    include_processor: bool = True,
 ) -> tuple[str, ...]:
     names = {
         entry.name
         for entry in checkpoint.iterdir()
         if entry.is_file() and not entry.is_symlink()
     }
-    processor = names & _PROCESSOR_FILES
+    processor = names & _PROCESSOR_FILES if include_processor else set()
     if artifact_kind is Stage2ArtifactKind.PEFT:
         model_names = {
             STAGE2_PEFT_METADATA_FILENAME,
@@ -187,7 +192,9 @@ def _checkpoint_records(
         if path.is_symlink() or not path.is_file():
             raise ValueError(f"checkpoint loader input must be a regular file: {path}")
         size, digest = _sha256_file(path)
-        records.append(CheckpointFile(relative_path, size, digest))
+        records.append(
+            CheckpointFile(relative_path, size, digest, str(checkpoint))
+        )
     return tuple(records)
 
 
@@ -207,6 +214,28 @@ def _tokenizer_identity(records: Iterable[CheckpointFile]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _resolved_local_base(reference: str) -> Path:
+    if not isinstance(reference, str) or not reference:
+        raise ValueError("PEFT base-model reference must be a local regular directory")
+    candidate = Path(reference).expanduser()
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise ValueError("PEFT base-model reference must be a local regular directory")
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_dir():
+        raise ValueError("PEFT base-model reference must be a local regular directory")
+    return resolved
+
+
+def _runtime_precision(model, *, fallback_device: str, fallback_dtype: torch.dtype):
+    parameters = getattr(model, "parameters", None)
+    parameter = next(iter(parameters()), None) if callable(parameters) else None
+    if parameter is None:
+        return str(torch.device(fallback_device)), str(fallback_dtype).removeprefix(
+            "torch."
+        )
+    return str(parameter.device), str(parameter.dtype).removeprefix("torch.")
+
+
 def load_frozen_stage2a_snapshot(
     *,
     checkpoint_path: str | Path,
@@ -222,8 +251,27 @@ def load_frozen_stage2a_snapshot(
     if checkpoint.is_symlink() or not checkpoint.is_dir():
         raise ValueError("Stage 2A checkpoint path must be a regular directory")
     inspection = inspect_artifact(checkpoint)
-    relative_paths = _loader_relative_paths(checkpoint, inspection.artifact_kind)
-    checkpoint_files = _checkpoint_records(checkpoint, relative_paths)
+    checkpoint_relative_paths = _loader_relative_paths(
+        checkpoint, inspection.artifact_kind
+    )
+    base = None
+    if inspection.artifact_kind is Stage2ArtifactKind.PEFT:
+        metadata_snapshot = inspection.peft_metadata_snapshot
+        if metadata_snapshot is None:
+            raise ValueError("Stage 2A PEFT inspection lost its metadata")
+        metadata = decode_stage2_peft_metadata_snapshot(metadata_snapshot)
+        base = _resolved_local_base(metadata.base_model_reference)
+        base_inspection = inspect_artifact(base)
+        if base_inspection.artifact_kind is not Stage2ArtifactKind.FULL:
+            raise ValueError("PEFT base-model reference must identify a full local model")
+        base_relative_paths = _loader_relative_paths(
+            base, Stage2ArtifactKind.FULL, include_processor=False
+        )
+    checkpoint_files = _checkpoint_records(
+        checkpoint, checkpoint_relative_paths
+    )
+    if base is not None:
+        checkpoint_files += _checkpoint_records(base, base_relative_paths)
 
     if load_processor is None:
         load_processor = lambda source: AutoProcessor.from_pretrained(
@@ -243,14 +291,10 @@ def load_frozen_stage2a_snapshot(
             str(checkpoint), local_files_only=True, **model_options
         )
     else:
-        metadata_snapshot = inspection.peft_metadata_snapshot
-        if metadata_snapshot is None:
-            raise ValueError("Stage 2A PEFT inspection lost its metadata")
-        metadata = decode_stage2_peft_metadata_snapshot(metadata_snapshot)
         if load_peft_model is None:
             load_peft_model = load_stage2_model_for_inference
         loaded = load_peft_model(
-            metadata.base_model_reference,
+            str(base),
             str(checkpoint),
             processor,
             source_provenance_kwargs={"local_files_only": True},
@@ -263,12 +307,17 @@ def load_frozen_stage2a_snapshot(
     if callable(parameters):
         for parameter in parameters():
             parameter.requires_grad_(False)
+    resolved_device, actual_dtype = _runtime_precision(
+        model, fallback_device=device, fallback_dtype=dtype
+    )
 
     return LoadedStage2ASnapshot(
         model=model,
         processor=processor,
         checkpoint_files=checkpoint_files,
         tokenizer_config_identity=_tokenizer_identity(checkpoint_files),
+        resolved_device=resolved_device,
+        torch_dtype=actual_dtype,
     )
 
 
@@ -502,8 +551,10 @@ def main(argv: list[str] | None = None) -> int:
     selected_row_indices = tuple(range(len(examples)))
     generation_settings = {
         "attention_implementation": args.attention_implementation,
+        "device": snapshot.resolved_device,
         "max_new_tokens": args.max_new_tokens,
         "min_tokens": args.min_tokens,
+        "torch_dtype": snapshot.torch_dtype,
     }
     write_negative_artifact(
         negative_path=args.output_path,

@@ -41,7 +41,14 @@ def _identity(tmp_path):
         "source_sha256": SOURCE_SHA256,
         "selected_row_indices": (0,),
         "stage2a_checkpoint_path": str(checkpoint.resolve()),
-        "checkpoint_files": (CheckpointFile("config.json", 19, CHECKPOINT_SHA256),),
+        "checkpoint_files": (
+            CheckpointFile(
+                "config.json",
+                19,
+                CHECKPOINT_SHA256,
+                str(checkpoint.resolve()),
+            ),
+        ),
         "tokenizer_config_identity": "tokenizer-config-v1",
         "latent_size": 8,
         "generation_settings": {"max_new_tokens": 32, "min_tokens": 2},
@@ -153,7 +160,7 @@ def test_write_and_load_artifact_bind_raw_bytes_and_every_expected_identity(tmp_
         "3323476b34b66fdff82c8814e925828fa08ef4131dfe54df4c55c59efdf5a399"
     )
     assert store == {("sample-a", 0): _negative()}
-    assert json.loads(manifest_path.read_text(encoding="utf-8"))["schema_version"] == 1
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["schema_version"] == 2
 
 
 def test_load_negative_store_rejects_duplicate_join_identity(tmp_path):
@@ -335,11 +342,13 @@ def test_generation_settings_preserve_nested_list_object_distinction(tmp_path):
 def test_negative_manifest_is_immutable():
     """Catches a frozen reference identity being mutable after validation."""
     manifest = NegativeManifest(
-        schema_version=1,
+        schema_version=2,
         source_sha256=SOURCE_SHA256,
         selected_row_indices=(0,),
         stage2a_checkpoint_path="/checkpoint",
-        checkpoint_files=(CheckpointFile("config.json", 19, CHECKPOINT_SHA256),),
+        checkpoint_files=(
+            CheckpointFile("config.json", 19, CHECKPOINT_SHA256, "/checkpoint"),
+        ),
         tokenizer_config_identity="tokenizer-config-v1",
         latent_size=8,
         generation_settings={"max_new_tokens": 32},
@@ -348,3 +357,66 @@ def test_negative_manifest_is_immutable():
 
     with pytest.raises(Exception):
         manifest.latent_size = 4
+
+
+def test_load_negative_store_revalidates_every_checkpoint_load_root(tmp_path):
+    """Catches a PEFT base model changing behind an otherwise valid adapter manifest."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    adapter = tmp_path / "stage2a-adapter"
+    adapter.mkdir()
+    (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
+    base = tmp_path / "stage2a-base"
+    base.mkdir()
+    (base / "model.safetensors").write_bytes(b"base")
+    adapter_record = CheckpointFile(
+        relative_path="adapter_model.safetensors",
+        size=7,
+        sha256="a183428b1e10e9c20acb5bd2175b9373892104e1e597dea7b9642f7a48c8705a",
+        load_root=str(adapter.resolve()),
+    )
+    base_record = CheckpointFile(
+        relative_path="model.safetensors",
+        size=4,
+        sha256="cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2",
+        load_root=str(base.resolve()),
+    )
+    negative_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    identity = {
+        "source_sha256": SOURCE_SHA256,
+        "selected_row_indices": (0,),
+        "stage2a_checkpoint_path": str(adapter.resolve()),
+        "checkpoint_files": (adapter_record, base_record),
+        "tokenizer_config_identity": "tokenizer-config-v1",
+        "latent_size": 8,
+        "generation_settings": {
+            "device": "cuda:0",
+            "torch_dtype": "bfloat16",
+        },
+    }
+    write_negative_artifact(
+        negative_path=negative_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    (base / "model.safetensors").write_bytes(b"changed")
+
+    with pytest.raises(
+        ValueError, match=r"checkpoint file hash or size does not match.*model\.safetensors"
+    ):
+        load_negative_store(
+            negative_path=negative_path,
+            manifest_path=manifest_path,
+            source_path=source,
+            expected_source_sha256=SOURCE_SHA256,
+            expected_selected_row_indices=(0,),
+            expected_stage2a_checkpoint_path=adapter,
+            expected_checkpoint_files=(adapter_record, base_record),
+            expected_tokenizer_config_identity="tokenizer-config-v1",
+            expected_latent_size=8,
+            expected_generation_settings=identity["generation_settings"],
+            expected_keys=(("sample-a", 0),),
+        )

@@ -1,6 +1,7 @@
 from copy import deepcopy
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -166,11 +167,16 @@ def test_greedy_generation_builds_one_shifted_modality_mask_per_token(
         (1, 1, 8, 8),
     ]
     minimum = torch.finfo(model.dtype).min
+    first_target_query_row = _step_span().target_text_start - 1
     for generation_index, mask in enumerate(final_masks):
-        query_row = 5 + generation_index
-        assert all(mask[0, 0, query_row, column] == minimum for column in blocked_columns)
+        current_query_row = first_target_query_row + generation_index
+        for query_row in range(first_target_query_row, current_query_row + 1):
+            assert all(
+                mask[0, 0, query_row, column] == minimum
+                for column in blocked_columns
+            )
         other_source = 1 if modality == "visual" else 3
-        assert mask[0, 0, query_row, other_source] == 0
+        assert mask[0, 0, current_query_row, other_source] == 0
 
 
 def test_dummy_terminal_token_cannot_change_the_selected_preceding_logits():
@@ -402,6 +408,8 @@ def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_
     assert snapshot.model is model
     assert snapshot.processor is processor
     assert model.training is False
+    assert snapshot.resolved_device == "cpu"
+    assert snapshot.torch_dtype == "float32"
     expected_names = (
         "chat_template.json",
         "config.json",
@@ -417,6 +425,7 @@ def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_
             relative_path=name,
             size=len(payloads[name]),
             sha256=hashlib.sha256(payloads[name]).hexdigest(),
+            load_root=str(checkpoint.resolve()),
         )
         for name in expected_names
     )
@@ -464,13 +473,17 @@ def test_peft_snapshot_loader_keeps_source_selectors_out_of_model_options(
         peft_metadata_snapshot=SimpleNamespace(),
     )
     processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    base = tmp_path / "stage2-base"
+    base.mkdir()
+    (base / "config.json").write_bytes(b"base-config")
+    (base / "model.safetensors").write_bytes(b"base-weights")
     underlying = _zero_logits_model()
     loaded_wrapper = object()
     calls = []
     monkeypatch.setattr(
         generator,
         "decode_stage2_peft_metadata_snapshot",
-        lambda _snapshot: SimpleNamespace(base_model_reference="original/base"),
+        lambda _snapshot: SimpleNamespace(base_model_reference=str(base)),
     )
     monkeypatch.setattr(
         generator,
@@ -482,17 +495,76 @@ def test_peft_snapshot_loader_keeps_source_selectors_out_of_model_options(
         checkpoint_path=checkpoint,
         attention_implementation="sdpa",
         device="cpu",
-        inspect_artifact=lambda _path: inspection,
+        inspect_artifact=lambda path: (
+            inspection
+            if Path(path).resolve() == checkpoint.resolve()
+            else Stage2ArtifactInspection(Stage2ArtifactKind.FULL)
+        ),
         load_processor=lambda _source: processor,
         load_peft_model=lambda *args, **kwargs: calls.append((args, kwargs))
         or loaded_wrapper,
     )
 
     assert snapshot.model is underlying
-    assert calls[0][0] == ("original/base", str(checkpoint.resolve()), processor)
+    assert calls[0][0] == (str(base.resolve()), str(checkpoint.resolve()), processor)
     assert calls[0][1]["source_provenance_kwargs"] == {"local_files_only": True}
     assert "local_files_only" not in calls[0][1]["model_load_kwargs"]
     assert calls[0][1]["artifact_inspection"] is inspection
+    assert tuple(
+        (entry.load_root, entry.relative_path) for entry in snapshot.checkpoint_files
+    ) == (
+        (str(checkpoint.resolve()), "adapter_config.json"),
+        (str(checkpoint.resolve()), "adapter_model.safetensors"),
+        (str(checkpoint.resolve()), "stage2_peft_metadata.json"),
+        (str(checkpoint.resolve()), "tokenizer_config.json"),
+        (str(base.resolve()), "config.json"),
+        (str(base.resolve()), "model.safetensors"),
+    )
+
+
+@pytest.mark.parametrize("base_reference", ["Qwen/Qwen2.5-VL-7B-Instruct", "missing"])
+def test_peft_snapshot_rejects_nonlocal_base_before_any_load(
+    monkeypatch, tmp_path, base_reference
+):
+    """Catches publishing unverifiable PEFT provenance for a remote/missing base."""
+    import scripts.generate_step_negatives as generator
+    from stage2.checkpointing import Stage2ArtifactInspection, Stage2ArtifactKind
+
+    checkpoint = tmp_path / "stage2-peft"
+    checkpoint.mkdir()
+    for name in (
+        "stage2_peft_metadata.json",
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "tokenizer_config.json",
+    ):
+        (checkpoint / name).write_bytes(name.encode("utf-8"))
+    inspection = Stage2ArtifactInspection(
+        Stage2ArtifactKind.PEFT,
+        peft_metadata_snapshot=SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        generator,
+        "decode_stage2_peft_metadata_snapshot",
+        lambda _snapshot: SimpleNamespace(base_model_reference=base_reference),
+    )
+    processor_loads = []
+    model_loads = []
+
+    with pytest.raises(ValueError, match="local regular directory"):
+        generator.load_frozen_stage2a_snapshot(
+            checkpoint_path=checkpoint,
+            attention_implementation="sdpa",
+            device="cpu",
+            inspect_artifact=lambda _path: inspection,
+            load_processor=lambda source: processor_loads.append(source),
+            load_peft_model=lambda *args, **kwargs: model_loads.append(
+                (args, kwargs)
+            ),
+        )
+
+    assert processor_loads == []
+    assert model_loads == []
 
 
 def test_cli_publishes_and_validates_once_before_zero_pair_exit(monkeypatch, tmp_path):
@@ -508,17 +580,22 @@ def test_cli_publishes_and_validates_once_before_zero_pair_exit(monkeypatch, tmp
     checkpoint_file = checkpoint / "config.json"
     checkpoint_file.write_bytes(b"config")
     checkpoint_record = CheckpointFile(
-        "config.json", 6, hashlib.sha256(b"config").hexdigest()
+        "config.json",
+        6,
+        hashlib.sha256(b"config").hexdigest(),
+        str(checkpoint.resolve()),
     )
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     negative_path = output_dir / "negatives.jsonl"
     manifest_path = output_dir / "manifest.json"
-    snapshot = generator.LoadedStage2ASnapshot(
+    snapshot = SimpleNamespace(
         model=object(),
         processor=object(),
         checkpoint_files=(checkpoint_record,),
         tokenizer_config_identity="tokenizer-v1",
+        resolved_device="cpu",
+        torch_dtype="float32",
     )
     row = StepNegative(
         sample_id="sample-a",
@@ -567,6 +644,13 @@ def test_cli_publishes_and_validates_once_before_zero_pair_exit(monkeypatch, tmp
 
     assert status == 2
     assert len(validations) == 1
+    assert validations[0]["expected_generation_settings"] == {
+        "attention_implementation": "sdpa",
+        "device": "cpu",
+        "max_new_tokens": 32,
+        "min_tokens": 2,
+        "torch_dtype": "float32",
+    }
     assert sorted(path.name for path in output_dir.iterdir()) == [
         "manifest.json",
         "negatives.jsonl",

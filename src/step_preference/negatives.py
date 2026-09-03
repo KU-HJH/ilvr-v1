@@ -19,7 +19,7 @@ from step_preference.ablation import (
 from step_preference.spans import ReasoningStepSpan, expand_qwen_image_placeholders
 
 
-NEGATIVE_MANIFEST_SCHEMA_VERSION = 1
+NEGATIVE_MANIFEST_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -144,7 +144,9 @@ def greedy_generate_step_negative(
     terminal dummy token keeps the Qwen Stage 2 full-sequence validator intact;
     logits are selected from the physical row immediately before that dummy.
     Causality therefore makes the dummy invisible, and it advances by one
-    position after every generated token.
+    position after every generated token. Because no cache is used, every mask
+    continues to block all recomputed target query rows from the original
+    ``T_k`` boundary through the current prediction row.
     """
     _require_eval_model(model)
     _require_positive_int("max_new_tokens", max_new_tokens)
@@ -216,7 +218,7 @@ def greedy_generate_step_negative(
         query_position = dummy_position - 1
         spec = StepAblationSpec(
             modality=modality,
-            target_start=dummy_position,
+            target_start=prefix_end,
             target_end=dummy_position + 1,
             source_start=source_start,
             source_end=source_end,
@@ -493,6 +495,7 @@ class CheckpointFile:
     relative_path: str
     size: int
     sha256: str
+    load_root: str
 
     def __post_init__(self) -> None:
         if (
@@ -502,6 +505,15 @@ class CheckpointFile:
             or ".." in Path(self.relative_path).parts
         ):
             raise ValueError("checkpoint relative_path must be a safe non-empty relative path")
+        if not isinstance(self.load_root, str) or not self.load_root:
+            raise ValueError("checkpoint load_root must be a resolved absolute path")
+        root = Path(self.load_root)
+        if (
+            not root.is_absolute()
+            or ".." in root.parts
+            or str(root.resolve(strict=False)) != self.load_root
+        ):
+            raise ValueError("checkpoint load_root must be a resolved absolute path")
         _require_int("checkpoint file size", self.size)
         _require_sha256("checkpoint file SHA-256", self.sha256)
 
@@ -587,9 +599,16 @@ class NegativeManifest:
             isinstance(entry, CheckpointFile) for entry in self.checkpoint_files
         ):
             raise ValueError("checkpoint_files must be CheckpointFile values")
-        relative_paths = [entry.relative_path for entry in self.checkpoint_files]
-        if len(relative_paths) != len(set(relative_paths)):
-            raise ValueError("checkpoint_files contains duplicate relative paths")
+        file_keys = [
+            (entry.load_root, entry.relative_path) for entry in self.checkpoint_files
+        ]
+        if len(file_keys) != len(set(file_keys)):
+            raise ValueError("checkpoint_files contains duplicate load-root paths")
+        if self.checkpoint_files and not any(
+            entry.load_root == self.stage2a_checkpoint_path
+            for entry in self.checkpoint_files
+        ):
+            raise ValueError("checkpoint_files do not identify the Stage 2A load root")
         if (
             not isinstance(self.tokenizer_config_identity, str)
             or not self.tokenizer_config_identity
@@ -779,8 +798,18 @@ def _verify_checkpoint_files(manifest: NegativeManifest) -> None:
     checkpoint_root = Path(manifest.stage2a_checkpoint_path)
     if checkpoint_root.is_symlink() or not checkpoint_root.is_dir():
         raise ValueError("Stage 2A checkpoint path must be a regular directory")
+    checked_roots = set()
     for entry in manifest.checkpoint_files:
-        path = checkpoint_root / entry.relative_path
+        load_root = Path(entry.load_root)
+        if load_root not in checked_roots:
+            if load_root.is_symlink() or not load_root.is_dir():
+                raise ValueError(
+                    f"checkpoint load root must be a regular directory: {load_root}"
+                )
+            if str(load_root.resolve(strict=True)) != entry.load_root:
+                raise ValueError(f"checkpoint load root is not resolved: {load_root}")
+            checked_roots.add(load_root)
+        path = load_root / entry.relative_path
         raw = _read_regular_file(path, "checkpoint file")
         if len(raw) != entry.size or hashlib.sha256(raw).hexdigest() != entry.sha256:
             raise ValueError(f"checkpoint file hash or size does not match: {entry.relative_path}")
