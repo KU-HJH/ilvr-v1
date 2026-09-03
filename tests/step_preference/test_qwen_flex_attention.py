@@ -11,6 +11,7 @@ from step_preference.packing import (
     dense_visibility,
 )
 from tests.stage2.helpers import tiny_stage2_qwen
+from transformers.cache_utils import DynamicCache
 
 
 def _tiny_flex_qwen(*, attn_implementation: str):
@@ -170,3 +171,29 @@ def test_qwen_flex_decoder_matches_dense_tree_mask_with_copied_positions():
             os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
         else:
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = cublas_workspace_config
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
+def test_qwen_flex_decoder_rejects_existing_cache_when_cache_output_is_disabled():
+    """Catches a BlockMask decoder call silently ignoring an existing KV cache."""
+    model = _tiny_flex_qwen(attn_implementation="eager").cuda().float().eval()
+    plan = _one_block_tree_plan()
+    block_mask = build_flex_block_mask(plan, torch.device("cuda"))
+    logical_positions = (
+        plan.logical_position_sources.view(1, 1, -1).expand(3, 1, -1).clone().cuda()
+    )
+    embeds = torch.zeros(
+        (1, plan.padded_length, model.config.hidden_size),
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    with pytest.raises(ValueError, match="does not support past_key_value"):
+        model.model(
+            inputs_embeds=embeds,
+            attention_mask=block_mask,
+            position_ids=logical_positions,
+            past_key_values=DynamicCache(),
+            use_cache=False,
+            return_dict=True,
+        )

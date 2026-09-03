@@ -1302,6 +1302,8 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
 
         # Self Attention
         if _is_block_mask(attention_mask):
+            if past_key_value is not None:
+                raise ValueError("packed Stage 2 FlexAttention does not support past_key_value")
             hidden_states, self_attn_weights, present_key_value = self.self_attn.forward_flex(
                 hidden_states,
                 block_mask=attention_mask,
