@@ -13,7 +13,6 @@ REQUIRED_ENV = {
     "DATA_PATH": "/datasets/train data.jsonl",
     "IMAGE_ROOT": "/datasets/images root",
     "OUTPUT_DIR": "/outputs/stage 2",
-    "LOG_FILE": "/logs/stage 2.log",
 }
 
 
@@ -37,6 +36,11 @@ def dry_run_tokens(result):
 
 def option_value(tokens: list[str], option: str) -> str:
     return tokens[tokens.index(option) + 1]
+
+
+CANONICAL_DEFAULT_LOG = (
+    REPO_ROOT / "logs/zero-stage-compatibility/stage 2/train.log"
+)
 
 
 def assert_four_rank_prefix(tokens, rank, port):
@@ -89,9 +93,10 @@ def test_production_entrypoint_imports_with_build_marker_then_restores_platform(
             (
                 "import platform; "
                 "original = platform.python_version; "
-                "assert original().endswith('+'), original(); "
+                "platform.python_version = lambda: original() + '+'; "
+                "marked = platform.python_version; "
                 "import main; "
-                "assert platform.python_version is original; "
+                "assert platform.python_version is marked; "
                 "assert platform.python_version().endswith('+')"
             ),
         ],
@@ -132,12 +137,16 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         REQUIRED_ENV["DATA_PATH"],
         "--image_root",
         REQUIRED_ENV["IMAGE_ROOT"],
+        "--dataloader_num_workers",
+        "0",
         "--save_model_path",
         REQUIRED_ENV["OUTPUT_DIR"],
         "--log_file",
-        REQUIRED_ENV["LOG_FILE"],
+        str(CANONICAL_DEFAULT_LOG),
         "--latent_size",
         "8",
+        "--stage2_diagnostics_interval",
+        "0",
         "--supervise_latent_boundaries",
         "--learning_rate",
         "1e-5",
@@ -164,6 +173,10 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "1",
         "--evaluation_output_path",
         "/reports/stage 2.json",
+        "--stage2_length_manifest",
+        str(REPO_ROOT / "results/stage 2/stage2-length-manifest.json"),
+        "--stage2_length_manifest_sha256",
+        "0" * 64,
     ]
 
 

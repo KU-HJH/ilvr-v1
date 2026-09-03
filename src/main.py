@@ -80,6 +80,7 @@ from stage2.data import (
     prepare_stage2_example,
 )
 from stage2.evidence import observe_stage2_checkpoint_artifact
+from stage2.length_manifest import validate_stage2_length_manifest
 from stage2.peft import (
     build_stage2_tuned_model,
     load_stage1_dora_for_fresh_stage2,
@@ -242,6 +243,27 @@ def build_stage2_training_components(
         validate_stage2_sparse_processor(
             processor.tokenizer, decision.peft_metadata
         )
+    manifest_path = getattr(args, "stage2_length_manifest", None)
+    manifest_sha256 = getattr(args, "stage2_length_manifest_sha256", None)
+    if bool(manifest_path) != bool(manifest_sha256):
+        raise ValueError(
+            "--stage2_length_manifest and --stage2_length_manifest_sha256 "
+            "must be provided together"
+        )
+    manifest_snapshot = (
+        validate_stage2_length_manifest(
+            path=manifest_path,
+            expected_sha256=manifest_sha256,
+            data_path=args.data_path,
+            image_root=args.image_root,
+            processor=processor,
+            latent_size=decision.latent_size,
+            supervise_latent_boundaries=decision.supervise_latent_boundaries,
+            max_sequence_length=args.max_seq_length_train,
+        )
+        if manifest_path is not None
+        else None
+    )
     stage1_preflight = None
     stage1_metadata = None
     if decision.stage1_adapter_source is not None:
@@ -396,25 +418,37 @@ def build_stage2_training_components(
             ),
         )
 
-    raw_examples = load_jsonl_examples(Path(args.data_path))
-    selected_examples = (
-        raw_examples
-        if args.max_train_samples is None
-        else raw_examples[: args.max_train_samples]
-    )
-    prepared = [
-        prepare_stage2_example(
-            item,
-            image_root=Path(args.image_root),
-            latent_size=decision.latent_size,
+    if manifest_snapshot is None:
+        raw_examples = load_jsonl_examples(Path(args.data_path))
+        selected_examples = (
+            raw_examples
+            if args.max_train_samples is None
+            else raw_examples[: args.max_train_samples]
         )
-        for item in selected_examples
-    ]
-    kept, _length_stats = filter_stage2_examples(
-        examples=prepared,
-        measure_length=build_prepared_example_length_measure(processor),
-        max_length=args.max_seq_length_train,
-    )
+        prepared = [
+            prepare_stage2_example(
+                item,
+                image_root=Path(args.image_root),
+                latent_size=decision.latent_size,
+            )
+            for item in selected_examples
+        ]
+        kept, _length_stats = filter_stage2_examples(
+            examples=prepared,
+            measure_length=build_prepared_example_length_measure(processor),
+            max_length=args.max_seq_length_train,
+        )
+    else:
+        prepared = (
+            manifest_snapshot.prepared_examples
+            if args.max_train_samples is None
+            else manifest_snapshot.prepared_examples[: args.max_train_samples]
+        )
+        kept = [
+            prepared[index]
+            for index in manifest_snapshot.manifest.retained_indices
+            if index < len(prepared)
+        ]
     collator = Stage2DataCollator(
         processor,
         token_ids,
@@ -434,6 +468,12 @@ def build_stage2_training_components(
 
 def build_stage2_training_arguments(args) -> SFTConfig:
     validate_stage2_distributed_settings(args.per_device_train_batch_size)
+    dataloader_num_workers = getattr(args, "dataloader_num_workers", 0)
+    if dataloader_num_workers < 0:
+        raise ValueError("Stage 2 dataloader_num_workers must be non-negative")
+    dataloader_kwargs = {"dataloader_num_workers": dataloader_num_workers}
+    if dataloader_num_workers > 0:
+        dataloader_kwargs["dataloader_prefetch_factor"] = 2
     checkpointing_kwargs = _stage2_gradient_checkpointing_kwargs(
         gradient_checkpointing=args.gradient_checkpointing,
         tuning_method=args.tuning_method,
@@ -463,6 +503,7 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         gradient_checkpointing_kwargs=checkpointing_kwargs,
         deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False,
+        **dataloader_kwargs,
     )
 
 # ==============================================================
@@ -610,6 +651,7 @@ def run_stage2(args):
         processing_class=components.processor,
         stage2_peft_metadata=components.peft_metadata,
         deepspeed_runtime_profile=profile,
+        stage2_diagnostics_interval=args.stage2_diagnostics_interval,
     )
     train_result = trainer.train(
         resume_from_checkpoint=components.trainer_resume_path

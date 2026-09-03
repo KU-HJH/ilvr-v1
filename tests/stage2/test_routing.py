@@ -12,6 +12,7 @@ from transformers import Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 import main
+import stage2.length_manifest as length_manifest_module
 from .helpers import tiny_stage2_qwen
 from main import (
     CustomTrainerStage1,
@@ -43,9 +44,11 @@ from stage2.sampler import LatentBlockBalancedSampler
 class DiagnosticStage2Model:
     def __init__(self):
         self.last_inputs = None
+        self.diagnostics_requests = []
 
     def __call__(self, **inputs):
         self.last_inputs = inputs
+        self.diagnostics_requests.append(inputs["collect_stage2_diagnostics"])
         return SimpleNamespace(
             loss=torch.tensor(2.0, requires_grad=True),
             stage2_diagnostics={
@@ -60,9 +63,16 @@ class DiagnosticStage2Model:
         )
 
 
+def stage2_trainer_for_compute_loss(*, diagnostics_interval):
+    trainer = object.__new__(Stage2Trainer)
+    trainer.stage2_diagnostics_interval = diagnostics_interval
+    trainer._stage2_microbatch_index = 0
+    return trainer
+
+
 def test_stage2_trainer_collects_detached_model_native_diagnostics():
     """Catches generic Trainer calls silently disabling Stage 2 observability."""
-    trainer = object.__new__(Stage2Trainer)
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=1)
     model = DiagnosticStage2Model()
 
     loss, outputs = trainer.compute_loss(
@@ -72,6 +82,7 @@ def test_stage2_trainer_collects_detached_model_native_diagnostics():
     assert loss.item() == 2.0
     assert outputs.loss is loss
     assert model.last_inputs["collect_stage2_diagnostics"] is True
+    assert model.last_inputs["stage2_loss_only"] is False
     assert set(trainer._latest_stage2_diagnostics) == {
         "block_count",
         "latent_l2_norms",
@@ -81,6 +92,41 @@ def test_stage2_trainer_collects_detached_model_native_diagnostics():
         not value.requires_grad
         for value in trainer._latest_stage2_diagnostics.values()
     )
+
+
+def test_stage2_trainer_requests_loss_only_when_outputs_are_not_returned():
+    """Catches ordinary training projecting full logits unnecessarily."""
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
+    model = DiagnosticStage2Model()
+
+    loss = trainer.compute_loss(
+        model, {"input_ids": torch.ones(1, 3)}, return_outputs=False
+    )
+
+    assert loss.item() == 2.0
+    assert model.last_inputs["stage2_loss_only"] is True
+
+
+def test_stage2_trainer_diagnostics_interval_schedules_microbatches():
+    """Catches diagnostics running every batch or drifting from a zero-based cadence."""
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=2)
+    model = DiagnosticStage2Model()
+
+    for _ in range(5):
+        trainer.compute_loss(model, {"input_ids": torch.ones(1, 3)})
+
+    assert model.diagnostics_requests == [True, False, True, False, True]
+
+
+def test_stage2_trainer_diagnostics_interval_zero_disables_diagnostics():
+    """Catches the opt-in default still requesting diagnostic tensor work."""
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
+    model = DiagnosticStage2Model()
+
+    for _ in range(3):
+        trainer.compute_loss(model, {"input_ids": torch.ones(1, 3)})
+
+    assert model.diagnostics_requests == [False, False, False]
 
 
 def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(
@@ -93,7 +139,7 @@ def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(
         "log",
         lambda self, logs, start_time=None: emitted.append((dict(logs), start_time)),
     )
-    trainer = object.__new__(Stage2Trainer)
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
     trainer._latest_stage2_diagnostics = {
         "block_count": torch.tensor(2),
         "latent_l2_norms": torch.tensor([[3.0, 4.0]]),
@@ -122,7 +168,7 @@ def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(
 
 def test_stage2_trainer_rejects_helper_image_tensors_before_model_call():
     """Catches Stage 1 helper-image tensors leaking past the Trainer boundary."""
-    trainer = object.__new__(Stage2Trainer)
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
     model = DiagnosticStage2Model()
 
     with pytest.raises(ValueError, match="helper-image tensors leaked"):
@@ -219,6 +265,25 @@ def test_boundary_supervision_is_one_default_true_boolean():
         .supervise_latent_boundaries
         is False
     )
+
+
+def test_stage2_diagnostics_interval_defaults_to_disabled():
+    """Catches Stage 2 diagnostics becoming an implicit training cost."""
+    assert parse_args(["--stage", "stage2"]).stage2_diagnostics_interval == 0
+
+
+@pytest.mark.parametrize("interval", [-1, -2])
+def test_stage2_rejects_negative_diagnostics_interval(interval):
+    """Catches negative diagnostic cadences reaching the trainer."""
+    with pytest.raises(ValueError, match="diagnostics interval"):
+        parse_args(
+            [
+                "--stage",
+                "stage2",
+                "--stage2_diagnostics_interval",
+                str(interval),
+            ]
+        )
 
 
 def test_fresh_stage2_tuning_defaults_to_full():
@@ -448,9 +513,75 @@ def stage2_args(**overrides):
         lora_alpha=8,
         lora_dropout=0.0,
         lora_target_modules="q_proj,v_proj",
+        stage2_diagnostics_interval=0,
+        stage2_length_manifest=None,
+        stage2_length_manifest_sha256=None,
+        dataloader_num_workers=0,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--stage2_length_manifest", "manifest.json"], "must be provided together"),
+        (["--stage2_length_manifest_sha256", "a" * 64], "must be provided together"),
+        (["--dataloader_num_workers", "-1"], "must be non-negative"),
+    ],
+)
+def test_stage2_cli_rejects_incomplete_length_manifest_or_negative_dataloader_num_workers(argv, message):
+    """Catches Stage 2 accepting an unverifiable manifest or invalid workers."""
+    with pytest.raises(ValueError, match=message):
+        parse_args(["--stage", "stage2", *argv])
+
+
+def test_stage2_length_manifest_rejects_wrong_sha_or_configuration(
+    monkeypatch, tmp_path
+):
+    """Catches ranks accepting a different sealed file or a conflicting length policy."""
+    import hashlib
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"sealed manifest")
+    data_path = tmp_path / "data.jsonl"
+    data_path.write_bytes(b"[]\n")
+    manifest = SimpleNamespace(
+        data_sha256=hashlib.sha256(data_path.read_bytes()).hexdigest(),
+        processor_sha256="processor-digest",
+        latent_size=2,
+        supervise_latent_boundaries=True,
+        max_sequence_length=8,
+    )
+    monkeypatch.setattr(
+        length_manifest_module, "read_stage2_length_manifest", lambda path: manifest
+    )
+    monkeypatch.setattr(
+        length_manifest_module, "_processor_sha256", lambda processor: "processor-digest"
+    )
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        length_manifest_module.validate_stage2_length_manifest(
+            path=manifest_path,
+            expected_sha256="0" * 64,
+            data_path=data_path,
+            image_root=tmp_path,
+            processor=object(),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=8,
+        )
+    with pytest.raises(ValueError, match="configuration"):
+        length_manifest_module.validate_stage2_length_manifest(
+            path=manifest_path,
+            expected_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            data_path=data_path,
+            image_root=tmp_path,
+            processor=object(),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=9,
+        )
 
 
 def _stub_stage2_data_pipeline(monkeypatch, calls):
@@ -590,6 +721,124 @@ def test_stage2_components_compose_full_or_adapter_models_from_decision(
         )
 
 
+def test_stage2_components_select_length_manifest_indices_without_remeasuring_images(
+    monkeypatch, tmp_path
+):
+    """Catches each rank repeating image-aware length filtering after a sealed audit."""
+    calls = SimpleNamespace(prepared=[], filtered=None, sources=[])
+    processor = CompositionProcessor()
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    decision = Stage2LoadDecision(
+        base_model_source="stage1/base",
+        processor_source="stage1/processor",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=Stage2TuningConfig(
+            method="full", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+        ),
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"sealed manifest")
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", lambda source: processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **kwargs: model,
+    )
+    _stub_stage2_data_pipeline(monkeypatch, calls)
+    monkeypatch.setattr(
+        main,
+        "build_prepared_example_length_measure",
+        lambda processor: pytest.fail("manifest path must not remeasure image-aware lengths"),
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_stage2_length_manifest",
+        lambda **kwargs: SimpleNamespace(
+            manifest=SimpleNamespace(retained_indices=(2, 0)),
+            raw_examples=(1, 2, 3),
+            prepared_examples=(1, 2, 3),
+        ),
+        raising=False,
+    )
+
+    components = build_stage2_training_components(
+        stage2_args(
+            stage2_length_manifest=str(manifest_path),
+            stage2_length_manifest_sha256=__import__("hashlib").sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+        )
+    )
+
+    assert calls.filtered is None
+    assert components.train_dataset == [3, 1]
+
+
+@pytest.mark.parametrize(
+    ("sample_limit", "expected_examples"),
+    [(2, [1]), (3, [1, 3])],
+)
+def test_stage2_manifest_indices_respect_max_train_samples(
+    monkeypatch, tmp_path, sample_limit, expected_examples
+):
+    """Catches retained raw indices outside a requested prefix indexing the prepared data."""
+    processor = CompositionProcessor()
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    decision = Stage2LoadDecision(
+        base_model_source="stage1/base",
+        processor_source="stage1/processor",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=Stage2TuningConfig(
+            method="full", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+        ),
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"sealed manifest")
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", lambda source: processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **kwargs: model,
+    )
+    monkeypatch.setattr(
+        main,
+        "load_jsonl_examples",
+        lambda path: pytest.fail("manifest path must consume its sealed data snapshot"),
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_stage2_length_manifest",
+        lambda **kwargs: SimpleNamespace(
+            manifest=SimpleNamespace(retained_indices=(0, 2)),
+            raw_examples=(1, 2, 3),
+            prepared_examples=(1, 2, 3),
+        ),
+        raising=False,
+    )
+
+    components = build_stage2_training_components(
+        stage2_args(
+            max_train_samples=sample_limit,
+            stage2_length_manifest=str(manifest_path),
+            stage2_length_manifest_sha256=__import__("hashlib").sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+        )
+    )
+
+    assert components.train_dataset == expected_examples
+
+
 def test_stage2_peft_resume_validates_stage1_before_mutation_and_preserves_sidecar(
     monkeypatch, tmp_path
 ):
@@ -694,6 +943,19 @@ def test_stage2_training_arguments_create_fresh_optimizer_configuration():
     assert training_args.gradient_checkpointing_kwargs == {"use_reentrant": False}
 
 
+@pytest.mark.parametrize("worker_count", (0, 2))
+def test_stage2_training_arguments_set_requested_dataloader_workers(worker_count):
+    """Catches Stage 2 silently falling back to an implicit data-loader worker count."""
+    training_args = build_stage2_training_arguments(
+        stage2_args(dataloader_num_workers=worker_count)
+    )
+
+    assert training_args.dataloader_num_workers == worker_count
+    assert training_args.dataloader_prefetch_factor == (
+        None if worker_count == 0 else 2
+    )
+
+
 def test_stage2_training_arguments_omit_checkpoint_kwargs_when_disabled():
     """Catches inactive checkpointing carrying mode-specific runtime kwargs."""
     training_args = build_stage2_training_arguments(
@@ -770,6 +1032,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         log_file=str(tmp_path / "train.log"),
         cache_dir=str(tmp_path / "cache"),
         save_final_model=True,
+        stage2_diagnostics_interval=3,
     )
     processor = RecordingSavedProcessor()
     model = object()
@@ -807,6 +1070,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         "processing_class": processor,
         "stage2_peft_metadata": "preserved-sidecar",
         "deepspeed_runtime_profile": args.deepspeed_runtime_profile,
+        "stage2_diagnostics_interval": 3,
     }
     assert trainer.resume_path == "stage2/checkpoint-4"
     assert trainer.saved_path == "out"

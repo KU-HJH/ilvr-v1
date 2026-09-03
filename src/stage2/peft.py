@@ -257,6 +257,14 @@ def _stage2_adapter_target_names(
             for pattern in configured_targets
         )
     }
+    unmatched_configured_targets = tuple(
+        pattern
+        for pattern in configured_targets
+        if not any(
+            name == pattern or name.endswith(f".{pattern}")
+            for name in expected_targets
+        )
+    )
     if (
         not target_names
         or config.modules_to_save is not None
@@ -269,7 +277,8 @@ def _stage2_adapter_target_names(
     ):
         raise ValueError("Stage 2 PEFT adapter targets must be decoder LoRA modules")
     if (
-        configured_matches != expected_targets
+        unmatched_configured_targets
+        or configured_matches != expected_targets
         or set(target_names) != expected_targets
     ):
         raise ValueError("loaded adapter targets do not match Stage 2 tuning")

@@ -83,7 +83,7 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         "--lora_target_modules",
         "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
         "--stage2_length_manifest",
-        "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json",
+        str(REPO_ROOT / "results/stage 2/stage2-length-manifest.json"),
         "--stage2_length_manifest_sha256",
         "0" * 64,
     ]
@@ -95,7 +95,7 @@ def test_stage2_launcher_dry_run_owns_length_manifest_and_dataloader_num_workers
         run_launcher(env_overrides={"DATALOADER_NUM_WORKERS": "2"})
     )
 
-    manifest = "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json"
+    manifest = str(REPO_ROOT / "results/stage 2/stage2-length-manifest.json")
     assert arguments[arguments.index("--stage2_length_manifest") + 1] == manifest
     assert arguments[arguments.index("--stage2_length_manifest_sha256") + 1] == "0" * 64
     assert arguments[arguments.index("--dataloader_num_workers") + 1] == "2"
@@ -142,7 +142,7 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         "--deepspeed_config",
         "/configs/zero 3.json",
         "--stage2_length_manifest",
-        "/root/workspace/ILVR/results/zero-stage-compatibility/stage 2/stage2-length-manifest.json",
+        str(REPO_ROOT / "results/stage 2/stage2-length-manifest.json"),
         "--stage2_length_manifest_sha256",
         "0" * 64,
     ]
