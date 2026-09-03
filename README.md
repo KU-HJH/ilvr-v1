@@ -1,5 +1,12 @@
 # [ACL'26 Oral] ILVR: Interleaved Latent Visual Reasoning with Selective Perceptual Modeling
 
+## Final Stage 1/2 training
+
+For the consolidated Stage 1 → Stage 2 training and evaluation workflow, start
+with [the final training runbook](docs/final-stage1-stage2/README.md). Its
+[provenance manifest](docs/final-stage1-stage2/PROVENANCE.md) records the exact
+source and evidence boundaries.
+
 [![arXiv](https://img.shields.io/badge/arXiv-2512.05665-b31b1b.svg)](https://arxiv.org/abs/2512.05665)
 [![ACL 2026](https://img.shields.io/badge/ACL%202026-Accepted-success)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
