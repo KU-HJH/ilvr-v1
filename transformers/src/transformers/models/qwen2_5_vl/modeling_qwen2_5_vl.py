@@ -2190,7 +2190,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 dtype=torch.long,
                 device=input_ids.device,
             )
-            if bool(torch.isin(token_ids[direct_non_root], control_ids).any()):
+            direct_control = direct_non_root & torch.isin(token_ids, control_ids)
+            matching_latent_end = (
+                direct_control
+                & (token_ids == self.config.latent_end_token_id)
+                & (
+                    token_ids
+                    == input_ids[0].index_select(0, logical_position_sources)
+                )
+            )
+            if bool((direct_control & ~matching_latent_end).any()):
                 raise ValueError(
                     "packed non-root direct-token slots cannot contain a control token"
                 )

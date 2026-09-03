@@ -513,6 +513,15 @@ other. The specified modality edge remains blocked, clean-prefix gradients are
 preserved, and logical multimodal positions are copied rather than recomputed
 from packed physical offsets.
 
+A rejected branch may begin on the clean `<|latent_end|>` query row when its
+first completion token immediately follows the latent block. That direct slot
+is allowed only when its token ID is `latent_end_token_id` and the token at its
+copied logical source in the clean root is identical. Other direct image,
+video, vision-start, latent-start, latent-pad, or mismatched latent-end control
+tokens fail closed. This narrow exception is design commitment v2, prompted by
+the first real-data packed run; it preserves the causal row needed to score the
+first target token without permitting multimodal embedding substitution.
+
 Reducing Python forward-call count alone is insufficient. The optimized path
 must use block-sparse/FlexAttention or an equivalently measured mechanism that
 skips masked computation.

@@ -367,7 +367,7 @@ Packed output retains the existing `Qwen2_5_VLCausalLMOutputWithPast` type: `los
 
 - [ ] **Step 4: Add fail-closed boundary cases**
 
-Reject CPU BlockMasks, mismatched vector lengths/devices/dtypes, negative or out-of-root logical position sources, clean embedding sources other than `-1` or `[0, S)`, a root length unequal to the original input length, non-root valid direct-token slots containing image/vision/latent control IDs, packed mode with cache/output attentions/gradient checkpointing, duplicate or unsorted selected positions, empty selections, and any selected position outside the packed length. Padding slots are exempt from the direct-token control-ID check and use the valid vocabulary ID zero.
+Reject CPU BlockMasks, mismatched vector lengths/devices/dtypes, negative or out-of-root logical position sources, clean embedding sources other than `-1` or `[0, S)`, a root length unequal to the original input length, packed mode with cache/output attentions/gradient checkpointing, duplicate or unsorted selected positions, empty selections, and any selected position outside the packed length. Non-root valid direct-token slots reject image/video/vision-start and latent-start/pad control IDs. A direct latent-end token is allowed only when the clean root has the identical latent-end token at that slot's copied logical source; a mismatched latent-end token is rejected. This narrow case is required when the first rejected completion token immediately follows the latent block and its causal prediction row is `<|latent_end|>`. Padding slots are exempt from the direct-token control-ID check and use the valid vocabulary ID zero.
 
 - [ ] **Step 5: Run focused model regressions**
 

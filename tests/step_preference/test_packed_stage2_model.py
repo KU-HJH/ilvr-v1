@@ -67,6 +67,46 @@ def _packed_fixture():
     return clean_ids, rejected_ids, span, plan
 
 
+def _latent_end_branch_fixture():
+    clean_ids = torch.tensor([[11, 91, 90, 90, 92, 13, 14, 15]])
+    rejected_ids = torch.tensor([[11, 91, 90, 90, 92, 23, 24, 15]])
+    span = ReasoningStepSpan(0, 0, 1, 2, 4, 5, 7, None)
+    negative = StepNegative(
+        sample_id="latent-end-branch",
+        step_id=0,
+        chosen_text="chosen",
+        rejected_visual_text="rejected",
+        rejected_textual_text=None,
+        valid_visual_negative=True,
+        valid_textual_negative=False,
+        reference_chosen_score=-0.1,
+        reference_visual_rejected_score=-0.2,
+        reference_textual_rejected_score=None,
+    )
+    plan = build_packed_tree_plan(
+        clean_input_ids=clean_ids,
+        attention_mask=torch.ones_like(clean_ids),
+        reasoning_spans=(span,),
+        joined_steps=(
+            {
+                "span": span,
+                "negative": negative,
+                "visual_rejected": {
+                    "model_inputs": {
+                        "input_ids": rejected_ids,
+                        "attention_mask": torch.ones_like(rejected_ids),
+                    },
+                    "completion_token_positions": (5, 6),
+                    "completion_token_ids": (23, 24),
+                    "rendered_text": "latent-end rejected",
+                },
+                "textual_rejected": None,
+            },
+        ),
+    )
+    return clean_ids, rejected_ids, plan
+
+
 def _independent_selected_logits(model, clean_ids, rejected_ids, span, plan):
     attention_mask = torch.ones_like(clean_ids)
     root_positions = torch.tensor(plan.root_selected_positions, device=clean_ids.device)
@@ -187,6 +227,70 @@ def test_packed_stage2_matches_independent_forwards_with_one_rollout_and_final_d
     assert torch.isfinite(clean_prefix_grad).all() and clean_prefix_grad.abs().sum() > 0
     assert q_proj_grad is not None
     assert torch.isfinite(q_proj_grad).all() and q_proj_grad.abs().sum() > 0
+
+
+def test_packed_stage2_accepts_matching_latent_end_rejected_branch_start():
+    """Catches valid target-adjacent rejected branches being rejected as control leakage."""
+    assert torch.cuda.is_available(), "packed Stage 2 requires CUDA"
+    torch.manual_seed(223)
+    model = _tiny_packed_qwen().cuda().float().eval()
+    clean_ids, rejected_ids, plan = _latent_end_branch_fixture()
+    clean_ids = clean_ids.cuda()
+    rejected_ids = rejected_ids.cuda()
+    branch = plan.branch("step-0-visual-rejected")
+    assert plan.token_ids[branch.packed_start].item() == model.config.latent_end_token_id
+    assert plan.logical_position_sources[branch.packed_start].item() == 4
+
+    packed = model(
+        input_ids=clean_ids,
+        attention_mask=torch.ones_like(clean_ids),
+        labels=clean_ids,
+        use_cache=False,
+        stage2_loss_only=True,
+        stage2_packed_inputs=plan.to_model_inputs(torch.device("cuda")),
+        stage2_logit_positions=plan.selected_positions().cuda(),
+    )
+    independent = model(
+        input_ids=rejected_ids,
+        attention_mask=torch.ones_like(rejected_ids),
+        use_cache=False,
+        stage2_logit_positions=torch.tensor(
+            branch.logical_query_positions, device="cuda"
+        ),
+        stage2_selective_logits_only=True,
+    )
+    branch_offset = len(plan.root_selected_positions) + sum(
+        len(item.selected_positions)
+        for item in plan.branches
+        if item.packed_start < branch.packed_start
+    )
+    actual = packed.stage2_selected_logits[
+        :, branch_offset : branch_offset + len(branch.selected_positions)
+    ]
+    torch.testing.assert_close(
+        actual.float(), independent.stage2_selected_logits.float(), rtol=2e-4, atol=2e-5
+    )
+
+
+def test_packed_stage2_rejects_latent_end_with_nonmatching_logical_source():
+    """Catches broad latent-end exemptions that can conceal malformed sidecars."""
+    assert torch.cuda.is_available(), "packed Stage 2 requires CUDA"
+    model = _tiny_packed_qwen().cuda().float().eval()
+    clean_ids, _rejected_ids, plan = _latent_end_branch_fixture()
+    clean_ids = clean_ids.cuda()
+    packed_inputs = plan.to_model_inputs(torch.device("cuda"))
+    branch = plan.branch("step-0-visual-rejected")
+    packed_inputs["logical_position_sources"] = packed_inputs[
+        "logical_position_sources"
+    ].clone()
+    packed_inputs["logical_position_sources"][branch.packed_start] = 0
+    with pytest.raises(ValueError, match="control token"):
+        _packed_call(
+            model,
+            clean_ids,
+            packed_inputs,
+            plan.selected_positions().cuda(),
+        )
 
 
 @pytest.fixture
