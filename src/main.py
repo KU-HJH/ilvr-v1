@@ -83,7 +83,6 @@ from stage2.data import (
     load_jsonl_examples,
     prepare_stage2_example,
 )
-from stage2.evidence import observe_stage2_checkpoint_artifact
 from stage2.length_manifest import validate_stage2_length_manifest
 from stage2.peft import (
     build_stage2_tuned_model,
@@ -113,6 +112,13 @@ _PHASE_A_METRIC_NAMES = (
     "stats/valid_visual_pairs",
     "stats/valid_textual_pairs",
 )
+
+
+def observe_stage2_checkpoint_artifact(*args, **kwargs):
+    """Load optional producer-evidence dependencies only when evidence is requested."""
+    from stage2.evidence import observe_stage2_checkpoint_artifact as observe
+
+    return observe(*args, **kwargs)
 
 
 @dataclass(frozen=True)

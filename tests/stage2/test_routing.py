@@ -1250,3 +1250,33 @@ def test_direct_main_rejects_artifacts_before_importing_transformers(tmp_path):
     assert completed.returncode != 0
     assert "canonical checkpoint root" in completed.stderr
     assert "transformers import reached before preflight" not in completed.stderr
+
+
+def test_direct_main_help_uses_documented_top_level_pythonpath():
+    """Catches optional evidence imports requiring the repository root on PYTHONPATH."""
+    repo_root = Path(main.__file__).resolve().parents[1]
+    run_id = "step-preference-phase-a-20260903T133145Z"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        (str(repo_root / "transformers/src"), str(repo_root / "src"))
+    )
+
+    completed = subprocess.run(
+        [
+            str(Path(sys.executable)),
+            str(Path(main.__file__).resolve()),
+            "--save_model_path",
+            str(repo_root / "checkpoints" / run_id),
+            "--log_file",
+            str(repo_root / "logs" / run_id / "stage2b.log"),
+            "--help",
+        ],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--step_preference_enabled" in completed.stdout
