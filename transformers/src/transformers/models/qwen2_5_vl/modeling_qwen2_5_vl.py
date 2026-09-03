@@ -27,7 +27,7 @@
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -2056,11 +2056,14 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         output_attentions: bool,
         output_hidden_states: bool,
         return_dict: bool,
+        use_cache: bool,
+        past_key_values: Optional[List[torch.FloatTensor]],
         return_stage2_latent_states: bool,
         collect_stage2_diagnostics: bool,
         retain_stage2_latent_grads: bool,
         stage2_loss_only: bool,
         stage2_final_attention_mask: Optional[torch.Tensor],
+        stage2_packed_inputs: Optional[Mapping[str, object]],
         stage2_logit_positions: Optional[torch.LongTensor],
         stage2_selective_logits_only: bool,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
@@ -2068,6 +2071,136 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             raise ValueError("Stage 2 forward requires input_ids")
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise NotImplementedError("Stage 2 forward currently supports batch_size=1 only")
+        packed = stage2_packed_inputs is not None
+        packed_values = None
+        if packed:
+            if not return_dict:
+                raise ValueError("packed Stage 2 forward requires return_dict=True")
+            if use_cache:
+                raise ValueError("packed Stage 2 forward requires use_cache=False")
+            if past_key_values is not None:
+                raise ValueError("packed Stage 2 forward does not support past_key_values")
+            if output_attentions:
+                raise ValueError("packed Stage 2 forward requires output_attentions=False")
+            if self.model.gradient_checkpointing:
+                raise ValueError("packed Stage 2 forward requires gradient checkpointing disabled")
+            if stage2_final_attention_mask is not None:
+                raise ValueError(
+                    "stage2_packed_inputs cannot be combined with stage2_final_attention_mask"
+                )
+            if not isinstance(stage2_packed_inputs, Mapping):
+                raise TypeError("stage2_packed_inputs must be a mapping")
+            expected_keys = {
+                "block_mask",
+                "token_ids",
+                "clean_embedding_sources",
+                "logical_position_sources",
+                "valid_slots",
+                "root_length",
+            }
+            if set(stage2_packed_inputs) != expected_keys:
+                raise ValueError("stage2_packed_inputs must contain the exact keys")
+
+            block_mask = stage2_packed_inputs["block_mask"]
+            token_ids = stage2_packed_inputs["token_ids"]
+            clean_embedding_sources = stage2_packed_inputs[
+                "clean_embedding_sources"
+            ]
+            logical_position_sources = stage2_packed_inputs[
+                "logical_position_sources"
+            ]
+            valid_slots = stage2_packed_inputs["valid_slots"]
+            root_length = stage2_packed_inputs["root_length"]
+            vectors = (
+                token_ids,
+                clean_embedding_sources,
+                logical_position_sources,
+                valid_slots,
+            )
+            if any(not isinstance(value, torch.Tensor) or value.ndim != 1 for value in vectors):
+                raise ValueError("packed input vectors must be one-dimensional tensors")
+            packed_length = token_ids.numel()
+            if packed_length == 0 or any(value.numel() != packed_length for value in vectors):
+                raise ValueError("packed input vectors must have the same nonzero length")
+            for name, value in (
+                ("token_ids", token_ids),
+                ("clean_embedding_sources", clean_embedding_sources),
+                ("logical_position_sources", logical_position_sources),
+            ):
+                if value.dtype != torch.long:
+                    raise ValueError(f"packed {name} must have dtype torch.long")
+            if valid_slots.dtype != torch.bool:
+                raise ValueError("packed valid_slots must have dtype torch.bool")
+            if input_ids.device.type != "cuda" or any(
+                value.device != input_ids.device for value in vectors
+            ):
+                raise ValueError("packed input vectors must use the same CUDA device as input_ids")
+            if not _is_block_mask(block_mask):
+                raise TypeError("packed block_mask must be a BlockMask")
+            block_device = block_mask.kv_num_blocks.device
+            if block_device.type != "cuda" or block_device != input_ids.device:
+                raise ValueError("packed block_mask must be a CUDA BlockMask on the input device")
+            if (
+                len(block_mask.shape) != 4
+                or block_mask.shape[0] != 1
+                or tuple(block_mask.shape[-2:]) != (packed_length, packed_length)
+            ):
+                raise ValueError("packed BlockMask dimensions must match the packed sequence")
+            if (
+                isinstance(root_length, bool)
+                or not isinstance(root_length, int)
+                or root_length != input_ids.shape[1]
+            ):
+                raise ValueError("packed root_length must equal the original input length")
+            if (
+                int(logical_position_sources.min()) < 0
+                or int(logical_position_sources.max()) >= root_length
+            ):
+                raise ValueError(
+                    "packed logical_position_sources must index the original root"
+                )
+            if (
+                int(clean_embedding_sources.min()) < -1
+                or int(clean_embedding_sources.max()) >= root_length
+            ):
+                raise ValueError(
+                    "packed clean_embedding_sources must be -1 or index the original root"
+                )
+            if int(token_ids.min()) < 0 or int(token_ids.max()) >= self.config.vocab_size:
+                raise ValueError("packed token_ids must be valid vocabulary IDs")
+            if bool((token_ids[~valid_slots] != 0).any()):
+                raise ValueError("packed padding token_ids must use vocabulary ID zero")
+            direct_non_root = (
+                valid_slots
+                & (clean_embedding_sources == -1)
+                & (
+                    torch.arange(packed_length, device=input_ids.device)
+                    >= root_length
+                )
+            )
+            control_ids = torch.tensor(
+                (
+                    self.config.image_token_id,
+                    self.config.video_token_id,
+                    self.config.vision_start_token_id,
+                    self.config.latent_pad_token_id,
+                    self.config.latent_start_token_id,
+                    self.config.latent_end_token_id,
+                ),
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            if bool(torch.isin(token_ids[direct_non_root], control_ids).any()):
+                raise ValueError(
+                    "packed non-root direct-token slots cannot contain a control token"
+                )
+            packed_values = (
+                block_mask,
+                token_ids,
+                clean_embedding_sources,
+                logical_position_sources,
+                root_length,
+            )
         if stage2_loss_only and stage2_selective_logits_only:
             raise ValueError(
                 "stage2_loss_only and stage2_selective_logits_only are mutually exclusive"
@@ -2080,6 +2213,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             raise ValueError(
                 "stage2_selective_logits_only requires stage2_logit_positions"
             )
+        if packed and stage2_logit_positions is None:
+            raise ValueError("packed Stage 2 forward requires stage2_logit_positions")
         if stage2_selective_logits_only and labels is not None and not stage2_loss_only:
             raise ValueError(
                 "stage2_selective_logits_only cannot compute full-sequence label loss"
@@ -2098,12 +2233,22 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     "stage2_logit_positions must be a nonempty 1-D integer tensor"
                 )
             if torch.unique(stage2_logit_positions).numel() != stage2_logit_positions.numel():
+                if packed:
+                    raise ValueError("packed stage2_logit_positions must be strictly increasing")
                 raise ValueError("stage2_logit_positions must be unique")
-            sequence_length = input_ids.shape[1]
+            if packed and bool(
+                (stage2_logit_positions[1:] <= stage2_logit_positions[:-1]).any()
+            ):
+                raise ValueError("packed stage2_logit_positions must be strictly increasing")
+            sequence_length = packed_values[1].numel() if packed else input_ids.shape[1]
             if (
                 int(stage2_logit_positions.min()) < 0
                 or int(stage2_logit_positions.max()) >= sequence_length
             ):
+                if packed:
+                    raise ValueError(
+                        "stage2_logit_positions must be in range for the packed sequence"
+                    )
                 raise ValueError(
                     "stage2_logit_positions must be in range for the final decoder sequence"
                 )
@@ -2172,14 +2317,38 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             collect_diagnostics=collect_stage2_diagnostics,
         )
 
+        final_inputs_embeds = rollout.final_inputs_embeds
+        final_attention_mask = (
+            attention_mask
+            if stage2_final_attention_mask is None
+            else stage2_final_attention_mask
+        )
+        final_position_ids = full_position_ids
+        root_length = input_ids.shape[1]
+        if packed:
+            (
+                final_attention_mask,
+                packed_token_ids,
+                clean_embedding_sources,
+                logical_position_sources,
+                root_length,
+            ) = packed_values
+            direct = self.model.embed_tokens(packed_token_ids.unsqueeze(0))
+            safe_sources = clean_embedding_sources.clamp_min(0)
+            shared = rollout.final_inputs_embeds.index_select(1, safe_sources)
+            final_inputs_embeds = torch.where(
+                (clean_embedding_sources >= 0).view(1, -1, 1),
+                shared,
+                direct,
+            )
+            final_position_ids = full_position_ids.index_select(
+                2, logical_position_sources
+            )
+
         final_outputs = language_model(
-            inputs_embeds=rollout.final_inputs_embeds,
-            attention_mask=(
-                attention_mask
-                if stage2_final_attention_mask is None
-                else stage2_final_attention_mask
-            ),
-            position_ids=full_position_ids,
+            inputs_embeds=final_inputs_embeds,
+            attention_mask=final_attention_mask,
+            position_ids=final_position_ids,
             use_cache=False,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -2195,7 +2364,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 raise ValueError(
                     "Stage 2 loss-only forward requires at least one supervised label"
                 )
-            shifted_hidden = final_outputs.last_hidden_state[..., :-1, :].contiguous().view(
+            root_hidden = final_outputs.last_hidden_state[:, :root_length, :]
+            shifted_hidden = root_hidden[..., :-1, :].contiguous().view(
                 -1, final_outputs.last_hidden_state.shape[-1]
             )
             active_logits = self.lm_head(shifted_hidden[active]).float()
@@ -2217,8 +2387,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             logits = self.lm_head(final_outputs.last_hidden_state)
             loss = None
             if labels is not None:
-                logits = logits.float()
-                shift_logits = logits[..., :-1, :].contiguous().view(
+                root_logits = logits[:, :root_length, :].float()
+                shift_logits = root_logits[..., :-1, :].contiguous().view(
                     -1, self.config.vocab_size
                 )
                 shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
@@ -2263,7 +2433,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             hidden_states=getattr(final_outputs, "hidden_states", None),
             attentions=getattr(final_outputs, "attentions", None),
             rope_deltas=stage2_rope_deltas,
-            inputs_embeds=rollout.final_inputs_embeds,
+            inputs_embeds=final_inputs_embeds,
             stage2_latent_states=rollout.latent_states if return_stage2_latent_states else None,
             stage2_diagnostics=diagnostics,
             stage2_selected_logits=selected_logits,
@@ -2300,6 +2470,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         retain_stage2_latent_grads: bool = False,
         stage2_loss_only: bool = False,
         stage2_final_attention_mask: Optional[torch.Tensor] = None,
+        stage2_packed_inputs: Optional[Mapping[str, object]] = None,
         stage2_logit_positions: Optional[torch.LongTensor] = None,
         stage2_selective_logits_only: bool = False,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
@@ -2318,6 +2489,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        resolved_use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         if getattr(self.config, "stage", None) == "stage2":
             for name, value in (
@@ -2340,11 +2512,14 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                use_cache=resolved_use_cache,
+                past_key_values=past_key_values,
                 return_stage2_latent_states=return_stage2_latent_states,
                 collect_stage2_diagnostics=collect_stage2_diagnostics,
                 retain_stage2_latent_grads=retain_stage2_latent_grads,
                 stage2_loss_only=stage2_loss_only,
                 stage2_final_attention_mask=stage2_final_attention_mask,
+                stage2_packed_inputs=stage2_packed_inputs,
                 stage2_logit_positions=stage2_logit_positions,
                 stage2_selective_logits_only=stage2_selective_logits_only,
             )
