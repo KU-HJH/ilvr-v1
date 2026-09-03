@@ -470,7 +470,12 @@ def test_peft_snapshot_loader_keeps_source_selectors_out_of_model_options(
         (checkpoint / name).write_bytes(name.encode("utf-8"))
     inspection = Stage2ArtifactInspection(
         Stage2ArtifactKind.PEFT,
-        peft_metadata_snapshot=SimpleNamespace(),
+        peft_metadata_snapshot=SimpleNamespace(
+            artifact_dir=checkpoint.resolve(),
+            metadata_json=b"stage2_peft_metadata.json",
+        ),
+        adapter_config_json=b"adapter_config.json",
+        adapter_safetensors=b"adapter_model.safetensors",
     )
     processor = SimpleNamespace(tokenizer=SimpleNamespace())
     base = tmp_path / "stage2-base"
@@ -520,6 +525,74 @@ def test_peft_snapshot_loader_keeps_source_selectors_out_of_model_options(
         (str(base.resolve()), "config.json"),
         (str(base.resolve()), "model.safetensors"),
     )
+
+
+def test_peft_snapshot_rejects_mutation_after_retained_inspection(
+    monkeypatch, tmp_path
+):
+    """Catches hashing new disk bytes while loading older retained adapter bytes."""
+    import scripts.generate_step_negatives as generator
+    from stage2.checkpointing import Stage2ArtifactInspection, Stage2ArtifactKind
+
+    checkpoint = tmp_path / "stage2-peft"
+    checkpoint.mkdir()
+    payloads = {
+        "stage2_peft_metadata.json": b"retained-metadata",
+        "adapter_config.json": b"retained-config",
+        "adapter_model.safetensors": b"retained-adapter",
+        "tokenizer_config.json": b"tokenizer-config",
+    }
+    for name, raw in payloads.items():
+        (checkpoint / name).write_bytes(raw)
+    inspection = Stage2ArtifactInspection(
+        Stage2ArtifactKind.PEFT,
+        peft_metadata_snapshot=SimpleNamespace(
+            artifact_dir=checkpoint.resolve(),
+            metadata_json=payloads["stage2_peft_metadata.json"],
+        ),
+        adapter_config_json=payloads["adapter_config.json"],
+        adapter_safetensors=payloads["adapter_model.safetensors"],
+    )
+    base = tmp_path / "stage2-base"
+    base.mkdir()
+    (base / "config.json").write_bytes(b"base-config")
+    (base / "model.safetensors").write_bytes(b"base-weights")
+    processor_loads = []
+    model_loads = []
+    loaded_wrapper = object()
+
+    def inspect_then_mutate(path):
+        if Path(path).resolve() == checkpoint.resolve():
+            (checkpoint / "adapter_model.safetensors").write_bytes(
+                b"mutated-after-inspection"
+            )
+            return inspection
+        return Stage2ArtifactInspection(Stage2ArtifactKind.FULL)
+
+    monkeypatch.setattr(
+        generator,
+        "decode_stage2_peft_metadata_snapshot",
+        lambda _snapshot: SimpleNamespace(base_model_reference=str(base)),
+    )
+    monkeypatch.setattr(
+        generator, "resolve_stage2_qwen_model", lambda _loaded: _zero_logits_model()
+    )
+
+    with pytest.raises(ValueError, match="retained PEFT inspection"):
+        generator.load_frozen_stage2a_snapshot(
+            checkpoint_path=checkpoint,
+            attention_implementation="sdpa",
+            device="cpu",
+            inspect_artifact=inspect_then_mutate,
+            load_processor=lambda source: processor_loads.append(source),
+            load_peft_model=lambda *args, **kwargs: model_loads.append(
+                (args, kwargs)
+            )
+            or loaded_wrapper,
+        )
+
+    assert processor_loads == []
+    assert model_loads == []
 
 
 @pytest.mark.parametrize("base_reference", ["Qwen/Qwen2.5-VL-7B-Instruct", "missing"])

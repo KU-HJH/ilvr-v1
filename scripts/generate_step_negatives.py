@@ -184,18 +184,64 @@ def _sha256_file(path: Path) -> tuple[int, str]:
 
 
 def _checkpoint_records(
-    checkpoint: Path, relative_paths: Iterable[str]
+    checkpoint: Path,
+    relative_paths: Iterable[str],
+    *,
+    retained_payloads: dict[str, bytes] | None = None,
 ) -> tuple[CheckpointFile, ...]:
+    retained_payloads = retained_payloads or {}
+    relative_paths = tuple(sorted(relative_paths))
+    unexpected = set(retained_payloads) - set(relative_paths)
+    if unexpected:
+        raise ValueError(
+            "retained PEFT inspection contains unconsumed files: "
+            f"{sorted(unexpected)}"
+        )
     records = []
-    for relative_path in sorted(relative_paths):
+    for relative_path in relative_paths:
         path = checkpoint / relative_path
         if path.is_symlink() or not path.is_file():
             raise ValueError(f"checkpoint loader input must be a regular file: {path}")
         size, digest = _sha256_file(path)
+        retained = retained_payloads.get(relative_path)
+        if retained is not None:
+            retained_size = len(retained)
+            retained_digest = hashlib.sha256(retained).hexdigest()
+            if (size, digest) != (retained_size, retained_digest):
+                raise ValueError(
+                    "checkpoint file does not match retained PEFT inspection: "
+                    f"{path}"
+                )
+            size, digest = retained_size, retained_digest
         records.append(
             CheckpointFile(relative_path, size, digest, str(checkpoint))
         )
     return tuple(records)
+
+
+def _retained_peft_payloads(
+    inspection, relative_paths: Iterable[str]
+) -> dict[str, bytes]:
+    metadata_snapshot = inspection.peft_metadata_snapshot
+    payloads = {
+        STAGE2_PEFT_METADATA_FILENAME: (
+            None if metadata_snapshot is None else metadata_snapshot.metadata_json
+        ),
+        "adapter_config.json": inspection.adapter_config_json,
+        "adapter_model.safetensors": inspection.adapter_safetensors,
+    }
+    if (
+        SPARSE_TOKEN_ROWS_FILENAME in relative_paths
+        or inspection.sparse_safetensors is not None
+    ):
+        payloads[SPARSE_TOKEN_ROWS_FILENAME] = inspection.sparse_safetensors
+    for relative_path, payload in payloads.items():
+        if type(payload) is not bytes:
+            raise ValueError(
+                "Stage 2A PEFT inspection lost retained bytes for "
+                f"{relative_path}"
+            )
+    return payloads
 
 
 def _tokenizer_identity(records: Iterable[CheckpointFile]) -> str:
@@ -267,8 +313,15 @@ def load_frozen_stage2a_snapshot(
         base_relative_paths = _loader_relative_paths(
             base, Stage2ArtifactKind.FULL, include_processor=False
         )
+    retained_payloads = None
+    if inspection.artifact_kind is Stage2ArtifactKind.PEFT:
+        retained_payloads = _retained_peft_payloads(
+            inspection, checkpoint_relative_paths
+        )
     checkpoint_files = _checkpoint_records(
-        checkpoint, checkpoint_relative_paths
+        checkpoint,
+        checkpoint_relative_paths,
+        retained_payloads=retained_payloads,
     )
     if base is not None:
         checkpoint_files += _checkpoint_records(base, base_relative_paths)
