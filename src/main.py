@@ -829,7 +829,6 @@ def main_train():
         stage2b_preflight = preflight_stage2b_artifacts(args)
     if getattr(args, "stage2b_preflight_only", False):
         return 0
-    args._stage2b_preflight = stage2b_preflight
     if _DIRECT_MAIN_PROFILE is not None:
         args.deepspeed_runtime_profile = _DIRECT_MAIN_PROFILE
     bind_deepspeed_runtime_profile(args)
@@ -848,6 +847,8 @@ def main_train():
     logging.info(args)
     logging.info('==' * 20)
 
+    if stage2b_preflight is not None:
+        args._stage2b_preflight = stage2b_preflight
     return route_training(args)
 
 

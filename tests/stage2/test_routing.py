@@ -1018,6 +1018,93 @@ class RecordingSavedProcessor:
         self.saved_path = path
 
 
+def test_main_keeps_stage2b_preflight_out_of_startup_log_and_reuses_snapshot(
+    monkeypatch,
+):
+    """Catches validated prompts and rejections leaking through argparse logging."""
+    secret_prompt = "stage2b-secret-prompt-7bbf85"
+    secret_rejected = "stage2b-secret-rejected-40a32c"
+    preflight = main.Stage2BPreflight(
+        prepared_examples=(SimpleNamespace(prompt=secret_prompt),),
+        negative_store={
+            ("sample-1", 0): SimpleNamespace(rejected_text=secret_rejected)
+        },
+    )
+    args = stage2_args(
+        stage="stage2",
+        log_file="unused.log",
+        step_preference_config=main.StepPreferenceConfig(
+            enabled=True,
+            mode="stage2b",
+            stage2a_checkpoint_path="stage2a/checkpoint",
+            negative_path="negatives.jsonl",
+            negative_manifest="negatives.manifest.json",
+        ),
+    )
+    logged_records = []
+    routed_preflights = []
+
+    monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(main, "validate_generated_artifact_paths", lambda selected: None)
+    monkeypatch.setattr(main, "preflight_stage2b_artifacts", lambda selected: preflight)
+    monkeypatch.setattr(main, "bind_deepspeed_runtime_profile", lambda selected: None)
+    monkeypatch.setattr(main, "seed_everything", lambda **kwargs: None)
+    monkeypatch.setattr(main.logging, "FileHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "StreamHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "basicConfig", lambda **kwargs: None)
+    monkeypatch.setattr(
+        main.logging, "info", lambda value: logged_records.append(str(value))
+    )
+
+    def record_stage2(selected):
+        routed_preflights.append(selected._stage2b_preflight)
+        return "stage2b-result"
+
+    monkeypatch.setattr(main, "run_stage2", record_stage2)
+
+    result = main_train()
+
+    startup_log = "\n".join(logged_records)
+    assert result == "stage2b-result"
+    assert routed_preflights == [preflight]
+    assert routed_preflights[0] is preflight
+    assert secret_prompt not in startup_log
+    assert secret_rejected not in startup_log
+    assert "_stage2b_preflight" not in startup_log
+
+
+def test_main_disabled_startup_log_has_no_private_preflight_field(monkeypatch):
+    """Catches disabled startup logs gaining a private ``None`` payload field."""
+    args = stage2_args(
+        stage="stage2",
+        log_file="unused.log",
+        step_preference_config=main.StepPreferenceConfig(),
+    )
+    logged_records = []
+
+    monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(main, "validate_generated_artifact_paths", lambda selected: None)
+    monkeypatch.setattr(
+        main,
+        "preflight_stage2b_artifacts",
+        lambda selected: pytest.fail("disabled training must not run Stage 2B preflight"),
+    )
+    monkeypatch.setattr(main, "bind_deepspeed_runtime_profile", lambda selected: None)
+    monkeypatch.setattr(main, "seed_everything", lambda **kwargs: None)
+    monkeypatch.setattr(main.logging, "FileHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "StreamHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "basicConfig", lambda **kwargs: None)
+    monkeypatch.setattr(
+        main.logging, "info", lambda value: logged_records.append(str(value))
+    )
+    monkeypatch.setattr(main, "run_stage2", lambda selected: "stage2-result")
+
+    result = main_train()
+
+    assert result == "stage2-result"
+    assert "_stage2b_preflight" not in "\n".join(logged_records)
+
+
 @pytest.mark.parametrize(
     ("world_process_zero", "expected_processor_path"),
     [(True, "out"), (False, None)],
