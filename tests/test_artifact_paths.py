@@ -49,6 +49,15 @@ def test_run_paths_share_one_experiment_identifier():
     assert paths.log_dir.name == paths.checkpoint_dir.name
 
 
+def test_run_paths_accept_plan_utc_timestamp_identifier():
+    """Catches the documented ``date -u`` run ID being rejected at startup."""
+    run_id = "step-preference-phase-a-20260903T132925Z"
+
+    paths = resolve_run_artifact_paths(run_id)
+
+    assert paths.experiment_id == run_id
+
+
 @pytest.mark.parametrize("experiment_id", ["../escape", "has/slash", "UPPER", ""])
 def test_experiment_identifier_rejects_unsafe_values(experiment_id):
     """Catches unsafe experiment IDs escaping the canonical artifact roots."""

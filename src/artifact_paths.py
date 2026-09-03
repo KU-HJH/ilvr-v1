@@ -16,7 +16,9 @@ CANONICAL_EVALUATION_STAGING_ROOT = (
 CANONICAL_RESULT_ROOT = CANONICAL_REPOSITORY_ROOT / "results"
 CANONICAL_REPOSITORY_LOG_ROOT = CANONICAL_REPOSITORY_ROOT / "logs"
 CANONICAL_LOG_ROOT = CANONICAL_REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
-EXPERIMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
+EXPERIMENT_ID_PATTERN = re.compile(
+    r"^(?=.{3,128}$)[a-z0-9][a-z0-9-]*(?:[0-9]{8}T[0-9]{6}Z)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -31,7 +33,8 @@ def resolve_run_artifact_paths(experiment_id: str) -> RunArtifactPaths:
     """Return the three canonical directories for a safe run identity."""
     if not EXPERIMENT_ID_PATTERN.fullmatch(experiment_id):
         raise ValueError(
-            "experiment ID must be 3-128 lowercase letters, digits, or hyphens"
+            "experiment ID must be 3-128 lowercase letters, digits, or hyphens, "
+            "optionally ending in a YYYYMMDDTHHMMSSZ UTC timestamp"
         )
     return RunArtifactPaths(
         experiment_id=experiment_id,
