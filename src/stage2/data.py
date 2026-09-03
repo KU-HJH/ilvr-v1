@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 import json
 import logging
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 from PIL import Image
@@ -14,6 +15,12 @@ from transformers import AutoProcessor
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
     parse_latent_spans,
+)
+from step_preference.spans import (
+    PlanCharSpan,
+    ReasoningStepPlan,
+    build_assistant_plan,
+    canonical_sample_id,
 )
 
 
@@ -46,6 +53,10 @@ class Stage2PreparedExample:
     conversation: list[dict]
     original_image_paths: tuple[str, ...]
     latent_block_count: int
+    sample_id: str = ""
+    sequence_plan: tuple[dict, ...] = ()
+    plan_char_spans: tuple[PlanCharSpan, ...] = ()
+    reasoning_steps: tuple[ReasoningStepPlan, ...] = ()
 
 
 def parse_jsonl_examples(contents: str) -> list[dict]:
@@ -111,30 +122,10 @@ def resolve_original_images(sample: dict, image_root: Path) -> tuple[str, ...]:
 
 
 def _assistant_text(sequence_plan: list, latent_size: int) -> tuple[str, int]:
-    if latent_size <= 0:
-        raise ValueError("latent_size must be positive")
-
-    latent_block = "<|latent_start|>" + "<|latent_pad|>" * latent_size + "<|latent_end|>"
-    assistant_parts: list[str] = []
-    latent_block_count = 0
-    for step in sequence_plan:
-        if not isinstance(step, dict):
-            raise ValueError("sequence_plan steps must be objects")
-        step_type = step.get("type")
-        if step_type == "text":
-            content = step.get("content")
-            if not isinstance(content, str):
-                raise ValueError("text step content must be a string")
-            assistant_parts.append(content)
-        elif step_type == "latent":
-            helper_image = step.get("helper_image")
-            if not isinstance(helper_image, str) or not helper_image:
-                raise ValueError("latent step is missing helper_image")
-            assistant_parts.append(latent_block)
-            latent_block_count += 1
-        else:
-            raise ValueError(f"unsupported sequence_plan step type: {step_type}")
-    return "".join(assistant_parts), latent_block_count
+    assistant_text, plan_char_spans, _ = build_assistant_plan(
+        sequence_plan, latent_size, require_reasoning_units=False
+    )
+    return assistant_text, sum(span.step_type == "latent" for span in plan_char_spans)
 
 
 def build_stage2_conversation(
@@ -170,11 +161,17 @@ def prepare_stage2_example(
 ) -> Stage2PreparedExample:
     """Build a conversation together with validated original-image metadata."""
     conversation = build_stage2_conversation(sample, image_root=image_root, latent_size=latent_size)
-    _, latent_block_count = _assistant_text(sample["sequence_plan"], latent_size)
+    _, plan_char_spans, reasoning_steps = build_assistant_plan(
+        sample["sequence_plan"], latent_size, require_reasoning_units=False
+    )
     return Stage2PreparedExample(
         conversation=conversation,
         original_image_paths=resolve_original_images(sample, image_root),
-        latent_block_count=latent_block_count,
+        latent_block_count=sum(span.step_type == "latent" for span in plan_char_spans),
+        sample_id=canonical_sample_id(sample),
+        sequence_plan=tuple(MappingProxyType(dict(step)) for step in sample["sequence_plan"]),
+        plan_char_spans=plan_char_spans,
+        reasoning_steps=reasoning_steps,
     )
 
 
