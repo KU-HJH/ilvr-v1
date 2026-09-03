@@ -20,6 +20,8 @@ from step_preference.spans import (
     ReasoningStepPlan,
     build_assistant_plan,
     canonical_sample_id,
+    expand_qwen_image_placeholders,
+    map_reasoning_step_spans,
 )
 
 
@@ -230,11 +232,19 @@ def _load_original_images(paths: tuple[str, ...]) -> list[Image.Image]:
 class Stage2DataCollator:
     """Tokenize exactly one complete CoMT sample without truncation."""
 
-    def __init__(self, processor, token_ids, latent_size, supervise_latent_boundaries):
+    def __init__(
+        self,
+        processor,
+        token_ids,
+        latent_size,
+        supervise_latent_boundaries,
+        step_preference_enabled=False,
+    ):
         self.processor = processor
         self.token_ids = token_ids
         self.latent_size = latent_size
         self.supervise_latent_boundaries = supervise_latent_boundaries
+        self.step_preference_enabled = step_preference_enabled
         self.assistant_pattern = processor.tokenizer(
             "<|im_start|>assistant", add_special_tokens=False, return_tensors="pt"
         )["input_ids"][0]
@@ -274,6 +284,46 @@ class Stage2DataCollator:
             latent_size=self.latent_size,
             supervise_latent_boundaries=self.supervise_latent_boundaries,
         )
+        if self.step_preference_enabled:
+            tokenizer = self.processor.tokenizer
+            if not getattr(tokenizer, "is_fast", False):
+                raise ValueError("step preference span mapping requires a fast tokenizer")
+            expanded_text = expand_qwen_image_placeholders(
+                text,
+                image_grid_thw=batch["image_grid_thw"],
+                image_token=self.processor.image_token,
+                merge_size=self.processor.image_processor.merge_size,
+            )
+            offset_batch = tokenizer(
+                [expanded_text],
+                padding=True,
+                truncation=False,
+                return_tensors="pt",
+                return_offsets_mapping=True,
+            )
+            offset_mapping = offset_batch.pop("offset_mapping")
+            for key, value in offset_batch.items():
+                if key not in batch or not torch.equal(value, batch[key]):
+                    raise ValueError(
+                        f"offset tokenization does not match processor tensor: {key}"
+                    )
+
+            assistant_text = example.conversation[1]["content"][0]["text"]
+            reasoning_step_spans = map_reasoning_step_spans(
+                rendered_text=expanded_text,
+                assistant_text=assistant_text,
+                plan_char_spans=example.plan_char_spans,
+                reasoning_steps=example.reasoning_steps,
+                offset_mapping=offset_mapping,
+                input_ids=batch["input_ids"],
+                latent_pad_token_id=self.token_ids.pad_token_id,
+            )
+            batch["sample_ids"] = (example.sample_id,)
+            batch["reasoning_step_spans"] = reasoning_step_spans
+            batch["step_preference"] = {
+                "expanded_rendered_text": expanded_text,
+                "offset_mapping": offset_mapping,
+            }
         return batch
 
 
