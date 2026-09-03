@@ -1,6 +1,6 @@
 # Step-wise Modality DPO Design
 
-**Status:** design commitment v1, pending final human approval
+**Status:** design commitment v1, approved 2026-09-03
 **Date:** 2026-09-03  
 **Target branch/worktree:** `ours1` / `.worktrees/ours1`  
 **Source brief:** `documents/TODO-ours1.md` in the primary ILVR checkout
@@ -553,13 +553,15 @@ regeneration, a new judge, or generalized failure recovery.
 
 ## 13. Critique resolution and interpretation limit
 
-The final critique identified one unresolved methodological disagreement:
+The final critique identified one non-blocking methodological hypothesis:
 attention-ablated continuations may be coherent, equally valid, or better than
 the source `T_k`, while the configured DPO dataset labels the source as chosen
 and the generated continuation as rejected. Filters 1–3 do not independently
 establish a preference ordering, and the repository has no step-level
 correctness checker. Adding a judge or human-labelled preference dataset is
-outside the approved first-version scope.
+outside the approved first-version scope. Whether the weak-label method improves
+the model is decided later by full training and an independent held-out
+evaluation, not by the training objective's own loss.
 
 Accordingly, this implementation uses the source target as chosen **by
 construction** and must not claim that milestone 1 proves negative inferiority,
