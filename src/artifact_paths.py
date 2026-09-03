@@ -8,9 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 
-CANONICAL_REPOSITORY_ROOT = Path(
-    "/root/workspace/ILVR"
-)
+CANONICAL_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_CHECKPOINT_ROOT = CANONICAL_REPOSITORY_ROOT / "checkpoints"
 CANONICAL_EVALUATION_STAGING_ROOT = (
     CANONICAL_CHECKPOINT_ROOT / "evaluation-staging"

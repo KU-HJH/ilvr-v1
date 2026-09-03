@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Sequence
 
 
-_CANONICAL_CHECKPOINT_ROOT = Path("/root/workspace/ILVR/checkpoints")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_CANONICAL_CHECKPOINT_ROOT = _REPOSITORY_ROOT / "checkpoints"
 _RANK_FIELDS = {
     "rank", "global_step", "optimizer_step", "loss", "gradient_norm",
     "worker_error",

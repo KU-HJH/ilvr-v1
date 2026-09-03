@@ -56,7 +56,11 @@ from src.multinode_runtime import (
 )
 
 
-_REPOSITORY_ROOT = Path("/root/workspace/ILVR")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_REMOTE_CONTAINER_REPOSITORY_BASE = Path("/root/workspace/ILVR")
+_REMOTE_HOST_REPOSITORY_BASE = Path(
+    "/home/korea/Workspace/hjh/workspace/ILVR"
+)
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _TRAINING_REQUIRED_FREE_BYTES = 100 * 1024**3
 _ATTEMPT_TIMEOUT_SECONDS = 24 * 60 * 60
@@ -66,6 +70,11 @@ _PROC_ROOT = Path("/proc")
 
 def _evaluation_staging_root() -> Path:
     return _REPOSITORY_ROOT / "checkpoints" / "evaluation-staging"
+
+
+def _remote_host_repository_root(repository_root: Path) -> Path:
+    relative = repository_root.relative_to(_REMOTE_CONTAINER_REPOSITORY_BASE)
+    return _REMOTE_HOST_REPOSITORY_BASE / relative
 
 
 @dataclass(frozen=True)
@@ -90,7 +99,7 @@ class ClusterSpec:
             remote_host="korea@10.1.102.41",
             remote_container="llm_kd",
             remote_repo_root=_REPOSITORY_ROOT,
-            remote_host_repo_root=Path("/home/korea/Workspace/hjh/workspace/ILVR"),
+            remote_host_repo_root=_remote_host_repository_root(_REPOSITORY_ROOT),
             master_addr="10.1.102.41",
             socket_ifname="bond1.102",
         )
@@ -869,7 +878,7 @@ def _node_info(args: argparse.Namespace) -> NodeSnapshot:
     """Collect node-local evidence after validating the exact config bytes."""
     repository = Path(args.repository)
     if repository != _REPOSITORY_ROOT:
-        raise ValueError("node-info repository must be /root/workspace/ILVR")
+        raise ValueError(f"node-info repository must be {_REPOSITORY_ROOT}")
     expected_config = selected_deepspeed_config(
         args.stage, args.tuning_method, args.zero_stage
     )
@@ -1669,7 +1678,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             result_root.relative_to(canonical_result_root)
         except ValueError as error:
             raise ValueError(
-                "result_root must be inside /root/workspace/ILVR/results"
+                f"result_root must be inside {_REPOSITORY_ROOT / 'results'}"
             ) from error
         forwarded = tuple(stage_arguments)
         if stage == "stage1":

@@ -65,9 +65,9 @@ def test_matrix_plans_exact_initial_and_resume_harness_jobs_per_cell(tmp_path):
         assert plan.initial_launch_plan.attempt_id == "initial"
         assert plan.resume_launch_plan.attempt_id == "resume"
         expected_harness = (
-            "/root/workspace/ILVR/tests/stage1/zero_compat_diagnostic.py"
+            str(REPO_ROOT / "tests/stage1/zero_compat_diagnostic.py")
             if plan.case.stage == "stage1"
-            else "/root/workspace/ILVR/tests/stage2/integration/tiny_stage2_train.py"
+            else str(REPO_ROOT / "tests/stage2/integration/tiny_stage2_train.py")
         )
         for phase, commands in (
             ("initial", plan.initial_commands),
@@ -77,7 +77,9 @@ def test_matrix_plans_exact_initial_and_resume_harness_jobs_per_cell(tmp_path):
             for machine_rank, node in enumerate(commands.node_specs):
                 command = node.command
                 child = command[command.index("--") + 1 :]
-                assert child[0] == "/root/workspace/ILVR/venv/ilvr-venv/bin/accelerate"
+                assert child[0] == str(
+                    REPO_ROOT / "venv/ilvr-venv/bin/accelerate"
+                )
                 assert child[1] == "launch"
                 assert child[child.index("--num_machines") + 1] == "2"
                 assert child[child.index("--num_processes") + 1] == "4"
@@ -157,7 +159,7 @@ def test_lifecycle_worker_environment_resolves_canonical_venv_deepspeed():
 
     for node in plan.initial_commands.node_specs:
         resolved = shutil.which("deepspeed", path=dict(node.environment)["PATH"])
-        assert resolved == "/root/workspace/ILVR/venv/ilvr-venv/bin/deepspeed"
+        assert resolved == str(REPO_ROOT / "venv/ilvr-venv/bin/deepspeed")
         assert canonical_command_digest(
             node.command, dict(node.environment)
         ) == plan.initial_commands.command_digests[node.machine_rank]
@@ -312,9 +314,9 @@ def test_lifecycle_plans_bind_safe_child_ids_ports_and_two_ordered_phase_jobs(tm
         assert len(plan.initial_commands.node_specs) == 2
         assert len(plan.resume_commands.node_specs) == 2
         assert plan.checkpoint_path.name == "checkpoint-2"
-        assert plan.checkpoint_path == Path("/root/workspace/ILVR/checkpoints") / child / "checkpoint-2"
-        assert plan.initial_witness_path == Path("/root/workspace/ILVR/results") / child / "initial-witness.json"
-        assert plan.resume_witness_path == Path("/root/workspace/ILVR/results") / child / "resume-witness.json"
+        assert plan.checkpoint_path == REPO_ROOT / "checkpoints" / child / "checkpoint-2"
+        assert plan.initial_witness_path == REPO_ROOT / "results" / child / "initial-witness.json"
+        assert plan.resume_witness_path == REPO_ROOT / "results" / child / "resume-witness.json"
 
 
 def _phase_bytes(plan, phase, *, gradient):
@@ -469,13 +471,13 @@ def test_remote_phase_evidence_uses_only_the_fixed_bounded_node_cli(tmp_path):
     assert len(calls[0][0]) == 7
     remote = shlex.split(calls[0][0][6])
     assert remote[:7] == [
-        "/usr/bin/docker", "exec", "--workdir", "/root/workspace/ILVR",
+        "/usr/bin/docker", "exec", "--workdir", str(REPO_ROOT),
         "llm_kd", "/usr/bin/bash", "-lc",
     ]
     assert len(remote) == 8
     assert shlex.split(remote[7]) == [
-        "env", "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "env", f"PYTHONPATH={REPO_ROOT}:{REPO_ROOT / 'src'}",
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
         "-m", "src.multinode", "lifecycle-evidence-show",
         "--run-id", plan.child_run_id, "--phase", "initial",
     ]

@@ -253,7 +253,7 @@ if [[ ! $ema_tau =~ ^\+?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))([eE][+-]?[0-9]+)?$ ]] |
 fi
 
 experiment_id=${output_dir##*/}
-canonical_log_root='/root/workspace/ILVR/logs/zero-stage-compatibility'
+canonical_log_root="$script_dir/logs/zero-stage-compatibility"
 if [[ -z $log_file ]]; then
     if [[ -n $resume_path ]]; then
         log_file="$canonical_log_root/$experiment_id/resume-$(date +%Y%m%dT%H%M%S)-$$.log"

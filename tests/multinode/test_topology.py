@@ -23,15 +23,30 @@ from src.multinode import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_default_topology_preserves_the_worktree_suffix_on_remote_host():
+    """Catches the fixed remote mapping dropping the active worktree suffix."""
+    spec = ClusterSpec.default()
+
+    assert spec.remote_repo_root == REPO_ROOT
+    relative = REPO_ROOT.relative_to(Path("/root/workspace/ILVR"))
+    assert spec.remote_host_repo_root == (
+        Path("/home/korea/Workspace/hjh/workspace/ILVR") / relative
+    )
+
+
 def test_default_cluster_is_fixed_two_node_four_process_topology():
     """Catches a launch silently drifting from the approved four-GPU topology."""
     spec = ClusterSpec.default()
 
     assert spec.remote_host == "korea@10.1.102.41"
     assert spec.remote_container == "llm_kd"
-    assert spec.remote_repo_root == Path("/root/workspace/ILVR")
-    assert spec.remote_host_repo_root == Path(
-        "/home/korea/Workspace/hjh/workspace/ILVR"
+    assert spec.remote_repo_root == REPO_ROOT
+    relative = REPO_ROOT.relative_to(Path("/root/workspace/ILVR"))
+    assert spec.remote_host_repo_root == (
+        Path("/home/korea/Workspace/hjh/workspace/ILVR") / relative
     )
     assert (spec.num_machines, spec.gpus_per_node, spec.num_processes) == (2, 2, 4)
     assert (spec.remote_rank, spec.local_rank) == (0, 1)
@@ -51,8 +66,8 @@ def test_launch_plan_selects_exact_zero_config(zero_stage):
     )
 
     assert plan.world_size == 4
-    assert plan.deepspeed_config == Path(
-        f"/root/workspace/ILVR/configs/deepspeed_zero{zero_stage}.json"
+    assert plan.deepspeed_config == (
+        REPO_ROOT / f"configs/deepspeed_zero{zero_stage}.json"
     )
     assert plan.required_free_bytes == 100 * 1024**3
 
@@ -84,8 +99,8 @@ def test_stage2_peft_zero3_selects_dedicated_gpu_only_config(tuning_method):
         main_process_port=29630,
     )
 
-    assert plan.deepspeed_config == Path(
-        "/root/workspace/ILVR/configs/deepspeed_zero3_stage2_peft.json"
+    assert plan.deepspeed_config == (
+        REPO_ROOT / "configs/deepspeed_zero3_stage2_peft.json"
     )
     canonical = json.loads(
         canonical_deepspeed_config_path(3).read_text(encoding="utf-8")
@@ -331,7 +346,9 @@ def test_plan_cli_prints_sorted_json_without_creating_files(tmp_path):
     assert completed.stdout == json.dumps(payload, sort_keys=True) + "\n"
     assert payload["attempt_id"] == "initial"
     assert payload["cluster"]["num_processes"] == 4
-    assert payload["deepspeed_config"] == "/root/workspace/ILVR/configs/deepspeed_zero2.json"
+    assert payload["deepspeed_config"] == str(
+        REPO_ROOT / "configs/deepspeed_zero2.json"
+    )
     assert len(payload["deepspeed_config_digest"]) == 64
     assert set(tmp_path.iterdir()) == before
 

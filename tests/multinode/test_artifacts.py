@@ -851,12 +851,12 @@ def test_push_never_overwrites_and_is_scoped_to_the_run():
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
     )
     assert command[-2] == (
-        "/root/workspace/ILVR/checkpoints/"
+        f"{_REPOSITORY_ROOT}/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert command[-1] == (
         "korea@10.1.102.41:"
-        "/root/workspace/ILVR/checkpoints/"
+        f"{_REPOSITORY_ROOT}/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert not any("venv" in argument or "/data/" in argument for argument in command)
@@ -879,7 +879,7 @@ def test_pull_selects_only_local_process_ranks_and_common_metadata(tmp_path):
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
     )
     assert command[-2].startswith(
-        "korea@10.1.102.41:/root/workspace/ILVR/checkpoints/"
+        f"korea@10.1.102.41:{_REPOSITORY_ROOT}/checkpoints/"
     )
     assert command[-1] == f"{tmp_path}/checkpoint-copy/"
     assert "--checksum" not in command
@@ -1173,7 +1173,7 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
         log_root=tmp_path / "logs",
         command_runner=fake_command,
     )
-    checkpoint = Path("/root/workspace/ILVR/checkpoints") / plan.run_id / "checkpoint-2"
+    checkpoint = _REPOSITORY_ROOT / "checkpoints" / plan.run_id / "checkpoint-2"
 
     collected = collect_checkpoint_artifacts(
         runner,
@@ -1848,10 +1848,10 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
 
     assert mirror(manifest, destination) == manifest
 
-    python = "/root/workspace/ILVR/venv/ilvr-venv/bin/python"
+    python = str(_REPOSITORY_ROOT / "venv/ilvr-venv/bin/python")
     fixed_prefix = (
         "/usr/bin/env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
+        f"PYTHONPATH={_REPOSITORY_ROOT}:{_REPOSITORY_ROOT / 'src'}",
         python,
     )
     assert calls[0] == tuple(runtime_module.build_remote_exec(
@@ -1860,7 +1860,7 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
             "-m", "src.multinode", "prepare-inference-destination",
             "--destination", str(destination),
         ),
-        working_directory="/root/workspace/ILVR",
+        working_directory=_REPOSITORY_ROOT,
     ))
     files_path = (
         log_root / plan.run_id / plan.attempt_id
@@ -1879,7 +1879,7 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
             "-m", "src.multinode", "prepared-inference-show",
             "--model-dir", str(destination),
         ),
-        working_directory="/root/workspace/ILVR",
+        working_directory=_REPOSITORY_ROOT,
     ))
     names = set(files_path.read_bytes().split(b"\0")) - {b""}
     assert names == {
@@ -2681,6 +2681,9 @@ def test_prepare_inference_cli_dispatches_without_building_training_commands(
         return destination
 
     monkeypatch.setattr(multinode_module, "_REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(
+        multinode_module, "_REMOTE_CONTAINER_REPOSITORY_BASE", repository
+    )
     monkeypatch.setattr(
         multinode_module, "_command_stdout", lambda *args, **kwargs: "b" * 40
     )

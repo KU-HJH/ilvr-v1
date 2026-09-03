@@ -20,12 +20,13 @@ from src.multinode_capacity import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def test_capacity_parent_is_reserved_locally_then_remotely_before_child(
     monkeypatch,
 ):
-    result_root = Path(
-        "/root/workspace/ILVR/results/task12-capacity/capacity"
-    )
+    result_root = REPO_ROOT / "results/task12-capacity/capacity"
     parent_run_id = "capacity-parent"
     destination = result_root / parent_run_id
     events = []
@@ -43,15 +44,15 @@ def test_capacity_parent_is_reserved_locally_then_remotely_before_child(
             "/usr/bin/docker",
             "exec",
             "--workdir",
-            "/root/workspace/ILVR",
+            str(REPO_ROOT),
             "llm_kd",
             "/usr/bin/bash",
             "-lc",
         ]
         assert shlex.split(remote_argv[7]) == [
             "/usr/bin/env",
-            "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-            "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+            f"PYTHONPATH={REPO_ROOT}:{REPO_ROOT / 'src'}",
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
             "-m",
             "src.multinode",
             "prepare-evaluation-output",
@@ -83,9 +84,7 @@ def test_capacity_remote_parent_reservation_failure_prevents_child_launch(
     )
     runner = SubprocessCapacityRunner(
         parent_run_id="capacity-parent",
-        result_root=Path(
-            "/root/workspace/ILVR/results/task12-capacity/capacity"
-        ),
+        result_root=REPO_ROOT / "results/task12-capacity/capacity",
         training_runner=lambda *_args, **_kwargs: launched.append(True),
         control_runner=lambda command, **_kwargs: subprocess.CompletedProcess(
             command, 5, stdout="", stderr="remote reservation refused"
@@ -211,7 +210,9 @@ def _write_witness(
                 "world_size": 4,
                 "machine_ranks": [0, 1],
                 "exit_codes": {"0": 0, "1": 0},
-                "checkpoint_path": f"/root/workspace/ILVR/checkpoints/{child_run_id}",
+                "checkpoint_path": str(
+                    REPO_ROOT / "checkpoints" / child_run_id
+                ),
                 "finite_loss_evidence": {
                     "status": "validated",
                     "path": str(producer),
@@ -247,7 +248,7 @@ class FakeCapacityRunner:
                 )
             return ChildExecution(returncode=0, evidence=())
         log_path = (
-            Path("/root/workspace/ILVR/logs/zero-stage-compatibility")
+            REPO_ROOT / "logs/zero-stage-compatibility"
             / child_run_id
             / "initial-train.log"
         )
@@ -585,8 +586,8 @@ def test_subprocess_runner_rejects_remote_evidence_outside_exact_child(tmp_path)
         ]
         assert shlex.split(remote_argv[5]) == [
             "env",
-            "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-            "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+            f"PYTHONPATH={REPO_ROOT}:{REPO_ROOT / 'src'}",
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
             "-m",
             "src.multinode",
             "capacity-evidence-show",
@@ -677,7 +678,7 @@ def test_wrapper_help_and_dry_run_are_local_and_do_not_publish():
     assert help_result.returncode == 0, help_result.stderr
 
     run_id = "capacity-stage1-dry-run-test"
-    parent_result = Path("/root/workspace/ILVR/results") / run_id
+    parent_result = REPO_ROOT / "results" / run_id
     assert not parent_result.exists()
     dry_result = subprocess.run(
         (
@@ -719,7 +720,7 @@ def test_task12_capacity_invocation_shape_dry_runs_without_publication():
     repository = Path(__file__).resolve().parents[2]
     wrapper = repository / "run_multinode_stage1_batch_probe.sh"
     run_id = "task12-stage1-capacity-lora-zero3-dry"
-    capacity_root = Path("/root/workspace/ILVR/results/task12-dry/capacity")
+    capacity_root = REPO_ROOT / "results/task12-dry/capacity"
     parent_result = capacity_root / run_id
     assert not parent_result.exists()
 

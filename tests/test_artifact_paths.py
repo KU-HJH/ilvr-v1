@@ -3,11 +3,20 @@ from pathlib import Path
 
 import pytest
 
+import src.artifact_paths as artifact_paths
 from src.artifact_paths import (
     resolve_run_artifact_paths,
     require_canonical_artifact_path,
     validate_generated_artifact_paths,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_canonical_repository_root_is_the_active_checkout():
+    """Catches generated artifacts escaping the active checkout."""
+    assert artifact_paths.CANONICAL_REPOSITORY_ROOT == REPO_ROOT
 
 
 @pytest.fixture
@@ -26,15 +35,15 @@ def test_run_paths_share_one_experiment_identifier():
     """Catches a run writing related artifacts beneath different experiment IDs."""
     paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
 
-    assert paths.checkpoint_dir == Path(
-        "/root/workspace/ILVR/checkpoints/stage1-zero2-dora-mb4-ga2-candidate"
+    assert paths.checkpoint_dir == (
+        REPO_ROOT / "checkpoints/stage1-zero2-dora-mb4-ga2-candidate"
     )
-    assert paths.result_dir == Path(
-        "/root/workspace/ILVR/results/stage1-zero2-dora-mb4-ga2-candidate"
+    assert paths.result_dir == (
+        REPO_ROOT / "results/stage1-zero2-dora-mb4-ga2-candidate"
     )
-    assert paths.log_dir == Path(
-        "/root/workspace/ILVR/logs/zero-stage-compatibility/"
-        "stage1-zero2-dora-mb4-ga2-candidate"
+    assert paths.log_dir == (
+        REPO_ROOT
+        / "logs/zero-stage-compatibility/stage1-zero2-dora-mb4-ga2-candidate"
     )
     assert paths.result_dir.name == paths.checkpoint_dir.name
     assert paths.log_dir.name == paths.checkpoint_dir.name
@@ -57,9 +66,7 @@ def test_worktree_local_outputs_are_not_canonical():
 
 def test_canonical_checkpoint_path_preserves_repository_symlink_spelling():
     """Catches validation returning the checkpoint symlink's storage target."""
-    canonical = Path(
-        "/root/workspace/ILVR/checkpoints/example-run"
-    )
+    canonical = REPO_ROOT / "checkpoints/example-run"
 
     assert require_canonical_artifact_path(canonical, kind="checkpoint") == canonical
 
@@ -95,7 +102,7 @@ def test_owned_training_evidence_supports_nested_capacity_result_root(stage1_arg
     stage1_args.save_model_path = str(paths.checkpoint_dir)
     stage1_args.log_file = str(paths.log_dir / "initial-train.log")
     stage1_args.training_evidence_path = str(
-        Path("/root/workspace/ILVR/results/hardware/capacity")
+        REPO_ROOT / "results/hardware/capacity"
         / run_id
         / "initial-producer-evidence.json"
     )
@@ -103,7 +110,7 @@ def test_owned_training_evidence_supports_nested_capacity_result_root(stage1_arg
     assert validate_generated_artifact_paths(stage1_args) == paths
 
     stage1_args.training_evidence_path = str(
-        Path("/root/workspace/ILVR/results/hardware/capacity/wrong-run")
+        REPO_ROOT / "results/hardware/capacity/wrong-run"
         / "initial-producer-evidence.json"
     )
     with pytest.raises(ValueError, match="experiment ID"):
@@ -116,7 +123,7 @@ def test_owned_stage2_evidence_supports_nested_batch1_result_root(stage1_args):
     stage1_args.save_model_path = str(paths.checkpoint_dir)
     stage1_args.log_file = str(paths.log_dir / "initial-train.log")
     stage1_args.benchmark_evidence_path = str(
-        Path("/root/workspace/ILVR/results/hardware/capacity/stage2-batch1")
+        REPO_ROOT / "results/hardware/capacity/stage2-batch1"
         / run_id
         / "initial-producer-evidence.json"
     )
@@ -124,7 +131,7 @@ def test_owned_stage2_evidence_supports_nested_batch1_result_root(stage1_args):
     assert validate_generated_artifact_paths(stage1_args) == paths
 
     stage1_args.benchmark_evidence_path = str(
-        Path("/root/workspace/ILVR/results/hardware/capacity/stage2-batch1/wrong-run")
+        REPO_ROOT / "results/hardware/capacity/stage2-batch1/wrong-run"
         / "initial-producer-evidence.json"
     )
     with pytest.raises(ValueError, match="experiment ID"):
@@ -136,14 +143,14 @@ def test_multinode_direct_artifact_tuple_rejects_legacy_nested_checkpoint(
 ):
     run_id = "multinode-four-gpu-stage2-full-zero1"
     paths = resolve_run_artifact_paths(run_id)
-    stage1_args.save_model_path = str(Path("/root/workspace/ILVR/checkpoints") / run_id)
+    stage1_args.save_model_path = str(REPO_ROOT / "checkpoints" / run_id)
     stage1_args.log_file = str(
-        Path("/root/workspace/ILVR/logs/zero-stage-compatibility")
+        REPO_ROOT / "logs/zero-stage-compatibility"
         / run_id
         / "initial-train.log"
     )
     stage1_args.benchmark_evidence_path = str(
-        Path("/root/workspace/ILVR/results")
+        REPO_ROOT / "results"
         / run_id
         / "initial-producer-evidence.json"
     )
@@ -151,7 +158,7 @@ def test_multinode_direct_artifact_tuple_rejects_legacy_nested_checkpoint(
     assert validate_generated_artifact_paths(stage1_args) == paths
 
     stage1_args.save_model_path = str(
-        Path("/root/workspace/ILVR/checkpoints/zero-stage-compatibility") / run_id
+        REPO_ROOT / "checkpoints/zero-stage-compatibility" / run_id
     )
     with pytest.raises(ValueError, match="share one experiment ID"):
         validate_generated_artifact_paths(stage1_args)
