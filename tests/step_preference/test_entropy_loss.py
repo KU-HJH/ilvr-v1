@@ -149,6 +149,27 @@ def test_token_entropies_ignores_nonfinite_logits_outside_the_target_mask():
     assert torch.allclose(actual, torch.tensor([_entropy([0.25, 0.75])]), atol=1e-6)
 
 
+def test_token_entropies_runs_log_softmax_on_exact_selected_target_rows(monkeypatch):
+    """Catches reintroducing a full-sequence float32 softmax graph before masking."""
+    logits = torch.zeros((2, 4, 3))
+    target_mask = torch.tensor(
+        [[False, True, False, True], [False, False, True, False]]
+    )
+    real_log_softmax = torch.nn.functional.log_softmax
+    seen_shapes = []
+
+    def recording_log_softmax(values, *args, **kwargs):
+        seen_shapes.append(tuple(values.shape))
+        return real_log_softmax(values, *args, **kwargs)
+
+    monkeypatch.setattr("step_preference.entropy_loss.F.log_softmax", recording_log_softmax)
+
+    actual = token_entropies(logits, target_mask)
+
+    assert actual.shape == (3,)
+    assert seen_shapes == [(3, 3)]
+
+
 def test_entropy_margin_loss_promotes_bfloat16_logits_and_preserves_finite_gradients():
     """Catches BF16 entropy reduction losing precision or disconnecting either policy branch."""
     clean = _logits([0.5, 0.5], [0.8, 0.2], [0.5, 0.5]).to(torch.bfloat16).requires_grad_()
