@@ -73,14 +73,20 @@ def mean_completion_logps(
     ``i`` is scored from the causal logits at index ``i - 1``.
     """
     _validate_target_inputs(logits, input_ids, target_mask)
-    next_log_probs = F.log_softmax(logits[:, :-1].float(), dim=-1)
-    next_ids = input_ids[:, 1:]
     selected = target_mask[:, 1:]
-    token_logps = next_log_probs.gather(-1, next_ids.unsqueeze(-1)).squeeze(-1)
-    if not torch.isfinite(token_logps[selected]).all():
+    selected_logits = logits[:, :-1][selected].float()
+    selected_ids = input_ids[:, 1:][selected]
+    selected_logps = F.log_softmax(selected_logits, dim=-1).gather(
+        -1, selected_ids.unsqueeze(-1)
+    ).squeeze(-1)
+    if not torch.isfinite(selected_logps).all():
         raise ValueError("selected next-token log probabilities must be finite")
-    weights = selected.to(token_logps.dtype)
-    return (token_logps * weights).sum(dim=1) / weights.sum(dim=1)
+    batch_indices = torch.arange(logits.shape[0], device=logits.device).unsqueeze(1)
+    batch_indices = batch_indices.expand_as(selected)[selected]
+    sums = torch.zeros(logits.shape[0], device=logits.device, dtype=selected_logps.dtype)
+    sums.scatter_add_(0, batch_indices, selected_logps)
+    counts = selected.sum(dim=1).to(selected_logps.dtype)
+    return sums / counts
 
 
 def _validate_score_tensors(*scores: torch.Tensor) -> None:

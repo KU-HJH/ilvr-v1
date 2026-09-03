@@ -54,12 +54,12 @@ def _validate_logits_and_mask(logits: torch.Tensor, target_mask: torch.Tensor) -
 def token_entropies(logits: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
     """Return float32 Shannon entropies at selected logical target positions."""
     _validate_logits_and_mask(logits, target_mask)
-    log_probs = F.log_softmax(logits[:, :-1].float(), dim=-1)
+    selected_logits = logits[:, :-1][target_mask[:, 1:]].float()
+    log_probs = F.log_softmax(selected_logits, dim=-1)
     entropies = -(log_probs.exp() * log_probs).sum(dim=-1)
-    selected = entropies[target_mask[:, 1:]]
-    if not torch.isfinite(selected).all():
+    if not torch.isfinite(entropies).all():
         raise ValueError("selected token entropies must be finite")
-    return selected
+    return entropies
 
 
 def _zero(clean_logits: torch.Tensor) -> torch.Tensor:

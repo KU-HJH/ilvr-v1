@@ -158,3 +158,21 @@ def test_mean_completion_logps_rejects_empty_or_noncausal_target_selection():
         mean_completion_logps(logits, input_ids, torch.tensor([[False, False, False]]))
     with pytest.raises(ValueError, match="position 0"):
         mean_completion_logps(logits, input_ids, torch.tensor([[True, False, True]]))
+
+
+def test_mean_completion_logps_ignores_unselected_invalid_ids_and_nonfinite_logits():
+    """Catches gathering every sequence ID or multiplying unselected NaNs by zero."""
+    logits = torch.tensor(
+        [[
+            [math.log(0.25), math.log(0.75)],
+            [float("nan"), float("nan")],
+            [float("nan"), float("nan")],
+            [float("nan"), float("nan")],
+        ]]
+    )
+    input_ids = torch.tensor([[0, 1, 0, 99]])
+    target_mask = torch.tensor([[False, True, False, False]])
+
+    actual = mean_completion_logps(logits, input_ids, target_mask)
+
+    assert torch.allclose(actual, torch.tensor([math.log(0.75)]), atol=1e-6)

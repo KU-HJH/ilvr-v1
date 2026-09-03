@@ -132,6 +132,23 @@ def test_token_entropies_rejects_empty_or_noncausal_target_selection():
         token_entropies(logits, torch.tensor([[True, False, True]]))
 
 
+def test_token_entropies_ignores_nonfinite_logits_outside_the_target_mask():
+    """Catches selected entropy being contaminated by unrelated sequence positions."""
+    logits = torch.tensor(
+        [[
+            [math.log(0.25), math.log(0.75)],
+            [float("nan"), float("nan")],
+            [float("nan"), float("nan")],
+            [float("nan"), float("nan")],
+        ]]
+    )
+    target_mask = torch.tensor([[False, True, False, False]])
+
+    actual = token_entropies(logits, target_mask)
+
+    assert torch.allclose(actual, torch.tensor([_entropy([0.25, 0.75])]), atol=1e-6)
+
+
 def test_entropy_margin_loss_promotes_bfloat16_logits_and_preserves_finite_gradients():
     """Catches BF16 entropy reduction losing precision or disconnecting either policy branch."""
     clean = _logits([0.5, 0.5], [0.8, 0.2], [0.5, 0.5]).to(torch.bfloat16).requires_grad_()
