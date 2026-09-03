@@ -1522,6 +1522,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if (
             self.config._attn_implementation == "sdpa"
             and attention_mask is not None
+            and attention_mask.dim() == 2
             and attention_mask.device.type in ["cuda", "xpu"]
             and not output_attentions
         ):
@@ -1631,6 +1632,8 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
             heads.
         rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
             The rope index difference between sequence length and multimodal rope.
+        stage2_selected_logits (`torch.FloatTensor` of shape `(1, num_positions, config.vocab_size)`, *optional*):
+            Stage 2 logits for the requested physical final-decoder query rows.
     """
 
     loss: Optional[torch.FloatTensor] = None
@@ -1642,6 +1645,7 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     inputs_embeds: Optional[torch.FloatTensor] = None
     stage2_latent_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     stage2_diagnostics: Optional[Dict[str, torch.Tensor]] = None
+    stage2_selected_logits: Optional[torch.FloatTensor] = None
 
 
 QWEN2_5_VL_INPUTS_DOCSTRING = r"""
@@ -1987,6 +1991,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         collect_stage2_diagnostics: bool,
         retain_stage2_latent_grads: bool,
         stage2_loss_only: bool,
+        stage2_final_attention_mask: Optional[torch.Tensor],
+        stage2_logit_positions: Optional[torch.LongTensor],
+        stage2_selective_logits_only: bool,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         if input_ids is None:
             raise ValueError("Stage 2 forward requires input_ids")
@@ -1996,6 +2003,41 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             raise ValueError("Stage 2 loss-only forward requires labels")
         if stage2_loss_only and not return_dict:
             raise ValueError("Stage 2 loss-only forward requires return_dict=True")
+        if stage2_selective_logits_only and stage2_logit_positions is None:
+            raise ValueError(
+                "stage2_selective_logits_only requires stage2_logit_positions"
+            )
+        if stage2_selective_logits_only and labels is not None and not stage2_loss_only:
+            raise ValueError(
+                "stage2_selective_logits_only cannot compute full-sequence label loss"
+            )
+
+        selected_positions = None
+        if stage2_logit_positions is not None:
+            if (
+                not isinstance(stage2_logit_positions, torch.Tensor)
+                or stage2_logit_positions.ndim != 1
+                or stage2_logit_positions.numel() == 0
+                or stage2_logit_positions.dtype
+                not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+            ):
+                raise ValueError(
+                    "stage2_logit_positions must be a nonempty 1-D integer tensor"
+                )
+            if torch.unique(stage2_logit_positions).numel() != stage2_logit_positions.numel():
+                raise ValueError("stage2_logit_positions must be unique")
+            sequence_length = input_ids.shape[1]
+            if (
+                int(stage2_logit_positions.min()) < 0
+                or int(stage2_logit_positions.max()) >= sequence_length
+            ):
+                raise ValueError(
+                    "stage2_logit_positions must be in range for the final decoder sequence"
+                )
+            selected_positions = stage2_logit_positions.to(
+                device=input_ids.device,
+                dtype=torch.long,
+            )
 
         base_inputs_embeds = self.prepare_stage2_base_inputs_embeds(
             input_ids=input_ids,
@@ -2005,6 +2047,27 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
         attention_mask = attention_mask.to(base_inputs_embeds.device)
+        if stage2_final_attention_mask is not None:
+            expected_mask_shape = (
+                1,
+                1,
+                input_ids.shape[1],
+                input_ids.shape[1],
+            )
+            if (
+                not isinstance(stage2_final_attention_mask, torch.Tensor)
+                or tuple(stage2_final_attention_mask.shape) != expected_mask_shape
+                or stage2_final_attention_mask.dtype != base_inputs_embeds.dtype
+                or stage2_final_attention_mask.device != base_inputs_embeds.device
+            ):
+                raise ValueError(
+                    "stage2_final_attention_mask must have shape [1, 1, L, L] "
+                    "in the decoder compute dtype and device"
+                )
+            if self.config._attn_implementation == "flash_attention_2":
+                raise ValueError(
+                    "stage2_final_attention_mask is not supported with flash_attention_2"
+                )
 
         stage2_rope_deltas = None
         if position_ids is None:
@@ -2038,13 +2101,18 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
         final_outputs = language_model(
             inputs_embeds=rollout.final_inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=(
+                attention_mask
+                if stage2_final_attention_mask is None
+                else stage2_final_attention_mask
+            ),
             position_ids=full_position_ids,
             use_cache=False,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
         )
+        selected_logits = None
         if stage2_loss_only:
             shift_labels = labels[..., 1:].contiguous().view(-1).to(
                 final_outputs.last_hidden_state.device
@@ -2060,6 +2128,18 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             active_logits = self.lm_head(shifted_hidden[active]).float()
             loss = CrossEntropyLoss()(active_logits, shift_labels[active])
             logits = None
+            if selected_positions is not None:
+                selected_hidden = final_outputs.last_hidden_state.index_select(
+                    1, selected_positions
+                )
+                selected_logits = self.lm_head(selected_hidden)
+        elif stage2_selective_logits_only:
+            selected_hidden = final_outputs.last_hidden_state.index_select(
+                1, selected_positions
+            )
+            selected_logits = self.lm_head(selected_hidden)
+            logits = None
+            loss = None
         else:
             logits = self.lm_head(final_outputs.last_hidden_state)
             loss = None
@@ -2070,6 +2150,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 )
                 shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
                 loss = CrossEntropyLoss()(shift_logits, shift_labels)
+            if selected_positions is not None:
+                selected_logits = logits.index_select(1, selected_positions)
 
         diagnostics = None
         if rollout.diagnostics is not None:
@@ -2096,6 +2178,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 stage2_outputs += (rollout.latent_states,)
             if collect_stage2_diagnostics:
                 stage2_outputs += (diagnostics,)
+            if selected_logits is not None:
+                stage2_outputs += (selected_logits,)
             output = (logits,) + decoder_outputs + stage2_outputs
             return (loss,) + output if loss is not None else output
 
@@ -2109,6 +2193,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             inputs_embeds=rollout.final_inputs_embeds,
             stage2_latent_states=rollout.latent_states if return_stage2_latent_states else None,
             stage2_diagnostics=diagnostics,
+            stage2_selected_logits=selected_logits,
         )
 
     @add_start_docstrings_to_model_forward(QWEN2_5_VL_INPUTS_DOCSTRING)
@@ -2141,6 +2226,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         collect_stage2_diagnostics: bool = False,
         retain_stage2_latent_grads: bool = False,
         stage2_loss_only: bool = False,
+        stage2_final_attention_mask: Optional[torch.Tensor] = None,
+        stage2_logit_positions: Optional[torch.LongTensor] = None,
+        stage2_selective_logits_only: bool = False,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2183,6 +2271,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 collect_stage2_diagnostics=collect_stage2_diagnostics,
                 retain_stage2_latent_grads=retain_stage2_latent_grads,
                 stage2_loss_only=stage2_loss_only,
+                stage2_final_attention_mask=stage2_final_attention_mask,
+                stage2_logit_positions=stage2_logit_positions,
+                stage2_selective_logits_only=stage2_selective_logits_only,
             )
 
         # ===================================================================
