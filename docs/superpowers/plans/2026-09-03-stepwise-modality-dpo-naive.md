@@ -373,6 +373,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-v
 ```bash
 PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/python scripts/verify_step_preference_phase_a.py \
   --negative_manifest "results/$run_id/negative-manifest.json" \
+  --negative_path "results/$run_id/negatives.jsonl" \
   --training_log "logs/$run_id/stage2b.log" \
   --checkpoint_path "checkpoints/$run_id" \
   --output_path "results/$run_id/phase-a-verification.json"

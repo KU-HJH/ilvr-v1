@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import json
 import logging
 import math
 import os
@@ -99,6 +100,18 @@ from step_preference.negatives import (
 from step_preference.spans import reject_duplicate_sample_ids
 
 platform.python_version = _platform_python_version
+
+
+_PHASE_A_SUMMARY_PREFIX = "STEP_PREFERENCE_PHASE_A_SUMMARY "
+_PHASE_A_METRIC_NAMES = (
+    "loss/ce",
+    "loss/dpo_visual",
+    "loss/dpo_text",
+    "loss/entropy_visual",
+    "loss/entropy_text",
+    "stats/valid_visual_pairs",
+    "stats/valid_textual_pairs",
+)
 
 
 @dataclass(frozen=True)
@@ -770,6 +783,39 @@ def publish_stage2_training_evidence(args, *, trainer, train_result, profile):
     )
 
 
+def publish_step_preference_phase_a_summary(args, *, trainer, train_result):
+    """Log one rank-zero scalar summary for the focused Stage 2B verifier."""
+    config = getattr(args, "step_preference_config", None)
+    if config is None:
+        config = StepPreferenceConfig.from_args(args)
+    if not config.is_stage2b or not trainer.is_world_process_zero():
+        return None
+    latest = next(
+        (
+            entry
+            for entry in reversed(trainer.state.log_history)
+            if isinstance(entry, Mapping)
+            and all(name in entry for name in _PHASE_A_METRIC_NAMES)
+        ),
+        None,
+    )
+    if latest is None:
+        raise ValueError("Stage 2B trainer log history has no complete metric record")
+    summary = {
+        "schema_version": 1,
+        "global_step": trainer.state.global_step,
+        "optimizer_step": trainer._observed_optimizer_step,
+        "training_loss": train_result.training_loss,
+        "gradient_norm": trainer._representative_gradient_norm,
+        "metrics": {name: latest[name] for name in _PHASE_A_METRIC_NAMES},
+    }
+    encoded = json.dumps(
+        summary, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    logging.info(_PHASE_A_SUMMARY_PREFIX + encoded)
+    return summary
+
+
 def run_stage2(args):
     """Run the existing Stage 2 path without importing Stage 1 Trainer code."""
 
@@ -795,6 +841,9 @@ def run_stage2(args):
     trainer = components.trainer_class(**trainer_kwargs)
     train_result = trainer.train(
         resume_from_checkpoint=components.trainer_resume_path
+    )
+    publish_step_preference_phase_a_summary(
+        args, trainer=trainer, train_result=train_result
     )
     publish_stage2_training_evidence(
         args, trainer=trainer, train_result=train_result, profile=profile
