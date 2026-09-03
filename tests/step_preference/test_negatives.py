@@ -48,8 +48,9 @@ def _identity(tmp_path):
     }
 
 
-def _expected_identity(identity):
+def _expected_identity(identity, source_path):
     return {
+        "source_path": source_path,
         "expected_source_sha256": identity["source_sha256"],
         "expected_selected_row_indices": identity["selected_row_indices"],
         "expected_stage2a_checkpoint_path": identity["stage2a_checkpoint_path"],
@@ -144,7 +145,7 @@ def test_write_and_load_artifact_bind_raw_bytes_and_every_expected_identity(tmp_
         negative_path=negatives_path,
         manifest_path=manifest_path,
         expected_keys=(("sample-a", 0),),
-        **_expected_identity(identity),
+        **_expected_identity(identity, source),
     )
 
     assert manifest.source_sha256 == SOURCE_SHA256
@@ -185,7 +186,7 @@ def test_load_negative_store_rejects_duplicate_join_identity(tmp_path):
             negative_path=negatives_path,
             manifest_path=manifest_path,
             expected_keys=(("sample-a", 0),),
-            **_expected_identity(identity),
+            **_expected_identity(identity, source),
         )
     assert manifest.negative_sha256 != ""
 
@@ -205,10 +206,11 @@ def test_load_negative_store_rejects_manifest_identity_and_missing_rows(tmp_path
         **identity,
     )
 
-    with pytest.raises(ValueError, match="source SHA-256 does not match"):
+    with pytest.raises(ValueError, match="source JSONL SHA-256 does not match"):
         load_negative_store(
             negative_path=negatives_path,
             manifest_path=manifest_path,
+            source_path=source,
             expected_source_sha256="b" * 64,
             expected_selected_row_indices=(0,),
             expected_stage2a_checkpoint_path=identity["stage2a_checkpoint_path"],
@@ -223,7 +225,7 @@ def test_load_negative_store_rejects_manifest_identity_and_missing_rows(tmp_path
             negative_path=negatives_path,
             manifest_path=manifest_path,
             expected_keys=(("sample-a", 0), ("sample-a", 1)),
-            **_expected_identity(identity),
+            **_expected_identity(identity, source),
         )
 
 
@@ -248,7 +250,7 @@ def test_load_negative_store_rejects_changed_checkpoint_file_or_jsonl_bytes(tmp_
             negative_path=negatives_path,
             manifest_path=manifest_path,
             expected_keys=(("sample-a", 0),),
-            **_expected_identity(identity),
+            **_expected_identity(identity, source),
         )
 
     (tmp_path / "stage2a" / "config.json").write_bytes(b"checkpoint-content\n")
@@ -258,7 +260,75 @@ def test_load_negative_store_rejects_changed_checkpoint_file_or_jsonl_bytes(tmp_
             negative_path=negatives_path,
             manifest_path=manifest_path,
             expected_keys=(("sample-a", 0),),
-            **_expected_identity(identity),
+            **_expected_identity(identity, source),
+        )
+
+
+def test_load_negative_store_rejects_changed_source_bytes_despite_repeated_digest(tmp_path):
+    """Catches callers reusing a manifest digest after the source JSONL changed."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negatives_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "negative-manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negatives_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    source.write_bytes(b'{"row":2}\n')
+
+    with pytest.raises(ValueError, match="source JSONL SHA-256 does not match"):
+        load_negative_store(
+            negative_path=negatives_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(identity, source),
+        )
+
+
+def test_generation_settings_preserve_nested_list_object_distinction(tmp_path):
+    """Catches serializing a JSON list of pairs as an indistinguishable object."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    list_identity = _identity(tmp_path)
+    list_identity["generation_settings"] = {"payload": [["key", 1]]}
+    object_identity = dict(list_identity)
+    object_identity["generation_settings"] = {"payload": {"key": 1}}
+    list_path = tmp_path / "list-negatives.jsonl"
+    list_manifest_path = tmp_path / "list-manifest.json"
+    object_path = tmp_path / "object-negatives.jsonl"
+    object_manifest_path = tmp_path / "object-manifest.json"
+
+    write_negative_artifact(
+        negative_path=list_path,
+        manifest_path=list_manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **list_identity,
+    )
+    write_negative_artifact(
+        negative_path=object_path,
+        manifest_path=object_manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **object_identity,
+    )
+
+    assert json.loads(list_manifest_path.read_text(encoding="utf-8"))["generation_settings"] == {
+        "payload": [["key", 1]]
+    }
+    assert json.loads(object_manifest_path.read_text(encoding="utf-8"))["generation_settings"] == {
+        "payload": {"key": 1}
+    }
+    with pytest.raises(ValueError, match="generation settings do not match"):
+        load_negative_store(
+            negative_path=list_path,
+            manifest_path=list_manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(object_identity, source),
         )
 
 
@@ -272,7 +342,7 @@ def test_negative_manifest_is_immutable():
         checkpoint_files=(CheckpointFile("config.json", 19, CHECKPOINT_SHA256),),
         tokenizer_config_identity="tokenizer-config-v1",
         latent_size=8,
-        generation_settings=(("max_new_tokens", 32),),
+        generation_settings={"max_new_tokens": 32},
         negative_sha256="c" * 64,
     )
 

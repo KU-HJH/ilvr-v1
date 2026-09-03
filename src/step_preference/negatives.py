@@ -54,26 +54,23 @@ def _freeze_json(value):
             if not isinstance(key, str):
                 raise ValueError("generation setting keys must be strings")
             frozen.append((key, _freeze_json(item)))
-        return tuple(sorted(frozen))
+        return ("object", tuple(sorted(frozen)))
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_json(item) for item in value)
+        return ("array", tuple(_freeze_json(item) for item in value))
     raise ValueError("generation settings must be JSON values")
 
 
 def _thaw_json(value):
-    if isinstance(value, tuple):
-        if all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) for item in value):
-            return {key: _thaw_json(item) for key, item in value}
-        return [_thaw_json(item) for item in value]
+    if isinstance(value, tuple) and len(value) == 2 and value[0] == "object":
+        return {key: _thaw_json(item) for key, item in value[1]}
+    if isinstance(value, tuple) and len(value) == 2 and value[0] == "array":
+        return [_thaw_json(item) for item in value[1]]
     return value
 
 
-def _normalize_generation_settings(value) -> tuple[tuple[str, object], ...]:
+def _normalize_generation_settings(value):
     frozen = _freeze_json(value)
-    if not isinstance(frozen, tuple) or not all(
-        isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
-        for item in frozen
-    ):
+    if not (isinstance(frozen, tuple) and len(frozen) == 2 and frozen[0] == "object"):
         raise ValueError("generation_settings must be a JSON object")
     return frozen
 
@@ -154,7 +151,7 @@ class NegativeManifest:
     checkpoint_files: tuple[CheckpointFile, ...]
     tokenizer_config_identity: str
     latent_size: int
-    generation_settings: tuple[tuple[str, object], ...]
+    generation_settings: object
     negative_sha256: str
 
     def __post_init__(self) -> None:
@@ -182,10 +179,9 @@ class NegativeManifest:
         if not isinstance(self.tokenizer_config_identity, str) or not self.tokenizer_config_identity:
             raise ValueError("tokenizer_config_identity must be a non-empty string")
         _require_int("latent_size", self.latent_size, minimum=1)
-        if self.generation_settings != _normalize_generation_settings(
-            self.generation_settings
-        ):
-            raise ValueError("generation_settings must be normalized immutable JSON")
+        object.__setattr__(
+            self, "generation_settings", _normalize_generation_settings(self.generation_settings)
+        )
 
 
 def filter_negative(
@@ -259,7 +255,7 @@ def write_negative_artifact(
         checkpoint_files=tuple(checkpoint_files),
         tokenizer_config_identity=tokenizer_config_identity,
         latent_size=latent_size,
-        generation_settings=_normalize_generation_settings(generation_settings),
+        generation_settings=generation_settings,
         negative_sha256=hashlib.sha256(negative_bytes).hexdigest(),
     )
     negative_path = Path(negative_path)
@@ -336,7 +332,7 @@ def _manifest_from_bytes(raw: bytes) -> NegativeManifest:
         checkpoint_files=tuple(checkpoint_files),
         tokenizer_config_identity=payload["tokenizer_config_identity"],
         latent_size=payload["latent_size"],
-        generation_settings=_normalize_generation_settings(payload["generation_settings"]),
+        generation_settings=payload["generation_settings"],
         negative_sha256=payload["negative_sha256"],
     )
 
@@ -373,6 +369,7 @@ def load_negative_store(
     *,
     negative_path: str | Path,
     manifest_path: str | Path,
+    source_path: str | Path,
     expected_source_sha256: str,
     expected_selected_row_indices: Sequence[int],
     expected_stage2a_checkpoint_path: str | Path,
@@ -385,8 +382,14 @@ def load_negative_store(
     """Fail closed unless artifact bytes and every frozen producer identity agree."""
     manifest = _manifest_from_bytes(_read_regular_file(manifest_path, "negative manifest"))
     expected_checkpoint_path = str(Path(expected_stage2a_checkpoint_path).resolve(strict=True))
-    if manifest.source_sha256 != expected_source_sha256:
-        raise ValueError("source SHA-256 does not match")
+    current_source_sha256 = hashlib.sha256(
+        _read_regular_file(source_path, "source JSONL")
+    ).hexdigest()
+    if (
+        current_source_sha256 != manifest.source_sha256
+        or current_source_sha256 != expected_source_sha256
+    ):
+        raise ValueError("source JSONL SHA-256 does not match")
     if manifest.selected_row_indices != tuple(expected_selected_row_indices):
         raise ValueError("selected row indices do not match")
     if manifest.stage2a_checkpoint_path != expected_checkpoint_path:
