@@ -190,17 +190,43 @@ def test_tree_plan_requires_128_token_flex_alignment():
         )
 
 
-def test_tree_plan_rejects_overlapping_consecutive_step_trajectories():
-    """Catches contiguous IDs being mistaken for ordered clean-step spans."""
+def test_tree_plan_accepts_adjacent_steps_that_share_target_and_previous_text():
+    """Catches rejecting the canonical text-latent-text-latent-text trajectory."""
     clean_ids, spans, joined = _two_step_fixture()
-    overlapping_step = ReasoningStepSpan(1, 5, 7, 7, 8, 9, 11, None)
-    overlapping_joined = list(joined)
-    overlapping_joined[1] = dict(overlapping_joined[1], span=overlapping_step)
+    shared_step = ReasoningStepSpan(1, 4, 6, 7, 8, 9, 11, None)
+    shared_joined = list(joined)
+    shared_joined[1] = dict(shared_joined[1], span=shared_step)
+
+    plan = build_packed_tree_plan(
+        clean_input_ids=clean_ids,
+        attention_mask=torch.ones_like(clean_ids),
+        reasoning_spans=(spans[0], shared_step),
+        joined_steps=tuple(shared_joined),
+    )
+
+    assert plan.root_selected_positions == (3, 4, 8, 9)
+
+
+@pytest.mark.parametrize(
+    "malformed_step",
+    (
+        ReasoningStepSpan(1, 5, 7, 7, 8, 9, 11, None),
+        ReasoningStepSpan(1, 2, 3, 7, 8, 9, 11, None),
+    ),
+    ids=("partial-overlap", "reordered"),
+)
+def test_tree_plan_rejects_partial_or_reordered_consecutive_trajectories(
+    malformed_step,
+):
+    """Catches treating any prior-text overlap as canonical step adjacency."""
+    clean_ids, spans, joined = _two_step_fixture()
+    malformed_joined = list(joined)
+    malformed_joined[1] = dict(malformed_joined[1], span=malformed_step)
 
     with pytest.raises(ValueError, match="trajectory"):
         build_packed_tree_plan(
             clean_input_ids=clean_ids,
             attention_mask=torch.ones_like(clean_ids),
-            reasoning_spans=(spans[0], overlapping_step),
-            joined_steps=tuple(overlapping_joined),
+            reasoning_spans=(spans[0], malformed_step),
+            joined_steps=tuple(malformed_joined),
         )

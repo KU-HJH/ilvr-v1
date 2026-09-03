@@ -103,6 +103,7 @@ def _validate_spans(
     if not spans:
         raise ValueError("packing requires at least one reasoning step")
     validated = tuple(spans)
+    previous_target_start = 0
     previous_target_end = 0
     for expected_step_id, span in enumerate(validated):
         if not isinstance(span, ReasoningStepSpan) or span.step_id != expected_step_id:
@@ -121,8 +122,15 @@ def _validate_spans(
             raise ValueError("reasoning spans must be ordered nonempty intervals in root")
         if span.target_text_start < 1:
             raise ValueError("reasoning target must have a causal prediction row")
-        if expected_step_id and span.prev_text_start < previous_target_end:
-            raise ValueError("reasoning spans must follow the clean trajectory")
+        if expected_step_id:
+            shares_previous_target = (
+                span.prev_text_start == previous_target_start
+                and span.prev_text_end == previous_target_end
+            )
+            follows_previous_target = span.prev_text_start >= previous_target_end
+            if not (shares_previous_target or follows_previous_target):
+                raise ValueError("reasoning spans must follow the clean trajectory")
+        previous_target_start = span.target_text_start
         previous_target_end = span.target_text_end
     return validated
 
