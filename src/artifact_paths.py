@@ -14,6 +14,7 @@ CANONICAL_EVALUATION_STAGING_ROOT = (
     CANONICAL_CHECKPOINT_ROOT / "evaluation-staging"
 )
 CANONICAL_RESULT_ROOT = CANONICAL_REPOSITORY_ROOT / "results"
+CANONICAL_REPOSITORY_LOG_ROOT = CANONICAL_REPOSITORY_ROOT / "logs"
 CANONICAL_LOG_ROOT = CANONICAL_REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
 EXPERIMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 
@@ -49,7 +50,7 @@ def require_canonical_artifact_path(
     roots = {
         "checkpoint": CANONICAL_CHECKPOINT_ROOT,
         "result": CANONICAL_RESULT_ROOT,
-        "log": CANONICAL_LOG_ROOT,
+        "log": CANONICAL_REPOSITORY_LOG_ROOT,
     }
     if path is None:
         raise ValueError(f"path must be below the canonical {kind} root: {roots[kind]}")
@@ -74,8 +75,18 @@ def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPa
     log_path = require_canonical_artifact_path(args.log_file, kind="log")
     experiment_id = checkpoint_dir.name
     paths = resolve_run_artifact_paths(experiment_id)
-    if checkpoint_dir != paths.checkpoint_dir or log_path.parent != paths.log_dir:
+    allowed_log_dirs = {
+        paths.log_dir,
+        CANONICAL_REPOSITORY_LOG_ROOT / experiment_id,
+    }
+    if checkpoint_dir != paths.checkpoint_dir or log_path.parent not in allowed_log_dirs:
         raise ValueError("checkpoint and log paths must share one experiment ID")
+    validated_paths = RunArtifactPaths(
+        experiment_id=experiment_id,
+        checkpoint_dir=paths.checkpoint_dir,
+        result_dir=paths.result_dir,
+        log_dir=log_path.parent,
+    )
     for attribute in (
         "benchmark_run_config",
         "benchmark_evidence_path",
@@ -107,7 +118,7 @@ def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPa
             raise ValueError(
                 "stage2_length_manifest must use the run stage2-length-manifest.json"
             )
-    return paths
+    return validated_paths
 
 
 def _json_paths(paths: RunArtifactPaths) -> str:

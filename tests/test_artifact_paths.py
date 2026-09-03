@@ -83,6 +83,21 @@ def test_generated_checkpoint_result_and_log_share_experiment_id(stage1_args):
     assert validate_generated_artifact_paths(stage1_args) == paths
 
 
+def test_generated_paths_accept_direct_repository_log_run_directory(stage1_args):
+    """Catches Task 10's logs/<run-id> layout being rejected as noncanonical."""
+    run_id = "step-preference-phase-a-20260903t132506z"
+    paths = resolve_run_artifact_paths(run_id)
+    direct_log_dir = REPO_ROOT / "logs" / run_id
+    stage1_args.save_model_path = str(paths.checkpoint_dir)
+    stage1_args.log_file = str(direct_log_dir / "stage2b.log")
+
+    validated = validate_generated_artifact_paths(stage1_args)
+
+    assert validated.checkpoint_dir == paths.checkpoint_dir
+    assert validated.result_dir == paths.result_dir
+    assert validated.log_dir == direct_log_dir
+
+
 def test_generated_paths_accept_only_the_run_stage2_length_manifest(stage1_args):
     paths = resolve_run_artifact_paths("stage2-zero2-dora-final")
     stage1_args.save_model_path = str(paths.checkpoint_dir)
