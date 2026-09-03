@@ -103,6 +103,7 @@ def _validate_spans(
     if not spans:
         raise ValueError("packing requires at least one reasoning step")
     validated = tuple(spans)
+    previous_target_end = 0
     for expected_step_id, span in enumerate(validated):
         if not isinstance(span, ReasoningStepSpan) or span.step_id != expected_step_id:
             raise ValueError("reasoning step IDs must be contiguous and start at zero")
@@ -120,6 +121,9 @@ def _validate_spans(
             raise ValueError("reasoning spans must be ordered nonempty intervals in root")
         if span.target_text_start < 1:
             raise ValueError("reasoning target must have a causal prediction row")
+        if expected_step_id and span.prev_text_start < previous_target_end:
+            raise ValueError("reasoning spans must follow the clean trajectory")
+        previous_target_end = span.target_text_end
     return validated
 
 
@@ -235,8 +239,8 @@ def build_packed_tree_plan(
     pad_to_multiple: int = 128,
 ) -> PackedTreePlan:
     """Build immutable metadata for one clean root and its causal sidecars."""
-    if type(pad_to_multiple) is not int or pad_to_multiple <= 0:
-        raise ValueError("pad_to_multiple must be a positive integer")
+    if pad_to_multiple != 128:
+        raise ValueError("pad_to_multiple must be 128 for FlexAttention blocks")
     clean_ids, root_length = _validate_clean_inputs(clean_input_ids, attention_mask)
     spans = _validate_spans(reasoning_spans, root_length)
     if len(joined_steps) != len(spans):

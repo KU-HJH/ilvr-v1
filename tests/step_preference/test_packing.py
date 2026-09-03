@@ -174,3 +174,33 @@ def test_tree_plan_rejects_noncontiguous_masks_and_pre_latent_rejected_prefixes(
             reasoning_spans=spans,
             joined_steps=tuple(invalid),
         )
+
+
+def test_tree_plan_requires_128_token_flex_alignment():
+    """Catches a caller creating a plan that cannot use Flex's fixed blocks."""
+    clean_ids, spans, joined = _two_step_fixture()
+
+    with pytest.raises(ValueError, match="128"):
+        build_packed_tree_plan(
+            clean_input_ids=clean_ids,
+            attention_mask=torch.ones_like(clean_ids),
+            reasoning_spans=spans,
+            joined_steps=joined,
+            pad_to_multiple=1,
+        )
+
+
+def test_tree_plan_rejects_overlapping_consecutive_step_trajectories():
+    """Catches contiguous IDs being mistaken for ordered clean-step spans."""
+    clean_ids, spans, joined = _two_step_fixture()
+    overlapping_step = ReasoningStepSpan(1, 5, 7, 7, 8, 9, 11, None)
+    overlapping_joined = list(joined)
+    overlapping_joined[1] = dict(overlapping_joined[1], span=overlapping_step)
+
+    with pytest.raises(ValueError, match="trajectory"):
+        build_packed_tree_plan(
+            clean_input_ids=clean_ids,
+            attention_mask=torch.ones_like(clean_ids),
+            reasoning_spans=(spans[0], overlapping_step),
+            joined_steps=tuple(overlapping_joined),
+        )
