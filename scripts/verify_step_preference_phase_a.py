@@ -35,6 +35,7 @@ _SUMMARY_FIELDS = {
     "global_step",
     "optimizer_step",
     "training_loss",
+    "total_loss",
     "gradient_norm",
     "metrics",
 }
@@ -65,6 +66,13 @@ def _finite_number(value, label: str) -> float:
     return float(value)
 
 
+def _pair_count(value, label: str) -> float:
+    count = _finite_number(value, label)
+    if count < 0 or not count.is_integer():
+        raise ValueError(f"{label} must be a nonnegative integer-valued number")
+    return count
+
+
 def _read_training_summary(path: Path) -> dict:
     raw = _read_regular_file(path, "Stage 2B training log")
     try:
@@ -93,6 +101,7 @@ def _read_training_summary(path: Path) -> dict:
     if optimizer_step != global_step:
         raise ValueError("Phase A optimizer and global steps disagree")
     training_loss = _finite_number(payload["training_loss"], "training loss")
+    total_loss = _finite_number(payload["total_loss"], "total loss")
     gradient_norm = _finite_number(payload["gradient_norm"], "gradient norm")
     metrics = payload["metrics"]
     if not isinstance(metrics, dict) or set(metrics) != set(_METRIC_FIELDS):
@@ -101,15 +110,19 @@ def _read_training_summary(path: Path) -> dict:
         name: _finite_number(metrics[name], f"training metric {name}")
         for name in _METRIC_FIELDS
     }
-    visual_pairs = normalized_metrics["stats/valid_visual_pairs"]
-    textual_pairs = normalized_metrics["stats/valid_textual_pairs"]
-    if visual_pairs < 0 or textual_pairs < 0 or visual_pairs + textual_pairs <= 0:
+    visual_pairs = _pair_count(
+        metrics["stats/valid_visual_pairs"], "training visual pair count"
+    )
+    textual_pairs = _pair_count(
+        metrics["stats/valid_textual_pairs"], "training textual pair count"
+    )
+    if visual_pairs + textual_pairs < 1:
         raise ValueError("Phase A training did not observe a valid preference pair")
     return {
         "global_step": global_step,
         "optimizer_step": optimizer_step,
         "training_loss": training_loss,
-        "total_loss": training_loss,
+        "total_loss": total_loss,
         "gradient_norm": gradient_norm,
         "metrics": normalized_metrics,
         "valid_pairs": visual_pairs + textual_pairs,
@@ -145,6 +158,18 @@ def _read_negative_evidence(negative_path: Path, manifest_path: Path) -> dict:
         "valid_textual_pairs": textual_pairs,
         "valid_pairs": visual_pairs + textual_pairs,
     }
+
+
+def _validate_pair_agreement(negative: dict, training: dict) -> None:
+    metrics = training["metrics"]
+    for modality in ("visual", "textual"):
+        trained = metrics[f"stats/valid_{modality}_pairs"]
+        available = negative[f"valid_{modality}_pairs"]
+        if trained > available:
+            raise ValueError(
+                "training pair counts exceed authenticated negative artifact: "
+                f"{modality} trained={trained}, available={available}"
+            )
 
 
 def _validate_checkpoint(path: Path) -> dict:
@@ -188,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
             args.negative_path, args.negative_manifest
         )
         training = _read_training_summary(args.training_log)
+        _validate_pair_agreement(negative, training)
         checkpoint = _validate_checkpoint(args.checkpoint_path)
         report = {
             "schema_version": 1,

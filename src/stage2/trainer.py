@@ -44,6 +44,7 @@ from step_preference.spans import ReasoningStepSpan
 
 
 _STEP_PREFERENCE_LOG_NAMES = (
+    "loss/total",
     "loss/ce",
     "loss/dpo_visual",
     "loss/dpo_text",
@@ -737,6 +738,7 @@ class Stage2Trainer(Trainer):
             raise ValueError("Stage 2B total loss must be finite")
         self._accumulate_step_preference_metrics(
             {
+                "loss/total": total_loss,
                 "loss/ce": clean_ce,
                 "loss/dpo_visual": dpo.visual_loss,
                 "loss/dpo_text": dpo.textual_loss,

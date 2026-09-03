@@ -746,7 +746,10 @@ class NegativeManifest:
     negative_sha256: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != NEGATIVE_MANIFEST_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != NEGATIVE_MANIFEST_SCHEMA_VERSION
+        ):
             raise ValueError(f"unsupported schema_version: {self.schema_version}")
         _require_sha256("source_sha256", self.source_sha256)
         _require_sha256("negative_sha256", self.negative_sha256)

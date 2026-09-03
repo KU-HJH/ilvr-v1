@@ -402,6 +402,21 @@ def test_negative_manifest_is_immutable():
         manifest.latent_size = 4
 
 
+@pytest.mark.parametrize("schema_version", [2.0, True, "2"])
+def test_negative_manifest_requires_exact_integer_schema_version(
+    tmp_path, schema_version
+):
+    """Catches JSON-compatible non-integers entering the schema-2 contract."""
+    identity = _identity(tmp_path)
+
+    with pytest.raises(ValueError, match="schema_version"):
+        NegativeManifest(
+            schema_version=schema_version,
+            **identity,
+            negative_sha256="c" * 64,
+        )
+
+
 def test_load_negative_store_revalidates_every_checkpoint_load_root(tmp_path):
     """Catches a PEFT base model changing behind an otherwise valid adapter manifest."""
     source = tmp_path / "source.jsonl"

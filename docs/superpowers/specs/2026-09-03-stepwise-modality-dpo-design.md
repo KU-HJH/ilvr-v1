@@ -386,6 +386,7 @@ The Trainer combines the clean CE, Step-DPO, and entropy terms and accumulates
 the following interval means:
 
 ```text
+loss/total
 loss/ce
 loss/dpo_visual
 loss/dpo_text

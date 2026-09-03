@@ -208,6 +208,7 @@ def test_stage2b_runs_the_naive_graph_and_uses_global_pair_and_token_denominator
 
     metrics = emitted[0]
     required = {
+        "loss/total",
         "loss/ce",
         "loss/dpo_visual",
         "loss/dpo_text",
@@ -225,6 +226,7 @@ def test_stage2b_runs_the_naive_graph_and_uses_global_pair_and_token_denominator
     }
     assert required <= metrics.keys()
     assert all(math.isfinite(metrics[name]) for name in required)
+    assert metrics["loss/total"] == pytest.approx(float(loss.detach()))
     assert metrics["stats/valid_visual_pairs"] == 2.0
     assert metrics["stats/valid_textual_pairs"] == 1.0
     assert metrics["stats/branch_forwards"] == 8.0

@@ -104,6 +104,7 @@ platform.python_version = _platform_python_version
 
 _PHASE_A_SUMMARY_PREFIX = "STEP_PREFERENCE_PHASE_A_SUMMARY "
 _PHASE_A_METRIC_NAMES = (
+    "loss/total",
     "loss/ce",
     "loss/dpo_visual",
     "loss/dpo_text",
@@ -806,8 +807,13 @@ def publish_step_preference_phase_a_summary(args, *, trainer, train_result):
         "global_step": trainer.state.global_step,
         "optimizer_step": trainer._observed_optimizer_step,
         "training_loss": train_result.training_loss,
+        "total_loss": latest["loss/total"],
         "gradient_norm": trainer._representative_gradient_norm,
-        "metrics": {name: latest[name] for name in _PHASE_A_METRIC_NAMES},
+        "metrics": {
+            name: latest[name]
+            for name in _PHASE_A_METRIC_NAMES
+            if name != "loss/total"
+        },
     }
     encoded = json.dumps(
         summary, sort_keys=True, separators=(",", ":"), allow_nan=False

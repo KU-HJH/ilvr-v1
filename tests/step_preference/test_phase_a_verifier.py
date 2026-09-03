@@ -54,7 +54,7 @@ def _negative_row(**overrides) -> StepNegative:
     return StepNegative(**values)
 
 
-def _write_negative_fixture(tmp_path):
+def _write_negative_fixture(tmp_path, *, negatives=None):
     source = tmp_path / "source.jsonl"
     source.write_text('{"sample_id":"sample-1"}\n', encoding="utf-8")
     stage2a = tmp_path / "stage2a"
@@ -64,7 +64,7 @@ def _write_negative_fixture(tmp_path):
     write_negative_artifact(
         negative_path=negative_path,
         manifest_path=manifest_path,
-        negatives=[_negative_row()],
+        negatives=[_negative_row()] if negatives is None else negatives,
         source_path=source,
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         selected_row_indices=[0],
@@ -83,6 +83,7 @@ def _summary_payload(**overrides):
         "global_step": 1,
         "optimizer_step": 1,
         "training_loss": 1.84,
+        "total_loss": 1.83,
         "gradient_norm": 0.75,
         "metrics": dict(COMPONENT_METRICS),
     }
@@ -155,7 +156,7 @@ def test_phase_a_verifier_writes_one_deterministic_success_report(tmp_path):
             "gradient_norm": 0.75,
             "metrics": COMPONENT_METRICS,
             "optimizer_step": 1,
-            "total_loss": 1.84,
+            "total_loss": 1.83,
             "training_loss": 1.84,
             "valid_pairs": 1.0,
         },
@@ -213,11 +214,32 @@ def test_phase_a_verifier_fails_closed_on_malformed_or_duplicate_summary(
         _summary_payload(metric__loss__ce=float("nan")),
         _summary_payload(global_step=0, optimizer_step=0),
         _summary_payload(
+            metric__stats__valid_visual_pairs=-1.0,
+            metric__stats__valid_textual_pairs=2.0,
+        ),
+        _summary_payload(
+            metric__stats__valid_visual_pairs=0.5,
+            metric__stats__valid_textual_pairs=0.5,
+        ),
+        _summary_payload(
+            metric__stats__valid_visual_pairs=True,
+            metric__stats__valid_textual_pairs=0.0,
+        ),
+        _summary_payload(
             metric__stats__valid_visual_pairs=0.0,
             metric__stats__valid_textual_pairs=0.0,
         ),
     ],
-    ids=["nonfinite-total", "nonfinite-gradient", "nonfinite-component", "zero-steps", "zero-trained-pairs"],
+    ids=[
+        "nonfinite-training-loss",
+        "nonfinite-gradient",
+        "nonfinite-component",
+        "zero-steps",
+        "negative-pair-count",
+        "fractional-pair-count",
+        "boolean-pair-count",
+        "pair-total-below-one",
+    ],
 )
 def test_phase_a_verifier_rejects_nonfinite_or_zero_training_evidence(
     tmp_path, payload
@@ -227,6 +249,64 @@ def test_phase_a_verifier_rejects_nonfinite_or_zero_training_evidence(
 
     assert exit_code != 0
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == "fail"
+
+
+@pytest.mark.parametrize("case", ["missing", "nonfinite"])
+def test_phase_a_verifier_requires_independently_observed_total_loss(
+    tmp_path, case
+):
+    """Catches total loss being inferred from a finite aggregate training loss."""
+    payload = _summary_payload()
+    if case == "missing":
+        payload.pop("total_loss")
+    else:
+        payload["total_loss"] = float("nan")
+
+    exit_code, output, *_ = _invoke(tmp_path, payload=payload)
+
+    assert exit_code != 0
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == "fail"
+
+
+def test_phase_a_verifier_binds_trained_pair_modalities_to_artifact(tmp_path):
+    """Catches trained pair claims unsupported by authenticated modality flags."""
+    payload = _summary_payload(
+        metric__stats__valid_visual_pairs=0.0,
+        metric__stats__valid_textual_pairs=1.0,
+    )
+
+    exit_code, output, *_ = _invoke(tmp_path, payload=payload)
+
+    assert exit_code != 0
+    assert "pair counts" in json.loads(output.read_text(encoding="utf-8"))["errors"][0]
+
+
+def test_phase_a_verifier_requires_pair_in_authenticated_artifact(tmp_path):
+    """Catches a training claim being accepted when no artifact pair survived."""
+    negative_path, manifest_path = _write_negative_fixture(tmp_path, negatives=[])
+    training_log = tmp_path / "stage2b.log"
+    _write_training_log(training_log, _summary_payload())
+    checkpoint = tmp_path / "checkpoint"
+    _write_full_stage2_checkpoint(checkpoint)
+    output = tmp_path / "verification.json"
+
+    exit_code = verifier.main(
+        [
+            "--negative_manifest",
+            str(manifest_path),
+            "--negative_path",
+            str(negative_path),
+            "--training_log",
+            str(training_log),
+            "--checkpoint_path",
+            str(checkpoint),
+            "--output_path",
+            str(output),
+        ]
+    )
+
+    assert exit_code != 0
+    assert "no valid pair" in json.loads(output.read_text(encoding="utf-8"))["errors"][0]
 
 
 def test_phase_a_verifier_rejects_stale_negative_artifact(tmp_path):
@@ -311,7 +391,10 @@ def test_stage2b_summary_producer_logs_only_canonical_scalar_evidence(monkeypatc
     trainer = SimpleNamespace(
         state=SimpleNamespace(
             global_step=3,
-            log_history=[{"loss/ce": 99.0}, dict(COMPONENT_METRICS)],
+            log_history=[
+                {"loss/ce": 99.0},
+                {"loss/total": 1.625, **COMPONENT_METRICS},
+            ],
         ),
         _observed_optimizer_step=3,
         _representative_gradient_norm=0.625,
@@ -342,11 +425,44 @@ def test_stage2b_summary_producer_logs_only_canonical_scalar_evidence(monkeypatc
         "global_step": 3,
         "optimizer_step": 3,
         "training_loss": 1.75,
+        "total_loss": 1.625,
         "gradient_norm": 0.625,
         "metrics": COMPONENT_METRICS,
     }
     assert "chosen" not in logged[0]
     assert "rejected" not in logged[0]
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "stage2a", "nonzero-rank"])
+def test_phase_a_summary_is_suppressed_outside_rank_zero_stage2b(
+    monkeypatch, mode
+):
+    """Catches focused evidence leaking into other Stage 2 phases or ranks."""
+    config = (
+        StepPreferenceConfig()
+        if mode == "ordinary"
+        else StepPreferenceConfig(enabled=True, mode="stage2a", total_steps=2)
+        if mode == "stage2a"
+        else StepPreferenceConfig(
+            enabled=True,
+            mode="stage2b",
+            stage2a_checkpoint_path="stage2a",
+            negative_path="negatives.jsonl",
+            negative_manifest="manifest.json",
+        )
+    )
+    trainer = SimpleNamespace(is_world_process_zero=lambda: mode != "nonzero-rank")
+    logged = []
+    monkeypatch.setattr(training_main.logging, "info", logged.append)
+
+    result = training_main.publish_step_preference_phase_a_summary(
+        SimpleNamespace(step_preference_config=config),
+        trainer=trainer,
+        train_result=SimpleNamespace(training_loss=1.0),
+    )
+
+    assert result is None
+    assert logged == []
 
 
 def test_run_stage2_publishes_phase_a_summary_once_after_training(monkeypatch):
