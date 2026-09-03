@@ -46,6 +46,7 @@ from ...utils import (
     add_start_docstrings_to_model_forward,
     is_flash_attn_2_available,
     is_flash_attn_greater_or_equal_2_10,
+    is_torch_flex_attn_available,
     logging,
     replace_return_docstrings,
 )
@@ -66,9 +67,23 @@ else:
     flash_attn_varlen_func = None
 
 
+if is_torch_flex_attn_available():
+    from torch.nn.attention.flex_attention import BlockMask
+
+    from ...integrations.flex_attention import flex_attention_forward
+
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "Qwen2_5_VLConfig"
+
+
+def _is_block_mask(attention_mask: object) -> bool:
+    if is_torch_flex_attn_available():
+        return isinstance(attention_mask, BlockMask)
+    if attention_mask is not None and attention_mask.__class__.__name__ == "BlockMask":
+        raise RuntimeError("packed Stage 2 requires torch FlexAttention")
+    return False
 
 
 class Qwen2_5_VLMLP(nn.Module):
@@ -708,6 +723,7 @@ class Qwen2_5_VLAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
         self.rope_scaling = config.rope_scaling
@@ -789,6 +805,46 @@ class Qwen2_5_VLAttention(nn.Module):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+
+    def forward_flex(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        block_mask: "BlockMask",
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, None, None]:
+        if output_attentions:
+            raise ValueError("packed Stage 2 FlexAttention does not support output_attentions")
+        if use_cache:
+            raise ValueError("packed Stage 2 FlexAttention does not support use_cache")
+        if self.training and self.attention_dropout != 0.0:
+            raise ValueError("packed Stage 2 FlexAttention requires zero attention dropout while training")
+
+        batch_size, packed_length, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(batch_size, packed_length, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, packed_length, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, packed_length, -1, self.head_dim).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_multimodal_rotary_pos_emb(
+            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        )
+        attn_output, _ = flex_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            block_mask,
+            scaling=self.scaling,
+        )
+        attn_output = attn_output.reshape(batch_size, packed_length, self.hidden_size)
+        return self.o_proj(attn_output), None, None
 
     
     
@@ -1245,7 +1301,15 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        if generate_mode and self.attn_type == "flash_attention_2":
+        if _is_block_mask(attention_mask):
+            hidden_states, self_attn_weights, present_key_value = self.self_attn.forward_flex(
+                hidden_states,
+                block_mask=attention_mask,
+                position_embeddings=position_embeddings,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+        elif generate_mode and self.attn_type == "flash_attention_2":
         #generate, normal forward
             hidden_states, self_attn_weights, present_key_value = self.self_attn.forward_normal(
                 hidden_states=hidden_states,
@@ -1380,9 +1444,12 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         elif position_ids.dim() == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
+        if _is_block_mask(attention_mask):
+            causal_mask = attention_mask
+        else:
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            )
 
         hidden_states = inputs_embeds
 
