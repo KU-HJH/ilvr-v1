@@ -31,6 +31,7 @@ _PROCESSOR_FILES = frozenset(
     {
         "added_tokens.json",
         "chat_template.json",
+        "chat_template.jinja",
         "merges.txt",
         "preprocessor_config.json",
         "processor_config.json",

@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 from stage2.checkpointing import (
+    Stage2ArtifactInspection,
+    Stage2ArtifactKind,
     Stage2LoadDecision,
     configure_stage2_metadata,
     resolve_latent_token_ids,
@@ -78,6 +80,44 @@ def test_stage2b_initialization_reuses_resume_resolution_but_clears_trainer_stat
         latent_size=4,
         supervise_latent_boundaries=False,
     )
+
+
+def test_stage2b_peft_initialization_rejects_a_relocated_compatible_base_before_load(
+    monkeypatch, tmp_path
+):
+    """Catches loading base B while the negative artifact binds PEFT base A."""
+    import stage2.checkpointing as checkpointing
+
+    stage2a_adapter = tmp_path / "stage2a-adapter"
+    recorded_base = tmp_path / "base-a"
+    requested_base = tmp_path / "base-b"
+    for directory in (stage2a_adapter, recorded_base, requested_base):
+        directory.mkdir()
+    snapshot = object()
+    inspection = Stage2ArtifactInspection(
+        Stage2ArtifactKind.PEFT,
+        peft_metadata_snapshot=snapshot,
+    )
+    monkeypatch.setattr(
+        checkpointing,
+        "decode_stage2_peft_metadata_snapshot",
+        lambda value: SimpleNamespace(base_model_reference=str(recorded_base))
+        if value is snapshot
+        else None,
+    )
+    config_loads = []
+
+    with pytest.raises(ValueError, match="exact Stage 2A PEFT base root"):
+        resolve_stage2b_initialization_decision(
+            load_model_path=str(requested_base),
+            stage2a_checkpoint_path=str(stage2a_adapter),
+            load_config=lambda source: config_loads.append(source),
+            inspect_artifact=lambda path: inspection,
+            latent_size=4,
+            supervise_latent_boundaries=False,
+        )
+
+    assert config_loads == []
 
 
 def test_resume_requires_stage2_and_uses_single_source_for_all_state():

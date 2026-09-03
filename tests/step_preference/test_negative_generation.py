@@ -11,8 +11,10 @@ from step_preference.negatives import (
     CheckpointFile,
     StepNegative,
     greedy_generate_step_negative,
+    load_negative_store,
     score_step_completion,
     tokenize_step_completion,
+    write_negative_artifact,
 )
 from step_preference.spans import ReasoningStepSpan
 from tests.stage2.helpers import tiny_stage2_qwen
@@ -371,6 +373,7 @@ def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_
         "tokenizer_config.json": b"tokenizer-config",
         "tokenizer.json": b"tokenizer",
         "chat_template.json": b"template",
+        "chat_template.jinja": b"preferred-template",
         "training_args.bin": b"must-not-be-hashed",
         "trainer_state.json": b"must-not-be-hashed",
     }
@@ -411,6 +414,7 @@ def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_
     assert snapshot.resolved_device == "cpu"
     assert snapshot.torch_dtype == "float32"
     expected_names = (
+        "chat_template.jinja",
         "chat_template.json",
         "config.json",
         "generation_config.json",
@@ -441,6 +445,7 @@ def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_
                 if entry.relative_path
                 in {
                     "chat_template.json",
+                    "chat_template.jinja",
                     "preprocessor_config.json",
                     "tokenizer.json",
                     "tokenizer_config.json",
@@ -450,6 +455,88 @@ def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def test_preferred_chat_template_mutation_makes_generated_negatives_stale(tmp_path):
+    """Catches omitting the active Jinja chat template from frozen provenance."""
+    from scripts.generate_step_negatives import load_frozen_stage2a_snapshot
+    from stage2.checkpointing import Stage2ArtifactInspection, Stage2ArtifactKind
+
+    checkpoint = tmp_path / "stage2-full"
+    checkpoint.mkdir()
+    for name, raw in {
+        "config.json": b"config",
+        "model.safetensors": b"weights",
+        "tokenizer.json": b"tokenizer",
+        "chat_template.jinja": b"template-v1",
+    }.items():
+        (checkpoint / name).write_bytes(raw)
+
+    class FrozenModel:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+    snapshot = load_frozen_stage2a_snapshot(
+        checkpoint_path=checkpoint,
+        attention_implementation="eager",
+        device="cpu",
+        inspect_artifact=lambda _path: Stage2ArtifactInspection(
+            Stage2ArtifactKind.FULL
+        ),
+        load_processor=lambda _source: SimpleNamespace(tokenizer=object()),
+        load_full_model=lambda _source, **_kwargs: FrozenModel(),
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    negative_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    settings = {"min_tokens": 2, "max_new_tokens": 32}
+    write_negative_artifact(
+        negative_path=negative_path,
+        manifest_path=manifest_path,
+        negatives=(
+            StepNegative(
+                sample_id="sample-a",
+                step_id=0,
+                chosen_text="chosen",
+                rejected_visual_text=None,
+                rejected_textual_text=None,
+                valid_visual_negative=False,
+                valid_textual_negative=False,
+                reference_chosen_score=-0.2,
+                reference_visual_rejected_score=None,
+                reference_textual_rejected_score=None,
+            ),
+        ),
+        source_path=source,
+        source_sha256=source_sha256,
+        selected_row_indices=(0,),
+        stage2a_checkpoint_path=checkpoint,
+        checkpoint_files=snapshot.checkpoint_files,
+        tokenizer_config_identity=snapshot.tokenizer_config_identity,
+        latent_size=8,
+        generation_settings=settings,
+    )
+    (checkpoint / "chat_template.jinja").write_bytes(b"template-v2")
+
+    with pytest.raises(ValueError, match="chat_template.jinja"):
+        load_negative_store(
+            negative_path=negative_path,
+            manifest_path=manifest_path,
+            source_path=source,
+            expected_source_sha256=source_sha256,
+            expected_selected_row_indices=(0,),
+            expected_stage2a_checkpoint_path=checkpoint,
+            expected_checkpoint_files=snapshot.checkpoint_files,
+            expected_tokenizer_config_identity=snapshot.tokenizer_config_identity,
+            expected_latent_size=8,
+            expected_generation_settings=settings,
+            expected_keys=(("sample-a", 0),),
+        )
 
 
 def test_peft_snapshot_loader_keeps_source_selectors_out_of_model_options(

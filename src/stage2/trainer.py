@@ -490,7 +490,7 @@ class Stage2Trainer(Trainer):
 
         clean_call = dict(clean_inputs)
         clean_call.update(
-            stage2_loss_only=True,
+            stage2_loss_only=not return_outputs,
             collect_stage2_diagnostics=collect_diagnostics,
         )
         if all_query_positions:
@@ -753,7 +753,10 @@ class Stage2Trainer(Trainer):
                 "stats/scored_tokens": scored_tokens,
             }
         )
-        return (total_loss, clean_outputs) if return_outputs else total_loss
+        if return_outputs:
+            clean_outputs.loss = total_loss
+            return total_loss, clean_outputs
+        return total_loss
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None

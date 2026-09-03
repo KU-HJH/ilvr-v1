@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -7,9 +8,11 @@ from step_preference.negatives import (
     NegativeManifest,
     StepNegative,
     filter_negative,
+    inspect_stage2a_checkpoint_identity,
     load_negative_store,
     write_negative_artifact,
 )
+from stage2.checkpointing import Stage2ArtifactInspection, Stage2ArtifactKind
 
 
 SOURCE_SHA256 = "c805f1e47450a7698e2e0b9f59b08d1f8945598a99ef24b5f25dbe046567307f"
@@ -66,6 +69,46 @@ def _expected_identity(identity, source_path):
         "expected_latent_size": identity["latent_size"],
         "expected_generation_settings": identity["generation_settings"],
     }
+
+
+def test_stage2b_checkpoint_identity_includes_preferred_jinja_template(
+    monkeypatch, tmp_path
+):
+    """Catches Stage 2B accepting a tokenizer identity that omits its active template."""
+    import step_preference.negatives as negatives
+
+    checkpoint = tmp_path / "stage2a"
+    checkpoint.mkdir()
+    payloads = {
+        "config.json": b"config",
+        "model.safetensors": b"weights",
+        "tokenizer.json": b"tokenizer",
+        "chat_template.jinja": b"preferred-template",
+    }
+    for name, raw in payloads.items():
+        (checkpoint / name).write_bytes(raw)
+    monkeypatch.setattr(
+        negatives,
+        "inspect_stage2_artifact",
+        lambda _path: Stage2ArtifactInspection(Stage2ArtifactKind.FULL),
+    )
+
+    records, tokenizer_identity = inspect_stage2a_checkpoint_identity(checkpoint)
+
+    assert tuple(entry.relative_path for entry in records) == tuple(sorted(payloads))
+    tokenizer_payload = [
+        {
+            "relative_path": name,
+            "sha256": hashlib.sha256(payloads[name]).hexdigest(),
+            "size": len(payloads[name]),
+        }
+        for name in ("chat_template.jinja", "tokenizer.json")
+    ]
+    assert tokenizer_identity == hashlib.sha256(
+        json.dumps(
+            tokenizer_payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 @pytest.mark.parametrize(

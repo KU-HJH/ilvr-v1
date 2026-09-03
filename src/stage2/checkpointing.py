@@ -1546,12 +1546,56 @@ def resolve_stage2_load_decision(
     )
 
 
+def validate_stage2b_peft_base_identity(
+    *,
+    stage2a_checkpoint_path: str,
+    requested_base_model_path: str,
+    inspect_artifact=inspect_stage2_artifact,
+) -> None:
+    """Require a Stage 2B PEFT policy to load its recorded local base root."""
+    inspection = inspect_artifact(stage2a_checkpoint_path)
+    if inspection.artifact_kind is not Stage2ArtifactKind.PEFT:
+        return
+    snapshot = inspection.peft_metadata_snapshot
+    if snapshot is None:
+        raise ValueError("Stage 2A PEFT inspection lost its metadata")
+    metadata = decode_stage2_peft_metadata_snapshot(snapshot)
+
+    def resolved_local_root(value: str, label: str) -> Path:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label} must be a local directory")
+        candidate = Path(value).expanduser()
+        if not candidate.is_dir():
+            raise ValueError(f"{label} must be a local directory")
+        return candidate.resolve(strict=True)
+
+    recorded_root = resolved_local_root(
+        metadata.base_model_reference, "recorded Stage 2A PEFT base"
+    )
+    requested_root = resolved_local_root(
+        requested_base_model_path, "requested Stage 2B PEFT base"
+    )
+    if requested_root != recorded_root:
+        raise ValueError(
+            "Stage 2B must load the exact Stage 2A PEFT base root: "
+            f"recorded={recorded_root}, requested={requested_root}"
+        )
+
+
 def resolve_stage2b_initialization_decision(
-    *, stage2a_checkpoint_path: str, **stage2_resume_kwargs
+    *,
+    stage2a_checkpoint_path: str,
+    inspect_artifact=inspect_stage2_artifact,
+    **stage2_resume_kwargs,
 ) -> Stage2LoadDecision:
     """Resolve Stage 2A as a resume artifact, then discard only trainer state."""
     if not isinstance(stage2a_checkpoint_path, str) or not stage2a_checkpoint_path:
         raise ValueError("stage2a_checkpoint_path must be a non-empty path")
+    validate_stage2b_peft_base_identity(
+        stage2a_checkpoint_path=stage2a_checkpoint_path,
+        requested_base_model_path=stage2_resume_kwargs["load_model_path"],
+        inspect_artifact=inspect_artifact,
+    )
     decision = resolve_stage2_load_decision(
         resume_from_checkpoint_path=stage2a_checkpoint_path,
         **stage2_resume_kwargs,

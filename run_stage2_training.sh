@@ -200,6 +200,7 @@ MANAGED_OPTIONS=(
   --stage2a_ratio
   --stage2_total_steps
   --stage2a_checkpoint_path
+  --stage2b_preflight_only
   --supervise_latent_boundaries
   --no-supervise_latent_boundaries
   --learning_rate
@@ -415,6 +416,11 @@ TRAINING_ARGS=(
   "${EVIDENCE_ARGS[@]}"
   "$@"
 )
+
+if [[ "${STAGE2_DRY_RUN:-false}" != "true" && "$stage2b_checkpoint_initialization" == true ]]; then
+  "$REPO_ROOT/venv/ilvr-venv/bin/python" -m main \
+    "${TRAINING_ARGS[@]}" --stage2b_preflight_only
+fi
 
 if [[ "${STAGE2_DRY_RUN:-false}" != "true" ]]; then
   "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.artifact_paths validate-run \

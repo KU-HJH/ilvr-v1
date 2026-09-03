@@ -1,3 +1,4 @@
+import hashlib
 import math
 from types import SimpleNamespace
 
@@ -270,11 +271,7 @@ def test_stage2b_rejects_missing_or_mismatched_private_join_metadata():
         trainer.compute_loss(model, mismatched)
 
 
-def test_stage2b_tiny_qwen_has_finite_loss_and_policy_gradients():
-    """Catches trainer kwargs that violate the real selective Qwen Stage 2 contract."""
-    torch.manual_seed(73)
-    trainer = _trainer(_config())
-    model = tiny_stage2_qwen(attn_implementation="eager").train()
+def _tiny_qwen_batch():
     span = ReasoningStepSpan(0, 1, 2, 3, 5, 6, 8, 0)
     negative = StepNegative(
         sample_id="sample-real",
@@ -292,7 +289,7 @@ def test_stage2b_tiny_qwen_has_finite_loss_and_policy_gradients():
     labels = input_ids.clone()
     labels[:, :6] = -100
     rejected_ids = torch.tensor([[1, 5, 91, 90, 90, 92, 9, 10, 11]])
-    batch = {
+    return {
         "input_ids": input_ids,
         "attention_mask": torch.ones_like(input_ids),
         "labels": labels,
@@ -316,7 +313,14 @@ def test_stage2b_tiny_qwen_has_finite_loss_and_policy_gradients():
         },
     }
 
-    loss = trainer.compute_loss(model, batch)
+
+def test_stage2b_tiny_qwen_has_finite_loss_and_policy_gradients():
+    """Catches trainer kwargs that violate the real selective Qwen Stage 2 contract."""
+    torch.manual_seed(73)
+    trainer = _trainer(_config())
+    model = tiny_stage2_qwen(attn_implementation="eager").train()
+
+    loss = trainer.compute_loss(model, _tiny_qwen_batch())
     loss.backward()
 
     assert torch.isfinite(loss)
@@ -327,6 +331,29 @@ def test_stage2b_tiny_qwen_has_finite_loss_and_policy_gradients():
     ]
     assert trainable_grads
     assert all(torch.isfinite(gradient).all() for gradient in trainable_grads)
+
+
+def test_stage2b_return_outputs_keeps_full_clean_logits_and_combined_loss():
+    """Catches returning the clean loss-only payload or stale CE as output.loss."""
+    torch.manual_seed(79)
+    trainer = _trainer(_config())
+    model = tiny_stage2_qwen(attn_implementation="eager").train()
+    outer_calls = []
+    handle = model.register_forward_pre_hook(
+        lambda _module, _args, kwargs: outer_calls.append(kwargs), with_kwargs=True
+    )
+    try:
+        loss, outputs = trainer.compute_loss(
+            model, _tiny_qwen_batch(), return_outputs=True
+        )
+    finally:
+        handle.remove()
+
+    assert outer_calls[0]["stage2_loss_only"] is False
+    assert outputs.logits.shape[:2] == _tiny_qwen_batch()["input_ids"].shape
+    assert outputs.stage2_selected_logits.shape[1] == 2
+    assert outputs.loss is loss
+    assert torch.isfinite(outputs.loss)
 
 
 def test_stage2b_components_validate_exact_store_and_clear_stage2a_resume(
@@ -414,11 +441,15 @@ def test_stage2b_components_validate_exact_store_and_clear_stage2a_resume(
     monkeypatch.setattr(main, "resolve_latent_token_ids", lambda *_args: LatentTokenIds(90, 91, 92))
     checkpoint_files = ()
     manifest = SimpleNamespace(
+        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         checkpoint_files=checkpoint_files,
         tokenizer_config_identity="tokenizer-v1",
         generation_settings_dict={"min_tokens": 2, "max_new_tokens": 32},
     )
     monkeypatch.setattr(main, "read_negative_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        main, "validate_stage2b_peft_base_identity", lambda **_kwargs: None
+    )
     monkeypatch.setattr(
         main,
         "inspect_stage2a_checkpoint_identity",

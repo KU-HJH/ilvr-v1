@@ -71,6 +71,7 @@ from stage2.checkpointing import (
     resolve_latent_token_ids,
     resolve_stage2_load_decision,
     resolve_stage2b_initialization_decision,
+    validate_stage2b_peft_base_identity,
     validate_stage2_peft_compatibility,
     validate_stage2_sparse_processor,
 )
@@ -131,6 +132,14 @@ class Stage2TrainingComponents:
 
 
 @dataclass(frozen=True)
+class Stage2BPreflight:
+    """Read-only validated inputs required before Stage 2B may construct runtime."""
+
+    prepared_examples: tuple[object, ...]
+    negative_store: Mapping[tuple[str, int], object]
+
+
+@dataclass(frozen=True)
 class Stage2SourceDependencies:
     """All source-sensitive Stage 2 loaders, injected as one safe bundle."""
 
@@ -148,6 +157,82 @@ def _default_stage2_source_dependencies() -> Stage2SourceDependencies:
         load_config=AutoConfig.from_pretrained,
         load_processor=AutoProcessor.from_pretrained,
         load_model=Qwen2_5_VLForConditionalGeneration.from_pretrained,
+    )
+
+
+def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
+    """Validate Stage 2B source, checkpoint, and negatives without runtime writes."""
+    config = getattr(args, "step_preference_config", None)
+    if config is None:
+        config = StepPreferenceConfig.from_args(args)
+    if not isinstance(config, StepPreferenceConfig) or not config.is_stage2b:
+        raise ValueError("Stage 2B artifact preflight requires Stage 2B configuration")
+
+    source_path = Path(args.data_path)
+    source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    manifest = read_negative_manifest(config.negative_manifest)
+    if manifest.source_sha256 != source_sha256:
+        raise ValueError("source JSONL SHA-256 does not match negative manifest")
+
+    raw_examples = load_jsonl_examples(source_path)
+    selected_examples = (
+        raw_examples
+        if args.max_train_samples is None
+        else raw_examples[: args.max_train_samples]
+    )
+    prepared = tuple(
+        prepare_stage2_example(
+            item,
+            image_root=Path(args.image_root),
+            latent_size=args.latent_size,
+            require_reasoning_units=True,
+        )
+        for item in selected_examples
+    )
+    reject_duplicate_sample_ids(example.sample_id for example in prepared)
+
+    validate_stage2b_peft_base_identity(
+        stage2a_checkpoint_path=config.stage2a_checkpoint_path,
+        requested_base_model_path=args.load_model_path,
+    )
+    checkpoint_files, tokenizer_identity = inspect_stage2a_checkpoint_identity(
+        config.stage2a_checkpoint_path
+    )
+    generation_settings = manifest.generation_settings_dict
+    if generation_settings.get("min_tokens") != config.min_tokens:
+        raise ValueError("negative manifest min_tokens does not match Stage 2B")
+    if generation_settings.get("max_new_tokens") != config.max_new_tokens:
+        raise ValueError("negative manifest max_new_tokens does not match Stage 2B")
+    expected_keys = tuple(
+        (example.sample_id, step.step_id)
+        for example in prepared
+        for step in example.reasoning_steps
+    )
+    negative_store = load_negative_store(
+        negative_path=config.negative_path,
+        manifest_path=config.negative_manifest,
+        source_path=source_path,
+        expected_source_sha256=source_sha256,
+        expected_selected_row_indices=tuple(range(len(prepared))),
+        expected_stage2a_checkpoint_path=config.stage2a_checkpoint_path,
+        expected_checkpoint_files=checkpoint_files,
+        expected_tokenizer_config_identity=tokenizer_identity,
+        expected_latent_size=args.latent_size,
+        expected_generation_settings=generation_settings,
+        expected_keys=expected_keys,
+    )
+    for example in prepared:
+        assistant_text = example.conversation[1]["content"][0]["text"]
+        for step in example.reasoning_steps:
+            key = (example.sample_id, step.step_id)
+            chosen = assistant_text[step.target_text.start : step.target_text.end]
+            if negative_store[key].chosen_text != chosen:
+                raise ValueError(
+                    f"negative chosen text does not match source step: {key}"
+                )
+    return Stage2BPreflight(
+        prepared_examples=prepared,
+        negative_store=MappingProxyType(dict(negative_store)),
     )
 
 
@@ -226,6 +311,12 @@ def build_stage2_training_components(
         step_preference_config = StepPreferenceConfig.from_args(args)
     if not isinstance(step_preference_config, StepPreferenceConfig):
         raise TypeError("step_preference_config must be a StepPreferenceConfig")
+    stage2b_preflight = getattr(args, "_stage2b_preflight", None)
+    if step_preference_config.is_stage2b:
+        if stage2b_preflight is None:
+            stage2b_preflight = preflight_stage2b_artifacts(args)
+        elif not isinstance(stage2b_preflight, Stage2BPreflight):
+            raise TypeError("_stage2b_preflight must be a Stage2BPreflight")
     source_dependencies = (
         source_dependencies or _default_stage2_source_dependencies()
     )
@@ -443,23 +534,15 @@ def build_stage2_training_components(
         )
 
     if manifest_snapshot is None:
-        raw_examples = load_jsonl_examples(Path(args.data_path))
-        selected_examples = (
-            raw_examples
-            if args.max_train_samples is None
-            else raw_examples[: args.max_train_samples]
-        )
         if step_preference_config.is_stage2b:
-            prepared = [
-                prepare_stage2_example(
-                    item,
-                    image_root=Path(args.image_root),
-                    latent_size=decision.latent_size,
-                    require_reasoning_units=True,
-                )
-                for item in selected_examples
-            ]
+            prepared = stage2b_preflight.prepared_examples
         else:
+            raw_examples = load_jsonl_examples(Path(args.data_path))
+            selected_examples = (
+                raw_examples
+                if args.max_train_samples is None
+                else raw_examples[: args.max_train_samples]
+            )
             prepared = [
                 prepare_stage2_example(
                     item,
@@ -474,79 +557,25 @@ def build_stage2_training_components(
             max_length=args.max_seq_length_train,
         )
     else:
-        prepared = (
-            manifest_snapshot.prepared_examples
-            if args.max_train_samples is None
-            else manifest_snapshot.prepared_examples[: args.max_train_samples]
-        )
+        if step_preference_config.is_stage2b:
+            prepared = stage2b_preflight.prepared_examples
+        else:
+            prepared = (
+                manifest_snapshot.prepared_examples
+                if args.max_train_samples is None
+                else manifest_snapshot.prepared_examples[: args.max_train_samples]
+            )
         kept = [
             prepared[index]
             for index in manifest_snapshot.manifest.retained_indices
             if index < len(prepared)
         ]
-        selected_examples = tuple(manifest_snapshot.raw_examples[: len(prepared)])
-        if step_preference_config.is_stage2b:
-            prepared = tuple(
-                prepare_stage2_example(
-                    item,
-                    image_root=Path(args.image_root),
-                    latent_size=decision.latent_size,
-                    require_reasoning_units=True,
-                )
-                for item in selected_examples
-            )
-            kept = [
-                prepared[index]
-                for index in manifest_snapshot.manifest.retained_indices
-                if index < len(prepared)
-            ]
 
-    negative_store = None
-    if step_preference_config.is_stage2b:
-        reject_duplicate_sample_ids(example.sample_id for example in prepared)
-        manifest = read_negative_manifest(step_preference_config.negative_manifest)
-        checkpoint_files, tokenizer_identity = inspect_stage2a_checkpoint_identity(
-            step_preference_config.stage2a_checkpoint_path
-        )
-        generation_settings = manifest.generation_settings_dict
-        if generation_settings.get("min_tokens") != step_preference_config.min_tokens:
-            raise ValueError("negative manifest min_tokens does not match Stage 2B")
-        if (
-            generation_settings.get("max_new_tokens")
-            != step_preference_config.max_new_tokens
-        ):
-            raise ValueError("negative manifest max_new_tokens does not match Stage 2B")
-        source_path = Path(args.data_path)
-        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
-        expected_keys = tuple(
-            (example.sample_id, step.step_id)
-            for example in prepared
-            for step in example.reasoning_steps
-        )
-        negative_store = load_negative_store(
-            negative_path=step_preference_config.negative_path,
-            manifest_path=step_preference_config.negative_manifest,
-            source_path=source_path,
-            expected_source_sha256=source_sha256,
-            expected_selected_row_indices=tuple(range(len(prepared))),
-            expected_stage2a_checkpoint_path=(
-                step_preference_config.stage2a_checkpoint_path
-            ),
-            expected_checkpoint_files=checkpoint_files,
-            expected_tokenizer_config_identity=tokenizer_identity,
-            expected_latent_size=decision.latent_size,
-            expected_generation_settings=generation_settings,
-            expected_keys=expected_keys,
-        )
-        for example in prepared:
-            assistant_text = example.conversation[1]["content"][0]["text"]
-            for step in example.reasoning_steps:
-                key = (example.sample_id, step.step_id)
-                chosen = assistant_text[step.target_text.start : step.target_text.end]
-                if negative_store[key].chosen_text != chosen:
-                    raise ValueError(
-                        f"negative chosen text does not match source step: {key}"
-                    )
+    negative_store = (
+        stage2b_preflight.negative_store
+        if step_preference_config.is_stage2b
+        else None
+    )
     collator = Stage2DataCollator(
         processor,
         token_ids,
@@ -792,6 +821,15 @@ def route_training(args, *, stage1_handler=None, stage2_handler=None):
 def main_train():
     args = get_args()
     validate_generated_artifact_paths(args)
+    step_preference_config = getattr(args, "step_preference_config", None)
+    if step_preference_config is None:
+        step_preference_config = StepPreferenceConfig.from_args(args)
+    stage2b_preflight = None
+    if step_preference_config.is_stage2b:
+        stage2b_preflight = preflight_stage2b_artifacts(args)
+    if getattr(args, "stage2b_preflight_only", False):
+        return 0
+    args._stage2b_preflight = stage2b_preflight
     if _DIRECT_MAIN_PROFILE is not None:
         args.deepspeed_runtime_profile = _DIRECT_MAIN_PROFILE
     bind_deepspeed_runtime_profile(args)

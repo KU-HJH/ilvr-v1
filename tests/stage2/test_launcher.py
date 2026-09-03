@@ -1,5 +1,7 @@
+import json
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -396,6 +398,91 @@ def test_stage2_launcher_rejects_invalid_opt_in_environment(updates, message):
 
     assert result.returncode == 2
     assert message in result.stderr
+
+
+def test_stage2b_launcher_preflights_stale_artifact_before_creating_run_paths(
+    tmp_path,
+):
+    """Catches output/log/result writes preceding Stage 2B provenance validation."""
+    source = tmp_path / "train.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "sample_id": "sample-a",
+                "image_input": ["image.bin"],
+                "text_input": "question",
+                "sequence_plan": [
+                    {"type": "text", "content": "before"},
+                    {"type": "latent", "helper_image": "helper.bin"},
+                    {"type": "text", "content": "after"},
+                ],
+                "original_final_answer": "answer",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    (image_root / "image.bin").write_bytes(b"image")
+    stage2a = tmp_path / "stage2a"
+    stage2a.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    negative_path = tmp_path / "negatives.jsonl"
+    negative_path.write_bytes(b"")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "source_sha256": "0" * 64,
+                "selected_row_indices": [0],
+                "stage2a_checkpoint_path": str(stage2a.resolve()),
+                "checkpoint_files": [],
+                "tokenizer_config_identity": "stale-tokenizer",
+                "latent_size": 8,
+                "generation_settings": {
+                    "min_tokens": 2,
+                    "max_new_tokens": 32,
+                },
+                "negative_sha256": "0" * 64,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    experiment_id = f"t8-preflight-{abs(hash(str(tmp_path)))}"
+    output_dir = REPO_ROOT / "checkpoints" / experiment_id
+    log_dir = REPO_ROOT / "logs/zero-stage-compatibility" / experiment_id
+    result_dir = REPO_ROOT / "results" / experiment_id
+    assert not output_dir.exists()
+    assert not log_dir.exists()
+    assert not result_dir.exists()
+
+    try:
+        completed = run_launcher(
+            env_overrides={
+                "STAGE2_DRY_RUN": "false",
+                "STAGE1_CHECKPOINT": str(stage2a),
+                "DATA_PATH": str(source),
+                "IMAGE_ROOT": str(image_root),
+                "OUTPUT_DIR": str(output_dir),
+                "LOG_FILE": str(log_dir / "train.log"),
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STAGE2A_CHECKPOINT_PATH": str(stage2a),
+                "STEP_NEGATIVE_PATH": str(negative_path),
+                "STEP_NEGATIVE_MANIFEST": str(manifest_path),
+            }
+        )
+
+        assert completed.returncode != 0
+        assert "source JSONL SHA-256 does not match" in completed.stderr
+        assert not output_dir.exists()
+        assert not log_dir.exists()
+        assert not result_dir.exists()
+    finally:
+        for path in (output_dir, log_dir, result_dir):
+            shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.mark.parametrize(

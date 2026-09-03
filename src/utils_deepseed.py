@@ -41,6 +41,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage2a_ratio", type=float, default=0.5)
     parser.add_argument("--stage2_total_steps", type=int)
     parser.add_argument("--stage2a_checkpoint_path")
+    parser.add_argument(
+        "--stage2b_preflight_only", action="store_true", help=argparse.SUPPRESS
+    )
     parser.add_argument("--save_steps", type=int, default=612)
     parser.add_argument("--compress_strategy", type=str, default='average', choices=['average'])
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -161,6 +164,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
     args.step_preference_config = StepPreferenceConfig.from_args(args)
+    if args.stage2b_preflight_only and not args.step_preference_config.is_stage2b:
+        raise ValueError("--stage2b_preflight_only requires Stage 2B")
     if args.stage == "stage2":
         manifest_fields = (
             args.stage2_length_manifest,
