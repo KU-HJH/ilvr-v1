@@ -3,8 +3,10 @@ import subprocess
 import sys
 
 import pytest
+import torch
 
 from step_preference.benchmark import (
+    Stage2BTrainingStep,
     benchmark_training_path,
     evaluate_benchmark_gate,
 )
@@ -58,6 +60,35 @@ class _Step:
 
     def __call__(self):
         self.calls.append("step")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="BF16 benchmark requires CUDA")
+def test_training_step_uses_bfloat16_cuda_autocast(monkeypatch):
+    """Catches the handcrafted benchmark silently measuring FP32 execution."""
+    observed = []
+
+    def fake_compute_loss(_trainer, _model, _batch):
+        observed.append(
+            (
+                torch.is_autocast_enabled("cuda"),
+                torch.get_autocast_dtype("cuda"),
+            )
+        )
+        return torch.ones((), device="cuda", requires_grad=True)
+
+    monkeypatch.setattr(
+        "step_preference.benchmark.Stage2Trainer.compute_loss", fake_compute_loss
+    )
+
+    class Model:
+        def zero_grad(self, *, set_to_none):
+            assert set_to_none is True
+
+    step = Stage2BTrainingStep(Model(), {}, object())
+    step()
+
+    assert observed == [(True, torch.bfloat16)]
+    assert step.autocast_dtype == torch.bfloat16
 
 
 def test_benchmark_protocol_warms_up_then_times_exactly_ten_iterations():

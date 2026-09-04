@@ -70,6 +70,7 @@ class Stage2BTrainingStep:
     def __init__(self, model, batch, config: StepPreferenceConfig):
         self.model = model
         self.batch = batch
+        self.autocast_dtype = torch.bfloat16
         self.trainer = object.__new__(Stage2Trainer)
         self.trainer.stage2_diagnostics_interval = 0
         self.trainer._stage2_microbatch_index = 0
@@ -81,7 +82,8 @@ class Stage2BTrainingStep:
         self.model.zero_grad(set_to_none=True)
 
     def __call__(self):
-        loss = self.trainer.compute_loss(self.model, self.batch)
+        with torch.autocast("cuda", dtype=self.autocast_dtype):
+            loss = self.trainer.compute_loss(self.model, self.batch)
         loss.backward()
 
 
@@ -162,4 +164,3 @@ def evaluate_benchmark_gate(
         time_reduction=time_reduction,
         memory_reduction=memory_reduction,
     )
-

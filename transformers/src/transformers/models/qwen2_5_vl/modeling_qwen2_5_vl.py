@@ -2180,8 +2180,31 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 )
             if int(token_ids.min()) < 0 or int(token_ids.max()) >= self.config.vocab_size:
                 raise ValueError("packed token_ids must be valid vocabulary IDs")
+            root_indices = torch.arange(root_length, device=input_ids.device)
+            if (
+                not bool(valid_slots[:root_length].all())
+                or not torch.equal(token_ids[:root_length], input_ids[0])
+                or not torch.equal(
+                    clean_embedding_sources[:root_length], root_indices
+                )
+                or not torch.equal(
+                    logical_position_sources[:root_length], root_indices
+                )
+            ):
+                raise ValueError(
+                    "packed clean root must be a valid identity copy of input_ids"
+                )
+            padding_indices = torch.nonzero(~valid_slots, as_tuple=False).flatten()
+            if padding_indices.numel():
+                first_padding = int(padding_indices[0])
+                if bool(valid_slots[first_padding:].any()):
+                    raise ValueError("packed valid_slots must be one contiguous prefix")
             if bool((token_ids[~valid_slots] != 0).any()):
                 raise ValueError("packed padding token_ids must use vocabulary ID zero")
+            if bool((clean_embedding_sources[~valid_slots] != -1).any()) or bool(
+                (logical_position_sources[~valid_slots] != 0).any()
+            ):
+                raise ValueError("packed padding metadata must use canonical sentinels")
             direct_non_root = (
                 valid_slots
                 & (clean_embedding_sources == -1)
@@ -2277,6 +2300,12 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 device=input_ids.device,
                 dtype=torch.long,
             )
+            if packed and not bool(
+                valid_slots.index_select(0, selected_positions).all()
+            ):
+                raise ValueError(
+                    "packed stage2_logit_positions must select valid packed slots"
+                )
 
         base_inputs_embeds = self.prepare_stage2_base_inputs_embeds(
             input_ids=input_ids,

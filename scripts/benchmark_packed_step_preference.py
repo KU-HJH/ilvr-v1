@@ -57,20 +57,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         runtime = CudaBenchmarkRuntime(args.device)
         torch.manual_seed(307)
-        naive = benchmark_training_path(
-            Stage2BTrainingStep(
-                context.model, context.batch, context.naive_config
-            ),
-            runtime,
+        naive_step = Stage2BTrainingStep(
+            context.model, context.batch, context.naive_config
         )
+        packed_step = Stage2BTrainingStep(
+            context.model, context.batch, context.packed_config
+        )
+        if naive_step.autocast_dtype != packed_step.autocast_dtype:
+            raise ValueError("benchmark paths must use the same autocast dtype")
+        naive = benchmark_training_path(naive_step, runtime)
         context.model.zero_grad(set_to_none=True)
         torch.manual_seed(307)
-        packed = benchmark_training_path(
-            Stage2BTrainingStep(
-                context.model, context.batch, context.packed_config
-            ),
-            runtime,
-        )
+        packed = benchmark_training_path(packed_step, runtime)
         gate = evaluate_benchmark_gate(
             naive_ms=naive.median_ms,
             packed_ms=packed.median_ms,
@@ -78,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
             packed_bytes=packed.peak_allocated_bytes,
         )
         identity = dict(context.identity)
+        identity["dtype"] = str(naive_step.autocast_dtype).removeprefix("torch.")
         identity["git_commit"] = git_commit
         report = {
             "schema_version": 1,
@@ -114,4 +113,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

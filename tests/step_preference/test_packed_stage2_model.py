@@ -332,8 +332,14 @@ def _packed_call(model, clean_ids, packed_inputs, positions, **kwargs):
         ("small-clean-source", "clean_embedding_sources"),
         ("large-clean-source", "clean_embedding_sources"),
         ("root-length", "root_length"),
+        ("mutated-root-token", "clean root"),
+        ("mutated-root-source", "clean root"),
+        ("mutated-root-logical", "clean root"),
         ("control-direct-token", "control token"),
         ("nonzero-padding", "padding token_ids"),
+        ("noncanonical-padding-source", "padding metadata"),
+        ("noncanonical-padding-logical", "padding metadata"),
+        ("noncontiguous-valid-slots", "contiguous prefix"),
     ),
 )
 def test_packed_stage2_rejects_malformed_packed_boundaries(
@@ -394,6 +400,19 @@ def test_packed_stage2_rejects_malformed_packed_boundaries(
         packed_inputs["clean_embedding_sources"][0] = clean_ids.shape[1]
     elif mutation == "root-length":
         packed_inputs["root_length"] = clean_ids.shape[1] - 1
+    elif mutation == "mutated-root-token":
+        packed_inputs["token_ids"] = packed_inputs["token_ids"].clone()
+        packed_inputs["token_ids"][0] = int(clean_ids[0, 0]) + 1
+    elif mutation == "mutated-root-source":
+        packed_inputs["clean_embedding_sources"] = packed_inputs[
+            "clean_embedding_sources"
+        ].clone()
+        packed_inputs["clean_embedding_sources"][0] = 1
+    elif mutation == "mutated-root-logical":
+        packed_inputs["logical_position_sources"] = packed_inputs[
+            "logical_position_sources"
+        ].clone()
+        packed_inputs["logical_position_sources"][0] = 1
     elif mutation == "control-direct-token":
         direct = torch.nonzero(
             packed_inputs["valid_slots"]
@@ -406,6 +425,21 @@ def test_packed_stage2_rejects_malformed_packed_boundaries(
         padding = torch.nonzero(~packed_inputs["valid_slots"])[0, 0]
         packed_inputs["token_ids"] = packed_inputs["token_ids"].clone()
         packed_inputs["token_ids"][padding] = 1
+    elif mutation == "noncanonical-padding-source":
+        padding = torch.nonzero(~packed_inputs["valid_slots"])[0, 0]
+        packed_inputs["clean_embedding_sources"] = packed_inputs[
+            "clean_embedding_sources"
+        ].clone()
+        packed_inputs["clean_embedding_sources"][padding] = 0
+    elif mutation == "noncanonical-padding-logical":
+        padding = torch.nonzero(~packed_inputs["valid_slots"])[0, 0]
+        packed_inputs["logical_position_sources"] = packed_inputs[
+            "logical_position_sources"
+        ].clone()
+        packed_inputs["logical_position_sources"][padding] = 1
+    elif mutation == "noncontiguous-valid-slots":
+        packed_inputs["valid_slots"] = packed_inputs["valid_slots"].clone()
+        packed_inputs["valid_slots"][plan.root_length] = False
 
     with pytest.raises((TypeError, ValueError), match=message):
         _packed_call(
@@ -424,6 +458,7 @@ def test_packed_stage2_rejects_malformed_packed_boundaries(
         (torch.tensor([5, 5]), "strictly increasing"),
         (torch.tensor([6, 5]), "strictly increasing"),
         (torch.tensor([128]), "packed sequence"),
+        (torch.tensor([127]), "valid packed slots"),
     ),
 )
 def test_packed_stage2_rejects_invalid_selected_positions(

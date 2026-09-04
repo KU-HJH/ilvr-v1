@@ -548,10 +548,9 @@ against packed FlexAttention. Its raw loss and gradient differences are a
 diagnostic, not a fitted equivalence threshold: exceptions or nonfinite values
 fail closed, but finite cross-kernel drift does not replace the strict FP32
 correctness oracle. Completion therefore does not claim one-percent BF16
-gradient equivalence. This change follows direct evidence that the production
-graph agrees in FP32 (loss at most `3.35e-7`, representative gradient relative
-L2 at most `1.41e-5`) while SDPA/Flex BF16 reductions differ by roughly
-five-to-six percent on the observed sample.
+gradient equivalence. The versioned runtime report records the exact observed
+FP32 agreement and BF16 SDPA/Flex drift; transient measurements are not frozen
+into this design contract.
 
 The benchmark uses the same process, GPU, model state, precision, and fixed
 collated samples for both paths. Each path performs three unmeasured warmups and
