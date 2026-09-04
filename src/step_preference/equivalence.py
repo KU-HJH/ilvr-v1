@@ -595,6 +595,8 @@ def load_production_context(
     negative_path: str | Path,
     negative_manifest: str | Path,
     device: str | torch.device,
+    tuning_method: str = "full",
+    gradient_checkpointing: bool = False,
 ) -> ProductionContext:
     """Load one authenticated valid-pair sample through production assembly."""
     from main import build_stage2_training_components, preflight_stage2b_artifacts
@@ -636,7 +638,13 @@ def load_production_context(
             str(len(selected)),
             "--attention_implementation",
             "sdpa",
-            "--no-gradient_checkpointing",
+            "--tuning_method",
+            tuning_method,
+            (
+                "--gradient_checkpointing"
+                if gradient_checkpointing
+                else "--no-gradient_checkpointing"
+            ),
         ]
     )
     preflight = preflight_stage2b_artifacts(args)
@@ -677,9 +685,12 @@ def load_production_context(
             module.p = 0.0
     if hasattr(model.config, "attention_dropout"):
         model.config.attention_dropout = 0.0
-    model.gradient_checkpointing_disable()
     model.to(device)
     model.train()
+    if getattr(model, "is_gradient_checkpointing", None) is not gradient_checkpointing:
+        raise ValueError(
+            "loaded model gradient checkpointing state does not match the request"
+        )
     batch = _to_device(batch, device)
     naive_config = replace(
         components.step_preference_config,
@@ -698,5 +709,7 @@ def load_production_context(
             "negative_sha256": manifest.negative_sha256,
             "device": str(device),
             "dtype": "bfloat16",
+            "tuning_method": tuning_method,
+            "gradient_checkpointing": gradient_checkpointing,
         },
     )
