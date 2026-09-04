@@ -2,7 +2,7 @@
 
 ## Status
 
-Design commitment v2, approved by the user on 2026-09-04.
+Design commitment v3, approved by the user on 2026-09-04.
 
 ## Problem and scope
 
@@ -65,14 +65,15 @@ This work addresses three observed blockers before training:
 ## Data boundary contract
 
 When and only when `--step_preference_enabled` is active,
-`build_assistant_plan` inserts one literal LF character between every pair of
-adjacent text plan entries. It does not strip or normalize either entry, even if
-one already starts or ends with whitespace. The current dataset contains such
-adjacency only at the final reasoning/final-answer boundary. Plan character
-spans are half-open and are computed after insertion. The LF belongs to neither
+`build_assistant_plan` inserts exactly one ASCII space followed by one LF
+(`" \n"`) between every pair of adjacent text plan entries. It does not strip
+or normalize either entry, even if one already starts or ends with whitespace.
+The current dataset contains such adjacency only at the final
+reasoning/final-answer boundary. Plan character spans are half-open and are
+computed after insertion. The two-character delimiter belongs to neither
 entry: the left span ends before it and the right span starts after it. Token
 intervals remain the minimal contiguous intervals whose offset endpoints equal
-the corresponding text span endpoints; the LF is excluded from reasoning
+the corresponding text span endpoints; the delimiter is excluded from reasoning
 targets. Each source text entry otherwise remains unchanged. Ordinary Stage 2
 keeps its existing byte-identical rendering.
 
@@ -85,7 +86,7 @@ training set and bias the retained distribution.
 Negative generation, reference scoring, Stage 2B collation, and all three
 training recipes consume the new step-preference rendering. Negative manifest
 schema version 3 adds the exact field
-`assistant_plan_rendering="adjacent-text-lf-v1"`. The strict dataclass parser
+`assistant_plan_rendering="adjacent-text-space-lf-v1"`. The strict dataclass parser
 requires that field and value, and canonical manifest serialization covers it.
 An absent or different value fails preflight before model loading. Artifacts
 made before the separator contract are therefore rejected even though the raw
@@ -171,7 +172,7 @@ gate:
    fresh schema-3 negative artifact is generated. It is retried first with
    single-device DoRA and the intended BF16/checkpointed packed model path.
 4. Source row 1078, previously measured as the longest retained clean sample at
-   8,095 tokens, is regenerated under the LF rendering and accepted only if it
+   8,095 tokens, is regenerated under the space-LF rendering and accepted only if it
    remains at or below 8,192 without truncation. It is collated and packed, then
    run through one BF16 DoRA forward/backward. After full negative generation,
    the retained row with maximum packed padded length is also run if it is not
@@ -201,7 +202,7 @@ run ID, output/log paths, and the three declared coefficients; every other
 training field must be equal.
 
 One shared negative-generation run ID uses
-`step-pref-negatives-adjacent-text-lf-v1-<UTC timestamp>`, with
+`step-pref-negatives-adjacent-text-space-lf-v1-<UTC timestamp>`, with
 `results/<negative-run-id>/negatives.jsonl`,
 `results/<negative-run-id>/negative-manifest.json`, and
 `logs/<negative-run-id>/generate.log`. It runs
@@ -275,14 +276,25 @@ rather than silently shortening the dataset or changing the comparison.
 
 Independent review preferred, as an alternative, preserving the original text
 and assigning or masking the crossing token. That avoids a rendering shift but
-cannot give `.The` an exact source-span ownership. The selected newline design
+cannot give `.The` an exact source-span ownership. The selected space-LF design
 accepts a small, explicit Stage 2B rendering shift and controls it by applying
 the same rendering to the CE baseline and both preference recipes. This controls
 the within-experiment comparison but does not make it comparable to historical
 Stage 2 runs without an additional control, which is outside the requested
 simple three-run experiment.
 
-The remaining unvalidated premises are FlexAttention checkpoint compatibility
+The v3 delimiter revision was required because the fixed Qwen tokenizer merges
+the v2 LF-only boundary `".\n"` into one token spanning the preceding text and
+the delimiter. Across all 3,449 adjacent-text boundaries in `data/TRAIN.jsonl`,
+LF-only failed exact endpoint separation 3,448 times, while space-LF failed zero
+times. U+2028 also failed zero times but was rejected because it is less
+readable and its byte-level tokenization reports duplicated offsets for one
+character. Independent correctness and experimental-comparability lenses both
+approved v3; the prepared-example and capacity gates remain the runtime
+evidence.
+
+The remaining unvalidated premises are full rendered-chat length eligibility,
+FlexAttention checkpoint compatibility
 under backward, sufficient real-sample memory reduction, and stable two-GPU
 DoRA+ZeRO-2 execution. The verification gates above are the required evidence;
 they are not waived.

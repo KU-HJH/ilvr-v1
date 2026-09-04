@@ -15,7 +15,7 @@
 - Run Python, pytest, training, and evaluation through `./venv/ilvr-venv` with `PYTHONPATH="$PWD/transformers/src:$PWD/src"`.
 - Keep model-bearing artifacts under `checkpoints/`, results under `results/`, and logs under `logs/` in this worktree.
 - Preserve ordinary Stage 2 byte-for-byte behavior when step preference is disabled.
-- Use `assistant_plan_rendering="adjacent-text-lf-v1"` only when step preference is enabled; legacy rendering is `concatenated-v1`.
+- Use `assistant_plan_rendering="adjacent-text-space-lf-v1"` only when step preference is enabled; legacy rendering is `concatenated-v1`.
 - Use negative manifest schema 3 and Stage 2 length-manifest schema 2 after the rendering change; reject older artifacts instead of upgrading them implicitly.
 - Keep packed attention as FlexAttention with the existing `BlockMask`; public Stage 2B attention remains `sdpa`.
 - Use non-reentrant gradient checkpointing with RNG-state preservation and `use_cache=False`.
@@ -38,7 +38,7 @@
 - Modify: `tests/stage2/test_launcher.py`
 
 **Interfaces:**
-- Produces: `ASSISTANT_PLAN_RENDERING_CONCATENATED`, `ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_LF`, and `normalize_assistant_plan_rendering(value: str) -> str`.
+- Produces: `ASSISTANT_PLAN_RENDERING_CONCATENATED`, `ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF`, and `normalize_assistant_plan_rendering(value: str) -> str`.
 - Produces: `build_assistant_plan(..., assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED)` and the same optional keyword on `build_stage2_conversation` and `prepare_stage2_example`.
 - Produces: `Stage2LengthManifest.assistant_plan_rendering: str`, schema version 2, with the rendering passed through build, read, validate, and CLI paths.
 - Consumes: the existing strict half-open `PlanCharSpan` and no-truncation length measurement.
@@ -51,22 +51,24 @@ Add tests which construct `text("A.") -> text("The final answer")` and assert:
 assistant, spans, _ = build_assistant_plan(
     plan,
     1,
-    assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_LF,
+    assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
 )
-assert assistant == "A.\nThe final answer"
+assert assistant == "A. \nThe final answer"
 assert (spans[0].start, spans[0].end) == (0, 2)
-assert (spans[1].start, spans[1].end) == (3, 19)
-assert assistant[spans[0].end:spans[1].start] == "\n"
+assert (spans[1].start, spans[1].end) == (4, 20)
+assert assistant[spans[0].end:spans[1].start] == " \n"
 ```
 
 Also assert the default returns `"A.The final answer"`, existing leading or trailing whitespace is not normalized, and an unknown rendering value raises `ValueError`.
 
 Add the causal tokenizer regression using the real fast tokenizer from the
 fixed Stage 2A checkpoint. First assert legacy rendering produces one offset
-covering characters from both sides of the `.The` boundary. Then render with
-LF and call `map_reasoning_step_spans`; assert no token crosses the two text
-endpoints, the mapped target interval starts/ends on exact offsets, and the LF
-token position belongs to neither the reasoning target nor final-answer span.
+covering characters from both sides of the `.The` boundary, and direct
+tokenization of `"A.\nThe final answer"` produces one offset covering `".\n"`.
+Then render with space-LF and
+call `map_reasoning_step_spans`; assert no token crosses the two text endpoints,
+the mapped target interval starts/ends on exact offsets, and the delimiter token
+position belongs to neither the reasoning target nor final-answer span.
 
 - [ ] **Step 2: Run the rendering tests and verify RED**
 
@@ -81,26 +83,26 @@ Expected: FAIL because the constants/keyword do not exist.
 
 - [ ] **Step 3: Implement the minimal rendering policy**
 
-In `spans.py`, validate exactly two identities and insert an LF before the current entry only when both the previous and current plan entries are text:
+In `spans.py`, validate exactly two identities and insert an ASCII space followed by LF before the current entry only when both the previous and current plan entries are text:
 
 ```python
 ASSISTANT_PLAN_RENDERING_CONCATENATED = "concatenated-v1"
-ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_LF = "adjacent-text-lf-v1"
+ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF = "adjacent-text-space-lf-v1"
 
 def normalize_assistant_plan_rendering(value: str) -> str:
     if value not in {
         ASSISTANT_PLAN_RENDERING_CONCATENATED,
-        ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_LF,
+        ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
     }:
         raise ValueError(f"unsupported assistant plan rendering: {value}")
     return value
 ```
 
-Before appending a rendered entry, append `"\n"` and increment the character cursor when the LF identity is active and the adjacent raw plan types are both `text`. Do not widen either `PlanCharSpan` over the LF.
+Before appending a rendered entry, append `" \n"` and increment the character cursor by two when the space-LF identity is active and the adjacent raw plan types are both `text`. Do not widen either `PlanCharSpan` over the delimiter.
 
 - [ ] **Step 4: Add failing prepared-example and length-manifest tests**
 
-Assert that `prepare_stage2_example(..., assistant_plan_rendering=...)` uses the same rendered assistant text and span coordinates. Extend length-manifest construction/round-trip tests to require schema 2 and the exact rendering identity. Assert validation fails when a legacy-rendered manifest is supplied for LF-rendered Stage 2B.
+Assert that `prepare_stage2_example(..., assistant_plan_rendering=...)` uses the same rendered assistant text and span coordinates. Extend length-manifest construction/round-trip tests to require schema 2 and the exact rendering identity. Assert validation fails when a legacy-rendered manifest is supplied for space-LF-rendered Stage 2B.
 
 Add an end-to-end ordinary Stage 2 golden test: prepare and collate the same
 sample through the default path and assert conversation, `input_ids`,
@@ -122,11 +124,11 @@ Expected: FAIL on the missing keyword and manifest field.
 
 Add the optional keyword to `_assistant_text`, `build_stage2_conversation`, and `prepare_stage2_example`, and pass it to both assistant-plan calls so conversation and spans cannot diverge. Set `STAGE2_LENGTH_MANIFEST_SCHEMA_VERSION = 2`; add the field to the dataclass, writer, strict reader, validator, snapshot preparation, and CLI parser as `--assistant-plan-rendering` with the legacy default.
 
-In `src/main.py`, derive the expected rendering from `StepPreferenceConfig.enabled` and pass it both when validating the length manifest and preparing examples. In the launcher, pass `adjacent-text-lf-v1` to length-manifest generation whenever `STEP_PREFERENCE_ENABLED=true`, otherwise pass `concatenated-v1`.
+In `src/main.py`, derive the expected rendering from `StepPreferenceConfig.enabled` and pass it both when validating the length manifest and preparing examples. In the launcher, pass `adjacent-text-space-lf-v1` to length-manifest generation whenever `STEP_PREFERENCE_ENABLED=true`, otherwise pass `concatenated-v1`.
 
 - [ ] **Step 7: Add and run launcher regression tests**
 
-Assert a Stage 2B dry-run includes the LF rendering in its length-manifest command/identity, while an ordinary Stage 2 dry-run retains the legacy identity. Run:
+Assert a Stage 2B dry-run includes the space-LF rendering in its length-manifest command/identity, while an ordinary Stage 2 dry-run retains the legacy identity. Run:
 
 ```bash
 PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q \
@@ -161,7 +163,7 @@ git commit -m "fix: version step preference rendering"
 - Modify: `tests/stage2/test_routing.py`
 
 **Interfaces:**
-- Consumes: `ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_LF` and the rendering-aware `prepare_stage2_example` from Task 1.
+- Consumes: `ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF` and the rendering-aware `prepare_stage2_example` from Task 1.
 - Produces: `NEGATIVE_MANIFEST_SCHEMA_VERSION = 3` and `NegativeManifest.assistant_plan_rendering: str`.
 - Produces: `assistant_plan_rendering` on `write_negative_artifact` and
   `expected_assistant_plan_rendering` on `load_negative_store`.
@@ -172,10 +174,10 @@ Extend manifest fixtures with:
 
 ```python
 "schema_version": 3,
-"assistant_plan_rendering": "adjacent-text-lf-v1",
+"assistant_plan_rendering": "adjacent-text-space-lf-v1",
 ```
 
-Assert missing, unknown, or `concatenated-v1` rendering fails when the consumer expects `adjacent-text-lf-v1`. Assert canonical write/read retains the field.
+Assert missing, unknown, or `concatenated-v1` rendering fails when the consumer expects `adjacent-text-space-lf-v1`. Assert canonical write/read retains the field.
 
 - [ ] **Step 2: Run negative tests and verify RED**
 
@@ -190,23 +192,23 @@ Expected: FAIL because schema 2 has no rendering field.
 - [ ] **Step 3: Implement schema 3 and strict consumer matching**
 
 Set schema version 3, add the string field to `NegativeManifest`, require its
-value to be exactly `adjacent-text-lf-v1`, include it in
+value to be exactly `adjacent-text-space-lf-v1`, include it in
 `_manifest_from_bytes`, and require equality in `load_negative_store`. Do not
 accept schema 2, a schema-3 legacy rendering, or synthesize a default.
 
-- [ ] **Step 4: Make the generator use LF rendering**
+- [ ] **Step 4: Make the generator use space-LF rendering**
 
 In `_selected_examples`, validate and prepare every source row with:
 
 ```python
-assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_LF
+    assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
 ```
 
 Pass the same identity to `write_negative_artifact` and its post-publication `load_negative_store` check. Include the identity directly in the manifest, not only inside `generation_settings`.
 
-- [ ] **Step 5: Make Stage 2B preflight demand schema 3 LF artifacts**
+- [ ] **Step 5: Make Stage 2B preflight demand schema 3 space-LF artifacts**
 
-In `src/main.py`, supply `expected_assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_LF` when loading the negative store. Add a test proving preflight rejects an otherwise valid legacy artifact before model construction.
+In `src/main.py`, supply `expected_assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF` when loading the negative store. Add a test proving preflight rejects an otherwise valid legacy artifact before model construction.
 
 - [ ] **Step 6: Run focused tests**
 
@@ -583,7 +585,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
 
 - [ ] **Step 4: Run the near-8192 probe on row 1078**
 
-Repeat Step 3 with the row-1078 pair. Require its LF-rendered clean length to remain `<=8192`, no truncation, status `pass`, and finite witnesses. Stop on failure.
+Repeat Step 3 with the row-1078 pair. Require its space-LF-rendered clean length to remain `<=8192`, no truncation, status `pass`, and finite witnesses. Stop on failure.
 
 ```bash
 set -o pipefail
@@ -601,10 +603,10 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
 
 - [ ] **Step 5: Generate the shared full negative artifact once**
 
-Allocate `step-pref-negatives-adjacent-text-lf-v1-<UTC>` and run the generator on all 3,450 rows. Tee one log and validate the emitted schema-3 manifest/store once. Record its negative and manifest SHA-256; do not regenerate per training arm.
+Allocate `step-pref-negatives-adjacent-text-space-lf-v1-<UTC>` and run the generator on all 3,450 rows. Tee one log and validate the emitted schema-3 manifest/store once. Record its negative and manifest SHA-256; do not regenerate per training arm.
 
 ```bash
-negative_run_id="step-pref-negatives-adjacent-text-lf-v1-$(date -u +%Y%m%dT%H%M%SZ)"
+negative_run_id="step-pref-negatives-adjacent-text-space-lf-v1-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "results/$negative_run_id" "logs/$negative_run_id"
 set -o pipefail
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
