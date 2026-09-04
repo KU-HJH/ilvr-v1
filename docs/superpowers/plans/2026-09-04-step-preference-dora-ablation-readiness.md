@@ -520,7 +520,7 @@ test "$(sha256sum data/TRAIN.jsonl | cut -d' ' -f1)" = 5bc1313a594f5713975b67388
 test "$(sha256sum data/TEST.jsonl | cut -d' ' -f1)" = 6a1dccf32bb5196d09941adfd8ea79e29b58c34316f286673b557ed29dc69618
 test "$(sha256sum configs/deepspeed_zero2.json | cut -d' ' -f1)" = 20615765b665d38647ee0447ca984ea28d16a1b8738363b505b054871bfc3f85
 test "$(sha256sum checkpoints/zero-stage-compatibility/stage2-eval-full-smoke-20260827/config.json | cut -d' ' -f1)" = cbec86a55c91603e7f91d506d94c975113de3af4ef6e9cce6e124e6825bc7b44
-test "$(sha256sum checkpoints/zero-stage-compatibility/stage2-eval-full-smoke-20260827/model.safetensors.index.json | cut -d' ' -f1)" = d28f59cc1060d05418f59a2320b4f53f83ba50374d7283d59ee559aefe35864
+test "$(sha256sum checkpoints/zero-stage-compatibility/stage2-eval-full-smoke-20260827/model.safetensors.index.json | cut -d' ' -f1)" = d28f59cc1060d05418f59a2320b4f53f83ba50374d7283d59ee559aefe35864b
 ```
 
 Then run:
