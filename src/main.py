@@ -189,6 +189,18 @@ def _default_stage2_source_dependencies() -> Stage2SourceDependencies:
     )
 
 
+def _require_stage2b_attention_contract(args) -> None:
+    if (
+        args.attention_implementation != "sdpa"
+        or getattr(args, "vision_attention_implementation", None)
+        != "flash_attention_2"
+    ):
+        raise ValueError(
+            "Stage 2B requires attention_implementation='sdpa' and "
+            "vision_attention_implementation='flash_attention_2'"
+        )
+
+
 def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     """Validate Stage 2B source, checkpoint, and negatives without runtime writes."""
     config = getattr(args, "step_preference_config", None)
@@ -196,6 +208,7 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
         config = StepPreferenceConfig.from_args(args)
     if not isinstance(config, StepPreferenceConfig) or not config.is_stage2b:
         raise ValueError("Stage 2B artifact preflight requires Stage 2B configuration")
+    _require_stage2b_attention_contract(args)
 
     source_path = Path(args.data_path)
     source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -351,6 +364,8 @@ def build_stage2_training_components(
         step_preference_config = StepPreferenceConfig.from_args(args)
     if not isinstance(step_preference_config, StepPreferenceConfig):
         raise TypeError("step_preference_config must be a StepPreferenceConfig")
+    if step_preference_config.is_stage2b:
+        _require_stage2b_attention_contract(args)
     assistant_plan_rendering = (
         ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
         if step_preference_config.enabled

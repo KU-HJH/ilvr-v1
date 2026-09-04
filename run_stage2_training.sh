@@ -40,7 +40,7 @@ LEARNING_RATE=${LEARNING_RATE:-1e-5}
 CE_WEIGHT=${CE_WEIGHT:-1.0}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-8}
 ATTENTION_IMPLEMENTATION=${ATTENTION_IMPLEMENTATION:-sdpa}
-if [[ -v VISION_ATTENTION_IMPLEMENTATION ]]; then
+if [[ -n "${VISION_ATTENTION_IMPLEMENTATION:-}" ]]; then
   vision_attention_implementation_explicit=true
 else
   vision_attention_implementation_explicit=false
@@ -97,6 +97,10 @@ case "$STEP_PREFERENCE_ENABLED" in
     if [[ "$STEP_PREFERENCE_MODE" == stage2b ]]; then
       if [[ "$vision_attention_implementation_explicit" == false ]]; then
         VISION_ATTENTION_IMPLEMENTATION=flash_attention_2
+      fi
+      if [[ "$ATTENTION_IMPLEMENTATION" != sdpa || "$VISION_ATTENTION_IMPLEMENTATION" != flash_attention_2 ]]; then
+        printf "Stage 2B requires ATTENTION_IMPLEMENTATION=sdpa and VISION_ATTENTION_IMPLEMENTATION=flash_attention_2\n" >&2
+        exit 2
       fi
       [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]] || {
         printf 'Stage 2B requires STAGE2A_CHECKPOINT_PATH\n' >&2

@@ -113,6 +113,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _require_negative_generation_attention_contract(
+    attention_implementation: str,
+    vision_attention_implementation: str | None,
+) -> None:
+    if (
+        attention_implementation != "sdpa"
+        or vision_attention_implementation != "flash_attention_2"
+    ):
+        raise ValueError(
+            "negative generation requires attention_implementation='sdpa' and "
+            "vision_attention_implementation='flash_attention_2'"
+        )
+
+
 def _read_weight_index(checkpoint: Path, name: str) -> tuple[str, ...]:
     path = checkpoint / name
     try:
@@ -308,7 +322,10 @@ def load_frozen_stage2a_snapshot(
     load_full_model: Callable | None = None,
     load_peft_model: Callable | None = None,
 ) -> LoadedStage2ASnapshot:
-    """Load a local full Stage 2 checkpoint directly, or its validated PEFT form."""
+    """Load one canonical mixed-attention full or PEFT Stage 2A snapshot."""
+    _require_negative_generation_attention_contract(
+        attention_implementation, vision_attention_implementation
+    )
     checkpoint = Path(checkpoint_path).resolve(strict=True)
     if checkpoint.is_symlink() or not checkpoint.is_dir():
         raise ValueError("Stage 2A checkpoint path must be a regular directory")
@@ -352,64 +369,41 @@ def load_frozen_stage2a_snapshot(
         "device_map": device,
         "torch_dtype": dtype,
     }
-    vision_attention_implementation = (
-        attention_implementation
-        if vision_attention_implementation is None
-        else vision_attention_implementation
-    )
-    use_mixed_attention = vision_attention_implementation != attention_implementation
     if inspection.artifact_kind is Stage2ArtifactKind.FULL:
         if load_full_model is None:
             load_full_model = Qwen2_5_VLForConditionalGeneration.from_pretrained
-        if use_mixed_attention:
-            model = load_qwen2_5_vl_with_attention(
-                str(checkpoint),
-                attention_implementation=attention_implementation,
-                vision_attention_implementation=vision_attention_implementation,
-                config_load_kwargs={"local_files_only": True},
-                model_load_kwargs={
-                    "local_files_only": True,
-                    **runtime_model_options,
-                },
-                load_config=load_config,
-                load_model=load_full_model,
-            )
-        else:
-            model = load_full_model(
-                str(checkpoint),
-                local_files_only=True,
-                attn_implementation=attention_implementation,
+        model = load_qwen2_5_vl_with_attention(
+            str(checkpoint),
+            attention_implementation=attention_implementation,
+            vision_attention_implementation=vision_attention_implementation,
+            config_load_kwargs={"local_files_only": True},
+            model_load_kwargs={
+                "local_files_only": True,
                 **runtime_model_options,
-            )
+            },
+            load_config=load_config,
+            load_model=load_full_model,
+        )
     else:
         if load_peft_model is None:
             load_peft_model = load_stage2_model_for_inference
-        peft_load_kwargs = {}
         model_options = dict(runtime_model_options)
-        if use_mixed_attention:
-            load_config = load_config or AutoConfig.from_pretrained
-            load_full_model = (
-                load_full_model
-                or Qwen2_5_VLForConditionalGeneration.from_pretrained
+        load_config = load_config or AutoConfig.from_pretrained
+        load_full_model = (
+            load_full_model or Qwen2_5_VLForConditionalGeneration.from_pretrained
+        )
+
+        def load_mixed_base(source, **kwargs):
+            return load_qwen2_5_vl_with_attention(
+                source,
+                attention_implementation=attention_implementation,
+                vision_attention_implementation=vision_attention_implementation,
+                config_load_kwargs={"local_files_only": True},
+                model_load_kwargs=kwargs,
+                load_config=load_config,
+                load_model=load_full_model,
             )
 
-            def load_mixed_base(source, **kwargs):
-                return load_qwen2_5_vl_with_attention(
-                    source,
-                    attention_implementation=attention_implementation,
-                    vision_attention_implementation=vision_attention_implementation,
-                    config_load_kwargs={"local_files_only": True},
-                    model_load_kwargs=kwargs,
-                    load_config=load_config,
-                    load_model=load_full_model,
-                )
-
-            peft_load_kwargs = {
-                "load_config": load_config,
-                "load_model": load_mixed_base,
-            }
-        else:
-            model_options["attn_implementation"] = attention_implementation
         loaded = load_peft_model(
             str(base),
             str(checkpoint),
@@ -417,15 +411,15 @@ def load_frozen_stage2a_snapshot(
             source_provenance_kwargs={"local_files_only": True},
             model_load_kwargs=model_options,
             artifact_inspection=inspection,
-            **peft_load_kwargs,
+            load_config=load_config,
+            load_model=load_mixed_base,
         )
         model = resolve_stage2_qwen_model(loaded)
-    if use_mixed_attention:
-        validate_qwen2_5_vl_attention_backends(
-            model,
-            attention_implementation=attention_implementation,
-            vision_attention_implementation=vision_attention_implementation,
-        )
+    validate_qwen2_5_vl_attention_backends(
+        model,
+        attention_implementation=attention_implementation,
+        vision_attention_implementation=vision_attention_implementation,
+    )
     model.eval()
     parameters = getattr(model, "parameters", None)
     if callable(parameters):
@@ -646,6 +640,9 @@ def _selected_examples(data_path: Path, image_root: Path, latent_size: int, max_
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _require_negative_generation_attention_contract(
+        args.attention_implementation, args.vision_attention_implementation
+    )
     if args.max_samples is not None and args.max_samples <= 0:
         raise ValueError("max_samples must be positive")
     if args.latent_size <= 0:

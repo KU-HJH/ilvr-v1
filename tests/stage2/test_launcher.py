@@ -435,6 +435,7 @@ def test_stage2b_launcher_dry_run_identifies_space_lf_length_manifest_rendering(
                 "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
                 "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
                 "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+                "VISION_ATTENTION_IMPLEMENTATION": "",
             }
         )
     )
@@ -446,6 +447,30 @@ def test_stage2b_launcher_dry_run_identifies_space_lf_length_manifest_rendering(
         arguments[arguments.index("--vision_attention_implementation") + 1]
         == "flash_attention_2"
     )
+
+
+@pytest.mark.parametrize(
+    ("attention_implementation", "vision_attention_implementation"),
+    (("eager", "eager"), ("sdpa", "sdpa")),
+)
+def test_stage2b_launcher_rejects_noncanonical_attention_contract(
+    attention_implementation, vision_attention_implementation
+):
+    """Catches Stage 2B forwarding equal backends around mixed validation."""
+    result = run_launcher(
+        env_overrides={
+            "STEP_PREFERENCE_ENABLED": "true",
+            "STEP_PREFERENCE_MODE": "stage2b",
+            "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
+            "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
+            "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+            "ATTENTION_IMPLEMENTATION": attention_implementation,
+            "VISION_ATTENTION_IMPLEMENTATION": vision_attention_implementation,
+        }
+    )
+
+    assert result.returncode == 2
+    assert "Stage 2B requires" in result.stderr
 
 
 def test_ordinary_stage2_launcher_dry_run_identifies_concatenated_length_rendering():

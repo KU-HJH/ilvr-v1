@@ -1201,6 +1201,7 @@ def test_stage2b_preflight_binds_space_lf_rendering_to_prepare_and_negative_load
         latent_size=8,
         max_train_samples=None,
         step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
     )
     manifest = SimpleNamespace(
         source_sha256=source_sha256,
@@ -1250,12 +1251,82 @@ def test_stage2b_preflight_binds_space_lf_rendering_to_prepare_and_negative_load
     )
     assert load_calls[0]["expected_generation_settings"] == {
         "attention_implementation": "sdpa",
-        "vision_attention_implementation": "sdpa",
+        "vision_attention_implementation": "flash_attention_2",
         "device": "cuda:0",
         "max_new_tokens": 32,
         "min_tokens": 2,
         "torch_dtype": "bfloat16",
     }
+
+
+@pytest.mark.parametrize(
+    ("attention_implementation", "vision_attention_implementation"),
+    (("eager", "eager"), ("sdpa", "sdpa")),
+)
+def test_stage2b_preflight_rejects_noncanonical_attention_before_source_read(
+    tmp_path,
+    attention_implementation,
+    vision_attention_implementation,
+):
+    """Catches Stage 2B authenticating a mutually matching noncanonical manifest."""
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        stage2a_checkpoint_path=str(tmp_path / "stage2a"),
+        negative_path=str(tmp_path / "negatives.jsonl"),
+        negative_manifest=str(tmp_path / "manifest.json"),
+    )
+    args = stage2_args(
+        data_path=str(tmp_path / "must-not-be-read.jsonl"),
+        step_preference_config=config,
+        attention_implementation=attention_implementation,
+        vision_attention_implementation=vision_attention_implementation,
+    )
+
+    with pytest.raises(ValueError, match="Stage 2B requires"):
+        main.preflight_stage2b_artifacts(args)
+
+
+@pytest.mark.parametrize(
+    ("attention_implementation", "vision_attention_implementation"),
+    (("eager", "eager"), ("sdpa", "sdpa")),
+)
+def test_stage2b_components_reject_noncanonical_attention_with_cached_preflight(
+    tmp_path,
+    attention_implementation,
+    vision_attention_implementation,
+):
+    """Catches an injected preflight bypass reaching configuration/model loading."""
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        stage2a_checkpoint_path=str(tmp_path / "stage2a"),
+        negative_path=str(tmp_path / "negatives.jsonl"),
+        negative_manifest=str(tmp_path / "manifest.json"),
+    )
+    args = stage2_args(
+        step_preference_config=config,
+        attention_implementation=attention_implementation,
+        vision_attention_implementation=vision_attention_implementation,
+        _stage2b_preflight=main.Stage2BPreflight((), {}),
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: pytest.fail(
+            "artifact discovery must not start"
+        ),
+        load_config=lambda *_args, **_kwargs: pytest.fail(
+            "configuration loading must not start"
+        ),
+        load_processor=lambda *_args, **_kwargs: pytest.fail(
+            "processor loading must not start"
+        ),
+        load_model=lambda *_args, **_kwargs: pytest.fail(
+            "model loading must not start"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Stage 2B requires"):
+        main.build_stage2_training_components(args, source_dependencies=dependencies)
 
 
 def test_stage2b_preflight_rejects_changed_vision_backend_before_model_load(
@@ -1385,6 +1456,7 @@ def test_main_stage2b_rejects_legacy_negative_manifest_before_model_construction
         latent_size=8,
         log_file=str(tmp_path / "train.log"),
         step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
     )
     prepared = SimpleNamespace(
         sample_id="sample-a",

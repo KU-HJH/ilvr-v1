@@ -360,11 +360,85 @@ def test_generator_parser_exposes_the_normative_names_and_defaults(tmp_path):
     assert args.device == "cuda:0"
 
 
-def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_files(
+@pytest.mark.parametrize(
+    ("attention_implementation", "vision_attention_implementation"),
+    (("eager", "eager"), ("sdpa", "sdpa")),
+)
+def test_generator_rejects_noncanonical_attention_before_snapshot_loading(
+    monkeypatch,
     tmp_path,
+    attention_implementation,
+    vision_attention_implementation,
+):
+    """Catches equal backends bypassing the authenticated mixed-model loader."""
+    import scripts.generate_step_negatives as generator
+
+    data_path = tmp_path / "data.jsonl"
+    data_path.write_text("", encoding="utf-8")
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    monkeypatch.setattr(
+        generator,
+        "load_frozen_stage2a_snapshot",
+        lambda **_kwargs: pytest.fail("snapshot loading must not start"),
+    )
+    monkeypatch.setattr(generator, "_selected_examples", lambda *_args: (object(),))
+
+    with pytest.raises(ValueError, match="negative generation requires"):
+        generator.main(
+            [
+                "--data_path",
+                str(data_path),
+                "--image_root",
+                str(image_root),
+                "--stage2a_checkpoint_path",
+                str(checkpoint),
+                "--output_path",
+                str(tmp_path / "negatives.jsonl"),
+                "--manifest_path",
+                str(tmp_path / "manifest.json"),
+                "--attention_implementation",
+                attention_implementation,
+                "--vision_attention_implementation",
+                vision_attention_implementation,
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("attention_implementation", "vision_attention_implementation"),
+    (("eager", "eager"), ("sdpa", "sdpa")),
+)
+def test_snapshot_loader_rejects_noncanonical_attention_before_artifact_loading(
+    tmp_path,
+    attention_implementation,
+    vision_attention_implementation,
+):
+    """Catches direct use of the generator loader reviving its legacy branch."""
+    from scripts.generate_step_negatives import load_frozen_stage2a_snapshot
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+
+    with pytest.raises(ValueError, match="negative generation requires"):
+        load_frozen_stage2a_snapshot(
+            checkpoint_path=checkpoint,
+            attention_implementation=attention_implementation,
+            vision_attention_implementation=vision_attention_implementation,
+            device="cpu",
+            inspect_artifact=lambda _path: pytest.fail(
+                "artifact inspection must not start"
+            ),
+        )
+
+
+def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_files(
+    monkeypatch, tmp_path
 ):
     """Catches treating the real full snapshot as PEFT or hashing trainer debris."""
-    from scripts.generate_step_negatives import load_frozen_stage2a_snapshot
+    import scripts.generate_step_negatives as generator
     from stage2.checkpointing import Stage2ArtifactInspection, Stage2ArtifactKind
 
     checkpoint = tmp_path / "stage2-full"
@@ -396,22 +470,37 @@ def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_
     model = FrozenModel()
     processor_loads = []
     model_loads = []
-    snapshot = load_frozen_stage2a_snapshot(
+    monkeypatch.setattr(
+        generator,
+        "load_qwen2_5_vl_with_attention",
+        lambda source, **kwargs: model_loads.append((source, kwargs)) or model,
+    )
+    monkeypatch.setattr(
+        generator,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda *_args, **_kwargs: None,
+    )
+    snapshot = generator.load_frozen_stage2a_snapshot(
         checkpoint_path=checkpoint,
-        attention_implementation="eager",
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
         device="cpu",
         inspect_artifact=lambda _path: Stage2ArtifactInspection(
             Stage2ArtifactKind.FULL
         ),
         load_processor=lambda source: processor_loads.append(source) or processor,
-        load_full_model=lambda source, **kwargs: model_loads.append((source, kwargs))
-        or model,
+        load_full_model=lambda *_args, **_kwargs: pytest.fail(
+            "the shared mixed loader must own model construction"
+        ),
     )
 
     assert processor_loads == [str(checkpoint.resolve())]
     assert model_loads[0][0] == str(checkpoint.resolve())
-    assert model_loads[0][1]["attn_implementation"] == "eager"
-    assert model_loads[0][1]["device_map"] == "cpu"
+    assert model_loads[0][1]["attention_implementation"] == "sdpa"
+    assert model_loads[0][1]["vision_attention_implementation"] == (
+        "flash_attention_2"
+    )
+    assert model_loads[0][1]["model_load_kwargs"]["device_map"] == "cpu"
     assert snapshot.model is model
     assert snapshot.processor is processor
     assert model.training is False
@@ -531,9 +620,11 @@ def test_full_snapshot_loader_routes_the_mixed_language_and_vision_backends(
     ]
 
 
-def test_preferred_chat_template_mutation_makes_generated_negatives_stale(tmp_path):
+def test_preferred_chat_template_mutation_makes_generated_negatives_stale(
+    monkeypatch, tmp_path
+):
     """Catches omitting the active Jinja chat template from frozen provenance."""
-    from scripts.generate_step_negatives import load_frozen_stage2a_snapshot
+    import scripts.generate_step_negatives as generator
     from stage2.checkpointing import Stage2ArtifactInspection, Stage2ArtifactKind
 
     checkpoint = tmp_path / "stage2-full"
@@ -553,15 +644,28 @@ def test_preferred_chat_template_mutation_makes_generated_negatives_stale(tmp_pa
             self.training = False
             return self
 
-    snapshot = load_frozen_stage2a_snapshot(
+    monkeypatch.setattr(
+        generator,
+        "load_qwen2_5_vl_with_attention",
+        lambda *_args, **_kwargs: FrozenModel(),
+    )
+    monkeypatch.setattr(
+        generator,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda *_args, **_kwargs: None,
+    )
+    snapshot = generator.load_frozen_stage2a_snapshot(
         checkpoint_path=checkpoint,
-        attention_implementation="eager",
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
         device="cpu",
         inspect_artifact=lambda _path: Stage2ArtifactInspection(
             Stage2ArtifactKind.FULL
         ),
         load_processor=lambda _source: SimpleNamespace(tokenizer=object()),
-        load_full_model=lambda _source, **_kwargs: FrozenModel(),
+        load_full_model=lambda *_args, **_kwargs: pytest.fail(
+            "the shared mixed loader must own model construction"
+        ),
     )
     source = tmp_path / "source.jsonl"
     source.write_bytes(b'{"sample_id":"sample-a"}\n')
@@ -660,10 +764,16 @@ def test_peft_snapshot_loader_keeps_source_selectors_out_of_model_options(
         "resolve_stage2_qwen_model",
         lambda loaded: underlying if loaded is loaded_wrapper else None,
     )
+    monkeypatch.setattr(
+        generator,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda *_args, **_kwargs: None,
+    )
 
     snapshot = generator.load_frozen_stage2a_snapshot(
         checkpoint_path=checkpoint,
         attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
         device="cpu",
         inspect_artifact=lambda path: (
             inspection
@@ -747,6 +857,7 @@ def test_peft_snapshot_rejects_mutation_after_retained_inspection(
         generator.load_frozen_stage2a_snapshot(
             checkpoint_path=checkpoint,
             attention_implementation="sdpa",
+            vision_attention_implementation="flash_attention_2",
             device="cpu",
             inspect_artifact=inspect_then_mutate,
             load_processor=lambda source: processor_loads.append(source),
@@ -793,6 +904,7 @@ def test_peft_snapshot_rejects_nonlocal_base_before_any_load(
         generator.load_frozen_stage2a_snapshot(
             checkpoint_path=checkpoint,
             attention_implementation="sdpa",
+            vision_attention_implementation="flash_attention_2",
             device="cpu",
             inspect_artifact=lambda _path: inspection,
             load_processor=lambda source: processor_loads.append(source),
