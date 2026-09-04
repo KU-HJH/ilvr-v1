@@ -71,6 +71,8 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         "1",
         "--attention_implementation",
         "sdpa",
+        "--vision_attention_implementation",
+        "sdpa",
         "--no-gradient_checkpointing",
         "--max_seq_length_train",
         "8192",
@@ -114,6 +116,7 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
                 "LEARNING_RATE": "2e-5",
                 "GRADIENT_ACCUMULATION_STEPS": "16",
                 "ATTENTION_IMPLEMENTATION": "flash_attention_2",
+                "VISION_ATTENTION_IMPLEMENTATION": "sdpa",
                 "GRADIENT_CHECKPOINTING": "true",
                 "MAX_SEQUENCE_LENGTH": "4096",
                 "DEEPSPEED_CONFIG": "/configs/zero 3.json",
@@ -138,6 +141,8 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         "1",
         "--attention_implementation",
         "flash_attention_2",
+        "--vision_attention_implementation",
+        "sdpa",
         "--gradient_checkpointing",
         "--max_seq_length_train",
         "4096",
@@ -174,6 +179,17 @@ def test_stage2_launcher_rejects_unknown_attention_backend():
 
     assert result.returncode == 2
     assert "ATTENTION_IMPLEMENTATION must be eager, sdpa, or flash_attention_2" in result.stderr
+
+
+def test_stage2_launcher_rejects_unknown_vision_attention_backend():
+    """Catches an unsupported vision backend reaching an expensive model startup."""
+    result = run_launcher(env_overrides={"VISION_ATTENTION_IMPLEMENTATION": "magic"})
+
+    assert result.returncode == 2
+    assert (
+        "VISION_ATTENTION_IMPLEMENTATION must be eager, sdpa, or flash_attention_2"
+        in result.stderr
+    )
 
 
 def test_stage2_launcher_rejects_non_positive_integer_settings():
@@ -224,6 +240,7 @@ MANAGED_OPTIONS = (
     "--gradient_accumulation_steps",
     "--per_device_train_batch_size",
     "--attention_implementation",
+    "--vision_attention_implementation",
     "--gradient_checkpointing",
     "--no-gradient_checkpointing",
     "--max_seq_length_train",

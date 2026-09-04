@@ -40,6 +40,12 @@ LEARNING_RATE=${LEARNING_RATE:-1e-5}
 CE_WEIGHT=${CE_WEIGHT:-1.0}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-8}
 ATTENTION_IMPLEMENTATION=${ATTENTION_IMPLEMENTATION:-sdpa}
+if [[ -v VISION_ATTENTION_IMPLEMENTATION ]]; then
+  vision_attention_implementation_explicit=true
+else
+  vision_attention_implementation_explicit=false
+fi
+VISION_ATTENTION_IMPLEMENTATION=${VISION_ATTENTION_IMPLEMENTATION:-$ATTENTION_IMPLEMENTATION}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 MAX_SEQUENCE_LENGTH=${MAX_SEQUENCE_LENGTH:-8192}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
@@ -89,6 +95,9 @@ case "$STEP_PREFERENCE_ENABLED" in
       STEP_PREFERENCE_ARGS+=(--stage2_total_steps "$STAGE2_TOTAL_STEPS")
     fi
     if [[ "$STEP_PREFERENCE_MODE" == stage2b ]]; then
+      if [[ "$vision_attention_implementation_explicit" == false ]]; then
+        VISION_ATTENTION_IMPLEMENTATION=flash_attention_2
+      fi
       [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]] || {
         printf 'Stage 2B requires STAGE2A_CHECKPOINT_PATH\n' >&2
         exit 2
@@ -223,6 +232,7 @@ MANAGED_OPTIONS=(
   --gradient_accumulation_steps
   --per_device_train_batch_size
   --attention_implementation
+  --vision_attention_implementation
   --gradient_checkpointing
   --no-gradient_checkpointing
   --max_seq_length_train
@@ -405,6 +415,14 @@ case "$ATTENTION_IMPLEMENTATION" in
     ;;
 esac
 
+case "$VISION_ATTENTION_IMPLEMENTATION" in
+  eager|sdpa|flash_attention_2) ;;
+  *)
+    printf 'VISION_ATTENTION_IMPLEMENTATION must be eager, sdpa, or flash_attention_2\n' >&2
+    exit 2
+    ;;
+esac
+
 RESUME_ARGS=()
 if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
   RESUME_ARGS+=(--resume_from_checkpoint_path "$RESUME_CHECKPOINT")
@@ -449,6 +467,7 @@ TRAINING_ARGS=(
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
   --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE"
   --attention_implementation "$ATTENTION_IMPLEMENTATION"
+  --vision_attention_implementation "$VISION_ATTENTION_IMPLEMENTATION"
   "${CHECKPOINTING_ARGS[@]}"
   --max_seq_length_train "$MAX_SEQUENCE_LENGTH"
   "${TUNING_ARGS[@]}"

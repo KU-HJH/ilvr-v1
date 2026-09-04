@@ -230,6 +230,19 @@ class RealControllerCapModel(ModelWhoseGenerateRaises):
 def _import_entry_point(module_name, monkeypatch):
     module = importlib.import_module(module_name)
     monkeypatch.setattr(module.torch.cuda, "is_available", lambda: False)
+    if module_name == "eval":
+        monkeypatch.setattr(
+            module,
+            "load_qwen2_5_vl_with_attention",
+            lambda source, **kwargs: kwargs["load_model"](
+                source, **dict(kwargs["model_load_kwargs"])
+            ),
+        )
+        monkeypatch.setattr(
+            module,
+            "validate_qwen2_5_vl_attention_backends",
+            lambda *_args, **_kwargs: None,
+        )
     return module
 
 
@@ -858,6 +871,7 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
     processor = FakeProcessor()
     processor_sources = []
     model_sources = []
+    validations = []
 
     def load_processor(source, **_kwargs):
         processor_sources.append(source)
@@ -873,6 +887,12 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
         "from_pretrained",
         load_model,
     )
+    if module_name == "eval":
+        monkeypatch.setattr(
+            module,
+            "validate_qwen2_5_vl_attention_backends",
+            lambda selected, **kwargs: validations.append((selected, kwargs)),
+        )
 
     model, loaded_processor = module.load_evaluation_artifacts(
         model_dir=str(artifact_dir),
@@ -885,6 +905,90 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
     assert processor_sources == [str(artifact_dir)]
     assert model_sources == [str(base_dir)]
     assert resolve_stage2_qwen_model(model).config.stage == "stage2"
+    if module_name == "eval":
+        assert validations[-1] == (
+            resolve_stage2_qwen_model(model),
+            {
+                "attention_implementation": "sdpa",
+                "vision_attention_implementation": "flash_attention_2",
+            },
+        )
+
+
+def test_eval_load_model_requires_fixed_mixed_backend_and_validates_runtime(
+    monkeypatch,
+):
+    """Catches evaluation flattening both towers onto one attention backend."""
+    module = _import_entry_point("eval", monkeypatch)
+    model = tiny_stage2_qwen()
+    loads = []
+    validations = []
+
+    def load_mixed(source, **kwargs):
+        loads.append((source, kwargs))
+        return model
+
+    monkeypatch.setattr(module, "load_qwen2_5_vl_with_attention", load_mixed)
+    monkeypatch.setattr(
+        module,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda selected, **kwargs: validations.append((selected, kwargs)),
+    )
+
+    assert module.load_model("model", "cache") is model
+    assert loads[0][0] == "model"
+    assert loads[0][1]["attention_implementation"] == "sdpa"
+    assert loads[0][1]["vision_attention_implementation"] == "flash_attention_2"
+    assert loads[0][1]["config_load_kwargs"] == {"cache_dir": "cache"}
+    assert loads[0][1]["model_load_kwargs"] == {
+        "cache_dir": "cache",
+        "device_map": "auto",
+        "torch_dtype": torch.bfloat16,
+    }
+    assert "attn_implementation" not in loads[0][1]["model_load_kwargs"]
+    assert validations == [
+        (
+            model,
+            {
+                "attention_implementation": "sdpa",
+                "vision_attention_implementation": "flash_attention_2",
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ImportError("cannot import flash_attn CUDA extension"),
+        ValueError("FlashAttention2 class resolution failed"),
+    ],
+    ids=("initialization", "class-resolution"),
+)
+def test_eval_mixed_backend_failure_propagates_without_eager_retry(
+    monkeypatch, failure
+):
+    """Catches evaluation retrying an unauthenticated eager model after mixed failure."""
+    module = _import_entry_point("eval", monkeypatch)
+    calls = []
+
+    def fail_mixed(source, **kwargs):
+        calls.append(
+            (
+                source,
+                kwargs["attention_implementation"],
+                kwargs["vision_attention_implementation"],
+            )
+        )
+        raise failure
+
+    monkeypatch.setattr(module, "load_qwen2_5_vl_with_attention", fail_mixed)
+
+    with pytest.raises(type(failure), match=str(failure)) as raised:
+        module.load_model("model", "cache")
+
+    assert raised.value is failure
+    assert calls == [("model", "sdpa", "flash_attention_2")]
 
 
 def test_stage1_eval_loads_validated_stage1_dora_adapter(monkeypatch, tmp_path):
@@ -1309,7 +1413,7 @@ def test_peft_eval_requires_base_before_loading_or_iterating(
         )
 
 
-@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
 @pytest.mark.parametrize(
     "error_type,error_message",
     [
@@ -1376,7 +1480,7 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
     assert calls == ["flash_attention_2"]
 
 
-@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
 @pytest.mark.parametrize("nested", [False, True], ids=("direct", "nested"))
 @pytest.mark.parametrize(
     "error_message",
@@ -1415,7 +1519,7 @@ def test_near_flash_attn_module_name_does_not_retry_eager(
     assert calls == ["flash_attention_2"]
 
 
-@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
 def test_nested_non_backend_error_does_not_combine_classifier_signals(
     module_name, monkeypatch
 ):
@@ -1441,7 +1545,7 @@ def test_nested_non_backend_error_does_not_combine_classifier_signals(
     assert calls == ["flash_attention_2"]
 
 
-@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
 @pytest.mark.parametrize("nesting", ["direct", "cause", "context"])
 @pytest.mark.parametrize(
     "failure", ["unsupported-model", "missing-package"]
@@ -1481,7 +1585,7 @@ def test_real_transformers_flash_attention_error_retries_eager(
     assert calls == ["flash_attention_2", "eager"]
 
 
-@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
 @pytest.mark.parametrize("nesting", ["direct", "cause", "context"])
 @pytest.mark.parametrize(
     "failure", ["unsupported-model", "missing-package"]

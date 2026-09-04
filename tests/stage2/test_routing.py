@@ -274,6 +274,28 @@ def test_stage2_diagnostics_interval_defaults_to_disabled():
     assert parse_args(["--stage", "stage2"]).stage2_diagnostics_interval == 0
 
 
+def test_ordinary_stage2_vision_attention_defaults_to_language_backend():
+    """Catches the new vision option changing ordinary Stage 2 loader behavior."""
+    defaults = parse_args(["--stage", "stage2"])
+    eager = parse_args(
+        ["--stage", "stage2", "--attention_implementation", "eager"]
+    )
+    mixed = parse_args(
+        [
+            "--stage",
+            "stage2",
+            "--attention_implementation",
+            "sdpa",
+            "--vision_attention_implementation",
+            "flash_attention_2",
+        ]
+    )
+
+    assert defaults.vision_attention_implementation == "sdpa"
+    assert eager.vision_attention_implementation == "eager"
+    assert mixed.vision_attention_implementation == "flash_attention_2"
+
+
 @pytest.mark.parametrize("interval", [-1, -2])
 def test_stage2_rejects_negative_diagnostics_interval(interval):
     """Catches negative diagnostic cadences reaching the trainer."""
@@ -492,6 +514,7 @@ def stage2_args(**overrides):
         load_model_path="stage1/model",
         resume_from_checkpoint_path=None,
         attention_implementation="sdpa",
+        vision_attention_implementation="sdpa",
         latent_size=4,
         supervise_latent_boundaries=True,
         data_path="data/train.jsonl",
@@ -729,6 +752,81 @@ def test_stage2_components_compose_full_or_adapter_models_from_decision(
             "model.layers.0.self_attn.q_proj",
             "model.layers.0.self_attn.v_proj",
         )
+
+
+def test_stage2_components_route_distinct_vision_backend_through_shared_loader(
+    monkeypatch,
+):
+    """Catches Stage 2 flattening a requested FlashAttention2 vision backend."""
+    processor = CompositionProcessor()
+    model = tiny_stage2_qwen(attn_implementation="sdpa")
+    model.config.stage = "stage1"
+    model.config.supervise_latent_boundaries = True
+    decision = Stage2LoadDecision(
+        base_model_source="stage1/base",
+        processor_source="stage1/processor",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=Stage2TuningConfig(
+            method="full", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+        ),
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **_kwargs: decision)
+    calls = SimpleNamespace(prepared=[], filtered=None, mixed=[], validated=[])
+    _stub_stage2_data_pipeline(monkeypatch, calls)
+
+    load_config = lambda *_args, **_kwargs: model.config
+    load_model = lambda *_args, **_kwargs: pytest.fail(
+        "direct one-backend loader must not run"
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: None,
+        load_config=load_config,
+        load_processor=lambda _source, **_kwargs: processor,
+        load_model=load_model,
+    )
+
+    def load_mixed(source, **kwargs):
+        calls.mixed.append((source, kwargs))
+        return model
+
+    monkeypatch.setattr(main, "load_qwen2_5_vl_with_attention", load_mixed)
+    monkeypatch.setattr(
+        main,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda selected, **kwargs: calls.validated.append((selected, kwargs)),
+    )
+
+    components = build_stage2_training_components(
+        stage2_args(vision_attention_implementation="flash_attention_2"),
+        source_dependencies=dependencies,
+    )
+
+    assert components.model is model
+    assert calls.mixed == [
+        (
+            "stage1/base",
+            {
+                "attention_implementation": "sdpa",
+                "vision_attention_implementation": "flash_attention_2",
+                "config_load_kwargs": {},
+                "model_load_kwargs": {},
+                "load_config": load_config,
+                "load_model": load_model,
+            },
+        )
+    ]
+    assert calls.validated == [
+        (
+            model,
+            {
+                "attention_implementation": "sdpa",
+                "vision_attention_implementation": "flash_attention_2",
+            },
+        )
+    ]
 
 
 def test_stage2_components_select_length_manifest_indices_without_remeasuring_images(
@@ -1150,6 +1248,101 @@ def test_stage2b_preflight_binds_space_lf_rendering_to_prepare_and_negative_load
     assert load_calls[0]["expected_assistant_plan_rendering"] == (
         "adjacent-text-space-lf-v1"
     )
+    assert load_calls[0]["expected_generation_settings"] == {
+        "attention_implementation": "sdpa",
+        "vision_attention_implementation": "sdpa",
+        "device": "cuda:0",
+        "max_new_tokens": 32,
+        "min_tokens": 2,
+        "torch_dtype": "bfloat16",
+    }
+
+
+def test_stage2b_preflight_rejects_changed_vision_backend_before_model_load(
+    monkeypatch, tmp_path
+):
+    """Catches trusting a schema-3 manifest's producer-selected vision backend."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    stage2a = tmp_path / "stage2a"
+    stage2a.mkdir()
+    negatives = tmp_path / "negatives.jsonl"
+    negatives.write_bytes(b"")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "selected_row_indices": [0],
+                "stage2a_checkpoint_path": str(stage2a.resolve()),
+                "checkpoint_files": [],
+                "tokenizer_config_identity": "tokenizer-v1",
+                "latent_size": 8,
+                "assistant_plan_rendering": "adjacent-text-space-lf-v1",
+                "generation_settings": {
+                    "attention_implementation": "sdpa",
+                    "vision_attention_implementation": "sdpa",
+                    "device": "cuda:0",
+                    "max_new_tokens": 32,
+                    "min_tokens": 2,
+                    "torch_dtype": "bfloat16",
+                },
+                "negative_sha256": hashlib.sha256(b"").hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        stage2a_checkpoint_path=str(stage2a),
+        negative_path=str(negatives),
+        negative_manifest=str(manifest_path),
+    )
+    args = stage2_args(
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        latent_size=8,
+        step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
+    )
+    prepared = SimpleNamespace(
+        sample_id="sample-a",
+        reasoning_steps=(
+            SimpleNamespace(step_id=0, target_text=SimpleNamespace(start=0, end=6)),
+        ),
+        conversation=[
+            {"role": "user", "content": []},
+            {"role": "assistant", "content": [{"type": "text", "text": "chosen"}]},
+        ],
+    )
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+    monkeypatch.setattr(
+        main, "prepare_stage2_example", lambda *_args, **_kwargs: prepared
+    )
+    monkeypatch.setattr(
+        main, "validate_stage2b_peft_base_identity", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        main,
+        "inspect_stage2a_checkpoint_identity",
+        lambda _path: ((), "tokenizer-v1"),
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: None,
+        load_config=lambda *_args, **_kwargs: pytest.fail("config load must not start"),
+        load_processor=lambda *_args, **_kwargs: pytest.fail(
+            "processor load must not start"
+        ),
+        load_model=lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
+
+    with pytest.raises(ValueError, match="generation settings do not match"):
+        main.build_stage2_training_components(args, source_dependencies=dependencies)
 
 
 def test_main_stage2b_rejects_legacy_negative_manifest_before_model_construction(

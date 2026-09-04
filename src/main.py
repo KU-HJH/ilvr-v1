@@ -55,6 +55,7 @@ from transformers import (
 from transformers.utils.peft_utils import find_adapter_config_file
 from trl import SFTConfig
 from peft import PeftConfig
+from peft_common import resolve_qwen2_5_vl_model
 
 from qwen_vl_utils import process_vision_info
 
@@ -84,6 +85,10 @@ from stage2.data import (
     prepare_stage2_example,
 )
 from stage2.length_manifest import validate_stage2_length_manifest
+from stage2.attention_backend import (
+    load_qwen2_5_vl_with_attention,
+    validate_qwen2_5_vl_attention_backends,
+)
 from stage2.peft import (
     build_stage2_tuned_model,
     load_stage1_dora_for_fresh_stage2,
@@ -223,11 +228,18 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     checkpoint_files, tokenizer_identity = inspect_stage2a_checkpoint_identity(
         config.stage2a_checkpoint_path
     )
-    generation_settings = manifest.generation_settings_dict
-    if generation_settings.get("min_tokens") != config.min_tokens:
-        raise ValueError("negative manifest min_tokens does not match Stage 2B")
-    if generation_settings.get("max_new_tokens") != config.max_new_tokens:
-        raise ValueError("negative manifest max_new_tokens does not match Stage 2B")
+    expected_generation_settings = {
+        "attention_implementation": args.attention_implementation,
+        "vision_attention_implementation": getattr(
+            args,
+            "vision_attention_implementation",
+            args.attention_implementation,
+        ),
+        "device": "cuda:0",
+        "max_new_tokens": config.max_new_tokens,
+        "min_tokens": config.min_tokens,
+        "torch_dtype": "bfloat16",
+    }
     expected_keys = tuple(
         (example.sample_id, step.step_id)
         for example in prepared
@@ -246,7 +258,7 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
         expected_assistant_plan_rendering=(
             ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
         ),
-        expected_generation_settings=generation_settings,
+        expected_generation_settings=expected_generation_settings,
         expected_keys=expected_keys,
     )
     for example in prepared:
@@ -427,14 +439,32 @@ def build_stage2_training_components(
         stage1_metadata = decode_stage1_peft_metadata_snapshot(
             decision.stage1_metadata_snapshot
         )
-    model_only_kwargs = {
-        "attn_implementation": args.attention_implementation,
-    }
-    base_model = source_dependencies.load_model(
-        decision.base_model_source,
-        **sparse_source_kwargs,
-        **model_only_kwargs,
+    vision_attention_implementation = getattr(
+        args, "vision_attention_implementation", None
     )
+    use_mixed_attention = (
+        vision_attention_implementation is not None
+        and vision_attention_implementation != args.attention_implementation
+    )
+    if use_mixed_attention:
+        base_model = load_qwen2_5_vl_with_attention(
+            decision.base_model_source,
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=vision_attention_implementation,
+            config_load_kwargs=sparse_source_kwargs,
+            model_load_kwargs=sparse_source_kwargs,
+            load_config=source_dependencies.load_config,
+            load_model=source_dependencies.load_model,
+        )
+    else:
+        model_only_kwargs = {
+            "attn_implementation": args.attention_implementation,
+        }
+        base_model = source_dependencies.load_model(
+            decision.base_model_source,
+            **sparse_source_kwargs,
+            **model_only_kwargs,
+        )
     if decision.stage1_adapter_source is not None:
         model = load_stage1_dora_for_fresh_stage2(
             base_model,
@@ -513,6 +543,12 @@ def build_stage2_training_components(
                 adapter_path=decision.adapter_source,
                 is_trainable=True,
             )
+    if use_mixed_attention:
+        validate_qwen2_5_vl_attention_backends(
+            resolve_qwen2_5_vl_model(model),
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=vision_attention_implementation,
+        )
     sparse_continuation = (
         decision.stage1_adapter_source is not None
         or decision.peft_metadata is not None

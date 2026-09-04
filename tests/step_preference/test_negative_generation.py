@@ -356,6 +356,7 @@ def test_generator_parser_exposes_the_normative_names_and_defaults(tmp_path):
     assert args.min_tokens == 2
     assert args.max_new_tokens == 32
     assert args.attention_implementation == "sdpa"
+    assert args.vision_attention_implementation == "flash_attention_2"
     assert args.device == "cuda:0"
 
 
@@ -458,6 +459,76 @@ def test_full_snapshot_loader_uses_checkpoint_directly_and_hashes_only_consumed_
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def test_full_snapshot_loader_routes_the_mixed_language_and_vision_backends(
+    monkeypatch, tmp_path
+):
+    """Catches the full Stage 2A load flattening vision attention onto SDPA."""
+    import scripts.generate_step_negatives as generator
+    from stage2.checkpointing import Stage2ArtifactInspection, Stage2ArtifactKind
+
+    checkpoint = tmp_path / "stage2-full"
+    checkpoint.mkdir()
+    for name in ("config.json", "model.safetensors", "tokenizer.json"):
+        (checkpoint / name).write_bytes(name.encode("utf-8"))
+
+    class FrozenModel:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+    model = FrozenModel()
+    calls = []
+    validations = []
+
+    def load_mixed(source, **kwargs):
+        calls.append((source, kwargs))
+        return model
+
+    monkeypatch.setattr(generator, "load_qwen2_5_vl_with_attention", load_mixed)
+    monkeypatch.setattr(
+        generator,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda selected, **kwargs: validations.append((selected, kwargs)),
+    )
+
+    snapshot = generator.load_frozen_stage2a_snapshot(
+        checkpoint_path=checkpoint,
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
+        device="cpu",
+        inspect_artifact=lambda _path: Stage2ArtifactInspection(
+            Stage2ArtifactKind.FULL
+        ),
+        load_processor=lambda _source: SimpleNamespace(tokenizer=object()),
+        load_config=lambda *_args, **_kwargs: object(),
+        load_full_model=lambda *_args, **_kwargs: pytest.fail(
+            "the direct one-backend loader must not run"
+        ),
+    )
+
+    assert snapshot.model is model
+    assert calls[0][0] == str(checkpoint.resolve())
+    assert calls[0][1]["attention_implementation"] == "sdpa"
+    assert calls[0][1]["vision_attention_implementation"] == "flash_attention_2"
+    assert calls[0][1]["config_load_kwargs"] == {"local_files_only": True}
+    assert calls[0][1]["model_load_kwargs"] == {
+        "device_map": "cpu",
+        "local_files_only": True,
+        "torch_dtype": torch.float32,
+    }
+    assert validations == [
+        (
+            model,
+            {
+                "attention_implementation": "sdpa",
+                "vision_attention_implementation": "flash_attention_2",
+            },
+        )
+    ]
 
 
 def test_preferred_chat_template_mutation_makes_generated_negatives_stale(tmp_path):
@@ -777,8 +848,11 @@ def test_cli_publishes_and_validates_once_before_zero_pair_exit(monkeypatch, tmp
         reference_textual_rejected_score=None,
     )
     monkeypatch.setattr(generator, "_selected_examples", lambda *_args: (object(),))
+    snapshot_loads = []
     monkeypatch.setattr(
-        generator, "load_frozen_stage2a_snapshot", lambda **_kwargs: snapshot
+        generator,
+        "load_frozen_stage2a_snapshot",
+        lambda **kwargs: snapshot_loads.append(kwargs) or snapshot,
     )
     monkeypatch.setattr(
         generator, "generate_negative_rows", lambda **_kwargs: (row,)
@@ -811,11 +885,16 @@ def test_cli_publishes_and_validates_once_before_zero_pair_exit(monkeypatch, tmp
 
     assert status == 2
     assert len(validations) == 1
+    assert snapshot_loads[0]["attention_implementation"] == "sdpa"
+    assert snapshot_loads[0]["vision_attention_implementation"] == (
+        "flash_attention_2"
+    )
     assert validations[0]["expected_assistant_plan_rendering"] == (
         "adjacent-text-space-lf-v1"
     )
     assert validations[0]["expected_generation_settings"] == {
         "attention_implementation": "sdpa",
+        "vision_attention_implementation": "flash_attention_2",
         "device": "cpu",
         "max_new_tokens": 32,
         "min_tokens": 2,

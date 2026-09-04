@@ -163,6 +163,8 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "1",
         "--attention_implementation",
         "sdpa",
+        "--vision_attention_implementation",
+        "sdpa",
         "--no-gradient_checkpointing",
         "--max_seq_length_train",
         "8192",
@@ -438,6 +440,12 @@ def test_stage2b_launcher_dry_run_identifies_space_lf_length_manifest_rendering(
     )
 
     assert "ASSISTANT_PLAN_RENDERING=adjacent-text-space-lf-v1" in tokens
+    arguments = tokens[tokens.index(str(REPO_ROOT / "src/main.py")) + 1 :]
+    assert arguments[arguments.index("--attention_implementation") + 1] == "sdpa"
+    assert (
+        arguments[arguments.index("--vision_attention_implementation") + 1]
+        == "flash_attention_2"
+    )
 
 
 def test_ordinary_stage2_launcher_dry_run_identifies_concatenated_length_rendering():

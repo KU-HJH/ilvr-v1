@@ -595,6 +595,8 @@ def load_production_context(
     negative_path: str | Path,
     negative_manifest: str | Path,
     device: str | torch.device,
+    attention_implementation: str = "sdpa",
+    vision_attention_implementation: str = "flash_attention_2",
     tuning_method: str = "full",
     gradient_checkpointing: bool = False,
 ) -> ProductionContext:
@@ -637,7 +639,9 @@ def load_production_context(
             "--max_train_samples",
             str(len(selected)),
             "--attention_implementation",
-            "sdpa",
+            attention_implementation,
+            "--vision_attention_implementation",
+            vision_attention_implementation,
             "--tuning_method",
             tuning_method,
             (
@@ -694,7 +698,7 @@ def load_production_context(
     batch = _to_device(batch, device)
     naive_config = replace(
         components.step_preference_config,
-        attention_implementation="sdpa",
+        attention_implementation=attention_implementation,
         packing_enabled=False,
     )
     packed_config = replace(naive_config, packing_enabled=True)
@@ -709,6 +713,8 @@ def load_production_context(
             "negative_sha256": manifest.negative_sha256,
             "device": str(device),
             "dtype": "bfloat16",
+            "attention_implementation": attention_implementation,
+            "vision_attention_implementation": vision_attention_implementation,
             "tuning_method": tuning_method,
             "gradient_checkpointing": gradient_checkpointing,
         },

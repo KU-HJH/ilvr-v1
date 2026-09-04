@@ -13,7 +13,7 @@ from typing import Callable, Iterable
 
 from PIL import Image
 import torch
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoConfig, AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from stage2.checkpointing import (
     SPARSE_TOKEN_ROWS_FILENAME,
@@ -29,6 +29,10 @@ from stage2.data import (
     prepare_stage2_example,
 )
 from stage2.peft import load_stage2_model_for_inference, resolve_stage2_qwen_model
+from stage2.attention_backend import (
+    load_qwen2_5_vl_with_attention,
+    validate_qwen2_5_vl_attention_backends,
+)
 from step_preference.negatives import (
     CheckpointFile,
     StepNegative,
@@ -99,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_new_tokens", type=int, default=32)
     parser.add_argument(
         "--attention_implementation", choices=("eager", "sdpa"), default="sdpa"
+    )
+    parser.add_argument(
+        "--vision_attention_implementation",
+        choices=("eager", "sdpa", "flash_attention_2"),
+        default="flash_attention_2",
     )
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -292,8 +301,10 @@ def load_frozen_stage2a_snapshot(
     checkpoint_path: str | Path,
     attention_implementation: str,
     device: str,
+    vision_attention_implementation: str | None = None,
     inspect_artifact: Callable = inspect_stage2_artifact,
     load_processor: Callable | None = None,
+    load_config: Callable | None = None,
     load_full_model: Callable | None = None,
     load_peft_model: Callable | None = None,
 ) -> LoadedStage2ASnapshot:
@@ -337,20 +348,68 @@ def load_frozen_stage2a_snapshot(
         )
     processor = load_processor(str(checkpoint))
     dtype = torch.float32 if torch.device(device).type == "cpu" else torch.bfloat16
-    model_options = {
-        "attn_implementation": attention_implementation,
+    runtime_model_options = {
         "device_map": device,
         "torch_dtype": dtype,
     }
+    vision_attention_implementation = (
+        attention_implementation
+        if vision_attention_implementation is None
+        else vision_attention_implementation
+    )
+    use_mixed_attention = vision_attention_implementation != attention_implementation
     if inspection.artifact_kind is Stage2ArtifactKind.FULL:
         if load_full_model is None:
             load_full_model = Qwen2_5_VLForConditionalGeneration.from_pretrained
-        model = load_full_model(
-            str(checkpoint), local_files_only=True, **model_options
-        )
+        if use_mixed_attention:
+            model = load_qwen2_5_vl_with_attention(
+                str(checkpoint),
+                attention_implementation=attention_implementation,
+                vision_attention_implementation=vision_attention_implementation,
+                config_load_kwargs={"local_files_only": True},
+                model_load_kwargs={
+                    "local_files_only": True,
+                    **runtime_model_options,
+                },
+                load_config=load_config,
+                load_model=load_full_model,
+            )
+        else:
+            model = load_full_model(
+                str(checkpoint),
+                local_files_only=True,
+                attn_implementation=attention_implementation,
+                **runtime_model_options,
+            )
     else:
         if load_peft_model is None:
             load_peft_model = load_stage2_model_for_inference
+        peft_load_kwargs = {}
+        model_options = dict(runtime_model_options)
+        if use_mixed_attention:
+            load_config = load_config or AutoConfig.from_pretrained
+            load_full_model = (
+                load_full_model
+                or Qwen2_5_VLForConditionalGeneration.from_pretrained
+            )
+
+            def load_mixed_base(source, **kwargs):
+                return load_qwen2_5_vl_with_attention(
+                    source,
+                    attention_implementation=attention_implementation,
+                    vision_attention_implementation=vision_attention_implementation,
+                    config_load_kwargs={"local_files_only": True},
+                    model_load_kwargs=kwargs,
+                    load_config=load_config,
+                    load_model=load_full_model,
+                )
+
+            peft_load_kwargs = {
+                "load_config": load_config,
+                "load_model": load_mixed_base,
+            }
+        else:
+            model_options["attn_implementation"] = attention_implementation
         loaded = load_peft_model(
             str(base),
             str(checkpoint),
@@ -358,8 +417,15 @@ def load_frozen_stage2a_snapshot(
             source_provenance_kwargs={"local_files_only": True},
             model_load_kwargs=model_options,
             artifact_inspection=inspection,
+            **peft_load_kwargs,
         )
         model = resolve_stage2_qwen_model(loaded)
+    if use_mixed_attention:
+        validate_qwen2_5_vl_attention_backends(
+            model,
+            attention_implementation=attention_implementation,
+            vision_attention_implementation=vision_attention_implementation,
+        )
     model.eval()
     parameters = getattr(model, "parameters", None)
     if callable(parameters):
@@ -604,6 +670,7 @@ def main(argv: list[str] | None = None) -> int:
     snapshot = load_frozen_stage2a_snapshot(
         checkpoint_path=checkpoint_path,
         attention_implementation=args.attention_implementation,
+        vision_attention_implementation=args.vision_attention_implementation,
         device=args.device,
     )
     rows = generate_negative_rows(
@@ -621,6 +688,7 @@ def main(argv: list[str] | None = None) -> int:
     selected_row_indices = tuple(range(len(examples)))
     generation_settings = {
         "attention_implementation": args.attention_implementation,
+        "vision_attention_implementation": args.vision_attention_implementation,
         "device": snapshot.resolved_device,
         "max_new_tokens": args.max_new_tokens,
         "min_tokens": args.min_tokens,

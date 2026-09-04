@@ -114,6 +114,10 @@ def collect_packed_length_audit(args) -> tuple[dict[str, object], tuple[dict, ..
     images = Path(args.image_root).resolve(strict=True)
     negatives = Path(args.negative_path).resolve(strict=True)
     manifest_path = Path(args.negative_manifest).resolve(strict=True)
+    attention_implementation = getattr(args, "attention_implementation", "sdpa")
+    vision_attention_implementation = getattr(
+        args, "vision_attention_implementation", "flash_attention_2"
+    )
     production_args = parse_args(
         [
             "--stage",
@@ -134,7 +138,9 @@ def collect_packed_length_audit(args) -> tuple[dict[str, object], tuple[dict, ..
             "--step_negative_manifest",
             str(manifest_path),
             "--attention_implementation",
-            "sdpa",
+            attention_implementation,
+            "--vision_attention_implementation",
+            vision_attention_implementation,
             "--tuning_method",
             "full",
             "--no-gradient_checkpointing",
@@ -194,6 +200,8 @@ def collect_packed_length_audit(args) -> tuple[dict[str, object], tuple[dict, ..
         "negative_manifest": str(manifest_path),
         "negative_sha256": manifest.negative_sha256,
         "assistant_plan_rendering": manifest.assistant_plan_rendering,
+        "attention_implementation": attention_implementation,
+        "vision_attention_implementation": vision_attention_implementation,
         "max_sequence_length": production_args.max_seq_length_train,
     }
     return identity, tuple(records)
@@ -206,6 +214,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--image_root", required=True)
     parser.add_argument("--negative_path", required=True)
     parser.add_argument("--negative_manifest", required=True)
+    parser.add_argument(
+        "--attention_implementation", choices=("sdpa",), default="sdpa"
+    )
+    parser.add_argument(
+        "--vision_attention_implementation",
+        choices=("flash_attention_2",),
+        default="flash_attention_2",
+    )
     parser.add_argument("--report_path", type=Path, required=True)
     parser.add_argument("--subset_output_path", type=Path, required=True)
     return parser

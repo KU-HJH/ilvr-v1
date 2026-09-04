@@ -67,6 +67,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source_row_index", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
+        "--attention_implementation", choices=("sdpa",), default="sdpa"
+    )
+    parser.add_argument(
+        "--vision_attention_implementation",
+        choices=("flash_attention_2",),
+        default="flash_attention_2",
+    )
+    parser.add_argument(
         "--tuning_method", choices=("full", "lora", "dora"), default="full"
     )
     parser.add_argument(
@@ -207,6 +215,8 @@ def _error_report(
             "checkpoint_path": str(Path(args.checkpoint_path).resolve()),
             "device": args.device,
             "dtype": "bfloat16",
+            "attention_implementation": args.attention_implementation,
+            "vision_attention_implementation": args.vision_attention_implementation,
             "tuning_method": args.tuning_method,
             "gradient_checkpointing": args.gradient_checkpointing,
             "git_commit": git_commit,
@@ -258,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
             negative_path=args.negative_path,
             negative_manifest=args.negative_manifest,
             device=args.device,
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=args.vision_attention_implementation,
             tuning_method=args.tuning_method,
             gradient_checkpointing=args.gradient_checkpointing,
         )

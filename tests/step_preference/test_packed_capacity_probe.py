@@ -8,6 +8,7 @@ import torch
 
 from step_preference.equivalence import load_production_context
 from step_preference.config import StepPreferenceConfig
+from scripts import audit_packed_stage2b_lengths as capacity_audit
 from scripts import probe_packed_stage2b_capacity as capacity_probe
 from scripts.probe_packed_stage2b_capacity import run_capacity_probe
 
@@ -123,12 +124,103 @@ def test_production_context_routes_tuning_and_checkpointing_without_overrides(
     )
 
     argv = captured["argv"]
+    assert argv[argv.index("--attention_implementation") + 1] == "sdpa"
+    assert (
+        argv[argv.index("--vision_attention_implementation") + 1]
+        == "flash_attention_2"
+    )
     assert argv[argv.index("--tuning_method") + 1] == expected_method
     assert expected_flag in argv
     assert model.disable_calls == 0
     assert model.is_gradient_checkpointing is checkpointing
     assert context.identity["tuning_method"] == expected_method
     assert context.identity["gradient_checkpointing"] is checkpointing
+    assert context.identity["attention_implementation"] == "sdpa"
+    assert context.identity["vision_attention_implementation"] == (
+        "flash_attention_2"
+    )
+
+
+def test_length_audit_authenticates_and_records_both_attention_backends(
+    monkeypatch, tmp_path
+):
+    """Catches the audit authenticating or reporting only the language backend."""
+    checkpoint = tmp_path / "checkpoint"
+    images = tmp_path / "images"
+    checkpoint.mkdir()
+    images.mkdir()
+    data = tmp_path / "data.jsonl"
+    negatives = tmp_path / "negatives.jsonl"
+    manifest = tmp_path / "manifest.json"
+    for path in (data, negatives, manifest):
+        path.write_text("{}\n", encoding="utf-8")
+    captured = {}
+
+    def parse_args(argv):
+        captured["argv"] = tuple(argv)
+        return SimpleNamespace(
+            attention_implementation="sdpa",
+            vision_attention_implementation="flash_attention_2",
+            latent_size=8,
+            max_seq_length_train=8192,
+            supervise_latent_boundaries=True,
+        )
+
+    monkeypatch.setattr("utils_deepseed.parse_args", parse_args)
+    monkeypatch.setattr(
+        "main.preflight_stage2b_artifacts",
+        lambda _args: SimpleNamespace(prepared_examples=(), negative_store={}),
+    )
+    monkeypatch.setattr(
+        "step_preference.negatives.read_negative_manifest",
+        lambda _path: SimpleNamespace(
+            negative_sha256="a" * 64,
+            assistant_plan_rendering="adjacent-text-space-lf-v1",
+        ),
+    )
+    monkeypatch.setattr(
+        "transformers.AutoProcessor.from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(tokenizer=object()),
+    )
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "stage2.checkpointing.resolve_latent_token_ids",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "stage2.data.build_prepared_example_length_measure",
+        lambda _processor: object(),
+    )
+    monkeypatch.setattr(
+        "stage2.data.filter_stage2_examples",
+        lambda **_kwargs: ((), object()),
+    )
+    monkeypatch.setattr(
+        "stage2.data.Stage2DataCollator", lambda *_args, **_kwargs: object()
+    )
+
+    identity, records = capacity_audit.collect_packed_length_audit(
+        SimpleNamespace(
+            checkpoint_path=str(checkpoint),
+            data_path=str(data),
+            image_root=str(images),
+            negative_path=str(negatives),
+            negative_manifest=str(manifest),
+        )
+    )
+
+    argv = captured["argv"]
+    assert argv[argv.index("--attention_implementation") + 1] == "sdpa"
+    assert (
+        argv[argv.index("--vision_attention_implementation") + 1]
+        == "flash_attention_2"
+    )
+    assert identity["attention_implementation"] == "sdpa"
+    assert identity["vision_attention_implementation"] == "flash_attention_2"
+    assert records == ()
 
 
 class _Runtime:
@@ -333,11 +425,13 @@ def test_capacity_cli_publishes_exact_failure_status_and_exit_code(
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(stdout="deadbeef\n"),
     )
-    monkeypatch.setattr(
-        capacity_probe,
-        "load_production_context",
-        lambda **_kwargs: (_ for _ in ()).throw(error),
-    )
+    context_loads = []
+
+    def fail_context(**kwargs):
+        context_loads.append(kwargs)
+        raise error
+
+    monkeypatch.setattr(capacity_probe, "load_production_context", fail_context)
 
     exit_code = capacity_probe.main(
         [
@@ -359,6 +453,14 @@ def test_capacity_cli_publishes_exact_failure_status_and_exit_code(
     report = json.loads(output.read_text(encoding="utf-8"))
     assert exit_code == expected_exit
     assert report["status"] == expected_status
+    assert context_loads[0]["attention_implementation"] == "sdpa"
+    assert context_loads[0]["vision_attention_implementation"] == (
+        "flash_attention_2"
+    )
+    assert report["identity"]["attention_implementation"] == "sdpa"
+    assert report["identity"]["vision_attention_implementation"] == (
+        "flash_attention_2"
+    )
     assert set(report) == {
         "schema_version",
         "status",
