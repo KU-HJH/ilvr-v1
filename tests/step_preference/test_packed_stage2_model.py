@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
+from main import configure_stage2_model_backend
 from step_preference.ablation import (
     StepAblationSpec,
     build_additive_step_attention_mask,
@@ -513,14 +514,104 @@ def test_packed_stage2_rejects_incompatible_decoder_options(
         )
 
 
-def test_packed_stage2_rejects_active_gradient_checkpointing(packed_case):
-    """Catches a BlockMask entering the unspecified checkpoint wrapper."""
-    model, clean_ids, plan, packed_inputs = packed_case
-    model.gradient_checkpointing_enable()
-    with pytest.raises(ValueError, match="gradient checkpointing"):
-        _packed_call(
-            model,
-            clean_ids,
-            packed_inputs,
-            plan.selected_positions().cuda(),
+def test_packed_stage2_gradient_checkpointing_matches_plain():
+    """Catches packed checkpointing drift or loss of backward recomputation."""
+    assert torch.cuda.is_available(), "packed Stage 2 requires a real CUDA FlexAttention run"
+    torch.manual_seed(42)
+    plain = _tiny_packed_qwen().cuda().float().train()
+    assert plain.config.attention_dropout == 0.0
+    checkpointed = copy.deepcopy(plain).train()
+    plain.config.use_cache = False
+    configure_stage2_model_backend(checkpointed, gradient_checkpointing=True)
+    assert checkpointed.model._gradient_checkpointing_func.keywords == {
+        "use_reentrant": False
+    }
+
+    clean_ids, _rejected_ids, _span, plan = _packed_fixture()
+    clean_ids = clean_ids.cuda()
+    packed_inputs = plan.to_model_inputs(torch.device("cuda"))
+    positions = plan.selected_positions().cuda()
+    plain_calls = [0] * len(plain.model.layers)
+    checkpointed_calls = [0] * len(checkpointed.model.layers)
+    handles = []
+
+    def count_packed_calls(counts, layer_index):
+        def hook(_module, args, _output):
+            if args[0].shape[1] == plan.padded_length:
+                counts[layer_index] += 1
+
+        return hook
+
+    for layer_index, layer in enumerate(plain.model.layers):
+        handles.append(
+            layer.self_attn.q_proj.register_forward_hook(
+                count_packed_calls(plain_calls, layer_index)
+            )
         )
+    for layer_index, layer in enumerate(checkpointed.model.layers):
+        handles.append(
+            layer.self_attn.q_proj.register_forward_hook(
+                count_packed_calls(checkpointed_calls, layer_index)
+            )
+        )
+
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+
+        plain_output = _packed_call(plain, clean_ids, packed_inputs, positions)
+        plain_output.loss.backward()
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+        checkpointed_output = _packed_call(
+            checkpointed, clean_ids, packed_inputs, positions
+        )
+        checkpointed_output.loss.backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+    assert torch.isfinite(plain_output.loss)
+    assert torch.isfinite(checkpointed_output.loss)
+    assert plain_output.loss.abs() > 0
+    assert checkpointed_output.loss.abs() > 0
+    torch.testing.assert_close(
+        checkpointed_output.loss, plain_output.loss, rtol=1e-5, atol=1e-6
+    )
+    assert torch.isfinite(plain_output.stage2_selected_logits).all()
+    assert torch.isfinite(checkpointed_output.stage2_selected_logits).all()
+    assert plain_output.stage2_selected_logits.abs().sum() > 0
+    assert checkpointed_output.stage2_selected_logits.abs().sum() > 0
+    torch.testing.assert_close(
+        checkpointed_output.stage2_selected_logits,
+        plain_output.stage2_selected_logits,
+        rtol=2e-4,
+        atol=2e-5,
+    )
+
+    def decoder_projection_gradients(model):
+        gradients = []
+        for layer in model.model.layers:
+            for name, parameter in layer.named_parameters():
+                if name.split(".")[-2].endswith("_proj") and parameter.requires_grad:
+                    assert parameter.grad is not None
+                    gradients.append(parameter.grad.flatten())
+        assert gradients
+        return torch.cat(gradients)
+
+    plain_grad = decoder_projection_gradients(plain)
+    checkpointed_grad = decoder_projection_gradients(checkpointed)
+    assert torch.isfinite(plain_grad).all()
+    assert torch.isfinite(checkpointed_grad).all()
+    assert plain_grad.norm() > 0
+    assert checkpointed_grad.norm() > 0
+    relative_l2 = (checkpointed_grad - plain_grad).norm() / plain_grad.norm()
+    assert relative_l2 <= 1e-4
+    assert plain_calls == [1] * len(plain.model.layers)
+    assert checkpointed_calls == [2] * len(checkpointed.model.layers)

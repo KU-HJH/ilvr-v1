@@ -2094,8 +2094,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 raise ValueError("packed Stage 2 forward does not support past_key_values")
             if output_attentions:
                 raise ValueError("packed Stage 2 forward requires output_attentions=False")
-            if self.model.gradient_checkpointing:
-                raise ValueError("packed Stage 2 forward requires gradient checkpointing disabled")
             if stage2_final_attention_mask is not None:
                 raise ValueError(
                     "stage2_packed_inputs cannot be combined with stage2_final_attention_mask"

@@ -69,7 +69,7 @@ def test_training_cli_maps_zero_ce_weight_into_step_preference_config():
     assert args.step_preference_config.lambda_ce == 0.0
 
 
-def test_step_preference_packing_is_an_explicit_stage2b_only_opt_in():
+def test_packed_stage2b_configuration():
     """Catches packed execution leaking into disabled or Stage 2A training."""
     required = [
         "--stage", "stage2", "--step_preference_enabled",
@@ -85,8 +85,10 @@ def test_step_preference_packing_is_an_explicit_stage2b_only_opt_in():
 
     with pytest.raises(ValueError, match="packing.*Stage 2B"):
         StepPreferenceConfig(packing_enabled=True)
-    with pytest.raises(ValueError, match="packing.*gradient checkpointing"):
-        parse_args(required + ["--gradient_checkpointing"])
+
+    checkpointed_args = parse_args(required + ["--gradient_checkpointing"])
+    assert checkpointed_args.step_preference_config.packing_enabled is True
+    assert checkpointed_args.gradient_checkpointing is True
 
 
 def test_stage2b_requires_checkpoint_and_both_negative_paths():
