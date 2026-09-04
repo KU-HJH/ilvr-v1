@@ -20,9 +20,13 @@ from stage2.data import (
     prepare_stage2_example,
     summarize_stage2_lengths,
 )
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_CONCATENATED,
+    normalize_assistant_plan_rendering,
+)
 
 
-STAGE2_LENGTH_MANIFEST_SCHEMA_VERSION = 1
+STAGE2_LENGTH_MANIFEST_SCHEMA_VERSION = 2
 
 
 def _class_name(value) -> str:
@@ -199,6 +203,7 @@ class Stage2LengthManifest:
     latent_size: int
     supervise_latent_boundaries: bool
     max_sequence_length: int
+    assistant_plan_rendering: str
     images: tuple[Stage2ImageIdentity, ...]
     lengths: tuple[int, ...]
     latent_block_counts: tuple[int, ...]
@@ -215,6 +220,7 @@ class Stage2LengthManifest:
         if not isinstance(self.supervise_latent_boundaries, bool):
             raise ValueError("supervise_latent_boundaries must be a boolean")
         _require_int("max_sequence_length", self.max_sequence_length, minimum=1)
+        normalize_assistant_plan_rendering(self.assistant_plan_rendering)
         for name in ("images", "lengths", "latent_block_counts", "retained_indices"):
             if not isinstance(getattr(self, name), tuple):
                 raise ValueError(f"{name} must be a tuple")
@@ -288,6 +294,7 @@ def validate_stage2_length_manifest(
     latent_size: int,
     supervise_latent_boundaries: bool,
     max_sequence_length: int,
+    assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED,
 ) -> Stage2LengthManifestSnapshot:
     """Bind a strict manifest to one parsed dataset snapshot and current images."""
     path = Path(path)
@@ -309,7 +316,13 @@ def validate_stage2_length_manifest(
         manifest.latent_size,
         manifest.supervise_latent_boundaries,
         manifest.max_sequence_length,
-    ) != (latent_size, supervise_latent_boundaries, max_sequence_length):
+        manifest.assistant_plan_rendering,
+    ) != (
+        latent_size,
+        supervise_latent_boundaries,
+        max_sequence_length,
+        assistant_plan_rendering,
+    ):
         raise ValueError("Stage 2 length manifest configuration does not match")
     raw_examples = tuple(parse_jsonl_examples(data_bytes.decode("utf-8")))
     if len(manifest.lengths) != len(raw_examples):
@@ -319,6 +332,7 @@ def validate_stage2_length_manifest(
             raw_example,
             image_root=Path(image_root),
             latent_size=latent_size,
+            assistant_plan_rendering=assistant_plan_rendering,
         )
         for raw_example in raw_examples
     )
@@ -345,6 +359,7 @@ def build_stage2_length_manifest(
     latent_size: int,
     supervise_latent_boundaries: bool,
     max_sequence_length: int,
+    assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED,
 ) -> Stage2LengthManifest:
     """Audit each ordered raw record exactly once and bind all length inputs."""
     if not isinstance(processor_source, str) or not processor_source:
@@ -353,6 +368,9 @@ def build_stage2_length_manifest(
     if not isinstance(supervise_latent_boundaries, bool):
         raise ValueError("supervise_latent_boundaries must be a boolean")
     _require_int("max_sequence_length", max_sequence_length, minimum=1)
+    assistant_plan_rendering = normalize_assistant_plan_rendering(
+        assistant_plan_rendering
+    )
 
     data_path = Path(data_path)
     image_root = Path(image_root)
@@ -368,6 +386,7 @@ def build_stage2_length_manifest(
             raw_example,
             image_root=image_root,
             latent_size=latent_size,
+            assistant_plan_rendering=assistant_plan_rendering,
         )
         images_before = tuple(
             _image_identity(path) for path in prepared.original_image_paths
@@ -398,6 +417,7 @@ def build_stage2_length_manifest(
         latent_size=latent_size,
         supervise_latent_boundaries=supervise_latent_boundaries,
         max_sequence_length=max_sequence_length,
+        assistant_plan_rendering=assistant_plan_rendering,
         images=tuple(images),
         lengths=lengths_tuple,
         latent_block_counts=latent_block_counts_tuple,
@@ -482,6 +502,7 @@ def _manifest_from_payload(payload) -> Stage2LengthManifest:
         latent_size=payload["latent_size"],
         supervise_latent_boundaries=payload["supervise_latent_boundaries"],
         max_sequence_length=payload["max_sequence_length"],
+        assistant_plan_rendering=payload["assistant_plan_rendering"],
         images=tuple(images),
         lengths=tuple(payload["lengths"]),
         latent_block_counts=tuple(payload["latent_block_counts"]),
@@ -544,6 +565,10 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
     )
     parser.add_argument("--max-sequence-length", required=True, type=int)
+    parser.add_argument(
+        "--assistant-plan-rendering",
+        default=ASSISTANT_PLAN_RENDERING_CONCATENATED,
+    )
     parser.add_argument("--manifest-path", required=True)
     args = parser.parse_args(argv)
     processor = AutoProcessor.from_pretrained(args.processor_source)
@@ -555,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
         latent_size=args.latent_size,
         supervise_latent_boundaries=args.supervise_latent_boundaries,
         max_sequence_length=args.max_sequence_length,
+        assistant_plan_rendering=args.assistant_plan_rendering,
     )
     write_stage2_length_manifest(args.manifest_path, manifest)
     return 0

@@ -45,6 +45,7 @@ DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
+ASSISTANT_PLAN_RENDERING=concatenated-v1
 stage2b_checkpoint_initialization=false
 case "${STEP_PREFERENCE_PACKING-}" in
   ""|0|false|False) step_preference_packing=false ;;
@@ -60,6 +61,7 @@ if [[ "$step_preference_packing" == true ]]; then
 fi
 case "$STEP_PREFERENCE_ENABLED" in
   true)
+    ASSISTANT_PLAN_RENDERING=adjacent-text-space-lf-v1
     STEP_PREFERENCE_MODE=${STEP_PREFERENCE_MODE:-stage2a}
     STEP_DPO_BETA=${STEP_DPO_BETA:-0.1}
     STEP_DPO_WEIGHT=${STEP_DPO_WEIGHT:-1.0}
@@ -467,6 +469,7 @@ if [[ "${STAGE2_DRY_RUN:-false}" != "true" ]]; then
       --latent-size "$LATENT_SIZE" \
       "$MANIFEST_BOUNDARY_ARG" \
       --max-sequence-length "$MAX_SEQUENCE_LENGTH" \
+      --assistant-plan-rendering "$ASSISTANT_PLAN_RENDERING" \
       --manifest-path "$length_manifest"
   elif [[ -e $LOG_FILE ]]; then
     printf 'resume log file must be distinct: %s\n' "$LOG_FILE" >&2
@@ -528,8 +531,8 @@ else
 fi
 
 if [[ "${STAGE2_DRY_RUN:-false}" == "true" ]]; then
-  printf 'PYTHONPATH=%q TOKENIZERS_PARALLELISM=%q ' \
-    "$PYTHONPATH" "$TOKENIZERS_PARALLELISM"
+  printf 'PYTHONPATH=%q TOKENIZERS_PARALLELISM=%q ASSISTANT_PLAN_RENDERING=%q ' \
+    "$PYTHONPATH" "$TOKENIZERS_PARALLELISM" "$ASSISTANT_PLAN_RENDERING"
   printf '%q ' "${COMMAND[@]}"
   printf '\n'
   exit 0

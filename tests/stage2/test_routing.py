@@ -552,6 +552,7 @@ def test_stage2_length_manifest_rejects_wrong_sha_or_configuration(
         latent_size=2,
         supervise_latent_boundaries=True,
         max_sequence_length=8,
+        assistant_plan_rendering="concatenated-v1",
     )
     monkeypatch.setattr(
         length_manifest_module, "read_stage2_length_manifest", lambda path: manifest
@@ -587,8 +588,10 @@ def test_stage2_length_manifest_rejects_wrong_sha_or_configuration(
 def _stub_stage2_data_pipeline(monkeypatch, calls):
     monkeypatch.setattr(main, "load_jsonl_examples", lambda path: [1, 2, 3])
 
-    def prepare(item, *, image_root, latent_size):
-        calls.prepared.append((item, image_root, latent_size))
+    def prepare(item, *, image_root, latent_size, assistant_plan_rendering):
+        calls.prepared.append(
+            (item, image_root, latent_size, assistant_plan_rendering)
+        )
         return item
 
     monkeypatch.setattr(main, "prepare_stage2_example", prepare)
@@ -684,8 +687,13 @@ def test_stage2_components_compose_full_or_adapter_models_from_decision(
     assert calls.wrap_states == [("stage2", True, None, True)]
     assert isinstance(components.model, PeftModel) is expected_peft
     assert processor.tokenizer.ids == tokenizer_ids_before
-    assert [item for item, _, _ in calls.prepared] == expected_examples
-    assert all(str(root) == "images" and size == 2 for _, root, size in calls.prepared)
+    assert [item for item, _, _, _ in calls.prepared] == expected_examples
+    assert all(
+        str(root) == "images"
+        and size == 2
+        and rendering == "concatenated-v1"
+        for _, root, size, rendering in calls.prepared
+    )
     assert calls.filtered == (expected_examples, "measure", 8192)
     assert components.processor is processor
     assert components.train_dataset == expected_examples

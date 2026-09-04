@@ -14,7 +14,16 @@ from stage2.data import (
     prepare_stage2_example,
     resolve_original_images,
 )
-from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds, LatentStructureError
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    PlanCharSpan,
+)
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
+    LatentSpan,
+    LatentStructureError,
+    LatentTokenIds,
+    parse_latent_spans,
+)
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
 
@@ -228,6 +237,92 @@ def test_prepare_example_preserves_original_image_paths_and_latent_count(tmp_pat
         str(tmp_path / "second.png"),
     )
     assert prepared.latent_block_count == 1
+
+
+def test_prepare_example_uses_one_adjacent_text_rendering_for_content_and_spans(
+    tmp_path,
+):
+    """Catches conversation text and recorded spans using different renderings."""
+    Image.new("RGB", (2, 2)).save(tmp_path / "input.png")
+    sample = {
+        "image_input": "input.png",
+        "text_input": "question",
+        "sequence_plan": [
+            {"type": "text", "content": "A."},
+            {"type": "text", "content": "The final answer"},
+        ],
+    }
+
+    prepared = prepare_stage2_example(
+        sample,
+        image_root=tmp_path,
+        latent_size=1,
+        assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    )
+
+    assert prepared.conversation[1]["content"][0]["text"] == "A. \nThe final answer"
+    assert prepared.plan_char_spans == (
+        PlanCharSpan(0, "text", 0, 2),
+        PlanCharSpan(1, "text", 4, 20),
+    )
+
+
+def test_ordinary_stage2_prepare_and_collate_matches_the_legacy_golden(tmp_path):
+    """Catches opt-in rendering changing any ordinary Stage 2 model input."""
+    Image.new("RGB", (2, 2)).save(tmp_path / "input.png")
+    sample = {
+        "sample_id": "ordinary-golden",
+        "image_input": "input.png",
+        "text_input": "question",
+        "sequence_plan": [
+            {"type": "text", "content": "A"},
+            {"type": "latent", "helper_image": "ignored.png"},
+            {"type": "text", "content": "B"},
+            {"type": "text", "content": "C"},
+        ],
+    }
+
+    prepared = prepare_stage2_example(sample, image_root=tmp_path, latent_size=2)
+    collator = make_collator()
+    batch = collator([prepared])
+
+    assert prepared.conversation == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": str(tmp_path / "input.png")},
+                {"type": "text", "text": "question"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "A<|latent_start|><|latent_pad|><|latent_pad|><|latent_end|>BC",
+                }
+            ],
+        },
+    ]
+    assert prepared.plan_char_spans == (
+        PlanCharSpan(0, "text", 0, 1),
+        PlanCharSpan(1, "latent", 1, 59),
+        PlanCharSpan(2, "text", 59, 60),
+        PlanCharSpan(3, "text", 60, 61),
+    )
+    assert torch.equal(
+        batch["input_ids"], torch.tensor([[1, 31, 32, 91, 90, 90, 92, 7]])
+    )
+    assert torch.equal(batch["attention_mask"], torch.ones((1, 8), dtype=torch.long))
+    assert torch.equal(
+        batch["labels"],
+        torch.tensor([[-100, -100, -100, 91, -100, -100, 92, 7]]),
+    )
+    assert torch.equal(batch["pixel_values"], torch.ones((1, 3, 2, 2)))
+    assert torch.equal(batch["image_grid_thw"], torch.tensor([[1, 2, 2]]))
+    assert parse_latent_spans(
+        batch["input_ids"][0], token_ids=TOKENS, latent_size=2
+    ) == (LatentSpan(3, (4, 5), 6),)
 
 
 def test_load_jsonl_examples_ignores_blank_lines(tmp_path):

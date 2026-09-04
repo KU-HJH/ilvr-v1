@@ -127,10 +127,13 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
     assert tokens[:3] == [
         f"PYTHONPATH={expected_pythonpath}",
         "TOKENIZERS_PARALLELISM=false",
-        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+        "ASSISTANT_PLAN_RENDERING=concatenated-v1",
     ]
-    assert tokens[3:] == [
+    assert tokens[3:5] == [
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
         str(REPO_ROOT / "src/main.py"),
+    ]
+    assert tokens[5:] == [
         "--stage",
         "stage2",
         "--load_model_path",
@@ -365,6 +368,30 @@ def test_stage2_launcher_propagates_opt_in_stage2b_environment_without_resume_st
     assert option_value(tokens, "--stage2a_checkpoint_path") == "/models/stage 2a"
     assert "--resume_from_checkpoint_path" not in tokens
     assert "--tuning_method" not in tokens
+
+
+def test_stage2b_launcher_dry_run_identifies_space_lf_length_manifest_rendering():
+    """Catches Stage 2B auditing lengths from concatenated assistant bytes."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
+                "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
+                "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+            }
+        )
+    )
+
+    assert "ASSISTANT_PLAN_RENDERING=adjacent-text-space-lf-v1" in tokens
+
+
+def test_ordinary_stage2_launcher_dry_run_identifies_concatenated_length_rendering():
+    """Catches disabled step preference changing the legacy length identity."""
+    tokens = dry_run_tokens(run_launcher())
+
+    assert "ASSISTANT_PLAN_RENDERING=concatenated-v1" in tokens
 
 
 @pytest.mark.parametrize("value", ("1", "true", "True"))

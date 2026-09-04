@@ -16,6 +16,7 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     parse_latent_spans,
 )
 from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_CONCATENATED,
     PlanCharSpan,
     ReasoningStepPlan,
     build_assistant_plan,
@@ -126,9 +127,17 @@ def resolve_original_images(sample: dict, image_root: Path) -> tuple[str, ...]:
     )
 
 
-def _assistant_text(sequence_plan: list, latent_size: int) -> tuple[str, int]:
+def _assistant_text(
+    sequence_plan: list,
+    latent_size: int,
+    *,
+    assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED,
+) -> tuple[str, int]:
     assistant_text, plan_char_spans, _ = build_assistant_plan(
-        sequence_plan, latent_size, require_reasoning_units=False
+        sequence_plan,
+        latent_size,
+        require_reasoning_units=False,
+        assistant_plan_rendering=assistant_plan_rendering,
     )
     return assistant_text, sum(span.step_type == "latent" for span in plan_char_spans)
 
@@ -138,6 +147,7 @@ def build_stage2_conversation(
     *,
     image_root: Path,
     latent_size: int,
+    assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED,
 ) -> list[dict]:
     """Convert a raw CoMT sample into a multimodal user/assistant conversation."""
     sequence_plan = sample.get("sequence_plan")
@@ -145,7 +155,11 @@ def build_stage2_conversation(
         raise ValueError("sequence_plan must be a list")
 
     original_images = resolve_original_images(sample, image_root)
-    assistant_text, _ = _assistant_text(sequence_plan, latent_size)
+    assistant_text, _ = _assistant_text(
+        sequence_plan,
+        latent_size,
+        assistant_plan_rendering=assistant_plan_rendering,
+    )
     text_input = sample.get("text_input")
     if not isinstance(text_input, str):
         raise ValueError("text_input must be a string")
@@ -164,13 +178,20 @@ def prepare_stage2_example(
     image_root: Path,
     latent_size: int,
     require_reasoning_units: bool = False,
+    assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED,
 ) -> Stage2PreparedExample:
     """Build a conversation together with validated original-image metadata."""
-    conversation = build_stage2_conversation(sample, image_root=image_root, latent_size=latent_size)
+    conversation = build_stage2_conversation(
+        sample,
+        image_root=image_root,
+        latent_size=latent_size,
+        assistant_plan_rendering=assistant_plan_rendering,
+    )
     _, plan_char_spans, reasoning_steps = build_assistant_plan(
         sample["sequence_plan"],
         latent_size,
         require_reasoning_units=require_reasoning_units,
+        assistant_plan_rendering=assistant_plan_rendering,
     )
     return Stage2PreparedExample(
         conversation=conversation,

@@ -96,7 +96,11 @@ from step_preference.negatives import (
     load_negative_store,
     read_negative_manifest,
 )
-from step_preference.spans import reject_duplicate_sample_ids
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    ASSISTANT_PLAN_RENDERING_CONCATENATED,
+    reject_duplicate_sample_ids,
+)
 
 platform.python_version = _platform_python_version
 
@@ -206,6 +210,7 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
             image_root=Path(args.image_root),
             latent_size=args.latent_size,
             require_reasoning_units=True,
+            assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
         )
         for item in selected_examples
     )
@@ -331,6 +336,11 @@ def build_stage2_training_components(
         step_preference_config = StepPreferenceConfig.from_args(args)
     if not isinstance(step_preference_config, StepPreferenceConfig):
         raise TypeError("step_preference_config must be a StepPreferenceConfig")
+    assistant_plan_rendering = (
+        ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+        if step_preference_config.enabled
+        else ASSISTANT_PLAN_RENDERING_CONCATENATED
+    )
     stage2b_preflight = getattr(args, "_stage2b_preflight", None)
     if step_preference_config.is_stage2b:
         if stage2b_preflight is None:
@@ -395,6 +405,7 @@ def build_stage2_training_components(
             latent_size=decision.latent_size,
             supervise_latent_boundaries=decision.supervise_latent_boundaries,
             max_sequence_length=args.max_seq_length_train,
+            assistant_plan_rendering=assistant_plan_rendering,
         )
         if manifest_path is not None
         else None
@@ -568,6 +579,7 @@ def build_stage2_training_components(
                     item,
                     image_root=Path(args.image_root),
                     latent_size=decision.latent_size,
+                    assistant_plan_rendering=assistant_plan_rendering,
                 )
                 for item in selected_examples
             ]

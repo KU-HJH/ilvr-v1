@@ -11,11 +11,16 @@ from PIL import Image
 from stage2.length_manifest import (
     Stage2LengthManifest,
     build_stage2_length_manifest,
+    main as build_length_manifest_main,
     read_stage2_length_manifest,
     validate_stage2_length_manifest,
     write_stage2_length_manifest,
 )
 from stage2.data import summarize_stage2_lengths
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    ASSISTANT_PLAN_RENDERING_CONCATENATED,
+)
 
 
 class StableToken:
@@ -112,7 +117,13 @@ def manifest_inputs(tmp_path):
     return data_path, rows
 
 
-def build_manifest(manifest_inputs, processor, *, max_sequence_length=8):
+def build_manifest(
+    manifest_inputs,
+    processor,
+    *,
+    max_sequence_length=8,
+    assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_CONCATENATED,
+):
     data_path, _ = manifest_inputs
     return build_stage2_length_manifest(
         data_path=data_path,
@@ -122,6 +133,7 @@ def build_manifest(manifest_inputs, processor, *, max_sequence_length=8):
         latent_size=2,
         supervise_latent_boundaries=True,
         max_sequence_length=max_sequence_length,
+        assistant_plan_rendering=assistant_plan_rendering,
     )
 
 
@@ -131,6 +143,8 @@ def test_manifest_selects_exact_raw_indices_and_round_trips(
     """Catches post-filter indexing, repeated measurement, or lossy JSON decoding."""
     manifest = build_manifest(manifest_inputs, processor)
 
+    assert manifest.schema_version == 2
+    assert manifest.assistant_plan_rendering == ASSISTANT_PLAN_RENDERING_CONCATENATED
     assert manifest.lengths == (8, 10)
     assert manifest.latent_block_counts == (0, 1)
     assert manifest.retained_indices == (0,)
@@ -143,6 +157,64 @@ def test_manifest_selects_exact_raw_indices_and_round_trips(
     assert read_stage2_length_manifest(path) == manifest
     assert write_stage2_length_manifest(path, manifest) == path
     assert path.read_bytes() == first_bytes
+
+
+def test_manifest_cli_records_the_requested_assistant_rendering(
+    tmp_path, manifest_inputs, monkeypatch
+):
+    """Catches the standalone audit dropping its rendering identity."""
+    data_path, _ = manifest_inputs
+    monkeypatch.setattr(
+        "transformers.AutoProcessor.from_pretrained",
+        lambda _source: ManifestProcessor(),
+    )
+    path = tmp_path / "cli-manifest.json"
+
+    assert build_length_manifest_main(
+        [
+            "--data-path",
+            str(data_path),
+            "--image-root",
+            str(data_path.parent),
+            "--processor-source",
+            "/models/stage2a",
+            "--latent-size",
+            "2",
+            "--max-sequence-length",
+            "8",
+            "--assistant-plan-rendering",
+            ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+            "--manifest-path",
+            str(path),
+        ]
+    ) == 0
+    assert (
+        read_stage2_length_manifest(path).assistant_plan_rendering
+        == ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+    )
+
+
+def test_manifest_validation_rejects_a_different_assistant_rendering(
+    tmp_path, manifest_inputs
+):
+    """Catches Stage 2B consuming lengths audited from legacy assistant bytes."""
+    data_path, _ = manifest_inputs
+    processor = ManifestProcessor()
+    manifest = build_manifest(manifest_inputs, processor)
+    path = write_stage2_length_manifest(tmp_path / "manifest.json", manifest)
+
+    with pytest.raises(ValueError, match="configuration does not match"):
+        validate_stage2_length_manifest(
+            path=path,
+            expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            data_path=data_path,
+            image_root=data_path.parent,
+            processor=processor,
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=8,
+            assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+        )
 
 
 def test_manifest_consumption_rejects_missing_or_changed_dataset(tmp_path, manifest_inputs):
@@ -350,6 +422,7 @@ def _write_mutated_manifest(tmp_path, manifest, mutate):
     "mutate, message",
     [
         (lambda payload: payload.update(unknown=True), "unknown fields"),
+        (lambda payload: payload.update(schema_version=1), "unsupported schema_version"),
         (lambda payload: payload.update(latent_size=True), "latent_size"),
         (lambda payload: payload.update(lengths=[8]), "same cardinality"),
         (lambda payload: payload.update(retained_indices=[1]), "retained_indices"),

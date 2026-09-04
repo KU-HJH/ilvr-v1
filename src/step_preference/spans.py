@@ -9,6 +9,17 @@ from typing import Iterable
 LATENT_START_TOKEN = "<|latent_start|>"
 LATENT_PAD_TOKEN = "<|latent_pad|>"
 LATENT_END_TOKEN = "<|latent_end|>"
+ASSISTANT_PLAN_RENDERING_CONCATENATED = "concatenated-v1"
+ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF = "adjacent-text-space-lf-v1"
+
+
+def normalize_assistant_plan_rendering(value: str) -> str:
+    if value not in {
+        ASSISTANT_PLAN_RENDERING_CONCATENATED,
+        ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    }:
+        raise ValueError(f"unsupported assistant plan rendering: {value}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -216,10 +227,14 @@ def build_assistant_plan(
     latent_size: int,
     *,
     require_reasoning_units: bool = False,
+    assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED,
 ) -> tuple[str, tuple[PlanCharSpan, ...], tuple[ReasoningStepPlan, ...]]:
     """Render a plan and retain its complete-entry and strict-unit character spans."""
     if latent_size <= 0:
         raise ValueError("latent_size must be positive")
+    assistant_plan_rendering = normalize_assistant_plan_rendering(
+        assistant_plan_rendering
+    )
 
     latent_block = (
         LATENT_START_TOKEN + LATENT_PAD_TOKEN * latent_size + LATENT_END_TOKEN
@@ -245,6 +260,15 @@ def build_assistant_plan(
         else:
             raise ValueError(f"unsupported sequence_plan step type: {step_type}")
 
+        if (
+            assistant_plan_rendering
+            == ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+            and plan_index > 0
+            and sequence_plan[plan_index - 1].get("type") == "text"
+            and step_type == "text"
+        ):
+            assistant_parts.append(" \n")
+            cursor += 2
         assistant_parts.append(rendered)
         plan_char_spans.append(
             PlanCharSpan(plan_index, step_type, cursor, cursor + len(rendered))
