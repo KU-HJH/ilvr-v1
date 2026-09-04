@@ -72,6 +72,7 @@ def _write_negative_fixture(tmp_path, *, negatives=None):
         checkpoint_files=[],
         tokenizer_config_identity="tokenizer-v1",
         latent_size=2,
+        assistant_plan_rendering="adjacent-text-space-lf-v1",
         generation_settings={"do_sample": False},
     )
     return negative_path, manifest_path

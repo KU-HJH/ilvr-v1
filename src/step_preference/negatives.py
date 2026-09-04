@@ -16,7 +16,11 @@ from step_preference.ablation import (
     StepAblationSpec,
     build_additive_step_attention_mask,
 )
-from step_preference.spans import ReasoningStepSpan, expand_qwen_image_placeholders
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    ReasoningStepSpan,
+    expand_qwen_image_placeholders,
+)
 from stage2.checkpointing import (
     SPARSE_TOKEN_ROWS_FILENAME,
     STAGE2_PEFT_METADATA_FILENAME,
@@ -26,7 +30,7 @@ from stage2.checkpointing import (
 )
 
 
-NEGATIVE_MANIFEST_SCHEMA_VERSION = 2
+NEGATIVE_MANIFEST_SCHEMA_VERSION = 3
 _PROCESSOR_FILES = frozenset(
     {
         "added_tokens.json",
@@ -742,6 +746,7 @@ class NegativeManifest:
     checkpoint_files: tuple[CheckpointFile, ...]
     tokenizer_config_identity: str
     latent_size: int
+    assistant_plan_rendering: str
     generation_settings: object
     negative_sha256: str
 
@@ -786,6 +791,13 @@ class NegativeManifest:
         ):
             raise ValueError("tokenizer_config_identity must be a non-empty string")
         _require_int("latent_size", self.latent_size, minimum=1)
+        if (
+            self.assistant_plan_rendering
+            != ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+        ):
+            raise ValueError(
+                "assistant_plan_rendering must be adjacent-text-space-lf-v1"
+            )
         object.__setattr__(
             self, "generation_settings", _normalize_generation_settings(self.generation_settings)
         )
@@ -848,6 +860,7 @@ def write_negative_artifact(
     checkpoint_files: Sequence[CheckpointFile],
     tokenizer_config_identity: str,
     latent_size: int,
+    assistant_plan_rendering: str,
     generation_settings: Mapping[str, object],
 ) -> NegativeManifest:
     """Write deterministic JSONL and its sidecar manifest, without overwriting either."""
@@ -871,6 +884,7 @@ def write_negative_artifact(
         checkpoint_files=tuple(checkpoint_files),
         tokenizer_config_identity=tokenizer_config_identity,
         latent_size=latent_size,
+        assistant_plan_rendering=assistant_plan_rendering,
         generation_settings=generation_settings,
         negative_sha256=hashlib.sha256(negative_bytes).hexdigest(),
     )
@@ -948,13 +962,14 @@ def _manifest_from_bytes(raw: bytes) -> NegativeManifest:
         checkpoint_files=tuple(checkpoint_files),
         tokenizer_config_identity=payload["tokenizer_config_identity"],
         latent_size=payload["latent_size"],
+        assistant_plan_rendering=payload["assistant_plan_rendering"],
         generation_settings=payload["generation_settings"],
         negative_sha256=payload["negative_sha256"],
     )
 
 
 def read_negative_manifest(path: str | Path) -> NegativeManifest:
-    """Read one strict schema-2 manifest from a regular non-symlink file."""
+    """Read one strict schema-3 manifest from a regular non-symlink file."""
     return _manifest_from_bytes(_read_regular_file(path, "negative manifest"))
 
 
@@ -1007,6 +1022,7 @@ def load_negative_store(
     expected_checkpoint_files: Sequence[CheckpointFile],
     expected_tokenizer_config_identity: str,
     expected_latent_size: int,
+    expected_assistant_plan_rendering: str,
     expected_generation_settings: Mapping[str, object],
     expected_keys: Iterable[tuple[str, int]],
 ) -> dict[tuple[str, int], StepNegative]:
@@ -1031,6 +1047,8 @@ def load_negative_store(
         raise ValueError("tokenizer/config identity does not match")
     if manifest.latent_size != expected_latent_size:
         raise ValueError("latent size does not match")
+    if manifest.assistant_plan_rendering != expected_assistant_plan_rendering:
+        raise ValueError("assistant plan rendering does not match")
     if manifest.generation_settings != _normalize_generation_settings(expected_generation_settings):
         raise ValueError("generation settings do not match")
     _verify_checkpoint_files(manifest)

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -1079,6 +1081,156 @@ def test_main_keeps_stage2b_preflight_out_of_startup_log_and_reuses_snapshot(
     assert secret_prompt not in startup_log
     assert secret_rejected not in startup_log
     assert "_stage2b_preflight" not in startup_log
+
+
+def test_stage2b_preflight_binds_space_lf_rendering_to_prepare_and_negative_load(
+    monkeypatch, tmp_path
+):
+    """Catches Stage 2B preparing or authenticating a different assistant stream."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        stage2a_checkpoint_path=str(tmp_path / "stage2a"),
+        negative_path=str(tmp_path / "negatives.jsonl"),
+        negative_manifest=str(tmp_path / "manifest.json"),
+    )
+    args = stage2_args(
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        latent_size=8,
+        max_train_samples=None,
+        step_preference_config=config,
+    )
+    manifest = SimpleNamespace(
+        source_sha256=source_sha256,
+        generation_settings_dict={"min_tokens": 2, "max_new_tokens": 32},
+    )
+    prepared = SimpleNamespace(
+        sample_id="sample-a",
+        reasoning_steps=(
+            SimpleNamespace(step_id=0, target_text=SimpleNamespace(start=0, end=6)),
+        ),
+        conversation=[
+            {"role": "user", "content": []},
+            {"role": "assistant", "content": [{"type": "text", "text": "chosen"}]},
+        ],
+    )
+    prepare_calls = []
+    load_calls = []
+    monkeypatch.setattr(main, "read_negative_manifest", lambda _path: manifest)
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+
+    def prepare(item, **kwargs):
+        prepare_calls.append((item, kwargs))
+        return prepared
+
+    monkeypatch.setattr(main, "prepare_stage2_example", prepare)
+    monkeypatch.setattr(main, "validate_stage2b_peft_base_identity", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "inspect_stage2a_checkpoint_identity",
+        lambda _path: ((), "tokenizer-v1"),
+    )
+
+    def load(**kwargs):
+        load_calls.append(kwargs)
+        return {("sample-a", 0): SimpleNamespace(chosen_text="chosen")}
+
+    monkeypatch.setattr(main, "load_negative_store", load)
+
+    result = main.preflight_stage2b_artifacts(args)
+
+    assert result.prepared_examples == (prepared,)
+    assert prepare_calls[0][1]["assistant_plan_rendering"] == (
+        "adjacent-text-space-lf-v1"
+    )
+    assert load_calls[0]["expected_assistant_plan_rendering"] == (
+        "adjacent-text-space-lf-v1"
+    )
+
+
+def test_main_stage2b_rejects_legacy_negative_manifest_before_model_construction(
+    monkeypatch, tmp_path
+):
+    """Catches enabled main routing accepting a schema-2 rendering-less artifact."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "selected_row_indices": [0],
+                "stage2a_checkpoint_path": str((tmp_path / "stage2a").resolve()),
+                "checkpoint_files": [],
+                "tokenizer_config_identity": "tokenizer-v1",
+                "latent_size": 8,
+                "generation_settings": {"min_tokens": 2, "max_new_tokens": 32},
+                "negative_sha256": "0" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        stage2a_checkpoint_path=str(tmp_path / "stage2a"),
+        negative_path=str(tmp_path / "negatives.jsonl"),
+        negative_manifest=str(manifest_path),
+    )
+    args = stage2_args(
+        stage="stage2",
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        latent_size=8,
+        log_file=str(tmp_path / "train.log"),
+        step_preference_config=config,
+    )
+    prepared = SimpleNamespace(
+        sample_id="sample-a",
+        reasoning_steps=(
+            SimpleNamespace(step_id=0, target_text=SimpleNamespace(start=0, end=6)),
+        ),
+        conversation=[
+            {"role": "user", "content": []},
+            {"role": "assistant", "content": [{"type": "text", "text": "chosen"}]},
+        ],
+    )
+    monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(main, "validate_generated_artifact_paths", lambda _args: None)
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+    monkeypatch.setattr(main, "prepare_stage2_example", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(main, "validate_stage2b_peft_base_identity", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "inspect_stage2a_checkpoint_identity",
+        lambda _path: ((), "tokenizer-v1"),
+    )
+    monkeypatch.setattr(
+        main,
+        "load_negative_store",
+        lambda **_kwargs: {("sample-a", 0): SimpleNamespace(chosen_text="chosen")},
+    )
+    monkeypatch.setattr(main, "bind_deepspeed_runtime_profile", lambda _args: None)
+    monkeypatch.setattr(main, "seed_everything", lambda **_kwargs: None)
+    monkeypatch.setattr(main.logging, "FileHandler", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(main.logging, "StreamHandler", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(main.logging, "basicConfig", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "run_stage2",
+        lambda _args: pytest.fail("model construction reached for legacy artifact"),
+    )
+
+    with pytest.raises(ValueError, match="unknown or missing fields|schema_version"):
+        main_train()
 
 
 def test_main_disabled_startup_log_has_no_private_preflight_field(monkeypatch):

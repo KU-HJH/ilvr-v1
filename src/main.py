@@ -243,6 +243,9 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
         expected_checkpoint_files=checkpoint_files,
         expected_tokenizer_config_identity=tokenizer_identity,
         expected_latent_size=args.latent_size,
+        expected_assistant_plan_rendering=(
+            ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+        ),
         expected_generation_settings=generation_settings,
         expected_keys=expected_keys,
     )

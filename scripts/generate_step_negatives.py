@@ -39,7 +39,11 @@ from step_preference.negatives import (
     tokenize_step_completion,
     write_negative_artifact,
 )
-from step_preference.spans import build_assistant_plan, reject_duplicate_sample_ids
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    build_assistant_plan,
+    reject_duplicate_sample_ids,
+)
 
 
 _PROCESSOR_FILES = frozenset(
@@ -552,10 +556,22 @@ def _selected_examples(data_path: Path, image_root: Path, latent_size: int, max_
         if not isinstance(sequence_plan, list):
             raise ValueError("sequence_plan must be a list")
         build_assistant_plan(
-            sequence_plan, latent_size, require_reasoning_units=True
+            sequence_plan,
+            latent_size,
+            require_reasoning_units=True,
+            assistant_plan_rendering=(
+                ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+            ),
         )
     examples = tuple(
-        prepare_stage2_example(sample, image_root=image_root, latent_size=latent_size)
+        prepare_stage2_example(
+            sample,
+            image_root=image_root,
+            latent_size=latent_size,
+            assistant_plan_rendering=(
+                ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+            ),
+        )
         for sample in samples
     )
     reject_duplicate_sample_ids(example.sample_id for example in examples)
@@ -621,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint_files=snapshot.checkpoint_files,
         tokenizer_config_identity=snapshot.tokenizer_config_identity,
         latent_size=args.latent_size,
+        assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
         generation_settings=generation_settings,
     )
     # One post-publication read is the complete consumer-side validation gate.
@@ -634,6 +651,9 @@ def main(argv: list[str] | None = None) -> int:
         expected_checkpoint_files=snapshot.checkpoint_files,
         expected_tokenizer_config_identity=snapshot.tokenizer_config_identity,
         expected_latent_size=args.latent_size,
+        expected_assistant_plan_rendering=(
+            ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+        ),
         expected_generation_settings=generation_settings,
         expected_keys=((row.sample_id, row.step_id) for row in rows),
     )

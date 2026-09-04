@@ -54,6 +54,7 @@ def _identity(tmp_path):
         ),
         "tokenizer_config_identity": "tokenizer-config-v1",
         "latent_size": 8,
+        "assistant_plan_rendering": "adjacent-text-space-lf-v1",
         "generation_settings": {"max_new_tokens": 32, "min_tokens": 2},
     }
 
@@ -67,6 +68,7 @@ def _expected_identity(identity, source_path):
         "expected_checkpoint_files": identity["checkpoint_files"],
         "expected_tokenizer_config_identity": identity["tokenizer_config_identity"],
         "expected_latent_size": identity["latent_size"],
+        "expected_assistant_plan_rendering": identity["assistant_plan_rendering"],
         "expected_generation_settings": identity["generation_settings"],
     }
 
@@ -203,7 +205,119 @@ def test_write_and_load_artifact_bind_raw_bytes_and_every_expected_identity(tmp_
         "3323476b34b66fdff82c8814e925828fa08ef4131dfe54df4c55c59efdf5a399"
     )
     assert store == {("sample-a", 0): _negative()}
-    assert json.loads(manifest_path.read_text(encoding="utf-8"))["schema_version"] == 2
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest.assistant_plan_rendering == "adjacent-text-space-lf-v1"
+    assert manifest_payload["schema_version"] == 3
+    assert manifest_payload["assistant_plan_rendering"] == (
+        "adjacent-text-space-lf-v1"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda payload: payload.pop("assistant_plan_rendering"), "unknown or missing fields"),
+        (
+            lambda payload: payload.update(
+                assistant_plan_rendering="unknown-rendering-v1"
+            ),
+            "assistant_plan_rendering",
+        ),
+        (
+            lambda payload: payload.update(
+                assistant_plan_rendering="concatenated-v1"
+            ),
+            "assistant_plan_rendering",
+        ),
+    ],
+)
+def test_load_negative_store_rejects_missing_or_noncanonical_rendering(
+    tmp_path, mutation, message
+):
+    """Catches consuming negatives produced from a different assistant byte stream."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negative_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negative_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutation(payload)
+    manifest_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_negative_store(
+            negative_path=negative_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(identity, source),
+        )
+
+
+def test_load_negative_store_rejects_legacy_schema_two_manifest(tmp_path):
+    """Catches silently defaulting a schema-2 artifact to the active rendering."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negative_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negative_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 2
+    payload.pop("assistant_plan_rendering")
+    manifest_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_negative_store(
+            negative_path=negative_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(identity, source),
+        )
+
+
+def test_load_negative_store_rejects_expected_rendering_mismatch(tmp_path):
+    """Catches a consumer authenticating the artifact against the wrong rendering."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negative_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negative_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    expected_identity = _expected_identity(identity, source)
+    expected_identity["expected_assistant_plan_rendering"] = "concatenated-v1"
+
+    with pytest.raises(ValueError, match="assistant plan rendering does not match"):
+        load_negative_store(
+            negative_path=negative_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **expected_identity,
+        )
 
 
 def test_load_negative_store_rejects_duplicate_join_identity(tmp_path):
@@ -267,6 +381,7 @@ def test_load_negative_store_rejects_manifest_identity_and_missing_rows(tmp_path
             expected_checkpoint_files=identity["checkpoint_files"],
             expected_tokenizer_config_identity="tokenizer-config-v1",
             expected_latent_size=8,
+            expected_assistant_plan_rendering="adjacent-text-space-lf-v1",
             expected_generation_settings=identity["generation_settings"],
             expected_keys=(("sample-a", 0),),
         )
@@ -385,7 +500,7 @@ def test_generation_settings_preserve_nested_list_object_distinction(tmp_path):
 def test_negative_manifest_is_immutable():
     """Catches a frozen reference identity being mutable after validation."""
     manifest = NegativeManifest(
-        schema_version=2,
+        schema_version=3,
         source_sha256=SOURCE_SHA256,
         selected_row_indices=(0,),
         stage2a_checkpoint_path="/checkpoint",
@@ -394,6 +509,7 @@ def test_negative_manifest_is_immutable():
         ),
         tokenizer_config_identity="tokenizer-config-v1",
         latent_size=8,
+        assistant_plan_rendering="adjacent-text-space-lf-v1",
         generation_settings={"max_new_tokens": 32},
         negative_sha256="c" * 64,
     )
@@ -402,11 +518,11 @@ def test_negative_manifest_is_immutable():
         manifest.latent_size = 4
 
 
-@pytest.mark.parametrize("schema_version", [2.0, True, "2"])
+@pytest.mark.parametrize("schema_version", [2, 3.0, True, "3"])
 def test_negative_manifest_requires_exact_integer_schema_version(
     tmp_path, schema_version
 ):
-    """Catches JSON-compatible non-integers entering the schema-2 contract."""
+    """Catches legacy or JSON-compatible non-integers entering schema 3."""
     identity = _identity(tmp_path)
 
     with pytest.raises(ValueError, match="schema_version"):
@@ -448,6 +564,7 @@ def test_load_negative_store_revalidates_every_checkpoint_load_root(tmp_path):
         "checkpoint_files": (adapter_record, base_record),
         "tokenizer_config_identity": "tokenizer-config-v1",
         "latent_size": 8,
+        "assistant_plan_rendering": "adjacent-text-space-lf-v1",
         "generation_settings": {
             "device": "cuda:0",
             "torch_dtype": "bfloat16",
@@ -475,6 +592,7 @@ def test_load_negative_store_revalidates_every_checkpoint_load_root(tmp_path):
             expected_checkpoint_files=(adapter_record, base_record),
             expected_tokenizer_config_identity="tokenizer-config-v1",
             expected_latent_size=8,
+            expected_assistant_plan_rendering="adjacent-text-space-lf-v1",
             expected_generation_settings=identity["generation_settings"],
             expected_keys=(("sample-a", 0),),
         )

@@ -16,7 +16,10 @@ from step_preference.negatives import (
     tokenize_step_completion,
     write_negative_artifact,
 )
-from step_preference.spans import ReasoningStepSpan
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    ReasoningStepSpan,
+)
 from tests.stage2.helpers import tiny_stage2_qwen
 
 
@@ -519,6 +522,7 @@ def test_preferred_chat_template_mutation_makes_generated_negatives_stale(tmp_pa
         checkpoint_files=snapshot.checkpoint_files,
         tokenizer_config_identity=snapshot.tokenizer_config_identity,
         latent_size=8,
+        assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
         generation_settings=settings,
     )
     (checkpoint / "chat_template.jinja").write_bytes(b"template-v2")
@@ -534,6 +538,9 @@ def test_preferred_chat_template_mutation_makes_generated_negatives_stale(tmp_pa
             expected_checkpoint_files=snapshot.checkpoint_files,
             expected_tokenizer_config_identity=snapshot.tokenizer_config_identity,
             expected_latent_size=8,
+            expected_assistant_plan_rendering=(
+                ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+            ),
             expected_generation_settings=settings,
             expected_keys=(("sample-a", 0),),
         )
@@ -804,6 +811,9 @@ def test_cli_publishes_and_validates_once_before_zero_pair_exit(monkeypatch, tmp
 
     assert status == 2
     assert len(validations) == 1
+    assert validations[0]["expected_assistant_plan_rendering"] == (
+        "adjacent-text-space-lf-v1"
+    )
     assert validations[0]["expected_generation_settings"] == {
         "attention_implementation": "sdpa",
         "device": "cpu",
@@ -815,4 +825,46 @@ def test_cli_publishes_and_validates_once_before_zero_pair_exit(monkeypatch, tmp
         "manifest.json",
         "negatives.jsonl",
     ]
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))[
+        "assistant_plan_rendering"
+    ] == "adjacent-text-space-lf-v1"
     assert json.loads(negative_path.read_text(encoding="utf-8"))["sample_id"] == "sample-a"
+
+
+def test_selected_examples_prepare_space_lf_rendering(monkeypatch, tmp_path):
+    """Catches the generator validating one rendering and scoring another."""
+    import scripts.generate_step_negatives as generator
+
+    sample = {"sample_id": "sample-a", "sequence_plan": []}
+    prepared = SimpleNamespace(sample_id="sample-a")
+    validation_calls = []
+    calls = []
+    monkeypatch.setattr(generator, "load_jsonl_examples", lambda _path: [sample])
+
+    def validate(sequence_plan, latent_size, **kwargs):
+        validation_calls.append((sequence_plan, latent_size, kwargs))
+
+    monkeypatch.setattr(generator, "build_assistant_plan", validate)
+
+    def prepare(item, *, image_root, latent_size, assistant_plan_rendering):
+        calls.append((item, image_root, latent_size, assistant_plan_rendering))
+        return prepared
+
+    monkeypatch.setattr(generator, "prepare_stage2_example", prepare)
+
+    result = generator._selected_examples(tmp_path / "data.jsonl", tmp_path, 8, None)
+
+    assert result == (prepared,)
+    assert validation_calls == [
+        (
+            [],
+            8,
+            {
+                "require_reasoning_units": True,
+                "assistant_plan_rendering": "adjacent-text-space-lf-v1",
+            },
+        )
+    ]
+    assert calls == [
+        (sample, tmp_path, 8, "adjacent-text-space-lf-v1")
+    ]
