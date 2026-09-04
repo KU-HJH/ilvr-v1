@@ -17,7 +17,7 @@
 - Preserve ordinary Stage 2 byte-for-byte behavior when step preference is disabled.
 - Use `assistant_plan_rendering="adjacent-text-space-lf-v1"` only when step preference is enabled; legacy rendering is `concatenated-v1`.
 - Use negative manifest schema 3 and Stage 2 length-manifest schema 2 after the rendering change; reject older artifacts instead of upgrading them implicitly.
-- Keep packed attention as FlexAttention with the existing `BlockMask`; public Stage 2B attention remains `sdpa`.
+- Keep packed attention as FlexAttention with the existing `BlockMask`; ordinary/reference language attention remains `sdpa`, and vision attention is `flash_attention_2`.
 - Use non-reentrant gradient checkpointing with RNG-state preservation and `use_cache=False`.
 - Use DoRA rank 32, alpha 64, dropout 0.05, the seven approved decoder projection suffixes, BF16, two local H100 processes, ZeRO-2, seed 42, local batch 1, accumulation 2, two epochs, and learning rate `5e-5`.
 - Do not launch a full training arm until the focused tests and all capacity gates are green.
@@ -562,7 +562,8 @@ PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/python \
   --output_path "results/$capacity_run_id/row-$row_index-negatives.jsonl" \
   --manifest_path "results/$capacity_run_id/row-$row_index-manifest.json" \
   --latent_size 8 --min_tokens 2 --max_new_tokens 32 \
-  --attention_implementation sdpa --device cuda:0
+  --attention_implementation sdpa --vision_attention_implementation flash_attention_2 \
+  --device cuda:0
 ```
 
 - [ ] **Step 3: Run the first nail on row 2102**
@@ -578,6 +579,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
   --negative_path "results/$capacity_run_id/row-2102-negatives.jsonl" \
   --negative_manifest "results/$capacity_run_id/row-2102-manifest.json" \
   --source_row_index 0 --device cuda:0 --tuning_method dora \
+  --vision_attention_implementation flash_attention_2 \
   --gradient_checkpointing \
   --output_path "results/$capacity_run_id/row-2102-capacity.json" \
   2>&1 | tee "logs/$capacity_run_id/row-2102-capacity.log"
@@ -596,6 +598,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
   --negative_path "results/$capacity_run_id/row-1078-negatives.jsonl" \
   --negative_manifest "results/$capacity_run_id/row-1078-manifest.json" \
   --source_row_index 0 --device cuda:0 --tuning_method dora \
+  --vision_attention_implementation flash_attention_2 \
   --gradient_checkpointing \
   --output_path "results/$capacity_run_id/row-1078-capacity.json" \
   2>&1 | tee "logs/$capacity_run_id/row-1078-capacity.log"
@@ -616,7 +619,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
   --output_path "results/$negative_run_id/negatives.jsonl" \
   --manifest_path "results/$negative_run_id/negative-manifest.json" \
   --latent_size 8 --min_tokens 2 --max_new_tokens 32 \
-  --attention_implementation sdpa --device cuda:0 \
+  --attention_implementation sdpa --vision_attention_implementation flash_attention_2 \
+  --device cuda:0 \
   2>&1 | tee "logs/$negative_run_id/generate.log"
 sha256sum "results/$negative_run_id/negatives.jsonl" \
   "results/$negative_run_id/negative-manifest.json"
@@ -641,6 +645,7 @@ PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/python \
   --data_path data/TRAIN.jsonl --image_root data \
   --negative_path "results/$negative_run_id/negatives.jsonl" \
   --negative_manifest "results/$negative_run_id/negative-manifest.json" \
+  --vision_attention_implementation flash_attention_2 \
   --report_path "results/$capacity_run_id/packed-length-audit.json" \
   --subset_output_path "results/$capacity_run_id/max-packed-row.jsonl"
 ```
@@ -655,7 +660,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
   --output_path "results/$capacity_run_id/max-packed-negatives.jsonl" \
   --manifest_path "results/$capacity_run_id/max-packed-manifest.json" \
   --latent_size 8 --min_tokens 2 --max_new_tokens 32 \
-  --attention_implementation sdpa --device cuda:0
+  --attention_implementation sdpa --vision_attention_implementation flash_attention_2 \
+  --device cuda:0
 ```
 
 If the winner is not row 1078, invoke the probe with those three
@@ -687,7 +693,8 @@ TUNING_METHOD=dora LORA_R=32 LORA_ALPHA=64 LORA_DROPOUT=0.05 \
 LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
 DEEPSPEED_CONFIG="$PWD/configs/deepspeed_zero2.json" LEARNING_RATE=5e-5 \
 GRADIENT_ACCUMULATION_STEPS=1 GRADIENT_CHECKPOINTING=true \
-ATTENTION_IMPLEMENTATION=sdpa MAX_SEQUENCE_LENGTH=8192 \
+ATTENTION_IMPLEMENTATION=sdpa VISION_ATTENTION_IMPLEMENTATION=flash_attention_2 \
+MAX_SEQUENCE_LENGTH=8192 \
 SUPERVISE_LATENT_BOUNDARIES=true DATALOADER_NUM_WORKERS=0 \
 STAGE2_NUM_PROCESSES=2 ./run_stage2_training.sh --max_steps 1 --epochs 1
 ```
@@ -745,7 +752,8 @@ launch_arm() {
   LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
   DEEPSPEED_CONFIG="$PWD/configs/deepspeed_zero2.json" LEARNING_RATE=5e-5 \
   GRADIENT_ACCUMULATION_STEPS=2 GRADIENT_CHECKPOINTING=true \
-  ATTENTION_IMPLEMENTATION=sdpa MAX_SEQUENCE_LENGTH=8192 \
+  ATTENTION_IMPLEMENTATION=sdpa VISION_ATTENTION_IMPLEMENTATION=flash_attention_2 \
+  MAX_SEQUENCE_LENGTH=8192 \
   SUPERVISE_LATENT_BOUNDARIES=true DATALOADER_NUM_WORKERS=0 \
   STAGE2_NUM_PROCESSES=2 ./run_stage2_training.sh \
     --epochs 2 --warm_up_steps 10 --save_steps 612

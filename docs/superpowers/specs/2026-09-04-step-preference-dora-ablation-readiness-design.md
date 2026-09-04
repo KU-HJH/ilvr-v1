@@ -2,7 +2,7 @@
 
 ## Status
 
-Design commitment v3, approved by the user on 2026-09-04.
+Design commitment v5, approved by the user's instruction to continue on 2026-09-04.
 
 ## Problem and scope
 
@@ -43,15 +43,15 @@ The fixed local identities and common training settings are:
   learning rate `5e-5`, two epochs, two local processes, ZeRO-2 config
   `configs/deepspeed_zero2.json` (SHA-256
   `20615765b665d38647ee0447ca984ea28d16a1b8738363b505b054871bfc3f85`),
-  gradient checkpointing enabled, public attention implementation `sdpa`, and
-  packed FlexAttention enabled. The public Stage 2B setting remains `sdpa`
-  because FlexAttention is selected internally only for the packed `BlockMask`.
+  gradient checkpointing enabled, language attention implementation `sdpa`,
+  vision attention implementation `flash_attention_2`, and packed FlexAttention
+  enabled. FlexAttention is selected internally only for the packed `BlockMask`.
 - Trainer defaults retained explicitly: `adamw_torch`, weight decay `0.01`,
   linear scheduler, 10 warmup steps, gradient clipping `1.0`, logging every 20
   steps, save every 612 steps, one retained numbered checkpoint, latent-boundary
   supervision enabled, and dataloader workers zero.
 
-This work addresses three observed blockers before training:
+This work addresses four observed blockers before training:
 
 1. Packed BF16 full tuning exhausted a 93.09 GiB H100 at clean length 759 and
    packed padded length 1280.
@@ -61,6 +61,37 @@ This work addresses three observed blockers before training:
    no observed crossings at intermediate reasoning boundaries.
 3. The current Stage 2B loss always adds CE with coefficient one, so zeroing the
    DPO or entropy weights cannot express DPO-only or entropy-only training.
+4. Full-resolution source row 1078 exhausts one H100 during negative generation
+   in the vision SDPA path: the process held 68.81 GiB and requested another
+   56.87 GiB. This happens before DoRA is attached.
+
+## Mixed attention backend contract
+
+Every production model used by negative generation, capacity probes, training,
+and evaluation is constructed with FlashAttention2 in every vision block and
+SDPA in every ordinary language-decoder block. The packed final decoder keeps
+the existing inherited FlexAttention `BlockMask` dispatch. This split preserves
+the full processor output and language additive masks while removing the
+quadratic dense vision-attention allocation. Global FlashAttention2 is invalid
+because the reference-scoring language path requires custom 4-D additive masks.
+
+One shared loader prepares the composite configuration before weight loading
+and then validates the instantiated module classes. It fails closed rather than
+falling back: every vision block must be
+`Qwen2_5_VLVisionFlashAttention2`, and every ordinary decoder block must be
+`Qwen2_5_VLSdpaAttention`. Passing a public attention dictionary directly is
+forbidden because this vendored Transformers version can silently leave the
+root decoder on eager attention.
+
+The explicit settings are `attention_implementation=sdpa` and
+`vision_attention_implementation=flash_attention_2`. Negative generation
+records both values. Stage 2B preflight constructs the complete expected
+generation-settings mapping independently from its fixed runtime contract and
+compares it to the manifest; it must not reuse the manifest mapping as its own
+expected value. A one-field mismatch fails before model construction. Capacity,
+launch, and evaluation records include both identities. The processor, pixels,
+retained rows, sequence limit, objectives, and optimization settings do not
+change.
 
 ## Data boundary contract
 
@@ -208,7 +239,8 @@ One shared negative-generation run ID uses
 `logs/<negative-run-id>/generate.log`. It runs
 `scripts/generate_step_negatives.py` on all 3,450 source rows with the fixed
 Stage 2A checkpoint, `latent_size=8`, `min_tokens=2`, `max_new_tokens=32`,
-`attention_implementation=sdpa`, BF16, and `cuda:0`. Its post-write consumer
+language `attention_implementation=sdpa`, vision
+`vision_attention_implementation=flash_attention_2`, BF16, and `cuda:0`. Its post-write consumer
 validation must pass; the resulting manifest and negative SHA-256 are then
 copied into each normalized launch record, and every arm receives the exact
 same two paths.
@@ -223,6 +255,8 @@ The canonical launch is `run_stage2_training.sh` with
 `STEP_PREFERENCE_ENABLED=true`, `STEP_PREFERENCE_MODE=stage2b`,
 `STEP_PREFERENCE_PACKING=true`, the shared Stage 2A/negative paths,
 `TUNING_METHOD=dora`, the DoRA and runtime values fixed above,
+`ATTENTION_IMPLEMENTATION=sdpa`,
+`VISION_ATTENTION_IMPLEMENTATION=flash_attention_2`,
 `DEEPSPEED_CONFIG=configs/deepspeed_zero2.json`, and
 `STAGE2_NUM_PROCESSES=2`. The launcher adds and owns `CE_WEIGHT`, default `1.0`,
 and forwards it as `--ce_weight`. The arm-specific values are exactly:
@@ -245,6 +279,7 @@ final DoRA artifact directly; if preparation requires a copy, only the existing
 preparation workflow may place it under
 `checkpoints/evaluation-staging/<run-id>/`. `eval.py` consumes the same Stage 2A
 base and each final DoRA adapter on all 400 TEST rows with
+the same vision-FlashAttention2/language-SDPA split,
 `max_sequence_length=32768`, `max_new_tokens=4096`,
 `repetition_penalty=1.05`, `temperature=0`, and `top_p=1`. Completion requires
 400 per-sample records plus the summary record with `correct`,
@@ -260,7 +295,13 @@ predictions remain available for error analysis.
 
 ## First nail and residual uncertainty
 
-The load-bearing premise is that non-reentrant layer checkpointing reduces the
+The first runtime premise is that the mixed backend eliminates the observed
+row-1078 vision SDPA OOM without changing processor tensors or language mask
+semantics. Its cheapest retained-path falsification is one fresh complete
+row-1078 negative-generation run after module-class and independent-manifest
+tests pass. Failure, non-finite output, backend mismatch, or OOM stops the plan.
+
+The next load-bearing premise is that non-reentrant layer checkpointing reduces the
 packed FlexAttention activation peak enough for the longest retained sample on
 an H100. The cheapest decisive experiment is one real DoRA forward/backward on
 the existing clean-759/packed-1280 reproduction, followed by the near-8192
