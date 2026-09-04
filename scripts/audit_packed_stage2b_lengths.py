@@ -9,7 +9,10 @@ import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from scripts.select_jsonl_rows import select_jsonl_rows
+if __package__:
+    from scripts.select_jsonl_rows import select_jsonl_rows
+else:
+    from select_jsonl_rows import select_jsonl_rows
 
 
 _RECORD_KEYS = (

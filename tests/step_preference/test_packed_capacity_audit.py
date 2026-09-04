@@ -1,4 +1,7 @@
 import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -6,6 +9,24 @@ from scripts.audit_packed_stage2b_lengths import (
     publish_packed_length_audit,
     select_packed_length_winner,
 )
+
+
+def test_audit_documented_direct_execution_reaches_cli_help():
+    """Catches package-only imports that fail when Python executes the script path."""
+    repository = Path(__file__).resolve().parents[2]
+    script = repository / "scripts" / "audit_packed_stage2b_lengths.py"
+
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--checkpoint_path" in completed.stdout
+    assert "--subset_output_path" in completed.stdout
 
 
 def _records():

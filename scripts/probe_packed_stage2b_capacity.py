@@ -197,7 +197,9 @@ def run_capacity_probe(
     return report
 
 
-def _error_report(args, git_commit: str, error: Exception) -> dict[str, object]:
+def _error_report(
+    args, git_commit: str | None, error: Exception
+) -> dict[str, object]:
     return {
         "schema_version": 1,
         "status": "oom" if isinstance(error, torch.OutOfMemoryError) else "error",
@@ -241,13 +243,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"output path already exists: {args.output_path}")
     if args.source_row_index < 0:
         parser.error("source_row_index must be nonnegative")
-    git_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.strip()
+    git_commit = None
     try:
+        git_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
         context = load_production_context(
             checkpoint_path=args.checkpoint_path,
             data_path=args.data_path,

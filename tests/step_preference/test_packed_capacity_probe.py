@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -369,3 +370,39 @@ def test_capacity_cli_publishes_exact_failure_status_and_exit_code(
         "elapsed_seconds",
         "errors",
     }
+
+
+def test_capacity_cli_publishes_git_identity_failure_as_error(monkeypatch, tmp_path):
+    """Catches Git setup failure escaping without JSON or reusing OOM exit 1."""
+    output = tmp_path / "capacity.json"
+
+    def fail_git(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(128, ["git", "rev-parse", "HEAD"])
+
+    monkeypatch.setattr(capacity_probe.subprocess, "run", fail_git)
+
+    exit_code = capacity_probe.main(
+        [
+            "--checkpoint_path",
+            "checkpoint",
+            "--data_path",
+            "data.jsonl",
+            "--image_root",
+            "images",
+            "--negative_path",
+            "negatives.jsonl",
+            "--negative_manifest",
+            "manifest.json",
+            "--output_path",
+            str(output),
+        ]
+    )
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 2
+    assert report["status"] == "error"
+    assert report["identity"]["git_commit"] is None
+    assert report["errors"] == [
+        "CalledProcessError: Command '['git', 'rev-parse', 'HEAD']' "
+        "returned non-zero exit status 128."
+    ]
