@@ -82,6 +82,54 @@ def test_stage2b_initialization_reuses_resume_resolution_but_clears_trainer_stat
     )
 
 
+def test_stage2b_full_stage2a_initializes_fresh_dora_without_weakening_resume():
+    """Catches treating fresh Stage 2B DoRA as an ordinary PEFT resume."""
+    stage2a_checkpoint = "stage2a/checkpoint-20"
+    stage2a_config = SimpleNamespace(
+        stage="stage2", latent_size=4, supervise_latent_boundaries=True
+    )
+    decision_kwargs = {
+        "load_model_path": "stage1/original",
+        "load_config": lambda source: stage2a_config,
+        "load_peft_metadata": no_stage2_peft_metadata,
+        "latent_size": 4,
+        "supervise_latent_boundaries": True,
+        "tuning_method": "dora",
+        "tuning_method_explicit": True,
+        "lora_r": 32,
+        "lora_alpha": 64,
+        "lora_dropout": 0.05,
+        "lora_target_modules": "q_proj,k_proj,v_proj",
+    }
+
+    with pytest.raises(
+        ValueError, match="requested PEFT resume is missing Stage 2 PEFT metadata"
+    ):
+        resolve_stage2_load_decision(
+            resume_from_checkpoint_path=stage2a_checkpoint,
+            **decision_kwargs,
+        )
+
+    decision = resolve_stage2b_initialization_decision(
+        stage2a_checkpoint_path=stage2a_checkpoint,
+        inspect_artifact=lambda _: Stage2ArtifactInspection(Stage2ArtifactKind.FULL),
+        **decision_kwargs,
+    )
+
+    assert decision.base_model_source == stage2a_checkpoint
+    assert decision.processor_source == stage2a_checkpoint
+    assert decision.adapter_source is None
+    assert decision.trainer_resume_path is None
+    assert decision.peft_metadata is None
+    assert decision.tuning.method == "dora"
+    assert decision.tuning.r == 32
+    assert decision.tuning.alpha == 64
+    assert decision.tuning.dropout == 0.05
+    assert decision.tuning.target_modules == ("q_proj", "k_proj", "v_proj")
+    assert decision.latent_size == 4
+    assert decision.supervise_latent_boundaries is True
+
+
 def test_stage2b_peft_initialization_rejects_a_relocated_compatible_base_before_load(
     monkeypatch, tmp_path
 ):

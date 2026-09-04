@@ -1329,6 +1329,7 @@ def resolve_stage2_load_decision(
     lora_alpha: int = 16,
     lora_dropout: float = 0.0,
     lora_target_modules: str | Sequence[str] = ("q_proj",),
+    _fresh_peft_from_full_stage2: bool = False,
 ) -> Stage2LoadDecision:
     """Choose fresh/full/adapter Stage 2 initialization and resume sources.
 
@@ -1456,7 +1457,8 @@ def resolve_stage2_load_decision(
         resume_config = load_config(resume_from_checkpoint_path)
         if getattr(resume_config, "stage", None) != "stage2":
             raise ValueError("expected stage2 checkpoint for resume")
-        if requested_tuning.is_peft:
+        fresh_peft = requested_tuning.is_peft and _fresh_peft_from_full_stage2
+        if requested_tuning.is_peft and not fresh_peft:
             raise ValueError("requested PEFT resume is missing Stage 2 PEFT metadata")
         for field, requested in (
             ("latent_size", latent_size),
@@ -1472,7 +1474,7 @@ def resolve_stage2_load_decision(
             resume_from_checkpoint_path,
             resume_from_checkpoint_path,
             None,
-            resume_from_checkpoint_path,
+            None if fresh_peft else resume_from_checkpoint_path,
             requested_tuning,
             resume_config.latent_size,
             resume_config.supervise_latent_boundaries,
@@ -1591,13 +1593,17 @@ def resolve_stage2b_initialization_decision(
     """Resolve Stage 2A as a resume artifact, then discard only trainer state."""
     if not isinstance(stage2a_checkpoint_path, str) or not stage2a_checkpoint_path:
         raise ValueError("stage2a_checkpoint_path must be a non-empty path")
+    inspection = inspect_artifact(stage2a_checkpoint_path)
     validate_stage2b_peft_base_identity(
         stage2a_checkpoint_path=stage2a_checkpoint_path,
         requested_base_model_path=stage2_resume_kwargs["load_model_path"],
-        inspect_artifact=inspect_artifact,
+        inspect_artifact=lambda _: inspection,
     )
     decision = resolve_stage2_load_decision(
         resume_from_checkpoint_path=stage2a_checkpoint_path,
+        _fresh_peft_from_full_stage2=(
+            inspection.artifact_kind is Stage2ArtifactKind.FULL
+        ),
         **stage2_resume_kwargs,
     )
     return replace(decision, trainer_resume_path=None)
