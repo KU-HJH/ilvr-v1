@@ -337,7 +337,7 @@ git commit -m "test: verify naive step preference integration"
 - [ ] Use a fresh explicit run ID. Generate offline negatives on CUDA from two real samples with greedy maximum 32 new tokens and minimum two completion tokens. If zero valid pairs survive, make exactly one fresh run on eight samples.
 
 ```bash
-run_id=step-preference-phase-a-$(date -u +%Y%m%dT%H%M%SZ)
+run_id=step-preference-phase-a-$(date -u +%Y%m%dt%H%M%Sz)
 mkdir -p "results/$run_id" "logs/$run_id"
 PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/python scripts/generate_step_negatives.py \
   --data_path data/TRAIN.jsonl \

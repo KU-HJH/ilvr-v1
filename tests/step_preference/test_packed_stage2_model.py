@@ -1,5 +1,4 @@
 import copy
-import os
 from unittest.mock import patch
 
 import pytest
@@ -13,6 +12,19 @@ from step_preference.ablation import (
 from step_preference.negatives import StepNegative
 from step_preference.packing import build_packed_tree_plan
 from step_preference.spans import ReasoningStepSpan
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tf32_backend_state():
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
 from tests.stage2.helpers import tiny_stage2_qwen
 from transformers.cache_utils import DynamicCache
 
@@ -162,7 +174,6 @@ def _independent_selected_logits(model, clean_ids, rejected_ids, span, plan):
 def test_packed_stage2_matches_independent_forwards_with_one_rollout_and_final_decode():
     """Catches packed sidecars drifting from eager forwards or repeating Stage 2 work."""
     assert torch.cuda.is_available(), "packed Stage 2 requires a real CUDA FlexAttention run"
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.manual_seed(211)
     model = _tiny_packed_qwen().cuda().float().eval()
     clean_ids, rejected_ids, _span, plan = _packed_fixture()

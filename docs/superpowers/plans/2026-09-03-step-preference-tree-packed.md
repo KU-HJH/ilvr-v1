@@ -680,7 +680,7 @@ git commit -m "perf: benchmark packed step preference"
 - [ ] **Step 1: Allocate one collision-free run ID**
 
 ```bash
-export PACKED_RUN_ID=step-preference-packed-$(date -u +%Y%m%dT%H%M%SZ)
+export PACKED_RUN_ID=step-preference-packed-$(date -u +%Y%m%dt%H%M%Sz)
 test ! -e "results/$PACKED_RUN_ID"
 test ! -e "logs/$PACKED_RUN_ID"
 mkdir "results/$PACKED_RUN_ID" "logs/$PACKED_RUN_ID"
