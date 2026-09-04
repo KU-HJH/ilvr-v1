@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
@@ -262,6 +263,74 @@ def _tiny_batch(device: torch.device) -> dict:
     }
 
 
+def _tiny_multistep_batch(device: torch.device) -> dict:
+    sample_id = "tiny-multistep-equivalence"
+    clean_ids = torch.tensor(
+        [[11, 91, 90, 90, 92, 12, 13, 14, 91, 90, 90, 92, 15, 16, 17]],
+        device=device,
+    )
+    spans = (
+        ReasoningStepSpan(0, 0, 1, 2, 4, 6, 8, None),
+        ReasoningStepSpan(1, 6, 8, 9, 11, 12, 15, None),
+    )
+
+    def negative(step_id: int, *, textual: bool) -> StepNegative:
+        return StepNegative(
+            sample_id=sample_id,
+            step_id=step_id,
+            chosen_text="chosen",
+            rejected_visual_text="visual rejected",
+            rejected_textual_text="text rejected" if textual else None,
+            valid_visual_negative=True,
+            valid_textual_negative=textual,
+            reference_chosen_score=-0.1,
+            reference_visual_rejected_score=-0.2,
+            reference_textual_rejected_score=-0.3 if textual else None,
+        )
+
+    def encoded(ids: torch.Tensor, positions: tuple[int, ...]) -> dict:
+        return {
+            "model_inputs": {
+                "input_ids": ids,
+                "attention_mask": torch.ones_like(ids),
+            },
+            "completion_token_positions": positions,
+            "completion_token_ids": tuple(int(ids[0, position]) for position in positions),
+            "rendered_text": "tiny rejected",
+        }
+
+    step0_visual = clean_ids.clone()
+    step0_visual[0, 6:8] = torch.tensor([23, 24], device=device)
+    step0_textual = clean_ids.clone()
+    step0_textual[0, 6:8] = torch.tensor([25, 26], device=device)
+    step1_visual = clean_ids.clone()
+    step1_visual[0, 12:15] = torch.tensor([27, 28, 29], device=device)
+    negatives = (negative(0, textual=True), negative(1, textual=False))
+    return {
+        "input_ids": clean_ids,
+        "attention_mask": torch.ones_like(clean_ids),
+        "labels": clean_ids.clone(),
+        "sample_ids": (sample_id,),
+        "reasoning_step_spans": spans,
+        "step_preference": {
+            "steps": (
+                {
+                    "span": spans[0],
+                    "negative": negatives[0],
+                    "visual_rejected": encoded(step0_visual, (6, 7)),
+                    "textual_rejected": encoded(step0_textual, (6, 7)),
+                },
+                {
+                    "span": spans[1],
+                    "negative": negatives[1],
+                    "visual_rejected": encoded(step1_visual, (12, 13, 14)),
+                    "textual_rejected": None,
+                },
+            )
+        },
+    }
+
+
 def _copy_gradients(model, names: tuple[str, ...]) -> dict[str, torch.Tensor | None]:
     parameters = dict(model.named_parameters())
     return {
@@ -301,33 +370,38 @@ def _result(
     )
 
 
-def run_tiny_fp32_equivalence(device: str | torch.device = "cuda:0") -> EquivalenceResult:
-    """Compare every trainable gradient on identical deterministic tiny Qwen models."""
+def _run_tiny_fp32_equivalence(
+    batch_factory,
+    *,
+    device: str | torch.device,
+    model_seed: int,
+    path_seed: int,
+) -> EquivalenceResult:
     device = torch.device(device)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise ValueError("tiny packed equivalence requires CUDA")
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.manual_seed(101)
+    torch.manual_seed(model_seed)
     base = _tiny_model().to(device=device, dtype=torch.float32).eval()
     naive_model = copy.deepcopy(base)
     packed_model = copy.deepcopy(base)
     names = tuple(
         name for name, parameter in naive_model.named_parameters() if parameter.requires_grad
     )
-    batch = _tiny_batch(device)
+    batch = batch_factory(device)
 
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     previous_deterministic = torch.are_deterministic_algorithms_enabled()
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.use_deterministic_algorithms(True)
-        torch.manual_seed(211)
+        torch.manual_seed(path_seed)
         naive_trainer = _trainer(_config(packing=False))
         naive_loss = naive_trainer.compute_loss(naive_model, copy.deepcopy(batch))
         naive_loss.backward()
         naive_gradients = _copy_gradients(naive_model, names)
 
-        torch.manual_seed(211)
+        torch.manual_seed(path_seed)
         packed_trainer = _trainer(_config(packing=True))
         packed_loss = packed_trainer.compute_loss(packed_model, copy.deepcopy(batch))
         packed_loss.backward()
@@ -351,6 +425,22 @@ def run_tiny_fp32_equivalence(device: str | torch.device = "cuda:0") -> Equivale
     )
 
 
+def run_tiny_fp32_equivalence(device: str | torch.device = "cuda:0") -> EquivalenceResult:
+    """Compare every trainable gradient on the fixed one-step tiny tree."""
+    return _run_tiny_fp32_equivalence(
+        _tiny_batch, device=device, model_seed=101, path_seed=211
+    )
+
+
+def run_tiny_multistep_fp32_equivalence(
+    device: str | torch.device = "cuda:0",
+) -> EquivalenceResult:
+    """Compare every trainable gradient on a ragged two-step tree."""
+    return _run_tiny_fp32_equivalence(
+        _tiny_multistep_batch, device=device, model_seed=103, path_seed=223
+    )
+
+
 def _production_parameter_names(model) -> tuple[str, ...]:
     named = sorted(model.named_parameters())
     selected = []
@@ -366,6 +456,109 @@ def _production_parameter_names(model) -> tuple[str, ...]:
     return tuple(selected)
 
 
+def _run_production_comparison(
+    model,
+    batch: Mapping,
+    *,
+    naive_config: StepPreferenceConfig,
+    packed_config: StepPreferenceConfig,
+    autocast_bf16: bool,
+    epsilon_loss: float,
+    epsilon_grad: float,
+) -> EquivalenceResult:
+    names = _production_parameter_names(model)
+    rng = torch.random.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all()
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    previous_deterministic = torch.are_deterministic_algorithms_enabled()
+
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.use_deterministic_algorithms(True)
+        model.zero_grad(set_to_none=True)
+        naive_trainer = _trainer(naive_config)
+        context = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if autocast_bf16
+            else nullcontext()
+        )
+        with context:
+            naive_loss = naive_trainer.compute_loss(model, copy.deepcopy(batch))
+        naive_loss.backward()
+        naive_gradients = _copy_gradients(model, names)
+
+        model.zero_grad(set_to_none=True)
+        torch.random.set_rng_state(rng)
+        torch.cuda.set_rng_state_all(cuda_rng)
+        packed_trainer = _trainer(packed_config)
+        context = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if autocast_bf16
+            else nullcontext()
+        )
+        with context:
+            packed_loss = packed_trainer.compute_loss(model, copy.deepcopy(batch))
+        packed_loss.backward()
+        packed_gradients = _copy_gradients(model, names)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        torch.use_deterministic_algorithms(previous_deterministic)
+
+    scalars = compare_scalar_metrics(
+        _loss_metrics(naive_trainer),
+        _loss_metrics(packed_trainer),
+        epsilon=epsilon_loss,
+    )
+    gradients = compare_gradients(
+        naive_gradients, packed_gradients, epsilon=epsilon_grad
+    )
+    return _result(
+        scalar_comparison=scalars,
+        gradient_comparison=gradients,
+        trainable_parameters=names,
+        epsilon_loss=epsilon_loss,
+        epsilon_grad=epsilon_grad,
+    )
+
+
+def run_production_fp32_equivalence(
+    model,
+    batch: Mapping,
+    *,
+    naive_config: StepPreferenceConfig,
+    packed_config: StepPreferenceConfig,
+) -> EquivalenceResult:
+    """Strictly compare the authenticated production graph in FP32."""
+    return _run_production_comparison(
+        model,
+        batch,
+        naive_config=naive_config,
+        packed_config=packed_config,
+        autocast_bf16=False,
+        epsilon_loss=1e-5,
+        epsilon_grad=1e-4,
+    )
+
+
+def run_production_bf16_diagnostic(
+    model,
+    batch: Mapping,
+    *,
+    naive_config: StepPreferenceConfig,
+    packed_config: StepPreferenceConfig,
+) -> EquivalenceResult:
+    """Record finite SDPA/Flex BF16 drift without fitting an acceptance bound."""
+    return _run_production_comparison(
+        model,
+        batch,
+        naive_config=naive_config,
+        packed_config=packed_config,
+        autocast_bf16=True,
+        epsilon_loss=1e100,
+        epsilon_grad=1e100,
+    )
+
+
 def run_production_bf16_equivalence(
     model,
     batch: Mapping,
@@ -373,39 +566,12 @@ def run_production_bf16_equivalence(
     naive_config: StepPreferenceConfig,
     packed_config: StepPreferenceConfig,
 ) -> EquivalenceResult:
-    """Compare named BF16 production gradients without mutating model weights."""
-    names = _production_parameter_names(model)
-    rng = torch.random.get_rng_state()
-    cuda_rng = torch.cuda.get_rng_state_all()
-
-    model.zero_grad(set_to_none=True)
-    naive_trainer = _trainer(naive_config)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        naive_loss = naive_trainer.compute_loss(model, copy.deepcopy(batch))
-    naive_loss.backward()
-    naive_gradients = _copy_gradients(model, names)
-
-    model.zero_grad(set_to_none=True)
-    torch.random.set_rng_state(rng)
-    torch.cuda.set_rng_state_all(cuda_rng)
-    packed_trainer = _trainer(packed_config)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        packed_loss = packed_trainer.compute_loss(model, copy.deepcopy(batch))
-    packed_loss.backward()
-    packed_gradients = _copy_gradients(model, names)
-
-    scalars = compare_scalar_metrics(
-        _loss_metrics(naive_trainer),
-        _loss_metrics(packed_trainer),
-        epsilon=1e-3,
-    )
-    gradients = compare_gradients(naive_gradients, packed_gradients, epsilon=1e-2)
-    return _result(
-        scalar_comparison=scalars,
-        gradient_comparison=gradients,
-        trainable_parameters=names,
-        epsilon_loss=1e-3,
-        epsilon_grad=1e-2,
+    """Backward-compatible name for the observational BF16 diagnostic."""
+    return run_production_bf16_diagnostic(
+        model,
+        batch,
+        naive_config=naive_config,
+        packed_config=packed_config,
     )
 
 
@@ -469,7 +635,7 @@ def load_production_context(
             "--max_train_samples",
             str(len(selected)),
             "--attention_implementation",
-            "eager",
+            "sdpa",
             "--no-gradient_checkpointing",
         ]
     )
@@ -517,7 +683,7 @@ def load_production_context(
     batch = _to_device(batch, device)
     naive_config = replace(
         components.step_preference_config,
-        attention_implementation="eager",
+        attention_implementation="sdpa",
         packing_enabled=False,
     )
     packed_config = replace(naive_config, packing_enabled=True)

@@ -13,8 +13,10 @@ import torch
 from step_preference.equivalence import (
     EquivalenceResult,
     load_production_context,
-    run_production_bf16_equivalence,
+    run_production_bf16_diagnostic,
+    run_production_fp32_equivalence,
     run_tiny_fp32_equivalence,
+    run_tiny_multistep_fp32_equivalence,
     write_evidence_exclusive,
 )
 
@@ -48,6 +50,14 @@ def _section(result: EquivalenceResult, *, production: bool) -> dict:
     }
 
 
+def _diagnostic_section(result: EquivalenceResult) -> dict:
+    section = _section(result, production=True)
+    return {
+        "loss_errors": section["loss_errors"],
+        "gradient_relative_l2": section["gradient_relative_l2"],
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -62,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     context = None
     try:
         tiny = run_tiny_fp32_equivalence(args.device)
+        tiny_multistep = run_tiny_multistep_fp32_equivalence(args.device)
         torch.cuda.empty_cache()
         context = load_production_context(
             checkpoint_path=args.checkpoint_path,
@@ -71,21 +82,38 @@ def main(argv: list[str] | None = None) -> int:
             negative_manifest=args.negative_manifest,
             device=args.device,
         )
-        production = run_production_bf16_equivalence(
+        production_fp32 = run_production_fp32_equivalence(
             context.model,
             context.batch,
             naive_config=context.naive_config,
             packed_config=context.packed_config,
         )
-        errors = list(tiny.errors) + list(production.errors)
+        production_bf16 = run_production_bf16_diagnostic(
+            context.model,
+            context.batch,
+            naive_config=context.naive_config,
+            packed_config=context.packed_config,
+        )
+        errors = (
+            list(tiny.errors)
+            + list(tiny_multistep.errors)
+            + list(production_fp32.errors)
+            + list(production_bf16.errors)
+        )
         identity = dict(context.identity)
         identity["git_commit"] = git_commit
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "pass" if not errors else "fail",
             "identity": identity,
             "tiny_fp32": _section(tiny, production=False),
-            "production_bf16": _section(production, production=True),
+            "tiny_multistep_fp32": _section(
+                tiny_multistep, production=False
+            ),
+            "production_fp32": _section(production_fp32, production=True),
+            "production_bf16_diagnostic": _diagnostic_section(
+                production_bf16
+            ),
             "errors": errors,
         }
         write_evidence_exclusive(args.output_path, report)
@@ -97,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             write_evidence_exclusive(
                 args.output_path,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "status": "fail",
                     "identity": identity,
                     "errors": [str(error)],

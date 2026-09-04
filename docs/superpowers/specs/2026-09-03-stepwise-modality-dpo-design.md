@@ -536,12 +536,22 @@ Completion requires, on the same inputs:
   lower peak allocated GPU memory;
 - unchanged behavior when packing is disabled.
 
-The deterministic FP32 tiny-model equivalence thresholds are
-`epsilon_loss=1e-5` and `epsilon_grad=1e-4`. A BF16 production-shaped witness
-uses `epsilon_loss=1e-3` and `epsilon_grad=1e-2`. Gradient comparison covers all
-trainable parameters in the tiny model; the production-shaped record names and
-checks the first trainable decoder `q_proj`, `o_proj`, and `down_proj` parameters
-that exist after tuning wrappers are applied.
+Design commitment v3 makes the correctness gate kernel-independent. The
+deterministic FP32 equivalence thresholds are `epsilon_loss=1e-5` and
+`epsilon_grad=1e-4` for the one-step tiny model, a fixed multi-step ragged tree,
+and the authenticated production graph. Tiny cases cover every trainable
+parameter; the production record names the first trainable decoder `q_proj`,
+`o_proj`, and `down_proj` parameters after tuning wrappers are applied.
+
+The target BF16 runtime is also measured with the supported SDPA naive backend
+against packed FlexAttention. Its raw loss and gradient differences are a
+diagnostic, not a fitted equivalence threshold: exceptions or nonfinite values
+fail closed, but finite cross-kernel drift does not replace the strict FP32
+correctness oracle. Completion therefore does not claim one-percent BF16
+gradient equivalence. This change follows direct evidence that the production
+graph agrees in FP32 (loss at most `3.35e-7`, representative gradient relative
+L2 at most `1.41e-5`) while SDPA/Flex BF16 reductions differ by roughly
+five-to-six percent on the observed sample.
 
 The benchmark uses the same process, GPU, model state, precision, and fixed
 collated samples for both paths. Each path performs three unmeasured warmups and

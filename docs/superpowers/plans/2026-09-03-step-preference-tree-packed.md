@@ -19,8 +19,8 @@
 - V/T-off sidecars retain the exact shifted blocked edge. Rejected sidecars have clean context and no modality block.
 - Logical 3-axis multimodal position IDs are copied from the clean sequence; never derive them from packed physical offsets.
 - FlexAttention must skip masked blocks. Reducing Python call count with a dense attention mask is not completion.
-- Deterministic FP32 tiny equivalence thresholds are `epsilon_loss=1e-5` and `epsilon_grad=1e-4`, over every trainable parameter.
-- BF16 production thresholds are `epsilon_loss=1e-3` and `epsilon_grad=1e-2`, over the first trainable decoder `q_proj`, `o_proj`, and `down_proj` parameters.
+- Deterministic FP32 equivalence thresholds are `epsilon_loss=1e-5` and `epsilon_grad=1e-4`: every trainable parameter for fixed one-step and multi-step/ragged tiny trees, plus the first trainable production decoder `q_proj`, `o_proj`, and `down_proj` parameters on the authenticated real graph.
+- Record finite production BF16 SDPA-versus-Flex loss and gradient drift without fitting a pass threshold to the observed values. The completion claim is strict FP32 graph equivalence, not one-percent cross-kernel BF16 gradient equivalence.
 - Benchmark both paths in one process on the same GPU/model/precision/fixed sample, with three warmups, ten measured iterations, CUDA synchronization around every timed iteration, and peak-memory reset after warmup.
 - Completion requires at least 5% lower median iteration time or 1% lower peak allocated memory.
 - Model artifacts stay under `checkpoints/`; generated metrics under `results/`; execution logs under `logs/`.
@@ -482,11 +482,11 @@ git commit -m "feat: integrate packed step preference training"
 
 **Interfaces:**
 - Consumes: one model, fixed collated Stage 2B batch, and naive/packed `Stage2Trainer` configurations.
-- Produces: `relative_l2_error`, `compare_scalar_metrics`, `run_tiny_fp32_equivalence`, `run_production_bf16_equivalence`, and schema-1 JSON evidence.
+- Produces: strict one-step and multi-step tiny FP32 checks, strict authenticated production FP32 comparison, observational production BF16 diagnostics, and schema-2 JSON evidence.
 
 - [ ] **Step 1: Write failing math and end-to-end tiny-model tests**
 
-Unit-test zero-reference gradients, a known relative error, missing/nonfinite gradients, and per-component tolerance failures. Then run two identical CUDA FP32 tiny Qwen models on the same one-step batch, backward both losses, and require all trainable parameter gradients to satisfy the spec.
+Unit-test zero-reference gradients, a known relative error, missing/nonfinite gradients, and per-component tolerance failures. Then run identical CUDA FP32 tiny Qwen models on fixed one-step and multi-step/ragged batches. The latter crosses padding and mask boundaries and contains both modalities plus unequal completion lengths. Backward both paths and require all trainable parameter gradients to satisfy the spec.
 
 ```python
 def test_tiny_fp32_naive_and_packed_match_all_trainable_gradients():
@@ -527,17 +527,17 @@ above. Scalar/component loss error is absolute difference. Missing or nonfinite
 values are recorded as named errors and fail the result rather than being
 coerced to zero.
 
-Reset RNG and gradients before each path. Tiny equivalence uses deep-copied identical models and compares every trainable parameter. Production equivalence uses one frozen model state sequentially: naive forward/backward, copy named gradients to CPU, clear gradients and graph, then packed forward/backward. Select the first trainable decoder parameters whose names end in `q_proj.weight`, `o_proj.weight`, and `down_proj.weight` after wrappers.
+Reset RNG and gradients before each path. Tiny equivalence uses deep-copied identical models and compares every trainable parameter. Production equivalence uses one frozen model state sequentially: naive forward/backward, copy named gradients to CPU, clear gradients and graph, then packed forward/backward. Select the first trainable decoder parameters whose names end in `q_proj.weight`, `o_proj.weight`, and `down_proj.weight` after wrappers. Run the authenticated production comparison once without autocast as the strict oracle, then under BF16 autocast as a finite diagnostic. Load the supported naive runtime with SDPA; do not mutate the Phase A call graph.
 
 - [ ] **Step 4: Implement a strict evidence CLI**
 
-The CLI accepts `--checkpoint_path`, `--data_path`, `--image_root`, `--negative_path`, `--negative_manifest`, `--device`, and `--output_path`. It reuses `build_stage2_training_components` and the real collator, selects the lowest manifest `selected_row_indices` entry that has at least one valid pair, and verifies that its collated `sample_id` joins the authenticated negative store. It runs both equivalence levels with dropout zero, TF32 disabled, identical RNG state, and no autocast for tiny FP32 versus BF16 autocast for production. It refuses to overwrite `output_path`.
+The CLI accepts `--checkpoint_path`, `--data_path`, `--image_root`, `--negative_path`, `--negative_manifest`, `--device`, and `--output_path`. It reuses `build_stage2_training_components` and the real collator, selects the lowest manifest `selected_row_indices` entry that has at least one valid pair, and verifies that its collated `sample_id` joins the authenticated negative store. It runs the fixed tiny and authenticated production FP32 gates with dropout zero, TF32 disabled, and identical RNG state, then records a finite BF16 SDPA/Flex diagnostic. It refuses to overwrite `output_path`.
 
 Write this schema-1 shape and exit nonzero on any failed predicate:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "status": "pass",
   "identity": {"checkpoint_path": "/raid/checkpoints/stage2a",
                "sample_id": "sample-a",
@@ -547,11 +547,18 @@ Write this schema-1 shape and exit nonzero on any failed predicate:
   "tiny_fp32": {"loss_errors": {"loss/total": 0.0},
                   "gradient_relative_l2": {"model.layers.0.self_attn.q_proj.weight": 0.0},
                   "epsilon_loss": 1e-5, "epsilon_grad": 1e-4},
-  "production_bf16": {"loss_errors": {"loss/total": 0.0},
+  "tiny_multistep_fp32": {"loss_errors": {"loss/total": 0.0},
+                            "gradient_relative_l2": {},
+                            "epsilon_loss": 1e-5, "epsilon_grad": 1e-4},
+  "production_fp32": {"loss_errors": {"loss/total": 0.0},
                        "gradient_relative_l2": {"q_proj": 0.0,
-                                                  "o_proj": 0.0,
-                                                  "down_proj": 0.0},
-                       "epsilon_loss": 1e-3, "epsilon_grad": 1e-2},
+                                                "o_proj": 0.0,
+                                                "down_proj": 0.0},
+                       "epsilon_loss": 1e-5, "epsilon_grad": 1e-4},
+  "production_bf16_diagnostic": {"loss_errors": {"loss/total": 0.0},
+                                  "gradient_relative_l2": {"q_proj": 0.0,
+                                                           "o_proj": 0.0,
+                                                           "down_proj": 0.0}},
   "errors": []
 }
 ```
@@ -668,7 +675,7 @@ git commit -m "perf: benchmark packed step preference"
 
 **Interfaces:**
 - Consumes: Tasks 1–6.
-- Produces: green tiny FP32, production BF16, and performance JSON witnesses for TODO 9–11.
+- Produces: green fixed-tree and authenticated production FP32 correctness witnesses, finite production BF16 diagnostics, and a BF16 performance witness for TODO 9–11.
 
 - [ ] **Step 1: Allocate one collision-free run ID**
 
@@ -706,7 +713,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
   2>&1 | tee "logs/$PACKED_RUN_ID/equivalence.log"
 ```
 
-Require tiny FP32 loss `<=1e-5`, all-gradient relative L2 `<=1e-4`, BF16 loss `<=1e-3`, and named production-gradient relative L2 `<=1e-2`.
+Require one-step and multi-step tiny FP32 plus authenticated production FP32 loss `<=1e-5` and gradient relative L2 `<=1e-4`. Require BF16 diagnostics to be finite and preserve their raw SDPA/Flex differences; do not claim BF16 cross-kernel equivalence.
 
 - [ ] **Step 4: Run the synchronized benchmark in the same fresh run**
 

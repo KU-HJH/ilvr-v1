@@ -14,9 +14,10 @@ from step_preference.equivalence import (
     compare_scalar_metrics,
     relative_l2_error,
     run_tiny_fp32_equivalence,
+    run_tiny_multistep_fp32_equivalence,
     write_evidence_exclusive,
 )
-from scripts.verify_packed_step_preference import _section
+from scripts.verify_packed_step_preference import _diagnostic_section, _section
 
 
 def test_relative_l2_error_uses_float64_reference_norm():
@@ -117,10 +118,44 @@ def test_production_evidence_uses_declared_projection_names():
     }
 
 
+def test_bf16_diagnostic_evidence_has_no_fitted_acceptance_threshold():
+    """Catches observed BF16 drift being relabeled as a passing equivalence gate."""
+    result = EquivalenceResult(
+        status="pass",
+        loss_errors={"loss/total": 0.0012},
+        gradients={
+            "model.layers.0.self_attn.q_proj.weight": 0.05,
+            "model.layers.0.self_attn.o_proj.weight": 0.06,
+            "model.layers.0.mlp.down_proj.weight": 0.04,
+        },
+        trainable_parameters=(),
+        epsilon_loss=1.0,
+        epsilon_grad=1.0,
+        errors=(),
+    )
+    section = _diagnostic_section(result)
+    assert set(section) == {"loss_errors", "gradient_relative_l2"}
+    assert section["gradient_relative_l2"] == {
+        "q_proj": 0.05,
+        "o_proj": 0.06,
+        "down_proj": 0.04,
+    }
+
+
 def test_tiny_fp32_naive_and_packed_match_all_trainable_gradients():
     """Catches packed loss or autograd drift against the independent naive graph."""
     assert torch.cuda.is_available(), "packed equivalence requires CUDA"
     result = run_tiny_fp32_equivalence(device="cuda:0")
+    assert result.status == "pass", result.errors
+    assert result.max_loss_error <= 1e-5
+    assert result.max_gradient_relative_l2 <= 1e-4
+    assert set(result.gradients) == set(result.trainable_parameters)
+
+
+def test_multistep_ragged_fp32_tree_matches_all_trainable_gradients():
+    """Catches topology drift hidden by the one-step equivalence fixture."""
+    assert torch.cuda.is_available(), "packed equivalence requires CUDA"
+    result = run_tiny_multistep_fp32_equivalence(device="cuda:0")
     assert result.status == "pass", result.errors
     assert result.max_loss_error <= 1e-5
     assert result.max_gradient_relative_l2 <= 1e-4
