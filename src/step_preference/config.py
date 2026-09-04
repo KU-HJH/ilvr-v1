@@ -50,6 +50,7 @@ class StepPreferenceConfig:
     enabled: bool = False
     mode: StepPreferenceMode = "stage2a"
     beta: float = 0.1
+    lambda_ce: float = 1.0
     lambda_dpo: float = 1.0
     lambda_entropy: float = 0.1
     entropy_margin: float = 0.1
@@ -74,8 +75,13 @@ class StepPreferenceConfig:
         beta = _finite("step_dpo_beta", self.beta)
         if beta <= 0:
             raise ValueError("step_dpo_beta must be positive")
-        _finite("step_dpo_weight", self.lambda_dpo)
-        _finite("step_entropy_weight", self.lambda_entropy)
+        for name, value in (
+            ("ce_weight", self.lambda_ce),
+            ("step_dpo_weight", self.lambda_dpo),
+            ("step_entropy_weight", self.lambda_entropy),
+        ):
+            if _finite(name, value) < 0:
+                raise ValueError(f"{name} must be nonnegative")
         entropy_margin = _finite("step_entropy_margin", self.entropy_margin)
         if entropy_margin < 0:
             raise ValueError("step_entropy_margin must be nonnegative")
@@ -141,6 +147,7 @@ class StepPreferenceConfig:
             enabled=getattr(args, "step_preference_enabled", False),
             mode=getattr(args, "step_preference_mode", "stage2a"),
             beta=getattr(args, "step_dpo_beta", 0.1),
+            lambda_ce=getattr(args, "ce_weight", 1.0),
             lambda_dpo=getattr(args, "step_dpo_weight", 1.0),
             lambda_entropy=getattr(args, "step_entropy_weight", 0.1),
             entropy_margin=getattr(args, "step_entropy_margin", 0.1),

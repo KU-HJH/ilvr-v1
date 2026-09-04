@@ -37,6 +37,7 @@ LATENT_SIZE=${LATENT_SIZE:-8}
 STAGE2_DIAGNOSTICS_INTERVAL=${STAGE2_DIAGNOSTICS_INTERVAL:-0}
 SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
+CE_WEIGHT=${CE_WEIGHT:-1.0}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-8}
 ATTENTION_IMPLEMENTATION=${ATTENTION_IMPLEMENTATION:-sdpa}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
@@ -207,6 +208,7 @@ MANAGED_OPTIONS=(
   --step_preference_mode
   --step_negative_path
   --step_negative_manifest
+  --ce_weight
   --step_dpo_beta
   --step_dpo_weight
   --step_entropy_weight
@@ -271,6 +273,25 @@ require_non_negative_integer() {
   fi
 }
 
+require_finite_non_negative_number() {
+  local name=$1
+  local value=$2
+  if ! "$REPO_ROOT/venv/ilvr-venv/bin/python" - "$value" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value >= 0 else 1)
+PY
+  then
+    printf '%s must be a finite non-negative number\n' "$name" >&2
+    exit 2
+  fi
+}
+
 require_positive_integer LATENT_SIZE "$LATENT_SIZE"
 require_non_negative_integer STAGE2_DIAGNOSTICS_INTERVAL "$STAGE2_DIAGNOSTICS_INTERVAL"
 require_positive_integer GRADIENT_ACCUMULATION_STEPS "$GRADIENT_ACCUMULATION_STEPS"
@@ -278,6 +299,11 @@ require_positive_integer MAX_SEQUENCE_LENGTH "$MAX_SEQUENCE_LENGTH"
 require_non_negative_integer DATALOADER_NUM_WORKERS "$DATALOADER_NUM_WORKERS"
 require_positive_integer LORA_R "$LORA_R"
 require_positive_integer LORA_ALPHA "$LORA_ALPHA"
+require_finite_non_negative_number CE_WEIGHT "$CE_WEIGHT"
+if [[ "$STEP_PREFERENCE_ENABLED" == true ]]; then
+  require_finite_non_negative_number STEP_DPO_WEIGHT "$STEP_DPO_WEIGHT"
+  require_finite_non_negative_number STEP_ENTROPY_WEIGHT "$STEP_ENTROPY_WEIGHT"
+fi
 
 case "$TUNING_METHOD" in
   full|lora|dora) ;;
@@ -417,6 +443,7 @@ TRAINING_ARGS=(
   --latent_size "$LATENT_SIZE"
   --stage2_diagnostics_interval "$STAGE2_DIAGNOSTICS_INTERVAL"
   "${STEP_PREFERENCE_ARGS[@]}"
+  --ce_weight "$CE_WEIGHT"
   "${BOUNDARY_ARGS[@]}"
   --learning_rate "$LEARNING_RATE"
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"

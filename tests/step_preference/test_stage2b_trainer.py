@@ -23,6 +23,7 @@ def _config(**changes):
         enabled=True,
         mode="stage2b",
         beta=0.5,
+        lambda_ce=1.0,
         lambda_dpo=2.0,
         lambda_entropy=0.3,
         entropy_margin=0.2,
@@ -186,6 +187,124 @@ def _entropy(coefficient):
     logits = torch.tensor([coefficient, 0.0, 0.0, 0.0])
     logps = torch.log_softmax(logits, dim=0)
     return -(logps.exp() * logps).sum()
+
+
+def _gradient_vector(model):
+    """Flatten every trainable slot, treating an untouched slot as zero."""
+    return torch.cat(
+        [
+            (
+                parameter.grad
+                if parameter.grad is not None
+                else torch.zeros_like(parameter)
+            ).reshape(-1)
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ]
+    )
+
+
+def _raw_policy_components(model):
+    """Hand-derived objectives for the deterministic tiny policy."""
+    def logp(coefficient):
+        logits = torch.stack(
+            (
+                coefficient * model.weight,
+                model.weight * 0.0,
+                model.weight * 0.0,
+                model.weight * 0.0,
+            )
+        )
+        return torch.log_softmax(logits, dim=0)[0]
+
+    def entropy(coefficient):
+        logits = torch.stack(
+            (
+                coefficient * model.weight,
+                model.weight * 0.0,
+                model.weight * 0.0,
+                model.weight * 0.0,
+            )
+        )
+        logps = torch.log_softmax(logits, dim=0)
+        return -(logps.exp() * logps).sum()
+
+    chosen = logp(0.6)
+    dpo_terms = [
+        -F.logsigmoid(0.5 * ((chosen - logp(rejected)) - reference_margin))
+        for rejected, reference_margin in zip(
+            (-0.2, -0.4, -0.6), (0.9, 0.2, 0.6)
+        )
+    ]
+    entropy_terms = [
+        F.relu(entropy(0.6) + 0.2 - entropy(coefficient))
+        for coefficient in (0.1, 0.2, 0.3, 0.4)
+    ]
+    return {
+        "loss/ce": (model.weight - 0.25).square() + 0.75,
+        "loss/dpo": sum(dpo_terms) / 3,
+        "loss/entropy": sum(entropy_terms) / 4,
+    }
+
+
+@pytest.mark.parametrize(
+    ("coefficients", "selected_metric", "expected_scalar"),
+    [
+        ((1.0, 0.0, 0.0), "loss/ce", 1.3125),
+        ((0.0, 1.0, 0.0), "loss/dpo", 0.6574867963790894),
+        ((0.0, 0.0, 1.0), "loss/entropy", 0.1679723560810089),
+    ],
+    ids=("ce-objective", "dpo-objective", "entropy-objective"),
+)
+def test_stage2b_objective_coefficients_isolate_scalar_and_gradient(
+    coefficients, selected_metric, expected_scalar
+):
+    """Catches inactive objectives contributing loss or policy gradients."""
+    lambda_ce, lambda_dpo, lambda_entropy = coefficients
+    config = _config(
+        lambda_ce=lambda_ce,
+        lambda_dpo=lambda_dpo,
+        lambda_entropy=lambda_entropy,
+    )
+
+    objective_trainer = _trainer(config)
+    objective_metrics = {}
+    objective_trainer._accumulate_step_preference_metrics = objective_metrics.update
+    objective_model = _Policy()
+    objective_loss = objective_trainer.compute_loss(objective_model, _batch())
+    objective_loss.backward()
+
+    component_model = _Policy()
+    selected_component = _raw_policy_components(component_model)[selected_metric]
+    selected_component.backward()
+
+    assert len(objective_model.calls) == 8
+    assert float(selected_component.detach()) == pytest.approx(expected_scalar)
+    torch.testing.assert_close(
+        objective_loss.detach(), selected_component.detach(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        _gradient_vector(objective_model),
+        _gradient_vector(component_model),
+        rtol=1e-5,
+        atol=1e-7,
+    )
+    assert float(objective_metrics[selected_metric].detach()) == pytest.approx(
+        expected_scalar
+    )
+
+
+def test_stage2b_component_metrics_are_raw_and_unweighted():
+    """Catches coefficient scaling leaking into capacity-probe metrics."""
+    trainer = _trainer(_config(lambda_ce=0.25, lambda_dpo=3.0, lambda_entropy=4.0))
+    metrics = {}
+    trainer._accumulate_step_preference_metrics = metrics.update
+
+    trainer.compute_loss(_Policy(), _batch())
+
+    assert float(metrics["loss/ce"].detach()) == pytest.approx(1.3125)
+    assert float(metrics["loss/dpo"].detach()) == pytest.approx(0.6574867963790894)
+    assert float(metrics["loss/entropy"].detach()) == pytest.approx(0.1679723560810089)
 
 
 def test_stage2b_runs_the_naive_graph_and_uses_global_pair_and_token_denominators(
@@ -558,6 +677,7 @@ def test_stage2b_components_validate_exact_store_and_clear_stage2a_resume(
             "image_root": tmp_path,
             "latent_size": 8,
             "require_reasoning_units": True,
+            "assistant_plan_rendering": "adjacent-text-space-lf-v1",
         }
     ]
     assert store_calls[0]["expected_selected_row_indices"] == (0,)

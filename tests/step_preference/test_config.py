@@ -29,6 +29,7 @@ def test_step_preference_config_is_immutable_and_exposes_normative_defaults():
     assert config.enabled is False
     assert config.mode == "stage2a"
     assert config.beta == 0.1
+    assert config.lambda_ce == 1.0
     assert config.lambda_dpo == 1.0
     assert config.lambda_entropy == 0.1
     assert config.entropy_margin == 0.1
@@ -51,6 +52,7 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
     assert args.step_negative_path is None
     assert args.step_negative_manifest is None
     assert args.step_dpo_beta == 0.1
+    assert args.ce_weight == 1.0
     assert args.step_dpo_weight == 1.0
     assert args.step_entropy_weight == 0.1
     assert args.step_entropy_margin == 0.1
@@ -58,6 +60,13 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
     assert args.stage2_total_steps is None
     assert args.stage2a_checkpoint_path is None
     assert args.step_preference_packing is False
+
+
+def test_training_cli_maps_zero_ce_weight_into_step_preference_config():
+    """Catches the public CE coefficient being ignored by Stage 2B."""
+    args = parse_args(["--stage", "stage2", "--ce_weight", "0"])
+
+    assert args.step_preference_config.lambda_ce == 0.0
 
 
 def test_step_preference_packing_is_an_explicit_stage2b_only_opt_in():
@@ -136,6 +145,14 @@ def test_step_preference_config_rejects_invalid_objective_settings(updates):
     """Catches a non-finite objective or unknown lifecycle mode at construction."""
     with pytest.raises(ValueError):
         StepPreferenceConfig(**updates)
+
+
+@pytest.mark.parametrize("field", ("lambda_ce", "lambda_dpo", "lambda_entropy"))
+@pytest.mark.parametrize("value", (-0.1, float("nan"), float("inf")))
+def test_step_preference_config_rejects_invalid_objective_coefficients(field, value):
+    """Catches negative or non-finite coefficients reaching objective reduction."""
+    with pytest.raises(ValueError):
+        StepPreferenceConfig(**{field: value})
 
 
 def test_optional_total_budget_selects_the_current_phase_steps():

@@ -47,6 +47,8 @@ from step_preference.spans import ReasoningStepSpan
 _STEP_PREFERENCE_LOG_NAMES = (
     "loss/total",
     "loss/ce",
+    "loss/dpo",
+    "loss/entropy",
     "loss/dpo_visual",
     "loss/dpo_text",
     "loss/entropy_visual",
@@ -493,7 +495,7 @@ class Stage2Trainer(Trainer):
             textual_off_entropy = zero
 
         total_loss = (
-            clean_ce
+            config.lambda_ce * clean_ce
             + config.lambda_dpo * dpo.loss
             + config.lambda_entropy * entropy_loss
         )
@@ -502,6 +504,8 @@ class Stage2Trainer(Trainer):
         metrics = {
             "loss/total": total_loss,
             "loss/ce": clean_ce,
+            "loss/dpo": dpo.loss,
+            "loss/entropy": entropy_loss,
             "loss/dpo_visual": dpo.visual_loss,
             "loss/dpo_text": dpo.textual_loss,
             "loss/entropy_visual": visual_entropy_loss,

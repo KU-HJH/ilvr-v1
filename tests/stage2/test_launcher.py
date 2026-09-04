@@ -152,6 +152,8 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "8",
         "--stage2_diagnostics_interval",
         "0",
+        "--ce_weight",
+        "1.0",
         "--supervise_latent_boundaries",
         "--learning_rate",
         "1e-5",
@@ -345,6 +347,7 @@ def test_stage2_launcher_propagates_opt_in_stage2b_environment_without_resume_st
                 "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
                 "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
                 "STEP_DPO_BETA": "0.2",
+                "CE_WEIGHT": "0.7",
                 "STEP_DPO_WEIGHT": "1.5",
                 "STEP_ENTROPY_WEIGHT": "0.4",
                 "STEP_ENTROPY_MARGIN": "0.3",
@@ -360,6 +363,7 @@ def test_stage2_launcher_propagates_opt_in_stage2b_environment_without_resume_st
     assert option_value(tokens, "--step_negative_path") == "/results/negatives.jsonl"
     assert option_value(tokens, "--step_negative_manifest") == "/results/manifest.json"
     assert option_value(tokens, "--step_dpo_beta") == "0.2"
+    assert option_value(tokens, "--ce_weight") == "0.7"
     assert option_value(tokens, "--step_dpo_weight") == "1.5"
     assert option_value(tokens, "--step_entropy_weight") == "0.4"
     assert option_value(tokens, "--step_entropy_margin") == "0.3"
@@ -368,6 +372,55 @@ def test_stage2_launcher_propagates_opt_in_stage2b_environment_without_resume_st
     assert option_value(tokens, "--stage2a_checkpoint_path") == "/models/stage 2a"
     assert "--resume_from_checkpoint_path" not in tokens
     assert "--tuning_method" not in tokens
+
+
+@pytest.mark.parametrize(
+    ("ce_weight", "dpo_weight", "entropy_weight"),
+    [("1", "0", "0"), ("0", "1", "0"), ("0", "0", "1")],
+)
+def test_stage2b_launcher_forwards_isolated_objective_coefficient_triplets(
+    ce_weight, dpo_weight, entropy_weight
+):
+    """Catches launcher ownership changing an isolated ablation request."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
+                "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
+                "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+                "CE_WEIGHT": ce_weight,
+                "STEP_DPO_WEIGHT": dpo_weight,
+                "STEP_ENTROPY_WEIGHT": entropy_weight,
+            }
+        )
+    )
+
+    assert option_value(tokens, "--ce_weight") == ce_weight
+    assert option_value(tokens, "--step_dpo_weight") == dpo_weight
+    assert option_value(tokens, "--step_entropy_weight") == entropy_weight
+
+
+@pytest.mark.parametrize(
+    "name", ("CE_WEIGHT", "STEP_DPO_WEIGHT", "STEP_ENTROPY_WEIGHT")
+)
+@pytest.mark.parametrize("value", ("-0.1", "nan", "inf"))
+def test_stage2b_launcher_rejects_invalid_objective_coefficients(name, value):
+    """Catches invalid objective coefficients surviving launcher preflight."""
+    result = run_launcher(
+        env_overrides={
+            "STEP_PREFERENCE_ENABLED": "true",
+            "STEP_PREFERENCE_MODE": "stage2b",
+            "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
+            "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
+            "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+            name: value,
+        }
+    )
+
+    assert result.returncode == 2
+    assert f"{name} must be a finite non-negative number" in result.stderr
 
 
 def test_stage2b_launcher_dry_run_identifies_space_lf_length_manifest_rendering():
@@ -511,13 +564,14 @@ def test_stage2b_launcher_preflights_stale_artifact_before_creating_run_paths(
     manifest_path.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "source_sha256": "0" * 64,
                 "selected_row_indices": [0],
                 "stage2a_checkpoint_path": str(stage2a.resolve()),
                 "checkpoint_files": [],
                 "tokenizer_config_identity": "stale-tokenizer",
                 "latent_size": 8,
+                "assistant_plan_rendering": "adjacent-text-space-lf-v1",
                 "generation_settings": {
                     "min_tokens": 2,
                     "max_new_tokens": 32,
