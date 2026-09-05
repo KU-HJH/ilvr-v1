@@ -2,8 +2,7 @@
 
 ## Status
 
-Design commitment v11, approved by the user's instruction to proceed on
-2026-09-04.
+Design commitment v13, pending explicit user approval on 2026-09-05.
 
 This commitment amends the capacity gates and training population in
 `2026-09-04-step-preference-dora-ablation-readiness-design.md`. Everything not
@@ -26,8 +25,19 @@ packed layout, not vision SDPA, allocator fragmentation, or DoRA alone.
 
 The existing 8192 limit measures the clean sequence, not the actual packed
 model input. It therefore does not bound packed attention memory. A complete
-clean scan measured 3450 source rows: 3379 pass the clean 8192 limit, and 3374
-have clean length at most 7168.
+clean scan measured 3450 source rows: 3379 pass the clean 8192 limit, and 3354
+have clean length at most 4608.
+
+The v11 fixed pilot rejected its proposed 7168 cap. Row 1372, with 20 branches
+and packed padded length 6784, OOMed at a peak-reserved fraction of
+0.9924943168071045. Follow-up capacity-tail probes then established that packed
+length alone is not a sufficient ordering: row 1714 (20 branches, padded 6400)
+completed at 0.9801148899981706, while row 1582 (24 branches, padded 6144)
+OOMed at 0.9916550336336175. With 24 branches held fixed, row 1098 (padded
+5632) completed at 0.9806394419816, row 1241 (padded 4864) completed but
+failed the strict limit at 0.8515786719786298, and row 1314 (padded 4608)
+completed with finite losses and gradient norm at 0.7896185916959487. These
+measurements replace, rather than waive, the failed v11 premise.
 
 ## Frozen experiment identity
 
@@ -107,7 +117,7 @@ is a tie and valid-gold accuracy is secondary only.
 ## Decision and scientific scope
 
 Exclude whole examples whose unchanged natural packed plan exceeds a new
-packed length cap of 7168. Keep the clean tokenizer/model limit at 8192. Do not
+packed length cap of 4608. Keep the clean tokenizer/model limit at 8192. Do not
 truncate, split, or prune branches. A retained example keeps its exact natural
 packed plan, targets, masks, selected positions, and losses.
 
@@ -127,9 +137,9 @@ artifact, and LoRA already failed on the observed layout.
 ## Fixed runtime and admission interface
 
 - Keep `MAX_SEQUENCE_LENGTH=8192` as the clean upper bound.
-- Add `max_packed_sequence_length=7168`, exposed as
+- Add `max_packed_sequence_length=4608`, exposed as
   `--step_max_packed_sequence_length` and
-  `STEP_MAX_PACKED_SEQUENCE_LENGTH=7168`. It must be positive when packing is
+  `STEP_MAX_PACKED_SEQUENCE_LENGTH=4608`. It must be positive when packing is
   enabled.
 - Keep DoRA 32/64/0.05, BF16, language SDPA, vision FlashAttention2, packed
   FlexAttention, non-reentrant checkpointing, two-rank ZeRO-2, seeds,
@@ -137,45 +147,45 @@ artifact, and LoRA already failed on the observed layout.
 - Evaluation remains the full 400-row TEST set because it does not construct
   packed preference trees.
 
-## First nail: cheap tail pilot
+## First nail: observed capacity-tail search
 
-Before implementing the manifest path or generating full negatives, generate
-exact one-row schema-3 artifacts for these fixed source indices from the
-authenticated clean scan:
+The v11 first nail ran under
+`results/step-pref-packed-pilot-20260904T183536Z/` and rejected 7168 on its
+first admitted row. Its immutable failure summary has SHA-256
+`7419aff8604072b57966fb4b460f99735cb6f7f2c2b386d2f46d7a28139a2c6f`.
+The failed run was not retried and the later v11 rows were not probed inside
+that run ID.
 
-| Source index | Clean length | Reasoning blocks | Purpose |
-|---:|---:|---:|---|
-| 1372 | 6065 | 5 | closest expected natural layout below the cap |
-| 1714 | 5660 | 5 | fallback boundary if row 1372 packs over the cap |
-| 1582 | 5256 | 6 | higher branch-count shape |
+The user then authorized a descending capacity-tail spike. Every candidate used
+its own fresh result/log path, the same frozen source and checkpoint, the same
+schema-3 negative protocol, and the same canonical one-H100 combined-positive
+DoRA forward/backward probe. Source indices remain zero-based JSONL line
+ordinals.
 
-Build each unchanged natural packed plan. A pilot is ignored only if its
-natural padded length exceeds 7168, because such a row would not be admitted.
-At least two pilots must be admitted, including the admitted row with maximum
-padded length and the six-block row. Run the canonical one-H100
-combined-positive DoRA forward/backward probe on every admitted pilot. Each
-must produce finite component losses, a finite nonzero trainable-gradient norm,
-and peak reserved memory no greater than 85% of total device memory. Any failure
-rejects the 7168 cap before full generation; the cap must not be lowered
-silently.
+| Source | Steps / branches | Clean / padded | Outcome | Peak reserved fraction |
+|---:|---:|---:|---|---:|
+| 1372 | 5 / 20 | 6065 / 6784 | OOM | 0.9924943168071045 |
+| 1714 | 5 / 20 | 5660 / 6400 | pass, unsafe | 0.9801148899981706 |
+| 1582 | 6 / 24 | 5256 / 6144 | OOM | 0.9916550336336175 |
+| 1098 | 6 / 24 | 4725 / 5632 | pass, unsafe | 0.9806394419816 |
+| 1241 | 6 / 24 | 4000 / 4864 | pass, unsafe | 0.8515786719786298 |
+| 1314 | 6 / 24 | 3733 / 4608 | pass | 0.7896185916959487 |
 
-Here and throughout this document, source indices are zero-based JSONL line
-ordinals. “Maximum admitted pilot” means the greatest natural padded length
-among these three candidates, with the packed-length audit tuple used to break
-ties. The clean-device and CUDA measurement rules in the post-generation
-section apply unchanged to pilot probes. The finite raw components are CE,
-DPO, entropy, and total as emitted by the canonical probe; its gradient witness
-is the FP32 L2 norm across all trainable DoRA parameters with missing gradients
-ignored, and it must observe at least one gradient.
+Row 1314 is the observed v13 premise witness. Its capacity report is
+`results/step-pref-packed-cap-search-20260905T062915Z-row1314/row-1314-capacity.json`
+with SHA-256
+`8785cd4283c95d0bac6c5e96531342a0b565b355cf9805037d74bc2a6ce82fff`.
+It contains finite CE, DPO, entropy, and total losses plus finite nonzero
+trainable-gradient norm. Its authenticated packed audit has SHA-256
+`c4cbac9305439f7de50cc7503fb26e6639e2266208a16ed17725649e06a014a0`.
+The immediate 24-branch upper boundary, row 1241 at padded 4864, is rejected
+rather than rounded down because 0.8515786719786298 exceeds 0.85.
 
-Concretely, if row 1582 is over-cap, the mandatory six-block condition fails
-and the 7168 design is rejected; no replacement row is selected without a new
-explicit design decision. If fewer than two rows are admitted, the design is
-also rejected. Thus “ignored” means no capacity execution for an excluded row,
-not that a required witness can be waived.
-
-A missing, invalid, duplicate, or generation-failed pilot negative rejects the
-pilot. It is never converted into an admission exclusion or silently retried.
+This first nail supports 4608 as a practical candidate; it does not establish
+that every admitted topology is monotone in packed length. The post-generation
+multidimensional and exact distributed gates below remain mandatory. A missing,
+invalid, or identity-mismatched premise artifact rejects v13 before full
+generation; it is never regenerated under the same run ID.
 
 The combined-positive probe evaluates every objective branch and backpropagates
 their sum. Since each final arm uses the same forward graph and trainable
@@ -184,9 +194,10 @@ single-device graph-capacity probe, not an accuracy proxy.
 
 ## Clean-admissible source and shared negatives
 
-Only after the pilot passes, create the schema-2 clean manifest and an ordered
+Only after the v13 premise evidence validates, create the schema-2 clean
+manifest and an ordered
 `clean-admissible.jsonl` containing exactly the original rows whose clean length
-is at most 7168. Record the original TRAIN SHA-256, clean-manifest SHA-256,
+is at most 4608. Record the original TRAIN SHA-256, clean-manifest SHA-256,
 ordered original indices/sample IDs, and subset SHA-256. This prefilter cannot
 remove a packed-admissible row because packed length is never less than clean
 length.
@@ -211,7 +222,8 @@ One producer creates an exclusive manifest that binds:
   ordered original indices/sample IDs;
 - negative artifact and negative-manifest paths and hashes;
 - rendering and tokenizer/config identities, language and vision backends,
-  latent size, clean limit 8192, and packed cap 7168;
+  latent size, clean model limit 8192, clean prefilter 4608, and packed cap
+  4608;
 - for every clean-admissible row: sample ID, clean length, packed unpadded and
   padded lengths, vision-token count, image count, reasoning-block count,
   branch count, scored-token count, and admission reason;
@@ -228,7 +240,7 @@ the same verifier-result path and expected SHA-256.
 Stage 2B preflight validates all bound artifact and configuration identities and
 selects only the recorded retained order. Normal training collation rebuilds
 each selected plan. A padded length that differs from the manifest record or
-exceeds 7168 raises before model forward. There is no dynamic skipping or
+exceeds 4608 raises before model forward. There is no dynamic skipping or
 arm-specific filtering.
 
 Both files use exact-field JSON schema 1, UTF-8, no duplicate keys, no NaN or
@@ -252,17 +264,18 @@ Each ordered `records` entry has exact fields
 Counts and lengths are nonnegative integers, lengths are positive, sample IDs
 are nonempty strings, and source indices/sample IDs are unique. The only reason
 values are `"retained"` and `"packed_length_exceeds_limit"`, with the value
-required to agree with `packed_padded_length <= 7168`. The four ordered
+required to agree with `packed_padded_length <= 4608`. The four ordered
 retained/filtered arrays must be the exact stable partition of `records` in
 source order. `counts` contains exact integers
 `original,clean_admissible,retained,filtered`; `boundary_witnesses` contains the
 ordered Pareto source indices and the selected maximum-packed source index.
 
-`records` contains exactly the 3374 clean-admissible rows, in original source
+`records` contains exactly the 3354 clean-admissible rows, in original source
 order. `filtered` means only packed-over-cap rows among those records. The
-schema-2 clean manifest separately records the 76 original rows rejected by the
-clean prefilter; the final capacity summary joins both sources to report all
-original exclusions and reasons. The identity also binds the image root, the
+schema-2 clean manifest separately records the 96 original rows rejected by the
+clean 4608 prefilter, including rows that still pass the model's separate clean
+8192 limit; the final capacity summary joins both sources to report all original
+exclusions and reasons. The identity also binds the image root, the
 packed-retained JSONL path/hash, the producing git commit, and a clean-worktree
 flag. The existing negative-manifest checkpoint inventory binds every referenced
 weight shard, not only the config and index files named in the frozen identity.
@@ -319,38 +332,42 @@ memory. The implementation plan must specify one read-only GPU preflight that
 rejects any pre-existing compute process, binds physical GPU 0 by UUID, and is
 used identically for pilots and Pareto probes.
 
-Then run two optimizer steps on the maximum-packed-length witness with the exact
-two-rank ZeRO-2 stack and combined-positive objective. The first step witnesses
-lazy optimizer-state allocation and the second steady execution. Require a
-valid DoRA checkpoint and no OOM or non-finite value. Any failure stops before
-ablation training.
+Then run every row in the final probe set through the exact two-rank ZeRO-2
+stack and combined-positive objective for two optimizer steps. The first step
+witnesses lazy optimizer-state allocation and the second steady execution.
+Every physical rank must record peak reserved memory no greater than 85% of its
+own total memory. Require a valid DoRA checkpoint and no OOM, skipped update, or
+non-finite value for every row. Any failure stops before ablation training.
 
-The distributed gate launches `run_stage2_training.sh` with two local
-processes, local batch 1, accumulation 1, `(1,1,0.1)`, the frozen DoRA and
-backend settings, the shared authenticated artifacts, and `--max_steps 2
---epochs 1`. It passes only with exit zero, logged global steps 1 and 2, finite
-raw and total losses at both steps, no skipped update/OOM, and a final artifact
-inside its fresh `checkpoints/<run-id>/`. `stage2.checkpointing.inspect_stage2_artifact`
-must classify that artifact as Stage 2 PEFT with tuning method `dora`; regular
-nonempty `adapter_config.json`, `adapter_model.safetensors`, and
-`stage2_peft_metadata.json` must exist, and the metadata must bind the frozen
-Stage 2A identity, latent configuration, target modules, and DoRA parameters.
-The capacity summary records hashes of those three files.
+Each distributed gate launches `run_stage2_training.sh` with two local
+processes, local batch 1, production-identical accumulation 2, `(1,1,0.1)`, the
+frozen DoRA and backend settings, the shared authenticated artifacts, and
+`--max_steps 2 --epochs 1`. It passes only with exit zero, four completed
+microbatches, logged global steps 1 and 2, finite raw and total losses at both
+steps, rank-local peak-reserved fractions at most 0.85, no skipped update/OOM,
+and a final artifact inside its own fresh `checkpoints/<run-id>/`.
+`stage2.checkpointing.inspect_stage2_artifact` must classify that artifact as
+Stage 2 PEFT with tuning method `dora`; regular nonempty `adapter_config.json`,
+`adapter_model.safetensors`, and `stage2_peft_metadata.json` must exist, and the
+metadata must bind the frozen Stage 2A identity, latent configuration, target
+modules, and DoRA parameters. The capacity summary records every witness run
+and hashes of those three files per run.
 
-For this capacity-only singleton gate, the ordinary distributed sampler pads
+For each capacity-only singleton gate, the ordinary distributed sampler pads
 the one retained occurrence onto both ranks; the Trainer restarts the iterator
-to reach step 2. Both ranks must report the same sample ID at both steps. The
-capacity gate's accumulation 1 intentionally maximizes optimizer-step frequency
-and covers optimizer allocation, while final accumulation 2 has the same
-per-microbatch activation shape and fewer optimizer boundaries. A mismatch in
-rank sample IDs or step count fails the gate.
+to provide four microbatches for two accumulation-2 optimizer steps. Both ranks
+must report the same sample ID on all four microbatches. This exactly matches
+production gradient-accumulation lifetime and witnesses optimizer allocation
+before the second accumulated step. A mismatch in rank sample IDs,
+microbatch count, or optimizer-step count fails the gate.
 
 This does not mathematically prove that every retained row fits: allocator
 behavior and feature interactions may be non-monotonic. Exhaustively probing
 roughly 3000 rows would approach an additional training epoch and is not part of
-this commitment. The 15% headroom, multidimensional Pareto boundary,
-fail-closed runtime length check, and two-step distributed gate define the
-accepted practical evidence boundary.
+this commitment. The 15% threshold, multidimensional Pareto boundary,
+fail-closed runtime length check, and exact distributed gates for every selected
+witness define the accepted practical evidence boundary. They are not described
+as a proof for omitted rows.
 
 ## Matched arms and stopping rules
 
@@ -361,64 +378,61 @@ run/output identities and the coefficient triplet. Each result records original,
 clean-admissible, packed-retained, and packed-filtered counts, every excluded ID
 and reason, all governing hashes, and the capacity-admitted-subset limitation.
 
-If packed admission excludes more than 1% of the 3374 clean-admissible rows,
+If packed admission excludes more than 1% of the 3354 clean-admissible rows,
 stop for a new explicit decision. The 1% threshold is only a review trigger; it
 is not evidence that a smaller exclusion is unbiased.
 
 The integer rule is `filtered >= 34`; it applies only to the second-stage packed
-filter, not to the 76 rows already excluded by the clean 7168 prefilter. Arms
+filter, not to the 96 rows already excluded by the clean 4608 prefilter. Arms
 launch in the fixed order CE-only, DPO-only, entropy-only. A failed arm stops
 later arms; no arm resumes or reuses partial Trainer state without a new
 explicit decision.
 
 ## Critique synthesis and risk waiver
 
-The load-bearing objection (`hate`) is that 7168 may still fail on a natural
-high-branch layout, wasting later manifest and full-generation work. Its exact
-result is `{root: "the proposed cap can still admit a natural high-branch layout
-that OOMs, invalidating the launch premise", first_nail: "generate and probe
-fixed tail rows 1372, 1714, and 1582 before full negatives; reject on an
-admitted failure or peak reserved memory above 85%"}`. The first nail has not
-run because executing it is implementation-like and this commitment is not yet
-approved.
+The v13 load-bearing objection (`hate`) is exactly
+`{root: "the four Pareto features are not proved to be complete monotone
+coordinates for allocator peak, so a dominated retained row could be worse",
+first_nail: "run every selected witness under both the canonical single-GPU
+probe and exact accumulation-2 two-rank production gate, enforce the cap on
+every runtime batch, and use the complete CE arm as the first production
+witness before starting later arms"}`. The row-1314 capacity-tail part is
+observed and passing. The post-generation and production parts remain not run
+because they require the implementation authorized by this commitment.
 
-Fresh independent readings (`macrothink`) converged only as reassurance on an
-arm-blind feasible cohort, a frozen shared identity/order, real boundary probes,
-and the capacity-admitted estimand. Their material incompatible divergence was
-that some readers required every Pareto witness under two-rank ZeRO-2, or each
-loss arm separately, rather than one-GPU Pareto probes plus one two-rank maximum
-witness. That stronger option is not adopted: all arms compute the same three
-raw loss graphs over the same trainable parameters, combined-positive backward
-activates all of them, optimizer-state size is coefficient-independent, and up
-to eight separate distributed launches would add cost without isolating a known
-different graph. The unresolved uncertainty is that distributed allocator or
-communication behavior could nevertheless be non-monotonic across Pareto
-shapes. A second divergent suggestion—deliberately find the closest excluded
-row that OOMs—is also not adopted because the observed natural 8960 layout
-already establishes a real failure beyond the cap and boundary hunting adds
-intentional OOM work without validating retained rows.
+Fresh independent readings (`macrothink`) all raised one incompatible
+divergence: at most eight aggregate Pareto representatives cannot prove a bound
+for omitted layouts because branch-length distribution, block-mask topology,
+modality placement, and allocator behavior may differ. They recommended exact
+two-rank probing of every distinct execution signature. That exhaustive option
+is not adopted because it approaches an additional full training epoch and
+defeats the bounded preflight. Instead, v13 labels Pareto coverage as practical
+risk control, runs exact two-rank accumulation-2 gates on every selected
+witness, and stops after any CE-arm failure before spending on DPO or entropy.
+The incompatible divergence remains an explicit uncertainty, not an implied
+proof.
 
-All independent readings identified population shift as the largest scientific
-limitation. This document therefore makes the capacity-admitted population
-explicit rather than claiming full-population results.
+Earlier fresh reads also proposed objective-specific capacity cohorts. That is
+rejected because all final arms intentionally compute the same three raw loss
+graphs and differ only in scalar coefficients; arm-specific cohorts would break
+the matched comparison. All readings identified population shift as the largest
+scientific limitation, so results remain explicitly conditional on the shared
+capacity-admitted population.
 
-Independent correctness, validity, and cost lenses (`prism`) all pass this v11
-commitment. Correctness accepts the staged fail-closed escalation and capacity
-witnesses after the global maximum was explicitly unioned with Pareto
-representatives; validity accepts the separately hashed verifier and explicit
-conditional estimand; cost accepts the three early pilot rows, the final maximum
-of eight boundary probes, and two distributed optimizer steps. The v10
-correctness failure and its v11 repair are preserved in the execution ledger.
-Their agreement is review evidence, not runtime proof.
+Independent correctness, validity, and cost lenses (`prism`) all pass v13 as a
+practical protocol. Correctness accepts exact-production gating for every
+selected representative plus fail-closed redesign on a full-arm failure.
+Validity accepts the identical cohort and explicit non-proof scope. Cost accepts
+at most eight single-GPU plus eight short distributed probes before three full
+arms. Their agreement is review evidence, not runtime proof.
 
 Approval of this commitment explicitly waives these remaining risks:
 
 1. Filtering changes the scientific population.
-2. The empirical 7168/85% envelope can miss a non-monotonic retained-row OOM.
+2. The empirical 4608/85% envelope can miss a non-monotonic retained-row OOM.
 3. Full negative generation can still reveal artifact or runtime failures after
    the pilot.
 4. The separate verifier shares the authoritative production collator/planner,
    so a defect in that common primitive can affect both producer and verifier.
-5. Only the maximum-packed witness receives the exact two-rank gate; other
-   Pareto witnesses are single-device probes, so shape-specific distributed
-   non-monotonicity remains possible.
+5. Even though every selected Pareto witness receives an exact two-rank gate,
+   an omitted dominated row can still exhibit shape-specific non-monotonicity.
