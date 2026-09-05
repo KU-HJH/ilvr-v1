@@ -2477,10 +2477,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             ) = packed_values
             direct = self.model.embed_tokens(packed_token_ids.unsqueeze(0))
             safe_sources = clean_embedding_sources.clamp_min(0)
-            shared = rollout.final_inputs_embeds.index_select(1, safe_sources)
+            shared_embeddings = rollout.final_inputs_embeds.index_select(1, safe_sources)
             final_inputs_embeds = torch.where(
                 (clean_embedding_sources >= 0).view(1, -1, 1),
-                shared,
+                shared_embeddings,
                 direct,
             )
             final_position_ids = full_position_ids.index_select(
