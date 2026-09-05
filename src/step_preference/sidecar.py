@@ -87,7 +87,7 @@ def _rejected_branch(
     model_inputs = rejected.get("model_inputs")
     completion_positions = rejected.get("completion_token_positions")
     target_token_ids = rejected.get("completion_token_ids")
-    if not isinstance(model_inputs, Mapping) or not isinstance(completion_positions, tuple):
+    if not isinstance(model_inputs, Mapping) or not isinstance(completion_positions, (tuple, list)):
         raise ValueError("rejected branch has invalid model inputs or completion_token_positions")
 
     input_ids = model_inputs.get("input_ids")
@@ -117,7 +117,7 @@ def _rejected_branch(
     expected_target_ids = tuple(
         int(rejected_ids[position].item()) for position in completion_positions
     )
-    if not isinstance(target_token_ids, tuple) or target_token_ids != expected_target_ids:
+    if not isinstance(target_token_ids, (tuple, list)) or tuple(target_token_ids) != expected_target_ids:
         raise ValueError("completion_token_ids must match rejected input_ids")
 
     common_prefix_length = 0

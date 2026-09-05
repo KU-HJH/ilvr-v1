@@ -9,6 +9,9 @@ import sys
 from pathlib import Path
 
 import torch
+from step_preference.shared_prefix_measurement import (
+    add_shared_measurement_arguments, validate_measurement_arguments, run_shared_measurement_cli,
+)
 
 from step_preference.benchmark import (
     CudaBenchmarkRuntime,
@@ -24,19 +27,21 @@ from step_preference.equivalence import (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint_path", required=True)
-    parser.add_argument("--data_path", required=True)
-    parser.add_argument("--image_root", required=True)
-    parser.add_argument("--negative_path", required=True)
-    parser.add_argument("--negative_manifest", required=True)
+    parser.add_argument("--checkpoint_path")
+    parser.add_argument("--data_path")
+    parser.add_argument("--image_root")
+    parser.add_argument("--negative_path")
+    parser.add_argument("--negative_manifest")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output_path", type=Path, required=True)
+    add_shared_measurement_arguments(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    validate_measurement_arguments(parser, args)
     if args.output_path.exists():
         parser.error(f"output path already exists: {args.output_path}")
     git_commit = subprocess.run(
@@ -47,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
     ).stdout.strip()
     context = None
     try:
+        if args.shared_prefix:
+            return run_shared_measurement_cli(args, benchmark=True, git_commit=git_commit)
         context = load_production_context(
             checkpoint_path=args.checkpoint_path,
             data_path=args.data_path,

@@ -601,6 +601,7 @@ def load_production_context(
     tuning_method: str = "full",
     gradient_checkpointing: bool = False,
     requested_sample_id: str | None = None,
+    preserve_dropout: bool = False,
 ) -> ProductionContext:
     """Load one authenticated valid-pair sample through production assembly."""
     from main import build_stage2_training_components, preflight_stage2b_artifacts
@@ -694,11 +695,12 @@ def load_production_context(
         raise ValueError("collated sample does not join the authenticated negative store")
 
     model = components.model
-    for module in model.modules():
-        if isinstance(module, torch.nn.Dropout):
-            module.p = 0.0
-    if hasattr(model.config, "attention_dropout"):
-        model.config.attention_dropout = 0.0
+    if not preserve_dropout:
+        for module in model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.p = 0.0
+        if hasattr(model.config, "attention_dropout"):
+            model.config.attention_dropout = 0.0
     model.to(device)
     model.train()
     if getattr(model, "is_gradient_checkpointing", None) is not gradient_checkpointing:
@@ -727,5 +729,62 @@ def load_production_context(
             "vision_attention_implementation": vision_attention_implementation,
             "tuning_method": tuning_method,
             "gradient_checkpointing": gradient_checkpointing,
+            "preserve_dropout": preserve_dropout,
         },
     )
+
+
+def run_shared_prefix_comparison(model, batch, *, naive_config, backend="dense",
+                                 query_budget=1024, autocast_dtype=None, strict=False):
+    """Compare same-model Trainer objectives and every trainable gradient.
+
+    BF16 errors are diagnostics, never interpreted using FP32 tolerances.
+    """
+    from contextlib import nullcontext
+    from step_preference.shared_prefix_measurement import RuntimeCounters, batch_accounting
+    configs = (naive_config, replace(naive_config, packing_enabled=False,
+        shared_prefix_enabled=True, sidecar_attention_backend=backend, sidecar_query_budget=query_budget))
+    records = []
+    for config in configs:
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(307)
+        trainer = _trainer(config)
+        with RuntimeCounters(model) as counters:
+            precision = torch.autocast(batch["input_ids"].device.type, dtype=autocast_dtype) if autocast_dtype else nullcontext()
+            with precision:
+                loss = trainer.compute_loss(model, batch)
+            counters.phase = "backward"
+            loss.backward()
+            grads = {n: p.grad.detach().float().cpu().clone() if p.grad is not None else None
+                     for n, p in model.named_parameters() if p.requires_grad}
+            records.append((float(loss.detach()), _loss_metrics(trainer), grads, counters.snapshot()))
+    left, right = records
+    errors, gradient_errors = [], {}
+    for name, expected in left[2].items():
+        actual = right[2][name]
+        if expected is None or actual is None:
+            errors.append(f"missing gradient: {name}")
+            continue
+        delta = actual-expected
+        gradient_errors[name] = dict(max_abs=float(delta.abs().max()),
+            relative_l2=relative_l2_error(expected, actual),
+            near_zero_elements=int((expected.abs() < 1e-8).sum()))
+        if not torch.isfinite(actual).all() or not torch.isfinite(expected).all():
+            errors.append(f"nonfinite gradient: {name}")
+        elif strict and not torch.allclose(actual, expected, atol=1e-5, rtol=1e-4):
+            errors.append(f"gradient tolerance: {name}")
+    component_errors = {key: abs(value-right[1][key]) for key, value in left[1].items()}
+    if strict and any(not math.isclose(left[1][k], right[1][k], abs_tol=1e-5, rel_tol=1e-4) for k in component_errors):
+        errors.append("objective component tolerance")
+    if not all(math.isfinite(x[0]) for x in records):
+        errors.append("nonfinite loss")
+    return dict(status="fail" if errors else "pass" if strict else "diagnostic",
+        backend=backend, dtype=str(autocast_dtype or next(model.parameters()).dtype),
+        parameter_dtypes=sorted({str(p.dtype) for p in model.parameters()}),
+        dropout=sorted({m.p for m in model.modules() if isinstance(m, torch.nn.Dropout)}),
+        strict=strict, atol=1e-5 if strict else None, rtol=1e-4 if strict else None,
+        loss_naive=left[0], loss_shared=right[0], total_abs=abs(left[0]-right[0]),
+        component_errors=component_errors, max_component_abs=max(component_errors.values(), default=0.),
+        trainable_parameters_compared=len(gradient_errors), gradient_errors=gradient_errors,
+        max_gradient_abs=max((x["max_abs"] for x in gradient_errors.values()), default=0.),
+        runtime_counters=dict(naive=left[3], shared=right[3]), errors=errors, **batch_accounting(batch))
