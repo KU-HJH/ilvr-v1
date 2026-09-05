@@ -10,6 +10,20 @@ export TOKENIZERS_PARALLELISM=false
 : "${IMAGE_ROOT:?set IMAGE_ROOT}"
 : "${OUTPUT_DIR:?set OUTPUT_DIR}"
 
+stage2_dry_run=${STAGE2_DRY_RUN:-false}
+if [[ -v STAGE2_DRY_RUN_FORMAT && "$stage2_dry_run" != true ]]; then
+  printf 'STAGE2_DRY_RUN_FORMAT is only valid with STAGE2_DRY_RUN=true\n' >&2
+  exit 2
+fi
+STAGE2_DRY_RUN_FORMAT=${STAGE2_DRY_RUN_FORMAT:-text}
+case "$STAGE2_DRY_RUN_FORMAT" in
+  text|json) ;;
+  *)
+    printf 'STAGE2_DRY_RUN_FORMAT must be text or json\n' >&2
+    exit 2
+    ;;
+esac
+
 experiment_id=${OUTPUT_DIR##*/}
 canonical_log_root="$REPO_ROOT/logs/zero-stage-compatibility"
 result_dir="$REPO_ROOT/results/$experiment_id"
@@ -52,6 +66,8 @@ DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
+SEED=${SEED:-42}
+STEP_MAX_PACKED_SEQUENCE_LENGTH=${STEP_MAX_PACKED_SEQUENCE_LENGTH:-4608}
 ASSISTANT_PLAN_RENDERING=concatenated-v1
 stage2b_checkpoint_initialization=false
 case "${STEP_PREFERENCE_PACKING-}" in
@@ -64,7 +80,36 @@ case "${STEP_PREFERENCE_PACKING-}" in
 esac
 STEP_PREFERENCE_ARGS=()
 if [[ "$step_preference_packing" == true ]]; then
-  STEP_PREFERENCE_ARGS+=(--step_preference_packing)
+  if [[ ! "$STEP_MAX_PACKED_SEQUENCE_LENGTH" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'STEP_MAX_PACKED_SEQUENCE_LENGTH must be a positive integer\n' >&2
+    exit 2
+  fi
+  for admission_variable in \
+    STEP_PACKED_ADMISSION_MANIFEST \
+    STEP_PACKED_ADMISSION_MANIFEST_SHA256 \
+    STEP_PACKED_ADMISSION_VERIFICATION \
+    STEP_PACKED_ADMISSION_VERIFICATION_SHA256; do
+    if [[ -z "${!admission_variable:-}" ]]; then
+      printf '%s is required when STEP_PREFERENCE_PACKING=true\n' "$admission_variable" >&2
+      exit 2
+    fi
+  done
+  for admission_hash_variable in \
+    STEP_PACKED_ADMISSION_MANIFEST_SHA256 \
+    STEP_PACKED_ADMISSION_VERIFICATION_SHA256; do
+    if [[ ! "${!admission_hash_variable}" =~ ^[0-9a-f]{64}$ ]]; then
+      printf '%s must be a lowercase SHA-256\n' "$admission_hash_variable" >&2
+      exit 2
+    fi
+  done
+  STEP_PREFERENCE_ARGS+=(
+    --step_preference_packing
+    --step_max_packed_sequence_length "$STEP_MAX_PACKED_SEQUENCE_LENGTH"
+    --step_packed_admission_manifest "$STEP_PACKED_ADMISSION_MANIFEST"
+    --step_packed_admission_manifest_sha256 "$STEP_PACKED_ADMISSION_MANIFEST_SHA256"
+    --step_packed_admission_verification "$STEP_PACKED_ADMISSION_VERIFICATION"
+    --step_packed_admission_verification_sha256 "$STEP_PACKED_ADMISSION_VERIFICATION_SHA256"
+  )
 fi
 case "$STEP_PREFERENCE_ENABLED" in
   true)
@@ -221,6 +266,11 @@ MANAGED_OPTIONS=(
   --step_preference_mode
   --step_negative_path
   --step_negative_manifest
+  --step_max_packed_sequence_length
+  --step_packed_admission_manifest
+  --step_packed_admission_manifest_sha256
+  --step_packed_admission_verification
+  --step_packed_admission_verification_sha256
   --ce_weight
   --step_dpo_beta
   --step_dpo_weight
@@ -247,6 +297,7 @@ MANAGED_OPTIONS=(
   --lora_alpha
   --lora_dropout
   --lora_target_modules
+  --seed
   --benchmark_evidence_path
   --stage2_length_manifest
   --stage2_length_manifest_sha256
@@ -475,18 +526,19 @@ TRAINING_ARGS=(
   "${CHECKPOINTING_ARGS[@]}"
   --max_seq_length_train "$MAX_SEQUENCE_LENGTH"
   "${TUNING_ARGS[@]}"
+  --seed "$SEED"
   "${RESUME_ARGS[@]}"
   "${DEEPSPEED_ARGS[@]}"
   "${EVIDENCE_ARGS[@]}"
   "$@"
 )
 
-if [[ "${STAGE2_DRY_RUN:-false}" != "true" && "$stage2b_checkpoint_initialization" == true ]]; then
+if [[ "$stage2_dry_run" != true && "$stage2b_checkpoint_initialization" == true ]]; then
   "$REPO_ROOT/venv/ilvr-venv/bin/python" -m main \
     "${TRAINING_ARGS[@]}" --stage2b_preflight_only
 fi
 
-if [[ "${STAGE2_DRY_RUN:-false}" != "true" ]]; then
+if [[ "$stage2_dry_run" != true ]]; then
   "$REPO_ROOT/venv/ilvr-venv/bin/python" -m src.artifact_paths validate-run \
     --checkpoint "$OUTPUT_DIR" --log "$LOG_FILE" \
     --stage2-length-manifest "$length_manifest" >/dev/null
@@ -580,7 +632,16 @@ else
   )
 fi
 
-if [[ "${STAGE2_DRY_RUN:-false}" == "true" ]]; then
+if [[ "$stage2_dry_run" == true ]]; then
+  "$REPO_ROOT/venv/ilvr-venv/bin/python" -c \
+    'import sys; from utils_deepseed import parse_args; parse_args(sys.argv[1:])' \
+    "${TRAINING_ARGS[@]}"
+  if [[ "$STAGE2_DRY_RUN_FORMAT" == json ]]; then
+    "$REPO_ROOT/venv/ilvr-venv/bin/python" -c \
+      'import json, sys; print(json.dumps(sys.argv[1:], separators=(",", ":")))' \
+      "${COMMAND[@]}"
+    exit 0
+  fi
   printf 'PYTHONPATH=%q TOKENIZERS_PARALLELISM=%q ASSISTANT_PLAN_RENDERING=%q ' \
     "$PYTHONPATH" "$TOKENIZERS_PARALLELISM" "$ASSISTANT_PLAN_RENDERING"
   printf '%q ' "${COMMAND[@]}"

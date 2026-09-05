@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from numbers import Real
+import re
 from typing import Literal
 
 
@@ -43,6 +44,20 @@ def _optional_path(name: str, value: str | None) -> None:
         raise ValueError(f"{name} must be a non-empty path when provided")
 
 
+def _optional_sha256(name: str, value: str | None) -> None:
+    if value is not None and (
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 when provided")
+
+
+def _optional_path_hash_pair(path_name: str, path: str | None, hash_name: str, sha256: str | None) -> None:
+    _optional_path(path_name, path)
+    _optional_sha256(hash_name, sha256)
+    if (path is None) != (sha256 is None):
+        raise ValueError(f"{path_name} and {hash_name} must be provided together")
+
+
 @dataclass(frozen=True)
 class StepPreferenceConfig:
     """One validated configuration for ordinary Stage 2 or fresh Stage 2B."""
@@ -64,6 +79,11 @@ class StepPreferenceConfig:
     attention_implementation: str = "sdpa"
     resume_from_checkpoint_path: str | None = None
     packing_enabled: bool = False
+    max_packed_sequence_length: int | None = None
+    packed_admission_manifest: str | None = None
+    packed_admission_manifest_sha256: str | None = None
+    packed_admission_verification: str | None = None
+    packed_admission_verification_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -104,6 +124,18 @@ class StepPreferenceConfig:
             "resume_from_checkpoint_path",
         ):
             _optional_path(name, getattr(self, name))
+        _optional_path_hash_pair(
+            "packed_admission_manifest",
+            self.packed_admission_manifest,
+            "packed_admission_manifest_sha256",
+            self.packed_admission_manifest_sha256,
+        )
+        _optional_path_hash_pair(
+            "packed_admission_verification",
+            self.packed_admission_verification,
+            "packed_admission_verification_sha256",
+            self.packed_admission_verification_sha256,
+        )
         ratio = _finite("stage2a_ratio", self.stage2a_ratio)
         if not 0.0 < ratio < 1.0:
             raise ValueError("stage2a_ratio must be a finite number in (0, 1)")
@@ -123,6 +155,14 @@ class StepPreferenceConfig:
                 raise ValueError(
                     "--stage2a_checkpoint_path and --resume_from_checkpoint_path "
                     "are mutually exclusive for Stage 2B"
+                )
+            if self.packing_enabled and (
+                isinstance(self.max_packed_sequence_length, bool)
+                or not isinstance(self.max_packed_sequence_length, int)
+                or self.max_packed_sequence_length <= 0
+            ):
+                raise ValueError(
+                    "max_packed_sequence_length must be a positive integer when packing is enabled"
                 )
         elif self.packing_enabled:
             raise ValueError("step preference packing is only valid for Stage 2B")
@@ -161,4 +201,19 @@ class StepPreferenceConfig:
                 args, "resume_from_checkpoint_path", None
             ),
             packing_enabled=getattr(args, "step_preference_packing", False),
+            max_packed_sequence_length=getattr(
+                args, "step_max_packed_sequence_length", None
+            ),
+            packed_admission_manifest=getattr(
+                args, "step_packed_admission_manifest", None
+            ),
+            packed_admission_manifest_sha256=getattr(
+                args, "step_packed_admission_manifest_sha256", None
+            ),
+            packed_admission_verification=getattr(
+                args, "step_packed_admission_verification", None
+            ),
+            packed_admission_verification_sha256=getattr(
+                args, "step_packed_admission_verification_sha256", None
+            ),
         )

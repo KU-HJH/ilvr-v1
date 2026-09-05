@@ -40,6 +40,15 @@ def option_value(tokens: list[str], option: str) -> str:
     return tokens[tokens.index(option) + 1]
 
 
+PACKED_ADMISSION_ENV = {
+    "STEP_MAX_PACKED_SEQUENCE_LENGTH": "4608",
+    "STEP_PACKED_ADMISSION_MANIFEST": "/results/admission.json",
+    "STEP_PACKED_ADMISSION_MANIFEST_SHA256": "a" * 64,
+    "STEP_PACKED_ADMISSION_VERIFICATION": "/results/verification.json",
+    "STEP_PACKED_ADMISSION_VERIFICATION_SHA256": "b" * 64,
+}
+
+
 CANONICAL_DEFAULT_LOG = (
     REPO_ROOT / "logs/zero-stage-compatibility/stage 2/train.log"
 )
@@ -178,6 +187,8 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "0.05",
         "--lora_target_modules",
         "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        "--seed",
+        "42",
         "--max_steps",
         "1",
         "--evaluation_output_path",
@@ -492,10 +503,117 @@ def test_stage2_launcher_propagates_explicit_packing_opt_in(value):
                 "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
                 "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
                 "STEP_PREFERENCE_PACKING": value,
+                **PACKED_ADMISSION_ENV,
             }
         )
     )
     assert "--step_preference_packing" in tokens
+    assert option_value(tokens, "--step_max_packed_sequence_length") == "4608"
+    assert option_value(tokens, "--step_packed_admission_manifest") == "/results/admission.json"
+    assert option_value(tokens, "--step_packed_admission_manifest_sha256") == "a" * 64
+    assert option_value(tokens, "--step_packed_admission_verification") == "/results/verification.json"
+    assert option_value(tokens, "--step_packed_admission_verification_sha256") == "b" * 64
+    assert option_value(tokens, "--seed") == "42"
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    (
+        ({"STEP_MAX_PACKED_SEQUENCE_LENGTH": "0"}, "STEP_MAX_PACKED_SEQUENCE_LENGTH"),
+        ({"STEP_PACKED_ADMISSION_MANIFEST_SHA256": ""}, "STEP_PACKED_ADMISSION_MANIFEST_SHA256"),
+        ({"STEP_PACKED_ADMISSION_MANIFEST": ""}, "STEP_PACKED_ADMISSION_MANIFEST"),
+        ({"STEP_PACKED_ADMISSION_VERIFICATION": ""}, "STEP_PACKED_ADMISSION_VERIFICATION"),
+        ({"STEP_PACKED_ADMISSION_VERIFICATION_SHA256": ""}, "STEP_PACKED_ADMISSION_VERIFICATION_SHA256"),
+    ),
+)
+def test_packed_launcher_rejects_incomplete_or_invalid_admission_environment(
+    updates, message
+):
+    """Catches a packed launch reaching Python without every admission identity."""
+    environment = {
+        "STEP_PREFERENCE_ENABLED": "true",
+        "STEP_PREFERENCE_MODE": "stage2b",
+        "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
+        "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
+        "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+        "STEP_PREFERENCE_PACKING": "true",
+        **PACKED_ADMISSION_ENV,
+        **updates,
+    }
+    result = run_launcher(env_overrides=environment)
+
+    assert result.returncode == 2
+    assert message in result.stderr
+
+
+def test_packed_launcher_rejects_directly_supplied_managed_admission_option():
+    """Catches callers overriding the launcher's authenticated admission binding."""
+    result = run_launcher("--step_packed_admission_manifest=/override.json")
+
+    assert result.returncode == 2
+    assert "launcher-owned option" in result.stderr
+
+
+def test_packed_json_dry_run_preserves_argv_tokens_without_creating_artifacts(tmp_path):
+    """Catches JSON dry-run shell quoting, noisy output, or artifact side effects."""
+    run_id = "stage2-json-dry-run-a"
+    output_dir = REPO_ROOT / "checkpoints" / run_id
+    result_dir = REPO_ROOT / "results" / run_id
+    log_dir = REPO_ROOT / "logs" / "zero-stage-compatibility" / run_id
+    assert not output_dir.exists()
+    assert not result_dir.exists()
+    assert not log_dir.exists()
+
+    result = run_launcher(
+        "--evaluation_output_path",
+        "/reports/a value with spaces.json",
+        env_overrides={
+            "STAGE2_DRY_RUN_FORMAT": "json",
+            "OUTPUT_DIR": str(output_dir),
+            "LOG_FILE": str(log_dir / "train log.json"),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("\n") == 1
+    tokens = json.loads(result.stdout)
+    assert option_value(tokens, "--evaluation_output_path") == "/reports/a value with spaces.json"
+    assert option_value(tokens, "--seed") == "42"
+    assert tokens.count("--stage2_length_manifest") == 1
+    assert option_value(tokens, "--stage2_length_manifest") == str(
+        REPO_ROOT / "results" / run_id / "stage2-length-manifest.json"
+    )
+    assert option_value(tokens, "--stage2_length_manifest_sha256") == "0" * 64
+    run_derived_options = {
+        "--save_model_path",
+        "--log_file",
+        "--stage2_length_manifest",
+    }
+    for index, token in enumerate(tokens):
+        if index and tokens[index - 1] in run_derived_options:
+            continue
+        assert run_id not in token
+    assert not output_dir.exists()
+    assert not result_dir.exists()
+    assert not log_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"STAGE2_DRY_RUN_FORMAT": "yaml"}, "STAGE2_DRY_RUN_FORMAT"),
+        (
+            {"STAGE2_DRY_RUN": "false", "STAGE2_DRY_RUN_FORMAT": "json"},
+            "STAGE2_DRY_RUN_FORMAT",
+        ),
+    ),
+)
+def test_packed_launcher_rejects_illegal_dry_run_format(overrides, message):
+    """Catches JSON protocol selection outside its dry-run-only contract."""
+    result = run_launcher(env_overrides=overrides)
+
+    assert result.returncode == 2
+    assert message in result.stderr
 
 
 @pytest.mark.parametrize("value", ("", "0", "false", "False"))
@@ -524,11 +642,16 @@ def test_stage2_launcher_rejects_unknown_packing_value():
 
 
 def test_stage2_launcher_does_not_silently_ignore_packing_without_stage2b():
-    """Catches a true packing request disappearing when Stage 2B is not enabled."""
-    tokens = dry_run_tokens(
-        run_launcher(env_overrides={"STEP_PREFERENCE_PACKING": "true"})
+    """Catches dry-run skipping the invalid packed configuration preflight."""
+    result = run_launcher(
+        env_overrides={
+            "STEP_PREFERENCE_PACKING": "true",
+            **PACKED_ADMISSION_ENV,
+        }
     )
-    assert "--step_preference_packing" in tokens
+
+    assert result.returncode != 0
+    assert "packing is only valid for Stage 2B" in result.stderr
 
 
 def test_stage2_launcher_false_step_preference_keeps_disabled_tokens_identical():

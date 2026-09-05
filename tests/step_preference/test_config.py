@@ -39,6 +39,11 @@ def test_step_preference_config_is_immutable_and_exposes_normative_defaults():
     assert config.negative_path is None
     assert config.negative_manifest is None
     assert config.packing_enabled is False
+    assert config.max_packed_sequence_length is None
+    assert config.packed_admission_manifest is None
+    assert config.packed_admission_manifest_sha256 is None
+    assert config.packed_admission_verification is None
+    assert config.packed_admission_verification_sha256 is None
     with pytest.raises(FrozenInstanceError):
         config.mode = "stage2b"
 
@@ -60,6 +65,7 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
     assert args.stage2_total_steps is None
     assert args.stage2a_checkpoint_path is None
     assert args.step_preference_packing is False
+    assert args.step_max_packed_sequence_length == 4608
 
 
 def test_training_cli_maps_zero_ce_weight_into_step_preference_config():
@@ -89,6 +95,90 @@ def test_packed_stage2b_configuration():
     checkpointed_args = parse_args(required + ["--gradient_checkpointing"])
     assert checkpointed_args.step_preference_config.packing_enabled is True
     assert checkpointed_args.gradient_checkpointing is True
+
+
+def test_packed_stage2b_configuration_binds_packed_admission_inputs():
+    """Catches a packed Stage 2B launch losing its authenticated admission inputs."""
+    args = parse_args(
+        [
+            "--stage", "stage2", "--step_preference_enabled",
+            "--step_preference_mode", "stage2b",
+            "--stage2a_checkpoint_path", "checkpoint",
+            "--step_negative_path", "negatives.jsonl",
+            "--step_negative_manifest", "manifest.json",
+            "--step_preference_packing",
+            "--step_max_packed_sequence_length", "4608",
+            "--step_packed_admission_manifest", "admission.json",
+            "--step_packed_admission_manifest_sha256", "a" * 64,
+            "--step_packed_admission_verification", "verification.json",
+            "--step_packed_admission_verification_sha256", "b" * 64,
+        ]
+    )
+
+    config = args.step_preference_config
+    assert config.max_packed_sequence_length == 4608
+    assert config.packed_admission_manifest == "admission.json"
+    assert config.packed_admission_manifest_sha256 == "a" * 64
+    assert config.packed_admission_verification == "verification.json"
+    assert config.packed_admission_verification_sha256 == "b" * 64
+
+
+@pytest.mark.parametrize("value", (None, 0, -1, True, 1.5))
+def test_packed_configuration_rejects_nonpositive_or_noninteger_capacity(value):
+    """Catches an unusable packed capacity reaching the packed sequence planner."""
+    with pytest.raises(ValueError, match="max_packed_sequence_length"):
+        StepPreferenceConfig(
+            enabled=True,
+            mode="stage2b",
+            stage2a_checkpoint_path="checkpoint",
+            negative_path="negatives.jsonl",
+            negative_manifest="manifest.json",
+            packing_enabled=True,
+            max_packed_sequence_length=value,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    (
+        (
+            {"packed_admission_manifest": "admission.json"},
+            "packed_admission_manifest",
+        ),
+        (
+            {"packed_admission_manifest_sha256": "a" * 64},
+            "packed_admission_manifest",
+        ),
+        (
+            {"packed_admission_verification": "verification.json"},
+            "packed_admission_verification",
+        ),
+        (
+            {"packed_admission_verification_sha256": "b" * 64},
+            "packed_admission_verification",
+        ),
+        (
+            {
+                "packed_admission_manifest": "admission.json",
+                "packed_admission_manifest_sha256": "A" * 64,
+            },
+            "packed_admission_manifest_sha256",
+        ),
+        (
+            {
+                "packed_admission_verification": "verification.json",
+                "packed_admission_verification_sha256": "a" * 63,
+            },
+            "packed_admission_verification_sha256",
+        ),
+    ),
+)
+def test_packed_admission_artifacts_require_complete_lowercase_sha256_pairs(
+    kwargs, message
+):
+    """Catches a path/hash half-pair or malformed identity entering any Stage 2 mode."""
+    with pytest.raises(ValueError, match=message):
+        StepPreferenceConfig(**kwargs)
 
 
 def test_stage2b_requires_checkpoint_and_both_negative_paths():
