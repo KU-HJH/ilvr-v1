@@ -72,8 +72,8 @@ def inputs(tmp_path, monkeypatch):
     for name, raw in {"config.json": b'{}', "model.safetensors": b"weights", "tokenizer.json": b'{}'}.items():
         (checkpoint / name).write_bytes(raw)
 
-    def make(*, count=2, selected=None, clean_cap=4608, long_last=False):
-        rows = [dict(sample_id=f"sample-{i}", image_input="input.png", text_input="question", sequence_plan=[
+    def make(*, count=2, selected=None, clean_cap=4608, long_last=False, image_input="input.png"):
+        rows = [dict(sample_id=f"sample-{i}", image_input=image_input, text_input="question", sequence_plan=[
             {"type": "text", "content": "A"},
             {"type": "latent", "helper_image": "helper.png"},
             {"type": "text", "content": "BC"},
@@ -342,3 +342,54 @@ def test_build_cli_accepts_the_required_public_flags(inputs):
     payload = json.loads(args.manifest_output_path.read_bytes())
     assert payload["retained_source_indices"] == [1]
     assert args.retained_output_path.read_bytes() == args.clean_data_path.read_bytes()
+
+
+@pytest.mark.parametrize("form", ["relative", "root_prefixed", "list"])
+def test_build_rejects_original_image_leaf_symlink_before_loading(inputs, tmp_path, monkeypatch, form):
+    (tmp_path / "alias.png").symlink_to(tmp_path / "input.png")
+    image_input = {
+        "relative": "alias.png", "root_prefixed": f"{tmp_path.name}/alias.png",
+        "list": ["alias.png"],
+    }[form]
+    args = inputs(image_input=image_input)
+    def forbidden_loader(*_args, **_kwargs):
+        raise AssertionError("image symlink reached processor loading")
+    monkeypatch.setattr("transformers.AutoProcessor.from_pretrained", forbidden_loader)
+    with pytest.raises(ValueError, match="original image"):
+        build(args)
+    assert not args.retained_output_path.exists() and not args.manifest_output_path.exists()
+
+
+def test_verify_cli_self_referential_manifest_symlink_publishes_bounded_failure(inputs):
+    args = inputs()
+    args.manifest_output_path.symlink_to(args.manifest_output_path.name)
+    code, result = verify(args, "0" * 64)
+    assert code == 2
+    assert result["status"] == "fail"
+    assert result["manifest_path"] == str(args.manifest_output_path)
+    assert all(result[key] is None for key in (
+        "manifest_sha256", "clean_admissible_sha256", "packed_retained_sha256",
+        "negative_sha256", "negative_manifest_sha256",
+    ))
+    assert result["verified_record_count"] == 0
+    assert result["retained_source_indices"] == result["filtered_source_indices"] == []
+    assert len(result["errors"]) == 1
+    output = args.manifest_output_path.parent / "verification.json"
+    assert admission.read_packed_admission_verification(output).status == "fail"
+    assert args.manifest_output_path.is_symlink()
+
+
+@pytest.mark.parametrize("form", ["root_prefixed", "parent_symlink"])
+def test_build_preserves_allowed_original_image_root_semantics(inputs, tmp_path, form):
+    if form == "root_prefixed":
+        image_input = f"{tmp_path.name}/input.png"
+    else:
+        (tmp_path / "real-images").mkdir()
+        (tmp_path / "input.png").rename(tmp_path / "real-images" / "input.png")
+        (tmp_path / "image-alias").symlink_to(tmp_path / "real-images", target_is_directory=True)
+        image_input = "image-alias/input.png"
+    args = inputs(image_input=image_input)
+    manifest = build(args)
+    assert manifest.retained_source_indices == (0, 1)
+    assert args.retained_output_path.read_bytes() == args.clean_data_path.read_bytes()
+    assert verify(args)[0] == 0

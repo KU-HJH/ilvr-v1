@@ -49,6 +49,14 @@ def _require_absolute_path(name: str, value: object) -> str:
     return value
 
 
+def _verification_manifest_path(path: str | Path) -> str:
+    """Identify a rejected path even when a symlink loop prevents resolution."""
+    try:
+        return str(Path(path).resolve(strict=False))
+    except (OSError, RuntimeError):
+        return os.path.abspath(path)
+
+
 def _require_tuple(name: str, value: object) -> tuple:
     if not isinstance(value, tuple):
         raise ValueError(f"{name} must be a tuple")
@@ -317,7 +325,15 @@ class PackedAdmissionVerification:
             raise ValueError("unsupported packed admission verification schema_version")
         if self.kind != PACKED_ADMISSION_VERIFICATION_KIND or self.status not in ("pass", "fail"):
             raise ValueError("invalid packed admission verification kind or status")
-        _require_absolute_path("manifest_path", self.manifest_path)
+        if self.status == "fail" and self.manifest_sha256 is None:
+            if (
+                not isinstance(self.manifest_path, str) or not self.manifest_path
+                or not Path(self.manifest_path).is_absolute()
+                or _verification_manifest_path(self.manifest_path) != self.manifest_path
+            ):
+                raise ValueError("manifest_path must be a resolved or normalized rejected absolute path")
+        else:
+            _require_absolute_path("manifest_path", self.manifest_path)
         for name in (
             "manifest_sha256", "clean_admissible_sha256", "packed_retained_sha256",
             "negative_sha256", "negative_manifest_sha256",
@@ -827,6 +843,7 @@ def reconstruct_natural_packed_records(
         negative_path=negative_path, negative_manifest=negative_manifest,
     )
     images = _directory(image_root, "image root")
+    _validate_original_image_inputs(rows, images)
     if len(rows) != len(original_source_indices):
         raise ValueError("source-map cardinality does not match reconstruction")
     prepared = tuple(
@@ -921,6 +938,7 @@ def validate_clean_source_chain(args) -> _CleanSourceChain:
     if mapping.sample_ids != tuple(canonical_sample_id(rows[index]) for index in mapping.original_source_indices):
         raise ValueError("source map sample IDs do not match original rows")
     images = _directory(args.image_root, "image root")
+    _validate_original_image_inputs(rows, images)
     checkpoint = _directory(args.checkpoint_path, "checkpoint")
     negative, _, _, negative_bytes = _negative_inputs(
         checkpoint_path=checkpoint, data_path=args.clean_data_path,
@@ -967,6 +985,33 @@ def validate_clean_source_chain(args) -> _CleanSourceChain:
         mapping.original_source_indices, mapping.sample_ids, len(rows),
         len(manifest.retained_indices), clean, tuple(bound), values, processor, manifest.images,
     )
+
+
+def _validate_original_image_inputs(rows, image_root):
+    """Check supplied leaves before the existing resolver erases symlink identity."""
+    for row in rows:
+        raw_images = row.get("image_input")
+        if isinstance(raw_images, str):
+            raw_images = [raw_images]
+        if not isinstance(raw_images, list) or not raw_images:
+            raise ValueError("image_input must contain at least one original image")
+        for raw_image in raw_images:
+            if not isinstance(raw_image, str) or not raw_image:
+                raise ValueError("original image path must be a non-empty string")
+            candidate = Path(raw_image)
+            if (
+                candidate.is_absolute() or not candidate.parts
+                or any(part in ("", ".", "..") for part in candidate.parts)
+                or any(ord(char) < 32 or ord(char) == 127 for char in raw_image)
+            ):
+                raise ValueError("original image must use a safe relative path")
+            if candidate.parts[0] == image_root.name:
+                candidate = Path(*candidate.parts[1:])
+            if not candidate.parts:
+                raise ValueError("original image must use a safe relative path")
+            # Parent symlinks remain legal. The production resolver below still
+            # enforces containment after resolution; only the leaf is rejected.
+            _read_strict_bytes(image_root / candidate, "original image")
 
 
 def _validate_images(images):
@@ -1132,7 +1177,7 @@ def verify_packed_admission(args) -> PackedAdmissionVerification:
     verification = PackedAdmissionVerification(
         schema_version=1, kind=PACKED_ADMISSION_VERIFICATION_KIND,
         status="fail" if errors else "pass",
-        manifest_path=str(Path(args.manifest_path).resolve(strict=False)),
+        manifest_path=_verification_manifest_path(args.manifest_path),
         **hashes,
         verified_record_count=0 if errors else len(records),
         retained_source_indices=() if errors else tuple(row.source_index for row in retained),
