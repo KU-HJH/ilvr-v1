@@ -178,3 +178,28 @@ def test_mixed_loader_rejects_unsupported_distinct_backend_pairs(language, visio
             load_config=lambda _source: deepcopy(_tiny_qwen_config()),
             load_model=lambda *_args, **_kwargs: pytest.fail("model load must not start"),
         )
+
+
+def test_attention_counters_increment_at_real_kernel_dispatch(monkeypatch):
+    import transformers.models.qwen2_5_vl.modeling_qwen2_5_vl as module
+    model, *_ = _load_tiny_mixed_model()
+    language=model.model.layers[0].self_attn
+    vision=model.visual.blocks[0].attn
+    observed=[]
+    def sdpa(q,k,v,**kw):
+        observed.append(("sdpa", getattr(language, "_sdpa_forward_count", 0)))
+        return q
+    def flex(owner,q,k,v,mask,**kw):
+        observed.append(("flex", getattr(language, "_flex_attention_forward_count", 0)))
+        return q.transpose(1,2), None
+    def flash(q,k,v,*a):
+        observed.append(("vision", getattr(vision, "_vision_flash_attention_forward_count", 0)))
+        return q
+    monkeypatch.setattr(torch.nn.functional,"scaled_dot_product_attention",sdpa)
+    monkeypatch.setattr(module,"flex_attention_forward",flex)
+    monkeypatch.setattr(module,"flash_attn_varlen_func",flash)
+    embeddings=(torch.ones(3,1,2,4),torch.zeros(3,1,2,4))
+    language(torch.zeros(1,2,8),position_embeddings=embeddings)
+    language.forward_flex(torch.zeros(1,2,8),block_mask=object(),position_embeddings=embeddings)
+    vision(torch.zeros(2,8),torch.tensor([0,2]),position_embeddings=(torch.ones(2,4),torch.zeros(2,4)))
+    assert observed == [("sdpa",1),("flex",1),("vision",1)]

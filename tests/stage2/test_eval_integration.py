@@ -45,6 +45,24 @@ from tests.stage2.test_stage1_checkpoint_handoff import (
 
 
 MODULE_NAMES = ("eval", "evaluate_deepseed")
+
+
+def test_evaluation_runtime_sidecar_counts_concrete_blocks_exclusively(monkeypatch, tmp_path):
+    module = importlib.import_module("eval")
+    from tests.stage2.test_attention_backend import _load_tiny_mixed_model
+    model, *_ = _load_tiny_mixed_model()
+    assert hasattr(module, "publish_evaluation_runtime_identity"), "evaluation runtime publisher missing"
+    from step_preference import capacity_evidence
+    monkeypatch.setattr(capacity_evidence, "git_identity", lambda: "a"*40)
+    output=tmp_path / "runtime.json"
+    module.publish_evaluation_runtime_identity(model, tmp_path, output)
+    payload=json.loads(output.read_bytes())
+    assert payload["language_attention_layer_count"] == payload["vision_attention_block_count"] == 2
+    with pytest.raises(ValueError): module.publish_evaluation_runtime_identity(model,tmp_path,output)
+    model.visual.blocks[0].attn=nn.Identity()
+    rejected=tmp_path / "rejected.json"
+    with pytest.raises(ValueError): module.publish_evaluation_runtime_identity(model,tmp_path,rejected)
+    assert not rejected.exists()
 LATENT_TOKEN_IDS = {
     "<|latent_pad|>": 90,
     "<|latent_start|>": 91,
@@ -355,6 +373,8 @@ def test_eval_cli_accepts_explicit_stage1_base(module_name, monkeypatch):
         ],
     )
 
+    if module_name == "eval":
+        monkeypatch.setattr(sys, "argv", [*sys.argv,"--runtime_identity_path","runtime.json"])
     assert module.get_eval_args().base_model_dir == "stage1"
 
 
@@ -376,6 +396,8 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
         ],
     )
 
+    if module_name == "eval":
+        monkeypatch.setattr(sys, "argv", [*sys.argv,"--runtime_identity_path","runtime.json"])
     args = module.get_eval_args()
 
     assert args.num_shards == 1
@@ -599,7 +621,7 @@ def test_default_single_worker_records_shared_answer_scoring(
         rows = [dict(row, index=index) for index in range(6)]
 
     expected = "".join(
-        json.dumps(row, ensure_ascii=False) + "\n" for row in rows
+        json.dumps(row, ensure_ascii=False, **({"sort_keys":True,"separators":(",",":")} if module_name == "eval" else {})) + "\n" for row in rows
     )
     assert result is None
     assert output.read_text(encoding="utf-8") == expected
@@ -734,7 +756,9 @@ def test_inference_error_rows_preserve_invalid_gold_for_summary(
         return result
 
     monkeypatch.setattr(module, "run_one_example", run_one)
-    module.main()
+    exit_status = module.main()
+    if module_name == "eval":
+        assert exit_status == 1, "caught inference errors must fail the evaluation process"
 
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     failed = next(row for row in rows if row.get("index") == 0)

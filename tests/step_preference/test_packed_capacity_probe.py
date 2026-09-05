@@ -236,6 +236,15 @@ class _Runtime:
     def device_total_bytes(self):
         return 10_000
 
+    def physical_index(self):
+        return 0
+
+    def device_name(self):
+        return "NVIDIA H100 NVL"
+
+    def device_uuid(self):
+        return "01234567-0123-4567-89ab-0123456789ab"
+
     def memory_allocated(self):
         return 1_000
 
@@ -331,6 +340,7 @@ def test_capacity_report_passes_only_with_finite_losses_and_adapter_gradient(
         "losses",
         "gradient_norm",
         "memory",
+        "gpu",
         "elapsed_seconds",
         "errors",
     }
@@ -357,6 +367,7 @@ def test_capacity_report_passes_only_with_finite_losses_and_adapter_gradient(
         "peak_allocated_bytes": 4_000,
         "baseline_reserved_bytes": 1_500,
         "peak_reserved_bytes": 5_000,
+        "peak_reserved_fraction": 0.5,
     }
     assert report["elapsed_seconds"] == 2.5
     assert report["errors"] == []
@@ -429,6 +440,8 @@ def test_capacity_cli_publishes_exact_failure_status_and_exit_code(
         lambda *_args, **_kwargs: SimpleNamespace(stdout="deadbeef\n"),
     )
     context_loads = []
+    monkeypatch.setattr(capacity_probe, "git_identity", lambda: "a"*40)
+    monkeypatch.setattr(capacity_probe, "authenticate_probe_gpu", lambda *a: {}, raising=False)
 
     def fail_context(**kwargs):
         context_loads.append(kwargs)
@@ -450,6 +463,8 @@ def test_capacity_cli_publishes_exact_failure_status_and_exit_code(
             "manifest.json",
             "--output_path",
             str(output),
+            "--gpu-snapshot", str(tmp_path / "gpu.json"),
+            "--gpu-snapshot-sha256", "a" * 64,
         ]
     )
 
@@ -472,6 +487,7 @@ def test_capacity_cli_publishes_exact_failure_status_and_exit_code(
         "losses",
         "gradient_norm",
         "memory",
+        "gpu",
         "elapsed_seconds",
         "errors",
     }
@@ -500,6 +516,8 @@ def test_capacity_cli_publishes_git_identity_failure_as_error(monkeypatch, tmp_p
             "manifest.json",
             "--output_path",
             str(output),
+            "--gpu-snapshot", str(tmp_path / "gpu.json"),
+            "--gpu-snapshot-sha256", "a" * 64,
         ]
     )
 
@@ -511,3 +529,29 @@ def test_capacity_cli_publishes_git_identity_failure_as_error(monkeypatch, tmp_p
         "CalledProcessError: Command '['git', 'rev-parse', 'HEAD']' "
         "returned non-zero exit status 128."
     ]
+
+
+@pytest.mark.parametrize("peak,status", [(8500, "pass"), (8501, "error")])
+def test_capacity_headroom_uses_exact_bytes(monkeypatch, peak, status):
+    context, runtime = _context(), _Runtime()
+    monkeypatch.setattr(runtime, "max_memory_reserved", lambda: peak)
+    monkeypatch.setattr(capacity_probe, "build_packed_tree_plan", lambda **kw: SimpleNamespace(
+        root_length=3, unpadded_length=100, padded_length=128, branches=(1,)))
+    class Step:
+        def __init__(self, *a):
+            self.trainer = SimpleNamespace(_step_preference_metric_batches=1,
+                _step_preference_metric_totals={k: 1.0 for k in ("loss/ce", "loss/dpo", "loss/entropy", "loss/total")})
+        def zero_grad(self): pass
+        def __call__(self): context.model.adapter.grad = torch.ones(1)
+    report = run_capacity_probe(context, runtime, source_row_index=7, step_factory=Step)
+    assert report["status"] == status
+    assert report["memory"]["peak_reserved_fraction"] == peak / 10000
+    assert report["gpu"]["name"] == "NVIDIA H100 NVL"
+
+
+def test_capacity_rejects_wrong_requested_sample_before_step(monkeypatch):
+    monkeypatch.setattr(capacity_probe, "build_packed_tree_plan", lambda **kw: SimpleNamespace(
+        root_length=3, unpadded_length=100, padded_length=128, branches=(1,)))
+    report = run_capacity_probe(_context(), _Runtime(), source_row_index=7,
+        sample_id="another", step_factory=lambda *a: pytest.fail("step constructed"))
+    assert report["status"] == "error"

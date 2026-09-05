@@ -54,6 +54,70 @@ CANONICAL_DEFAULT_LOG = (
 )
 
 
+def test_capacity_launcher_requires_complete_private_options_and_forwards_them():
+    env={**PACKED_ADMISSION_ENV,"STEP_PREFERENCE_ENABLED":"true","STEP_PREFERENCE_MODE":"stage2b",
+        "STEP_PREFERENCE_PACKING":"true","STAGE2A_CHECKPOINT_PATH":"/models/stage 1",
+        "STEP_NEGATIVE_PATH":"/results/negative.jsonl","STEP_NEGATIVE_MANIFEST":"/results/negative-manifest.json",
+        "STEP_PACKED_CAPACITY_EVIDENCE_PATH":"/results/evidence.json",
+        "STEP_PACKED_CAPACITY_SAMPLE_ID":"sample-a","STEP_PACKED_GPU_SNAPSHOT":"/results/gpu.json",
+        "STEP_PACKED_GPU_SNAPSHOT_SHA256":"c"*64,"TUNING_METHOD":"dora","GRADIENT_ACCUMULATION_STEPS":"2",
+        "GRADIENT_CHECKPOINTING":"true","DEEPSPEED_CONFIG":str(REPO_ROOT / "configs/deepspeed_zero2.json"),
+        "STAGE2_NUM_PROCESSES":"2","DATALOADER_NUM_WORKERS":"0"}
+    tokens=dry_run_tokens(run_launcher("--max_steps","2",env_overrides=env))
+    assert option_value(tokens,"--step_packed_capacity_sample_id") == "sample-a"
+    assert option_value(tokens,"--step_packed_gpu_snapshot_sha256") == "c"*64
+    for name in ["STEP_PACKED_CAPACITY_SAMPLE_ID","STEP_PACKED_GPU_SNAPSHOT_SHA256","STEP_PACKED_CAPACITY_EVIDENCE_PATH"]:
+        bad={**env,name:""}
+        assert run_launcher("--max_steps","2",env_overrides=bad).returncode != 0
+    assert run_launcher(env_overrides={"STEP_PACKED_CAPACITY_SAMPLE_ID":"sample-a"}).returncode != 0
+    assert run_launcher("--max_steps","2",env_overrides={**env,"DEEPSPEED_CONFIG":str(REPO_ROOT/"configs/deepspeed_zero3.json")}).returncode != 0
+    assert run_launcher("--max_steps","1",env_overrides=env).returncode != 0
+
+
+def test_packed_launcher_captures_preprocessing_and_traceback_after_preflight(tmp_path):
+    launcher=tmp_path/"run_stage2_training.sh";shutil.copyfile(LAUNCHER,launcher)
+    binary=tmp_path/"venv/ilvr-venv/bin";binary.mkdir(parents=True)
+    python=binary/"python"
+    python.write_text("#!"+str(REPO_ROOT/"venv/ilvr-venv/bin/python")+"\n"+'''
+import os,sys
+from pathlib import Path
+args=sys.argv[1:]
+if args[:2] == ['-m','main']:
+    if os.environ.get('FAIL_PREFLIGHT') == 'yes': raise SystemExit(2)
+if args[:2] == ['-m','stage2.length_manifest']:
+    Path(args[args.index('--manifest-path')+1]).write_text('{}\\n')
+    print('preprocessing stdout')
+    print('preprocessing stderr',file=sys.stderr)
+''')
+    python.chmod(0o755)
+    accelerate=binary/"accelerate"
+    accelerate.write_text("#!"+str(REPO_ROOT/"venv/ilvr-venv/bin/python")+"\n"+'''
+import sys
+assert '--stage2_launcher_log_capture' in sys.argv
+print('training stdout')
+print('Traceback: training failure',file=sys.stderr)
+raise SystemExit(1)
+''')
+    accelerate.chmod(0o755)
+    identifier="step-pref-packed-admission-test-zero2-7"
+    env={"PATH":os.environ["PATH"],**REQUIRED_ENV,**PACKED_ADMISSION_ENV,
+        "OUTPUT_DIR":str(tmp_path/"checkpoints"/identifier),"LOG_FILE":str(tmp_path/"logs"/identifier/"train.log"),
+        "STEP_PREFERENCE_ENABLED":"true","STEP_PREFERENCE_MODE":"stage2b","STEP_PREFERENCE_PACKING":"true",
+        "STAGE2A_CHECKPOINT_PATH":"/models/stage 1","STEP_NEGATIVE_PATH":"/n","STEP_NEGATIVE_MANIFEST":"/nm",
+        "DEEPSPEED_CONFIG":"/zero2","TUNING_METHOD":"dora"}
+    failed=subprocess.run(["bash",str(launcher)],env={**env,"FAIL_PREFLIGHT":"yes"},capture_output=True,text=True)
+    assert failed.returncode != 0
+    assert not (tmp_path/"logs"/identifier).exists()
+    assert not (tmp_path/"checkpoints"/identifier).exists()
+    actual=subprocess.run(["bash",str(launcher)],env=env,capture_output=True,text=True)
+    assert actual.returncode == 1
+    log=Path(env["LOG_FILE"])
+    assert log.exists(),"launcher-owned complete output capture missing"
+    text=log.read_text()
+    assert text.count("preprocessing stdout") == text.count("preprocessing stderr") == 1
+    assert text.count("training stdout") == text.count("Traceback: training failure") == 1
+
+
 def assert_four_rank_prefix(tokens, rank, port):
     """Catches Accelerate receiving a partial or single-node topology."""
     expected = {

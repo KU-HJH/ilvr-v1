@@ -330,6 +330,8 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
         "max_new_tokens": config.max_new_tokens,
         "min_tokens": config.min_tokens,
         "torch_dtype": "bfloat16",
+        "seed": 42,
+        "decoding": "greedy-argmax-v1",
     }
     expected_keys = tuple(
         (example.sample_id, step.step_id)
@@ -368,6 +370,10 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
         records_by_sample_id = MappingProxyType({
             row.sample_id: row for row in admission.records if row.admission_reason == "retained"
         })
+    from step_preference.capacity_evidence import validate_capacity_options
+    if validate_capacity_options(args):
+        from stage2.data import select_packed_capacity_example
+        prepared = select_packed_capacity_example(prepared, admission, args.step_packed_capacity_sample_id)
     return Stage2BPreflight(
         prepared_examples=prepared,
         negative_store=MappingProxyType(dict(negative_store)),
@@ -811,6 +817,7 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         save_total_limit=1,
         optim="adamw_torch",
         bf16=True,
+        seed=args.seed,
         report_to=[],
         remove_unused_columns=False,
         dataset_text_field="",
@@ -998,12 +1005,19 @@ def run_stage2(args):
     profile = bind_deepspeed_runtime_profile(
         args, world_size=int(os.environ.get("WORLD_SIZE", "1"))
     )
+    from step_preference.capacity_evidence import (
+        validate_capacity_options, CapacitySampleRecorder, begin_capacity_memory, finish_capacity_memory,
+        publish_training_runtime, publish_distributed_capacity,
+    )
+    capacity = validate_capacity_options(args, world_size=profile.world_size, zero_stage=profile.zero_stage)
     components = build_stage2_training_components(args)
+    recorder = (CapacitySampleRecorder(components.data_collator, args.step_packed_capacity_sample_id)
+                if capacity else None)
     trainer_kwargs = dict(
         model=components.model,
         args=build_stage2_training_arguments(args),
         train_dataset=components.train_dataset,
-        data_collator=components.data_collator,
+        data_collator=recorder if capacity else components.data_collator,
         processing_class=components.processor,
         stage2_peft_metadata=components.peft_metadata,
         deepspeed_runtime_profile=profile,
@@ -1015,9 +1029,11 @@ def run_stage2(args):
     ):
         trainer_kwargs["step_preference_config"] = components.step_preference_config
     trainer = components.trainer_class(**trainer_kwargs)
+    baseline = begin_capacity_memory(trainer.accelerator.device) if capacity else None
     train_result = trainer.train(
         resume_from_checkpoint=components.trainer_resume_path
     )
+    peak = finish_capacity_memory(trainer.accelerator.device,baseline) if capacity else None
     publish_step_preference_phase_a_summary(
         args, trainer=trainer, train_result=train_result
     )
@@ -1026,8 +1042,16 @@ def run_stage2(args):
     )
     if args.save_final_model:
         trainer.save_model(args.save_model_path)
+        if capacity or (components.step_preference_config and components.step_preference_config.packing_enabled):
+            trainer.accelerator.wait_for_everyone()
         if trainer.is_world_process_zero():
             components.processor.save_pretrained(args.save_model_path)
+        if capacity or (components.step_preference_config and components.step_preference_config.packing_enabled):
+            trainer.accelerator.wait_for_everyone()
+    if components.step_preference_config and components.step_preference_config.packing_enabled:
+        runtime_path, runtime_sha = publish_training_runtime(args, trainer)
+        if capacity:
+            publish_distributed_capacity(args,trainer,train_result,recorder,peak,runtime_path,runtime_sha)
 
 
 def route_training(args, *, stage1_handler=None, stage2_handler=None):
@@ -1061,14 +1085,14 @@ def main_train():
     bind_deepspeed_runtime_profile(args)
     seed_everything(seed=42 if args.stage == "stage2" else args.seed)
 
+    log_handlers = [logging.StreamHandler()]
+    if not getattr(args, "stage2_launcher_log_capture", False):
+        log_handlers.insert(0, logging.FileHandler(args.log_file, mode='a', encoding='utf-8'))
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[
-            logging.FileHandler(args.log_file, mode='a', encoding='utf-8'),
-            logging.StreamHandler()
-        ],
+        handlers=log_handlers,
     )
     logging.info('==' * 20)
     logging.info(args)

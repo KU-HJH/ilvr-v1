@@ -177,6 +177,7 @@ class Qwen2_5_VLPatchMerger(nn.Module):
 class Qwen2_5_VLVisionFlashAttention2(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
+        self._vision_flash_attention_forward_count = 0
         self.num_heads = num_heads
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
@@ -205,6 +206,7 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        self._vision_flash_attention_forward_count += 1
         attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
             seq_length, -1
         )
@@ -709,6 +711,8 @@ class Qwen2_5_VLAttention(nn.Module):
 
     def __init__(self, config: Qwen2_5_VLConfig, layer_idx: Optional[int] = None):
         super().__init__()
+        self._sdpa_forward_count = 0
+        self._flex_attention_forward_count = 0
         self.config = config
         self.layer_idx = layer_idx
         if layer_idx is None:
@@ -847,6 +851,7 @@ class Qwen2_5_VLAttention(nn.Module):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
+        self._flex_attention_forward_count += 1
         attn_output, _ = flex_attention_forward(
             self,
             query_states,
@@ -1232,6 +1237,7 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
         is_causal = True if causal_mask is None and q_len > 1 else False
 
+        self._sdpa_forward_count += 1
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,

@@ -271,6 +271,10 @@ MANAGED_OPTIONS=(
   --step_packed_admission_manifest_sha256
   --step_packed_admission_verification
   --step_packed_admission_verification_sha256
+  --step_packed_capacity_evidence_path
+  --step_packed_capacity_sample_id
+  --step_packed_gpu_snapshot
+  --step_packed_gpu_snapshot_sha256
   --ce_weight
   --step_dpo_beta
   --step_dpo_weight
@@ -301,6 +305,7 @@ MANAGED_OPTIONS=(
   --benchmark_evidence_path
   --stage2_length_manifest
   --stage2_length_manifest_sha256
+  --stage2_launcher_log_capture
 )
 
 reject_managed_arguments() {
@@ -500,11 +505,40 @@ if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
 fi
 
 EVIDENCE_ARGS=()
+capacity_variables=(STEP_PACKED_CAPACITY_EVIDENCE_PATH STEP_PACKED_CAPACITY_SAMPLE_ID STEP_PACKED_GPU_SNAPSHOT STEP_PACKED_GPU_SNAPSHOT_SHA256)
+capacity_requested=false
+for capacity_variable in "${capacity_variables[@]}"; do
+  if [[ -v "$capacity_variable" ]]; then capacity_requested=true; fi
+done
+if [[ "$capacity_requested" == true ]]; then
+  for capacity_variable in "${capacity_variables[@]}"; do
+    if [[ -z "${!capacity_variable:-}" ]]; then
+      printf 'capacity-only options require %s\n' "$capacity_variable" >&2
+      exit 2
+    fi
+  done
+  if [[ "$step_preference_packing" != true || "${STEP_PREFERENCE_MODE:-}" != stage2b || "$TUNING_METHOD" != dora || "$GRADIENT_ACCUMULATION_STEPS" != 2 || "$DATALOADER_NUM_WORKERS" != 0 || "${STAGE2_NUM_PROCESSES:-2}" != 2 || -z "${DEEPSPEED_CONFIG:-}" || -n "${RESUME_CHECKPOINT:-}" || -n "${BENCHMARK_EVIDENCE_PATH:-}" ]]; then
+    printf 'capacity-only options require packed Stage 2B DoRA two-rank ZeRO-2 accumulation 2\n' >&2
+    exit 2
+  fi
+  if [[ ! "$STEP_PACKED_GPU_SNAPSHOT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'STEP_PACKED_GPU_SNAPSHOT_SHA256 must be a lowercase SHA-256\n' >&2
+    exit 2
+  fi
+  EVIDENCE_ARGS+=(--step_packed_capacity_evidence_path "$STEP_PACKED_CAPACITY_EVIDENCE_PATH"
+    --step_packed_capacity_sample_id "$STEP_PACKED_CAPACITY_SAMPLE_ID"
+    --step_packed_gpu_snapshot "$STEP_PACKED_GPU_SNAPSHOT"
+    --step_packed_gpu_snapshot_sha256 "$STEP_PACKED_GPU_SNAPSHOT_SHA256")
+fi
 if [[ -n "${BENCHMARK_EVIDENCE_PATH:-}" ]]; then
   EVIDENCE_ARGS+=(--benchmark_evidence_path "$BENCHMARK_EVIDENCE_PATH")
 fi
 
 MANIFEST_ARGS=()
+LAUNCHER_LOG_ARGS=()
+if [[ "$step_preference_packing" == true && -z "${RESUME_CHECKPOINT:-}" ]]; then
+  LAUNCHER_LOG_ARGS+=(--stage2_launcher_log_capture)
+fi
 TRAINING_ARGS=(
   --stage stage2
   --load_model_path "$STAGE1_CHECKPOINT"
@@ -513,6 +547,7 @@ TRAINING_ARGS=(
   --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
   --save_model_path "$OUTPUT_DIR"
   --log_file "$LOG_FILE"
+  "${LAUNCHER_LOG_ARGS[@]}"
   --latent_size "$LATENT_SIZE"
   --stage2_diagnostics_interval "$STAGE2_DIAGNOSTICS_INTERVAL"
   "${STEP_PREFERENCE_ARGS[@]}"
@@ -563,6 +598,13 @@ if [[ "$stage2_dry_run" != true ]]; then
     if ! mkdir -- "$result_dir"; then
       printf 'fresh run artifact directory already exists: %s\n' "$result_dir" >&2
       exit 2
+    fi
+    if [[ "$step_preference_packing" == true ]]; then
+      # The launcher owns this fresh log, including preprocessing and failures.
+      # Python uses its stream handler only under this explicit capture mode.
+      set -o noclobber
+      exec >"$LOG_FILE" 2>&1
+      set +o noclobber
     fi
     "$REPO_ROOT/venv/ilvr-venv/bin/python" -m stage2.length_manifest \
       --data-path "$DATA_PATH" \

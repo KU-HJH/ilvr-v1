@@ -805,6 +805,7 @@ def _negative_inputs(*, checkpoint_path, data_path, negative_path, negative_mani
         attention_implementation="sdpa",
         vision_attention_implementation="flash_attention_2",
         device="cuda:0", max_new_tokens=32, min_tokens=2, torch_dtype="bfloat16",
+        seed=42, decoding="greedy-argmax-v1",
     )
     if manifest.generation_settings_dict != expected_settings:
         raise ValueError("negative generation settings do not match packed Stage 2B")

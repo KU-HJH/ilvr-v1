@@ -40,6 +40,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step_packed_admission_manifest_sha256")
     parser.add_argument("--step_packed_admission_verification")
     parser.add_argument("--step_packed_admission_verification_sha256")
+    parser.add_argument("--step_packed_capacity_evidence_path")
+    parser.add_argument("--step_packed_capacity_sample_id")
+    parser.add_argument("--step_packed_gpu_snapshot")
+    parser.add_argument("--step_packed_gpu_snapshot_sha256")
     parser.add_argument("--step_dpo_beta", type=float, default=0.1)
     parser.add_argument("--step_dpo_weight", type=float, default=1.0)
     parser.add_argument("--step_entropy_weight", type=float, default=0.1)
@@ -99,6 +103,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Stage-2")  # 改默认 8192
     parser.add_argument("--stage2_length_manifest")
     parser.add_argument("--stage2_length_manifest_sha256")
+    parser.add_argument("--stage2_launcher_log_capture", action="store_true")
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument(
         "--supervise_latent_boundaries",
@@ -176,6 +181,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
     args.step_preference_config = StepPreferenceConfig.from_args(args)
+    capacity_fields = (args.step_packed_capacity_evidence_path, args.step_packed_capacity_sample_id,
+                       args.step_packed_gpu_snapshot, args.step_packed_gpu_snapshot_sha256)
+    if any(value is not None for value in capacity_fields):
+        if not all(type(value) is str and value for value in capacity_fields):
+            raise ValueError("capacity-only options must be supplied together")
+        if not args.step_preference_config.is_stage2b or not args.step_preference_config.packing_enabled:
+            raise ValueError("capacity-only options require packed Stage 2B")
+        from deepspeed_runtime import load_deepspeed_runtime_profile
+        profile = load_deepspeed_runtime_profile(args.deepspeed_config, world_size=2)
+        if profile.zero_stage != 2 or args.max_steps != 2:
+            raise ValueError("capacity-only options require ZeRO-2 and exactly two optimizer steps")
     if args.stage2b_preflight_only and not args.step_preference_config.is_stage2b:
         raise ValueError("--stage2b_preflight_only requires Stage 2B")
     if args.stage == "stage2":

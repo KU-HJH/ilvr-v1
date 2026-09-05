@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from dataclasses import asdict, fields
 
 import torch
 
@@ -18,6 +19,10 @@ from step_preference.equivalence import (
     write_evidence_exclusive,
 )
 from step_preference.packing import build_packed_tree_plan
+from step_preference.capacity_evidence import (
+    PackedGpuSnapshot, PackedCapacityReport, ProbeIdentity, GpuIdentity,
+    read_json, publish_json, git_identity, observe_gpu, require_gpu_match, require,
+)
 
 
 _LOSS_METRICS = {
@@ -39,6 +44,15 @@ class CudaCapacityRuntime:
 
     def device_total_bytes(self) -> int:
         return int(torch.cuda.get_device_properties(self.device).total_memory)
+
+    def physical_index(self):
+        return observe_gpu(self.device).physical_index
+
+    def device_name(self):
+        return torch.cuda.get_device_properties(self.device).name
+
+    def device_uuid(self):
+        return observe_gpu(self.device).uuid
 
     def memory_allocated(self) -> int:
         return int(torch.cuda.memory_allocated(self.device))
@@ -65,6 +79,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--negative_manifest", required=True)
     parser.add_argument("--output_path", type=Path, required=True)
     parser.add_argument("--source_row_index", type=int, default=0)
+    parser.add_argument("--sample_id")
+    parser.add_argument("--gpu-snapshot", required=True)
+    parser.add_argument("--gpu-snapshot-sha256", required=True)
+    parser.add_argument("--max_peak_reserved_fraction", type=float, default=.85)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--attention_implementation", choices=("sdpa",), default="sdpa"
@@ -102,18 +120,23 @@ def _empty_losses() -> dict[str, None]:
 
 
 def _memory_baseline(runtime) -> dict[str, int]:
-    return {
+    result = {
         "device_total_bytes": int(runtime.device_total_bytes()),
         "baseline_allocated_bytes": int(runtime.memory_allocated()),
         "peak_allocated_bytes": 0,
         "baseline_reserved_bytes": int(runtime.memory_reserved()),
         "peak_reserved_bytes": 0,
     }
+    result["peak_allocated_bytes"] = result["baseline_allocated_bytes"]
+    result["peak_reserved_bytes"] = result["baseline_reserved_bytes"]
+    result["peak_reserved_fraction"] = result["peak_reserved_bytes"] / result["device_total_bytes"]
+    return result
 
 
 def _capture_peaks(runtime, memory: dict[str, int]) -> None:
-    memory["peak_allocated_bytes"] = int(runtime.max_memory_allocated())
-    memory["peak_reserved_bytes"] = int(runtime.max_memory_reserved())
+    memory["peak_allocated_bytes"] = max(memory["baseline_allocated_bytes"], int(runtime.max_memory_allocated()))
+    memory["peak_reserved_bytes"] = max(memory["baseline_reserved_bytes"], int(runtime.max_memory_reserved()))
+    memory["peak_reserved_fraction"] = memory["peak_reserved_bytes"] / memory["device_total_bytes"]
 
 
 def _losses(step) -> dict[str, float]:
@@ -157,30 +180,37 @@ def run_capacity_probe(
     runtime,
     *,
     source_row_index: int,
+    sample_id: str | None = None,
+    max_peak_reserved_fraction: float = .85,
     step_factory=Stage2BTrainingStep,
     clock=time.perf_counter,
 ) -> dict[str, object]:
     """Build one layout witness and execute one packed forward/backward."""
-    plan = build_packed_tree_plan(
-        clean_input_ids=context.batch["input_ids"],
-        attention_mask=context.batch["attention_mask"],
-        reasoning_spans=context.batch["reasoning_step_spans"],
-        joined_steps=context.batch["step_preference"]["steps"],
-    )
     report = {
         "schema_version": 1,
         "status": "error",
-        "identity": dict(context.identity),
-        "sample": _sample_report(context, plan, source_row_index),
+        "identity": {field.name: context.identity.get(field.name) for field in fields(ProbeIdentity)},
+        "sample": dict(source_row_index=source_row_index, sample_id=None, clean_length=None,
+                       step_count=None,branch_count=None,packed_unpadded_length=None,packed_padded_length=None),
         "losses": _empty_losses(),
         "gradient_norm": None,
         "memory": None,
+        "gpu": None,
         "elapsed_seconds": None,
         "errors": [],
     }
     started = None
-    step = step_factory(context.model, context.batch, context.packed_config)
     try:
+        require(math.isfinite(max_peak_reserved_fraction) and 0 < max_peak_reserved_fraction <= .85,
+                "max_peak_reserved_fraction must be positive and at most 0.85")
+        require(sample_id is None or list(context.batch["sample_ids"]) == [sample_id], "capacity sample identity differs")
+        plan = build_packed_tree_plan(clean_input_ids=context.batch["input_ids"],
+            attention_mask=context.batch["attention_mask"],reasoning_spans=context.batch["reasoning_step_spans"],
+            joined_steps=context.batch["step_preference"]["steps"])
+        report["sample"] = _sample_report(context,plan,source_row_index)
+        gpu = GpuIdentity(runtime.physical_index(),runtime.device_name(),runtime.device_uuid(),runtime.device_total_bytes())
+        report["gpu"] = asdict(gpu)
+        step = step_factory(context.model, context.batch, context.packed_config)
         step.zero_grad()
         runtime.synchronize()
         report["memory"] = _memory_baseline(runtime)
@@ -192,6 +222,8 @@ def run_capacity_probe(
         _capture_peaks(runtime, report["memory"])
         report["losses"] = _losses(step)
         report["gradient_norm"] = _trainable_gradient_norm(context.model)
+        require(report["memory"]["peak_reserved_fraction"] <= max_peak_reserved_fraction,
+                "peak reserved memory exceeds the accepted fraction")
         report["status"] = "pass"
     except Exception as error:
         if started is not None and report["elapsed_seconds"] is None:
@@ -220,6 +252,8 @@ def _error_report(
             "tuning_method": args.tuning_method,
             "gradient_checkpointing": args.gradient_checkpointing,
             "git_commit": git_commit,
+            "gpu_snapshot_path": str(Path(args.gpu_snapshot).resolve()),
+            "gpu_snapshot_sha256": args.gpu_snapshot_sha256,
         },
         "sample": {
             "source_row_index": args.source_row_index,
@@ -233,6 +267,7 @@ def _error_report(
         "losses": _empty_losses(),
         "gradient_norm": None,
         "memory": None,
+        "gpu": None,
         "elapsed_seconds": None,
         "errors": [f"{type(error).__name__}: {error}"],
     }
@@ -246,21 +281,25 @@ def _exit_code(status: str) -> int:
     return 2
 
 
+def authenticate_probe_gpu(args):
+    snapshot = read_json(args.gpu_snapshot, PackedGpuSnapshot, args.gpu_snapshot_sha256)
+    require(args.device == "cuda:0", "single capacity probe requires visible CUDA zero")
+    gpu = observe_gpu(args.device)
+    require_gpu_match(snapshot,gpu,0)
+    return asdict(gpu)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.output_path.exists():
+    if args.output_path.exists() or args.output_path.is_symlink():
         parser.error(f"output path already exists: {args.output_path}")
     if args.source_row_index < 0:
         parser.error("source_row_index must be nonnegative")
     git_commit = None
     try:
-        git_commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            check=True,
-            text=True,
-            capture_output=True,
-        ).stdout.strip()
+        git_commit = git_identity()
+        authenticate_probe_gpu(args)
         context = load_production_context(
             checkpoint_path=args.checkpoint_path,
             data_path=args.data_path,
@@ -272,17 +311,22 @@ def main(argv: list[str] | None = None) -> int:
             vision_attention_implementation=args.vision_attention_implementation,
             tuning_method=args.tuning_method,
             gradient_checkpointing=args.gradient_checkpointing,
+            requested_sample_id=args.sample_id,
         )
         report = run_capacity_probe(
             context,
             CudaCapacityRuntime(args.device),
             source_row_index=args.source_row_index,
+            sample_id=args.sample_id,
+            max_peak_reserved_fraction=args.max_peak_reserved_fraction,
         )
         report["identity"]["git_commit"] = git_commit
+        report["identity"]["gpu_snapshot_path"] = str(Path(args.gpu_snapshot).resolve(strict=True))
+        report["identity"]["gpu_snapshot_sha256"] = args.gpu_snapshot_sha256
     except Exception as error:
         report = _error_report(args, git_commit, error)
     try:
-        write_evidence_exclusive(args.output_path, report)
+        publish_json(args.output_path, report, PackedCapacityReport)
     except Exception as error:
         print(str(error), file=sys.stderr)
         return 2

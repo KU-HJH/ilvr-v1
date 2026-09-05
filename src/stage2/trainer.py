@@ -133,7 +133,8 @@ class _ObservedOptimizerStep(TrainerCallback):
 
     def on_step_end(self, args, state, control, **kwargs):
         del args, control, kwargs
-        self.owner._observed_optimizer_step = int(state.global_step)
+        if not getattr(self.owner, "_stage2_deepspeed_gradient_adapter", None):
+            self.owner._observed_optimizer_step = int(state.global_step)
 
 
 class _Stage2DeepSpeedGradientAdapter:
@@ -159,7 +160,25 @@ class _Stage2DeepSpeedGradientAdapter:
                 self.engine.optimizer, zero_stage=zero_stage
             )
             trainer._representative_gradient_norm = float(norm.cpu().item())
-        return self.original_step(*args, **kwargs)
+            value = trainer._representative_gradient_norm
+            if not math.isfinite(value):
+                trainer._nonfinite_pre_step_gradient_count = getattr(trainer, "_nonfinite_pre_step_gradient_count", 0) + 1
+            elif value > 0:
+                trainer._positive_pre_step_gradient_count = getattr(trainer, "_positive_pre_step_gradient_count", 0) + 1
+            if not hasattr(trainer, "_observed_pre_step_gradient_norms"):
+                trainer._observed_pre_step_gradient_norms = []
+            if math.isfinite(value) and value > 0 and len(trainer._observed_pre_step_gradient_norms) < 2:
+                trainer._observed_pre_step_gradient_norms.append(value)
+        skipped_before = getattr(self.engine, "skipped_steps", 0)
+        result = self.original_step(*args, **kwargs)
+        if boundary:
+            if getattr(self.engine, "skipped_steps", 0) != skipped_before:
+                raise RuntimeError("Stage 2 DeepSpeed skipped an optimizer step")
+            observed_step = getattr(trainer, "_observed_optimizer_step", None)
+            if observed_step is None:
+                observed_step = getattr(getattr(trainer, "state", None), "global_step", 0)
+            trainer._observed_optimizer_step = observed_step + 1
+        return result
 
 
 class Stage2Trainer(Trainer):
@@ -210,6 +229,10 @@ class Stage2Trainer(Trainer):
         self._stage2_microbatch_index = 0
         self._representative_gradient_norm: float | None = None
         self._observed_optimizer_step: int | None = None
+        self._observed_pre_step_gradient_norms = []
+        self._positive_pre_step_gradient_count = 0
+        self._nonfinite_pre_step_gradient_count = 0
+        self._runtime_objective_observation_counts = {}
         self._stage2_deepspeed_gradient_adapter = None
         callbacks = list(kwargs.pop("callbacks", ()) or ())
         callbacks.append(_ObservedOptimizerStep(self))
@@ -289,6 +312,11 @@ class Stage2Trainer(Trainer):
     def _ensure_stage2_train_sampler(
         self,
     ) -> LatentBlockBalancedSampler | None:
+        from step_preference.capacity_evidence import CapacitySampleRecorder
+        if isinstance(getattr(self,"data_collator",None), CapacitySampleRecorder):
+            self.stage2_sampler_identity = None
+            self._stage2_train_sampler = None
+            return None
         if self.args.world_size <= 1:
             self.stage2_sampler_identity = None
             self._stage2_train_sampler = None
@@ -343,6 +371,16 @@ class Stage2Trainer(Trainer):
         self.accelerator.wait_for_everyone()
 
     def _get_train_sampler(self):
+        from step_preference.capacity_evidence import CapacitySampleRecorder, require
+        if isinstance(getattr(self,"data_collator",None), CapacitySampleRecorder):
+            require(len(self.train_dataset) == 1 and self.train_dataset[0].sample_id == self.data_collator.sample_id
+                    and self.args.world_size == 2 and self.args.max_steps == 2
+                    and self.args.gradient_accumulation_steps == 2 and self.args.per_device_train_batch_size == 1,
+                    "capacity sampler requires the authenticated singleton and exact two-step protocol")
+            self.stage2_sampler_identity = None
+            # Accelerate shards eight global draws into four per rank. One epoch
+            # therefore contains both real accumulation-2 optimizer boundaries.
+            return torch.utils.data.SubsetRandomSampler([0] * 8, generator=torch.Generator().manual_seed(self.args.seed))
         if self.args.world_size <= 1:
             self.stage2_sampler_identity = None
             self._stage2_train_sampler = None
@@ -424,6 +462,10 @@ class Stage2Trainer(Trainer):
             if not math.isfinite(value):
                 raise ValueError(f"Stage 2B metric {name} must be finite")
             totals[name] = totals.get(name, 0.0) + value
+            counts = getattr(self, "_runtime_objective_observation_counts", None)
+            if counts is None:
+                counts = self._runtime_objective_observation_counts = {}
+            counts[name] = counts.get(name, 0) + 1
         self._step_preference_metric_batches += 1
 
     def _reduce_stage2b_objective(
@@ -1073,7 +1115,12 @@ class Stage2Trainer(Trainer):
             save_embedding_layers=False,
         )
         resolve_qwen2_5_vl_model(model).config.save_pretrained(target)
-        if self.processing_class is not None:
+        from step_preference.capacity_evidence import CapacitySampleRecorder
+        defer_processor = (
+            isinstance(getattr(self, "data_collator", None), CapacitySampleRecorder)
+            and target.resolve() == Path(self.args.output_dir).resolve()
+        )
+        if self.processing_class is not None and not defer_processor:
             self.processing_class.save_pretrained(target)
         torch.save(self.args, target / TRAINING_ARGS_NAME)
 

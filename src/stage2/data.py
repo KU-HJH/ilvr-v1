@@ -75,6 +75,12 @@ def load_jsonl_examples(path: Path) -> list[dict]:
     return parse_jsonl_examples(path.read_text(encoding="utf-8"))
 
 
+def select_packed_capacity_example(prepared, authenticated_admission, sample_id):
+    """Select privately only after the full retained cohort authenticates."""
+    from step_preference.capacity_evidence import select_capacity_sample
+    return select_capacity_sample(prepared, authenticated_admission, sample_id)
+
+
 def resolve_image_root_path(
     raw_path: str,
     image_root: Path,

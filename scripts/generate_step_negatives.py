@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 from dataclasses import dataclass
 import hashlib
 import json
@@ -101,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--latent_size", type=int, default=8)
     parser.add_argument("--min_tokens", type=int, default=2)
     parser.add_argument("--max_new_tokens", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--attention_implementation", choices=("eager", "sdpa"), default="sdpa"
     )
@@ -640,6 +642,12 @@ def _selected_examples(data_path: Path, image_root: Path, latent_size: int, max_
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.seed != 42:
+        raise ValueError("negative generation requires seed 42")
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     _require_negative_generation_attention_contract(
         args.attention_implementation, args.vision_attention_implementation
     )
@@ -690,6 +698,8 @@ def main(argv: list[str] | None = None) -> int:
         "max_new_tokens": args.max_new_tokens,
         "min_tokens": args.min_tokens,
         "torch_dtype": snapshot.torch_dtype,
+        "seed": args.seed,
+        "decoding": "greedy-argmax-v1",
     }
     write_negative_artifact(
         negative_path=args.output_path,

@@ -4,6 +4,112 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+
+@pytest.mark.parametrize("initial_step",[0,9])
+def test_zero2_adapter_observes_only_true_boundaries_before_gradient_clear(monkeypatch,initial_step):
+    from types import SimpleNamespace
+    import stage2.trainer as module
+    class Owner: pass
+    trainer = Owner()
+    trainer.deepspeed_runtime_profile = SimpleNamespace(zero_stage=2)
+    trainer._observed_optimizer_step = None
+    trainer.state = SimpleNamespace(global_step=initial_step)
+    trainer._observed_pre_step_gradient_norms = []
+    boundary = [False]
+    optimizer = SimpleNamespace(norm=1.25)
+    engine = SimpleNamespace(optimizer=optimizer,
+        is_gradient_accumulation_boundary=lambda: boundary[0])
+    monkeypatch.setattr(module, "collect_deepspeed_pre_step_norm", lambda opt, **kw: torch.tensor(opt.norm))
+    seen=[]
+    def step():
+        seen.append(list(trainer._observed_pre_step_gradient_norms))
+        optimizer.norm=0
+    wrapped=module._Stage2DeepSpeedGradientAdapter(trainer, engine, step)
+    wrapped(); boundary[0]=True; optimizer.norm=1.25; wrapped(); optimizer.norm=2.5; wrapped()
+    assert seen == [[], [1.25], [1.25, 2.5]]
+    assert trainer._observed_optimizer_step == initial_step + 2
+
+
+def test_capacity_singleton_dataloader_has_four_real_observations_per_rank():
+    from types import SimpleNamespace
+    from accelerate.data_loader import prepare_data_loader
+    from step_preference.capacity_evidence import CapacitySampleRecorder
+    from stage2.trainer import Stage2Trainer
+    for rank in (0,1):
+        trainer=object.__new__(Stage2Trainer)
+        trainer.args=SimpleNamespace(world_size=2,gradient_accumulation_steps=2,max_steps=2,
+            per_device_train_batch_size=1,seed=42)
+        trainer.train_dataset=[SimpleNamespace(sample_id="a",latent_block_count=1)]
+        trainer.data_collator=CapacitySampleRecorder(lambda rows:{"sample_ids":[r.sample_id for r in rows]},"a")
+        trainer._stage2_train_sampler=None
+        loader=torch.utils.data.DataLoader(trainer.train_dataset,batch_size=1,
+            sampler=trainer._get_train_sampler(),collate_fn=trainer.data_collator)
+        sharded=prepare_data_loader(loader,num_processes=2,process_index=rank,split_batches=False,put_on_device=False)
+        observed=list(sharded)
+        assert len(observed) == 4
+        assert trainer.data_collator.sample_ids == ["a"]*4
+
+
+def test_capacity_main_captures_training_peak_before_collective_final_save(monkeypatch,tmp_path):
+    import main
+    from types import SimpleNamespace as N
+    from step_preference import capacity_evidence as evidence
+    assert hasattr(evidence,"finish_capacity_memory"),"missing pre-save memory capture"
+    calls=[]
+    args=N(step_packed_capacity_sample_id="a",save_final_model=True,save_model_path=str(tmp_path),stage2_diagnostics_interval=0)
+    config=N(is_stage2b=True,packing_enabled=True)
+    class Trainer:
+        def __init__(self,**kw):
+            self.accelerator=N(device="cpu",wait_for_everyone=lambda:calls.append("barrier"))
+        def train(self,**kw): calls.append("train");return N(training_loss=1.)
+        def save_model(self,path):calls.append("save")
+        def is_world_process_zero(self):return True
+    components=N(model=object(),train_dataset=[N(sample_id="a")],data_collator=lambda x:x,
+        processor=N(save_pretrained=lambda p:calls.append("processor")),peft_metadata=None,
+        step_preference_config=config,trainer_class=Trainer,trainer_resume_path=None)
+    monkeypatch.setattr(main,"bind_deepspeed_runtime_profile",lambda *a,**k:N(world_size=2,zero_stage=2))
+    monkeypatch.setattr(main,"build_stage2_training_components",lambda a:components)
+    monkeypatch.setattr(main,"build_stage2_training_arguments",lambda a:object())
+    monkeypatch.setattr(main,"publish_step_preference_phase_a_summary",lambda *a,**k:None)
+    monkeypatch.setattr(main,"publish_stage2_training_evidence",lambda *a,**k:None)
+    monkeypatch.setattr(evidence,"validate_capacity_options",lambda *a,**k:True)
+    monkeypatch.setattr(evidence,"begin_capacity_memory",lambda *a:calls.append("baseline") or (1,2))
+    monkeypatch.setattr(evidence,"finish_capacity_memory",lambda *a:calls.append("peaks") or 3)
+    monkeypatch.setattr(evidence,"publish_training_runtime",lambda *a:calls.append("runtime") or (tmp_path/"runtime","a"*64))
+    monkeypatch.setattr(evidence,"publish_distributed_capacity",lambda *a:calls.append("evidence"))
+    main.run_stage2(args)
+    assert calls == ["baseline","train","peaks","save","barrier","processor","barrier","runtime","evidence"]
+
+
+def test_zero2_capacity_observation_does_not_accept_a_skipped_optimizer_step(monkeypatch):
+    from types import SimpleNamespace as N
+    import stage2.trainer as module
+    class Owner: pass
+    trainer=Owner();trainer.deepspeed_runtime_profile=N(zero_stage=2)
+    engine=N(optimizer=object(),skipped_steps=0,is_gradient_accumulation_boundary=lambda:True)
+    monkeypatch.setattr(module,"collect_deepspeed_pre_step_norm",lambda *a,**kw:torch.tensor(1.))
+    wrapped=module._Stage2DeepSpeedGradientAdapter(trainer,engine,lambda:setattr(engine,"skipped_steps",1))
+    with pytest.raises(RuntimeError,match="skipped"):wrapped()
+
+
+def test_capacity_final_adapter_save_defers_processor_but_numbered_save_does_not(monkeypatch,tmp_path):
+    import stage2.trainer as module
+    from types import SimpleNamespace as N
+    from step_preference.capacity_evidence import CapacitySampleRecorder
+    events=[]
+    class Model:
+        def save_pretrained(self,target,**kw):events.append(("weights",target.name))
+    model=Model();trainer=object.__new__(module.Stage2Trainer)
+    trainer.model=model;trainer.accelerator=N(unwrap_model=lambda m:m)
+    trainer.args=N(output_dir=str(tmp_path),save_safetensors=True)
+    trainer.data_collator=CapacitySampleRecorder(lambda rows:rows,"a")
+    trainer.processing_class=N(save_pretrained=lambda target:events.append(("processor",target.name)))
+    monkeypatch.setattr(module,"PeftModel",Model)
+    monkeypatch.setattr(module,"resolve_qwen2_5_vl_model",lambda m:N(config=N(save_pretrained=lambda target:None)))
+    monkeypatch.setattr(torch,"save",lambda *a:None)
+    trainer._save(tmp_path/"checkpoint-2");trainer._save(tmp_path)
+    assert events == [("weights","checkpoint-2"),("processor","checkpoint-2"),("weights",tmp_path.name)]
 import torch.nn.functional as F
 from transformers import Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds

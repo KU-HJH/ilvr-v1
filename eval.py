@@ -124,6 +124,7 @@ def get_eval_args():
                         help="Task name (used for bookkeeping and branching logic).")
     parser.add_argument("--output_json_path", type=str, default="evaluation_results.jsonl",
                         help="Path to save per-sample evaluation results.")
+    parser.add_argument("--runtime_identity_path", type=str, required=True)
     parser.add_argument("--cache_dir", type=str, default="./cache",
                         help="Hugging Face cache directory.")
     parser.add_argument("--max_new_tokens", type=int, default=4096)
@@ -473,6 +474,17 @@ def run_one_example(
     }
 
 
+def publish_evaluation_runtime_identity(model, model_dir, output_path):
+    from step_preference.capacity_evidence import EvaluationRuntimeIdentity, publish_json, git_identity
+    from stage2.attention_backend import validate_qwen2_5_vl_attention_backends
+    qwen = resolve_qwen2_5_vl_model(model)
+    validate_qwen2_5_vl_attention_backends(qwen, attention_implementation="sdpa", vision_attention_implementation="flash_attention_2")
+    value = EvaluationRuntimeIdentity(1, "stage2-evaluation-runtime-identity", git_identity(), True,
+        str(Path(model_dir).resolve(strict=True)), "Qwen2_5_VLSdpaAttention", len(qwen.model.layers),
+        "Qwen2_5_VLVisionFlashAttention2", len(qwen.visual.blocks))
+    return publish_json(output_path, value, EvaluationRuntimeIdentity)
+
+
 def main():
     args = get_eval_args()
     logging.basicConfig(
@@ -494,6 +506,12 @@ def main():
     if not dataset_path.is_file():
         raise ValueError("evaluation test data must be a file")
     dataset_root = dataset_path.parent
+    runtime_identity_path = getattr(args, "runtime_identity_path", None)
+    if runtime_identity_path is not None:
+        from step_preference.capacity_evidence import git_identity, require
+        git_identity()
+        require(not Path(runtime_identity_path).exists() and not Path(runtime_identity_path).is_symlink(),
+                "evaluation runtime identity output already exists")
 
     logging.info(f"Loading model from: {args.model_dir}")
     model, processor = load_evaluation_artifacts(
@@ -501,6 +519,8 @@ def main():
         base_model_dir=args.base_model_dir,
         cache_dir=args.cache_dir,
     )
+    if runtime_identity_path is not None:
+        publish_evaluation_runtime_identity(model, args.model_dir, runtime_identity_path)
 
     # Load test data
     data = []
@@ -624,8 +644,7 @@ def main():
 
         except Exception as e:
             logging.error(f"[{i}] Evaluation failed: {e}")
-            if sharded:
-                worker_failed = True
+            worker_failed = True
             error_result = {
                 "index": i,
                 "task_name": args.task_name,
@@ -676,7 +695,7 @@ def main():
 
     with open(args.output_json_path, "w", encoding="utf-8") as fout:
         for r in results:
-            fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+            fout.write(json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n")
         if not sharded:
             # Write a summary line as the last entry
             summary = {
@@ -697,7 +716,7 @@ def main():
                     "coverage_accuracy": score_summary.coverage_accuracy,
                     "valid_gold_accuracy": score_summary.valid_gold_accuracy,
                 })
-            fout.write(json.dumps(summary, ensure_ascii=False) + "\n")
+            fout.write(json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n")
 
     if sharded:
         write_shard_manifest(
@@ -726,7 +745,7 @@ def main():
         f"Evaluation finished: {success}/{report_total} correct; accuracy={acc:.4f}"
     )
     print(f"Accuracy = {acc:.4f} ({success}/{report_total})")
-    if sharded:
+    if sharded or worker_failed:
         return 1 if worker_failed else 0
 
 

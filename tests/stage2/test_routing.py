@@ -1256,6 +1256,8 @@ def test_stage2b_preflight_binds_space_lf_rendering_to_prepare_and_negative_load
         "max_new_tokens": 32,
         "min_tokens": 2,
         "torch_dtype": "bfloat16",
+        "seed": 42,
+        "decoding": "greedy-argmax-v1",
     }
 
 

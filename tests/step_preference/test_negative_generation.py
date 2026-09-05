@@ -1011,6 +1011,8 @@ def test_cli_publishes_and_validates_once_before_zero_pair_exit(monkeypatch, tmp
         "max_new_tokens": 32,
         "min_tokens": 2,
         "torch_dtype": "float32",
+        "seed": 42,
+        "decoding": "greedy-argmax-v1",
     }
     assert sorted(path.name for path in output_dir.iterdir()) == [
         "manifest.json",
@@ -1020,6 +1022,32 @@ def test_cli_publishes_and_validates_once_before_zero_pair_exit(monkeypatch, tmp
         "assistant_plan_rendering"
     ] == "adjacent-text-space-lf-v1"
     assert json.loads(negative_path.read_text(encoding="utf-8"))["sample_id"] == "sample-a"
+
+
+def test_generation_parser_owns_seed_and_has_no_sampling_path():
+    from scripts.generate_step_negatives import build_parser
+    parser = build_parser()
+    flags = {flag for action in parser._actions for flag in action.option_strings}
+    assert "--seed" in flags
+    assert not flags.intersection({"--do_sample", "--temperature", "--top_p"})
+    assert parser.get_default("seed") == 42
+
+
+from tests.step_preference.test_packed_admission_cli import inputs as admission_inputs
+
+
+@pytest.mark.parametrize("field,value", [("seed", 43), ("decoding", "sampling")])
+def test_admission_requires_seed42_greedy_identity(admission_inputs, field, value):
+    from step_preference.packed_admission import _negative_inputs
+    from tests.step_preference.test_packed_admission_cli import canonical
+    args=admission_inputs()
+    kwargs=dict(checkpoint_path=args.checkpoint_path, data_path=args.clean_data_path,
+        negative_path=args.negative_path, negative_manifest=args.negative_manifest)
+    _negative_inputs(**kwargs)
+    payload=json.loads(args.negative_manifest.read_bytes())
+    payload["generation_settings"][field]=value
+    args.negative_manifest.write_bytes(canonical(payload))
+    with pytest.raises(ValueError,match="generation settings"): _negative_inputs(**kwargs)
 
 
 def test_selected_examples_prepare_space_lf_rendering(monkeypatch, tmp_path):
