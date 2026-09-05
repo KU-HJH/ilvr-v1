@@ -1,6 +1,8 @@
 # Stage 2B shared-prefix sidecars
 
-Status: design commitment v2, proposed for human approval; implementation pending.
+Status: design commitment v2 approved by the user's “ㅇㅋ” after clarification
+that three logical groups do not mean exactly three decoder calls; implementation
+in progress following the user's “resume”.
 
 Understood as: revise the existing `ours1` Stage 2B computation to share clean
 decoder prefixes across all local entropy and rejected-scoring branches, while
@@ -362,4 +364,5 @@ integration. No performance, full-dataset OOM, stochastic-naive equivalence, or
 reference same-policy-latent claim is waived into existence by design approval.
 Approval accepts reversible implementation with these explicit test gates;
 failed gates prevent production rollout and require a targeted fix or revised
-design. The source TODO's required human approval is still pending.
+design. The source TODO's human approval gate was satisfied by the user's
+“ㅇㅋ” following the three-logical-groups clarification.
