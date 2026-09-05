@@ -79,6 +79,9 @@ class StepPreferenceConfig:
     attention_implementation: str = "sdpa"
     resume_from_checkpoint_path: str | None = None
     packing_enabled: bool = False
+    shared_prefix_enabled: bool = False
+    sidecar_attention_backend: str = "flex"
+    sidecar_query_budget: int = 1024
     max_packed_sequence_length: int | None = None
     packed_admission_manifest: str | None = None
     packed_admission_manifest_sha256: str | None = None
@@ -90,6 +93,19 @@ class StepPreferenceConfig:
             raise ValueError("enabled must be a boolean")
         if not isinstance(self.packing_enabled, bool):
             raise ValueError("packing_enabled must be a boolean")
+        if type(self.shared_prefix_enabled) is not bool:
+            raise ValueError("shared_prefix_enabled must be a boolean")
+        if self.sidecar_attention_backend not in ("dense", "flex"):
+            raise ValueError("sidecar_attention_backend must be dense or flex")
+        if type(self.sidecar_query_budget) is not int or self.sidecar_query_budget <= 0:
+            raise ValueError("sidecar_query_budget must be a positive integer")
+        if self.shared_prefix_enabled:
+            if not self.is_stage2b:
+                raise ValueError("shared prefix is only valid for Stage 2B")
+            if self.packing_enabled or any((self.packed_admission_manifest,
+                    self.packed_admission_manifest_sha256, self.packed_admission_verification,
+                    self.packed_admission_verification_sha256)):
+                raise ValueError("shared prefix cannot consume legacy packing or packed admission")
         if self.mode not in ("stage2a", "stage2b"):
             raise ValueError("step preference mode must be stage2a or stage2b")
         beta = _finite("step_dpo_beta", self.beta)
@@ -201,6 +217,9 @@ class StepPreferenceConfig:
                 args, "resume_from_checkpoint_path", None
             ),
             packing_enabled=getattr(args, "step_preference_packing", False),
+            shared_prefix_enabled=getattr(args, "step_shared_prefix_enabled", False),
+            sidecar_attention_backend=getattr(args, "step_sidecar_attention_backend", "flex"),
+            sidecar_query_budget=getattr(args, "step_sidecar_query_budget", 1024),
             max_packed_sequence_length=getattr(
                 args, "step_max_packed_sequence_length", None
             ),

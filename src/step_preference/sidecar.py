@@ -240,6 +240,36 @@ def chunk_sidecar_branches(
     return tuple(chunks)
 
 
+def build_sidecar_flex_block_mask(root_length, branches, device):
+    """Build rectangular suffix visibility; padded kernel probes have no edges."""
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    if type(root_length) is not int or root_length < 0:
+        raise ValueError("root_length must be a nonnegative integer")
+    rows = []
+    offset = 0
+    for branch in branches:
+        length = len(branch.token_ids)
+        rows.extend([(offset, branch.clean_ancestor_end, branch.blocked_start,
+                      branch.blocked_end)] * length)
+        offset += length
+    if not rows:
+        raise ValueError("Flex sidecars require at least one query row")
+    metadata = torch.tensor(rows, device=device, dtype=torch.long)
+    query_length = offset
+    kv_length = root_length + query_length
+
+    def mask_mod(batch, head, query, key):
+        # create_block_mask probes whole blocks beyond unpadded Q/KV lengths.
+        start, ancestor, blocked_start, blocked_end = metadata[query.clamp(max=query_length-1)].unbind(-1)
+        root_edge = (key < ancestor) & ~((key >= blocked_start) & (key < blocked_end))
+        suffix_edge = (key >= root_length + start) & (key <= root_length + query)
+        return (query < query_length) & (key < kv_length) & (root_edge | suffix_edge)
+
+    return create_block_mask(mask_mod, B=1, H=None, Q_LEN=query_length,
+                             KV_LEN=kv_length, device=device)
+
+
 def sidecar_dense_visibility(
     root_length: int,
     branches: Sequence[SidecarBranch],

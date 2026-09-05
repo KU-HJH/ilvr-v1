@@ -30,6 +30,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage2_diagnostics_interval", type=int, default=0)
     parser.add_argument("--step_preference_enabled", action="store_true")
     parser.add_argument("--step_preference_packing", action="store_true")
+    parser.add_argument("--step_shared_prefix_enabled", action="store_true")
+    parser.add_argument("--step_sidecar_attention_backend", choices=("dense", "flex"), default="flex")
+    parser.add_argument("--step_sidecar_query_budget", type=int, default=1024)
     parser.add_argument(
         "--step_preference_mode", choices=("stage2a", "stage2b"), default="stage2a"
     )

@@ -54,6 +54,30 @@ CANONICAL_DEFAULT_LOG = (
 )
 
 
+def test_shared_launcher_routes_without_legacy_admission_and_keeps_backend_independent():
+    """Catches requiring a packed certificate or overriding vision/clean attention."""
+    env = dict(STEP_PREFERENCE_ENABLED="true", STEP_PREFERENCE_MODE="stage2b",
+        STAGE2A_CHECKPOINT_PATH="/models/stage 1", STEP_NEGATIVE_PATH="/negative.jsonl",
+        STEP_NEGATIVE_MANIFEST="/manifest.json", STEP_SHARED_PREFIX_ENABLED="1",
+        STEP_SIDECAR_ATTENTION_BACKEND="dense", STEP_SIDECAR_QUERY_BUDGET="37",
+        VISION_ATTENTION_IMPLEMENTATION="flash_attention_2", TUNING_METHOD="dora")
+    tokens = dry_run_tokens(run_launcher(env_overrides=env))
+    assert "--step_shared_prefix_enabled" in tokens
+    assert "--step_preference_packing" not in tokens
+    assert option_value(tokens, "--step_sidecar_attention_backend") == "dense"
+    assert option_value(tokens, "--step_sidecar_query_budget") == "37"
+    assert option_value(tokens, "--attention_implementation") == "sdpa"
+    assert option_value(tokens, "--vision_attention_implementation") == "flash_attention_2"
+    assert option_value(tokens, "--max_seq_length_train") == "8192"
+    assert option_value(tokens, "--lora_dropout") == "0.05"
+    for bad in ({"STEP_SHARED_PREFIX_ENABLED": "perhaps"},
+                {"STEP_SIDECAR_QUERY_BUDGET": "0"}, {"STEP_SIDECAR_ATTENTION_BACKEND": "bad"},
+                {"STEP_PREFERENCE_PACKING": "true", **PACKED_ADMISSION_ENV},
+                {"STEP_PACKED_ADMISSION_MANIFEST": "/old.json"},
+                {"STEP_PREFERENCE_MODE": "stage2a"}):
+        assert run_launcher(env_overrides={**env, **bad}).returncode != 0
+
+
 def test_capacity_launcher_requires_complete_private_options_and_forwards_them():
     env={**PACKED_ADMISSION_ENV,"STEP_PREFERENCE_ENABLED":"true","STEP_PREFERENCE_MODE":"stage2b",
         "STEP_PREFERENCE_PACKING":"true","STAGE2A_CHECKPOINT_PATH":"/models/stage 1",

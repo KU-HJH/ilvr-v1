@@ -41,6 +41,7 @@ from step_preference.config import StepPreferenceConfig
 from step_preference.dpo_loss import aggregate_step_dpo
 from step_preference.negatives import StepNegative
 from step_preference.packing import build_packed_tree_plan
+from step_preference.sidecar import build_sidecar_plan
 from step_preference.spans import ReasoningStepSpan
 
 
@@ -567,6 +568,90 @@ class Stage2Trainer(Trainer):
         self._accumulate_step_preference_metrics(metrics)
         return total_loss
 
+    def _compute_stage2b_shared_prefix_loss(
+        self, model, *, clean_inputs, reasoning_spans, steps, validated_steps,
+        collect_diagnostics, return_outputs,
+    ):
+        config = self.step_preference_config
+        input_ids = clean_inputs["input_ids"]
+        plan = build_sidecar_plan(clean_input_ids=input_ids,
+            attention_mask=clean_inputs["attention_mask"], spans=reasoning_spans, steps=steps)
+        consumed = 0
+        missing = 0
+        for _, negative, _ in validated_steps:
+            scores = [negative.reference_chosen_score]
+            for modality in ("visual", "textual"):
+                if getattr(negative, f"valid_{modality}_negative"):
+                    scores.append(getattr(negative, f"reference_{modality}_rejected_score"))
+            for value in scores:
+                if value is None or not math.isfinite(value):
+                    missing += 1
+                else:
+                    consumed += 1
+        self._latest_stage2_reference_cache_stats = dict(consumed=consumed, missing=missing)
+        if missing:
+            raise ValueError(f"Stage 2B shared prefix is missing {missing} valid cached reference scores")
+        call = dict(clean_inputs, use_cache=False, stage2_loss_only=not return_outputs,
+            collect_stage2_diagnostics=collect_diagnostics,
+            stage2_shared_prefix_inputs=dict(plan=plan, backend=config.sidecar_attention_backend,
+                                            query_budget=config.sidecar_query_budget))
+        if plan.root_selected_positions:
+            call["stage2_logit_positions"] = torch.tensor(plan.root_selected_positions,
+                dtype=torch.long, device=input_ids.device)
+        outputs = model(**call)
+        clean_ce = outputs.loss
+        if not isinstance(clean_ce, torch.Tensor) or clean_ce.numel() != 1 or not bool(torch.isfinite(clean_ce)):
+            raise ValueError("Stage 2B clean CE must be a finite scalar")
+        diagnostics = getattr(outputs, "stage2_diagnostics", None)
+        self._latest_stage2_diagnostics = None if diagnostics is None else {
+            name: value.detach() for name, value in diagnostics.items()}
+        selected = _selected_logits(outputs, len(plan.root_selected_positions)) if validated_steps else None
+        results = {result["name"]: result for result in outputs.stage2_sidecar_results}
+        expected_names = {branch.name for group in plan.groups for branch in group}
+        if results.keys() != expected_names or len(results) != len(outputs.stage2_sidecar_results):
+            raise ValueError("shared-prefix sidecar score layout is inconsistent")
+        values = {name: [] for name in (
+            "chosen_scores", "visual_rejected_scores", "textual_rejected_scores",
+            "reference_chosen", "reference_visual_rejected", "reference_textual_rejected",
+            "valid_visual", "valid_textual", "visual_entropy_losses", "textual_entropy_losses",
+            "clean_entropy_values", "visual_entropy_values", "textual_entropy_values")}
+        offset = 0
+        zero = clean_ce * 0.0
+        for span, negative, _ in validated_steps:
+            count = span.target_text_end - span.target_text_start
+            logits = selected[:, offset:offset+count]
+            offset += count
+            values["chosen_scores"].append(_mean_selected_logp(logits,
+                input_ids[:, span.target_text_start:span.target_text_end]))
+            clean_entropy = _selected_entropies(logits)
+            values["clean_entropy_values"].extend((clean_entropy, clean_entropy))
+            values["reference_chosen"].append(clean_ce.new_tensor(negative.reference_chosen_score))
+            for modality in ("visual", "textual"):
+                entropy = results[f"step-{span.step_id}-{modality}-off"]["entropies"]
+                if entropy.shape != clean_entropy.shape or not bool(torch.isfinite(entropy).all()):
+                    raise ValueError("shared-prefix entropy must match clean target rows and be finite")
+                values[f"{modality}_entropy_values"].append(entropy)
+                values[f"{modality}_entropy_losses"].append(F.relu(clean_entropy + config.entropy_margin - entropy))
+                valid = getattr(negative, f"valid_{modality}_negative")
+                values[f"valid_{modality}"].append(valid)
+                score = results[f"step-{span.step_id}-{modality}-rejected"]["mean_logp"] if valid else zero
+                if score.numel() != 1 or not bool(torch.isfinite(score)):
+                    raise ValueError("shared-prefix rejected score must be a finite scalar")
+                values[f"{modality}_rejected_scores"].append(score)
+                reference = getattr(negative, f"reference_{modality}_rejected_score") if valid else 0.0
+                values[f"reference_{modality}_rejected"].append(clean_ce.new_tensor(reference))
+        stats = outputs.stage2_sidecar_stats
+        total = self._reduce_stage2b_objective(clean_ce=clean_ce, **values,
+            branch_forwards=1,
+            scored_tokens=len(plan.root_selected_positions) + stats["entropy_scored_rows"] + stats["rejected_scored_rows"],
+            extra_metrics={**{f"stats/sidecar_{key}": value for key, value in stats.items()},
+                "stats/reference_cache_entries_consumed": consumed,
+                "stats/reference_cache_entries_missing": missing})
+        if return_outputs:
+            outputs.loss = total
+            return total, outputs
+        return total
+
     def _compute_stage2b_packed_loss(
         self,
         model,
@@ -801,6 +886,12 @@ class Stage2Trainer(Trainer):
                     )
             validated_steps.append((span, negative, item))
 
+        if config.shared_prefix_enabled:
+            return self._compute_stage2b_shared_prefix_loss(
+                model, clean_inputs=clean_inputs, reasoning_spans=reasoning_spans,
+                steps=steps, validated_steps=validated_steps,
+                collect_diagnostics=collect_diagnostics, return_outputs=return_outputs,
+            )
         if config.packing_enabled:
             return self._compute_stage2b_packed_loss(
                 model,

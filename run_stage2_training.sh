@@ -79,6 +79,37 @@ case "${STEP_PREFERENCE_PACKING-}" in
     ;;
 esac
 STEP_PREFERENCE_ARGS=()
+case "${STEP_SHARED_PREFIX_ENABLED-}" in
+  ""|0|false|False) step_shared_prefix_enabled=false ;;
+  1|true|True) step_shared_prefix_enabled=true ;;
+  *)
+    printf 'STEP_SHARED_PREFIX_ENABLED must be 0, 1, false, or true\n' >&2
+    exit 2
+    ;;
+esac
+STEP_SIDECAR_ATTENTION_BACKEND=${STEP_SIDECAR_ATTENTION_BACKEND:-flex}
+STEP_SIDECAR_QUERY_BUDGET=${STEP_SIDECAR_QUERY_BUDGET:-1024}
+if [[ "$STEP_SIDECAR_ATTENTION_BACKEND" != dense && "$STEP_SIDECAR_ATTENTION_BACKEND" != flex ]]; then
+  printf 'STEP_SIDECAR_ATTENTION_BACKEND must be dense or flex\n' >&2
+  exit 2
+fi
+if [[ ! "$STEP_SIDECAR_QUERY_BUDGET" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'STEP_SIDECAR_QUERY_BUDGET must be a positive integer\n' >&2
+  exit 2
+fi
+if [[ "$step_shared_prefix_enabled" == true ]]; then
+  if [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b ]]; then
+    printf 'Shared prefix requires Stage 2B\n' >&2
+    exit 2
+  fi
+  if [[ "$step_preference_packing" == true || -n "${STEP_PACKED_ADMISSION_MANIFEST:-}${STEP_PACKED_ADMISSION_MANIFEST_SHA256:-}${STEP_PACKED_ADMISSION_VERIFICATION:-}${STEP_PACKED_ADMISSION_VERIFICATION_SHA256:-}" ]]; then
+    printf 'Shared prefix cannot consume legacy packing or packed admission\n' >&2
+    exit 2
+  fi
+  STEP_PREFERENCE_ARGS+=(--step_shared_prefix_enabled
+    --step_sidecar_attention_backend "$STEP_SIDECAR_ATTENTION_BACKEND"
+    --step_sidecar_query_budget "$STEP_SIDECAR_QUERY_BUDGET")
+fi
 if [[ "$step_preference_packing" == true ]]; then
   if [[ ! "$STEP_MAX_PACKED_SEQUENCE_LENGTH" =~ ^[1-9][0-9]*$ ]]; then
     printf 'STEP_MAX_PACKED_SEQUENCE_LENGTH must be a positive integer\n' >&2
@@ -263,6 +294,9 @@ MANAGED_OPTIONS=(
   --stage2_diagnostics_interval
   --step_preference_enabled
   --step_preference_packing
+  --step_shared_prefix_enabled
+  --step_sidecar_attention_backend
+  --step_sidecar_query_budget
   --step_preference_mode
   --step_negative_path
   --step_negative_manifest

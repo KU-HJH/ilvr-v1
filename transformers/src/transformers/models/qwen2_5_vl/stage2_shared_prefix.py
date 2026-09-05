@@ -17,8 +17,10 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
         raise ValueError("unknown shared-prefix input options")
     if not isinstance(options.get("plan"), SidecarPlan):
         raise ValueError("shared-prefix inputs require a SidecarPlan")
-    if options.get("backend", "dense") != "dense":
-        raise ValueError("shared-prefix backend must be dense")
+    if options.get("backend", "dense") not in ("dense", "flex"):
+        raise ValueError("shared-prefix backend must be dense or flex")
+    if options.get("backend") == "flex" and model.training and model.config.attention_dropout:
+        raise ValueError("Flex sidecars require zero attention dropout; adapter dropout remains independent")
     if type(options.get("checkpoint", True)) is not bool:
         raise ValueError("shared-prefix checkpoint must be a bool")
     chunk_sidecar_branches((), options.get("query_budget", 1024))
@@ -101,7 +103,9 @@ def _score_chunk(model, branches, embeds, positions, mask, flat_prefix):
 
 
 def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, prefix_kv):
-    from step_preference.sidecar import chunk_sidecar_branches, sidecar_dense_visibility
+    from step_preference.sidecar import (
+        chunk_sidecar_branches, sidecar_dense_visibility, build_sidecar_flex_block_mask,
+    )
 
     plan = options["plan"]
     budget = options.get("query_budget", 1024)
@@ -116,9 +120,12 @@ def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, pre
             parts = [_branch_inputs(model, branch, input_ids, clean_embeds, clean_positions) for branch in branches]
             embeds = torch.cat([part[0] for part in parts], dim=1)
             positions = torch.cat([part[1] for part in parts], dim=2)
-            visible = sidecar_dense_visibility(plan.root_length, branches, device=embeds.device)
-            mask = torch.zeros(visible.shape, dtype=embeds.dtype, device=embeds.device)
-            mask = mask.masked_fill(~visible, torch.finfo(embeds.dtype).min)[None, None]
+            if options.get("backend", "dense") == "flex":
+                mask = build_sidecar_flex_block_mask(plan.root_length, branches, embeds.device)
+            else:
+                visible = sidecar_dense_visibility(plan.root_length, branches, device=embeds.device)
+                mask = torch.zeros(visible.shape, dtype=embeds.dtype, device=embeds.device)
+                mask = mask.masked_fill(~visible, torch.finfo(embeds.dtype).min)[None, None]
             score, args = _score_chunk(model, branches, embeds, positions, mask, flat_prefix)
             values = checkpoint(score, *args, use_reentrant=False, preserve_rng_state=True) if options.get("checkpoint", True) else score(*args)
             for index, branch in enumerate(branches):
