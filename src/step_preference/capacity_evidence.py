@@ -646,10 +646,11 @@ def adapter_files(directory):
 
 
 def training_length_manifest(path, expected, identity):
-    from stage2.length_manifest import read_stage2_length_manifest
-    raw=read_bytes(path,expected)
-    manifest=read_stage2_length_manifest(path)
-    require(raw == read_bytes(path),"training length manifest changed while validating")
+    from stage2.length_manifest import read_stage2_length_manifest, _manifest_from_payload
+    raw=read_bytes(path)
+    manifest=_manifest_from_payload(admission._parse_json(raw,"training length manifest"))
+    require(raw == canonical(manifest),"training length manifest must use canonical JSON")
+    admission._authenticate(raw,expected,"training length manifest")
     require(manifest.data_sha256 == identity.retained_data_sha256 and manifest.latent_size == 8
             and manifest.max_sequence_length == 8192 and manifest.supervise_latent_boundaries
             and manifest.assistant_plan_rendering == "adjacent-text-space-lf-v1"

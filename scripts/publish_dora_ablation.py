@@ -303,7 +303,19 @@ def validate_launch_tokens(command,paths,triplet,summary,identity):
     for flag in ("--step_preference_enabled","--step_preference_packing","--gradient_checkpointing","--supervise_latent_boundaries"):
         require(command.count(flag) == 1,f"launcher lacks {flag}")
     require(not any(token.startswith("--step_packed_capacity") or token.startswith("--step_packed_gpu")
-                    or token in ("--resume_from_checkpoint_path","--max_steps") for token in command),"normal arm has capacity/resume/step overrides")
+                    or token.split("=",1)[0] in ("--resume_from_checkpoint_path","--max_steps","--stage2_total_steps")
+                    for token in command),"normal arm has capacity/resume/step overrides")
+    # Use the runtime parser as well: argparse accepts equals syntax and abbreviated
+    # option names, and a phase budget takes precedence over epochs in main.
+    from utils_deepseed import parse_args
+    entrypoint=str(root/"src/main.py")
+    require(command.count(entrypoint) == 1,"launcher training entrypoint differs")
+    try:
+        parsed=parse_args(command[command.index(entrypoint)+1:])
+    except SystemExit as error:
+        raise ValueError("invalid normal-arm training arguments") from error
+    require(parsed.step_preference_config.phase_steps is None and parsed.max_steps == -1
+            and parsed.epochs == 2,"normal arm must use two epochs without phase/step overrides")
 
 
 def freeze_launches(args,root):
@@ -381,7 +393,8 @@ def build_comparison(args,root):
         arm_args=SimpleNamespace(**{**vars(args),"arm":arm,"phase":"evaluation"})
         runs.append(validate_arm(arm_args,root,summary,manifest,configs))
         paths=arm_paths(root,configs[arm].run_id,arm)
-        runtime=read_json(paths["checkpoints"]/"stage2_training_runtime_identity.json",TrainingRuntimeIdentity)
+        runtime=read_json(paths["checkpoints"]/"stage2_training_runtime_identity.json",TrainingRuntimeIdentity,
+            runs[-1]["training_runtime_identity_sha256"])
         length_hashes.add(runtime.training_length_manifest_sha256)
     require(len(length_hashes) == 1,"cross-arm training length-manifest hashes differ")
     ranked=rank_runs(runs)
