@@ -2,7 +2,7 @@
 
 ## Status
 
-Design commitment v13, pending explicit user approval on 2026-09-05.
+Design commitment v13, explicitly approved by the user on 2026-09-05.
 
 This commitment amends the capacity gates and training population in
 `2026-09-04-step-preference-dora-ablation-readiness-design.md`. Everything not
