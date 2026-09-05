@@ -10,6 +10,33 @@ import pytest
 from tests.step_preference.test_packed_admission_cli import inputs,build,verify,AdmissionProcessor
 
 
+def test_ignore_preflight_checks_checkpoint_symlink_leaf_and_real_result_descendants(tmp_path,monkeypatch):
+    import subprocess
+    root=tmp_path/"repository";root.mkdir()
+    storage=tmp_path/"checkpoint-storage";storage.mkdir()
+    (root/"checkpoints").symlink_to(storage,target_is_directory=True)
+    for name in ("results","logs"):(root/name).mkdir()
+    subprocess.run(["git","init","-q",str(root)],check=True)
+    excludes=root/"empty-excludes";excludes.write_text("")
+    subprocess.run(["git","config","core.excludesFile",str(excludes)],cwd=root,check=True)
+    rules={"results":"/results/*\n","logs":"/logs/*\n","checkpoints":"/checkpoints\n"}
+    ignore=root/".gitignore";ignore.write_text("".join(rules.values()))
+    calls=[];run=subprocess.run
+    def observe(argv,**kwargs):
+        calls.append((argv,kwargs["cwd"]))
+        return run(argv,**kwargs)
+    monkeypatch.setattr(subprocess,"run",observe)
+    api().require_ignored_roots(root)
+    assert calls == [(["git","check-ignore","-q","--no-index",path],root) for path in
+        ("results/.codex-ignore-probe","logs/.codex-ignore-probe","checkpoints")]
+    for missing in rules:
+        ignore.write_text("".join(rule for name,rule in rules.items() if name != missing))
+        with pytest.raises(ValueError,match=missing):api().require_ignored_roots(root)
+    assert (root/"checkpoints").is_symlink()
+    assert not list(storage.iterdir())
+    assert all(not list((root/name).iterdir()) for name in ("results","logs"))
+
+
 @pytest.fixture
 def runtime_inputs(inputs,tmp_path):
     from pathlib import Path

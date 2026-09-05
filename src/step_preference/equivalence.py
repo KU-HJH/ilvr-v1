@@ -176,6 +176,7 @@ def _config(*, packing: bool) -> StepPreferenceConfig:
         stage2a_checkpoint_path="tiny-stage2a",
         attention_implementation="eager",
         packing_enabled=packing,
+        max_packed_sequence_length=4608 if packing else None,
     )
 
 

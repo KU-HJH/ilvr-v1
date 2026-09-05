@@ -20,6 +20,15 @@ from step_preference.equivalence import (
 from scripts.verify_packed_step_preference import _diagnostic_section, _section
 
 
+@pytest.mark.parametrize("packing,cap",[(False,None),(True,4608)])
+def test_tiny_equivalence_constructs_valid_config_with_exact_packed_cap(packing,cap):
+    """Catches equivalence rejecting its packed config before comparing either graph."""
+    from step_preference.equivalence import _config
+    config=_config(packing=packing)
+    assert config.packing_enabled is packing
+    assert config.max_packed_sequence_length == cap
+
+
 def test_relative_l2_error_uses_float64_reference_norm():
     """Catches elementwise or low-precision error replacing the required L2 ratio."""
     reference = torch.tensor([3.0, 4.0], dtype=torch.float16)

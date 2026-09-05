@@ -817,7 +817,7 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         save_total_limit=1,
         optim="adamw_torch",
         bf16=True,
-        seed=args.seed,
+        seed=getattr(args, "seed", 42),
         report_to=[],
         remove_unused_columns=False,
         dataset_text_field="",
@@ -1009,7 +1009,12 @@ def run_stage2(args):
         validate_capacity_options, CapacitySampleRecorder, begin_capacity_memory, finish_capacity_memory,
         publish_training_runtime, publish_distributed_capacity,
     )
-    capacity = validate_capacity_options(args, world_size=profile.world_size, zero_stage=profile.zero_stage)
+    capacity = False
+    if any(getattr(args, name, None) is not None for name in (
+        "step_packed_capacity_evidence_path", "step_packed_capacity_sample_id",
+        "step_packed_gpu_snapshot", "step_packed_gpu_snapshot_sha256",
+    )):
+        capacity = validate_capacity_options(args, world_size=profile.world_size, zero_stage=profile.zero_stage)
     components = build_stage2_training_components(args)
     recorder = (CapacitySampleRecorder(components.data_collator, args.step_packed_capacity_sample_id)
                 if capacity else None)

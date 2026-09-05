@@ -115,8 +115,9 @@ def git_identity():
 
 def require_ignored_roots(root):
     for name in ("results", "logs", "checkpoints"):
+        probe = name if name == "checkpoints" else str(Path(name) / ".codex-ignore-probe")
         result = subprocess.run(["git", "check-ignore", "-q", "--no-index",
-            str(Path(name) / ".codex-ignore-probe")], cwd=root)
+            probe], cwd=root)
         require(result.returncode == 0, f"{name} must ignore generated artifacts")
 
 

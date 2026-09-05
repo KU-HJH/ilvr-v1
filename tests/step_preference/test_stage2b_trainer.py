@@ -6,6 +6,28 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("provided,expected",[({},42),({"seed":42},42),({"seed":73},73)])
+def test_direct_stage2_arguments_default_seed_without_replacing_explicit_seed(monkeypatch,provided,expected):
+    import main
+    args=SimpleNamespace(save_model_path="out",epochs=1,per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,warm_up_steps=0,learning_rate=1e-4,save_steps=1,
+        max_seq_length_train=32,max_steps=2,gradient_checkpointing=False,tuning_method="full",
+        deepspeed_config=None,**provided)
+    monkeypatch.setattr(main,"SFTConfig",lambda **kwargs:SimpleNamespace(**kwargs))
+    arguments=main.build_stage2_training_arguments(args)
+    assert arguments.seed == expected
+
+
+@pytest.mark.parametrize("field",["step_packed_capacity_evidence_path","step_packed_capacity_sample_id",
+    "step_packed_gpu_snapshot","step_packed_gpu_snapshot_sha256"])
+def test_main_rejects_any_partial_capacity_request_before_model_construction(monkeypatch,field):
+    import main
+    monkeypatch.setattr(main,"bind_deepspeed_runtime_profile",lambda *a,**k:SimpleNamespace(world_size=2,zero_stage=2))
+    monkeypatch.setattr(main,"build_stage2_training_components",lambda args:pytest.fail("constructed a model for partial capacity settings"))
+    with pytest.raises(ValueError,match="capacity-only options must be supplied together"):
+        main.run_stage2(SimpleNamespace(**{field:"provided"}))
+
+
 @pytest.mark.parametrize("initial_step",[0,9])
 def test_zero2_adapter_observes_only_true_boundaries_before_gradient_clear(monkeypatch,initial_step):
     from types import SimpleNamespace
