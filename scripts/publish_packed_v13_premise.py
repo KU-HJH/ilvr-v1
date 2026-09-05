@@ -7,12 +7,14 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import stat
 import subprocess
 import sys
 from fractions import Fraction
 from pathlib import Path
 
-from step_preference.negatives import CheckpointFile, read_negative_manifest
+from step_preference.negatives import CheckpointFile, _manifest_from_bytes
 
 
 HISTORICAL_GIT_COMMIT = "0e69b54c02f5472c60c6ed64e5eebc2b46374a6c"
@@ -83,22 +85,8 @@ def _reject_duplicate_keys(pairs):
 
 def read_json_object(path: str | Path, label: str) -> dict:
     """Read a regular strict JSON object without duplicate/non-finite values."""
-    path = Path(path)
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"{label} must be a regular file: {path}")
-    try:
-        value = json.loads(
-            path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError(f"non-finite JSON constant: {value}")
-            ),
-        )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid {label} JSON: {error}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must be a JSON object")
-    _reject_nonfinite(value, label)
-    return value
+    _path, raw = _read_regular_bytes(path, label)
+    return _decode_json_bytes(raw, label)
 
 
 def _decode_json_bytes(raw: bytes, label: str) -> dict:
@@ -166,19 +154,62 @@ def _resolved(path: str | Path, label: str, *, directory: bool = False) -> Path:
     return path.resolve(strict=True)
 
 
-def _file_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _stable_regular_read(path: str | Path, label: str, consume):
+    """Read one stable regular file descriptor without following its final link."""
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{label} must be a regular non-symlink file: {path}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} must be a regular file: {path}")
+        descriptor_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        result = consume(descriptor)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        named = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"{label} changed during authenticated read") from error
+    if (
+        before.st_dev != after.st_dev or before.st_ino != after.st_ino
+        or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_dev != named.st_dev or before.st_ino != named.st_ino
+        or not stat.S_ISREG(named.st_mode)
+    ):
+        raise ValueError(f"{label} changed during authenticated read")
+    return descriptor_path, result
 
 
-def _bound_file(path: str | Path, expected: str, label: str) -> Path:
+def _read_regular_bytes(path: str | Path, label: str) -> tuple[Path, bytes]:
+    return _stable_regular_read(
+        path, label, lambda descriptor: b"".join(
+            iter(lambda: os.read(descriptor, 1024 * 1024), b"")
+        )
+    )
+
+
+def _file_sha256(path: str | Path, label: str = "file") -> str:
+    def digest(descriptor):
+        value = hashlib.sha256()
+        for chunk in iter(lambda: os.read(descriptor, 1024 * 1024), b""):
+            value.update(chunk)
+        return value.hexdigest()
+
+    _path, result = _stable_regular_read(path, label, digest)
+    return result
+
+
+def _bound_file(path: str | Path, expected: str, label: str) -> tuple[Path, bytes]:
     resolved = _resolved(path, label)
-    if _file_sha256(resolved) != _sha256(expected, f"{label} SHA-256"):
+    stable_path, raw = _read_regular_bytes(resolved, label)
+    if hashlib.sha256(raw).hexdigest() != _sha256(expected, f"{label} SHA-256"):
         raise ValueError(f"{label} SHA-256 does not match bytes")
-    return resolved
+    return stable_path, raw
 
 
 def _checkpoint_files(value, checkpoint: Path, label: str) -> list[dict]:
@@ -199,7 +230,7 @@ def _checkpoint_files(value, checkpoint: Path, label: str) -> list[dict]:
         file_path = checkpoint / record.relative_path
         if file_path.is_symlink() or not file_path.is_file():
             raise ValueError(f"checkpoint inventory file is not regular: {file_path}")
-        if file_path.stat().st_size != record.size or _file_sha256(file_path) != record.sha256:
+        if file_path.stat().st_size != record.size or _file_sha256(file_path, "checkpoint inventory file") != record.sha256:
             raise ValueError(f"checkpoint inventory does not match current file: {file_path}")
         records.append(raw)
     return records
@@ -219,8 +250,8 @@ def _validate_record(record: object, label: str) -> dict:
 
 
 def _read_audit(path: Path, expected_sha: str, *, checkpoint: Path, manifest_path: Path, manifest_sha: str, expected_row: int, expected_clean: int, expected_padded: int) -> dict:
-    path = _bound_file(path, expected_sha, "packed audit")
-    payload = read_json_object(path, "packed audit")
+    path, raw = _bound_file(path, expected_sha, "packed audit")
+    payload = _decode_json_bytes(raw, "packed audit")
     _exact(payload, _AUDIT_FIELDS, "packed audit")
     if payload["schema_version"] != 1:
         raise ValueError("unsupported packed audit schema")
@@ -245,8 +276,8 @@ def _read_audit(path: Path, expected_sha: str, *, checkpoint: Path, manifest_pat
 
 
 def _read_capacity(path: Path, expected_sha: str, *, checkpoint: Path, audit: dict, expected_row: int, expected_clean: int, expected_padded: int, expected_peak: int, required_status: str) -> dict:
-    path = _bound_file(path, expected_sha, "capacity report")
-    payload = read_json_object(path, "capacity report")
+    path, raw = _bound_file(path, expected_sha, "capacity report")
+    payload = _decode_json_bytes(raw, "capacity report")
     _exact(payload, _CAPACITY_FIELDS, "capacity report")
     if payload["schema_version"] != 1 or payload["status"] != required_status:
         raise ValueError("capacity report status is not the required frozen status")
@@ -282,9 +313,9 @@ def _read_capacity(path: Path, expected_sha: str, *, checkpoint: Path, audit: di
     return {"path": str(path), "sha256": expected_sha, "peak_reserved_fraction": memory["peak_reserved_bytes"] / memory["device_total_bytes"], "payload": payload}
 
 
-def _read_manifest(path: Path, expected_sha: str, *, checkpoint: Path, checkpoint_files: list[dict], label: str) -> tuple[Path, str]:
-    path = _bound_file(path, expected_sha, label)
-    manifest = read_negative_manifest(path)
+def _read_manifest(path: Path, expected_sha: str, *, checkpoint: Path, checkpoint_files: list[dict], label: str):
+    path, raw = _bound_file(path, expected_sha, label)
+    manifest = _manifest_from_bytes(raw)
     if manifest.schema_version != 3 or Path(manifest.stage2a_checkpoint_path).resolve(strict=False) != checkpoint:
         raise ValueError("negative manifest does not bind the frozen checkpoint")
     manifest_files = [
@@ -293,7 +324,7 @@ def _read_manifest(path: Path, expected_sha: str, *, checkpoint: Path, checkpoin
     ]
     if manifest_files != checkpoint_files:
         raise ValueError("negative manifest checkpoint inventory does not match completely")
-    return path, manifest.negative_sha256
+    return path, manifest
 
 
 def _v11_ref(payload: dict, name: str, fields: set, row_id: int) -> dict:
@@ -306,10 +337,11 @@ def _v11_ref(payload: dict, name: str, fields: set, row_id: int) -> dict:
 
 def _read_v11(path: str | Path, *, original: Path, original_sha: str, checkpoint: Path) -> tuple[Path, str, list[dict], dict]:
     path = _resolved(path, "rejected v11 summary")
-    raw_sha = _file_sha256(path)
+    path, raw = _read_regular_bytes(path, "rejected v11 summary")
+    raw_sha = hashlib.sha256(raw).hexdigest()
     if raw_sha != HISTORICAL_V11_SUMMARY_SHA256:
         raise ValueError("rejected v11 summary SHA-256 does not match frozen evidence")
-    payload = read_json_object(path, "rejected v11 summary")
+    payload = _decode_json_bytes(raw, "rejected v11 summary")
     _exact(payload, _V11_FIELDS, "rejected v11 summary")
     if payload["schema_version"] != 1 or payload["git_commit"] != HISTORICAL_GIT_COMMIT or payload["tracked_worktree_clean"] is not True or payload["overall_status"] != "fail":
         raise ValueError("v11 summary is not the frozen rejected premise")
@@ -335,11 +367,11 @@ def _read_v11(path: str | Path, *, original: Path, original_sha: str, checkpoint
     manifest_ref = _v11_ref(payload["checkpoint"], "identity_source_manifests", {"row_id", "path", "sha256", "schema_version"}, 1372)
     if manifest_ref["schema_version"] != 3:
         raise ValueError("v11 negative manifest must use schema 3")
-    manifest_path, _ = _read_manifest(manifest_ref["path"], manifest_ref["sha256"], checkpoint=checkpoint, checkpoint_files=checkpoint_files, label="v11 negative manifest")
+    manifest_path, manifest = _read_manifest(manifest_ref["path"], manifest_ref["sha256"], checkpoint=checkpoint, checkpoint_files=checkpoint_files, label="v11 negative manifest")
     audit_ref = _v11_ref(payload, "audits", {"row_id", "path", "sha256", "padded_length", "status"}, 1372)
     if audit_ref["status"] != "admitted" or audit_ref["padded_length"] != 6784:
         raise ValueError("v11 row-1372 audit is not admitted at 6784")
-    audit = _read_audit(audit_ref["path"], audit_ref["sha256"], checkpoint=checkpoint, manifest_path=manifest_path, manifest_sha=read_negative_manifest(manifest_path).negative_sha256, expected_row=1372, expected_clean=6065, expected_padded=6784)
+    audit = _read_audit(audit_ref["path"], audit_ref["sha256"], checkpoint=checkpoint, manifest_path=manifest_path, manifest_sha=manifest.negative_sha256, expected_row=1372, expected_clean=6065, expected_padded=6784)
     capacity_ref = _v11_ref(payload, "capacity_reports", {"row_id", "path", "sha256", "status", "device_total_bytes", "peak_reserved_bytes", "reserved_ratio"}, 1372)
     if capacity_ref["status"] != "oom" or capacity_ref["device_total_bytes"] != 99949674496 or capacity_ref["peak_reserved_bytes"] != 99199483904:
         raise ValueError("v11 row-1372 capacity reference is not the OOM premise")
@@ -357,18 +389,46 @@ def _read_v11(path: str | Path, *, original: Path, original_sha: str, checkpoint
     return path, raw_sha, checkpoint_files, payload["gpus"][0]
 
 
+def physical_gpu_zero_from_observations(physical_gpus: object, cuda_zero: object) -> dict:
+    """Bind logical CUDA device zero to host physical GPU zero by UUID."""
+    if not isinstance(physical_gpus, list):
+        raise ValueError("physical GPU observations must be a list")
+    matches = [item for item in physical_gpus if isinstance(item, dict) and item.get("index") == 0]
+    if len(matches) != 1:
+        raise ValueError("physical GPU observations do not contain exactly one GPU 0")
+    physical = matches[0]
+    _exact(physical, {"index", "name", "uuid"}, "physical GPU")
+    _integer(physical["index"], "physical GPU index")
+    _text(physical["name"], "physical GPU name")
+    physical_uuid = _text(physical["uuid"], "physical GPU uuid")
+    _exact(cuda_zero, {"uuid", "total_memory_bytes"}, "CUDA device 0")
+    cuda_uuid = _text(cuda_zero["uuid"], "CUDA device 0 uuid")
+    if not cuda_uuid.startswith("GPU-"):
+        cuda_uuid = f"GPU-{cuda_uuid}"
+    total_memory_bytes = _integer(cuda_zero["total_memory_bytes"], "CUDA device 0 total memory", minimum=1)
+    if cuda_uuid != physical_uuid:
+        raise ValueError("CUDA device 0 is not physical GPU 0")
+    return {
+        "index": 0,
+        "name": physical["name"],
+        "uuid": physical_uuid,
+        "total_memory_bytes": total_memory_bytes,
+    }
+
+
 def _live_gpu_inventory() -> list[dict]:
     try:
         import torch
         rows = subprocess.run(["nvidia-smi", "--query-gpu=index,name,uuid", "--format=csv,noheader"], check=True, text=True, capture_output=True).stdout.splitlines()
-        result = []
+        physical = []
         for row in rows:
             index, name, uuid = (part.strip() for part in row.split(",", 2))
-            physical_index = int(index)
-            if physical_index == 0:
-                total = int(torch.cuda.get_device_properties(0).total_memory)
-                result.append({"index": physical_index, "name": name, "uuid": uuid, "total_memory_bytes": total})
-        return result
+            physical.append({"index": int(index), "name": name, "uuid": uuid})
+        properties = torch.cuda.get_device_properties(0)
+        return [physical_gpu_zero_from_observations(
+            physical,
+            {"uuid": str(getattr(properties, "uuid", "")), "total_memory_bytes": int(properties.total_memory)},
+        )]
     except (OSError, ValueError, subprocess.CalledProcessError, RuntimeError) as error:
         raise ValueError(f"could not inspect live GPU inventory: {error}") from error
 
@@ -393,7 +453,8 @@ def _tail(root: str | Path, row: int, *, checkpoint: Path, checkpoint_files: lis
     capacity_path = root / f"row-{row}-capacity.json"
     manifest_path = _resolved(manifest_path, f"row-{row} negative manifest")
     manifest_sha = FROZEN_INPUT_SHA256[f"row{row}_manifest"]
-    manifest_path, negative_sha = _read_manifest(manifest_path, manifest_sha, checkpoint=checkpoint, checkpoint_files=checkpoint_files, label=f"row-{row} negative manifest")
+    manifest_path, manifest = _read_manifest(manifest_path, manifest_sha, checkpoint=checkpoint, checkpoint_files=checkpoint_files, label=f"row-{row} negative manifest")
+    negative_sha = manifest.negative_sha256
     expected = {1241: (4000, 4864, 85115011072), 1314: (3733, 4608, 78922121216)}[row]
     audit_path = _resolved(audit_path, f"row-{row} packed audit")
     audit_sha = FROZEN_INPUT_SHA256[f"row{row}_audit"]
@@ -439,18 +500,37 @@ def authenticate_v13_premise(*, original_data: str | Path, checkpoint: str | Pat
     }
 
 
+def _absolute_normalized_path(value, label: str) -> Path:
+    value = _text(value, label)
+    path = Path(value)
+    if not path.is_absolute() or str(path.resolve(strict=False)) != value:
+        raise ValueError(f"{label} must be an absolute normalized path")
+    return path
+
+
 def decode_pilot_summary(raw: bytes) -> dict:
     payload = _decode_json_bytes(raw, "pilot summary")
+    if raw != _canonical_json_bytes(payload):
+        raise ValueError("pilot summary must use canonical JSON bytes")
     _exact(payload, PILOT_SUMMARY_FIELDS, "pilot summary")
     if payload["schema_version"] != 1 or payload["kind"] != "stage2b-packed-pilot" or payload["status"] != "pass" or payload["git_commit"] != HISTORICAL_GIT_COMMIT or payload["tracked_worktree_clean"] is not True or payload["candidate_cap"] != 4608 or payload["errors"] != []:
         raise ValueError("pilot summary is not a passing v13 premise")
     _text(payload["run_id"], "pilot summary run_id")
-    _sha256(payload["original_data_sha256"], "pilot summary original data SHA-256")
+    original_path = _absolute_normalized_path(payload["original_data_path"], "pilot summary original data path")
+    original_sha = _sha256(payload["original_data_sha256"], "pilot summary original data SHA-256")
+    _bound_file(original_path, original_sha, "pilot summary original data")
+    checkpoint_path = _absolute_normalized_path(payload["checkpoint_path"], "pilot summary checkpoint path")
+    checkpoint = _resolved(checkpoint_path, "pilot summary checkpoint", directory=True)
+    _checkpoint_files(payload["checkpoint_files"], checkpoint, "pilot summary checkpoint_files")
     _exact(payload["rejected_v11_summary"], {"path", "sha256"}, "pilot rejected v11 summary")
-    _sha256(payload["rejected_v11_summary"]["sha256"], "pilot rejected v11 SHA-256")
+    rejected_path = _absolute_normalized_path(payload["rejected_v11_summary"]["path"], "pilot rejected v11 path")
+    rejected_sha = _sha256(payload["rejected_v11_summary"]["sha256"], "pilot rejected v11 SHA-256")
+    _bound_file(rejected_path, rejected_sha, "pilot rejected v11 summary")
     _exact(payload["gpu"], _GPU_OUTPUT_FIELDS, "pilot GPU")
-    if payload["gpu"]["physical_index"] != 0 or payload["gpu"]["total_memory_bytes"] != 99949674496:
+    if _integer(payload["gpu"]["physical_index"], "pilot GPU physical index") != 0 or _integer(payload["gpu"]["total_memory_bytes"], "pilot GPU total memory", minimum=1) != 99949674496:
         raise ValueError("pilot GPU identity is invalid")
+    _text(payload["gpu"]["name"], "pilot GPU name")
+    _text(payload["gpu"]["uuid"], "pilot GPU UUID")
     if payload["admitted_source_indices"] != [1314] or payload["ignored_source_indices"] != [1241]:
         raise ValueError("pilot summary partitions are not the v13 boundary")
     if not isinstance(payload["audits"], list) or not isinstance(payload["capacity_reports"], list) or len(payload["audits"]) != 2 or len(payload["capacity_reports"]) != 2:
@@ -459,7 +539,11 @@ def decode_pilot_summary(raw: bytes) -> dict:
         _exact(audit, {"source_index", "path", "sha256", "packed_padded_length", "admission"}, "pilot audit")
         if audit["source_index"] != expected_row or audit["packed_padded_length"] != expected_length or audit["admission"] != expected_admission:
             raise ValueError("pilot audit boundary is invalid")
-        _sha256(audit["sha256"], "pilot audit SHA-256")
+        _integer(audit["source_index"], "pilot audit source index")
+        _integer(audit["packed_padded_length"], "pilot audit packed padded length", minimum=1)
+        audit_path = _absolute_normalized_path(audit["path"], "pilot audit path")
+        audit_sha = _sha256(audit["sha256"], "pilot audit SHA-256")
+        _bound_file(audit_path, audit_sha, "pilot audit")
     for expected_row, report in zip((1241, 1314), payload["capacity_reports"]):
         _exact(report, {"source_index", "path", "sha256", "status", "peak_reserved_fraction"}, "pilot capacity report")
         if report["source_index"] != expected_row or report["status"] != "pass":
@@ -467,13 +551,17 @@ def decode_pilot_summary(raw: bytes) -> dict:
         fraction = _finite(report["peak_reserved_fraction"], "pilot peak reserved fraction")
         if (expected_row == 1241 and fraction <= 0.85) or (expected_row == 1314 and fraction > 0.85):
             raise ValueError("pilot capacity fraction does not establish the v13 boundary")
-        _sha256(report["sha256"], "pilot capacity SHA-256")
+        _integer(report["source_index"], "pilot capacity source index")
+        report_path = _absolute_normalized_path(report["path"], "pilot capacity path")
+        report_sha = _sha256(report["sha256"], "pilot capacity SHA-256")
+        _bound_file(report_path, report_sha, "pilot capacity report")
     return payload
 
 
 def read_pilot_summary(path: str | Path) -> dict:
     path = _resolved(path, "pilot summary")
-    return decode_pilot_summary(path.read_bytes())
+    _path, raw = _read_regular_bytes(path, "pilot summary")
+    return decode_pilot_summary(raw)
 
 
 def _canonical_json_bytes(payload: dict) -> bytes:

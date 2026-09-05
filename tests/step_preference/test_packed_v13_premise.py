@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -264,3 +265,49 @@ def test_mutated_historical_input_is_rejected(evidence, target):
     path.write_bytes(path.read_bytes() + b" ")
     with pytest.raises(ValueError, match="SHA-256"):
         _authenticate(evidence)
+
+
+def test_bound_reader_rejects_file_changed_after_open(monkeypatch, tmp_path):
+    """The SHA-256 must cover the same regular file descriptor that is decoded."""
+    path = tmp_path / "bound.json"
+    path.write_bytes(b'{"before":true}\n')
+    expected = _sha(path)
+    original_open = os.open
+    changed = False
+
+    def open_then_replace(candidate, flags, *args):
+        nonlocal changed
+        descriptor = original_open(candidate, flags, *args)
+        if Path(candidate) == path and not changed:
+            changed = True
+            replacement = original_open(path, os.O_WRONLY | os.O_TRUNC)
+            try:
+                os.write(replacement, b'{"after":true}\n')
+            finally:
+                os.close(replacement)
+        return descriptor
+
+    monkeypatch.setattr(premise.os, "open", open_then_replace)
+    with pytest.raises(ValueError, match="changed|SHA-256"):
+        premise._bound_file(path, expected, "test artifact")
+
+
+@pytest.mark.parametrize("mutation, message", [
+    (lambda summary: json.dumps(summary, indent=2).encode() + b"\n", "canonical"),
+    (lambda summary: _canonical({**summary, "checkpoint_files": []}), "checkpoint_files"),
+    (lambda summary: _canonical({**summary, "audits": [{**summary["audits"][0], "path": "relative-audit.json"}, summary["audits"][1]]}), "absolute"),
+])
+def test_strict_pilot_reload_requires_canonical_complete_identities(evidence, mutation, message):
+    summary = _authenticate(evidence)
+    with pytest.raises(ValueError, match=message):
+        premise.decode_pilot_summary(mutation(summary))
+
+
+def test_physical_gpu_zero_rejects_cuda_visible_device_remap():
+    physical = [
+        {"index": 0, "name": GPU["name"], "uuid": GPU["uuid"]},
+        {"index": 1, "name": GPU["name"], "uuid": "GPU-second-device"},
+    ]
+    cuda_zero = {"uuid": "GPU-second-device", "total_memory_bytes": TOTAL_BYTES}
+    with pytest.raises(ValueError, match="CUDA device 0.*physical GPU 0"):
+        premise.physical_gpu_zero_from_observations(physical, cuda_zero)
