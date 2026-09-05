@@ -37,7 +37,7 @@
 - `chunk_sidecar_branches(branches, query_budget: int) -> tuple[tuple[SidecarBranch,...],...]`; retain order, no splitting, oversized branch alone.
 - `sidecar_dense_visibility(root_length: int, branches, device=None) -> bool Tensor[Q,root_length+Q]`; no padding required for dense, each query sees its root ancestor except its own blocked range and causal rows of only its own branch.
 
-- [ ] **Step 1: RED independent masks and boundaries.** Manually enumerate expected edges without planner predicates:
+- [x] **Step 1: RED independent masks and boundaries.** Manually enumerate expected edges without planner predicates:
 
 ```python
 expected = torch.zeros((2, 7), dtype=torch.bool)
@@ -53,7 +53,7 @@ torch.testing.assert_close(sidecar_dense_visibility(5, (branch,)), expected)
 Add actual fixture tests for first-token-different rejects, LCP boundary divergence, longer-than-root rejects, latent-end prediction input, invalid negative skips, no-step empty plan, ragged padding invisibility, empty target and unfinished-latent errors, chunk retention and oversized behavior.
 Run `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/step_preference/test_sidecar.py`; expected initial missing module/API failure.
 
-- [ ] **Step 2: Implement planner.** Reuse existing pure validation where valid, but do not inherit legacy nonempty-step or rejected-within-root limitations. Core replay boundaries:
+- [x] **Step 2: Implement planner.** Reuse existing pure validation where valid, but do not inherit legacy nonempty-step or rejected-within-root limitations. Core replay boundaries:
 
 ```python
 chosen_start = span.target_text_start - 1
@@ -65,7 +65,7 @@ selected = tuple(p - 1 - rejected_start for p in completion_positions)
 
 Use full rejected own encoding for later position computation; validate selected IDs and strictly increasing in-range completion positions. Replay may start at latent-end token but not before completion of required latent pads. Root ancestor excludes replay start. Never share chosen target hidden rows. For each query, root visibility is `k < ancestor and not(blocked_start <= k < blocked_end)`; local visibility uses same-branch and local key<=query.
 
-- [ ] **Step 3: GREEN and commit.** Run the focused file once green, record evidence, commit `feat: plan grouped shared-prefix sidecars`.
+- [x] **Step 3: GREEN and commit.** Run the focused file once green, record evidence, commit `feat: plan grouped shared-prefix sidecars`.
 
 ### Task 2: Differentiable decoder capture and dense grouped scoring
 
@@ -79,7 +79,7 @@ Use full rejected own encoding for later position computation; validate selected
 - Provenance example: clean IDs `[11,91,90,90,92,12,13]` have latent slots 2,3. Existing rollout calls prefixes ending before each slot, differentiably replaces those two embeddings, then final clean decode captures all layer K/V from that single final call, never from intermediate rollout calls. Target `[5,7)` replays completed embeddings at `[4,6)` and shares final-clean keys `<4`; token92 at row4 is replayed as boundary. Rejected `[11,91,90,90,92,14,15]` with scored positions5,6 also replays `[4,6)`, uses own input IDs and mRoPE, and shares keys `<4`. Prefix and latent graph edges remain differentiable. Full rejected `model_inputs` retains collator keys `input_ids`, `attention_mask` and applicable `pixel_values`/`image_grid_thw`; no new image input is introduced.
 - Dense replay positions combine chosen clean mRoPE gathers and rejected own `get_rope_index`; assert shared ancestor tokens/positions match. Shared K/V differentiable; no mutable cache side effects.
 
-- [ ] **Step 1: RED two-layer dense oracle.** Build tiny two-layer FP32/dropout0 Qwen from `step_preference.equivalence` fixtures. Construct per-branch independently truncated inputs and literal shifted rectangular ablation mask; use existing full prefix clean model recomputation, never new planner visibility as expected output.
+- [x] **Step 1: RED two-layer dense oracle.** Build tiny two-layer FP32/dropout0 Qwen from `step_preference.equivalence` fixtures. Construct per-branch independently truncated inputs and literal shifted rectangular ablation mask; use existing full prefix clean model recomputation, never new planner visibility as expected output.
 
 ```python
 mask = torch.ones(length, length, dtype=torch.bool).tril()
@@ -89,7 +89,7 @@ mask4d = torch.zeros_like(mask, dtype=torch.float32).masked_fill(~mask, torch.fi
 
 Assert branch mean logp/entropy matches, no-op suffix matches clean, latent-end boundary responds, rejected first-token-different clean scoring matches, longer rejects work. Compare accumulated gradients from selected clean+branch scalar scores with independent oracle all trainable parameters using exact stated tolerances, noting near-zero gradients. Run focused file to capture expected unsupported kwarg/output failure.
 
-- [ ] **Step 2: Implement explicit capture/replay.** Reuse existing attention projection/rotary/GQA conventions. Every suffix layer projects only Q suffix rows, concatenates immutable root K/V once with group K/V, uses rectangular dense mask with `is_causal=False`, runs normal layer norms/MLP residual. Extend normal module forward dispatch rather than bypassing projection hooks. Keep existing clean rollout once; capture final clean K/V only. Return a focused ModelOutput extension rather than changing legacy tuple outputs.
+- [x] **Step 2: Implement explicit capture/replay.** Reuse existing attention projection/rotary/GQA conventions. Every suffix layer projects only Q suffix rows, concatenates immutable root K/V once with group K/V, uses rectangular dense mask with `is_causal=False`, runs normal layer norms/MLP residual. Extend normal module forward dispatch rather than bypassing projection hooks. Keep existing clean rollout once; capture final clean K/V only. Return a focused ModelOutput extension rather than changing legacy tuple outputs.
 
 ```python
 def score_chunk(embeds, positions, *flat_prefix_kv):
@@ -102,7 +102,7 @@ def score_chunk(embeds, positions, *flat_prefix_kv):
 
 Nonreentrant checkpoint covers this entire computation; tensors including prefix K/V passed explicitly, RNG preserved. Avoid nested layer replay within whole-chunk checkpoint without changing clean layer policy. No-step path remains clean-only. Stats include logical groups, chunks, oversized branches, query rows, entropy/rejected scored rows; runtime-only counts measured separately in Task4.
 
-- [ ] **Step 3: GREEN plus checkpoint witnesses.** Compare checkpoint on/off gradients; witness nonzero gradients in prefix-only inputs/latent generation parameters, immutable K/V and branch isolation; dropout active + checkpoint RNG equivalence to same shared path (not naive). Run focused new tests and existing `tests/stage2/test_stage2_modeling.py`, commit `feat: decode checkpointed sidecars from clean differentiable kv`.
+- [x] **Step 3: GREEN plus checkpoint witnesses.** Compare checkpoint on/off gradients; witness nonzero gradients in prefix-only inputs/latent generation parameters, immutable K/V and branch isolation; dropout active + checkpoint RNG equivalence to same shared path (not naive). Run focused new tests and existing `tests/stage2/test_stage2_modeling.py`, commit `feat: decode checkpointed sidecars from clean differentiable kv`.
 
 ### Task 3: Rectangular Flex and Trainer/config integration
 
@@ -115,7 +115,7 @@ Nonreentrant checkpoint covers this entire computation; tensors including prefix
 - Sidecar module adds `build_sidecar_flex_block_mask(root_length, branches, device)` returning rectangular BlockMask with dense-equivalent valid edges. Optional kernel padding must be invisible and excluded from scores/stats.
 - Trainer dispatches shared path before legacy only when enabled. Calls existing `_reduce_stage2b_objective` with clean selected logps/entropies and reduced sidecar tensors, stored reference scores unchanged.
 
-- [ ] **Step 1: RED objective/config/Flex tests.** Verify config rejects shared+legacy, shared outside Stage2B, nonpositive/bool budget, unknown backend. Ensure default disabled preserves old route. Add two-layer multistep test comparing naive/dense-shared components,total and all gradients; chunk budget 1 versus large preserves reduction.
+- [x] **Step 1: RED objective/config/Flex tests.** Verify config rejects shared+legacy, shared outside Stage2B, nonpositive/bool budget, unknown backend. Ensure default disabled preserves old route. Add two-layer multistep test comparing naive/dense-shared components,total and all gradients; chunk budget 1 versus large preserves reduction.
 
 ```python
 shared = dataclasses.replace(base_config, shared_prefix_enabled=True,
@@ -125,7 +125,7 @@ torch.testing.assert_close(shared_total, naive_total, atol=1e-5, rtol=1e-4)
 
 CUDA tests compare dense/Flex scores and backward under same input and dtype, assert actual Flex invocation; compare BlockMask materialized valid edges against independent hand-written dense oracle, not the new predicate. Run CPU/config tests first RED, then CUDA test RED separately.
 
-- [ ] **Step 2: Implement backend and routing.** SDPA clean remains configured; Flex handles rectangular suffix attention. Reuse installed integration/compile facilities. Preserve final clean CE and all current objective coefficients; invalid negatives skip DPO only, zero-step clean legal. Keep admission validation and sampler exclusively legacy; reject contradictory packed certificates in shared mode rather than silently consuming them. Production dropout stays 0.05.
+- [x] **Step 2: Implement backend and routing.** SDPA clean remains configured; Flex handles rectangular suffix attention. Reuse installed integration/compile facilities. Preserve final clean CE and all current objective coefficients; invalid negatives skip DPO only, zero-step clean legal. Keep admission validation and sampler exclusively legacy; reject contradictory packed certificates in shared mode rather than silently consuming them. Production dropout stays 0.05.
 
 ```python
 if config.shared_prefix_enabled:
@@ -136,7 +136,7 @@ if config.packing_enabled:
 
 Run required reference/store preflight unchanged; no online scoring fallback. Add stats actual cached score entries consumed/missing (missing consumption error); never equate intended calls to runtime calls.
 
-- [ ] **Step 3: GREEN/commit.** Focused shared/config/CLI and CUDA tests; legacy packed smoke plus ordinary Stage2 feature-off; commit `feat: integrate flex shared-prefix stage2b training`.
+- [x] **Step 3: GREEN/commit.** Focused shared/config/CLI and CUDA tests; legacy packed smoke plus ordinary Stage2 feature-off; commit `feat: integrate flex shared-prefix stage2b training`.
 
 ### Task 4: Runtime witnesses, benchmarks, reference audit, and handoff
 
@@ -144,7 +144,7 @@ Run required reference/store preflight unchanged; no online scoring fallback. Ad
 
 **Interfaces:** Preserve legacy defaults; verification/benchmark CLI accepts `--shared-prefix`, `--sidecar-attention-backend {dense,flex}`, `--sidecar-query-budget 1024`. Existing context loaders/checkpoint validation remain authority. Reuse `benchmark_training_path` timing rather than new runner. JSON measurement records explicit mode/backend/dtype/dropout/input lengths/valid scored tokens, warmup/measurement counts, elapsed forward+backward, throughput, peak allocated bytes and runtime counters.
 
-- [ ] **Step 1: RED counter and smoke coverage.** Hook actual outer policy, decoder, rollout invocation, first-layer q_proj/MLP and lm_head (ordinary module hooks) to distinguish initial forward versus backward checkpoint replay; no hooks capture model state.
+- [x] **Step 1: RED counter and smoke coverage.** Hook actual outer policy, decoder, rollout invocation, first-layer q_proj/MLP and lm_head (ordinary module hooks) to distinguish initial forward versus backward checkpoint replay; no hooks capture model state.
 
 ```python
 assert counters["rollout_calls_forward"] == 1
@@ -154,10 +154,10 @@ assert counters["entropy_scored_tokens"] == 2 * sum(s.target_length for s in spa
 
 Use actual span interval subtraction if no target_length property. Counter tests must compare observed calls/rows, not constants copied from configured group count. Distributed test launches current two-rank DoRA32/64/.05 ZeRO2 with gradient accumulation2, shared Flex, and asserts completed optimizer step/finite loss/gradients from emitted witnesses. Check no unrelated GPU process before launch.
 
-- [ ] **Step 2: Implement measurements and run evidence.** Same deterministic input/loss/precision/adapter settings for naive/new/legacy wherever each fits; compile/warmup excluded, full backward included. Tiny tests: FP32 dense strict equivalence and BF16 Flex report errors separately. Benchmarks vary K at fixed total target length and growing target length, plus a small available real sample/long sample where existing context loader artifacts permit. Do not regenerate expensive missing negatives or restart cancelled full training. Record unavailable/OOM cases explicitly as incomplete.
+- [x] **Step 2: Implement measurements and run evidence.** Same deterministic input/loss/precision/adapter settings for naive/new/legacy wherever each fits; compile/warmup excluded, full backward included. Tiny tests: FP32 dense strict equivalence and BF16 Flex report errors separately. Benchmarks vary K at fixed total target length and growing target length, plus a small available real sample/long sample where existing context loader artifacts permit. Do not regenerate expensive missing negatives or restart cancelled full training. Record unavailable/OOM cases explicitly as incomplete.
 
 Audit reference actual input call path; manifests omit external image bytes. Recompute a small available frozen-reference chosen/rejected score against stored scalars only with validated unchanged inputs; record exact compared values/tolerance/settings. If required original artifacts unavailable, report cache validity unresolved, do not invent hits or claim production validation. No generalized provenance system.
 
-- [ ] **Step 3: Document/commit.** Correct three primary source docs' forward/cache statements: three logical groups with internal latent calls, frozen reference generates own latents, cache inputs must be fixed. Keep untracked user docs untracked. Write concise measured result under distinct `results/shared-prefix-<run-id>/` and logs under matching `logs/`; model files only checkpoint tree. Commit worktree source/test/docs files as `test: verify and measure shared-prefix sidecars`.
+- [x] **Step 3: Document/commit.** Correct three primary source docs' forward/cache statements: three logical groups with internal latent calls, frozen reference generates own latents, cache inputs must be fixed. Keep untracked user docs untracked. Write concise measured result under distinct `results/shared-prefix-<run-id>/` and logs under matching `logs/`; model files only checkpoint tree. Commit worktree source/test/docs files as `test: verify and measure shared-prefix sidecars`.
 
 - [ ] **Step 4: Controller completion gate.** Request one whole-change review relative to `1912677`, fix concrete findings, choose fresh claim-specific tests once. Full branch finishing does not apply: no merge/worktree cleanup authorized. Report only witnessed completion; unavailable required distributed/Flex checks prohibit full completion or production-enable claims. Write ntfy summary before final response.

@@ -1,8 +1,9 @@
 # Stage 2B shared-prefix sidecars
 
 Status: design commitment v2 approved by the user's “ㅇㅋ” after clarification
-that three logical groups do not mean exactly three decoder calls; implementation
-in progress following the user's “resume”.
+that three logical groups do not mean exactly three decoder calls. Tasks1–4
+implemented and task-reviewed; final whole-change review/verification pending.
+Measured evidence: `results/shared-prefix-implementation-20260905/summary.md`.
 
 Understood as: revise the existing `ours1` Stage 2B computation to share clean
 decoder prefixes across all local entropy and rejected-scoring branches, while
