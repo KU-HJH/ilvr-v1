@@ -754,6 +754,8 @@ class Qwen2_5_VLAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        stage2_capture_kv: bool = False,
+        stage2_prefix_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -769,6 +771,11 @@ class Qwen2_5_VLAttention(nn.Module):
         query_states, key_states = apply_multimodal_rotary_pos_emb(
             query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
         )
+
+        captured_kv = (key_states, value_states)
+        if stage2_prefix_key_value is not None:
+            key_states = torch.cat((stage2_prefix_key_value[0], key_states), dim=2)
+            value_states = torch.cat((stage2_prefix_key_value[1], value_states), dim=2)
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
@@ -808,7 +815,8 @@ class Qwen2_5_VLAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        result = (attn_output, attn_weights, past_key_value)
+        return result + (captured_kv,) if stage2_capture_kv else result
 
     def forward_flex(
         self,
@@ -1181,6 +1189,8 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        stage2_capture_kv: bool = False,
+        stage2_prefix_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -1197,6 +1207,8 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                stage2_capture_kv=stage2_capture_kv,
+                stage2_prefix_key_value=stage2_prefix_key_value,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -1213,6 +1225,11 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         query_states, key_states = apply_multimodal_rotary_pos_emb(
             query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
         )
+
+        captured_kv = (key_states, value_states)
+        if stage2_prefix_key_value is not None:
+            key_states = torch.cat((stage2_prefix_key_value[0], key_states), dim=2)
+            value_states = torch.cat((stage2_prefix_key_value[1], value_states), dim=2)
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
@@ -1252,7 +1269,8 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
 
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, None, past_key_value
+        result = (attn_output, None, past_key_value)
+        return result + (captured_kv,) if stage2_capture_kv else result
 
 
 QWEN2_5_VL_ATTENTION_CLASSES = {
@@ -1290,6 +1308,8 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         generate_mode: Optional[bool] = False,
+        stage2_capture_kv: bool = False,
+        stage2_prefix_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1319,7 +1339,22 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        if _is_block_mask(attention_mask):
+        if stage2_capture_kv or stage2_prefix_key_value is not None:
+            if self.attn_type == "flash_attention_2":
+                raise ValueError("shared-prefix Stage 2 requires eager or sdpa language attention")
+            attention_outputs = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_attentions=output_attentions,
+                use_cache=False,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                stage2_capture_kv=stage2_capture_kv,
+                stage2_prefix_key_value=stage2_prefix_key_value,
+            )
+            hidden_states, self_attn_weights, present_key_value = attention_outputs[:3]
+        elif _is_block_mask(attention_mask):
             if past_key_value is not None:
                 raise ValueError("packed Stage 2 FlexAttention does not support past_key_value")
             hidden_states, self_attn_weights, present_key_value = self.self_attn.forward_flex(
@@ -1382,7 +1417,17 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
+        if stage2_capture_kv:
+            # Flatten outputs so both reentrant and nonreentrant layer checkpointing
+            # retain differentiable K/V without a mutable cache side channel.
+            outputs += attention_outputs[3]
+
         return outputs
+
+
+@dataclass
+class Qwen2_5_VLSharedPrefixOutput(BaseModelOutputWithPast):
+    stage2_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
 
 
 @add_start_docstrings(
@@ -1426,6 +1471,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         generate_mode: Optional[bool] = False,
+        stage2_capture_kv: bool = False,
+        stage2_prefix_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1434,6 +1481,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        shared = stage2_capture_kv or stage2_prefix_key_values is not None
+        if shared:
+            if use_cache or past_key_values is not None or not return_dict:
+                raise ValueError("shared-prefix decoder requires return_dict=True, use_cache=False and no cache")
+            if stage2_prefix_key_values is not None and len(stage2_prefix_key_values) != len(self.layers):
+                raise ValueError("shared-prefix K/V must contain one pair per decoder layer")
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1464,7 +1518,11 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         elif position_ids.dim() == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
-        if _is_block_mask(attention_mask):
+        if stage2_prefix_key_values is not None:
+            if attention_mask is None:
+                raise ValueError("shared-prefix replay requires explicit rectangular visibility")
+            causal_mask = attention_mask
+        elif _is_block_mask(attention_mask):
             causal_mask = attention_mask
         else:
             causal_mask = self._update_causal_mask(
@@ -1480,12 +1538,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        captured_key_values = ()
 
-        for decoder_layer in self.layers:
+        for layer_index, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training and stage2_prefix_key_values is None:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -1497,6 +1556,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     cache_position,
                     position_embeddings,
                     generate_mode,
+                    stage2_capture_kv,
+                    None,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1509,9 +1570,16 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     generate_mode=generate_mode,
+                    stage2_capture_kv=stage2_capture_kv,
+                    stage2_prefix_key_value=(
+                        stage2_prefix_key_values[layer_index]
+                        if stage2_prefix_key_values is not None else None
+                    ),
                 )
 
             hidden_states = layer_outputs[0]
+            if stage2_capture_kv:
+                captured_key_values += ((layer_outputs[-2], layer_outputs[-1]),)
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -1529,6 +1597,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        if stage2_capture_kv:
+            return Qwen2_5_VLSharedPrefixOutput(
+                last_hidden_state=hidden_states,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
+                stage2_key_values=captured_key_values,
+            )
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -1733,6 +1808,8 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     stage2_latent_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     stage2_diagnostics: Optional[Dict[str, torch.Tensor]] = None
     stage2_selected_logits: Optional[torch.FloatTensor] = None
+    stage2_sidecar_results: Optional[Tuple[Mapping[str, object], ...]] = None
+    stage2_sidecar_stats: Optional[Mapping[str, object]] = None
 
 
 QWEN2_5_VL_INPUTS_DOCSTRING = r"""
@@ -2082,6 +2159,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         stage2_loss_only: bool,
         stage2_final_attention_mask: Optional[torch.Tensor],
         stage2_packed_inputs: Optional[Mapping[str, object]],
+        stage2_shared_prefix_inputs: Optional[Mapping[str, object]],
         stage2_logit_positions: Optional[torch.LongTensor],
         stage2_selective_logits_only: bool,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
@@ -2090,6 +2168,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise NotImplementedError("Stage 2 forward currently supports batch_size=1 only")
         packed = stage2_packed_inputs is not None
+        shared = stage2_shared_prefix_inputs is not None
+        if shared:
+            from .stage2_shared_prefix import validate_shared_inputs
+
+            validate_shared_inputs(
+                self, stage2_shared_prefix_inputs, input_ids, attention_mask,
+                packed=packed, final_mask=stage2_final_attention_mask,
+                return_dict=return_dict, use_cache=use_cache,
+                past_key_values=past_key_values, output_attentions=output_attentions,
+            )
         packed_values = None
         if packed:
             if not return_dict:
@@ -2407,7 +2495,17 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
+            **({"stage2_capture_kv": True} if shared and any(stage2_shared_prefix_inputs["plan"].groups) else {}),
         )
+        sidecar_results, sidecar_stats = None, None
+        if shared:
+            from .stage2_shared_prefix import score_sidecars
+
+            sidecar_results, sidecar_stats = score_sidecars(
+                self, stage2_shared_prefix_inputs, input_ids,
+                rollout.final_inputs_embeds, full_position_ids,
+                getattr(final_outputs, "stage2_key_values", ()),
+            )
         selected_logits = None
         if stage2_loss_only:
             shift_labels = labels[..., 1:].contiguous().view(-1).to(
@@ -2492,6 +2590,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             stage2_latent_states=rollout.latent_states if return_stage2_latent_states else None,
             stage2_diagnostics=diagnostics,
             stage2_selected_logits=selected_logits,
+            stage2_sidecar_results=sidecar_results,
+            stage2_sidecar_stats=sidecar_stats,
         )
 
     @add_start_docstrings_to_model_forward(QWEN2_5_VL_INPUTS_DOCSTRING)
@@ -2526,6 +2626,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         stage2_loss_only: bool = False,
         stage2_final_attention_mask: Optional[torch.Tensor] = None,
         stage2_packed_inputs: Optional[Mapping[str, object]] = None,
+        stage2_shared_prefix_inputs: Optional[Mapping[str, object]] = None,
         stage2_logit_positions: Optional[torch.LongTensor] = None,
         stage2_selective_logits_only: bool = False,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
@@ -2545,6 +2646,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         resolved_use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        if stage2_shared_prefix_inputs is not None and getattr(self.config, "stage", None) != "stage2":
+            raise ValueError("shared-prefix inputs are supported only in Stage 2")
 
         if getattr(self.config, "stage", None) == "stage2":
             for name, value in (
@@ -2575,6 +2679,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 stage2_loss_only=stage2_loss_only,
                 stage2_final_attention_mask=stage2_final_attention_mask,
                 stage2_packed_inputs=stage2_packed_inputs,
+                stage2_shared_prefix_inputs=stage2_shared_prefix_inputs,
                 stage2_logit_positions=stage2_logit_positions,
                 stage2_selective_logits_only=stage2_selective_logits_only,
             )
