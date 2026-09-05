@@ -24,15 +24,16 @@ _RECORD_KEYS = (
     "unpadded_length",
     "padded_length",
 )
+_CAPACITY_KEYS = ("vision_token_count", "image_count", "reasoning_block_count", "scored_token_count")
 
 
 def _validated_record(record: Mapping[str, object]) -> dict[str, object]:
-    if not isinstance(record, Mapping) or set(record) != set(_RECORD_KEYS):
+    if not isinstance(record, Mapping) or set(record) not in (set(_RECORD_KEYS), set(_RECORD_KEYS + _CAPACITY_KEYS)):
         raise ValueError("packed length records must contain the exact audit fields")
-    result = {name: record[name] for name in _RECORD_KEYS}
+    result = dict(record)
     if not isinstance(result["sample_id"], str) or not result["sample_id"]:
         raise ValueError("packed length sample_id must be nonempty text")
-    for name in _RECORD_KEYS:
+    for name in result:
         if name == "sample_id":
             continue
         if type(result[name]) is not int or result[name] < 0:
@@ -190,6 +191,10 @@ def collect_packed_length_audit(args) -> tuple[dict[str, object], tuple[dict, ..
                 "branch_count": len(plan.branches),
                 "unpadded_length": int(plan.unpadded_length),
                 "padded_length": int(plan.padded_length),
+                "vision_token_count": int((batch["input_ids"] == model_config.image_token_id).sum()),
+                "image_count": len(example.original_image_paths),
+                "reasoning_block_count": len(batch["reasoning_step_spans"]),
+                "scored_token_count": int(plan.selected_positions().numel()),
             }
         )
     identity = {

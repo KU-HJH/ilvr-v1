@@ -150,3 +150,19 @@ def test_audit_rejects_one_path_for_both_outputs_without_partial_publication(tmp
         )
 
     assert not output.exists()
+
+
+def test_audit_preserves_new_capacity_features_and_old_winner_order(tmp_path):
+    """Catches dropping the four measured capacity axes from the audit report."""
+    extended = tuple({**row, "vision_token_count": 4, "image_count": 1,
+                      "reasoning_block_count": row["step_count"],
+                      "scored_token_count": 8} for row in _records())
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b"zero\none\ntwo\n")
+    report = tmp_path / "audit.json"
+    publish_packed_length_audit(input_path=source, report_path=report,
+                               subset_output_path=tmp_path / "winner.jsonl",
+                               identity={}, records=extended)
+    payload = json.loads(report.read_bytes())
+    assert payload["records"] == list(extended)
+    assert payload["winner"]["source_index"] == 2

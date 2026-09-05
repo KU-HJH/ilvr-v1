@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import stat
 from typing import Mapping, Sequence
+from types import SimpleNamespace
+import subprocess
 
 from step_preference.negatives import CheckpointFile
 
@@ -517,12 +519,17 @@ def _witnesses_from_payload(payload: object) -> PackedBoundaryWitnesses:
     tie_payload = body["tie_classes"]
     if not isinstance(tie_payload, list):
         raise ValueError("tie_classes must be an array")
-    ties = tuple(PackedTieClass(**_require_exact_fields(item, PackedTieClass, "packed tie class")) for item in tie_payload)
+    ties = []
+    for item in tie_payload:
+        entry = _require_exact_fields(item, PackedTieClass, "packed tie class")
+        if not isinstance(entry["member_source_indices"], list):
+            raise ValueError("member_source_indices must be an array")
+        ties.append(PackedTieClass(**{**entry, "member_source_indices": tuple(entry["member_source_indices"])}))
     for name in ("pareto_source_indices", "final_probe_source_indices"):
         if not isinstance(body[name], list):
             raise ValueError(f"{name} must be an array")
     return PackedBoundaryWitnesses(
-        tie_classes=ties, pareto_source_indices=tuple(body["pareto_source_indices"]),
+        tie_classes=tuple(ties), pareto_source_indices=tuple(body["pareto_source_indices"]),
         global_max_source_index=body["global_max_source_index"],
         final_probe_source_indices=tuple(body["final_probe_source_indices"]),
     )
@@ -648,3 +655,522 @@ def read_packed_admission_verification(path: str | Path) -> PackedAdmissionVerif
     if raw != _canonical_bytes(asdict(verification)):
         raise ValueError("packed admission verification is not canonical JSON")
     return verification
+
+
+def _sha(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _authenticate(raw: bytes, expected: str, label: str) -> str:
+    _require_sha256(label, expected)
+    if _sha(raw) != expected:
+        raise ValueError(f"{label} SHA-256 does not match")
+    return expected
+
+
+def _strict_json(path, label, decoder, expected=None):
+    raw = _read_strict_bytes(path, label)
+    payload = _parse_json(raw, label)
+    decoded = decoder(payload)
+    if raw != _canonical_bytes(payload):
+        raise ValueError(f"{label} is not canonical JSON")
+    if expected is not None:
+        _authenticate(raw, expected, label)
+    return decoded, raw
+
+
+def _directory(path, label) -> Path:
+    target = Path(path)
+    if target.is_symlink() or not target.is_dir():
+        raise ValueError(f"{label} must be a regular directory")
+    return target.resolve(strict=True)
+
+
+def _git_identity() -> str:
+    def run(*args):
+        result = subprocess.run(["git", *args], capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError("packed admission requires a clean tracked worktree")
+        return result.stdout.strip()
+    commit = run("rev-parse", "HEAD")
+    run("diff", "--quiet")
+    run("diff", "--cached", "--quiet")
+    status = run("status", "--porcelain=v1", "--untracked-files=all", "--ignored=no")
+    for line in status.splitlines():
+        path = line[3:]
+        if not (line.startswith("?? ") and "__pycache__" in Path(path).parts and path.endswith(".pyc")):
+            raise ValueError("packed admission requires a clean tracked worktree and no untracked executable inputs")
+    return commit
+
+
+@dataclass(frozen=True)
+class SubsetSourceMap:
+    schema_version: int
+    kind: str
+    original_source_sha256: str
+    subset_sha256: str
+    original_source_indices: tuple[int, ...]
+    sample_ids: tuple[str, ...]
+
+    def __post_init__(self):
+        if type(self.schema_version) is not int or self.schema_version != 1 or self.kind != "stage2b-subset-source-map":
+            raise ValueError("invalid subset source map schema or kind")
+        _require_sha256("original source", self.original_source_sha256)
+        _require_sha256("subset", self.subset_sha256)
+        _require_tuple("original_source_indices", self.original_source_indices)
+        _require_tuple("sample_ids", self.sample_ids)
+        for index in self.original_source_indices:
+            _require_int("original source index", index)
+        if tuple(sorted(set(self.original_source_indices))) != self.original_source_indices:
+            raise ValueError("source map indices must be unique and increasing")
+        if (not self.sample_ids or len(self.sample_ids) != len(self.original_source_indices)
+                or any(not isinstance(value, str) or not value for value in self.sample_ids)
+                or len(set(self.sample_ids)) != len(self.sample_ids)):
+            raise ValueError("source map sample IDs must be unique nonempty strings matching indices")
+
+
+def _source_map_from_payload(payload):
+    body = _require_exact_fields(payload, SubsetSourceMap, "subset source map")
+    for name in ("original_source_indices", "sample_ids"):
+        if not isinstance(body[name], list):
+            raise ValueError(f"{name} must be an array")
+    return SubsetSourceMap(**{
+        **body,
+        "original_source_indices": tuple(body["original_source_indices"]),
+        "sample_ids": tuple(body["sample_ids"]),
+    })
+
+
+def _source_rows(raw: bytes):
+    rows = []
+    # Physical original JSONL ordinals, never post-parse or post-filter ordinals.
+    for index, line in enumerate(raw.splitlines()):
+        value = _parse_json(line, f"source row {index}")
+        if not isinstance(value, dict):
+            raise ValueError(f"source row {index} must be an object")
+        rows.append(value)
+    if not rows:
+        raise ValueError("source JSONL must be nonempty")
+    return tuple(rows)
+
+
+def _negative_inputs(*, checkpoint_path, data_path, negative_path, negative_manifest):
+    from step_preference import negatives
+    raw_source = _read_strict_bytes(data_path, "clean source")
+    raw_negative = _read_strict_bytes(negative_path, "negative")
+    rows = _source_rows(raw_source)
+    store = _parse_negative_store(raw_negative)
+    manifest, raw_manifest = _strict_json(
+        negative_manifest, "negative manifest",
+        lambda body: negatives._manifest_from_bytes(_canonical_bytes(body)),
+    )
+    checkpoint = _directory(checkpoint_path, "checkpoint")
+    if manifest.stage2a_checkpoint_path != str(checkpoint):
+        raise ValueError("negative checkpoint identity does not match")
+    _authenticate(raw_source, manifest.source_sha256, "negative clean source")
+    _authenticate(raw_negative, manifest.negative_sha256, "negative")
+    for entry in manifest.checkpoint_files:
+        root = _directory(entry.load_root, "checkpoint load root")
+        if str(root) != entry.load_root:
+            raise ValueError("checkpoint load root must be resolved")
+        path = root / entry.relative_path
+        raw = _read_strict_bytes(path, "checkpoint file")
+        if len(raw) != entry.size:
+            raise ValueError("checkpoint file size does not match")
+        _authenticate(raw, entry.sha256, "checkpoint file")
+    inventory, tokenizer_identity = negatives.inspect_stage2a_checkpoint_identity(checkpoint)
+    if (tuple(sorted(inventory, key=lambda item: (item.load_root, item.relative_path)))
+            != tuple(sorted(manifest.checkpoint_files, key=lambda item: (item.load_root, item.relative_path)))
+            or tokenizer_identity != manifest.tokenizer_config_identity):
+        raise ValueError("checkpoint inventory or tokenizer identity does not match")
+    if manifest.latent_size != 8 or manifest.assistant_plan_rendering != "adjacent-text-space-lf-v1":
+        raise ValueError("negative configuration does not match")
+    expected_settings = dict(
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
+        device="cuda:0", max_new_tokens=32, min_tokens=2, torch_dtype="bfloat16",
+    )
+    if manifest.generation_settings_dict != expected_settings:
+        raise ValueError("negative generation settings do not match packed Stage 2B")
+    if manifest.selected_row_indices != tuple(range(len(rows))):
+        raise ValueError("negative selected row indices must cover the clean source")
+    return manifest, store, rows, (raw_source, raw_negative, raw_manifest)
+
+
+def _parse_negative_store(raw_negative):
+    from step_preference import negatives
+    negative_rows = []
+    for index, line in enumerate(raw_negative.splitlines()):
+        payload = _parse_json(line, f"negative row {index}")
+        negative_rows.append(negatives._row_from_payload(payload))
+        if line + b"\n" != _canonical_bytes(payload):
+            raise ValueError("negative rows must be canonical JSON")
+    if raw_negative != b"".join(_canonical_bytes(asdict(row)) for row in negative_rows):
+        raise ValueError("negative JSONL must end with LF")
+    return negatives._negative_store(negative_rows)
+
+
+def reconstruct_natural_packed_records(
+    *, checkpoint_path, data_path, image_root, negative_path, negative_manifest,
+    original_source_indices, max_packed_length, processor=None, model_config=None,
+) -> tuple[PackedAdmissionMeasurement, ...]:
+    """Measure unchanged natural plans through the production collator/planner."""
+    from stage2.checkpointing import resolve_latent_token_ids
+    from stage2.data import Stage2DataCollator, prepare_stage2_example
+    from step_preference.packing import build_packed_tree_plan
+    from transformers import AutoConfig, AutoProcessor
+
+    if type(max_packed_length) is not int or max_packed_length != 4608:
+        raise ValueError("max_packed_length must be 4608")
+    _, store, rows, before = _negative_inputs(
+        checkpoint_path=checkpoint_path, data_path=data_path,
+        negative_path=negative_path, negative_manifest=negative_manifest,
+    )
+    images = _directory(image_root, "image root")
+    if len(rows) != len(original_source_indices):
+        raise ValueError("source-map cardinality does not match reconstruction")
+    prepared = tuple(
+        prepare_stage2_example(
+            row, image_root=images, latent_size=8, require_reasoning_units=True,
+            assistant_plan_rendering="adjacent-text-space-lf-v1",
+        )
+        for row in rows
+    )
+    keys = tuple((example.sample_id, step.step_id) for example in prepared for step in example.reasoning_steps)
+    if len(keys) != len(set(keys)) or set(store) != set(keys):
+        raise ValueError("missing or unexpected negative join keys")
+    _git_identity()
+    if processor is None:
+        processor = AutoProcessor.from_pretrained(str(checkpoint_path), local_files_only=True)
+    if model_config is None:
+        model_config = AutoConfig.from_pretrained(str(checkpoint_path), local_files_only=True)
+    if getattr(model_config, "latent_size", None) != 8 or getattr(model_config, "supervise_latent_boundaries", None) is not True:
+        raise ValueError("checkpoint latent configuration does not match")
+    token_ids = resolve_latent_token_ids(processor.tokenizer, model_config)
+    collator = Stage2DataCollator(
+        processor, token_ids, 8, True,
+        step_preference_enabled=True, negative_store=store,
+    )
+    measurements = []
+    for source_index, example in zip(original_source_indices, prepared):
+        batch = collator([example])
+        plan = build_packed_tree_plan(
+            clean_input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            reasoning_spans=batch["reasoning_step_spans"],
+            joined_steps=batch["step_preference"]["steps"],
+        )
+        measurements.append(PackedAdmissionMeasurement(
+            source_index=source_index, sample_id=example.sample_id,
+            clean_length=int(plan.root_length),
+            packed_unpadded_length=int(plan.unpadded_length),
+            packed_padded_length=int(plan.padded_length),
+            vision_token_count=int((batch["input_ids"] == model_config.image_token_id).sum()),
+            image_count=len(example.original_image_paths),
+            reasoning_block_count=len(batch["reasoning_step_spans"]),
+            branch_count=len(plan.branches),
+            scored_token_count=int(plan.selected_positions().numel()),
+        ))
+    after = _negative_inputs(
+        checkpoint_path=checkpoint_path, data_path=data_path,
+        negative_path=negative_path, negative_manifest=negative_manifest,
+    )[3]
+    if after != before:
+        raise ValueError("negative inputs changed during reconstruction")
+    return tuple(measurements)
+
+
+@dataclass(frozen=True)
+class _CleanSourceChain:
+    original_source_indices: tuple[int, ...]
+    sample_ids: tuple[str, ...]
+    original_count: int
+    clean_admissible_count: int
+    clean_bytes: bytes
+    bound_files: tuple[tuple[str, bytes], ...]
+    identity_values: Mapping[str, object]
+    processor: object
+    images: tuple
+
+
+def validate_clean_source_chain(args) -> _CleanSourceChain:
+    """Authenticate mapped original ordinals and the original schema-2 audit."""
+    from stage2 import length_manifest
+    from step_preference.spans import canonical_sample_id
+    from transformers import AutoProcessor
+    if type(args.max_packed_sequence_length) is not int or args.max_packed_sequence_length != 4608:
+        raise ValueError("max_packed_sequence_length must be 4608")
+    original = _read_strict_bytes(args.original_data_path, "original source")
+    clean = _read_strict_bytes(args.clean_data_path, "clean source")
+    manifest, length_raw = _strict_json(args.clean_length_manifest, "clean length manifest", length_manifest._manifest_from_payload, args.clean_length_manifest_sha256)
+    mapping, map_raw = _strict_json(args.source_map_path, "source map", _source_map_from_payload, args.source_map_sha256)
+    _authenticate(original, manifest.data_sha256, "clean length original source")
+    _authenticate(original, mapping.original_source_sha256, "source map original source")
+    _authenticate(clean, mapping.subset_sha256, "source map clean source")
+    rows = _source_rows(original)
+    if len(rows) != len(manifest.lengths):
+        raise ValueError("clean length manifest cardinality does not match original source")
+    if (manifest.max_sequence_length, manifest.latent_size, manifest.supervise_latent_boundaries, manifest.assistant_plan_rendering) != (4608, 8, True, "adjacent-text-space-lf-v1"):
+        raise ValueError("clean length manifest configuration must be 4608/8/adjacent-text-space-lf-v1")
+    retained_indices = set(manifest.retained_indices)
+    if any(index not in retained_indices for index in mapping.original_source_indices):
+        raise ValueError("source map indices must belong to clean-admissible retained indices")
+    lines = original.splitlines()
+    expected_clean = b"".join(lines[index] + b"\n" for index in mapping.original_source_indices)
+    if clean != expected_clean:
+        raise ValueError("clean source bytes do not match mapped original lines")
+    if mapping.sample_ids != tuple(canonical_sample_id(rows[index]) for index in mapping.original_source_indices):
+        raise ValueError("source map sample IDs do not match original rows")
+    images = _directory(args.image_root, "image root")
+    checkpoint = _directory(args.checkpoint_path, "checkpoint")
+    negative, _, _, negative_bytes = _negative_inputs(
+        checkpoint_path=checkpoint, data_path=args.clean_data_path,
+        negative_path=args.negative_path, negative_manifest=args.negative_manifest,
+    )
+    commit = _git_identity()
+    _validate_images(manifest.images)
+    processor = AutoProcessor.from_pretrained(str(checkpoint), local_files_only=True)
+    # Existing schema-2 semantics check processor and every original image identity.
+    length_manifest.validate_stage2_length_manifest(
+        path=args.clean_length_manifest,
+        expected_sha256=args.clean_length_manifest_sha256,
+        data_path=args.original_data_path, image_root=images, processor=processor,
+        latent_size=8, supervise_latent_boundaries=True, max_sequence_length=4608,
+        assistant_plan_rendering="adjacent-text-space-lf-v1",
+    )
+    _validate_images(manifest.images)
+    file_inputs = (
+        ("original_data", args.original_data_path, original), ("clean_data", args.clean_data_path, clean),
+        ("source_map", args.source_map_path, map_raw), ("clean_length_manifest", args.clean_length_manifest, length_raw),
+        ("negative", args.negative_path, negative_bytes[1]), ("negative_manifest", args.negative_manifest, negative_bytes[2]),
+    )
+    values = {}
+    bound = []
+    for name, path, raw in file_inputs:
+        if _read_strict_bytes(path, name) != raw:
+            raise ValueError(f"{name} changed during validation")
+        resolved = str(Path(path).resolve(strict=True))
+        values[f"{name}_path"] = resolved
+        values[f"{name}_sha256"] = _sha(raw)
+        bound.append((resolved, raw))
+    values.update(
+        image_root_path=str(images), checkpoint_path=str(checkpoint),
+        checkpoint_files=tuple(sorted(
+            negative.checkpoint_files, key=lambda entry: (entry.load_root, entry.relative_path)
+        )),
+        tokenizer_config_identity=negative.tokenizer_config_identity,
+        assistant_plan_rendering=manifest.assistant_plan_rendering,
+        attention_implementation="sdpa", vision_attention_implementation="flash_attention_2",
+        latent_size=8, clean_model_limit=8192, clean_prefilter_limit=4608,
+        max_packed_sequence_length=4608, git_commit=commit, tracked_worktree_clean=True,
+    )
+    return _CleanSourceChain(
+        mapping.original_source_indices, mapping.sample_ids, len(rows),
+        len(manifest.retained_indices), clean, tuple(bound), values, processor, manifest.images,
+    )
+
+
+def _validate_images(images):
+    from stage2.length_manifest import _image_identity
+    for image in dict.fromkeys(images):
+        _read_strict_bytes(image.path, "original image")
+        if _image_identity(image.path) != image:
+            raise ValueError("original image identity changed during reconstruction")
+
+
+def _reconstruct_chain(args, chain):
+    rows = reconstruct_natural_packed_records(
+        checkpoint_path=args.checkpoint_path, data_path=args.clean_data_path,
+        image_root=args.image_root, negative_path=args.negative_path,
+        negative_manifest=args.negative_manifest,
+        original_source_indices=chain.original_source_indices,
+        max_packed_length=args.max_packed_sequence_length, processor=chain.processor,
+    )
+    if tuple(row.sample_id for row in rows) != chain.sample_ids:
+        raise ValueError("reconstructed sample IDs do not match source map")
+    return rows
+
+
+def _check_unchanged(chain):
+    for path, raw in chain.bound_files:
+        if _read_strict_bytes(path, "bound input") != raw:
+            raise ValueError("bound input changed before publication")
+    _validate_images(chain.images)
+    for entry in chain.identity_values["checkpoint_files"]:
+        raw = _read_strict_bytes(Path(entry.load_root) / entry.relative_path, "checkpoint file")
+        if len(raw) != entry.size:
+            raise ValueError("checkpoint file size changed before publication")
+        _authenticate(raw, entry.sha256, "checkpoint file")
+    if _git_identity() != chain.identity_values["git_commit"]:
+        raise ValueError("git identity changed before publication")
+
+
+def _retained_bytes(chain, indices):
+    chosen = set(indices)
+    return b"".join(
+        line + b"\n"
+        for index, line in zip(chain.original_source_indices, chain.clean_bytes.splitlines())
+        if index in chosen
+    )
+
+
+def _preflight_outputs(*paths):
+    resolved = tuple(Path(path).resolve(strict=False) for path in paths)
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("output paths must be distinct")
+    for path in paths:
+        if os.path.lexists(path):
+            raise ValueError(f"output path already exists: {path}")
+
+
+def build_packed_admission(args) -> PackedAdmissionManifest:
+    """Publish retained source first, then its exclusive admission manifest."""
+    _preflight_outputs(args.retained_output_path, args.manifest_output_path)
+    chain = validate_clean_source_chain(args)
+    measurements = _reconstruct_chain(args, chain)
+    retained, filtered = select_packed_admission(measurements, max_packed_length=args.max_packed_sequence_length)
+    witnesses = build_boundary_witnesses(retained)
+    indices = tuple(row.source_index for row in retained)
+    raw = _retained_bytes(chain, indices)
+    identity = PackedAdmissionIdentity(
+        **chain.identity_values,
+        retained_data_path=str(Path(args.retained_output_path).resolve(strict=False)),
+        retained_data_sha256=_sha(raw),
+    )
+    result = PackedAdmissionManifest(
+        schema_version=1, kind=PACKED_ADMISSION_MANIFEST_KIND, identity=identity,
+        records=tuple(sorted((*retained, *filtered), key=lambda row: row.source_index)),
+        retained_source_indices=indices,
+        retained_sample_ids=tuple(row.sample_id for row in retained),
+        filtered_source_indices=tuple(row.source_index for row in filtered),
+        filtered_sample_ids=tuple(row.sample_id for row in filtered),
+        boundary_witnesses=witnesses,
+        counts=PackedAdmissionCounts(
+            chain.original_count, chain.clean_admissible_count,
+            len(measurements), len(retained), len(filtered),
+        ),
+    )
+    _check_unchanged(chain)
+    _write_exclusively(args.retained_output_path, raw, "packed retained source")
+    _authenticate(_read_strict_bytes(args.retained_output_path, "packed retained source"), identity.retained_data_sha256, "packed retained source")
+    # A second-write failure deliberately preserves the immutable orphan source.
+    write_packed_admission_manifest(args.manifest_output_path, result)
+    return result
+
+
+def verify_packed_admission(args) -> PackedAdmissionVerification:
+    """Recompute from authenticated inputs without producer calls or repairs."""
+    _preflight_outputs(args.output_path)
+    hashes = dict(
+        manifest_sha256=None, clean_admissible_sha256=None,
+        packed_retained_sha256=None, negative_sha256=None, negative_manifest_sha256=None,
+    )
+    errors = ()
+    records, retained, filtered = (), (), ()
+    try:
+        manifest, raw = _strict_json(args.manifest_path, "packed admission manifest", _manifest_from_payload, args.manifest_sha256)
+        hashes["manifest_sha256"] = _sha(raw)
+        identity = manifest.identity
+        for key, path, expected in (
+            ("clean_admissible_sha256", identity.clean_data_path, identity.clean_data_sha256),
+            ("packed_retained_sha256", identity.retained_data_path, identity.retained_data_sha256),
+            ("negative_sha256", identity.negative_path, identity.negative_sha256),
+            ("negative_manifest_sha256", identity.negative_manifest_path, identity.negative_manifest_sha256),
+        ):
+            current = _read_strict_bytes(path, key)
+            if key in ("clean_admissible_sha256", "packed_retained_sha256"):
+                _source_rows(current)
+            elif key == "negative_sha256":
+                _parse_negative_store(current)
+            if key == "negative_manifest_sha256":
+                from step_preference.negatives import _manifest_from_bytes
+                _manifest_from_bytes(current)
+                if _canonical_bytes(_parse_json(current, key)) != current:
+                    raise ValueError("negative manifest is not canonical JSON")
+            hashes[key] = _authenticate(current, expected, key)
+        source_args = SimpleNamespace(
+            original_data_path=identity.original_data_path,
+            clean_data_path=identity.clean_data_path,
+            clean_length_manifest=identity.clean_length_manifest_path,
+            clean_length_manifest_sha256=identity.clean_length_manifest_sha256,
+            image_root=identity.image_root_path, checkpoint_path=identity.checkpoint_path,
+            source_map_path=identity.source_map_path, source_map_sha256=identity.source_map_sha256,
+            negative_path=identity.negative_path, negative_manifest=identity.negative_manifest_path,
+            max_packed_sequence_length=identity.max_packed_sequence_length,
+        )
+        if not identity.tracked_worktree_clean or _git_identity() != identity.git_commit:
+            raise ValueError("git identity or tracked worktree does not match")
+        chain = validate_clean_source_chain(source_args)
+        for key, value in chain.identity_values.items():
+            if getattr(identity, key) != value:
+                raise ValueError(f"reconstructed identity does not match: {key}")
+        measured = _reconstruct_chain(source_args, chain)
+        # Recompute classifications and complete expectations from measurements.
+        # No manifest record/partition value is an input to this decision.
+        retained, filtered = select_packed_admission(measured, max_packed_length=4608)
+        records = tuple(sorted((*retained, *filtered), key=lambda row: row.source_index))
+        expected_identity = PackedAdmissionIdentity(
+            **chain.identity_values,
+            retained_data_path=identity.retained_data_path,
+            retained_data_sha256=_sha(_retained_bytes(chain, tuple(row.source_index for row in retained))),
+        )
+        expected = PackedAdmissionManifest(
+            1, PACKED_ADMISSION_MANIFEST_KIND, expected_identity, records,
+            tuple(row.source_index for row in retained), tuple(row.sample_id for row in retained),
+            tuple(row.source_index for row in filtered), tuple(row.sample_id for row in filtered),
+            build_boundary_witnesses(retained),
+            PackedAdmissionCounts(chain.original_count, chain.clean_admissible_count, len(records), len(retained), len(filtered)),
+        )
+        if manifest != expected:
+            raise ValueError("admission manifest does not match independently reconstructed source records")
+        if _read_strict_bytes(identity.retained_data_path, "packed retained source") != _retained_bytes(chain, expected.retained_source_indices):
+            raise ValueError("retained source bytes do not match reconstructed partition")
+        _check_unchanged(chain)
+        if _read_strict_bytes(args.manifest_path, "packed admission manifest") != raw:
+            raise ValueError("admission manifest changed during verification")
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        errors = (str(error) or type(error).__name__,)
+    verification = PackedAdmissionVerification(
+        schema_version=1, kind=PACKED_ADMISSION_VERIFICATION_KIND,
+        status="fail" if errors else "pass",
+        manifest_path=str(Path(args.manifest_path).resolve(strict=False)),
+        **hashes,
+        verified_record_count=0 if errors else len(records),
+        retained_source_indices=() if errors else tuple(row.source_index for row in retained),
+        filtered_source_indices=() if errors else tuple(row.source_index for row in filtered),
+        errors=errors,
+    )
+    write_packed_admission_verification(args.output_path, verification)
+    return verification
+
+
+def main(argv=None) -> int:
+    import argparse
+    import sys
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    build = commands.add_parser("build")
+    for name in (
+        "original-data-path", "clean-data-path", "clean-length-manifest",
+        "clean-length-manifest-sha256", "image-root", "checkpoint-path",
+        "source-map-path", "source-map-sha256", "negative-path", "negative-manifest",
+        "retained-output-path", "manifest-output-path",
+    ):
+        build.add_argument(f"--{name}", required=True)
+    build.add_argument("--max-packed-sequence-length", required=True, type=int)
+    verify = commands.add_parser("verify")
+    for name in ("manifest-path", "manifest-sha256", "output-path"):
+        verify.add_argument(f"--{name}", required=True)
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "build":
+            build_packed_admission(args)
+        elif verify_packed_admission(args).status != "pass":
+            return 2
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
