@@ -396,7 +396,7 @@ def test_packed_stage2b_uses_one_policy_call_and_same_objective(monkeypatch):
     naive_model = _Policy()
     naive_loss = naive_trainer.compute_loss(naive_model, _batch())
 
-    packed_trainer = _trainer(_config(packing_enabled=True))
+    packed_trainer = _trainer(_config(packing_enabled=True, max_packed_sequence_length=4608))
     packed_model = _Policy()
     packed_loss = packed_trainer.compute_loss(packed_model, _batch())
 
@@ -569,6 +569,8 @@ def test_stage2b_components_validate_exact_store_and_clear_stage2a_resume(
             str(negative_path),
             "--step_negative_manifest",
             str(manifest_path),
+            "--vision_attention_implementation",
+            "flash_attention_2",
             "--no-gradient_checkpointing",
         ]
     )
@@ -601,6 +603,11 @@ def test_stage2b_components_validate_exact_store_and_clear_stage2a_resume(
 
     processor = SimpleNamespace(tokenizer=Tokenizer())
     model = tiny_stage2_qwen()
+    # Keep the real mixed-backend construction and validation on this CPU fixture.
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration, "_check_and_enable_flash_attn_2",
+        lambda config, **kwargs: config,
+    )
     prepared = SimpleNamespace(
         sample_id="sample-a",
         reasoning_steps=(
@@ -661,9 +668,9 @@ def test_stage2b_components_validate_exact_store_and_clear_stage2a_resume(
     )
     dependencies = main.Stage2SourceDependencies(
         find_adapter_config=lambda *_args, **_kwargs: None,
-        load_config=lambda *_args, **_kwargs: SimpleNamespace(stage="stage2"),
+        load_config=lambda *_args, **_kwargs: model.config,
         load_processor=lambda *_args, **_kwargs: processor,
-        load_model=lambda *_args, **_kwargs: model,
+        load_model=lambda _source, *, config: main.Qwen2_5_VLForConditionalGeneration(config),
     )
 
     components = main.build_stage2_training_components(

@@ -265,6 +265,8 @@ class Stage2DataCollator:
         supervise_latent_boundaries,
         step_preference_enabled=False,
         negative_store=None,
+        packed_admission_records_by_sample_id=None,
+        max_packed_sequence_length=4608,
     ):
         self.processor = processor
         self.token_ids = token_ids
@@ -274,6 +276,16 @@ class Stage2DataCollator:
         if negative_store is not None and not step_preference_enabled:
             raise ValueError("a negative store requires step preference metadata")
         self.negative_store = negative_store
+        self.packed_admission_records_by_sample_id = (
+            _ImmutableDict(packed_admission_records_by_sample_id)
+            if packed_admission_records_by_sample_id is not None else None
+        )
+        self.max_packed_sequence_length = max_packed_sequence_length
+        if packed_admission_records_by_sample_id is not None:
+            if not step_preference_enabled or negative_store is None:
+                raise ValueError("packed admission requires joined step preference negatives")
+            if type(max_packed_sequence_length) is not int or max_packed_sequence_length != 4608:
+                raise ValueError("packed admission cap must match 4608")
         self.assistant_pattern = processor.tokenizer(
             "<|im_start|>assistant", add_special_tokens=False, return_tensors="pt"
         )["input_ids"][0]
@@ -408,6 +420,24 @@ class Stage2DataCollator:
                         }
                     )
                 batch["step_preference"]["steps"] = tuple(joined_steps)
+        if self.packed_admission_records_by_sample_id is not None:
+            from step_preference.packed_admission import PackedAdmissionRecord
+            from step_preference.packing import build_packed_tree_plan
+
+            record = self.packed_admission_records_by_sample_id.get(example.sample_id)
+            if (not isinstance(record, PackedAdmissionRecord)
+                    or record.sample_id != example.sample_id or record.admission_reason != "retained"):
+                raise ValueError("packed admission has no retained record for sample ID")
+            plan = build_packed_tree_plan(
+                clean_input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                reasoning_spans=batch["reasoning_step_spans"],
+                joined_steps=batch["step_preference"]["steps"],
+            )
+            if (plan.unpadded_length != record.packed_unpadded_length
+                    or plan.padded_length != record.packed_padded_length
+                    or self.max_packed_sequence_length != 4608
+                    or plan.padded_length > self.max_packed_sequence_length):
+                raise ValueError("packed admission natural plan lengths or cap do not match")
         return batch
 
 

@@ -72,7 +72,8 @@ def test_production_context_routes_tuning_and_checkpointing_without_overrides(
 
     def fake_parse_args(argv):
         captured["argv"] = tuple(argv)
-        return SimpleNamespace()
+        captured["parsed"] = SimpleNamespace()
+        return captured["parsed"]
 
     negative = SimpleNamespace(
         valid_visual_negative=True,
@@ -101,6 +102,7 @@ def test_production_context_routes_tuning_and_checkpointing_without_overrides(
             negative_manifest=str(manifest_path),
             stage2a_checkpoint_path=str(checkpoint),
             attention_implementation="sdpa",
+            max_packed_sequence_length=4608,
         ),
     )
     monkeypatch.setattr("utils_deepseed.parse_args", fake_parse_args)
@@ -124,6 +126,7 @@ def test_production_context_routes_tuning_and_checkpointing_without_overrides(
     )
 
     argv = captured["argv"]
+    assert captured["parsed"]._stage2b_capacity_probe is True
     assert argv[argv.index("--attention_implementation") + 1] == "sdpa"
     assert (
         argv[argv.index("--vision_attention_implementation") + 1]

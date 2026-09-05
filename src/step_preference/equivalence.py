@@ -599,6 +599,7 @@ def load_production_context(
     vision_attention_implementation: str = "flash_attention_2",
     tuning_method: str = "full",
     gradient_checkpointing: bool = False,
+    requested_sample_id: str | None = None,
 ) -> ProductionContext:
     """Load one authenticated valid-pair sample through production assembly."""
     from main import build_stage2_training_components, preflight_stage2b_artifacts
@@ -651,10 +652,16 @@ def load_production_context(
             ),
         ]
     )
+    args._stage2b_capacity_probe = True
     preflight = preflight_stage2b_artifacts(args)
     args._stage2b_preflight = preflight
     valid_sample_id = None
     for example in preflight.prepared_examples:
+        if requested_sample_id is not None:
+            if example.sample_id == requested_sample_id:
+                valid_sample_id = example.sample_id
+                break
+            continue
         rows = [
             preflight.negative_store[(example.sample_id, step.step_id)]
             for step in example.reasoning_steps
@@ -663,6 +670,8 @@ def load_production_context(
             valid_sample_id = example.sample_id
             break
     if valid_sample_id is None:
+        if requested_sample_id is not None:
+            raise ValueError("requested sample ID is absent from the authenticated clean source")
         raise ValueError("authenticated selected rows contain no valid preference pair")
 
     components = build_stage2_training_components(args)
@@ -672,7 +681,7 @@ def load_production_context(
         if example.sample_id == valid_sample_id
     ]
     if len(matches) != 1:
-        raise ValueError("lowest valid-pair sample was not retained exactly once")
+        raise ValueError("selected authenticated sample was not retained exactly once")
     batch = components.data_collator(matches)
     if batch.get("sample_ids") != (valid_sample_id,):
         raise ValueError("collated sample identity does not match authenticated negatives")

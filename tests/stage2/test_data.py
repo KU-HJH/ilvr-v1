@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -28,6 +29,58 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageP
 
 
 TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
+
+
+@pytest.mark.parametrize("mutation", [None, "unpadded_length", "padded_length", "sample_id", "cap"])
+def test_packed_admission_collator_rechecks_natural_plan(tmp_path, monkeypatch, mutation):
+    from tests.step_preference.test_packed_admission_cli import AdmissionProcessor
+    from step_preference.negatives import StepNegative
+    from step_preference.packed_admission import PackedAdmissionRecord
+    from step_preference import packing
+
+    Image.new("RGB", (2, 2)).save(tmp_path / "input.png")
+    example = prepare_stage2_example(
+        dict(sample_id="sample-a", image_input="input.png", text_input="question",
+             sequence_plan=[dict(type="text", content="A"),
+                            dict(type="latent", helper_image="ignored.png"),
+                            dict(type="text", content="BC")]),
+        image_root=tmp_path, latent_size=8, require_reasoning_units=True,
+        assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    )
+    processor = AdmissionProcessor()
+    store = {("sample-a", 0): StepNegative("sample-a", 0, "BC", "DD", None, True, False, -1.0, -2.0, None)}
+    kwargs = dict(processor=processor, token_ids=TOKENS, latent_size=8,
+                  supervise_latent_boundaries=True, step_preference_enabled=True, negative_store=store)
+    original = Stage2DataCollator(**kwargs)([example])
+    natural = packing.build_packed_tree_plan(
+        clean_input_ids=original["input_ids"], attention_mask=original["attention_mask"],
+        reasoning_spans=original["reasoning_step_spans"], joined_steps=original["step_preference"]["steps"],
+    )
+    record = PackedAdmissionRecord(0, "sample-a", natural.root_length, natural.unpadded_length,
+                                   natural.padded_length, 4, 1, 1, 3, 8, "retained")
+    records = {"sample-a": record}
+    if mutation == "sample_id":
+        records = {}
+    if mutation in ("unpadded_length", "padded_length"):
+        planner = packing.build_packed_tree_plan
+        def changed(**kwargs):
+            plan = planner(**kwargs)
+            return replace(plan, **{mutation: getattr(plan, mutation) + 128})
+        monkeypatch.setattr(packing, "build_packed_tree_plan", changed)
+    collator_kwargs = dict(kwargs, packed_admission_records_by_sample_id=records,
+                           max_packed_sequence_length=128 if mutation == "cap" else 4608)
+    if mutation is not None:
+        with pytest.raises(ValueError, match="admission"):
+            Stage2DataCollator(**collator_kwargs)([example])
+        return
+    collator = Stage2DataCollator(**collator_kwargs)
+    records.clear()  # The caller cannot mutate the collator's authenticated snapshot.
+    actual = collator([example])
+    assert actual.keys() == original.keys()
+    for key in ("input_ids", "attention_mask", "labels", "pixel_values", "image_grid_thw"):
+        assert torch.equal(actual[key], original[key])
+    assert actual["sample_ids"] == ("sample-a",)
+    assert actual["reasoning_step_spans"] == original["reasoning_step_spans"]
 
 
 class RecordingTokenizer:

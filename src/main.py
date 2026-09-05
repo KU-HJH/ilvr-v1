@@ -44,7 +44,9 @@ _DIRECT_MAIN_PROFILE = (
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
+
+from step_preference import packed_admission as packed_admission_artifacts
 
 import torch
 from transformers import (
@@ -166,6 +168,8 @@ class Stage2BPreflight:
 
     prepared_examples: tuple[object, ...]
     negative_store: Mapping[tuple[str, int], object]
+    packed_admission: packed_admission_artifacts.PackedAdmissionManifest | None = None
+    packed_admission_records_by_sample_id: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +205,75 @@ def _require_stage2b_attention_contract(args) -> None:
         )
 
 
+def validate_packed_admission_inputs(args, config):
+    """Authenticate admission, its verifier, and the original-to-retained chain."""
+    artifacts = packed_admission_artifacts
+    if not all((config.packed_admission_manifest, config.packed_admission_manifest_sha256,
+                config.packed_admission_verification, config.packed_admission_verification_sha256)):
+        raise ValueError("normal packed Stage 2B requires all four admission artifacts")
+    manifest, manifest_raw = artifacts._strict_json(
+        config.packed_admission_manifest, "packed admission manifest",
+        artifacts._manifest_from_payload, config.packed_admission_manifest_sha256,
+    )
+    verification, verification_raw = artifacts._strict_json(
+        config.packed_admission_verification, "packed admission verification",
+        artifacts._verification_from_payload, config.packed_admission_verification_sha256,
+    )
+    identity = manifest.identity
+    expected_verification = artifacts.PackedAdmissionVerification(
+        1, artifacts.PACKED_ADMISSION_VERIFICATION_KIND, "pass",
+        str(Path(config.packed_admission_manifest).resolve(strict=True)),
+        config.packed_admission_manifest_sha256, identity.clean_data_sha256,
+        identity.retained_data_sha256, identity.negative_sha256, identity.negative_manifest_sha256,
+        len(manifest.records), manifest.retained_source_indices, manifest.filtered_source_indices, (),
+    )
+    if verification != expected_verification:
+        raise ValueError("packed admission verification does not match manifest")
+    for name, supplied, expected in (
+        ("packed data", args.data_path, identity.retained_data_path),
+        ("negative", config.negative_path, identity.negative_path),
+        ("negative manifest", config.negative_manifest, identity.negative_manifest_path),
+        ("checkpoint", config.stage2a_checkpoint_path, identity.checkpoint_path),
+        ("image root", args.image_root, identity.image_root_path),
+    ):
+        path = Path(supplied)
+        if path.is_symlink() or str(path.resolve(strict=True)) != expected:
+            raise ValueError(f"packed admission {name} path does not match")
+    if (args.latent_size, args.max_seq_length_train, args.supervise_latent_boundaries,
+            config.max_packed_sequence_length) != (
+            identity.latent_size, identity.clean_model_limit, True, identity.max_packed_sequence_length):
+        raise ValueError("packed admission runtime configuration does not match")
+    if args.max_train_samples is not None:
+        raise ValueError("packed admission does not permit max_train_samples truncation")
+    chain = artifacts.validate_clean_source_chain(SimpleNamespace(
+        original_data_path=identity.original_data_path, clean_data_path=identity.clean_data_path,
+        clean_length_manifest=identity.clean_length_manifest_path,
+        clean_length_manifest_sha256=identity.clean_length_manifest_sha256,
+        source_map_path=identity.source_map_path, source_map_sha256=identity.source_map_sha256,
+        image_root=identity.image_root_path, checkpoint_path=identity.checkpoint_path,
+        negative_path=identity.negative_path, negative_manifest=identity.negative_manifest_path,
+        max_packed_sequence_length=identity.max_packed_sequence_length,
+    ))
+    for name, expected in chain.identity_values.items():
+        if getattr(identity, name) != expected:
+            raise ValueError(f"packed admission source identity does not match: {name}")
+    if (tuple(row.source_index for row in manifest.records) != chain.original_source_indices
+            or tuple(row.sample_id for row in manifest.records) != chain.sample_ids
+            or manifest.counts.original != chain.original_count
+            or manifest.counts.clean_admissible != chain.clean_admissible_count):
+        raise ValueError("packed admission records do not match authenticated source map")
+    retained_raw = artifacts._read_strict_bytes(args.data_path, "packed retained source")
+    artifacts._authenticate(retained_raw, identity.retained_data_sha256, "packed retained source")
+    if retained_raw != artifacts._retained_bytes(chain, manifest.retained_source_indices):
+        raise ValueError("packed admission retained bytes/order do not match source")
+    artifacts._check_unchanged(chain)
+    for path, raw in ((config.packed_admission_manifest, manifest_raw),
+                      (config.packed_admission_verification, verification_raw)):
+        if artifacts._read_strict_bytes(path, "packed admission artifact") != raw:
+            raise ValueError("packed admission artifact changed during preflight")
+    return manifest
+
+
 def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     """Validate Stage 2B source, checkpoint, and negatives without runtime writes."""
     config = getattr(args, "step_preference_config", None)
@@ -210,7 +283,12 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
         raise ValueError("Stage 2B artifact preflight requires Stage 2B configuration")
     _require_stage2b_attention_contract(args)
 
-    source_path = Path(args.data_path)
+    admission = (
+        validate_packed_admission_inputs(args, config)
+        if config.packing_enabled and not getattr(args, "_stage2b_capacity_probe", False)
+        else None
+    )
+    source_path = Path(admission.identity.clean_data_path if admission is not None else args.data_path)
     source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
     manifest = read_negative_manifest(config.negative_manifest)
     if manifest.source_sha256 != source_sha256:
@@ -219,7 +297,7 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     raw_examples = load_jsonl_examples(source_path)
     selected_examples = (
         raw_examples
-        if args.max_train_samples is None
+        if admission is not None or args.max_train_samples is None
         else raw_examples[: args.max_train_samples]
     )
     prepared = tuple(
@@ -283,9 +361,18 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
                 raise ValueError(
                     f"negative chosen text does not match source step: {key}"
                 )
+    records_by_sample_id = None
+    if admission is not None:
+        by_sample_id = {example.sample_id: example for example in prepared}
+        prepared = tuple(by_sample_id[sample_id] for sample_id in admission.retained_sample_ids)
+        records_by_sample_id = MappingProxyType({
+            row.sample_id: row for row in admission.records if row.admission_reason == "retained"
+        })
     return Stage2BPreflight(
         prepared_examples=prepared,
         negative_store=MappingProxyType(dict(negative_store)),
+        packed_admission=admission,
+        packed_admission_records_by_sample_id=records_by_sample_id,
     )
 
 
@@ -377,6 +464,10 @@ def build_stage2_training_components(
             stage2b_preflight = preflight_stage2b_artifacts(args)
         elif not isinstance(stage2b_preflight, Stage2BPreflight):
             raise TypeError("_stage2b_preflight must be a Stage2BPreflight")
+        elif (step_preference_config.packing_enabled
+              and not getattr(args, "_stage2b_capacity_probe", False)
+              and stage2b_preflight.packed_admission is None):
+            stage2b_preflight = preflight_stage2b_artifacts(args)
     source_dependencies = (
         source_dependencies or _default_stage2_source_dependencies()
     )
@@ -618,7 +709,9 @@ def build_stage2_training_components(
             ),
         )
 
-    if manifest_snapshot is None:
+    if stage2b_preflight is not None and stage2b_preflight.packed_admission is not None:
+        kept = stage2b_preflight.prepared_examples
+    elif manifest_snapshot is None:
         if step_preference_config.is_stage2b:
             prepared = stage2b_preflight.prepared_examples
         else:
@@ -669,6 +762,11 @@ def build_stage2_training_components(
         decision.supervise_latent_boundaries,
         step_preference_enabled=step_preference_config.is_stage2b,
         negative_store=negative_store,
+        packed_admission_records_by_sample_id=(
+            stage2b_preflight.packed_admission_records_by_sample_id
+            if step_preference_config.is_stage2b else None
+        ),
+        max_packed_sequence_length=step_preference_config.max_packed_sequence_length,
     )
     return Stage2TrainingComponents(
         model=model,
@@ -947,6 +1045,8 @@ def route_training(args, *, stage1_handler=None, stage2_handler=None):
 # ==============================================================
 def main_train():
     args = get_args()
+    if hasattr(args, "_stage2b_capacity_probe"):
+        raise ValueError("the private capacity probe is not a normal training option")
     validate_generated_artifact_paths(args)
     step_preference_config = getattr(args, "step_preference_config", None)
     if step_preference_config is None:
