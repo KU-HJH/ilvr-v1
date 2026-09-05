@@ -37,8 +37,13 @@ def _require_sha256(name: str, value: object) -> str:
 
 
 def _require_absolute_path(name: str, value: object) -> str:
-    if not isinstance(value, str) or not value or not Path(value).is_absolute():
-        raise ValueError(f"{name} must be a non-empty absolute path")
+    if (
+        not isinstance(value, str)
+        or not value
+        or not Path(value).is_absolute()
+        or str(Path(value).resolve(strict=False)) != value
+    ):
+        raise ValueError(f"{name} must be a resolved non-empty absolute path")
     return value
 
 
@@ -107,6 +112,8 @@ class PackedAdmissionIdentity:
         _require_int("clean_model_limit", self.clean_model_limit, minimum=1)
         _require_int("clean_prefilter_limit", self.clean_prefilter_limit, minimum=1)
         _require_int("max_packed_sequence_length", self.max_packed_sequence_length, minimum=1)
+        if self.latent_size != 8:
+            raise ValueError("latent_size must be 8")
         if self.clean_model_limit != 8192 or self.clean_prefilter_limit != 4608:
             raise ValueError("clean model and prefilter limits must be 8192 and 4608")
         if self.max_packed_sequence_length != 4608:
@@ -335,8 +342,29 @@ class PackedAdmissionVerification:
                 )
             ):
                 raise ValueError("passing verification requires all hashes and no errors")
-        elif not self.errors or self.verified_record_count or self.retained_source_indices or self.filtered_source_indices:
-            raise ValueError("failing verification requires one error and empty result fields")
+        else:
+            hashes = (
+                self.manifest_sha256,
+                self.clean_admissible_sha256,
+                self.packed_retained_sha256,
+                self.negative_sha256,
+                self.negative_manifest_sha256,
+            )
+            saw_null_hash = False
+            for value in hashes:
+                if value is None:
+                    saw_null_hash = True
+                elif saw_null_hash:
+                    raise ValueError(
+                        "failing verification hashes must form an authenticated prefix"
+                    )
+            if (
+                not self.errors
+                or self.verified_record_count
+                or self.retained_source_indices
+                or self.filtered_source_indices
+            ):
+                raise ValueError("failing verification requires one error and empty result fields")
 
 
 def _require_partition(
@@ -363,7 +391,7 @@ def _tie_axes(row: PackedAdmissionRecord | PackedTieClass) -> tuple[int, int, in
 def select_packed_admission(
     measurements: Sequence[PackedAdmissionMeasurement], *, max_packed_length: int
 ) -> tuple[tuple[PackedAdmissionRecord, ...], tuple[PackedAdmissionRecord, ...]]:
-    """Classify validated measurements without changing their order or contents."""
+    """Classify unique measurements into source-index-sorted partitions."""
     _require_int("max_packed_length", max_packed_length, minimum=1)
     rows = tuple(measurements)
     if not all(type(item) is PackedAdmissionMeasurement for item in rows):
@@ -373,7 +401,7 @@ def select_packed_admission(
     if len(source_indices) != len(set(source_indices)) or len(sample_ids) != len(set(sample_ids)):
         raise ValueError("measurements must have unique source indices and sample IDs")
     retained, filtered = [], []
-    for item in rows:
+    for item in sorted(rows, key=lambda value: value.source_index):
         reason = "retained" if item.packed_padded_length <= max_packed_length else "packed_length_exceeds_limit"
         target = retained if reason == "retained" else filtered
         target.append(PackedAdmissionRecord(**asdict(item), admission_reason=reason))

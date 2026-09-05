@@ -15,6 +15,7 @@ from step_preference.packed_admission import (
     PackedAdmissionManifest,
     PackedAdmissionMeasurement,
     PackedAdmissionRecord,
+    PackedAdmissionVerification,
     PackedBoundaryWitnesses,
     build_boundary_witnesses,
     read_packed_admission_manifest,
@@ -107,6 +108,26 @@ def manifest() -> PackedAdmissionManifest:
     )
 
 
+def failed_verification(**changes) -> PackedAdmissionVerification:
+    values = dict(
+        schema_version=PACKED_ADMISSION_SCHEMA_VERSION,
+        kind="stage2b-packed-admission-verification",
+        status="fail",
+        manifest_path="/verification-manifest.json",
+        manifest_sha256=None,
+        clean_admissible_sha256=None,
+        packed_retained_sha256=None,
+        negative_sha256=None,
+        negative_manifest_sha256=None,
+        verified_record_count=0,
+        retained_source_indices=(),
+        filtered_source_indices=(),
+        errors=("manifest is invalid",),
+    )
+    values.update(changes)
+    return PackedAdmissionVerification(**values)
+
+
 def test_select_packed_admission_classifies_in_order_without_other_reasons():
     retained, filtered = select_packed_admission(
         (measurement(1), measurement(2, packed_padded_length=4736)),
@@ -115,6 +136,21 @@ def test_select_packed_admission_classifies_in_order_without_other_reasons():
 
     assert [row.admission_reason for row in retained] == ["retained"]
     assert [row.admission_reason for row in filtered] == ["packed_length_exceeds_limit"]
+
+
+def test_select_packed_admission_sorts_each_partition_by_source_index():
+    retained, filtered = select_packed_admission(
+        (
+            measurement(4, packed_padded_length=4736),
+            measurement(3),
+            measurement(2, packed_padded_length=4736),
+            measurement(1),
+        ),
+        max_packed_length=4608,
+    )
+
+    assert tuple(row.source_index for row in retained) == (1, 3)
+    assert tuple(row.source_index for row in filtered) == (2, 4)
 
 
 @pytest.mark.parametrize(
@@ -241,3 +277,32 @@ def test_manifest_rejects_exact_schema_hash_duplicate_reason_and_count_drift(tmp
                 ),
             }
         )
+
+
+def test_identity_requires_exact_latent_size_and_resolved_canonical_paths(tmp_path):
+    with pytest.raises(ValueError, match="latent_size"):
+        PackedAdmissionIdentity(**{**identity().__dict__, "latent_size": 7})
+
+
+def test_identity_and_verification_reject_noncanonical_absolute_paths(tmp_path):
+    with pytest.raises(ValueError, match="resolved"):
+        PackedAdmissionIdentity(
+            **{**identity().__dict__, "original_data_path": "/tmp/../original.jsonl"}
+        )
+    with pytest.raises(ValueError, match="resolved"):
+        failed_verification(manifest_path="/tmp/../verification-manifest.json")
+
+    path = tmp_path / "manifest.json"
+    write_packed_admission_manifest(path, manifest())
+    payload = json.loads(path.read_bytes())
+    payload["identity"]["original_data_path"] = "/tmp/../original.jsonl"
+    path.write_bytes((json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    with pytest.raises(ValueError, match="resolved"):
+        read_packed_admission_manifest(path)
+
+
+def test_failing_verification_hashes_must_form_an_authenticated_prefix():
+    with pytest.raises(ValueError, match="prefix"):
+        failed_verification(clean_admissible_sha256=HASH)
+    with pytest.raises(ValueError, match="prefix"):
+        failed_verification(manifest_sha256=HASH, packed_retained_sha256=HASH)
