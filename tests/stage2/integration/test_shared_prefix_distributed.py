@@ -41,6 +41,8 @@ def test_two_rank_shared_flex_dora_zero2_accumulation():
         assert rank["finite_loss"] and rank["finite_gradients"]
         assert rank["changed_trainable_tensors"] > 0
         assert rank["rollout_calls"] == 2
+        assert rank["pre_engine_parameter_dtypes"] == ["torch.float32"]
+        assert rank["trained_parameter_dtypes"] == ["torch.bfloat16"]
     assert witness["adapter"] == dict(method="dora", rank=32, alpha=64, dropout=0.05)
     assert witness["zero_stage"] == 2
     assert witness["gradient_accumulation_steps"] == 2

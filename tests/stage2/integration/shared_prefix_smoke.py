@@ -60,6 +60,7 @@ def run_shared_prefix_smoke(options):
     tuning = Stage2TuningConfig(method="dora", r=32, alpha=64, dropout=0.05,
                                target_modules=ALLOWED_STAGE2_TARGET_SUFFIXES)
     model = build_stage2_tuned_model(base, tuning, is_trainable=True)
+    pre_engine_parameter_dtypes = sorted({str(p.dtype) for p in model.parameters()})
     before = {n: p.detach().float().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
     gradients = []
     handles = [p.register_hook(lambda grad: gradients.append(bool(torch.isfinite(grad).all())) or grad)
@@ -86,6 +87,8 @@ def run_shared_prefix_smoke(options):
     after = {n: p.detach().float().cpu() for n, p in model.named_parameters() if p.requires_grad}
     gradient_norm = trainer._representative_gradient_norm
     record = dict(rank=rank, global_step=int(trainer.state.global_step),
+        pre_engine_parameter_dtypes=pre_engine_parameter_dtypes,
+        trained_parameter_dtypes=sorted({str(p.dtype) for p in model.parameters()}),
         optimizer_step=trainer._observed_optimizer_step,
         # Metric accumulation is reset by Trainer.log; this monotonic index
         # counts actual compute_loss entries across logging boundaries.

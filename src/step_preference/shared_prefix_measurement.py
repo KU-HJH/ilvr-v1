@@ -231,16 +231,32 @@ def validate_measurement_arguments(parser, args):
 
 def run_shared_measurement_cli(args, *, benchmark, git_commit):
     from artifact_paths import require_canonical_artifact_path
+    from step_preference.equivalence import write_evidence_exclusive
+
+    output = require_canonical_artifact_path(args.output_path, kind="result")
+    if output.exists():
+        raise ValueError(f"evidence path already exists: {output}")
+    report = dict(schema_version=3, git_commit=git_commit, status="pass", records=[],
+        stochastic_limitation="Naive resamples clean prefixes; active-dropout objectives are not numerical equivalence oracles.")
+    try:
+        code = _populate_shared_measurement_report(args, benchmark=benchmark, report=report)
+    except Exception as error:
+        report["status"] = "incomplete" if isinstance(error, torch.cuda.OutOfMemoryError) else "fail"
+        report["errors"] = [str(error)]
+        write_evidence_exclusive(output, report)
+        raise
+    write_evidence_exclusive(output, report)
+    return code
+
+
+def _populate_shared_measurement_report(args, *, benchmark, report):
     from stage2.peft import ALLOWED_STAGE2_TARGET_SUFFIXES, Stage2TuningConfig, build_stage2_tuned_model
     from step_preference.benchmark import CudaBenchmarkRuntime
     from step_preference.equivalence import (_config, load_production_context,
-        run_shared_prefix_comparison, write_evidence_exclusive)
+        run_shared_prefix_comparison)
 
-    output = require_canonical_artifact_path(args.output_path, kind="result")
     if args.preserve_dropout and not benchmark:
         raise ValueError("numerical comparison requires dropout disabled; use benchmark for stochastic training")
-    report = dict(schema_version=3, git_commit=git_commit, status="pass", records=[],
-        stochastic_limitation="Naive resamples clean prefixes; active-dropout objectives are not numerical equivalence oracles.")
     if args.tiny_only:
         cases = tiny_sweep_cases(device=args.device) if benchmark else [dict(
             series="tiny-two-layer", steps=2,
@@ -251,6 +267,12 @@ def run_shared_measurement_cli(args, *, benchmark, git_commit):
             device=args.device, tuning_method=args.tuning_method, gradient_checkpointing=args.gradient_checkpointing,
             requested_sample_id=args.requested_sample_id, preserve_dropout=args.preserve_dropout)
         report["identity"] = dict(context.identity)
+        report["identity"]["loaded_parameter_dtypes"] = sorted({str(p.dtype) for p in context.model.parameters()})
+        # Standalone measurements do not construct the DeepSpeed engine, whose
+        # bf16 initialization casts the whole model before either training route.
+        context.model.bfloat16()
+        report["identity"]["measurement_parameter_dtypes"] = sorted({str(p.dtype) for p in context.model.parameters()})
+        report["identity"]["parameter_precision_policy"] = "DeepSpeed bf16 model storage for every compared path"
         cases = [dict(series="production", steps=len(context.batch["reasoning_step_spans"]),
                       model=context.model, batch=context.batch)]
     for case in cases:
@@ -300,5 +322,4 @@ def run_shared_measurement_cli(args, *, benchmark, git_commit):
             report["records"].append(dict(series=case["series"], precision="BF16 diagnostic", **diagnostic))
             if any(record["status"] == "fail" for record in report["records"]):
                 report["status"] = "fail"
-    write_evidence_exclusive(output, report)
     return 0 if report["status"] == "pass" else 1
