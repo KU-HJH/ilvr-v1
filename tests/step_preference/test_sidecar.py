@@ -265,6 +265,25 @@ def test_plan_rejects_empty_chosen_target():
         )
 
 
+@pytest.mark.parametrize("target_start", [4, 5])
+def test_chosen_replay_requires_completed_latent_but_allows_end_token_boundary(target_start):
+    """Catches entropy-only replay entering a latent pad or rejecting the legal end token."""
+    clean_ids = torch.tensor([[10, 11, 90, 90, 92, 20, 21]])
+    span = ReasoningStepSpan(0, 0, 2, 2, 4, target_start, 7, None)
+    arguments = dict(clean_input_ids=clean_ids, attention_mask=torch.ones_like(clean_ids),
+        spans=(span,), steps=({"span": span, "negative": _negative(visual=False, textual=False),
+                              "visual_rejected": None, "textual_rejected": None},))
+    if target_start == 4:
+        with pytest.raises(ValueError, match="completed latent"):
+            build_sidecar_plan(**arguments)
+    else:
+        plan = build_sidecar_plan(**arguments)
+        for group in plan.groups:
+            assert len(group) == 1
+            assert group[0].logical_positions == (4, 5)
+            assert group[0].token_ids == (92, 20)
+
+
 def test_plan_rejects_empty_rejected_target_and_unfinished_latent_replay():
     """Catches unscoreable rejects and replay beginning inside required latent pads."""
     clean_ids = torch.tensor([[10, 11, 90, 90, 92, 20, 21]])

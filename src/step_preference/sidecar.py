@@ -52,6 +52,8 @@ def _chosen_branch(
     modality: Literal["visual", "textual"],
 ) -> SidecarBranch:
     start = span.target_text_start - 1
+    if start < span.latent_end:
+        raise ValueError("chosen branch begins before the completed latent prefix")
     stop = span.target_text_end - 1
     source_positions = tuple(range(start, stop))
     if modality == "visual":
