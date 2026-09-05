@@ -153,6 +153,7 @@ def flex_attention_forward(
     scaling: Optional[float] = None,
     softcap: Optional[float] = None,
     head_mask: Optional[torch.Tensor] = None,
+    kernel_options: Optional[dict] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     block_mask = None
@@ -185,6 +186,7 @@ def flex_attention_forward(
         # Last time checked on PyTorch == 2.5.1: Flex Attention always computes the lse regardless.
         # For simplification, we thus always return it as no additional computations are introduced.
         return_lse=True,
+        **({"kernel_options": kernel_options} if kernel_options is not None else {}),
     )
     # lse is returned in float32
     attention_weights = attention_weights.to(value.dtype)

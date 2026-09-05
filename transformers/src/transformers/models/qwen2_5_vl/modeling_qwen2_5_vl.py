@@ -787,6 +787,9 @@ class Qwen2_5_VLAttention(nn.Module):
             attn_output, _ = flex_attention_forward(
                 self, query_states, key_states, value_states, attention_mask,
                 scaling=self.head_dim ** -0.5,
+                # Short GQA sidecars can exceed shared memory in the decoding
+                # heuristic; use the normal Flex kernel for training replay.
+                kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
             )
             attn_output = self.o_proj(attn_output.reshape(bsz, q_len, -1))
             return attn_output, None, past_key_value
@@ -1249,6 +1252,7 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
             attn_output, _ = flex_attention_forward(
                 self, query_states, key_states, value_states, attention_mask,
                 scaling=self.head_dim ** -0.5,
+                kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
             )
             attn_output = self.o_proj(attn_output.reshape(bsz, q_len, -1))
             return attn_output, None, past_key_value

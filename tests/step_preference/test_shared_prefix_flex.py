@@ -39,6 +39,7 @@ def test_cuda_flex_rectangular_scores_and_backward_match_dense(monkeypatch, back
     calls = []
     original = integration.compile_friendly_flex_attention
     def witness(q, k, v, **kwargs):
+        assert kwargs.get("kernel_options") == {"FORCE_USE_FLEX_ATTENTION": True}
         calls.append((q.shape, k.shape, kwargs["enable_gqa"]))
         return original(q, k, v, **kwargs)
     monkeypatch.setattr(integration, "compile_friendly_flex_attention", witness)
@@ -57,3 +58,53 @@ def test_cuda_flex_rectangular_scores_and_backward_match_dense(monkeypatch, back
     for (name, got), (_, want) in zip(model.named_parameters(), reference.named_parameters()):
         if got.requires_grad:
             torch.testing.assert_close(got.grad, want.grad, atol=1e-5, rtol=1e-4, msg=name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="actual rectangular CUDA Flex geometry")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_actual_short_query_gqa_geometry_uses_normal_flex_with_dense_gradient_oracle(monkeypatch, dtype):
+    """Catches dropped kernel options and the observed Q99/GQA8 decoding resource failure."""
+    import transformers.integrations.flex_attention as integration
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    torch.manual_seed(419)
+    branch = sidecar.SidecarBranch(name="actual-shape", kind="visual_off", step_id=0,
+        token_ids=(12,)*99, clean_embedding_sources=tuple(range(114, 213)),
+        logical_positions=tuple(range(114, 213)), clean_ancestor_end=114,
+        blocked_start=100, blocked_end=108, selected_positions=tuple(range(99)),
+        target_token_ids=(12,)*99, rejected_model_inputs=None)
+    mask = sidecar.build_sidecar_flex_block_mask(213, (branch,), "cuda:0")
+    q = torch.randn((1, 16, 99, 128), device="cuda:0", dtype=dtype, requires_grad=True)
+    k = torch.randn((1, 2, 312, 128), device="cuda:0", dtype=dtype, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    reference_inputs = [t.detach().clone().requires_grad_() for t in (q,k,v)]
+    original = integration.compile_friendly_flex_attention
+    def observed(q, k, v, **kwargs):
+        # Fail before recompiling the already observed invalid default decoding
+        # specialization. GREEN delegates to actual compiled normal Flex.
+        assert kwargs.get("kernel_options") == {"FORCE_USE_FLEX_ATTENTION": True}
+        return original(q, k, v, **kwargs)
+    monkeypatch.setattr(integration, "compile_friendly_flex_attention", observed)
+    got, _ = integration.flex_attention_forward(torch.nn.Module(), q, k, v, mask,
+        scaling=128**-0.5, kernel_options={"FORCE_USE_FLEX_ATTENTION": True})
+    visible = torch.zeros((99, 312), device="cuda:0", dtype=torch.bool)
+    visible[:, :114] = True
+    visible[:, 100:108] = False
+    visible[:, 213:] = torch.ones((99,99), device="cuda:0", dtype=torch.bool).tril()
+    with sdpa_kernel(SDPBackend.MATH):
+        expected = torch.nn.functional.scaled_dot_product_attention(*reference_inputs,
+            attn_mask=visible[None,None], enable_gqa=True).transpose(1,2)
+    upstream = torch.randn_like(got)
+    score = (got.float()*upstream.float()).sum()
+    reference_score = (expected.float()*upstream.float()).sum()
+    score.backward()
+    reference_score.backward()
+    assert all(torch.isfinite(t.grad).all() and t.grad.norm() > 0 for t in (q,k,v))
+    if dtype == torch.float32:
+        torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(score, reference_score, atol=1e-5, rtol=1e-4)
+        for actual, reference in zip((q,k,v), reference_inputs):
+            torch.testing.assert_close(actual.grad, reference.grad, atol=1e-5, rtol=1e-4)
+    print(dict(dtype=str(dtype), q_heads=16, kv_heads=2, head_dim=128, query_rows=99,
+        root_rows=213, max_output_abs=float((got-expected).abs().max()),
+        score_abs=float((score-reference_score).abs()),
+        max_gradient_abs=max(float((a.grad-r.grad).abs().max()) for a,r in zip((q,k,v),reference_inputs))))
