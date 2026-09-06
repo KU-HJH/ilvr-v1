@@ -1,6 +1,6 @@
 # Stage 2B Context Preference + Entropy — 3-forward correction
 
-Status: 승인된 design commitment v1의 서면 명세. 서면 검토 대기이며 implementation plan은 아직 작성하지 않았다.
+Status: 승인된 design commitment v1의 서면 명세. 사용자의 writing-plans 명시 호출에 따라 서면 검토에서 계획 작성으로 진행했다. 후속 plan: ../plans/2026-09-06-context-preference-three-forward.md. 구현은 아직 재개하지 않았다.
 작업 위치: `/root/workspace/ILVR/.worktrees/ours1`.
 코드 조사 기준: `a69b9c0`.
 Understood as: 기존 ours1 Stage 2B의 shared-prefix 계산을 보존하면서 새 기본 학습 경로를 clean target의 local context preference로 교정한다. 계획 전 모호한 사항은 사용자에게 확인하며, spec 검토 → plan → 구현 순서를 따른다.
