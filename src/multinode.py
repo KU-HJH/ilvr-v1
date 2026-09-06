@@ -1890,7 +1890,11 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 requested_identity=resume_identity,
                 destination=redistributed,
             )
-        start_rank0_then_rank1(plan, runner, commands=commands)
+        # Stage 2 measures the full dataset before opening the rendezvous port.
+        start_rank0_then_rank1(
+            plan, runner, commands=commands,
+            ready_timeout_seconds=600 if stage == "stage2" else 30,
+        )
         exit_codes = monitor_owned_jobs(
             plan,
             runner,

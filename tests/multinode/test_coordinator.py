@@ -5,6 +5,7 @@ import signal
 import stat
 import subprocess
 import threading
+from types import SimpleNamespace
 from dataclasses import replace
 from pathlib import Path
 
@@ -40,6 +41,46 @@ from stage1.training_evidence import publish_stage1_training_evidence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_stage2_coordinator_waits_for_length_preprocessing(monkeypatch):
+    """Stage 2 length admission can take longer than the control RPC timeout."""
+    for key, value in {
+        "STAGE1_CHECKPOINT": "/models/base", "DATA_PATH": "/data/train.jsonl",
+        "IMAGE_ROOT": "/data", "TUNING_METHOD": "dora",
+    }.items():
+        monkeypatch.setenv(key, value)
+    commit = multinode_module._repository_git_stdout(("rev-parse", "HEAD"))
+    monkeypatch.setattr(multinode_module, "collect_node_snapshot", lambda *a, **kw: None)
+    monkeypatch.setattr(multinode_module, "validate_preflight", lambda *a: SimpleNamespace(commit=commit))
+    monkeypatch.setattr(multinode_module, "SubprocessCoordinatorRunner", lambda *a, **kw: None)
+
+    class BothNodesStarted(Exception):
+        pass
+
+    def start_after_preprocessing(launch_plan, unused_runner, **kwargs):
+        elapsed = [0.0]
+        started = []
+        runner = SimpleNamespace(
+            prepare_plan=lambda plan: None,
+            start_remote=lambda command: started.append(0),
+            rank0_is_ready=lambda plan: elapsed[0] >= 45,
+            start_local=lambda command: started.append(1),
+            sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+            cleanup_owned=lambda *a, **kw: True,
+        )
+        with monkeypatch.context() as clock_patch:
+            clock_patch.setattr(runtime_module.time, "monotonic", lambda: elapsed[0])
+            start_rank0_then_rank1(launch_plan, runner, **kwargs)
+        assert started == [0, 1]
+        raise BothNodesStarted
+
+    monkeypatch.setattr(multinode_module, "start_rank0_then_rank1", start_after_preprocessing)
+    with pytest.raises(BothNodesStarted):
+        multinode_module._training_main("stage2", [
+            "--run-id", "stage2-preprocessing-test", "--zero-stage", "2",
+            "--main-process-port", "29631", "--max_steps", "1", "--save_steps", "1",
+        ])
 
 
 def plan(stage="stage1", method="lora"):
