@@ -43,6 +43,7 @@ class SidecarPlan:
     root_length: int
     root_selected_positions: tuple[int, ...]
     groups: tuple[tuple[SidecarBranch, ...], tuple[SidecarBranch, ...]]
+    context_preference: bool = False
 
 
 def _chosen_branch(
@@ -211,6 +212,35 @@ def build_sidecar_plan(
         root_length=root_length,
         root_selected_positions=tuple(root_selected_positions),
         groups=(tuple(visual_group), tuple(textual_group)),
+    )
+
+
+def build_context_sidecar_plan(
+    *,
+    clean_input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    spans: Sequence[ReasoningStepSpan],
+) -> SidecarPlan:
+    """Build local visual/textual ablations for every clean target step."""
+    clean_ids, root_length = _validate_clean_inputs(clean_input_ids, attention_mask)
+    validated_spans = _validate_spans(spans, root_length) if spans else ()
+    root_selected_positions = tuple(
+        position
+        for span in validated_spans
+        for position in range(span.target_text_start - 1, span.target_text_end - 1)
+    )
+    groups = tuple(
+        tuple(
+            _chosen_branch(clean_ids=clean_ids, span=span, modality=modality)
+            for span in validated_spans
+        )
+        for modality in ("visual", "textual")
+    )
+    return SidecarPlan(
+        root_length=root_length,
+        root_selected_positions=root_selected_positions,
+        groups=groups,
+        context_preference=True,
     )
 
 

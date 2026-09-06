@@ -9,7 +9,7 @@ from torch.utils.checkpoint import checkpoint
 def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
                            final_mask, return_dict, use_cache, past_key_values,
                            output_attentions):
-    from step_preference.sidecar import SidecarPlan, chunk_sidecar_branches
+    from step_preference.sidecar import SidecarBranch, SidecarPlan, chunk_sidecar_branches
 
     if not isinstance(options, Mapping):
         raise TypeError("stage2_shared_prefix_inputs must be a mapping")
@@ -17,6 +17,19 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
         raise ValueError("unknown shared-prefix input options")
     if not isinstance(options.get("plan"), SidecarPlan):
         raise ValueError("shared-prefix inputs require a SidecarPlan")
+    plan = options["plan"]
+    if plan.context_preference:
+        expected_kinds = ("visual_off", "textual_off")
+        if not isinstance(plan.groups, tuple) or len(plan.groups) != len(expected_kinds):
+            raise ValueError("context preference permits only local chosen branches")
+        for group, expected_kind in zip(plan.groups, expected_kinds):
+            if not isinstance(group, tuple) or any(
+                not isinstance(branch, SidecarBranch)
+                or branch.kind != expected_kind
+                or branch.rejected_model_inputs is not None
+                for branch in group
+            ):
+                raise ValueError("context preference permits only local chosen branches")
     if options.get("backend", "dense") not in ("dense", "flex"):
         raise ValueError("shared-prefix backend must be dense or flex")
     if options.get("backend") == "flex" and model.training and model.config.attention_dropout:
@@ -30,7 +43,6 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
         raise ValueError("shared-prefix Stage 2 requires return_dict=True, use_cache=False, no cache or attentions")
     if model.config._attn_implementation not in ("eager", "sdpa"):
         raise ValueError("shared-prefix Stage 2 requires eager or sdpa language attention")
-    plan = options["plan"]
     mask = torch.ones_like(input_ids) if attention_mask is None else attention_mask
     if mask.shape != input_ids.shape or mask.ndim != 2:
         raise ValueError("shared-prefix attention_mask must match input_ids")
@@ -116,7 +128,8 @@ def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, pre
                  oversized_branches=0, query_rows=0, entropy_scored_rows=0,
                  rejected_scored_rows=0)
     for group in plan.groups:
-        for branches in chunk_sidecar_branches(group, budget):
+        batches = ((group,) if group else ()) if plan.context_preference else chunk_sidecar_branches(group, budget)
+        for branches in batches:
             parts = [_branch_inputs(model, branch, input_ids, clean_embeds, clean_positions) for branch in branches]
             embeds = torch.cat([part[0] for part in parts], dim=1)
             positions = torch.cat([part[1] for part in parts], dim=2)
