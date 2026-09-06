@@ -170,7 +170,7 @@ def authenticated_admission(manifest_path,manifest_sha,verification_path,verific
     from step_preference.config import StepPreferenceConfig
     manifest,_=admission._strict_json(manifest_path,"admission manifest",admission._manifest_from_payload,manifest_sha)
     identity=manifest.identity
-    config=StepPreferenceConfig(enabled=True,mode="stage2b",packing_enabled=True,max_packed_sequence_length=4608,
+    config=StepPreferenceConfig(enabled=True,mode="stage2b",objective="legacy_dpo",packing_enabled=True,max_packed_sequence_length=4608,
         negative_path=identity.negative_path,negative_manifest=identity.negative_manifest_path,
         stage2a_checkpoint_path=identity.checkpoint_path,packed_admission_manifest=str(Path(manifest_path).resolve(strict=True)),
         packed_admission_manifest_sha256=manifest_sha,packed_admission_verification=str(Path(verification_path).resolve(strict=True)),

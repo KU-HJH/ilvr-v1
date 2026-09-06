@@ -38,10 +38,10 @@ from step_preference.ablation import (
     build_additive_step_attention_mask,
 )
 from step_preference.config import StepPreferenceConfig
-from step_preference.dpo_loss import aggregate_step_dpo
+from step_preference.dpo_loss import aggregate_step_dpo, context_preference_loss
 from step_preference.negatives import StepNegative
 from step_preference.packing import build_packed_tree_plan
-from step_preference.sidecar import build_sidecar_plan
+from step_preference.sidecar import build_context_sidecar_plan, build_sidecar_plan
 from step_preference.spans import ReasoningStepSpan
 
 
@@ -63,6 +63,27 @@ _STEP_PREFERENCE_LOG_NAMES = (
     "stats/valid_textual_pairs",
     "stats/branch_forwards",
     "stats/scored_tokens",
+)
+
+_CONTEXT_PREFERENCE_LOG_NAMES = (
+    "loss/total",
+    "loss/ce",
+    "loss/context_preference",
+    "loss/entropy",
+    "loss/context_preference_visual",
+    "loss/context_preference_text",
+    "loss/entropy_visual",
+    "loss/entropy_text",
+    "stats/context_margin_visual",
+    "stats/context_margin_text",
+    "stats/logp_clean",
+    "stats/logp_visual_off",
+    "stats/logp_text_off",
+    "stats/entropy_clean",
+    "stats/entropy_visual_off",
+    "stats/entropy_text_off",
+    "stats/scored_tokens",
+    "stats/logical_scoring_groups",
 )
 
 
@@ -450,7 +471,13 @@ class Stage2Trainer(Trainer):
             totals = {}
             self._step_preference_metric_totals = totals
             self._step_preference_metric_batches = 0
-        missing = set(_STEP_PREFERENCE_LOG_NAMES) - set(values)
+        config = getattr(self, "step_preference_config", None)
+        required = (
+            _CONTEXT_PREFERENCE_LOG_NAMES
+            if isinstance(config, StepPreferenceConfig) and config.is_context_preference
+            else _STEP_PREFERENCE_LOG_NAMES
+        )
+        missing = set(required) - set(values)
         if missing:
             raise ValueError(f"Stage 2B metrics are missing {sorted(missing)}")
         for name, value in values.items():
@@ -468,6 +495,190 @@ class Stage2Trainer(Trainer):
                 counts = self._runtime_objective_observation_counts = {}
             counts[name] = counts.get(name, 0) + 1
         self._step_preference_metric_batches += 1
+
+    def _reduce_context_objective(
+        self, clean_ce, clean_scores, clean_entropies, results
+    ):
+        config = self.step_preference_config
+        zero = clean_ce * 0.0
+        pref, ent, margins, off_logps, off_entropies = {}, {}, {}, {}, {}
+        for modality in ("visual", "textual"):
+            if clean_scores:
+                clean = torch.stack(clean_scores)
+                off = torch.stack(
+                    [
+                        results[(step_id, modality)]["mean_logp"]
+                        for step_id in range(len(clean_scores))
+                    ]
+                )
+                pref[modality] = context_preference_loss(
+                    clean, off, config.beta, config.preference_margin
+                )
+                sidecar_entropies = [
+                    results[(step_id, modality)]["entropies"]
+                    for step_id in range(len(clean_scores))
+                ]
+                if any(
+                    sidecar.shape != clean_entropy.shape
+                    for sidecar, clean_entropy in zip(
+                        sidecar_entropies, clean_entropies
+                    )
+                ):
+                    raise ValueError("sidecar entropy rows must match clean target rows")
+                ent[modality] = torch.stack(
+                    [
+                        F.relu(
+                            config.entropy_margin - (sidecar - clean_entropy)
+                        ).mean()
+                        for clean_entropy, sidecar in zip(
+                            clean_entropies, sidecar_entropies
+                        )
+                    ]
+                ).mean()
+                margins[modality] = (clean - off).mean()
+                off_logps[modality] = off.mean()
+                off_entropies[modality] = torch.stack(
+                    [entropy.mean() for entropy in sidecar_entropies]
+                ).mean()
+            else:
+                pref[modality] = ent[modality] = margins[modality] = zero
+                off_logps[modality] = off_entropies[modality] = zero
+        preference = (pref["visual"] + pref["textual"]) / 2
+        entropy = (ent["visual"] + ent["textual"]) / 2
+        total = (
+            clean_ce
+            + config.lambda_preference * preference
+            + config.lambda_entropy * entropy
+        )
+        metrics = {
+            "loss/total": total,
+            "loss/ce": clean_ce,
+            "loss/context_preference": preference,
+            "loss/entropy": entropy,
+            "stats/logp_clean": torch.stack(clean_scores).mean()
+            if clean_scores
+            else zero,
+            "stats/entropy_clean": torch.stack(
+                [entropy.mean() for entropy in clean_entropies]
+            ).mean()
+            if clean_entropies
+            else zero,
+        }
+        for modality, label in (("visual", "visual"), ("textual", "text")):
+            metrics[f"loss/context_preference_{label}"] = pref[modality]
+            metrics[f"loss/entropy_{label}"] = ent[modality]
+            metrics[f"stats/context_margin_{label}"] = margins[modality]
+            metrics[f"stats/logp_{label}_off"] = off_logps[modality]
+            metrics[f"stats/entropy_{label}_off"] = off_entropies[modality]
+        if not bool(torch.isfinite(total)):
+            raise ValueError("context preference total loss must be finite")
+        return total, metrics
+
+    def _compute_context_preference_loss(
+        self, model, inputs, *, collect_diagnostics: bool, return_outputs: bool
+    ):
+        config = self.step_preference_config
+        clean_inputs = dict(inputs)
+        sample_ids = clean_inputs.pop("sample_ids", None)
+        spans = clean_inputs.pop("reasoning_step_spans", None)
+        metadata = clean_inputs.pop("step_preference", None)
+        if (
+            not isinstance(sample_ids, (tuple, list))
+            or len(sample_ids) != 1
+            or not isinstance(sample_ids[0], str)
+            or not sample_ids[0]
+        ):
+            raise ValueError("context preference requires one sample_id")
+        if not isinstance(spans, (tuple, list)) or not isinstance(metadata, dict):
+            raise ValueError("context preference requires reasoning step metadata")
+        steps = metadata.get("steps")
+        if not isinstance(steps, (tuple, list)) or len(steps) != len(spans):
+            raise ValueError("context preference step cardinality mismatch")
+        if any(
+            not isinstance(item, dict)
+            or set(item) != {"span"}
+            or item["span"] != span
+            for item, span in zip(steps, spans)
+        ):
+            raise ValueError("context preference requires clean span-only metadata")
+        plan = build_context_sidecar_plan(
+            clean_input_ids=clean_inputs["input_ids"],
+            attention_mask=clean_inputs["attention_mask"],
+            spans=spans,
+        )
+        call = dict(
+            clean_inputs,
+            use_cache=False,
+            stage2_loss_only=not return_outputs,
+            collect_stage2_diagnostics=collect_diagnostics,
+            stage2_shared_prefix_inputs=dict(
+                plan=plan,
+                backend=config.sidecar_attention_backend,
+                query_budget=config.sidecar_query_budget,
+            ),
+        )
+        if plan.root_selected_positions:
+            call["stage2_logit_positions"] = torch.tensor(
+                plan.root_selected_positions,
+                device=clean_inputs["input_ids"].device,
+                dtype=torch.long,
+            )
+        outputs = model(**call)
+        clean_ce = outputs.loss
+        if (
+            not isinstance(clean_ce, torch.Tensor)
+            or clean_ce.numel() != 1
+            or not bool(torch.isfinite(clean_ce))
+        ):
+            raise ValueError("clean CE must be a finite scalar")
+        diagnostics = getattr(outputs, "stage2_diagnostics", None)
+        self._latest_stage2_diagnostics = (
+            None
+            if diagnostics is None
+            else {key: value.detach() for key, value in diagnostics.items()}
+        )
+        rows = (
+            _selected_logits(outputs, len(plan.root_selected_positions))
+            if spans
+            else None
+        )
+        results = {}
+        for result in outputs.stage2_sidecar_results:
+            modality = {"visual_off": "visual", "textual_off": "textual"}.get(
+                result["kind"]
+            )
+            key = (result["step_id"], modality)
+            if modality is None or key in results:
+                raise ValueError("unexpected or duplicate context sidecar")
+            results[key] = result
+        if set(results) != {
+            (span.step_id, modality)
+            for span in spans
+            for modality in ("visual", "textual")
+        }:
+            raise ValueError("context sidecar layout mismatch")
+        clean_scores, clean_entropies, offset = [], [], 0
+        for span in spans:
+            count = span.target_text_end - span.target_text_start
+            logits = rows[:, offset : offset + count]
+            targets = clean_inputs["input_ids"][
+                :, span.target_text_start : span.target_text_end
+            ]
+            clean_scores.append(_mean_selected_logp(logits, targets))
+            clean_entropies.append(_selected_entropies(logits))
+            offset += count
+        total, metrics = self._reduce_context_objective(
+            clean_ce, clean_scores, clean_entropies, results
+        )
+        metrics.update(
+            {
+                "stats/scored_tokens": 3 * len(plan.root_selected_positions),
+                "stats/logical_scoring_groups": 1
+                + sum(bool(group) for group in plan.groups),
+            }
+        )
+        self._accumulate_step_preference_metrics(metrics)
+        return (total, outputs) if return_outputs else total
 
     def _reduce_stage2b_objective(
         self,
@@ -1136,6 +1347,13 @@ class Stage2Trainer(Trainer):
                 f"helper-image tensors leaked into Stage 2: {sorted(forbidden)}"
             )
         config = getattr(self, "step_preference_config", None)
+        if isinstance(config, StepPreferenceConfig) and config.is_context_preference:
+            return self._compute_context_preference_loss(
+                model,
+                inputs,
+                collect_diagnostics=collect_diagnostics,
+                return_outputs=return_outputs,
+            )
         if isinstance(config, StepPreferenceConfig) and config.is_stage2b:
             return self._compute_stage2b_loss(
                 model,

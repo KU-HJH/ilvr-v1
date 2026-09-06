@@ -30,6 +30,7 @@ def test_cli_selects_shared_without_legacy_capacity():
     assert not StepPreferenceConfig().shared_prefix_enabled
     args = parse_args(["--stage", "stage2", "--step_preference_enabled",
         "--step_preference_mode", "stage2b", "--stage2a_checkpoint_path", "checkpoint",
+        "--step_preference_objective", "legacy_dpo",
         "--step_negative_path", "negative.jsonl", "--step_negative_manifest", "manifest.json",
         "--step_shared_prefix_enabled", "--step_sidecar_attention_backend", "dense",
         "--step_sidecar_query_budget", "1"])

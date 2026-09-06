@@ -117,6 +117,11 @@ def producing_ranks(runtime_inputs,tmp_path,monkeypatch):
     monkeypatch.setattr(torch.nn.functional,"scaled_dot_product_attention",lambda q,k,v,**kw:q)
     monkeypatch.setattr(qwen,"flex_attention_forward",lambda owner,q,k,v,mask,**kw:(q.transpose(1,2),None))
     monkeypatch.setattr(qwen,"flash_attn_varlen_func",lambda q,k,v,*a:q)
+    monkeypatch.setattr(
+        qwen.Qwen2_5_VLForConditionalGeneration,
+        "_check_and_enable_flash_attn_2",
+        classmethod(lambda cls, config, **kwargs: config),
+    )
     monkeypatch.setattr("step_preference.packing.build_flex_block_mask",lambda *a,**k:object())
     gpu_path=tmp_path/"producer-gpu.json"
     gpu_sha=m.publish_json(gpu_path,snapshot(),m.PackedGpuSnapshot)
@@ -129,7 +134,7 @@ def producing_ranks(runtime_inputs,tmp_path,monkeypatch):
         identifier=f"step-pref-dora-{arm}-producer" if arm else "step-pref-packed-admission-producer-zero2-0"
         checkpoint=tmp_path/"checkpoints"/identifier;write_adapter(checkpoint)
         source=runtime_inputs.admission_args
-        config=StepPreferenceConfig(enabled=True,mode="stage2b",packing_enabled=True,max_packed_sequence_length=4608,
+        config=StepPreferenceConfig(enabled=True,mode="stage2b",objective="legacy_dpo",packing_enabled=True,max_packed_sequence_length=4608,
             lambda_ce=triplet[0],lambda_dpo=triplet[1],lambda_entropy=triplet[2],
             stage2a_checkpoint_path=str(source.checkpoint_path),negative_path=str(source.negative_path),
             negative_manifest=str(source.negative_manifest),packed_admission_manifest=str(source.manifest_output_path),

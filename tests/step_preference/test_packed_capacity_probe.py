@@ -98,6 +98,7 @@ def test_production_context_routes_tuning_and_checkpointing_without_overrides(
         step_preference_config=StepPreferenceConfig(
             enabled=True,
             mode="stage2b",
+            objective="legacy_dpo",
             negative_path=str(negative_path),
             negative_manifest=str(manifest_path),
             stage2a_checkpoint_path=str(checkpoint),

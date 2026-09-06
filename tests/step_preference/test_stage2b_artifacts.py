@@ -19,6 +19,7 @@ def training_args(source, *, packed=True, artifacts=True):
         "--data_path", str(source.retained_output_path if packed else source.clean_data_path),
         "--image_root", str(source.image_root), "--step_preference_enabled",
         "--step_preference_mode", "stage2b", "--stage2a_checkpoint_path", str(source.checkpoint_path),
+        "--step_preference_objective", "legacy_dpo",
         "--step_negative_path", str(source.negative_path),
         "--step_negative_manifest", str(source.negative_manifest),
         "--attention_implementation", "sdpa", "--vision_attention_implementation", "flash_attention_2",

@@ -282,7 +282,7 @@ def test_protocol_exact_probe_and_distributed_shared_artifacts(tmp_path):
         ("DATA_PATH",shared/"packed-retained.jsonl"),("IMAGE_ROOT",root/"data"),("OUTPUT_DIR",root/"checkpoints"/witness),
         ("LOG_FILE",root/"logs"/witness/"train.log"),("STEP_PACKED_CAPACITY_EVIDENCE_PATH",shared/"zero2-7-evidence.json"),
         ("STEP_PACKED_CAPACITY_SAMPLE_ID","sample-a"),("STEP_PACKED_GPU_SNAPSHOT",shared/"gpu-snapshot.json"),("STEP_PACKED_GPU_SNAPSHOT_SHA256","a"*64),
-        ("STEP_PREFERENCE_ENABLED","true"),("STEP_PREFERENCE_MODE","stage2b"),("STEP_PREFERENCE_PACKING","true"),("STEP_MAX_PACKED_SEQUENCE_LENGTH","4608"),
+        ("STEP_PREFERENCE_ENABLED","true"),("STEP_PREFERENCE_MODE","stage2b"),("STEP_PREFERENCE_OBJECTIVE","legacy_dpo"),("STEP_PREFERENCE_PACKING","true"),("STEP_MAX_PACKED_SEQUENCE_LENGTH","4608"),
         ("STEP_NEGATIVE_PATH",shared/"negatives.jsonl"),("STEP_NEGATIVE_MANIFEST",shared/"negative-manifest.json"),
         ("STEP_PACKED_ADMISSION_MANIFEST",shared/"packed-admission.json"),("STEP_PACKED_ADMISSION_MANIFEST_SHA256","b"*64),
         ("STEP_PACKED_ADMISSION_VERIFICATION",shared/"packed-admission-verification.json"),("STEP_PACKED_ADMISSION_VERIFICATION_SHA256","c"*64),

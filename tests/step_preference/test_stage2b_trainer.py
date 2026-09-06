@@ -150,6 +150,7 @@ def _config(**changes):
     values = dict(
         enabled=True,
         mode="stage2b",
+        objective="legacy_dpo",
         beta=0.5,
         lambda_ce=1.0,
         lambda_dpo=2.0,
@@ -691,6 +692,8 @@ def test_stage2b_components_validate_exact_store_and_clear_stage2a_resume(
             "--step_preference_enabled",
             "--step_preference_mode",
             "stage2b",
+            "--step_preference_objective",
+            "legacy_dpo",
             "--stage2a_checkpoint_path",
             str(checkpoint),
             "--step_negative_path",

@@ -9,7 +9,7 @@ import torch
 
 from step_preference import dpo_loss
 from step_preference.config import StepPreferenceConfig
-from step_preference.equivalence import _trainer
+from step_preference.equivalence import _tiny_model, _trainer
 from step_preference.shared_prefix_measurement import RuntimeCounters, tiny_measurement_case
 from utils_deepseed import parse_args
 
@@ -69,6 +69,7 @@ def test_default_actual_scoring_calls_are_three_without_legacy(k, monkeypatch):
     batch["step_preference"] = {"steps": tuple(dict(span=s) for s in batch["reasoning_step_spans"])}
     trainer = _trainer(context_config(sidecar_query_budget=1))
     monkeypatch.setattr(model, "generate", forbidden)
+    monkeypatch.setattr(trainer, "_compute_stage2b_loss", forbidden)
     for name in ("_compute_stage2b_shared_prefix_loss", "_compute_stage2b_packed_loss"):
         monkeypatch.setattr(trainer, name, forbidden)
     monkeypatch.setattr("stage2.trainer.aggregate_step_dpo", forbidden)
@@ -115,6 +116,47 @@ def test_default_preflight_and_collator_need_no_negative_artifacts(inputs, monke
     batch = collator([prepared.prepared_examples[0]])
     assert batch["reasoning_step_spans"]
     assert all(set(s) == {"span"} for s in batch["step_preference"]["steps"])
+    config = copy.deepcopy(_tiny_model().config)
+    config.vocab_size = 512
+    config.latent_size = 8
+    config.image_token_id = 70
+    config.num_hidden_layers = 2
+    config.vision_config.window_size = 8
+    config.vision_config.spatial_merge_size = 2
+    model = type(_tiny_model())(config).float().train()
+    model.visual.requires_grad_(False)
+    patch_width = (
+        config.vision_config.in_channels
+        * config.vision_config.temporal_patch_size
+        * config.vision_config.patch_size**2
+    )
+    batch["pixel_values"] = torch.zeros(16, patch_width)
+    batch["position_ids"] = (
+        torch.arange(batch["input_ids"].shape[1]).view(1, 1, -1).expand(3, 1, -1)
+    )
+    trainer = _trainer(
+        replace(args.step_preference_config, sidecar_attention_backend="dense")
+    )
+    monkeypatch.setattr(model, "generate", forbidden)
+    monkeypatch.setattr(trainer, "_compute_stage2b_loss", forbidden)
+    monkeypatch.setattr("stage2.trainer.aggregate_step_dpo", forbidden)
+    monkeypatch.setattr("step_preference.sidecar._rejected_branch", forbidden)
+    with RuntimeCounters(model) as counters:
+        loss = trainer.compute_loss(model, batch)
+        before_backward = counters.snapshot()
+        counters.phase = "backward"
+        loss.backward()
+    assert torch.isfinite(loss)
+    assert (
+        before_backward["decoder_calls_forward"]
+        - before_backward["latent_decoder_calls_forward"]
+        == 3
+    )
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
 
 
 # Reuse input preparation, not negative data, from the existing admission tests.

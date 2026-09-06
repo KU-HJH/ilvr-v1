@@ -75,6 +75,7 @@ DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
+STEP_PREFERENCE_OBJECTIVE=${STEP_PREFERENCE_OBJECTIVE:-context_preference}
 SEED=${SEED:-42}
 STEP_MAX_PACKED_SEQUENCE_LENGTH=${STEP_MAX_PACKED_SEQUENCE_LENGTH:-4608}
 ASSISTANT_PLAN_RENDERING=concatenated-v1
@@ -106,6 +107,16 @@ if [[ ! "$STEP_SIDECAR_QUERY_BUDGET" =~ ^[1-9][0-9]*$ ]]; then
   printf 'STEP_SIDECAR_QUERY_BUDGET must be a positive integer\n' >&2
   exit 2
 fi
+if [[ "$STEP_PREFERENCE_ENABLED" == true && "${STEP_PREFERENCE_MODE:-stage2a}" == stage2b && "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
+  if [[ -n "${STEP_NEGATIVE_PATH:-}${STEP_NEGATIVE_MANIFEST:-}" ]]; then
+    printf 'Context preference does not consume negative artifacts; select legacy_dpo explicitly\n' >&2
+    exit 2
+  fi
+  if [[ "$step_preference_packing" == true || -n "${STEP_PACKED_ADMISSION_MANIFEST:-}${STEP_PACKED_ADMISSION_MANIFEST_SHA256:-}${STEP_PACKED_ADMISSION_VERIFICATION:-}${STEP_PACKED_ADMISSION_VERIFICATION_SHA256:-}" ]]; then
+    printf 'Context preference does not consume legacy packed admission\n' >&2
+    exit 2
+  fi
+fi
 if [[ "$step_shared_prefix_enabled" == true ]]; then
   if [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b ]]; then
     printf 'Shared prefix requires Stage 2B\n' >&2
@@ -115,9 +126,7 @@ if [[ "$step_shared_prefix_enabled" == true ]]; then
     printf 'Shared prefix cannot consume legacy packing or packed admission\n' >&2
     exit 2
   fi
-  STEP_PREFERENCE_ARGS+=(--step_shared_prefix_enabled
-    --step_sidecar_attention_backend "$STEP_SIDECAR_ATTENTION_BACKEND"
-    --step_sidecar_query_budget "$STEP_SIDECAR_QUERY_BUDGET")
+  STEP_PREFERENCE_ARGS+=(--step_shared_prefix_enabled)
 fi
 if [[ "$step_preference_packing" == true ]]; then
   if [[ ! "$STEP_MAX_PACKED_SEQUENCE_LENGTH" =~ ^[1-9][0-9]*$ ]]; then
@@ -157,6 +166,9 @@ case "$STEP_PREFERENCE_ENABLED" in
     STEP_PREFERENCE_MODE=${STEP_PREFERENCE_MODE:-stage2a}
     STEP_DPO_BETA=${STEP_DPO_BETA:-0.1}
     STEP_DPO_WEIGHT=${STEP_DPO_WEIGHT:-1.0}
+    STEP_PREFERENCE_BETA=${STEP_PREFERENCE_BETA:-$STEP_DPO_BETA}
+    STEP_PREFERENCE_WEIGHT=${STEP_PREFERENCE_WEIGHT:-1.0}
+    STEP_PREFERENCE_MARGIN=${STEP_PREFERENCE_MARGIN:-0.0}
     STEP_ENTROPY_WEIGHT=${STEP_ENTROPY_WEIGHT:-0.1}
     STEP_ENTROPY_MARGIN=${STEP_ENTROPY_MARGIN:-0.1}
     STAGE2A_RATIO=${STAGE2A_RATIO:-0.5}
@@ -167,15 +179,41 @@ case "$STEP_PREFERENCE_ENABLED" in
         exit 2
         ;;
     esac
+    case "$STEP_PREFERENCE_OBJECTIVE" in
+      context_preference|legacy_dpo) ;;
+      *)
+        printf 'Unknown STEP_PREFERENCE_OBJECTIVE\n' >&2
+        exit 2
+        ;;
+    esac
     STEP_PREFERENCE_ARGS+=(
       --step_preference_enabled
       --step_preference_mode "$STEP_PREFERENCE_MODE"
-      --step_dpo_beta "$STEP_DPO_BETA"
-      --step_dpo_weight "$STEP_DPO_WEIGHT"
+      --step_preference_objective "$STEP_PREFERENCE_OBJECTIVE"
       --step_entropy_weight "$STEP_ENTROPY_WEIGHT"
       --step_entropy_margin "$STEP_ENTROPY_MARGIN"
       --stage2a_ratio "$STAGE2A_RATIO"
     )
+    if [[ "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
+      STEP_PREFERENCE_ARGS+=(
+        --step_preference_beta "$STEP_PREFERENCE_BETA"
+        --step_preference_weight "$STEP_PREFERENCE_WEIGHT"
+        --step_preference_margin "$STEP_PREFERENCE_MARGIN"
+        --step_sidecar_attention_backend "$STEP_SIDECAR_ATTENTION_BACKEND"
+        --step_sidecar_query_budget "$STEP_SIDECAR_QUERY_BUDGET"
+      )
+    else
+      STEP_PREFERENCE_ARGS+=(
+        --step_dpo_beta "$STEP_DPO_BETA"
+        --step_dpo_weight "$STEP_DPO_WEIGHT"
+      )
+      if [[ "$step_shared_prefix_enabled" == true ]]; then
+        STEP_PREFERENCE_ARGS+=(
+          --step_sidecar_attention_backend "$STEP_SIDECAR_ATTENTION_BACKEND"
+          --step_sidecar_query_budget "$STEP_SIDECAR_QUERY_BUDGET"
+        )
+      fi
+    fi
     if [[ -n "${STAGE2_TOTAL_STEPS:-}" ]]; then
       STEP_PREFERENCE_ARGS+=(--stage2_total_steps "$STAGE2_TOTAL_STEPS")
     fi
@@ -191,25 +229,38 @@ case "$STEP_PREFERENCE_ENABLED" in
         printf 'Stage 2B requires STAGE2A_CHECKPOINT_PATH\n' >&2
         exit 2
       }
-      [[ -n "${STEP_NEGATIVE_PATH:-}" ]] || {
-        printf 'Stage 2B requires STEP_NEGATIVE_PATH\n' >&2
-        exit 2
-      }
-      [[ -n "${STEP_NEGATIVE_MANIFEST:-}" ]] || {
-        printf 'Stage 2B requires STEP_NEGATIVE_MANIFEST\n' >&2
-        exit 2
-      }
+      if [[ "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
+        if [[ -n "${STEP_NEGATIVE_PATH:-}${STEP_NEGATIVE_MANIFEST:-}" ]]; then
+          printf 'Context preference does not consume negative artifacts; select legacy_dpo explicitly\n' >&2
+          exit 2
+        fi
+        if [[ "$step_preference_packing" == true || -n "${STEP_PACKED_ADMISSION_MANIFEST:-}${STEP_PACKED_ADMISSION_MANIFEST_SHA256:-}${STEP_PACKED_ADMISSION_VERIFICATION:-}${STEP_PACKED_ADMISSION_VERIFICATION_SHA256:-}" ]]; then
+          printf 'Context preference does not consume legacy packed admission\n' >&2
+          exit 2
+        fi
+      else
+        [[ -n "${STEP_NEGATIVE_PATH:-}" ]] || {
+          printf 'Stage 2B requires STEP_NEGATIVE_PATH\n' >&2
+          exit 2
+        }
+        [[ -n "${STEP_NEGATIVE_MANIFEST:-}" ]] || {
+          printf 'Stage 2B requires STEP_NEGATIVE_MANIFEST\n' >&2
+          exit 2
+        }
+      fi
       if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
         printf 'Stage 2B Stage 2A initialization and RESUME_CHECKPOINT are mutually exclusive\n' >&2
         exit 2
       fi
       stage2b_checkpoint_initialization=true
       processor_source=$STAGE2A_CHECKPOINT_PATH
-      STEP_PREFERENCE_ARGS+=(
-        --step_negative_path "$STEP_NEGATIVE_PATH"
-        --step_negative_manifest "$STEP_NEGATIVE_MANIFEST"
-        --stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH"
-      )
+      if [[ "$STEP_PREFERENCE_OBJECTIVE" == legacy_dpo ]]; then
+        STEP_PREFERENCE_ARGS+=(
+          --step_negative_path "$STEP_NEGATIVE_PATH"
+          --step_negative_manifest "$STEP_NEGATIVE_MANIFEST"
+        )
+      fi
+      STEP_PREFERENCE_ARGS+=(--stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH")
     elif [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]]; then
       STEP_PREFERENCE_ARGS+=(--stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH")
     fi
@@ -307,6 +358,10 @@ MANAGED_OPTIONS=(
   --step_sidecar_attention_backend
   --step_sidecar_query_budget
   --step_preference_mode
+  --step_preference_objective
+  --step_preference_beta
+  --step_preference_weight
+  --step_preference_margin
   --step_negative_path
   --step_negative_manifest
   --step_max_packed_sequence_length
@@ -405,6 +460,63 @@ PY
   fi
 }
 
+require_finite_number() {
+  local name=$1
+  local value=$2
+  if ! "$REPO_ROOT/venv/ilvr-venv/bin/python" - "$value" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) else 1)
+PY
+  then
+    printf '%s must be a finite number\n' "$name" >&2
+    exit 2
+  fi
+}
+
+require_finite_positive_number() {
+  local name=$1
+  local value=$2
+  if ! "$REPO_ROOT/venv/ilvr-venv/bin/python" - "$value" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value > 0 else 1)
+PY
+  then
+    printf '%s must be a finite positive number\n' "$name" >&2
+    exit 2
+  fi
+}
+
+require_number_equal_one() {
+  local name=$1
+  local value=$2
+  if ! "$REPO_ROOT/venv/ilvr-venv/bin/python" - "$value" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value == 1.0 else 1)
+PY
+  then
+    printf 'Context preference requires %s=1\n' "$name" >&2
+    exit 2
+  fi
+}
+
 require_positive_integer LATENT_SIZE "$LATENT_SIZE"
 require_non_negative_integer STAGE2_DIAGNOSTICS_INTERVAL "$STAGE2_DIAGNOSTICS_INTERVAL"
 require_positive_integer GRADIENT_ACCUMULATION_STEPS "$GRADIENT_ACCUMULATION_STEPS"
@@ -414,7 +526,17 @@ require_positive_integer LORA_R "$LORA_R"
 require_positive_integer LORA_ALPHA "$LORA_ALPHA"
 require_finite_non_negative_number CE_WEIGHT "$CE_WEIGHT"
 if [[ "$STEP_PREFERENCE_ENABLED" == true ]]; then
-  require_finite_non_negative_number STEP_DPO_WEIGHT "$STEP_DPO_WEIGHT"
+  if [[ "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
+    require_finite_positive_number STEP_PREFERENCE_BETA "$STEP_PREFERENCE_BETA"
+    require_finite_non_negative_number STEP_PREFERENCE_WEIGHT "$STEP_PREFERENCE_WEIGHT"
+    require_finite_number STEP_PREFERENCE_MARGIN "$STEP_PREFERENCE_MARGIN"
+    if [[ "$STEP_PREFERENCE_MODE" == stage2b ]]; then
+      require_number_equal_one CE_WEIGHT "$CE_WEIGHT"
+    fi
+  else
+    require_finite_positive_number STEP_DPO_BETA "$STEP_DPO_BETA"
+    require_finite_non_negative_number STEP_DPO_WEIGHT "$STEP_DPO_WEIGHT"
+  fi
   require_finite_non_negative_number STEP_ENTROPY_WEIGHT "$STEP_ENTROPY_WEIGHT"
 fi
 

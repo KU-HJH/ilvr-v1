@@ -28,9 +28,12 @@ def test_step_preference_config_is_immutable_and_exposes_normative_defaults():
 
     assert config.enabled is False
     assert config.mode == "stage2a"
+    assert config.objective == "context_preference"
     assert config.beta == 0.1
     assert config.lambda_ce == 1.0
     assert config.lambda_dpo == 1.0
+    assert config.lambda_preference == 1.0
+    assert config.preference_margin == 0.0
     assert config.lambda_entropy == 0.1
     assert config.entropy_margin == 0.1
     assert config.stage2a_ratio == 0.5
@@ -54,9 +57,12 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
 
     assert args.step_preference_enabled is False
     assert args.step_preference_mode == "stage2a"
+    assert args.step_preference_objective == "context_preference"
     assert args.step_negative_path is None
     assert args.step_negative_manifest is None
     assert args.step_dpo_beta == 0.1
+    assert args.step_preference_weight == 1.0
+    assert args.step_preference_margin == 0.0
     assert args.ce_weight == 1.0
     assert args.step_dpo_weight == 1.0
     assert args.step_entropy_weight == 0.1
@@ -80,6 +86,7 @@ def test_packed_stage2b_configuration():
     required = [
         "--stage", "stage2", "--step_preference_enabled",
         "--step_preference_mode", "stage2b",
+        "--step_preference_objective", "legacy_dpo",
         "--stage2a_checkpoint_path", "checkpoint",
         "--step_negative_path", "negatives.jsonl",
         "--step_negative_manifest", "manifest.json",
@@ -103,6 +110,7 @@ def test_packed_stage2b_configuration_binds_packed_admission_inputs():
         [
             "--stage", "stage2", "--step_preference_enabled",
             "--step_preference_mode", "stage2b",
+            "--step_preference_objective", "legacy_dpo",
             "--stage2a_checkpoint_path", "checkpoint",
             "--step_negative_path", "negatives.jsonl",
             "--step_negative_manifest", "manifest.json",
@@ -130,6 +138,7 @@ def test_packed_configuration_rejects_nonpositive_or_noninteger_capacity(value):
         StepPreferenceConfig(
             enabled=True,
             mode="stage2b",
+            objective="legacy_dpo",
             stage2a_checkpoint_path="checkpoint",
             negative_path="negatives.jsonl",
             negative_manifest="manifest.json",
@@ -183,7 +192,8 @@ def test_packed_admission_artifacts_require_complete_lowercase_sha256_pairs(
 
 def test_stage2b_requires_checkpoint_and_both_negative_paths():
     """Catches a Stage 2B run starting without all frozen initialization inputs."""
-    base = ["--stage", "stage2", "--step_preference_enabled", "--step_preference_mode", "stage2b"]
+    base = ["--stage", "stage2", "--step_preference_enabled", "--step_preference_mode", "stage2b",
+            "--step_preference_objective", "legacy_dpo"]
     with pytest.raises(ValueError, match="requires.*stage2a_checkpoint_path"):
         parse_args(base)
     with pytest.raises(ValueError, match="requires.*step_negative_path"):
@@ -209,6 +219,8 @@ def test_stage2b_rejects_unsupported_attention_or_stage2_resume(backend):
         "--step_preference_enabled",
         "--step_preference_mode",
         "stage2b",
+        "--step_preference_objective",
+        "legacy_dpo",
         "--stage2a_checkpoint_path",
         "checkpoint",
         "--step_negative_path",
@@ -253,6 +265,7 @@ def test_optional_total_budget_selects_the_current_phase_steps():
     assert StepPreferenceConfig(mode="stage2a", **common).phase_steps == 3
     assert StepPreferenceConfig(
         mode="stage2b",
+        objective="legacy_dpo",
         stage2a_checkpoint_path="checkpoint",
         negative_path="negatives.jsonl",
         negative_manifest="manifest.json",

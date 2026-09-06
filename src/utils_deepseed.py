@@ -36,6 +36,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--step_preference_mode", choices=("stage2a", "stage2b"), default="stage2a"
     )
+    parser.add_argument(
+        "--step_preference_objective",
+        choices=("context_preference", "legacy_dpo"),
+        default="context_preference",
+    )
     parser.add_argument("--step_negative_path")
     parser.add_argument("--step_negative_manifest")
     parser.add_argument("--step_max_packed_sequence_length", type=int, default=4608)
@@ -47,7 +52,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step_packed_capacity_sample_id")
     parser.add_argument("--step_packed_gpu_snapshot")
     parser.add_argument("--step_packed_gpu_snapshot_sha256")
-    parser.add_argument("--step_dpo_beta", type=float, default=0.1)
+    parser.add_argument(
+        "--step_preference_beta",
+        "--step_dpo_beta",
+        dest="step_dpo_beta",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument("--step_preference_weight", type=float, default=1.0)
+    parser.add_argument("--step_preference_margin", type=float, default=0.0)
     parser.add_argument("--step_dpo_weight", type=float, default=1.0)
     parser.add_argument("--step_entropy_weight", type=float, default=0.1)
     parser.add_argument("--step_entropy_margin", type=float, default=0.1)

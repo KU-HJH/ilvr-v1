@@ -171,6 +171,7 @@ def _config(*, packing: bool) -> StepPreferenceConfig:
     return StepPreferenceConfig(
         enabled=True,
         mode="stage2b",
+        objective="legacy_dpo",
         negative_path="tiny-negatives.jsonl",
         negative_manifest="tiny-manifest.json",
         stage2a_checkpoint_path="tiny-stage2a",
@@ -633,6 +634,8 @@ def load_production_context(
             "--step_preference_enabled",
             "--step_preference_mode",
             "stage2b",
+            "--step_preference_objective",
+            "legacy_dpo",
             "--stage2a_checkpoint_path",
             str(checkpoint),
             "--step_negative_path",

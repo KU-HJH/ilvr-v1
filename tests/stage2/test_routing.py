@@ -1144,6 +1144,7 @@ def test_main_keeps_stage2b_preflight_out_of_startup_log_and_reuses_snapshot(
         step_preference_config=main.StepPreferenceConfig(
             enabled=True,
             mode="stage2b",
+            objective="legacy_dpo",
             stage2a_checkpoint_path="stage2a/checkpoint",
             negative_path="negatives.jsonl",
             negative_manifest="negatives.manifest.json",
@@ -1191,6 +1192,7 @@ def test_stage2b_preflight_binds_space_lf_rendering_to_prepare_and_negative_load
     config = main.StepPreferenceConfig(
         enabled=True,
         mode="stage2b",
+        objective="legacy_dpo",
         stage2a_checkpoint_path=str(tmp_path / "stage2a"),
         negative_path=str(tmp_path / "negatives.jsonl"),
         negative_manifest=str(tmp_path / "manifest.json"),
@@ -1274,6 +1276,7 @@ def test_stage2b_preflight_rejects_noncanonical_attention_before_source_read(
     config = main.StepPreferenceConfig(
         enabled=True,
         mode="stage2b",
+        objective="legacy_dpo",
         stage2a_checkpoint_path=str(tmp_path / "stage2a"),
         negative_path=str(tmp_path / "negatives.jsonl"),
         negative_manifest=str(tmp_path / "manifest.json"),
@@ -1302,6 +1305,7 @@ def test_stage2b_components_reject_noncanonical_attention_with_cached_preflight(
     config = main.StepPreferenceConfig(
         enabled=True,
         mode="stage2b",
+        objective="legacy_dpo",
         stage2a_checkpoint_path=str(tmp_path / "stage2a"),
         negative_path=str(tmp_path / "negatives.jsonl"),
         negative_manifest=str(tmp_path / "manifest.json"),
@@ -1372,6 +1376,7 @@ def test_stage2b_preflight_rejects_changed_vision_backend_before_model_load(
     config = main.StepPreferenceConfig(
         enabled=True,
         mode="stage2b",
+        objective="legacy_dpo",
         stage2a_checkpoint_path=str(stage2a),
         negative_path=str(negatives),
         negative_manifest=str(manifest_path),
@@ -1447,6 +1452,7 @@ def test_main_stage2b_rejects_legacy_negative_manifest_before_model_construction
     config = main.StepPreferenceConfig(
         enabled=True,
         mode="stage2b",
+        objective="legacy_dpo",
         stage2a_checkpoint_path=str(tmp_path / "stage2a"),
         negative_path=str(tmp_path / "negatives.jsonl"),
         negative_manifest=str(manifest_path),

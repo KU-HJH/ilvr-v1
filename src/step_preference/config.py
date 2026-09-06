@@ -10,6 +10,7 @@ from typing import Literal
 
 
 StepPreferenceMode = Literal["stage2a", "stage2b"]
+StepPreferenceObjective = Literal["context_preference", "legacy_dpo"]
 
 
 def split_stage2_budget(total_steps: int, stage2a_ratio: float) -> tuple[int, int]:
@@ -64,9 +65,12 @@ class StepPreferenceConfig:
 
     enabled: bool = False
     mode: StepPreferenceMode = "stage2a"
+    objective: StepPreferenceObjective = "context_preference"
     beta: float = 0.1
     lambda_ce: float = 1.0
     lambda_dpo: float = 1.0
+    lambda_preference: float = 1.0
+    preference_margin: float = 0.0
     lambda_entropy: float = 0.1
     entropy_margin: float = 0.1
     negative_path: str | None = None
@@ -108,6 +112,8 @@ class StepPreferenceConfig:
                 raise ValueError("shared prefix cannot consume legacy packing or packed admission")
         if self.mode not in ("stage2a", "stage2b"):
             raise ValueError("step preference mode must be stage2a or stage2b")
+        if self.objective not in ("context_preference", "legacy_dpo"):
+            raise ValueError("unknown step preference objective")
         beta = _finite("step_dpo_beta", self.beta)
         if beta <= 0:
             raise ValueError("step_dpo_beta must be positive")
@@ -118,6 +124,9 @@ class StepPreferenceConfig:
         ):
             if _finite(name, value) < 0:
                 raise ValueError(f"{name} must be nonnegative")
+        if _finite("step_preference_weight", self.lambda_preference) < 0:
+            raise ValueError("step_preference_weight must be nonnegative")
+        _finite("step_preference_margin", self.preference_margin)
         entropy_margin = _finite("step_entropy_margin", self.entropy_margin)
         if entropy_margin < 0:
             raise ValueError("step_entropy_margin must be nonnegative")
@@ -157,12 +166,33 @@ class StepPreferenceConfig:
             raise ValueError("stage2a_ratio must be a finite number in (0, 1)")
         if self.total_steps is not None:
             split_stage2_budget(self.total_steps, self.stage2a_ratio)
-        if self.is_stage2b:
-            for field_name, option in (
-                ("stage2a_checkpoint_path", "--stage2a_checkpoint_path"),
-                ("negative_path", "--step_negative_path"),
-                ("negative_manifest", "--step_negative_manifest"),
+        if self.is_context_preference:
+            if self.lambda_ce != 1.0:
+                raise ValueError("context preference requires ce_weight=1")
+            if self.negative_path is not None or self.negative_manifest is not None:
+                raise ValueError(
+                    "context preference does not consume negative artifacts; "
+                    "select legacy_dpo explicitly"
+                )
+            if self.packing_enabled or any(
+                (
+                    self.packed_admission_manifest,
+                    self.packed_admission_manifest_sha256,
+                    self.packed_admission_verification,
+                    self.packed_admission_verification_sha256,
+                )
             ):
+                raise ValueError(
+                    "context preference does not consume legacy packed admission"
+                )
+        if self.is_stage2b:
+            required = [("stage2a_checkpoint_path", "--stage2a_checkpoint_path")]
+            if not self.is_context_preference:
+                required += [
+                    ("negative_path", "--step_negative_path"),
+                    ("negative_manifest", "--step_negative_manifest"),
+                ]
+            for field_name, option in required:
                 if getattr(self, field_name) is None:
                     raise ValueError(f"Stage 2B requires {option}")
             if self.attention_implementation not in ("eager", "sdpa"):
@@ -188,6 +218,10 @@ class StepPreferenceConfig:
         return self.enabled and self.mode == "stage2b"
 
     @property
+    def is_context_preference(self) -> bool:
+        return self.is_stage2b and self.objective == "context_preference"
+
+    @property
     def phase_steps(self) -> int | None:
         if not self.enabled or self.total_steps is None:
             return None
@@ -202,9 +236,12 @@ class StepPreferenceConfig:
         return cls(
             enabled=getattr(args, "step_preference_enabled", False),
             mode=getattr(args, "step_preference_mode", "stage2a"),
+            objective=getattr(args, "step_preference_objective", "context_preference"),
             beta=getattr(args, "step_dpo_beta", 0.1),
             lambda_ce=getattr(args, "ce_weight", 1.0),
             lambda_dpo=getattr(args, "step_dpo_weight", 1.0),
+            lambda_preference=getattr(args, "step_preference_weight", 1.0),
+            preference_margin=getattr(args, "step_preference_margin", 0.0),
             lambda_entropy=getattr(args, "step_entropy_weight", 0.1),
             entropy_margin=getattr(args, "step_entropy_margin", 0.1),
             negative_path=getattr(args, "step_negative_path", None),

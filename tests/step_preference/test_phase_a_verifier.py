@@ -405,6 +405,7 @@ def test_stage2b_summary_producer_logs_only_canonical_scalar_evidence(monkeypatc
         step_preference_config=StepPreferenceConfig(
             enabled=True,
             mode="stage2b",
+            objective="legacy_dpo",
             stage2a_checkpoint_path="stage2a",
             negative_path="negatives.jsonl",
             negative_manifest="manifest.json",
@@ -447,6 +448,7 @@ def test_phase_a_summary_is_suppressed_outside_rank_zero_stage2b(
         else StepPreferenceConfig(
             enabled=True,
             mode="stage2b",
+            objective="legacy_dpo",
             stage2a_checkpoint_path="stage2a",
             negative_path="negatives.jsonl",
             negative_manifest="manifest.json",
@@ -483,6 +485,7 @@ def test_run_stage2_publishes_phase_a_summary_once_after_training(monkeypatch):
     config = StepPreferenceConfig(
         enabled=True,
         mode="stage2b",
+        objective="legacy_dpo",
         stage2a_checkpoint_path="stage2a",
         negative_path="negatives.jsonl",
         negative_manifest="manifest.json",

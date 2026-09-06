@@ -169,7 +169,7 @@ class Stage2BPreflight:
     """Read-only validated inputs required before Stage 2B may construct runtime."""
 
     prepared_examples: tuple[object, ...]
-    negative_store: Mapping[tuple[str, int], object]
+    negative_store: Mapping[tuple[str, int], object] | None
     packed_admission: packed_admission_artifacts.PackedAdmissionManifest | None = None
     packed_admission_records_by_sample_id: Mapping[str, object] | None = None
 
@@ -292,10 +292,6 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     )
     source_path = Path(admission.identity.clean_data_path if admission is not None else args.data_path)
     source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
-    manifest = read_negative_manifest(config.negative_manifest)
-    if manifest.source_sha256 != source_sha256:
-        raise ValueError("source JSONL SHA-256 does not match negative manifest")
-
     raw_examples = load_jsonl_examples(source_path)
     selected_examples = (
         raw_examples
@@ -321,6 +317,11 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     checkpoint_files, tokenizer_identity = inspect_stage2a_checkpoint_identity(
         config.stage2a_checkpoint_path
     )
+    if config.is_context_preference:
+        return Stage2BPreflight(prepared_examples=prepared, negative_store=None)
+    manifest = read_negative_manifest(config.negative_manifest)
+    if manifest.source_sha256 != source_sha256:
+        raise ValueError("source JSONL SHA-256 does not match negative manifest")
     expected_generation_settings = {
         "attention_implementation": args.attention_implementation,
         "vision_attention_implementation": getattr(

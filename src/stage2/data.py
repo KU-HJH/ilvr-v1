@@ -371,6 +371,7 @@ class Stage2DataCollator:
             batch["step_preference"] = {
                 "expanded_rendered_text": expanded_text,
                 "offset_mapping": offset_mapping,
+                "steps": tuple({"span": span} for span in reasoning_step_spans),
             }
             if self.negative_store is not None:
                 assistant_text = example.conversation[1]["content"][0]["text"]

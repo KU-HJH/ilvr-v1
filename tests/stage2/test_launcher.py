@@ -40,6 +40,25 @@ def option_value(tokens: list[str], option: str) -> str:
     return tokens[tokens.index(option) + 1]
 
 
+def test_context_default_launch_needs_no_negatives():
+    result = run_launcher(
+        env_overrides={
+            "STEP_PREFERENCE_ENABLED": "true",
+            "STEP_PREFERENCE_MODE": "stage2b",
+            "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+            "STEP_PREFERENCE_MARGIN": "0",
+            "STEP_PREFERENCE_WEIGHT": "1",
+            "STEP_SIDECAR_ATTENTION_BACKEND": "dense",
+        }
+    )
+    tokens = dry_run_tokens(result)
+    assert option_value(tokens, "--step_preference_objective") == "context_preference"
+    assert option_value(tokens, "--step_preference_weight") == "1"
+    assert option_value(tokens, "--step_sidecar_attention_backend") == "dense"
+    assert "--step_negative_path" not in tokens
+    assert "--step_negative_manifest" not in tokens
+
+
 PACKED_ADMISSION_ENV = {
     "STEP_MAX_PACKED_SEQUENCE_LENGTH": "4608",
     "STEP_PACKED_ADMISSION_MANIFEST": "/results/admission.json",
@@ -87,6 +106,7 @@ def test_stage1_dora_length_manifest_uses_adapter_processor(tmp_path, inline):
 def test_shared_launcher_routes_without_legacy_admission_and_keeps_backend_independent():
     """Catches requiring a packed certificate or overriding vision/clean attention."""
     env = dict(STEP_PREFERENCE_ENABLED="true", STEP_PREFERENCE_MODE="stage2b",
+        STEP_PREFERENCE_OBJECTIVE="legacy_dpo",
         STAGE2A_CHECKPOINT_PATH="/models/stage 1", STEP_NEGATIVE_PATH="/negative.jsonl",
         STEP_NEGATIVE_MANIFEST="/manifest.json", STEP_SHARED_PREFIX_ENABLED="1",
         STEP_SIDECAR_ATTENTION_BACKEND="dense", STEP_SIDECAR_QUERY_BUDGET="37",
@@ -110,6 +130,7 @@ def test_shared_launcher_routes_without_legacy_admission_and_keeps_backend_indep
 
 def test_capacity_launcher_requires_complete_private_options_and_forwards_them():
     env={**PACKED_ADMISSION_ENV,"STEP_PREFERENCE_ENABLED":"true","STEP_PREFERENCE_MODE":"stage2b",
+        "STEP_PREFERENCE_OBJECTIVE":"legacy_dpo",
         "STEP_PREFERENCE_PACKING":"true","STAGE2A_CHECKPOINT_PATH":"/models/stage 1",
         "STEP_NEGATIVE_PATH":"/results/negative.jsonl","STEP_NEGATIVE_MANIFEST":"/results/negative-manifest.json",
         "STEP_PACKED_CAPACITY_EVIDENCE_PATH":"/results/evidence.json",
@@ -157,6 +178,7 @@ raise SystemExit(1)
     env={"PATH":os.environ["PATH"],**REQUIRED_ENV,**PACKED_ADMISSION_ENV,
         "OUTPUT_DIR":str(tmp_path/"checkpoints"/identifier),"LOG_FILE":str(tmp_path/"logs"/identifier/"train.log"),
         "STEP_PREFERENCE_ENABLED":"true","STEP_PREFERENCE_MODE":"stage2b","STEP_PREFERENCE_PACKING":"true",
+        "STEP_PREFERENCE_OBJECTIVE":"legacy_dpo",
         "STAGE2A_CHECKPOINT_PATH":"/models/stage 1","STEP_NEGATIVE_PATH":"/n","STEP_NEGATIVE_MANIFEST":"/nm",
         "DEEPSPEED_CONFIG":"/zero2","TUNING_METHOD":"dora"}
     failed=subprocess.run(["bash",str(launcher)],env={**env,"FAIL_PREFLIGHT":"yes"},capture_output=True,text=True)
@@ -475,6 +497,7 @@ def test_stage2_launcher_propagates_opt_in_stage2b_environment_without_resume_st
             env_overrides={
                 "STEP_PREFERENCE_ENABLED": "true",
                 "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
                 "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
                 "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
                 "STEP_DPO_BETA": "0.2",
@@ -518,6 +541,7 @@ def test_stage2b_launcher_forwards_isolated_objective_coefficient_triplets(
             env_overrides={
                 "STEP_PREFERENCE_ENABLED": "true",
                 "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
                 "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
                 "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
                 "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
@@ -543,6 +567,7 @@ def test_stage2b_launcher_rejects_invalid_objective_coefficients(name, value):
         env_overrides={
             "STEP_PREFERENCE_ENABLED": "true",
             "STEP_PREFERENCE_MODE": "stage2b",
+            "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
             "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
             "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
             "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
@@ -561,6 +586,7 @@ def test_stage2b_launcher_dry_run_identifies_space_lf_length_manifest_rendering(
             env_overrides={
                 "STEP_PREFERENCE_ENABLED": "true",
                 "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
                 "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
                 "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
                 "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
@@ -590,6 +616,7 @@ def test_stage2b_launcher_rejects_noncanonical_attention_contract(
         env_overrides={
             "STEP_PREFERENCE_ENABLED": "true",
             "STEP_PREFERENCE_MODE": "stage2b",
+            "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
             "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
             "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
             "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
@@ -617,6 +644,7 @@ def test_stage2_launcher_propagates_explicit_packing_opt_in(value):
             env_overrides={
                 "STEP_PREFERENCE_ENABLED": "true",
                 "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
                 "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
                 "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
                 "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
@@ -651,6 +679,7 @@ def test_packed_launcher_rejects_incomplete_or_invalid_admission_environment(
     environment = {
         "STEP_PREFERENCE_ENABLED": "true",
         "STEP_PREFERENCE_MODE": "stage2b",
+        "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
         "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
         "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
         "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
@@ -742,6 +771,7 @@ def test_stage2_launcher_omits_disabled_packing(value):
             env_overrides={
                 "STEP_PREFERENCE_ENABLED": "true",
                 "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
                 "STEP_NEGATIVE_PATH": "/results/negatives.jsonl",
                 "STEP_NEGATIVE_MANIFEST": "/results/manifest.json",
                 "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
@@ -792,6 +822,7 @@ def test_stage2_launcher_false_step_preference_keeps_disabled_tokens_identical()
                 "STEP_PREFERENCE_ENABLED": "true",
                 "STEP_PREFERENCE_MODE": "stage2b",
                 "STAGE2A_CHECKPOINT_PATH": "/models/a",
+                "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
             },
             "requires STEP_NEGATIVE_PATH",
         ),
@@ -832,6 +863,9 @@ def test_stage2b_launcher_preflights_stale_artifact_before_creating_run_paths(
     (image_root / "image.bin").write_bytes(b"image")
     stage2a = tmp_path / "stage2a"
     stage2a.mkdir()
+    (stage2a / "model.safetensors").write_bytes(b"weights")
+    (stage2a / "config.json").write_text("{}\n", encoding="utf-8")
+    (stage2a / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
     manifest_path = tmp_path / "manifest.json"
     negative_path = tmp_path / "negatives.jsonl"
     negative_path.write_bytes(b"")
@@ -875,6 +909,7 @@ def test_stage2b_launcher_preflights_stale_artifact_before_creating_run_paths(
                 "LOG_FILE": str(log_dir / "train.log"),
                 "STEP_PREFERENCE_ENABLED": "true",
                 "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
                 "STAGE2A_CHECKPOINT_PATH": str(stage2a),
                 "STEP_NEGATIVE_PATH": str(negative_path),
                 "STEP_NEGATIVE_MANIFEST": str(manifest_path),
