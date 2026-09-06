@@ -666,7 +666,7 @@ the hardware-evidence blocker; substitution requires a new approved premise.
 - [ ] **Step 4: Allocate once, publish, and strictly reload the summary**
 
 ```bash
-premise_id="step-pref-packed-premise-v13-$(date -u +%Y%m%dT%H%M%SZ)"
+premise_id="step-pref-packed-premise-v13-$(date -u +%Y%m%d-%H%M%S)"
 test ! -e "results/$premise_id"
 test ! -e "logs/$premise_id"
 mkdir -p "results/$premise_id" "logs/$premise_id"
@@ -1594,7 +1594,7 @@ pilot_summary="${PILOT_SUMMARY_PATH:?absolute Task 1 pilot path required}"
 case "$pilot_summary" in /*) ;; *) exit 2 ;; esac
 test ! -L "$pilot_summary"
 pilot_summary_sha=$(sha256sum "$pilot_summary" | cut -d' ' -f1)
-admission_id="step-pref-packed-admission-$(date -u +%Y%m%dT%H%M%SZ)"
+admission_id="step-pref-packed-admission-$(date -u +%Y%m%d-%H%M%S)"
 test ! -e "results/$admission_id"
 test ! -e "logs/$admission_id"
 ```
@@ -1971,7 +1971,7 @@ SHA-256 before its real launch.
 Use this one launcher function for dry-run normalization and all real arms:
 
 ```bash
-ablation_stamp=$(date -u +%Y%m%dT%H%M%SZ)
+ablation_stamp=$(date -u +%Y%m%d-%H%M%S)
 launch_arm() {
   arm=$1; ce=$2; dpo=$3; entropy=$4
   run_id="step-pref-dora-$arm-$ablation_stamp"

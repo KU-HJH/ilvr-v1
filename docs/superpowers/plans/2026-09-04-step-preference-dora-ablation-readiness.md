@@ -511,7 +511,7 @@ git commit -m "test: probe packed dora capacity"
 First verify the frozen identities exactly:
 
 ```bash
-capacity_run_id="step-pref-capacity-$(date -u +%Y%m%dT%H%M%SZ)"
+capacity_run_id="step-pref-capacity-$(date -u +%Y%m%d-%H%M%S)"
 test ! -e "results/$capacity_run_id"
 test ! -e "logs/$capacity_run_id"
 test ! -e "checkpoints/$capacity_run_id-zero2"
@@ -609,7 +609,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
 Allocate `step-pref-negatives-adjacent-text-space-lf-v1-<UTC>` and run the generator on all 3,450 rows. Tee one log and validate the emitted schema-3 manifest/store once. Record its negative and manifest SHA-256; do not regenerate per training arm.
 
 ```bash
-negative_run_id="step-pref-negatives-adjacent-text-space-lf-v1-$(date -u +%Y%m%dT%H%M%SZ)"
+negative_run_id="step-pref-negatives-adjacent-text-space-lf-v1-$(date -u +%Y%m%d-%H%M%S)"
 mkdir -p "results/$negative_run_id" "logs/$negative_run_id"
 set -o pipefail
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/transformers/src:$PWD/src" \
@@ -730,7 +730,7 @@ Use one shared timestamp and this direct launch function as the single command
 template; invoke it sequentially, never concurrently:
 
 ```bash
-ablation_stamp=$(date -u +%Y%m%dT%H%M%SZ)
+ablation_stamp=$(date -u +%Y%m%d-%H%M%S)
 negative_dir="$PWD/results/$negative_run_id"
 launch_arm() {
   arm=$1

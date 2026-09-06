@@ -164,7 +164,7 @@ git commit -m "fix: split qwen vision attention backend"
 Create only the fresh result/log directories. Re-run the parent plan's fixed input SHA-256 checks and select source row 1078 into the result directory. Do not reuse or overwrite any failed run directory.
 
 ```bash
-capacity_run_id="step-pref-capacity-$(date -u +%Y%m%dT%H%M%SZ)"
+capacity_run_id="step-pref-capacity-$(date -u +%Y%m%d-%H%M%S)"
 test ! -e "results/$capacity_run_id"
 test ! -e "logs/$capacity_run_id"
 test ! -e "checkpoints/$capacity_run_id-zero2"
