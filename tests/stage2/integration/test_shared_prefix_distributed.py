@@ -35,6 +35,7 @@ def test_two_rank_shared_flex_dora_zero2_accumulation():
     assert completed.returncode == 0, log.read_text()[-16000:]
     witness = json.loads((root / "results" / run_id / "ddp-witness.json").read_text())
     assert witness["world_size"] == 2
+    assert witness["objective"] == "context_preference"
     for rank in witness["ranks"]:
         assert rank["global_step"] == rank["optimizer_step"] == 1
         assert rank["microbatches"] == 2
@@ -43,6 +44,12 @@ def test_two_rank_shared_flex_dora_zero2_accumulation():
         assert rank["rollout_calls"] == 2
         assert rank["pre_engine_parameter_dtypes"] == ["torch.float32"]
         assert rank["trained_parameter_dtypes"] == ["torch.bfloat16"]
+        assert len(rank["scoring_microbatches"]) == 2
+        for batch in rank["scoring_microbatches"]:
+            assert batch["policy_calls_forward"] == 1
+            assert batch["scoring_decoder_calls_forward"] == 3
+            assert batch["latent_decoder_calls_forward"] == 4
+        assert rank["legacy_route_calls"] == 0
     assert witness["adapter"] == dict(method="dora", rank=32, alpha=64, dropout=0.05)
     assert witness["zero_stage"] == 2
     assert witness["gradient_accumulation_steps"] == 2

@@ -147,6 +147,49 @@ with differentiable continuous-latent blocks. The original/user image remains
 a model input, but helper images are never loaded as Stage 2 visual inputs. The
 entire visual tower is frozen and is encoded once per rank-local batch.
 
+#### Stage 2B context preference
+
+Context preference is the default Stage 2B objective. With real Stage 1 and
+Stage 2A checkpoints and dataset paths, launch it in this form:
+
+```bash
+STEP_PREFERENCE_ENABLED=true \
+STEP_PREFERENCE_MODE=stage2b \
+STEP_PREFERENCE_OBJECTIVE=context_preference \
+STEP_PREFERENCE_BETA=0.1 \
+STEP_PREFERENCE_WEIGHT=1.0 \
+STEP_PREFERENCE_MARGIN=0.0 \
+STEP_ENTROPY_WEIGHT=0.1 \
+STEP_ENTROPY_MARGIN=0.1 \
+STAGE1_CHECKPOINT="$STAGE1_CHECKPOINT" \
+STAGE2A_CHECKPOINT_PATH="$STAGE2A_CHECKPOINT_PATH" \
+DATA_PATH="$DATA_PATH" IMAGE_ROOT="$IMAGE_ROOT" \
+OUTPUT_DIR="$OUTPUT_DIR" \
+bash run_stage2_training.sh
+```
+
+Set `OUTPUT_DIR` to a distinct run directory below the current worktree's
+`checkpoints/` symlink. The context objective shares the clean prefix and
+scores the clean, visual-off (V), and textual-off (T) contexts in at most
+three scoring decoder calls per local microbatch. Existing clean latent
+decoder calls and backward checkpoint recomputation are counted and reported
+separately. The default context route performs zero reference forwards,
+negative generations, rejected-branch scorings, or preference rollouts.
+
+Each target block score is its mean target-token log probability. Preference
+and entropy losses are reduced within each step first, then all V/T steps have
+equal weight, so longer text steps do not receive more weight. Every valid
+step is scored. If the input does not fit memory, report the input size as a
+blocker; do not split sidecar groups into chunks or silently drop steps to fit.
+These call-count and numerical checks establish implementation behavior, not
+training quality, long real-input memory suitability, or paper-level results.
+
+Ordinary Stage 2 remains available with `STEP_PREFERENCE_ENABLED=false`.
+Historical DPO experiments require the explicit
+`STEP_PREFERENCE_OBJECTIVE=legacy_dpo` selection and their separate legacy
+negative data and manifest files; those artifacts are not inputs to context
+preference.
+
 `run_stage2_training.sh` launches the Stage 2 path with this checkout's
 `./venv/ilvr-venv` Python and local `transformers/src` and `src` trees. It is
 safe to invoke from outside the repository because all runtime paths are

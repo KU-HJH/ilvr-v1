@@ -2,6 +2,7 @@
 
 import copy
 from dataclasses import replace
+import os
 
 import pytest
 import torch
@@ -41,6 +42,97 @@ def two_step_case():
     positions = torch.arange(ids.shape[1])[None, None, :]
     batch["position_ids"] = torch.cat((positions, 2 * positions, 3 * positions))
     return model, batch
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.environ.get("RUN_CONTEXT_CUDA") != "1" or not torch.cuda.is_available(),
+    reason="explicit context CUDA check",
+)
+def test_context_cuda_flex_matches_dense_scores_gradients_and_calls(monkeypatch):
+    """Catches a dense fallback, non-rectangular Flex, or CUDA parity regression."""
+    import transformers.integrations.flex_attention as integration
+
+    base, batch = two_step_case()
+    batch = {
+        key: (value.to("cuda:0") if isinstance(value, torch.Tensor) else value)
+        for key, value in batch.items()
+    }
+    base = base.to("cuda:0")
+    records = []
+    actual_flex_calls = []
+    original = integration.compile_friendly_flex_attention
+
+    def observed(q, k, v, **kwargs):
+        assert kwargs.get("kernel_options") == {"FORCE_USE_FLEX_ATTENTION": True}
+        actual_flex_calls.append(
+            {
+                "query_length": q.shape[-2],
+                "key_length": k.shape[-2],
+                "enable_gqa": kwargs["enable_gqa"],
+            }
+        )
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(integration, "compile_friendly_flex_attention", observed)
+    for backend in ("dense", "flex"):
+        model = copy.deepcopy(base)
+        config = replace(context_config(), sidecar_attention_backend=backend)
+        trainer = _trainer(config)
+        with RuntimeCounters(model) as counters:
+            loss, output = trainer.compute_loss(model, batch, return_outputs=True)
+            before = counters.snapshot()
+            counters.phase = "backward"
+            loss.backward()
+            counts = counters.snapshot()
+        assert (
+            before["decoder_calls_forward"]
+            - before["latent_decoder_calls_forward"]
+            == 3
+        )
+        records.append(
+            (
+                loss.detach(),
+                output.stage2_sidecar_results,
+                {
+                    name: parameter.grad.clone()
+                    for name, parameter in model.named_parameters()
+                    if parameter.requires_grad
+                },
+                counts,
+            )
+        )
+
+    root_length = batch["input_ids"].shape[1]
+    assert actual_flex_calls
+    assert all(
+        call["key_length"] == root_length + call["query_length"]
+        and call["enable_gqa"]
+        for call in actual_flex_calls
+    )
+    torch.testing.assert_close(records[0][0], records[1][0], atol=1e-5, rtol=1e-4)
+    for left, right in zip(records[0][1], records[1][1]):
+        assert left["name"] == right["name"]
+        for key in ("mean_logp", "entropies"):
+            torch.testing.assert_close(
+                left[key], right[key], atol=1e-5, rtol=1e-4
+            )
+    for name in records[0][2]:
+        torch.testing.assert_close(
+            records[0][2][name],
+            records[1][2][name],
+            atol=1e-5,
+            rtol=1e-4,
+            msg=name,
+        )
+    print(
+        {
+            "backend_seen": "actual_cuda_flex",
+            "actual_flex_calls": actual_flex_calls,
+            "context_cuda_dense": records[0][3],
+            "context_cuda_flex": records[1][3],
+        }
+    )
 
 
 def literal_context_oracle(model, batch):

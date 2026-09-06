@@ -1,6 +1,5 @@
 """Two-rank shared Flex smoke through the actual Stage2Trainer training loop."""
 import copy
-from dataclasses import replace
 import math
 import os
 from pathlib import Path
@@ -15,7 +14,8 @@ from deepspeed_runtime import load_deepspeed_runtime_profile
 from main import build_stage2_training_arguments
 from stage2.peft import ALLOWED_STAGE2_TARGET_SUFFIXES, Stage2TuningConfig, build_stage2_tuned_model
 from stage2.trainer import Stage2Trainer
-from step_preference.equivalence import _config, write_evidence_exclusive
+from step_preference.config import StepPreferenceConfig
+from step_preference.equivalence import write_evidence_exclusive
 from step_preference.shared_prefix_measurement import RuntimeCounters, tiny_measurement_case
 
 
@@ -45,8 +45,13 @@ def run_shared_prefix_smoke(options):
         checkpoint.mkdir(parents=True, exist_ok=False)
         result.parent.mkdir(parents=True, exist_ok=False)
         log.mkdir(parents=True, exist_ok=True)
-    config = replace(_config(packing=False), attention_implementation="sdpa",
-        shared_prefix_enabled=True, sidecar_attention_backend="flex", sidecar_query_budget=1024)
+    config = StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        stage2a_checkpoint_path="tiny-stage2a",
+        attention_implementation="sdpa",
+        sidecar_attention_backend="flex",
+    )
     values = SimpleNamespace(save_model_path=str(checkpoint), epochs=1,
         per_device_train_batch_size=1, gradient_accumulation_steps=2, warm_up_steps=0,
         learning_rate=1e-3, save_steps=100, max_seq_length_train=128, max_steps=1,
@@ -57,6 +62,9 @@ def run_shared_prefix_smoke(options):
     args.logging_steps = 1
     args.disable_tqdm = True
     base, batch = tiny_measurement_case(steps=2, total_target_tokens=8, device="cpu")
+    batch["step_preference"] = {
+        "steps": tuple({"span": span} for span in batch["reasoning_step_spans"])
+    }
     tuning = Stage2TuningConfig(method="dora", r=32, alpha=64, dropout=0.05,
                                target_modules=ALLOWED_STAGE2_TARGET_SUFFIXES)
     model = build_stage2_tuned_model(base, tuning, is_trainable=True)
@@ -69,18 +77,52 @@ def run_shared_prefix_smoke(options):
         data_collator=lambda samples: copy.deepcopy(batch), processing_class=TinyStage2Processor(),
         deepspeed_runtime_profile=profile, step_preference_config=config)
     with RuntimeCounters(model) as counters:
+        scoring_microbatches = []
+        legacy_route_calls = 0
         original_backward = trainer.accelerator.backward
+        original_compute = trainer.compute_loss
+        original_legacy = trainer._compute_stage2b_loss
+
         def observed_backward(*args, **kwargs):
             counters.phase = "backward"
             try:
                 return original_backward(*args, **kwargs)
             finally:
                 counters.phase = "forward"
+
+        def reject_legacy(*args, **kwargs):
+            nonlocal legacy_route_calls
+            legacy_route_calls += 1
+            raise AssertionError("default context smoke entered legacy Stage 2B")
+
+        def observed_compute(*args, **kwargs):
+            before_counts = counters.snapshot()
+            value = original_compute(*args, **kwargs)
+            after_counts = counters.snapshot()
+            delta = {
+                key: after_counts.get(key, 0) - before_counts.get(key, 0)
+                for key in (
+                    "policy_calls_forward",
+                    "decoder_calls_forward",
+                    "latent_decoder_calls_forward",
+                )
+            }
+            delta["scoring_decoder_calls_forward"] = (
+                delta["decoder_calls_forward"]
+                - delta["latent_decoder_calls_forward"]
+            )
+            scoring_microbatches.append(delta)
+            return value
+
         trainer.accelerator.backward = observed_backward
+        trainer.compute_loss = observed_compute
+        trainer._compute_stage2b_loss = reject_legacy
         try:
             trained = trainer.train()
         finally:
             trainer.accelerator.backward = original_backward
+            trainer.compute_loss = original_compute
+            trainer._compute_stage2b_loss = original_legacy
         counts = counters.snapshot()
     for handle in handles:
         handle.remove()
@@ -97,7 +139,10 @@ def run_shared_prefix_smoke(options):
         gradient_norm=gradient_norm,
         finite_gradients=bool(gradients) and all(gradients) and gradient_norm is not None and math.isfinite(gradient_norm),
         gradient_hook_calls=len(gradients), changed_trainable_tensors=sum(not torch.equal(before[n], p) for n,p in after.items()),
-        rollout_calls=counts.get("rollout_calls_forward", 0), runtime_counters=counts)
+        rollout_calls=counts.get("rollout_calls_forward", 0),
+        scoring_microbatches=scoring_microbatches,
+        legacy_route_calls=legacy_route_calls,
+        runtime_counters=counts)
     records = [None, None]
     dist.all_gather_object(records, record)
     for witness in records:
@@ -105,7 +150,8 @@ def run_shared_prefix_smoke(options):
         assert witness["microbatches"] == witness["rollout_calls"] == 2, witness
         assert witness["finite_loss"] and witness["finite_gradients"] and witness["changed_trainable_tensors"] > 0, witness
     if rank == 0:
-        write_evidence_exclusive(result, dict(status="pass", world_size=2, ranks=records,
+        write_evidence_exclusive(result, dict(status="pass", objective="context_preference",
+            world_size=2, ranks=records,
             adapter=dict(method="dora", rank=32, alpha=64, dropout=0.05),
             zero_stage=int(trainer.model_wrapped.zero_optimization_stage()),
             gradient_accumulation_steps=args.gradient_accumulation_steps,
