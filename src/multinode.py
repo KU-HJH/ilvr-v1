@@ -1799,6 +1799,14 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             )
             if "RESUME_CHECKPOINT" in stage_environment:
                 input_paths += (Path(stage_environment["RESUME_CHECKPOINT"]),)
+            if stage_environment.get("STEP_PREFERENCE_ENABLED") == "true":
+                input_paths += tuple(
+                    Path(stage_environment[name])
+                    for name in (
+                        "STAGE2A_CHECKPOINT_PATH", "STEP_NEGATIVE_PATH", "STEP_NEGATIVE_MANIFEST"
+                    )
+                    if stage_environment.get(name)
+                )
         artifact_roots = (checkpoint_root, result_root, _REPOSITORY_ROOT / "logs")
         run_paths = [control_directory, witness_path, stage_log_file]
         if commands.finite_loss_evidence_path is not None:

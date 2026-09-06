@@ -19,6 +19,8 @@ from deepspeed_runtime import bind_deepspeed_runtime_profile
 def _preflight_direct_main(argv: list[str]) -> object:
     """Validate generated ownership before importing the training runtime."""
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--stage")
+    parser.add_argument("--tuning_method")
     parser.add_argument("--save_model_path", default="./checkpoints/model_stage1")
     parser.add_argument("--log_file")
     parser.add_argument("--benchmark_run_config")

@@ -12,6 +12,7 @@ from pathlib import Path
 
 DEEPSPEED_RUNTIME_FILENAME = "deepspeed-runtime.json"
 DEEPSPEED_RUNTIME_SCHEMA_VERSION = 1
+STAGE2_FULL_OPTIMIZER_OFFLOAD_CONFIG = "deepspeed_zero3_stage2_full_optimizer_offload.json"
 _DEEPSPEED_RUNTIME_FIELDS = frozenset(
     {
         "schema_version",
@@ -188,7 +189,8 @@ def validate_deepspeed_resume_identity(
 
 
 def validate_supported_deepspeed_policy(
-    payload: Mapping[str, object], *, stage2_peft_zero3: bool = False
+    payload: Mapping[str, object], *, stage2_peft_zero3: bool = False,
+    stage2_full_optimizer_offload: bool = False,
 ) -> None:
     """Reject unsupported precision, batching, and offload policies."""
     if payload.get("bf16") != {"enabled": True}:
@@ -207,7 +209,19 @@ def validate_supported_deepspeed_policy(
         value = zero.get(field)
         if value is not None and not isinstance(value, Mapping):
             raise ValueError(f"{field} must be a JSON object")
-    if stage2_peft_zero3:
+    if stage2_full_optimizer_offload:
+        if (
+            zero.get("stage") != 3
+            or zero.get("offload_optimizer") != {"device": "cpu", "pin_memory": False}
+            or zero.get("offload_param") != {"device": "none"}
+            or "optimizer" in payload
+            or payload.get("zero_force_ds_cpu_optimizer", True) is not True
+        ):
+            raise ValueError(
+                "Full ZeRO-3 optimizer offload requires CPU optimizer without pinning, "
+                "GPU parameters, and Trainer optimizer groups mapped to CPUAdam"
+            )
+    elif stage2_peft_zero3:
         if (
             zero.get("stage") != 3
             or zero.get("stage3_prefetch_bucket_size") != 0
@@ -260,7 +274,10 @@ def load_deepspeed_runtime_profile(
         "deepspeed_zero3_stage2_peft.json"
     ).resolve(strict=False)
     validate_supported_deepspeed_policy(
-        payload, stage2_peft_zero3=dedicated_stage2_peft_zero3
+        payload, stage2_peft_zero3=dedicated_stage2_peft_zero3,
+        stage2_full_optimizer_offload=(path == canonical_deepspeed_config_path(3).with_name(
+            STAGE2_FULL_OPTIMIZER_OFFLOAD_CONFIG
+        ).resolve(strict=False)),
     )
     return DeepSpeedRuntimeProfile(
         True, zero_stage, path, hashlib.sha256(raw).hexdigest(), world_size
@@ -283,6 +300,13 @@ def bind_deepspeed_runtime_profile(
     if existing is not None:
         if not isinstance(existing, DeepSpeedRuntimeProfile):
             raise TypeError("args.deepspeed_runtime_profile has an invalid type")
+    selected_config = existing.config_path if existing is not None else getattr(args, "deepspeed_config", None)
+    if selected_config is not None and Path(selected_config).expanduser().resolve(strict=False) == (
+        canonical_deepspeed_config_path(3).with_name(STAGE2_FULL_OPTIMIZER_OFFLOAD_CONFIG).resolve(strict=False)
+    ):
+        if (getattr(args, "stage", None), getattr(args, "tuning_method", None)) != ("stage2", "full"):
+            raise ValueError("CPU optimizer offload requires explicit Stage 2 full tuning")
+    if existing is not None:
         return existing
     resolved_world_size = (
         int(os.environ.get("WORLD_SIZE", "1")) if world_size is None else world_size
