@@ -119,6 +119,27 @@ def dpo_pair_losses(
     return -F.logsigmoid(beta * (policy_margin - reference_margin))
 
 
+def context_preference_loss(
+    clean_logps: torch.Tensor,
+    ablated_logps: torch.Tensor,
+    beta: float,
+    margin: float,
+) -> torch.Tensor:
+    """Return the mean context-preference loss for paired step scores."""
+    beta = _require_positive_finite("beta", beta)
+    _validate_score_tensors(clean_logps, ablated_logps)
+    if clean_logps.numel() == 0:
+        raise ValueError("context preference requires at least one step")
+    if (
+        isinstance(margin, bool)
+        or not isinstance(margin, Real)
+        or not math.isfinite(margin)
+    ):
+        raise ValueError("margin must be finite")
+    delta = clean_logps - ablated_logps
+    return -F.logsigmoid(beta * (delta - float(margin))).mean()
+
+
 def _validate_aggregate_inputs(
     clean_ce: torch.Tensor,
     score_tensors: tuple[torch.Tensor, ...],
