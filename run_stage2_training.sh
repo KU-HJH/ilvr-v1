@@ -229,16 +229,7 @@ case "$STEP_PREFERENCE_ENABLED" in
         printf 'Stage 2B requires STAGE2A_CHECKPOINT_PATH\n' >&2
         exit 2
       }
-      if [[ "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
-        if [[ -n "${STEP_NEGATIVE_PATH:-}${STEP_NEGATIVE_MANIFEST:-}" ]]; then
-          printf 'Context preference does not consume negative artifacts; select legacy_dpo explicitly\n' >&2
-          exit 2
-        fi
-        if [[ "$step_preference_packing" == true || -n "${STEP_PACKED_ADMISSION_MANIFEST:-}${STEP_PACKED_ADMISSION_MANIFEST_SHA256:-}${STEP_PACKED_ADMISSION_VERIFICATION:-}${STEP_PACKED_ADMISSION_VERIFICATION_SHA256:-}" ]]; then
-          printf 'Context preference does not consume legacy packed admission\n' >&2
-          exit 2
-        fi
-      else
+      if [[ "$STEP_PREFERENCE_OBJECTIVE" == legacy_dpo ]]; then
         [[ -n "${STEP_NEGATIVE_PATH:-}" ]] || {
           printf 'Stage 2B requires STEP_NEGATIVE_PATH\n' >&2
           exit 2
