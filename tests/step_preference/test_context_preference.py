@@ -23,6 +23,99 @@ def forbidden(*args, **kwargs):
     pytest.fail("new default reached legacy negative/reference/rejected computation")
 
 
+def test_entropy_reduces_steps_equally_even_with_different_lengths():
+    """Catches token-weighting the entropy penalty across unequal steps."""
+    trainer = _trainer(context_config())
+    clean_ce = torch.tensor(2.0, requires_grad=True)
+    clean_scores = [torch.tensor(-2.0), torch.tensor(-2.0)]
+    clean_entropies = [torch.zeros(1), torch.zeros(3)]
+    results = {
+        (step_id, modality): {
+            "mean_logp": torch.tensor(-2.0),
+            "entropies": (
+                torch.zeros(1)
+                if step_id == 0
+                else torch.full((3,), 2.0)
+            ),
+        }
+        for step_id in (0, 1)
+        for modality in ("visual", "textual")
+    }
+
+    total, metrics = trainer._reduce_context_objective(
+        clean_ce, clean_scores, clean_entropies, results
+    )
+
+    assert float(metrics["loss/entropy"]) == pytest.approx(0.05)
+    assert float(total.detach()) == pytest.approx(
+        2 + math.log(2) + 0.1 * 0.05
+    )
+
+
+def test_zero_steps_execute_only_clean_and_report_zero_step_metrics():
+    """Catches sidecar execution or nonzero preference metrics for no transitions."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    ids = torch.tensor([[11, 12, 13]])
+    batch.update(
+        input_ids=ids,
+        attention_mask=torch.ones_like(ids),
+        labels=ids.clone(),
+        reasoning_step_spans=(),
+        step_preference={"steps": ()},
+    )
+    trainer = _trainer(context_config())
+
+    with RuntimeCounters(model) as counters:
+        loss = trainer.compute_loss(model, batch)
+
+    counts = counters.snapshot()
+    assert counts["decoder_calls_forward"] == 1
+    assert counts.get("latent_decoder_calls_forward", 0) == 0
+    assert counts.get("sidecar_chunks_forward", 0) == 0
+    metrics = trainer._step_preference_metric_totals
+    assert metrics["loss/context_preference"] == 0
+    assert metrics["loss/entropy"] == 0
+    assert metrics["stats/scored_tokens"] == 0
+    assert torch.isfinite(loss)
+
+
+def test_disabled_preference_matches_direct_stage2_loss_and_gradients():
+    """Catches the disabled route changing ordinary Stage 2 loss or gradients."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    reference = copy.deepcopy(model)
+    inputs = {
+        key: batch[key]
+        for key in ("input_ids", "attention_mask", "labels")
+    }
+
+    loss = _trainer(StepPreferenceConfig()).compute_loss(model, inputs)
+    baseline = reference(
+        **inputs,
+        stage2_loss_only=True,
+        collect_stage2_diagnostics=False,
+    ).loss
+
+    torch.testing.assert_close(loss, baseline, atol=1e-5, rtol=1e-4)
+    loss.backward()
+    baseline.backward()
+    for (name, parameter), (_, reference_parameter) in zip(
+        model.named_parameters(), reference.named_parameters()
+    ):
+        if parameter.requires_grad:
+            assert parameter.grad is not None and reference_parameter.grad is not None, name
+            torch.testing.assert_close(
+                parameter.grad,
+                reference_parameter.grad,
+                atol=1e-5,
+                rtol=1e-4,
+                msg=name,
+            )
+
+
 def test_context_preference_averages_individual_losses_and_keeps_both_gradients():
     """Catches sigmoid-after-mean and detached ablated scores."""
     clean = torch.tensor([-1., -3.], requires_grad=True)

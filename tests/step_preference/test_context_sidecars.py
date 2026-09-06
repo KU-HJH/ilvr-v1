@@ -1,12 +1,107 @@
 """Context-only sidecar planning and grouped replay contracts."""
 
+import copy
 from dataclasses import replace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import step_preference.sidecar as sidecar
+from step_preference.equivalence import _trainer
 from step_preference.shared_prefix_measurement import RuntimeCounters, tiny_measurement_case
+from tests.step_preference.test_context_preference import context_config
+
+
+def two_step_case():
+    """Return two FP32 steps whose target lengths differ (2 versus 5)."""
+    model, batch = tiny_measurement_case(
+        steps=2, total_target_tokens=4, device="cpu"
+    )
+    assert model.config.num_hidden_layers == 2
+    assert {parameter.dtype for parameter in model.parameters()} == {torch.float32}
+    assert model.config.attention_dropout == 0
+    assert all(
+        module.p == 0
+        for module in model.modules()
+        if isinstance(module, torch.nn.Dropout)
+    )
+    ids = torch.cat((batch["input_ids"], torch.tensor([[17, 18, 19]])), dim=1)
+    spans = batch["reasoning_step_spans"]
+    spans = (spans[0], replace(spans[1], target_text_end=ids.shape[1]))
+    batch = {
+        "input_ids": ids,
+        "attention_mask": torch.ones_like(ids),
+        "labels": ids.clone(),
+        "sample_ids": ("context-two-step",),
+        "reasoning_step_spans": spans,
+        "step_preference": {"steps": tuple({"span": span} for span in spans)},
+    }
+    # Distinct temporal/height/width coordinates catch accidental 1-D reuse.
+    positions = torch.arange(ids.shape[1])[None, None, :]
+    batch["position_ids"] = torch.cat((positions, 2 * positions, 3 * positions))
+    return model, batch
+
+
+def literal_context_oracle(model, batch):
+    """Score literal full-prefix ablations without production planning/reduction."""
+    ids = batch["input_ids"]
+    kwargs = {
+        key: batch[key]
+        for key in ("input_ids", "attention_mask", "labels", "position_ids")
+    }
+    clean = model(**kwargs, use_cache=False)
+    preference_losses, entropy_losses, scores = [], [], {}
+
+    def scored(logits, targets):
+        log_probs = logits.float().log_softmax(-1)
+        mean_logp = log_probs.gather(-1, targets[:, None]).mean()
+        entropies = -(log_probs.exp() * log_probs).sum(-1)
+        return mean_logp, entropies
+
+    for span in batch["reasoning_step_spans"]:
+        start, end = span.target_text_start, span.target_text_end
+        clean_logp, clean_entropy = scored(
+            clean.logits[0, start - 1 : end - 1], ids[0, start:end]
+        )
+        for modality, blocked in (
+            ("visual", (span.latent_start, span.latent_end)),
+            ("textual", (span.prev_text_start, span.prev_text_end)),
+        ):
+            length = ids.shape[1]
+            visible = torch.ones(
+                length, length, dtype=torch.bool, device=ids.device
+            ).tril()
+            visible[start - 1 : end - 1, blocked[0] : blocked[1]] = False
+            mask = torch.zeros(length, length, device=ids.device).masked_fill(
+                ~visible, torch.finfo(torch.float32).min
+            )[None, None]
+            output = model(
+                **kwargs,
+                stage2_final_attention_mask=mask,
+                use_cache=False,
+            )
+            off_logp, off_entropy = scored(
+                output.logits[0, start - 1 : end - 1], ids[0, start:end]
+            )
+            preference_losses.append(
+                -F.logsigmoid(0.1 * (clean_logp - off_logp))
+            )
+            entropy_losses.append(
+                F.relu(0.1 - (off_entropy - clean_entropy)).mean()
+            )
+            scores[(span.step_id, modality)] = (
+                off_logp,
+                off_entropy,
+                output.logits[0, start - 1 : end - 1],
+            )
+
+    total = (
+        clean.loss
+        + torch.stack(preference_losses).mean()
+        + 0.1 * torch.stack(entropy_losses).mean()
+    )
+    return total, clean, scores
 
 
 def _context_plan(batch):
@@ -16,6 +111,250 @@ def _context_plan(batch):
         clean_input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         spans=batch["reasoning_step_spans"],
+    )
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_context_matches_literal_loss_and_all_trainable_gradients(checkpoint):
+    """Catches planner/replay/reducer errors with an independent full-prefix oracle."""
+    model, batch = two_step_case()
+    reference = copy.deepcopy(model)
+    if checkpoint:
+        for current in (model, reference):
+            current.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
+    actual, output = _trainer(context_config()).compute_loss(
+        model, batch, return_outputs=True
+    )
+    expected, clean, scores = literal_context_oracle(reference, batch)
+    loss_error = float((actual.detach() - expected.detach()).abs())
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(output.logits, clean.logits, atol=1e-5, rtol=1e-4)
+    for result in output.stage2_sidecar_results:
+        modality = {
+            "visual_off": "visual",
+            "textual_off": "textual",
+        }[result["kind"]]
+        mean_logp, entropies, _ = scores[(result["step_id"], modality)]
+        torch.testing.assert_close(
+            result["mean_logp"], mean_logp, atol=1e-5, rtol=1e-4
+        )
+        torch.testing.assert_close(
+            result["entropies"], entropies, atol=1e-5, rtol=1e-4
+        )
+
+    actual.backward()
+    expected.backward()
+    max_gradient_error = 0.0
+    trainable_count = 0
+    for (name, parameter), (other_name, reference_parameter) in zip(
+        model.named_parameters(), reference.named_parameters()
+    ):
+        assert name == other_name
+        if parameter.requires_grad:
+            trainable_count += 1
+            assert parameter.grad is not None and reference_parameter.grad is not None, name
+            max_gradient_error = max(
+                max_gradient_error,
+                float((parameter.grad - reference_parameter.grad).abs().max()),
+            )
+            torch.testing.assert_close(
+                parameter.grad,
+                reference_parameter.grad,
+                atol=1e-5,
+                rtol=1e-4,
+                msg=name,
+            )
+    print(
+        {
+            "checkpoint": checkpoint,
+            "loss_abs_error": loss_error,
+            "max_trainable_gradient_abs_error": max_gradient_error,
+            "trainable_parameters_checked": trainable_count,
+        }
+    )
+
+
+def test_context_visibility_has_only_own_ancestors_and_branch_past():
+    """Catches access to clean future, a sibling branch, or the blocked context."""
+    _, batch = two_step_case()
+    plan = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+    )
+
+    for group, blocked_ranges in zip(
+        plan.groups,
+        (((2, 4), (8, 10)), ((0, 1), (5, 7))),
+    ):
+        expected = torch.zeros(7, 23, dtype=torch.bool)
+        for low, high, ancestor_end, blocked in (
+            (0, 2, 4, blocked_ranges[0]),
+            (2, 7, 10, blocked_ranges[1]),
+        ):
+            for row in range(low, high):
+                expected[row, :ancestor_end] = True
+                expected[row, blocked[0] : blocked[1]] = False
+                expected[row, 16 + low : 16 + row + 1] = True
+
+        actual = sidecar.sidecar_dense_visibility(16, group, device="cpu")
+        assert torch.equal(actual, expected)
+        block_mask = sidecar.build_sidecar_flex_block_mask(16, group, "cpu")
+        probe = block_mask.mask_mod(
+            torch.tensor(0),
+            torch.tensor(0),
+            torch.arange(7)[:, None],
+            torch.arange(23)[None, :],
+        )
+        assert torch.equal(probe, expected)
+
+
+def test_runtime_prefix_bank_identity_and_mrope_reuse():
+    """Catches copied/detached prefix KV or collapsed one-dimensional positions."""
+    model, batch = two_step_case()
+    clean_banks, sidecar_banks, sidecar_positions = [], [], []
+
+    def observe(_module, _args, kwargs, output):
+        if kwargs.get("stage2_capture_kv"):
+            clean_banks.append(output.stage2_key_values)
+        if kwargs.get("stage2_prefix_key_values") is not None:
+            sidecar_banks.append(kwargs["stage2_prefix_key_values"])
+            sidecar_positions.append(kwargs["position_ids"])
+
+    handle = model.model.register_forward_hook(observe, with_kwargs=True)
+    try:
+        _trainer(context_config()).compute_loss(model, batch)
+    finally:
+        handle.remove()
+
+    assert len(clean_banks) == 1
+    assert len(sidecar_banks) == 2
+    for layer, clean_pair in enumerate(clean_banks[0]):
+        for index, tensor in enumerate(clean_pair):
+            for bank in sidecar_banks:
+                torch.testing.assert_close(bank[layer][index], tensor)
+                assert bank[layer][index].requires_grad
+            assert (
+                sidecar_banks[0][layer][index].data_ptr()
+                == sidecar_banks[1][layer][index].data_ptr()
+            )
+    expected_positions = batch["position_ids"][:, :, [4, 5, 10, 11, 12, 13, 14]]
+    for positions in sidecar_positions:
+        assert torch.equal(positions, expected_positions)
+
+
+@pytest.mark.parametrize(
+    ("modality", "group_index"),
+    (("visual", 0), ("textual", 1)),
+)
+def test_first_prediction_changes_without_propagating_to_clean_or_other_sidecars(
+    modality, group_index
+):
+    """Catches a copied boundary predictor or propagation outside one local branch."""
+    model, batch = two_step_case()
+    plan = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+    )
+    first = replace(
+        plan.groups[group_index][0], blocked_start=0, blocked_end=0
+    )
+    changed_group = (first, *plan.groups[group_index][1:])
+    changed_groups = list(plan.groups)
+    changed_groups[group_index] = changed_group
+    altered = replace(plan, groups=tuple(changed_groups))
+
+    outputs, projected = [], []
+    for current_plan in (plan, altered):
+        head_outputs = []
+
+        def observe_head(_module, _args, output):
+            head_outputs.append(output)
+
+        handle = model.lm_head.register_forward_hook(observe_head)
+        try:
+            outputs.append(
+                model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    position_ids=batch["position_ids"],
+                    use_cache=False,
+                    stage2_shared_prefix_inputs={
+                        "plan": current_plan,
+                        "backend": "dense",
+                        "checkpoint": False,
+                    },
+                )
+            )
+        finally:
+            handle.remove()
+        projected.append(head_outputs)
+
+    expected_result_order = [
+        "step-0-visual-off",
+        "step-1-visual-off",
+        "step-0-textual-off",
+        "step-1-textual-off",
+    ]
+    for output, head_outputs in zip(outputs, projected):
+        # The observed row counts distinguish the two grouped sidecar projections
+        # from the full clean projection and establish their runtime order.
+        assert [head.shape[1] for head in head_outputs] == [7, 7, 16]
+        assert [
+            result["name"] for result in output.stage2_sidecar_results
+        ] == expected_result_order
+        for observed_group, expected_modality in enumerate(("visual", "textual")):
+            offset = 0
+            for span in batch["reasoning_step_spans"]:
+                target_count = span.target_text_end - span.target_text_start
+                logits = head_outputs[observed_group][0, offset : offset + target_count]
+                targets = batch["input_ids"][0, span.target_text_start : span.target_text_end]
+                log_probs = logits.float().log_softmax(-1)
+                result = {
+                    item["name"]: item for item in output.stage2_sidecar_results
+                }[f"step-{span.step_id}-{expected_modality}-off"]
+                torch.testing.assert_close(
+                    result["mean_logp"],
+                    log_probs.gather(-1, targets[:, None]).mean(),
+                )
+                torch.testing.assert_close(
+                    result["entropies"],
+                    -(log_probs.exp() * log_probs).sum(-1),
+                )
+                offset += target_count
+
+    first_token_change = torch.linalg.vector_norm(
+        projected[0][group_index][0, 0] - projected[1][group_index][0, 0]
+    )
+    assert first_token_change > 1e-8
+    torch.testing.assert_close(outputs[0].logits, outputs[1].logits)
+    original = {
+        result["name"]: result for result in outputs[0].stage2_sidecar_results
+    }
+    changed = {
+        result["name"]: result for result in outputs[1].stage2_sidecar_results
+    }
+    changed_name = f"step-0-{modality}-off"
+    for name in original:
+        if name != changed_name:
+            torch.testing.assert_close(
+                original[name]["mean_logp"], changed[name]["mean_logp"]
+            )
+            torch.testing.assert_close(
+                original[name]["entropies"], changed[name]["entropies"]
+            )
+    print(
+        {
+            "unblocked": modality,
+            "first_token_logit_l2_change": float(first_token_change),
+            "head_rows_in_runtime_order": [
+                head.shape[1] for head in projected[0]
+            ],
+        }
     )
 
 
