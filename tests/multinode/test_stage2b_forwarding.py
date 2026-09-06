@@ -24,6 +24,7 @@ def stage2b_environment(dpo="1", entropy="0.1"):
         "CE_WEIGHT": "1",
         "STEP_PREFERENCE_ENABLED": "true",
         "STEP_PREFERENCE_MODE": "stage2b",
+        "STEP_PREFERENCE_OBJECTIVE": "legacy_dpo",
         "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
         "STEP_NEGATIVE_PATH": "/data/negative cache.jsonl",
         "STEP_NEGATIVE_MANIFEST": "/data/negative manifest.json",
@@ -72,7 +73,8 @@ def test_stage2b_variants_reach_both_worker_training_commands(dpo, entropy):
             "--num_machines": "2", "--num_processes": "4", "--machine_rank": str(rank),
             "--per_device_train_batch_size": "1", "--gradient_accumulation_steps": "2",
             "--tuning_method": "dora", "--deepspeed_config": str(plan.deepspeed_config),
-            "--step_preference_mode": "stage2b", "--ce_weight": "1",
+            "--step_preference_mode": "stage2b", "--step_preference_objective": "legacy_dpo",
+            "--ce_weight": "1",
             "--step_dpo_weight": dpo, "--step_entropy_weight": entropy,
             "--step_negative_path": "/data/negative cache.jsonl",
             "--step_negative_manifest": "/data/negative manifest.json",
@@ -85,6 +87,64 @@ def test_stage2b_variants_reach_both_worker_training_commands(dpo, entropy):
             assert argv[argv.index(option) + 1] == value
         assert "--step_preference_enabled" in argv
         assert "--step_shared_prefix_enabled" in argv
+
+
+def test_context_preference_settings_reach_both_owned_worker_commands():
+    """Dropping context objective settings must fail at the real worker boundary."""
+    plan = multinode.build_launch_plan(
+        stage="stage2", tuning_method="dora", zero_stage=2,
+        run_id="context-forwarding-test", main_process_port=29631,
+    )
+    source = stage2b_environment()
+    source.pop("STEP_NEGATIVE_PATH")
+    source.pop("STEP_NEGATIVE_MANIFEST")
+    source.update(
+        {
+            "STEP_PREFERENCE_OBJECTIVE": "context_preference",
+            "STEP_PREFERENCE_BETA": "0.37",
+            "STEP_PREFERENCE_WEIGHT": "1.7",
+            "STEP_PREFERENCE_MARGIN": "-0.25",
+        }
+    )
+    environment = validated_stage2_environment(
+        source, output_dir=str(REPO / "checkpoints" / plan.run_id),
+        log_file=str(REPO / "logs" / plan.run_id / "train.log"),
+        deepspeed_config=str(plan.deepspeed_config),
+    )
+    commands = build_owned_tmux_commands(
+        plan, commit="a" * 40, stage_environment=environment
+    )
+
+    for spec in commands.node_specs:
+        worker_env = dict(spec.environment)
+        assert {
+            name: worker_env.get(name)
+            for name in (
+                "STEP_PREFERENCE_OBJECTIVE",
+                "STEP_PREFERENCE_BETA",
+                "STEP_PREFERENCE_WEIGHT",
+                "STEP_PREFERENCE_MARGIN",
+            )
+        } == {
+            "STEP_PREFERENCE_OBJECTIVE": "context_preference",
+            "STEP_PREFERENCE_BETA": "0.37",
+            "STEP_PREFERENCE_WEIGHT": "1.7",
+            "STEP_PREFERENCE_MARGIN": "-0.25",
+        }
+        stage_command = spec.command[spec.command.index("--") + 1:]
+        result = subprocess.run(
+            stage_command, cwd=REPO, capture_output=True, text=True,
+            env={**worker_env, "STAGE2_DRY_RUN": "true", "STAGE2_DRY_RUN_FORMAT": "json"},
+        )
+        assert result.returncode == 0, result.stderr
+        argv = json.loads(result.stdout)
+        for option, value in {
+            "--step_preference_objective": "context_preference",
+            "--step_preference_beta": "0.37",
+            "--step_preference_weight": "1.7",
+            "--step_preference_margin": "-0.25",
+        }.items():
+            assert argv[argv.index(option) + 1] == value
 
 
 def test_stage2b_preflight_includes_checkpoint_and_negative_inputs(monkeypatch):

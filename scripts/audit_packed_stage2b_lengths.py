@@ -132,6 +132,8 @@ def collect_packed_length_audit(args) -> tuple[dict[str, object], tuple[dict, ..
             "--step_preference_enabled",
             "--step_preference_mode",
             "stage2b",
+            "--step_preference_objective",
+            "legacy_dpo",
             "--stage2a_checkpoint_path",
             str(checkpoint),
             "--step_negative_path",

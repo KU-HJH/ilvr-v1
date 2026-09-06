@@ -534,3 +534,94 @@ def test_run_stage2_publishes_phase_a_summary_once_after_training(monkeypatch):
     training_main.run_stage2(args)
 
     assert events == ["train", "summary", "benchmark"]
+
+
+def test_context_stage2_completion_skips_legacy_summary_and_reaches_evidence_and_final_save(
+    monkeypatch,
+):
+    """Catches context training failing in the legacy summary before final publication."""
+    events = []
+    logged = []
+    train_result = SimpleNamespace(training_loss=5.5)
+
+    class Trainer:
+        def __init__(self, **_kwargs):
+            self.state = SimpleNamespace(
+                global_step=1,
+                log_history=[
+                    {
+                        "loss/total": 5.5,
+                        "loss/ce": 4.75,
+                        "loss/context_preference": 0.7,
+                        "loss/entropy": 0.5,
+                    }
+                ],
+            )
+            self.accelerator = SimpleNamespace(wait_for_everyone=lambda: None)
+
+        def train(self, *, resume_from_checkpoint):
+            assert resume_from_checkpoint is None
+            events.append("train")
+            return train_result
+
+        def save_model(self, path):
+            events.append(("model", path))
+
+        def is_world_process_zero(self):
+            return True
+
+    config = StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="context_preference",
+        stage2a_checkpoint_path="stage2a",
+    )
+    args = SimpleNamespace(
+        step_preference_config=config,
+        stage2_diagnostics_interval=0,
+        save_final_model=True,
+        save_model_path="checkpoints/context-completion-test",
+    )
+    components = SimpleNamespace(
+        model=object(),
+        processor=SimpleNamespace(
+            save_pretrained=lambda path: events.append(("processor", path))
+        ),
+        train_dataset=["sample"],
+        data_collator=object(),
+        trainer_class=Trainer,
+        trainer_resume_path=None,
+        peft_metadata=None,
+        step_preference_config=config,
+    )
+    monkeypatch.setattr(
+        training_main,
+        "bind_deepspeed_runtime_profile",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        training_main,
+        "build_stage2_training_components",
+        lambda _args: components,
+    )
+    monkeypatch.setattr(
+        training_main,
+        "build_stage2_training_arguments",
+        lambda _args: object(),
+    )
+    monkeypatch.setattr(
+        training_main,
+        "publish_stage2_training_evidence",
+        lambda _args, *, trainer, train_result, profile: events.append("evidence"),
+    )
+    monkeypatch.setattr(training_main.logging, "info", logged.append)
+
+    training_main.run_stage2(args)
+
+    assert events == [
+        "train",
+        "evidence",
+        ("model", "checkpoints/context-completion-test"),
+        ("processor", "checkpoints/context-completion-test"),
+    ]
+    assert logged == []

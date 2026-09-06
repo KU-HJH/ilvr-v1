@@ -969,7 +969,11 @@ def publish_step_preference_phase_a_summary(args, *, trainer, train_result):
     config = getattr(args, "step_preference_config", None)
     if config is None:
         config = StepPreferenceConfig.from_args(args)
-    if not config.is_stage2b or not trainer.is_world_process_zero():
+    if (
+        not config.is_stage2b
+        or config.objective != "legacy_dpo"
+        or not trainer.is_world_process_zero()
+    ):
         return None
     latest = next(
         (
