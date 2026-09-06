@@ -54,6 +54,36 @@ CANONICAL_DEFAULT_LOG = (
 )
 
 
+@pytest.mark.parametrize("inline", [False, True])
+def test_stage1_dora_length_manifest_uses_adapter_processor(tmp_path, inline):
+    """Catch base-tokenizer admission disagreeing with the trainer's adapter tokenizer."""
+    launcher = tmp_path / "run_stage2_training.sh"
+    shutil.copy2(LAUNCHER, launcher)
+    python = tmp_path / "venv/ilvr-venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == -m && "$2" == stage2.length_manifest ]]; then\n'
+        "  printf '%s\\n' \"$@\"\n  exit 77\nfi\n"
+        # This fixture tests manifest command selection, not artifact ownership.
+        'if [[ "$1" == -m && "$2" == src.artifact_paths ]]; then exit 0; fi\n'
+        f"exec {shlex.quote(str(REPO_ROOT / 'venv/ilvr-venv/bin/python'))} \"$@\"\n"
+    )
+    python.chmod(0o755)
+    adapter = "/models/stage1 adapter"
+    arguments = [f"--stage1_adapter_path={adapter}"] if inline else ["--stage1_adapter_path", adapter]
+    result = subprocess.run(
+        ["bash", str(launcher), *arguments], capture_output=True, text=True,
+        env={"PATH": os.environ["PATH"], **REQUIRED_ENV,
+             "STAGE2_DRY_RUN": "false", "TUNING_METHOD": "dora",
+             "OUTPUT_DIR": str(tmp_path / "checkpoints/run"),
+             "LOG_FILE": str(tmp_path / "logs/run/train.log")},
+    )
+    assert result.returncode == 77, result.stderr
+    argv = result.stdout.splitlines()
+    assert argv[argv.index("--processor-source") + 1] == adapter
+
+
 def test_shared_launcher_routes_without_legacy_admission_and_keeps_backend_independent():
     """Catches requiring a packed certificate or overriding vision/clean attention."""
     env = dict(STEP_PREFERENCE_ENABLED="true", STEP_PREFERENCE_MODE="stage2b",

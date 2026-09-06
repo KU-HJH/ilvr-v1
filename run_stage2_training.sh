@@ -29,6 +29,15 @@ canonical_log_root="$REPO_ROOT/logs/zero-stage-compatibility"
 result_dir="$REPO_ROOT/results/$experiment_id"
 length_manifest="$result_dir/stage2-length-manifest.json"
 processor_source=${RESUME_CHECKPOINT:-$STAGE1_CHECKPOINT}
+if [[ -z "${RESUME_CHECKPOINT:-}" ]]; then
+  stage2_launcher_arguments=("$@")
+  for ((stage2_argument_index=0; stage2_argument_index<${#stage2_launcher_arguments[@]}; stage2_argument_index++)); do
+    case "${stage2_launcher_arguments[stage2_argument_index]}" in
+      --stage1_adapter_path) processor_source=${stage2_launcher_arguments[stage2_argument_index+1]:-} ;;
+      --stage1_adapter_path=*) processor_source=${stage2_launcher_arguments[stage2_argument_index]#*=} ;;
+    esac
+  done
+fi
 if [[ -z "${LOG_FILE:-}" ]]; then
   if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
     LOG_FILE="$canonical_log_root/$experiment_id/resume-$(date +%Y%m%dT%H%M%S)-$$.log"
