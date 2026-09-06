@@ -9,6 +9,19 @@ import step_preference.sidecar as sidecar
 from test_shared_prefix_model import fixture
 
 
+@pytest.fixture(autouse=True)
+def _isolate_tf32_backend_state():
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+
 def test_rectangular_block_mask_matches_literal_edges_and_padding():
     """Catches root leakage, other-branch edges, or padded create_block_mask probes."""
     _, _, _, _, plan = fixture()

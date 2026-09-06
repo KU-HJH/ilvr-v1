@@ -14,6 +14,19 @@ from step_preference.shared_prefix_measurement import RuntimeCounters, tiny_meas
 from tests.step_preference.test_context_preference import context_config
 
 
+@pytest.fixture(autouse=True)
+def _isolate_tf32_backend_state():
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+
 def two_step_case():
     """Return two FP32 steps whose target lengths differ (2 versus 5)."""
     model, batch = tiny_measurement_case(
