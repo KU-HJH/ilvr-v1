@@ -307,6 +307,12 @@ case "$STEP_PREFERENCE_ENABLED" in
     ;;
 esac
 
+if [[ "$stage2b_direct_from_stage1" == true ]] &&
+   [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b ]]; then
+  printf 'STAGE2B_DIRECT_FROM_STAGE1 requires Stage 2B\n' >&2
+  exit 2
+fi
+
 if [[ "$step_visual_only_context_preference" == true ]] &&
    [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b || "$STEP_PREFERENCE_OBJECTIVE" != context_preference ]]; then
   printf 'STEP_VISUAL_ONLY_CONTEXT_PREFERENCE requires context-preference Stage 2B\n' >&2

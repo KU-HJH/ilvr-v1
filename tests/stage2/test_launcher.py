@@ -571,6 +571,25 @@ def test_stage2b_launcher_forwards_direct_stage1_initialization():
 
 
 @pytest.mark.parametrize(
+    "environment",
+    [
+        {"STAGE2B_DIRECT_FROM_STAGE1": "true"},
+        {
+            "STEP_PREFERENCE_ENABLED": "true",
+            "STEP_PREFERENCE_MODE": "stage2a",
+            "STAGE2B_DIRECT_FROM_STAGE1": "true",
+        },
+    ],
+)
+def test_stage2b_direct_launcher_rejects_disabled_or_stage2a_scope(environment):
+    """Catches a direct request being silently ignored outside its Stage 2B scope."""
+    result = run_launcher(env_overrides=environment)
+
+    assert result.returncode == 2
+    assert "STAGE2B_DIRECT_FROM_STAGE1 requires Stage 2B" in result.stderr
+
+
+@pytest.mark.parametrize(
     ("ce_weight", "dpo_weight", "entropy_weight"),
     [("1", "0", "0"), ("0", "1", "0"), ("0", "0", "1")],
 )
