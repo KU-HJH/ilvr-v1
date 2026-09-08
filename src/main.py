@@ -172,6 +172,7 @@ class Stage2BPreflight:
     negative_store: Mapping[tuple[str, int], object] | None
     packed_admission: packed_admission_artifacts.PackedAdmissionManifest | None = None
     packed_admission_records_by_sample_id: Mapping[str, object] | None = None
+    stage1_peft_preflight: object | None = None
 
 
 @dataclass(frozen=True)
@@ -312,7 +313,7 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
 
     if config.direct_from_stage1:
         source_dependencies = _default_stage2_source_dependencies()
-        resolve_stage2_load_decision(
+        decision = resolve_stage2_load_decision(
             load_model_path=args.load_model_path,
             stage1_adapter_path=args.stage1_adapter_path,
             resume_from_checkpoint_path=None,
@@ -328,7 +329,19 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
             lora_dropout=args.lora_dropout,
             lora_target_modules=args.lora_target_modules,
         )
-        return Stage2BPreflight(prepared_examples=prepared, negative_store=None)
+        processor = source_dependencies.load_processor(decision.processor_source)
+        stage1_preflight = preflight_stage1_peft_artifact(
+            processor,
+            source_dependencies.load_config(decision.base_model_source),
+            Path(decision.stage1_adapter_source),
+            requested_base_model_reference=decision.base_model_source,
+            metadata_snapshot=decision.stage1_metadata_snapshot,
+        )
+        return Stage2BPreflight(
+            prepared_examples=prepared,
+            negative_store=None,
+            stage1_peft_preflight=stage1_preflight,
+        )
 
     validate_stage2b_peft_base_identity(
         stage2a_checkpoint_path=config.stage2a_checkpoint_path,
@@ -565,17 +578,22 @@ def build_stage2_training_components(
         if manifest_path is not None
         else None
     )
-    stage1_preflight = None
+    stage1_preflight = (
+        stage2b_preflight.stage1_peft_preflight
+        if step_preference_config.direct_from_stage1
+        else None
+    )
     stage1_metadata = None
     if decision.stage1_adapter_source is not None:
-        base_config = source_dependencies.load_config(decision.base_model_source)
-        stage1_preflight = preflight_stage1_peft_artifact(
-            processor,
-            base_config,
-            Path(decision.stage1_adapter_source),
-            requested_base_model_reference=decision.base_model_source,
-            metadata_snapshot=decision.stage1_metadata_snapshot,
-        )
+        if stage1_preflight is None:
+            base_config = source_dependencies.load_config(decision.base_model_source)
+            stage1_preflight = preflight_stage1_peft_artifact(
+                processor,
+                base_config,
+                Path(decision.stage1_adapter_source),
+                requested_base_model_reference=decision.base_model_source,
+                metadata_snapshot=decision.stage1_metadata_snapshot,
+            )
         stage1_metadata = decode_stage1_peft_metadata_snapshot(
             decision.stage1_metadata_snapshot
         )

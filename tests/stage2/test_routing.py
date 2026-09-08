@@ -1285,13 +1285,27 @@ def test_direct_stage1_preflight_uses_fresh_dora_resolution_without_stage2a(
     )
     prepared = SimpleNamespace(sample_id="sample-a", reasoning_steps=())
     decisions = []
+    decision = SimpleNamespace(
+        base_model_source="stage1-base",
+        processor_source="stage1-adapter",
+        stage1_adapter_source="stage1-adapter",
+        stage1_metadata_snapshot=object(),
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: None,
+        load_config=lambda source: {"source": source},
+        load_processor=lambda source: {"source": source},
+        load_model=lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
     monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
     monkeypatch.setattr(main, "prepare_stage2_example", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(main, "_default_stage2_source_dependencies", lambda: dependencies)
     monkeypatch.setattr(
         main,
         "resolve_stage2_load_decision",
-        lambda **kwargs: decisions.append(kwargs) or object(),
+        lambda **kwargs: decisions.append(kwargs) or decision,
     )
+    monkeypatch.setattr(main, "preflight_stage1_peft_artifact", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
         main,
         "validate_stage2b_peft_base_identity",
@@ -1304,6 +1318,70 @@ def test_direct_stage1_preflight_uses_fresh_dora_resolution_without_stage2a(
     assert result.negative_store is None
     assert decisions[0]["resume_from_checkpoint_path"] is None
     assert decisions[0]["stage1_adapter_path"] == "stage1-adapter"
+
+
+def test_direct_stage1_preflight_rejects_invalid_adapter_payload_before_return(
+    monkeypatch, tmp_path
+):
+    """Catches valid adapter metadata masking a missing required payload until build."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="context_preference",
+        visual_only_context_preference=True,
+        direct_from_stage1=True,
+    )
+    args = stage2_args(
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        stage1_adapter_path="stage1-adapter",
+        step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
+    )
+    metadata_snapshot = object()
+    decision = SimpleNamespace(
+        base_model_source="stage1-base",
+        processor_source="stage1-adapter",
+        stage1_adapter_source="stage1-adapter",
+        stage1_metadata_snapshot=metadata_snapshot,
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: None,
+        load_config=lambda source: {"source": source},
+        load_processor=lambda source: {"source": source},
+        load_model=lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
+    calls = []
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+    monkeypatch.setattr(
+        main, "prepare_stage2_example",
+        lambda *_args, **_kwargs: SimpleNamespace(sample_id="sample-a", reasoning_steps=()),
+    )
+    monkeypatch.setattr(main, "_default_stage2_source_dependencies", lambda: dependencies)
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **_kwargs: decision)
+
+    def reject_payload(processor, base_config, artifact, **kwargs):
+        calls.append((processor, base_config, artifact, kwargs))
+        raise ValueError("adapter_model.safetensors is required")
+
+    monkeypatch.setattr(main, "preflight_stage1_peft_artifact", reject_payload)
+
+    with pytest.raises(ValueError, match="adapter_model.safetensors is required"):
+        main.preflight_stage2b_artifacts(args)
+
+    assert calls == [
+        (
+            {"source": "stage1-adapter"},
+            {"source": "stage1-base"},
+            Path("stage1-adapter"),
+            {
+                "requested_base_model_reference": "stage1-base",
+                "metadata_snapshot": metadata_snapshot,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize(

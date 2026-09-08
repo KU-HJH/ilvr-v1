@@ -570,6 +570,25 @@ def test_stage2b_launcher_forwards_direct_stage1_initialization():
     assert "--stage2a_checkpoint_path" not in tokens
 
 
+def test_direct_stage1_launcher_rejects_trailing_adapter_override():
+    """Catches a trailing adapter option disagreeing with the direct env adapter."""
+    result = run_launcher(
+        "--stage1_adapter_path", "/models/override-adapter",
+        env_overrides={
+            "STEP_PREFERENCE_ENABLED": "true",
+            "STEP_PREFERENCE_MODE": "stage2b",
+            "STEP_PREFERENCE_OBJECTIVE": "context_preference",
+            "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
+            "STAGE2B_DIRECT_FROM_STAGE1": "true",
+            "STAGE1_ADAPTER_PATH": "/models/env-adapter",
+            "TUNING_METHOD": "dora",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "cannot override STAGE1_ADAPTER_PATH" in result.stderr
+
+
 @pytest.mark.parametrize(
     "environment",
     [
