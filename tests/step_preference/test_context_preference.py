@@ -242,6 +242,8 @@ def test_visual_only_tiny_runtime_executes_clean_plus_v_off_with_gradients():
 
     with RuntimeCounters(model) as counters:
         loss, outputs = trainer.compute_loss(model, batch, return_outputs=True)
+        visual_off_score = outputs.stage2_sidecar_results[0]["mean_logp"]
+        visual_off_score.retain_grad()
         before_backward = counters.snapshot()
         counters.phase = "backward"
         loss.backward()
@@ -255,7 +257,9 @@ def test_visual_only_tiny_runtime_executes_clean_plus_v_off_with_gradients():
     assert [result["kind"] for result in outputs.stage2_sidecar_results] == [
         "visual_off"
     ]
-    assert loss.grad_fn is not None
+    assert visual_off_score.grad is not None
+    assert torch.isfinite(visual_off_score.grad)
+    assert float(visual_off_score.grad) != 0.0
     assert any(
         parameter.grad is not None
         and torch.isfinite(parameter.grad).all()
