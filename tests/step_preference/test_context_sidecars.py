@@ -513,6 +513,34 @@ def test_context_group_ignores_legacy_chunk_budget(k):
         )
 
 
+def test_visual_only_context_plan_emits_only_visual_off_sidecars():
+    """Catches V-only planning retaining any textual sidecar computation."""
+    _, batch = tiny_measurement_case(
+        steps=2, total_target_tokens=4, device="cpu"
+    )
+
+    default = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+    )
+    visual_only = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+        visual_only=True,
+    )
+
+    assert [[branch.kind for branch in group] for group in default.groups] == [
+        ["visual_off", "visual_off"],
+        ["textual_off", "textual_off"],
+    ]
+    assert [[branch.kind for branch in group] for group in visual_only.groups] == [
+        ["visual_off", "visual_off"],
+        [],
+    ]
+
+
 @pytest.mark.parametrize("group_count", [1, 3])
 def test_context_plan_requires_exactly_two_modality_groups(group_count):
     """Catches silently accepting a missing or extra context modality group."""

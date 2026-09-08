@@ -59,6 +59,27 @@ def test_context_default_launch_needs_no_negatives():
     assert "--step_negative_manifest" not in tokens
 
 
+def test_visual_only_context_launcher_validates_and_forwards_boolean():
+    """Catches the launcher dropping V-only mode or accepting an invalid boolean."""
+    environment = {
+        "STEP_PREFERENCE_ENABLED": "true",
+        "STEP_PREFERENCE_MODE": "stage2b",
+        "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+        "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
+    }
+
+    tokens = dry_run_tokens(run_launcher(env_overrides=environment))
+    assert "--step_visual_only_context_preference" in tokens
+    invalid = run_launcher(
+        env_overrides={
+            **environment,
+            "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "sometimes",
+        }
+    )
+    assert invalid.returncode == 2
+    assert "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE" in invalid.stderr
+
+
 PACKED_ADMISSION_ENV = {
     "STEP_MAX_PACKED_SEQUENCE_LENGTH": "4608",
     "STEP_PACKED_ADMISSION_MANIFEST": "/results/admission.json",

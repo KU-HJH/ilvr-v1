@@ -52,6 +52,44 @@ def test_entropy_reduces_steps_equally_even_with_different_lengths():
     )
 
 
+def test_visual_only_reducer_uses_ce_plus_visual_loss_and_zero_text_metrics():
+    """Catches averaging V-only preference with a phantom zero textual loss."""
+    trainer = _trainer(
+        context_config(
+            visual_only_context_preference=True,
+            beta=1.0,
+            lambda_preference=1.0,
+            lambda_entropy=0.0,
+        )
+    )
+    clean_ce = torch.tensor(2.0, requires_grad=True)
+    clean_score = torch.tensor(-1.0, requires_grad=True)
+    visual_off = torch.tensor(-2.0, requires_grad=True)
+
+    total, metrics = trainer._reduce_context_objective(
+        clean_ce,
+        [clean_score],
+        [torch.tensor([0.2])],
+        {(0, "visual"): {"mean_logp": visual_off, "entropies": torch.tensor([0.5])}},
+    )
+
+    visual_loss = math.log1p(math.exp(-1.0))
+    assert float(total.detach()) == pytest.approx(2.0 + visual_loss)
+    assert float(metrics["loss/context_preference"]) == pytest.approx(visual_loss)
+    assert float(metrics["loss/context_preference_visual"]) == pytest.approx(visual_loss)
+    for name in (
+        "loss/context_preference_text",
+        "loss/entropy_text",
+        "stats/context_margin_text",
+        "stats/logp_text_off",
+        "stats/entropy_text_off",
+    ):
+        assert float(metrics[name]) == 0.0
+    total.backward()
+    assert clean_score.grad is not None and clean_score.grad < 0
+    assert visual_off.grad is not None and visual_off.grad > 0
+
+
 def test_zero_steps_execute_only_clean_and_report_zero_step_metrics():
     """Catches sidecar execution or nonzero preference metrics for no transitions."""
     model, batch = tiny_measurement_case(
@@ -183,6 +221,48 @@ def test_default_actual_scoring_calls_are_three_without_legacy(k, monkeypatch):
     assert metrics["stats/scored_tokens"] == 6*k
     assert "loss/context_preference" in metrics and "loss/dpo" not in metrics
     print(dict(K=k, counts=counts, metrics=metrics))
+
+
+def test_visual_only_tiny_runtime_executes_clean_plus_v_off_with_gradients():
+    """Catches a hidden T-off forward or a detached visual-only objective."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    batch["step_preference"] = {
+        "steps": tuple({"span": span} for span in batch["reasoning_step_spans"])
+    }
+    trainer = _trainer(
+        context_config(
+            visual_only_context_preference=True,
+            lambda_preference=1.0,
+            lambda_entropy=0.0,
+            sidecar_query_budget=1,
+        )
+    )
+
+    with RuntimeCounters(model) as counters:
+        loss, outputs = trainer.compute_loss(model, batch, return_outputs=True)
+        before_backward = counters.snapshot()
+        counters.phase = "backward"
+        loss.backward()
+
+    assert (
+        before_backward["decoder_calls_forward"]
+        - before_backward["latent_decoder_calls_forward"]
+        == 2
+    )
+    assert before_backward["sidecar_chunks_forward"] == 1
+    assert [result["kind"] for result in outputs.stage2_sidecar_results] == [
+        "visual_off"
+    ]
+    assert loss.grad_fn is not None
+    assert any(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and bool((parameter.grad != 0).any())
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
 
 
 def test_default_preflight_and_collator_need_no_negative_artifacts(inputs, monkeypatch):

@@ -220,8 +220,11 @@ def build_context_sidecar_plan(
     clean_input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     spans: Sequence[ReasoningStepSpan],
+    visual_only: bool = False,
 ) -> SidecarPlan:
     """Build local visual/textual ablations for every clean target step."""
+    if type(visual_only) is not bool:
+        raise ValueError("visual_only must be a boolean")
     clean_ids, root_length = _validate_clean_inputs(clean_input_ids, attention_mask)
     validated_spans = _validate_spans(spans, root_length) if spans else ()
     root_selected_positions = tuple(
@@ -229,12 +232,17 @@ def build_context_sidecar_plan(
         for span in validated_spans
         for position in range(span.target_text_start - 1, span.target_text_end - 1)
     )
-    groups = tuple(
-        tuple(
-            _chosen_branch(clean_ids=clean_ids, span=span, modality=modality)
-            for span in validated_spans
-        )
-        for modality in ("visual", "textual")
+    visual_group = tuple(
+        _chosen_branch(clean_ids=clean_ids, span=span, modality="visual")
+        for span in validated_spans
+    )
+    textual_group = tuple(
+        _chosen_branch(clean_ids=clean_ids, span=span, modality="textual")
+        for span in validated_spans
+    ) if not visual_only else ()
+    groups = (
+        visual_group,
+        textual_group,
     )
     return SidecarPlan(
         root_length=root_length,

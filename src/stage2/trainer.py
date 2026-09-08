@@ -502,8 +502,16 @@ class Stage2Trainer(Trainer):
         config = self.step_preference_config
         zero = clean_ce * 0.0
         pref, ent, margins, off_logps, off_entropies = {}, {}, {}, {}, {}
+        active_modalities = (
+            ("visual",)
+            if config.visual_only_context_preference
+            else ("visual", "textual")
+        )
         for modality in ("visual", "textual"):
-            if clean_scores:
+            if modality not in active_modalities or not clean_scores:
+                pref[modality] = ent[modality] = margins[modality] = zero
+                off_logps[modality] = off_entropies[modality] = zero
+            else:
                 clean = torch.stack(clean_scores)
                 off = torch.stack(
                     [
@@ -540,11 +548,12 @@ class Stage2Trainer(Trainer):
                 off_entropies[modality] = torch.stack(
                     [entropy.mean() for entropy in sidecar_entropies]
                 ).mean()
-            else:
-                pref[modality] = ent[modality] = margins[modality] = zero
-                off_logps[modality] = off_entropies[modality] = zero
-        preference = (pref["visual"] + pref["textual"]) / 2
-        entropy = (ent["visual"] + ent["textual"]) / 2
+        preference = torch.stack(
+            [pref[modality] for modality in active_modalities]
+        ).mean()
+        entropy = torch.stack(
+            [ent[modality] for modality in active_modalities]
+        ).mean()
         total = (
             clean_ce
             + config.lambda_preference * preference
@@ -605,6 +614,7 @@ class Stage2Trainer(Trainer):
             clean_input_ids=clean_inputs["input_ids"],
             attention_mask=clean_inputs["attention_mask"],
             spans=spans,
+            visual_only=config.visual_only_context_preference,
         )
         call = dict(
             clean_inputs,
@@ -651,10 +661,15 @@ class Stage2Trainer(Trainer):
             if modality is None or key in results:
                 raise ValueError("unexpected or duplicate context sidecar")
             results[key] = result
+        expected_modalities = (
+            ("visual",)
+            if config.visual_only_context_preference
+            else ("visual", "textual")
+        )
         if set(results) != {
             (span.step_id, modality)
             for span in spans
-            for modality in ("visual", "textual")
+            for modality in expected_modalities
         }:
             raise ValueError("context sidecar layout mismatch")
         clean_scores, clean_entropies, offset = [], [], 0
@@ -672,7 +687,8 @@ class Stage2Trainer(Trainer):
         )
         metrics.update(
             {
-                "stats/scored_tokens": 3 * len(plan.root_selected_positions),
+                "stats/scored_tokens": (1 + len(expected_modalities))
+                * len(plan.root_selected_positions),
                 "stats/logical_scoring_groups": 1
                 + sum(bool(group) for group in plan.groups),
             }

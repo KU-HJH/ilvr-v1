@@ -76,6 +76,14 @@ PER_DEVICE_TRAIN_BATCH_SIZE=1
 
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
 STEP_PREFERENCE_OBJECTIVE=${STEP_PREFERENCE_OBJECTIVE:-context_preference}
+case "${STEP_VISUAL_ONLY_CONTEXT_PREFERENCE-}" in
+  ""|0|false|False) step_visual_only_context_preference=false ;;
+  1|true|True) step_visual_only_context_preference=true ;;
+  *)
+    printf 'STEP_VISUAL_ONLY_CONTEXT_PREFERENCE must be 0, 1, false, or true\n' >&2
+    exit 2
+    ;;
+esac
 SEED=${SEED:-42}
 STEP_MAX_PACKED_SEQUENCE_LENGTH=${STEP_MAX_PACKED_SEQUENCE_LENGTH:-4608}
 ASSISTANT_PLAN_RENDERING=concatenated-v1
@@ -202,6 +210,9 @@ case "$STEP_PREFERENCE_ENABLED" in
         --step_sidecar_attention_backend "$STEP_SIDECAR_ATTENTION_BACKEND"
         --step_sidecar_query_budget "$STEP_SIDECAR_QUERY_BUDGET"
       )
+      if [[ "$step_visual_only_context_preference" == true ]]; then
+        STEP_PREFERENCE_ARGS+=(--step_visual_only_context_preference)
+      fi
     else
       STEP_PREFERENCE_ARGS+=(
         --step_dpo_beta "$STEP_DPO_BETA"
@@ -262,6 +273,12 @@ case "$STEP_PREFERENCE_ENABLED" in
     exit 2
     ;;
 esac
+
+if [[ "$step_visual_only_context_preference" == true ]] &&
+   [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b || "$STEP_PREFERENCE_OBJECTIVE" != context_preference ]]; then
+  printf 'STEP_VISUAL_ONLY_CONTEXT_PREFERENCE requires context-preference Stage 2B\n' >&2
+  exit 2
+fi
 
 ilvr_topology_variables=(
   ILVR_NUM_MACHINES
@@ -353,6 +370,7 @@ MANAGED_OPTIONS=(
   --step_preference_beta
   --step_preference_weight
   --step_preference_margin
+  --step_visual_only_context_preference
   --step_negative_path
   --step_negative_manifest
   --step_max_packed_sequence_length

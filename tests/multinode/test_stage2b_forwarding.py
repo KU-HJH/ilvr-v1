@@ -104,6 +104,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
             "STEP_PREFERENCE_BETA": "0.37",
             "STEP_PREFERENCE_WEIGHT": "1.7",
             "STEP_PREFERENCE_MARGIN": "-0.25",
+            "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
         }
     )
     environment = validated_stage2_environment(
@@ -124,12 +125,14 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
                 "STEP_PREFERENCE_BETA",
                 "STEP_PREFERENCE_WEIGHT",
                 "STEP_PREFERENCE_MARGIN",
+                "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE",
             )
         } == {
             "STEP_PREFERENCE_OBJECTIVE": "context_preference",
             "STEP_PREFERENCE_BETA": "0.37",
             "STEP_PREFERENCE_WEIGHT": "1.7",
             "STEP_PREFERENCE_MARGIN": "-0.25",
+            "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
         }
         stage_command = spec.command[spec.command.index("--") + 1:]
         result = subprocess.run(
@@ -145,6 +148,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
             "--step_preference_margin": "-0.25",
         }.items():
             assert argv[argv.index(option) + 1] == value
+        assert "--step_visual_only_context_preference" in argv
 
 
 def test_stage2b_preflight_includes_checkpoint_and_negative_inputs(monkeypatch):

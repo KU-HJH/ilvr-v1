@@ -34,6 +34,7 @@ def test_step_preference_config_is_immutable_and_exposes_normative_defaults():
     assert config.lambda_dpo == 1.0
     assert config.lambda_preference == 1.0
     assert config.preference_margin == 0.0
+    assert config.visual_only_context_preference is False
     assert config.lambda_entropy == 0.1
     assert config.entropy_margin == 0.1
     assert config.stage2a_ratio == 0.5
@@ -63,6 +64,7 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
     assert args.step_dpo_beta == 0.1
     assert args.step_preference_weight == 1.0
     assert args.step_preference_margin == 0.0
+    assert args.step_visual_only_context_preference is False
     assert args.ce_weight == 1.0
     assert args.step_dpo_weight == 1.0
     assert args.step_entropy_weight == 0.1
@@ -72,6 +74,26 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
     assert args.stage2a_checkpoint_path is None
     assert args.step_preference_packing is False
     assert args.step_max_packed_sequence_length == 4608
+
+
+def test_visual_only_context_preference_cli_maps_and_validates_scope():
+    """Catches the V-only setting being dropped or accepted outside context Stage 2B."""
+    args = parse_args(
+        [
+            "--stage", "stage2", "--step_preference_enabled",
+            "--step_preference_mode", "stage2b",
+            "--stage2a_checkpoint_path", "checkpoint",
+            "--step_visual_only_context_preference",
+        ]
+    )
+
+    assert args.step_visual_only_context_preference is True
+    assert args.step_preference_config.visual_only_context_preference is True
+
+    with pytest.raises(ValueError, match="visual-only context preference requires"):
+        StepPreferenceConfig(visual_only_context_preference=True)
+    with pytest.raises(ValueError, match="visual_only_context_preference must be a boolean"):
+        StepPreferenceConfig(visual_only_context_preference=1)
 
 
 def test_training_cli_maps_zero_ce_weight_into_step_preference_config():

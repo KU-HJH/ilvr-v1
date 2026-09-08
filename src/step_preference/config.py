@@ -71,6 +71,7 @@ class StepPreferenceConfig:
     lambda_dpo: float = 1.0
     lambda_preference: float = 1.0
     preference_margin: float = 0.0
+    visual_only_context_preference: bool = False
     lambda_entropy: float = 0.1
     entropy_margin: float = 0.1
     negative_path: str | None = None
@@ -99,6 +100,8 @@ class StepPreferenceConfig:
             raise ValueError("packing_enabled must be a boolean")
         if type(self.shared_prefix_enabled) is not bool:
             raise ValueError("shared_prefix_enabled must be a boolean")
+        if type(self.visual_only_context_preference) is not bool:
+            raise ValueError("visual_only_context_preference must be a boolean")
         if self.sidecar_attention_backend not in ("dense", "flex"):
             raise ValueError("sidecar_attention_backend must be dense or flex")
         if type(self.sidecar_query_budget) is not int or self.sidecar_query_budget <= 0:
@@ -185,6 +188,10 @@ class StepPreferenceConfig:
                 raise ValueError(
                     "context preference does not consume legacy packed admission"
                 )
+        elif self.visual_only_context_preference:
+            raise ValueError(
+                "visual-only context preference requires context-preference Stage 2B"
+            )
         if self.is_stage2b:
             required = [("stage2a_checkpoint_path", "--stage2a_checkpoint_path")]
             if not self.is_context_preference:
@@ -242,6 +249,9 @@ class StepPreferenceConfig:
             lambda_dpo=getattr(args, "step_dpo_weight", 1.0),
             lambda_preference=getattr(args, "step_preference_weight", 1.0),
             preference_margin=getattr(args, "step_preference_margin", 0.0),
+            visual_only_context_preference=getattr(
+                args, "step_visual_only_context_preference", False
+            ),
             lambda_entropy=getattr(args, "step_entropy_weight", 0.1),
             entropy_margin=getattr(args, "step_entropy_margin", 0.1),
             negative_path=getattr(args, "step_negative_path", None),
