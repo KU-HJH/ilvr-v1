@@ -570,10 +570,18 @@ def test_stage2b_launcher_forwards_direct_stage1_initialization():
     assert "--stage2a_checkpoint_path" not in tokens
 
 
-def test_direct_stage1_launcher_rejects_trailing_adapter_override():
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("--stage1_adapter_path", "/models/override-adapter"),
+        ("--stage1_adapter_p", "/models/override-adapter"),
+        ("--stage1_adapter_p=/models/override-adapter",),
+    ],
+)
+def test_direct_stage1_launcher_rejects_trailing_adapter_override(arguments):
     """Catches a trailing adapter option disagreeing with the direct env adapter."""
     result = run_launcher(
-        "--stage1_adapter_path", "/models/override-adapter",
+        *arguments,
         env_overrides={
             "STEP_PREFERENCE_ENABLED": "true",
             "STEP_PREFERENCE_MODE": "stage2b",
@@ -586,7 +594,7 @@ def test_direct_stage1_launcher_rejects_trailing_adapter_override():
     )
 
     assert result.returncode == 2
-    assert "cannot override STAGE1_ADAPTER_PATH" in result.stderr
+    assert "launcher-owned option" in result.stderr
 
 
 @pytest.mark.parametrize(

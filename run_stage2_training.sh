@@ -470,18 +470,10 @@ reject_managed_arguments() {
   done
 }
 
-reject_managed_arguments "$@"
-
 if [[ "$stage2b_direct_from_stage1" == true ]]; then
-  for stage2_launcher_argument in "$@"; do
-    case "$stage2_launcher_argument" in
-      --stage1_adapter_path|--stage1_adapter_path=*)
-        printf 'direct Stage 2B cannot override STAGE1_ADAPTER_PATH\n' >&2
-        exit 2
-        ;;
-    esac
-  done
+  MANAGED_OPTIONS+=(--stage1_adapter_path)
 fi
+reject_managed_arguments "$@"
 
 require_positive_integer() {
   local name=$1
