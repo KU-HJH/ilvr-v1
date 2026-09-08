@@ -549,6 +549,27 @@ def test_stage2_launcher_propagates_opt_in_stage2b_environment_without_resume_st
     assert "--tuning_method" not in tokens
 
 
+def test_stage2b_launcher_forwards_direct_stage1_initialization():
+    """Catches a direct V-only request silently reverting to Stage 2A initialization."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STEP_PREFERENCE_OBJECTIVE": "context_preference",
+                "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
+                "STAGE2B_DIRECT_FROM_STAGE1": "true",
+                "STAGE1_ADAPTER_PATH": "/models/stage1-adapter",
+                "STAGE2_TOTAL_STEPS": "424",
+            }
+        )
+    )
+
+    assert "--stage2b_direct_from_stage1" in tokens
+    assert option_value(tokens, "--stage1_adapter_path") == "/models/stage1-adapter"
+    assert "--stage2a_checkpoint_path" not in tokens
+
+
 @pytest.mark.parametrize(
     ("ce_weight", "dpo_weight", "entropy_weight"),
     [("1", "0", "0"), ("0", "1", "0"), ("0", "0", "1")],

@@ -1263,6 +1263,49 @@ def test_stage2b_preflight_binds_space_lf_rendering_to_prepare_and_negative_load
     }
 
 
+def test_direct_stage1_preflight_uses_fresh_dora_resolution_without_stage2a(
+    monkeypatch, tmp_path
+):
+    """Catches direct V-only Stage 2B falling back to Stage 2A initialization."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="context_preference",
+        visual_only_context_preference=True,
+        direct_from_stage1=True,
+    )
+    args = stage2_args(
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        stage1_adapter_path="stage1-adapter",
+        step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
+    )
+    prepared = SimpleNamespace(sample_id="sample-a", reasoning_steps=())
+    decisions = []
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+    monkeypatch.setattr(main, "prepare_stage2_example", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(
+        main,
+        "resolve_stage2_load_decision",
+        lambda **kwargs: decisions.append(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_stage2b_peft_base_identity",
+        lambda **_kwargs: pytest.fail("direct mode used Stage 2A validation"),
+    )
+
+    result = main.preflight_stage2b_artifacts(args)
+
+    assert result.prepared_examples == (prepared,)
+    assert result.negative_store is None
+    assert decisions[0]["resume_from_checkpoint_path"] is None
+    assert decisions[0]["stage1_adapter_path"] == "stage1-adapter"
+
+
 @pytest.mark.parametrize(
     ("attention_implementation", "vision_attention_implementation"),
     (("eager", "eager"), ("sdpa", "sdpa")),

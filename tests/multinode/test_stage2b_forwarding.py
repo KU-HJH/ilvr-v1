@@ -151,6 +151,48 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
         assert "--step_visual_only_context_preference" in argv
 
 
+def test_direct_stage1_setting_reaches_both_owned_worker_commands():
+    """Catches the coordinator dropping direct Stage 1 admission on either worker."""
+    plan = multinode.build_launch_plan(
+        stage="stage2", tuning_method="dora", zero_stage=2,
+        run_id="direct-stage1-forwarding-test", main_process_port=29631,
+    )
+    source = stage2b_environment()
+    source.pop("STAGE2A_CHECKPOINT_PATH")
+    source.pop("STEP_NEGATIVE_PATH")
+    source.pop("STEP_NEGATIVE_MANIFEST")
+    source.update(
+        {
+            "STEP_PREFERENCE_OBJECTIVE": "context_preference",
+            "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
+            "STAGE2B_DIRECT_FROM_STAGE1": "true",
+            "STAGE1_ADAPTER_PATH": "/models/stage1-adapter",
+        }
+    )
+    environment = validated_stage2_environment(
+        source, output_dir=str(REPO / "checkpoints" / plan.run_id),
+        log_file=str(REPO / "logs" / plan.run_id / "train.log"),
+        deepspeed_config=str(plan.deepspeed_config),
+    )
+    commands = build_owned_tmux_commands(
+        plan, commit="a" * 40, stage_environment=environment
+    )
+
+    for spec in commands.node_specs:
+        worker_env = dict(spec.environment)
+        assert worker_env["STAGE2B_DIRECT_FROM_STAGE1"] == "true"
+        stage_command = spec.command[spec.command.index("--") + 1:]
+        result = subprocess.run(
+            stage_command, cwd=REPO, capture_output=True, text=True,
+            env={**worker_env, "STAGE2_DRY_RUN": "true", "STAGE2_DRY_RUN_FORMAT": "json"},
+        )
+        assert result.returncode == 0, result.stderr
+        argv = json.loads(result.stdout)
+        assert "--stage2b_direct_from_stage1" in argv
+        assert argv[argv.index("--stage1_adapter_path") + 1] == "/models/stage1-adapter"
+        assert "--stage2a_checkpoint_path" not in argv
+
+
 def test_stage2b_preflight_includes_checkpoint_and_negative_inputs(monkeypatch):
     """Missing Stage 2B inputs must be checked before either worker launches."""
     for name, value in stage2b_environment().items():

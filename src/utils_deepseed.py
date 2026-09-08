@@ -68,6 +68,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage2a_ratio", type=float, default=0.5)
     parser.add_argument("--stage2_total_steps", type=int)
     parser.add_argument("--stage2a_checkpoint_path")
+    parser.add_argument("--stage2b_direct_from_stage1", action="store_true")
     parser.add_argument(
         "--stage2b_preflight_only", action="store_true", help=argparse.SUPPRESS
     )
@@ -230,6 +231,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.stage1_adapter_path and args.resume_from_checkpoint_path:
             raise ValueError(
                 "--stage1_adapter_path and --resume_from_checkpoint_path are mutually exclusive"
+            )
+        if (
+            args.step_preference_config.direct_from_stage1
+            and not args.stage1_adapter_path
+        ):
+            raise ValueError(
+                "--stage2b_direct_from_stage1 requires --stage1_adapter_path"
             )
         if (
             args.tuning_method is None

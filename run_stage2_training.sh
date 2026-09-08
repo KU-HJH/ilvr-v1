@@ -84,6 +84,14 @@ case "${STEP_VISUAL_ONLY_CONTEXT_PREFERENCE-}" in
     exit 2
     ;;
 esac
+case "${STAGE2B_DIRECT_FROM_STAGE1-}" in
+  ""|0|false|False) stage2b_direct_from_stage1=false ;;
+  1|true|True) stage2b_direct_from_stage1=true ;;
+  *)
+    printf 'STAGE2B_DIRECT_FROM_STAGE1 must be 0, 1, false, or true\n' >&2
+    exit 2
+    ;;
+esac
 SEED=${SEED:-42}
 STEP_MAX_PACKED_SEQUENCE_LENGTH=${STEP_MAX_PACKED_SEQUENCE_LENGTH:-4608}
 ASSISTANT_PLAN_RENDERING=concatenated-v1
@@ -236,10 +244,31 @@ case "$STEP_PREFERENCE_ENABLED" in
         printf "Stage 2B requires ATTENTION_IMPLEMENTATION=sdpa and VISION_ATTENTION_IMPLEMENTATION=flash_attention_2\n" >&2
         exit 2
       fi
-      [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]] || {
-        printf 'Stage 2B requires STAGE2A_CHECKPOINT_PATH\n' >&2
-        exit 2
-      }
+      if [[ "$stage2b_direct_from_stage1" == true ]]; then
+        if [[ "$STEP_PREFERENCE_OBJECTIVE" != context_preference || "$step_visual_only_context_preference" != true ]]; then
+          printf 'STAGE2B_DIRECT_FROM_STAGE1 requires visual-only context-preference Stage 2B\n' >&2
+          exit 2
+        fi
+        if [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]]; then
+          printf 'STAGE2B_DIRECT_FROM_STAGE1 cannot use STAGE2A_CHECKPOINT_PATH\n' >&2
+          exit 2
+        fi
+        if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+          printf 'STAGE2B_DIRECT_FROM_STAGE1 cannot use RESUME_CHECKPOINT\n' >&2
+          exit 2
+        fi
+        [[ -n "${STAGE1_ADAPTER_PATH:-}" ]] || {
+          printf 'STAGE2B_DIRECT_FROM_STAGE1 requires STAGE1_ADAPTER_PATH\n' >&2
+          exit 2
+        }
+        STEP_PREFERENCE_ARGS+=(--stage2b_direct_from_stage1 --stage1_adapter_path "$STAGE1_ADAPTER_PATH")
+        processor_source=$STAGE1_ADAPTER_PATH
+      else
+        [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]] || {
+          printf 'Stage 2B requires STAGE2A_CHECKPOINT_PATH\n' >&2
+          exit 2
+        }
+      fi
       if [[ "$STEP_PREFERENCE_OBJECTIVE" == legacy_dpo ]]; then
         [[ -n "${STEP_NEGATIVE_PATH:-}" ]] || {
           printf 'Stage 2B requires STEP_NEGATIVE_PATH\n' >&2
@@ -255,14 +284,18 @@ case "$STEP_PREFERENCE_ENABLED" in
         exit 2
       fi
       stage2b_checkpoint_initialization=true
-      processor_source=$STAGE2A_CHECKPOINT_PATH
+      if [[ "$stage2b_direct_from_stage1" == false ]]; then
+        processor_source=$STAGE2A_CHECKPOINT_PATH
+      fi
       if [[ "$STEP_PREFERENCE_OBJECTIVE" == legacy_dpo ]]; then
         STEP_PREFERENCE_ARGS+=(
           --step_negative_path "$STEP_NEGATIVE_PATH"
           --step_negative_manifest "$STEP_NEGATIVE_MANIFEST"
         )
       fi
-      STEP_PREFERENCE_ARGS+=(--stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH")
+      if [[ "$stage2b_direct_from_stage1" == false ]]; then
+        STEP_PREFERENCE_ARGS+=(--stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH")
+      fi
     elif [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]]; then
       STEP_PREFERENCE_ARGS+=(--stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH")
     fi
@@ -390,6 +423,7 @@ MANAGED_OPTIONS=(
   --stage2a_ratio
   --stage2_total_steps
   --stage2a_checkpoint_path
+  --stage2b_direct_from_stage1
   --stage2b_preflight_only
   --supervise_latent_boundaries
   --no-supervise_latent_boundaries

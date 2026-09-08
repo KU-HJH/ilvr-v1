@@ -40,6 +40,7 @@ def test_step_preference_config_is_immutable_and_exposes_normative_defaults():
     assert config.stage2a_ratio == 0.5
     assert config.total_steps is None
     assert config.stage2a_checkpoint_path is None
+    assert config.direct_from_stage1 is False
     assert config.negative_path is None
     assert config.negative_manifest is None
     assert config.packing_enabled is False
@@ -72,6 +73,7 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
     assert args.stage2a_ratio == 0.5
     assert args.stage2_total_steps is None
     assert args.stage2a_checkpoint_path is None
+    assert args.stage2b_direct_from_stage1 is False
     assert args.step_preference_packing is False
     assert args.step_max_packed_sequence_length == 4608
 
@@ -94,6 +96,57 @@ def test_visual_only_context_preference_cli_maps_and_validates_scope():
         StepPreferenceConfig(visual_only_context_preference=True)
     with pytest.raises(ValueError, match="visual_only_context_preference must be a boolean"):
         StepPreferenceConfig(visual_only_context_preference=1)
+
+
+def test_direct_stage1_stage2b_requires_visual_context_and_uses_full_budget():
+    """Catches direct Stage 1 initialization being accepted outside its narrow V-only scope."""
+    args = parse_args(
+        [
+            "--stage", "stage2", "--step_preference_enabled",
+            "--step_preference_mode", "stage2b",
+            "--step_preference_objective", "context_preference",
+            "--step_visual_only_context_preference",
+            "--stage2b_direct_from_stage1",
+            "--stage1_adapter_path", "stage1-adapter",
+            "--stage2_total_steps", "424",
+        ]
+    )
+
+    assert args.stage2b_direct_from_stage1 is True
+    assert args.step_preference_config.direct_from_stage1 is True
+    assert args.step_preference_config.phase_steps == 424
+
+    with pytest.raises(ValueError, match="visual-only context-preference Stage 2B"):
+        StepPreferenceConfig(
+            enabled=True,
+            mode="stage2b",
+            objective="context_preference",
+            direct_from_stage1=True,
+        )
+    with pytest.raises(ValueError, match="visual-only context-preference Stage 2B"):
+        StepPreferenceConfig(direct_from_stage1=True)
+    with pytest.raises(ValueError, match="cannot use --stage2a_checkpoint_path"):
+        parse_args(
+            [
+                "--stage", "stage2", "--step_preference_enabled",
+                "--step_preference_mode", "stage2b",
+                "--step_preference_objective", "context_preference",
+                "--step_visual_only_context_preference",
+                "--stage2b_direct_from_stage1",
+                "--stage1_adapter_path", "stage1-adapter",
+                "--stage2a_checkpoint_path", "stage2a",
+            ]
+        )
+    with pytest.raises(ValueError, match="requires --stage1_adapter_path"):
+        parse_args(
+            [
+                "--stage", "stage2", "--step_preference_enabled",
+                "--step_preference_mode", "stage2b",
+                "--step_preference_objective", "context_preference",
+                "--step_visual_only_context_preference",
+                "--stage2b_direct_from_stage1",
+            ]
+        )
 
 
 def test_training_cli_maps_zero_ce_weight_into_step_preference_config():

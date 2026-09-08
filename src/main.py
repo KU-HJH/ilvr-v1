@@ -310,6 +310,26 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     )
     reject_duplicate_sample_ids(example.sample_id for example in prepared)
 
+    if config.direct_from_stage1:
+        source_dependencies = _default_stage2_source_dependencies()
+        resolve_stage2_load_decision(
+            load_model_path=args.load_model_path,
+            stage1_adapter_path=args.stage1_adapter_path,
+            resume_from_checkpoint_path=None,
+            load_config=source_dependencies.load_config,
+            discover_adapter_config=source_dependencies.find_adapter_config,
+            source_provenance_kwargs=build_stage2_source_provenance_kwargs(args),
+            latent_size=args.latent_size,
+            supervise_latent_boundaries=args.supervise_latent_boundaries,
+            tuning_method=args.tuning_method,
+            tuning_method_explicit=args.tuning_method_explicit,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_target_modules=args.lora_target_modules,
+        )
+        return Stage2BPreflight(prepared_examples=prepared, negative_store=None)
+
     validate_stage2b_peft_base_identity(
         stage2a_checkpoint_path=config.stage2a_checkpoint_path,
         requested_base_model_path=args.load_model_path,
@@ -496,7 +516,12 @@ def build_stage2_training_components(
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
     )
-    if step_preference_config.is_stage2b:
+    if step_preference_config.direct_from_stage1:
+        decision = resolve_stage2_load_decision(
+            resume_from_checkpoint_path=None,
+            **decision_kwargs,
+        )
+    elif step_preference_config.is_stage2b:
         decision = resolve_stage2b_initialization_decision(
             stage2a_checkpoint_path=step_preference_config.stage2a_checkpoint_path,
             **decision_kwargs,

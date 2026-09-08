@@ -1803,7 +1803,8 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 input_paths += tuple(
                     Path(stage_environment[name])
                     for name in (
-                        "STAGE2A_CHECKPOINT_PATH", "STEP_NEGATIVE_PATH", "STEP_NEGATIVE_MANIFEST"
+                        "STAGE1_ADAPTER_PATH", "STAGE2A_CHECKPOINT_PATH",
+                        "STEP_NEGATIVE_PATH", "STEP_NEGATIVE_MANIFEST"
                     )
                     if stage_environment.get(name)
                 )

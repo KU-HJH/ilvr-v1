@@ -81,6 +81,7 @@ class StepPreferenceConfig:
     stage2a_ratio: float = 0.5
     total_steps: int | None = None
     stage2a_checkpoint_path: str | None = None
+    direct_from_stage1: bool = False
     attention_implementation: str = "sdpa"
     resume_from_checkpoint_path: str | None = None
     packing_enabled: bool = False
@@ -102,6 +103,8 @@ class StepPreferenceConfig:
             raise ValueError("shared_prefix_enabled must be a boolean")
         if type(self.visual_only_context_preference) is not bool:
             raise ValueError("visual_only_context_preference must be a boolean")
+        if type(self.direct_from_stage1) is not bool:
+            raise ValueError("direct_from_stage1 must be a boolean")
         if self.sidecar_attention_backend not in ("dense", "flex"):
             raise ValueError("sidecar_attention_backend must be dense or flex")
         if type(self.sidecar_query_budget) is not int or self.sidecar_query_budget <= 0:
@@ -168,7 +171,11 @@ class StepPreferenceConfig:
         if not 0.0 < ratio < 1.0:
             raise ValueError("stage2a_ratio must be a finite number in (0, 1)")
         if self.total_steps is not None:
-            split_stage2_budget(self.total_steps, self.stage2a_ratio)
+            if self.direct_from_stage1:
+                if isinstance(self.total_steps, bool) or not isinstance(self.total_steps, int) or self.total_steps <= 0:
+                    raise ValueError("stage2_total_steps must be a positive integer")
+            else:
+                split_stage2_budget(self.total_steps, self.stage2a_ratio)
         if self.is_context_preference:
             if self.lambda_ce != 1.0:
                 raise ValueError("context preference requires ce_weight=1")
@@ -192,8 +199,23 @@ class StepPreferenceConfig:
             raise ValueError(
                 "visual-only context preference requires context-preference Stage 2B"
             )
+        if self.direct_from_stage1 and not (
+            self.is_context_preference and self.visual_only_context_preference
+        ):
+            raise ValueError(
+                "direct Stage 1 initialization requires visual-only "
+                "context-preference Stage 2B"
+            )
         if self.is_stage2b:
-            required = [("stage2a_checkpoint_path", "--stage2a_checkpoint_path")]
+            if self.direct_from_stage1:
+                if self.stage2a_checkpoint_path is not None:
+                    raise ValueError(
+                        "--stage2b_direct_from_stage1 cannot use "
+                        "--stage2a_checkpoint_path"
+                    )
+            required = [] if self.direct_from_stage1 else [
+                ("stage2a_checkpoint_path", "--stage2a_checkpoint_path")
+            ]
             if not self.is_context_preference:
                 required += [
                     ("negative_path", "--step_negative_path"),
@@ -232,6 +254,8 @@ class StepPreferenceConfig:
     def phase_steps(self) -> int | None:
         if not self.enabled or self.total_steps is None:
             return None
+        if self.direct_from_stage1:
+            return self.total_steps
         stage2a, stage2b = split_stage2_budget(
             self.total_steps, self.stage2a_ratio
         )
@@ -259,6 +283,7 @@ class StepPreferenceConfig:
             stage2a_ratio=getattr(args, "stage2a_ratio", 0.5),
             total_steps=getattr(args, "stage2_total_steps", None),
             stage2a_checkpoint_path=getattr(args, "stage2a_checkpoint_path", None),
+            direct_from_stage1=getattr(args, "stage2b_direct_from_stage1", False),
             attention_implementation=getattr(args, "attention_implementation", "sdpa"),
             resume_from_checkpoint_path=getattr(
                 args, "resume_from_checkpoint_path", None
