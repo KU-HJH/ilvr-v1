@@ -27,6 +27,8 @@
 
 **Interfaces:** Produce `VisualIntervention(mode, image_token_id, sliding_window=None)`, generation-local `.events` and `.forward_records`; `.begin(input_ids, token_ids)`, `.register_latent_span(span)`, `.wrap_decoder(language_model)` returning a keyword-callable, and `.process_logits(sequences, raw_logits, decision_logits, token_ids)` returning intervention-adjusted logits. Add optional `intervention=None` to controller `generate`. `begin` resets all per-generation state; wrapper derives current prefix length from received embeddings and mask. Image ID is supplied by runner after tokenizer/config validation. Expose `build_image_attention_mask(validity_mask, image_positions, latent_query_positions, mode, dtype, sliding_window=None)` and `identify_image_positions(input_ids, image_token_id)`. Positions are physical zero-based sequence indices, batch=1.
 
+Public mode strings consumed by Task3: `baseline`, `no_input_image`, `no_latent_execution`, `latent_image_attention_block`, `global_image_attention_block`, `image_replacement`. E0-E5 below are conceptual labels. E1 and image replacement are attention/logit no-ops here; Task3 owns processor image inputs.
+
 - [ ] Write tests first for exact allowed-edge matrices with independently enumerated expected edges, including START producer and previous blocks. Example:
 
 ```python
@@ -75,6 +77,8 @@ git commit -m 'Add opt-in visual causal interventions to continuous inference'
 **Files:** Create `src/evaluation/visual_metrics.py`, `tests/evaluation/test_visual_metrics.py`.
 
 **Interfaces:** Produce `paired_summary(baseline_rows, condition_rows, *, seed=42, bootstrap_samples=10000)` returning JSON-safe dict, `aggregate_rows(rows)` for one condition, `matched_image_groups(samples)` returning original-index groups of normalized identical questions with differing valid golds, and `matched_group_summary(rows, groups)` for independent group-level image discrimination. Row keys are `index`, `match`, `invalid_gold_reason`, `prediction_normalized`, `generated_suffix_token_ids`, `latent_block_count`, `inference_time_sec`, `category`, optional `error`; runner provides those exact keys.
+
+Rows additionally contain `gold_normalized`, `gold_parse_status`, and `prediction_parse_status` from the existing scorer for validity and cross-condition gold checks. Group labels come from original dataset annotations; the nineteen matched rows form nine independent groups, not twenty independent directed-pair samples.
 
 - [ ] Write meaningful RED tests using the explicit toy transition table:
 
