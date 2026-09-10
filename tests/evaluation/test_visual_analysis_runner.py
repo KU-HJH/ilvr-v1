@@ -1,0 +1,392 @@
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from scripts import analyze_comt_visual as runner
+
+
+class Qwen2_5_VLSdpaAttention(nn.Module):
+    pass
+
+
+class Qwen2_5_VLFlashAttention2(nn.Module):
+    pass
+
+
+class Qwen2_5_VLVisionFlashAttention2(nn.Module):
+    pass
+
+
+class _DecoderLayer(nn.Module):
+    def __init__(self, attention_class=Qwen2_5_VLSdpaAttention):
+        super().__init__()
+        self.self_attn = attention_class()
+
+
+class _VisionBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = Qwen2_5_VLVisionFlashAttention2()
+
+
+class FakeModel(nn.Module):
+    def __init__(self, *, attention_class=Qwen2_5_VLSdpaAttention):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1, dtype=torch.float32))
+        self.model = SimpleNamespace(
+            layers=nn.ModuleList([_DecoderLayer(attention_class), _DecoderLayer(attention_class)])
+        )
+        self.visual = SimpleNamespace(blocks=nn.ModuleList([_VisionBlock()]))
+        self.lm_head = nn.Identity()
+        self.config = SimpleNamespace(
+            stage="stage2",
+            latent_size=2,
+            latent_pad_token_id=90,
+            latent_start_token_id=91,
+            latent_end_token_id=92,
+            image_token_id=80,
+            use_sliding_window=False,
+            sliding_window=4096,
+            max_position_embeddings=128,
+            torch_dtype=torch.bfloat16,
+            _attn_implementation="sdpa",
+            vision_config=SimpleNamespace(_attn_implementation="flash_attention_2"),
+        )
+        self.generation_config = SimpleNamespace(eos_token_id=3, repetition_penalty=1.05)
+        self.device = torch.device("cpu")
+
+
+class FakeTokenizer:
+    eos_token_id = 3
+    unk_token_id = 0
+    unk_token = "<unk>"
+
+    _ids = {
+        "<|image_pad|>": 80,
+        "<|latent_pad|>": 90,
+        "<|latent_start|>": 91,
+        "<|latent_end|>": 92,
+    }
+
+    def convert_tokens_to_ids(self, token):
+        return self._ids.get(token, self.unk_token_id)
+
+
+class FakeProcessor:
+    def __init__(self):
+        self.tokenizer = FakeTokenizer()
+        self.messages = []
+        self.processor_calls = []
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        self.messages.append(messages)
+        content = messages[0]["content"]
+        image_count = sum(item["type"] == "image" for item in content)
+        text = next(item["text"] for item in content if item["type"] == "text")
+        return "<image>" * image_count + text
+
+    def __call__(self, *, text, images, return_tensors, padding):
+        self.processor_calls.append({"text": text, "images": images})
+        ids = [5]
+        result = {}
+        if images:
+            ids.extend([80] * len(images))
+            result["pixel_values"] = torch.ones(len(images), 2, dtype=torch.float32)
+            result["image_grid_thw"] = torch.ones(len(images), 3, dtype=torch.long)
+        ids.append(6)
+        result["input_ids"] = torch.tensor([ids], dtype=torch.long)
+        result["attention_mask"] = torch.ones(1, len(ids), dtype=torch.long)
+        return result
+
+    def batch_decode(self, token_ids, *, skip_special_tokens):
+        ids = token_ids[0].tolist()
+        answer = "11" if 11 in ids else "10"
+        return [f"assistant: The final answer is: {answer}<|im_end|>"]
+
+
+def _write_source(tmp_path, rows):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    for row in rows:
+        for image in row.get("image_input", []):
+            image_path = tmp_path / image
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_path.write_bytes(b"image")
+    path = tmp_path / "source.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def _successful_generator(**context):
+    suffix = torch.tensor([[91, 90, 92, 10]], dtype=torch.long)
+    sequences = torch.cat((context["prepared"].tensors["input_ids"], suffix), dim=1)
+    return SimpleNamespace(
+        sequences=sequences,
+        generated_suffix_ids=(91, 90, 92, 10),
+        latent_start_count=1,
+        latent_block_count=1,
+        stop_reason="max_new_tokens",
+    )
+
+
+def _run(tmp_path, rows, **overrides):
+    source = _write_source(tmp_path, rows)
+    processor = FakeProcessor()
+    arguments = dict(
+        model_dir="checkpoints/fake",
+        base_model_dir="checkpoints/base",
+        test_data_path=source,
+        source_data_path=source,
+        indices=None,
+        output_dir=tmp_path / "results" / "run",
+        visual_ablation_mode="baseline",
+        attention_backend="sdpa",
+        replacement_map=None,
+        max_new_tokens=8,
+        max_sequence_length=128,
+        repetition_penalty=1.05,
+        temperature=0.0,
+        top_p=1.0,
+        limit=None,
+        artifact_loader=lambda **_kwargs: (FakeModel(), processor),
+        generation_runner=_successful_generator,
+        image_loader=lambda paths: [f"opened:{path}" for path in paths],
+    )
+    arguments.update(overrides)
+    result = runner.run_analysis(**arguments)
+    return result, processor, arguments["output_dir"]
+
+
+def test_run_uses_only_recipient_text_for_prompt_and_e1_has_no_visual_tensors(tmp_path):
+    """Catches gold/helper leakage and an E1 path that still prepares image inputs."""
+    rows = [{
+        "text_input": "VISIBLE QUESTION",
+        "image_input": ["images_comt/creation/a.png"],
+        "sequence_plan": [{"helper_image": "SECRET-HELPER", "content": "SECRET-RATIONALE"}],
+        "original_final_answer": "SECRET-GOLD-10",
+    }]
+    captured = {}
+
+    def generate(**context):
+        captured.update(context)
+        return _successful_generator(**context)
+
+    result, processor, _ = _run(
+        tmp_path,
+        rows,
+        visual_ablation_mode="no_input_image",
+        generation_runner=generate,
+    )
+
+    rendered = processor.processor_calls[0]["text"][0]
+    assert rendered == "VISIBLE QUESTION"
+    assert "SECRET" not in rendered
+    assert processor.processor_calls[0]["images"] is None
+    assert set(captured["prepared"].tensors) == {"input_ids", "attention_mask"}
+    assert captured["allow_latent_generation"] is True
+    assert captured["intervention"].mode == "no_input_image"
+    assert result["rows"][0]["latent_block_count"] == 1
+
+
+def test_run_records_raw_token_positions_scoring_and_instantiated_runtime_metadata(tmp_path):
+    """Catches evidence derived from cleaned text or requested rather than actual runtime state."""
+    rows = [{
+        "text_input": "question",
+        "image_input": ["images_comt/deletion/a.png"],
+        "original_final_answer": "10",
+    }]
+    result, _, output_dir = _run(tmp_path, rows)
+
+    row = result["rows"][0]
+    assert row["generated_suffix_token_ids"] == [91, 90, 92, 10]
+    assert row["latent_start_positions"] == {"suffix": [0], "absolute": [3]}
+    assert row["latent_end_positions"] == {"suffix": [2], "absolute": [5]}
+    assert row["prediction_normalized"] == "10"
+    assert row["gold_normalized"] == "10"
+    assert row["match"] is True
+    assert row["category"] == "deletion"
+    metadata = result["metadata"]
+    assert metadata["runtime"]["decoder_attention_classes"] == [
+        "Qwen2_5_VLSdpaAttention", "Qwen2_5_VLSdpaAttention"
+    ]
+    assert metadata["runtime"]["vision_attention_classes"] == [
+        "Qwen2_5_VLVisionFlashAttention2"
+    ]
+    assert metadata["runtime"]["parameter_dtypes"] == ["torch.float32"]
+    assert metadata["runtime"]["configured_torch_dtype"] == "torch.bfloat16"
+    assert metadata["runtime"]["input_tensor_dtypes"]["pixel_values"] == ["torch.float32"]
+    assert metadata["generation"]["latent_size"] == 2
+    assert json.loads((output_dir / "predictions.jsonl").read_text()) == row
+    assert json.loads((output_dir / "metadata.json").read_text()) == metadata
+
+
+def test_image_token_id_is_resolved_from_tokenizer_and_checked_against_model(tmp_path):
+    """Catches a hard-coded image token ID or tokenizer/config disagreement."""
+    rows = [{"text_input": "q", "image_input": [], "original_final_answer": "10"}]
+    captured = {}
+
+    def generate(**context):
+        captured["image_token_id"] = context["intervention"].image_token_id
+        return _successful_generator(**context)
+
+    _run(tmp_path, rows, generation_runner=generate)
+    assert captured["image_token_id"] == 80
+
+    def bad_loader(**_kwargs):
+        model = FakeModel()
+        model.config.image_token_id = 81
+        return model, FakeProcessor()
+
+    result, _, _ = _run(tmp_path / "bad", rows, artifact_loader=bad_loader)
+    assert result["metadata"]["status"] == "failed"
+    assert "image token ID mismatch" in result["metadata"]["error"]
+
+
+def test_masked_modes_reject_every_incompatible_decoder_layer(tmp_path):
+    """Catches a silent masked-mode fallback onto a decoder lacking the 4-D SDPA contract."""
+    rows = [{"text_input": "q", "image_input": [], "original_final_answer": "10"}]
+    result, _, _ = _run(
+        tmp_path,
+        rows,
+        visual_ablation_mode="global_image_attention_block",
+        artifact_loader=lambda **_kwargs: (FakeModel(attention_class=Qwen2_5_VLFlashAttention2), FakeProcessor()),
+    )
+    assert result["metadata"]["status"] == "failed"
+    assert "requires Qwen2_5_VLSdpaAttention at every decoder layer" in result["metadata"]["error"]
+
+
+def test_replacement_keeps_recipient_text_and_scores_only_valid_matched_donor_gold(tmp_path):
+    """Catches image replacement swapping the question or accepting an unmatched donor."""
+    rows = [
+        {"text_input": "same   question", "image_input": ["images_comt/update/a.png"], "original_final_answer": "10"},
+        {"text_input": "same question", "image_input": ["images_comt/update/b.png"], "original_final_answer": "11"},
+        {"text_input": "different", "image_input": ["images_comt/update/c.png"], "original_final_answer": "12"},
+    ]
+    result, processor, _ = _run(
+        tmp_path,
+        rows,
+        indices=(0, 2),
+        visual_ablation_mode="image_replacement",
+        replacement_map={0: 1, 2: 1},
+    )
+
+    valid, invalid = result["rows"]
+    assert processor.processor_calls[0]["text"] == ["<image>same   question"]
+    assert processor.processor_calls[0]["images"] == ["opened:" + str(tmp_path / "images_comt/update/b.png")]
+    assert valid["replacement_donor_index"] == 1
+    assert valid["gold_final_answer"] == "11"
+    assert valid["gold_source"] == "replacement_donor"
+    assert invalid["index"] == 2
+    assert "normalized question mismatch" in invalid["error"]
+    assert result["metadata"]["status"] == "failed"
+
+
+def test_valid_replacement_inference_error_retains_donor_gold_lineage(tmp_path):
+    """Catches a failed E5 attempt being mislabeled with the recipient's gold."""
+    rows = [
+        {"text_input": "same q", "image_input": ["images_comt/update/a.png"], "original_final_answer": "10"},
+        {"text_input": "same q", "image_input": ["images_comt/update/b.png"], "original_final_answer": "11"},
+    ]
+
+    def fail(**_context):
+        raise RuntimeError("generation exploded")
+
+    result, _, _ = _run(
+        tmp_path,
+        rows,
+        indices=(0,),
+        visual_ablation_mode="image_replacement",
+        replacement_map={0: 1},
+        generation_runner=fail,
+    )
+
+    row = result["rows"][0]
+    assert row["replacement_donor_index"] == 1
+    assert row["gold_final_answer"] == "11"
+    assert row["gold_normalized"] == "11"
+    assert row["gold_source"] == "replacement_donor"
+
+
+def test_requested_missing_index_and_generation_error_are_serialized_as_failed_rows(tmp_path):
+    """Catches requested or attempted samples disappearing from the output denominator."""
+    rows = [{"text_input": "q", "image_input": [], "original_final_answer": "10"}]
+
+    def fail(**_context):
+        raise RuntimeError("generation exploded")
+
+    result, _, _ = _run(tmp_path, rows, indices=(0, 7), generation_runner=fail)
+    assert [row["index"] for row in result["rows"]] == [0, 7]
+    assert result["rows"][0]["prediction_parse_status"] == "inference_error"
+    assert result["rows"][0]["error"] == "generation exploded"
+    assert result["rows"][1]["error"] == "source index 7 is missing"
+    assert result["rows"][1]["condition"] == "baseline"
+    assert result["rows"][1]["checkpoint"] == "checkpoints/fake"
+    assert result["metadata"]["status"] == "failed"
+    assert result["metadata"]["completed_count"] == 0
+    assert result["metadata"]["error_count"] == 2
+
+
+def test_native_loader_selection_uses_stage_artifact_and_sdpa_uses_mixed_loader(tmp_path):
+    """Catches Stage 1/2 native loaders being interchanged or SDPA bypassing eval.py."""
+    stage1 = tmp_path / "stage1"
+    stage2 = tmp_path / "stage2"
+    stage1.mkdir()
+    stage2.mkdir()
+    (stage1 / "stage1_peft_metadata.json").write_text("{}")
+    (stage2 / "stage2_peft_metadata.json").write_text("{}")
+
+    assert runner.select_loader_module_name(stage1, "native") == "eval"
+    assert runner.select_loader_module_name(stage2, "native") == "src.evaluate_deepseed"
+    assert runner.select_loader_module_name(stage2, "sdpa") == "eval"
+
+
+def test_baseline_equivalence_requires_raw_prompt_and_scoring_identity():
+    """Catches a baseline bridge calling normalized text equality exact equivalence."""
+    native = [{
+        "index": 4, "generated_suffix_token_ids": [1, 2], "prompt_identity": "p",
+        "prediction_normalized": "10", "gold_normalized": "10", "match": True,
+        "prediction_parse_status": "parsed", "gold_parse_status": "parsed",
+        "invalid_gold_reason": None,
+    }]
+    same = [dict(native[0])]
+    changed = [dict(native[0], generated_suffix_token_ids=[1, 3])]
+
+    exact = runner.baseline_equivalence(native, same)
+    assert exact["exact"] is True
+    assert exact["raw_token_id_match_count"] == 1
+    mismatch = runner.baseline_equivalence(native, changed)
+    assert mismatch["exact"] is False
+    assert mismatch["mismatched_indices"] == {"raw_token_ids": [4], "prompt_identity": [], "scoring": []}
+
+
+def test_groups_and_compare_are_cpu_file_operations_with_complete_outputs(tmp_path, monkeypatch):
+    """Catches incomplete group/compare artifacts or a comparison that omits exact evidence."""
+    monkeypatch.chdir(tmp_path)
+    source = _write_source(tmp_path, [
+        {"text_input": "same q", "image_input": [], "original_final_answer": "10"},
+        {"text_input": "same   q", "image_input": [], "original_final_answer": "11"},
+    ])
+    manifest = runner.create_group_manifest(source, Path("data/groups.json"))
+    assert manifest["groups"] == [[0, 1]]
+    assert manifest["indices"] == [0, 1]
+
+    baseline = tmp_path / "baseline.jsonl"
+    condition = tmp_path / "condition.jsonl"
+    base_rows = [
+        {"index": 0, "category": "creation", "generated_suffix_token_ids": [1], "prompt_identity": "p0", "prediction_normalized": "10", "prediction_parse_status": "parsed", "gold_normalized": "10", "gold_parse_status": "parsed", "invalid_gold_reason": None, "match": True, "latent_block_count": 0, "inference_time_sec": 1.0},
+        {"index": 1, "category": "creation", "generated_suffix_token_ids": [2], "prompt_identity": "p1", "prediction_normalized": "10", "prediction_parse_status": "parsed", "gold_normalized": "11", "gold_parse_status": "parsed", "invalid_gold_reason": None, "match": False, "latent_block_count": 0, "inference_time_sec": 1.0},
+    ]
+    condition_rows = [dict(row) for row in base_rows]
+    condition_rows[1].update(prediction_normalized="11", match=True, generated_suffix_token_ids=[3])
+    baseline.write_text("".join(json.dumps(row) + "\n" for row in base_rows))
+    condition.write_text("".join(json.dumps(row) + "\n" for row in condition_rows))
+
+    summary = runner.compare_prediction_files(baseline, condition, tmp_path / "comparison")
+    assert summary["paired"]["accuracy_delta_pp"] == 50.0
+    assert summary["equivalence"]["raw_token_id_match_count"] == 1
+    assert (tmp_path / "comparison/summary.json").is_file()
+    assert (tmp_path / "comparison/summary.csv").is_file()
+    assert (tmp_path / "comparison/analysis.md").is_file()
