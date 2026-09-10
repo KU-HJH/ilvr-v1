@@ -219,6 +219,91 @@ def test_e2_changes_only_start_and_controller_still_forces_complete_template():
     assert baseline.events[0]["changed"] is False
 
 
+def test_controller_routes_normal_rollout_post_end_and_next_text_through_one_policy():
+    """Catches any controller decoder route bypassing E3, mRoPE, or no-cache policy."""
+    model = scripted_model(
+        latent_size=2,
+        emitted_ids=[TOKENS.start_token_id, 11, 3],
+    )
+    input_ids = torch.tensor([[80, 7]])
+    intervention = VisualIntervention(
+        "latent_image_attention_block", image_token_id=80
+    )
+    decoder_calls = []
+
+    def capture_decoder_call(_module, _args, kwargs):
+        decoder_calls.append(
+            {
+                "attention_mask": kwargs["attention_mask"].clone(),
+                "position_ids": kwargs["position_ids"].clone(),
+                "use_cache": kwargs["use_cache"],
+            }
+        )
+
+    handle = model.model.register_forward_pre_hook(
+        capture_decoder_call, with_kwargs=True
+    )
+    try:
+        result = ContinuousLatentController().generate(
+            model=model,
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            token_ids=TOKENS,
+            generation_config=ContinuousLatentGenerationConfig(
+                max_new_tokens=5, eos_token_id=3
+            ),
+            return_latent_states=True,
+            return_post_end_logits=True,
+            intervention=intervention,
+        )
+    finally:
+        handle.remove()
+
+    expected_allowed = [
+        [[True, False], [True, True]],
+        [[True, False, False], [True, True, False], [False, True, True]],
+        [
+            [True, False, False, False],
+            [True, True, False, False],
+            [False, True, True, False],
+            [False, True, True, True],
+        ],
+        [
+            [True, False, False, False, False, False],
+            [True, True, False, False, False, False],
+            [False, True, True, False, False, False],
+            [False, True, True, True, False, False],
+            [False, True, True, True, True, False],
+            [True, True, True, True, True, True],
+        ],
+        [
+            [True, False, False, False, False, False],
+            [True, True, False, False, False, False],
+            [False, True, True, False, False, False],
+            [False, True, True, True, False, False],
+            [False, True, True, True, True, False],
+            [True, True, True, True, True, True],
+        ],
+    ]
+    assert result.generated_suffix_ids == (91, 90, 90, 92, 3)
+    assert len(result.post_end_logits_by_block) == 1
+    assert len(decoder_calls) == len(expected_allowed)
+    for call, allowed in zip(decoder_calls, expected_allowed, strict=True):
+        prefix_length = len(allowed)
+        assert call["use_cache"] is False
+        assert _allowed(call["attention_mask"]) == allowed
+        torch.testing.assert_close(
+            call["position_ids"], _position_ids(prefix_length), rtol=0, atol=0
+        )
+    assert [record["role"] for record in intervention.forward_records] == [
+        "text",
+        "latent_rollout",
+        "latent_rollout",
+        "text_or_post_end",
+        "text_or_post_end",
+    ]
+
+
 def test_begin_resets_generation_local_events_records_spans_and_image_positions():
     """Catches per-example evidence and masks carrying into the next generation."""
     intervention = VisualIntervention("latent_image_attention_block", image_token_id=80)
