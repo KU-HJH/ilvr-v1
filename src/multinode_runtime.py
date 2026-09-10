@@ -1070,6 +1070,7 @@ class EvaluationPlan:
     repetition_penalty: float = 1.05
     temperature: float = 0.0
     top_p: float = 1.0
+    vision_ablation: str = "none"
     attempt_timeout_seconds: int = 24 * 60 * 60
 
     def __post_init__(self) -> None:
@@ -1143,6 +1144,8 @@ class EvaluationPlan:
             or not 0 < self.top_p <= 1
         ):
             raise ValueError("top_p must be finite and in (0, 1]")
+        if self.vision_ablation not in ("none", "all", "interleaved"):
+            raise ValueError("vision_ablation must be none, all, or interleaved")
         if type(self.attempt_timeout_seconds) is not int or self.attempt_timeout_seconds <= 0:
             raise ValueError("attempt_timeout_seconds must be positive")
 
@@ -1213,6 +1216,8 @@ def _build_evaluation_commands_for_stage(
 
     if stage not in ("stage1", "stage2"):
         raise ValueError("observed inference stage must be stage1 or stage2")
+    if stage == "stage1" and plan.vision_ablation != "none":
+        raise ValueError("vision ablation is only supported for Stage 2 evaluation")
     _require_digest("model_identity", model_identity.removeprefix("task6:"))
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise ValueError("commit must be a lowercase 40-character Git object ID")
@@ -1243,6 +1248,8 @@ def _build_evaluation_commands_for_stage(
         ]
         if plan.base_model_dir is not None:
             evaluator_command.extend(("--base_model_dir", str(plan.base_model_dir)))
+        if stage == "stage2":
+            evaluator_command.extend(("--vision-ablation", plan.vision_ablation))
         evaluator_command.extend(
             (
                 "--model-identity", model_identity,
@@ -2951,6 +2958,7 @@ class EvaluationSubprocessRunner:
                 "repetition_penalty": self.plan.repetition_penalty,
                 "temperature": self.plan.temperature,
                 "top_p": self.plan.top_p,
+                "vision_ablation": self.plan.vision_ablation,
             },
         )
 

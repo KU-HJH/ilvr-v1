@@ -194,6 +194,7 @@ def test_merge_sorts_rows_and_computes_accuracy_once(tmp_path):
             "repetition_penalty": 1.05,
             "temperature": 0.0,
             "top_p": 1.0,
+            "vision_ablation": "none",
         },
     }
     assert json.loads((tmp_path / "summary.json").read_text()) == summary
@@ -248,6 +249,7 @@ def test_merge_preserves_gold_denominators_and_invalid_gold_records(tmp_path):
             "repetition_penalty": 1.05,
             "temperature": 0.0,
             "top_p": 1.0,
+            "vision_ablation": "none",
         },
     }
 
@@ -284,6 +286,26 @@ def test_merge_rejects_generation_config_mismatch(tmp_path):
         _merge(tmp_path, shards, expected_sample_count=4)
 
 
+def test_merge_rejects_mixed_vision_ablation_modes(tmp_path):
+    configs = [
+        {
+            "max_new_tokens": 4096,
+            "max_sequence_length": 32768,
+            "repetition_penalty": 1.05,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "vision_ablation": "all",
+        }
+        for _ in range(4)
+    ]
+    configs[3] = {**configs[3], "vision_ablation": "interleaved"}
+
+    shards = _write_fake_shards(tmp_path, generation_configs=configs)
+
+    with pytest.raises(ValueError, match="generation config mismatch"):
+        _merge(tmp_path, shards, expected_sample_count=4)
+
+
 def test_merge_keeps_schema_one_sidecar_compatibility(tmp_path):
     shards = _write_fake_shards(tmp_path)
     for path in shards:
@@ -305,6 +327,7 @@ def test_merge_keeps_schema_two_generation_config_compatibility(tmp_path):
         manifest["schema_version"] = 2
         manifest["generation_config"].pop("max_sequence_length")
         manifest["generation_config"].pop("repetition_penalty")
+        manifest["generation_config"].pop("vision_ablation")
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
     summary = _merge(tmp_path, shards, expected_sample_count=4)
@@ -323,6 +346,7 @@ def test_merge_keeps_schema_three_sequence_cap_compatibility(tmp_path):
         manifest = json.loads(path.read_text(encoding="utf-8"))
         manifest["schema_version"] = 3
         manifest["generation_config"].pop("repetition_penalty")
+        manifest["generation_config"].pop("vision_ablation")
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
     summary = _merge(tmp_path, shards, expected_sample_count=4)

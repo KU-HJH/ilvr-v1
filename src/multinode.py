@@ -2200,6 +2200,9 @@ def _evaluate_main(argv: list[str]) -> int:
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--vision-ablation", choices=("none", "all", "interleaved"), default="none"
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -2217,19 +2220,22 @@ def _evaluate_main(argv: list[str]) -> int:
             repetition_penalty=args.repetition_penalty,
             temperature=args.temperature,
             top_p=args.top_p,
+            vision_ablation=args.vision_ablation,
         )
         if args.dry_run:
             dry_identity = f"task6:{'0' * 64}"
-            variants = {
-                stage: _build_evaluation_commands_for_stage(
-                    plan,
-                    stage=stage,
-                    model_identity=dry_identity,
-                    commit="0" * 40,
-                )
-                for stage in ("stage1", "stage2")
-            }
-            first = variants["stage1"]
+            variants = {}
+            for stage in ("stage1", "stage2"):
+                try:
+                    variants[stage] = _build_evaluation_commands_for_stage(
+                        plan,
+                        stage=stage,
+                        model_identity=dry_identity,
+                        commit="0" * 40,
+                    )
+                except ValueError as error:
+                    variants[stage] = {"unsupported": str(error)}
+            first = variants["stage2"] if args.vision_ablation != "none" else variants["stage1"]
             print(
                 json.dumps(
                     {
@@ -2242,7 +2248,11 @@ def _evaluate_main(argv: list[str]) -> int:
                         ],
                         "remote_result_pull": list(first.remote_pull),
                         "worker_commands_by_observed_stage": {
-                            stage: [list(worker.launch) for worker in commands.workers]
+                            stage: (
+                                commands
+                                if isinstance(commands, dict)
+                                else [list(worker.launch) for worker in commands.workers]
+                            )
                             for stage, commands in variants.items()
                         },
                     },

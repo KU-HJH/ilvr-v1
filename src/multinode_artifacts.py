@@ -2059,7 +2059,7 @@ def validate_evaluation_sidecars(
 
     common_dataset_identity: object | None = None
     generation_config = _validate_generation_config(
-        dict(expected_generation_config)
+        dict(expected_generation_config), include_default_vision_ablation=True
     )
     required = {
         "schema_version",
@@ -2100,7 +2100,9 @@ def validate_evaluation_sidecars(
         if payload["model_identity"] != expected_model_identity:
             raise ValueError("model identity mismatch across evaluation sidecars")
         if (
-            _validate_generation_config(payload["generation_config"])
+            _validate_generation_config(
+                payload["generation_config"], include_default_vision_ablation=True
+            )
             != generation_config
         ):
             raise ValueError("generation config mismatch across evaluation sidecars")

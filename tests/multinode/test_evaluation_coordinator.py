@@ -982,3 +982,34 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
                 assert command[option + 1] == "1.05"
             else:
                 assert "--repetition_penalty 1.05" in command[-1]
+
+
+def test_vision_ablation_dry_run_keeps_stage2_commands_and_marks_stage1_unsupported(
+    monkeypatch, capsys
+):
+    import src.multinode_runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "EvaluationSubprocessRunner",
+        lambda *args, **kwargs: pytest.fail("dry-run constructed live runner"),
+    )
+
+    assert _main(
+        [
+            "evaluate",
+            "--run-id", "eval-four-gpu",
+            "--model-dir",
+            str(REPO_ROOT / "checkpoints/evaluation-staging/model/prepared-model"),
+            "--test-data-path", str(REPO_ROOT / "data/TEST.jsonl"),
+            "--task-name", "zebra-cot",
+            "--output-dir", str(REPO_ROOT / "results/eval-four-gpu"),
+            "--vision-ablation", "all",
+            "--dry-run",
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert "unsupported" in payload["worker_commands_by_observed_stage"]["stage1"]
+    stage2 = payload["worker_commands_by_observed_stage"]["stage2"]
+    assert all("--vision-ablation all" in " ".join(command) for command in stage2)

@@ -159,6 +159,7 @@ class ContinuousLatentController:
         image_grid_thw: torch.LongTensor | None = None,
         return_latent_states: bool = False,
         return_post_end_logits: bool = False,
+        disable_latent_generation: bool = False,
     ) -> ContinuousLatentGenerationResult:
         self._validate_inputs(
             model=model,
@@ -166,6 +167,8 @@ class ContinuousLatentController:
             attention_mask=attention_mask,
             generation_config=generation_config,
         )
+        if type(disable_latent_generation) is not bool:
+            raise TypeError("disable_latent_generation must be a boolean")
         sequences = input_ids
         mask = attention_mask
         inputs_embeds = model.prepare_stage2_base_inputs_embeds(
@@ -204,10 +207,18 @@ class ContinuousLatentController:
             )
             logits = model.lm_head(outputs.last_hidden_state[:, -1, :]).clone()
             logits = repetition_processor(sequences, logits)
+            if disable_latent_generation:
+                logits[..., token_ids.start_token_id] = -torch.inf
             logits[..., token_ids.pad_token_id] = -torch.inf
             logits[..., token_ids.end_token_id] = -torch.inf
             next_id = _select_text_token(logits, generation_config)
             next_token_id = int(next_id.item())
+            if disable_latent_generation and next_token_id in {
+                token_ids.start_token_id,
+                token_ids.pad_token_id,
+                token_ids.end_token_id,
+            }:
+                raise RuntimeError("disabled latent generation selected a control token")
 
             next_ids = next_id[:, None]
             sequences = torch.cat((sequences, next_ids), dim=1)
@@ -284,7 +295,7 @@ class ContinuousLatentController:
                 stop_reason = boundary_stop_reason
                 break
 
-        return ContinuousLatentGenerationResult(
+        result = ContinuousLatentGenerationResult(
             sequences=sequences,
             latent_states_by_block=tuple(latent_blocks) if return_latent_states else (),
             generated_suffix_ids=tuple(sequences[0, input_ids.shape[1] :].tolist()),
@@ -293,6 +304,14 @@ class ContinuousLatentController:
             stop_reason=stop_reason,
             post_end_logits_by_block=tuple(post_end_logits) if return_post_end_logits else (),
         )
+        if disable_latent_generation and (
+            result.latent_start_count
+            or result.latent_block_count
+            or set(result.generated_suffix_ids)
+            & {token_ids.start_token_id, token_ids.pad_token_id, token_ids.end_token_id}
+        ):
+            raise RuntimeError("disabled latent generation produced a latent control")
+        return result
 
     @staticmethod
     def _validate_inputs(*, model, input_ids, attention_mask, generation_config) -> None:

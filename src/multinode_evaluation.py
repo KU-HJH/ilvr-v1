@@ -10,7 +10,8 @@ from evaluation.scoring import EvaluationScoreSummary
 
 
 NUM_EVALUATION_SHARDS = 4
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
+REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION = 4
 SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION = 3
 GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION = 2
 LEGACY_MANIFEST_SCHEMA_VERSION = 1
@@ -135,19 +136,29 @@ def _validate_generation_config(
     *,
     require_sequence_length: bool = True,
     require_repetition_penalty: bool = True,
+    require_vision_ablation: bool = False,
+    include_default_vision_ablation: bool = False,
 ) -> dict[str, Any]:
     required = {"max_new_tokens", "temperature", "top_p"}
     if require_sequence_length:
         required.add("max_sequence_length")
     if require_repetition_penalty:
         required.add("repetition_penalty")
-    if not isinstance(value, dict) or set(value) != required:
+    if require_vision_ablation:
+        required.add("vision_ablation")
+    accepted_field_sets = (
+        (required,)
+        if require_vision_ablation
+        else (required, required | {"vision_ablation"})
+    )
+    if not isinstance(value, dict) or set(value) not in accepted_field_sets:
         raise ValueError("invalid generation config")
     max_new_tokens = value["max_new_tokens"]
     max_sequence_length = value.get("max_sequence_length")
     repetition_penalty = value.get("repetition_penalty")
     temperature = value["temperature"]
     top_p = value["top_p"]
+    vision_ablation = value.get("vision_ablation", "none")
     if not _is_int(max_new_tokens) or max_new_tokens <= 0:
         raise ValueError("invalid generation config max_new_tokens")
     if require_sequence_length and (
@@ -172,6 +183,8 @@ def _validate_generation_config(
         or not 0 < top_p <= 1
     ):
         raise ValueError("invalid generation config top_p")
+    if vision_ablation not in ("none", "all", "interleaved"):
+        raise ValueError("invalid generation config vision_ablation")
     normalized = {
         "max_new_tokens": max_new_tokens,
         "temperature": float(temperature),
@@ -181,6 +194,8 @@ def _validate_generation_config(
         normalized["max_sequence_length"] = max_sequence_length
     if require_repetition_penalty:
         normalized["repetition_penalty"] = float(repetition_penalty)
+    if require_vision_ablation or include_default_vision_ablation or "vision_ablation" in value:
+        normalized["vision_ablation"] = vision_ablation
     return normalized
 
 
@@ -213,7 +228,9 @@ def write_shard_manifest(
         raise ValueError("worker exit status must be a non-negative integer")
 
     identity = _validate_dataset_identity(dict(dataset_identity))
-    generation = _validate_generation_config(dict(generation_config))
+    generation = _validate_generation_config(
+        dict(generation_config), include_default_vision_ablation=True
+    )
     expected = _validate_index_list(
         list(expected_source_indices), "expected source indices"
     )
@@ -269,6 +286,7 @@ def _validate_manifest(
         raise ValueError(f"unsupported shard manifest schema in {path}")
     if schema_version in (
         MANIFEST_SCHEMA_VERSION,
+        REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION,
         SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION,
         GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION,
     ):
@@ -298,6 +316,7 @@ def _validate_manifest(
         raise ValueError(f"invalid model identity in {path}")
     if schema_version in (
         MANIFEST_SCHEMA_VERSION,
+        REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION,
         SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION,
         GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION,
     ):
@@ -305,9 +324,14 @@ def _validate_manifest(
             manifest["generation_config"],
             require_sequence_length=(
                 schema_version
-                in (MANIFEST_SCHEMA_VERSION, SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION)
+                in (MANIFEST_SCHEMA_VERSION, REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION,
+                    SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION)
             ),
-            require_repetition_penalty=(schema_version == MANIFEST_SCHEMA_VERSION),
+            require_repetition_penalty=(
+                schema_version
+                in (MANIFEST_SCHEMA_VERSION, REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION)
+            ),
+            require_vision_ablation=(schema_version == MANIFEST_SCHEMA_VERSION),
         )
     exit_status = manifest["worker_exit_status"]
     if not _is_int(exit_status) or exit_status < 0:

@@ -121,6 +121,32 @@ def test_neutral_controller_records_complete_latent_block_evidence():
     assert len(result.post_end_logits_by_block) == 1
 
 
+def test_disabling_latent_generation_masks_the_highest_logit_start_without_rollout():
+    """A vision ablation must not emit a latent control or invoke recurrence."""
+    model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
+    model.stage2_rollout_engine.rollout = lambda **_kwargs: pytest.fail(
+        "latent rollout ran while disabled"
+    )
+
+    result = ContinuousLatentController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=ContinuousLatentGenerationConfig(max_new_tokens=1),
+        disable_latent_generation=True,
+        return_latent_states=True,
+    )
+
+    assert result.latent_start_count == 0
+    assert result.latent_block_count == 0
+    assert not set(result.generated_suffix_ids) & {
+        TOKENS.start_token_id,
+        TOKENS.pad_token_id,
+        TOKENS.end_token_id,
+    }
+
+
 def test_post_end_logits_use_complete_post_recurrence_scaffold():
     """Catches evidence taken before continuous latent replacements finish."""
     model = scripted_model(

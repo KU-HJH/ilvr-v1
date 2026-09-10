@@ -616,6 +616,8 @@ def test_default_single_worker_records_shared_answer_scoring(
             "latent_start_count": 1,
             "latent_block_count": 1,
             "stop_reason": "eos",
+            "vision_ablation": None,
+            "input_image_count": None,
             "match": True,
         }
         rows = [dict(row, index=index) for index in range(6)]
@@ -807,6 +809,7 @@ def test_four_shard_worker_uses_global_indices_and_writes_success_sidecar(
         "repetition_penalty": 1.05,
         "temperature": 0.0,
         "top_p": 1.0,
+        "vision_ablation": "none",
     }
     assert manifest["expected_source_indices"] == [1, 5]
     assert manifest["processed_source_indices"] == [1, 5]
@@ -1763,7 +1766,60 @@ def test_eval_uses_controller_with_original_visual_inputs_and_preserves_decoding
     }
     if module_name == "eval":
         expected_result_fields.add("inference_time")
+    else:
+        expected_result_fields.update({"vision_ablation", "input_image_count"})
     assert set(result) == expected_result_fields
+
+
+@pytest.mark.parametrize(
+    ("vision_ablation", "expected_image_count"),
+    (("all", 0), ("interleaved", 1)),
+)
+def test_stage2_vision_ablation_controls_processor_images_and_disables_latents(
+    vision_ablation, expected_image_count, monkeypatch, tmp_path
+):
+    """Ablation must change only the approved image boundary and latent control."""
+    module = _import_entry_point("evaluate_deepseed", monkeypatch)
+    controller = RecordingController()
+    controller.generate = lambda **kwargs: (
+        controller.calls.append(kwargs)
+        or SimpleNamespace(
+            sequences=controller.sequences,
+            generated_suffix_ids=(21, 22),
+            latent_start_count=0,
+            latent_block_count=0,
+            stop_reason="eos",
+        )
+    )
+    monkeypatch.setattr(module, "Stage2InferenceController", lambda: controller)
+    original_image = tmp_path / "original.png"
+    Image.new("RGB", (2, 2), color="white").save(original_image)
+    processor = FakeProcessor()
+
+    result = module.run_one_example(
+        ModelWhoseGenerateRaises(),
+        processor,
+        {"text_input": "question", "image_input": str(original_image)},
+        {
+            "max_new_tokens": 1,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "vision_ablation": vision_ablation,
+        },
+    )
+
+    call = controller.calls[0]
+    assert call["disable_latent_generation"] is True
+    assert result["vision_ablation"] == vision_ablation
+    assert result["input_image_count"] == expected_image_count
+    if vision_ablation == "all":
+        assert processor.images is None
+        assert call["pixel_values"] is None
+        assert call["image_grid_thw"] is None
+    else:
+        assert len(processor.images) == 1
+        assert torch.equal(call["pixel_values"], processor.pixel_values)
+        assert torch.equal(call["image_grid_thw"], processor.image_grid_thw)
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
