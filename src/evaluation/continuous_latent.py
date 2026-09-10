@@ -160,6 +160,7 @@ class ContinuousLatentController:
         return_latent_states: bool = False,
         return_post_end_logits: bool = False,
         disable_latent_generation: bool = False,
+        intervention=None,
     ) -> ContinuousLatentGenerationResult:
         self._validate_inputs(
             model=model,
@@ -184,6 +185,10 @@ class ContinuousLatentController:
         repetition_processor = RepetitionPenaltyLogitsProcessor(
             generation_config.repetition_penalty
         )
+        decoder = partial(model.model, generate_mode=True)
+        if intervention is not None:
+            intervention.begin(input_ids, token_ids)
+            decoder = intervention.wrap_decoder(decoder)
 
         while True:
             remaining_capacity, boundary_stop_reason = _remaining_capacity(
@@ -197,20 +202,24 @@ class ContinuousLatentController:
             position_ids, _ = model.get_rope_index(
                 sequences, image_grid_thw=image_grid_thw, attention_mask=mask
             )
-            outputs = model.model(
+            outputs = decoder(
                 inputs_embeds=inputs_embeds,
                 attention_mask=mask,
                 position_ids=position_ids,
                 use_cache=False,
                 return_dict=True,
-                generate_mode=True,
             )
-            logits = model.lm_head(outputs.last_hidden_state[:, -1, :]).clone()
+            raw_logits = model.lm_head(outputs.last_hidden_state[:, -1, :])
+            logits = raw_logits.clone()
             logits = repetition_processor(sequences, logits)
             if disable_latent_generation:
                 logits[..., token_ids.start_token_id] = -torch.inf
             logits[..., token_ids.pad_token_id] = -torch.inf
             logits[..., token_ids.end_token_id] = -torch.inf
+            if intervention is not None:
+                logits = intervention.process_logits(
+                    sequences, raw_logits, logits, token_ids
+                )
             next_id = _select_text_token(logits, generation_config)
             next_token_id = int(next_id.item())
             if disable_latent_generation and next_token_id in {
@@ -259,8 +268,10 @@ class ContinuousLatentController:
                     ),
                     end_position=block_start + model.config.latent_size + 1,
                 )
+                if intervention is not None:
+                    intervention.register_latent_span(span)
                 rollout = model.stage2_rollout_engine.rollout(
-                    language_model=partial(model.model, generate_mode=True),
+                    language_model=decoder,
                     base_inputs_embeds=inputs_embeds,
                     attention_mask=mask,
                     full_position_ids=full_position_ids,
@@ -268,13 +279,12 @@ class ContinuousLatentController:
                 )
                 inputs_embeds = rollout.final_inputs_embeds
                 if return_post_end_logits:
-                    post_end_outputs = model.model(
+                    post_end_outputs = decoder(
                         inputs_embeds=inputs_embeds,
                         attention_mask=mask,
                         position_ids=full_position_ids,
                         use_cache=False,
                         return_dict=True,
-                        generate_mode=True,
                     )
                     post_end_logits.append(
                         model.lm_head(post_end_outputs.last_hidden_state[:, -1, :])
