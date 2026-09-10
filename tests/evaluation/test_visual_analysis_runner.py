@@ -174,7 +174,7 @@ def test_run_uses_only_recipient_text_for_prompt_and_e1_has_no_visual_tensors(tm
         captured.update(context)
         return _successful_generator(**context)
 
-    result, processor, _ = _run(
+    result, processor, output_dir = _run(
         tmp_path,
         rows,
         visual_ablation_mode="no_input_image",
@@ -188,7 +188,12 @@ def test_run_uses_only_recipient_text_for_prompt_and_e1_has_no_visual_tensors(tm
     assert set(captured["prepared"].tensors) == {"input_ids", "attention_mask"}
     assert captured["allow_latent_generation"] is True
     assert captured["intervention"].mode == "no_input_image"
-    assert result["rows"][0]["latent_block_count"] == 1
+    row = result["rows"][0]
+    assert row["latent_block_count"] == 1
+    assert row["recipient_image_input"] == ["images_comt/creation/a.png"]
+    assert row["effective_image_input"] == []
+    assert row["image_identity"] == "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    assert json.loads((output_dir / "predictions.jsonl").read_text()) == row
 
 
 def test_run_records_raw_token_positions_scoring_and_instantiated_runtime_metadata(tmp_path):
@@ -362,6 +367,58 @@ def test_baseline_equivalence_requires_raw_prompt_and_scoring_identity():
     assert mismatch["mismatched_indices"] == {"raw_token_ids": [4], "prompt_identity": [], "scoring": []}
 
 
+def test_baseline_equivalence_reports_identical_error_rows_as_unavailable():
+    """Catches matching absent evidence satisfying the exact no-op gate."""
+    failed = [{
+        "index": 4,
+        "generated_suffix_token_ids": [],
+        "prompt_identity": None,
+        "prediction_normalized": "",
+        "prediction_parse_status": "inference_error",
+        "gold_normalized": "10",
+        "gold_parse_status": "parsed",
+        "invalid_gold_reason": None,
+        "match": False,
+        "error": "generation exploded",
+    }]
+
+    result = runner.baseline_equivalence(failed, [dict(failed[0])])
+
+    assert result["exact"] is False
+    assert result["paired_count"] == 1
+    assert result["comparable_count"] == 0
+    assert result["unavailable_count"] == 1
+    assert result["raw_token_id_match_count"] == 0
+    assert result["unavailable_evidence"] == [{
+        "index": 4,
+        "baseline": ["inference_error", "missing_prompt_identity"],
+        "analysis": ["inference_error", "missing_prompt_identity"],
+    }]
+
+
+def test_baseline_equivalence_keeps_successful_invalid_gold_row_comparable():
+    """Catches invalid gold excluding otherwise valid raw no-op evidence."""
+    row = {
+        "index": 9,
+        "generated_suffix_token_ids": [7, 8],
+        "prompt_identity": "prompt-9",
+        "prediction_normalized": "answer",
+        "prediction_parse_status": "parsed",
+        "gold_normalized": "",
+        "gold_parse_status": "invalid_gold",
+        "invalid_gold_reason": "missing",
+        "match": False,
+        "error": None,
+    }
+
+    result = runner.baseline_equivalence([row], [dict(row)])
+
+    assert result["exact"] is True
+    assert result["comparable_count"] == 1
+    assert result["unavailable_count"] == 0
+    assert result["raw_token_id_match_count"] == 1
+
+
 def test_groups_and_compare_are_cpu_file_operations_with_complete_outputs(tmp_path, monkeypatch):
     """Catches incomplete group/compare artifacts or a comparison that omits exact evidence."""
     monkeypatch.chdir(tmp_path)
@@ -390,3 +447,6 @@ def test_groups_and_compare_are_cpu_file_operations_with_complete_outputs(tmp_pa
     assert (tmp_path / "comparison/summary.json").is_file()
     assert (tmp_path / "comparison/summary.csv").is_file()
     assert (tmp_path / "comparison/analysis.md").is_file()
+    assert "Unavailable equivalence evidence: 0" in (
+        tmp_path / "comparison/analysis.md"
+    ).read_text()

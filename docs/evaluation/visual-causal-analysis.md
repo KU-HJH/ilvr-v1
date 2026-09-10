@@ -86,7 +86,7 @@ PYTHONDONTWRITEBYTECODE=1 python -B scripts/analyze_comt_visual.py run \
   --visual-ablation-mode baseline --attention-backend sdpa
 ```
 
-Compare same-index E0 files as follows:
+Compare same-index native and SDPA E0 files to measure the backend bridge:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -B scripts/analyze_comt_visual.py compare \
@@ -96,9 +96,38 @@ PYTHONDONTWRITEBYTECODE=1 python -B scripts/analyze_comt_visual.py compare \
 ```
 
 `summary.json` separates exact raw-token, prompt-identity, and scoring agreement from
-paired accuracy. A backend mismatch is a backend result; it must not be attributed to
-the visual intervention. The same-backend observer no-op must match raw suffix IDs,
-prompt identity, and scorer fields exactly.
+paired accuracy. This native-versus-SDPA comparison is not the observer no-op gate. A
+backend mismatch is a backend result and must not be attributed to the intervention.
+
+Use two distinct same-backend checks before the causal comparisons. First, compare the
+original evaluator's no-policy native output with the new runner's native baseline. The
+authenticated original indices must already be restored in both files. For example, the
+normalized original-evaluator CE baseline is:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -B scripts/analyze_comt_visual.py compare \
+  --baseline-jsonl results/visual-causal-native-reproduction-20260910/ce-predictions.jsonl \
+  --condition-jsonl results/visual-causal-ce-e0-native-runner-20260910/predictions.jsonl \
+  --output-dir results/visual-causal-ce-native-reproduction-gate-20260910
+```
+
+Second, compare an existing-evaluator SDPA run with no policy against an SDPA baseline
+run with the `VisualIntervention("baseline", ...)` observer. Remove the existing
+evaluator's final summary row and replace its subset-local indices with the authenticated
+original indices before comparison:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -B scripts/analyze_comt_visual.py compare \
+  --baseline-jsonl results/visual-causal-stage2a-e0-sdpa-no-policy-20260910/predictions-normalized.jsonl \
+  --condition-jsonl results/visual-causal-stage2a-e0-sdpa-20260910/predictions.jsonl \
+  --output-dir results/visual-causal-stage2a-e0-sdpa-observer-noop-20260910
+```
+
+Only this second, same-backend no-policy-versus-observer comparison is the observer
+no-op gate. It must match raw suffix IDs, prompt identity, and scorer fields exactly for
+every available row. Successful rows with an invalid gold remain part of the raw no-op
+comparison. Inference errors or missing raw/prompt/scoring evidence are reported under
+`equivalence.unavailable_evidence` and make `equivalence.exact` false.
 
 ## E1 through E4
 
@@ -222,10 +251,20 @@ CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=transformers/src:sr
   tests/evaluation/test_visual_metrics.py \
   tests/evaluation/test_visual_analysis_runner.py \
   tests/evaluation/test_continuous_latent.py \
-  tests/stage2/test_eval_integration.py
+  tests/stage2/test_eval_integration.py \
+  -k 'not evaluation_runtime_sidecar_counts_concrete_blocks_exclusively'
 
 CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=transformers/src:src:. \
   ./venv/ilvr-venv/bin/python -B scripts/analyze_comt_visual.py --help
+```
+
+The excluded existing integration test deliberately constructs a FlashAttention 2
+model. Run it separately when one GPU is free:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=transformers/src:src:. \
+  ./venv/ilvr-venv/bin/python -B -m pytest -q \
+  tests/stage2/test_eval_integration.py::test_evaluation_runtime_sidecar_counts_concrete_blocks_exclusively
 ```
 
 After an E0 same-backend comparison, this numeric no-op gate verifies exact agreement:
@@ -235,9 +274,11 @@ After an E0 same-backend comparison, this numeric no-op gate verifies exact agre
 import json
 from pathlib import Path
 
-summary = json.loads(Path("results/visual-causal-stage2a-e0-bridge-20260910/summary.json").read_text())
+summary = json.loads(Path("results/visual-causal-stage2a-e0-sdpa-observer-noop-20260910/summary.json").read_text())
 equivalence = summary["equivalence"]
 assert equivalence["paired_count"] > 0
+assert equivalence["comparable_count"] == equivalence["paired_count"]
+assert equivalence["unavailable_count"] == 0
 assert equivalence["exact"] is True
 assert equivalence["raw_token_id_match_count"] == equivalence["paired_count"]
 assert equivalence["prompt_identity_match_count"] == equivalence["paired_count"]

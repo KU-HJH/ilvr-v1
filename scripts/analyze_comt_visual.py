@@ -517,10 +517,14 @@ def run_analysis(
                     gold_source = "replacement_donor"
                 raw_image_input = sample.get("image_input", [])
                 if visual_ablation_mode == "no_input_image":
+                    effective_image_input: object = []
                     resolved_paths: list[str] = []
                     images = None
                 else:
-                    resolved_paths = resolve_evaluation_image_paths(raw_image_input, source_path.parent)
+                    effective_image_input = raw_image_input
+                    resolved_paths = resolve_evaluation_image_paths(
+                        effective_image_input, source_path.parent
+                    )
                     images = opener(resolved_paths) if resolved_paths else None
                 prepared = prepare_evaluation_input(processor, sample, images)
                 for name, tensor in prepared.tensors.items():
@@ -579,8 +583,8 @@ def run_analysis(
                     "text_input": original_sample.get("text_input", ""),
                     "text_identity": _value_identity(original_sample.get("text_input", "")),
                     "recipient_image_input": original_sample.get("image_input", []),
-                    "effective_image_input": sample.get("image_input", []),
-                    "image_identity": _value_identity(sample.get("image_input", [])),
+                    "effective_image_input": effective_image_input,
+                    "image_identity": _value_identity(effective_image_input),
                     "replacement_donor_index": donor_index,
                     "gold_source": gold_source,
                     "prompt_identity": prepared.prompt_identity,
@@ -680,6 +684,7 @@ def baseline_equivalence(
     if set(baseline) != set(analysis):
         raise ValueError("baseline equivalence requires the same index set")
     mismatches = {"raw_token_ids": [], "prompt_identity": [], "scoring": []}
+    unavailable: list[dict[str, Any]] = []
     scoring_fields = (
         "prediction_normalized",
         "prediction_parse_status",
@@ -690,6 +695,17 @@ def baseline_equivalence(
     )
     for index in sorted(baseline):
         before, after = baseline[index], analysis[index]
+        before_reasons = _equivalence_unavailable_reasons(before)
+        after_reasons = _equivalence_unavailable_reasons(after)
+        if before_reasons or after_reasons:
+            unavailable.append(
+                {
+                    "index": index,
+                    "baseline": before_reasons,
+                    "analysis": after_reasons,
+                }
+            )
+            continue
         if before.get("generated_suffix_token_ids") != after.get("generated_suffix_token_ids"):
             mismatches["raw_token_ids"].append(index)
         if before.get("prompt_identity") != after.get("prompt_identity"):
@@ -697,14 +713,55 @@ def baseline_equivalence(
         if any(before.get(field) != after.get(field) for field in scoring_fields):
             mismatches["scoring"].append(index)
     count = len(baseline)
+    comparable_count = count - len(unavailable)
     return {
         "paired_count": count,
-        "exact": not any(mismatches.values()),
-        "raw_token_id_match_count": count - len(mismatches["raw_token_ids"]),
-        "prompt_identity_match_count": count - len(mismatches["prompt_identity"]),
-        "scoring_match_count": count - len(mismatches["scoring"]),
+        "comparable_count": comparable_count,
+        "unavailable_count": len(unavailable),
+        "exact": not unavailable and not any(mismatches.values()),
+        "raw_token_id_match_count": comparable_count - len(mismatches["raw_token_ids"]),
+        "prompt_identity_match_count": comparable_count - len(mismatches["prompt_identity"]),
+        "scoring_match_count": comparable_count - len(mismatches["scoring"]),
         "mismatched_indices": mismatches,
+        "unavailable_evidence": unavailable,
     }
+
+
+def _equivalence_unavailable_reasons(row: Mapping[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    inference_error = (
+        row.get("error") not in (None, "")
+        or row.get("prediction_parse_status") == "inference_error"
+    )
+    if inference_error:
+        reasons.append("inference_error")
+
+    raw_ids = row.get("generated_suffix_token_ids")
+    if not isinstance(raw_ids, list) or any(
+        not isinstance(token_id, int) or isinstance(token_id, bool) or token_id < 0
+        for token_id in raw_ids
+    ):
+        reasons.append("missing_or_invalid_raw_token_ids")
+    prompt_identity = row.get("prompt_identity")
+    if not isinstance(prompt_identity, str) or not prompt_identity:
+        reasons.append("missing_prompt_identity")
+
+    if not inference_error:
+        valid_scoring = (
+            isinstance(row.get("prediction_normalized"), str)
+            and isinstance(row.get("prediction_parse_status"), str)
+            and bool(row["prediction_parse_status"])
+            and isinstance(row.get("gold_normalized"), str)
+            and isinstance(row.get("gold_parse_status"), str)
+            and bool(row["gold_parse_status"])
+            and (
+                row.get("invalid_gold_reason") is None
+                or isinstance(row.get("invalid_gold_reason"), str)
+            )
+        ) and isinstance(row.get("match"), bool)
+        if not valid_scoring:
+            reasons.append("missing_or_invalid_scoring_evidence")
+    return reasons
 
 
 def _flatten(prefix: str, value: Any, rows: list[tuple[str, Any]]) -> None:
@@ -751,9 +808,11 @@ def compare_prediction_files(
         "# Visual causal comparison\n\n"
         f"Paired rows: {paired['paired_count']}  \n"
         f"Accuracy change: {paired['accuracy_delta_pp']} percentage points  \n"
-        f"Raw-token exact rows: {equivalence['raw_token_id_match_count']}/{equivalence['paired_count']}  \n"
-        f"Prompt-identity exact rows: {equivalence['prompt_identity_match_count']}/{equivalence['paired_count']}  \n"
-        f"Scoring exact rows: {equivalence['scoring_match_count']}/{equivalence['paired_count']}\n\n"
+        f"Comparable equivalence rows: {equivalence['comparable_count']}  \n"
+        f"Unavailable equivalence evidence: {equivalence['unavailable_count']}  \n"
+        f"Raw-token exact rows: {equivalence['raw_token_id_match_count']}/{equivalence['comparable_count']}  \n"
+        f"Prompt-identity exact rows: {equivalence['prompt_identity_match_count']}/{equivalence['comparable_count']}  \n"
+        f"Scoring exact rows: {equivalence['scoring_match_count']}/{equivalence['comparable_count']}\n\n"
         "The paired inferential statistics exclude invalid gold labels and inference errors. "
         "All comparisons are exploratory and use rows with identical original indices.\n"
     )
