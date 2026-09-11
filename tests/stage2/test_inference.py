@@ -63,7 +63,7 @@ def test_stage2_generation_result_retains_legacy_two_field_construction():
     assert result.latent_states_by_block == ()
 
 
-def test_stage2_controller_retains_its_original_generate_signature():
+def test_stage2_controller_retains_its_public_generate_signature():
     """Catches neutral-only evidence arguments leaking into Stage 2's API."""
     signature = inspect.signature(Stage2InferenceController.generate)
 
@@ -113,6 +113,11 @@ def test_stage2_controller_retains_its_original_generate_signature():
         ),
         (
             "return_latent_states",
+            inspect.Parameter.KEYWORD_ONLY,
+            False,
+        ),
+        (
+            "disable_latent_generation",
             inspect.Parameter.KEYWORD_ONLY,
             False,
         ),
