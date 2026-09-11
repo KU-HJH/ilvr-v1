@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** draft execution plan prepared at the user's explicit request. Do not execute until the written design commitment v3 receives final approval. Existing E0/E1/E2/E5 work remains authorized; E3/E4 remain held. Subagent-Driven execution was already selected in this session; do not ask the user to select it again.
+**Status:** approved for execution on 2026-09-11 by user `진행해`, bound to commitment v3. Subagent-Driven execution is selected. E3/E4 launch still requires the specified runtime gates; existing E0/E1/E2/E5 work remains authorized.
 
 **Goal:** Separate E3/E4 image-edge removal from the observed 2D-to-4D SDPA numerical-path confound.
 

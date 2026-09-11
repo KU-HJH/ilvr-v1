@@ -1,6 +1,6 @@
 # ILVR visual causal analysis — mask-control amendment v3
 
-Status: proposed implementation commitment; final written-design approval pending. The user's latest `ㅇㅋ` approves preparing this spec/plan revision in the direction presented, not starting the revised experiments. This amendment remains inside the architectural brainstorming gate.
+Status: APPROVED. On 2026-09-11 the user explicitly instructed `진행해` in response to the final commitment v3 / Subagent-Driven implementation approval request. This authorizes implementation and bounded witnesses, then full amended panels only after their gates pass.
 
 Parent contract: [approved v1](2026-09-10-ilvr-visual-causal-analysis-design.md). This amendment replaces only the E3/E4 comparison control and its validation/launch requirements. All other v1 requirements remain in force. Companion [draft execution plan](../plans/2026-09-10-ilvr-visual-causal-mask-control.md) supplies task commands and handoff; read this amendment, its plan and v1 together. Implementation source before this amendment is `a78ea0576348885326c2708185081a2c6a2395b3` in `/root/workspace/ILVR/.worktrees/ours1-visual-causal`; original native source is `ff53706882e39c9ce2ce4ac9e75242e1438ffc14`.
 
