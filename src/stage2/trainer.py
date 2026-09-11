@@ -615,6 +615,9 @@ class Stage2Trainer(Trainer):
             attention_mask=clean_inputs["attention_mask"],
             spans=spans,
             visual_only=config.visual_only_context_preference,
+            suppress_latent_boundaries=(
+                config.visual_off_suppress_latent_boundaries
+            ),
         )
         call = dict(
             clean_inputs,

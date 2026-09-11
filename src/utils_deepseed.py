@@ -62,6 +62,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step_preference_weight", type=float, default=1.0)
     parser.add_argument("--step_preference_margin", type=float, default=0.0)
     parser.add_argument("--step_visual_only_context_preference", action="store_true")
+    parser.add_argument(
+        "--step_visual_off_suppress_latent_boundaries", action="store_true"
+    )
     parser.add_argument("--step_dpo_weight", type=float, default=1.0)
     parser.add_argument("--step_entropy_weight", type=float, default=0.1)
     parser.add_argument("--step_entropy_margin", type=float, default=0.1)

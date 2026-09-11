@@ -84,6 +84,14 @@ case "${STEP_VISUAL_ONLY_CONTEXT_PREFERENCE-}" in
     exit 2
     ;;
 esac
+case "${STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES-}" in
+  ""|0|false|False) step_visual_off_suppress_latent_boundaries=false ;;
+  1|true|True) step_visual_off_suppress_latent_boundaries=true ;;
+  *)
+    printf 'STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES must be 0, 1, false, or true\n' >&2
+    exit 2
+    ;;
+esac
 case "${STAGE2B_DIRECT_FROM_STAGE1-}" in
   ""|0|false|False) stage2b_direct_from_stage1=false ;;
   1|true|True) stage2b_direct_from_stage1=true ;;
@@ -221,6 +229,9 @@ case "$STEP_PREFERENCE_ENABLED" in
       if [[ "$step_visual_only_context_preference" == true ]]; then
         STEP_PREFERENCE_ARGS+=(--step_visual_only_context_preference)
       fi
+      if [[ "$step_visual_off_suppress_latent_boundaries" == true ]]; then
+        STEP_PREFERENCE_ARGS+=(--step_visual_off_suppress_latent_boundaries)
+      fi
     else
       STEP_PREFERENCE_ARGS+=(
         --step_dpo_beta "$STEP_DPO_BETA"
@@ -319,6 +330,12 @@ if [[ "$step_visual_only_context_preference" == true ]] &&
   exit 2
 fi
 
+if [[ "$step_visual_off_suppress_latent_boundaries" == true ]] &&
+   [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b || "$STEP_PREFERENCE_OBJECTIVE" != context_preference || "$step_visual_only_context_preference" != true ]]; then
+  printf 'STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES requires visual-only context-preference Stage 2B\n' >&2
+  exit 2
+fi
+
 ilvr_topology_variables=(
   ILVR_NUM_MACHINES
   ILVR_NUM_PROCESSES
@@ -410,6 +427,7 @@ MANAGED_OPTIONS=(
   --step_preference_weight
   --step_preference_margin
   --step_visual_only_context_preference
+  --step_visual_off_suppress_latent_boundaries
   --step_negative_path
   --step_negative_manifest
   --step_max_packed_sequence_length

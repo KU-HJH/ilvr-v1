@@ -105,6 +105,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
             "STEP_PREFERENCE_WEIGHT": "1.7",
             "STEP_PREFERENCE_MARGIN": "-0.25",
             "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
+            "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES": "true",
         }
     )
     environment = validated_stage2_environment(
@@ -126,6 +127,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
                 "STEP_PREFERENCE_WEIGHT",
                 "STEP_PREFERENCE_MARGIN",
                 "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE",
+                "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES",
             )
         } == {
             "STEP_PREFERENCE_OBJECTIVE": "context_preference",
@@ -133,6 +135,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
             "STEP_PREFERENCE_WEIGHT": "1.7",
             "STEP_PREFERENCE_MARGIN": "-0.25",
             "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
+            "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES": "true",
         }
         stage_command = spec.command[spec.command.index("--") + 1:]
         result = subprocess.run(
@@ -149,6 +152,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
         }.items():
             assert argv[argv.index(option) + 1] == value
         assert "--step_visual_only_context_preference" in argv
+        assert "--step_visual_off_suppress_latent_boundaries" in argv
 
 
 def test_direct_stage1_setting_reaches_both_owned_worker_commands():

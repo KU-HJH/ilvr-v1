@@ -62,7 +62,10 @@ def two_step_case():
     os.environ.get("RUN_CONTEXT_CUDA") != "1" or not torch.cuda.is_available(),
     reason="explicit context CUDA check",
 )
-def test_context_cuda_flex_matches_dense_scores_gradients_and_calls(monkeypatch):
+@pytest.mark.parametrize("suppress_boundaries", [False, True])
+def test_context_cuda_flex_matches_dense_scores_gradients_and_calls(
+    monkeypatch, suppress_boundaries
+):
     """Catches a dense fallback, non-rectangular Flex, or CUDA parity regression."""
     import transformers.integrations.flex_attention as integration
 
@@ -90,7 +93,12 @@ def test_context_cuda_flex_matches_dense_scores_gradients_and_calls(monkeypatch)
     monkeypatch.setattr(integration, "compile_friendly_flex_attention", observed)
     for backend in ("dense", "flex"):
         model = copy.deepcopy(base)
-        config = replace(context_config(), sidecar_attention_backend=backend)
+        config = replace(
+            context_config(),
+            sidecar_attention_backend=backend,
+            visual_only_context_preference=suppress_boundaries,
+            visual_off_suppress_latent_boundaries=suppress_boundaries,
+        )
         trainer = _trainer(config)
         with RuntimeCounters(model) as counters:
             loss, output = trainer.compute_loss(model, batch, return_outputs=True)
@@ -101,7 +109,7 @@ def test_context_cuda_flex_matches_dense_scores_gradients_and_calls(monkeypatch)
         assert (
             before["decoder_calls_forward"]
             - before["latent_decoder_calls_forward"]
-            == 3
+            == (2 if suppress_boundaries else 3)
         )
         records.append(
             (
@@ -141,6 +149,7 @@ def test_context_cuda_flex_matches_dense_scores_gradients_and_calls(monkeypatch)
     print(
         {
             "backend_seen": "actual_cuda_flex",
+            "suppress_boundaries": suppress_boundaries,
             "actual_flex_calls": actual_flex_calls,
             "context_cuda_dense": records[0][3],
             "context_cuda_flex": records[1][3],
@@ -539,6 +548,300 @@ def test_visual_only_context_plan_emits_only_visual_off_sidecars():
         ["visual_off", "visual_off"],
         [],
     ]
+
+
+def test_suppressed_boundaries_expand_visual_cut_and_zero_boundary_query():
+    """Catches either control token retaining a content path into V-off scores."""
+    _, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    span = batch["reasoning_step_spans"][0]
+
+    plan = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=(span,),
+        visual_only=True,
+        suppress_latent_boundaries=True,
+    )
+
+    branch = plan.groups[0][0]
+    assert (branch.blocked_start, branch.blocked_end) == (
+        span.latent_start - 1,
+        span.latent_end + 1,
+    )
+    assert branch.zero_first_embedding is True
+    assert plan.groups[1] == ()
+
+
+def test_suppressed_boundary_logits_ignore_both_control_token_embeddings():
+    """Catches latent control content leaking through root K/V or boundary replay."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    model.eval()
+    altered = copy.deepcopy(model)
+    with torch.no_grad():
+        altered.model.embed_tokens.weight[91].fill_(17.0)
+        altered.model.embed_tokens.weight[92].fill_(-19.0)
+    plan = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+        visual_only=True,
+        suppress_latent_boundaries=True,
+    )
+
+    def projected(current):
+        calls = []
+        handle = current.lm_head.register_forward_hook(
+            lambda _module, _args, output: calls.append(output.detach().clone())
+        )
+        try:
+            output = current(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                use_cache=False,
+                stage2_shared_prefix_inputs={
+                    "plan": plan,
+                    "backend": "dense",
+                    "checkpoint": False,
+                },
+            )
+        finally:
+            handle.remove()
+        assert [call.shape[1] for call in calls] == [2, 7]
+        return calls[0], output.logits
+
+    baseline_sidecar, baseline_clean = projected(model)
+    altered_sidecar, altered_clean = projected(altered)
+
+    torch.testing.assert_close(altered_sidecar, baseline_sidecar, rtol=0, atol=1e-6)
+    assert torch.linalg.vector_norm(altered_clean - baseline_clean) > 1e-6
+
+
+def test_suppressed_boundary_sidecar_cuts_latent_and_control_gradients():
+    """Catches a hidden differentiable path from current latent-unit content."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    plan = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+        visual_only=True,
+        suppress_latent_boundaries=True,
+    )
+
+    output = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        use_cache=False,
+        return_stage2_latent_states=True,
+        retain_stage2_latent_grads=True,
+        stage2_shared_prefix_inputs={
+            "plan": plan,
+            "backend": "dense",
+            "checkpoint": False,
+        },
+    )
+    output.stage2_sidecar_results[0]["mean_logp"].backward()
+
+    for state in output.stage2_latent_states:
+        assert state.grad is not None
+        torch.testing.assert_close(state.grad, torch.zeros_like(state.grad))
+    embedding_grad = model.model.embed_tokens.weight.grad
+    torch.testing.assert_close(embedding_grad[91], torch.zeros_like(embedding_grad[91]))
+    torch.testing.assert_close(embedding_grad[92], torch.zeros_like(embedding_grad[92]))
+    assert torch.linalg.vector_norm(embedding_grad[11]) > 1e-8
+
+
+def test_boundary_suppression_requires_target_adjacent_to_latent_end():
+    """Catches an intervening clean row relaying latent content into V-off."""
+    _, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    ids = torch.cat((batch["input_ids"], torch.tensor([[13]])), dim=1)
+    span = replace(
+        batch["reasoning_step_spans"][0],
+        target_text_start=6,
+        target_text_end=8,
+    )
+
+    with pytest.raises(ValueError, match="immediately follow latent_end"):
+        sidecar.build_context_sidecar_plan(
+            clean_input_ids=ids,
+            attention_mask=torch.ones_like(ids),
+            spans=(span,),
+            visual_only=True,
+            suppress_latent_boundaries=True,
+        )
+
+
+def test_zero_boundary_query_rejects_noninclusive_marker_metadata():
+    """Catches zeroing an arbitrary replay row under malformed branch metadata."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    plan = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+        visual_only=True,
+        suppress_latent_boundaries=True,
+    )
+    malformed = replace(
+        plan,
+        groups=((replace(plan.groups[0][0], blocked_start=2),), ()),
+    )
+
+    with pytest.raises(ValueError, match="marker-inclusive visual branch"):
+        model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            use_cache=False,
+            stage2_shared_prefix_inputs={
+                "plan": malformed,
+                "backend": "dense",
+                "checkpoint": False,
+            },
+        )
+
+
+def test_zero_boundary_query_rejects_post_boundary_clean_ancestors():
+    """Catches clean target-prefix K/V relaying latent content into V-off."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    plan = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+        visual_only=True,
+        suppress_latent_boundaries=True,
+    )
+    malformed = replace(
+        plan,
+        groups=((replace(plan.groups[0][0], clean_ancestor_end=6),), ()),
+    )
+
+    with pytest.raises(ValueError, match="marker-inclusive visual branch"):
+        model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            use_cache=False,
+            stage2_shared_prefix_inputs={
+                "plan": malformed,
+                "backend": "dense",
+                "checkpoint": False,
+            },
+        )
+
+
+def test_zero_boundary_query_rejects_textual_sidecar_group():
+    """Catches the new V-only mode silently retaining T-off computation."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    suppressed = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+        visual_only=True,
+        suppress_latent_boundaries=True,
+    )
+    default = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+    )
+    malformed = replace(
+        suppressed,
+        groups=(suppressed.groups[0], default.groups[1]),
+    )
+
+    with pytest.raises(ValueError, match="requires an empty textual group"):
+        model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            use_cache=False,
+            stage2_shared_prefix_inputs={
+                "plan": malformed,
+                "backend": "dense",
+                "checkpoint": False,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"clean_embedding_sources": (4, 2)},
+        {"logical_positions": (4, 2)},
+        {"token_ids": (92, 77)},
+        {"selected_positions": (1, 0)},
+        {"target_token_ids": (77, 12)},
+    ),
+)
+def test_zero_boundary_query_rejects_noncanonical_replay_metadata(changes):
+    """Catches any replay metadata vector reopening latent-content paths."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    plan = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+        visual_only=True,
+        suppress_latent_boundaries=True,
+    )
+    malformed = replace(
+        plan,
+        groups=((replace(plan.groups[0][0], **changes),), ()),
+    )
+
+    with pytest.raises(ValueError, match="canonical teacher-forced replay"):
+        model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            use_cache=False,
+            stage2_shared_prefix_inputs={
+                "plan": malformed,
+                "backend": "dense",
+                "checkpoint": False,
+            },
+        )
+
+
+def test_zero_boundary_query_rejects_cross_step_marker_interval():
+    """Catches pairing one step's latent_start with another step's latent_end."""
+    model, batch = tiny_measurement_case(
+        steps=2, total_target_tokens=4, device="cpu"
+    )
+    plan = sidecar.build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+        visual_only=True,
+        suppress_latent_boundaries=True,
+    )
+    first, second = plan.groups[0]
+    malformed = replace(
+        plan,
+        groups=((first, replace(second, blocked_start=first.blocked_start)), ()),
+    )
+
+    with pytest.raises(ValueError, match="one canonical latent block"):
+        model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            use_cache=False,
+            stage2_shared_prefix_inputs={
+                "plan": malformed,
+                "backend": "dense",
+                "checkpoint": False,
+            },
+        )
 
 
 @pytest.mark.parametrize("group_count", [1, 3])

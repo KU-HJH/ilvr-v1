@@ -72,6 +72,7 @@ class StepPreferenceConfig:
     lambda_preference: float = 1.0
     preference_margin: float = 0.0
     visual_only_context_preference: bool = False
+    visual_off_suppress_latent_boundaries: bool = False
     lambda_entropy: float = 0.1
     entropy_margin: float = 0.1
     negative_path: str | None = None
@@ -103,6 +104,10 @@ class StepPreferenceConfig:
             raise ValueError("shared_prefix_enabled must be a boolean")
         if type(self.visual_only_context_preference) is not bool:
             raise ValueError("visual_only_context_preference must be a boolean")
+        if type(self.visual_off_suppress_latent_boundaries) is not bool:
+            raise ValueError(
+                "visual_off_suppress_latent_boundaries must be a boolean"
+            )
         if type(self.direct_from_stage1) is not bool:
             raise ValueError("direct_from_stage1 must be a boolean")
         if self.sidecar_attention_backend not in ("dense", "flex"):
@@ -199,6 +204,13 @@ class StepPreferenceConfig:
             raise ValueError(
                 "visual-only context preference requires context-preference Stage 2B"
             )
+        if self.visual_off_suppress_latent_boundaries and not (
+            self.is_context_preference and self.visual_only_context_preference
+        ):
+            raise ValueError(
+                "visual-off boundary suppression requires visual-only "
+                "context-preference Stage 2B"
+            )
         if self.direct_from_stage1 and not (
             self.is_context_preference and self.visual_only_context_preference
         ):
@@ -275,6 +287,9 @@ class StepPreferenceConfig:
             preference_margin=getattr(args, "step_preference_margin", 0.0),
             visual_only_context_preference=getattr(
                 args, "step_visual_only_context_preference", False
+            ),
+            visual_off_suppress_latent_boundaries=getattr(
+                args, "step_visual_off_suppress_latent_boundaries", False
             ),
             lambda_entropy=getattr(args, "step_entropy_weight", 0.1),
             entropy_margin=getattr(args, "step_entropy_margin", 0.1),

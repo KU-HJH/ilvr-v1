@@ -80,6 +80,35 @@ def test_visual_only_context_launcher_validates_and_forwards_boolean():
     assert "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE" in invalid.stderr
 
 
+def test_visual_off_boundary_suppression_launcher_validates_and_forwards_boolean():
+    """Catches the boundary mode being dropped or accepted outside V-only context."""
+    environment = {
+        "STEP_PREFERENCE_ENABLED": "true",
+        "STEP_PREFERENCE_MODE": "stage2b",
+        "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+        "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
+        "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES": "true",
+    }
+
+    tokens = dry_run_tokens(run_launcher(env_overrides=environment))
+    assert "--step_visual_off_suppress_latent_boundaries" in tokens
+
+    invalid = run_launcher(
+        env_overrides={
+            **environment,
+            "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES": "sometimes",
+        }
+    )
+    assert invalid.returncode == 2
+    assert "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES" in invalid.stderr
+
+    wrong_scope = dict(environment)
+    wrong_scope.pop("STEP_VISUAL_ONLY_CONTEXT_PREFERENCE")
+    rejected = run_launcher(env_overrides=wrong_scope)
+    assert rejected.returncode == 2
+    assert "requires visual-only context-preference Stage 2B" in rejected.stderr
+
+
 PACKED_ADMISSION_ENV = {
     "STEP_MAX_PACKED_SEQUENCE_LENGTH": "4608",
     "STEP_PACKED_ADMISSION_MANIFEST": "/results/admission.json",

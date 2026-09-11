@@ -116,6 +116,11 @@ def test_stage2_controller_retains_its_original_generate_signature():
             inspect.Parameter.KEYWORD_ONLY,
             False,
         ),
+        (
+            "disable_latent_generation",
+            inspect.Parameter.KEYWORD_ONLY,
+            False,
+        ),
     )
 
 

@@ -34,6 +34,7 @@ class SidecarBranch:
     selected_positions: tuple[int, ...]
     target_token_ids: tuple[int, ...]
     rejected_model_inputs: Mapping[str, object] | None
+    zero_first_embedding: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,7 @@ def _chosen_branch(
     clean_ids: torch.Tensor,
     span: ReasoningStepSpan,
     modality: Literal["visual", "textual"],
+    suppress_latent_boundaries: bool = False,
 ) -> SidecarBranch:
     start = span.target_text_start - 1
     if start < span.latent_end:
@@ -58,7 +60,11 @@ def _chosen_branch(
     stop = span.target_text_end - 1
     source_positions = tuple(range(start, stop))
     if modality == "visual":
-        blocked_start, blocked_end = span.latent_start, span.latent_end
+        blocked_start, blocked_end = (
+            (span.latent_start - 1, span.latent_end + 1)
+            if suppress_latent_boundaries
+            else (span.latent_start, span.latent_end)
+        )
     else:
         blocked_start, blocked_end = span.prev_text_start, span.prev_text_end
     return SidecarBranch(
@@ -77,6 +83,7 @@ def _chosen_branch(
             for position in range(span.target_text_start, span.target_text_end)
         ),
         rejected_model_inputs=None,
+        zero_first_embedding=suppress_latent_boundaries,
     )
 
 
@@ -221,19 +228,36 @@ def build_context_sidecar_plan(
     attention_mask: torch.Tensor,
     spans: Sequence[ReasoningStepSpan],
     visual_only: bool = False,
+    suppress_latent_boundaries: bool = False,
 ) -> SidecarPlan:
     """Build local visual/textual ablations for every clean target step."""
     if type(visual_only) is not bool:
         raise ValueError("visual_only must be a boolean")
+    if type(suppress_latent_boundaries) is not bool:
+        raise ValueError("suppress_latent_boundaries must be a boolean")
+    if suppress_latent_boundaries and not visual_only:
+        raise ValueError("suppress_latent_boundaries requires visual_only")
     clean_ids, root_length = _validate_clean_inputs(clean_input_ids, attention_mask)
     validated_spans = _validate_spans(spans, root_length) if spans else ()
+    if suppress_latent_boundaries and any(
+        span.target_text_start != span.latent_end + 1
+        for span in validated_spans
+    ):
+        raise ValueError(
+            "boundary-suppressed target must immediately follow latent_end"
+        )
     root_selected_positions = tuple(
         position
         for span in validated_spans
         for position in range(span.target_text_start - 1, span.target_text_end - 1)
     )
     visual_group = tuple(
-        _chosen_branch(clean_ids=clean_ids, span=span, modality="visual")
+        _chosen_branch(
+            clean_ids=clean_ids,
+            span=span,
+            modality="visual",
+            suppress_latent_boundaries=suppress_latent_boundaries,
+        )
         for span in validated_spans
     )
     textual_group = tuple(

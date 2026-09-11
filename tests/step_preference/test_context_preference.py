@@ -269,6 +269,40 @@ def test_visual_only_tiny_runtime_executes_clean_plus_v_off_with_gradients():
     )
 
 
+def test_boundary_suppression_config_reaches_runtime_causal_cut():
+    """Catches the public boundary mode being dropped before sidecar planning."""
+    model, batch = tiny_measurement_case(
+        steps=1, total_target_tokens=2, device="cpu"
+    )
+    batch["step_preference"] = {
+        "steps": tuple({"span": span} for span in batch["reasoning_step_spans"])
+    }
+    model.eval()
+    altered = copy.deepcopy(model)
+    with torch.no_grad():
+        altered.model.embed_tokens.weight[91].fill_(17.0)
+        altered.model.embed_tokens.weight[92].fill_(-19.0)
+    config = context_config(
+        visual_only_context_preference=True,
+        visual_off_suppress_latent_boundaries=True,
+        lambda_entropy=0.0,
+    )
+
+    results = []
+    for current in (model, altered):
+        _, output = _trainer(config).compute_loss(
+            current, batch, return_outputs=True
+        )
+        results.append(output.stage2_sidecar_results[0])
+
+    torch.testing.assert_close(
+        results[0]["mean_logp"], results[1]["mean_logp"], rtol=0, atol=1e-6
+    )
+    torch.testing.assert_close(
+        results[0]["entropies"], results[1]["entropies"], rtol=0, atol=1e-6
+    )
+
+
 def test_default_preflight_and_collator_need_no_negative_artifacts(inputs, monkeypatch):
     """Catches hidden negative requirements above the trainer."""
     import main

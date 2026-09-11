@@ -30,6 +30,76 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
                 for branch in group
             ):
                 raise ValueError("context preference permits only local chosen branches")
+    zero_boundary_mode = any(
+        branch.zero_first_embedding
+        for group in plan.groups
+        for branch in group
+    )
+    if zero_boundary_mode and plan.groups[1]:
+        raise ValueError("zero boundary mode requires an empty textual group")
+    if zero_boundary_mode and any(
+        not branch.zero_first_embedding for branch in plan.groups[0]
+    ):
+        raise ValueError(
+            "zero boundary mode requires consistently suppressed visual branches"
+        )
+    for group in plan.groups:
+        for branch in group:
+            if type(branch.zero_first_embedding) is not bool:
+                raise ValueError("zero_first_embedding must be a boolean")
+            if not branch.zero_first_embedding:
+                continue
+            marker_start = branch.blocked_start
+            marker_end = branch.blocked_end - 1
+            valid_boundary_branch = (
+                plan.context_preference
+                and branch.kind == "visual_off"
+                and 0 <= marker_start < marker_end < plan.root_length
+                and branch.clean_ancestor_end == marker_end
+                and int(input_ids[0, marker_start])
+                == model.config.latent_start_token_id
+                and int(input_ids[0, marker_end])
+                == model.config.latent_end_token_id
+            )
+            if not valid_boundary_branch:
+                raise ValueError(
+                    "zero boundary query requires a marker-inclusive visual branch"
+                )
+            canonical_latent_block = (
+                type(model.config.latent_size) is int
+                and model.config.latent_size > 0
+                and marker_end - marker_start == model.config.latent_size + 1
+                and bool(
+                    (
+                        input_ids[0, marker_start + 1 : marker_end]
+                        == model.config.latent_pad_token_id
+                    ).all()
+                )
+            )
+            if not canonical_latent_block:
+                raise ValueError(
+                    "zero boundary query requires one canonical latent block"
+                )
+            row_count = len(branch.token_ids)
+            replay_positions = tuple(range(marker_end, marker_end + row_count))
+            target_positions = tuple(
+                range(marker_end + 1, marker_end + row_count + 1)
+            )
+            canonical_replay = (
+                row_count > 0
+                and target_positions[-1] < plan.root_length
+                and branch.clean_embedding_sources == replay_positions
+                and branch.logical_positions == replay_positions
+                and branch.selected_positions == tuple(range(row_count))
+                and branch.token_ids
+                == tuple(int(input_ids[0, position]) for position in replay_positions)
+                and branch.target_token_ids
+                == tuple(int(input_ids[0, position]) for position in target_positions)
+            )
+            if not canonical_replay:
+                raise ValueError(
+                    "zero boundary query requires canonical teacher-forced replay"
+                )
     if options.get("backend", "dense") not in ("dense", "flex"):
         raise ValueError("shared-prefix backend must be dense or flex")
     if options.get("backend") == "flex" and model.training and model.config.attention_dropout:
@@ -56,7 +126,11 @@ def _branch_inputs(model, branch, input_ids, clean_embeds, clean_positions):
     logical = torch.tensor(branch.logical_positions, dtype=torch.long, device=device)
     if branch.rejected_model_inputs is None:
         sources = torch.tensor(branch.clean_embedding_sources, dtype=torch.long, device=device)
-        return clean_embeds.index_select(1, sources), clean_positions.index_select(2, logical)
+        embeds = clean_embeds.index_select(1, sources)
+        if branch.zero_first_embedding:
+            embeds = embeds.clone()
+            embeds[:, 0] = 0
+        return embeds, clean_positions.index_select(2, logical)
 
     rejected = branch.rejected_model_inputs
     rejected_ids = rejected["input_ids"].to(device)

@@ -176,6 +176,23 @@ decoder calls and backward checkpoint recomputation are counted and reported
 separately. The default context route performs zero reference forwards,
 negative generations, rejected-branch scorings, or preference rollouts.
 
+To train the V-only variant while also suppressing the current latent control
+boundaries, add both settings to the Stage 2B launch:
+
+```bash
+STEP_VISUAL_ONLY_CONTEXT_PREFERENCE=true \
+STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES=true \
+bash run_stage2_training.sh
+```
+
+The second setting is valid only with V-only context preference. Its V-off
+sidecar blocks root attention to `<|latent_start|>`, every current latent
+state, and `<|latent_end|>`, and replaces the replayed `<|latent_end|>` query
+embedding with a fixed zero vector. Clean scoring, including ordinary latent
+boundary supervision, remains unchanged. This is a content intervention that
+preserves the original mRoPE positions and latent-block geometry; it is not
+equivalent to deleting the latent block from the sequence.
+
 Each target block score is its mean target-token log probability. Preference
 and entropy losses are reduced within each step first, then all V/T steps have
 equal weight, so longer text steps do not receive more weight. Every valid
