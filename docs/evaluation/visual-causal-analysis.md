@@ -359,3 +359,42 @@ aggregate accuracy alone: verify identical paired counts, review exclusions and 
 transitions, report the paired interval, and keep normalized-answer change separate from
 raw-token change. Activation patching remains deferred. It needs a later design with
 alignment, identity-patch controls, and a separately validated causal target.
+
+## Observed campaign artifacts (2026-09-11)
+
+The three-checkpoint campaign evaluated the fixed 100 original TEST indices. Each
+main-panel condition has 100 successful rows, of which 99 have valid gold labels. The original
+index 57 remains in coverage and is excluded from paired valid-gold statistics.
+These are observed subset results, not full-400 or paper-protocol reproduction.
+
+| Evidence | Local artifact directory |
+| --- | --- |
+| Native original evaluation and exact new-runner no-op comparisons | `results/visual-causal-native-reproduction-20260910/` and each model's `native-original-noop/` under the original panel |
+| SDPA E0, E1, E2 and matched E5 | `results/visual-causal-panel-20260910t115000z/{s1,ce,pref}/` |
+| Actual delivered masks, positions, fresh-state and CUDA operator witness | `results/visual-causal-mask-control-witness-20260910-r1/` |
+| neutral4D, E3, E4 and paired comparisons | `results/visual-causal-mask-control-20260910-r1/{s1,ce,pref}/` |
+| Four independent sample shards per E3/E4 condition | `results/visual-causal-multigpu-20260911-r1/` |
+| Cross-model report, aggregate tables and delivery evidence | `results/visual-causal-final-report-20260911/` |
+
+E1/E2/E5 retain the existing SDPA2D control. E3/E4 compare only with
+`causal_mask_control` (neutral4D). SDPA2D versus neutral4D is a separate representation
+bridge; it is not an equivalence gate and its delta is not subtracted from another
+delta. All three short max64 witnesses observed efficient SDPA for neutral/E3/E4 and
+flash SDPA for baseline2D. Full-panel calls were not individually profiled: incoming
+policy records and decoder class names alone do not authenticate concrete dispatch.
+
+The user authorized acceleration across two nodes and four GPUs. Existing neutral100
+runs were preserved; E3/E4 used four disjoint 25-row shards, batch one per worker.
+The simple merger checks original source IDs, metadata and file hashes. It does not
+renumber samples, pool controls, or claim a measured distributed makespan. Generation
+time per row excludes loading and preprocessing; reused E5 rows have no newly
+measured replacement-generation duration.
+
+Exact executed commands are retained in `logs/visual-causal-panel-20260910t115000z/`
+and `logs/visual-causal-mask-control-20260910-r1/` model queues, and in
+`logs/visual-causal-multigpu-20260911-r1/rank0.sh` through `rank3.sh`. The witness command
+is retained in `logs/visual-causal-mask-control-witness-20260910-r1/launch.sh`. These
+are historical execution records with existing output paths; use a new explicit run
+ID for any later rerun. Final review and test outcomes are recorded separately in
+`results/visual-causal-final-report-20260911/delivery.md`; a populated result directory
+alone does not assert that those completion gates passed.
