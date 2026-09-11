@@ -263,6 +263,85 @@ def test_masked_modes_reject_every_incompatible_decoder_layer(tmp_path):
     assert "requires Qwen2_5_VLSdpaAttention at every decoder layer" in result["metadata"]["error"]
 
 
+def test_neutral_control_runner_keeps_images_and_fresh_policies(tmp_path):
+    """Catches neutral runs dropping visual inputs or sharing intervention state."""
+    seen = []
+
+    def generate(**context):
+        policy = context["intervention"]
+        assert policy.mode == "causal_mask_control"
+        assert {"pixel_values", "image_grid_thw"} <= set(context["inputs"])
+        assert context["allow_latent_generation"] is True
+        seen.append(policy)
+        return _successful_generator(**context)
+
+    rows = [
+        {
+            "text_input": "question A",
+            "image_input": ["images_comt/deletion/a.png"],
+            "original_final_answer": "10",
+        },
+        {
+            "text_input": "question B",
+            "image_input": ["images_comt/deletion/b.png"],
+            "original_final_answer": "10",
+        },
+    ]
+
+    result, _, _ = _run(
+        tmp_path,
+        rows,
+        visual_ablation_mode="causal_mask_control",
+        generation_runner=generate,
+    )
+
+    assert result["metadata"]["status"] == "completed"
+    assert len(seen) == 2 and seen[0] is not seen[1]
+    assert {row["condition"] for row in result["rows"]} == {
+        "causal_mask_control"
+    }
+
+
+@pytest.mark.parametrize(
+    ("backend", "attention"),
+    [
+        ("native", "Qwen2_5_VLSdpaAttention"),
+        ("sdpa", "Qwen2_5_VLFlashAttention2"),
+    ],
+)
+def test_neutral_control_rejects_incompatible_backend(backend, attention):
+    """Catches the neutral 4-D mask running through an incompatible decoder path."""
+    with pytest.raises(ValueError, match="requires"):
+        runner._require_mask_compatible(
+            {"decoder_attention_classes": [attention]},
+            "causal_mask_control",
+            backend,
+        )
+
+
+def test_cli_accepts_neutral_control():
+    """Catches the implemented neutral mode being unreachable from the run CLI."""
+    args = runner.build_parser().parse_args(
+        [
+            "run",
+            "--model-dir",
+            "checkpoints/fake",
+            "--test-data-path",
+            "data/TEST.jsonl",
+            "--source-data-path",
+            "data/TEST.jsonl",
+            "--output-dir",
+            "results/fake",
+            "--visual-ablation-mode",
+            "causal_mask_control",
+            "--attention-backend",
+            "sdpa",
+        ]
+    )
+
+    assert args.visual_ablation_mode == "causal_mask_control"
+
+
 def test_replacement_keeps_recipient_text_and_scores_only_valid_matched_donor_gold(tmp_path):
     """Catches image replacement swapping the question or accepting an unmatched donor."""
     rows = [

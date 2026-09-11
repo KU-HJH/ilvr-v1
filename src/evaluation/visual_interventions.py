@@ -12,6 +12,7 @@ _MODE_ALIASES = {
     "image_replacement": "noop",
     "no_input_image": "noop",
     "no_latent_execution": "suppress_start",
+    "causal_mask_control": "causal_mask",
     "latent_image_attention_block": "latent_mask",
     "global_image_attention_block": "global_mask",
 }
@@ -158,7 +159,7 @@ class VisualIntervention:
                     ),
                 }
             )
-            if self._effect in {"latent_mask", "global_mask"}:
+            if self._effect in {"causal_mask", "latent_mask", "global_mask"}:
                 kwargs["attention_mask"] = build_image_attention_mask(
                     attention_mask,
                     self._image_positions,

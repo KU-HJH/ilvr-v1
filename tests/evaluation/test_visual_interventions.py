@@ -50,6 +50,11 @@ def test_mask_modes_match_independently_enumerated_allowed_edges():
     ) == causal
     assert _allowed(
         build_image_attention_mask(
+            validity, (1, 2), (4, 5, 6), "causal_mask_control", torch.float32
+        )
+    ) == causal
+    assert _allowed(
+        build_image_attention_mask(
             validity,
             (1, 2),
             (4, 5, 6),
@@ -68,7 +73,8 @@ def test_mask_modes_match_independently_enumerated_allowed_edges():
     ) == e4
 
 
-def test_mask_preserves_padding_and_sliding_window_constraints():
+@pytest.mark.parametrize("mode", ["baseline", "causal_mask_control"])
+def test_mask_preserves_padding_and_sliding_window_constraints(mode):
     """Catches an intervention mask that restores padded or expired causal keys."""
     validity = torch.tensor([[1, 1, 0, 1, 1]], dtype=torch.long)
     expected = [
@@ -83,7 +89,7 @@ def test_mask_preserves_padding_and_sliding_window_constraints():
         validity,
         image_positions=(1,),
         latent_query_positions=(3,),
-        mode="baseline",
+        mode=mode,
         dtype=torch.float32,
         sliding_window=2,
     )
@@ -116,6 +122,27 @@ def _decoder_kwargs(length, *, token=0):
         "use_cache": False,
         "return_dict": True,
     }
+
+
+def test_causal_mask_control_retains_image_edges_and_logits():
+    """Catches the neutral control removing an image edge or changing free logits."""
+    decoder = _CaptureDecoder()
+    policy = VisualIntervention("causal_mask_control", image_token_id=80)
+    policy.begin(torch.tensor([[7, 80, 8]]), TOKENS)
+    policy.register_latent_span(
+        SimpleNamespace(start_position=2, latent_positions=(3,), end_position=4)
+    )
+    kwargs = _decoder_kwargs(5)
+
+    policy.wrap_decoder(decoder)(**kwargs)
+
+    expected = [[key <= query for key in range(5)] for query in range(5)]
+    assert _allowed(decoder.calls[0]["attention_mask"]) == expected
+    assert decoder.calls[0]["position_ids"] is kwargs["position_ids"]
+    logits = torch.zeros(1, 128)
+    assert policy.process_logits(
+        torch.tensor([[7, 80, 8]]), logits, logits, TOKENS
+    ) is logits
 
 
 def test_wrapper_masks_registered_start_and_pad_producers_on_every_replay():
@@ -219,16 +246,79 @@ def test_e2_changes_only_start_and_controller_still_forces_complete_template():
     assert baseline.events[0]["changed"] is False
 
 
-def test_controller_routes_normal_rollout_post_end_and_next_text_through_one_policy():
-    """Catches any controller decoder route bypassing E3, mRoPE, or no-cache policy."""
+@pytest.mark.parametrize(
+    ("mode", "expected_allowed"),
+    [
+        (
+            "latent_image_attention_block",
+            [
+                [[True, False], [True, True]],
+                [[True, False, False], [True, True, False], [False, True, True]],
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [False, True, True, False],
+                    [False, True, True, True],
+                ],
+                [
+                    [True, False, False, False, False, False],
+                    [True, True, False, False, False, False],
+                    [False, True, True, False, False, False],
+                    [False, True, True, True, False, False],
+                    [False, True, True, True, True, False],
+                    [True, True, True, True, True, True],
+                ],
+                [
+                    [True, False, False, False, False, False],
+                    [True, True, False, False, False, False],
+                    [False, True, True, False, False, False],
+                    [False, True, True, True, False, False],
+                    [False, True, True, True, True, False],
+                    [True, True, True, True, True, True],
+                ],
+            ],
+        ),
+        (
+            "causal_mask_control",
+            [
+                [[True, False], [True, True]],
+                [[True, False, False], [True, True, False], [True, True, True]],
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [True, True, True, False],
+                    [True, True, True, True],
+                ],
+                [
+                    [True, False, False, False, False, False],
+                    [True, True, False, False, False, False],
+                    [True, True, True, False, False, False],
+                    [True, True, True, True, False, False],
+                    [True, True, True, True, True, False],
+                    [True, True, True, True, True, True],
+                ],
+                [
+                    [True, False, False, False, False, False],
+                    [True, True, False, False, False, False],
+                    [True, True, True, False, False, False],
+                    [True, True, True, True, False, False],
+                    [True, True, True, True, True, False],
+                    [True, True, True, True, True, True],
+                ],
+            ],
+        ),
+    ],
+)
+def test_controller_routes_normal_rollout_post_end_and_next_text_through_one_policy(
+    mode, expected_allowed
+):
+    """Catches controller routes bypassing the selected mask, mRoPE, or no-cache policy."""
     model = scripted_model(
         latent_size=2,
         emitted_ids=[TOKENS.start_token_id, 11, 3],
     )
     input_ids = torch.tensor([[80, 7]])
-    intervention = VisualIntervention(
-        "latent_image_attention_block", image_token_id=80
-    )
+    intervention = VisualIntervention(mode, image_token_id=80)
     decoder_calls = []
 
     def capture_decoder_call(_module, _args, kwargs):
@@ -259,32 +349,6 @@ def test_controller_routes_normal_rollout_post_end_and_next_text_through_one_pol
     finally:
         handle.remove()
 
-    expected_allowed = [
-        [[True, False], [True, True]],
-        [[True, False, False], [True, True, False], [False, True, True]],
-        [
-            [True, False, False, False],
-            [True, True, False, False],
-            [False, True, True, False],
-            [False, True, True, True],
-        ],
-        [
-            [True, False, False, False, False, False],
-            [True, True, False, False, False, False],
-            [False, True, True, False, False, False],
-            [False, True, True, True, False, False],
-            [False, True, True, True, True, False],
-            [True, True, True, True, True, True],
-        ],
-        [
-            [True, False, False, False, False, False],
-            [True, True, False, False, False, False],
-            [False, True, True, False, False, False],
-            [False, True, True, True, False, False],
-            [False, True, True, True, True, False],
-            [True, True, True, True, True, True],
-        ],
-    ]
     assert result.generated_suffix_ids == (91, 90, 90, 92, 3)
     assert len(result.post_end_logits_by_block) == 1
     assert len(decoder_calls) == len(expected_allowed)

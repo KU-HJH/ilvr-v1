@@ -26,11 +26,13 @@ VISUAL_ABLATION_MODES = (
     "baseline",
     "no_input_image",
     "no_latent_execution",
+    "causal_mask_control",
     "latent_image_attention_block",
     "global_image_attention_block",
     "image_replacement",
 )
 MASKED_MODES = {
+    "causal_mask_control",
     "latent_image_attention_block",
     "global_image_attention_block",
 }

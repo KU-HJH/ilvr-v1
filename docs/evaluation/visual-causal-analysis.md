@@ -129,12 +129,79 @@ every available row. Successful rows with an invalid gold remain part of the raw
 comparison. Inference errors or missing raw/prompt/scoring evidence are reported under
 `equivalence.unavailable_evidence` and make `equivalence.exact` false.
 
-## E1 through E4
+## Neutral mask control and amended E3/E4 comparisons
 
-Use the SDPA bridge for the intervention panel and change only the mode and output path:
+The `causal_mask_control` condition keeps the original images and free continuous-latent
+generation. It supplies a complete additive 4-D causal/padding/sliding-window mask on
+every decoder call without removing any otherwise-visible image edge or changing logits.
+It is a mask-representation control, not an image ablation or a token-equivalent
+replacement for the official baseline.
+
+Use these paired controls when reporting the panel:
+
+| Condition/report | Paired comparison control |
+| --- | --- |
+| E1 `no_input_image` | Existing SDPA E0 with its ordinary 2-D validity mask |
+| E2 `no_latent_execution` | Existing SDPA E0 with its ordinary 2-D validity mask |
+| E5 matched images | Existing SDPA originals and verified donor-equivalent inputs |
+| Mask-representation bridge | Existing SDPA E0 versus `causal_mask_control` |
+| E3 `latent_image_attention_block` | `causal_mask_control` from the same checkpoint |
+| E4 `global_image_attention_block` | `causal_mask_control` from the same checkpoint |
+
+For each of the three approved checkpoints, set `MODEL_TAG` to `s1`, `ce`, or `pref`,
+set `MODEL_DIR` to its matching prepared checkpoint listed above, and run the neutral,
+E3, and E4 conditions on the fixed main100 panel. The example below shows `ce`:
 
 ```bash
-for MODE in no_input_image no_latent_execution latent_image_attention_block global_image_attention_block; do
+RUN_ID=visual-causal-mask-control-20260911
+MODEL_TAG=ce
+MODEL_DIR=checkpoints/evaluation-staging/ours1-stage2a-s1matched-egb16-lr5e5-dora-z2-20260908t022000z-r3/prepared-checkpoint-212
+E0_JSONL=results/visual-causal-panel-20260910t115000z/ce/e0-main.jsonl
+
+for MODE in causal_mask_control latent_image_attention_block global_image_attention_block; do
+  PYTHONDONTWRITEBYTECODE=1 python -B scripts/analyze_comt_visual.py run \
+    --model-dir "$MODEL_DIR" \
+    --base-model-dir /root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct \
+    --test-data-path data/TEST.jsonl --source-data-path data/TEST.jsonl \
+    --indices "$MAIN_INDICES" \
+    --output-dir "results/${RUN_ID}/${MODEL_TAG}/${MODE}" \
+    --visual-ablation-mode "$MODE" --attention-backend sdpa \
+    --max-new-tokens 4096 --max-sequence-length 32768 \
+    --repetition-penalty 1.05 --temperature 0 --top-p 1
+done
+```
+
+Measure the representation bridge separately, then compare E3 and E4 only with the
+neutral control from the same checkpoint:
+
+```bash
+NEUTRAL_JSONL="results/${RUN_ID}/${MODEL_TAG}/causal_mask_control/predictions.jsonl"
+
+PYTHONDONTWRITEBYTECODE=1 python -B scripts/analyze_comt_visual.py compare \
+  --baseline-jsonl "$E0_JSONL" --condition-jsonl "$NEUTRAL_JSONL" \
+  --output-dir "results/${RUN_ID}/${MODEL_TAG}/bridge-e0-vs-neutral"
+
+for MODE in latent_image_attention_block global_image_attention_block; do
+  PYTHONDONTWRITEBYTECODE=1 python -B scripts/analyze_comt_visual.py compare \
+    --baseline-jsonl "$NEUTRAL_JSONL" \
+    --condition-jsonl "results/${RUN_ID}/${MODEL_TAG}/${MODE}/predictions.jsonl" \
+    --output-dir "results/${RUN_ID}/${MODEL_TAG}/${MODE}-vs-neutral"
+done
+```
+
+The E0-versus-neutral comparison measures a numerical representation/path effect.
+Baseline2D-versus-neutral equality is not a gate, and its aggregate delta must not be
+subtracted from E3/E4. The `intervention_forward_records.attention_mask_shape` field is
+the incoming 2-D validity-mask shape; it is not evidence of the 4-D mask actually
+delivered to the decoder. Use the approved decoder pre-hook witness for delivered masks,
+positions, cache state, and concrete SDPA dispatch before launching these full panels.
+
+## E1 and E2
+
+Use the SDPA bridge for E1/E2 and change only the mode and output path:
+
+```bash
+for MODE in no_input_image no_latent_execution; do
   PYTHONDONTWRITEBYTECODE=1 python -B scripts/analyze_comt_visual.py run \
     --model-dir checkpoints/evaluation-staging/ours1-stage2a-s1matched-egb16-lr5e5-dora-z2-20260908t022000z-r3/prepared-checkpoint-212 \
     --base-model-dir /root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct \
@@ -166,8 +233,8 @@ evidence about direct latent-to-image edges rather than complete image independe
 
 E4 blocks original image keys for every non-image decoder query from the first forward
 call. The image tokens, pixels, grids, token count, and mRoPE geometry remain present;
-therefore E4 removes direct content access while retaining image-layout geometry. Both
-masked modes require every instantiated decoder layer to be
+therefore E4 removes direct content access while retaining image-layout geometry. E3/E4
+and the neutral 4-D control require every instantiated decoder layer to be
 `Qwen2_5_VLSdpaAttention`; the runner fails rather than falling back.
 
 `intervention_forward_records` records the 2-D validity-mask shape received at the
