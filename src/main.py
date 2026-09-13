@@ -813,6 +813,7 @@ def build_stage2_training_components(
         decision.latent_size,
         decision.supervise_latent_boundaries,
         step_preference_enabled=step_preference_config.is_stage2b,
+        preference_target_scope=step_preference_config.target_scope,
         negative_store=negative_store,
         packed_admission_records_by_sample_id=(
             stage2b_preflight.packed_admission_records_by_sample_id

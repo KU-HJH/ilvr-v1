@@ -13,6 +13,12 @@ ASSISTANT_PLAN_RENDERING_CONCATENATED = "concatenated-v1"
 ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF = "adjacent-text-space-lf-v1"
 
 
+def normalize_preference_target_scope(value: str) -> str:
+    if value not in ("immediate_text", "until_next_latent"):
+        raise ValueError("preference target scope must be immediate_text or until_next_latent")
+    return value
+
+
 def normalize_assistant_plan_rendering(value: str) -> str:
     if value not in {
         ASSISTANT_PLAN_RENDERING_CONCATENATED,
@@ -126,8 +132,10 @@ def map_reasoning_step_spans(
     offset_mapping,
     input_ids,
     latent_pad_token_id: int,
+    preference_target_scope: str = "immediate_text",
 ) -> tuple[ReasoningStepSpan, ...]:
     """Map assistant character plans onto half-open full-sequence token spans."""
+    preference_target_scope = normalize_preference_target_scope(preference_target_scope)
     offsets = (
         offset_mapping.tolist() if hasattr(offset_mapping, "tolist") else offset_mapping
     )
@@ -198,9 +206,17 @@ def map_reasoning_step_spans(
             assistant_start + step.latent.start + len(LATENT_START_TOKEN),
             assistant_start + step.latent.end - len(LATENT_END_TOKEN),
         )
+        target_char_end = step.target_text.end
+        if preference_target_scope == "until_next_latent":
+            # Preserve rendering and previous-text ablation; extend only the target.
+            target_char_end = next(
+                (span.start for span in plan_char_spans
+                 if span.step_type == "latent" and span.start >= step.latent.end),
+                len(assistant_text),
+            )
         target_start, target_end = token_interval(
             assistant_start + step.target_text.start,
-            assistant_start + step.target_text.end,
+            assistant_start + target_char_end,
         )
         if any(
             token_id != latent_pad_token_id

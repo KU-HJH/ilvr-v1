@@ -8,6 +8,8 @@ from numbers import Real
 import re
 from typing import Literal
 
+from step_preference.spans import normalize_preference_target_scope
+
 
 StepPreferenceMode = Literal["stage2a", "stage2b"]
 StepPreferenceObjective = Literal["context_preference", "legacy_dpo"]
@@ -66,6 +68,7 @@ class StepPreferenceConfig:
     enabled: bool = False
     mode: StepPreferenceMode = "stage2a"
     objective: StepPreferenceObjective = "context_preference"
+    target_scope: str = "immediate_text"
     beta: float = 0.1
     lambda_ce: float = 1.0
     lambda_dpo: float = 1.0
@@ -96,6 +99,9 @@ class StepPreferenceConfig:
     packed_admission_verification_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        normalize_preference_target_scope(self.target_scope)
+        if self.target_scope != "immediate_text" and not self.is_context_preference:
+            raise ValueError("full preference target scope requires context-preference Stage 2B")
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled must be a boolean")
         if not isinstance(self.packing_enabled, bool):
@@ -280,6 +286,7 @@ class StepPreferenceConfig:
             enabled=getattr(args, "step_preference_enabled", False),
             mode=getattr(args, "step_preference_mode", "stage2a"),
             objective=getattr(args, "step_preference_objective", "context_preference"),
+            target_scope=getattr(args, "step_preference_target_scope", "immediate_text"),
             beta=getattr(args, "step_dpo_beta", 0.1),
             lambda_ce=getattr(args, "ce_weight", 1.0),
             lambda_dpo=getattr(args, "step_dpo_weight", 1.0),

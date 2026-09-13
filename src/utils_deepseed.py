@@ -60,6 +60,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.1,
     )
     parser.add_argument("--step_preference_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--step_preference_target_scope",
+        choices=("immediate_text", "until_next_latent"), default="immediate_text",
+        help="Preference target: next text entry (default), or all text until the next latent block.",
+    )
     parser.add_argument("--step_preference_margin", type=float, default=0.0)
     parser.add_argument("--step_visual_only_context_preference", action="store_true")
     parser.add_argument(

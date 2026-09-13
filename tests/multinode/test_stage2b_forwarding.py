@@ -89,7 +89,8 @@ def test_stage2b_variants_reach_both_worker_training_commands(dpo, entropy):
         assert "--step_shared_prefix_enabled" in argv
 
 
-def test_context_preference_settings_reach_both_owned_worker_commands():
+@pytest.mark.parametrize("target_scope", ["immediate_text", "until_next_latent"])
+def test_context_preference_settings_reach_both_owned_worker_commands(target_scope):
     """Dropping context objective settings must fail at the real worker boundary."""
     plan = multinode.build_launch_plan(
         stage="stage2", tuning_method="dora", zero_stage=2,
@@ -102,6 +103,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
         {
             "STEP_PREFERENCE_OBJECTIVE": "context_preference",
             "STEP_PREFERENCE_BETA": "0.37",
+            "STEP_PREFERENCE_TARGET_SCOPE": target_scope,
             "STEP_PREFERENCE_WEIGHT": "1.7",
             "STEP_PREFERENCE_MARGIN": "-0.25",
             "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
@@ -124,6 +126,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
             for name in (
                 "STEP_PREFERENCE_OBJECTIVE",
                 "STEP_PREFERENCE_BETA",
+                "STEP_PREFERENCE_TARGET_SCOPE",
                 "STEP_PREFERENCE_WEIGHT",
                 "STEP_PREFERENCE_MARGIN",
                 "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE",
@@ -132,6 +135,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
         } == {
             "STEP_PREFERENCE_OBJECTIVE": "context_preference",
             "STEP_PREFERENCE_BETA": "0.37",
+            "STEP_PREFERENCE_TARGET_SCOPE": target_scope,
             "STEP_PREFERENCE_WEIGHT": "1.7",
             "STEP_PREFERENCE_MARGIN": "-0.25",
             "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
@@ -147,6 +151,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands():
         for option, value in {
             "--step_preference_objective": "context_preference",
             "--step_preference_beta": "0.37",
+            "--step_preference_target_scope": target_scope,
             "--step_preference_weight": "1.7",
             "--step_preference_margin": "-0.25",
         }.items():

@@ -23,6 +23,7 @@ from step_preference.spans import (
     canonical_sample_id,
     expand_qwen_image_placeholders,
     map_reasoning_step_spans,
+    normalize_preference_target_scope,
 )
 from step_preference.negatives import StepNegative, tokenize_step_completion
 
@@ -273,7 +274,13 @@ class Stage2DataCollator:
         negative_store=None,
         packed_admission_records_by_sample_id=None,
         max_packed_sequence_length=4608,
+        preference_target_scope="immediate_text",
     ):
+        self.preference_target_scope = normalize_preference_target_scope(preference_target_scope)
+        if self.preference_target_scope != "immediate_text" and (
+            not step_preference_enabled or negative_store is not None
+        ):
+            raise ValueError("full target scope requires context-preference without negative artifacts")
         self.processor = processor
         self.token_ids = token_ids
         self.latent_size = latent_size
@@ -365,6 +372,7 @@ class Stage2DataCollator:
                 offset_mapping=offset_mapping,
                 input_ids=batch["input_ids"],
                 latent_pad_token_id=self.token_ids.pad_token_id,
+                preference_target_scope=self.preference_target_scope,
             )
             batch["sample_ids"] = (example.sample_id,)
             batch["reasoning_step_spans"] = reasoning_step_spans

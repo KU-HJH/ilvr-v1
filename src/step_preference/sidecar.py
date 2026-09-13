@@ -238,7 +238,9 @@ def build_context_sidecar_plan(
     if suppress_latent_boundaries and not visual_only:
         raise ValueError("suppress_latent_boundaries requires visual_only")
     clean_ids, root_length = _validate_clean_inputs(clean_input_ids, attention_mask)
-    validated_spans = _validate_spans(spans, root_length) if spans else ()
+    # A full-text target may contain several entries; the next previous-text
+    # ablation still covers only the last entry, an exact suffix of that target.
+    validated_spans = _validate_spans(spans, root_length, allow_target_suffix=True) if spans else ()
     if suppress_latent_boundaries and any(
         span.target_text_start != span.latent_end + 1
         for span in validated_spans

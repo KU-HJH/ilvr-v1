@@ -76,6 +76,11 @@ PER_DEVICE_TRAIN_BATCH_SIZE=1
 
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
 STEP_PREFERENCE_OBJECTIVE=${STEP_PREFERENCE_OBJECTIVE:-context_preference}
+STEP_PREFERENCE_TARGET_SCOPE=${STEP_PREFERENCE_TARGET_SCOPE:-immediate_text}
+case "$STEP_PREFERENCE_TARGET_SCOPE" in
+  immediate_text|until_next_latent) ;;
+  *) printf 'Unknown STEP_PREFERENCE_TARGET_SCOPE\n' >&2; exit 2 ;;
+esac
 case "${STEP_VISUAL_ONLY_CONTEXT_PREFERENCE-}" in
   ""|0|false|False) step_visual_only_context_preference=false ;;
   1|true|True) step_visual_only_context_preference=true ;;
@@ -222,6 +227,7 @@ case "$STEP_PREFERENCE_ENABLED" in
       STEP_PREFERENCE_ARGS+=(
         --step_preference_beta "$STEP_PREFERENCE_BETA"
         --step_preference_weight "$STEP_PREFERENCE_WEIGHT"
+        --step_preference_target_scope "$STEP_PREFERENCE_TARGET_SCOPE"
         --step_preference_margin "$STEP_PREFERENCE_MARGIN"
         --step_sidecar_attention_backend "$STEP_SIDECAR_ATTENTION_BACKEND"
         --step_sidecar_query_budget "$STEP_SIDECAR_QUERY_BUDGET"
@@ -321,6 +327,12 @@ esac
 if [[ "$stage2b_direct_from_stage1" == true ]] &&
    [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b ]]; then
   printf 'STAGE2B_DIRECT_FROM_STAGE1 requires Stage 2B\n' >&2
+  exit 2
+fi
+
+if [[ "$STEP_PREFERENCE_TARGET_SCOPE" != immediate_text ]] &&
+   [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b || "$STEP_PREFERENCE_OBJECTIVE" != context_preference ]]; then
+  printf 'STEP_PREFERENCE_TARGET_SCOPE requires context-preference Stage 2B\n' >&2
   exit 2
 fi
 
@@ -425,6 +437,7 @@ MANAGED_OPTIONS=(
   --step_preference_objective
   --step_preference_beta
   --step_preference_weight
+  --step_preference_target_scope
   --step_preference_margin
   --step_visual_only_context_preference
   --step_visual_off_suppress_latent_boundaries

@@ -98,7 +98,7 @@ def _validate_clean_inputs(
 
 
 def _validate_spans(
-    spans: Sequence[ReasoningStepSpan], root_length: int
+    spans: Sequence[ReasoningStepSpan], root_length: int, *, allow_target_suffix: bool = False
 ) -> tuple[ReasoningStepSpan, ...]:
     if not spans:
         raise ValueError("packing requires at least one reasoning step")
@@ -128,7 +128,12 @@ def _validate_spans(
                 and span.prev_text_end == previous_target_end
             )
             follows_previous_target = span.prev_text_start >= previous_target_end
-            if not (shares_previous_target or follows_previous_target):
+            is_target_suffix = (
+                allow_target_suffix
+                and previous_target_start <= span.prev_text_start
+                and span.prev_text_end == previous_target_end
+            )
+            if not (shares_previous_target or follows_previous_target or is_target_suffix):
                 raise ValueError("reasoning spans must follow the clean trajectory")
         previous_target_start = span.target_text_start
         previous_target_end = span.target_text_end
