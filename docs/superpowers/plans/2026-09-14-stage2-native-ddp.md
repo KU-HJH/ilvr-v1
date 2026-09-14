@@ -59,7 +59,7 @@ write mutation2failed. No remote/GPU/training verification was run.
 - Forward existing objective options through the allowlist: enable/no-enable boolean and lambda_dyn/lambda_vis/reference_model_path/gamma_H/m_V/entropy_eps/pre_window/post_window values. Freeze resolved config into the Stage2 plan so evidence checking does not reread mutable environment later.
 - Environment guard scope is `ACCELERATE_USE_DEEPSPEED`, `ACCELERATE_USE_FSDP`, `ACCELERATE_USE_MEGATRON_LM`, and `ACCELERATE_USE_CPU`: reject truthy values using installed Accelerate str_to_bool spellings (case-insensitive y/yes/t/true/on/1; false n/no/f/false/off/0; unset=false; malformed including explicit empty raises). Reject `ACCELERATE_DYNAMO_BACKEND` other than unset or case-insensitive `no`; do not reject harmless subordinate DS option names when the plugin is disabled. DDP coordinator also rejects forwarded `--use_cpu`, preserving mandated GPU topology; separate CPU subprocess unit tests do not use that coordinator path.
 
-- [ ] Write real coordinator dry-run and worker-shell RED tests. Name failure mutations: wrong launcher backend, missing topology, inherited DS mode, dropped objective args, invalid active aux/ZeRO launch. Use controlled shell inputs and assert parsed argv/exit/no files, not source text.
+- [x] Write real coordinator dry-run and worker-shell RED tests. Name failure mutations: wrong launcher backend, missing topology, inherited DS mode, dropped objective args, invalid active aux/ZeRO launch. Use controlled shell inputs and assert parsed argv/exit/no files, not source text.
 
 ```python
 plan = build_launch_plan(stage='stage2', tuning_method='dora', backend='ddp',
@@ -77,8 +77,8 @@ assert '--deepspeed_config_file' not in argv
 assert argv[argv.index('--num_processes') + 1] == '4'
 ```
 
-- [ ] Run RED `pytest -q tests/multinode/test_native_ddp_launch.py` with the repo environment above; capture actual missing-feature failures. Add separate causal RED before each environment/preflight guard beyond the initial API test.
-- [ ] Implement the exact LaunchPlan two-way validation and conditional node-info argv/config inspection. Reject DDP for Stage1 and unsupported historical matrix/capacity/inference commands; do not make shared parser additions silently enable them.
+- [x] Run RED `pytest -q tests/multinode/test_native_ddp_launch.py` with the repo environment above; capture actual missing-feature failures. Add separate causal RED before each environment/preflight guard beyond the initial API test.
+- [x] Implement the exact LaunchPlan two-way validation and conditional node-info argv/config inspection. Reject DDP for Stage1 and unsupported historical matrix/capacity/inference commands; do not make shared parser additions silently enable them.
 
 ```python
 if backend == 'ddp':
@@ -91,9 +91,9 @@ else:
         raise ValueError('DeepSpeed requires an explicit ZeRO stage')
 ```
 
-- [ ] Implement worker backend selection only after strict fixed-topology and conflicting-environment validation. On DDP use `ACCELERATE_BACKEND_ARGS=(--multi_gpu)` and no training `--deepspeed_config`; retain old DS arguments verbatim. Validate on coordinator and worker (remote inheritance matters). Active auxiliaries fail early on DeepSpeed; zero-weight/off retain existing backend rules.
-- [ ] Add input-preflight RED tests for entropy reference and original DoRA base missing/nonlocal on either node. In live preflight, use existing Stage1 PEFT metadata snapshot decoder to discover local base before any model/config download boundary; append reference/base to existing required paths. `lambda_dyn=0` skips reference work. Readiness, ownership, storage checks and existing installed-version checks remain intact. Dry-run is not live remote input validation.
-- [ ] Run covering GREEN `pytest -q tests/multinode/test_native_ddp_launch.py tests/multinode/test_topology.py tests/multinode/test_preflight.py tests/multinode/test_coordinator.py tests/stage2/test_launcher.py`; preserve the known baseline platform test failure if reached, do not alter it. Exact known node is `tests/stage2/test_launcher.py::test_production_entrypoint_imports_with_build_marker_then_restores_platform`, which asserts original platform.python_version ends in `+`, but host is `3.11.15`. Run `bash -n run_stage2_training.sh`, diff check, self-review, report exact red/green and commit only Task1 files.
+- [x] Implement worker backend selection only after strict fixed-topology and conflicting-environment validation. On DDP use `ACCELERATE_BACKEND_ARGS=(--multi_gpu)` and no training `--deepspeed_config`; retain old DS arguments verbatim. Validate on coordinator and worker (remote inheritance matters). Active auxiliaries fail early on DeepSpeed; zero-weight/off retain existing backend rules.
+- [x] Add input-preflight RED tests for entropy reference and original DoRA base missing/nonlocal on either node. In live preflight, use existing Stage1 PEFT metadata snapshot decoder to discover local base before any model/config download boundary; append reference/base to existing required paths. `lambda_dyn=0` skips reference work. Readiness, ownership, storage checks and existing installed-version checks remain intact. Dry-run is not live remote input validation.
+- [x] Run covering GREEN `pytest -q tests/multinode/test_native_ddp_launch.py tests/multinode/test_topology.py tests/multinode/test_preflight.py tests/multinode/test_coordinator.py tests/stage2/test_launcher.py`; preserve the known baseline platform test failure if reached, do not alter it. Exact known node is `tests/stage2/test_launcher.py::test_production_entrypoint_imports_with_build_marker_then_restores_platform`, which asserts original platform.python_version ends in `+`, but host is `3.11.15`. Run `bash -n run_stage2_training.sh`, diff check, self-review, report exact red/green and commit only Task1 files.
 
 ### Task 2: Native manifest ownership, collection, and actual save/resume
 
@@ -112,7 +112,7 @@ warnings retained; GPU/NCCL/real two-host transfer remain unrun.
 - Required `deepspeed-runtime.json` is NOT a forbidden DeepSpeed state marker: native requires its existing schema with `enabled=false`, `zero_stage=null`, `config_path=null`, `config_digest=null`, `world_size=4`. Forbidden state means `latest`, `global_stepN` and DeepSpeed model/optimizer shard files.
 - Test helper, if needed: `run_native_checkpoint_probe(method: str, *, output_root: Path, log_path: Path)->dict` launches four CPU Gloo processes, two logical node roots, real tiny Stage2Trainer save/resume, and returns observed JSON summary. The helper and concrete filesystem-mapped transport live only in tests. Output roots are distinct directories below repo checkpoints.
 
-- [ ] Write artifact contract RED tests with literal V2 identity fields, legacy V1 controls, malformed mixed identities, missing optimizer/RNG/sidecar, conflicting stage/backend/step, illegal duplicates/paths and DS markers. Test actual files/readers, not same-builder expectations.
+- [x] Write artifact contract RED tests with literal V2 identity fields, legacy V1 controls, malformed mixed identities, missing optimizer/RNG/sidecar, conflicting stage/backend/step, illegal duplicates/paths and DS markers. Test actual files/readers, not same-builder expectations.
 
 ```python
 ddp_identity = dict(stage='stage2', tuning_method='full', zero_stage=None,
@@ -125,8 +125,8 @@ with pytest.raises(ValueError):
     validate_runtime_identity(dict(ddp_identity, zero_stage=0))
 ```
 
-- [ ] BEFORE collection implementation, add and run actual native-save behavioral RED: a tiny full model uses four CPU Trainer ranks with root selected by `global_rank//2`; observe real rank0 common files and local RNG2/3. Feed those actual directories into production manifest/collection functions; today's DS assumptions must fail causally, not due missing fixtures. The subprocess explicitly sets `CUDA_VISIBLE_DEVICES=''`, `ACCELERATE_MIXED_PRECISION=no`, OMP/MKL threads1, bounded timeout and retained failure log.
-- [ ] Implement strict DDP V2 schema and native observed identity. Verify disabled/world4 runtime sidecar, checkpoint-N/trainer_state step, method-specific full/PEFT loader requirements, sampler and conditional objective sidecars. Required native common files include optimizer.pt, scheduler.pt, trainer_state.json, training_args.bin. Reject latest/global_step DS state. Do not deserialize optimizer weights merely to classify layout.
+- [x] BEFORE collection implementation, add and run actual native-save behavioral RED: a tiny full model uses four CPU Trainer ranks with root selected by `global_rank//2`; observe real rank0 common files and local RNG2/3. Feed those actual directories into production manifest/collection functions; today's DS assumptions must fail causally, not due missing fixtures. The subprocess explicitly sets `CUDA_VISIBLE_DEVICES=''`, `ACCELERATE_MIXED_PRECISION=no`, OMP/MKL threads1, bounded timeout and retained failure log.
+- [x] Implement strict DDP V2 schema and native observed identity. Verify disabled/world4 runtime sidecar, checkpoint-N/trainer_state step, method-specific full/PEFT loader requirements, sampler and conditional objective sidecars. Required native common files include optimizer.pt, scheduler.pt, trainer_state.json, training_args.bin. Reject latest/global_step DS state. Do not deserialize optimizer weights merely to classify layout.
 
 ```python
 if identity.get('execution_backend') == 'ddp':
@@ -142,8 +142,8 @@ if identity.get('execution_backend') == 'ddp':
         raise ValueError(f'missing native checkpoint file: {sorted(map(str, missing))[0]}')
 ```
 
-- [ ] Implement original RNG-only node rule and canonical re-observation through existing pinned-directory/readers. Keep no-overwrite collection/redistribution transport; test only RNG2/3 is pushed, then complete canonical state is copied back for native resume. Require exact all-four RNG and correct owner/common-file rules.
-- [ ] BEFORE resume changes, run behavioral RED through production redistribution with the actual saved state; no preconstructed successful manifests. Resume all four real Trainer ranks and compare optimizer/scheduler/state/RNG/reference invariance against the saved checkpoint and uninterrupted tiny-model control. Keep total max_steps3/schedule unchanged: stop the initial test at step2 with callback, resume to3 rather than changing the schedule. Include full and actual PEFT/DoRA fixtures; LoRA loader-contract cases too. Preserve fixed reference identity; no GPU or SSH launch.
+- [x] Implement original RNG-only node rule and canonical re-observation through existing pinned-directory/readers. Keep no-overwrite collection/redistribution transport; test only RNG2/3 is pushed, then complete canonical state is copied back for native resume. Require exact all-four RNG and correct owner/common-file rules.
+- [x] BEFORE resume changes, run behavioral RED through production redistribution with the actual saved state; no preconstructed successful manifests. Resume all four real Trainer ranks and compare optimizer/scheduler/state/RNG/reference invariance against the saved checkpoint and uninterrupted tiny-model control. Keep total max_steps3/schedule unchanged: stop the initial test at step2 with callback, resume to3 rather than changing the schedule. Include full and actual PEFT/DoRA fixtures; LoRA loader-contract cases too. Preserve fixed reference identity; no GPU or SSH launch.
 
 ```python
 observed = run_native_checkpoint_probe('dora', output_root=checkpoint_fixture_root,
@@ -154,7 +154,7 @@ assert observed['reference_changed'] == [False,False,False,False]
 assert observed['matches_uninterrupted'] is True
 ```
 
-- [ ] Run GREEN `pytest -q tests/multinode/test_native_ddp_artifacts.py tests/multinode/test_native_ddp_checkpoint.py tests/multinode/test_artifacts.py`; report original-save/collection/resume red chronology, exact observed file sets and numerical comparisons, unrun GPU limitations; self-review and commit Task2.
+- [x] Run GREEN `pytest -q tests/multinode/test_native_ddp_artifacts.py tests/multinode/test_native_ddp_checkpoint.py tests/multinode/test_artifacts.py`; report original-save/collection/resume red chronology, exact observed file sets and numerical comparisons, unrun GPU limitations; self-review and commit Task2.
 
 ### Task 3: Actual DDP producer and final completion witness
 
