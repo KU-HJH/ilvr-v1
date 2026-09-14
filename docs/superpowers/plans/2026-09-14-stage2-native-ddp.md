@@ -158,6 +158,11 @@ assert observed['matches_uninterrupted'] is True
 
 ### Task 3: Actual DDP producer and final completion witness
 
+**Status:** Complete; implementationc07a026, task review approved. Frozen-tree
+covering182passed4skipped161.16s; actual four-rank CPU success/failure records,
+CE-only canonical digest and completion verified. Four existing CUDA/opt-in
+skips and worker warnings are disclosed; GPU/real-host execution unrun.
+
 **Files:** Modify `src/stage2/evidence.py`, `src/main.py:publish_stage2_training_evidence`, `src/multinode_runtime.py:_finite_loss_reference/write_training_witness`, narrowly necessary `src/multinode.py` training call sites; create `tests/multinode/test_native_ddp_evidence.py`; extend native checkpoint probe to exercise publication.
 
 **Interfaces:**
@@ -166,9 +171,9 @@ assert observed['matches_uninterrupted'] is True
 - Final witness uses schema_version2 and execution_backend ddp for native, with existing run/attempt/ranks/path/finite_loss_evidence fields. Add optional `objective_identity_bytes: bytes|None=None` to `write_training_witness` and its finite-loss helper; legacy callers remain unchanged. Expected objective config comes from Task1 frozen plan.
 - Existing remote readers handle lifecycle/Stage1 evidence, not the new objective sidecar. Add narrowly scoped `SubprocessCoordinatorRunner.read_stage2_objective_identity(checkpoint_step: int)->bytes` and internal CLI `stage2-objective-identity-show --run-id RUN --checkpoint-step N`. It reads only the pinned canonical checkpoints/RUN/checkpoint-N/stage2_objective.json using the existing bounded no-follow file primitives (maximum4MiB), after plan/run/step validation. No arbitrary path argument, generic metadata service or additional persistent copy. DDP coordinator calls it only when objective enabled, after canonical collection validation, and passes bytes directly to the witness verifier.
 
-- [ ] Write RED on real builders/readers and actual main publisher boundary: strict V2 types/nullable hash, V1 roundtrip unchanged, missing ranks/nonfinite/wrong backend/world mismatch fail; enabled CE-only requires digest and disabled config rejects one. Use literal expected JSON fields, not builder-vs-itself comparisons.
-- [ ] Run RED `pytest -q tests/multinode/test_native_ddp_evidence.py`. Add separate distributed behavioral RED before changing collective observation/publication: original machine1 has no model/common sidecar, rank0 observation fails, every process reports failure within a bounded subprocess without hanging.
-- [ ] Implement only V2 branch and actual prepared-runtime checks; rank0 observe/hash and collective error propagation BEFORE success broadcast, using existing failure-reduction pattern on the actual backend-compatible device (CPU for Gloo tests, local CUDA for NCCL). Do not alter V1 semantics or add generic recovery.
+- [x] Write RED on real builders/readers and actual main publisher boundary: strict V2 types/nullable hash, V1 roundtrip unchanged, missing ranks/nonfinite/wrong backend/world mismatch fail; enabled CE-only requires digest and disabled config rejects one. Use literal expected JSON fields, not builder-vs-itself comparisons.
+- [x] Run RED `pytest -q tests/multinode/test_native_ddp_evidence.py`. Add separate distributed behavioral RED before changing collective observation/publication: original machine1 has no model/common sidecar, rank0 observation fails, every process reports failure within a bounded subprocess without hanging.
+- [x] Implement only V2 branch and actual prepared-runtime checks; rank0 observe/hash and collective error propagation BEFORE success broadcast, using existing failure-reduction pattern on the actual backend-compatible device (CPU for Gloo tests, local CUDA for NCCL). Do not alter V1 semantics or add generic recovery.
 
 ```python
 # All ranks execute the same reduction before any success broadcast.
@@ -188,9 +193,9 @@ observation/reduction blocks in the existing publisher, not required new public
 functions. Keep them small and use existing helpers where their device/error
 contracts match; no test-only production extension.
 
-- [ ] Wire coordinator producer config/digest check against collected canonical sidecar and frozen requested config; missing/changed sidecar or wrong backend cannot produce success. Ensure a local RNG-only checkpoint path is not used for common-file hashing before redistribution: use the fixed-path remote objective reader described above and existing bounded read primitives. Test its path/no-follow/size failures before implementation. Reuse full collected identity rather than fabricating claims.
-- [ ] Extend the four-process CPU native checkpoint probe to exercise actual publisher and coordinator witness consumer; verify four real rank records and digest equality, enabled-zero-weight behavior, propagated failure, and no success record on incomplete/cross-backend state.
-- [ ] Run GREEN `pytest -q tests/multinode/test_native_ddp_evidence.py tests/multinode/test_native_ddp_checkpoint.py tests/multinode/test_coordinator.py tests/stage2/integration/test_distributed_contract.py -m 'not gpu'`; record warnings/failures at exact scope, self-review and commit Task3.
+- [x] Wire coordinator producer config/digest check against collected canonical sidecar and frozen requested config; missing/changed sidecar or wrong backend cannot produce success. Ensure a local RNG-only checkpoint path is not used for common-file hashing before redistribution: use the fixed-path remote objective reader described above and existing bounded read primitives. Test its path/no-follow/size failures before implementation. Reuse full collected identity rather than fabricating claims.
+- [x] Extend the four-process CPU native checkpoint probe to exercise actual publisher and coordinator witness consumer; verify four real rank records and digest equality, enabled-zero-weight behavior, propagated failure, and no success record on incomplete/cross-backend state.
+- [x] Run GREEN `pytest -q tests/multinode/test_native_ddp_evidence.py tests/multinode/test_native_ddp_checkpoint.py tests/multinode/test_coordinator.py tests/stage2/integration/test_distributed_contract.py -m 'not gpu'`; record warnings/failures at exact scope, self-review and commit Task3.
 
 ### Task 4: Comparison examples, operator docs and combined handoff
 
