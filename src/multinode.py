@@ -1484,7 +1484,7 @@ def _exit_show(argv: list[str]) -> int:
 
 
 def _artifact_manifest(argv: list[str]) -> int:
-    from src.multinode_artifacts import build_node_manifest
+    from src.multinode_artifacts import build_node_manifest, native_resume_destination_is_canonical
 
     parser = argparse.ArgumentParser(prog="python -m src.multinode artifact-manifest")
     parser.add_argument("--run-directory", required=True)
@@ -1497,11 +1497,20 @@ def _artifact_manifest(argv: list[str]) -> int:
     parser.add_argument("--runtime-identity-json", required=True)
     parser.add_argument("--completion-marker", action="store_true")
     parser.add_argument("--canonical-owner", action="store_true")
+    parser.add_argument("--resume-destination", action="store_true")
     args = parser.parse_args(argv)
     try:
         identity = json.loads(args.runtime_identity_json)
         if type(identity) is not dict:
             raise ValueError("runtime identity must be a JSON object")
+        if args.resume_destination:
+            if args.node_rank != 1 or args.canonical_owner or tuple(args.process_rank) != (2, 3):
+                raise ValueError("resume destination read requires original local node rank arguments")
+            args.canonical_owner = native_resume_destination_is_canonical(
+                args.run_directory, runtime_identity=identity, checkpoint_root=args.checkpoint_root,
+            )
+            if args.canonical_owner:
+                args.process_rank = [0, 1, 2, 3]
         manifest = build_node_manifest(
             args.run_directory,
             node_rank=args.node_rank,
@@ -1676,7 +1685,7 @@ def _checkpoint_artifact_identity(
         raise ValueError("checkpoint global step must be a nonnegative integer")
     from src.multinode_artifacts import derive_model_state_layout
 
-    model_state_layout = derive_model_state_layout(plan.zero_stage)
+    model_state_layout = "trainer" if plan.backend == "ddp" else derive_model_state_layout(plan.zero_stage)
     if plan.stage == "stage1":
         sidecar = (
             "stage1_peft_metadata.json"
@@ -1689,7 +1698,7 @@ def _checkpoint_artifact_identity(
             if plan.tuning_method in ("lora", "dora")
             else "stage2-sampler.json"
         )
-    return {
+    identity = {
         "stage": plan.stage,
         "tuning_method": plan.tuning_method,
         "zero_stage": plan.zero_stage,
@@ -1705,6 +1714,12 @@ def _checkpoint_artifact_identity(
         "commit": commit,
         "run_id": plan.run_id,
     }
+    if plan.backend == "ddp":
+        identity.update(execution_backend="ddp", objective_enabled=(
+            plan.stage2_objective_config is not None
+            and plan.stage2_objective_config.enable_stage2_objective
+        ))
+    return identity
 
 
 def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:

@@ -42,6 +42,9 @@ _MANIFEST_IDENTITY_FIELDS = (
     "run_id",
 )
 _RESUME_IDENTITY_FIELDS = _MANIFEST_IDENTITY_FIELDS
+_NATIVE_IDENTITY_FIELDS = _MANIFEST_IDENTITY_FIELDS + (
+    "execution_backend", "objective_enabled",
+)
 _LOCAL_REPOSITORY = Path("/root/workspace/ILVR")
 _REMOTE_HOST_REPOSITORY = Path("/home/korea/Workspace/hjh/workspace/ILVR")
 _REMOTE_HOST = "korea@10.1.102.41"
@@ -300,7 +303,7 @@ def _top_level_regular_names(artifact: Path) -> set[str]:
 
 
 def _decode_checkpoint_step(
-    checkpoint: Path, *, pinned_step: int | None = None
+    checkpoint: Path, *, pinned_step: int | None = None, native: bool = False
 ) -> int:
     if pinned_step is None:
         match = re.fullmatch(r"checkpoint-(0|[1-9][0-9]*)", checkpoint.name)
@@ -311,15 +314,16 @@ def _decode_checkpoint_step(
         if type(pinned_step) is not int or pinned_step < 0:
             raise ValueError("pinned checkpoint step must be a nonnegative integer")
         numbered_step = pinned_step
-    latest = _read_small_regular(
-        checkpoint / "latest", maximum_size=_MAX_LATEST_BYTES, label="DeepSpeed latest"
-    )
-    try:
-        latest_tag = latest.decode("utf-8")
-    except UnicodeError as error:
-        raise ValueError("DeepSpeed latest must be UTF-8") from error
-    if latest_tag != f"global_step{numbered_step}":
-        raise ValueError("checkpoint-N and latest global_stepN disagree")
+    if not native:
+        latest = _read_small_regular(
+            checkpoint / "latest", maximum_size=_MAX_LATEST_BYTES, label="DeepSpeed latest"
+        )
+        try:
+            latest_tag = latest.decode("utf-8")
+        except UnicodeError as error:
+            raise ValueError("DeepSpeed latest must be UTF-8") from error
+        if latest_tag != f"global_step{numbered_step}":
+            raise ValueError("checkpoint-N and latest global_stepN disagree")
     trainer_raw = _read_small_regular(
         checkpoint / "trainer_state.json",
         maximum_size=_MAX_COMMON_METADATA_BYTES,
@@ -391,6 +395,8 @@ def _checkpoint_stage_and_method(
         raise ValueError("loader config is invalid JSON") from error
     if type(config) is not dict:
         raise ValueError("loader config must be a JSON object")
+    if expected.get("execution_backend") == "ddp" and config.get("stage") != "stage2":
+        raise ValueError("native loader config stage differs from Stage 2 identity")
     stage1_metadata = artifact / "stage1_peft_metadata.json"
     stage2_metadata = artifact / "stage2_peft_metadata.json"
     stage1_present = stage1_metadata.name in artifact_names
@@ -678,12 +684,16 @@ def observe_checkpoint_identity(
     )
 
     expected = _validate_identity(trusted_identity)
+    native = expected.get("execution_backend") == "ddp"
     checkpoint, owned_descriptor = _pin_directory_for_inspection(
         Path(checkpoint_directory), label="checkpoint artifact"
     )
     try:
+        if (native and owned_descriptor is not None
+                and Path(checkpoint_directory).name != f"checkpoint-{expected['global_step']}"):
+            raise ValueError("checkpoint-N differs from trusted global_step")
         step = _decode_checkpoint_step(
-            checkpoint, pinned_step=int(expected["global_step"])
+            checkpoint, pinned_step=int(expected["global_step"]), native=native
         )
         runtime_path = checkpoint / DEEPSPEED_RUNTIME_FILENAME
         runtime_raw = _read_small_regular(
@@ -692,14 +702,18 @@ def observe_checkpoint_identity(
             label="DeepSpeed runtime identity",
         )
         profile = decode_deepspeed_runtime_sidecar(runtime_raw, path=runtime_path)
-        if not profile.enabled:
+        if native:
+            if profile.enabled or profile.config_path is not None:
+                raise ValueError("native checkpoint runtime must have disabled DeepSpeed")
+            _observe_native_sidecars(checkpoint, expected)
+        elif not profile.enabled:
             raise ValueError("checkpoint DeepSpeed runtime must be enabled")
         observed = {
             "zero_stage": profile.zero_stage,
             "deepspeed_config_digest": profile.config_digest,
             "world_size": profile.world_size,
             "global_step": step,
-            "model_state_layout": _observed_model_layout(checkpoint, step),
+            "model_state_layout": "trainer" if native else _observed_model_layout(checkpoint, step),
         }
         stage, method = _checkpoint_stage_and_method(checkpoint, expected)
         observed.update({"stage": stage, "tuning_method": method})
@@ -709,13 +723,58 @@ def observe_checkpoint_identity(
                     f"observed checkpoint identity mismatch for {field}: "
                     f"observed={value!r}, expected={expected[field]!r}"
                 )
-        derived = derive_model_state_layout(expected["zero_stage"])
+        derived = "trainer" if native else derive_model_state_layout(expected["zero_stage"])
         if observed["model_state_layout"] != derived:
             raise ValueError("observed model-state filenames disagree with ZeRO stage")
         return {**expected, **observed}
     finally:
         if owned_descriptor is not None:
             os.close(owned_descriptor)
+
+
+def _observe_native_sidecars(checkpoint: Path, identity: Mapping[str, object]) -> None:
+    """Read bounded native controls; never deserialize optimizer/model payloads."""
+    descriptor = _pinned_directory_descriptor(checkpoint)
+    if descriptor is None:
+        raise ValueError("native checkpoint observation requires a pinned directory")
+    paths = {relative for relative, _ in _walk_regular_files_fd(descriptor)}
+    _validate_native_paths(paths)
+    with os.scandir(checkpoint) as children:
+        if any(entry.name.startswith("global_step") for entry in children):
+            raise ValueError("native checkpoint rejects DeepSpeed global_step state")
+    missing = _required_common_paths(identity) - paths
+    if missing:
+        raise ValueError(f"missing native checkpoint file: {sorted(map(str, missing))[0]}")
+    sampler = json.loads(_read_small_regular(checkpoint / "stage2-sampler.json",
+        maximum_size=_MAX_COMMON_METADATA_BYTES, label="Stage 2 sampler sidecar"))
+    from stage2.sampler import Stage2SamplerIdentity
+    if type(sampler) is not dict or type(sampler.get("global_step")) is not int or sampler["global_step"] != identity["global_step"]:
+        raise ValueError("Stage 2 sampler global_step differs from checkpoint")
+    observed = Stage2SamplerIdentity.from_dict({key: value for key, value in sampler.items() if key != "global_step"})
+    if observed.world_size != identity["world_size"]:
+        raise ValueError("Stage 2 sampler world_size differs from checkpoint")
+    objective_present = Path("stage2_objective.json") in paths
+    if objective_present != identity["objective_enabled"]:
+        raise ValueError("native checkpoint objective presence differs from identity")
+    if objective_present:
+        objective = json.loads(_read_small_regular(checkpoint / "stage2_objective.json",
+            maximum_size=_MAX_COMMON_METADATA_BYTES, label="Stage 2 objective sidecar"))
+        if (type(objective) is not dict or set(objective) != {"schema_version", "config", "reference_identity", "vocabulary_identity"}
+                or type(objective["schema_version"]) is not int or objective["schema_version"] != 1
+                or type(objective["config"]) is not dict
+                or objective["config"].get("enable_stage2_objective") is not True):
+            raise ValueError("invalid native Stage 2 objective sidecar")
+
+
+def _validate_native_paths(paths: set[Path]) -> None:
+    for path in paths:
+        if (path.name == "latest" or any(part.startswith("global_step") for part in path.parts)
+                or _OPTIMIZER_SHARD.fullmatch(path.name)
+                or _PARTITIONED_MODEL_SHARD.fullmatch(path.name)
+                or path.name == _REPLICATED_MODEL_STATE):
+            raise ValueError("native checkpoint rejects DeepSpeed state markers")
+        if _RNG_STATE.fullmatch(path.name) and path.parent != Path():
+            raise ValueError("native RNG files must be top-level")
 
 
 def _process_rank(path: Path) -> int | None:
@@ -847,6 +906,9 @@ class NodeArtifactManifest:
             raise ValueError("invalid node artifact runtime identity")
         if type(payload["schema_version"]) is not int:
             raise ValueError("invalid node artifact schema version")
+        identity = _validate_identity(runtime_identity)
+        if payload["schema_version"] != (2 if identity.get("execution_backend") == "ddp" else 1):
+            raise ValueError("artifact manifest schema mismatch")
         if type(payload["run_id"]) is not str:
             raise ValueError("invalid node artifact run ID")
         if type(payload["node_rank"]) is not int:
@@ -999,6 +1061,10 @@ def build_node_manifest(
     )
     try:
         pinned_directory = Path(f"/proc/self/fd/{checkpoint_descriptor}")
+        if trusted_identity.get("execution_backend") == "ddp" and node_rank == 1 and not canonical_owner:
+            with os.scandir(checkpoint_descriptor) as children:
+                if any(not entry.is_file(follow_symlinks=False) for entry in children):
+                    raise ValueError("original native node 1 must contain only top-level RNG files")
         entries: list[ArtifactEntry] = []
         for relative, metadata in _walk_regular_files_fd(checkpoint_descriptor):
             item = ArtifactEntry(relative, metadata.st_size, node_rank)
@@ -1018,8 +1084,8 @@ def build_node_manifest(
     manifest_run_id = _validate_run_id(run_id or str(identity["run_id"]))
     if manifest_run_id != identity["run_id"]:
         raise ValueError("node manifest run ID differs from its canonical ancestor")
-    return NodeArtifactManifest(
-        schema_version=_MANIFEST_SCHEMA_VERSION,
+    manifest = NodeArtifactManifest(
+        schema_version=2 if identity.get("execution_backend") == "ddp" else _MANIFEST_SCHEMA_VERSION,
         run_id=manifest_run_id,
         node_rank=node_rank,
         process_ranks=ranks,
@@ -1028,6 +1094,43 @@ def build_node_manifest(
         completion_marker=completion_marker,
         checkpoint_relative=checkpoint_relative,
     )
+    if identity.get("execution_backend") == "ddp":
+        _validate_manifest(manifest, world_size=4)
+    return manifest
+
+
+def native_resume_destination_is_canonical(
+    run_directory: str | Path,
+    *,
+    runtime_identity: Mapping[str, object],
+    checkpoint_root: str | Path,
+) -> bool:
+    """Select original RNG-only or canonical ownership for the local resume read.
+
+    This is a classification, never a validation-error fallback. The caller must
+    rebuild with the selected ownership, including full canonical observation.
+    """
+    identity = _validate_identity(runtime_identity)
+    if identity.get("execution_backend") != "ddp":
+        raise ValueError("resume destination classification is native DDP only")
+    descriptor, _ = _open_pinned_checkpoint_directory(
+        Path(run_directory), checkpoint_root=checkpoint_root,
+        run_id=str(identity["run_id"]), global_step=int(identity["global_step"]),
+    )
+    try:
+        paths = {path for path, _ in _walk_regular_files_fd(descriptor)}
+        with os.scandir(descriptor) as children:
+            if any(not entry.is_file(follow_symlinks=False) for entry in children):
+                raise ValueError("native resume destination requires top-level regular files")
+        local_rng = {Path("rng_state_2.pth"), Path("rng_state_3.pth")}
+        if paths == local_rng:
+            return False
+        all_rng = {Path(f"rng_state_{rank}.pth") for rank in range(4)}
+        if not (all_rng | _required_common_paths(identity)) <= paths:
+            raise ValueError("native resume destination is a partial checkpoint replica")
+        return True
+    finally:
+        os.close(descriptor)
 
 
 def _validate_identity(
@@ -1037,6 +1140,9 @@ def _validate_identity(
 ) -> dict[str, object]:
     if type(identity) is not dict:
         raise ValueError("runtime identity must be an exact JSON object")
+    native = identity.get("execution_backend") == "ddp"
+    if native:
+        required_fields = _NATIVE_IDENTITY_FIELDS
     missing = [field for field in required_fields if field not in identity]
     if missing:
         raise ValueError(f"runtime identity is missing fields: {', '.join(missing)}")
@@ -1071,7 +1177,14 @@ def _validate_identity(
     ):
         raise ValueError("runtime identity tuning_method is invalid")
     zero_stage = normalized["zero_stage"]
-    if type(zero_stage) is not int or zero_stage not in (1, 2, 3):
+    if native and (
+        normalized["stage"] != "stage2"
+        or zero_stage is not None
+        or normalized["deepspeed_config_digest"] is not None
+        or type(normalized["objective_enabled"]) is not bool
+    ):
+        raise ValueError("native runtime identity backend/stage/profile is invalid")
+    if not native and (type(zero_stage) is not int or zero_stage not in (1, 2, 3)):
         raise ValueError("runtime identity zero_stage is invalid")
     world_size = normalized["world_size"]
     if type(world_size) is not int or world_size != 4:
@@ -1080,7 +1193,7 @@ def _validate_identity(
     if type(global_step) is not int or global_step < 0:
         raise ValueError("runtime identity global_step is invalid")
     digest = normalized["deepspeed_config_digest"]
-    if (
+    if not native and (
         type(digest) is not str
         or len(digest) != 64
         or any(character not in "0123456789abcdef" for character in digest)
@@ -1095,9 +1208,9 @@ def _validate_identity(
         raise ValueError("runtime identity commit is invalid")
     _validate_run_id(normalized["run_id"])
     layout = normalized["model_state_layout"]
-    if type(layout) is not str or layout not in ("replicated", "partitioned"):
+    if type(layout) is not str or layout not in (("trainer",) if native else ("replicated", "partitioned")):
         raise ValueError("runtime identity model_state_layout is invalid")
-    if layout != derive_model_state_layout(zero_stage):
+    if not native and layout != derive_model_state_layout(zero_stage):
         raise ValueError("runtime identity model_state_layout conflicts with zero_stage")
     if normalized["optimizer"] is not True:
         raise ValueError("runtime identity optimizer must be true")
@@ -1140,6 +1253,12 @@ def _primary_stage_sidecar(identity: Mapping[str, object]) -> str:
 
 
 def _required_common_paths(identity: Mapping[str, object]) -> frozenset[Path]:
+    if identity.get("execution_backend") == "ddp":
+        names = {"optimizer.pt", "scheduler.pt", "trainer_state.json", "training_args.bin",
+                 "deepspeed-runtime.json", "stage2-sampler.json", str(identity["stage_sidecar"])}
+        if identity["objective_enabled"]:
+            names.add("stage2_objective.json")
+        return frozenset(Path(name) for name in names)
     key = (identity["stage"], identity["tuning_method"], identity["zero_stage"])
     try:
         return _COMMON_METADATA_ALLOWLIST[key]
@@ -1160,7 +1279,7 @@ def _validate_manifest(manifest: NodeArtifactManifest, *, world_size: int) -> No
         raise TypeError("collection members must be NodeArtifactManifest values")
     if (
         type(manifest.schema_version) is not int
-        or manifest.schema_version != _MANIFEST_SCHEMA_VERSION
+        or manifest.schema_version != (2 if manifest.runtime_identity.get("execution_backend") == "ddp" else _MANIFEST_SCHEMA_VERSION)
     ):
         raise ValueError("artifact manifest schema mismatch")
     _validate_run_id(manifest.run_id)
@@ -1194,6 +1313,20 @@ def _validate_manifest(manifest: NodeArtifactManifest, *, world_size: int) -> No
             raise ValueError("artifact entry node-rank ownership mismatch")
         if entry.process_rank is not None and entry.process_rank not in manifest.process_ranks:
             raise ValueError("artifact entry is outside assigned process ranks")
+    if identity.get("execution_backend") == "ddp":
+        _validate_native_paths(seen)
+        expected_rng = {Path(f"rng_state_{rank}.pth") for rank in manifest.process_ranks}
+        actual_rng = {path for path in seen if _RNG_STATE.fullmatch(path.name)}
+        if actual_rng != expected_rng:
+            raise ValueError("native checkpoint requires exactly its assigned RNG ranks")
+        if manifest.node_rank == 1 and manifest.process_ranks == (2, 3):
+            if seen != expected_rng:
+                raise ValueError("original native node 1 must contain only RNG2/3")
+        else:
+            missing = _required_common_paths(identity) - seen
+            if missing:
+                raise ValueError(f"missing native checkpoint file: {sorted(map(str, missing))[0]}")
+            select_inference_entries(manifest)
 
 
 def validate_collection(
@@ -1218,6 +1351,15 @@ def validate_collection(
         raise ValueError(
             "artifact collection requires one manifest from each node and ranks 0 through 3"
         )
+
+    if identities[0].get("execution_backend") == "ddp":
+        for manifest in values:
+            if manifest.process_ranks != ((0, 1) if manifest.node_rank == 0 else (2, 3)):
+                raise ValueError("native collection requires original node ownership")
+        # Strict original-node validation makes their paths disjoint: all common
+        # state belongs to node 0, and node 1 owns only its two top-level RNG files.
+        return tuple(sorted((entry for manifest in values for entry in manifest.entries),
+                            key=lambda entry: entry.relative_path.as_posix()))
 
     combined: dict[Path, ArtifactEntry] = {}
     identity = identities[0]
@@ -1695,8 +1837,8 @@ def validate_resume_identity(checkpoint: object, requested: object) -> None:
     """Reject every checkpoint/runtime identity change before artifact transfer."""
     actual = _identity_mapping(checkpoint)
     expected = _identity_mapping(requested)
-    for field in _RESUME_IDENTITY_FIELDS:
-        if actual[field] != expected[field]:
+    for field in sorted(set(actual) | set(expected)):
+        if field not in actual or field not in expected or actual[field] != expected[field]:
             raise ValueError(f"resume identity mismatch for {field}")
 
 

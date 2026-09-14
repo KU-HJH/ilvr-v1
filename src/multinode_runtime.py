@@ -2305,6 +2305,7 @@ class SubprocessCoordinatorRunner:
         runtime_identity: Mapping[str, object],
         *,
         canonical_owner: bool = False,
+        resume_destination: bool = False,
     ) -> object:
         """Collect one bounded node-local lstat manifest through the node CLI."""
         from src.multinode_artifacts import (
@@ -2313,6 +2314,8 @@ class SubprocessCoordinatorRunner:
         )
 
         identity = validate_runtime_identity(runtime_identity)
+        if resume_destination and (machine_rank != 1 or canonical_owner or identity.get("execution_backend") != "ddp"):
+            raise ValueError("resume destination read is native local node only")
         if (
             identity["run_id"] != self.plan.run_id
             or identity["stage"] != self.plan.stage
@@ -2353,6 +2356,8 @@ class SubprocessCoordinatorRunner:
             arguments.extend(("--process-rank", str(rank)))
         if canonical_owner:
             arguments.append("--canonical-owner")
+        if resume_destination:
+            arguments.append("--resume-destination")
         completed = self._run(
             self._internal_command(machine_rank, "artifact-manifest", arguments)
         )
@@ -3173,6 +3178,7 @@ def collect_checkpoint_artifacts(
         select_collection_push_entries,
         validate_canonical_destination,
         validate_collection,
+        validate_runtime_identity,
     )
 
     if dict(exit_codes) != {0: 0, 1: 0}:
@@ -3180,6 +3186,11 @@ def collect_checkpoint_artifacts(
     checkpoint = Path(checkpoint_path)
     remote = runner.read_artifact_manifest(0, checkpoint, runtime_identity)
     local = runner.read_artifact_manifest(1, checkpoint, runtime_identity)
+    if runtime_identity.get("execution_backend") == "ddp":
+        trusted = validate_runtime_identity(runtime_identity)
+        for manifest in (remote, local):
+            if validate_runtime_identity(manifest.runtime_identity) != trusted:
+                raise ValueError("native node manifest differs from trusted runtime identity")
     combined = validate_collection((remote, local), world_size=world_size)
     local_entries = select_collection_push_entries(local)
     runner.validate_push_destination(local, local_entries)
@@ -3226,7 +3237,8 @@ def redistribute_resume_checkpoint(
         manifest, expected_identity=checkpoint_identity
     )
     local = getattr(runner, "read_artifact_manifest")(
-        1, checkpoint, checkpoint_identity
+        1, checkpoint, checkpoint_identity,
+        **({"resume_destination": True} if checkpoint_identity.get("execution_backend") == "ddp" else {}),
     )
     required, missing = resume_entry_delta(manifest, local)
     if missing:
