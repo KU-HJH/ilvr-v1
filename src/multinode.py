@@ -884,6 +884,36 @@ def _stage1_training_evidence_show(argv: list[str]) -> int:
     return 0
 
 
+def _stage2_objective_identity_show(argv: list[str]) -> int:
+    """Emit bounded bytes from one fixed-run canonical objective sidecar."""
+    parser = argparse.ArgumentParser(prog="python -m src.multinode stage2-objective-identity-show",
+                                     allow_abbrev=False)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--checkpoint-step", type=int, required=True)
+    args = parser.parse_args(argv)
+    descriptor = None
+    try:
+        _validate_identifier("run_id", args.run_id)
+        if args.checkpoint_step <= 0:
+            raise ValueError("checkpoint step must be positive")
+        from src.multinode_artifacts import _open_pinned_checkpoint_directory, _read_small_regular
+        checkpoint_root = _REPOSITORY_ROOT / "checkpoints"
+        checkpoint = checkpoint_root / args.run_id / f"checkpoint-{args.checkpoint_step}"
+        descriptor, _physical = _open_pinned_checkpoint_directory(checkpoint,
+            checkpoint_root=checkpoint_root, run_id=args.run_id, global_step=args.checkpoint_step)
+        raw = _read_small_regular(Path(f"/proc/self/fd/{descriptor}") / "stage2_objective.json",
+                                 maximum_size=4 * 1024 * 1024, label="Stage 2 objective identity")
+        if not raw:
+            raise ValueError("Stage 2 objective identity is empty")
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    sys.stdout.buffer.write(raw)
+    return 0
+
+
 def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stage", choices=("stage1", "stage2"), required=True)
     parser.add_argument(
@@ -2082,6 +2112,11 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         else:
             batch_per_gpu = 1
         try:
+            objective_identity_bytes = None
+            if (plan.stage == "stage2" and plan.backend == "ddp"
+                    and plan.stage2_objective_config is not None
+                    and plan.stage2_objective_config.enable_stage2_objective):
+                objective_identity_bytes = runner.read_stage2_objective_identity(final_step)
             witness = write_training_witness(
                 plan,
                 result_root=result_root,
@@ -2090,6 +2125,8 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 batch_per_gpu=batch_per_gpu,
                 finite_loss_evidence_path=commands.finite_loss_evidence_path,
                 expected_global_step=final_step,
+                **({"objective_identity_bytes": objective_identity_bytes}
+                   if plan.backend == "ddp" else {}),
             )
         except ValueError as error:
             incomplete = write_incomplete_attempt(
@@ -2369,6 +2406,8 @@ def _main(argv: list[str] | None = None) -> int:
         return _lifecycle_evidence_show(argv[1:])
     if argv and argv[0] == "stage1-training-evidence-show":
         return _stage1_training_evidence_show(argv[1:])
+    if argv and argv[0] == "stage2-objective-identity-show":
+        return _stage2_objective_identity_show(argv[1:])
     if argv and argv[0] in ("train-stage1", "train-stage2"):
         return _training_main(argv[0].removeprefix("train-"), argv[1:])  # type: ignore[arg-type]
     if argv and argv[0] == "prepare-inference":

@@ -572,6 +572,85 @@ def publish_stage2_training_evidence(args, *, trainer, train_result, profile):
     evidence_path = getattr(args, "benchmark_evidence_path", None)
     if evidence_path is None:
         return None
+    from accelerate.utils import DistributedType
+
+    # The disabled profile is only a candidate: prepared state must prove DDP.
+    native = (getattr(profile, "enabled", True) is False
+              or getattr(getattr(trainer, "accelerator", None), "distributed_type", None)
+              in (DistributedType.MULTI_CPU, DistributedType.MULTI_GPU)
+              or isinstance(getattr(trainer, "model_wrapped", None), torch.nn.parallel.DistributedDataParallel))
+    if native:
+        from stage2.evidence import _failure_count, validate_stage2_objective_identity
+        from src.multinode_artifacts import _pin_directory_for_inspection, _read_small_regular
+        import torch.distributed as dist
+
+        local_error = None
+        try:
+            accelerator = trainer.accelerator
+            if (not dist.is_available() or not dist.is_initialized()
+                    or profile.enabled is not False
+                    or dist.get_world_size() != 4 or profile.world_size != 4
+                    or profile.zero_stage is not None or profile.config_digest is not None
+                    or profile.config_path is not None
+                    or trainer.deepspeed_runtime_profile != profile
+                    or trainer.is_deepspeed_enabled
+                    or accelerator.state.deepspeed_plugin is not None
+                    or accelerator.num_processes != 4
+                    or accelerator.distributed_type not in (
+                        DistributedType.MULTI_CPU, DistributedType.MULTI_GPU)
+                    or not isinstance(trainer.model_wrapped, torch.nn.parallel.DistributedDataParallel)):
+                raise ValueError("Stage 2 producer requires prepared native DDP world four")
+            if (type(trainer.state.global_step) is not int or trainer.state.global_step <= 0
+                    or type(trainer._observed_optimizer_step) is not int
+                    or trainer._observed_optimizer_step != trainer.state.global_step
+                    or type(train_result.training_loss) not in (int, float)
+                    or not math.isfinite(train_result.training_loss)
+                    or type(trainer._representative_gradient_norm) not in (int, float)
+                    or not math.isfinite(trainer._representative_gradient_norm)):
+                raise ValueError("Stage 2 producer native rank observation is invalid")
+        except Exception as error:
+            local_error = error
+        if _failure_count(int(local_error is not None)):
+            raise RuntimeError("native runtime/rank observation failed") from local_error
+
+        output = Path(args.save_model_path)
+        checkpoint = output / f"checkpoint-{trainer.state.global_step}"
+        observed = None
+        local_error = None
+        if dist.get_rank() == 0:
+            try:
+                if checkpoint.is_symlink() or not checkpoint.is_dir():
+                    raise ValueError("Stage 2 producer requires its numbered checkpoint")
+                artifact = observe_stage2_checkpoint_artifact(checkpoint,
+                    method=args.tuning_method, is_rank_zero=True, broadcaster=lambda value: value)
+                pinned, descriptor = _pin_directory_for_inspection(checkpoint, label="native checkpoint")
+                try:
+                    sidecar = pinned / "stage2_objective.json"
+                    raw = (_read_small_regular(sidecar, maximum_size=4 * 1024 * 1024,
+                            label="Stage 2 objective identity")
+                           if sidecar.exists() or sidecar.is_symlink() else None)
+                    digest = validate_stage2_objective_identity(raw, config=trainer.stage2_objective_config)
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
+                observed = (artifact, digest)
+            except Exception as error:
+                local_error = error
+        # Every rank reduces failure before anyone enters the success broadcast.
+        if _failure_count(int(local_error is not None)):
+            raise RuntimeError("native checkpoint observation failed") from local_error
+        values = [observed]
+        dist.broadcast_object_list(values, src=0)
+        artifact_kind, objective_digest = values[0]
+        from stage2.evidence import publish_stage2_producer_evidence
+        return publish_stage2_producer_evidence(evidence_path, run_id=output.name,
+            method=args.tuning_method, zero_stage=None, execution_backend="ddp",
+            objective_identity_sha256=objective_digest, checkpoint_path=checkpoint,
+            artifact_kind=artifact_kind, local_rank_record={"rank": dist.get_rank(),
+                "global_step": trainer.state.global_step,
+                "optimizer_step": trainer._observed_optimizer_step,
+                "loss": float(train_result.training_loss),
+                "gradient_norm": float(trainer._representative_gradient_norm), "worker_error": None})
     global_step = trainer.state.global_step
     optimizer_step = trainer._observed_optimizer_step
     gradient_norm = trainer._representative_gradient_norm

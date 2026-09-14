@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -64,7 +65,7 @@ def _validate_decoded_types(payload: dict[str, object]) -> None:
         or type(payload["run_id"]) is not str
         or type(payload["stage"]) is not str
         or type(payload["method"]) is not str
-        or type(payload["zero_stage"]) is not int
+        or (payload.get("execution_backend") != "ddp" and type(payload["zero_stage"]) is not int)
         or type(payload["world_size"]) is not int
         or type(payload["process_ranks"]) is not list
         or any(type(rank) is not int for rank in payload["process_ranks"])
@@ -87,14 +88,19 @@ def _validate_identity(
     zero_stage: object,
     checkpoint_path: object,
     artifact_kind: object,
-) -> tuple[str, str, int, Path, str]:
+    execution_backend: str = "deepspeed",
+) -> tuple[str, str, int | None, Path, str]:
     from src.multinode import _RUN_ID_PATTERN
 
     if type(run_id) is not str or not _RUN_ID_PATTERN.fullmatch(run_id):
         raise ValueError("Stage 2 producer run ID is invalid")
     if type(method) is not str or method not in ("full", "lora", "dora"):
         raise ValueError("Stage 2 producer method is invalid")
-    if type(zero_stage) is not int or zero_stage not in (1, 2, 3):
+    if execution_backend not in ("deepspeed", "ddp"):
+        raise ValueError("Stage 2 producer execution backend is invalid")
+    if execution_backend == "ddp" and zero_stage is not None:
+        raise ValueError("native Stage 2 producer must have null ZeRO stage")
+    if execution_backend == "deepspeed" and (type(zero_stage) is not int or zero_stage not in (1, 2, 3)):
         raise ValueError("Stage 2 producer ZeRO stage is invalid")
     if type(checkpoint_path) is not str and not isinstance(checkpoint_path, Path):
         raise ValueError("Stage 2 producer checkpoint path is invalid")
@@ -117,10 +123,12 @@ def build_stage2_producer_evidence(
     *,
     run_id: str,
     method: str,
-    zero_stage: int,
+    zero_stage: int | None,
     checkpoint_path: str | Path,
     artifact_kind: str,
     rank_records: Sequence[dict[str, object]],
+    execution_backend: str = "deepspeed",
+    objective_identity_sha256: str | None = None,
 ) -> dict[str, object]:
     """Validate four observed rank records and derive one exact evidence object."""
     run_id, method, zero_stage, checkpoint, artifact_kind = _validate_identity(
@@ -129,7 +137,14 @@ def build_stage2_producer_evidence(
         zero_stage=zero_stage,
         checkpoint_path=checkpoint_path,
         artifact_kind=artifact_kind,
+        execution_backend=execution_backend,
     )
+    if objective_identity_sha256 is not None and (
+        execution_backend != "ddp" or type(objective_identity_sha256) is not str
+        or len(objective_identity_sha256) != 64
+        or any(c not in "0123456789abcdef" for c in objective_identity_sha256)
+    ):
+        raise ValueError("Stage 2 producer objective digest is invalid")
     if type(rank_records) not in (list, tuple) or len(rank_records) != 4:
         raise ValueError("Stage 2 producer requires exactly four rank records")
     normalized: list[dict[str, object]] = []
@@ -163,7 +178,7 @@ def build_stage2_producer_evidence(
     optimizer_step = next(iter(optimizer_steps))
     if optimizer_step != global_step or checkpoint.name != f"checkpoint-{global_step}":
         raise ValueError("Stage 2 producer checkpoint and optimizer steps disagree")
-    return {
+    payload = {
         "schema_version": 1,
         "kind": "stage2-producer-evidence",
         "run_id": run_id,
@@ -181,6 +196,10 @@ def build_stage2_producer_evidence(
         "worker_errors": [],
         "ranks": normalized,
     }
+    if execution_backend == "ddp":
+        payload.update(schema_version=2, execution_backend="ddp",
+                       objective_identity_sha256=objective_identity_sha256)
+    return payload
 
 
 def decode_stage2_producer_evidence(
@@ -188,9 +207,10 @@ def decode_stage2_producer_evidence(
     *,
     expected_run_id: str,
     expected_method: str,
-    expected_zero_stage: int,
+    expected_zero_stage: int | None,
     expected_checkpoint: str | Path,
     expected_global_step: int,
+    expected_execution_backend: str = "deepspeed",
 ) -> dict[str, object]:
     """Decode one duplicate-free bounded producer object and revalidate identity."""
     if type(raw) is not bytes or not raw or len(raw) > 1024 * 1024:
@@ -199,7 +219,9 @@ def decode_stage2_producer_evidence(
         payload = json.loads(raw, object_pairs_hook=_reject_duplicate_fields)
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("Stage 2 producer evidence is invalid JSON") from error
-    if type(payload) is not dict or set(payload) != _EVIDENCE_FIELDS:
+    fields = _EVIDENCE_FIELDS | ({"execution_backend", "objective_identity_sha256"}
+                               if expected_execution_backend == "ddp" else set())
+    if type(payload) is not dict or set(payload) != fields:
         raise ValueError("Stage 2 producer evidence fields are invalid")
     _validate_decoded_types(payload)
     rebuilt = build_stage2_producer_evidence(
@@ -209,6 +231,8 @@ def decode_stage2_producer_evidence(
         checkpoint_path=payload["checkpoint_path"],
         artifact_kind=payload["artifact_kind"],
         rank_records=payload["ranks"],
+        execution_backend=payload.get("execution_backend", "deepspeed"),
+        objective_identity_sha256=payload.get("objective_identity_sha256"),
     )
     if payload != rebuilt:
         raise ValueError("Stage 2 producer evidence contains unobserved claims")
@@ -218,6 +242,7 @@ def decode_stage2_producer_evidence(
         or payload["zero_stage"] != expected_zero_stage
         or payload["checkpoint_path"] != str(Path(expected_checkpoint))
         or payload["global_step"] != expected_global_step
+        or payload.get("execution_backend", "deepspeed") != expected_execution_backend
     ):
         raise ValueError("Stage 2 producer evidence identity is inconsistent")
     return payload
@@ -236,7 +261,8 @@ def _gather_records(local_record: dict[str, object]) -> list[dict[str, object]]:
 def _failure_count(local_failure: int) -> int:
     if not dist.is_available() or not dist.is_initialized():
         return local_failure
-    device = torch.device("cuda", int(__import__("os").environ["LOCAL_RANK"]))
+    device = (torch.device("cuda", torch.cuda.current_device())
+              if dist.get_backend() == "nccl" else torch.device("cpu"))
     failed = torch.tensor(local_failure, dtype=torch.int32, device=device)
     dist.all_reduce(failed, op=dist.ReduceOp.SUM)
     return int(failed.item())
@@ -312,10 +338,12 @@ def publish_stage2_producer_evidence(
     *,
     run_id: str,
     method: str,
-    zero_stage: int,
+    zero_stage: int | None,
     checkpoint_path: str | Path,
     artifact_kind: str,
     local_rank_record: dict[str, object],
+    execution_backend: str = "deepspeed",
+    objective_identity_sha256: str | None = None,
     gather_records: Callable[[dict[str, object]], list[dict[str, object]]] = _gather_records,
     is_machine_leader: bool | None = None,
     failure_counter: Callable[[int], int] = _failure_count,
@@ -330,6 +358,8 @@ def publish_stage2_producer_evidence(
         checkpoint_path=checkpoint_path,
         artifact_kind=artifact_kind,
         rank_records=records,
+        execution_backend=execution_backend,
+        objective_identity_sha256=objective_identity_sha256,
     )
     writer = (
         _is_machine_local_leader()
@@ -350,3 +380,36 @@ def publish_stage2_producer_evidence(
         raise RuntimeError("Stage 2 producer publication failed on a machine-local leader")
     synchronize()
     return payload
+
+
+def validate_stage2_objective_identity(raw: bytes | None, *, config) -> str | None:
+    """Bind the complete canonical sidecar to the frozen resolved configuration."""
+    enabled = config is not None and config.enable_stage2_objective
+    if not enabled:
+        if raw is not None:
+            raise ValueError("disabled Stage 2 objective must not have an identity")
+        return None
+    if type(raw) is not bytes or not raw or len(raw) > 4 * 1024 * 1024:
+        raise ValueError("Stage 2 objective identity is missing or exceeds its bound")
+    try:
+        payload = json.loads(raw, object_pairs_hook=_reject_duplicate_fields)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("Stage 2 objective identity is invalid JSON") from error
+    if (type(payload) is not dict
+            or set(payload) != {"schema_version", "config", "reference_identity", "vocabulary_identity"}
+            or type(payload["schema_version"]) is not int or payload["schema_version"] != 1
+            or type(payload["config"]) is not dict
+            or payload["config"].get("enable_stage2_objective") is not True):
+        raise ValueError("Stage 2 objective identity schema is invalid")
+    expected = config.to_dict()
+    if (set(payload["config"]) != set(expected)
+            or any(type(payload["config"][key]) is not type(value)
+                   or payload["config"][key] != value for key, value in expected.items())):
+        raise ValueError("Stage 2 objective configuration differs from requested config")
+    if any(value is not None and type(value) is not dict
+           for value in (payload["reference_identity"], payload["vocabulary_identity"])):
+        raise ValueError("Stage 2 objective reference/vocabulary identity is invalid")
+    if not config.active and (payload["reference_identity"] is not None
+                              or payload["vocabulary_identity"] is not None):
+        raise ValueError("CE-only objective must have null reference/vocabulary identities")
+    return hashlib.sha256(raw).hexdigest()

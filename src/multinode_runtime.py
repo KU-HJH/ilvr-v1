@@ -2262,6 +2262,28 @@ class SubprocessCoordinatorRunner:
             raise ValueError("remote Stage 1 training evidence size is invalid")
         return raw
 
+    def read_stage2_objective_identity(self, checkpoint_step: int) -> bytes:
+        """Read exact canonical objective bytes from the collected remote checkpoint."""
+        config = self.plan.stage2_objective_config
+        if (self.plan.stage != "stage2" or self.plan.backend != "ddp"
+                or config is None or not config.enable_stage2_objective
+                or type(checkpoint_step) is not int or checkpoint_step <= 0
+                or self.checkpoint_root != _CHECKPOINT_ROOT):
+            raise ValueError("native objective reader requires an enabled fixed-run checkpoint")
+        repository = _REPOSITORY_ROOT
+        completed = self._run(build_remote_exec((
+            "env", f"PYTHONPATH={repository}:{repository / 'src'}",
+            str(repository / "venv/ilvr-venv/bin/python"), "-m", "src.multinode",
+            "stage2-objective-identity-show", "--run-id", self.plan.run_id,
+            "--checkpoint-step", str(checkpoint_step)), working_directory=repository),
+            # Select the existing byte-capture path so universal-newline decoding
+            # cannot change the canonical sidecar digest.
+            input_bytes=b"")
+        raw = completed.stdout.encode("utf-8")
+        if not raw or len(raw) > 4 * 1024 * 1024:
+            raise ValueError("remote Stage 2 objective identity size is invalid")
+        return raw
+
     def cleanup_owned(self, machine_rank: int, *, timeout_seconds: float) -> bool:
         """Signal only an exactly revalidated owner, then boundedly observe exit."""
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
@@ -3556,6 +3578,7 @@ def _finite_loss_reference(
     plan: "LaunchPlan" | None = None,
     checkpoint_root: Path | None = None,
     expected_global_step: int | None = None,
+    objective_identity_bytes: bytes | None = None,
 ) -> dict[str, object]:
     if path is None:
         raise ValueError("finite loss evidence is required for a successful attempt")
@@ -3584,19 +3607,32 @@ def _finite_loss_reference(
             raise ValueError("Stage 2 producer evidence identity is invalid")
         from stage2.evidence import decode_stage2_producer_evidence
 
+        native = plan.backend == "ddp"
+        if native and (type(expected_global_step) is not int or expected_global_step <= 0
+                       or checkpoint_root is None):
+            raise ValueError("native Stage 2 evidence requires the exact checkpoint step")
+
         decoded = decode_stage2_producer_evidence(
             raw,
             expected_run_id=plan.run_id,
             expected_method=plan.tuning_method,
             expected_zero_stage=plan.zero_stage,
-            expected_checkpoint=producer_checkpoint,
-            expected_global_step=global_step,
+            expected_checkpoint=(checkpoint_root / f"checkpoint-{expected_global_step}"
+                                 if native else producer_checkpoint),
+            expected_global_step=expected_global_step if native else global_step,
+            expected_execution_backend=plan.backend,
         )
         if (
             checkpoint_root is None
             or Path(decoded["checkpoint_path"]).parent != checkpoint_root
         ):
             raise ValueError("Stage 2 producer checkpoint differs from training output")
+        if native:
+            from stage2.evidence import validate_stage2_objective_identity
+            digest = validate_stage2_objective_identity(objective_identity_bytes,
+                                                       config=plan.stage2_objective_config)
+            if decoded["objective_identity_sha256"] != digest:
+                raise ValueError("Stage 2 producer objective digest differs from canonical checkpoint")
         return {
             "status": "validated",
             "path": str(path),
@@ -3697,6 +3733,7 @@ def write_training_witness(
     batch_per_gpu: int,
     finite_loss_evidence_path: str | Path | None = None,
     expected_global_step: int | None = None,
+    objective_identity_bytes: bytes | None = None,
 ) -> Path:
     """Exclusively publish one attempt witness without inventing loss evidence."""
     if dict(exit_codes) != {0: 0, 1: 0}:
@@ -3727,6 +3764,7 @@ def write_training_witness(
         plan=plan,
         checkpoint_root=checkpoint,
         expected_global_step=expected_global_step,
+        objective_identity_bytes=objective_identity_bytes,
     )
     run_directory = _trusted_absolute_path(result_root) / plan.run_id
     path = run_directory / f"{plan.attempt_id}-train-witness.json"
@@ -3744,6 +3782,8 @@ def write_training_witness(
         "checkpoint_path": str(checkpoint),
         "finite_loss_evidence": finite_loss,
     }
+    if plan.stage == "stage2" and plan.backend == "ddp":
+        payload.update(schema_version=2, execution_backend="ddp")
     return _publish_bytes_no_replace(path, _canonical_json_bytes(payload) + b"\n")
 
 

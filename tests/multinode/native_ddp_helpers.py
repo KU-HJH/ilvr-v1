@@ -34,6 +34,7 @@ class FilesystemTransport:
     """Exercise production coordinator flow with two explicit filesystem roots."""
 
     def __init__(self, root):
+        self.logical_root = root
         self.root = root.resolve()
         self.pushed = []
         self.pulled = []
@@ -54,6 +55,24 @@ class FilesystemTransport:
 
     def read_canonical_artifact_manifest(self, checkpoint, identity):
         return self.read_artifact_manifest(0, checkpoint, identity, canonical_owner=True)
+
+    def read_stage2_objective_identity(self, checkpoint_step):
+        # Replace only the remote process boundary; execute the fixed CLI reader.
+        import io
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import src.multinode as multinode
+        stream = io.BytesIO()
+        repository = self.root / "remote-repository"
+        repository.mkdir(exist_ok=True)
+        checkpoint_root = repository / "checkpoints"
+        if not checkpoint_root.is_symlink():
+            checkpoint_root.symlink_to(self.root / "node0", target_is_directory=True)
+        with patch.object(multinode, "_REPOSITORY_ROOT", repository), \
+             patch.object(multinode.sys, "stdout", SimpleNamespace(buffer=stream)):
+            multinode._main(["stage2-objective-identity-show", "--run-id", "ddp-checkpoint-contract",
+                             "--checkpoint-step", str(checkpoint_step)])
+        return stream.getvalue()
 
     def validate_push_destination(self, manifest, entries):
         from src.multinode_artifacts import validate_transfer_destination
@@ -128,6 +147,7 @@ def run_native_checkpoint_probe(method: str, *, output_root: Path, log_path: Pat
     collect_checkpoint_artifacts(runner, checkpoint_path=runner.path(0), runtime_identity=identity,
                                  exit_codes={0: 0, 1: 0}, world_size=4)
     assert runner.pushed == ["rng_state_2.pth", "rng_state_3.pth"]
+    validate_native_publication(runner, method)
     for _ in range(2):
         redistribute_resume_checkpoint(runner, checkpoint_path=runner.path(0),
             checkpoint_identity=identity, requested_identity=identity, destination=runner.path(0))
@@ -164,6 +184,35 @@ def run_native_checkpoint_probe(method: str, *, output_root: Path, log_path: Pat
                   scheduler=summaries[0]["scheduler"], reference_identity=summaries[0]["reference_identity"])
     (results / "comparison.json").write_text(json.dumps(result, indent=2))
     return result
+
+
+def validate_native_publication(runner, method="full", *, ce_only=False):
+    """Consume actual producer plus collected bytes before node1 redistribution."""
+    from src.multinode import build_launch_plan
+    from src.multinode_runtime import write_training_witness
+    from src.stage2.objective import Stage2ObjectiveConfig
+    raw = runner.read_stage2_objective_identity(2)
+    sidecar = json.loads(raw)
+    config = (Stage2ObjectiveConfig(True) if ce_only else
+              Stage2ObjectiveConfig(True, 0.5, 0.5, str(runner.logical_root / "source")))
+    assert sidecar["config"] == config.to_dict()
+    plan = build_launch_plan(stage="stage2", tuning_method=method, zero_stage=None, backend="ddp",
+        run_id="ddp-checkpoint-contract", main_process_port=29876, stage2_objective_config=config)
+    results = result_directory(runner.root)
+    for node in (0, 1):
+        payload = json.loads((results / f"producer-node{node}.json").read_text())
+        assert payload["schema_version"] == 2 and payload["execution_backend"] == "ddp"
+        assert payload["objective_identity_sha256"] == hashlib.sha256(raw).hexdigest()
+        assert payload["process_ranks"] == [0, 1, 2, 3]
+        assert [r["rank"] for r in payload["ranks"]] == [0, 1, 2, 3]
+        assert all(r["global_step"] == r["optimizer_step"] == 2 for r in payload["ranks"])
+    assert sorted(p.name for p in runner.path(1).iterdir()) == ["rng_state_2.pth", "rng_state_3.pth"]
+    witness = write_training_witness(plan, result_root=results, exit_codes={0: 0, 1: 0},
+        checkpoint_path=runner.logical_root / "node1/ddp-checkpoint-contract", batch_per_gpu=1,
+        finite_loss_evidence_path=results / "producer-node1.json", expected_global_step=2,
+        objective_identity_bytes=raw)
+    assert json.loads(witness.read_text())["execution_backend"] == "ddp"
+    return sidecar
 
 
 def _worker(method, root, phase):
@@ -207,7 +256,8 @@ def _worker(method, root, phase):
                     model_config=model.config, token_ids=LatentTokenIds(90, 91, 92),
                     resolved_target_names=resolve_stage2_target_module_names(model, tuning.target_modules))
         model = build_stage2_tuned_model(model, tuning)
-    config = Stage2ObjectiveConfig(True, 0.5, 0.5, str(root / "source"))
+    config = (Stage2ObjectiveConfig(True) if phase == "evidence_ce"
+              else Stage2ObjectiveConfig(True, 0.5, 0.5, str(root / "source")))
     rt = runtime(config, initial)
     output = root / (f"control{rank // 2}" if phase == "control" else f"node{rank // 2}") / "ddp-checkpoint-contract"
 
@@ -219,7 +269,7 @@ def _worker(method, root, phase):
                     "numpy": np.random.get_state(), "cpu": torch.get_rng_state()}), root / f"loaded-{rank}.pt")
 
         def on_step_end(self, args, state, control, **kwargs):
-            if phase == "save" and state.global_step == 2:
+            if (phase == "save" or phase.startswith("evidence_")) and state.global_step == 2:
                 control.should_training_stop = True
                 control.should_save = True
             return control
@@ -234,8 +284,8 @@ def _worker(method, root, phase):
     trainer = Stage2Trainer(model=model, args=args, processing_class=processor,
                 train_dataset=[SimpleNamespace(latent_block_count=1, index=i) for i in range(24)],
                 data_collator=lambda examples: batch(), callbacks=[Witness()],
-                stage2_objective_config=config, stage2_objective_runtime=rt, stage2_peft_metadata=metadata)
-    if rank == 0 and phase == "save":
+                stage2_objective_config=config, stage2_objective_runtime=rt if config.active else None, stage2_peft_metadata=metadata)
+    if rank == 0 and (phase == "save" or phase.startswith("evidence_")):
         initial.save_pretrained(root / "source")
         processor.save_pretrained(root / "source")
     trainer.accelerator.wait_for_everyone()
@@ -246,7 +296,55 @@ def _worker(method, root, phase):
     rt.reference = FrozenReference(fixed_reference, {"source": str(root / "source"),
         "model_sha256": hashlib.sha256((root / "source/model.safetensors").read_bytes()).hexdigest()})
     reference_before = {name: p.detach().clone() for name, p in fixed_reference.named_parameters()}
-    trainer.train(resume_from_checkpoint=str(output / "checkpoint-2") if phase == "resume" else None)
+    train_result = trainer.train(resume_from_checkpoint=str(output / "checkpoint-2") if phase == "resume" else None)
+    if phase == "save" or phase.startswith("evidence_"):
+        from main import publish_stage2_training_evidence
+        from datetime import timedelta
+        torch.distributed.distributed_c10d._set_pg_timeout(timedelta(seconds=12))
+        assert isinstance(trainer.model_wrapped, torch.nn.parallel.DistributedDataParallel)
+        assert trainer.accelerator.num_processes == 4 and not trainer.is_deepspeed_enabled
+        os.environ["LOCAL_RANK"] = str(rank % 2)
+        producer_path = result_directory(root) / f"producer-node{rank // 2}.json"
+        if phase == "evidence_fail" and rank == 0:
+            (output / "checkpoint-2/model.safetensors").unlink()
+        trainer.accelerator.wait_for_everyone()
+        if phase == "evidence_runtime":
+            from dataclasses import replace
+            rejections = []
+            for failure in ("cross_backend", "world", "rank2_nonfinite"):
+                wrong_profile = trainer.deepspeed_runtime_profile
+                if failure == "cross_backend":
+                    wrong_profile = replace(wrong_profile, enabled=True, zero_stage=2,
+                                            config_path=Path("/wrong-ds.json"), config_digest="a"*64)
+                elif failure == "world":
+                    wrong_profile = replace(wrong_profile, world_size=2)
+                checked_result = train_result
+                if failure == "rank2_nonfinite" and rank == 2:
+                    checked_result = train_result._replace(training_loss=float("nan"))
+                try:
+                    publish_stage2_training_evidence(SimpleNamespace(benchmark_evidence_path=str(producer_path),
+                        save_model_path=str(output), tuning_method=method), trainer=trainer,
+                        train_result=checked_result, profile=wrong_profile)
+                except RuntimeError as error:
+                    assert str(error) == "native runtime/rank observation failed"
+                    rejections.append(failure)
+                else:
+                    raise AssertionError(f"prepared native DDP accepted {failure}")
+                assert not producer_path.exists()
+            (result_directory(root) / f"runtime-rejections-{rank}.json").write_text(json.dumps(rejections))
+        try:
+            produced = publish_stage2_training_evidence(SimpleNamespace(
+                benchmark_evidence_path=str(producer_path), save_model_path=str(output), tuning_method=method),
+                trainer=trainer, train_result=train_result, profile=trainer.deepspeed_runtime_profile)
+        except Exception as error:
+            (result_directory(root) / f"publication-{rank}.json").write_text(json.dumps({"error": str(error)}))
+            if phase != "evidence_fail":
+                raise
+        else:
+            (result_directory(root) / f"publication-{rank}.json").write_text(json.dumps(produced))
+        if phase == "evidence_fail":
+            torch.distributed.destroy_process_group()
+            return
     observed = {"step": trainer.state.global_step,
                 "reference_changed": any(not torch.equal(p, reference_before[name]) for name, p in rt.reference.model.named_parameters()),
                 "reference_identity": rt.reference.identity,
