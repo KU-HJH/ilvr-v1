@@ -204,6 +204,62 @@ is fresh. A separately authorized execution uses the same command plus
 
 Evidence must be read at its actual scope:
 
+Final verification at production/test commit `092a95e`:
+
+```bash
+CUDA_VISIBLE_DEVICES='' PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+  ./venv/ilvr-venv/bin/pytest -q tests -m 'not gpu'
+```
+
+Exit 1: **2626 passed, 4 failed, 7 skipped, 3 deselected, 10 warnings in
+429.00 seconds**. Full output is retained in
+`logs/stage2-ddp-dev/final-project-cpu-092a95e.log`. No passing-full-suite or
+ready-to-merge claim is made. The finishing gate stopped before integration
+options; the worktree is preserved and canonical deployment was not performed.
+
+The four failures are:
+
+1. `tests/multinode/test_capacity.py::test_stage1_coordinator_uses_training_evidence_step_without_max_steps`:
+   an unchanged Stage 1 test replaces `build_launch_plan` with a
+   `SimpleNamespace` lacking `backend`; the new witness keyword selection at
+   `src/multinode.py:2129` accesses that field. This is an unresolved newly
+   exposed integration-test incompatibility, **not** one of the three known
+   platform baseline failures. The real builder returns `LaunchPlan` with a
+   backend field, so this traceback alone does not demonstrate a production
+   Stage 1 execution failure. It still blocks a full regression pass.
+2. `tests/stage1/test_evaluation_diagnostics.py::test_diagnostic_entrypoint_leaves_an_extra_build_marker_invalid`.
+3. `tests/stage1/test_evaluation_diagnostics.py::test_diagnostic_entrypoint_restores_platform_after_heavy_import_failure`.
+4. `tests/stage2/test_launcher.py::test_production_entrypoint_imports_with_build_marker_then_restores_platform`.
+
+Failures 2–4 reproduce the earlier canonical-baseline symptoms recorded below.
+The final ten warnings are located in Stage 2 evaluation/inference tests and
+report PEFT's missing-config fallback; this identifies their observed location,
+not causal attribution to the new objective. Syntax checks passed for all three
+Stage 2 wrappers/workers. An actual import probe resolved Transformers
+`4.50.0.dev0` and Qwen to this worktree's `transformers/src`, not the installed
+unmodified package. Only documentation/checklist evidence changed afterward.
+
+- Combined whole-branch review and the single scoped re-review are complete
+  through `092a95e`. All seven findings were addressed: loadable reference
+  symlink/indexed-shard hashing, active provenance presence and runtime binding,
+  disabled-reference preflight, FP16 rejection, collator typing, asymmetric
+  blockwise-nonlinearity regression, and contextual numerical errors.
+  The amended-file covering run passed 169 tests in 74.05 seconds; complete
+  output: `logs/stage2-ddp-dev/final-fix-covering.log`. Actual four-CPU producer
+  records in `results/stage2-ddp-dev/native-provenance-rdgde5bm/` reject missing
+  and different reference/vocabulary identities on all ranks before restored
+  valid publication. This is not a GPU or full-project pass.
+- Three final actual-coordinator dry-runs are captured in
+  `logs/stage2-ddp-dev/final-dryrun-092a95e-{ce,entropy,combined}.json`.
+  They use the same local reproduced checkpoint-431 path, `data/TRAIN.jsonl`,
+  image root and seed 42, with weights `(0,0)`, `(0.4,0)`, `(0.4,0.6)`.
+  The supplied 423-update budget and weights are command-construction inputs,
+  not validated retained-data counts or recommended research hyperparameters.
+  All three exited zero and created no experiment artifacts in either local
+  repository root. No live port/input/resource check occurred, and their
+  canonical worker commit is still the undeployed `31f745e`; do not launch
+  these captured commands as evidence of deployment or readiness.
+
 - The executable wrapper boundary in `tests/stage2/test_objective_examples.py`
   has 26 passing CPU shell tests for all three argv/environment variants,
   validation, explicit-launch selection, collision rejection, and dry-run
@@ -248,3 +304,35 @@ training readiness. Increasing `D` does not ensure both entropy directions;
 increasing `G` can result from lowering `S_M`; neither value nor a lower loss
 establishes semantic visual grounding, training stability, novelty, or task
 performance improvement.
+
+### Acceptance evidence map
+
+| Criterion | Executed witness and scope |
+| --- | --- |
+| A: math and gradients | `test_objective_math.py`: literal values/signs, detached reference/M, finite small-entropy/BF16 cases; asymmetric scalar and broadcast mean-first mutations rejected. |
+| B: alignment and masks | `test_objective_windows.py`, `test_data.py`, `test_objective_ablation.py`: causal offsets, vocabulary, marker/latent masks, padding, overlap and invalid/empty windows; local tokenizer/processor probe recorded in the objective plan. |
+| C: intervention | `test_objective_ablation.py`: actual tiny Qwen F depends on selected latent; M post/downstream perturbation difference is zero, prefix/input/RoPE preserved, no F suffix reuse. |
+| D: integration/regression | `test_objective_trainer.py`, `test_objective_distributed.py`, native checkpoint/evidence tests: actual Trainer gradients, checkpointing, fixed reference, full/DoRA CPU resume and global-count oracle; legacy controls are bounded by the final suite result. |
+| E: execution | Local CPU tests and actual multi-process Gloo integration only. Three coordinator dry-runs construct commands. Real two-host GPU/NCCL, production sparse-row resume, capacity, full training and evaluation remain unrun. |
+
+### Implementation rulings
+
+These choices did not change the approved research objective:
+
+1. Zero-weight CE bypasses auxiliary metadata/vocabulary/count collectives;
+   otherwise unused window parsing could reject valid CE inputs. If wrong,
+   unused diagnostic metadata is unavailable; CE arithmetic is unchanged.
+2. One fixed-run/checkpoint-step canonical objective reader supplies in-memory
+   bytes to the existing witness path, because original node1 is RNG-only.
+   If wrong, one narrow internal read API is unnecessary maintenance.
+3. An explicit internal `resume_destination` mode recognizes a fully validated
+   previously redistributed native checkpoint as well as original RNG2/3-only
+   state; partial/mixed state still fails. If wrong, one internal mode is
+   unnecessary maintenance, without weaker validation or new recovery.
+4. Native `zero_stage` is required-but-nullable, not an omitted keyword, to
+   preserve legacy call shape. If wrong, callers supply an unnecessary `None`;
+   serialized/runtime behavior is unchanged.
+5. Load-relevant local symlink/indexed-shard bytes are hashed rather than
+   banning sources the loader already accepts. If wrong, linked artifacts
+   remain an availability dependency instead of being rejected; no remote
+   loading or generic traversal infrastructure was added.

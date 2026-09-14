@@ -200,15 +200,19 @@ contracts match; no test-only production extension.
 ### Task 4: Comparison examples, operator docs and combined handoff
 
 **Status:** Delivery implemented67a7676, task review and docs-only remainder
-clarification41a6285 approved. Executable shell26passed; actual coordinator
-dry-run verified without launching. Combined whole-branch review and final
-project CPU verification remain pending below.
+clarification41a6285 approved. Combined review plus single fix092a95e/scoped
+re-review addressed all seven findings. Final CPU execution:2626passed,
+4failed,7skipped,3deselected,10warnings429.00s. Three known platform failures
+plus a newly exposed Stage1 test-double/backend incompatibility remain;
+finishing stopped, no full-pass/integration claim. Three actual coordinator
+dry-runs passed command construction only. Exact commands, failure nodes,
+acceptance mapping, rulings and unrun limits are in docs/stage2-objective.md.
 
 **Files:** Create `run_stage2_objective_examples.sh`, `docs/stage2-objective.md`, `tests/stage2/test_objective_examples.py`; modify only relevant `docs/multinode-training.md` native-DDP instructions. This is also original objective plan Task5, not a second wrapper/review cycle.
 
 **Interfaces:** Wrapper mode `ce|entropy|combined`; required --stage1, --data, --image-root, --run-id, --max-steps, --main-process-port; entropy/combined require positive --lambda-dyn, combined positive --lambda-vis. --dry-run prints actual coordinated command without launching ranks; require explicit --launch for execution, reject both together. Same inputs/seed/baseline across modes; select explicit --backend ddp and enable_stage2_objective for ALL three, including CE.
 
-- [ ] Write executable-shell RED tests using controlled environment and coordinator boundary: compare actual argv/env for three modes, same source/data/seed/LR/batch/update budget, different weights/skipped branches; errors for missing paths/invalid mode/weights/port/output collisions. Dry-run starts no ranks/writes no checkpoints. Do not grep shell source or assert a mock's existence.
+- [x] Write executable-shell RED tests using controlled environment and coordinator boundary: compare actual argv/env for three modes, same source/data/seed/LR/batch/update budget, different weights/skipped branches; errors for missing paths/invalid mode/weights/port/output collisions. Dry-run starts no ranks/writes no checkpoints. Do not grep shell source or assert a mock's existence.
 
 ```python
 assert ce_args[ce_args.index('--lambda_dyn') + 1] == '0'
@@ -221,11 +225,11 @@ assert observed_environment['GRADIENT_ACCUMULATION_STEPS'] == '2'
 assert observed_environment['LEARNING_RATE'] == '5e-5'
 ```
 
-- [ ] Run RED `pytest -q tests/stage2/test_objective_examples.py`; implement direct readable wrapper. Baseline micro1/global8/LR5e-5/seed42/warmup10/BF16/DoRA r32 alpha64 dropout0.05/latent8, supervised markers, supported SDPA and native non-reentrant GC. Use supplied max-steps (derived by operator from actual retained data/remainder), save_steps same terminal budget; never hardcode Stage2=431. No GPU launch in tests.
-- [ ] Write operator/objective docs with exact formulas/window/vocab/graph/reference/M semantics from approved original design, backend and checkpoint support, actual CPU evidence, known platform failures and unrun GPU/ZeRO/training/capacity. Show three same-source/data/seed examples with distinct run IDs, required free ports and explicit step budget; default Stage1 is reproduced checkpoint-431, not old comt checkpoint. D/G do not establish task performance.
-- [ ] Run GREEN `pytest -q tests/stage2/test_objective_examples.py`; `bash -n run_stage2_objective_examples.sh run_stage2_training.sh`; use actual coordinator dry-run to confirm final forwarded args, no training. Consolidate exact objective/DDP evidence into durable docs before any scratch cleanup.
-- [ ] Self-review and commit delivery. Root conducts ONE combined whole-branch requesting-code-review including both approved plans and deferred objective minors, then one consolidated fix wave/scoped rereview if needed. Reuse this gate for original Task5; no duplicate final review.
-- [ ] Root selects final verification/finishing applicability first. Project CPU suite is `pytest -q tests -m 'not gpu'` with CUDA hidden and repo PYTHONPATH; use it once for the final suite claim, plus distinct shell/dry-run/requirements checks once. Known baseline failures must remain visible; do not declare a full pass or advance finishing options if required evidence fails. No GPU training, merge, push or canonical deployment without separate authority.
+- [x] Run RED `pytest -q tests/stage2/test_objective_examples.py`; implement direct readable wrapper. Baseline micro1/global8/LR5e-5/seed42/warmup10/BF16/DoRA r32 alpha64 dropout0.05/latent8, supervised markers, supported SDPA and native non-reentrant GC. Use supplied max-steps (derived by operator from actual retained data/remainder), save_steps same terminal budget; never hardcode Stage2=431. No GPU launch in tests.
+- [x] Write operator/objective docs with exact formulas/window/vocab/graph/reference/M semantics from approved original design, backend and checkpoint support, actual CPU evidence, known platform failures and unrun GPU/ZeRO/training/capacity. Show three same-source/data/seed examples with distinct run IDs, required free ports and explicit step budget; default Stage1 is reproduced checkpoint-431, not old comt checkpoint. D/G do not establish task performance.
+- [x] Run GREEN `pytest -q tests/stage2/test_objective_examples.py`; `bash -n run_stage2_objective_examples.sh run_stage2_training.sh`; use actual coordinator dry-run to confirm final forwarded args, no training. Consolidate exact objective/DDP evidence into durable docs before any scratch cleanup.
+- [x] Self-review and commit delivery. Root conducts ONE combined whole-branch requesting-code-review including both approved plans and deferred objective minors, then one consolidated fix wave/scoped rereview if needed. Reuse this gate for original Task5; no duplicate final review.
+- [x] Root selects final verification/finishing applicability first. Project CPU suite is `pytest -q tests -m 'not gpu'` with CUDA hidden and repo PYTHONPATH; use it once for the final suite claim, plus distinct shell/dry-run/requirements checks once. Known baseline failures must remain visible; do not declare a full pass or advance finishing options if required evidence fails. No GPU training, merge, push or canonical deployment without separate authority. Executed; finishing remains blocked by the four failures above, not marked complete.
 
 ## Plan self-review coverage
 

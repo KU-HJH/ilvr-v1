@@ -179,16 +179,20 @@ minor review items, not GPU support evidence. Task5/final verification remains o
 this original wrapper interface and its sketch commands: it requires an explicit
 update budget and port, and invokes the real coordinator with `--dry-run` rather
 than skipping it. Use `docs/stage2-objective.md` for current executable examples.
-Delivery67a7676 and remainder-doc fix41a6285 passed their task review; the shared
-combined whole-branch review and final CPU verification remain pending.
+Delivery67a7676 and remainder-doc fix41a6285 passed their task review. Shared
+combined review and single fix092a95e/scoped re-review addressed all7findings.
+Final CPU execution2626passed/4failed/7skipped/3deselected/10warnings429.00s:
+three known platform failures and one new Stage1 test-double/backend mismatch.
+Finishing remains blocked; no full-regression-pass or GPU readiness claim.
+Exact evidence, acceptance mapping and remaining limits: docs/stage2-objective.md.
 
 **Files:** Create `run_stage2_objective_examples.sh`, `docs/stage2-objective.md`, `tests/stage2/test_objective_examples.py`; update plan checklist/evidence only, not frozen proposal text.
 
 **Interfaces:** Wrapper accepts mode `ce|entropy|combined`, original Stage1 source, data/image roots, run ID and lambda values, validates inputs, invokes existing `run_multinode_stage2_training.sh` with explicit approved baseline and objective flags/env forwarding. Never launches all three implicitly; dry-run prints exact launch without starting ranks. If coordinator lacks passthrough, smallest feature-only CLI forwarding change plus causal test is allowed; do not port unrelated launcher changes from main.
 
-- [ ] Write RED executable-shell tests with temporary fake coordinator/environment boundary: modes preserve same source/data/seed and only intended lambda flags differ; missing paths, unsupported mode, destructive output collision fail; dry-run never executes coordinator. Assert observable argv/exit behavior rather than source grep.
-- [ ] Run RED `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/stage2/test_objective_examples.py`.
-- [ ] Implement direct wrapper and operator doc with formulas/windows/vocabulary/ref identity/local ablation/gradients/forward cost/backend limits. Show three invocations with user-supplied paths/weights and distinct run IDs. Retained-sample-derived Stage2 budget must be supplied or validated by existing coordinator; no hardcoded 431. No new orchestration/recovery system.
+- [x] Write RED executable-shell tests with temporary fake coordinator/environment boundary: modes preserve same source/data/seed and only intended lambda flags differ; missing paths, unsupported mode, destructive output collision fail; dry-run never executes coordinator. Assert observable argv/exit behavior rather than source grep.
+- [x] Run RED `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/stage2/test_objective_examples.py`.
+- [x] Implement direct wrapper and operator doc with formulas/windows/vocabulary/ref identity/local ablation/gradients/forward cost/backend limits. Show three invocations with user-supplied paths/weights and distinct run IDs. Retained-sample-derived Stage2 budget must be supplied or validated by existing coordinator; no hardcoded 431. No new orchestration/recovery system.
 
 ```bash
 ./run_stage2_objective_examples.sh ce --stage1 "$STAGE1" --data "$DATA" --image-root "$IMAGES" --run-id "$CE_RUN" --dry-run
@@ -196,6 +200,6 @@ combined whole-branch review and final CPU verification remain pending.
 ./run_stage2_objective_examples.sh combined --stage1 "$STAGE1" --data "$DATA" --image-root "$IMAGES" --run-id "$BOTH_RUN" --lambda-dyn "$LAMBDA_DYN" --lambda-vis "$LAMBDA_VIS" --dry-run
 ```
 
-- [ ] Run GREEN shell behavior tests and `bash -n run_stage2_objective_examples.sh`. Document actual CPU tests separately from NOT RUN four-rank GPU/ZeRO/real-data/full-training checks; include reproduction commands for those. Check read-only resource/checkpoint availability before deciding GPU smoke is runnable, not by assuming it.
-- [ ] Record all A–E criteria with exact test ownership/evidence; perform requesting-code-review over complete branch. Address findings through the designated fixer and focused rereview, then select final full project CPU suite with verification-before-completion/finishing-a-development-branch. Do not run upstream Transformers' unrelated enormous suite as ILVR regression evidence.
+- [x] Run GREEN shell behavior tests and `bash -n run_stage2_objective_examples.sh`. Document actual CPU tests separately from NOT RUN four-rank GPU/ZeRO/real-data/full-training checks; include reproduction commands for those. Check read-only resource/checkpoint availability before deciding GPU smoke is runnable, not by assuming it.
+- [x] Record all A–E criteria with exact test ownership/evidence; perform requesting-code-review over complete branch. Address findings through the designated fixer and focused rereview, then select final full project CPU suite with verification-before-completion/finishing-a-development-branch. Do not run upstream Transformers' unrelated enormous suite as ILVR regression evidence. Executed; four final failures still block finishing.
 - [ ] Commit only delivery files; preserve implementation worktree pending human integration choice. Final response lists changes, tests/run limits, examples, and no claim of task performance gain.
