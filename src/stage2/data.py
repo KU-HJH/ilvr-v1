@@ -208,11 +208,19 @@ def _load_original_images(paths: tuple[str, ...]) -> list[Image.Image]:
 class Stage2DataCollator:
     """Tokenize exactly one complete CoMT sample without truncation."""
 
-    def __init__(self, processor, token_ids, latent_size, supervise_latent_boundaries):
+    def __init__(
+        self,
+        processor,
+        token_ids,
+        latent_size,
+        supervise_latent_boundaries,
+        enable_stage2_objective=False,
+    ):
         self.processor = processor
         self.token_ids = token_ids
         self.latent_size = latent_size
         self.supervise_latent_boundaries = supervise_latent_boundaries
+        self.enable_stage2_objective = enable_stage2_objective
         self.assistant_pattern = processor.tokenizer(
             "<|im_start|>assistant", add_special_tokens=False, return_tensors="pt"
         )["input_ids"][0]
@@ -252,7 +260,155 @@ class Stage2DataCollator:
             latent_size=self.latent_size,
             supervise_latent_boundaries=self.supervise_latent_boundaries,
         )
+        if self.enable_stage2_objective:
+            batch["stage2_text_segments"] = [
+                _derive_stage2_text_segments(
+                    tokenizer=self.processor.tokenizer,
+                    rendered_text=text,
+                    final_input_ids=batch["input_ids"][0],
+                    example=example,
+                    token_ids=self.token_ids,
+                    latent_size=self.latent_size,
+                )
+            ]
         return batch
+
+
+def _one_dimensional_list(value, *, name: str, entries_are_pairs: bool = False) -> list:
+    if isinstance(value, torch.Tensor):
+        value = value.tolist()
+    is_batched = bool(
+        value
+        and isinstance(value[0], (list, tuple))
+        and (
+            not entries_are_pairs
+            or (value[0] and isinstance(value[0][0], (list, tuple)))
+        )
+    )
+    if is_batched:
+        if len(value) != 1:
+            raise ValueError(f"{name} must contain exactly one tokenized row")
+        value = value[0]
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be a one-dimensional token sequence")
+    return value
+
+
+def _token_boundary(offsets: list[tuple[int, int]], character_position: int) -> int:
+    for index, (start, end) in enumerate(offsets):
+        if start < character_position < end:
+            raise ValueError(
+                "assistant content has BPE-boundary ambiguity in full rendered tokenization"
+            )
+        if start >= character_position and end > start:
+            return index
+    return len(offsets)
+
+
+def _assistant_content(example: Stage2PreparedExample) -> str:
+    if not example.conversation or example.conversation[-1].get("role") != "assistant":
+        raise ValueError("Stage 2 conversation must end with one assistant turn")
+    content = example.conversation[-1].get("content")
+    if (
+        not isinstance(content, list)
+        or len(content) != 1
+        or not isinstance(content[0], dict)
+        or content[0].get("type") != "text"
+        or not isinstance(content[0].get("text"), str)
+    ):
+        raise ValueError("Stage 2 assistant turn must contain exactly one text item")
+    return content[0]["text"]
+
+
+def _derive_stage2_text_segments(
+    *,
+    tokenizer,
+    rendered_text: str,
+    final_input_ids: torch.Tensor,
+    example: Stage2PreparedExample,
+    token_ids: LatentTokenIds,
+    latent_size: int,
+) -> list[tuple[int, int]]:
+    """Locate assistant content via full-render offsets and verify its final suffix."""
+    content = _assistant_content(example)
+    header = "<|im_start|>assistant\n"
+    needle = header + content
+    matches = []
+    cursor = 0
+    while True:
+        position = rendered_text.find(needle, cursor)
+        if position < 0:
+            break
+        matches.append(position)
+        cursor = position + 1
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected one rendered assistant content bound, found {len(matches)}"
+        )
+    content_character_start = matches[0] + len(header)
+    content_character_end = content_character_start + len(content)
+    if rendered_text[content_character_start:content_character_end] != content:
+        raise ValueError("rendered assistant content bytes do not match the conversation")
+    if not rendered_text[content_character_end:].startswith("<|im_end|>"):
+        raise ValueError("rendered assistant content is not followed by chat termination")
+
+    try:
+        encoded = tokenizer(
+            rendered_text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        raw_ids = _one_dimensional_list(encoded["input_ids"], name="input_ids")
+        raw_offsets = _one_dimensional_list(
+            encoded["offset_mapping"], name="offset_mapping", entries_are_pairs=True
+        )
+    except (KeyError, TypeError, ValueError, NotImplementedError) as error:
+        raise ValueError(
+            "Stage 2 objective requires tokenizer offsets for the complete rendered text"
+        ) from error
+    offsets = [tuple(int(value) for value in pair) for pair in raw_offsets]
+    if len(offsets) != len(raw_ids) or any(len(pair) != 2 for pair in offsets):
+        raise ValueError("tokenizer returned inconsistent full-render offsets")
+    raw_content_start = _token_boundary(offsets, content_character_start)
+    raw_content_end = _token_boundary(offsets, content_character_end)
+    if raw_content_end < raw_content_start:
+        raise ValueError("assistant content token bounds are reversed")
+
+    final_ids = [int(value) for value in final_input_ids.tolist()]
+    assistant_suffix = [int(value) for value in raw_ids[raw_content_start:]]
+    if len(assistant_suffix) > len(final_ids):
+        raise ValueError("processor output is shorter than the assistant token suffix")
+    final_suffix_start = len(final_ids) - len(assistant_suffix)
+    if final_ids[final_suffix_start:] != assistant_suffix:
+        raise ValueError(
+            "processor output does not preserve the verified assistant token suffix"
+        )
+    shift = final_suffix_start - raw_content_start
+    content_start = raw_content_start + shift
+    content_end = raw_content_end + shift
+
+    try:
+        spans = parse_latent_spans(
+            final_input_ids, token_ids=token_ids, latent_size=latent_size
+        )
+    except LatentStructureError as error:
+        raise ValueError(f"malformed final Stage 2 latent markers: {error}") from error
+    if len(spans) != example.latent_block_count:
+        raise ValueError(
+            "final latent block count does not match prepared example metadata"
+        )
+    if any(
+        span.start_position < content_start or span.end_position >= content_end
+        for span in spans
+    ):
+        raise ValueError("latent marker lies outside verified assistant content bounds")
+    segments: list[tuple[int, int]] = []
+    start = content_start
+    for span in spans:
+        segments.append((start, span.start_position))
+        start = span.end_position + 1
+    segments.append((start, content_end))
+    return segments
 
 
 def build_prepared_example_length_measure(processor):
