@@ -197,6 +197,16 @@ def _latent_inputs():
     return {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
 
 
+def _sparse_input_rows(model):
+    rows = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if name.endswith("trainable_tokens_delta.default")
+    ]
+    assert len(rows) == 1
+    return rows[0]
+
+
 @pytest.mark.parametrize("artifact_kind", ["full", "dora"])
 def test_reference_is_independent_frozen_and_stable_through_student_update(
     checkpoint_directory, artifact_kind
@@ -224,6 +234,14 @@ def test_reference_is_independent_frozen_and_stable_through_student_update(
     assert not ({parameter.data_ptr() for parameter in student.parameters()} & {
         parameter.data_ptr() for parameter in reference.model.parameters()
     })
+    if artifact_kind == "dora":
+        torch.testing.assert_close(
+            _sparse_input_rows(reference.model), _sparse_input_rows(student)
+        )
+        torch.testing.assert_close(
+            find_sparse_output_token_rows(reference.model).output_delta,
+            find_sparse_output_token_rows(student).output_delta,
+        )
 
     optimizer = SGD((p for p in student.parameters() if p.requires_grad), lr=0.01)
     optimizer_ids = {
@@ -397,6 +415,47 @@ def test_reference_identity_hashes_sources_and_never_uses_resume_student(
         "tokenizer.json",
     }
     assert all("never-reference-resumed-student" not in source for _, source, _ in loads)
+
+
+def test_dora_rejects_nonlocal_metadata_base_before_source_loader(
+    checkpoint_directory,
+):
+    """Catches Hub resolution or model loading before the local-base policy gate."""
+    reference_api = _api()
+    _, reference_path = _write_schema2_dora(checkpoint_directory)
+    metadata_path = reference_path / "stage1_peft_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["base_model_reference"] = "forbidden/remote-model"
+    metadata_path.write_text(
+        json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    student_source = _write_full_stage1(checkpoint_directory)
+    student = _student_from_full(student_source)
+    calls = []
+
+    def forbidden(name):
+        def fail(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            raise AssertionError(f"forbidden source dependency reached: {name}")
+
+        return fail
+
+    dependencies = SimpleNamespace(
+        find_adapter_config=lambda source, **kwargs: str(
+            Path(source) / "adapter_config.json"
+        ),
+        load_config=forbidden("load_config"),
+        load_processor=forbidden("load_processor"),
+        load_model=forbidden("load_model"),
+    )
+    with pytest.raises(ValueError, match="base.*local.*directory"):
+        reference_api.load_frozen_reference(
+            _args(reference_path),
+            student=student,
+            tokenizer=TinyStage1Processor.from_pretrained(student_source).tokenizer,
+            source_dependencies=dependencies,
+        )
+    assert calls == []
 
 
 def test_objective_sidecar_rejects_missing_and_every_identity_mismatch(

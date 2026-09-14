@@ -223,6 +223,12 @@ def _resolve_reference_decision(args, source_dependencies, reference_source: Pat
 
     snapshot = read_stage1_peft_metadata_snapshot(reference_source)
     metadata = decode_stage1_peft_metadata_snapshot(snapshot)
+    metadata_base_source = Path(metadata.base_model_reference)
+    if not metadata_base_source.is_dir():
+        raise ValueError(
+            "Stage 1 DoRA base_model_reference must be a local directory: "
+            f"{metadata.base_model_reference}"
+        )
     return resolve_stage2_load_decision(
         load_model_path=metadata.base_model_reference,
         stage1_adapter_path=str(reference_source),
