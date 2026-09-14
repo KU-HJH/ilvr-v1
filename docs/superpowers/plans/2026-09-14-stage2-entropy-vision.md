@@ -40,6 +40,8 @@
 - Produce `stage2_finite_ce: bool=False`, opt-in finite graph-zero for all-ignore labels; default unchanged.
 - Produce `capture_rng_state() -> RNGState` and contextmanager `replay_rng_state(state: RNGState)` in `stage2.rng`, preserving outer CPU/initialized-CUDA RNG state without initializing unused devices.
 - Keep existing logits/output fields and default forward behavior. No selected-logit output API is needed: later tasks index returned logits before any additional FP32 conversion.
+- F means normal student forward; M means independently replayed masked forward. s/e are the actual start/end marker positions, e strictly inside sequence; example slots [3,4] mean (s,e)=(2,5). Require the pair to match a parsed nonempty latent span, reject bool/noninteger indices, padding markers, B>1 runtime, and intervention/finite-CE use outside Stage 2. Active intervention supports eager/SDPA only, not FlashAttention or sliding-window/native-nonzero-attention-dropout configurations. Errors are explicit ValueError/NotImplementedError with reason, not an exact-text contract.
+- Finite CE applies when every shifted supervised label in the B1 forward is ignored, returning graph-connected FP32 zero; normal labels use untouched legacy CE. The gradient witness means loss ONLY on post-text predictions reaches the generated latent states. Compare all non-None trainable gradients between matched-RNG F-forward then M then F-backward versus F-only backward, and checkpoint on/off, with tight dtype-appropriate numerical tolerances and reported maximum errors. RNGState is an internal snapshot, not a serialization API; clone states, support nested replay, and reject incompatible initialized-device sets rather than silently perturb new streams.
 
 - [ ] Write failing tests using existing `tests/stage2/helpers.py:tiny_stage2_qwen`, two layers/two blocks, eager first. The intended new kwarg must cause the missing-feature failure; do not stop at an import/fixture error. Include deterministic generated-latent perturbation, not overwritten pad-embedding perturbation.
 
@@ -80,6 +82,7 @@ mask = mask.masked_fill(blocked[None, None], torch.finfo(dtype).min)
 - `WindowBlock(batch_index,block_index,start_position,end_position,pre_positions,post_positions,target_ids)` frozen dataclass, position/ID collections immutable tuples. `WindowSelection(blocks: tuple[WindowBlock,...], excluded: dict[str,int])`.
 - `select_objective_windows(input_ids,labels,attention_mask,text_segments,*,token_ids,latent_size,text_vocabulary,pre_window,post_window) -> WindowSelection`. `text_segments` is a per-batch list of half-open assistant text-token ranges, split at latent blocks; helpers support B>1.
 - Collator optional `enable_stage2_objective=False`; only when on emit `stage2_text_segments` metadata. Derive verified token ranges from the actual unique assistant content bounds and strict latent markers, excluding chat termination. Do not retokenize prefixes with different context, alter rendered bytes, or use next-label validity as pre criterion.
+- The existing assistant pattern excludes the template newline; preserve its legacy CE labels but exclude that formatting newline from objective P metadata. An empty pre-text plan must not acquire a valid pre window from the chat header. Tokenizer offsets on the complete rendered text, with verified final assistant-suffix token equality after processor image expansion, are an acceptable way to identify content boundaries; detect BPE-boundary ambiguity explicitly. Include a leading-newline/empty-P regression.
 
 - [ ] Write scalar/logit RED tests with independent literals, including:
 
@@ -103,7 +106,7 @@ assert scores['loss_vis'].item() == pytest.approx(math.log(2))
 
 ### Task 3: Independent fixed reference and checkpoint identity
 
-**Files:** Create `src/stage2/reference.py`; create `tests/stage2/test_objective_reference.py`; use existing `src/stage2/loading.py`, `stage1/checkpointing.py`, `stage2/checkpointing.py` contracts without changing Stage 1.
+**Files:** Create `src/stage2/reference.py`; create `tests/stage2/test_objective_reference.py`; use existing `src/stage2/checkpointing.py:resolve_stage2_load_decision`, `src/stage2/peft.py:load_stage1_dora_for_fresh_stage2`, and `src/stage1/checkpointing.py` contracts without changing Stage 1.
 
 **Interfaces:**
 - `FrozenReference(model, identity: dict)` owns only a frozen model and JSON-safe identity; no optimizer/EMA ownership.
@@ -132,7 +135,7 @@ assert not ({p.data_ptr() for p in student.parameters()} &
 **Files:** Create `src/stage2/objective_runtime.py`; modify `src/stage2/trainer.py`, `src/main.py`; create `tests/stage2/test_objective_trainer.py`, `tests/stage2/test_objective_distributed.py`.
 
 **Interfaces:**
-- `Stage2ObjectiveRuntime(config,token_ids,latent_size,text_vocabulary,reference)` exposes `select(inputs)->WindowSelection`, `forward(model,inputs,selection)->ObjectiveBatchResult`.
+- `Stage2ObjectiveRuntime(config,token_ids,latent_size,text_vocabulary,reference)` exposes `select(inputs)->WindowSelection`, `forward(model,inputs,selection,*,counterfactual_model=None)->ObjectiveBatchResult`. Trainer supplies its unwrapped current student as counterfactual_model: F uses the training wrapper, while no_grad M bypasses DDP forward buffer broadcasts. This is the same student, not a copy. Test with registered buffers and unequal M call counts; do not assume no_grad disables forward collectives.
 - `ObjectiveBatchResult(outputs,ce,dyn_sum,vis_sum,count,metric_sums,metric_counts)` carries graph-bearing local sums and detached metric sums; no global mean inside runtime.
 - Trainer optional kwargs `stage2_objective_config`, `stage2_objective_runtime`; legacy when absent/off. `get_batch_samples` attaches private per-window global count to each batch after calling parent and stripping nothing the parent needs. `compute_loss` strips objective metadata before model calls.
 - Main config validation occurs before expensive model/reference loading; wire feature metadata collator, lazy reference and runtime after student initialization, and pass trainer kwargs only in enabled path.
