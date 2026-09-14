@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -117,14 +118,23 @@ def _artifact_identity(
     for label, root in roots:
         if not root.is_dir():
             raise ValueError(f"reference source is not a local directory: {root}")
-        for candidate in sorted(root.rglob("*")):
-            if (
-                not candidate.is_file()
-                or candidate.is_symlink()
-                or not _is_load_artifact(candidate)
-            ):
+        candidates = {candidate for candidate in root.rglob("*")
+                      if candidate.is_file() and _is_load_artifact(candidate)}
+        # The local loader follows file links and index-selected shard paths,
+        # including arbitrary shard names beneath linked directories.
+        # Match this loader's default local checkpoint precedence. A stale,
+        # unselected index remains hashed, but its contents are not interpreted.
+        for name in ("model.safetensors", "model.safetensors.index.json",
+                     "pytorch_model.bin", "pytorch_model.bin.index.json"):
+            selected = root / name
+            if not selected.is_file():
                 continue
-            relative = candidate.relative_to(root).as_posix()
+            if name.endswith(".index.json"):
+                payload = json.loads(selected.read_text(encoding="utf-8"))
+                candidates.update(root / shard for shard in payload["weight_map"].values())
+            break
+        for candidate in sorted(candidates):
+            relative = Path(os.path.relpath(candidate, root)).as_posix()
             artifacts.append(
                 {
                     "path": relative if len(roots) == 1 else f"{label}/{relative}",
@@ -402,6 +412,16 @@ def validate_objective_resume(
         raise FileNotFoundError(f"missing Stage 2 objective identity: {sidecar}") from None
     except json.JSONDecodeError as error:
         raise ValueError(f"invalid Stage 2 objective identity: {sidecar}") from error
+    validate_objective_identity_payload(payload, config_dict, reference_identity, vocabulary_identity)
+
+
+def validate_objective_identity_payload(
+    payload: Any,
+    config_dict: Mapping[str, Any],
+    reference_identity: Mapping[str, Any] | None,
+    vocabulary_identity: Mapping[str, Any] | None,
+) -> None:
+    """Compare a captured sidecar with the runtime using the resume contract."""
     expected = _objective_payload(
         config_dict, reference_identity, vocabulary_identity
     )

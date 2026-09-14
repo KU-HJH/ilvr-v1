@@ -122,9 +122,10 @@ targets, latent size 8).
 
 Active auxiliaries reject DeepSpeed/ZeRO, FlashAttention 2, effective sliding-
 window attention, nonzero native attention dropout, FSDP/compiled or custom
-accumulation plugins, and unsupported checkpoint functions. FP16 is outside the
-declared objective support boundary even though a lower-level parser may accept
-it. Feature-off and enabled zero-weight CE do not acquire restrictions required
+accumulation plugins, and unsupported checkpoint functions. Active auxiliaries
+also reject FP16 requested through settings or inherited mixed precision, and
+FP16 model parameters.
+Feature-off and enabled zero-weight CE do not acquire restrictions required
 only by auxiliary computation.
 
 Native DDP checkpoints use Trainer-format model/adapter, optimizer, scheduler,

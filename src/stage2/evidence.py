@@ -409,6 +409,10 @@ def validate_stage2_objective_identity(raw: bytes | None, *, config) -> str | No
     if any(value is not None and type(value) is not dict
            for value in (payload["reference_identity"], payload["vocabulary_identity"])):
         raise ValueError("Stage 2 objective reference/vocabulary identity is invalid")
+    if config.active and payload["vocabulary_identity"] is None:
+        raise ValueError("active Stage 2 objective requires vocabulary identity")
+    if config.active and config.lambda_dyn and payload["reference_identity"] is None:
+        raise ValueError("entropy objective requires reference identity")
     if not config.active and (payload["reference_identity"] is not None
                               or payload["vocabulary_identity"] is not None):
         raise ValueError("CE-only objective must have null reference/vocabulary identities")

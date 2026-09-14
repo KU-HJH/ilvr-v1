@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import math
 import os
@@ -630,6 +631,9 @@ def publish_stage2_training_evidence(args, *, trainer, train_result, profile):
                             label="Stage 2 objective identity")
                            if sidecar.exists() or sidecar.is_symlink() else None)
                     digest = validate_stage2_objective_identity(raw, config=trainer.stage2_objective_config)
+                    if trainer.stage2_objective_config.enable_stage2_objective:
+                        from stage2.reference import validate_objective_identity_payload
+                        validate_objective_identity_payload(json.loads(raw), *trainer._objective_identity())
                 finally:
                     if descriptor is not None:
                         os.close(descriptor)

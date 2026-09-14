@@ -65,20 +65,22 @@ def test_v1_unchanged():
 
 
 def witness_case(tmp_path, *, enabled=True, config_change=False, digest=True, step=2, raw_missing=False,
-                 digest_mismatch=False, cross_backend=False, unexpected_reference=False):
+                 digest_mismatch=False, cross_backend=False, unexpected_reference=False,
+                 dyn=0.0, vis=0.0, reference=None, vocabulary=None):
     root = Path(tempfile.mkdtemp(prefix="native-witness-", dir=ROOT / "checkpoints"))
     checkpoint = root / "ddp-checkpoint-contract"
     (checkpoint / "checkpoint-2").mkdir(parents=True)
     (checkpoint / "checkpoint-2/rng_state_2.pth").write_bytes(b"local RNG only")
-    config = Stage2ObjectiveConfig(enable_stage2_objective=enabled)
+    config = Stage2ObjectiveConfig(enable_stage2_objective=enabled, lambda_dyn=dyn, lambda_vis=vis,
+                                  reference_model_path="local-reference" if dyn else None)
     plan = build_launch_plan(stage="stage2", tuning_method="full", zero_stage=None, backend="ddp",
         run_id=checkpoint.name, main_process_port=29876, stage2_objective_config=config)
     saved_config = config.to_dict()
     if config_change:
         saved_config["gamma_H"] = 0.5
     raw = json.dumps(dict(schema_version=1, config=saved_config,
-                          reference_identity={"unexpected": True} if unexpected_reference else None,
-                          vocabulary_identity=None)).encode()+b"\n"
+                          reference_identity={"unexpected": True} if unexpected_reference else reference,
+                          vocabulary_identity=vocabulary)).encode()+b"\n"
     payload = literal(checkpoint / "checkpoint-2", hashlib.sha256(raw).hexdigest() if digest else None)
     if digest_mismatch:
         raw += b" "
@@ -97,6 +99,25 @@ def test_ce_only_witness_accepts_canonical_bytes_without_local_common_files(tmp_
     payload = json.loads(path.read_text())
     assert payload["schema_version"] == 2 and payload["execution_backend"] == "ddp"
     assert payload["zero_stage"] is None and payload["world_size"] == 4
+
+
+@pytest.mark.parametrize("dyn,vis,reference,vocabulary", [
+    (1.0, 0.0, None, None), (0.0, 1.0, None, None), (1.0, 1.0, None, None),
+    (1.0, 0.0, None, {"token_ids": [7, 8]}),
+    (1.0, 1.0, {"source": "local-reference"}, None),
+])
+def test_active_canonical_witness_rejects_missing_provenance(tmp_path, dyn, vis, reference, vocabulary):
+    with pytest.raises(ValueError, match="identity"):
+        witness_case(tmp_path, dyn=dyn, vis=vis, reference=reference, vocabulary=vocabulary)
+    assert not list(tmp_path.glob("**/*train-witness.json"))
+
+
+def test_actual_bad_saved_provenance_fails_collectively_before_publication():
+    root = Path(tempfile.mkdtemp(prefix="native-provenance-", dir=ROOT / "checkpoints"))
+    launch_workers("full", root, ROOT / "logs/stage2-ddp-dev" / f"{root.name}.log", "evidence_provenance")
+    for rank in range(4):
+        observed = json.loads((result_directory(root) / f"provenance-rejections-{rank}.json").read_text())
+        assert observed == ["missing_reference", "missing_vocabulary", "different_reference", "different_vocabulary"]
 
 
 @pytest.mark.parametrize("changes", [dict(config_change=True), dict(digest=False), dict(enabled=False),

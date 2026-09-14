@@ -308,6 +308,35 @@ def _worker(method, root, phase):
         if phase == "evidence_fail" and rank == 0:
             (output / "checkpoint-2/model.safetensors").unlink()
         trainer.accelerator.wait_for_everyone()
+        if phase == "evidence_provenance":
+            sidecar = output / "checkpoint-2/stage2_objective.json"
+            original = sidecar.read_bytes() if rank == 0 else None
+            rejected = []
+            for failure in ("missing_reference", "missing_vocabulary", "different_reference", "different_vocabulary"):
+                bad_producer_path = producer_path.with_name(f"bad-{failure}-node{rank // 2}.json")
+                if rank == 0:
+                    payload = json.loads(original)
+                    field = "reference_identity" if failure.endswith("reference") else "vocabulary_identity"
+                    payload[field] = None if failure.startswith("missing") else {"wrong": "not-the-runtime-identity"}
+                    sidecar.write_text(json.dumps(payload))
+                trainer.accelerator.wait_for_everyone()
+                try:
+                    publish_stage2_training_evidence(SimpleNamespace(benchmark_evidence_path=str(bad_producer_path),
+                        save_model_path=str(output), tuning_method=method), trainer=trainer,
+                        train_result=train_result, profile=trainer.deepspeed_runtime_profile)
+                except RuntimeError as error:
+                    assert str(error) == "native checkpoint observation failed"
+                    if rank == 0:
+                        assert isinstance(error.__cause__, ValueError)
+                        assert "identity" in str(error.__cause__)
+                    rejected.append(failure)
+                    assert not bad_producer_path.exists()
+                else:
+                    rejected.append(f"accepted {failure}")
+            if rank == 0:
+                sidecar.write_bytes(original)
+            trainer.accelerator.wait_for_everyone()
+            (result_directory(root) / f"provenance-rejections-{rank}.json").write_text(json.dumps(rejected))
         if phase == "evidence_runtime":
             from dataclasses import replace
             rejections = []

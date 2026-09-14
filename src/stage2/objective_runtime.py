@@ -27,6 +27,9 @@ def objective_config_from_args(args):
 
 def validate_objective_backend(settings):
     """Fail closed for execution combinations without a paired-forward witness."""
+    if (getattr(settings, "fp16", False)
+            or os.environ.get("ACCELERATE_MIXED_PRECISION", "").lower() == "fp16"):
+        raise ValueError("active Stage 2 objective does not support FP16; use FP32 or BF16")
     backend = getattr(settings, "attention_implementation", getattr(settings, "_attn_implementation", "eager"))
     if backend not in ("eager", "sdpa"):
         raise ValueError("Stage 2 objective backend must be eager or sdpa")
@@ -56,6 +59,8 @@ def model_inputs(inputs):
 def validate_objective_student(model):
     base = resolve_qwen2_5_vl_model(model)
     validate_objective_backend(base.config)
+    if any(parameter.dtype == torch.float16 for parameter in model.parameters()):
+        raise ValueError("active Stage 2 objective does not support FP16 parameters; use FP32 or BF16")
     if base.model.gradient_checkpointing:
         function = getattr(base.model, "_gradient_checkpointing_func", None)
         if not (isinstance(function, partial) and function.func is checkpoint
@@ -145,32 +150,39 @@ class Stage2ObjectiveRuntime:
         for block in selection.blocks:
             # Select sequence rows BEFORE FP32 entropy / likelihood operations.
             post_logits = outputs.logits[block.batch_index, list(block.post_positions)]
-            if self.config.lambda_dyn:
-                pre = text_entropy(outputs.logits[block.batch_index, list(block.pre_positions)], self.text_vocabulary.token_ids).mean()
-                post = text_entropy(post_logits, self.text_vocabulary.token_ids).mean()
-                ref_pre_tokens = text_entropy(ref_outputs.logits[block.batch_index, list(block.pre_positions)], self.text_vocabulary.token_ids)
-                ref_post_tokens = text_entropy(ref_outputs.logits[block.batch_index, list(block.post_positions)], self.text_vocabulary.token_ids)
-                ref_pre, ref_post = ref_pre_tokens.mean(), ref_post_tokens.mean()
-                metrics = entropy_transition(pre, post, ref_pre, ref_post, eps=self.config.entropy_eps, gamma_H=self.config.gamma_H)
-                result.dyn_sum = result.dyn_sum + metrics["loss_dyn"]
-                for name, value in dict(H_pre=pre, H_post=post, H_ref_pre=ref_pre, H_ref_post=ref_post, **metrics).items():
-                    add(name, value)
-                add("r_pre_gt_1", (metrics["r_pre"] > 1).float())
-                add("r_post_lt_1", (metrics["r_post"] < 1).float())
-                add("low_reference_entropy", (ref_pre_tokens < self.config.entropy_eps).sum() + (ref_post_tokens < self.config.entropy_eps).sum(), 0)
-            if self.config.lambda_vis:
-                targets = torch.tensor(block.target_ids, device=post_logits.device)
-                score_f = target_log_likelihood(post_logits, targets).mean()
-                with torch.no_grad(), replay_rng_state(rng):
-                    masked, calls = counted_forward(current_student, auxiliary_inputs,
-                                                     stage2_ablation=(block.start_position, block.end_position))
-                    score_m = target_log_likelihood(masked.logits[block.batch_index, list(block.post_positions)], targets).mean()
-                del masked
-                metrics = vision_gain(score_f, score_m.detach(), m_V=self.config.m_V)
-                result.vis_sum = result.vis_sum + metrics["loss_vis"]
-                for name, value in metrics.items():
-                    add(name, value)
-                add("G_gt_0", (metrics["G"] > 0).float())
-                add("model_forwards_M", 1, 0)
-                add("decoder_forwards_M", calls, 0)
+            try:
+                if self.config.lambda_dyn:
+                    pre = text_entropy(outputs.logits[block.batch_index, list(block.pre_positions)], self.text_vocabulary.token_ids).mean()
+                    post = text_entropy(post_logits, self.text_vocabulary.token_ids).mean()
+                    ref_pre_tokens = text_entropy(ref_outputs.logits[block.batch_index, list(block.pre_positions)], self.text_vocabulary.token_ids)
+                    ref_post_tokens = text_entropy(ref_outputs.logits[block.batch_index, list(block.post_positions)], self.text_vocabulary.token_ids)
+                    ref_pre, ref_post = ref_pre_tokens.mean(), ref_post_tokens.mean()
+                    metrics = entropy_transition(pre, post, ref_pre, ref_post, eps=self.config.entropy_eps, gamma_H=self.config.gamma_H)
+                    result.dyn_sum = result.dyn_sum + metrics["loss_dyn"]
+                    for name, value in dict(H_pre=pre, H_post=post, H_ref_pre=ref_pre, H_ref_post=ref_post, **metrics).items():
+                        add(name, value)
+                    add("r_pre_gt_1", (metrics["r_pre"] > 1).float())
+                    add("r_post_lt_1", (metrics["r_post"] < 1).float())
+                    add("low_reference_entropy", (ref_pre_tokens < self.config.entropy_eps).sum() + (ref_post_tokens < self.config.entropy_eps).sum(), 0)
+                if self.config.lambda_vis:
+                    targets = torch.tensor(block.target_ids, device=post_logits.device)
+                    score_f = target_log_likelihood(post_logits, targets).mean()
+                    with torch.no_grad(), replay_rng_state(rng):
+                        masked, calls = counted_forward(current_student, auxiliary_inputs,
+                                                         stage2_ablation=(block.start_position, block.end_position))
+                        score_m = target_log_likelihood(masked.logits[block.batch_index, list(block.post_positions)], targets).mean()
+                    del masked
+                    metrics = vision_gain(score_f, score_m.detach(), m_V=self.config.m_V)
+                    result.vis_sum = result.vis_sum + metrics["loss_vis"]
+                    for name, value in metrics.items():
+                        add(name, value)
+                    add("G_gt_0", (metrics["G"] > 0).float())
+                    add("model_forwards_M", 1, 0)
+                    add("decoder_forwards_M", calls, 0)
+            except ValueError as error:
+                raise ValueError(
+                    f"Stage 2 objective batch_index={block.batch_index}, block_index={block.block_index}, "
+                    f"start_position={block.start_position}, end_position={block.end_position}, "
+                    f"pre_positions={block.pre_positions}, post_positions={block.post_positions}: {error}"
+                ) from error
         return result

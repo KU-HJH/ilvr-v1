@@ -452,7 +452,8 @@ def test_zero_entropy_weight_skips_reference_preflight(checkpoint_directory):
     assert runtime.stage2_reference_preflight_paths(config) == ()
 
 
-def test_zero_entropy_weight_does_not_import_stage1_metadata_code(monkeypatch):
+@pytest.mark.parametrize("enabled,weight", [(True, 0.0), (False, 1.0)])
+def test_zero_entropy_weight_does_not_import_stage1_metadata_code(monkeypatch, enabled, weight):
     """Catches the disabled entropy path warming the PEFT metadata boundary."""
     original_import = builtins.__import__
 
@@ -462,6 +463,6 @@ def test_zero_entropy_weight_does_not_import_stage1_metadata_code(monkeypatch):
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", reject_stage1_checkpointing)
-    config = Stage2ObjectiveConfig(enable_stage2_objective=True, lambda_dyn=0.0)
+    config = Stage2ObjectiveConfig(enable_stage2_objective=enabled, lambda_dyn=weight)
 
     assert runtime.stage2_reference_preflight_paths(config) == ()

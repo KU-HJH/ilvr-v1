@@ -225,7 +225,9 @@ class Stage2DataCollator:
             "<|im_start|>assistant", add_special_tokens=False, return_tensors="pt"
         )["input_ids"][0]
 
-    def __call__(self, examples: list[Stage2PreparedExample]) -> dict[str, torch.Tensor]:
+    def __call__(
+        self, examples: list[Stage2PreparedExample]
+    ) -> dict[str, torch.Tensor | list[list[tuple[int, int]]]]:
         if len(examples) != 1:
             raise NotImplementedError("Stage 2 collator currently supports batch_size=1 only")
 

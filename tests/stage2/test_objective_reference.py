@@ -375,6 +375,61 @@ def test_frozen_reference_value_rejects_mutable_or_training_model():
         reference_api.FrozenReference(model, {"source": "fixture"})
 
 
+@pytest.mark.parametrize("indexed", [False, "linked", "absolute"])
+def test_loadable_symlink_weights_change_reference_identity_and_reject_resume(checkpoint_directory, indexed):
+    """Catches omitted linked weights, including index-selected nonstandard shard paths."""
+    api = _api()
+    source = _write_full_stage1(checkpoint_directory)
+    weights = source / "model.safetensors"
+    external = checkpoint_directory / "linked-weights"
+    external.mkdir()
+    target = external / "weights.safetensors"
+    weights.rename(target)
+    if indexed:
+        from safetensors import safe_open
+        with safe_open(target, framework="pt") as tensors:
+            names = list(tensors.keys())
+        (source / "linked").symlink_to(external.resolve(), target_is_directory=True)
+        shard_path = str(target.resolve()) if indexed == "absolute" else "linked/weights.safetensors"
+        (source / "model.safetensors.index.json").write_text(json.dumps({
+            "metadata": {}, "weight_map": {name: shard_path for name in names}}))
+    else:
+        weights.symlink_to(target.resolve())
+    student = _student_from_full(source)
+    args = _args(source)
+    def load():
+        return api.load_frozen_reference(args, student=student,
+            tokenizer=TinyStage1Processor.from_pretrained(source).tokenizer,
+            source_dependencies=_dependencies())
+    first = load()
+    first_weight = first.model.lm_head.weight.detach().clone()
+    config = {"enable_stage2_objective": True, "lambda_dyn": 1.0}
+    vocabulary = {"token_ids": [7, 8]}
+    saved = checkpoint_directory / "resume-symlink"
+    api.save_objective_identity(saved, config, first.identity, vocabulary)
+    from safetensors.torch import load_file, save_file
+    changed = load_file(target)
+    changed["lm_head.weight"] = changed["lm_head.weight"] + 0.25
+    save_file(changed, target, metadata={"format": "pt"})
+    second = load()
+    assert not torch.equal(first_weight, second.model.lm_head.weight)
+    with pytest.raises(ValueError, match="reference identity mismatch"):
+        api.validate_objective_resume(saved, config, second.identity, vocabulary)
+    assert first.identity != second.identity
+
+
+def test_reference_hashing_preserves_loadable_model_with_unused_stale_index(checkpoint_directory):
+    """Catches interpreting a stale index that the actual model loader ignores."""
+    api = _api()
+    source = _write_full_stage1(checkpoint_directory)
+    (source / "model.safetensors.index.json").write_text("stale unused index")
+    student = _student_from_full(source)
+    reference = api.load_frozen_reference(_args(source), student=student,
+        tokenizer=TinyStage1Processor.from_pretrained(source).tokenizer,
+        source_dependencies=_dependencies())
+    torch.testing.assert_close(reference.model.lm_head.weight, student.lm_head.weight)
+
+
 def test_dora_reference_preserves_student_mixed_precision_policy(checkpoint_directory):
     """Catches collapsing FP32 adapter parameters into the BF16 base dtype."""
     reference_api = _api()

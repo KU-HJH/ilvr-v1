@@ -163,6 +163,60 @@ def test_actual_trainer_rejects_accumulation_plugin():
                      accelerator_config={"gradient_accumulation_kwargs": {"sync_each_batch": True}})
 
 
+@pytest.mark.parametrize("source", ["args", "environment", "student"])
+def test_active_objective_rejects_fp16(source, monkeypatch):
+    from types import SimpleNamespace
+    from stage2.objective_runtime import objective_config_from_args, validate_objective_student
+    if source == "student":
+        with pytest.raises(ValueError, match="FP16"):
+            validate_objective_student(tiny_stage2_qwen().half())
+    else:
+        if source == "environment":
+            monkeypatch.setenv("ACCELERATE_MIXED_PRECISION", "fp16")
+        with pytest.raises(ValueError, match="FP16"):
+            objective_config_from_args(SimpleNamespace(enable_stage2_objective=True,
+                lambda_vis=1.0, fp16=source == "args"))
+
+
+@pytest.mark.parametrize("enabled,weight", [(False, 1.0), (True, 0.0)])
+def test_inactive_objective_preserves_fp16_configuration(enabled, weight, monkeypatch):
+    from types import SimpleNamespace
+    from stage2.objective_runtime import objective_config_from_args
+    monkeypatch.setenv("ACCELERATE_MIXED_PRECISION", "fp16")
+    assert not objective_config_from_args(SimpleNamespace(enable_stage2_objective=enabled,
+        lambda_vis=weight, fp16=True)).active
+
+
+@pytest.mark.parametrize("branch", ["F_entropy", "reference_entropy", "F_likelihood", "M_likelihood"])
+def test_numerical_failure_reports_sample_block_and_selected_positions(branch):
+    """Catches loss of context when the actual selected logit rows are nonfinite."""
+    dyn = "entropy" in branch
+    config = Stage2ObjectiveConfig(True, float(dyn), float(not dyn), "original" if dyn else None)
+    model = tiny_stage2_qwen().eval()
+    rt = runtime(config, model)
+    inputs = batch(two=True)
+    selection = rt.select(inputs)
+    bad = selection.blocks[1]
+    target = rt.reference.model if branch.startswith("reference") else model
+    def corrupt(module, args, kwargs, output):
+        masked = "stage2_ablation" in kwargs
+        if (branch.startswith("M_") and masked) or (not branch.startswith("M_") and not masked):
+            output.logits[bad.batch_index, bad.post_positions[0], 7] = float("nan")
+    handle = target.register_forward_hook(corrupt, with_kwargs=True)
+    try:
+        with pytest.raises(ValueError) as caught:
+            rt.forward(model, inputs, selection)
+    finally:
+        handle.remove()
+    message = str(caught.value)
+    assert f"batch_index={bad.batch_index}" in message
+    assert f"block_index={bad.block_index}" in message
+    assert f"pre_positions={bad.pre_positions}" in message
+    assert f"post_positions={bad.post_positions}" in message
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert "nonfinite" in str(caught.value.__cause__)
+
+
 def test_active_rejects_fsdp_environment_before_loading(monkeypatch):
     from main import route_training
     from types import SimpleNamespace

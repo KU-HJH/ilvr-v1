@@ -1049,7 +1049,7 @@ def stage2_reference_preflight_paths(
 
     if not isinstance(config, Stage2ObjectiveConfig):
         raise TypeError("config must be a Stage2ObjectiveConfig")
-    if config.lambda_dyn == 0.0:
+    if not config.enable_stage2_objective or config.lambda_dyn == 0.0:
         return ()
     from src.stage1.checkpointing import (
         decode_stage1_peft_metadata_snapshot,

@@ -45,7 +45,7 @@ def test_entropy_transition_has_hand_checked_value_and_gradient_directions():
 
 def test_entropy_transition_detaches_reference_and_is_per_block_nonlinear():
     objective = _objective()
-    h_pre = torch.tensor([0.0, 3.0], requires_grad=True)
+    h_pre = torch.tensor([0.0, 2.0], requires_grad=True)
     h_post = torch.tensor([2.0, 1.0], requires_grad=True)
     ref_pre = torch.ones(2, requires_grad=True)
     ref_post = torch.ones(2, requires_grad=True)
@@ -54,12 +54,13 @@ def test_entropy_transition_detaches_reference_and_is_per_block_nonlinear():
         h_pre, h_post, ref_pre, ref_post, eps=1e-6, gamma_H=0.0
     )
     observed = result["loss_dyn"].mean()
-    literal_per_block = (-torch.sigmoid(torch.tensor([-2.0, 2.0]))).mean()
-    nonlinear_global_mean = -torch.sigmoid(torch.tensor(0.0))
-
-    assert observed.item() == pytest.approx(literal_per_block.item(), abs=2e-6)
-    assert observed.item() == pytest.approx(-0.5)
-    assert not torch.equal(result["loss_dyn"], nonlinear_global_mean.expand(2))
+    # D is [-2, 1]: mean of the two losses is -0.42513, whereas applying
+    # sigmoid to mean(D) gives -0.37754. Both shape and values are required.
+    assert result["loss_dyn"].shape == (2,)
+    torch.testing.assert_close(result["loss_dyn"], torch.tensor([-0.11920292, -0.73105858]),
+                               atol=2e-6, rtol=0)
+    assert observed.item() == pytest.approx(-0.42513075, abs=2e-6)
+    assert abs(observed.item() - (-0.37754067)) > 0.04
     observed.backward()
     assert ref_pre.grad is None
     assert ref_post.grad is None
