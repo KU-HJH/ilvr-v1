@@ -199,6 +199,11 @@ contracts match; no test-only production extension.
 
 ### Task 4: Comparison examples, operator docs and combined handoff
 
+**Status:** Delivery implemented67a7676, task review and docs-only remainder
+clarification41a6285 approved. Executable shell26passed; actual coordinator
+dry-run verified without launching. Combined whole-branch review and final
+project CPU verification remain pending below.
+
 **Files:** Create `run_stage2_objective_examples.sh`, `docs/stage2-objective.md`, `tests/stage2/test_objective_examples.py`; modify only relevant `docs/multinode-training.md` native-DDP instructions. This is also original objective plan Task5, not a second wrapper/review cycle.
 
 **Interfaces:** Wrapper mode `ce|entropy|combined`; required --stage1, --data, --image-root, --run-id, --max-steps, --main-process-port; entropy/combined require positive --lambda-dyn, combined positive --lambda-vis. --dry-run prints actual coordinated command without launching ranks; require explicit --launch for execution, reject both together. Same inputs/seed/baseline across modes; select explicit --backend ddp and enable_stage2_objective for ALL three, including CE.

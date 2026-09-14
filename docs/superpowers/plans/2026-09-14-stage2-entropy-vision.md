@@ -175,6 +175,13 @@ minor review items, not GPU support evidence. Task5/final verification remains o
 
 ### Task 5: Reproducible examples and evidence-based handoff
 
+**Delivery update:** The subsequently approved native-DDP plan Task4 supersedes
+this original wrapper interface and its sketch commands: it requires an explicit
+update budget and port, and invokes the real coordinator with `--dry-run` rather
+than skipping it. Use `docs/stage2-objective.md` for current executable examples.
+Delivery67a7676 and remainder-doc fix41a6285 passed their task review; the shared
+combined whole-branch review and final CPU verification remain pending.
+
 **Files:** Create `run_stage2_objective_examples.sh`, `docs/stage2-objective.md`, `tests/stage2/test_objective_examples.py`; update plan checklist/evidence only, not frozen proposal text.
 
 **Interfaces:** Wrapper accepts mode `ce|entropy|combined`, original Stage1 source, data/image roots, run ID and lambda values, validates inputs, invokes existing `run_multinode_stage2_training.sh` with explicit approved baseline and objective flags/env forwarding. Never launches all three implicitly; dry-run prints exact launch without starting ranks. If coordinator lacks passthrough, smallest feature-only CLI forwarding change plus causal test is allowed; do not port unrelated launcher changes from main.
