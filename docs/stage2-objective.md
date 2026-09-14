@@ -104,10 +104,12 @@ For active auxiliaries, the valid block count `N` is collected across every
 rank and microbatch in the actual optimizer accumulation window, including
 zero-block ranks. With DDP world size `W` and Trainer loss divisor `A`, each
 local differentiable block sum is scaled by `W*A/N` before backward. DDP's
-`/W` and Trainer's `/A` recover the global block mean. The actual last partial
-window uses its actual divisor. Existing CE reduction is unchanged. Logged
-means are separately count-weighted global reductions; they are not the
-backward-scaled scalar.
+`/W` and Trainer's `/A` recover the global block mean. The pinned Trainer
+continues to divide every microbatch by the configured accumulation factor `A`,
+including a final partial window; `N` uses the actual globally valid block count
+for that window. Do not replace `A` with the partial-window microbatch count.
+Existing CE reduction is unchanged. Logged means are separately count-weighted
+global reductions; they are not the backward-scaled scalar.
 
 ## Supported execution boundary
 
