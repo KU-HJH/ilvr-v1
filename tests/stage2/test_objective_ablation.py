@@ -389,6 +389,35 @@ def test_rng_replay_rejects_an_incompatible_initialized_device_set():
     assert not torch.cuda.is_initialized()
 
 
+def test_rng_replay_restores_every_existing_cuda_generator(monkeypatch):
+    """Catches a non-current initialized CUDA generator escaping paired replay."""
+    from stage2.rng import capture_rng_state, replay_rng_state
+
+    generators = (torch.Generator().manual_seed(47), torch.Generator().manual_seed(53))
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "default_generators", generators)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_rng_state",
+        lambda *args, **kwargs: pytest.fail("CUDA lazy RNG getter was called"),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_rng_state",
+        lambda *args, **kwargs: pytest.fail("CUDA lazy RNG setter was called"),
+    )
+    paired = capture_rng_state()
+    other_before = generators[1].get_state().clone()
+
+    with replay_rng_state(paired):
+        torch.rand(4, generator=generators[1])
+
+    captured_devices = tuple(device for device, _ in paired.cuda_states)
+    assert captured_devices == (0, 1)
+    torch.testing.assert_close(generators[1].get_state(), other_before)
+
+
 def test_train_mode_dora_no_intervention_replay_matches_f_and_restores_rng():
     """Catches no_grad/eval confusion or unmatched DoRA dropout in paired replay."""
     from stage2.rng import capture_rng_state, replay_rng_state

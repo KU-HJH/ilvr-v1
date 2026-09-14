@@ -9,7 +9,7 @@ import torch
 
 @dataclass(frozen=True)
 class RNGState:
-    """Cloned CPU and already-active CUDA generator state for one process."""
+    """Cloned CPU and existing CUDA generator states for one process."""
 
     cpu_state: torch.Tensor
     cuda_states: tuple[tuple[int, torch.Tensor], ...]
@@ -20,15 +20,18 @@ def capture_rng_state() -> RNGState:
     cpu_state = torch.get_rng_state().clone()
     cuda_states: tuple[tuple[int, torch.Tensor], ...] = ()
     if torch.cuda.is_initialized():
-        device = torch.cuda.current_device()
-        cuda_states = ((device, torch.cuda.get_rng_state(device).clone()),)
+        cuda_states = tuple(
+            (device, generator.get_state().clone())
+            for device, generator in enumerate(torch.cuda.default_generators)
+        )
     return RNGState(cpu_state=cpu_state, cuda_states=cuda_states)
 
 
 def _set_rng_state(state: RNGState) -> None:
     torch.set_rng_state(state.cpu_state.clone())
+    generators = torch.cuda.default_generators if state.cuda_states else ()
     for device, cuda_state in state.cuda_states:
-        torch.cuda.set_rng_state(cuda_state.clone(), device=device)
+        generators[device].set_state(cuda_state.clone())
 
 
 @contextmanager
