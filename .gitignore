@@ -1,0 +1,9 @@
+/.worktrees/
+/.superpowers/
+/venv
+/data
+/checkpoints
+/logs/
+/results/
+__pycache__/
+.pytest_cache/

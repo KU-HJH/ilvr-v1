@@ -1,6 +1,6 @@
 # Stage 2 entropy transition and counterfactual Vision gain
 
-Status: design commitment v1; written-spec/implementation approval pending.
+Status: design commitment v1 approved by the user's “ㅇㅋ” on 2026-09-14.
 Date: 2026-09-14.
 
 Understood as: implement the fixed three-term objective in the current main
@@ -373,7 +373,7 @@ depends on the first-nail witness; training feasibility separately depends on
 the required two-node preflight and actual memory/step smoke. Critique agreement
 is not premise evidence, and neither gate substitutes for the other.
 
-## 12. Design commitment v1 — pending explicit written-spec approval
+## 12. Design commitment v1 — approved for implementation
 
 This is the exact implementation authorization proposal. Sections 1–10 of
 this document define its detailed interfaces and acceptance conditions; the
