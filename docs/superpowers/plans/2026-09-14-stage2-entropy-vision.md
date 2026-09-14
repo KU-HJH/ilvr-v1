@@ -75,7 +75,7 @@ mask = mask.masked_fill(blocked[None, None], torch.finfo(dtype).min)
 **Files:** Create `src/stage2/objective.py`, `src/stage2/objective_windows.py`; modify `src/utils_deepseed.py:parse_args`, `src/stage2/data.py:Stage2DataCollator`; create `tests/stage2/test_objective_math.py`, `test_objective_windows.py`, `test_objective_config.py`.
 
 **Interfaces:**
-- `Stage2ObjectiveConfig` frozen dataclass with the ten options in Global Constraints, `from_args(args)`, `validate(stage, supervise_latent_boundaries)`, `active` property (enabled and either weight positive), `to_dict()` for JSON metadata.
+- `Stage2ObjectiveConfig` frozen dataclass with the nine options in Global Constraints, `from_args(args)`, `validate(stage, supervise_latent_boundaries)`, `active` property (enabled and either weight positive), `to_dict()` for JSON metadata.
 - `entropy_transition(h_pre,h_post,ref_pre,ref_post,*,eps,gamma_H) -> dict[str,Tensor]` returning r_pre,r_post,D,loss_dyn per block. Detach reference at math boundary.
 - `vision_gain(s_f,s_m,*,m_V) -> dict[str,Tensor]` returning S_F,S_M,G,loss_vis per block; detach M.
 - `text_entropy(logits,text_token_ids) -> Tensor` and `target_log_likelihood(logits,target_ids) -> Tensor`, FP32 selected-row operations, no mean across blocks inside these helpers.
@@ -140,6 +140,7 @@ assert not ({p.data_ptr() for p in student.parameters()} &
 - `ObjectiveBatchResult(outputs,ce,dyn_sum,vis_sum,count,metric_sums,metric_counts)` carries graph-bearing local sums and detached metric sums; no global mean inside runtime.
 - Trainer optional kwargs `stage2_objective_config`, `stage2_objective_runtime`; legacy when absent/off. `get_batch_samples` attaches private per-window global count to each batch after calling parent and stripping nothing the parent needs. `compute_loss` strips objective metadata before model calls.
 - Main config validation occurs before expensive model/reference loading; wire feature metadata collator, lazy reference and runtime after student initialization, and pass trainer kwargs only in enabled path.
+- For enabled weights-zero, bypass auxiliary vocabulary/window construction and denominator collectives entirely: pass the collator metadata flag only when config.active, keep runtime None, and use F with opt-in finite CE. Save enabled config identity with absent reference/vocabulary fields. This keeps unused window parsing from rejecting a CE-only example accepted by legacy. Test zero-weight equivalence on empty-P/leading-newline trajectories too.
 
 - [ ] Write RED tests on actual tiny Qwen + Stage2Trainer (not just a toy compute_loss replacement). Include four modes, all-ignore labels, malformed/empty windows, F latent gradients, ref/M no graph, optimizer ownership, off/CE-only equality, resume sidecar mismatch. Tests witness exact forward counts and no helper tensors.
 - [ ] Run RED `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/stage2/test_objective_trainer.py`.
