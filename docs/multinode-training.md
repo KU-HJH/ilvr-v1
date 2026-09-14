@@ -202,6 +202,61 @@ TUNING_METHOD=dora \
   --save_steps 11
 ```
 
+## Stage 2 native DDP objective comparisons
+
+The opt-in entropy/Vision auxiliaries use the existing coordinator with
+explicit `--backend ddp`; they do not run through DeepSpeed/ZeRO. The fixed
+topology remains remote rank 0 at `10.1.102.41`, local rank 1, two GPUs per
+node, and four ranks. Native workers use Accelerate `--multi_gpu` and reject an
+active DeepSpeed, FSDP, Megatron, CPU, or Dynamo mode inherited from the
+environment. Do not start ranks manually or replace the coordinator.
+
+Use `run_stage2_objective_examples.sh` for the controlled CE-only, entropy, and
+combined comparison commands. It requires an original Stage 1 source, retained
+data and image roots, a fresh run ID, a verified positive Stage 2 update budget,
+and a free port. Entropy additionally requires a positive `--lambda-dyn`;
+combined also requires a positive `--lambda-vis`. It explicitly fixes the
+current four-rank/global-batch-8/learning-rate/seed/DoRA/SDPA/checkpointing
+baseline and sets `save_steps` equal to the terminal budget. All three modes
+enable the new objective identity, including the zero-weight CE-only control.
+
+The wrapper defaults to `--dry-run`. This invokes the actual coordinator's
+dry-run path and prints its complete remote/local environment and argv without
+starting SSH, tmux, or ranks and without creating the run's checkpoint, result,
+or log directories. Dry-run output is not a live preflight or participation
+witness. Review the formulas, exact three-command template, branch costs,
+backend limits, and evidence boundary in
+[stage2-objective.md](stage2-objective.md).
+
+Before an authorized `--launch`, complete the live preflight from this guide on
+both hosts. First integrate the feature delivery so both canonical repositories
+contain the same committed implementation; a worktree dry-run does not deploy
+it. Confirm identical committed code and environments, readable
+Stage1/data/image inputs at the same absolute paths, all four required GPUs and
+memory, `bond1.102`, the selected free port, and fresh destinations. The default
+fresh Stage 2 DoRA source is the reproduced
+`checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431`,
+not `comt_ckpt` or checkpoint-215. Derive the Stage 2 step budget from retained
+samples and actual Trainer remainder behavior; never substitute Stage 1's 431.
+
+Native checkpoint collection expects Trainer-format common model/adapter,
+optimizer, scheduler, Trainer, sampler, runtime, and conditional objective state
+from remote ranks 0/1 plus rank RNG files 2/3 from the local node. The existing
+collector validates both node identities, moves only locally owned RNG files to
+the canonical checkpoint, and re-observes all four ranks. Resume redistributes
+the complete canonical checkpoint without overwrite and requires the same DDP
+backend, method, run, objective/reference/vocabulary identity, optimizer/
+scheduler, sampler, and RNG contract. Use a fresh attempt ID and port for a
+resume. A native DDP checkpoint is not an entry in the historical ZeRO matrix,
+and native DDP inference preparation remains unsupported.
+
+Current CPU evidence does not establish target-model GPU memory fit, NCCL,
+real-host save/transfer/resume, or successful training. The required first GPU
+acceptance is a separately authorized complete combined-objective optimizer
+update through this coordinator with actual four-rank participation and per-rank
+peak-memory evidence, followed by the requested save/resume protocol. Do not
+silently change the objective, batch, sequence limit, or topology after an OOM.
+
 ## Four-worker evaluation
 
 Evaluation accepts only a Task 6 prepared inference artifact below the
