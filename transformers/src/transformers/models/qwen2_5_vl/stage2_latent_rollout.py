@@ -180,6 +180,7 @@ class LatentRolloutEngine:
         attention_mask: torch.Tensor,
         full_position_ids: torch.Tensor,
         latent_spans: tuple[LatentSpan, ...],
+        stage2_ablation: tuple[int, int] | None = None,
         retain_latent_grads: bool = False,
         collect_diagnostics: bool = False,
     ) -> LatentRolloutResult:
@@ -192,10 +193,37 @@ class LatentRolloutEngine:
             raise ValueError("attention_mask must match the embedding batch and sequence dimensions")
         if full_position_ids.ndim != 3 or full_position_ids.shape[-2:] != sequence_shape:
             raise ValueError("full_position_ids must match the embedding batch and sequence dimensions")
+        if stage2_ablation is not None:
+            if (
+                not isinstance(stage2_ablation, tuple)
+                or len(stage2_ablation) != 2
+                or any(
+                    not isinstance(position, int) or isinstance(position, bool)
+                    for position in stage2_ablation
+                )
+            ):
+                raise ValueError("stage2_ablation must be an integer (start, end) tuple")
+            matching_spans = tuple(
+                span
+                for span in latent_spans
+                if (span.start_position, span.end_position) == stage2_ablation
+            )
+            if len(matching_spans) != 1 or not matching_spans[0].latent_positions:
+                raise ValueError("stage2_ablation must match one parsed nonempty latent span")
+            start, end = stage2_ablation
+            if end >= sequence_shape[1]:
+                raise ValueError("stage2_ablation end marker must be inside the sequence")
+            if not torch.all(attention_mask[0, start : end + 1] != 0):
+                raise ValueError("stage2_ablation latent span must not be padding")
 
         current = base_inputs_embeds
         states = []
         prefix_lengths = []
+        intervention_kwargs = (
+            {"stage2_ablation": stage2_ablation}
+            if stage2_ablation is not None
+            else {}
+        )
         for span in latent_spans:
             for position in span.latent_positions:
                 outputs = language_model(
@@ -204,6 +232,7 @@ class LatentRolloutEngine:
                     position_ids=full_position_ids[..., :position],
                     use_cache=False,
                     return_dict=True,
+                    **intervention_kwargs,
                 )
                 latent = outputs.last_hidden_state[:, -1, :]
                 if retain_latent_grads:

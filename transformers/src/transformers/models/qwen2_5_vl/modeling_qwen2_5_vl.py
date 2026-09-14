@@ -1342,6 +1342,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         generate_mode: Optional[bool] = False,
+        stage2_ablation: Optional[Tuple[int, int]] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1381,7 +1382,12 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
         causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            attention_mask,
+            inputs_embeds,
+            cache_position,
+            past_key_values,
+            output_attentions,
+            stage2_ablation=stage2_ablation,
         )
 
         hidden_states = inputs_embeds
@@ -1456,6 +1462,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         cache_position: torch.Tensor,
         past_key_values: Cache,
         output_attentions: bool,
+        stage2_ablation: Optional[Tuple[int, int]] = None,
     ):
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and past_key_values is not None:
@@ -1482,6 +1489,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             self.config._attn_implementation == "sdpa"
             and not (using_static_cache or using_sliding_window_cache)
             and not output_attentions
+            and stage2_ablation is None
         ):
             if AttentionMaskConverter._ignore_causal_mask_sdpa(
                 attention_mask,
@@ -1529,6 +1537,21 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
             # Details: https://github.com/pytorch/pytorch/issues/110213
             causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+
+        if stage2_ablation is not None:
+            if causal_mask is None or causal_mask.dim() != 4:
+                raise RuntimeError("Stage 2 ablation requires an additive decoder mask")
+            start, end = stage2_ablation
+            query_positions = torch.arange(sequence_length, device=device)[:, None]
+            key_positions = torch.arange(causal_mask.shape[-1], device=device)[None, :]
+            blocked = (
+                (query_positions >= end)
+                & (key_positions > start)
+                & (key_positions < end)
+            )
+            causal_mask = causal_mask.clone().masked_fill(
+                blocked[None, None], min_dtype
+            )
 
         return causal_mask
 
@@ -1986,6 +2009,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         return_stage2_latent_states: bool,
         collect_stage2_diagnostics: bool,
         retain_stage2_latent_grads: bool,
+        stage2_ablation: Optional[Tuple[int, int]],
+        stage2_finite_ce: bool,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         if input_ids is None:
             raise ValueError("Stage 2 forward requires input_ids")
@@ -2020,13 +2045,33 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             token_ids=token_ids,
             latent_size=latent_size,
         )
+        if stage2_ablation is not None:
+            backend = self.config._attn_implementation
+            if backend not in ("eager", "sdpa"):
+                raise NotImplementedError(
+                    "Stage 2 ablation supports only eager and SDPA attention"
+                )
+            if bool(getattr(self.config, "use_sliding_window", False)):
+                raise NotImplementedError(
+                    "Stage 2 ablation does not support sliding-window attention"
+                )
+            if float(getattr(self.config, "attention_dropout", 0.0)) != 0.0:
+                raise NotImplementedError(
+                    "Stage 2 ablation requires zero native attention dropout"
+                )
         language_model = partial(self.model, generate_mode=True)
+        intervention_kwargs = (
+            {"stage2_ablation": stage2_ablation}
+            if stage2_ablation is not None
+            else {}
+        )
         rollout = self.stage2_rollout_engine.rollout(
             language_model=language_model,
             base_inputs_embeds=base_inputs_embeds,
             attention_mask=attention_mask,
             full_position_ids=full_position_ids,
             latent_spans=latent_spans,
+            stage2_ablation=stage2_ablation,
             retain_latent_grads=retain_stage2_latent_grads,
             collect_diagnostics=collect_stage2_diagnostics,
         )
@@ -2039,6 +2084,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
+            **intervention_kwargs,
         )
         logits = self.lm_head(final_outputs.last_hidden_state)
 
@@ -2047,7 +2093,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             logits = logits.float()
             shift_logits = logits[..., :-1, :].contiguous().view(-1, self.config.vocab_size)
             shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
-            loss = CrossEntropyLoss()(shift_logits, shift_labels)
+            if stage2_finite_ce and not torch.any(shift_labels != -100):
+                loss = shift_logits.sum() * 0.0
+            else:
+                loss = CrossEntropyLoss()(shift_logits, shift_labels)
 
         diagnostics = None
         if rollout.diagnostics is not None:
@@ -2118,6 +2167,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         return_stage2_latent_states: bool = False,
         collect_stage2_diagnostics: bool = False,
         retain_stage2_latent_grads: bool = False,
+        stage2_ablation: Optional[Tuple[int, int]] = None,
+        stage2_finite_ce: bool = False,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2134,6 +2185,13 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if not isinstance(stage2_finite_ce, bool):
+            raise ValueError("stage2_finite_ce must be a bool")
+        if getattr(self.config, "stage", None) != "stage2" and (
+            stage2_ablation is not None or stage2_finite_ce
+        ):
+            raise ValueError("Stage 2 objective controls are valid only in Stage 2")
 
         if getattr(self.config, "stage", None) == "stage2":
             for name, value in (
@@ -2159,6 +2217,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 return_stage2_latent_states=return_stage2_latent_states,
                 collect_stage2_diagnostics=collect_stage2_diagnostics,
                 retain_stage2_latent_grads=retain_stage2_latent_grads,
+                stage2_ablation=stage2_ablation,
+                stage2_finite_ce=stage2_finite_ce,
             )
 
         # ===================================================================
