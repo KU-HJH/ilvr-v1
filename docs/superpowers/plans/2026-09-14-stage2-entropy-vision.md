@@ -44,7 +44,7 @@
 - F means normal student forward; M means independently replayed masked forward. s/e are the actual start/end marker positions, e strictly inside sequence; example slots [3,4] mean (s,e)=(2,5). Require the pair to match a parsed nonempty latent span, reject bool/noninteger indices, padding markers, B>1 runtime, and intervention/finite-CE use outside Stage 2. Active intervention supports eager/SDPA only, not FlashAttention or sliding-window/native-nonzero-attention-dropout configurations. Errors are explicit ValueError/NotImplementedError with reason, not an exact-text contract.
 - Finite CE applies when every shifted supervised label in the B1 forward is ignored, returning graph-connected FP32 zero; normal labels use untouched legacy CE. The gradient witness means loss ONLY on post-text predictions reaches the generated latent states. Compare all non-None trainable gradients between matched-RNG F-forward then M then F-backward versus F-only backward, and checkpoint on/off, with tight dtype-appropriate numerical tolerances and reported maximum errors. RNGState is an internal snapshot, not a serialization API; clone states, support nested replay, and reject incompatible initialized-device sets rather than silently perturb new streams.
 
-- [ ] Write failing tests using existing `tests/stage2/helpers.py:tiny_stage2_qwen`, two layers/two blocks, eager first. The intended new kwarg must cause the missing-feature failure; do not stop at an import/fixture error. Include deterministic generated-latent perturbation, not overwritten pad-embedding perturbation.
+- [x] Write failing tests using existing `tests/stage2/helpers.py:tiny_stage2_qwen`, two layers/two blocks, eager first. The intended new kwarg must cause the missing-feature failure; do not stop at an import/fixture error. Include deterministic generated-latent perturbation, not overwritten pad-embedding perturbation.
 
 ```python
 # Hand-selected slots [3,4], marker e=5. Capture/inject at the existing
@@ -55,8 +55,8 @@ torch.testing.assert_close(m_original.logits[:, 5:8], m_changed.logits[:, 5:8])
 torch.testing.assert_close(m_original.logits[:, :3], f_original.logits[:, :3])
 ```
 
-- [ ] Run RED: `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/stage2/test_objective_ablation.py`. Save failure reason in task report/log.
-- [ ] Implement immutable per-forward (s,e), strict span/backend validation, original 2-D padding mask for RoPE, additive causal/padding mask for decoder calls, sliced to current prefix. Preserve defaults, positions and sequence. Core restriction:
+- [x] Run RED: `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/stage2/test_objective_ablation.py`. Save failure reason in task report/log.
+- [x] Implement immutable per-forward (s,e), strict span/backend validation, original 2-D padding mask for RoPE, additive causal/padding mask for decoder calls, sliced to current prefix. Preserve defaults, positions and sequence. Core restriction:
 
 ```python
 q = torch.arange(length, device=device)[:, None]
@@ -66,9 +66,9 @@ blocked = (q >= end) & (j > start) & (j < end)
 mask = mask.masked_fill(blocked[None, None], torch.finfo(dtype).min)
 ```
 
-- [ ] Add first-nail tests for DoRA 0.05 paired no-intervention replay in train/no_grad mode, state restoration, downstream generated-latent invariance, F post-only latent gradients, and M-then-F-checkpoint-backward equality. Force informative nonzero adapter deltas. Test image/position/input preservation and SDPA separately; reject any unsupported mode explicitly.
-- [ ] Run GREEN plus existing `tests/stage2/test_qwen_forward.py` and `tests/stage2/test_rollout.py`. If first nail fails causally, use systematic-debugging and resolve before Task 2; do not change ablation meaning.
-- [ ] Self-review, record complete red/green evidence, and commit only Task 1 files.
+- [x] Add first-nail tests for DoRA 0.05 paired no-intervention replay in train/no_grad mode, state restoration, downstream generated-latent invariance, F post-only latent gradients, and M-then-F-checkpoint-backward equality. Force informative nonzero adapter deltas. Test image/position/input preservation and SDPA separately; reject any unsupported mode explicitly.
+- [x] Run GREEN plus existing `tests/stage2/test_qwen_forward.py` and `tests/stage2/test_rollout.py`. If first nail fails causally, use systematic-debugging and resolve before Task 2; do not change ablation meaning.
+- [x] Self-review, record complete red/green evidence, and commit only Task 1 files.
 
 ### Task 2: Fixed math, vocabulary, windows, and opt-in settings
 
@@ -85,7 +85,7 @@ mask = mask.masked_fill(blocked[None, None], torch.finfo(dtype).min)
 - Collator optional `enable_stage2_objective=False`; only when on emit `stage2_text_segments` metadata. Derive verified token ranges from the actual unique assistant content bounds and strict latent markers, excluding chat termination. Do not retokenize prefixes with different context, alter rendered bytes, or use next-label validity as pre criterion.
 - The existing assistant pattern excludes the template newline; preserve its legacy CE labels but exclude that formatting newline from objective P metadata. An empty pre-text plan must not acquire a valid pre window from the chat header. Tokenizer offsets on the complete rendered text, with verified final assistant-suffix token equality after processor image expansion, are an acceptable way to identify content boundaries; detect BPE-boundary ambiguity explicitly. Include a leading-newline/empty-P regression.
 
-- [ ] Write scalar/logit RED tests with independent literals, including:
+- [x] Write scalar/logit RED tests with independent literals, including:
 
 ```python
 a = torch.tensor([1.0], requires_grad=True)
@@ -99,11 +99,11 @@ scores = vision_gain(torch.tensor([0.0], requires_grad=True),
 assert scores['loss_vis'].item() == pytest.approx(math.log(2))
 ```
 
-- [ ] Run RED on the three new test files before adding production helpers; use callable existence assertions inside tests if necessary so a missing implementation is an assertion failure, not collection error.
-- [ ] Implement fixed math exactly; natural-log text-only softmax on selected rows, full-vocab score gathers never using -100, nonfinite validation with location context, no clipping. Validate finite config, weights, integer windows, Stage2-only enable and marker supervision.
-- [ ] Implement tokenizer-resolved partition including actual non-special structural tool/FIM IDs and unmapped output rows, retaining ordinary added tokens. Enumerate exclusions/reasons and reject unresolved IDs/mismatches. Keep control-logit changes from affecting text entropy.
-- [ ] Implement eight-token literal alignment pre=(1,), post=(5,), target=(y0,); pre candidate positions are text-state positions in P. Remove any pre/post overlap from both sides simultaneously without refill; exclude empty windows with reasons. Reference later consumes identical final blocks. Test padding, assistant boundaries, zero blocks, malformed markers, short segments, B>1 helpers and B1 runtime error. Test actual collator output unchanged apart from feature metadata.
-- [ ] Run GREEN on new files and `tests/stage2/test_data.py`; verify BF16/extreme finite gradients, per-block nonlinearity versus nonlinear global mean, CE vocabulary unchanged. Commit Task 2 files with evidence.
+- [x] Run RED on the three new test files before adding production helpers; use callable existence assertions inside tests if necessary so a missing implementation is an assertion failure, not collection error.
+- [x] Implement fixed math exactly; natural-log text-only softmax on selected rows, full-vocab score gathers never using -100, nonfinite validation with location context, no clipping. Validate finite config, weights, integer windows, Stage2-only enable and marker supervision.
+- [x] Implement tokenizer-resolved partition including actual non-special structural tool/FIM IDs and unmapped output rows, retaining ordinary added tokens. Enumerate exclusions/reasons and reject unresolved IDs/mismatches. Keep control-logit changes from affecting text entropy.
+- [x] Implement eight-token literal alignment pre=(1,), post=(5,), target=(y0,); pre candidate positions are text-state positions in P. Remove any pre/post overlap from both sides simultaneously without refill; exclude empty windows with reasons. Reference later consumes identical final blocks. Test padding, assistant boundaries, zero blocks, malformed markers, short segments, B>1 helpers and B1 runtime error. Test actual collator output unchanged apart from feature metadata.
+- [x] Run GREEN on new files and `tests/stage2/test_data.py`; verify BF16/extreme finite gradients, per-block nonlinearity versus nonlinear global mean, CE vocabulary unchanged. Commit Task 2 files with evidence.
 
 ### Task 3: Independent fixed reference and checkpoint identity
 
@@ -114,7 +114,7 @@ assert scores['loss_vis'].item() == pytest.approx(math.log(2))
 - `load_frozen_reference(args, *, student, tokenizer, source_dependencies) -> FrozenReference | None`; dyn zero returns None before any load. Dependencies use the existing Stage2SourceDependencies model/config/processor entry points. Avoid importing main into reference module.
 - `validate_objective_resume(path, config_dict, reference_identity, vocabulary_identity)` and `save_objective_identity(path, config_dict, reference_identity, vocabulary_identity)` use a single `stage2_objective.json` sidecar. Reference path resolves to original Stage 1 source, never resume student. Missing/mismatched identity is a clear error.
 
-- [ ] Write RED tests with tiny locally serialized Stage1 full and schema-2 DoRA fixtures stored under a unique checkpoints test directory. Compare storage pointers, optimizer parameter IDs, token rows, eval/no_grad state, own latent outputs, and actual parameter values after student optimizer update/reload.
+- [x] Write RED tests with tiny locally serialized Stage1 full and schema-2 DoRA fixtures stored under a unique checkpoints test directory. Compare storage pointers, optimizer parameter IDs, token rows, eval/no_grad state, own latent outputs, and actual parameter values after student optimizer update/reload.
 
 ```python
 before = {n:p.detach().clone() for n,p in ref.model.named_parameters()}
@@ -126,10 +126,10 @@ assert not ({p.data_ptr() for p in student.parameters()} &
             {p.data_ptr() for p in ref.model.parameters()})
 ```
 
-- [ ] Run RED `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/stage2/test_objective_reference.py`.
-- [ ] Implement separate source resolution/load using existing Stage1 full/adapter loaders including sparse marker rows. Freeze/eval, align tokenizer/output layout, preserve student RNG around construction, honor backend/dtype policy. No student deepcopy. Compute checkpoint/tokenizer identity once with hashes of load-relevant weight/config/tokenizer artifacts; do not hash optimizer shards or per microbatch.
-- [ ] Implement sidecar exact-config/reference/vocabulary checks and original-source reconstruction. Tests mutate source file/sidecar/config and require rejection; matched deterministic student/reference initialization yields D near zero. Config feature-off save behavior remains untouched.
-- [ ] Run GREEN and existing Stage2 source/checkpoint loader tests relevant to changed calls, record actual commands, commit Task 3.
+- [x] Run RED `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/stage2/test_objective_reference.py`.
+- [x] Implement separate source resolution/load using existing Stage1 full/adapter loaders including sparse marker rows. Freeze/eval, align tokenizer/output layout, preserve student RNG around construction, honor backend/dtype policy. No student deepcopy. Compute checkpoint/tokenizer identity once with hashes of load-relevant weight/config/tokenizer artifacts; do not hash optimizer shards or per microbatch.
+- [x] Implement sidecar exact-config/reference/vocabulary checks and original-source reconstruction. Tests mutate source file/sidecar/config and require rejection; matched deterministic student/reference initialization yields D near zero. Config feature-off save behavior remains untouched.
+- [x] Run GREEN and existing Stage2 source/checkpoint loader tests relevant to changed calls, record actual commands, commit Task 3.
 
 ### Task 4: Actual Trainer integration, global mean, and regressions
 
@@ -142,9 +142,9 @@ assert not ({p.data_ptr() for p in student.parameters()} &
 - Main config validation occurs before expensive model/reference loading; wire feature metadata collator, lazy reference and runtime after student initialization, and pass trainer kwargs only in enabled path.
 - For enabled weights-zero, bypass auxiliary vocabulary/window construction and denominator collectives entirely: pass the collator metadata flag only when config.active, keep runtime None, and use F with opt-in finite CE. Save enabled config identity with absent reference/vocabulary fields. This keeps unused window parsing from rejecting a CE-only example accepted by legacy. Test zero-weight equivalence on empty-P/leading-newline trajectories too.
 
-- [ ] Write RED tests on actual tiny Qwen + Stage2Trainer (not just a toy compute_loss replacement). Include four modes, all-ignore labels, malformed/empty windows, F latent gradients, ref/M no graph, optimizer ownership, off/CE-only equality, resume sidecar mismatch. Tests witness exact forward counts and no helper tensors.
-- [ ] Run RED `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/stage2/test_objective_trainer.py`.
-- [ ] Implement runtime F once with graph and diagnostics, reference once only when needed, each M no_grad within replayed F RNG state from original inputs and own rollout. M/reference omit unnecessary CE; select rows before auxiliary FP32 ops; release M logits sequentially. Sum blockwise nonlinear losses; detach only logging/M/reference.
+- [x] Write RED tests on actual tiny Qwen + Stage2Trainer (not just a toy compute_loss replacement). Include four modes, all-ignore labels, malformed/empty windows, F latent gradients, ref/M no graph, optimizer ownership, off/CE-only equality, resume sidecar mismatch. Tests witness exact forward counts and no helper tensors.
+- [x] Run RED `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/pytest -q tests/stage2/test_objective_trainer.py`.
+- [x] Implement runtime F once with graph and diagnostics, reference once only when needed, each M no_grad within replayed F RNG state from original inputs and own rollout. M/reference omit unnecessary CE; select rows before auxiliary FP32 ops; release M logits sequentially. Sum blockwise nonlinear losses; detach only logging/M/reference.
 
 ```python
 loss = result.ce
@@ -156,10 +156,22 @@ else:
     loss = loss + result.ce * 0.0
 ```
 
-- [ ] Implement count collection over actual upcoming accumulation batches, all ranks including empty, respecting last partial window and actual parent/Accelerate scaling. Force or verify native Trainer no-loss-kwargs scaling contract; do not use double division. Keep CE reduction untouched. Direct compute_loss outside training gets an explicitly documented single-batch denominator, including global count when distributed.
-- [ ] Add CPU Gloo subprocess regression using actual Trainer path at unequal counts, zero rank, remainder, and gradient accumulation; compare gradients/updates against independent literal concatenated-block oracle. CPU unit-test distributed processes are not GPU training jobs. Fail fast active-aux DeepSpeed, FlashAttention, sliding window, attention dropout, or unvalidated GC settings; test error occurs before model load.
-- [ ] Integrate existing save/resume metadata; global count-weighted logs for all required components/ratios/sign fractions/exclusions/low entropy/actual forward counts. Label absent metrics, separate backward-scaled scalar from logged objective. Preserve existing sampler/runtime hooks and feature-off behavior.
-- [ ] Run GREEN new integration files and the repository Stage 1/Stage 2 CPU regression suite once; record native hook/scaling witnesses and any pre-existing failures without weakening assertions. Commit Task 4.
+- [x] Implement count collection over actual upcoming accumulation batches, all ranks including empty, respecting last partial window and actual parent/Accelerate scaling. Force or verify native Trainer no-loss-kwargs scaling contract; do not use double division. Keep CE reduction untouched. Direct compute_loss outside training gets an explicitly documented single-batch denominator, including global count when distributed.
+- [x] Add CPU Gloo subprocess regression using actual Trainer path at unequal counts, zero rank, remainder, and gradient accumulation; compare gradients/updates against independent literal concatenated-block oracle. CPU unit-test distributed processes are not GPU training jobs. Fail fast active-aux DeepSpeed, FlashAttention, sliding window, attention dropout, or unvalidated GC settings; test error occurs before model load.
+- [x] Integrate existing save/resume metadata; global count-weighted logs for all required components/ratios/sign fractions/exclusions/low entropy/actual forward counts. Label absent metrics, separate backward-scaled scalar from logged objective. Preserve existing sampler/runtime hooks and feature-off behavior.
+- [x] Run GREEN new integration files and the repository Stage 1/Stage 2 CPU regression suite once; record native hook/scaling witnesses and any pre-existing failures without weakening assertions. Commit Task 4.
+
+Task4 evidence boundary: commit `abf7462`, task-scoped spec/quality review approved.
+Post-remediation focused tests: 32 passed; separate original Stage1 mask symptom
+plus eager/SDPA controls: 3 passed. PRE-REMEDY broad run: 1943 passed, 5 failed,
+7 skipped, 3 deselected, 10 warnings. Three platform failures independently
+reproduced on canonical baseline; the two other failures received focused fixes.
+This does not establish a current-head passing full suite. Initial normalization
+and multi-batch logging implementation preceded behavioral tests, violating TDD;
+those portions were removed, causal RED observed, and reimplemented from tests.
+That remedy does not retroactively erase the original process violation.
+FP16 boundary validation and broad-run PEFT warning attribution are deferred
+minor review items, not GPU support evidence. Task5/final verification remains open.
 
 ### Task 5: Reproducible examples and evidence-based handoff
 
