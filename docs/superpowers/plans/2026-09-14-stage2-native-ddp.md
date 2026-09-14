@@ -44,6 +44,11 @@ plan's pending Task5 delivery (one wrapper, one document, one final branch revie
 
 ### Task 1: Explicit backend, real worker argv, and preflight inputs
 
+**Status:** Complete; implementation4c02422, no-write regression testsd2e26cb;
+task review and scoped fix review approved. Covering suite213passed/1known
+baseline platform failure; amended dry-run tests2passed after causal temporary
+write mutation2failed. No remote/GPU/training verification was run.
+
 **Files:** Modify `src/multinode.py`, `src/multinode_runtime.py`, `run_stage2_training.sh`; create `tests/multinode/test_native_ddp_launch.py`; extend `tests/stage2/test_launcher.py` only for executable worker behavior.
 
 **Interfaces:**
