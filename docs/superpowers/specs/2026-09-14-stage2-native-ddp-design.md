@@ -400,3 +400,10 @@ plan. The approved objective spec and existing loader/ownership source are
 required implementation references. Writing-plans will bind task-specific
 function signatures and method file requirements from those inspected sources;
 it may not weaken these contracts or invent a new loader/ownership API.
+
+## Approval record
+
+2026-09-14: user replied “ㅇㅋ” to the final commitment v1 approval question.
+Section12 is approved for implementation with GPU feasibility explicitly
+unvalidated. Frozen proposal and commitment text above are retained as reviewed.
+This approval does not authorize deployment, GPU training, merge, or push.
