@@ -74,6 +74,8 @@ class StepPreferenceConfig:
     lambda_dpo: float = 1.0
     lambda_preference: float = 1.0
     preference_margin: float = 0.0
+    prefix_mode: str = "clean_prefix"
+    block_original_image: bool = False
     visual_only_context_preference: bool = False
     visual_off_suppress_latent_boundaries: bool = False
     lambda_entropy: float = 0.1
@@ -100,6 +102,18 @@ class StepPreferenceConfig:
 
     def __post_init__(self) -> None:
         normalize_preference_target_scope(self.target_scope)
+        if self.prefix_mode not in ("clean_prefix", "v_off_prefix"):
+            raise ValueError("prefix_mode must be clean_prefix or v_off_prefix")
+        if type(self.block_original_image) is not bool:
+            raise ValueError("block_original_image must be a boolean")
+        if self.block_original_image and self.prefix_mode != "v_off_prefix":
+            raise ValueError("block_original_image requires v_off_prefix")
+        if self.prefix_mode == "v_off_prefix" and (
+            not self.is_context_preference
+            or not self.visual_only_context_preference
+            or self.visual_off_suppress_latent_boundaries
+        ):
+            raise ValueError("v_off_prefix requires V-only context preference with START/END kept")
         if self.target_scope != "immediate_text" and not self.is_context_preference:
             raise ValueError("full preference target scope requires context-preference Stage 2B")
         if not isinstance(self.enabled, bool):
@@ -292,6 +306,8 @@ class StepPreferenceConfig:
             lambda_dpo=getattr(args, "step_dpo_weight", 1.0),
             lambda_preference=getattr(args, "step_preference_weight", 1.0),
             preference_margin=getattr(args, "step_preference_margin", 0.0),
+            prefix_mode=getattr(args, "step_preference_prefix_mode", "clean_prefix"),
+            block_original_image=getattr(args, "step_preference_block_original_image", False),
             visual_only_context_preference=getattr(
                 args, "step_visual_only_context_preference", False
             ),

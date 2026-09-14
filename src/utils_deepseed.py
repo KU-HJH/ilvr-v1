@@ -66,6 +66,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Preference target: next text entry (default), or all text until the next latent block.",
     )
     parser.add_argument("--step_preference_margin", type=float, default=0.0)
+    parser.add_argument("--step_preference_prefix_mode",
+        choices=("clean_prefix", "v_off_prefix"), default="clean_prefix")
+    parser.add_argument("--step_preference_block_original_image", action="store_true")
     parser.add_argument("--step_visual_only_context_preference", action="store_true")
     parser.add_argument(
         "--step_visual_off_suppress_latent_boundaries", action="store_true"

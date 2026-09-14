@@ -2517,7 +2517,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
-            **({"stage2_capture_kv": True} if shared and any(stage2_shared_prefix_inputs["plan"].groups) else {}),
+            **({"stage2_capture_kv": True} if shared
+               and stage2_shared_prefix_inputs.get("prefix_mode", "clean_prefix") == "clean_prefix"
+               and any(stage2_shared_prefix_inputs["plan"].groups) else {}),
         )
         sidecar_results, sidecar_stats = None, None
         if shared:

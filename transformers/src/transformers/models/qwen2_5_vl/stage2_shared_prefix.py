@@ -13,11 +13,23 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
 
     if not isinstance(options, Mapping):
         raise TypeError("stage2_shared_prefix_inputs must be a mapping")
-    if set(options) - {"plan", "backend", "query_budget", "checkpoint"}:
+    if set(options) - {"plan", "backend", "query_budget", "checkpoint", "prefix_mode", "block_original_image"}:
         raise ValueError("unknown shared-prefix input options")
     if not isinstance(options.get("plan"), SidecarPlan):
         raise ValueError("shared-prefix inputs require a SidecarPlan")
     plan = options["plan"]
+    prefix_mode = options.get("prefix_mode", "clean_prefix")
+    if prefix_mode not in ("clean_prefix", "v_off_prefix"):
+        raise ValueError("unknown preference prefix_mode")
+    if type(options.get("block_original_image", False)) is not bool:
+        raise ValueError("block_original_image must be a boolean")
+    if options.get("block_original_image", False) and prefix_mode != "v_off_prefix":
+        raise ValueError("block_original_image requires v_off_prefix")
+    if prefix_mode == "v_off_prefix" and (
+        not plan.context_preference or plan.groups[1]
+        or any(branch.zero_first_embedding for branch in plan.groups[0])
+    ):
+        raise ValueError("v_off_prefix requires V-only context preference with START/END kept")
     if plan.context_preference:
         expected_kinds = ("visual_off", "textual_off")
         if not isinstance(plan.groups, tuple) or len(plan.groups) != len(expected_kinds):
@@ -188,7 +200,91 @@ def _score_chunk(model, branches, embeds, positions, mask, flat_prefix):
     return score, (embeds, positions, *flat_prefix)
 
 
+def _evidence_mask(input_ids, embeds, branch, image_token_id, *, block_image, off, backend):
+    length = embeds.shape[1]
+    hidden_keys = (input_ids[0, :length] == image_token_id) & block_image
+    if off:
+        hidden_keys = hidden_keys.clone()
+        hidden_keys[branch.blocked_start:branch.blocked_end] = True
+    if backend == "flex":
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        def visible(batch, head, query, key):
+            return ((query >= key) & (query < length) & (key < length)
+                    & ~hidden_keys[key.clamp(max=length - 1)])
+
+        return create_block_mask(visible, B=1, H=None, Q_LEN=length,
+                                 KV_LEN=length, device=str(embeds.device))
+    positions = torch.arange(length, device=embeds.device)
+    visible = (positions[:, None] >= positions[None, :]) & ~hidden_keys[None, :]
+    return torch.zeros((1, 1, length, length), device=embeds.device,
+                       dtype=embeds.dtype).masked_fill(~visible, torch.finfo(embeds.dtype).min)
+
+
+def _evidence_pair(model, branch, on_mask, off_mask, device):
+    # Bind each branch's metadata before checkpoint's delayed backward replay.
+    selected = torch.tensor(branch.logical_positions, device=device, dtype=torch.long)
+    selected = selected[list(branch.selected_positions)]
+    targets = torch.tensor(branch.target_token_ids, device=device, dtype=torch.long)
+
+    def score(embeds, positions, mask):
+        hidden = model.model(inputs_embeds=embeds, position_ids=positions,
+                             attention_mask=mask, use_cache=False,
+                             return_dict=True).last_hidden_state
+        log_probs = model.lm_head(hidden.index_select(1, selected))[0].float().log_softmax(-1)
+        return (log_probs.gather(-1, targets[:, None]).mean(),
+                -(log_probs.exp() * log_probs).sum(-1))
+
+    def pair(embeds, positions):
+        # Common random numbers: changing visibility must not change dropout draws.
+        cpu_rng = torch.get_rng_state()
+        devices = [embeds.device.index] if embeds.is_cuda else []
+        cuda_rng = torch.cuda.get_rng_state(embeds.device) if devices else None
+        on = score(embeds, positions, on_mask)
+        with torch.random.fork_rng(devices=devices):
+            torch.set_rng_state(cpu_rng)
+            if devices:
+                torch.cuda.set_rng_state(cuda_rng, embeds.device)
+            off = score(embeds, positions, off_mask)
+        return (*on, *off)
+
+    return pair
+
+
+def score_evidence_gain(model, options, input_ids, clean_embeds, clean_positions):
+    """Recompute both prefixes; keep clean latent vectors, boundaries, positions and CE.
+
+    Image blocking removes direct original-image keys throughout each replay. It
+    does not erase image information from clean-generated latent vectors or text.
+    No already-clean decoder K/V is reused in either preference branch.
+    """
+    results = []
+    stats = dict(logical_groups=1, chunks=0, oversized_branches=0, query_rows=0,
+                 entropy_scored_rows=0, rejected_scored_rows=0)
+    for branch in options["plan"].groups[0]:
+        length = branch.logical_positions[-1] + 1
+        embeds = clean_embeds[:, :length]
+        positions = clean_positions[:, :, :length]
+        masks = [_evidence_mask(input_ids, embeds, branch, model.config.image_token_id,
+                  block_image=options.get("block_original_image", False), off=off,
+                  backend=options.get("backend", "dense")) for off in (False, True)]
+        pair = _evidence_pair(model, branch, *masks, embeds.device)
+        values = (checkpoint(pair, embeds, positions, use_reentrant=False,
+                             preserve_rng_state=True) if options.get("checkpoint", True)
+                  else pair(embeds, positions))
+        for offset, kind in ((0, "visual_on"), (2, "visual_off")):
+            results.append(dict(name=f"{kind}:{branch.step_id}", kind=kind,
+                step_id=branch.step_id, mean_logp=values[offset], entropies=values[offset + 1]))
+        stats["logical_groups"] += 2
+        stats["chunks"] += 1
+        stats["query_rows"] += 2 * length
+        stats["entropy_scored_rows"] += 2 * len(branch.target_token_ids)
+    return tuple(results), stats
+
+
 def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, prefix_kv):
+    if options.get("prefix_mode", "clean_prefix") == "v_off_prefix":
+        return score_evidence_gain(model, options, input_ids, clean_embeds, clean_positions)
     from step_preference.sidecar import (
         chunk_sidecar_branches, sidecar_dense_visibility, build_sidecar_flex_block_mask,
     )

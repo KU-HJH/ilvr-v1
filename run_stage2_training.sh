@@ -77,6 +77,16 @@ PER_DEVICE_TRAIN_BATCH_SIZE=1
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
 STEP_PREFERENCE_OBJECTIVE=${STEP_PREFERENCE_OBJECTIVE:-context_preference}
 STEP_PREFERENCE_TARGET_SCOPE=${STEP_PREFERENCE_TARGET_SCOPE:-immediate_text}
+STEP_PREFERENCE_PREFIX_MODE=${STEP_PREFERENCE_PREFIX_MODE:-clean_prefix}
+case "$STEP_PREFERENCE_PREFIX_MODE" in
+  clean_prefix|v_off_prefix) ;;
+  *) printf 'Unknown STEP_PREFERENCE_PREFIX_MODE\n' >&2; exit 2 ;;
+esac
+case "${STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE-false}" in
+  0|false|False) step_preference_block_original_image=false ;;
+  1|true|True) step_preference_block_original_image=true ;;
+  *) printf 'STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE must be a boolean\n' >&2; exit 2 ;;
+esac
 case "$STEP_PREFERENCE_TARGET_SCOPE" in
   immediate_text|until_next_latent) ;;
   *) printf 'Unknown STEP_PREFERENCE_TARGET_SCOPE\n' >&2; exit 2 ;;
@@ -228,12 +238,16 @@ case "$STEP_PREFERENCE_ENABLED" in
         --step_preference_beta "$STEP_PREFERENCE_BETA"
         --step_preference_weight "$STEP_PREFERENCE_WEIGHT"
         --step_preference_target_scope "$STEP_PREFERENCE_TARGET_SCOPE"
+        --step_preference_prefix_mode "$STEP_PREFERENCE_PREFIX_MODE"
         --step_preference_margin "$STEP_PREFERENCE_MARGIN"
         --step_sidecar_attention_backend "$STEP_SIDECAR_ATTENTION_BACKEND"
         --step_sidecar_query_budget "$STEP_SIDECAR_QUERY_BUDGET"
       )
       if [[ "$step_visual_only_context_preference" == true ]]; then
         STEP_PREFERENCE_ARGS+=(--step_visual_only_context_preference)
+      fi
+      if [[ "$step_preference_block_original_image" == true ]]; then
+        STEP_PREFERENCE_ARGS+=(--step_preference_block_original_image)
       fi
       if [[ "$step_visual_off_suppress_latent_boundaries" == true ]]; then
         STEP_PREFERENCE_ARGS+=(--step_visual_off_suppress_latent_boundaries)
@@ -333,6 +347,16 @@ fi
 if [[ "$STEP_PREFERENCE_TARGET_SCOPE" != immediate_text ]] &&
    [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b || "$STEP_PREFERENCE_OBJECTIVE" != context_preference ]]; then
   printf 'STEP_PREFERENCE_TARGET_SCOPE requires context-preference Stage 2B\n' >&2
+  exit 2
+fi
+
+if [[ "$STEP_PREFERENCE_PREFIX_MODE" == v_off_prefix ]] &&
+   [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b || "$STEP_PREFERENCE_OBJECTIVE" != context_preference || "$step_visual_only_context_preference" != true || "$step_visual_off_suppress_latent_boundaries" == true ]]; then
+  printf 'v_off_prefix requires V-only context preference with START/END kept\n' >&2
+  exit 2
+fi
+if [[ "$step_preference_block_original_image" == true && "$STEP_PREFERENCE_PREFIX_MODE" != v_off_prefix ]]; then
+  printf 'STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE requires v_off_prefix\n' >&2
   exit 2
 fi
 
@@ -438,6 +462,8 @@ MANAGED_OPTIONS=(
   --step_preference_beta
   --step_preference_weight
   --step_preference_target_scope
+  --step_preference_prefix_mode
+  --step_preference_block_original_image
   --step_preference_margin
   --step_visual_only_context_preference
   --step_visual_off_suppress_latent_boundaries
