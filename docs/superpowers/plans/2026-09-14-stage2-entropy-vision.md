@@ -23,6 +23,7 @@
 - Execute in `/root/workspace/ILVR/.worktrees/stage2-entropy-vision`; do not modify main or unrelated worktrees. Source baseline is `31f745e`. User-modified launchers on main are not copied or overwritten.
 - Python/tests use `PYTHONPATH="$PWD/transformers/src:$PWD/src" ./venv/ilvr-venv/bin/python` or the corresponding `pytest`. Reuse the validated venv; no dependency reinstall/download.
 - CPU tests may run locally. All training including GPU smoke requires the existing two-node/four-rank coordinator and operator preflight. No full training/push/download without separate approval.
+- Broad CPU regression commands set `CUDA_VISIBLE_DEVICES=""` and select `-m "not gpu"` so existing CUDA-availability guards cannot accidentally launch GPU integration tests. New actual-Qwen CPU BF16-autocast tests belong in Task4; scalar BF16 tests alone do not prove model/autocast compatibility.
 - All model-bearing artifacts live under `./checkpoints/`, datasets under `./data/`, results under `./results/`, logs under `./logs/`. Preserve symlinks; test checkpoint fixtures also use a distinct temporary directory under checkpoints.
 - Reproduction examples use same Stage 1 checkpoint/data/seed; four ranks, microbatch 1, accumulation 2, global batch 8, LR 5e-5, seed 42, warmup 10. Derive update budget, do not copy 431.
 - TDD and task-scoped spec/quality review for each task. Children never spawn agents or invoke paperthin hooks. Report observed red/green commands and evidence, not assumed passes.
