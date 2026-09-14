@@ -39,6 +39,15 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 MAX_SEQUENCE_LENGTH=${MAX_SEQUENCE_LENGTH:-8192}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 
+stage2_backend=${ILVR_STAGE2_BACKEND:-deepspeed}
+case "$stage2_backend" in
+  deepspeed|ddp) ;;
+  *)
+    printf 'ILVR_STAGE2_BACKEND must be deepspeed or ddp\n' >&2
+    exit 2
+    ;;
+esac
+
 ilvr_topology_variables=(
   ILVR_NUM_MACHINES
   ILVR_NUM_PROCESSES
@@ -92,6 +101,44 @@ else
   ilvr_main_process_ip=
   ilvr_main_process_port=${STAGE2_MAIN_PROCESS_PORT:-29502}
   ilvr_socket_ifname=
+fi
+
+if [[ "$stage2_backend" == ddp ]]; then
+  if [[ "$ilvr_multinode" != true ]]; then
+    printf 'native DDP requires the complete fixed multi-node topology\n' >&2
+    exit 2
+  fi
+  if [[ -n "${DEEPSPEED_CONFIG:-}" ]]; then
+    printf 'DEEPSPEED_CONFIG conflicts with native DDP\n' >&2
+    exit 2
+  fi
+  accelerate_boolean_names=(
+    ACCELERATE_USE_DEEPSPEED
+    ACCELERATE_USE_FSDP
+    ACCELERATE_USE_MEGATRON_LM
+    ACCELERATE_USE_CPU
+  )
+  for accelerate_boolean_name in "${accelerate_boolean_names[@]}"; do
+    if [[ ! -v $accelerate_boolean_name ]]; then
+      continue
+    fi
+    accelerate_boolean_value=${!accelerate_boolean_name,,}
+    case "$accelerate_boolean_value" in
+      n|no|f|false|off|0) ;;
+      y|yes|t|true|on|1)
+        printf '%s conflicts with native DDP\n' "$accelerate_boolean_name" >&2
+        exit 2
+        ;;
+      *)
+        printf '%s must use an Accelerate boolean spelling\n' "$accelerate_boolean_name" >&2
+        exit 2
+        ;;
+    esac
+  done
+  if [[ -v ACCELERATE_DYNAMO_BACKEND && "${ACCELERATE_DYNAMO_BACKEND,,}" != no ]]; then
+    printf 'ACCELERATE_DYNAMO_BACKEND conflicts with native DDP\n' >&2
+    exit 2
+  fi
 fi
 
 accelerate_topology=(
@@ -345,18 +392,20 @@ if [[ -n "${DEEPSPEED_CONFIG:-}" || "$ilvr_multinode" == true ]]; then
     STAGE2_NUM_PROCESSES=${STAGE2_NUM_PROCESSES:-2}
     require_positive_integer STAGE2_NUM_PROCESSES "$STAGE2_NUM_PROCESSES"
   fi
-  ACCELERATE_DEEPSPEED_ARGS=()
-  if [[ "$ilvr_num_machines" == 2 ]]; then
-    ACCELERATE_DEEPSPEED_ARGS=(
-      --use_deepspeed
-      --deepspeed_multinode_launcher standard
-      --deepspeed_config_file "$DEEPSPEED_CONFIG"
-    )
+  ACCELERATE_BACKEND_ARGS=()
+  if [[ "$stage2_backend" == ddp ]]; then
+    ACCELERATE_BACKEND_ARGS=(--multi_gpu)
+  elif [[ "$ilvr_num_machines" == 2 ]]; then
+    ACCELERATE_BACKEND_ARGS=(
+        --use_deepspeed
+        --deepspeed_multinode_launcher standard
+        --deepspeed_config_file "$DEEPSPEED_CONFIG"
+      )
   fi
   COMMAND=(
     "$REPO_ROOT/venv/ilvr-venv/bin/accelerate" launch
     "${accelerate_topology[@]}"
-    "${ACCELERATE_DEEPSPEED_ARGS[@]}"
+    "${ACCELERATE_BACKEND_ARGS[@]}"
     "$REPO_ROOT/src/main.py"
     "${TRAINING_ARGS[@]}"
   )

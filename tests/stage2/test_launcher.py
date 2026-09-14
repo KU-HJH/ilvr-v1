@@ -52,6 +52,84 @@ def assert_four_rank_prefix(tokens, rank, port):
         assert tokens[tokens.index(flag) + 1] == value
 
 
+def native_ddp_environment(rank="0"):
+    return {
+        "ILVR_STAGE2_BACKEND": "ddp",
+        "ILVR_NUM_MACHINES": "2",
+        "ILVR_NUM_PROCESSES": "4",
+        "ILVR_MACHINE_RANK": rank,
+        "ILVR_MAIN_PROCESS_IP": "10.1.102.41",
+        "ILVR_MAIN_PROCESS_PORT": "29871",
+        "ILVR_SOCKET_IFNAME": "bond1.102",
+    }
+
+
+def test_stage2_native_ddp_worker_dry_run_uses_multi_gpu_without_deepspeed():
+    """Catches the DDP worker selecting the legacy DeepSpeed launcher backend."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            "--enable_stage2_objective",
+            "--lambda_dyn", "0.75",
+            "--lambda_vis", "0.25",
+            "--reference_model_path", "/models/reference",
+            env_overrides=native_ddp_environment(),
+        )
+    )
+
+    assert_four_rank_prefix(tokens, rank=0, port=29871)
+    assert "--multi_gpu" in tokens
+    assert "--use_deepspeed" not in tokens
+    assert "--deepspeed_config_file" not in tokens
+    assert "--deepspeed_config" not in tokens
+    assert option_value(tokens, "--lambda_dyn") == "0.75"
+    assert option_value(tokens, "--lambda_vis") == "0.25"
+    assert option_value(tokens, "--reference_model_path") == "/models/reference"
+
+
+def test_stage2_native_ddp_worker_rejects_incomplete_topology():
+    """Catches native DDP entering the launcher's single-node fallback."""
+    environment = native_ddp_environment()
+    environment.pop("ILVR_SOCKET_IFNAME")
+
+    result = run_launcher(env_overrides=environment)
+
+    assert result.returncode == 2
+    assert "all distributed variables" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("ACCELERATE_USE_DEEPSPEED", "true"),
+        ("ACCELERATE_USE_FSDP", "1"),
+        ("ACCELERATE_USE_MEGATRON_LM", "yes"),
+        ("ACCELERATE_USE_CPU", "on"),
+        ("ACCELERATE_DYNAMO_BACKEND", "inductor"),
+    ),
+)
+def test_stage2_native_ddp_worker_rejects_inherited_accelerate_mode(name, value):
+    """Catches a remote worker honoring an inherited conflicting backend mode."""
+    result = run_launcher(
+        env_overrides={**native_ddp_environment(), name: value}
+    )
+
+    assert result.returncode == 2
+    assert name in result.stderr
+
+
+def test_stage2_native_ddp_worker_rejects_a_deepspeed_training_config():
+    """Catches an invalid native-DDP/DeepSpeed mixed worker launch."""
+    result = run_launcher(
+        env_overrides={
+            **native_ddp_environment(),
+            "DEEPSPEED_CONFIG": "/configs/zero3.json",
+        }
+    )
+
+    assert result.returncode == 2
+    assert "DEEPSPEED_CONFIG" in result.stderr
+
+
 def test_stage2_multinode_dry_run_emits_rank_zero_four_process_command():
     """Catches Stage 2 omitting the rank-zero four-GPU Accelerate contract."""
     tokens = dry_run_tokens(

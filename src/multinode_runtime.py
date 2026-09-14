@@ -23,6 +23,7 @@ from src.deepspeed_runtime import load_deepspeed_runtime_profile
 
 if TYPE_CHECKING:
     from src.multinode import LaunchPlan
+    from src.stage2.objective import Stage2ObjectiveConfig
 
 
 _REMOTE_HOST = "korea@10.1.102.41"
@@ -872,10 +873,42 @@ def validated_stage2_environment(
     *,
     output_dir: str,
     log_file: str,
-    deepspeed_config: str,
+    deepspeed_config: str | None,
+    backend: str = "deepspeed",
     benchmark_evidence_path: str | None = None,
 ) -> dict[str, str]:
     """Copy only the existing approved Stage 2 knobs and owned artifact values."""
+    if backend not in ("deepspeed", "ddp"):
+        raise ValueError("backend must be 'deepspeed' or 'ddp'")
+    if backend == "ddp":
+        from accelerate.utils import str_to_bool
+
+        for name in (
+            "ACCELERATE_USE_DEEPSPEED",
+            "ACCELERATE_USE_FSDP",
+            "ACCELERATE_USE_MEGATRON_LM",
+            "ACCELERATE_USE_CPU",
+        ):
+            if name not in source:
+                continue
+            try:
+                enabled = str_to_bool(source[name], to_bool=True)
+            except (AttributeError, ValueError) as error:
+                raise ValueError(f"{name} must be a valid boolean") from error
+            if enabled:
+                raise ValueError(f"{name} conflicts with native DDP")
+        dynamo_backend = source.get("ACCELERATE_DYNAMO_BACKEND")
+        if dynamo_backend is not None and (
+            not isinstance(dynamo_backend, str)
+            or dynamo_backend.lower() != "no"
+        ):
+            raise ValueError(
+                "ACCELERATE_DYNAMO_BACKEND conflicts with native DDP"
+            )
+        if deepspeed_config:
+            raise ValueError("native DDP must not receive a DeepSpeed config")
+    elif not deepspeed_config:
+        raise ValueError("DeepSpeed requires a nonempty config")
     result = {
         name: source[name]
         for name in sorted(_STAGE2_ENVIRONMENT_ALLOWLIST)
@@ -886,13 +919,12 @@ def validated_stage2_environment(
     )
     if missing:
         raise ValueError(f"missing required Stage 2 environment: {', '.join(missing)}")
-    result.update(
-        {
-            "OUTPUT_DIR": output_dir,
-            "LOG_FILE": log_file,
-            "DEEPSPEED_CONFIG": deepspeed_config,
-        }
-    )
+    result.update({"OUTPUT_DIR": output_dir, "LOG_FILE": log_file})
+    if backend == "ddp":
+        result["ILVR_STAGE2_BACKEND"] = "ddp"
+    else:
+        assert deepspeed_config is not None
+        result["DEEPSPEED_CONFIG"] = deepspeed_config
     if benchmark_evidence_path is not None:
         evidence = Path(benchmark_evidence_path)
         if not evidence.is_absolute() or ".." in evidence.parts:
@@ -923,6 +955,14 @@ _STAGE2_VALUE_OPTIONS = {
     "--max_train_samples",
     "--max_steps",
     "--seed",
+    "--lambda_dyn",
+    "--lambda_vis",
+    "--reference_model_path",
+    "--gamma_H",
+    "--m_V",
+    "--entropy_eps",
+    "--pre_window",
+    "--post_window",
 }
 _STAGE2_BOOLEAN_OPTIONS = {
     "--save_final_model",
@@ -930,6 +970,8 @@ _STAGE2_BOOLEAN_OPTIONS = {
     "--final_save",
     "--no_final_save",
     "--use_cpu",
+    "--enable_stage2_objective",
+    "--no-enable_stage2_objective",
 }
 _STAGE2_COORDINATOR_OPTIONS = {
     "--stage",
@@ -984,6 +1026,61 @@ def validate_stage2_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
     if save_steps and re.fullmatch(r"[1-9][0-9]*", save_steps[0]) is None:
         raise ValueError("--save_steps must be a canonical positive integer")
     return validated
+
+
+def resolve_stage2_objective_config(
+    arguments: Sequence[str], *, supervise_latent_boundaries: bool
+) -> "Stage2ObjectiveConfig":
+    """Resolve one frozen objective config through the training parser contract."""
+    from src.stage2.objective import Stage2ObjectiveConfig
+    from src.utils_deepseed import parse_args
+
+    args = parse_args(["--stage", "stage2", *arguments])
+    config = Stage2ObjectiveConfig.from_args(args)
+    config.validate("stage2", supervise_latent_boundaries)
+    return config
+
+
+def stage2_reference_preflight_paths(
+    config: "Stage2ObjectiveConfig",
+) -> tuple[Path, ...]:
+    """Resolve local entropy-reference inputs without crossing a model loader."""
+    from src.stage2.objective import Stage2ObjectiveConfig
+
+    if not isinstance(config, Stage2ObjectiveConfig):
+        raise TypeError("config must be a Stage2ObjectiveConfig")
+    if config.lambda_dyn == 0.0:
+        return ()
+    from src.stage1.checkpointing import (
+        decode_stage1_peft_metadata_snapshot,
+        read_stage1_peft_metadata_snapshot,
+    )
+
+    raw_reference = config.reference_model_path
+    if not isinstance(raw_reference, str) or not raw_reference.strip():
+        raise ValueError(
+            "reference_model_path must be a local Stage 1 directory"
+        )
+    reference = Path(raw_reference).resolve()
+    if not reference.is_dir():
+        raise ValueError(
+            f"reference_model_path must be a local Stage 1 directory: {raw_reference}"
+        )
+    metadata_path = reference / "stage1_peft_metadata.json"
+    adapter_path = reference / "adapter_config.json"
+    if not metadata_path.exists() and not adapter_path.exists():
+        return (reference,)
+    metadata = decode_stage1_peft_metadata_snapshot(
+        read_stage1_peft_metadata_snapshot(reference)
+    )
+    base = Path(metadata.base_model_reference)
+    if not base.is_dir():
+        raise ValueError(
+            "Stage 1 DoRA base_model_reference must be a local directory: "
+            f"{metadata.base_model_reference}"
+        )
+    canonical_base = base.resolve()
+    return (reference,) if canonical_base == reference else (reference, canonical_base)
 
 
 def _distributed_environment(plan: "LaunchPlan", machine_rank: int) -> dict[str, str]:
@@ -1655,6 +1752,7 @@ def build_owned_tmux_commands(
             "OUTPUT_DIR",
             "LOG_FILE",
             "DEEPSPEED_CONFIG",
+            "ILVR_STAGE2_BACKEND",
         }
         unexpected = sorted(set(supplied_environment) - approved_stage2_names)
         if unexpected:
@@ -1666,6 +1764,15 @@ def build_owned_tmux_commands(
         )
         if missing:
             raise ValueError(f"missing required Stage 2 environment: {', '.join(missing)}")
+        if plan.backend == "ddp":
+            if supplied_environment.get("ILVR_STAGE2_BACKEND") != "ddp":
+                raise ValueError(
+                    "native DDP workers require ILVR_STAGE2_BACKEND=ddp"
+                )
+            if supplied_environment.get("DEEPSPEED_CONFIG"):
+                raise ValueError("native DDP workers must not receive DEEPSPEED_CONFIG")
+        elif "ILVR_STAGE2_BACKEND" in supplied_environment:
+            raise ValueError("DeepSpeed workers must not receive ILVR_STAGE2_BACKEND")
         base_environment = supplied_environment
         evidence_value = supplied_environment.get("BENCHMARK_EVIDENCE_PATH")
         finite_loss_evidence_path = (
@@ -3978,13 +4085,23 @@ def _node_info_command(
         plan.stage,
         "--tuning-method",
         plan.tuning_method,
-        "--deepspeed-config",
-        str(plan.deepspeed_config),
-        "--deepspeed-config-digest",
-        plan.deepspeed_config_digest,
-        "--zero-stage",
-        str(plan.zero_stage),
+        "--backend",
+        plan.backend,
     ]
+    if plan.backend == "deepspeed":
+        assert plan.deepspeed_config is not None
+        assert plan.deepspeed_config_digest is not None
+        assert plan.zero_stage is not None
+        command.extend(
+            (
+                "--deepspeed-config",
+                str(plan.deepspeed_config),
+                "--deepspeed-config-digest",
+                plan.deepspeed_config_digest,
+                "--zero-stage",
+                str(plan.zero_stage),
+            )
+        )
     for flag, paths in (
         ("--input-path", input_paths),
         ("--artifact-root", artifact_roots),

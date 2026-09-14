@@ -1,5 +1,7 @@
 """Pure fixed topology and launch planning for ILVR multi-node runs."""
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -12,7 +14,10 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Callable, Literal, Sequence
+from typing import TYPE_CHECKING, Callable, Literal, Sequence
+
+if TYPE_CHECKING:
+    from src.stage2.objective import Stage2ObjectiveConfig
 
 if __name__ == "__main__":
     # Keep runtime type checks stable when this module is executed with ``-m``.
@@ -48,6 +53,8 @@ from src.multinode_runtime import (
     validate_preflight,
     validate_stage1_arguments,
     validate_stage2_arguments,
+    resolve_stage2_objective_config,
+    stage2_reference_preflight_paths,
     validate_resume_path,
     validated_stage2_environment,
     write_ownership,
@@ -102,24 +109,33 @@ class LaunchPlan:
 
     stage: Literal["stage1", "stage2"]
     tuning_method: Literal["full", "lora", "dora"]
-    zero_stage: Literal[1, 2, 3]
+    zero_stage: Literal[1, 2, 3] | None
     run_id: str
     main_process_port: int
     world_size: int
-    deepspeed_config: Path
-    deepspeed_config_digest: str
+    deepspeed_config: Path | None
+    deepspeed_config_digest: str | None
     cluster: ClusterSpec
     attempt_id: str = "initial"
     required_free_bytes: int = _TRAINING_REQUIRED_FREE_BYTES
     attempt_timeout_seconds: int = _ATTEMPT_TIMEOUT_SECONDS
+    backend: Literal["deepspeed", "ddp"] = "deepspeed"
+    stage2_objective_config: Stage2ObjectiveConfig | None = None
 
     def __post_init__(self) -> None:
         if self.stage not in ("stage1", "stage2"):
             raise ValueError("stage must be 'stage1' or 'stage2'")
         if self.tuning_method not in ("full", "lora", "dora"):
             raise ValueError("tuning_method must be 'full', 'lora', or 'dora'")
-        if type(self.zero_stage) is not int or self.zero_stage not in (1, 2, 3):
-            raise ValueError("zero_stage must be 1, 2, or 3")
+        if self.backend not in ("deepspeed", "ddp"):
+            raise ValueError("backend must be 'deepspeed' or 'ddp'")
+        if self.backend == "ddp":
+            if self.stage != "stage2" or self.zero_stage is not None:
+                raise ValueError("native DDP requires Stage2 without a ZeRO stage")
+            if self.deepspeed_config is not None or self.deepspeed_config_digest is not None:
+                raise ValueError("native DDP must not carry a DeepSpeed config")
+        elif type(self.zero_stage) is not int or self.zero_stage not in (1, 2, 3):
+            raise ValueError("DeepSpeed requires an explicit ZeRO stage (zero_stage)")
         _validate_identifier("run_id", self.run_id)
         _validate_identifier("attempt_id", self.attempt_id)
         if (
@@ -135,20 +151,31 @@ class LaunchPlan:
             raise ValueError("required_free_bytes must be 100 GiB for training")
         if self.attempt_timeout_seconds != _ATTEMPT_TIMEOUT_SECONDS:
             raise ValueError("attempt_timeout_seconds must be the fixed 24-hour bound")
-        expected_config = selected_deepspeed_config(
-            self.stage, self.tuning_method, self.zero_stage
-        )
-        if self.deepspeed_config != expected_config:
-            raise ValueError("deepspeed_config must match the selected ZeRO policy")
-        if (
-            not isinstance(self.deepspeed_config_digest, str)
-            or len(self.deepspeed_config_digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.deepspeed_config_digest
+        if self.backend == "deepspeed":
+            assert self.zero_stage is not None
+            expected_config = selected_deepspeed_config(
+                self.stage, self.tuning_method, self.zero_stage
             )
-        ):
-            raise ValueError("deepspeed_config_digest must be a SHA-256 digest")
+            if self.deepspeed_config != expected_config:
+                raise ValueError("deepspeed_config must match the selected ZeRO policy")
+            if (
+                not isinstance(self.deepspeed_config_digest, str)
+                or len(self.deepspeed_config_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in self.deepspeed_config_digest
+                )
+            ):
+                raise ValueError("deepspeed_config_digest must be a SHA-256 digest")
+        if self.stage2_objective_config is not None:
+            from src.stage2.objective import Stage2ObjectiveConfig
+
+            if self.stage != "stage2" or not isinstance(
+                self.stage2_objective_config, Stage2ObjectiveConfig
+            ):
+                raise ValueError(
+                    "stage2_objective_config must be a Stage2ObjectiveConfig for Stage2"
+                )
 
 
 @dataclass(frozen=True)
@@ -342,26 +369,38 @@ def build_launch_plan(
     *,
     stage: Literal["stage1", "stage2"],
     tuning_method: Literal["full", "lora", "dora"],
-    zero_stage: Literal[1, 2, 3],
+    zero_stage: Literal[1, 2, 3] | None = None,
     run_id: str,
     main_process_port: int,
     attempt_id: str = "initial",
+    backend: Literal["deepspeed", "ddp"] = "deepspeed",
+    stage2_objective_config: Stage2ObjectiveConfig | None = None,
 ) -> LaunchPlan:
     """Validate and build the fixed four-process training launch plan."""
     cluster = ClusterSpec.default()
-    config_path = selected_deepspeed_config(stage, tuning_method, zero_stage)
-    source_config_path = (
-        canonical_deepspeed_config_path(zero_stage)
-        if config_path.name == f"deepspeed_zero{zero_stage}.json"
-        else canonical_deepspeed_config_path(zero_stage).with_name(config_path.name)
-    )
-    profile = load_deepspeed_runtime_profile(
-        source_config_path, world_size=cluster.num_processes
-    )
-    if profile.zero_stage != zero_stage:
-        raise ValueError(
-            "zero_optimization.stage must match the requested zero_stage"
+    if backend not in ("deepspeed", "ddp"):
+        raise ValueError("backend must be 'deepspeed' or 'ddp'")
+    if backend == "ddp":
+        if stage != "stage2" or zero_stage is not None:
+            raise ValueError("native DDP requires Stage2 without a ZeRO stage")
+        config_path = config_digest = None
+    else:
+        if type(zero_stage) is not int or zero_stage not in (1, 2, 3):
+            raise ValueError("DeepSpeed requires an explicit ZeRO stage (zero_stage)")
+        config_path = selected_deepspeed_config(stage, tuning_method, zero_stage)
+        source_config_path = (
+            canonical_deepspeed_config_path(zero_stage)
+            if config_path.name == f"deepspeed_zero{zero_stage}.json"
+            else canonical_deepspeed_config_path(zero_stage).with_name(config_path.name)
         )
+        profile = load_deepspeed_runtime_profile(
+            source_config_path, world_size=cluster.num_processes
+        )
+        if profile.zero_stage != zero_stage:
+            raise ValueError(
+                "zero_optimization.stage must match the requested zero_stage"
+            )
+        config_digest = profile.config_digest
     plan = LaunchPlan(
         stage=stage,
         tuning_method=tuning_method,
@@ -370,9 +409,11 @@ def build_launch_plan(
         main_process_port=main_process_port,
         world_size=cluster.num_processes,
         deepspeed_config=config_path,
-        deepspeed_config_digest=profile.config_digest,
+        deepspeed_config_digest=config_digest,
         cluster=cluster,
         attempt_id=attempt_id,
+        backend=backend,
+        stage2_objective_config=stage2_objective_config,
     )
     return plan
 
@@ -848,7 +889,10 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tuning-method", choices=("full", "lora", "dora"), required=True
     )
-    parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)
+    parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int)
+    parser.add_argument(
+        "--backend", choices=("deepspeed", "ddp"), default="deepspeed"
+    )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", default="initial")
     parser.add_argument("--main-process-port", type=int, required=True)
@@ -862,6 +906,7 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
         run_id=args.run_id,
         main_process_port=args.main_process_port,
         attempt_id=args.attempt_id,
+        backend=args.backend,
     )
 
 
@@ -870,16 +915,29 @@ def _node_info(args: argparse.Namespace) -> NodeSnapshot:
     repository = Path(args.repository)
     if repository != _REPOSITORY_ROOT:
         raise ValueError("node-info repository must be /root/workspace/ILVR")
-    expected_config = selected_deepspeed_config(
-        args.stage, args.tuning_method, args.zero_stage
-    )
-    if Path(args.deepspeed_config) != expected_config:
-        raise ValueError("node-info config must match the selected DeepSpeed policy")
-    validate_node_config_digest(
-        args.deepspeed_config,
-        zero_stage=args.zero_stage,
-        expected_digest=args.deepspeed_config_digest,
-    )
+    if args.backend == "ddp":
+        if args.stage != "stage2" or any(
+            value is not None
+            for value in (
+                args.zero_stage,
+                args.deepspeed_config,
+                args.deepspeed_config_digest,
+            )
+        ):
+            raise ValueError("native DDP node-info must not inspect ZeRO/config fields")
+    else:
+        if args.zero_stage is None or args.deepspeed_config is None:
+            raise ValueError("DeepSpeed node-info requires ZeRO/config fields")
+        expected_config = selected_deepspeed_config(
+            args.stage, args.tuning_method, args.zero_stage
+        )
+        if Path(args.deepspeed_config) != expected_config:
+            raise ValueError("node-info config must match the selected DeepSpeed policy")
+        validate_node_config_digest(
+            args.deepspeed_config,
+            zero_stage=args.zero_stage,
+            expected_digest=args.deepspeed_config_digest,
+        )
 
     commit = _repository_git_stdout(("rev-parse", "HEAD"))
     tracked_clean = not _repository_git_stdout(
@@ -1655,7 +1713,10 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
     )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", default="initial")
-    parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)
+    parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int)
+    parser.add_argument(
+        "--backend", choices=("deepspeed", "ddp"), default="deepspeed"
+    )
     parser.add_argument("--main-process-port", type=int, required=True)
     parser.add_argument("--result-root", default=str(_REPOSITORY_ROOT / "results"))
     parser.add_argument("--dry-run", action="store_true")
@@ -1678,19 +1739,36 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             if tuning_method not in ("full", "lora", "dora"):
                 raise ValueError("Stage 1 requires --method full, lora, or dora")
             stage_environment: dict[str, str] = {}
+            stage2_objective_config = None
             resume_requested = _argument_value(forwarded, "--resume") is not None
         else:
             forwarded = validate_stage2_arguments(forwarded)
             tuning_method = os.environ.get("TUNING_METHOD", "full")
             if tuning_method not in ("full", "lora", "dora"):
                 raise ValueError("TUNING_METHOD must be full, lora, or dora")
-            validate_stage2_checkpointing_policy(
-                tuning_method=tuning_method,
-                zero_stage=args.zero_stage,
-                gradient_checkpointing=os.environ.get(
-                    "GRADIENT_CHECKPOINTING", "false"
-                ),
+            supervise_latent_boundaries = os.environ.get(
+                "SUPERVISE_LATENT_BOUNDARIES", "true"
             )
+            if supervise_latent_boundaries not in ("true", "false"):
+                raise ValueError("SUPERVISE_LATENT_BOUNDARIES must be true or false")
+            stage2_objective_config = resolve_stage2_objective_config(
+                forwarded,
+                supervise_latent_boundaries=supervise_latent_boundaries == "true",
+            )
+            if args.backend == "ddp" and any(
+                argument == "--use_cpu" for argument in forwarded
+            ):
+                raise ValueError("native DDP rejects forwarded --use_cpu")
+            if args.backend == "deepspeed" and stage2_objective_config.active:
+                raise ValueError("active Stage 2 auxiliaries require native DDP")
+            if args.backend == "deepspeed":
+                validate_stage2_checkpointing_policy(
+                    tuning_method=tuning_method,
+                    zero_stage=args.zero_stage,
+                    gradient_checkpointing=os.environ.get(
+                        "GRADIENT_CHECKPOINTING", "false"
+                    ),
+                )
             output_dir = _REPOSITORY_ROOT / "checkpoints" / args.run_id
             log_file = (
                 _REPOSITORY_ROOT
@@ -1704,15 +1782,26 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 / args.run_id
                 / f"{args.attempt_id}-producer-evidence.json"
             )
+            plan = build_launch_plan(
+                stage=stage,
+                tuning_method=tuning_method,
+                zero_stage=args.zero_stage,
+                run_id=args.run_id,
+                main_process_port=args.main_process_port,
+                attempt_id=args.attempt_id,
+                backend=args.backend,
+                stage2_objective_config=stage2_objective_config,
+            )
             stage_environment = validated_stage2_environment(
                 os.environ,
                 output_dir=str(output_dir),
                 log_file=str(log_file),
-                deepspeed_config=str(
-                    selected_deepspeed_config(
-                        stage, tuning_method, args.zero_stage
-                    )
+                deepspeed_config=(
+                    str(plan.deepspeed_config)
+                    if plan.deepspeed_config is not None
+                    else None
                 ),
+                backend=args.backend,
                 benchmark_evidence_path=str(producer_evidence),
             )
             resume_requested = "RESUME_CHECKPOINT" in stage_environment
@@ -1731,14 +1820,16 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                     args.run_id, stage_environment["RESUME_CHECKPOINT"]
                 )
             )
-        plan = build_launch_plan(
-            stage=stage,
-            tuning_method=tuning_method,
-            zero_stage=args.zero_stage,
-            run_id=args.run_id,
-            main_process_port=args.main_process_port,
-            attempt_id=args.attempt_id,
-        )
+        if stage == "stage1":
+            plan = build_launch_plan(
+                stage=stage,
+                tuning_method=tuning_method,
+                zero_stage=args.zero_stage,
+                run_id=args.run_id,
+                main_process_port=args.main_process_port,
+                attempt_id=args.attempt_id,
+                backend=args.backend,
+            )
         commit = _repository_git_stdout(("rev-parse", "HEAD"))
         commands = build_owned_tmux_commands(
             plan,
@@ -1790,6 +1881,10 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             )
             if "RESUME_CHECKPOINT" in stage_environment:
                 input_paths += (Path(stage_environment["RESUME_CHECKPOINT"]),)
+            assert plan.stage2_objective_config is not None
+            input_paths += stage2_reference_preflight_paths(
+                plan.stage2_objective_config
+            )
         artifact_roots = (checkpoint_root, result_root, _REPOSITORY_ROOT / "logs")
         run_paths = [control_directory, witness_path, stage_log_file]
         if commands.finite_loss_evidence_path is not None:
@@ -2013,6 +2108,8 @@ def _prepare_inference_main(argv: list[str]) -> int:
         if args.checkpoint_step < 0:
             raise ValueError("checkpoint step must be nonnegative")
         plan = _plan_from_args(args)
+        if plan.backend == "ddp":
+            raise ValueError("native DDP inference preparation is unsupported")
         destination = Path(args.destination)
         staging_root = _evaluation_staging_root()
         if not destination.is_absolute() or ".." in destination.parts:
@@ -2343,9 +2440,12 @@ def _main(argv: list[str] | None = None) -> int:
     node_info_parser.add_argument(
         "--tuning-method", choices=("full", "lora", "dora"), required=True
     )
-    node_info_parser.add_argument("--deepspeed-config", required=True)
-    node_info_parser.add_argument("--deepspeed-config-digest", required=True)
-    node_info_parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int, required=True)
+    node_info_parser.add_argument(
+        "--backend", choices=("deepspeed", "ddp"), default="deepspeed"
+    )
+    node_info_parser.add_argument("--deepspeed-config")
+    node_info_parser.add_argument("--deepspeed-config-digest")
+    node_info_parser.add_argument("--zero-stage", choices=(1, 2, 3), type=int)
     node_info_parser.add_argument("--input-path", action="append", default=[])
     node_info_parser.add_argument("--artifact-root", action="append", default=[])
     node_info_parser.add_argument("--run-path", action="append", default=[])
