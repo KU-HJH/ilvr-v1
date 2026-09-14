@@ -1,6 +1,8 @@
 import os
 import shlex
+import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
@@ -64,15 +66,40 @@ def native_ddp_environment(rank="0"):
     }
 
 
-def test_stage2_native_ddp_worker_dry_run_uses_multi_gpu_without_deepspeed():
+@pytest.fixture
+def native_ddp_worker_dry_run_destinations():
+    run_id = f"task1-worker-dry-{uuid.uuid4().hex}"
+    output_dir = REPO_ROOT / "checkpoints" / run_id
+    log_dir = REPO_ROOT / "logs" / "stage2-ddp-dev" / run_id
+    log_file = log_dir / "train.log"
+    assert not output_dir.exists()
+    assert not log_dir.exists()
+    try:
+        yield output_dir, log_file
+    finally:
+        for path in (output_dir, log_dir):
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+
+
+def test_stage2_native_ddp_worker_dry_run_uses_multi_gpu_without_deepspeed(
+    native_ddp_worker_dry_run_destinations,
+):
     """Catches the DDP worker selecting the legacy DeepSpeed launcher backend."""
+    output_dir, log_file = native_ddp_worker_dry_run_destinations
     tokens = dry_run_tokens(
         run_launcher(
             "--enable_stage2_objective",
             "--lambda_dyn", "0.75",
             "--lambda_vis", "0.25",
             "--reference_model_path", "/models/reference",
-            env_overrides=native_ddp_environment(),
+            env_overrides={
+                **native_ddp_environment(),
+                "OUTPUT_DIR": str(output_dir),
+                "LOG_FILE": str(log_file),
+            },
         )
     )
 
@@ -84,6 +111,11 @@ def test_stage2_native_ddp_worker_dry_run_uses_multi_gpu_without_deepspeed():
     assert option_value(tokens, "--lambda_dyn") == "0.75"
     assert option_value(tokens, "--lambda_vis") == "0.25"
     assert option_value(tokens, "--reference_model_path") == "/models/reference"
+    assert option_value(tokens, "--save_model_path") == str(output_dir)
+    assert option_value(tokens, "--log_file") == str(log_file)
+    assert not output_dir.exists()
+    assert not log_file.exists()
+    assert not log_file.parent.exists()
 
 
 def test_stage2_native_ddp_worker_rejects_incomplete_topology():

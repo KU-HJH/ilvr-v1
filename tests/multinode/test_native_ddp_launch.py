@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import uuid
 
 import pytest
 
@@ -29,7 +30,9 @@ def checkpoint_directory():
         shutil.rmtree(directory)
 
 
-def run_stage2_coordinator(*arguments, environment=None):
+def run_stage2_coordinator(
+    *arguments, environment=None, run_id="ddp-contract-test", attempt_id="initial"
+):
     env = {
         "PATH": os.environ["PATH"],
         "PYTHONPATH": f"{REPO_ROOT}/transformers/src:{REPO_ROOT}/src",
@@ -44,7 +47,8 @@ def run_stage2_coordinator(*arguments, environment=None):
         [
             f"{REPO_ROOT}/venv/ilvr-venv/bin/python",
             "-m", "src.multinode", "train-stage2",
-            "--run-id", "ddp-contract-test",
+            "--run-id", run_id,
+            "--attempt-id", attempt_id,
             "--main-process-port", "29871",
             "--dry-run",
             *arguments,
@@ -54,6 +58,26 @@ def run_stage2_coordinator(*arguments, environment=None):
         capture_output=True,
         text=True,
     )
+
+
+@pytest.fixture
+def coordinator_dry_run_destinations():
+    run_id = f"task1-coordinator-dry-{uuid.uuid4().hex}"
+    paths = (
+        Path("/root/workspace/ILVR/checkpoints") / run_id,
+        Path("/root/workspace/ILVR/results") / run_id,
+        Path("/root/workspace/ILVR/logs/multinode") / run_id,
+        Path("/root/workspace/ILVR/logs/zero-stage-compatibility") / run_id,
+    )
+    assert all(not path.exists() for path in paths)
+    try:
+        yield run_id, paths
+    finally:
+        for path in paths:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
 
 
 def test_stage2_native_ddp_plan_has_no_deepspeed_identity():
@@ -213,14 +237,18 @@ def test_native_ddp_environment_accepts_disabled_accelerate_plugins(value):
     assert environment["ILVR_STAGE2_BACKEND"] == "ddp"
 
 
-def test_real_stage2_coordinator_dry_run_freezes_ddp_objective_and_worker_inputs():
+def test_real_stage2_coordinator_dry_run_freezes_ddp_objective_and_worker_inputs(
+    coordinator_dry_run_destinations,
+):
     """Catches coordinator backend/topology/objective values being lost in real argv."""
+    run_id, destinations = coordinator_dry_run_destinations
     result = run_stage2_coordinator(
         "--backend", "ddp",
         "--enable_stage2_objective",
         "--lambda_dyn", "0.75",
         "--lambda_vis", "0.25",
         "--reference_model_path", "/models/reference",
+        run_id=run_id,
     )
 
     assert result.returncode == 0, result.stderr
@@ -234,6 +262,8 @@ def test_real_stage2_coordinator_dry_run_freezes_ddp_objective_and_worker_inputs
     assert "DEEPSPEED_CONFIG=" not in " ".join(local)
     assert "--lambda_dyn" in local
     assert local[local.index("--lambda_dyn") + 1] == "0.75"
+    assert f"OUTPUT_DIR=/root/workspace/ILVR/checkpoints/{run_id}" in local
+    assert all(not path.exists() for path in destinations)
 
 
 def test_owned_ddp_worker_commands_require_the_coordinator_backend_binding():
