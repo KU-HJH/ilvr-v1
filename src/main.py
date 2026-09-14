@@ -117,6 +117,8 @@ class Stage2TrainingComponents:
     trainer_class: type
     trainer_resume_path: str | None
     peft_metadata: Stage2PeftMetadata | None
+    objective_config: object = None
+    objective_runtime: object = None
 
 
 @dataclass(frozen=True)
@@ -209,6 +211,12 @@ def build_stage2_training_components(
     args, *, source_dependencies: Stage2SourceDependencies | None = None
 ) -> Stage2TrainingComponents:
     from stage2.trainer import Stage2Trainer
+    from peft_common import resolve_qwen2_5_vl_model
+    from stage2.objective_runtime import objective_config_from_args, Stage2ObjectiveRuntime, validate_objective_backend
+    from stage2.objective_windows import build_text_vocabulary
+    from stage2.reference import load_frozen_reference
+
+    objective_config = objective_config_from_args(args)
 
     source_dependencies = (
         source_dependencies or _default_stage2_source_dependencies()
@@ -230,6 +238,8 @@ def build_stage2_training_components(
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
     )
+    if objective_config.active:
+        validate_objective_backend(source_dependencies.load_config(decision.base_model_source))
     sparse_resume = (
         decision.peft_metadata is not None
         and decision.peft_metadata.token_row_source == "sparse_adapter"
@@ -415,11 +425,20 @@ def build_stage2_training_components(
         measure_length=build_prepared_example_length_measure(processor),
         max_length=args.max_seq_length_train,
     )
+    objective_runtime = None
+    if objective_config.active:
+        student = resolve_qwen2_5_vl_model(model)
+        vocabulary = build_text_vocabulary(processor.tokenizer, student.config, student.get_output_embeddings().weight.shape[0])
+        reference = load_frozen_reference(args, student=model, tokenizer=processor.tokenizer,
+                                          source_dependencies=source_dependencies) if objective_config.lambda_dyn else None
+        objective_runtime = Stage2ObjectiveRuntime(objective_config, token_ids, decision.latent_size, vocabulary, reference)
+    collator_kwargs = {"enable_stage2_objective": True} if objective_config.active else {}
     collator = Stage2DataCollator(
         processor,
         token_ids,
         decision.latent_size,
         decision.supervise_latent_boundaries,
+        **collator_kwargs,
     )
     return Stage2TrainingComponents(
         model=model,
@@ -429,6 +448,8 @@ def build_stage2_training_components(
         trainer_class=Stage2Trainer,
         trainer_resume_path=decision.trainer_resume_path,
         peft_metadata=peft_metadata,
+        objective_config=objective_config if objective_config.enable_stage2_objective else None,
+        objective_runtime=objective_runtime,
     )
 
 
@@ -598,10 +619,16 @@ def publish_stage2_training_evidence(args, *, trainer, train_result, profile):
 def run_stage2(args):
     """Run the existing Stage 2 path without importing Stage 1 Trainer code."""
 
+    from stage2.objective_runtime import objective_config_from_args
+    objective_config_from_args(args)
     profile = bind_deepspeed_runtime_profile(
         args, world_size=int(os.environ.get("WORLD_SIZE", "1"))
     )
     components = build_stage2_training_components(args)
+    objective_kwargs = {}
+    if components.objective_config is not None:
+        objective_kwargs = dict(stage2_objective_config=components.objective_config,
+                                stage2_objective_runtime=components.objective_runtime)
     trainer = components.trainer_class(
         model=components.model,
         args=build_stage2_training_arguments(args),
@@ -610,6 +637,7 @@ def run_stage2(args):
         processing_class=components.processor,
         stage2_peft_metadata=components.peft_metadata,
         deepspeed_runtime_profile=profile,
+        **objective_kwargs,
     )
     train_result = trainer.train(
         resume_from_checkpoint=components.trainer_resume_path
@@ -626,6 +654,8 @@ def run_stage2(args):
 def route_training(args, *, stage1_handler=None, stage2_handler=None):
     """Select exactly one public stage handler and return its observable result."""
 
+    from stage2.objective_runtime import objective_config_from_args
+    objective_config_from_args(args)
     if args.stage == "stage1":
         return (stage1_handler or run_stage1)(args)
     if args.stage == "stage2":

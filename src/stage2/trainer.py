@@ -7,6 +7,7 @@ import weakref
 from pathlib import Path
 
 import torch
+from accelerate.utils import get_mixed_precision_context_manager
 from peft import PeftModel
 from transformers import Trainer, TrainerCallback
 from transformers.trainer import TRAINING_ARGS_NAME
@@ -21,6 +22,9 @@ from deepspeed_runtime import (
 from peft_common import resolve_qwen2_5_vl_model
 from stage1.trainer import collect_deepspeed_pre_step_norm
 from .checkpointing import save_stage2_peft_metadata
+from .objective import Stage2ObjectiveConfig
+from .objective_runtime import counted_forward, model_inputs, validate_objective_backend, validate_objective_student
+from .reference import STAGE2_OBJECTIVE_FILENAME, save_objective_identity, validate_objective_resume
 from .sampler import (
     LatentBlockBalancedSampler,
     Stage2SamplerIdentity,
@@ -30,6 +34,21 @@ from .sampler import (
 from stage1.token_rows import (
     save_sparse_token_rows,
     sparse_token_rows_are_partitioned,
+)
+
+
+# Every rank reduces the same schema, even when its valid-block set is empty.
+_OBJECTIVE_METRICS = (
+    "loss_ce", "loss_dyn", "loss_vis",
+    "H_pre", "H_post", "H_ref_pre", "H_ref_post",
+    "r_pre", "r_post", "D", "S_F", "S_M", "G",
+    "r_pre_gt_1", "r_post_lt_1", "G_gt_0",
+    "valid_blocks", "excluded_blocks",
+    "excluded_empty_pre", "excluded_empty_post",
+    "excluded_overlap_empty_pre", "excluded_overlap_empty_post",
+    "low_reference_entropy",
+    "model_forwards_F", "model_forwards_M", "model_forwards_reference",
+    "decoder_forwards_F", "decoder_forwards_M", "decoder_forwards_reference",
 )
 
 
@@ -76,13 +95,29 @@ class _Stage2DeepSpeedGradientAdapter:
 class Stage2Trainer(Trainer):
     """Add Stage 2 observability and PEFT sidecars to ordinary Trainer flows."""
 
+    stage2_objective_config = Stage2ObjectiveConfig()
+
     def __init__(
         self,
         *args,
         deepspeed_runtime_profile: DeepSpeedRuntimeProfile | None = None,
         stage2_peft_metadata=None,
+        stage2_objective_config=None,
+        stage2_objective_runtime=None,
         **kwargs,
     ):
+        self.stage2_objective_config = stage2_objective_config or Stage2ObjectiveConfig()
+        self.stage2_objective_runtime = stage2_objective_runtime
+        self._objective_metrics = {}
+        config = self.stage2_objective_config
+        config.validate("stage2", True)
+        training_args = kwargs.get("args", args[1] if len(args) > 1 else None)
+        if config.active:
+            if stage2_objective_runtime is None or stage2_objective_runtime.config != config:
+                raise ValueError("active Stage 2 objective requires its matching runtime")
+            validate_objective_backend(training_args)
+            if kwargs.get("compute_loss_func") is not None:
+                raise ValueError("active Stage 2 objective requires native loss scaling")
         if deepspeed_runtime_profile is None:
             training_args = kwargs.get("args")
             if training_args is None and len(args) > 1:
@@ -105,6 +140,8 @@ class Stage2Trainer(Trainer):
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
             raise TypeError("Stage 2 trainer requires a DeepSpeed runtime profile")
         self.deepspeed_runtime_profile = deepspeed_runtime_profile
+        if config.active and deepspeed_runtime_profile.enabled:
+            raise ValueError("active Stage 2 objective does not support DeepSpeed")
         self.stage2_peft_metadata = stage2_peft_metadata
         self.stage2_sampler_identity: Stage2SamplerIdentity | None = None
         self._stage2_train_sampler: LatentBlockBalancedSampler | None = None
@@ -115,6 +152,68 @@ class Stage2Trainer(Trainer):
         callbacks.append(_ObservedOptimizerStep(self))
         kwargs["callbacks"] = callbacks
         super().__init__(*args, **kwargs)
+        if config.active:
+            validate_objective_student(self.model)
+            self.model_accepts_loss_kwargs = False
+            if self.accelerator.gradient_accumulation_steps != 1:
+                raise ValueError("active Stage 2 objective requires native Trainer accumulation")
+            reference = stage2_objective_runtime.reference
+            if reference is not None:
+                # Trainer has now placed the student on this rank's actual device.
+                reference.model.to(self.accelerator.device)
+                reference.model.eval()
+
+    def _objective_identity(self):
+        runtime = self.stage2_objective_runtime
+        return (
+            self.stage2_objective_config.to_dict(),
+            runtime.reference.identity if runtime is not None and runtime.reference is not None else None,
+            runtime.text_vocabulary.identity if runtime is not None else None,
+        )
+
+    def _global_objective_count(self, local_count):
+        count = torch.tensor(local_count, device=self.accelerator.device, dtype=torch.int64)
+        return int(self.accelerator.reduce(count, reduction="sum").item())
+
+    def get_batch_samples(self, epoch_iterator, num_batches):
+        samples, num_items_in_batch = super().get_batch_samples(epoch_iterator, num_batches)
+        if self.stage2_objective_config.active:
+            selected = [self.stage2_objective_runtime.select(sample) for sample in samples]
+            valid_count = self._global_objective_count(sum(len(window.blocks) for window in selected))
+            for sample, window in zip(samples, selected):
+                sample["_stage2_objective_selection"] = window
+                sample["_stage2_objective_global_count"] = valid_count
+        return samples, num_items_in_batch
+
+    def _accumulate_objective_metrics(self, sums, counts):
+        for name in sums:
+            aggregate = self._objective_metrics.setdefault(name, [0.0, 0])
+            aggregate[0] += float(sums[name])
+            aggregate[1] += counts[name]
+
+    def _drain_objective_logs(self):
+        statistics = torch.zeros(
+            (len(_OBJECTIVE_METRICS), 3), device=self.accelerator.device, dtype=torch.float64
+        )
+        for row, name in enumerate(_OBJECTIVE_METRICS):
+            if name in self._objective_metrics:
+                total, count = self._objective_metrics[name]
+                statistics[row, 0] = total
+                statistics[row, 1] = count
+                statistics[row, 2] = 1
+        statistics = self.accelerator.reduce(statistics, reduction="sum").tolist()
+        self._objective_metrics.clear()
+        means = {}
+        for name, (total, count, present) in zip(_OBJECTIVE_METRICS, statistics):
+            if present:
+                means[name] = total / count if count else total
+        if "loss_ce" in means:
+            config = self.stage2_objective_config
+            means["loss_total"] = means["loss_ce"]
+            means["loss_total"] += config.lambda_dyn * means.get("loss_dyn", 0.0)
+            means["loss_total"] += config.lambda_vis * means.get("loss_vis", 0.0)
+            means["backend"] = resolve_qwen2_5_vl_model(self.model).config._attn_implementation
+        return {"stage2/objective/" + name: value for name, value in means.items()}
 
     def _install_deepspeed_gradient_adapter(self) -> None:
         from accelerate.utils import DistributedType
@@ -279,6 +378,8 @@ class Stage2Trainer(Trainer):
                 raise TypeError(
                     "Stage 2 resume_from_checkpoint must be a path, True, or None"
                 )
+            if self.stage2_objective_config.enable_stage2_objective or (Path(resume_from_checkpoint) / STAGE2_OBJECTIVE_FILENAME).exists():
+                validate_objective_resume(resume_from_checkpoint, *self._objective_identity())
             validate_deepspeed_resume_identity(
                 Path(resume_from_checkpoint), self.deepspeed_runtime_profile
             )
@@ -313,16 +414,62 @@ class Stage2Trainer(Trainer):
             raise ValueError(
                 f"helper-image tensors leaked into Stage 2: {sorted(forbidden)}"
             )
-        outputs = model(**inputs, collect_stage2_diagnostics=True)
+        config = self.stage2_objective_config
+        if config.active:
+            runtime = self.stage2_objective_runtime
+            selection = inputs.get("_stage2_objective_selection")
+            if selection is None:
+                selection = runtime.select(inputs)
+            # A prepared student's forward owns its own autocast wrapper. The
+            # independent reference needs the same policy around the whole run.
+            # Use Accelerate's underlying torch context so exceptions also exit it.
+            with get_mixed_precision_context_manager(
+                self.accelerator.native_amp, self.accelerator.autocast_handler
+            ):
+                result = runtime.forward(model, inputs, selection,
+                                         counterfactual_model=self.accelerator.unwrap_model(model))
+            outputs = result.outputs
+            loss = result.ce
+            count = inputs.get("_stage2_objective_global_count")
+            if count is None:
+                # A direct compute_loss call describes one global batch, with no
+                # pending Trainer backward division to cancel.
+                count = self._global_objective_count(result.count)
+                native_divisor = 1
+            else:
+                # The pinned native Trainer divides by configured A, including
+                # its final partial window. Accelerator contributes no extra /A.
+                native_divisor = self.args.gradient_accumulation_steps
+            if count > 0:
+                local_sum = config.lambda_dyn * result.dyn_sum + config.lambda_vis * result.vis_sum
+                loss = loss + local_sum * (self.accelerator.num_processes * native_divisor / count)
+            else:
+                loss = loss + result.ce * 0.0
+            self._accumulate_objective_metrics(result.metric_sums, result.metric_counts)
+        elif config.enable_stage2_objective:
+            outputs, calls = counted_forward(model, model_inputs(inputs), student=self.accelerator.unwrap_model(model),
+                                             collect_stage2_diagnostics=True, stage2_finite_ce=True)
+            loss = outputs.loss
+            self._accumulate_objective_metrics(
+                {"loss_ce": loss.detach(), "model_forwards_F": 1, "decoder_forwards_F": calls},
+                {"loss_ce": 1, "model_forwards_F": 0, "decoder_forwards_F": 0},
+            )
+        else:
+            outputs = model(**inputs, collect_stage2_diagnostics=True)
+            loss = outputs.loss
+        if config.enable_stage2_objective and not bool(torch.isfinite(outputs.loss).all()):
+            raise ValueError("nonfinite Stage 2 CE in normal F branch")
         diagnostics = getattr(outputs, "stage2_diagnostics", None)
         self._latest_stage2_diagnostics = (
             None
             if diagnostics is None
             else {name: value.detach() for name, value in diagnostics.items()}
         )
-        return (outputs.loss, outputs) if return_outputs else outputs.loss
+        return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, start_time=None):
+        if self.stage2_objective_config.enable_stage2_objective:
+            logs = {**logs, **self._drain_objective_logs()}
         diagnostics = getattr(self, "_latest_stage2_diagnostics", None)
         self._latest_stage2_diagnostics = None
         if diagnostics is not None:
@@ -366,6 +513,8 @@ class Stage2Trainer(Trainer):
 
     def save_model(self, output_dir=None, _internal_call=False):
         super().save_model(output_dir, _internal_call=_internal_call)
+        if self.stage2_objective_config.enable_stage2_objective and self.args.should_save:
+            save_objective_identity(Path(output_dir or self.args.output_dir), *self._objective_identity())
         metadata = self.stage2_peft_metadata
         if metadata is None:
             return

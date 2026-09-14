@@ -1381,13 +1381,14 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         elif position_ids.dim() == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
+        ablation_kwargs = {"stage2_ablation": stage2_ablation} if stage2_ablation is not None else {}
         causal_mask = self._update_causal_mask(
             attention_mask,
             inputs_embeds,
             cache_position,
             past_key_values,
             output_attentions,
-            stage2_ablation=stage2_ablation,
+            **ablation_kwargs,
         )
 
         hidden_states = inputs_embeds
