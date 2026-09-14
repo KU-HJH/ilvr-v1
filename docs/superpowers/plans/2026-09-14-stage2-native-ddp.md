@@ -97,6 +97,11 @@ else:
 
 ### Task 2: Native manifest ownership, collection, and actual save/resume
 
+**Status:** Complete; implementation615a626, task review approved. Covering
+artifact suite190passed111.98s. Real four-rank CPU Full/DoRA resume/control
+matches model/optimizer/RNG exactly; actual LoRA loader probe passes. Worker
+warnings retained; GPU/NCCL/real two-host transfer remain unrun.
+
 **Files:** Modify `src/multinode_artifacts.py`, `src/multinode.py:_checkpoint_artifact_identity` and narrowly necessary `src/multinode_runtime.py` artifact runner call sites; create `tests/multinode/test_native_ddp_artifacts.py`, `tests/multinode/test_native_ddp_checkpoint.py`, optional `tests/multinode/native_ddp_helpers.py`.
 
 **Interfaces:**
