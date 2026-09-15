@@ -42,13 +42,24 @@ def _on_function(model, branch, positions, backend):
     spans = tuple(LatentSpan(start - prefix_length,
                             tuple(p - prefix_length for p in pads), end - prefix_length)
                   for start, pads, end in branch.active_spans)
+    # Branch metadata, device and dtype are fixed across checkpoint replay.
+    # Compact Flex masks have no gradient or RNG state; reuse the exact forward
+    # objects. Dense masks are quadratic: preserve their release/rebuild path.
+    causal_masks = {}
 
     def score(embeds, *prefix_tensors):
         prefix = tuple(zip(prefix_tensors[::2], prefix_tensors[1::2]))
 
         def decoder(*, inputs_embeds, attention_mask, position_ids, **kwargs):
+            length = inputs_embeds.shape[1]
+            if backend == 'flex':
+                if length not in causal_masks:
+                    causal_masks[length] = _causal_mask(model, inputs_embeds, prefix_length, backend)
+                mask = causal_masks[length]
+            else:
+                mask = _causal_mask(model, inputs_embeds, prefix_length, backend)
             return model.model(inputs_embeds=inputs_embeds, position_ids=position_ids,
-                attention_mask=_causal_mask(model, inputs_embeds, prefix_length, backend),
+                attention_mask=mask,
                 stage2_prefix_key_values=prefix, stage2_checkpoint_prefix=True,
                 generate_mode=True, **kwargs)
 
