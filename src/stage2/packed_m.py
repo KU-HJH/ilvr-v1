@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from peft import PeftModel
 from peft.tuners.lora.layer import Linear as PeftLinear
+from peft.tuners.tuners_utils import BaseTunerLayer
+from peft.utils.other import AuxiliaryTrainingWrapper
 from torch import nn
 from transformers.cache_utils import DynamicCache
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -47,12 +49,44 @@ def _active_adapter_sites(model: nn.Module, decoder: nn.Module) -> tuple[nn.Drop
     if isinstance(wrapped, PeftModel) and len(wrapped.peft_config) != 1:
         raise ValueError("packed M requires exactly one configured adapter")
 
+    allowed_projection_ids = set()
+    for layer in decoder.layers:
+        for owner in (layer.self_attn, layer.mlp):
+            allowed_projection_ids.update(
+                id(getattr(owner, suffix))
+                for suffix in ALLOWED_QWEN_DECODER_SUFFIXES
+                if hasattr(owner, suffix)
+            )
+
+    base = resolve_qwen2_5_vl_model(model)
+    auxiliary_modules = tuple(
+        name
+        for name, module in base.named_modules()
+        if isinstance(module, AuxiliaryTrainingWrapper)
+    )
+    if auxiliary_modules:
+        raise ValueError(
+            f"packed M does not support auxiliary PEFT modules: {auxiliary_modules}"
+        )
+    tuner_modules = tuple(
+        (name, module)
+        for name, module in base.named_modules()
+        if isinstance(module, BaseTunerLayer)
+    )
+    for name, module in tuner_modules:
+        if type(module) is not PeftLinear:
+            raise ValueError(
+                f"packed M supports only standard Linear LoRA/DoRA tuner modules: {name}"
+            )
+        if id(module) not in allowed_projection_ids:
+            raise ValueError(
+                f"packed M active PEFT modules must be allowed decoder projections: {name}"
+            )
+
     sites: list[nn.Dropout] = []
     adapters: set[str] = set()
     adapter_dropout_ids: set[int] = set()
-    for name, module in decoder.named_modules():
-        if not isinstance(module, PeftLinear):
-            continue
+    for name, module in tuner_modules:
         if type(module.get_base_layer()) is not nn.Linear:
             raise ValueError("packed M supports only standard Linear LoRA/DoRA adapters")
         suffix = name.rsplit(".", 1)[-1]

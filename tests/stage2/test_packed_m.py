@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from peft import LoraConfig, get_peft_model
 
 from peft_common import resolve_qwen2_5_vl_model
 from stage2.objective import target_log_likelihood
@@ -563,3 +564,80 @@ def test_packed_m_cpu_path_does_not_initialize_cuda(monkeypatch):
         model(**model_inputs(inputs), collect_stage2_diagnostics=True)
     score_packed_m(model, inputs, blocks, captured)
     assert not torch.cuda.is_initialized()
+
+
+def _unsupported_adapter(model, target, *, dropout=0.05):
+    return get_peft_model(
+        model,
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            lora_dropout=dropout,
+            target_modules=[target],
+        ),
+    ).train()
+
+
+def test_capture_rejects_model_wide_lm_head_adapter_without_advancing_rng():
+    """Catches an active output-head adapter escaping decoder-only inventory."""
+    model = _unsupported_adapter(make_packed_model(tuning="full"), "lm_head")
+    inputs = make_packed_inputs(blocks=1)
+    rng_before = capture_rng_state()
+    with pytest.raises(ValueError, match="allowed decoder projections"):
+        with PackedMPrefixCapture(model, inputs["input_ids"].shape[1]):
+            model(**model_inputs(inputs), collect_stage2_diagnostics=True)
+    torch.testing.assert_close(capture_rng_state().cpu_state, rng_before.cpu_state)
+
+
+def test_score_rejects_lm_head_adapter_added_after_capture_before_execution():
+    """Catches an unsupported post-capture target consuming RNG in selected projection."""
+    base = make_packed_model(tuning="full")
+    inputs = make_packed_inputs(blocks=1)
+    blocks = select_packed_blocks(inputs)
+    with PackedMPrefixCapture(base, inputs["input_ids"].shape[1]) as captured:
+        base(**model_inputs(inputs), collect_stage2_diagnostics=True)
+    model = _unsupported_adapter(base, "lm_head")
+    calls = 0
+
+    def observed(_module, _args):
+        nonlocal calls
+        calls += 1
+
+    handle = decoder(model).register_forward_pre_hook(observed)
+    rng_before = capture_rng_state()
+    try:
+        with pytest.raises(ValueError, match="allowed decoder projections"):
+            score_packed_m(model, inputs, blocks, captured)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(capture_rng_state().cpu_state, rng_before.cpu_state)
+    assert calls == 0
+
+
+def test_capture_rejects_non_linear_peft_tuner_even_without_dropout():
+    """Catches unsupported tuner subclasses being mistaken for full tuning."""
+    model = _unsupported_adapter(
+        make_packed_model(tuning="full"), "embed_tokens", dropout=0.0
+    )
+    inputs = make_packed_inputs(blocks=1)
+    with pytest.raises(ValueError, match="standard Linear"):
+        with PackedMPrefixCapture(model, inputs["input_ids"].shape[1]):
+            pass
+
+
+def test_capture_rejects_peft_auxiliary_modules_outside_decoder_inventory():
+    """Catches modules-to-save wrappers bypassing the exact adapter inventory."""
+    model = get_peft_model(
+        make_packed_model(tuning="full"),
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            lora_dropout=0.05,
+            target_modules=["q_proj"],
+            modules_to_save=["lm_head"],
+        ),
+    ).train()
+    inputs = make_packed_inputs(blocks=1)
+    with pytest.raises(ValueError, match="auxiliary PEFT modules"):
+        with PackedMPrefixCapture(model, inputs["input_ids"].shape[1]):
+            pass
