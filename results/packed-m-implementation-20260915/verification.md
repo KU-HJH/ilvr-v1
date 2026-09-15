@@ -1,4 +1,62 @@
-# Packed M Task 3 verification
+# Packed M implementation verification
+
+## Final project CPU gate — 2026-09-15
+
+Verified code commit: `d1d2cc1`. The root ran the project CPU suite once after
+all implementation and review fixes:
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+./venv/ilvr-venv/bin/pytest -q tests -m 'not gpu'
+```
+
+Exit **0**: **2698 passed, 7 skipped, 3 deselected, 10 warnings in 456.20s**.
+Complete output: `logs/packed-m-implementation-20260915/final-cpu.log`.
+The ten warnings are the existing PEFT missing-config warning from
+`test_eval_integration.py` (8) and `test_inference.py` (2). Skipped/deselected
+tests are not counted as passes. The vendored upstream Transformers suite was
+not run. This one run supplies the overlapping verification/branch-finishing
+test-pass evidence; it was not repeated.
+
+`git diff --check 516cf49 HEAD`, shell syntax checks of the three existing
+Stage 2 scripts, and `git diff --exit-code 516cf49 HEAD -- transformers`
+produced no errors. The Transformers fork/normal latent engine is unchanged.
+
+## Implementation and review evidence
+
+- Approved commitment v2 was implemented through writing-plans, isolated-worktree
+  SDD/TDD, task reviews, one final feature review and one scoped final fix review.
+  The plan cold read clarified token mapping, RNG chronology and DDP aggregation.
+- Core: real two-layer Qwen and tiny image/nontrivial mRoPE; eager/SDPA,
+  FP32/BF16 autocast and native checkpointing; independent full/packed selected
+  M vocabulary logits and scores, causal leakage/negative controls, dropout/RNG
+  preservation and exception cleanup.
+- Runtime: full/packed parameter and retained-latent gradient equality/None
+  structure, finite gradients, independently nonzero post-only latent gradients,
+  unchanged F outputs/parameters/RNG, skip paths, literal call counters and old
+  missing-mode resume compatibility. Existing fixed-reference regression tests
+  are included in the project gate.
+- Final review found and resolved unsupported stochastic-module guard gaps,
+  missing durable selected-M-logit evidence, late-bound dropout probability
+  validation, and an overly weak negative-control predicate. Final core/runtime
+  covering command passed **58 tests in 4.03s** before the project gate.
+- No unresolved or parked review findings remain. GPU numeric/dropout fidelity,
+  large-checkpoint/image-data training, memory/time and two-host execution remain
+  unverified. These results establish no task-performance improvement.
+
+## Controller decisions
+
+1. Use the established project CPU command `pytest -q tests -m 'not gpu'`, not
+   bare pytest: the latter also collects vendored upstream tests. Cost if this
+   scope is insufficient: upstream/GPU validation remains missing, not passed.
+2. Identify final F by its unique full input length rather than gradient mode,
+   because inherited Trainer evaluation can call F under `no_grad`. Retain
+   repeated-call rejection and train/eval tests. Cost if the premise changes:
+   final F could be misidentified or evaluation rejected; no normal F execution
+   or M intervention semantics were changed.
+
+## Task 3 delivery evidence
 
 ## Executed CPU evidence
 

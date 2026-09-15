@@ -246,6 +246,26 @@ Evidence must be read at its actual scope:
 
 ### Current CPU verification — 2026-09-15
 
+Packed M code `d1d2cc1` passed the project CPU suite after task reviews and the
+final review fixes:
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+  ./venv/ilvr-venv/bin/pytest -q tests -m 'not gpu'
+```
+
+Exit 0: **2698 passed, 7 skipped, 3 deselected, 10 warnings in 456.20 seconds**.
+Full output: `logs/packed-m-implementation-20260915/final-cpu.log`.
+The existing ten PEFT missing-config warnings were not suppressed. This single
+full run follows the final 58-test packed core/runtime check and the 63-test
+delivery check, which includes native two-process CPU DDP and all three actual
+coordinator dry-runs. See the [packed M verification record](../results/packed-m-implementation-20260915/verification.md)
+for exact scope, remaining GPU/real-data/two-host limitations and controller
+decisions. No task-performance, speedup, GPU training or ZeRO success is claimed.
+
+### Prior objective/DDP CPU verification — 2026-09-15
+
 User-requested repair `cc9ba9f` changes only
 `tests/multinode/test_capacity.py`,
 `tests/stage1/test_evaluation_diagnostics.py`, and

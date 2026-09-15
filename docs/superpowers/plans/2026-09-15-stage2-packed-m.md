@@ -243,7 +243,13 @@ Run explicit `git add` for changed Files paths and `git commit -m "test: verify 
 
 ## Root verification and handoff
 
-- [ ] Task-level spec and code-quality reviews must pass before the next task; one final feature review covers `516cf49..HEAD`, without re-reviewing already completed objective/DDP work below this feature baseline.
-- [ ] Read finishing and verification skills before the final command. Run the repository project CPU suite once: `./venv/ilvr-venv/bin/pytest -q tests -m 'not gpu'` with the CPU environment above, full output saved under the designated logs directory; use that single run for both overlapping gates. This excludes the vendored upstream Transformers suite and explicitly gated GPU tests, matching the established project command.
-- [ ] Separately inspect `git diff --check`, shell syntax and actual forward-count/causal witnesses from their specific test logs. Record full-suite failures honestly; do not count unrun GPU/large-checkpoint/two-host verification as passed.
-- [ ] Keep the implementation on this feature branch/worktree pending the user's integration choice; do not merge, push, synchronize, train or delete user artifacts. Send required completion summary via the local ntfy summary hook before the final response.
+- [x] Task-level spec and code-quality reviews must pass before the next task; one final feature review covers `516cf49..HEAD`, without re-reviewing already completed objective/DDP work below this feature baseline.
+- [x] Read finishing and verification skills before the final command. Run the repository project CPU suite once: `./venv/ilvr-venv/bin/pytest -q tests -m 'not gpu'` with the CPU environment above, full output saved under the designated logs directory; use that single run for both overlapping gates. This excludes the vendored upstream Transformers suite and explicitly gated GPU tests, matching the established project command.
+- [x] Separately inspect `git diff --check`, shell syntax and actual forward-count/causal witnesses from their specific test logs. Record full-suite failures honestly; do not count unrun GPU/large-checkpoint/two-host verification as passed.
+- [x] Keep the implementation on this feature branch/worktree pending the user's integration choice; do not merge, push, synchronize, train or delete user artifacts.
+
+Final verified code: `d1d2cc1`. Project CPU gate: 2698 passed, 7 skipped,
+3 deselected, 10 existing PEFT warnings, exit 0, 456.20s. Final review's four
+findings were resolved in one fix wave and approved by scoped re-review.
+Complete evidence and controller decisions:
+`results/packed-m-implementation-20260915/verification.md`.
