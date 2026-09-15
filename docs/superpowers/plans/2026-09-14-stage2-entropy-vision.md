@@ -175,6 +175,13 @@ minor review items, not GPU support evidence. Task5/final verification remains o
 
 ### Task 5: Reproducible examples and evidence-based handoff
 
+**Current status, 2026-09-15:** Shared native-DDP resumed test repaircc9ba9f
+passed scoped review and finalCPU2632passed/0failed/7skipped/3deselected/
+10warnings421.86s. Prior four failures described below are historical and
+resolved by test-only portability/fixture repairs, with production unchanged.
+CPU gate passed; no GPU/real-host/deployment/merge claim. See the current
+evidence section of docs/stage2-objective.md for exact commands and limits.
+
 **Delivery update:** The subsequently approved native-DDP plan Task4 supersedes
 this original wrapper interface and its sketch commands: it requires an explicit
 update budget and port, and invokes the real coordinator with `--dry-run` rather
@@ -183,7 +190,8 @@ Delivery67a7676 and remainder-doc fix41a6285 passed their task review. Shared
 combined review and single fix092a95e/scoped re-review addressed all7findings.
 Final CPU execution2626passed/4failed/7skipped/3deselected/10warnings429.00s:
 three known platform failures and one new Stage1 test-double/backend mismatch.
-Finishing remains blocked; no full-regression-pass or GPU readiness claim.
+Finishing was blocked at that revision; the resumed repair above resolved the
+CPU failures without establishing GPU readiness.
 Exact evidence, acceptance mapping and remaining limits: docs/stage2-objective.md.
 
 **Files:** Create `run_stage2_objective_examples.sh`, `docs/stage2-objective.md`, `tests/stage2/test_objective_examples.py`; update plan checklist/evidence only, not frozen proposal text.
@@ -201,5 +209,5 @@ Exact evidence, acceptance mapping and remaining limits: docs/stage2-objective.m
 ```
 
 - [x] Run GREEN shell behavior tests and `bash -n run_stage2_objective_examples.sh`. Document actual CPU tests separately from NOT RUN four-rank GPU/ZeRO/real-data/full-training checks; include reproduction commands for those. Check read-only resource/checkpoint availability before deciding GPU smoke is runnable, not by assuming it.
-- [x] Record all A–E criteria with exact test ownership/evidence; perform requesting-code-review over complete branch. Address findings through the designated fixer and focused rereview, then select final full project CPU suite with verification-before-completion/finishing-a-development-branch. Do not run upstream Transformers' unrelated enormous suite as ILVR regression evidence. Executed; four final failures still block finishing.
-- [ ] Commit only delivery files; preserve implementation worktree pending human integration choice. Final response lists changes, tests/run limits, examples, and no claim of task performance gain.
+- [x] Record all A–E criteria with exact test ownership/evidence; perform requesting-code-review over complete branch. Address findings through the designated fixer and focused rereview, then select final full project CPU suite with verification-before-completion/finishing-a-development-branch. Do not run upstream Transformers' unrelated enormous suite as ILVR regression evidence. The original four-failure gate was subsequently resolved by the resumed repair above.
+- [x] Commit only delivery files; preserve implementation worktree pending human integration choice. Final response lists changes, tests/run limits, examples, and no claim of task performance gain.

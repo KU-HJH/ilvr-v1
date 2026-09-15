@@ -199,7 +199,12 @@ contracts match; no test-only production extension.
 
 ### Task 4: Comparison examples, operator docs and combined handoff
 
-**Status:** Delivery implemented67a7676, task review and docs-only remainder
+**Status:** CPU implementation/verification complete through test repaircc9ba9f:
+2632passed,0failed,7skipped,3deselected,10warnings421.86s. Scoped resumed review
+approved; production unchanged. No GPU/real-host/deployment/merge claim. The
+historical four-failure gate below was resolved, not filtered out.
+
+**Historical delivery status:** Delivery implemented67a7676, task review and docs-only remainder
 clarification41a6285 approved. Combined review plus single fix092a95e/scoped
 re-review addressed all seven findings. Final CPU execution:2626passed,
 4failed,7skipped,3deselected,10warnings429.00s. Three known platform failures
@@ -229,7 +234,40 @@ assert observed_environment['LEARNING_RATE'] == '5e-5'
 - [x] Write operator/objective docs with exact formulas/window/vocab/graph/reference/M semantics from approved original design, backend and checkpoint support, actual CPU evidence, known platform failures and unrun GPU/ZeRO/training/capacity. Show three same-source/data/seed examples with distinct run IDs, required free ports and explicit step budget; default Stage1 is reproduced checkpoint-431, not old comt checkpoint. D/G do not establish task performance.
 - [x] Run GREEN `pytest -q tests/stage2/test_objective_examples.py`; `bash -n run_stage2_objective_examples.sh run_stage2_training.sh`; use actual coordinator dry-run to confirm final forwarded args, no training. Consolidate exact objective/DDP evidence into durable docs before any scratch cleanup.
 - [x] Self-review and commit delivery. Root conducts ONE combined whole-branch requesting-code-review including both approved plans and deferred objective minors, then one consolidated fix wave/scoped rereview if needed. Reuse this gate for original Task5; no duplicate final review.
-- [x] Root selects final verification/finishing applicability first. Project CPU suite is `pytest -q tests -m 'not gpu'` with CUDA hidden and repo PYTHONPATH; use it once for the final suite claim, plus distinct shell/dry-run/requirements checks once. Known baseline failures must remain visible; do not declare a full pass or advance finishing options if required evidence fails. No GPU training, merge, push or canonical deployment without separate authority. Executed; finishing remains blocked by the four failures above, not marked complete.
+- [x] Root selects final verification/finishing applicability first. Project CPU suite is `pytest -q tests -m 'not gpu'` with CUDA hidden and repo PYTHONPATH; use it once for the final suite claim, plus distinct shell/dry-run/requirements checks once. Known baseline failures must remain visible; do not declare a full pass or advance finishing options if required evidence fails. No GPU training, merge, push or canonical deployment without separate authority. The original four-failure gate was subsequently resolved by the resumed repair below.
+
+### Resumed verification repair — 2026-09-15
+
+Understood as: the user's "진행해" resumes repair of the four reported CPU
+failures and final verification, not training, merge, deployment or a new
+objective. The approved implementation design remains unchanged. This is a
+bounded regression-evidence repair after the previous finishing gate stopped.
+
+- [x] Reproduce the four exact failures on165342c, retaining the new run log.
+- [x] Repair only the three affected test files: use a real Stage1 LaunchPlan
+  in the capacity fixture; explicitly provide marked/unmarked Python version
+  inputs; observe one-marker normalization at the diagnostics heavy-import
+  boundary and original callable restoration, rather than depending on a
+  downstream library rejecting the version. Do not weaken literal expectations,
+  skip failing cases, or modify Stage1/training/objective code.
+- [x] Demonstrate regressions with in-memory production mutations (normalization
+  omitted/all markers removed, restoration omitted, wrong inferred final step),
+  run one focused covering set, then one scoped review of this repair only.
+- [x] Root runs one fresh full CPU suite on the repaired tree, updates exact
+  evidence and applies finishing. No repeated whole-branch review or GPU run.
+
+This repair overlaps only test files; current production code is an unchanged
+input, documentation/evidence is root-owned. It introduces no new backend,
+loss, public interface or research assumption. The same explicit real-data
+and GPU support limitations remain.
+
+Result: exact4RED4.56s, covering112passed14.55s, five actual repaired-test
+mutants rejected, scoped review approved. FinalCPU2632passed/0failed/7skipped/
+3deselected/10warnings421.86s atcc9ba9f. Complete evidence and commands live in
+docs/stage2-objective.md and logs/stage2-ddp-dev/final-project-cpu-cc9ba9f.log.
+The capacity mutant proves wrong inferred-step rejection by the evidence
+decoder, not post-validation path selection from its pre-created directory.
+Finishing CPU gate passed; branch/worktree remain pending human integration.
 
 ## Plan self-review coverage
 

@@ -204,7 +204,55 @@ is fresh. A separately authorized execution uses the same command plus
 
 Evidence must be read at its actual scope:
 
-Final verification at production/test commit `092a95e`:
+### Current CPU verification — 2026-09-15
+
+User-requested repair `cc9ba9f` changes only
+`tests/multinode/test_capacity.py`,
+`tests/stage1/test_evaluation_diagnostics.py`, and
+`tests/stage2/test_launcher.py`. Production source, training behavior and the
+objective are unchanged from `165342c`; the prior failures are preserved below
+as historical evidence, not erased or excluded.
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+  ./venv/ilvr-venv/bin/pytest -q tests -m 'not gpu'
+```
+
+Exit 0: **2632 passed, 7 skipped, 3 deselected, 10 warnings in 421.86 seconds**.
+Full output: `logs/stage2-ddp-dev/final-project-cpu-cc9ba9f.log`.
+This is a passing project CPU suite, not GPU/real-host training verification.
+The ten warnings are the existing PEFT missing-config fallback in Stage2
+evaluation/inference tests; they were not suppressed. The branch-finishing
+CPU gate passed; merge, push, deployment and training still require the user's
+separate decision. Only documentation/evidence changed after this run.
+
+Repair evidence: the exact original four tests first failed in 4.56 seconds
+(`logs/stage2-ddp-dev/resumed-4red.log`). The amended three-file covering command
+passed **112 tests in 14.55 seconds** (`resumed-covering.log`):
+
+```bash
+CUDA_VISIBLE_DEVICES='' PYTHONPATH="$PWD/transformers/src:$PWD/src" \
+  ./venv/ilvr-venv/bin/python -m pytest -q \
+  tests/multinode/test_capacity.py \
+  tests/stage1/test_evaluation_diagnostics.py tests/stage2/test_launcher.py
+```
+
+The scoped review approved the repair and inspected actual regression failures
+for five in-memory mutants: omitted/all-marker normalization, omitted
+diagnostics/main restoration, and an incorrect inferred final step. Their
+full traces are in `logs/stage2-ddp-dev/resumed-actual-regression-mutations.log`;
+the executed command/script body is retained in `resumed-mutation-command.log`
+in the same directory. No production mutation persisted. Earlier checks that
+duplicated marker assertions are supplemental only, not the final mutation
+witness. Test portability now comes from explicit marked/unmarked input and
+real import-boundary observations; the capacity fixture uses a real validated
+LaunchPlan without changing its topology/config validation.
+
+### Historical and task-level evidence
+
+Historical verification at production/test commit `092a95e` (before the
+user-requested test repair `cc9ba9f`):
 
 ```bash
 CUDA_VISIBLE_DEVICES='' PYTHONPATH="$PWD/transformers/src:$PWD/src" \
@@ -214,19 +262,19 @@ CUDA_VISIBLE_DEVICES='' PYTHONPATH="$PWD/transformers/src:$PWD/src" \
 Exit 1: **2626 passed, 4 failed, 7 skipped, 3 deselected, 10 warnings in
 429.00 seconds**. Full output is retained in
 `logs/stage2-ddp-dev/final-project-cpu-092a95e.log`. No passing-full-suite or
-ready-to-merge claim is made. The finishing gate stopped before integration
-options; the worktree is preserved and canonical deployment was not performed.
+ready-to-merge claim was made at that revision. The finishing gate stopped
+before integration options; the worktree was preserved without deployment.
 
-The four failures are:
+The four failures at that revision were:
 
 1. `tests/multinode/test_capacity.py::test_stage1_coordinator_uses_training_evidence_step_without_max_steps`:
    an unchanged Stage 1 test replaces `build_launch_plan` with a
    `SimpleNamespace` lacking `backend`; the new witness keyword selection at
-   `src/multinode.py:2129` accesses that field. This is an unresolved newly
-   exposed integration-test incompatibility, **not** one of the three known
+   `src/multinode.py:2129` accesses that field. This was a newly exposed
+   integration-test incompatibility, **not** one of the three known
    platform baseline failures. The real builder returns `LaunchPlan` with a
    backend field, so this traceback alone does not demonstrate a production
-   Stage 1 execution failure. It still blocks a full regression pass.
+   Stage 1 execution failure. It blocked the full regression pass then.
 2. `tests/stage1/test_evaluation_diagnostics.py::test_diagnostic_entrypoint_leaves_an_extra_build_marker_invalid`.
 3. `tests/stage1/test_evaluation_diagnostics.py::test_diagnostic_entrypoint_restores_platform_after_heavy_import_failure`.
 4. `tests/stage2/test_launcher.py::test_production_entrypoint_imports_with_build_marker_then_restores_platform`.
@@ -237,7 +285,8 @@ report PEFT's missing-config fallback; this identifies their observed location,
 not causal attribution to the new objective. Syntax checks passed for all three
 Stage 2 wrappers/workers. An actual import probe resolved Transformers
 `4.50.0.dev0` and Qwen to this worktree's `transformers/src`, not the installed
-unmodified package. Only documentation/checklist evidence changed afterward.
+unmodified package. Only documentation/checklist evidence changed before the
+subsequent user-requested test repair.
 
 - Combined whole-branch review and the single scoped re-review are complete
   through `092a95e`. All seven findings were addressed: loadable reference
@@ -315,6 +364,13 @@ performance improvement.
 | D: integration/regression | `test_objective_trainer.py`, `test_objective_distributed.py`, native checkpoint/evidence tests: actual Trainer gradients, checkpointing, fixed reference, full/DoRA CPU resume and global-count oracle; legacy controls are bounded by the final suite result. |
 | E: execution | Local CPU tests and actual multi-process Gloo integration only. Three coordinator dry-runs construct commands. Real two-host GPU/NCCL, production sparse-row resume, capacity, full training and evaluation remain unrun. |
 
+The resumed Stage1 capacity-test mutation demonstrates rejection of an
+incorrect inferred final step by the real evidence decoder. Its final
+directory-existence assertion alone does not prove post-validation checkpoint
+selection, because that test creates `checkpoint-2` before calling `_main`.
+This pre-existing evidence limit is distinct from the native-DDP actual
+save/collection/resume fixtures described above.
+
 ### Implementation rulings
 
 These choices did not change the approved research objective:
@@ -336,3 +392,10 @@ These choices did not change the approved research objective:
    banning sources the loader already accepts. If wrong, linked artifacts
    remain an availability dependency instead of being rejected; no remote
    loading or generic traversal infrastructure was added.
+6. The resumed repair corrects host-dependent marker tests and the partial
+   LaunchPlan fixture without changing training code. Explicit inputs and real
+   import-boundary observations protect one-marker normalization/restoration;
+   a real builder supplies the complete plan. If wrong, downstream dependency
+   invalid-version rejection is no longer asserted by that boundary test;
+   production validation was not relaxed. Actual repaired tests reject all
+   five normalization/restoration/inferred-step mutations.
