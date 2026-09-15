@@ -1495,6 +1495,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         generate_mode: Optional[bool] = False,
         stage2_capture_kv: bool = False,
         stage2_prefix_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        stage2_checkpoint_prefix: bool = False,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1566,7 +1567,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training and stage2_prefix_key_values is None:
+            if self.gradient_checkpointing and self.training and (
+                stage2_prefix_key_values is None or stage2_checkpoint_prefix
+            ):
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -1579,7 +1582,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     position_embeddings,
                     generate_mode,
                     stage2_capture_kv,
-                    None,
+                    (stage2_prefix_key_values[layer_index]
+                     if stage2_prefix_key_values is not None else None),
                 )
             else:
                 layer_outputs = decoder_layer(

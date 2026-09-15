@@ -146,6 +146,33 @@ def test_off_is_independent_of_raw_image_and_clean_latent_values():
 
 
 @pytest.mark.parametrize('mode', ['independent', 'cumulative'])
+def test_insertion_replay_uses_layer_checkpointing_for_attached_prefix(mode, monkeypatch):
+    # Without this route, outer ON recomputation retains every rollout layer's
+    # activations together and the real DoRA run exhausts a 93-GiB GPU.
+    from tests.step_preference.insertion_helpers import native_case, preference
+    model, ids, _, grid, options, pixels = native_case()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+    options.update(branch_mode=mode, checkpoint=True)
+    original = model.model._gradient_checkpointing_func
+    prefix_calls = []
+
+    def observe(function, *args, **kwargs):
+        if args[-1] is not None:
+            prefix_calls.append(tuple(t.requires_grad for t in args[-1]))
+        return original(function, *args, **kwargs)
+
+    monkeypatch.setattr(model.model, '_gradient_checkpointing_func', observe)
+    base = model.prepare_stage2_base_inputs_embeds(input_ids=ids, pixel_values=pixels, image_grid_thw=grid)
+    values, _ = scorer(model, options, ids, base, grid)
+    scores = {(r['kind'], r['step_id']): r['mean_logp'] for r in values}
+    preference(scores).backward()
+    assert prefix_calls, 'ON prefix replay bypassed decoder layer checkpointing'
+    assert all(flags == (True, True) for flags in prefix_calls)
+    assert model.model.embed_tokens.weight.grad.isfinite().all()
+    assert model.model.embed_tokens.weight.grad.norm() > 0
+
+
+@pytest.mark.parametrize('mode', ['independent', 'cumulative'])
 @pytest.mark.parametrize('checkpointed', [False, True])
 @pytest.mark.parametrize('window_settings', [(None, False), (4, False), (4, True)],
                          ids=['full', 'sliding_disabled', 'sliding_enabled'])

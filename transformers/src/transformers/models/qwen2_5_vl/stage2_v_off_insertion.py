@@ -49,7 +49,8 @@ def _on_function(model, branch, positions, backend):
         def decoder(*, inputs_embeds, attention_mask, position_ids, **kwargs):
             return model.model(inputs_embeds=inputs_embeds, position_ids=position_ids,
                 attention_mask=_causal_mask(model, inputs_embeds, prefix_length, backend),
-                stage2_prefix_key_values=prefix, generate_mode=True, **kwargs)
+                stage2_prefix_key_values=prefix, stage2_checkpoint_prefix=True,
+                generate_mode=True, **kwargs)
 
         mask = torch.ones(embeds.shape[:2], dtype=torch.long, device=embeds.device)
         rollout = model.stage2_rollout_engine.rollout(language_model=decoder,
