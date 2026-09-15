@@ -161,6 +161,30 @@ def independent_full_replay_scores(model, inputs, blocks, pre_f_rng):
     return torch.stack(scores) if scores else torch.empty(0)
 
 
+def independent_full_replay_logits(model, inputs, blocks, pre_f_rng):
+    """Observe the oracle M LM-head outputs at the selected predictor rows."""
+    clean = {key: value for key, value in model_inputs(inputs).items() if key != "labels"}
+    selected_logits = []
+    lm_head = resolve_qwen2_5_vl_model(model).lm_head
+    with torch.no_grad():
+        for block in blocks:
+            observed = []
+            handle = lm_head.register_forward_hook(
+                lambda _module, _args, value: observed.append(value.detach().clone())
+            )
+            try:
+                with replay_rng_state(pre_f_rng):
+                    model(
+                        **clean,
+                        stage2_ablation=(block.start_position, block.end_position),
+                    )
+            finally:
+                handle.remove()
+            assert len(observed) == 1
+            selected_logits.append(observed[0][block.batch_index, list(block.post_positions)])
+    return torch.cat(selected_logits, dim=0) if selected_logits else torch.empty(0)
+
+
 def autocast_for(dtype):
     return (
         torch.autocast("cpu", dtype=torch.bfloat16)

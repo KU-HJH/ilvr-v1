@@ -116,10 +116,10 @@ def _active_adapter_sites(model: nn.Module, decoder: nn.Module) -> tuple[nn.Drop
     unexpected = [
         name
         for name, module in decoder.named_modules()
-        if isinstance(module, nn.Dropout)
+        if isinstance(module, nn.modules.dropout._DropoutNd)
         and module.training
         and module.p > 0.0
-        and id(module) not in adapter_dropout_ids
+        and (type(module) is not nn.Dropout or id(module) not in adapter_dropout_ids)
     ]
     if unexpected:
         raise ValueError(
@@ -406,7 +406,7 @@ def _replay_adapter_dropout(
             previous_forward = module.__dict__.get("forward")
             restored.append((module, had_forward, previous_forward))
 
-            def replay(value, record=record, site_id=site_id):
+            def replay(value, record=record, site_id=site_id, module=module):
                 visits[site_id] += 1
                 if visits[site_id] > 1:
                     raise RuntimeError("packed M replay visited a stochastic site more than once")
@@ -480,6 +480,11 @@ def score_packed_m(
     current_sites = _active_adapter_sites(model, base.model)
     if tuple(map(id, current_sites)) != tuple(map(id, capture._dropout_sites)):
         raise ValueError("packed M stochastic site identities changed after final F")
+    if any(
+        float(site.p) != capture._dropout_records[id(site)].probability
+        for site in current_sites
+    ):
+        raise ValueError("packed M stochastic site probabilities changed after final F")
 
     logical_rows, visible, branch_rows = _packed_layout(inputs, blocks, capture)
     query_rows = int(logical_rows.numel())

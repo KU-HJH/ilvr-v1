@@ -19,6 +19,7 @@ from transformers.models.qwen2_5_vl import stage2_latent_rollout
 from .packed_m_helpers import (
     autocast_for,
     decoder,
+    independent_full_replay_logits,
     independent_full_replay_scores,
     make_packed_inputs,
     make_packed_model,
@@ -49,11 +50,17 @@ def test_packed_m_one_decoder_call_matches_independent_full_replays(
             calls += 1
 
         handle = decoder(model).register_forward_pre_hook(observed)
+        packed_logits = []
+        lm_head_handle = resolve_qwen2_5_vl_model(model).lm_head.register_forward_hook(
+            lambda _module, _args, value: packed_logits.append(value.detach().clone())
+        )
         try:
             scored = score_packed_m(model, inputs, blocks, captured)
         finally:
             handle.remove()
+            lm_head_handle.remove()
         oracle = independent_full_replay_scores(model, inputs, blocks, pre_f_rng)
+        oracle_logits = independent_full_replay_logits(model, inputs, blocks, pre_f_rng)
 
     tolerance = (
         {"atol": 1e-3, "rtol": 1e-2}
@@ -66,6 +73,8 @@ def test_packed_m_one_decoder_call_matches_independent_full_replays(
     )
     assert len(scored.scores) == len(blocks)
     assert all(not score.requires_grad for score in scored.scores)
+    assert len(packed_logits) == 1
+    torch.testing.assert_close(packed_logits[0][0], oracle_logits, **tolerance)
     torch.testing.assert_close(torch.stack(scored.scores), oracle, **tolerance)
 
 
@@ -464,7 +473,13 @@ def test_packed_m_unmatched_dropout_negative_control_is_observable():
         wrong_state = torch.Generator().manual_seed(991 + index).get_state()
         captured._dropout_records[site_id] = replace(record, rng_state=wrong_state)
     unmatched = score_packed_m(model, inputs, blocks, captured)
-    assert float((torch.stack(matched.scores) - torch.stack(unmatched.scores)).abs().max()) > 1e-6
+    matched_scores = torch.stack(matched.scores)
+    unmatched_scores = torch.stack(unmatched.scores)
+    assert torch.isfinite(matched_scores).all()
+    assert torch.isfinite(unmatched_scores).all()
+    assert not torch.allclose(
+        matched_scores, unmatched_scores, atol=1e-6, rtol=1e-5
+    )
 
 
 @pytest.mark.parametrize("invalid", ["inplace", "multiple", "merged", "nonstandard"])
@@ -641,3 +656,104 @@ def test_capture_rejects_peft_auxiliary_modules_outside_decoder_inventory():
     with pytest.raises(ValueError, match="auxiliary PEFT modules"):
         with PackedMPrefixCapture(model, inputs["input_ids"].shape[1]):
             pass
+
+
+@pytest.mark.parametrize("dropout_type", [torch.nn.AlphaDropout, torch.nn.Dropout1d])
+def test_capture_rejects_nonstandard_decoder_dropout_before_f_or_rng_advance(dropout_type):
+    """Catches alpha and channelwise decoder dropout escaping packed replay inventory."""
+    model = make_packed_model(tuning="full")
+    inputs = make_packed_inputs(blocks=1)
+    base = resolve_qwen2_5_vl_model(model)
+    base.model.layers[0].mlp.act_fn = torch.nn.Sequential(
+        base.model.layers[0].mlp.act_fn, dropout_type(0.05)
+    ).train()
+    calls = 0
+
+    def observed(_module, _args):
+        nonlocal calls
+        calls += 1
+
+    handle = decoder(model).register_forward_pre_hook(observed)
+    rng_before = capture_rng_state()
+    try:
+        with pytest.raises(ValueError, match="unsupported decoder dropout"):
+            with PackedMPrefixCapture(model, inputs["input_ids"].shape[1]):
+                model(**model_inputs(inputs), collect_stage2_diagnostics=True)
+    finally:
+        handle.remove()
+    assert calls == 0
+    torch.testing.assert_close(capture_rng_state().cpu_state, rng_before.cpu_state)
+
+
+def test_score_rejects_nonstandard_decoder_dropout_added_after_capture_before_m_or_rng():
+    """Catches post-capture stochastic decoder modules reaching direct packed execution."""
+    model = make_packed_model(tuning="full")
+    inputs = make_packed_inputs(blocks=1)
+    blocks = select_packed_blocks(inputs)
+    with PackedMPrefixCapture(model, inputs["input_ids"].shape[1]) as captured:
+        model(**model_inputs(inputs), collect_stage2_diagnostics=True)
+    base = resolve_qwen2_5_vl_model(model)
+    base.model.layers[0].mlp.act_fn = torch.nn.Sequential(
+        base.model.layers[0].mlp.act_fn, torch.nn.AlphaDropout(0.05)
+    ).train()
+    calls = 0
+
+    def observed(_module, _args):
+        nonlocal calls
+        calls += 1
+
+    handle = decoder(model).register_forward_pre_hook(observed)
+    rng_before = capture_rng_state()
+    try:
+        with pytest.raises(ValueError, match="unsupported decoder dropout"):
+            score_packed_m(model, inputs, blocks, captured)
+    finally:
+        handle.remove()
+    assert calls == 0
+    torch.testing.assert_close(capture_rng_state().cpu_state, rng_before.cpu_state)
+
+
+def test_packed_m_replays_heterogeneous_captured_dropout_probabilities():
+    """Catches replay closures reading the final site's probability for every site."""
+    model = make_packed_model()
+    inputs = make_packed_inputs()
+    blocks = select_packed_blocks(inputs)
+    adapter_modules = [
+        module
+        for module in resolve_qwen2_5_vl_model(model).model.modules()
+        if hasattr(module, "lora_dropout")
+    ]
+    assert len(adapter_modules) > 1
+    adapter_modules[0].lora_dropout["default"].p = 0.1
+    pre_f_rng = capture_rng_state()
+    with PackedMPrefixCapture(model, inputs["input_ids"].shape[1]) as captured:
+        model(**model_inputs(inputs), collect_stage2_diagnostics=True)
+    scored = score_packed_m(model, inputs, blocks, captured)
+    oracle = independent_full_replay_scores(model, inputs, blocks, pre_f_rng)
+    torch.testing.assert_close(torch.stack(scored.scores), oracle, atol=1e-6, rtol=1e-5)
+
+
+def test_packed_m_rejects_probability_change_after_capture_before_decoder_execution():
+    """Catches replay starting before its captured stochastic probability is verified."""
+    model = make_packed_model()
+    inputs = make_packed_inputs(blocks=1)
+    blocks = select_packed_blocks(inputs)
+    with PackedMPrefixCapture(model, inputs["input_ids"].shape[1]) as captured:
+        model(**model_inputs(inputs), collect_stage2_diagnostics=True)
+    record = next(iter(captured._dropout_records.values()))
+    record.module.p = 0.1
+    calls = 0
+
+    def observed(_module, _args):
+        nonlocal calls
+        calls += 1
+
+    handle = decoder(model).register_forward_pre_hook(observed)
+    rng_before = capture_rng_state()
+    try:
+        with pytest.raises(ValueError, match="probabilities changed"):
+            score_packed_m(model, inputs, blocks, captured)
+    finally:
+        handle.remove()
+    assert calls == 0
+    torch.testing.assert_close(capture_rng_state().cpu_state, rng_before.cpu_state)

@@ -13,6 +13,7 @@ from stage2.objective import Stage2ObjectiveConfig
 from stage2.objective_runtime import Stage2ObjectiveRuntime
 from stage2.reference import FrozenReference
 from stage2.rng import capture_rng_state, replay_rng_state
+from peft_common import resolve_qwen2_5_vl_model
 from transformers.models.qwen2_5_vl import stage2_latent_rollout
 
 from .packed_m_helpers import (
@@ -63,6 +64,7 @@ def _run_runtime(model, inputs, *, mode, retain_latents=False, post_only=False):
     latents = []
     original_gain = objective_runtime.vision_gain
     original_replace = stage2_latent_rollout._replace_embedding
+    lm_head_outputs = []
 
     def observe_gain(*args, **kwargs):
         metrics = original_gain(*args, **kwargs)
@@ -75,17 +77,34 @@ def _run_runtime(model, inputs, *, mode, retain_latents=False, post_only=False):
             latents.append(value)
         return original_replace(embeds, position, value)
 
-    with patch.object(objective_runtime, "vision_gain", side_effect=observe_gain), patch.object(
-        stage2_latent_rollout, "_replace_embedding", side_effect=retain
-    ):
-        result = runtime.forward(model, inputs, selection)
+    lm_head_handle = resolve_qwen2_5_vl_model(model).lm_head.register_forward_hook(
+        lambda _module, _args, value: lm_head_outputs.append(value.detach().clone())
+    )
+    try:
+        with patch.object(objective_runtime, "vision_gain", side_effect=observe_gain), patch.object(
+            stage2_latent_rollout, "_replace_embedding", side_effect=retain
+        ):
+            result = runtime.forward(model, inputs, selection)
+    finally:
+        lm_head_handle.remove()
+    assert len(lm_head_outputs) == 1 + (len(selection.blocks) if mode == "full_replay" else 1)
+    if mode == "full_replay":
+        m_logits = torch.cat(
+            [
+                output[block.batch_index, list(block.post_positions)]
+                for output, block in zip(lm_head_outputs[1:], selection.blocks, strict=True)
+            ],
+            dim=0,
+        )
+    else:
+        m_logits = lm_head_outputs[-1][0]
     total = result.vis_sum if post_only else result.ce + result.vis_sum / result.count
     total.backward()
     gradients = {
         name: None if parameter.grad is None else parameter.grad.detach().clone()
         for name, parameter in model.named_parameters()
     }
-    return result, tuple(scores), gradients, latents, capture_rng_state()
+    return result, tuple(scores), m_logits, gradients, latents, capture_rng_state()
 
 
 @pytest.mark.parametrize(
@@ -110,16 +129,17 @@ def test_actual_runtime_packed_matches_full_loss_scores_and_gradients(
     autocast = torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16)
 
     with replay_rng_state(paired_rng), autocast:
-        full_result, full_scores, full_grads, full_latents, full_rng = _run_runtime(
+        full_result, full_scores, full_m_logits, full_grads, full_latents, full_rng = _run_runtime(
             full, inputs, mode="full_replay", retain_latents=True
         )
     with replay_rng_state(paired_rng), torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
-        packed_result, packed_scores, packed_grads, packed_latents, packed_rng = _run_runtime(
+        packed_result, packed_scores, packed_m_logits, packed_grads, packed_latents, packed_rng = _run_runtime(
             packed, inputs, mode="packed_suffix", retain_latents=True
         )
 
     tolerance = {"atol": 1e-3, "rtol": 1e-2} if bf16 else {"atol": 1e-6, "rtol": 1e-5}
     torch.testing.assert_close(packed_result.outputs.logits, full_result.outputs.logits, atol=0, rtol=0)
+    torch.testing.assert_close(packed_m_logits, full_m_logits, **tolerance)
     torch.testing.assert_close(packed_result.vis_sum, full_result.vis_sum, **tolerance)
     torch.testing.assert_close(torch.stack(packed_scores), torch.stack(full_scores), **tolerance)
     assert packed_grads.keys() == full_grads.keys()
@@ -160,7 +180,7 @@ def test_post_only_packed_loss_has_independent_retained_latent_gradients():
     """Catches checking merely any parameter gradient while latent paths are detached."""
     model = make_packed_model(tuning="dora")
     inputs = make_packed_inputs(blocks=2)
-    result, _, _, latents, _ = _run_runtime(
+    result, _, _, _, latents, _ = _run_runtime(
         model, inputs, mode="packed_suffix", retain_latents=True, post_only=True
     )
     assert result.vis_sum.requires_grad
