@@ -48,7 +48,7 @@ replacement copy of framework code.
 - Produces: frozen `PackedMScores` with `scores: tuple[torch.Tensor, ...]` in block order, `decoder_calls: int`, `query_rows: int`; each score is graph-free full-vocabulary token-mean log-likelihood. No full-sequence placeholder logits.
 - Produces test helper `make_packed_model(*, backend="eager", tuning="dora", checkpointing=False)` using genuinely indexed two-layer Qwen config, nonzero adapter deltas and dropout .05, and `make_packed_inputs(*, blocks=2, padding=None)` returning runtime-compatible inputs. Later tasks may extend fixture parameters without changing these defaults.
 
-- [ ] **Step 1: Write failing capture/scoring API tests with actual Qwen forwards.**
+- [x] **Step 1: Write failing capture/scoring API tests with actual Qwen forwards.**
 
 ```python
 from stage2.packed_m import PackedMPrefixCapture, score_packed_m
@@ -76,12 +76,12 @@ independent full-M oracle under the saved pre-F RNG with the existing RNG replay
 context; exit that context so outer RNG remains post-F. Observe the two paths
 separately, without counting oracle calls as packed execution.
 
-- [ ] **Step 2: Run the new focused test and retain the expected missing-module/API failure.**
+- [x] **Step 2: Run the new focused test and retain the expected missing-module/API failure.**
 
 Run: `./venv/ilvr-venv/bin/pytest tests/stage2/test_packed_m.py -xq`.
 Expected: missing packed API before production code exists, not an environment failure.
 
-- [ ] **Step 3: Implement capture, exact dropout replay, layout and selected-row scoring.**
+- [x] **Step 3: Implement capture, exact dropout replay, layout and selected-row scoring.**
 
 ```python
 # Visibility for query original e+u in branch offset o:
@@ -104,7 +104,7 @@ reject repeats and missing/unexpected replay sites. Read the actual PEFT forward
 and Qwen attention dispatch locally before installing hooks; do not infer them
 from class names or comments.
 
-- [ ] **Step 4: Add and run causal, numerical, cleanup and geometry regressions.**
+- [x] **Step 4: Add and run causal, numerical, cleanup and geometry regressions.**
 
 ```python
 assert safe_m_delta <= 1e-7
@@ -120,7 +120,7 @@ Use actual selected-logit observations, not counters alone. Cover eager/SDPA × 
 Run: `./venv/ilvr-venv/bin/pytest tests/stage2/test_packed_m.py -q`.
 Expected: all focused tests pass. Report actual matrix and gaps, not planned coverage.
 
-- [ ] **Step 5: Self-review and commit only Task 1 files.**
+- [x] **Step 5: Self-review and commit only Task 1 files.**
 
 Run: `git add src/stage2/packed_m.py tests/stage2/packed_m_helpers.py tests/stage2/test_packed_m.py` then `git commit -m "feat: add graph-free packed Stage 2 M suffix scorer"`.
 
@@ -135,7 +135,7 @@ Run: `git add src/stage2/packed_m.py tests/stage2/packed_m_helpers.py tests/stag
 - Consumes fixtures: `make_packed_model(*, backend="eager", tuning="dora", checkpointing=False)` and `make_packed_inputs(*, blocks=2, padding=None)`.
 - Produces appended config field `stage2_m_execution: str = "full_replay"`, matching CLI `--stage2_m_execution` choices and serialized key. Trainer fixed metric schema gains `m_branches`, `m_query_rows`; existing model/decoder counters retain literal meaning.
 
-- [ ] **Step 1: Add failing config, old-resume and actual-runtime tests.**
+- [x] **Step 1: Add failing config, old-resume and actual-runtime tests.**
 
 ```python
 assert Stage2ObjectiveConfig().stage2_m_execution == "full_replay"
@@ -149,12 +149,12 @@ torch.testing.assert_close(packed_result.vis_sum, full_result.vis_sum,
 
 Instantiate actual runtime/Trainer using existing helpers and use real selected blocks; capture logits/per-block scores through scoped observation hooks. Remove mode from saved objective identity to test legacy full-replay resume succeeds and packed mismatch fails, while unrelated identity corruption remains rejected.
 
-- [ ] **Step 2: Run focused new tests and retain RED.**
+- [x] **Step 2: Run focused new tests and retain RED.**
 
 Run: `./venv/ilvr-venv/bin/pytest tests/stage2/test_packed_m_runtime.py -xq`.
 Expected: new config/routing absent, before implementation.
 
-- [ ] **Step 3: Integrate narrowly with no changed F/reference or reduction logic.**
+- [x] **Step 3: Integrate narrowly with no changed F/reference or reduction logic.**
 
 ```python
 use_packed = (config.stage2_m_execution == "packed_suffix"
@@ -170,7 +170,7 @@ packed_scores = score_packed_m(student, inputs, selection.blocks, captured) if u
 
 Use the existing unwrapped student for capture/direct graph-free M and the wrapped model for F. Preserve pre-F RNG capture for full replay; no capture for zero blocks, feature off, CE-only or entropy-only. Append dataclass field to preserve positional callers; use getattr default in from_args. Normalize only absent `stage2_m_execution` to `full_replay` in copied saved/expected config dictionaries during identity comparison; retain all schema/reference/vocabulary strictness and source-byte hashing. Do not rewrite old metadata to pass validation.
 
-- [ ] **Step 4: Complete runtime gradient and baseline regression witnesses.**
+- [x] **Step 4: Complete runtime gradient and baseline regression witnesses.**
 
 ```python
 assert set(full_grads) == set(packed_grads)
@@ -184,7 +184,7 @@ Compare actual F output, selected M logits/scores, total loss, parameter and ret
 
 Run: `./venv/ilvr-venv/bin/pytest tests/stage2/test_packed_m_runtime.py tests/stage2/test_objective_trainer.py tests/stage2/test_objective_config.py -q` plus the concrete reference/Stage 1 regression files identified in Step 1; record the exact complete command in the report.
 
-- [ ] **Step 5: Self-review and commit Task 2's explicit changed paths.**
+- [x] **Step 5: Self-review and commit Task 2's explicit changed paths.**
 
 Run: `git diff --check` then explicit `git add` for the Files list and `git commit -m "feat: route Stage 2 Vision gain through opt-in packed M"`.
 
@@ -199,7 +199,7 @@ Run: `git diff --check` then explicit `git add` for the Files list and `git comm
 - Consumes Task 2 CLI/config `stage2_m_execution`, modes `full_replay`/`packed_suffix`, default full replay, and fixed metrics `m_branches`, `m_query_rows`, literal `model_forwards_M`/`decoder_forwards_M`.
 - Produces existing coordinator allowlist/forwarding of `--stage2_m_execution`; all three existing examples explicitly select packed_suffix with no new launcher. No changes to mandatory topology/baseline or remote coordination.
 
-- [ ] **Step 1: Add failing coordinator/example and packed native CPU DDP tests.**
+- [x] **Step 1: Add failing coordinator/example and packed native CPU DDP tests.**
 
 ```python
 assert resolved_config["stage2_m_execution"] == "full_replay"
@@ -217,12 +217,12 @@ accumulation windows of 2, 2 and 1 microbatches, respectively. The first window
 has two nonempty microbatches (both rank 0), hence two packed M decoder calls
 for three branches; the middle has zero; the final has one branch on rank 1.
 
-- [ ] **Step 2: Run focused added checks and retain RED.**
+- [x] **Step 2: Run focused added checks and retain RED.**
 
 Run: `./venv/ilvr-venv/bin/pytest tests/multinode/test_native_ddp_launch.py -xq`.
 Expected: mode not forwarded or examples not selecting packed mode, before delivery edits. DDP tests may already pass due Task 2; do not invent a failure.
 
-- [ ] **Step 3: Extend existing forwarding and example command assembly.**
+- [x] **Step 3: Extend existing forwarding and example command assembly.**
 
 ```bash
 # Add to the existing common objective example arguments (do not add a launcher):
@@ -231,13 +231,13 @@ Expected: mode not forwarded or examples not selecting packed mode, before deliv
 
 Add the value-bearing CLI flag to the existing allowlist and preserve generic forwarding. Update exact config expectations to include default mode. Test all three existing example variants through the actual coordinator's dry-run path with temporary readable inputs where existing tests require them; no training or remote writes. Preserve existing checkpoint/data/seed matching and canonical defaults.
 
-- [ ] **Step 4: Document measured counts and limits, then run covering tests once.**
+- [x] **Step 4: Document measured counts and limits, then run covering tests once.**
 
 Document opting in/out, old-resume behavior, dropout/backend limitations, mask/cache semantics, memory still unmeasured, and the following prediction counts excluding unchanged latent recurrence: CE=1, CE+entropy=2, CE+Vision=2, combined=3. Clarify one M decoder call is not one top-level model call and not an assurance of constant memory/work as K grows. Add three executable dry-run examples using existing wrapper syntax and same Stage 1/data/seed. Report actual CPU tests separately from unrun GPU/ZeRO/two-host training.
 
 Run: `./venv/ilvr-venv/bin/pytest tests/multinode/test_native_ddp_launch.py tests/stage2/test_objective_distributed.py -q` plus actual objective-example test file(s); `bash -n run_stage2_objective_examples.sh run_stage2_training.sh run_multinode_stage2_training.sh`; `git diff --check`.
 
-- [ ] **Step 5: Self-review and commit only Task 3 files.**
+- [x] **Step 5: Self-review and commit only Task 3 files.**
 
 Run explicit `git add` for changed Files paths and `git commit -m "test: verify packed M DDP and coordinator examples"`.
 
