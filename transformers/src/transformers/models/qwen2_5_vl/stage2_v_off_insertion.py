@@ -6,20 +6,27 @@ from .stage2_latent_rollout import LatentSpan
 from .stage2_shared_prefix import score_selected_hidden
 
 
-def _causal_mask(embeds, prefix_length, backend):
+def _causal_mask(model, embeds, prefix_length, backend):
     length = embeds.shape[1]
     if backend == 'flex':
         from torch.nn.attention.flex_attention import create_block_mask
 
+        # Match the native no-cache mask, which uses sliding_window directly
+        # even when the separate use_sliding_window flag is False.
+        window = model.config.sliding_window
+
         def visible(batch, head, query, key):
-            return (query < length) & (key < prefix_length + length) & (key <= prefix_length + query)
+            global_query = prefix_length + query
+            causal = (query < length) & (key < prefix_length + length) & (key <= global_query)
+            return causal if window is None else causal & (key > global_query - window)
 
         return create_block_mask(visible, B=1, H=None, Q_LEN=length,
                                  KV_LEN=prefix_length + length, device=str(embeds.device))
-    query = torch.arange(length, device=embeds.device)[:, None] + prefix_length
-    keys = torch.arange(prefix_length + length, device=embeds.device)[None, :]
-    return torch.zeros((1, 1, length, prefix_length + length), device=embeds.device,
-                       dtype=embeds.dtype).masked_fill(keys > query, torch.finfo(embeds.dtype).min)
+    return model.model._prepare_4d_causal_attention_mask_with_cache_position(
+        attention_mask=None, sequence_length=length, target_length=prefix_length + length,
+        dtype=embeds.dtype, device=embeds.device,
+        cache_position=torch.arange(length, device=embeds.device) + prefix_length,
+        batch_size=embeds.shape[0], config=model.config, past_key_values=None)
 
 
 def _target_tensors(targets, device, offset=0):
@@ -41,7 +48,7 @@ def _on_function(model, branch, positions, backend):
 
         def decoder(*, inputs_embeds, attention_mask, position_ids, **kwargs):
             return model.model(inputs_embeds=inputs_embeds, position_ids=position_ids,
-                attention_mask=_causal_mask(inputs_embeds, prefix_length, backend),
+                attention_mask=_causal_mask(model, inputs_embeds, prefix_length, backend),
                 stage2_prefix_key_values=prefix, generate_mode=True, **kwargs)
 
         mask = torch.ones(embeds.shape[:2], dtype=torch.long, device=embeds.device)

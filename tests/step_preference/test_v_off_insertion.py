@@ -147,10 +147,13 @@ def test_off_is_independent_of_raw_image_and_clean_latent_values():
 
 @pytest.mark.parametrize('mode', ['independent', 'cumulative'])
 @pytest.mark.parametrize('checkpointed', [False, True])
-def test_native_prefix_matches_literal_full_sequence_oracle(mode, checkpointed, monkeypatch):
+@pytest.mark.parametrize('window_settings', [(None, False), (4, False), (4, True)],
+                         ids=['full', 'sliding_disabled', 'sliding_enabled'])
+def test_native_prefix_matches_literal_full_sequence_oracle(mode, checkpointed, window_settings, monkeypatch):
     import copy
     from tests.step_preference.insertion_helpers import native_case, literal_oracle, preference
     model, ids, _, grid, options, pixels = native_case()
+    model.config.sliding_window, model.config.use_sliding_window = window_settings
     oracle = copy.deepcopy(model)
     if checkpointed:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
@@ -251,6 +254,24 @@ def test_native_trainer_reduces_true_evidence_scores_and_emits_metrics(mode, mon
     assert logged[0]['stats/logp_evidence_off'] == pytest.approx(float(torch.stack([scores[('visual_off', i)] for i in (0, 1)]).mean().detach()))
     total.backward()
     assert model.model.embed_tokens.weight.grad.isfinite().all()
+
+
+@pytest.mark.parametrize('active', [True, False])
+def test_native_insertion_requires_pixels_only_for_active_visual_branches(active):
+    from tests.step_preference.insertion_helpers import native_case
+    model, ids, _, grid, options, _ = native_case()
+    if not active:
+        options['plan'] = replace(options['plan'], groups=((), ()), root_selected_positions=())
+    kwargs = dict(input_ids=ids, attention_mask=torch.ones_like(ids), labels=ids.clone(),
+        image_grid_thw=grid, pixel_values=None, use_cache=False, return_dict=True,
+        stage2_shared_prefix_inputs=options)
+    if active:
+        with pytest.raises(ValueError, match='pixel_values'):
+            model(**kwargs)
+    else:
+        output = model(**kwargs)
+        assert torch.isfinite(output.loss)
+        assert output.stage2_sidecar_results == ()
 
 
 @pytest.mark.parametrize('scope,wanted', [('immediate_text', [(13,), (15,)]),
@@ -400,10 +421,13 @@ def test_empty_native_plan_executes_no_off_or_latent_forward():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='Flex native insertion probe needs CUDA')
 @pytest.mark.parametrize('mode', ['independent', 'cumulative'])
-def test_cuda_flex_insertion_forward_backward_matches_dense(mode):
+@pytest.mark.parametrize('window_settings', [(None, False), (4, False), (4, True)],
+                         ids=['full', 'sliding_disabled', 'sliding_enabled'])
+def test_cuda_flex_insertion_forward_backward_matches_dense(mode, window_settings):
     import copy
     from tests.step_preference.insertion_helpers import native_case, preference
     model, ids, _, grid, options, pixels = native_case()
+    model.config.sliding_window, model.config.use_sliding_window = window_settings
     model = model.cuda()
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
     dense = copy.deepcopy(model)
