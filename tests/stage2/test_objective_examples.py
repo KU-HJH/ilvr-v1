@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -147,6 +148,7 @@ def test_three_modes_forward_the_same_baseline_and_only_required_objective_branc
     ):
         assert _option_value(arguments, "--backend") == "ddp"
         assert "--enable_stage2_objective" in arguments
+        assert _option_value(arguments, "--stage2_m_execution") == "packed_suffix"
         assert _option_value(arguments, "--seed") == "42"
         assert _option_value(arguments, "--warm_up_steps") == "10"
         assert _option_value(arguments, "--max_steps") == "423"
@@ -195,6 +197,47 @@ def test_default_dry_run_creates_no_run_artifacts(
     assert "--dry-run" in arguments
     assert all(not path.exists() for path in destinations)
 
+
+@pytest.mark.parametrize(
+    ("mode", "objective_arguments"),
+    (
+        ("ce", ()),
+        ("entropy", ("--lambda-dyn", "0.4")),
+        ("combined", ("--lambda-dyn", "0.4", "--lambda-vis", "0.6")),
+    ),
+)
+def test_each_example_forwards_packed_m_through_the_actual_coordinator_dry_run(
+    mode, objective_arguments, example_inputs
+):
+    """Catches the real coordinator dropping the wrapper's packed M opt-in."""
+    stage1, data_path, image_root = example_inputs
+    run_id = f"objective-real-coordinator-{uuid.uuid4().hex}"
+    result = subprocess.run(
+        [
+            "bash", str(WRAPPER), mode,
+            "--stage1", str(stage1),
+            "--data", str(data_path),
+            "--image-root", str(image_root),
+            "--run-id", run_id,
+            "--max-steps", "423",
+            "--main-process-port", "29871",
+            *objective_arguments,
+        ],
+        cwd=REPO_ROOT,
+        env={
+            "PATH": os.environ["PATH"],
+            "PYTHONPATH": f"{REPO_ROOT}/transformers/src:{REPO_ROOT}/src",
+            "CUDA_VISIBLE_DEVICES": "",
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["plan"]["stage2_objective_config"]["stage2_m_execution"] == "packed_suffix"
+    assert "--stage2_m_execution" in payload["local"]
+    assert payload["local"][payload["local"].index("--stage2_m_execution") + 1] == "packed_suffix"
 
 def test_launch_is_explicit_and_cannot_be_combined_with_dry_run(
     example_inputs, recording_coordinator, tmp_path

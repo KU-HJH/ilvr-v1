@@ -963,6 +963,7 @@ _STAGE2_VALUE_OPTIONS = {
     "--entropy_eps",
     "--pre_window",
     "--post_window",
+    "--stage2_m_execution",
 }
 _STAGE2_BOOLEAN_OPTIONS = {
     "--save_final_model",

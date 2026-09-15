@@ -217,6 +217,7 @@ objective_arguments=(
   --entropy_eps 1e-6
   --pre_window 1
   --post_window 1
+  --stage2_m_execution packed_suffix
 )
 if [[ $mode != ce ]]; then
   objective_arguments+=(--reference_model_path "$stage1")

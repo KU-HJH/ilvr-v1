@@ -135,6 +135,7 @@ def test_resolve_stage2_objective_config_uses_training_parser_defaults_and_value
             "--entropy_eps", "0.00001",
             "--pre_window", "2",
             "--post_window=3",
+            "--stage2_m_execution", "packed_suffix",
         ),
         supervise_latent_boundaries=True,
     )
@@ -149,7 +150,18 @@ def test_resolve_stage2_objective_config_uses_training_parser_defaults_and_value
         "entropy_eps": 0.00001,
         "pre_window": 2,
         "post_window": 3,
+        "stage2_m_execution": "packed_suffix",
     }
+
+
+def test_resolve_stage2_objective_config_defaults_m_execution_to_full_replay():
+    """Catches an absent saved/CLI mode changing legacy coordinator behavior."""
+    config = runtime.resolve_stage2_objective_config(
+        ("--enable_stage2_objective", "--lambda_vis", "0.25"),
+        supervise_latent_boundaries=True,
+    )
+
+    assert config.to_dict()["stage2_m_execution"] == "full_replay"
 
 
 def test_stage2_objective_arguments_are_forwarded_by_the_coordinator_allowlist():
@@ -164,6 +176,7 @@ def test_stage2_objective_arguments_are_forwarded_by_the_coordinator_allowlist()
         "--entropy_eps", "0.00001",
         "--pre_window", "2",
         "--post_window=3",
+        "--stage2_m_execution", "packed_suffix",
     )
 
     assert runtime.validate_stage2_arguments(arguments) == arguments
@@ -248,6 +261,7 @@ def test_real_stage2_coordinator_dry_run_freezes_ddp_objective_and_worker_inputs
         "--lambda_dyn", "0.75",
         "--lambda_vis", "0.25",
         "--reference_model_path", "/models/reference",
+        "--stage2_m_execution", "packed_suffix",
         run_id=run_id,
     )
 
@@ -257,11 +271,14 @@ def test_real_stage2_coordinator_dry_run_freezes_ddp_objective_and_worker_inputs
     assert payload["plan"]["zero_stage"] is None
     assert payload["plan"]["deepspeed_config"] is None
     assert payload["plan"]["stage2_objective_config"]["lambda_dyn"] == 0.75
+    assert payload["plan"]["stage2_objective_config"]["stage2_m_execution"] == "packed_suffix"
     local = payload["local"]
     assert "ILVR_STAGE2_BACKEND=ddp" in local
     assert "DEEPSPEED_CONFIG=" not in " ".join(local)
     assert "--lambda_dyn" in local
     assert local[local.index("--lambda_dyn") + 1] == "0.75"
+    assert "--stage2_m_execution" in local
+    assert local[local.index("--stage2_m_execution") + 1] == "packed_suffix"
     assert f"OUTPUT_DIR=/root/workspace/ILVR/checkpoints/{run_id}" in local
     assert all(not path.exists() for path in destinations)
 

@@ -191,7 +191,45 @@ learning rate `5e-5`, seed 42, warmup 10 optimizer updates, BF16, AdamW/linear
 schedule, weight decay 0.01, max gradient norm 1.0, DoRA r32/alpha64/dropout0.05,
 latent size 8, supervised boundary markers, SDPA, native non-reentrant gradient
 checkpointing, and terminal `save_steps=max_steps`. It changes only run/port and
-the objective branches/weights required by the mode.
+the objective branches/weights required by the mode. These three wrapper examples
+explicitly forward `--stage2_m_execution packed_suffix`; each remains a dry-run
+until `--launch` is supplied.
+
+### Packed M suffix execution
+
+`stage2_m_execution` accepts `full_replay` (the default) and `packed_suffix`.
+The default preserves existing and older saved objective configurations: a saved
+configuration with no mode field is interpreted as `full_replay`. A resumed run
+with an explicit mode different from its saved objective configuration fails;
+choose the desired mode before creating or resuming the run. The three wrapper
+examples above are the supported packed opt-in path. Direct coordinator users
+may pass `--stage2_m_execution packed_suffix`; pass `full_replay` to opt out.
+
+Packed mode leaves normal Stage 2 latent recurrence and the F/reference call
+schedules unchanged. When Vision has valid blocks, it captures the unchanged
+final F cache and runs one graph-free decoder call for all M suffixes. For a
+block with start `s` and END `e`, each packed query can see active root keys
+before `e` except latent slots strictly between `s` and `e`, plus only its own
+causal suffix keys. It cannot read clean F END/post keys or another branch's
+suffix. The cache uses physical packed positions while the original three-axis
+mRoPE positions are passed separately.
+
+This CPU-supported path is limited to B=1, eager/SDPA, FP32/BF16, zero native
+attention dropout, native non-reentrant checkpointing, native DDP, and one
+unmerged supported Linear LoRA/DoRA adapter layout (ordinary adapter dropout is
+replayed at its recorded F RNG state). It does not establish support for
+ZeRO, FlashAttention, FP16, FSDP, compilation, CUDA dropout behavior, real-image
+equivalence, two-host execution, or a GPU training run.
+
+Excluding the unchanged latent recurrence, expected decoder prediction calls
+are CE=1, CE+entropy=2, CE+Vision=2, and combined=3. In packed mode one M
+decoder call is deliberately **not** a top-level model call:
+`model_forwards_M=0`, `decoder_forwards_M=1`, `m_branches=K`, and
+`m_query_rows=Q` for a nonempty packed microbatch. In full replay,
+`m_query_rows` still reports the same conceptual selected contiguous suffix-row
+total `Q`; it is not the total rows recomputed across separate legacy M
+rollouts. These counters are runtime observations, not a memory, throughput, or
+constant-work guarantee as `K` grows.
 
 After inspecting the dry-run, do not merely append `--launch`. First run the
 live two-node preflight described in [multinode-training.md](multinode-training.md),
