@@ -1663,8 +1663,9 @@ def test_main_disabled_startup_log_has_no_private_preflight_field(monkeypatch):
     ("world_process_zero", "expected_processor_path"),
     [(True, "out"), (False, None)],
 )
+@pytest.mark.parametrize("stage2_debugging", [False, True])
 def test_main_stage2_uses_only_stage2_components_and_validated_resume(
-    monkeypatch, tmp_path, world_process_zero, expected_processor_path
+    monkeypatch, tmp_path, world_process_zero, expected_processor_path, stage2_debugging
 ):
     """Catches Stage 2 falling through the Stage 1 trainer or auto-resume path."""
     args = stage2_args(
@@ -1674,6 +1675,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         cache_dir=str(tmp_path / "cache"),
         save_final_model=True,
         stage2_diagnostics_interval=3,
+        stage2_debugging=stage2_debugging,
     )
     processor = RecordingSavedProcessor()
     model = object()
@@ -1712,6 +1714,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         "stage2_peft_metadata": "preserved-sidecar",
         "deepspeed_runtime_profile": args.deepspeed_runtime_profile,
         "stage2_diagnostics_interval": 3,
+        "stage2_debugging": stage2_debugging,
     }
     assert trainer.resume_path == "stage2/checkpoint-4"
     assert trainer.saved_path == "out"

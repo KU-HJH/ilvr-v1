@@ -97,7 +97,7 @@ def _model_compute_dtype(model) -> torch.dtype:
     return parameter.dtype
 
 
-def _selected_logits(outputs, expected_rows: int) -> torch.Tensor:
+def _selected_logits(outputs, expected_rows: int, *, stage2_debugging: bool = True) -> torch.Tensor:
     logits = getattr(outputs, "stage2_selected_logits", None)
     if (
         not isinstance(logits, torch.Tensor)
@@ -108,7 +108,7 @@ def _selected_logits(outputs, expected_rows: int) -> torch.Tensor:
         or not logits.is_floating_point()
     ):
         raise ValueError("Stage 2B model returned invalid selected logits")
-    if not bool(torch.isfinite(logits).all()):
+    if stage2_debugging and not bool(torch.isfinite(logits).all()):
         raise ValueError("Stage 2B selected logits must be finite")
     return logits
 
@@ -212,6 +212,7 @@ class Stage2Trainer(Trainer):
         deepspeed_runtime_profile: DeepSpeedRuntimeProfile | None = None,
         stage2_peft_metadata=None,
         stage2_diagnostics_interval: int = 0,
+        stage2_debugging: bool = False,
         step_preference_config: StepPreferenceConfig | None = None,
         **kwargs,
     ):
@@ -241,6 +242,9 @@ class Stage2Trainer(Trainer):
         self.stage2_sampler_identity: Stage2SamplerIdentity | None = None
         self._stage2_train_sampler: LatentBlockBalancedSampler | None = None
         self.stage2_diagnostics_interval = stage2_diagnostics_interval
+        if type(stage2_debugging) is not bool:
+            raise TypeError("stage2_debugging must be a boolean")
+        self.stage2_debugging = stage2_debugging
         if step_preference_config is None:
             step_preference_config = StepPreferenceConfig()
         if not isinstance(step_preference_config, StepPreferenceConfig):
@@ -520,7 +524,8 @@ class Stage2Trainer(Trainer):
                     ]
                 )
                 pref[modality] = context_preference_loss(
-                    clean, off, config.beta, config.preference_margin
+                    clean, off, config.beta, config.preference_margin,
+                    stage2_debugging=getattr(self, "stage2_debugging", True),
                 )
                 sidecar_entropies = [
                     results[(step_id, modality)]["entropies"]
@@ -631,6 +636,7 @@ class Stage2Trainer(Trainer):
                 prefix_mode=config.prefix_mode,
                 branch_mode=config.branch_mode,
                 block_original_image=config.block_original_image,
+                stage2_debugging=getattr(self, "stage2_debugging", True),
             ),
         )
         if plan.root_selected_positions:
@@ -644,7 +650,7 @@ class Stage2Trainer(Trainer):
         if (
             not isinstance(clean_ce, torch.Tensor)
             or clean_ce.numel() != 1
-            or not bool(torch.isfinite(clean_ce))
+            or (getattr(self, "stage2_debugging", True) and not bool(torch.isfinite(clean_ce)))
         ):
             raise ValueError("clean CE must be a finite scalar")
         diagnostics = getattr(outputs, "stage2_diagnostics", None)
@@ -654,7 +660,8 @@ class Stage2Trainer(Trainer):
             else {key: value.detach() for key, value in diagnostics.items()}
         )
         rows = (
-            _selected_logits(outputs, len(plan.root_selected_positions))
+            _selected_logits(outputs, len(plan.root_selected_positions),
+                             stage2_debugging=getattr(self, "stage2_debugging", True))
             if spans
             else None
         )

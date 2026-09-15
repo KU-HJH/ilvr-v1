@@ -113,13 +113,11 @@ def test_stage2_peft_zero3_selects_dedicated_gpu_only_config(tuning_method):
     expected = json.loads(json.dumps(canonical))
     expected["zero_optimization"]["stage3_prefetch_bucket_size"] = 0
     expected["zero_optimization"]["offload_param"] = {
-        "device": "cpu",
-        "pin_memory": False,
+        "device": "none",
     }
     assert dedicated == expected
     assert dedicated["zero_optimization"]["offload_param"] == {
-        "device": "cpu",
-        "pin_memory": False,
+        "device": "none",
     }
     assert dedicated["zero_optimization"]["offload_optimizer"] == {
         "device": "none"
@@ -140,8 +138,9 @@ def test_stage2_peft_zero3_selects_dedicated_gpu_only_config(tuning_method):
     ).deepspeed_config == canonical_deepspeed_config(3)
 
 
-def test_dedicated_stage2_peft_zero3_allows_only_exact_cpu_param_offload(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("parameter_offload", [{"device": "cpu", "pin_memory": False}, {"device": "none"}])
+def test_dedicated_stage2_peft_zero3_allows_explicit_cpu_or_gpu_parameters(
+    tmp_path, monkeypatch, parameter_offload
 ):
     """Catches CPU parameter offload leaking beyond the selected PEFT policy."""
     canonical_path = tmp_path / "deepspeed_zero3.json"
@@ -151,10 +150,7 @@ def test_dedicated_stage2_peft_zero3_allows_only_exact_cpu_param_offload(
     )
     desired = deepcopy(canonical)
     desired["zero_optimization"]["stage3_prefetch_bucket_size"] = 0
-    desired["zero_optimization"]["offload_param"] = {
-        "device": "cpu",
-        "pin_memory": False,
-    }
+    desired["zero_optimization"]["offload_param"] = parameter_offload
     canonical_path.write_text(json.dumps(canonical), encoding="utf-8")
     dedicated_path.write_text(json.dumps(desired), encoding="utf-8")
     monkeypatch.setattr(
@@ -175,7 +171,7 @@ def test_dedicated_stage2_peft_zero3_allows_only_exact_cpu_param_offload(
         ("stage3_prefetch_bucket_size", 1),
         ("offload_optimizer", {"device": "cpu"}),
         ("offload_param", {"device": "cpu", "pin_memory": True}),
-        ("offload_param", {"device": "none"}),
+        ("offload_param", {"device": "nvme"}),
     ):
         mutated = deepcopy(desired)
         mutated["zero_optimization"][field] = value
@@ -185,6 +181,7 @@ def test_dedicated_stage2_peft_zero3_allows_only_exact_cpu_param_offload(
         with pytest.raises(ValueError, match="Stage 2 PEFT ZeRO-3"):
             load_deepspeed_runtime_profile(dedicated_path, world_size=4)
 
+    desired["zero_optimization"]["offload_param"] = {"device": "cpu", "pin_memory": False}
     canonical_path.write_text(json.dumps(desired), encoding="utf-8")
     with pytest.raises(ValueError, match="unsupported for canonical GPU runs"):
         load_deepspeed_runtime_profile(canonical_path, world_size=4)

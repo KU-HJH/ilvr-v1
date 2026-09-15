@@ -227,11 +227,11 @@ def validate_supported_deepspeed_policy(
             or zero.get("stage3_prefetch_bucket_size") != 0
             or zero.get("offload_optimizer") != {"device": "none"}
             or zero.get("offload_param")
-            != {"device": "cpu", "pin_memory": False}
+            not in ({"device": "cpu", "pin_memory": False}, {"device": "none"})
         ):
             raise ValueError(
-                "Stage 2 PEFT ZeRO-3 requires zero prefetch, CPU parameter "
-                "offload without pinning, and no optimizer offload"
+                "Stage 2 PEFT ZeRO-3 requires zero prefetch, GPU parameters or CPU "
+                "parameter offload without pinning, and no optimizer offload"
             )
     else:
         for field in ("offload_optimizer", "offload_param"):

@@ -13,8 +13,10 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
 
     if not isinstance(options, Mapping):
         raise TypeError("stage2_shared_prefix_inputs must be a mapping")
-    if set(options) - {"plan", "backend", "query_budget", "checkpoint", "prefix_mode", "branch_mode", "block_original_image"}:
+    if set(options) - {"plan", "backend", "query_budget", "checkpoint", "prefix_mode", "branch_mode", "block_original_image", "stage2_debugging"}:
         raise ValueError("unknown shared-prefix input options")
+    if type(options.get("stage2_debugging", True)) is not bool:
+        raise ValueError("stage2_debugging must be a boolean")
     if not isinstance(options.get("plan"), SidecarPlan):
         raise ValueError("shared-prefix inputs require a SidecarPlan")
     plan = options["plan"]
@@ -133,9 +135,12 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
     mask = torch.ones_like(input_ids) if attention_mask is None else attention_mask
     if mask.shape != input_ids.shape or mask.ndim != 2:
         raise ValueError("shared-prefix attention_mask must match input_ids")
-    expected = torch.arange(input_ids.shape[1], device=mask.device) < plan.root_length
-    if not torch.equal(mask.bool()[0], expected):
-        raise ValueError("shared-prefix root_length must match a right-padded clean input")
+    # The trainer already checks the input mask while building its CPU plan.
+    # Direct helper callers retain strict validation unless explicitly disabled.
+    if options.get("stage2_debugging", True):
+        expected = torch.arange(input_ids.shape[1], device=mask.device) < plan.root_length
+        if not torch.equal(mask.bool()[0], expected):
+            raise ValueError("shared-prefix root_length must match a right-padded clean input")
 
 
 def _branch_inputs(model, branch, input_ids, clean_embeds, clean_positions):

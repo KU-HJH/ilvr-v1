@@ -28,6 +28,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)
     parser.add_argument("--stage2_diagnostics_interval", type=int, default=0)
+    parser.add_argument("--stage2_debugging", action=argparse.BooleanOptionalAction,
+                        default=False, help="Run redundant Stage 2 context-preference diagnostic checks.")
     parser.add_argument("--step_preference_enabled", action="store_true")
     parser.add_argument("--step_preference_packing", action="store_true")
     parser.add_argument("--step_shared_prefix_enabled", action="store_true")

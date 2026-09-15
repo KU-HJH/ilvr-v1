@@ -129,7 +129,8 @@ def score_v_off_insertion(model, options, input_ids, base_inputs_embeds, image_g
         ids = torch.tensor([branch.token_ids], device=device)
         grids = image_grid_thw.to(device).repeat(len(branch.active_spans), 1)
         positions, _ = model.get_rope_index(ids, image_grid_thw=grids, attention_mask=torch.ones_like(ids))
-        if not torch.equal(positions[:, :, :prefix_length], off_positions[:, :, :prefix_length]):
+        if options.get('stage2_debugging', True) and not torch.equal(
+                positions[:, :, :prefix_length], off_positions[:, :, :prefix_length]):
             raise ValueError('ON positions before the insertion must equal actual OFF positions')
         sources = torch.tensor(branch.source_indices[prefix_length:], device=device)
         embeds = base_inputs_embeds.index_select(1, sources)

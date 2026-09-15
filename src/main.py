@@ -1078,6 +1078,7 @@ def run_stage2(args):
         stage2_peft_metadata=components.peft_metadata,
         deepspeed_runtime_profile=profile,
         stage2_diagnostics_interval=args.stage2_diagnostics_interval,
+        stage2_debugging=getattr(args, "stage2_debugging", False),
     )
     if (
         components.step_preference_config is not None
@@ -1085,6 +1086,10 @@ def run_stage2(args):
     ):
         trainer_kwargs["step_preference_config"] = components.step_preference_config
     trainer = components.trainer_class(**trainer_kwargs)
+    # Isolated experiment instrumentation; ordinary run IDs retain their path.
+    if Path(args.save_model_path).name.startswith("ours1-zero-speed-"):
+        from stage2.speed_probe import InsertionSpeedProbe
+        trainer.add_callback(InsertionSpeedProbe(trainer))
     baseline = begin_capacity_memory(trainer.accelerator.device) if capacity else None
     train_result = trainer.train(
         resume_from_checkpoint=components.trainer_resume_path

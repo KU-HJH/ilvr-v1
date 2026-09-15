@@ -955,6 +955,8 @@ _STAGE2_VALUE_OPTIONS = {
     "--seed",
 }
 _STAGE2_BOOLEAN_OPTIONS = {
+    "--stage2_debugging",
+    "--no-stage2_debugging",
     "--save_final_model",
     "--no-save_final_model",
     "--final_save",

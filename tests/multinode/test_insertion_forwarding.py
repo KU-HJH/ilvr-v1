@@ -6,7 +6,7 @@ import pytest
 
 from tests.multinode.test_stage2b_forwarding import REPO, stage2b_environment
 from src.multinode import build_launch_plan
-from src.multinode_runtime import build_owned_tmux_commands, validated_stage2_environment
+from src.multinode_runtime import build_owned_tmux_commands, validated_stage2_environment, validate_stage2_arguments
 from utils_deepseed import parse_args
 
 
@@ -50,3 +50,9 @@ def test_cumulative_is_rejected_for_old_cli_modes(prefix):
             '--step_preference_mode', 'stage2b', '--stage2a_checkpoint_path', 'tiny-a',
             '--step_preference_prefix_mode', prefix, '--step_preference_branch_mode', 'cumulative',
             '--no-step_visual_off_suppress_latent_boundaries'])
+
+
+@pytest.mark.parametrize('option,want', [('--stage2_debugging', True), ('--no-stage2_debugging', False)])
+def test_debugging_flag_passes_coordinator_argument_gate(option, want):
+    forwarded = validate_stage2_arguments([option])
+    assert parse_args(['--stage', 'stage2', *forwarded]).stage2_debugging is want

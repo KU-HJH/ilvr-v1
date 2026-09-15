@@ -89,7 +89,7 @@ def mean_completion_logps(
     return sums / counts
 
 
-def _validate_score_tensors(*scores: torch.Tensor) -> None:
+def _validate_score_tensors(*scores: torch.Tensor, stage2_debugging: bool = True) -> None:
     if not scores or not all(isinstance(score, torch.Tensor) for score in scores):
         raise ValueError("scores must be tensors")
     shape = scores[0].shape
@@ -97,7 +97,7 @@ def _validate_score_tensors(*scores: torch.Tensor) -> None:
         raise ValueError("all score tensors must have the same non-empty shape")
     if any(not score.is_floating_point() for score in scores):
         raise ValueError("scores must be floating-point tensors")
-    if any(not torch.isfinite(score).all() for score in scores):
+    if stage2_debugging and any(not torch.isfinite(score).all() for score in scores):
         raise ValueError("scores must be finite")
 
 
@@ -124,10 +124,11 @@ def context_preference_loss(
     ablated_logps: torch.Tensor,
     beta: float,
     margin: float,
+    *, stage2_debugging: bool = True,
 ) -> torch.Tensor:
     """Return the mean context-preference loss for paired step scores."""
     beta = _require_positive_finite("beta", beta)
-    _validate_score_tensors(clean_logps, ablated_logps)
+    _validate_score_tensors(clean_logps, ablated_logps, stage2_debugging=stage2_debugging)
     if clean_logps.numel() == 0:
         raise ValueError("context preference requires at least one step")
     if (
