@@ -2,6 +2,8 @@
 
 상태: **design proposal v1 (1–6절 동결), design commitment v1은 8절**. 7절은 중간 검토 당시의 기록이며, 그때의 OFF latent 질문은 이후 사용자 정정으로 해소되었다. 계산 흐름의 확인과 최종 문서에 대한 구현 승인을 구분한다. 코드는 아직 변경하지 않았다.
 
+승인 기록: 최종 문서 제시 후 사용자가 “진행해라”로 design commitment v1의 구현을 승인했다. 이제 구현·집중 검증을 진행한다. 학습 시작 승인은 포함하지 않는다.
+
 Understood as: 이미지 입력과 이미지에 조건화된 latent/KV를 받지 않은 V-off를 실제 실행하고, 그 실행에서 ON을 분기한다. `independent`는 매번 원래 V-off에서 시작하고, `cumulative`는 앞선 ON의 이미지 삽입과 계산 이력을 이어간다. 기존 `clean_prefix` 등은 보존한다.
 
 ## 1. 무엇을 바로잡는가
