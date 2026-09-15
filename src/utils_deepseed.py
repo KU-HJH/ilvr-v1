@@ -117,6 +117,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--entropy_eps", type=float, default=1e-6)
     parser.add_argument("--pre_window", type=int, default=1)
     parser.add_argument("--post_window", type=int, default=1)
+    parser.add_argument(
+        "--stage2_m_execution",
+        choices=("full_replay", "packed_suffix"),
+        default="full_replay",
+    )
     # global_pad_to 已存在，保留
 # 其余不变
 

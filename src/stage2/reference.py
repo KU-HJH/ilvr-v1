@@ -377,6 +377,13 @@ def _objective_payload(
     )
 
 
+def _objective_config_for_comparison(config_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Treat older objective sidecars as the historical full-replay mode."""
+    config = dict(config_dict)
+    config.setdefault("stage2_m_execution", "full_replay")
+    return config
+
+
 def save_objective_identity(
     path: str | Path,
     config_dict: Mapping[str, Any],
@@ -423,7 +430,9 @@ def validate_objective_identity_payload(
 ) -> None:
     """Compare a captured sidecar with the runtime using the resume contract."""
     expected = _objective_payload(
-        config_dict, reference_identity, vocabulary_identity
+        _objective_config_for_comparison(config_dict),
+        reference_identity,
+        vocabulary_identity,
     )
     if not isinstance(payload, dict) or set(payload) != set(expected):
         raise ValueError("invalid Stage 2 objective sidecar schema")
@@ -434,5 +443,8 @@ def validate_objective_identity_payload(
         ("reference_identity", "reference identity mismatch"),
         ("vocabulary_identity", "vocabulary identity mismatch"),
     ):
-        if payload.get(field) != expected[field]:
+        observed = payload.get(field)
+        if field == "config" and isinstance(observed, Mapping):
+            observed = _objective_config_for_comparison(observed)
+        if observed != expected[field]:
             raise ValueError(label)

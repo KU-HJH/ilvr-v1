@@ -36,6 +36,7 @@ def test_objective_cli_defaults_are_opt_in_and_json_serializable():
         "entropy_eps": 1e-6,
         "pre_window": 1,
         "post_window": 1,
+        "stage2_m_execution": "full_replay",
     }
     assert config.active is False
     json.dumps(config.to_dict())
@@ -65,6 +66,8 @@ def test_objective_cli_parses_all_explicit_values():
             "2",
             "--post_window",
             "3",
+            "--stage2_m_execution",
+            "packed_suffix",
         ]
     )
     config = _config_type().from_args(args)
@@ -80,6 +83,7 @@ def test_objective_cli_parses_all_explicit_values():
         "entropy_eps": 0.0001,
         "pre_window": 2,
         "post_window": 3,
+        "stage2_m_execution": "packed_suffix",
     }
 
 
@@ -93,6 +97,7 @@ def test_objective_cli_parses_all_explicit_values():
         ({"entropy_eps": 0.0}, "entropy_eps"),
         ({"pre_window": 0}, "pre_window"),
         ({"post_window": 1.5}, "post_window"),
+        ({"stage2_m_execution": "unknown"}, "stage2_m_execution"),
     ],
 )
 def test_objective_config_rejects_invalid_numeric_values(updates, message):

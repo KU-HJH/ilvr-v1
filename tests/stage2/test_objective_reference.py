@@ -582,6 +582,31 @@ def test_objective_sidecar_rejects_missing_and_every_identity_mismatch(
         )
 
 
+def test_objective_resume_defaults_missing_packed_mode_to_full_replay(tmp_path):
+    """Catches old resumes selecting packed execution or relaxing other identity checks."""
+    reference_api = _api()
+    checkpoint = tmp_path / "legacy-objective"
+    config = {"enable_stage2_objective": True, "lambda_vis": 1.0,
+              "stage2_m_execution": "full_replay"}
+    reference = {"source": "fixed"}
+    vocabulary = {"output_size": 8, "token_ids": [1, 2]}
+    reference_api.save_objective_identity(checkpoint, config, reference, vocabulary)
+    sidecar = checkpoint / "stage2_objective.json"
+    payload = json.loads(sidecar.read_text())
+    del payload["config"]["stage2_m_execution"]
+    sidecar.write_text(json.dumps(payload))
+
+    reference_api.validate_objective_resume(checkpoint, config, reference, vocabulary)
+    with pytest.raises(ValueError, match="configuration mismatch"):
+        reference_api.validate_objective_resume(
+            checkpoint, {**config, "stage2_m_execution": "packed_suffix"}, reference, vocabulary
+        )
+    with pytest.raises(ValueError, match="configuration mismatch"):
+        reference_api.validate_objective_resume(
+            checkpoint, {**config, "lambda_vis": 0.5}, reference, vocabulary
+        )
+
+
 def test_reference_rejects_incompatible_tokenizer_or_output_layout(checkpoint_directory):
     """Catches entropy comparison across different token IDs or output widths."""
     reference_api = _api()

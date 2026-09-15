@@ -39,6 +39,7 @@ class Stage2ObjectiveConfig:
     entropy_eps: float = 1e-6
     pre_window: int = 1
     post_window: int = 1
+    stage2_m_execution: str = "full_replay"
 
     @classmethod
     def from_args(cls, args) -> "Stage2ObjectiveConfig":
@@ -52,6 +53,7 @@ class Stage2ObjectiveConfig:
             entropy_eps=args.entropy_eps,
             pre_window=args.pre_window,
             post_window=args.post_window,
+            stage2_m_execution=getattr(args, "stage2_m_execution", "full_replay"),
         )
 
     @property
@@ -82,6 +84,10 @@ class Stage2ObjectiveConfig:
             or not self.reference_model_path.strip()
         ):
             raise ValueError("reference_model_path must be an unset or non-empty string")
+        if self.stage2_m_execution not in ("full_replay", "packed_suffix"):
+            raise ValueError(
+                "stage2_m_execution must be 'full_replay' or 'packed_suffix'"
+            )
         if not self.enable_stage2_objective:
             return
         if stage != "stage2":

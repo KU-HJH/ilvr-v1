@@ -1,6 +1,7 @@
 """Local F/reference/M execution; distributed reduction belongs to the Trainer."""
 
 from dataclasses import dataclass, fields
+from contextlib import nullcontext
 from functools import partial
 import os
 
@@ -10,6 +11,7 @@ from torch.utils.checkpoint import checkpoint
 from peft_common import resolve_qwen2_5_vl_model
 from .objective import Stage2ObjectiveConfig, entropy_transition, text_entropy, target_log_likelihood, vision_gain
 from .objective_windows import select_objective_windows, WindowSelection
+from .packed_m import PackedMPrefixCapture, score_packed_m
 from .rng import capture_rng_state, replay_rng_state
 
 
@@ -118,9 +120,24 @@ class Stage2ObjectiveRuntime:
         current_student = counterfactual_model if counterfactual_model is not None else model
         validate_objective_student(current_student)
         clean = model_inputs(inputs)
-        rng = capture_rng_state()
-        outputs, decoder_calls = counted_forward(model, clean, student=current_student,
-                                                 collect_stage2_diagnostics=True, stage2_finite_ce=True)
+        use_packed = (
+            self.config.stage2_m_execution == "packed_suffix"
+            and self.config.lambda_vis > 0.0
+            and bool(selection.blocks)
+        )
+        rng = (
+            capture_rng_state()
+            if self.config.lambda_vis > 0.0 and selection.blocks and not use_packed
+            else None
+        )
+        capture_context = (
+            PackedMPrefixCapture(current_student, clean["input_ids"].shape[1])
+            if use_packed
+            else nullcontext()
+        )
+        with capture_context as captured:
+            outputs, decoder_calls = counted_forward(model, clean, student=current_student,
+                                                     collect_stage2_diagnostics=True, stage2_finite_ce=True)
         zero = outputs.loss * 0.0
         result = ObjectiveBatchResult(outputs, outputs.loss, zero, zero, len(selection.blocks), {}, {})
 
@@ -147,7 +164,26 @@ class Stage2ObjectiveRuntime:
             add("model_forwards_reference", 1, 0)
             add("decoder_forwards_reference", calls, 0)
 
-        for block in selection.blocks:
+        packed_scores = (
+            score_packed_m(current_student, inputs, selection.blocks, captured)
+            if use_packed
+            else None
+        )
+        if self.config.lambda_vis:
+            add("m_branches", len(selection.blocks), 0)
+            add(
+                "m_query_rows",
+                sum(
+                    max(block.post_positions) - block.end_position + 1
+                    for block in selection.blocks
+                ),
+                0,
+            )
+            if packed_scores is not None:
+                add("model_forwards_M", 0, 0)
+                add("decoder_forwards_M", packed_scores.decoder_calls, 0)
+
+        for packed_index, block in enumerate(selection.blocks):
             # Select sequence rows BEFORE FP32 entropy / likelihood operations.
             post_logits = outputs.logits[block.batch_index, list(block.post_positions)]
             try:
@@ -167,18 +203,22 @@ class Stage2ObjectiveRuntime:
                 if self.config.lambda_vis:
                     targets = torch.tensor(block.target_ids, device=post_logits.device)
                     score_f = target_log_likelihood(post_logits, targets).mean()
-                    with torch.no_grad(), replay_rng_state(rng):
-                        masked, calls = counted_forward(current_student, auxiliary_inputs,
-                                                         stage2_ablation=(block.start_position, block.end_position))
-                        score_m = target_log_likelihood(masked.logits[block.batch_index, list(block.post_positions)], targets).mean()
-                    del masked
+                    if packed_scores is not None:
+                        score_m = packed_scores.scores[packed_index]
+                    else:
+                        with torch.no_grad(), replay_rng_state(rng):
+                            masked, calls = counted_forward(current_student, auxiliary_inputs,
+                                                             stage2_ablation=(block.start_position, block.end_position))
+                            score_m = target_log_likelihood(masked.logits[block.batch_index, list(block.post_positions)], targets).mean()
+                        del masked
                     metrics = vision_gain(score_f, score_m.detach(), m_V=self.config.m_V)
                     result.vis_sum = result.vis_sum + metrics["loss_vis"]
                     for name, value in metrics.items():
                         add(name, value)
                     add("G_gt_0", (metrics["G"] > 0).float())
-                    add("model_forwards_M", 1, 0)
-                    add("decoder_forwards_M", calls, 0)
+                    if packed_scores is None:
+                        add("model_forwards_M", 1, 0)
+                        add("decoder_forwards_M", calls, 0)
             except ValueError as error:
                 raise ValueError(
                     f"Stage 2 objective batch_index={block.batch_index}, block_index={block.block_index}, "

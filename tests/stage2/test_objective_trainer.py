@@ -117,6 +117,42 @@ def test_ce_only_bypasses_window_parser_and_preserves_legacy_loss():
         assert torch.equal(legacy.compute_loss(model, example), enabled.compute_loss(model, example))
 
 
+def test_actual_trainer_logs_packed_m_runtime_counters_once():
+    """Catches Trainer dropping packed M's literal model/decoder counter meanings."""
+    from .packed_m_helpers import (
+        TEXT_VOCABULARY,
+        TOKENS,
+        make_packed_inputs,
+        make_packed_model,
+    )
+    from stage2.objective_runtime import Stage2ObjectiveRuntime
+
+    model = make_packed_model()
+    config = Stage2ObjectiveConfig(
+        enable_stage2_objective=True,
+        lambda_vis=1.0,
+        stage2_m_execution="packed_suffix",
+        post_window=2,
+    )
+    objective_runtime = Stage2ObjectiveRuntime(
+        config, TOKENS, 2, TEXT_VOCABULARY, reference=None
+    )
+    trainer = make_trainer(model, config, objective_runtime, accumulation=1)
+    inputs = make_packed_inputs(blocks=2)
+    selection = objective_runtime.select(inputs)
+    loss = trainer.compute_loss(model, inputs)
+    assert torch.isfinite(loss)
+    trainer.log({})
+    logs = trainer.state.log_history[-1]
+    assert logs["stage2/objective/model_forwards_M"] == 0
+    assert logs["stage2/objective/decoder_forwards_M"] == 1
+    assert logs["stage2/objective/m_branches"] == len(selection.blocks)
+    assert logs["stage2/objective/m_query_rows"] == sum(
+        max(block.post_positions) - block.end_position + 1
+        for block in selection.blocks
+    )
+
+
 def test_empty_valid_set_skips_auxiliary_and_malformed_markers_raise():
     model = tiny_stage2_qwen()
     config = Stage2ObjectiveConfig(True, 1, 1, "original")

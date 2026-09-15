@@ -47,6 +47,7 @@ _OBJECTIVE_METRICS = (
     "excluded_empty_pre", "excluded_empty_post",
     "excluded_overlap_empty_pre", "excluded_overlap_empty_post",
     "low_reference_entropy",
+    "m_branches", "m_query_rows",
     "model_forwards_F", "model_forwards_M", "model_forwards_reference",
     "decoder_forwards_F", "decoder_forwards_M", "decoder_forwards_reference",
 )
