@@ -13,7 +13,7 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
 
     if not isinstance(options, Mapping):
         raise TypeError("stage2_shared_prefix_inputs must be a mapping")
-    if set(options) - {"plan", "backend", "query_budget", "checkpoint", "prefix_mode", "branch_mode", "block_original_image", "stage2_debugging"}:
+    if set(options) - {"plan", "backend", "query_budget", "checkpoint", "prefix_mode", "branch_mode", "block_original_image", "stage2_debugging", "on_layer_checkpoint_stride"}:
         raise ValueError("unknown shared-prefix input options")
     if type(options.get("stage2_debugging", True)) is not bool:
         raise ValueError("stage2_debugging must be a boolean")
@@ -23,6 +23,11 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
     prefix_mode = options.get("prefix_mode", "clean_prefix")
     if prefix_mode not in ("clean_prefix", "v_off_prefix", "v_off_insertion"):
         raise ValueError("unknown preference prefix_mode")
+    stride = options.get("on_layer_checkpoint_stride", 1)
+    if type(stride) is not int or stride not in (1, 2, 4):
+        raise ValueError("on_layer_checkpoint_stride must be 1, 2 or 4")
+    if stride != 1 and prefix_mode != "v_off_insertion":
+        raise ValueError("reduced on_layer_checkpoint_stride requires v_off_insertion")
     branch_mode = options.get("branch_mode", "independent")
     if branch_mode not in ("independent", "cumulative"):
         raise ValueError("unknown preference branch_mode")

@@ -72,6 +72,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("clean_prefix", "v_off_prefix", "v_off_insertion"), default="clean_prefix")
     parser.add_argument("--step_preference_branch_mode",
         choices=("independent", "cumulative"), default="independent")
+    parser.add_argument("--step_on_layer_checkpoint_stride", type=int, choices=(1, 2, 4), default=1,
+        help="Checkpoint every Nth ON decoder layer in v_off_insertion; CE/OFF are unchanged.")
     parser.add_argument("--step_preference_block_original_image", action="store_true")
     parser.add_argument(
         "--step_visual_only_context_preference",

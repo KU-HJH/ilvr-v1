@@ -933,6 +933,7 @@ def validated_stage2_environment(
 
 
 _STAGE2_VALUE_OPTIONS = {
+    "--step_on_layer_checkpoint_stride",
     "--evaluation_output_path",
     "--model",
     "--task",

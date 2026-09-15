@@ -11,7 +11,8 @@ from utils_deepseed import parse_args
 
 
 @pytest.mark.parametrize('mode', ['independent', 'cumulative'])
-def test_insertion_mode_reaches_both_workers_and_config(mode):
+@pytest.mark.parametrize('stride', [1, 2, 4])
+def test_insertion_mode_reaches_both_workers_and_config(mode, stride):
     source = stage2b_environment()
     source.pop('STEP_NEGATIVE_PATH')
     source.pop('STEP_NEGATIVE_MANIFEST')
@@ -25,7 +26,9 @@ def test_insertion_mode_reaches_both_workers_and_config(mode):
         output_dir=str(REPO/'checkpoints'/plan.run_id),
         log_file=str(REPO/'logs'/plan.run_id/'train.log'),
         deepspeed_config=str(plan.deepspeed_config))
-    commands = build_owned_tmux_commands(plan, commit='a'*40, stage_environment=environment)
+    forwarded = validate_stage2_arguments(['--step_on_layer_checkpoint_stride', str(stride)])
+    commands = build_owned_tmux_commands(plan, commit='a'*40, stage_environment=environment,
+                                        stage_arguments=forwarded)
     for spec in commands.node_specs:
         worker_env = dict(spec.environment)
         assert worker_env.get('STEP_PREFERENCE_BRANCH_MODE') == mode
@@ -36,11 +39,14 @@ def test_insertion_mode_reaches_both_workers_and_config(mode):
         argv = json.loads(result.stdout)
         assert argv[argv.index('--step_preference_prefix_mode')+1] == 'v_off_insertion'
         assert argv[argv.index('--step_preference_branch_mode')+1] == mode
+        assert argv[argv.index('--step_on_layer_checkpoint_stride')+1] == str(stride)
     args = parse_args(['--stage', 'stage2', '--step_preference_enabled',
         '--step_preference_mode', 'stage2b', '--stage2a_checkpoint_path', 'tiny-a',
         '--step_shared_prefix_enabled', '--step_preference_prefix_mode', 'v_off_insertion',
-        '--step_preference_branch_mode', mode, '--no-step_visual_off_suppress_latent_boundaries'])
+        '--step_preference_branch_mode', mode, '--no-step_visual_off_suppress_latent_boundaries',
+        '--step_on_layer_checkpoint_stride', str(stride)])
     assert args.step_preference_config.branch_mode == mode
+    assert args.step_preference_config.on_layer_checkpoint_stride == stride
 
 
 @pytest.mark.parametrize('prefix', ['clean_prefix', 'v_off_prefix'])

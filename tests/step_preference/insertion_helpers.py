@@ -9,10 +9,10 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentSpan
 from tests.step_preference.test_v_off_insertion import two_step_inputs
 
 
-def native_case():
+def native_case(num_hidden_layers=2):
     torch.manual_seed(481)
     config = _tiny_model().config
-    config.num_hidden_layers = 2
+    config.num_hidden_layers = num_hidden_layers
     config.vision_start_token_id = 78
     config.vision_end_token_id = 79
     config._attn_implementation = 'sdpa'

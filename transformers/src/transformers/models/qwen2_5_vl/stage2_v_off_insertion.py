@@ -35,7 +35,7 @@ def _target_tensors(targets, device, offset=0):
     return selected, tokens, tuple(len(t.target_token_ids) for t in targets)
 
 
-def _on_function(model, branch, positions, backend):
+def _on_function(model, branch, positions, backend, checkpoint_stride=1):
     """Bind metadata once per branch for nonreentrant backward recomputation."""
     prefix_length = branch.prefix_length
     selected, tokens, lengths = _target_tensors(branch.targets, positions.device, prefix_length)
@@ -50,6 +50,7 @@ def _on_function(model, branch, positions, backend):
             return model.model(inputs_embeds=inputs_embeds, position_ids=position_ids,
                 attention_mask=_causal_mask(model, inputs_embeds, prefix_length, backend),
                 stage2_prefix_key_values=prefix, stage2_checkpoint_prefix=True,
+                stage2_checkpoint_prefix_stride=checkpoint_stride,
                 generate_mode=True, **kwargs)
 
         mask = torch.ones(embeds.shape[:2], dtype=torch.long, device=embeds.device)
@@ -135,7 +136,8 @@ def score_v_off_insertion(model, options, input_ids, base_inputs_embeds, image_g
         sources = torch.tensor(branch.source_indices[prefix_length:], device=device)
         embeds = base_inputs_embeds.index_select(1, sources)
         prefix = tuple(tensor[:, :, :prefix_length] for pair in off.stage2_key_values for tensor in pair)
-        score = _on_function(model, branch, positions[:, :, prefix_length:], backend)
+        score = _on_function(model, branch, positions[:, :, prefix_length:], backend,
+                             options.get('on_layer_checkpoint_stride', 1))
         values = (checkpoint(score, embeds, *prefix, use_reentrant=False, preserve_rng_state=True)
                   if use_checkpoint else score(embeds, *prefix))
         append_results(branch.targets, 'visual_on', values)

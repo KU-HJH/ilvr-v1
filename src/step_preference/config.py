@@ -76,6 +76,7 @@ class StepPreferenceConfig:
     preference_margin: float = 0.0
     prefix_mode: str = "clean_prefix"
     branch_mode: str = "independent"
+    on_layer_checkpoint_stride: int = 1
     block_original_image: bool = False
     visual_only_context_preference: bool | None = None
     visual_off_suppress_latent_boundaries: bool | None = None
@@ -121,6 +122,10 @@ class StepPreferenceConfig:
             raise ValueError("branch_mode must be independent or cumulative")
         if self.branch_mode == "cumulative" and self.prefix_mode != "v_off_insertion":
             raise ValueError("cumulative branch_mode requires v_off_insertion")
+        if type(self.on_layer_checkpoint_stride) is not int or self.on_layer_checkpoint_stride not in (1, 2, 4):
+            raise ValueError("on_layer_checkpoint_stride must be 1, 2 or 4")
+        if self.on_layer_checkpoint_stride != 1 and self.prefix_mode != "v_off_insertion":
+            raise ValueError("reduced on_layer_checkpoint_stride requires v_off_insertion")
         if self.prefix_mode == "v_off_insertion" and not self.shared_prefix_enabled:
             raise ValueError("v_off_insertion requires shared-prefix execution")
         if type(self.block_original_image) is not bool:
@@ -327,6 +332,7 @@ class StepPreferenceConfig:
             preference_margin=getattr(args, "step_preference_margin", 0.0),
             prefix_mode=getattr(args, "step_preference_prefix_mode", "clean_prefix"),
             branch_mode=getattr(args, "step_preference_branch_mode", "independent"),
+            on_layer_checkpoint_stride=getattr(args, "step_on_layer_checkpoint_stride", 1),
             block_original_image=getattr(args, "step_preference_block_original_image", False),
             visual_only_context_preference=getattr(
                 args, "step_visual_only_context_preference", None

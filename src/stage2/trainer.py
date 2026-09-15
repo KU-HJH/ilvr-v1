@@ -635,6 +635,7 @@ class Stage2Trainer(Trainer):
                 query_budget=config.sidecar_query_budget,
                 prefix_mode=config.prefix_mode,
                 branch_mode=config.branch_mode,
+                on_layer_checkpoint_stride=config.on_layer_checkpoint_stride,
                 block_original_image=config.block_original_image,
                 stage2_debugging=getattr(self, "stage2_debugging", True),
             ),
