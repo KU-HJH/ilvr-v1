@@ -215,9 +215,11 @@ suffix. The cache uses physical packed positions while the original three-axis
 mRoPE positions are passed separately.
 
 This CPU-supported path is limited to B=1, eager/SDPA, FP32/BF16, zero native
-attention dropout, native non-reentrant checkpointing, native DDP, and one
-unmerged supported Linear LoRA/DoRA adapter layout (ordinary adapter dropout is
-replayed at its recorded F RNG state). It does not establish support for
+attention dropout, native non-reentrant checkpointing, and native DDP.
+Full tuning is supported with zero native attention dropout in that envelope.
+When a LoRA/DoRA adapter is active,
+packed mode instead requires one unmerged supported Linear adapter layout;
+ordinary adapter dropout is replayed at its recorded F RNG state. It does not establish support for
 ZeRO, FlashAttention, FP16, FSDP, compilation, CUDA dropout behavior, real-image
 equivalence, two-host execution, or a GPU training run.
 
