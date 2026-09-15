@@ -20,7 +20,12 @@ from utils_deepseed import parse_args
 @pytest.mark.parametrize("scope", ["immediate_text", "until_next_latent"])
 def test_cli_target_scope_reaches_config_independently_of_boundary_mode(scope):
     """Catches losing the option in CLI-to-config conversion or coupling boundaries."""
-    for boundary_args in ([], ["--step_visual_off_suppress_latent_boundaries"]):
+    boundary_cases = (
+        ([], True),
+        (["--step_visual_off_suppress_latent_boundaries"], True),
+        (["--no-step_visual_off_suppress_latent_boundaries"], False),
+    )
+    for boundary_args, expected_suppression in boundary_cases:
         args = parse_args([
             "--stage", "stage2", "--step_preference_enabled",
             "--step_preference_mode", "stage2b",
@@ -29,7 +34,10 @@ def test_cli_target_scope_reaches_config_independently_of_boundary_mode(scope):
             "--step_preference_target_scope", scope, *boundary_args,
         ])
         assert args.step_preference_config.target_scope == scope
-        assert args.step_preference_config.visual_off_suppress_latent_boundaries == bool(boundary_args)
+        assert (
+            args.step_preference_config.visual_off_suppress_latent_boundaries
+            is expected_suppression
+        )
     assert parse_args(["--stage", "stage2"]).step_preference_config.target_scope == "immediate_text"
 
 

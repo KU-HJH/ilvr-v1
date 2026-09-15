@@ -2200,6 +2200,12 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 return_dict=return_dict, use_cache=use_cache,
                 past_key_values=past_key_values, output_attentions=output_attentions,
             )
+            if (
+                stage2_shared_prefix_inputs.get("prefix_mode") == "v_off_insertion"
+                and stage2_shared_prefix_inputs["plan"].groups[0]
+                and pixel_values is None
+            ):
+                raise ValueError("v_off_insertion requires pixel_values for active visual branches")
         packed_values = None
         if packed:
             if not return_dict:
@@ -2517,17 +2523,27 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
-            **({"stage2_capture_kv": True} if shared and any(stage2_shared_prefix_inputs["plan"].groups) else {}),
+            **({"stage2_capture_kv": True} if shared
+               and stage2_shared_prefix_inputs.get("prefix_mode", "clean_prefix") == "clean_prefix"
+               and any(stage2_shared_prefix_inputs["plan"].groups) else {}),
         )
         sidecar_results, sidecar_stats = None, None
         if shared:
-            from .stage2_shared_prefix import score_sidecars
+            if stage2_shared_prefix_inputs.get("prefix_mode") == "v_off_insertion":
+                from .stage2_v_off_insertion import score_v_off_insertion
 
-            sidecar_results, sidecar_stats = score_sidecars(
-                self, stage2_shared_prefix_inputs, input_ids,
-                rollout.final_inputs_embeds, full_position_ids,
-                getattr(final_outputs, "stage2_key_values", ()),
-            )
+                sidecar_results, sidecar_stats = score_v_off_insertion(
+                    self, stage2_shared_prefix_inputs, input_ids,
+                    base_inputs_embeds, image_grid_thw,
+                )
+            else:
+                from .stage2_shared_prefix import score_sidecars
+
+                sidecar_results, sidecar_stats = score_sidecars(
+                    self, stage2_shared_prefix_inputs, input_ids,
+                    rollout.final_inputs_embeds, full_position_ids,
+                    getattr(final_outputs, "stage2_key_values", ()),
+                )
         selected_logits = None
         if stage2_loss_only:
             shift_labels = labels[..., 1:].contiguous().view(-1).to(
