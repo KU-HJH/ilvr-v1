@@ -1,6 +1,8 @@
 # Stage 2 packed M suffix replay — design proposal v2
 
-Status: **proposal, not implementation-authorizing approval**.
+Status: **design commitment v2 approved by the user ("ㅇㅋ"), 2026-09-15**.
+The historical proposal/approval-boundary wording below records the pre-approval
+sequence; approval applies only to sections 1–6 plus section 8, unchanged.
 
 understood as: leave normal Stage 2 latent generation unchanged; eliminate
 blockwise full M rollouts by sharing safe F prefix K/V and grouping independent
@@ -253,7 +255,7 @@ proposal does not itself authorize implementation or overwrite the kept branch.
 
 ## 8. Design commitment v2 — final approval target
 
-**Status: awaiting explicit human approval.** The exact approval target is
+**Status: explicitly approved by the user ("ㅇㅋ"), 2026-09-15.** The exact approval target is
 **design commitment v2: sections 1–6 of proposal v2 plus this section 8**.
 Sections 1–6 specify the problem/scope, final design, interfaces, tests and
 support limits. Sections 7–8 describe approval, not an already granted approval.
