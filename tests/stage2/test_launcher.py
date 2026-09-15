@@ -185,8 +185,11 @@ def test_stage2_multinode_dry_run_emits_rank_zero_four_process_command():
     )
 
 
-def test_production_entrypoint_imports_with_build_marker_then_restores_platform():
-    """Catches datasets rejecting 3.11.15+ or normalization leaking after imports."""
+@pytest.mark.parametrize("injected_version", ("3.11.15+", "3.11.15"))
+def test_production_entrypoint_imports_with_injected_version_then_restores_platform(
+    injected_version,
+):
+    """Catches normalization leaking after a real production entrypoint import."""
     environment = {
         **os.environ,
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -196,14 +199,16 @@ def test_production_entrypoint_imports_with_build_marker_then_restores_platform(
         [
             str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
             "-c",
-            (
-                "import platform; "
-                "original = platform.python_version; "
-                "assert original().endswith('+'), original(); "
-                "import main; "
-                "assert platform.python_version is original; "
-                "assert platform.python_version().endswith('+')"
-            ),
+            f"""
+import platform
+
+injected_version = {injected_version!r}
+original = lambda: injected_version
+platform.python_version = original
+import main
+assert platform.python_version is original
+assert platform.python_version() == injected_version
+""",
         ],
         cwd=REPO_ROOT,
         env=environment,

@@ -25,8 +25,11 @@ from stage1.evaluation_diagnostics import (
 )
 
 
-def test_diagnostic_entrypoint_imports_with_build_marker_outside_pytest_normalization():
-    """Catches diagnostics importing datasets with the host's trailing-plus version."""
+@pytest.mark.parametrize("injected_version", ("3.11.15+", "3.11.15"))
+def test_diagnostic_entrypoint_imports_with_injected_version_then_restores_platform(
+    injected_version,
+):
+    """Catches diagnostics leaking normalization after a real CLI import."""
     repo_root = Path(__file__).resolve().parents[2]
     environment = {
         **os.environ,
@@ -36,9 +39,26 @@ def test_diagnostic_entrypoint_imports_with_build_marker_outside_pytest_normaliz
     completed = subprocess.run(
         [
             str(repo_root / "venv/ilvr-venv/bin/python"),
-            "-m",
-            "stage1.evaluation_diagnostics",
-            "--help",
+            "-c",
+            f"""
+import platform
+import runpy
+import sys
+
+injected_version = {injected_version!r}
+original = lambda: injected_version
+platform.python_version = original
+sys.argv = ["stage1.evaluation_diagnostics", "--help"]
+try:
+    runpy.run_module("stage1.evaluation_diagnostics", run_name="__main__")
+except SystemExit as error:
+    assert error.code == 0
+else:
+    raise AssertionError("diagnostic help did not exit")
+
+assert platform.python_version is original
+assert platform.python_version() == injected_version
+""",
         ],
         cwd=repo_root,
         env=environment,
@@ -51,8 +71,8 @@ def test_diagnostic_entrypoint_imports_with_build_marker_outside_pytest_normaliz
     assert "recurrence-probe" in completed.stdout
 
 
-def test_diagnostic_entrypoint_leaves_an_extra_build_marker_invalid():
-    """Catches normalizing an independently invalid trailing-plus version."""
+def test_diagnostic_entrypoint_normalizes_one_marker_at_heavy_import_boundary():
+    """Catches skipping normalization, stripping all markers, or leaking on error."""
     repo_root = Path(__file__).resolve().parents[2]
     environment = {
         **os.environ,
@@ -64,16 +84,35 @@ def test_diagnostic_entrypoint_leaves_an_extra_build_marker_invalid():
             str(repo_root / "venv/ilvr-venv/bin/python"),
             "-c",
             """
+import builtins
 import platform
-from packaging.version import InvalidVersion
 
-platform.python_version = lambda: "3.11.15++"
+injected_version = "3.11.15++"
+expected_boundary_version = "3.11.15+"
+original = lambda: injected_version
+platform.python_version = original
+real_import = builtins.__import__
+observed_versions = []
+
+def fail_torch_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "torch":
+        observed_versions.append(platform.python_version())
+        raise RuntimeError("simulated heavy import failure")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = fail_torch_import
 try:
     import stage1.evaluation_diagnostics
-except InvalidVersion as error:
-    assert str(error) == "Invalid version: '3.11.15+'"
+except RuntimeError as error:
+    assert str(error) == "simulated heavy import failure"
 else:
-    raise AssertionError("an extra build marker was accepted")
+    raise AssertionError("the simulated heavy import unexpectedly succeeded")
+finally:
+    builtins.__import__ = real_import
+
+assert observed_versions == [expected_boundary_version]
+assert platform.python_version is original
+assert platform.python_version() == injected_version
 """,
         ],
         cwd=repo_root,
@@ -102,11 +141,16 @@ def test_diagnostic_entrypoint_restores_platform_after_heavy_import_failure():
 import builtins
 import platform
 
-original = platform.python_version
+injected_version = "3.11.15+"
+expected_boundary_version = "3.11.15"
+original = lambda: injected_version
+platform.python_version = original
 real_import = builtins.__import__
+observed_versions = []
 
 def fail_torch_import(name, globals=None, locals=None, fromlist=(), level=0):
     if name == "torch":
+        observed_versions.append(platform.python_version())
         raise RuntimeError("simulated heavy import failure")
     return real_import(name, globals, locals, fromlist, level)
 
@@ -120,8 +164,9 @@ else:
 finally:
     builtins.__import__ = real_import
 
+assert observed_versions == [expected_boundary_version]
 assert platform.python_version is original
-assert platform.python_version().endswith("+")
+assert platform.python_version() == injected_version
 """,
         ],
         cwd=repo_root,

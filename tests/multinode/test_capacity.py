@@ -778,22 +778,20 @@ def test_stage1_coordinator_uses_training_evidence_step_without_max_steps(
     result_root = repository / "results"
     checkpoint_root = repository / "checkpoints"
     child_run_id = "capacity-parent-batch2"
-    plan = SimpleNamespace(
-        run_id=child_run_id,
-        attempt_id="initial",
+    plan = multinode_module.build_launch_plan(
         stage="stage1",
         tuning_method="lora",
         zero_stage=3,
-        world_size=4,
-        cluster=SimpleNamespace(remote_repo_root=repository),
+        run_id=child_run_id,
+        main_process_port=29631,
     )
+    monkeypatch.setattr(multinode_module, "_REPOSITORY_ROOT", repository)
     commands = SimpleNamespace(
         command_digests=("a" * 64, "b" * 64),
         finite_loss_evidence_path=(
             result_root / child_run_id / "initial-producer-evidence.json"
         ),
     )
-    monkeypatch.setattr(multinode_module, "_REPOSITORY_ROOT", repository)
     monkeypatch.setattr(
         multinode_module, "validate_stage1_arguments", lambda values: tuple(values)
     )
