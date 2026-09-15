@@ -110,12 +110,12 @@ def test_actual_runtime_packed_matches_full_loss_scores_and_gradients(
     autocast = torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16)
 
     with replay_rng_state(paired_rng), autocast:
-        full_result, full_scores, full_grads, _, full_rng = _run_runtime(
-            full, inputs, mode="full_replay"
+        full_result, full_scores, full_grads, full_latents, full_rng = _run_runtime(
+            full, inputs, mode="full_replay", retain_latents=True
         )
     with replay_rng_state(paired_rng), torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
-        packed_result, packed_scores, packed_grads, _, packed_rng = _run_runtime(
-            packed, inputs, mode="packed_suffix"
+        packed_result, packed_scores, packed_grads, packed_latents, packed_rng = _run_runtime(
+            packed, inputs, mode="packed_suffix", retain_latents=True
         )
 
     tolerance = {"atol": 1e-3, "rtol": 1e-2} if bf16 else {"atol": 1e-6, "rtol": 1e-5}
@@ -130,6 +130,15 @@ def test_actual_runtime_packed_matches_full_loss_scores_and_gradients(
         if packed_gradient is not None:
             assert torch.isfinite(packed_gradient).all(), name
             torch.testing.assert_close(packed_gradient, full_grads[name], **tolerance)
+    assert full_latents and len(full_latents) == len(packed_latents)
+    for index, (full_latent, packed_latent) in enumerate(
+        zip(full_latents, packed_latents, strict=True)
+    ):
+        assert (full_latent.grad is None) == (packed_latent.grad is None), index
+        assert full_latent.grad is not None and packed_latent.grad is not None, index
+        assert torch.isfinite(full_latent.grad).all(), index
+        assert torch.isfinite(packed_latent.grad).all(), index
+        torch.testing.assert_close(packed_latent.grad, full_latent.grad, **tolerance)
     torch.testing.assert_close(packed_rng.cpu_state, full_rng.cpu_state, atol=0, rtol=0)
     assert packed_result.metric_sums["model_forwards_M"] == 0
     assert packed_result.metric_sums["decoder_forwards_M"] == 1
