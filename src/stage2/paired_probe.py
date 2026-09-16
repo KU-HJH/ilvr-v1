@@ -1,5 +1,6 @@
 """First-update evidence for isolated pair probes; never valid speed timings."""
 import dataclasses
+from collections.abc import Mapping
 import hashlib
 import json
 from pathlib import Path
@@ -39,7 +40,7 @@ def hash_structured_value(value):
         elif dataclasses.is_dataclass(item) and not isinstance(item, type):
             emit(b"dataclass"); visit(type(item).__module__ + "." + type(item).__qualname__)
             visit({field.name: getattr(item, field.name) for field in dataclasses.fields(item)})
-        elif isinstance(item, dict) and all(isinstance(key, str) for key in item):
+        elif isinstance(item, Mapping) and all(isinstance(key, str) for key in item):
             emit(b"dict")
             for key in sorted(item):
                 visit(key); visit(item[key])

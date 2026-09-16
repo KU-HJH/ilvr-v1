@@ -36,6 +36,30 @@ def test_structured_hash_is_order_stable_and_detects_tensor_or_metadata_mutation
         hash_structured_value(object())
 
 
+def test_real_batchfeature_hashes_all_mapping_values_without_mutation():
+    from transformers import BatchFeature
+
+    batch = BatchFeature(data={
+        "input_ids": torch.tensor([[11, 12, 13]]),
+        "attention_mask": torch.tensor([[1, 1, 1]]),
+        "labels": torch.tensor([[-100, 12, 13]]),
+    })
+    snapshot = {key: value.clone() for key, value in batch.items()}
+    try:
+        digest = hash_structured_value(batch)
+    except TypeError as error:
+        pytest.fail(f"real BatchFeature mapping rejected: {error}")
+    assert digest == hash_structured_value(snapshot)
+    assert set(batch) == set(snapshot)
+    for key, value in batch.items():
+        assert torch.equal(value, snapshot[key])
+        changed = BatchFeature(data={name: tensor.clone() for name, tensor in snapshot.items()})
+        changed[key][0, -1] += 1
+        assert hash_structured_value(changed) != digest
+    with pytest.raises(TypeError, match="unsupported paired-probe value"):
+        hash_structured_value(BatchFeature(data={1: torch.tensor([1])}))
+
+
 class _DropModel(nn.Module):
     def __init__(self):
         super().__init__()
