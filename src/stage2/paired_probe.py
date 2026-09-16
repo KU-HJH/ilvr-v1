@@ -62,7 +62,7 @@ def _rng_states(device=None):
     return dict(python=hash_structured_value(random.getstate()),
                 numpy=hash_structured_value(np.random.get_state()),
                 cpu=hash_structured_value(torch.get_rng_state()),
-                cuda=hash_structured_value(torch.cuda.get_rng_state(device)))
+                cuda=hash_structured_value(torch.cuda.get_rng_state("cuda" if device is None else device)))
 
 
 def _verify_collective(value):

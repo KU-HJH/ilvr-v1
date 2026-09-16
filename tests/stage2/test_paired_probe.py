@@ -60,6 +60,41 @@ def test_real_batchfeature_hashes_all_mapping_values_without_mutation():
         hash_structured_value(BatchFeature(data={1: torch.tensor([1])}))
 
 
+def test_rng_reader_uses_installed_cuda_device_resolution_without_changing_state(monkeypatch):
+    import random
+    import numpy as np
+    import torch.cuda.random as cuda_random
+    from stage2.paired_probe import _rng_states
+
+    # Keep the installed get_rng_state implementation. Substitute only absent
+    # CUDA initialization/device/generators so None still exercises its real bug.
+    generators = (torch.Generator().manual_seed(13), torch.Generator().manual_seed(17))
+    monkeypatch.setattr(cuda_random, "_lazy_init", lambda: None)
+    monkeypatch.setattr(cuda_random, "current_device", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "default_generators", generators)
+    generator_states = [generator.get_state().clone() for generator in generators]
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cpu_state = torch.get_rng_state().clone()
+
+    for args, expected_index in (((), 1), ((None,), 1), ((0,), 0),
+                                 (("cuda:0",), 0), ((torch.device("cuda:0"),), 0),
+                                 (("cuda",), 1)):
+        try:
+            result = _rng_states(*args)
+        except AttributeError as error:
+            pytest.fail(f"installed CUDA RNG device resolution failed: {error}")
+        assert result["cuda"] == hash_structured_value(generator_states[expected_index])
+    assert random.getstate() == python_state
+    after_numpy = np.random.get_state()
+    assert after_numpy[0] == numpy_state[0]
+    assert np.array_equal(after_numpy[1], numpy_state[1])
+    assert after_numpy[2:] == numpy_state[2:]
+    assert torch.equal(torch.get_rng_state(), cpu_state)
+    for generator, before in zip(generators, generator_states):
+        assert torch.equal(generator.get_state(), before)
+
+
 class _DropModel(nn.Module):
     def __init__(self):
         super().__init__()
