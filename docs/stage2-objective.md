@@ -219,7 +219,7 @@ attention dropout, native non-reentrant checkpointing, and native DDP.
 Full tuning is supported with zero native attention dropout in that envelope.
 When a LoRA/DoRA adapter is active,
 packed mode instead requires one unmerged supported Linear adapter layout;
-ordinary adapter dropout is replayed at its recorded F RNG state. It does not establish support for
+ordinary adapter dropout is replayed at its recorded F RNG state. CPU evidence alone does not establish support for
 ZeRO, FlashAttention, FP16, FSDP, compilation, CUDA dropout behavior, real-image
 equivalence, two-host execution, or a GPU training run.
 
@@ -234,6 +234,18 @@ output deltas are bypassed. The sparse-row CPU regression uses the actual
 Stage 1 artifact writer and fresh Stage 2 loader, nonzero rows and DoRA dropout
 0.05, comparing independent full replay with packed logits, scores, loss and
 F/latent gradients in FP32 and BF16/non-reentrant checkpointing.
+
+On 2026-09-16, commit `25c3b6c` additionally completed the production sparse-row
+combined-objective BF16 smoke on two nodes/four H100 NVL ranks through the native
+DDP coordinator: `bf16-stage2-combined-20260916-r4`. All ranks completed two
+optimizer steps with finite loss/gradients, both nodes exited 0, and saved
+adapter weights changed from the initial Stage 1 artifact. Saved arguments
+confirm BF16 on / FP16 off. Counters excluding latent recurrence were F=16,
+reference=16, packed M=16 across 16 rank-local microbatches. This is a short
+one-block-sample training smoke, not a CUDA full-replay equivalence test,
+multi-block GPU validation, resume test, full training or task-quality result.
+The canonical repository's `results/packed-m-sparse-20260916/verification.md`
+records CPU evidence (89 passed, 1 skipped), runtime witnesses and limitations.
 
 Excluding the unchanged latent recurrence, expected decoder prediction calls
 are CE=1, CE+entropy=2, CE+Vision=2, and combined=3. In packed mode one M
