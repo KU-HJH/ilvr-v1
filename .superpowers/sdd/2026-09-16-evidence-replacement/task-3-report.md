@@ -46,3 +46,6 @@ The allowed CPU tests directly witness dense native replay and Trainer wiring. T
 ## Self-review
 
 Reviewed the staged integration diff and ran `git diff --check`. The public route has no independent sampling-version knob, old-mode required metrics and logging retain their existing branch, and only replacement source means use the new cross-rank raw sum/count reduction.
+
+## Controller audit correction after task review
+The initially observed config-only RED was8 failed49 deselected. Its path was later reused for aggregate RED: the retained task-3-red.log is17 failed147 passed in155.27s, covering config/Trainer/launcher/forwarding. Do not treat the retained aggregate output as the config-only output. The retained GREEN log records intermediate9passed49deselected;1failed3passed;8passed95deselected;5passed;5passed98deselected; final193passed1skipped166.77s; then dedicated5passed9.77s. Controller read these actual summaries. Exact aggregate RED invocation was not retained in the report and is not reconstructed here.

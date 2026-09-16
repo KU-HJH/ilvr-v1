@@ -45,6 +45,8 @@ PYTHONPATH=src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q \
 ```
 
 Result: `93 passed, 1 skipped, 2 deselected in 15.18s`.
+The preserved command and complete pytest output are in
+`logs/evidence-replacement-20260916/task-2-cpu.log`.
 
 The focused CUDA witness was:
 
@@ -60,6 +62,9 @@ dense replay, and compared parameter gradients.  It used
 `sliding_window=4` with `use_sliding_window=False` so this is an observed
 native Flex dispatch, not inferred support configuration.  `git diff --check`
 also passed.
+The preserved command and complete pytest output are in
+`logs/evidence-replacement-20260916/task-2-cuda.log`; the pre-implementation
+RED witness is in `logs/evidence-replacement-20260916/task-2-red.log`.
 
 ## Runtime witnesses
 

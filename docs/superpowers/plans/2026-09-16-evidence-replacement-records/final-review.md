@@ -1,0 +1,7 @@
+Final review /root/replacement_final_review (gpt-6-astra high), ae5a1cd..606c854. Functional design aligned; no demonstrated new-mode production defect; Ready with fixes.
+Important: test_replacement_runtime.py:94-98 donor-copy detach regression ineffective. In-memory removal of detach still passes. Current actual gradients vs detached literal reference maxdiff0.0. Replace weak assertion with independent literal detached replay gradient comparison; retain live-original donor/nonzero decoder gradient assertions; add fallback-copy detach assertion.
+Minor1: stage2_shared_prefix.py:16 globally accepts new-mode-only sample_id/replacement_seed/replacement_version in old modes. Gate keys by mode; add old-mode rejection regression.
+Minor2: test_replacement_trainer.py:28-48 both target scopes use identical hand-built spans, so no differing-target witness. Use consecutive text entries with genuinely different endpoints, preferably existing collator path; compare literal target IDs/scores.
+Minor3: test_config.py:141-150 missing direct visual_only_context_preference=False rejection row. Add it.
+Task3 log discrepancy adequately disclosed. No material design change/reapproval needed. Limits: PEFT save path static/no fixture, reduction test double/no live collective; no production memory/throughput/efficacy evidence.
+Reviewer focused in-memory mutation/gradient probe exited successfully, no files changed; command/code not retained, so this is reviewer evidence, not durable completion verification.
