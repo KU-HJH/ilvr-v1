@@ -2,9 +2,11 @@
 import json
 import os
 import time
+from pathlib import Path
 
 import torch
 from transformers import TrainerCallback
+from .paired_probe import create_production_observer
 
 
 class InsertionSpeedProbe(TrainerCallback):
@@ -12,8 +14,12 @@ class InsertionSpeedProbe(TrainerCallback):
         self.owner = owner
         self.decoder_calls = None
         self.handles = []
+        self.pair_observer = None
 
     def on_train_begin(self, args, state, control, **kwargs):
+        if args is not None and Path(args.output_dir).name.startswith('ours1-zero-speed-pair-'):
+            self.pair_observer = create_production_observer(self.owner, args)
+            self.pair_observer.install()
         decoder = next(module for module in self.owner.model.modules()
                        if type(module).__name__ == 'Qwen2_5_VLModel')
         self.decoder_calls = {kind: [0] * len(decoder.layers) for kind in ('on', 'clean_or_off')}
@@ -26,6 +32,8 @@ class InsertionSpeedProbe(TrainerCallback):
         return control
 
     def on_train_end(self, args, state, control, **kwargs):
+        if self.pair_observer is not None:
+            self.pair_observer.close()
         for handle in self.handles:
             handle.remove()
         self.handles.clear()
@@ -48,6 +56,8 @@ class InsertionSpeedProbe(TrainerCallback):
         count = self.owner._step_preference_metric_batches - self.previous_batches
         metrics = {key: (value - self.previous.get(key, 0.0)) / count
                    for key, value in self.owner._step_preference_metric_totals.items()} if count else {}
+        if self.pair_observer is not None and state.global_step == 1:
+            self.pair_observer.finish_first_step(metrics)
         row = dict(
             rank=int(os.environ['RANK']), step=state.global_step, seconds=elapsed,
             peak_allocated_bytes=torch.cuda.max_memory_allocated(),
@@ -56,5 +66,7 @@ class InsertionSpeedProbe(TrainerCallback):
             metrics=metrics)
         if self.decoder_calls is not None:
             row['decoder_calls'] = self.decoder_calls
+        if self.pair_observer is not None:
+            row['timing_scope'] = 'instrumented-not-valid-for-speed-comparison'
         print('INSERTION_SPEED_PROBE ' + json.dumps(row, allow_nan=False), flush=True)
         return control

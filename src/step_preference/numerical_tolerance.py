@@ -24,18 +24,11 @@ def _scaled_l2(value: torch.Tensor) -> float:
     return scale * math.sqrt((value / scale).square().sum().item())
 
 
-def compare_numerical_tolerance(
+def compare_loss_tolerance(
     reference_losses: Mapping[str, float],
     candidate_losses: Mapping[str, float],
-    reference_gradients: Mapping[str, torch.Tensor | None],
-    candidate_gradients: Mapping[str, torch.Tensor | None],
 ) -> dict:
-    """Compare separate objective terms and all supplied named gradients.
-
-    Gradient values are detached and converted to CPU FP64 before arithmetic.
-    Callers must include every trainable parameter, including inactive None
-    entries; identical omissions cannot be detected from two mappings alone.
-    """
+    """Apply the fixed loss rules independently, without any gradient work."""
     errors, losses = [], {}
     for key in REQUIRED_LOSSES:
         values = {}
@@ -64,6 +57,23 @@ def compare_numerical_tolerance(
         losses[key] = {**values, "absolute_error": error, "limit": limit, "passed": passed}
         if not passed:
             errors.append(f"{key} absolute error {error} exceeds {limit}")
+    return dict(passed=not errors, errors=tuple(errors), losses=losses)
+
+
+def compare_numerical_tolerance(
+    reference_losses: Mapping[str, float],
+    candidate_losses: Mapping[str, float],
+    reference_gradients: Mapping[str, torch.Tensor | None],
+    candidate_gradients: Mapping[str, torch.Tensor | None],
+) -> dict:
+    """Compare separate objective terms and all supplied named gradients.
+
+    Gradient values are detached and converted to CPU FP64 before arithmetic.
+    Callers must include every trainable parameter, including inactive None
+    entries; identical omissions cannot be detected from two mappings alone.
+    """
+    loss_result = compare_loss_tolerance(reference_losses, candidate_losses)
+    errors, losses = list(loss_result["errors"]), loss_result["losses"]
 
     gradient_errors = []
     reference_names, candidate_names = set(reference_gradients), set(candidate_gradients)
