@@ -69,3 +69,42 @@ Python CLI는 `--step_preference_prefix_mode v_off_insertion`과 `--step_prefere
 이 모드는 Stage2B context preference, V-only, START/END 유지, shared-prefix 실행과 microbatch1을 요구한다. legacy packing과 `block_original_image=true`는 오류이며, 기존 prefix mode에서 cumulative를 지정해도 오류다. `until_next_latent`의 기존 target 매핑도 보존한다. dense 또는 CUDA Flex backend를 선택할 수 있고, Flex는 학습 attention dropout0이 필요하다. 지원하지 않는 조합은 명시적으로 실패한다.
 
 CE는 원래 clean 실행을 유지하고 preference는 실제 `stats/logp_evidence_on/off`를 사용한다. `stats/logp_clean`은 이 모드에서도 evidence-on의 호환 별칭이다. tiny FP32/dropout0 모델의 전체 시퀀스 재계산 대비 latent/logit/score/gradient 검증과 nonreentrant checkpoint 검증은 방법의 수치 확인이며, 실제 학습의 메모리 적합성·수렴·정답률 개선을 뜻하지 않는다.
+
+## 같은 이미지 evidence replacement
+
+`evidence_replacement`는 각 reasoning step의 원본 full-prefix 점수와, 같은 이미지에서 고른 대체 evidence를 넣은 full-prefix 점수를 비교한다. 첫 step은 같은 이미지 encoder feature에서 latent 길이만큼 선택한다. 이미지 slot 수가 latent 길이 이상이면 without replacement, 더 적으면 with replacement이며 선택 위치는 정렬한다. 이후 step은 더 이른 검증된 latent block 하나를 donor로 쓴다. 대체 복사본은 detach되지만 원본 occurrence는 미분 가능하다. 선택은 training `SEED`, canonical sample ID, step ID와 고정 버전 `ilvr-evidence-replacement-v1`로 결정되므로 별도 replacement seed 옵션은 없다.
+
+이 모드는 Stage2B context preference, V-only, 원본 이미지 접근, 독립 branch, entropy weight 0, 그리고 START/END 유지가 필요하다. `STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE=true`, cumulative branch, boundary suppression, legacy DPO와 결합하면 launch가 실패한다. `immediate_text`와 `until_next_latent` target scope는 모두 기존 정의대로 지원한다. clean CE 경로는 그대로이며 preference는 step 평균
+
+$$
+\mathcal L=\mathcal L_{CE}+\lambda_{pref}\left[-\frac1K\sum_k\log\sigma\left(\beta(s_{original,k}-s_{replacement,k}-m)\right)\right].
+$$
+
+로그의 `stats/logp_visual_original`, `stats/logp_visual_replacement`, `stats/replacement_margin`을 비교 점수로 사용한다. `stats/replacement_{donor,image}_margin_sum`과 `_count`는 source별 raw 합계/표본 수이며, source mean은 모든 rank의 raw 합과 count를 reduce한 뒤 계산한다. 따라서 batch별 mean의 평균으로 source 진단을 해석하지 않는다. 저장 model config에는 mode, training seed, sampling version 및 고정 selection/gradient semantics가 기록된다. 이 identity는 새 public Stage2B resume 경로를 추가하지 않는다.
+
+다음은 실행 예시이며 여기서 학습을 시작하지 않는다. 두 노드 coordinator가 worker에 같은 mode, seed와 boundary 선택을 전달한다. `RUN_ID`는 고유해야 하며 checkpoint/log/result 경로는 현재 worktree의 표준 symlink 아래에 둔다.
+
+```bash
+export RUN_ID=evidence-replacement-egb8-s423-20260916
+export STAGE1_CHECKPOINT=checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431
+export STAGE2A_CHECKPOINT_PATH=checkpoints/${RUN_ID}-stage2a/checkpoint-211
+export OUTPUT_DIR=checkpoints/${RUN_ID}
+export LOG_FILE=logs/${RUN_ID}/train.log
+export RESULT_DIR=results/${RUN_ID}
+export SEED=42
+export STEP_PREFERENCE_ENABLED=true
+export STEP_PREFERENCE_MODE=stage2b
+export STEP_PREFERENCE_OBJECTIVE=context_preference
+export STEP_PREFERENCE_PREFIX_MODE=evidence_replacement
+export STEP_PREFERENCE_BRANCH_MODE=independent
+export STEP_PREFERENCE_TARGET_SCOPE=immediate_text
+export STEP_VISUAL_ONLY_CONTEXT_PREFERENCE=true
+export STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES=false
+export STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE=false
+export STEP_PREFERENCE_WEIGHT=10
+export STEP_PREFERENCE_BETA=0.1
+export STEP_PREFERENCE_MARGIN=0
+export STEP_ENTROPY_WEIGHT=0
+export STEP_SIDECAR_ATTENTION_BACKEND=dense
+./run_multinode_stage2_training.sh --run-id "$RUN_ID" --tuning-method dora --zero-stage 2
+```

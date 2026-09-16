@@ -67,7 +67,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--step_preference_margin", type=float, default=0.0)
     parser.add_argument("--step_preference_prefix_mode",
-        choices=("clean_prefix", "v_off_prefix", "v_off_insertion"), default="clean_prefix")
+        choices=("clean_prefix", "v_off_prefix", "v_off_insertion", "evidence_replacement"), default="clean_prefix")
     parser.add_argument("--step_preference_branch_mode",
         choices=("independent", "cumulative"), default="independent")
     parser.add_argument("--step_preference_block_original_image", action="store_true")

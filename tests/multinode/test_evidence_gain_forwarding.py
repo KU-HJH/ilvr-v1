@@ -38,3 +38,34 @@ def test_evidence_gain_options_reach_both_workers(mode, blocked):
         argv = json.loads(result.stdout)
         assert argv[argv.index('--step_preference_prefix_mode')+1] == mode
         assert ('--step_preference_block_original_image' in argv) == (blocked == 'true')
+
+
+def test_evidence_replacement_forwards_fixed_entropy_seed_and_boundaries_to_both_workers():
+    """Catches rank-specific worker environments silently changing replacement sampling."""
+    source = stage2b_environment()
+    source.pop('STEP_NEGATIVE_PATH')
+    source.pop('STEP_NEGATIVE_MANIFEST')
+    source.update(
+        STEP_PREFERENCE_OBJECTIVE='context_preference',
+        STEP_PREFERENCE_PREFIX_MODE='evidence_replacement',
+        STEP_ENTROPY_WEIGHT='0',
+        STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES='false',
+        SEED='917',
+    )
+    plan = build_launch_plan(stage='stage2', tuning_method='dora', zero_stage=2,
+        run_id='replacement-forward-test', main_process_port=29874)
+    environment = validated_stage2_environment(source,
+        output_dir=str(REPO/'checkpoints'/plan.run_id),
+        log_file=str(REPO/'logs'/plan.run_id/'train.log'),
+        deepspeed_config=str(plan.deepspeed_config))
+    commands = build_owned_tmux_commands(plan, commit='b'*40, stage_environment=environment)
+    for spec in commands.node_specs:
+        result = subprocess.run(spec.command[spec.command.index('--')+1:], cwd=REPO,
+            capture_output=True, text=True, env={**dict(spec.environment),
+            'STAGE2_DRY_RUN': 'true', 'STAGE2_DRY_RUN_FORMAT': 'json'})
+        assert result.returncode == 0, result.stderr
+        argv = json.loads(result.stdout)
+        assert argv[argv.index('--step_preference_prefix_mode')+1] == 'evidence_replacement'
+        assert argv[argv.index('--step_entropy_weight')+1] == '0'
+        assert argv[argv.index('--seed')+1] == '917'
+        assert '--no-step_visual_off_suppress_latent_boundaries' in argv

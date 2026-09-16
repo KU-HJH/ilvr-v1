@@ -9,6 +9,7 @@ import re
 from typing import Literal
 
 from step_preference.spans import normalize_preference_target_scope
+from step_preference.replacement import EVIDENCE_REPLACEMENT_SAMPLING_VERSION
 
 
 StepPreferenceMode = Literal["stage2a", "stage2b"]
@@ -95,6 +96,7 @@ class StepPreferenceConfig:
     shared_prefix_enabled: bool = False
     sidecar_attention_backend: str = "flex"
     sidecar_query_budget: int = 1024
+    replacement_seed: int = 42
     max_packed_sequence_length: int | None = None
     packed_admission_manifest: str | None = None
     packed_admission_manifest_sha256: str | None = None
@@ -113,20 +115,38 @@ class StepPreferenceConfig:
             object.__setattr__(
                 self,
                 "visual_off_suppress_latent_boundaries",
-                self.is_context_preference and self.visual_only_context_preference,
+                self.is_context_preference
+                and self.visual_only_context_preference
+                and self.prefix_mode != "evidence_replacement",
             )
-        if self.prefix_mode not in ("clean_prefix", "v_off_prefix", "v_off_insertion"):
+        if self.prefix_mode not in (
+            "clean_prefix", "v_off_prefix", "v_off_insertion", "evidence_replacement"
+        ):
             raise ValueError("unknown preference prefix_mode")
         if self.branch_mode not in ("independent", "cumulative"):
             raise ValueError("branch_mode must be independent or cumulative")
+        if self.prefix_mode == "evidence_replacement" and self.branch_mode != "independent":
+            raise ValueError("evidence_replacement requires independent branch_mode")
         if self.branch_mode == "cumulative" and self.prefix_mode != "v_off_insertion":
             raise ValueError("cumulative branch_mode requires v_off_insertion")
         if self.prefix_mode == "v_off_insertion" and not self.shared_prefix_enabled:
             raise ValueError("v_off_insertion requires shared-prefix execution")
         if type(self.block_original_image) is not bool:
             raise ValueError("block_original_image must be a boolean")
-        if self.block_original_image and self.prefix_mode != "v_off_prefix":
+        if (
+            self.block_original_image
+            and self.prefix_mode not in ("v_off_prefix", "evidence_replacement")
+        ):
             raise ValueError("block_original_image requires v_off_prefix")
+        if self.prefix_mode == "evidence_replacement":
+            if not self.is_context_preference:
+                raise ValueError("evidence_replacement requires context-preference Stage 2B")
+            if not self.visual_only_context_preference:
+                raise ValueError("evidence_replacement requires visual-only context preference")
+            if self.visual_off_suppress_latent_boundaries:
+                raise ValueError("evidence_replacement requires latent boundaries kept")
+            if self.block_original_image:
+                raise ValueError("evidence_replacement preserves original image access")
         if self.prefix_mode in ("v_off_prefix", "v_off_insertion") and (
             not self.is_context_preference
             or not self.visual_only_context_preference
@@ -153,6 +173,8 @@ class StepPreferenceConfig:
             raise ValueError("sidecar_attention_backend must be dense or flex")
         if type(self.sidecar_query_budget) is not int or self.sidecar_query_budget <= 0:
             raise ValueError("sidecar_query_budget must be a positive integer")
+        if type(self.replacement_seed) is not int:
+            raise ValueError("replacement_seed must be an integer")
         if self.shared_prefix_enabled:
             if not self.is_stage2b:
                 raise ValueError("shared prefix is only valid for Stage 2B")
@@ -176,6 +198,8 @@ class StepPreferenceConfig:
                 raise ValueError(f"{name} must be nonnegative")
         if _finite("step_preference_weight", self.lambda_preference) < 0:
             raise ValueError("step_preference_weight must be nonnegative")
+        if self.prefix_mode == "evidence_replacement" and self.lambda_entropy != 0.0:
+            raise ValueError("evidence_replacement requires step_entropy_weight=0")
         _finite("step_preference_margin", self.preference_margin)
         entropy_margin = _finite("step_entropy_margin", self.entropy_margin)
         if entropy_margin < 0:
@@ -312,6 +336,11 @@ class StepPreferenceConfig:
         )
         return stage2b if self.mode == "stage2b" else stage2a
 
+    @property
+    def replacement_sampling_version(self) -> str:
+        """Fixed planner version recorded with an evidence-replacement run."""
+        return EVIDENCE_REPLACEMENT_SAMPLING_VERSION
+
     @classmethod
     def from_args(cls, args) -> "StepPreferenceConfig":
         """Build from the public training namespace without mutating it."""
@@ -350,6 +379,7 @@ class StepPreferenceConfig:
             shared_prefix_enabled=getattr(args, "step_shared_prefix_enabled", False),
             sidecar_attention_backend=getattr(args, "step_sidecar_attention_backend", "flex"),
             sidecar_query_budget=getattr(args, "step_sidecar_query_budget", 1024),
+            replacement_seed=getattr(args, "seed", 42),
             max_packed_sequence_length=getattr(
                 args, "step_max_packed_sequence_length", None
             ),

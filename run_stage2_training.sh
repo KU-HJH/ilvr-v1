@@ -80,7 +80,7 @@ STEP_PREFERENCE_TARGET_SCOPE=${STEP_PREFERENCE_TARGET_SCOPE:-immediate_text}
 STEP_PREFERENCE_PREFIX_MODE=${STEP_PREFERENCE_PREFIX_MODE:-clean_prefix}
 STEP_PREFERENCE_BRANCH_MODE=${STEP_PREFERENCE_BRANCH_MODE:-independent}
 case "$STEP_PREFERENCE_PREFIX_MODE" in
-  clean_prefix|v_off_prefix|v_off_insertion) ;;
+  clean_prefix|v_off_prefix|v_off_insertion|evidence_replacement) ;;
   *) printf 'Unknown STEP_PREFERENCE_PREFIX_MODE\n' >&2; exit 2 ;;
 esac
 case "$STEP_PREFERENCE_BRANCH_MODE" in
@@ -243,7 +243,9 @@ case "$STEP_PREFERENCE_ENABLED" in
       fi
     fi
     if [[ "$step_visual_off_suppress_latent_boundaries" == default ]]; then
-      if [[ "$STEP_PREFERENCE_MODE" == stage2b && "$STEP_PREFERENCE_OBJECTIVE" == context_preference && "$step_visual_only_context_preference" == true ]]; then
+      if [[ "$STEP_PREFERENCE_PREFIX_MODE" == evidence_replacement ]]; then
+        step_visual_off_suppress_latent_boundaries=false
+      elif [[ "$STEP_PREFERENCE_MODE" == stage2b && "$STEP_PREFERENCE_OBJECTIVE" == context_preference && "$step_visual_only_context_preference" == true ]]; then
         step_visual_off_suppress_latent_boundaries=true
       else
         step_visual_off_suppress_latent_boundaries=false
@@ -381,15 +383,25 @@ if [[ "$STEP_PREFERENCE_TARGET_SCOPE" != immediate_text ]] &&
   exit 2
 fi
 
-if [[ "$STEP_PREFERENCE_PREFIX_MODE" == v_off_prefix || "$STEP_PREFERENCE_PREFIX_MODE" == v_off_insertion ]] &&
+if [[ "$STEP_PREFERENCE_PREFIX_MODE" == v_off_prefix || "$STEP_PREFERENCE_PREFIX_MODE" == v_off_insertion || "$STEP_PREFERENCE_PREFIX_MODE" == evidence_replacement ]] &&
    [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b || "$STEP_PREFERENCE_OBJECTIVE" != context_preference || "$step_visual_only_context_preference" != true || "$step_visual_off_suppress_latent_boundaries" == true ]]; then
   printf 'Visual prefix modes require V-only context preference with START/END kept\n' >&2
   exit 2
 fi
+if [[ "$STEP_PREFERENCE_PREFIX_MODE" == evidence_replacement ]]; then
+  if [[ "$STEP_PREFERENCE_BRANCH_MODE" != independent ]]; then
+    printf 'evidence_replacement requires independent branches\n' >&2
+    exit 2
+  fi
+  if [[ "$step_preference_block_original_image" == true ]]; then
+    printf 'evidence_replacement preserves original image access\n' >&2
+    exit 2
+  fi
+fi
 if [[ "$STEP_PREFERENCE_PREFIX_MODE" == v_off_insertion && "$step_shared_prefix_enabled" != true ]]; then
   printf 'v_off_insertion requires shared-prefix execution\n' >&2; exit 2
 fi
-if [[ "$step_preference_block_original_image" == true && "$STEP_PREFERENCE_PREFIX_MODE" != v_off_prefix ]]; then
+if [[ "$step_preference_block_original_image" == true && "$STEP_PREFERENCE_PREFIX_MODE" != v_off_prefix && "$STEP_PREFERENCE_PREFIX_MODE" != evidence_replacement ]]; then
   printf 'STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE requires v_off_prefix\n' >&2
   exit 2
 fi
@@ -684,6 +696,19 @@ if [[ "$STEP_PREFERENCE_ENABLED" == true ]]; then
     require_finite_non_negative_number STEP_DPO_WEIGHT "$STEP_DPO_WEIGHT"
   fi
   require_finite_non_negative_number STEP_ENTROPY_WEIGHT "$STEP_ENTROPY_WEIGHT"
+  if [[ "$STEP_PREFERENCE_PREFIX_MODE" == evidence_replacement ]] && ! "$REPO_ROOT/venv/ilvr-venv/bin/python" - "$STEP_ENTROPY_WEIGHT" <<'PY'
+import math
+import sys
+try:
+    value = float(sys.argv[1])
+except (OverflowError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value == 0.0 else 1)
+PY
+  then
+    printf 'evidence_replacement requires STEP_ENTROPY_WEIGHT=0\n' >&2
+    exit 2
+  fi
 fi
 
 case "$TUNING_METHOD" in

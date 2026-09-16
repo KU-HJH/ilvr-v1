@@ -97,6 +97,49 @@ def test_context_launcher_can_keep_boundaries_without_disabling_v_only():
     assert "--no-step_visual_off_suppress_latent_boundaries" in tokens
 
 
+def test_evidence_replacement_launcher_forwards_seed_and_forces_its_fixed_contract():
+    """Catches the worker receiving a default seed or legacy boundary/entropy settings."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "SEED": "917",
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+                "STEP_PREFERENCE_PREFIX_MODE": "evidence_replacement",
+                "STEP_ENTROPY_WEIGHT": "0",
+            }
+        )
+    )
+    assert option_value(tokens, "--seed") == "917"
+    assert option_value(tokens, "--step_preference_prefix_mode") == "evidence_replacement"
+    assert option_value(tokens, "--step_entropy_weight") == "0"
+    assert "--step_visual_only_context_preference" in tokens
+    assert "--no-step_visual_off_suppress_latent_boundaries" in tokens
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"STEP_ENTROPY_WEIGHT": "0.1"}, "STEP_ENTROPY_WEIGHT=0"),
+        ({"STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES": "true"}, "START/END kept"),
+        ({"STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE": "true"}, "original image"),
+    ],
+)
+def test_evidence_replacement_launcher_rejects_conflicting_contract(overrides, message):
+    """Catches a shell launch accepting settings the scorer cannot faithfully interpret."""
+    result = run_launcher(env_overrides={
+        "STEP_PREFERENCE_ENABLED": "true",
+        "STEP_PREFERENCE_MODE": "stage2b",
+        "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+        "STEP_PREFERENCE_PREFIX_MODE": "evidence_replacement",
+        "STEP_ENTROPY_WEIGHT": "0",
+        **overrides,
+    })
+    assert result.returncode == 2
+    assert message in result.stderr
+
+
 def test_visual_only_context_launcher_validates_and_forwards_boolean():
     """Catches the launcher dropping V-only mode or accepting an invalid boolean."""
     environment = {

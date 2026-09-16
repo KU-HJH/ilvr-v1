@@ -11,7 +11,7 @@ import torch
 from step_preference.sidecar import SidecarBranch, SidecarPlan
 
 
-_SAMPLING_VERSION = "ilvr-evidence-replacement-v1"
+EVIDENCE_REPLACEMENT_SAMPLING_VERSION = "ilvr-evidence-replacement-v1"
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ class ReplacementPlan:
 
 def _local_generator(*, seed: int, sample_id: str, step_id: int, kind: str):
     raw = json.dumps(
-        [_SAMPLING_VERSION, seed, sample_id, step_id, kind],
+        [EVIDENCE_REPLACEMENT_SAMPLING_VERSION, seed, sample_id, step_id, kind],
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")

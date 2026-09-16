@@ -138,6 +138,60 @@ def test_v_only_context_cli_can_restore_visible_latent_boundaries():
     assert args.step_preference_config.visual_off_suppress_latent_boundaries is False
 
 
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"lambda_entropy": 0.1}, "entropy"),
+        ({"visual_off_suppress_latent_boundaries": True}, "boundaries"),
+        ({"block_original_image": True}, "original image"),
+        ({"branch_mode": "cumulative"}, "independent"),
+        ({"objective": "legacy_dpo", "negative_path": "n", "negative_manifest": "m"}, "context"),
+        ({"enabled": False}, "context"),
+    ],
+)
+def test_evidence_replacement_accepts_only_its_fixed_context_contract(updates, message):
+    """Catches a replacement launch weakening its fixed CE-plus-preference contract."""
+    base = dict(
+        enabled=True,
+        mode="stage2b",
+        stage2a_checkpoint_path="tiny-stage2a",
+        prefix_mode="evidence_replacement",
+        lambda_entropy=0.0,
+        sidecar_attention_backend="dense",
+    )
+    if not updates:
+        config = StepPreferenceConfig(**base)
+        assert config.visual_off_suppress_latent_boundaries is False
+    else:
+        with pytest.raises(ValueError, match=message):
+            StepPreferenceConfig(**(base | updates))
+
+
+def test_evidence_replacement_defaults_to_kept_boundaries():
+    """Catches replacement inheriting the older visual-off boundary suppression default."""
+    config = StepPreferenceConfig(
+        enabled=True, mode="stage2b", stage2a_checkpoint_path="tiny-stage2a",
+        prefix_mode="evidence_replacement", lambda_entropy=0.0,
+    )
+    assert config.visual_off_suppress_latent_boundaries is False
+
+
+def test_evidence_replacement_cli_binds_public_training_seed_without_new_knob():
+    """Catches replacement selection silently using a private or default-only seed."""
+    args = parse_args(
+        [
+            "--stage", "stage2", "--seed", "917",
+            "--step_preference_enabled", "--step_preference_mode", "stage2b",
+            "--stage2a_checkpoint_path", "tiny-stage2a",
+            "--step_preference_prefix_mode", "evidence_replacement",
+            "--step_entropy_weight", "0",
+            "--no-step_visual_off_suppress_latent_boundaries",
+        ]
+    )
+    assert args.step_preference_config.replacement_seed == 917
+    assert args.step_preference_config.replacement_sampling_version == "ilvr-evidence-replacement-v1"
+
+
 def test_visual_only_context_preference_cli_maps_and_validates_scope():
     """Catches the V-only setting being dropped or accepted outside context Stage 2B."""
     args = parse_args(

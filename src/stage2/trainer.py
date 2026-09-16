@@ -86,6 +86,25 @@ _CONTEXT_PREFERENCE_LOG_NAMES = (
     "stats/logical_scoring_groups",
 )
 
+_EVIDENCE_REPLACEMENT_LOG_NAMES = (
+    "loss/total",
+    "loss/ce",
+    "loss/evidence_replacement",
+    "stats/logp_visual_original",
+    "stats/logp_visual_replacement",
+    "stats/replacement_margin",
+    "stats/replacement_margin_sum",
+    "stats/replacement_margin_count",
+    "stats/replacement_donor_margin",
+    "stats/replacement_donor_margin_sum",
+    "stats/replacement_donor_margin_count",
+    "stats/replacement_image_margin",
+    "stats/replacement_image_margin_sum",
+    "stats/replacement_image_margin_count",
+    "stats/scored_tokens",
+    "stats/logical_scoring_groups",
+)
+
 
 def _model_compute_dtype(model) -> torch.dtype:
     dtype = getattr(model, "dtype", None)
@@ -142,6 +161,20 @@ def _selected_entropies(logits: torch.Tensor) -> torch.Tensor:
     if not bool(torch.isfinite(values).all()):
         raise ValueError("Stage 2B target entropies must be finite")
     return values
+
+
+def attach_evidence_replacement_identity(model, config: StepPreferenceConfig) -> None:
+    """Attach the fixed replacement objective identity before a model-config save."""
+    if config.prefix_mode != "evidence_replacement":
+        return
+    target = resolve_qwen2_5_vl_model(model)
+    target.config.stage2_evidence_replacement_objective = {
+        "mode": "evidence_replacement",
+        "training_seed": config.replacement_seed,
+        "sampling_version": config.replacement_sampling_version,
+        "selection": "earlier_latent_or_same_image_encoder_features_detached",
+        "replacement_gradient": "detached_copy_original_occurrence_differentiable",
+    }
 
 
 class _ObservedOptimizerStep(TrainerCallback):
@@ -473,7 +506,10 @@ class Stage2Trainer(Trainer):
             self._step_preference_metric_batches = 0
         config = getattr(self, "step_preference_config", None)
         required = (
-            _CONTEXT_PREFERENCE_LOG_NAMES
+            _EVIDENCE_REPLACEMENT_LOG_NAMES
+            if isinstance(config, StepPreferenceConfig)
+            and config.prefix_mode == "evidence_replacement"
+            else _CONTEXT_PREFERENCE_LOG_NAMES
             if isinstance(config, StepPreferenceConfig) and config.is_context_preference
             else _STEP_PREFERENCE_LOG_NAMES
         )
@@ -583,6 +619,81 @@ class Stage2Trainer(Trainer):
             raise ValueError("context preference total loss must be finite")
         return total, metrics
 
+    def _reduce_evidence_replacement_objective(self, clean_ce, results):
+        """Use paired full-prefix source scores without altering clean CE."""
+        config = self.step_preference_config
+        zero = clean_ce * 0.0
+        by_step = {}
+        for result in results:
+            if not isinstance(result, dict) or result.get("kind") not in (
+                "visual_original", "visual_replacement"
+            ):
+                raise ValueError("unexpected evidence replacement sidecar")
+            step_id = result.get("step_id")
+            if type(step_id) is not int or step_id < 0:
+                raise ValueError("evidence replacement sidecar step_id is invalid")
+            current = by_step.setdefault(step_id, {})
+            kind = result["kind"]
+            if kind in current:
+                raise ValueError("duplicate evidence replacement sidecar")
+            score = result.get("mean_logp")
+            if not isinstance(score, torch.Tensor) or score.numel() != 1:
+                raise ValueError("evidence replacement score must be scalar")
+            current[kind] = result
+        if any(set(pair) != {"visual_original", "visual_replacement"} for pair in by_step.values()):
+            raise ValueError("evidence replacement sidecar pair is incomplete")
+        originals, replacements, donor_margins, image_margins = [], [], [], []
+        for step_id in sorted(by_step):
+            pair = by_step[step_id]
+            original = pair["visual_original"]["mean_logp"]
+            replacement = pair["visual_replacement"]["mean_logp"]
+            margin = original - replacement
+            originals.append(original)
+            replacements.append(replacement)
+            source_kind = pair["visual_replacement"].get("source_kind")
+            if source_kind == "donor":
+                donor_margins.append(margin)
+            elif source_kind == "image":
+                image_margins.append(margin)
+            else:
+                raise ValueError("evidence replacement source_kind is invalid")
+        if originals:
+            margins = torch.stack([original - replacement for original, replacement in zip(originals, replacements)])
+            preference = -F.logsigmoid(
+                config.beta * (margins - config.preference_margin)
+            ).mean()
+            original_mean = torch.stack(originals).mean()
+            replacement_mean = torch.stack(replacements).mean()
+        else:
+            margins = zero.reshape(1)[:0]
+            preference = original_mean = replacement_mean = zero
+
+        def source_metrics(name, values):
+            count = clean_ce.new_tensor(float(len(values)))
+            total = torch.stack(values).sum() if values else zero
+            return {
+                f"stats/replacement_{name}_margin": total / count if values else zero,
+                f"stats/replacement_{name}_margin_sum": total,
+                f"stats/replacement_{name}_margin_count": count,
+            }
+
+        total = clean_ce + config.lambda_preference * preference
+        metrics = {
+            "loss/total": total,
+            "loss/ce": clean_ce,
+            "loss/evidence_replacement": preference,
+            "stats/logp_visual_original": original_mean,
+            "stats/logp_visual_replacement": replacement_mean,
+            "stats/replacement_margin": margins.mean() if originals else zero,
+            "stats/replacement_margin_sum": margins.sum() if originals else zero,
+            "stats/replacement_margin_count": clean_ce.new_tensor(float(len(originals))),
+        }
+        metrics.update(source_metrics("donor", donor_margins))
+        metrics.update(source_metrics("image", image_margins))
+        if not bool(torch.isfinite(total)):
+            raise ValueError("evidence replacement total loss must be finite")
+        return total, metrics
+
     def _compute_context_preference_loss(
         self, model, inputs, *, collect_diagnostics: bool, return_outputs: bool
     ):
@@ -631,6 +742,15 @@ class Stage2Trainer(Trainer):
                 prefix_mode=config.prefix_mode,
                 branch_mode=config.branch_mode,
                 block_original_image=config.block_original_image,
+                **(
+                    {
+                        "sample_id": sample_ids[0],
+                        "replacement_seed": config.replacement_seed,
+                        "replacement_version": config.replacement_sampling_version,
+                    }
+                    if config.prefix_mode == "evidence_replacement"
+                    else {}
+                ),
             ),
         )
         if plan.root_selected_positions:
@@ -653,6 +773,22 @@ class Stage2Trainer(Trainer):
             if diagnostics is None
             else {key: value.detach() for key, value in diagnostics.items()}
         )
+        if config.prefix_mode == "evidence_replacement":
+            expected_steps = {span.step_id for span in spans}
+            observed_steps = {result.get("step_id") for result in outputs.stage2_sidecar_results}
+            if observed_steps != expected_steps:
+                raise ValueError("evidence replacement sidecar layout mismatch")
+            total, metrics = self._reduce_evidence_replacement_objective(
+                clean_ce, outputs.stage2_sidecar_results
+            )
+            metrics.update(
+                {
+                    "stats/scored_tokens": 2 * len(plan.root_selected_positions),
+                    "stats/logical_scoring_groups": 2 * len(spans),
+                }
+            )
+            self._accumulate_step_preference_metrics(metrics)
+            return (total, outputs) if return_outputs else total
         rows = (
             _selected_logits(outputs, len(plan.root_selected_positions))
             if spans
@@ -1434,12 +1570,33 @@ class Stage2Trainer(Trainer):
         if metric_batches:
             logs = dict(logs)
             totals = self._step_preference_metric_totals
-            logs.update(
-                {
-                    name: totals[name] / metric_batches
-                    for name in totals
-                }
-            )
+            config = self.step_preference_config
+            if config.prefix_mode == "evidence_replacement":
+                logs.update({name: totals[name] / metric_batches for name in totals})
+                for source in ("", "donor_", "image_"):
+                    sum_name = f"stats/replacement_{source}margin_sum"
+                    count_name = f"stats/replacement_{source}margin_count"
+                    mean_name = f"stats/replacement_{source}margin"
+                    reduced = torch.tensor(
+                        [totals[sum_name], totals[count_name]],
+                        device=self.accelerator.device,
+                        dtype=torch.float64,
+                    )
+                    reduced = self.accelerator.reduce(reduced, reduction="sum")
+                    logs[sum_name] = float(reduced[0].item())
+                    logs[count_name] = float(reduced[1].item())
+                    logs[mean_name] = (
+                        float((reduced[0] / reduced[1]).item())
+                        if reduced[1].item()
+                        else 0.0
+                    )
+            else:
+                logs.update(
+                    {
+                        name: totals[name] / metric_batches
+                        for name in totals
+                    }
+                )
             self._step_preference_metric_totals = {}
             self._step_preference_metric_batches = 0
         super().log(logs, start_time=start_time)
@@ -1448,6 +1605,7 @@ class Stage2Trainer(Trainer):
         """Save Stage 2 adapters without PEFT's automatic embedding export."""
 
         model = self.accelerator.unwrap_model(self.model)
+        attach_evidence_replacement_identity(model, self.step_preference_config)
         if not isinstance(model, PeftModel):
             return super()._save(output_dir, state_dict=state_dict)
 
