@@ -562,7 +562,11 @@ class Stage2Trainer(Trainer):
         total = (
             clean_ce
             + config.lambda_preference * preference
-            + config.lambda_entropy * entropy
+            + config.lambda_entropy * (
+                entropy.detach()
+                if config.prefix_mode == "v_off_insertion" and config.lambda_entropy == 0
+                else entropy
+            )
         )
         metrics = {
             "loss/total": total,
@@ -640,7 +644,8 @@ class Stage2Trainer(Trainer):
                 stage2_debugging=getattr(self, "stage2_debugging", True),
             ),
         )
-        if plan.root_selected_positions:
+        skip_unused_clean_logits = config.prefix_mode == "v_off_insertion" and not return_outputs
+        if plan.root_selected_positions and not skip_unused_clean_logits:
             call["stage2_logit_positions"] = torch.tensor(
                 plan.root_selected_positions,
                 device=clean_inputs["input_ids"].device,
@@ -663,7 +668,7 @@ class Stage2Trainer(Trainer):
         rows = (
             _selected_logits(outputs, len(plan.root_selected_positions),
                              stage2_debugging=getattr(self, "stage2_debugging", True))
-            if spans
+            if spans and not skip_unused_clean_logits
             else None
         )
         results, evidence_on = {}, {}
@@ -696,14 +701,14 @@ class Stage2Trainer(Trainer):
             raise ValueError("evidence-on score layout mismatch")
         for span in spans:
             count = span.target_text_end - span.target_text_start
-            logits = rows[:, offset : offset + count]
-            targets = clean_inputs["input_ids"][
-                :, span.target_text_start : span.target_text_end
-            ]
             if config.prefix_mode in ("v_off_prefix", "v_off_insertion"):
                 clean_scores.append(evidence_on[span.step_id]["mean_logp"])
                 clean_entropies.append(evidence_on[span.step_id]["entropies"])
             else:
+                logits = rows[:, offset : offset + count]
+                targets = clean_inputs["input_ids"][
+                    :, span.target_text_start : span.target_text_end
+                ]
                 clean_scores.append(_mean_selected_logp(logits, targets))
                 clean_entropies.append(_selected_entropies(logits))
             offset += count
