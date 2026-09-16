@@ -10,8 +10,9 @@ import torch
 import torch.nn.functional as F
 from peft import PeftModel
 from peft.tuners.lora.layer import Linear as PeftLinear
+from peft.tuners.trainable_tokens.layer import TrainableTokensLayer
 from peft.tuners.tuners_utils import BaseTunerLayer
-from peft.utils.other import AuxiliaryTrainingWrapper
+from peft.utils.other import AuxiliaryTrainingWrapper, TrainableTokensWrapper
 from torch import nn
 from transformers.cache_utils import DynamicCache
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -19,6 +20,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 from peft_common import ALLOWED_QWEN_DECODER_SUFFIXES, resolve_qwen2_5_vl_model
+from stage1.token_rows import SparseOutputTokenRows
 from .objective import target_log_likelihood
 from .objective_windows import WindowBlock
 
@@ -43,6 +45,55 @@ class _DropoutRecord:
     probability: float
 
 
+def _sparse_embedding_exception(wrapped: nn.Module, base: nn.Module):
+    """Allow only the production Stage 1 DoRA sparse-token pair, by identity.
+
+    M consumes captured F embeddings, not a second embedding lookup; its head
+    still calls SparseOutputTokenRows.forward, including the output deltas.
+    """
+    embedding = base.model.embed_tokens
+    if not isinstance(embedding, TrainableTokensWrapper):
+        return None, None, None
+    if type(embedding) is not TrainableTokensWrapper or not isinstance(wrapped, PeftModel):
+        raise ValueError("packed M requires the canonical sparse embedding wrapper")
+    active = tuple(wrapped.active_adapters)
+    if len(active) != 1 or set(wrapped.peft_config) != set(active):
+        raise ValueError("packed M sparse rows require one active DoRA adapter")
+    adapter = active[0]
+    config = wrapped.peft_config[adapter]
+    layer = embedding.token_adapter
+    ids = tuple(getattr(base.config, name, None) for name in (
+        "latent_pad_token_id", "latent_start_token_id", "latent_end_token_id"
+    ))
+    if (
+        not config.use_dora
+        or any(type(value) is not int or not 0 <= value < base.config.vocab_size for value in ids)
+        or len(set(ids)) != 3
+        or config.trainable_token_indices != {"model.embed_tokens": list(ids)}
+        or type(layer) is not TrainableTokensLayer
+        or type(layer.base_layer) is not nn.Embedding
+        or layer.base_layer.max_norm is not None
+        or layer.tied_adapter is not None
+        or layer.merged
+        or embedding.disable_adapters
+        or layer.disable_adapters
+        or tuple(embedding.active_adapters) != active
+        or tuple(layer.active_adapters) != active
+        or layer.token_indices != {adapter: list(ids)}
+        or set(layer.trainable_tokens_delta) != {adapter}
+    ):
+        raise ValueError("packed M requires canonical unmerged active Stage 1 sparse input rows")
+    head = base.lm_head
+    if (
+        type(head) is not SparseOutputTokenRows
+        or type(head.base_head) is not nn.Linear
+        or tuple(head.token_ids.detach().cpu().tolist()) != ids
+        or tuple(module for module in base.modules() if isinstance(module, SparseOutputTokenRows)) != (head,)
+    ):
+        raise ValueError("packed M requires the matching canonical sparse output rows")
+    return embedding, layer, adapter
+
+
 def _active_adapter_sites(model: nn.Module, decoder: nn.Module) -> tuple[nn.Dropout, ...]:
     """Validate and return every supported active stochastic adapter site."""
     wrapped = getattr(model, "module", model)
@@ -59,10 +110,11 @@ def _active_adapter_sites(model: nn.Module, decoder: nn.Module) -> tuple[nn.Drop
             )
 
     base = resolve_qwen2_5_vl_model(model)
+    sparse_wrapper, sparse_layer, sparse_adapter = _sparse_embedding_exception(wrapped, base)
     auxiliary_modules = tuple(
         name
         for name, module in base.named_modules()
-        if isinstance(module, AuxiliaryTrainingWrapper)
+        if isinstance(module, AuxiliaryTrainingWrapper) and module is not sparse_wrapper
     )
     if auxiliary_modules:
         raise ValueError(
@@ -71,7 +123,7 @@ def _active_adapter_sites(model: nn.Module, decoder: nn.Module) -> tuple[nn.Drop
     tuner_modules = tuple(
         (name, module)
         for name, module in base.named_modules()
-        if isinstance(module, BaseTunerLayer)
+        if isinstance(module, BaseTunerLayer) and module is not sparse_layer
     )
     for name, module in tuner_modules:
         if type(module) is not PeftLinear:
@@ -98,6 +150,10 @@ def _active_adapter_sites(model: nn.Module, decoder: nn.Module) -> tuple[nn.Drop
         if module.merged:
             raise ValueError("packed M requires an unmerged adapter")
         adapter = active[0]
+        if sparse_adapter is not None and (
+            adapter != sparse_adapter or module.disable_adapters or not module.use_dora.get(adapter, False)
+        ):
+            raise ValueError("packed M sparse rows require the same active DoRA adapter at every projection")
         adapters.add(adapter)
         dropout = module.lora_dropout[adapter]
         if isinstance(dropout, nn.Dropout):

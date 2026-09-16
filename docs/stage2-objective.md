@@ -223,6 +223,18 @@ ordinary adapter dropout is replayed at its recorded F RNG state. It does not es
 ZeRO, FlashAttention, FP16, FSDP, compilation, CUDA dropout behavior, real-image
 equivalence, two-host execution, or a GPU training run.
 
+The production Stage 1 sparse-token DoRA handoff is also accepted: exactly one
+active, unmerged DoRA adapter, the canonical `TrainableTokensWrapper` only at
+`model.embed_tokens`, and its exact untied `TrainableTokensLayer` over ordinary
+`nn.Embedding` (`max_norm=None`). Its three token IDs must match the Stage 2
+config, PEFT mapping and canonical `SparseOutputTokenRows` LM head. Other
+auxiliary wrappers/tuners remain rejected. Packed M reuses detached embeddings
+captured from F and calls the sparse LM head normally; neither input rows nor
+output deltas are bypassed. The sparse-row CPU regression uses the actual
+Stage 1 artifact writer and fresh Stage 2 loader, nonzero rows and DoRA dropout
+0.05, comparing independent full replay with packed logits, scores, loss and
+F/latent gradients in FP32 and BF16/non-reentrant checkpointing.
+
 Excluding the unchanged latent recurrence, expected decoder prediction calls
 are CE=1, CE+entropy=2, CE+Vision=2, and combined=3. In packed mode one M
 decoder call is deliberately **not** a top-level model call:

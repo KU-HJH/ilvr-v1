@@ -49,7 +49,8 @@ def test_packed_execution_is_an_explicit_opt_in_runtime_mode():
     assert torch.isfinite(result.vis_sum)
 
 
-def _run_runtime(model, inputs, *, mode, retain_latents=False, post_only=False):
+def _run_runtime(model, inputs, *, mode, retain_latents=False, post_only=False,
+                 tokens=TOKENS, text_vocabulary=TEXT_VOCABULARY):
     import stage2.objective_runtime as objective_runtime
 
     config = Stage2ObjectiveConfig(
@@ -58,7 +59,7 @@ def _run_runtime(model, inputs, *, mode, retain_latents=False, post_only=False):
         stage2_m_execution=mode,
         post_window=2,
     )
-    runtime = Stage2ObjectiveRuntime(config, TOKENS, 2, TEXT_VOCABULARY, None)
+    runtime = Stage2ObjectiveRuntime(config, tokens, 2, text_vocabulary, None)
     selection = runtime.select(inputs)
     scores = []
     latents = []

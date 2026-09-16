@@ -77,20 +77,21 @@ def _write_full_stage1(directory: Path) -> Path:
     return source
 
 
-def _write_schema2_dora(directory: Path) -> tuple[Path, Path]:
+def _write_schema2_dora(directory: Path, *, dropout=0.0) -> tuple[Path, Path]:
     base_source = (directory / "original-base").resolve()
     adapter_source = directory / "stage1-dora"
     base = tiny_original_qwen()
     base.save_pretrained(base_source, safe_serialization=True)
 
     metadata = replace(
-        sample_metadata(base), base_model_reference=str(base_source.resolve())
+        sample_metadata(base, replace(stage1_tuning(), dropout=dropout)),
+        base_model_reference=str(base_source.resolve())
     )
     tuned_base = _configure_stage1_tokens(
         Qwen2_5_VLForConditionalGeneration.from_pretrained(base_source)
     )
     model = build_stage1_tuned_model(
-        tuned_base, stage1_tuning(), LATENT_TOKEN_IDS
+        tuned_base, replace(stage1_tuning(), dropout=dropout), LATENT_TOKEN_IDS
     )
     model.peft_config["default"].base_model_name_or_path = str(base_source.resolve())
     with torch.no_grad():
@@ -155,7 +156,7 @@ def _student_from_full(source: Path):
     return model
 
 
-def _student_from_dora(base_source: Path, adapter_source: Path, *, dtype=None):
+def _student_from_dora(base_source: Path, adapter_source: Path, *, dtype=None, dropout=0.0):
     base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         base_source, attn_implementation="eager", torch_dtype=dtype
     )
@@ -167,7 +168,7 @@ def _student_from_dora(base_source: Path, adapter_source: Path, *, dtype=None):
             method="dora",
             r=4,
             alpha=8,
-            dropout=0.0,
+            dropout=dropout,
             target_modules=stage1_tuning().target_suffixes,
         ),
         requested_base_model_reference=str(base_source.resolve()),
