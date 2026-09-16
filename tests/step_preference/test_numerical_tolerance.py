@@ -88,6 +88,18 @@ def test_fp64_accumulation_prevents_half_precision_square_overflow():
     assert result["gradients"]["relative_l2"] == pytest.approx(32 / 60000)
 
 
+@pytest.mark.parametrize("scale", [1e-161, 1e-200, 1e200])
+@pytest.mark.parametrize("fraction,passed", [(.005, True), (.02, False)])
+def test_scaled_gradient_norm_avoids_square_underflow_and_overflow(scale, fraction, passed):
+    # Direct squaring can erase a 2% difference even with a positive reference norm.
+    result = compare({"w": torch.tensor([scale], dtype=torch.float64)},
+                     {"w": torch.tensor([scale * (1. + fraction)], dtype=torch.float64)})
+    assert result.get("passed") is passed
+    assert result["gradients"]["relative_l2"] == pytest.approx(fraction, rel=1e-12, abs=0.)
+    assert result["gradients"]["reference_l2"] == pytest.approx(scale, rel=1e-12, abs=0.)
+    assert result["gradients"]["difference_l2"] == pytest.approx(scale * fraction, rel=1e-12, abs=0.)
+
+
 @pytest.mark.parametrize("reference,candidate,error", [
     ({"a": torch.ones(1)}, {"b": torch.ones(1)}, "keys"),
     ({"a": torch.ones(1)}, {"a": torch.ones(1), "b": torch.ones(1)}, "keys"),

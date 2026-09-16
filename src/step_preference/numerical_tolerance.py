@@ -16,6 +16,14 @@ GRADIENT_RELATIVE_L2_TOLERANCE = 0.01
 REQUIRED_LOSSES = ("loss/ce", "loss/context_preference")
 
 
+def _scaled_l2(value: torch.Tensor) -> float:
+    """Norm of a nonempty CPU FP64 tensor without squaring its raw scale."""
+    scale = value.abs().max().item()
+    if scale == 0. or not math.isfinite(scale):
+        return scale
+    return scale * math.sqrt((value / scale).square().sum().item())
+
+
 def compare_numerical_tolerance(
     reference_losses: Mapping[str, float],
     candidate_losses: Mapping[str, float],
@@ -64,8 +72,7 @@ def compare_numerical_tolerance(
             f"gradient keys differ: missing={sorted(reference_names - candidate_names)}, "
             f"extra={sorted(candidate_names - reference_names)}"
         )
-    reference_squared = torch.zeros((), dtype=torch.float64, device="cpu")
-    difference_squared = torch.zeros_like(reference_squared)
+    reference_l2 = difference_l2 = 0.
     difference_is_zero = True
     active_tensors, active_elements, inactive_names = 0, 0, []
     for name in sorted(reference_names & candidate_names):
@@ -97,13 +104,13 @@ def compare_numerical_tolerance(
         active_elements += reference.numel()
         difference = candidate - reference
         difference_is_zero = difference_is_zero and torch.equal(candidate, reference)
-        reference_squared += reference.square().sum()
-        difference_squared += difference.square().sum()
+        # hypot combines per-tensor norms into the full-vector L2 without
+        # under/overflow from directly squaring small/large FP64 values.
+        reference_l2 = math.hypot(reference_l2, _scaled_l2(reference))
+        difference_l2 = math.hypot(difference_l2, _scaled_l2(difference))
 
     if not active_tensors:
         gradient_errors.append("no active gradient tensors")
-    reference_l2 = math.sqrt(reference_squared.item())
-    difference_l2 = math.sqrt(difference_squared.item())
     if not math.isfinite(reference_l2) or not math.isfinite(difference_l2):
         gradient_errors.append("gradient FP64 accumulation must be finite")
     relative_l2 = (
