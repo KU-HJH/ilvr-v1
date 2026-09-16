@@ -62,6 +62,17 @@ def _validate_branch(
         raise ValueError("replacement does not support suppressed latent boundaries")
     if branch.rejected_model_inputs is not None:
         raise ValueError("visual_off branch cannot contain rejected model inputs")
+    for field in (
+        "token_ids",
+        "clean_embedding_sources",
+        "logical_positions",
+        "selected_positions",
+        "target_token_ids",
+    ):
+        if not isinstance(getattr(branch, field), tuple):
+            raise ValueError(
+                f"step {branch.step_id} {field} must be a tuple"
+            )
     if (
         type(branch.blocked_start) is not int
         or type(branch.blocked_end) is not int
@@ -102,7 +113,12 @@ def _validate_branch(
         branch.logical_positions[position] for position in branch.selected_positions
     )
     if (
-        any(type(position) is not int for position in predictor_positions)
+        branch.selected_positions != tuple(range(len(branch.logical_positions)))
+        or branch.logical_positions
+        != tuple(
+            range(branch.logical_positions[0], branch.logical_positions[-1] + 1)
+        )
+        or any(type(position) is not int for position in predictor_positions)
         or any(
             right <= left
             for left, right in zip(predictor_positions, predictor_positions[1:])
@@ -110,7 +126,9 @@ def _validate_branch(
         or predictor_positions[0] < 0
         or predictor_positions[-1] + 1 >= root_length
     ):
-        raise ValueError(f"step {branch.step_id} predictor positions are invalid")
+        raise ValueError(
+            f"step {branch.step_id} predictor positions must be the exact contiguous target range"
+        )
     expected_targets = tuple(
         int(clean_ids[position + 1].item()) for position in predictor_positions
     )
@@ -161,6 +179,14 @@ def build_replacement_plan(
     if type(image_count) is not int or image_count < 0:
         raise ValueError("image_count must be a nonnegative integer")
 
+    if (
+        not isinstance(sidecar_plan.groups, tuple)
+        or len(sidecar_plan.groups) != 2
+        or any(not isinstance(group, tuple) for group in sidecar_plan.groups)
+    ):
+        raise ValueError("sidecar_plan groups must contain two branch tuples")
+    if not isinstance(sidecar_plan.root_selected_positions, tuple):
+        raise ValueError("sidecar_plan root_selected_positions must be a tuple")
     visual_branches, textual_branches = sidecar_plan.groups
     if textual_branches:
         raise ValueError("replacement requires a visual-only context plan")
@@ -183,6 +209,7 @@ def build_replacement_plan(
 
     validated: list[tuple[SidecarBranch, tuple[int, ...], tuple[int, ...]]] = []
     all_predictors: list[int] = []
+    previous_latent_end: int | None = None
     for expected_step_id, branch in enumerate(visual_branches):
         predictors, targets = _validate_branch(
             branch,
@@ -191,8 +218,11 @@ def build_replacement_plan(
             root_length=sidecar_plan.root_length,
             latent_size=latent_size,
         )
+        if previous_latent_end is not None and previous_latent_end > branch.blocked_start:
+            raise ValueError("latent blocks must follow absolute causal order")
         validated.append((branch, predictors, targets))
         all_predictors.extend(predictors)
+        previous_latent_end = branch.blocked_end
     if tuple(all_predictors) != tuple(sidecar_plan.root_selected_positions):
         raise ValueError("root predictor positions do not match sidecar branches")
 
@@ -229,6 +259,8 @@ def build_replacement_plan(
                 torch.randint(branch.step_id, (1,), generator=generator).item()
             )
             donor = validated[donor_index][0]
+            if donor.blocked_end > branch.blocked_start:
+                raise ValueError("donor latent block must precede current branch")
             donor_step_id = donor.step_id
             source_positions = tuple(range(donor.blocked_start, donor.blocked_end))
         planned.append(

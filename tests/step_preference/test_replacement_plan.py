@@ -247,6 +247,96 @@ def test_branch_targets_predictors_and_step_order_are_validated(mutation, messag
         _build(ids, malformed)
 
 
+def test_predictor_positions_must_be_the_exact_contiguous_target_range():
+    """Catches an in-range predictor gap that skips a target token."""
+    ids, sidecar = planner_case()
+    sparse = replace(
+        sidecar.groups[0][0],
+        token_ids=(92, 21, 22),
+        clean_embedding_sources=(10, 11, 12),
+        logical_positions=(10, 11, 12),
+        selected_positions=(0, 2),
+        target_token_ids=(21, 91),
+    )
+    malformed = replace(
+        sidecar,
+        root_selected_positions=(10, 12, 16, 17),
+        groups=((sparse, sidecar.groups[0][1]), ()),
+    )
+
+    with pytest.raises(ValueError, match="predictor.*contiguous"):
+        _build(ids, malformed)
+
+
+def test_latent_blocks_must_follow_absolute_causal_order():
+    """Catches an earlier step ID donating a block after the current block."""
+    ids, sidecar = planner_case()
+    reordered_second = replace(
+        sidecar.groups[0][1],
+        blocked_start=6,
+        blocked_end=8,
+    )
+    malformed = replace(
+        sidecar,
+        groups=((sidecar.groups[0][0], reordered_second), ()),
+    )
+
+    with pytest.raises(ValueError, match="latent.*causal order"):
+        _build(ids, malformed)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("target_token_ids", "target_token_ids"),
+        ("clean_embedding_sources", "clean_embedding_sources"),
+    ],
+)
+def test_none_branch_sequence_metadata_raises_field_specific_value_error(
+    field, message
+):
+    """Catches malformed sequence metadata escaping as an incidental TypeError."""
+    ids, sidecar = planner_case()
+    malformed_branch = replace(sidecar.groups[0][0], **{field: None})
+    malformed = replace(
+        sidecar,
+        groups=((malformed_branch, sidecar.groups[0][1]), ()),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _build(ids, malformed)
+
+
+def test_ce_only_plan_rejects_none_visual_group_before_empty_return():
+    """Catches malformed groups being treated as a valid empty CE plan."""
+    ids = torch.tensor([[11, 12, 13]])
+    sidecar = build_context_sidecar_plan(
+        clean_input_ids=ids,
+        attention_mask=torch.ones_like(ids),
+        spans=(),
+        visual_only=True,
+    )
+    malformed = replace(sidecar, groups=(None, ()))
+
+    with pytest.raises(ValueError, match="groups"):
+        _build(ids, malformed, image_count=0)
+
+
+def test_ce_only_plan_rejects_none_root_predictors_before_empty_return():
+    """Catches malformed root predictor metadata bypassing validation."""
+    ids = torch.tensor([[11, 12, 13]])
+    sidecar = build_context_sidecar_plan(
+        clean_input_ids=ids,
+        attention_mask=torch.ones_like(ids),
+        spans=(),
+        visual_only=True,
+    )
+    malformed = replace(sidecar, root_selected_positions=None)
+
+    with pytest.raises(ValueError, match="root_selected_positions"):
+        _build(ids, malformed, image_count=0)
+
+
 def test_sidecar_must_be_active_context_plan():
     """Catches accepting unrelated or inactive sidecar metadata."""
     ids, sidecar = planner_case()
