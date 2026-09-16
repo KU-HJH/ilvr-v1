@@ -59,9 +59,9 @@ LORA_TARGET_MODULES=${LORA_TARGET_MODULES-q_proj,k_proj,v_proj,o_proj,gate_proj,
 LATENT_SIZE=${LATENT_SIZE:-8}
 STAGE2_DIAGNOSTICS_INTERVAL=${STAGE2_DIAGNOSTICS_INTERVAL:-0}
 SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
-LEARNING_RATE=${LEARNING_RATE:-1e-5}
+LEARNING_RATE=${LEARNING_RATE:-5e-5}
 CE_WEIGHT=${CE_WEIGHT:-1.0}
-GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-8}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-2}
 ATTENTION_IMPLEMENTATION=${ATTENTION_IMPLEMENTATION:-sdpa}
 if [[ -n "${VISION_ATTENTION_IMPLEMENTATION:-}" ]]; then
   vision_attention_implementation_explicit=true
@@ -77,12 +77,31 @@ PER_DEVICE_TRAIN_BATCH_SIZE=1
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
 STEP_PREFERENCE_OBJECTIVE=${STEP_PREFERENCE_OBJECTIVE:-context_preference}
 STEP_PREFERENCE_TARGET_SCOPE=${STEP_PREFERENCE_TARGET_SCOPE:-immediate_text}
+STEP_PREFERENCE_PREFIX_MODE=${STEP_PREFERENCE_PREFIX_MODE:-clean_prefix}
+STEP_PREFERENCE_BRANCH_MODE=${STEP_PREFERENCE_BRANCH_MODE:-independent}
+case "$STEP_PREFERENCE_PREFIX_MODE" in
+  clean_prefix|v_off_prefix|v_off_insertion) ;;
+  *) printf 'Unknown STEP_PREFERENCE_PREFIX_MODE\n' >&2; exit 2 ;;
+esac
+case "$STEP_PREFERENCE_BRANCH_MODE" in
+  independent|cumulative) ;;
+  *) printf 'Unknown STEP_PREFERENCE_BRANCH_MODE\n' >&2; exit 2 ;;
+esac
+if [[ "$STEP_PREFERENCE_BRANCH_MODE" == cumulative && "$STEP_PREFERENCE_PREFIX_MODE" != v_off_insertion ]]; then
+  printf 'cumulative branch mode requires v_off_insertion\n' >&2; exit 2
+fi
+case "${STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE-false}" in
+  0|false|False) step_preference_block_original_image=false ;;
+  1|true|True) step_preference_block_original_image=true ;;
+  *) printf 'STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE must be a boolean\n' >&2; exit 2 ;;
+esac
 case "$STEP_PREFERENCE_TARGET_SCOPE" in
   immediate_text|until_next_latent) ;;
   *) printf 'Unknown STEP_PREFERENCE_TARGET_SCOPE\n' >&2; exit 2 ;;
 esac
 case "${STEP_VISUAL_ONLY_CONTEXT_PREFERENCE-}" in
-  ""|0|false|False) step_visual_only_context_preference=false ;;
+  "") step_visual_only_context_preference=default ;;
+  0|false|False) step_visual_only_context_preference=false ;;
   1|true|True) step_visual_only_context_preference=true ;;
   *)
     printf 'STEP_VISUAL_ONLY_CONTEXT_PREFERENCE must be 0, 1, false, or true\n' >&2
@@ -90,7 +109,8 @@ case "${STEP_VISUAL_ONLY_CONTEXT_PREFERENCE-}" in
     ;;
 esac
 case "${STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES-}" in
-  ""|0|false|False) step_visual_off_suppress_latent_boundaries=false ;;
+  "") step_visual_off_suppress_latent_boundaries=default ;;
+  0|false|False) step_visual_off_suppress_latent_boundaries=false ;;
   1|true|True) step_visual_off_suppress_latent_boundaries=true ;;
   *)
     printf 'STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES must be 0, 1, false, or true\n' >&2
@@ -215,6 +235,20 @@ case "$STEP_PREFERENCE_ENABLED" in
         exit 2
         ;;
     esac
+    if [[ "$step_visual_only_context_preference" == default ]]; then
+      if [[ "$STEP_PREFERENCE_MODE" == stage2b && "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
+        step_visual_only_context_preference=true
+      else
+        step_visual_only_context_preference=false
+      fi
+    fi
+    if [[ "$step_visual_off_suppress_latent_boundaries" == default ]]; then
+      if [[ "$STEP_PREFERENCE_MODE" == stage2b && "$STEP_PREFERENCE_OBJECTIVE" == context_preference && "$step_visual_only_context_preference" == true ]]; then
+        step_visual_off_suppress_latent_boundaries=true
+      else
+        step_visual_off_suppress_latent_boundaries=false
+      fi
+    fi
     STEP_PREFERENCE_ARGS+=(
       --step_preference_enabled
       --step_preference_mode "$STEP_PREFERENCE_MODE"
@@ -228,15 +262,26 @@ case "$STEP_PREFERENCE_ENABLED" in
         --step_preference_beta "$STEP_PREFERENCE_BETA"
         --step_preference_weight "$STEP_PREFERENCE_WEIGHT"
         --step_preference_target_scope "$STEP_PREFERENCE_TARGET_SCOPE"
+        --step_preference_prefix_mode "$STEP_PREFERENCE_PREFIX_MODE"
+        --step_preference_branch_mode "$STEP_PREFERENCE_BRANCH_MODE"
         --step_preference_margin "$STEP_PREFERENCE_MARGIN"
         --step_sidecar_attention_backend "$STEP_SIDECAR_ATTENTION_BACKEND"
         --step_sidecar_query_budget "$STEP_SIDECAR_QUERY_BUDGET"
       )
-      if [[ "$step_visual_only_context_preference" == true ]]; then
-        STEP_PREFERENCE_ARGS+=(--step_visual_only_context_preference)
+      if [[ "$step_preference_block_original_image" == true ]]; then
+        STEP_PREFERENCE_ARGS+=(--step_preference_block_original_image)
       fi
-      if [[ "$step_visual_off_suppress_latent_boundaries" == true ]]; then
-        STEP_PREFERENCE_ARGS+=(--step_visual_off_suppress_latent_boundaries)
+      if [[ "$STEP_PREFERENCE_MODE" == stage2b ]]; then
+        if [[ "$step_visual_only_context_preference" == true ]]; then
+          STEP_PREFERENCE_ARGS+=(--step_visual_only_context_preference)
+        else
+          STEP_PREFERENCE_ARGS+=(--no-step_visual_only_context_preference)
+        fi
+        if [[ "$step_visual_off_suppress_latent_boundaries" == true ]]; then
+          STEP_PREFERENCE_ARGS+=(--step_visual_off_suppress_latent_boundaries)
+        else
+          STEP_PREFERENCE_ARGS+=(--no-step_visual_off_suppress_latent_boundaries)
+        fi
       fi
     else
       STEP_PREFERENCE_ARGS+=(
@@ -333,6 +378,19 @@ fi
 if [[ "$STEP_PREFERENCE_TARGET_SCOPE" != immediate_text ]] &&
    [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b || "$STEP_PREFERENCE_OBJECTIVE" != context_preference ]]; then
   printf 'STEP_PREFERENCE_TARGET_SCOPE requires context-preference Stage 2B\n' >&2
+  exit 2
+fi
+
+if [[ "$STEP_PREFERENCE_PREFIX_MODE" == v_off_prefix || "$STEP_PREFERENCE_PREFIX_MODE" == v_off_insertion ]] &&
+   [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b || "$STEP_PREFERENCE_OBJECTIVE" != context_preference || "$step_visual_only_context_preference" != true || "$step_visual_off_suppress_latent_boundaries" == true ]]; then
+  printf 'Visual prefix modes require V-only context preference with START/END kept\n' >&2
+  exit 2
+fi
+if [[ "$STEP_PREFERENCE_PREFIX_MODE" == v_off_insertion && "$step_shared_prefix_enabled" != true ]]; then
+  printf 'v_off_insertion requires shared-prefix execution\n' >&2; exit 2
+fi
+if [[ "$step_preference_block_original_image" == true && "$STEP_PREFERENCE_PREFIX_MODE" != v_off_prefix ]]; then
+  printf 'STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE requires v_off_prefix\n' >&2
   exit 2
 fi
 
@@ -438,9 +496,14 @@ MANAGED_OPTIONS=(
   --step_preference_beta
   --step_preference_weight
   --step_preference_target_scope
+  --step_preference_prefix_mode
+  --step_preference_branch_mode
+  --step_preference_block_original_image
   --step_preference_margin
   --step_visual_only_context_preference
+  --no-step_visual_only_context_preference
   --step_visual_off_suppress_latent_boundaries
+  --no-step_visual_off_suppress_latent_boundaries
   --step_negative_path
   --step_negative_manifest
   --step_max_packed_sequence_length
@@ -789,6 +852,7 @@ if [[ "$step_preference_packing" == true && -z "${RESUME_CHECKPOINT:-}" ]]; then
 fi
 TRAINING_ARGS=(
   --stage stage2
+  --epochs 1
   --load_model_path "$STAGE1_CHECKPOINT"
   --data_path "$DATA_PATH"
   --image_root "$IMAGE_ROOT"

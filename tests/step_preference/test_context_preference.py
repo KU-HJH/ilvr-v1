@@ -193,7 +193,7 @@ def test_context_loss_rejects_invalid_scores(clean, off):
 
 
 @pytest.mark.parametrize("k", [1, 4, 8, 16])
-def test_default_actual_scoring_calls_are_three_without_legacy(k, monkeypatch):
+def test_default_actual_scoring_calls_are_two_without_legacy(k, monkeypatch):
     """Catches a legacy default, per-step/chunk forwards, or skipped steps."""
     model, batch = tiny_measurement_case(steps=k, total_target_tokens=2*k, device="cpu")
     # Legacy fixture metadata is deliberately absent at the training boundary.
@@ -211,14 +211,14 @@ def test_default_actual_scoring_calls_are_three_without_legacy(k, monkeypatch):
         counters.phase = "backward"
         loss.backward()
         counts = counters.snapshot()
-    assert before_backward["decoder_calls_forward"] - before_backward["latent_decoder_calls_forward"] == 3
+    assert before_backward["decoder_calls_forward"] - before_backward["latent_decoder_calls_forward"] == 2
     assert before_backward["latent_decoder_calls_forward"] == 2*k
-    assert before_backward["sidecar_chunks_forward"] == 2
-    assert len(output.stage2_sidecar_results) == 2*k
-    assert {r["kind"] for r in output.stage2_sidecar_results} == {"visual_off", "textual_off"}
+    assert before_backward["sidecar_chunks_forward"] == 1
+    assert len(output.stage2_sidecar_results) == k
+    assert {r["kind"] for r in output.stage2_sidecar_results} == {"visual_off"}
     assert torch.isfinite(loss) and any(p.grad is not None for p in model.parameters())
     metrics = trainer._step_preference_metric_totals
-    assert metrics["stats/scored_tokens"] == 6*k
+    assert metrics["stats/scored_tokens"] == 4*k
     assert "loss/context_preference" in metrics and "loss/dpo" not in metrics
     print(dict(K=k, counts=counts, metrics=metrics))
 
@@ -361,7 +361,7 @@ def test_default_preflight_and_collator_need_no_negative_artifacts(inputs, monke
     assert (
         before_backward["decoder_calls_forward"]
         - before_backward["latent_decoder_calls_forward"]
-        == 3
+        == 2
     )
     assert all(
         torch.isfinite(parameter.grad).all()

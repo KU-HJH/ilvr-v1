@@ -628,6 +628,9 @@ class Stage2Trainer(Trainer):
                 plan=plan,
                 backend=config.sidecar_attention_backend,
                 query_budget=config.sidecar_query_budget,
+                prefix_mode=config.prefix_mode,
+                branch_mode=config.branch_mode,
+                block_original_image=config.block_original_image,
             ),
         )
         if plan.root_selected_positions:
@@ -655,8 +658,13 @@ class Stage2Trainer(Trainer):
             if spans
             else None
         )
-        results = {}
+        results, evidence_on = {}, {}
         for result in outputs.stage2_sidecar_results:
+            if config.prefix_mode in ("v_off_prefix", "v_off_insertion") and result["kind"] == "visual_on":
+                if result["step_id"] in evidence_on:
+                    raise ValueError("duplicate evidence-on score")
+                evidence_on[result["step_id"]] = result
+                continue
             modality = {"visual_off": "visual", "textual_off": "textual"}.get(
                 result["kind"]
             )
@@ -676,18 +684,27 @@ class Stage2Trainer(Trainer):
         }:
             raise ValueError("context sidecar layout mismatch")
         clean_scores, clean_entropies, offset = [], [], 0
+        if config.prefix_mode in ("v_off_prefix", "v_off_insertion") and set(evidence_on) != {s.step_id for s in spans}:
+            raise ValueError("evidence-on score layout mismatch")
         for span in spans:
             count = span.target_text_end - span.target_text_start
             logits = rows[:, offset : offset + count]
             targets = clean_inputs["input_ids"][
                 :, span.target_text_start : span.target_text_end
             ]
-            clean_scores.append(_mean_selected_logp(logits, targets))
-            clean_entropies.append(_selected_entropies(logits))
+            if config.prefix_mode in ("v_off_prefix", "v_off_insertion"):
+                clean_scores.append(evidence_on[span.step_id]["mean_logp"])
+                clean_entropies.append(evidence_on[span.step_id]["entropies"])
+            else:
+                clean_scores.append(_mean_selected_logp(logits, targets))
+                clean_entropies.append(_selected_entropies(logits))
             offset += count
         total, metrics = self._reduce_context_objective(
             clean_ce, clean_scores, clean_entropies, results
         )
+        if config.prefix_mode in ("v_off_prefix", "v_off_insertion"):
+            metrics["stats/logp_evidence_on"] = metrics["stats/logp_clean"]
+            metrics["stats/logp_evidence_off"] = metrics["stats/logp_visual_off"]
         metrics.update(
             {
                 "stats/scored_tokens": (1 + len(expected_modalities))

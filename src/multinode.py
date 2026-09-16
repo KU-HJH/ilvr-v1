@@ -1949,13 +1949,13 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 ),
                 expected_global_step=final_step,
                 expected_micro_batch=int(
-                    _argument_value(forwarded, "--micro-batch") or "8"
+                    _argument_value(forwarded, "--micro-batch") or "1"
                 ),
                 expected_gradient_accumulation_steps=int(
                     _argument_value(forwarded, "--gradient-accumulation") or "2"
                 ),
                 expected_ema_tau=float(
-                    _argument_value(forwarded, "--ema-tau") or "0.999"
+                    _argument_value(forwarded, "--ema-tau") or "1.0"
                 ),
                 expected_seed=int(_argument_value(forwarded, "--seed") or "42"),
             )
@@ -1989,7 +1989,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             world_size=plan.world_size,
         )
         if stage == "stage1":
-            batch_value = _argument_value(forwarded, "--micro-batch") or "8"
+            batch_value = _argument_value(forwarded, "--micro-batch") or "1"
             batch_per_gpu = int(batch_value)
         else:
             batch_per_gpu = 1

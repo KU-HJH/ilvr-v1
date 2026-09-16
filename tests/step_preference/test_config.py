@@ -80,6 +80,64 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
     assert args.step_max_packed_sequence_length == 4608
 
 
+def test_context_preference_defaults_to_winning_v_only_configuration():
+    """Catches context Stage 2B drifting from the selected training default."""
+    args = parse_args(
+        [
+            "--stage", "stage2", "--step_preference_enabled",
+            "--step_preference_mode", "stage2b",
+            "--stage2a_checkpoint_path", "checkpoint",
+        ]
+    )
+
+    assert args.step_preference_config.target_scope == "immediate_text"
+    assert args.step_preference_config.visual_only_context_preference is True
+    assert args.step_preference_config.visual_off_suppress_latent_boundaries is True
+
+
+def test_direct_context_config_defaults_to_winning_v_only_configuration():
+    """Catches direct config construction disagreeing with the CLI defaults."""
+    config = StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        stage2a_checkpoint_path="checkpoint",
+    )
+
+    assert config.target_scope == "immediate_text"
+    assert config.visual_only_context_preference is True
+    assert config.visual_off_suppress_latent_boundaries is True
+
+
+def test_context_preference_cli_can_restore_previous_v_and_t_default():
+    """Catches removal of the explicit opt-out for the former V+T behavior."""
+    args = parse_args(
+        [
+            "--stage", "stage2", "--step_preference_enabled",
+            "--step_preference_mode", "stage2b",
+            "--stage2a_checkpoint_path", "checkpoint",
+            "--no-step_visual_only_context_preference",
+        ]
+    )
+
+    assert args.step_preference_config.visual_only_context_preference is False
+    assert args.step_preference_config.visual_off_suppress_latent_boundaries is False
+
+
+def test_v_only_context_cli_can_restore_visible_latent_boundaries():
+    """Catches removal of the explicit opt-out for visible V-off boundaries."""
+    args = parse_args(
+        [
+            "--stage", "stage2", "--step_preference_enabled",
+            "--step_preference_mode", "stage2b",
+            "--stage2a_checkpoint_path", "checkpoint",
+            "--no-step_visual_off_suppress_latent_boundaries",
+        ]
+    )
+
+    assert args.step_preference_config.visual_only_context_preference is True
+    assert args.step_preference_config.visual_off_suppress_latent_boundaries is False
+
+
 def test_visual_only_context_preference_cli_maps_and_validates_scope():
     """Catches the V-only setting being dropped or accepted outside context Stage 2B."""
     args = parse_args(
@@ -120,6 +178,7 @@ def test_visual_off_boundary_suppression_cli_maps_and_validates_scope():
             enabled=True,
             mode="stage2b",
             stage2a_checkpoint_path="checkpoint",
+            visual_only_context_preference=False,
             visual_off_suppress_latent_boundaries=True,
         )
     with pytest.raises(
@@ -153,6 +212,7 @@ def test_direct_stage1_stage2b_requires_visual_context_and_uses_full_budget():
             mode="stage2b",
             objective="context_preference",
             direct_from_stage1=True,
+            visual_only_context_preference=False,
         )
     with pytest.raises(ValueError, match="visual-only context-preference Stage 2B"):
         StepPreferenceConfig(direct_from_stage1=True)

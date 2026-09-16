@@ -66,9 +66,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Preference target: next text entry (default), or all text until the next latent block.",
     )
     parser.add_argument("--step_preference_margin", type=float, default=0.0)
-    parser.add_argument("--step_visual_only_context_preference", action="store_true")
+    parser.add_argument("--step_preference_prefix_mode",
+        choices=("clean_prefix", "v_off_prefix", "v_off_insertion"), default="clean_prefix")
+    parser.add_argument("--step_preference_branch_mode",
+        choices=("independent", "cumulative"), default="independent")
+    parser.add_argument("--step_preference_block_original_image", action="store_true")
     parser.add_argument(
-        "--step_visual_off_suppress_latent_boundaries", action="store_true"
+        "--step_visual_only_context_preference",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use only the visual-off comparison for context preference "
+            "(default for context-preference Stage 2B)."
+        ),
+    )
+    parser.add_argument(
+        "--step_visual_off_suppress_latent_boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Suppress latent start/end controls in the visual-off comparison "
+            "(default when visual-only context preference is active)."
+        ),
     )
     parser.add_argument("--step_dpo_weight", type=float, default=1.0)
     parser.add_argument("--step_entropy_weight", type=float, default=0.1)
@@ -207,6 +226,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
     args.step_preference_config = StepPreferenceConfig.from_args(args)
+    args.step_visual_only_context_preference = (
+        args.step_preference_config.visual_only_context_preference
+    )
+    args.step_visual_off_suppress_latent_boundaries = (
+        args.step_preference_config.visual_off_suppress_latent_boundaries
+    )
     capacity_fields = (args.step_packed_capacity_evidence_path, args.step_packed_capacity_sample_id,
                        args.step_packed_gpu_snapshot, args.step_packed_gpu_snapshot_sha256)
     if any(value is not None for value in capacity_fields):
