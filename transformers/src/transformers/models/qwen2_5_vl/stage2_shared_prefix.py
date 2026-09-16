@@ -13,12 +13,23 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
 
     if not isinstance(options, Mapping):
         raise TypeError("stage2_shared_prefix_inputs must be a mapping")
-    if set(options) - {"plan", "backend", "query_budget", "checkpoint", "prefix_mode", "branch_mode", "block_original_image", "sample_id", "replacement_seed", "replacement_version"}:
+    shared_option_names = {
+        "plan", "backend", "query_budget", "checkpoint", "prefix_mode",
+        "branch_mode", "block_original_image",
+    }
+    replacement_option_names = {
+        "sample_id", "replacement_seed", "replacement_version",
+    }
+    prefix_mode = options.get("prefix_mode", "clean_prefix")
+    allowed_option_names = shared_option_names | (
+        replacement_option_names
+        if prefix_mode == "evidence_replacement" else set()
+    )
+    if set(options) - allowed_option_names:
         raise ValueError("unknown shared-prefix input options")
     if not isinstance(options.get("plan"), SidecarPlan):
         raise ValueError("shared-prefix inputs require a SidecarPlan")
     plan = options["plan"]
-    prefix_mode = options.get("prefix_mode", "clean_prefix")
     if prefix_mode not in ("clean_prefix", "v_off_prefix", "v_off_insertion", "evidence_replacement"):
         raise ValueError("unknown preference prefix_mode")
     branch_mode = options.get("branch_mode", "independent")

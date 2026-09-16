@@ -145,6 +145,7 @@ def test_v_only_context_cli_can_restore_visible_latent_boundaries():
         ({"visual_off_suppress_latent_boundaries": True}, "boundaries"),
         ({"block_original_image": True}, "original image"),
         ({"branch_mode": "cumulative"}, "independent"),
+        ({"visual_only_context_preference": False}, "visual-only"),
         ({"objective": "legacy_dpo", "negative_path": "n", "negative_manifest": "m"}, "context"),
         ({"enabled": False}, "context"),
     ],

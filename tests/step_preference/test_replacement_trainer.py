@@ -27,13 +27,18 @@ def _config(**updates):
 
 @pytest.mark.parametrize("target_scope", ["immediate_text", "until_next_latent"])
 def test_trainer_uses_original_minus_replacement_step_mean_and_clean_ce(target_scope, monkeypatch):
-    """Catches using clean logits, source scores in reverse, or a detached replacement loss."""
+    """Catches reversed scores, detached loss, or target scope collapsing distinct text spans."""
     from tests.step_preference.insertion_helpers import native_case
+    from step_preference.sidecar import build_context_sidecar_plan
+    from step_preference.replacement import build_replacement_plan
 
     model, ids, _, grid, _, pixels = native_case()
+    # The two text entries after step zero end at distinct token boundaries:
+    # immediate text is token 13; the full scope also includes token 14.
+    first_target_end = 10 if target_scope == "immediate_text" else 11
     spans = (
-        ReasoningStepSpan(0, 0, 5, 6, 8, 9, 11, None),
-        ReasoningStepSpan(1, 9, 11, 12, 14, 15, 17, 0),
+        ReasoningStepSpan(0, 0, 5, 6, 8, 9, first_target_end, None),
+        ReasoningStepSpan(1, 10, 11, 12, 14, 15, 17, 0),
     )
     batch = dict(
         input_ids=ids,
@@ -46,6 +51,25 @@ def test_trainer_uses_original_minus_replacement_step_mean_and_clean_ce(target_s
         step_preference={"steps": tuple({"span": span} for span in spans)},
     )
     trainer = _trainer(_config(target_scope=target_scope))
+    plan = build_context_sidecar_plan(
+        clean_input_ids=ids,
+        attention_mask=torch.ones_like(ids),
+        spans=spans,
+        visual_only=True,
+        suppress_latent_boundaries=False,
+    )
+    replacement_plan = build_replacement_plan(
+        input_ids=ids,
+        sidecar_plan=plan,
+        image_token_id=80,
+        image_count=1,
+        latent_size=2,
+        sample_id="replacement-trainer",
+        seed=42,
+    )
+    first_branch = replacement_plan.branches[0]
+    expected_target_ids = (13,) if target_scope == "immediate_text" else (13, 14)
+    assert first_branch.target_token_ids == expected_target_ids
     visual_calls, rollout_calls = [], []
     visual_hook = model.visual.register_forward_pre_hook(
         lambda *_: visual_calls.append(1)
@@ -73,6 +97,8 @@ def test_trainer_uses_original_minus_replacement_step_mean_and_clean_ce(target_s
     assert {result["kind"] for result in output.stage2_sidecar_results} == {
         "visual_original", "visual_replacement"
     }
+    first_replacement = by_step[0]["visual_replacement"]
+    assert first_replacement.numel() == 1
     assert len(visual_calls) == 1
     assert len(rollout_calls) == 1
     loss.backward()

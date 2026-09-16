@@ -92,14 +92,74 @@ def test_native_replacement_matches_literal_prefix_and_detaches_copied_block():
     assert stats["replacement_image_count"] == 1
 
     replacement = actual[(1, "visual_replacement")]["mean_logp"]
-    replacement_grad = torch.autograd.grad(replacement, clean, retain_graph=True)[0]
-    assert replacement_grad[:, branch.latent_start : branch.latent_end].count_nonzero() == 0
+    literal_replacement = _literal_score(model, ids, positions, base, clean, branch)
+    replacement_grad, base_grad = torch.autograd.grad(
+        replacement, (clean, base), retain_graph=True, allow_unused=True,
+    )
+    literal_grad, literal_base_grad = torch.autograd.grad(
+        literal_replacement, (clean, base), retain_graph=True, allow_unused=True,
+    )
+    donor_gradient_match = torch.allclose(
+        replacement_grad, literal_grad, atol=1e-5, rtol=1e-4,
+    )
+    donor_base_detached = base_grad is literal_base_grad is None
+    donor_copy_detached = (
+        replacement_grad[:, branch.latent_start : branch.latent_end].count_nonzero() == 0
+    )
     donor = plan.branches[branch.donor_step_id]
-    assert replacement_grad[:, donor.latent_start : donor.latent_end].count_nonzero() > 0
+    donor_original_live = (
+        replacement_grad[:, donor.latent_start : donor.latent_end].count_nonzero() > 0
+    )
+    image_branch = plan.branches[0]
+    image_replacement = actual[(image_branch.step_id, "visual_replacement")]["mean_logp"]
+    literal_image_replacement = _literal_score(
+        model, ids, positions, base, clean, image_branch,
+    )
+    image_clean_grad, image_base_grad = torch.autograd.grad(
+        image_replacement, (clean, base), retain_graph=True, allow_unused=True,
+    )
+    literal_image_clean_grad, literal_image_base_grad = torch.autograd.grad(
+        literal_image_replacement, (clean, base), retain_graph=True, allow_unused=True,
+    )
+    fallback_gradient_match = torch.allclose(
+        image_clean_grad, literal_image_clean_grad, atol=1e-5, rtol=1e-4,
+    )
+    fallback_copy_detached = image_base_grad is literal_image_base_grad is None
+    assert all((
+        donor_gradient_match,
+        donor_base_detached,
+        donor_copy_detached,
+        donor_original_live,
+        fallback_gradient_match,
+        fallback_copy_detached,
+    )), (
+        f"donor_gradient_match={donor_gradient_match}; "
+        f"donor_base_detached={donor_base_detached}; "
+        f"donor_copy_detached={donor_copy_detached}; "
+        f"donor_original_live={donor_original_live}; "
+        f"fallback_gradient_match={fallback_gradient_match}; "
+        f"fallback_copy_detached={fallback_copy_detached}"
+    )
     total = sum(result["mean_logp"] for result in results)
     total.backward()
     assert model.lm_head.weight.grad is not None and model.lm_head.weight.grad.count_nonzero() > 0
     assert clean.grad is not None and clean.grad.count_nonzero() > 0
+
+
+def test_old_shared_prefix_modes_reject_evidence_replacement_metadata():
+    """Catches old modes silently accepting replacement-only sampler metadata."""
+    model, ids, positions, _, _, options = _case()
+    old_mode_options = dict(options, prefix_mode="clean_prefix")
+    with pytest.raises(ValueError, match="unknown shared-prefix input options"):
+        model(
+            input_ids=ids,
+            attention_mask=torch.ones_like(ids),
+            position_ids=positions,
+            pixel_values=torch.zeros((3, 12)),
+            image_grid_thw=torch.tensor([[1, 1, 3]]),
+            use_cache=False,
+            stage2_shared_prefix_inputs=old_mode_options,
+        )
 
 
 def test_replacement_ignores_current_latent_and_responds_to_its_selected_source():
