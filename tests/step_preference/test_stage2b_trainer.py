@@ -124,6 +124,7 @@ def test_capacity_final_adapter_save_defers_processor_but_numbered_save_does_not
         def save_pretrained(self,target,**kw):events.append(("weights",target.name))
     model=Model();trainer=object.__new__(module.Stage2Trainer)
     trainer.model=model;trainer.accelerator=N(unwrap_model=lambda m:m)
+    trainer.step_preference_config=module.StepPreferenceConfig()
     trainer.args=N(output_dir=str(tmp_path),save_safetensors=True)
     trainer.data_collator=CapacitySampleRecorder(lambda rows:rows,"a")
     trainer.processing_class=N(save_pretrained=lambda target:events.append(("processor",target.name)))
