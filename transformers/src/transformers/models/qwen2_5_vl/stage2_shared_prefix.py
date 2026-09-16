@@ -13,13 +13,13 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
 
     if not isinstance(options, Mapping):
         raise TypeError("stage2_shared_prefix_inputs must be a mapping")
-    if set(options) - {"plan", "backend", "query_budget", "checkpoint", "prefix_mode", "branch_mode", "block_original_image"}:
+    if set(options) - {"plan", "backend", "query_budget", "checkpoint", "prefix_mode", "branch_mode", "block_original_image", "sample_id", "replacement_seed", "replacement_version"}:
         raise ValueError("unknown shared-prefix input options")
     if not isinstance(options.get("plan"), SidecarPlan):
         raise ValueError("shared-prefix inputs require a SidecarPlan")
     plan = options["plan"]
     prefix_mode = options.get("prefix_mode", "clean_prefix")
-    if prefix_mode not in ("clean_prefix", "v_off_prefix", "v_off_insertion"):
+    if prefix_mode not in ("clean_prefix", "v_off_prefix", "v_off_insertion", "evidence_replacement"):
         raise ValueError("unknown preference prefix_mode")
     branch_mode = options.get("branch_mode", "independent")
     if branch_mode not in ("independent", "cumulative"):
@@ -30,11 +30,20 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
         raise ValueError("block_original_image must be a boolean")
     if options.get("block_original_image", False) and prefix_mode != "v_off_prefix":
         raise ValueError("block_original_image requires v_off_prefix")
-    if prefix_mode in ("v_off_prefix", "v_off_insertion") and (
+    if prefix_mode in ("v_off_prefix", "v_off_insertion", "evidence_replacement") and (
         not plan.context_preference or plan.groups[1]
         or any(branch.zero_first_embedding for branch in plan.groups[0])
     ):
         raise ValueError(f"{prefix_mode} requires V-only context preference with START/END kept")
+    if prefix_mode == "evidence_replacement":
+        if not isinstance(options.get("sample_id"), str) or not options["sample_id"]:
+            raise ValueError("evidence replacement requires a nonempty sample_id")
+        if type(options.get("replacement_seed")) is not int:
+            raise ValueError("evidence replacement requires an integer replacement_seed")
+        if options.get("replacement_version") != "ilvr-evidence-replacement-v1":
+            raise ValueError("evidence replacement requires sampling version ilvr-evidence-replacement-v1")
+        if options.get("block_original_image", False):
+            raise ValueError("evidence replacement preserves original image access")
     if plan.context_preference:
         expected_kinds = ("visual_off", "textual_off")
         if not isinstance(plan.groups, tuple) or len(plan.groups) != len(expected_kinds):

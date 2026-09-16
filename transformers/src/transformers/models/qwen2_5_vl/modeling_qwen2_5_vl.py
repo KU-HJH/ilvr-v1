@@ -2206,6 +2206,18 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 and pixel_values is None
             ):
                 raise ValueError("v_off_insertion requires pixel_values for active visual branches")
+            if (
+                stage2_shared_prefix_inputs.get("prefix_mode") == "evidence_replacement"
+                and stage2_shared_prefix_inputs["plan"].groups[0]
+            ):
+                if pixel_values is None:
+                    raise ValueError("evidence replacement requires pixel_values for active visual branches")
+                if (
+                    not isinstance(image_grid_thw, torch.Tensor)
+                    or image_grid_thw.ndim != 2
+                    or tuple(image_grid_thw.shape) != (1, 3)
+                ):
+                    raise ValueError("evidence replacement requires exactly one image grid")
         packed_values = None
         if packed:
             if not return_dict:
@@ -2535,6 +2547,14 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 sidecar_results, sidecar_stats = score_v_off_insertion(
                     self, stage2_shared_prefix_inputs, input_ids,
                     base_inputs_embeds, image_grid_thw,
+                )
+            elif stage2_shared_prefix_inputs.get("prefix_mode") == "evidence_replacement":
+                from .stage2_evidence_replacement import score_evidence_replacement
+
+                sidecar_results, sidecar_stats = score_evidence_replacement(
+                    self, stage2_shared_prefix_inputs, input_ids,
+                    base_inputs_embeds, rollout.final_inputs_embeds,
+                    full_position_ids, image_grid_thw,
                 )
             else:
                 from .stage2_shared_prefix import score_sidecars
