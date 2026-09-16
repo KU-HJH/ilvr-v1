@@ -129,6 +129,23 @@ def test_stage2_native_ddp_worker_rejects_incomplete_topology():
     assert "all distributed variables" in result.stderr
 
 
+def test_worker_pythonpath_imports_actual_script_entrypoint_outside_repo(tmp_path):
+    """Catches the worker dropping repo root needed by stage2.evidence's src imports."""
+    tokens = dry_run_tokens(run_launcher(env_overrides=native_ddp_environment()))
+    pythonpath = next(token.split("=", 1)[1] for token in tokens if token.startswith("PYTHONPATH="))
+    completed = subprocess.run(
+        [str(REPO_ROOT / "venv/ilvr-venv/bin/python"), str(REPO_ROOT / "src/main.py"),
+         "--save_model_path", "/root/workspace/ILVR/checkpoints/test-worker-import",
+         "--help"],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": pythonpath, "CUDA_VISIBLE_DEVICES": ""},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--stage" in completed.stdout
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     (
@@ -231,7 +248,7 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
     )
 
     tokens = dry_run_tokens(result)
-    expected_pythonpath = f"{REPO_ROOT / 'transformers/src'}:{REPO_ROOT / 'src'}"
+    expected_pythonpath = f"{REPO_ROOT / 'transformers/src'}:{REPO_ROOT / 'src'}:{REPO_ROOT}"
     assert tokens[:3] == [
         f"PYTHONPATH={expected_pythonpath}",
         "TOKENIZERS_PARALLELISM=false",

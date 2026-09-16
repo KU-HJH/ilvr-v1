@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-export PYTHONPATH="$REPO_ROOT/transformers/src:$REPO_ROOT/src"
+export PYTHONPATH="$REPO_ROOT/transformers/src:$REPO_ROOT/src:$REPO_ROOT"
 export TOKENIZERS_PARALLELISM=false
 
 : "${STAGE1_CHECKPOINT:?set STAGE1_CHECKPOINT}"
