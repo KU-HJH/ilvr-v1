@@ -1280,11 +1280,13 @@ def configure_stage2_metadata(
     *,
     latent_size: int,
     supervise_latent_boundaries: bool,
+    latent_activation_checkpointing: bool = False,
 ) -> None:
     """Write the complete, backwards-compatible Stage 2 config metadata."""
     config.stage = "stage2"
     config.latent_size = latent_size
     config.supervise_latent_boundaries = supervise_latent_boundaries
+    config.stage2_latent_activation_checkpointing = latent_activation_checkpointing
     config.latent_pad_token_id = config.latent_token_id = token_ids.pad_token_id
     config.latent_start_token_id = config.latent_start_id = token_ids.start_token_id
     config.latent_end_token_id = config.latent_end_id = token_ids.end_token_id

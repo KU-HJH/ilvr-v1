@@ -183,6 +183,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
+        "--stage2_latent_activation_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
         "--attention_implementation",
         choices=("eager", "sdpa", "flash_attention_2"),
         default="sdpa",

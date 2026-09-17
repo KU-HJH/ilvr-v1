@@ -259,10 +259,12 @@ def test_configure_stage2_metadata_writes_canonical_and_legacy_aliases():
         LatentTokenIds(10, 11, 12),
         latent_size=4,
         supervise_latent_boundaries=True,
+        latent_activation_checkpointing=True,
     )
     assert config.stage == "stage2"
     assert config.latent_size == 4
     assert config.supervise_latent_boundaries is True
+    assert config.stage2_latent_activation_checkpointing is True
     assert config.latent_pad_token_id == config.latent_token_id == 10
     assert config.latent_start_token_id == config.latent_start_id == 11
     assert config.latent_end_token_id == config.latent_end_id == 12

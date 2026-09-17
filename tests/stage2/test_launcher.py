@@ -454,6 +454,7 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "--vision_attention_implementation",
         "sdpa",
         "--no-gradient_checkpointing",
+        "--no-stage2_latent_activation_checkpointing",
         "--max_seq_length_train",
         "8192",
         "--tuning_method",

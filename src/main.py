@@ -662,11 +662,28 @@ def build_stage2_training_components(
             adapter_config,
             decision.adapter_source,
         )
+    if (
+        args.resume_from_checkpoint_path
+        and getattr(base_model.config, "stage", None) == "stage2"
+    ):
+        checkpoint_latent_checkpointing = getattr(
+            base_model.config, "stage2_latent_activation_checkpointing", False
+        )
+        if (
+            checkpoint_latent_checkpointing
+            != args.stage2_latent_activation_checkpointing
+        ):
+            raise ValueError(
+                "cannot resume Stage 2 with changed stage2_latent_activation_checkpointing: "
+                f"checkpoint={checkpoint_latent_checkpointing}, "
+                f"requested={args.stage2_latent_activation_checkpointing}"
+            )
     configure_stage2_metadata(
         base_model.config,
         token_ids,
         latent_size=decision.latent_size,
         supervise_latent_boundaries=decision.supervise_latent_boundaries,
+        latent_activation_checkpointing=args.stage2_latent_activation_checkpointing,
     )
     configure_stage2_model_backend(
         base_model,
