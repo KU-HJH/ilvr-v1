@@ -1325,6 +1325,7 @@ def resolve_stage2_load_decision(
     load_stage1_metadata_snapshot=read_stage1_peft_metadata_snapshot,
     latent_size: int,
     supervise_latent_boundaries: bool,
+    latent_activation_checkpointing: bool = False,
     tuning_method: str | None = None,
     tuning_method_explicit: bool = False,
     lora_r: int = 8,
@@ -1465,8 +1466,16 @@ def resolve_stage2_load_decision(
         for field, requested in (
             ("latent_size", latent_size),
             ("supervise_latent_boundaries", supervise_latent_boundaries),
+            (
+                "stage2_latent_activation_checkpointing",
+                latent_activation_checkpointing,
+            ),
         ):
-            checkpoint_value = getattr(resume_config, field, None)
+            checkpoint_value = getattr(
+                resume_config,
+                field,
+                False if field == "stage2_latent_activation_checkpointing" else None,
+            )
             if checkpoint_value != requested:
                 raise ValueError(
                     f"cannot resume Stage 2 with changed {field}: "
@@ -1480,6 +1489,18 @@ def resolve_stage2_load_decision(
             requested_tuning,
             resume_config.latent_size,
             resume_config.supervise_latent_boundaries,
+        )
+
+    resume_config = load_config(resume_from_checkpoint_path)
+    checkpoint_latent_checkpointing = getattr(
+        resume_config, "stage2_latent_activation_checkpointing", False
+    )
+    if checkpoint_latent_checkpointing != latent_activation_checkpointing:
+        raise ValueError(
+            "cannot resume Stage 2 with changed "
+            "stage2_latent_activation_checkpointing: "
+            f"checkpoint={checkpoint_latent_checkpointing}, "
+            f"requested={latent_activation_checkpointing}"
         )
 
     if tuning_method_explicit and requested_method == "full":

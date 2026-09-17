@@ -30,6 +30,74 @@ def no_stage2_peft_metadata(_):
     raise FileNotFoundError
 
 
+def peft_resume_metadata():
+    return SimpleNamespace(
+        tuning_method="dora",
+        lora_r=32,
+        lora_alpha=64,
+        lora_dropout=0.05,
+        requested_target_modules=("q_proj",),
+        latent_size=4,
+        supervise_latent_boundaries=True,
+        token_row_source="base",
+    )
+
+
+@pytest.mark.parametrize(
+    ("saved_value", "requested_value"),
+    ((True, False), (False, True)),
+)
+def test_peft_resume_rejects_changed_latent_activation_checkpointing(
+    saved_value, requested_value
+):
+    """Catches PEFT resume reading the original base config instead of saved run config."""
+    def load_config(source, **_kwargs):
+        if source == "stage2/checkpoint-10":
+            return SimpleNamespace(stage2_latent_activation_checkpointing=saved_value)
+        return SimpleNamespace(stage="stage1")
+
+    with pytest.raises(
+        ValueError, match="changed stage2_latent_activation_checkpointing"
+    ):
+        resolve_stage2_load_decision(
+            load_model_path="stage1/base",
+            resume_from_checkpoint_path="stage2/checkpoint-10",
+            load_config=load_config,
+            load_peft_metadata=lambda _: peft_resume_metadata(),
+            latent_size=4,
+            supervise_latent_boundaries=True,
+            latent_activation_checkpointing=requested_value,
+        )
+
+
+@pytest.mark.parametrize(
+    "saved_config",
+    (
+        SimpleNamespace(),
+        SimpleNamespace(stage2_latent_activation_checkpointing=False),
+    ),
+)
+def test_peft_resume_accepts_legacy_or_explicit_false_checkpointing(saved_config):
+    """Catches legacy missing config being rejected instead of resolving to false."""
+    def load_config(source, **_kwargs):
+        return (
+            saved_config
+            if source == "stage2/checkpoint-10"
+            else SimpleNamespace(stage="stage1")
+        )
+
+    decision = resolve_stage2_load_decision(
+        load_model_path="stage1/base",
+        resume_from_checkpoint_path="stage2/checkpoint-10",
+        load_config=load_config,
+        load_peft_metadata=lambda _: peft_resume_metadata(),
+        latent_size=4,
+        supervise_latent_boundaries=True,
+        latent_activation_checkpointing=False,
+    )
+    assert decision.trainer_resume_path == "stage2/checkpoint-10"
+
+
 def test_resolve_latent_ids_requires_tokenizer_config_parity():
     tokenizer = FakeTokenizer(
         {

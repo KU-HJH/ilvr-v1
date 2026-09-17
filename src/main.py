@@ -523,6 +523,9 @@ def build_stage2_training_components(
         source_dependencies or _default_stage2_source_dependencies()
     )
     source_provenance_kwargs = build_stage2_source_provenance_kwargs(args)
+    latent_activation_checkpointing = getattr(
+        args, "stage2_latent_activation_checkpointing", False
+    )
     decision_kwargs = dict(
         load_model_path=args.load_model_path,
         stage1_adapter_path=getattr(args, "stage1_adapter_path", None),
@@ -531,6 +534,7 @@ def build_stage2_training_components(
         source_provenance_kwargs=source_provenance_kwargs,
         latent_size=args.latent_size,
         supervise_latent_boundaries=args.supervise_latent_boundaries,
+        latent_activation_checkpointing=latent_activation_checkpointing,
         tuning_method=args.tuning_method,
         tuning_method_explicit=args.tuning_method_explicit,
         lora_r=args.lora_r,
@@ -662,28 +666,12 @@ def build_stage2_training_components(
             adapter_config,
             decision.adapter_source,
         )
-    if (
-        args.resume_from_checkpoint_path
-        and getattr(base_model.config, "stage", None) == "stage2"
-    ):
-        checkpoint_latent_checkpointing = getattr(
-            base_model.config, "stage2_latent_activation_checkpointing", False
-        )
-        if (
-            checkpoint_latent_checkpointing
-            != args.stage2_latent_activation_checkpointing
-        ):
-            raise ValueError(
-                "cannot resume Stage 2 with changed stage2_latent_activation_checkpointing: "
-                f"checkpoint={checkpoint_latent_checkpointing}, "
-                f"requested={args.stage2_latent_activation_checkpointing}"
-            )
     configure_stage2_metadata(
         base_model.config,
         token_ids,
         latent_size=decision.latent_size,
         supervise_latent_boundaries=decision.supervise_latent_boundaries,
-        latent_activation_checkpointing=args.stage2_latent_activation_checkpointing,
+        latent_activation_checkpointing=latent_activation_checkpointing,
     )
     configure_stage2_model_backend(
         base_model,

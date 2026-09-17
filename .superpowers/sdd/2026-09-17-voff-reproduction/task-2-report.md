@@ -1,12 +1,14 @@
 # Task 2 implementation report
 
 Status: implementation complete for selective latent-prefix replay, CLI, launcher,
-coordinator, model config, and full-checkpoint resume identity. Independent review
-is pending. PEFT sidecar identity coverage remains a concern described below.
+coordinator, model config, and full/PEFT checkpoint resume identity. Independent
+review is pending.
 
 ## Commits
 
 - `b92bdb0 feat: checkpoint Stage 2 latent prefixes selectively`
+- `5f9d3ba docs: record latent checkpointing evidence`
+- Follow-up PEFT resume commit recorded after final verification.
 
 ## TDD evidence
 
@@ -33,6 +35,11 @@ PYTHONPATH="$PWD/transformers/src:$PWD/src:$PWD" \
 
 Recorded at `logs/task-2-checkpointing/final-focused-reviewed.log`: 16 passed in
 8.83 seconds.
+
+PEFT resume RED recorded at `logs/task-2-checkpointing/red-peft-resume.log`: four
+tests failed because the resolver did not accept the requested setting. Focused
+PEFT/routing GREEN recorded at
+`logs/task-2-checkpointing/final-peft-regression.log`: 84 passed in 17.91 seconds.
 
 The broader existing launcher/checkpoint regression run recorded 109 passed and
 one exact-token fixture failure at
@@ -61,9 +68,8 @@ included in the final green command above.
   behavior is unchanged in the parity test.
 - Task 1 rendering arguments and exact launcher ordering are preserved, with the
   new default-off flag added to the existing fixture.
-- Material concern: `stage2_latent_activation_checkpointing` is saved in model
-  config and checked for full-checkpoint resume, but it is not yet included in the
-  strict Stage 2 PEFT metadata sidecar schema. A PEFT resume therefore lacks the
-  same explicit sidecar mismatch rejection. Independent review should treat this
-  as unresolved specification coverage rather than a clean approval.
+- Full and PEFT resumes now read the authoritative saved checkpoint model config
+  through the existing load-decision identity path. Both mismatch directions are
+  rejected. Old checkpoints without the field resolve to false, and explicit
+  false remains accepted. No sidecar schema or provenance system was added.
 - No GPU training or distributed launch was performed.
