@@ -148,6 +148,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Stage-2")  # 改默认 8192
     parser.add_argument("--stage2_length_manifest")
     parser.add_argument("--stage2_length_manifest_sha256")
+    parser.add_argument(
+        "--stage2_assistant_plan_rendering",
+        choices=("auto", "concatenated-v1", "adjacent-text-space-lf-v1"),
+        default="auto",
+    )
     parser.add_argument("--stage2_launcher_log_capture", action="store_true")
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument(

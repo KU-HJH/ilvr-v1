@@ -11,6 +11,7 @@ LATENT_PAD_TOKEN = "<|latent_pad|>"
 LATENT_END_TOKEN = "<|latent_end|>"
 ASSISTANT_PLAN_RENDERING_CONCATENATED = "concatenated-v1"
 ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF = "adjacent-text-space-lf-v1"
+ASSISTANT_PLAN_RENDERING_AUTO = "auto"
 
 
 def normalize_preference_target_scope(value: str) -> str:
@@ -26,6 +27,19 @@ def normalize_assistant_plan_rendering(value: str) -> str:
     }:
         raise ValueError(f"unsupported assistant plan rendering: {value}")
     return value
+
+
+def resolve_assistant_plan_rendering(
+    requested: str, preference_enabled: bool
+) -> str:
+    """Resolve the public rendering selector while preserving the legacy policy."""
+    if requested == ASSISTANT_PLAN_RENDERING_AUTO:
+        return (
+            ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+            if preference_enabled
+            else ASSISTANT_PLAN_RENDERING_CONCATENATED
+        )
+    return normalize_assistant_plan_rendering(requested)
 
 
 @dataclass(frozen=True)
@@ -156,6 +170,14 @@ def map_reasoning_step_spans(
         for span in plan_char_spans
         for boundary in (span.start, span.end)
     }
+    if preference_target_scope == "until_next_latent":
+        # Consecutive concatenated text entries form one target extent. Their
+        # internal source-plan boundary need not be a tokenizer boundary.
+        boundaries.difference_update(
+            assistant_start + left.end
+            for left, right in zip(plan_char_spans, plan_char_spans[1:])
+            if left.step_type == right.step_type == "text" and left.end == right.start
+        )
     for span in plan_char_spans:
         if span.step_type != "latent":
             continue

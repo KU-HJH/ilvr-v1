@@ -215,6 +215,8 @@ def test_stage1_dora_length_manifest_uses_adapter_processor(tmp_path, inline):
     python.parent.mkdir(parents=True)
     python.write_text(
         "#!/usr/bin/env bash\n"
+        'if [[ "$1" == - && "$2" == auto && "$3" == false ]]; then\n'
+        "  printf 'concatenated-v1\\n'\n  exit 0\nfi\n"
         'if [[ "$1" == -m && "$2" == stage2.length_manifest ]]; then\n'
         "  printf '%s\\n' \"$@\"\n  exit 77\nfi\n"
         # This fixture tests manifest command selection, not artifact ownership.
@@ -436,6 +438,8 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "8",
         "--stage2_diagnostics_interval",
         "0",
+        "--stage2_assistant_plan_rendering",
+        "concatenated-v1",
         "--ce_weight",
         "1.0",
         "--supervise_latent_boundaries",

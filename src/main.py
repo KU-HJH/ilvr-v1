@@ -106,9 +106,8 @@ from step_preference.negatives import (
     read_negative_manifest,
 )
 from step_preference.spans import (
-    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
-    ASSISTANT_PLAN_RENDERING_CONCATENATED,
     reject_duplicate_sample_ids,
+    resolve_assistant_plan_rendering,
 )
 
 platform.python_version = _platform_python_version
@@ -284,6 +283,9 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
         config = StepPreferenceConfig.from_args(args)
     if not isinstance(config, StepPreferenceConfig) or not config.is_stage2b:
         raise ValueError("Stage 2B artifact preflight requires Stage 2B configuration")
+    assistant_plan_rendering = resolve_assistant_plan_rendering(
+        getattr(args, "stage2_assistant_plan_rendering", "auto"), config.enabled
+    )
     _require_stage2b_attention_contract(args)
 
     admission = (
@@ -305,7 +307,7 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
             image_root=Path(args.image_root),
             latent_size=args.latent_size,
             require_reasoning_units=True,
-            assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+            assistant_plan_rendering=assistant_plan_rendering,
         )
         for item in selected_examples
     )
@@ -384,9 +386,7 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
         expected_checkpoint_files=checkpoint_files,
         expected_tokenizer_config_identity=tokenizer_identity,
         expected_latent_size=args.latent_size,
-        expected_assistant_plan_rendering=(
-            ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
-        ),
+        expected_assistant_plan_rendering=assistant_plan_rendering,
         expected_generation_settings=expected_generation_settings,
         expected_keys=expected_keys,
     )
@@ -495,10 +495,9 @@ def build_stage2_training_components(
         raise TypeError("step_preference_config must be a StepPreferenceConfig")
     if step_preference_config.is_stage2b:
         _require_stage2b_attention_contract(args)
-    assistant_plan_rendering = (
-        ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
-        if step_preference_config.enabled
-        else ASSISTANT_PLAN_RENDERING_CONCATENATED
+    assistant_plan_rendering = resolve_assistant_plan_rendering(
+        getattr(args, "stage2_assistant_plan_rendering", "auto"),
+        step_preference_config.enabled,
     )
     stage2b_preflight = getattr(args, "_stage2b_preflight", None)
     if step_preference_config.is_stage2b:

@@ -10,7 +10,10 @@ from transformers import AutoProcessor
 from stage2.data import Stage2DataCollator, prepare_stage2_example
 from step_preference.config import StepPreferenceConfig
 from step_preference.sidecar import build_context_sidecar_plan
-from step_preference.spans import ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    ASSISTANT_PLAN_RENDERING_CONCATENATED,
+)
 from tests.step_preference.test_spans import STAGE2A_CHECKPOINT
 from tests.stage2.test_launcher import run_launcher, dry_run_tokens, option_value
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
@@ -127,6 +130,61 @@ def test_opt_in_real_collator_expands_targets_without_changing_input_or_ce(tmp_p
                 for token in (tokens.pad_token_id, tokens.start_token_id, tokens.end_token_id,
                               tokenizer.convert_tokens_to_ids("<|im_end|>"))
             )
+
+
+@pytest.mark.parametrize(
+    ("assistant_plan_rendering", "expected"),
+    [
+        (ASSISTANT_PLAN_RENDERING_CONCATENATED,
+         "reason.The final answer is: 7"),
+        (ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+         "reason. \nThe final answer is: 7"),
+    ],
+)
+def test_until_next_latent_decodes_final_answer_under_both_renderings(
+    tmp_path, assistant_plan_rendering, expected
+):
+    """Catches concatenated plan boundaries excluding the final-answer target."""
+    Image.new("RGB", (56, 56)).save(tmp_path / "input.png")
+    example = prepare_stage2_example(
+        {"image_input": "input.png", "text_input": "question", "sequence_plan": [
+            {"type": "text", "content": "Before."},
+            {"type": "latent", "helper_image": "helper.png"},
+            {"type": "text", "content": "reason."},
+            {"type": "text", "content": "The final answer is: 7"},
+        ]},
+        image_root=tmp_path,
+        latent_size=2,
+        require_reasoning_units=True,
+        assistant_plan_rendering=assistant_plan_rendering,
+    )
+    processor = AutoProcessor.from_pretrained(
+        STAGE2A_CHECKPOINT, local_files_only=True
+    )
+    tokenizer = processor.tokenizer
+    token_ids = LatentTokenIds(**{
+        f"{name}_token_id": tokenizer.convert_tokens_to_ids(f"<|latent_{name}|>")
+        for name in ("pad", "start", "end")
+    })
+    batch = Stage2DataCollator(
+        processor=processor,
+        token_ids=token_ids,
+        latent_size=2,
+        supervise_latent_boundaries=True,
+        step_preference_enabled=True,
+        preference_target_scope="until_next_latent",
+    )([example])
+    plan = build_context_sidecar_plan(
+        clean_input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        spans=batch["reasoning_step_spans"],
+        visual_only=True,
+        suppress_latent_boundaries=False,
+    )
+
+    decoded = tokenizer.decode(plan.groups[0][0].target_token_ids)
+    assert decoded == expected
+    assert "The final answer is: 7" in decoded
 
 
 def test_collator_rejects_full_scope_with_disabled_preference_or_legacy_negatives():

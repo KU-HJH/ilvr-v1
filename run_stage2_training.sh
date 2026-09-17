@@ -77,6 +77,7 @@ PER_DEVICE_TRAIN_BATCH_SIZE=1
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
 STEP_PREFERENCE_OBJECTIVE=${STEP_PREFERENCE_OBJECTIVE:-context_preference}
 STEP_PREFERENCE_TARGET_SCOPE=${STEP_PREFERENCE_TARGET_SCOPE:-immediate_text}
+STAGE2_ASSISTANT_PLAN_RENDERING=${STAGE2_ASSISTANT_PLAN_RENDERING:-auto}
 STEP_PREFERENCE_PREFIX_MODE=${STEP_PREFERENCE_PREFIX_MODE:-clean_prefix}
 STEP_PREFERENCE_BRANCH_MODE=${STEP_PREFERENCE_BRANCH_MODE:-independent}
 case "$STEP_PREFERENCE_PREFIX_MODE" in
@@ -127,7 +128,6 @@ case "${STAGE2B_DIRECT_FROM_STAGE1-}" in
 esac
 SEED=${SEED:-42}
 STEP_MAX_PACKED_SEQUENCE_LENGTH=${STEP_MAX_PACKED_SEQUENCE_LENGTH:-4608}
-ASSISTANT_PLAN_RENDERING=concatenated-v1
 stage2b_checkpoint_initialization=false
 case "${STEP_PREFERENCE_PACKING-}" in
   ""|0|false|False) step_preference_packing=false ;;
@@ -211,7 +211,6 @@ if [[ "$step_preference_packing" == true ]]; then
 fi
 case "$STEP_PREFERENCE_ENABLED" in
   true)
-    ASSISTANT_PLAN_RENDERING=adjacent-text-space-lf-v1
     STEP_PREFERENCE_MODE=${STEP_PREFERENCE_MODE:-stage2a}
     STEP_DPO_BETA=${STEP_DPO_BETA:-0.1}
     STEP_DPO_WEIGHT=${STEP_DPO_WEIGHT:-1.0}
@@ -370,6 +369,23 @@ case "$STEP_PREFERENCE_ENABLED" in
     exit 2
     ;;
 esac
+
+if ! ASSISTANT_PLAN_RENDERING=$(
+  "$REPO_ROOT/venv/ilvr-venv/bin/python" - \
+    "$STAGE2_ASSISTANT_PLAN_RENDERING" "$STEP_PREFERENCE_ENABLED" <<'PY'
+import sys
+from step_preference.spans import resolve_assistant_plan_rendering
+
+try:
+    print(resolve_assistant_plan_rendering(sys.argv[1], sys.argv[2] == "true"))
+except ValueError as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(2)
+PY
+); then
+  printf 'STAGE2_ASSISTANT_PLAN_RENDERING must be auto, concatenated-v1, or adjacent-text-space-lf-v1\n' >&2
+  exit 2
+fi
 
 if [[ "$stage2b_direct_from_stage1" == true ]] &&
    [[ "$STEP_PREFERENCE_ENABLED" != true || "${STEP_PREFERENCE_MODE:-stage2a}" != stage2b ]]; then
@@ -887,6 +903,7 @@ TRAINING_ARGS=(
   "${LAUNCHER_LOG_ARGS[@]}"
   --latent_size "$LATENT_SIZE"
   --stage2_diagnostics_interval "$STAGE2_DIAGNOSTICS_INTERVAL"
+  --stage2_assistant_plan_rendering "$ASSISTANT_PLAN_RENDERING"
   "${STEP_PREFERENCE_ARGS[@]}"
   --ce_weight "$CE_WEIGHT"
   "${BOUNDARY_ARGS[@]}"
