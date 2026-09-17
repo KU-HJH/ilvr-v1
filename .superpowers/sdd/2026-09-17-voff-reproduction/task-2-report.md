@@ -41,6 +41,10 @@ tests failed because the resolver did not accept the requested setting. Focused
 PEFT/routing GREEN recorded at
 `logs/task-2-checkpointing/final-peft-regression.log`: 84 passed in 17.91 seconds.
 
+Independent review round 1 required replacing the original MSE parity witness
+with a trainable embedding/output-head CE witness. The scoped rerun is recorded
+at `logs/task-2-checkpointing/review-fix-ce-parity.log`: 4 passed in 5.52 seconds.
+
 The broader existing launcher/checkpoint regression run recorded 109 passed and
 one exact-token fixture failure at
 `logs/task-2-checkpointing/green-launcher-checkpoint.log`; the fixture lacked the
@@ -53,9 +57,13 @@ included in the final green command above.
   helper. Its input, mask, and position tensors are explicit checkpoint operands.
 - The opt-in path uses non-reentrant checkpointing, preserved RNG, and disabled
   early stop. It runs only while gradients are enabled.
-- The test uses trainable linear parameters, dropout, four latent positions in two
-  blocks, and compares final embeddings, CE-derived scalar loss, input gradients,
-  parameter gradients, retained latent gradients, and observed decoder replay.
+- The original RED/GREEN witness used trainable decoder parameters, dropout, raw
+  differentiable inputs, and an MSE scalar objective. After independent review,
+  the final parity witness uses a trainable embedding, decoder, and output-head
+  projection with cross-entropy over the rollout result. It compares final
+  embeddings, CE loss, embedded-input gradients, embedding/decoder/output-head
+  parameter gradients, retained latent gradients, and observed decoder replay
+  across four latent positions in two blocks.
 - The default remains false. The launcher accepts and validates
   `STAGE2_LATENT_ACTIVATION_CHECKPOINTING`, emits an explicit positive or negative
   CLI flag, and the multinode environment allowlist preserves it.

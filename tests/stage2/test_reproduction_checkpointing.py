@@ -6,6 +6,7 @@ import subprocess
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentRolloutEngine,
@@ -32,8 +33,12 @@ class TinyDecoder(nn.Module):
 
 
 def run_case(*, checkpointing):
+    embedding = nn.Embedding(32, 6)
     decoder = TinyDecoder().train()
-    inputs = torch.randn(1, 10, 6, requires_grad=True)
+    output_head = nn.Linear(6, 32)
+    token_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    inputs = embedding(token_ids)
+    inputs.retain_grad()
     result = LatentRolloutEngine().rollout(
         language_model=decoder,
         base_inputs_embeds=inputs,
@@ -43,13 +48,25 @@ def run_case(*, checkpointing):
         retain_latent_grads=True,
         latent_activation_checkpointing=checkpointing,
     )
-    loss = result.final_inputs_embeds.square().mean()
+    logits = output_head(result.final_inputs_embeds)
+    targets = torch.tensor([[2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])
+    loss = F.cross_entropy(logits.flatten(0, 1), targets.flatten())
     loss.backward()
     return SimpleNamespace(
         result=result,
         loss=loss.detach(),
         input_grad=inputs.grad.detach().clone(),
-        parameter_grads=tuple(p.grad.detach().clone() for p in decoder.parameters()),
+        parameter_grads={
+            "embedding": embedding.weight.grad.detach().clone(),
+            "decoder": tuple(
+                parameter.grad.detach().clone()
+                for parameter in decoder.parameters()
+            ),
+            "output_head": tuple(
+                parameter.grad.detach().clone()
+                for parameter in output_head.parameters()
+            ),
+        },
         calls=decoder.calls,
     )
 
@@ -66,8 +83,15 @@ def test_checkpointed_prefix_replay_preserves_outputs_loss_and_gradients():
     )
     torch.testing.assert_close(plain.loss, checked.loss)
     torch.testing.assert_close(plain.input_grad, checked.input_grad)
-    for actual, expected in zip(plain.parameter_grads, checked.parameter_grads):
-        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        plain.parameter_grads["embedding"],
+        checked.parameter_grads["embedding"],
+    )
+    for component in ("decoder", "output_head"):
+        for actual, expected in zip(
+            plain.parameter_grads[component], checked.parameter_grads[component]
+        ):
+            torch.testing.assert_close(actual, expected)
     assert all(state.grad is not None for state in checked.result.latent_states)
     assert checked.calls > plain.calls == 4
 
