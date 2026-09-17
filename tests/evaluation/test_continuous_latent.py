@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -103,7 +104,12 @@ def load_external_controller_module():
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    previous = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 
 
@@ -503,3 +509,13 @@ def test_external_policy_matches_supplied_controller_sequence_boundary_error():
                 max_sequence_length=4,
             ),
         )
+
+
+def test_external_evidence_loader_does_not_write_copied_source(tmp_path, monkeypatch):
+    """The source-level controller loader must not generate evidence-tree bytecode."""
+    monkeypatch.setattr(sys, 'dont_write_bytecode', False)
+    copied = tmp_path / 'inference.py'
+    copied.write_text(EXTERNAL_CONTROLLER_PATH.read_text())
+    monkeypatch.setitem(load_external_controller_module.__globals__, 'EXTERNAL_CONTROLLER_PATH', copied)
+    load_external_controller_module()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ['inference.py']
