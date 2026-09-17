@@ -27,6 +27,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)
+    parser.add_argument("--stage2_reproduction_probe_dir", type=str, default="")
     parser.add_argument("--stage2_diagnostics_interval", type=int, default=0)
     parser.add_argument("--step_preference_enabled", action="store_true")
     parser.add_argument("--step_preference_packing", action="store_true")

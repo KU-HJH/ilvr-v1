@@ -58,6 +58,7 @@ LORA_DROPOUT=${LORA_DROPOUT-0.05}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
 LATENT_SIZE=${LATENT_SIZE:-8}
 STAGE2_DIAGNOSTICS_INTERVAL=${STAGE2_DIAGNOSTICS_INTERVAL:-0}
+STAGE2_REPRODUCTION_PROBE_DIR=${STAGE2_REPRODUCTION_PROBE_DIR:-}
 SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
 LEARNING_RATE=${LEARNING_RATE:-5e-5}
 CE_WEIGHT=${CE_WEIGHT:-1.0}
@@ -515,6 +516,7 @@ MANAGED_OPTIONS=(
   --log_file
   --latent_size
   --stage2_diagnostics_interval
+  --stage2_reproduction_probe_dir
   --step_preference_enabled
   --step_preference_packing
   --step_shared_prefix_enabled
@@ -914,6 +916,7 @@ TRAINING_ARGS=(
   "${LAUNCHER_LOG_ARGS[@]}"
   --latent_size "$LATENT_SIZE"
   --stage2_diagnostics_interval "$STAGE2_DIAGNOSTICS_INTERVAL"
+  --stage2_reproduction_probe_dir "$STAGE2_REPRODUCTION_PROBE_DIR"
   --stage2_assistant_plan_rendering "$ASSISTANT_PLAN_RENDERING"
   "${STEP_PREFERENCE_ARGS[@]}"
   --ce_weight "$CE_WEIGHT"

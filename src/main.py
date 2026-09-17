@@ -1098,6 +1098,8 @@ def run_stage2(args):
         and components.step_preference_config.is_stage2b
     ):
         trainer_kwargs["step_preference_config"] = components.step_preference_config
+    if getattr(args, "stage2_reproduction_probe_dir", ""):
+        trainer_kwargs["stage2_reproduction_probe_dir"] = args.stage2_reproduction_probe_dir
     trainer = components.trainer_class(**trainer_kwargs)
     baseline = begin_capacity_memory(trainer.accelerator.device) if capacity else None
     train_result = trainer.train(

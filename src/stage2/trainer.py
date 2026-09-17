@@ -224,6 +224,9 @@ class _Stage2DeepSpeedGradientAdapter:
                 trainer._observed_pre_step_gradient_norms = []
             if math.isfinite(value) and value > 0 and len(trainer._observed_pre_step_gradient_norms) < 2:
                 trainer._observed_pre_step_gradient_norms.append(value)
+        observer = getattr(trainer, "_reproduction_observer", None)
+        if boundary and observer is not None:
+            observer.before_step()
         skipped_before = getattr(self.engine, "skipped_steps", 0)
         result = self.original_step(*args, **kwargs)
         if boundary:
@@ -233,6 +236,8 @@ class _Stage2DeepSpeedGradientAdapter:
             if observed_step is None:
                 observed_step = getattr(getattr(trainer, "state", None), "global_step", 0)
             trainer._observed_optimizer_step = observed_step + 1
+            if observer is not None:
+                observer.after_step()
         return result
 
 
@@ -245,6 +250,7 @@ class Stage2Trainer(Trainer):
         deepspeed_runtime_profile: DeepSpeedRuntimeProfile | None = None,
         stage2_peft_metadata=None,
         stage2_diagnostics_interval: int = 0,
+        stage2_reproduction_probe_dir: str = "",
         step_preference_config: StepPreferenceConfig | None = None,
         **kwargs,
     ):
@@ -273,6 +279,8 @@ class Stage2Trainer(Trainer):
         self.stage2_peft_metadata = stage2_peft_metadata
         self.stage2_sampler_identity: Stage2SamplerIdentity | None = None
         self._stage2_train_sampler: LatentBlockBalancedSampler | None = None
+        self.stage2_reproduction_probe_dir = stage2_reproduction_probe_dir
+        self._reproduction_observer = None
         self.stage2_diagnostics_interval = stage2_diagnostics_interval
         if step_preference_config is None:
             step_preference_config = StepPreferenceConfig()
@@ -298,6 +306,8 @@ class Stage2Trainer(Trainer):
         from accelerate.utils import DistributedType
 
         if getattr(self.accelerator, "distributed_type", None) != DistributedType.DEEPSPEED:
+            if getattr(self, "stage2_reproduction_probe_dir", ""):
+                raise ValueError("reproduction witness requires DeepSpeed")
             return
         wrapper = getattr(self.accelerator, "deepspeed_engine_wrapped", None)
         engine = getattr(wrapper, "engine", None)
@@ -313,6 +323,9 @@ class Stage2Trainer(Trainer):
             for name in ("step", "is_gradient_accumulation_boundary")
         ):
             raise RuntimeError("Stage 2 DeepSpeed step boundary is unavailable")
+        if getattr(self, "stage2_reproduction_probe_dir", ""):
+            from .reproduction_probe import ReproductionObserver
+            self._reproduction_observer = ReproductionObserver(self, engine, self.stage2_reproduction_probe_dir)
         adapter = _Stage2DeepSpeedGradientAdapter(self, engine, engine.step)
         engine.step = adapter
         self._stage2_deepspeed_gradient_adapter = adapter
@@ -1505,7 +1518,16 @@ class Stage2Trainer(Trainer):
             return total_loss, clean_outputs
         return total_loss
 
-    def compute_loss(
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        result = self._compute_loss_without_reproduction_probe(
+            model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+        )
+        observer = getattr(self, "_reproduction_observer", None)
+        if observer is not None:
+            observer.observe_loss(result[0] if return_outputs else result, inputs)
+        return result
+
+    def _compute_loss_without_reproduction_probe(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         interval = self.stage2_diagnostics_interval
