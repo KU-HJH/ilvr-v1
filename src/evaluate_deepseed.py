@@ -69,6 +69,11 @@ def get_eval_args():
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--max_sequence_length", type=int, default=32768)
     parser.add_argument("--repetition_penalty", type=float, default=1.05)
+    parser.add_argument(
+        "--generation-limit-policy",
+        choices=("bounded", "external_full_latent_block"),
+        default="bounded",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--num-shards", type=int, default=1)
@@ -338,6 +343,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         max_sequence_length=args.max_sequence_length,
         repetition_penalty=args.repetition_penalty,
+        generation_limit_policy=getattr(args, "generation_limit_policy", "bounded"),
         temperature=args.temperature,
         top_p=args.top_p,
         do_sample=(args.temperature > 0),
@@ -509,6 +515,9 @@ def main():
                 "max_new_tokens": args.max_new_tokens,
                 "max_sequence_length": args.max_sequence_length,
                 "repetition_penalty": args.repetition_penalty,
+                "generation_limit_policy": getattr(
+                    args, "generation_limit_policy", "bounded"
+                ),
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "vision_ablation": vision_ablation,

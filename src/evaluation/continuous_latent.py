@@ -46,6 +46,7 @@ class ContinuousLatentGenerationConfig:
     temperature: float = 0.0
     top_p: float = 1.0
     eos_token_id: int | list[int] | tuple[int, ...] | None = None
+    generation_limit_policy: str = "bounded"
 
     def __post_init__(self) -> None:
         if self.max_new_tokens < 0:
@@ -67,6 +68,14 @@ class ContinuousLatentGenerationConfig:
             raise ValueError("temperature must be finite and non-negative")
         if not 0 < self.top_p <= 1:
             raise ValueError("top_p must be in the interval (0, 1]")
+        if self.generation_limit_policy not in (
+            "bounded",
+            "external_full_latent_block",
+        ):
+            raise ValueError(
+                "generation_limit_policy must be bounded or "
+                "external_full_latent_block"
+            )
         if self.eos_token_id is None:
             return
         if isinstance(self.eos_token_id, bool):
@@ -127,6 +136,9 @@ def build_continuous_generation_config(
         ),
         top_p=float(generation_kwargs.get("top_p", 1.0)),
         eos_token_id=eos_token_id,
+        generation_limit_policy=generation_kwargs.get(
+            "generation_limit_policy", "bounded"
+        ),
     )
 
 
@@ -186,11 +198,19 @@ class ContinuousLatentController:
         )
 
         while True:
-            remaining_capacity, boundary_stop_reason = _remaining_capacity(
-                sequence_length=sequences.shape[1],
-                generated=generated,
-                config=generation_config,
+            external_full_block = (
+                generation_config.generation_limit_policy
+                == "external_full_latent_block"
             )
+            if external_full_block:
+                remaining_capacity = generation_config.max_new_tokens - generated
+                boundary_stop_reason = "max_new_tokens"
+            else:
+                remaining_capacity, boundary_stop_reason = _remaining_capacity(
+                    sequence_length=sequences.shape[1],
+                    generated=generated,
+                    config=generation_config,
+                )
             if remaining_capacity <= 0:
                 stop_reason = boundary_stop_reason
                 break
@@ -220,6 +240,23 @@ class ContinuousLatentController:
             }:
                 raise RuntimeError("disabled latent generation selected a control token")
 
+            if (
+                external_full_block
+                and generation_config.max_sequence_length is not None
+            ):
+                completed_length = sequences.shape[1] + 1
+                if next_token_id == token_ids.start_token_id:
+                    completed_length += model.config.latent_size + 1
+                if completed_length > generation_config.max_sequence_length:
+                    description = (
+                        "latent block"
+                        if next_token_id == token_ids.start_token_id
+                        else "generated token"
+                    )
+                    raise GenerationLimitError(
+                        f"{description} would exceed max_sequence_length"
+                    )
+
             next_ids = next_id[:, None]
             sequences = torch.cat((sequences, next_ids), dim=1)
             mask = torch.cat((mask, torch.ones_like(next_ids)), dim=1)
@@ -237,7 +274,9 @@ class ContinuousLatentController:
                     dtype=sequences.dtype,
                     device=sequences.device,
                 )
-                suffix_capacity = remaining_capacity - 1
+                suffix_capacity = (
+                    suffix.shape[1] if external_full_block else remaining_capacity - 1
+                )
                 suffix = suffix[:, :suffix_capacity]
                 if suffix.shape[1] > 0:
                     sequences = torch.cat((sequences, suffix), dim=1)

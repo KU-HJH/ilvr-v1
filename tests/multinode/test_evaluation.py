@@ -195,6 +195,7 @@ def test_merge_sorts_rows_and_computes_accuracy_once(tmp_path):
             "temperature": 0.0,
             "top_p": 1.0,
             "vision_ablation": "none",
+            "generation_limit_policy": "bounded",
         },
     }
     assert json.loads((tmp_path / "summary.json").read_text()) == summary
@@ -250,6 +251,7 @@ def test_merge_preserves_gold_denominators_and_invalid_gold_records(tmp_path):
             "temperature": 0.0,
             "top_p": 1.0,
             "vision_ablation": "none",
+            "generation_limit_policy": "bounded",
         },
     }
 
@@ -328,6 +330,7 @@ def test_merge_keeps_schema_two_generation_config_compatibility(tmp_path):
         manifest["generation_config"].pop("max_sequence_length")
         manifest["generation_config"].pop("repetition_penalty")
         manifest["generation_config"].pop("vision_ablation")
+        manifest["generation_config"].pop("generation_limit_policy")
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
     summary = _merge(tmp_path, shards, expected_sample_count=4)
@@ -339,6 +342,20 @@ def test_merge_keeps_schema_two_generation_config_compatibility(tmp_path):
     }
 
 
+def test_merge_keeps_pre_policy_manifest_compatibility(tmp_path):
+    """A schema-five result remains readable without inventing a saved policy."""
+    shards = _write_fake_shards(tmp_path)
+    for path in shards:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 5
+        manifest["generation_config"].pop("generation_limit_policy", None)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    summary = _merge(tmp_path, shards, expected_sample_count=4)
+
+    assert "generation_limit_policy" not in summary["generation_config"]
+
+
 def test_merge_keeps_schema_three_sequence_cap_compatibility(tmp_path):
     """Reading a pre-penalty sidecar must not require rewriting history."""
     shards = _write_fake_shards(tmp_path)
@@ -347,6 +364,7 @@ def test_merge_keeps_schema_three_sequence_cap_compatibility(tmp_path):
         manifest["schema_version"] = 3
         manifest["generation_config"].pop("repetition_penalty")
         manifest["generation_config"].pop("vision_ablation")
+        manifest["generation_config"].pop("generation_limit_policy")
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
     summary = _merge(tmp_path, shards, expected_sample_count=4)

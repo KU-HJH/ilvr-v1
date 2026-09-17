@@ -406,6 +406,7 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
     assert args.max_new_tokens == 4096
     assert args.max_sequence_length == 32768
     assert args.repetition_penalty == 1.05
+    assert args.generation_limit_policy == "bounded"
 
 
 def _run_main_with_fake_sample(
@@ -810,6 +811,7 @@ def test_four_shard_worker_uses_global_indices_and_writes_success_sidecar(
         "temperature": 0.0,
         "top_p": 1.0,
         "vision_ablation": "none",
+        "generation_limit_policy": "bounded",
     }
     assert manifest["expected_source_indices"] == [1, 5]
     assert manifest["processed_source_indices"] == [1, 5]
@@ -1849,6 +1851,33 @@ def test_eval_maps_explicit_greedy_settings_to_controller(module_name, monkeypat
     assert config.top_p == 0.6
     assert config.eos_token_id == 3
     assert config.max_sequence_length == 128
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_forwards_external_generation_limit_policy(module_name, monkeypatch):
+    """Dropping the evaluator option must leave the controller on bounded semantics."""
+    module = _import_entry_point(module_name, monkeypatch)
+    controller = RecordingController()
+    monkeypatch.setattr(
+        module, "Stage2InferenceController", lambda: controller, raising=False
+    )
+
+    module.run_one_example(
+        ModelWhoseGenerateRaises(),
+        FakeProcessor(),
+        {"text_input": "question"},
+        {
+            "max_new_tokens": 1,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "generation_limit_policy": "external_full_latent_block",
+        },
+    )
+
+    assert (
+        controller.calls[0]["generation_config"].generation_limit_policy
+        == "external_full_latent_block"
+    )
 
 
 def test_deepspeed_eval_unwraps_model_for_controller_and_uses_wrapper_device(

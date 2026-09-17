@@ -187,6 +187,24 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
     } == {"1.05"}
 
 
+def test_worker_commands_forward_external_generation_limit_policy():
+    """Losing the coordinator option would silently restore bounded generation."""
+    plan = dataclasses.replace(
+        _plan(), generation_limit_policy="external_full_latent_block"
+    )
+
+    commands = build_evaluation_commands(
+        plan, inference_manifest=_manifest(), commit="b" * 40
+    )
+
+    assert {
+        worker.node_spec.command[
+            worker.node_spec.command.index("--generation-limit-policy") + 1
+        ]
+        for worker in commands.workers
+    } == {"external_full_latent_block"}
+
+
 def test_evaluation_worker_environment_imports_worktree_transformers():
     """Catches the shared venv editable path selecting another checkout."""
     commands = build_evaluation_commands(
@@ -909,6 +927,7 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
                 "repetition_penalty": 1.05,
                 "temperature": 0.0,
                 "top_p": 1.0,
+                "generation_limit_policy": "bounded",
             },
             shard_index=shard_index,
             num_shards=4,
@@ -931,6 +950,7 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
                 "repetition_penalty": 1.05,
                 "temperature": 0.0,
                 "top_p": 1.0,
+                "generation_limit_policy": "bounded",
             },
         )
 

@@ -1077,6 +1077,7 @@ class EvaluationPlan:
     max_new_tokens: int = 4096
     max_sequence_length: int = 32768
     repetition_penalty: float = 1.05
+    generation_limit_policy: str = "bounded"
     temperature: float = 0.0
     top_p: float = 1.0
     vision_ablation: str = "none"
@@ -1141,6 +1142,14 @@ class EvaluationPlan:
             or self.repetition_penalty <= 0
         ):
             raise ValueError("repetition_penalty must be finite and positive")
+        if self.generation_limit_policy not in (
+            "bounded",
+            "external_full_latent_block",
+        ):
+            raise ValueError(
+                "generation_limit_policy must be bounded or "
+                "external_full_latent_block"
+            )
         if (
             type(self.temperature) not in (int, float)
             or not math.isfinite(self.temperature)
@@ -1252,6 +1261,7 @@ def _build_evaluation_commands_for_stage(
             "--max_new_tokens", str(plan.max_new_tokens),
             "--max_sequence_length", str(plan.max_sequence_length),
             "--repetition_penalty", str(plan.repetition_penalty),
+            "--generation-limit-policy", plan.generation_limit_policy,
             "--temperature", str(plan.temperature),
             "--top_p", str(plan.top_p),
         ]
@@ -2965,6 +2975,7 @@ class EvaluationSubprocessRunner:
                 "max_new_tokens": self.plan.max_new_tokens,
                 "max_sequence_length": self.plan.max_sequence_length,
                 "repetition_penalty": self.plan.repetition_penalty,
+                "generation_limit_policy": self.plan.generation_limit_policy,
                 "temperature": self.plan.temperature,
                 "top_p": self.plan.top_p,
                 "vision_ablation": self.plan.vision_ablation,
