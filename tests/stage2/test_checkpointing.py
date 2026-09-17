@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -43,59 +44,76 @@ def peft_resume_metadata():
     )
 
 
-@pytest.mark.parametrize(
-    ("saved_value", "requested_value"),
-    ((True, False), (False, True)),
-)
-def test_peft_resume_rejects_changed_latent_activation_checkpointing(
-    saved_value, requested_value
-):
-    """Catches PEFT resume reading the original base config instead of saved run config."""
-    def load_config(source, **_kwargs):
-        if source == "stage2/checkpoint-10":
-            return SimpleNamespace(stage2_latent_activation_checkpointing=saved_value)
-        return SimpleNamespace(stage="stage1")
+@pytest.fixture
+def local_peft_resume(tmp_path):
+    from tests.stage2.test_peft_checkpointing import _write_structural_stage2_peft
 
-    with pytest.raises(
-        ValueError, match="changed stage2_latent_activation_checkpointing"
-    ):
-        resolve_stage2_load_decision(
-            load_model_path="stage1/base",
-            resume_from_checkpoint_path="stage2/checkpoint-10",
-            load_config=load_config,
-            load_peft_metadata=lambda _: peft_resume_metadata(),
-            latent_size=4,
-            supervise_latent_boundaries=True,
-            latent_activation_checkpointing=requested_value,
-        )
+    checkpoint = tmp_path / "checkpoint-10"
+    metadata = _write_structural_stage2_peft(checkpoint, sparse=False)
+    return checkpoint, metadata
 
 
-@pytest.mark.parametrize(
-    "saved_config",
-    (
-        SimpleNamespace(),
-        SimpleNamespace(stage2_latent_activation_checkpointing=False),
-    ),
-)
-def test_peft_resume_accepts_legacy_or_explicit_false_checkpointing(saved_config):
-    """Catches legacy missing config being rejected instead of resolving to false."""
-    def load_config(source, **_kwargs):
-        return (
-            saved_config
-            if source == "stage2/checkpoint-10"
-            else SimpleNamespace(stage="stage1")
-        )
+def resolve_local_peft_resume(fixture, requested):
+    checkpoint, metadata = fixture
 
-    decision = resolve_stage2_load_decision(
+    def load_original_base(source, **_kwargs):
+        assert source == "stage1/base", "saved runtime settings must not use the original-base loader"
+        # Opposite of the request: reading the base instead of the saved run must fail.
+        return SimpleNamespace(stage="stage1", stage2_latent_activation_checkpointing=not requested)
+
+    return resolve_stage2_load_decision(
         load_model_path="stage1/base",
-        resume_from_checkpoint_path="stage2/checkpoint-10",
-        load_config=load_config,
-        load_peft_metadata=lambda _: peft_resume_metadata(),
-        latent_size=4,
-        supervise_latent_boundaries=True,
-        latent_activation_checkpointing=False,
+        resume_from_checkpoint_path=str(checkpoint),
+        load_config=load_original_base,
+        latent_size=metadata.latent_size,
+        supervise_latent_boundaries=metadata.supervise_latent_boundaries,
+        latent_activation_checkpointing=requested,
     )
-    assert decision.trainer_resume_path == "stage2/checkpoint-10"
+
+
+@pytest.mark.parametrize("saved_value,requested_value", [(True, False), (False, True)])
+def test_peft_resume_rejects_changed_latent_activation_checkpointing(
+    local_peft_resume, saved_value, requested_value
+):
+    """Saved run JSON, never original-base config, governs resume semantics."""
+    checkpoint, _ = local_peft_resume
+    (checkpoint / "config.json").write_text(json.dumps({"stage2_latent_activation_checkpointing": saved_value}))
+    with pytest.raises(ValueError, match="changed stage2_latent_activation_checkpointing"):
+        resolve_local_peft_resume(local_peft_resume, requested_value)
+
+
+@pytest.mark.parametrize("saved_config", [None, {}, {"stage2_latent_activation_checkpointing": False},
+                                          {"stage2_latent_activation_checkpointing": True}])
+def test_peft_resume_accepts_legacy_or_explicit_checkpointing(local_peft_resume, saved_config):
+    checkpoint, _ = local_peft_resume
+    if saved_config is not None:
+        (checkpoint / "config.json").write_text(json.dumps(saved_config))
+    requested = bool(saved_config and saved_config.get("stage2_latent_activation_checkpointing", False))
+    decision = resolve_local_peft_resume(local_peft_resume, requested)
+    assert decision.trainer_resume_path == str(checkpoint)
+
+
+@pytest.mark.parametrize("saved_value", [0, 1, "false", None, [], {}])
+def test_peft_resume_rejects_non_boolean_saved_checkpointing(local_peft_resume, saved_value):
+    checkpoint, _ = local_peft_resume
+    (checkpoint / "config.json").write_text(json.dumps({"stage2_latent_activation_checkpointing": saved_value}))
+    with pytest.raises(ValueError, match="stage2_latent_activation_checkpointing.*bool"):
+        resolve_local_peft_resume(local_peft_resume, False)
+
+
+@pytest.mark.parametrize("payload", ["{", "[]", "null"])
+def test_peft_resume_rejects_malformed_saved_runtime_config(local_peft_resume, payload):
+    checkpoint, _ = local_peft_resume
+    (checkpoint / "config.json").write_text(payload)
+    with pytest.raises(ValueError, match="Stage 2.*config"):
+        resolve_local_peft_resume(local_peft_resume, False)
+
+
+def test_peft_resume_does_not_treat_broken_config_symlink_as_legacy(local_peft_resume):
+    checkpoint, _ = local_peft_resume
+    (checkpoint / "config.json").symlink_to(checkpoint / "absent.json")
+    with pytest.raises(ValueError, match="invalid Stage 2.*config"):
+        resolve_local_peft_resume(local_peft_resume, False)
 
 
 def test_resolve_latent_ids_requires_tokenizer_config_parity():

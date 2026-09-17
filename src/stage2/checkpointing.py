@@ -1491,10 +1491,25 @@ def resolve_stage2_load_decision(
             resume_config.supervise_latent_boundaries,
         )
 
-    resume_config = load_config(resume_from_checkpoint_path)
-    checkpoint_latent_checkpointing = getattr(
-        resume_config, "stage2_latent_activation_checkpointing", False
-    )
+    # This is saved run state, not the original-base configuration dependency.
+    # Legacy PEFT artifacts predate this flag and may omit config.json entirely.
+    checkpoint_latent_checkpointing = False
+    saved_config_path = resume_path / "config.json"
+    if saved_config_path.exists() or saved_config_path.is_symlink():
+        raw_config = _read_stage2_regular_payload(
+            saved_config_path, label="Stage 2 saved runtime config"
+        )
+        try:
+            saved_config = json.loads(raw_config)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError("invalid Stage 2 saved runtime config JSON") from error
+        if type(saved_config) is not dict:
+            raise ValueError("Stage 2 saved runtime config must be a JSON object")
+        checkpoint_latent_checkpointing = saved_config.get(
+            "stage2_latent_activation_checkpointing", False
+        )
+        if type(checkpoint_latent_checkpointing) is not bool:
+            raise ValueError("stage2_latent_activation_checkpointing must be a bool")
     if checkpoint_latent_checkpointing != latent_activation_checkpointing:
         raise ValueError(
             "cannot resume Stage 2 with changed "
