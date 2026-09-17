@@ -106,6 +106,7 @@ from step_preference.negatives import (
     read_negative_manifest,
 )
 from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
     reject_duplicate_sample_ids,
     resolve_assistant_plan_rendering,
 )
@@ -287,6 +288,15 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
         getattr(args, "stage2_assistant_plan_rendering", "auto"), config.enabled
     )
     _require_stage2b_attention_contract(args)
+    if (
+        config.packing_enabled
+        and assistant_plan_rendering
+        != ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+    ):
+        raise ValueError(
+            "packed Stage 2B requires assistant plan rendering "
+            "adjacent-text-space-lf-v1"
+        )
 
     admission = (
         validate_packed_admission_inputs(args, config)
