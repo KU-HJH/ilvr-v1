@@ -57,7 +57,7 @@ def run():
     from step_preference.dpo_loss import context_preference_loss
     tokenizer = AutoProcessor.from_pretrained(
         'checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431',
-        local_files_only=True).tokenizer
+        local_files_only=True, use_fast=False).tokenizer
     pad,start,end = [tokenizer.convert_tokens_to_ids(t) for t in ('<|latent_pad|>','<|latent_start|>','<|latent_end|>')]
     image,vision_start,video = [tokenizer.convert_tokens_to_ids(t) for t in ('<|image_pad|>','<|vision_start|>','<|video_pad|>')]
     config = dict(vocab_size=len(tokenizer),hidden_size=8,intermediate_size=16,

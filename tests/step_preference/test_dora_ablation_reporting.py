@@ -188,11 +188,21 @@ def test_real_launcher_phase_budget_is_rejected_at_freeze_and_reopen(ablation_fi
         result=subprocess.run(["bash",str(launcher),"--epochs","2","--warm_up_steps","10","--save_steps","612"],
             env=environment,check=True,capture_output=True,text=True)
         command=json.loads(result.stdout)
+        # This reporter freezes the historical two-epoch protocol. Normalize only
+        # the current launcher's known default, leaving the explicit historical 2.
+        epoch_indices=[i for i,token in enumerate(command) if token=="--epochs"]
+        assert [command[i+1] for i in epoch_indices] == ["1", "2"]
+        del command[epoch_indices[0]:epoch_indices[0]+2]
+        # The historical reporter rejects empty tokens; its protocol predates the
+        # observer. Remove only the explicitly disabled observer, never an active one.
+        probe_index=command.index("--stage2_reproduction_probe_dir")
+        assert command[probe_index+1] == ""
+        del command[probe_index:probe_index+2]
         parsed=parse_args(command[command.index(str(tmp_path/"src/main.py"))+1:])
         effective=training_main.build_stage2_training_arguments(parsed)
         assert parsed.step_preference_config.phase_steps == effective.max_steps == 2
         assert effective.num_train_epochs == 2
-        setattr(args,arm+"_command_json",result.stdout)
+        setattr(args,arm+"_command_json",json.dumps(command))
     with pytest.raises(ValueError,match="step|phase"):
         m.freeze_launches(args,tmp_path)
     assert not Path(args.comparison_dir).exists()

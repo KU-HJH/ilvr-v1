@@ -517,6 +517,9 @@ MANAGED_OPTIONS=(
   --latent_size
   --stage2_diagnostics_interval
   --stage2_reproduction_probe_dir
+  --stage2_assistant_plan_rendering
+  --stage2_latent_activation_checkpointing
+  --no-stage2_latent_activation_checkpointing
   --step_preference_enabled
   --step_preference_packing
   --step_shared_prefix_enabled

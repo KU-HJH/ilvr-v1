@@ -438,6 +438,8 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "8",
         "--stage2_diagnostics_interval",
         "0",
+        "--stage2_reproduction_probe_dir",
+        "",
         "--stage2_assistant_plan_rendering",
         "concatenated-v1",
         "--ce_weight",
@@ -1156,3 +1158,16 @@ def test_stage2_launcher_has_valid_bash_syntax():
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("arguments", [
+    ["--stage2_assistant_plan_rendering", "adjacent-text-space-lf-v1"],
+    ["--stage2_assistant_plan_rendering=adjacent-text-space-lf-v1"],
+    ["--stage2_latent_activation_checkpointing"],
+    ["--no-stage2_latent_activation_checkpointing"],
+])
+def test_launcher_rejects_reproduction_policy_cli_overrides(arguments):
+    """Trailing argv must not override the environment-owned reproduction policy."""
+    result = run_launcher(*arguments)
+    assert result.returncode == 2
+    assert "launcher-owned option" in result.stderr

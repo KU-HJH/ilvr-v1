@@ -44,6 +44,18 @@ from tests.stage2.test_stage1_checkpoint_handoff import (
 )
 
 
+@pytest.fixture(autouse=True)
+def restore_evaluator_backend_precision():
+    """Evaluator loading enables TF32; it must not leak into later numeric tests."""
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+
 MODULE_NAMES = ("eval", "evaluate_deepseed")
 
 
@@ -303,7 +315,9 @@ def _saved_adapter_artifact(tmp_path, method="lora"):
     source = build_stage2_tuned_model(source_base, tuning).eval()
     activate_stage2_adapter_deltas(source)
     artifact_dir = tmp_path / "adapter"
-    source.save_pretrained(artifact_dir)
+    # Synthetic base has no on-disk config; PEFT deliberately assumes unchanged vocab.
+    with pytest.warns(UserWarning, match=r"Could not find a config file in  - will assume that the vocabulary was not modified\."):
+        source.save_pretrained(artifact_dir)
     save_stage2_peft_metadata(
         artifact_dir,
         build_stage2_peft_metadata(
@@ -2063,3 +2077,16 @@ def test_eval_rejects_processor_batches_larger_than_one(module_name, monkeypatch
         )
 
     assert controller.calls == []
+
+
+def test_evaluator_precision_fixture_restores_backend_flags():
+    """Removing fixture teardown must expose evaluator TF32 state to later tests."""
+    initial = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    isolation = restore_evaluator_backend_precision.__wrapped__()
+    next(isolation)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = not initial[0]
+        torch.backends.cudnn.allow_tf32 = not initial[1]
+    finally:
+        isolation.close()
+    assert (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32) == initial

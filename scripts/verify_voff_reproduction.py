@@ -193,7 +193,7 @@ def _dataset_worker(args):
     if external:
         data.parse_latent_spans = rollout.parse_latent_spans
         LatentTokenIds = rollout.LatentTokenIds
-    processor = AutoProcessor.from_pretrained(args.processor, local_files_only=True)
+    processor = AutoProcessor.from_pretrained(args.processor, local_files_only=True, use_fast=False)
     token_ids = LatentTokenIds(*[processor.tokenizer.convert_tokens_to_ids(t) for t in
                                ('<|latent_pad|>', '<|latent_start|>', '<|latent_end|>')])
     collator = data.Stage2DataCollator(processor, token_ids, 8, True,

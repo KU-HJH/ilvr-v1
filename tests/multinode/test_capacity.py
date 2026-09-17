@@ -898,6 +898,8 @@ def test_stage1_coordinator_uses_training_evidence_step_without_max_steps(
             "lora",
             "--epochs",
             "3",
+            "--ema-tau",
+            "0.999",
             "--micro-batch",
             "2",
         ]
