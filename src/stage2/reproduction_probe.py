@@ -125,11 +125,14 @@ class ReproductionObserver:
     def _capture_output_hooks(self, engine, args, outputs):
         # DeepSpeed attaches each manager to its first output, which need not
         # contribute to the trainer's composed loss. Keep managers, not tensors.
+        tensors, managers = [], []
         def visit(value):
             if isinstance(value, torch.Tensor):
+                if value.grad_fn is not None:
+                    tensors.append(value)
                 for manager in getattr(value, '_backward_hook_managers', ()):
-                    if not any(manager is old for old in self._reference_output_managers):
-                        self._reference_output_managers.append(manager)
+                    if not any(manager is old for old in managers):
+                        managers.append(manager)
             elif isinstance(value, dict):
                 for child in value.values():
                     visit(child)
@@ -138,7 +141,23 @@ class ReproductionObserver:
                     visit(child)
             elif value is not None and not isinstance(value, (bool, int, float, str)):
                 raise RuntimeError('unsupported DeepSpeed output hook container')
-        visit(outputs)
+        try:
+            visit(outputs)
+            # Validate this forward independently: a manager from an earlier
+            # forward cannot cover a later output whose holder was removed.
+            for tensor in tensors:
+                hooks = tensor._backward_hooks
+                if not hooks or not any(
+                    handle.hooks_dict_ref() is hooks and handle.id in hooks
+                    for manager in managers for handle in manager.hook_handles
+                ):
+                    raise RuntimeError('incomplete DeepSpeed output hook capture')
+            for manager in managers:
+                if not any(manager is old for old in self._reference_output_managers):
+                    self._reference_output_managers.append(manager)
+        except Exception:
+            self._reference_output_managers.clear()
+            raise
 
     def _reference_gradients(self, loss):
         from deepspeed.runtime.utils import OutputBackwardHookManager

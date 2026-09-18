@@ -162,3 +162,59 @@ def test_reference_rejects_unsupported_output_hook_state(observer_factory,broken
     with pytest.raises(RuntimeError,match='output hook'):
         observer.observe_loss(out['logits'].sum()+out['nested'][0],inputs())
     assert engine.optimizer.events==[]
+
+
+def test_partial_manager_capture_rejects_second_forward_before_autograd(observer_factory):
+    engine=Engine()
+    # An earlier return transform hides the second manager's holder while
+    # preserving other outputs whose tensor hooks still call that manager.
+    def drop_second_holder(module,args,outputs):
+        if args[0]==2.:
+            return {'logits':outputs['logits'],'nested':outputs['nested']}
+    engine.register_forward_hook(drop_second_holder)
+    observer=observer_factory(engine,'partial')
+    first=engine(1.)
+    known=first['unused_first']._backward_hook_managers[0]
+    before=engine.optimizer.snapshot()
+    with pytest.raises(RuntimeError,match='output hook'):
+        second=engine(2.)
+        observer.observe_loss(first['logits'].sum()+second['logits'].sum(),inputs())
+    assert engine.optimizer.snapshot()==before
+    assert engine.optimizer.events==[]
+    assert known.preprocess_done is False
+    assert observer._reference_output_managers==[]
+
+
+def test_removed_output_hook_handle_rejects_capture(observer_factory):
+    engine=Engine()
+    def remove_hook(module,args,outputs):
+        manager=outputs['unused_first']._backward_hook_managers[0]
+        manager.hook_handles[1].remove()
+    engine.register_forward_hook(remove_hook)
+    observer=observer_factory(engine,'removed')
+    with pytest.raises(RuntimeError,match='output hook'):
+        engine(1.)
+    assert engine.optimizer.events==[]
+    assert observer._reference_output_managers==[]
+
+
+def test_two_complete_forwards_keep_unscaled_reference_and_normal_backward(observer_factory):
+    def run(enabled):
+        torch.manual_seed(42)
+        engine=Engine()
+        observer=observer_factory(engine,'two-complete') if enabled else None
+        first=engine(1.);second=engine(2.)
+        loss=first['logits'].sum()+second['logits'].sum()+second['nested'][0]
+        if observer:
+            before=engine.optimizer.snapshot()
+            observer.observe_loss(loss,inputs())
+            assert engine.optimizer.snapshot()==before
+        engine.backward(loss,scale_wrt_gas=False)
+        state=engine.optimizer.snapshot()
+        state[0]['post_backward_callback_graph_task_id']='graph-local identity'
+        return engine.module.p.grad,torch.get_rng_state(),state,observer
+    on=run(True);off=run(False)
+    assert torch.equal(on[0],off[0])
+    assert torch.equal(on[1],off[1])
+    assert on[2]==off[2]
+    assert torch.equal(on[3].total[0],off[0])
