@@ -54,8 +54,11 @@ class AdamReference:
             g = g * factor
             m.mul_(beta1).add_(g, alpha=1-beta1)
             v.mul_(beta2).addcmul_(g, g, value=1-beta2)
-            direction = (m / (1-beta1**self.steps)) / ((v / (1-beta2**self.steps)).sqrt() + opt['eps'])
-            result.append(-opt['lr'] * (direction + opt['weight_decay'] * p))
+            updated = p.clone()
+            updated.mul_(1-opt['lr']*opt['weight_decay'])
+            denominator = v.sqrt().div_((1-beta2**self.steps)**.5).add_(opt['eps'])
+            updated.addcdiv_(m, denominator, value=-opt['lr']/(1-beta1**self.steps))
+            result.append(updated.sub_(p))
         return result
 
 
@@ -90,6 +93,7 @@ class ReproductionObserver:
         self.clip_groups = []
         self.clip_factors = []
         self.mean_adam = AdamReference()
+        self.fixed_adam = AdamReference()
         self.effective_adam = AdamReference()
         zero = engine.optimizer
         original = zero.process_gradients
@@ -180,6 +184,7 @@ class ReproductionObserver:
         self.clip_factors = []
         self.pending = dict(weights=weights,
             mean_delta=self.mean_adam.delta(weights,means,options,clip=1.),
+            fixed_delta=self.fixed_adam.delta(weights,fixed,options,clip=1.),
             effective_delta=self.effective_adam.delta(weights,effective,options,clip=1.),
             report=dict(event='update',rank=self.rank,update=self.effective_adam.steps,
                 group_ids_by_rank=ids,actual_count=count,fixed_denominator=16,options=options,
@@ -193,6 +198,7 @@ class ReproductionObserver:
         actual = [new-old for new,old in zip(after,self.pending['weights'])]
         report = self.pending['report']
         report.update(actual_group_adam_delta=compare_vectors(self.pending['mean_delta'],actual),
+            historical_fixed_adam_delta=compare_vectors(self.pending['fixed_delta'],actual),
             effective_gradient_adam_delta=compare_vectors(self.pending['effective_delta'],actual),
             observed_delta_l2=sum(float(delta.double().square().sum()) for delta in actual)**.5,
             clip_calls_global_norm=list(self.clip_calls),clip_group_indices=list(self.clip_groups),

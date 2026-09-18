@@ -119,7 +119,51 @@ def test_adam_zero_lr_first_step_still_changes_second_step_moments():
     ref.delta([torch.tensor([2.])],[torch.tensor([1.])],options,1.)
     options[0]['lr']=.01
     delta=ref.delta([torch.tensor([2.])],[torch.tensor([0.])],options,1.)
-    assert delta[0].item() == pytest.approx(-.005773502691896258,abs=1e-8)
+    assert delta[0].item() == pytest.approx(-.0057735443115234375,abs=1e-12)
+
+
+@pytest.mark.parametrize('foreach',[False,True])
+def test_adam_reference_matches_rounded_fp32_adamw_observable(foreach):
+    """Catches returning an analytical displacement instead of stored FP32 delta."""
+    weights=torch.tensor([0.,.125,1.,4.,8.,16.,32.,-16.],dtype=torch.float32)
+    parameter=torch.nn.Parameter(weights.clone())
+    options=dict(lr=0.,betas=(.9,.999),eps=1e-8,weight_decay=.01)
+    optimizer=torch.optim.AdamW([parameter],foreach=foreach,**options)
+    reference=module().AdamReference()
+    gradients=(
+        torch.tensor([.001,-.002,.003,-.004,.005,-.006,.007,-.008]),
+        torch.tensor([-.0004,.0008,-.0012,.0016,-.002,.0024,-.0028,.0032]),
+        torch.tensor([.0007,-.0014,.0021,-.0028,.0035,-.0042,.0049,-.0056]),
+    )
+    deltas=[]
+    for lr,gradient in zip((0.,5e-6,1e-5),gradients,strict=True):
+        optimizer.param_groups[0]['lr']=lr
+        options['lr']=lr
+        before=parameter.detach().clone()
+        expected=reference.delta([before],[gradient],[options],clip=1.)
+        parameter.grad=gradient.clone()
+        optimizer.step()
+        observed=[parameter.detach().clone()-before]
+        assert module().compare_vectors(expected,observed)['pass']
+        deltas.append(expected)
+    assert deltas[1][0][5].item() == 0.
+
+
+def test_adam_reference_keeps_zero_lr_moments_with_production_betas():
+    """Catches discarding LR-zero history before the first nonzero AdamW step."""
+    parameter=torch.nn.Parameter(torch.tensor([16.,32.],dtype=torch.float32))
+    optimizer=torch.optim.AdamW([parameter],lr=0.,betas=(.9,.999),eps=1e-8,weight_decay=.01)
+    reference=module().AdamReference()
+    options=dict(lr=0.,betas=(.9,.999),eps=1e-8,weight_decay=.01)
+    first=torch.tensor([.006,-.007])
+    reference.delta([parameter.detach().clone()],[first],[options],clip=1.)
+    parameter.grad=first.clone(); optimizer.step(); optimizer.zero_grad(set_to_none=True)
+    options['lr']=optimizer.param_groups[0]['lr']=5e-6
+    second=torch.tensor([-.0024,.0028])
+    before=parameter.detach().clone()
+    expected=reference.delta([before],[second],[options],clip=1.)
+    parameter.grad=second.clone(); optimizer.step()
+    assert module().compare_vectors(expected,[parameter.detach()-before])['pass']
 
 
 def test_vector_comparison_rejects_missing_or_wrong_shape():
@@ -170,6 +214,9 @@ def test_observer_records_full_full_partial_vectors_and_real_adam_deltas(tmp_pat
     assert updates[1]['group_ids_by_rank']==[[f'1-{i}' for i in range(4)]]*4
     assert [r['actual_group_gradient']['pass'] for r in updates]==[True,True,False]
     assert all(r['historical_fixed_gradient']['pass'] for r in updates)
+    assert all(r['historical_fixed_adam_delta']['pass'] for r in updates)
+    assert updates[2]['actual_group_adam_delta']['pass'] is False
+    assert updates[2]['historical_fixed_adam_delta']['pass'] is True
     assert all(r['effective_gradient_adam_delta']['pass'] for r in updates)
     assert all(r['clip_once_per_partition_group'] for r in updates)
     assert all(r['clip_group_indices']==[0] for r in updates)
