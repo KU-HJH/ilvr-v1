@@ -329,9 +329,31 @@ def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, pre
     for group in plan.groups:
         batches = ((group,) if group else ()) if plan.context_preference else chunk_sidecar_branches(group, budget)
         for branches in batches:
-            parts = [_branch_inputs(model, branch, input_ids, clean_embeds, clean_positions) for branch in branches]
-            embeds = torch.cat([part[0] for part in parts], dim=1)
-            positions = torch.cat([part[1] for part in parts], dim=2)
+            token_ids = [token for branch in branches for token in branch.token_ids]
+            replaced_tokens = (model.config.image_token_id, model.config.video_token_id,
+                               model.config.latent_pad_token_id)
+            if (plan.context_preference
+                    and options.get("prefix_mode", "clean_prefix") == "clean_prefix"
+                    and not any(token in replaced_tokens for token in token_ids)):
+                # One independent lookup per context group preserves the BF16
+                # sparse-token backward accumulation used by grouped replay.
+                embeds = model.model.embed_tokens(torch.tensor(
+                    [token_ids], dtype=torch.long, device=clean_embeds.device))
+                logical = torch.tensor(
+                    [position for branch in branches for position in branch.logical_positions],
+                    dtype=torch.long, device=clean_embeds.device)
+                positions = clean_positions.index_select(2, logical)
+                offset = 0
+                for branch in branches:
+                    if branch.zero_first_embedding:
+                        embeds[:, offset] = 0
+                    offset += len(branch.token_ids)
+            else:
+                # Generated latent/image embeddings and non-context branches
+                # keep their existing clean-source/rejected-input semantics.
+                parts = [_branch_inputs(model, branch, input_ids, clean_embeds, clean_positions) for branch in branches]
+                embeds = torch.cat([part[0] for part in parts], dim=1)
+                positions = torch.cat([part[1] for part in parts], dim=2)
             if options.get("backend", "dense") == "flex":
                 mask = build_sidecar_flex_block_mask(plan.root_length, branches, embeds.device)
             else:

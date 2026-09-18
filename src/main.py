@@ -89,6 +89,7 @@ from stage2.data import (
     prepare_stage2_example,
 )
 from stage2.length_manifest import validate_stage2_length_manifest
+from stage2.sampler import select_stage2_sampler_policy
 from stage2.attention_backend import (
     load_qwen2_5_vl_with_attention,
     validate_qwen2_5_vl_attention_backends,
@@ -1093,6 +1094,13 @@ def run_stage2(args):
         deepspeed_runtime_profile=profile,
         stage2_diagnostics_interval=args.stage2_diagnostics_interval,
     )
+    sampler_policy = select_stage2_sampler_policy(
+        getattr(args, "stage2_sampler_policy", "auto"), profile=profile,
+        config=components.step_preference_config, resume=components.trainer_resume_path)
+    if sampler_policy == "reference_random":
+        trainer_kwargs["stage2_sampler_policy"] = sampler_policy
+    if getattr(args, "stage2_reference_sampler_probe_dir", ""):
+        trainer_kwargs["stage2_reference_sampler_probe_dir"] = args.stage2_reference_sampler_probe_dir
     if (
         components.step_preference_config is not None
         and components.step_preference_config.is_stage2b

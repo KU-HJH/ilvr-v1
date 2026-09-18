@@ -307,7 +307,9 @@ class Stage2DataCollator:
         if len(examples) != 1:
             raise NotImplementedError("Stage 2 collator currently supports batch_size=1 only")
 
-        example = examples[0]
+        from .sampler import ReferenceSample
+        slot = examples[0] if isinstance(examples[0], ReferenceSample) else None
+        example = slot.example if slot is not None else examples[0]
         text = self.processor.apply_chat_template(
             example.conversation, tokenize=False, add_generation_prompt=False
         )
@@ -319,6 +321,10 @@ class Stage2DataCollator:
             truncation=False,
             return_tensors="pt",
         )
+        if slot is not None:
+            batch["stage2_sample_weight"] = slot.weight
+            batch["stage2_sample_index"] = slot.index
+            batch["stage2_sample_latent_block_count"] = example.latent_block_count
         forbidden = {"pixel_values_latent", "image_grid_thw_latent"} & batch.keys()
         if forbidden:
             raise ValueError(f"helper-image tensors leaked into Stage 2: {sorted(forbidden)}")

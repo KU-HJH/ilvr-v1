@@ -59,6 +59,8 @@ LORA_TARGET_MODULES=${LORA_TARGET_MODULES-q_proj,k_proj,v_proj,o_proj,gate_proj,
 LATENT_SIZE=${LATENT_SIZE:-8}
 STAGE2_DIAGNOSTICS_INTERVAL=${STAGE2_DIAGNOSTICS_INTERVAL:-0}
 STAGE2_REPRODUCTION_PROBE_DIR=${STAGE2_REPRODUCTION_PROBE_DIR:-}
+STAGE2_SAMPLER_POLICY=${STAGE2_SAMPLER_POLICY:-auto}
+STAGE2_REFERENCE_SAMPLER_PROBE_DIR=${STAGE2_REFERENCE_SAMPLER_PROBE_DIR:-}
 SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
 LEARNING_RATE=${LEARNING_RATE:-5e-5}
 CE_WEIGHT=${CE_WEIGHT:-1.0}
@@ -517,6 +519,8 @@ MANAGED_OPTIONS=(
   --latent_size
   --stage2_diagnostics_interval
   --stage2_reproduction_probe_dir
+  --stage2_sampler_policy
+  --stage2_reference_sampler_probe_dir
   --stage2_assistant_plan_rendering
   --stage2_latent_activation_checkpointing
   --no-stage2_latent_activation_checkpointing
@@ -907,6 +911,14 @@ LAUNCHER_LOG_ARGS=()
 if [[ "$step_preference_packing" == true && -z "${RESUME_CHECKPOINT:-}" ]]; then
   LAUNCHER_LOG_ARGS+=(--stage2_launcher_log_capture)
 fi
+SAMPLER_ARGS=()
+if [[ "$STAGE2_SAMPLER_POLICY" != auto ]]; then
+  SAMPLER_ARGS+=(--stage2_sampler_policy "$STAGE2_SAMPLER_POLICY")
+fi
+if [[ -n "$STAGE2_REFERENCE_SAMPLER_PROBE_DIR" ]]; then
+  SAMPLER_ARGS+=(--stage2_reference_sampler_probe_dir "$STAGE2_REFERENCE_SAMPLER_PROBE_DIR")
+fi
+
 TRAINING_ARGS=(
   --stage stage2
   --epochs 1
@@ -920,6 +932,7 @@ TRAINING_ARGS=(
   --latent_size "$LATENT_SIZE"
   --stage2_diagnostics_interval "$STAGE2_DIAGNOSTICS_INTERVAL"
   --stage2_reproduction_probe_dir "$STAGE2_REPRODUCTION_PROBE_DIR"
+  "${SAMPLER_ARGS[@]}"
   --stage2_assistant_plan_rendering "$ASSISTANT_PLAN_RENDERING"
   "${STEP_PREFERENCE_ARGS[@]}"
   --ce_weight "$CE_WEIGHT"

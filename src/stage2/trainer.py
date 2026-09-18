@@ -1,6 +1,7 @@
 """Thin Hugging Face Trainer adapter for Stage 2 model-native loss."""
 
 import os
+from contextlib import nullcontext
 import math
 import tempfile
 import weakref
@@ -25,6 +26,8 @@ from stage1.trainer import collect_deepspeed_pre_step_norm
 from .checkpointing import save_stage2_peft_metadata
 from .sampler import (
     LatentBlockBalancedSampler,
+    ReferenceRandomDataset,
+    ReferenceRandomSampler,
     Stage2SamplerIdentity,
     validate_stage2_sampler_resume_identity,
     write_stage2_sampler_sidecar,
@@ -251,6 +254,8 @@ class Stage2Trainer(Trainer):
         stage2_peft_metadata=None,
         stage2_diagnostics_interval: int = 0,
         stage2_reproduction_probe_dir: str = "",
+        stage2_sampler_policy: str = "latent_balanced",
+        stage2_reference_sampler_probe_dir: str = "",
         step_preference_config: StepPreferenceConfig | None = None,
         **kwargs,
     ):
@@ -275,6 +280,14 @@ class Stage2Trainer(Trainer):
             )
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
             raise TypeError("Stage 2 trainer requires a DeepSpeed runtime profile")
+        if stage2_sampler_policy not in ("latent_balanced", "reference_random"):
+            raise ValueError("unknown Stage 2 sampler policy")
+        if stage2_reproduction_probe_dir and stage2_reference_sampler_probe_dir:
+            raise ValueError("select only one Stage 2 reproduction observer")
+        if stage2_reference_sampler_probe_dir and stage2_sampler_policy != "reference_random":
+            raise ValueError("reference sampler witness requires reference_random")
+        self.stage2_sampler_policy = stage2_sampler_policy
+        self.stage2_reference_sampler_probe_dir = stage2_reference_sampler_probe_dir
         self.deepspeed_runtime_profile = deepspeed_runtime_profile
         self.stage2_peft_metadata = stage2_peft_metadata
         self.stage2_sampler_identity: Stage2SamplerIdentity | None = None
@@ -287,6 +300,19 @@ class Stage2Trainer(Trainer):
         if not isinstance(step_preference_config, StepPreferenceConfig):
             raise TypeError("step_preference_config must be a StepPreferenceConfig")
         self.step_preference_config = step_preference_config
+        if stage2_sampler_policy == "reference_random":
+            config = step_preference_config
+            profile = deepspeed_runtime_profile
+            if not (profile.enabled and profile.zero_stage == 2 and profile.world_size == 4
+                    and config.is_context_preference and config.visual_only_context_preference
+                    and config.prefix_mode == "clean_prefix"):
+                raise ValueError("reference_random requires V-off clean-prefix context preference and four-rank ZeRO2")
+            if kwargs.get("compute_loss_func") is not None:
+                raise ValueError("reference_random requires the fixed Trainer accumulation denominator")
+            dataset = kwargs.get("train_dataset")
+            if dataset is None:
+                raise ValueError("reference_random requires an explicit train_dataset")
+            kwargs["train_dataset"] = ReferenceRandomDataset(dataset)
         self._step_preference_metric_totals: dict[str, float] = {}
         self._step_preference_metric_batches = 0
         self._stage2_microbatch_index = 0
@@ -301,12 +327,39 @@ class Stage2Trainer(Trainer):
         callbacks.append(_ObservedOptimizerStep(self))
         kwargs["callbacks"] = callbacks
         super().__init__(*args, **kwargs)
+        if stage2_sampler_policy == "reference_random":
+            if self.args.world_size != 4:
+                raise ValueError("reference_random requires four actual ranks")
+            if self.args.per_device_train_batch_size != 1 or self.args.dataloader_drop_last:
+                raise ValueError("reference_random requires microbatch 1 and drop_last=False")
+            self.accelerator.even_batches = False
+            # Stage2 composes example-level CE + preference itself; token-count kwargs
+            # must not bypass Trainer's fixed configured GAS divisor, including tails.
+            self.model_accepts_loss_kwargs = False
+
+    def set_initial_training_values(self, args, dataloader, total_train_batch_size):
+        values = list(super().set_initial_training_values(args, dataloader, total_train_batch_size))
+        if getattr(self, "stage2_sampler_policy", "latent_balanced") != "reference_random":
+            return tuple(values)
+        length = values[5]
+        if length is None or length < 1:
+            raise ValueError("reference_random requires a nonempty sized dataloader")
+        updates = math.ceil(length / args.gradient_accumulation_steps)
+        values[1] = updates
+        if values[4]:
+            values[6] = math.ceil(args.num_train_epochs * updates)
+        else:
+            values[0] = math.ceil(values[6] / updates)
+        # The inherited training loop uses this same count for schedule creation,
+        # resume epoch division, and resume microstep skips.
+        return tuple(values)
 
     def _install_deepspeed_gradient_adapter(self) -> None:
         from accelerate.utils import DistributedType
 
         if getattr(self.accelerator, "distributed_type", None) != DistributedType.DEEPSPEED:
-            if getattr(self, "stage2_reproduction_probe_dir", ""):
+            if (getattr(self, "stage2_reproduction_probe_dir", "")
+                    or getattr(self, "stage2_reference_sampler_probe_dir", "")):
                 raise ValueError("reproduction witness requires DeepSpeed")
             return
         wrapper = getattr(self.accelerator, "deepspeed_engine_wrapped", None)
@@ -326,6 +379,10 @@ class Stage2Trainer(Trainer):
         if getattr(self, "stage2_reproduction_probe_dir", ""):
             from .reproduction_probe import ReproductionObserver
             self._reproduction_observer = ReproductionObserver(self, engine, self.stage2_reproduction_probe_dir)
+        if getattr(self, "stage2_reference_sampler_probe_dir", ""):
+            from .reference_sampler_probe import ReferenceSamplerObserver
+            self._reproduction_observer = ReferenceSamplerObserver(
+                self, engine, self.stage2_reference_sampler_probe_dir)
         adapter = _Stage2DeepSpeedGradientAdapter(self, engine, engine.step)
         engine.step = adapter
         self._stage2_deepspeed_gradient_adapter = adapter
@@ -346,9 +403,11 @@ class Stage2Trainer(Trainer):
             self._representative_gradient_norm = math.sqrt(squared_norm)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        loss = super().training_step(
-            model, inputs, num_items_in_batch=num_items_in_batch
-        )
+        padding = float(inputs.get("stage2_sample_weight", 1.)) == 0.
+        with self._padding_rng_context(padding):
+            loss = super().training_step(
+                model, inputs, num_items_in_batch=num_items_in_batch
+            )
         self._record_representative_gradient_norm(model)
         return loss
 
@@ -389,18 +448,26 @@ class Stage2Trainer(Trainer):
             self.stage2_sampler_identity = None
             self._stage2_train_sampler = None
             return None
+        reference = getattr(self, "stage2_sampler_policy", "latent_balanced") == "reference_random"
+        if reference and self.args.world_size != 4:
+            raise ValueError("reference_random requires four actual ranks")
+        seed = (getattr(self.args, "data_seed", None) if reference else None)
+        seed = self.args.seed if seed is None else seed
+        sampler_type = ReferenceRandomSampler if reference else LatentBlockBalancedSampler
         sampler = getattr(self, "_stage2_train_sampler", None)
         if (
-            sampler is None
+            not isinstance(sampler, sampler_type)
             or sampler.dataset is not self.train_dataset
             or sampler.num_replicas != self.args.world_size
-            or sampler.seed != self.args.seed
+            or sampler.seed != seed
+            or (reference and sampler.identity.gradient_accumulation_steps != self.args.gradient_accumulation_steps)
             or sampler.identity.dataset_size != len(self.train_dataset)
         ):
-            sampler = LatentBlockBalancedSampler(
+            sampler = sampler_type(
                 self.train_dataset,
                 num_replicas=self.args.world_size,
-                seed=self.args.seed,
+                seed=seed,
+                **({"gradient_accumulation_steps": self.args.gradient_accumulation_steps} if reference else {}),
             )
             self._stage2_train_sampler = sampler
         self.stage2_sampler_identity = sampler.identity
@@ -512,6 +579,8 @@ class Stage2Trainer(Trainer):
         )
 
     def _accumulate_step_preference_metrics(self, values) -> None:
+        if getattr(self, "_stage2_padding_active", False):
+            return
         totals = getattr(self, "_step_preference_metric_totals", None)
         if totals is None:
             totals = {}
@@ -1518,14 +1587,47 @@ class Stage2Trainer(Trainer):
             return total_loss, clean_outputs
         return total_loss
 
+    @staticmethod
+    def _padding_rng_context(padding):
+        if not padding:
+            return nullcontext()
+        devices = [torch.cuda.current_device()] if torch.cuda.is_initialized() else []
+        return torch.random.fork_rng(devices=devices)
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        result = self._compute_loss_without_reproduction_probe(
-            model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
-        )
-        observer = getattr(self, "_reproduction_observer", None)
-        if observer is not None:
-            observer.observe_loss(result[0] if return_outputs else result, inputs)
-        return result
+        weight = float(inputs.get("stage2_sample_weight", 1.))
+        if weight not in (0., 1.):
+            raise ValueError("Stage 2 sample weight must be 0 or 1")
+        padding = weight == 0.
+        if "stage2_sample_weight" in inputs:
+            if getattr(self, "stage2_sampler_policy", "latent_balanced") != "reference_random":
+                raise ValueError("weighted slots require reference_random")
+            model_inputs = {key: value for key, value in inputs.items() if key not in {
+                "stage2_sample_weight", "stage2_sample_index", "stage2_sample_latent_block_count"}}
+        else:
+            model_inputs = inputs
+        previous_padding = getattr(self, "_stage2_padding_active", False)
+        self._stage2_padding_active = padding
+        try:
+            with self._padding_rng_context(padding):
+                result = self._compute_loss_without_reproduction_probe(
+                    model, model_inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+                )
+                if padding:
+                    # Keep the complete CE + preference graph participating in backward.
+                    loss = (result[0] if return_outputs else result) * 0.
+                    if return_outputs:
+                        result[1].loss = loss
+                        result = loss, result[1]
+                    else:
+                        result = loss
+                    self._latest_stage2_diagnostics = None
+                observer = getattr(self, "_reproduction_observer", None)
+                if observer is not None:
+                    observer.observe_loss(result[0] if return_outputs else result, inputs)
+                return result
+        finally:
+            self._stage2_padding_active = previous_padding
 
     def _compute_loss_without_reproduction_probe(
         self, model, inputs, return_outputs=False, num_items_in_batch=None

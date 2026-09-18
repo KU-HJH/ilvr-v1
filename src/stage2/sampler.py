@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from torch.utils.data import Sampler
+from torch.utils.data import Dataset, Sampler
+from accelerate.data_loader import SeedableRandomSampler
 
 
 STAGE2_SAMPLER_FILENAME = "stage2-sampler.json"
@@ -36,9 +37,11 @@ class Stage2SamplerIdentity:
     dataset_size: int
     bucket_sizes: tuple[tuple[int, int], ...]
     padded_samples: int
+    policy: str = "latent_balanced"
+    gradient_accumulation_steps: int | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "seed": self.seed,
             "world_size": self.world_size,
@@ -48,12 +51,18 @@ class Stage2SamplerIdentity:
             },
             "padded_samples": self.padded_samples,
         }
+        if self.policy == "reference_random":
+            payload.update(policy=self.policy, gradient_accumulation_steps=self.gradient_accumulation_steps,
+                           update_accounting="ceil", padding_weight=0)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "Stage2SamplerIdentity":
-        if not isinstance(payload, dict) or set(payload) != (
-            _STAGE2_SAMPLER_IDENTITY_FIELDS
-        ):
+        reference = isinstance(payload, dict) and payload.get("schema_version") == 2
+        fields = _STAGE2_SAMPLER_IDENTITY_FIELDS | (
+            {"policy", "gradient_accumulation_steps", "update_accounting", "padding_weight"} if reference else set()
+        )
+        if not isinstance(payload, dict) or set(payload) != fields:
             raise ValueError("invalid Stage 2 sampler identity schema")
         schema_version = payload["schema_version"]
         seed = payload["seed"]
@@ -63,7 +72,7 @@ class Stage2SamplerIdentity:
         padded_samples = payload["padded_samples"]
         if (
             type(schema_version) is not int
-            or schema_version != STAGE2_SAMPLER_SCHEMA_VERSION
+            or schema_version != (2 if reference else STAGE2_SAMPLER_SCHEMA_VERSION)
         ):
             raise ValueError("unsupported Stage 2 sampler identity schema")
         if type(seed) is not int:
@@ -74,6 +83,15 @@ class Stage2SamplerIdentity:
             raise ValueError("invalid Stage 2 sampler identity dataset_size")
         if type(padded_samples) is not int or padded_samples < 0:
             raise ValueError("invalid Stage 2 sampler identity padded_samples")
+        if reference:
+            gas = payload["gradient_accumulation_steps"]
+            if (payload["policy"] != "reference_random" or payload["update_accounting"] != "ceil"
+                    or type(payload["padding_weight"]) is not int or payload["padding_weight"] != 0
+                    or type(gas) is not int or gas < 1 or world_size != 4
+                    or bucket_sizes != {} or padded_samples != (-dataset_size) % world_size):
+                raise ValueError("invalid reference_random sampler geometry or policy")
+            return cls(schema_version, seed, world_size, dataset_size, (), padded_samples,
+                       "reference_random", gas)
         if not isinstance(bucket_sizes, dict) or not bucket_sizes:
             raise ValueError("invalid Stage 2 sampler identity bucket_sizes")
         restored_buckets = []
@@ -200,6 +218,69 @@ class LatentBlockBalancedSampler(Sampler[int]):
         self.epoch = epoch
 
 
+
+@dataclass(frozen=True)
+class ReferenceSample:
+    example: object
+    index: int
+    weight: float
+
+
+class ReferenceRandomDataset(Dataset):
+    """Keep real indices intact; -1 is a valid-forward, zero-weight slot."""
+
+    def __init__(self, dataset):
+        if not len(dataset):
+            raise ValueError("reference_random cannot sample an empty dataset")
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        if index == -1:
+            return ReferenceSample(self.dataset[0], -1, 0.)
+        if index < 0 or index >= len(self.dataset):
+            raise IndexError(index)
+        return ReferenceSample(self.dataset[index], index, 1.)
+
+
+class ReferenceRandomSampler(Sampler[int]):
+    """Source permutation followed only by explicit zero-contribution slots.
+
+    Accelerate shards this global stream with even_batches=False. Each rank has
+    the same number of microsteps; no bucket grouping or repeated real exposure.
+    """
+
+    def __init__(self, dataset, *, num_replicas, seed, gradient_accumulation_steps):
+        if num_replicas != 4 or type(seed) is not int:
+            raise ValueError("reference_random requires four ranks and an integer seed")
+        if type(gradient_accumulation_steps) is not int or gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be positive")
+        if not len(dataset):
+            raise ValueError("reference_random cannot sample an empty dataset")
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.seed = seed
+        self.epoch = 0
+        self.identity = Stage2SamplerIdentity(2, seed, num_replicas, len(dataset), (),
+            (-len(dataset)) % num_replicas, "reference_random", gradient_accumulation_steps)
+
+    def __len__(self):
+        return self.identity.dataset_size + self.identity.padded_samples
+
+    def set_epoch(self, epoch):
+        if type(epoch) is not int or epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self.epoch = epoch
+
+    def __iter__(self):
+        source = SeedableRandomSampler(self.dataset, data_seed=self.seed)
+        source.set_epoch(self.epoch)
+        yield from source
+        yield from [-1] * self.identity.padded_samples
+
+
 def _sampler_sidecar_payload(
     identity: Stage2SamplerIdentity, *, global_step: int
 ) -> dict[str, object]:
@@ -220,9 +301,7 @@ def _read_stage2_sampler_payload(directory: Path) -> dict[str, object]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid Stage 2 sampler identity: {path}") from error
-    if not isinstance(payload, dict) or set(payload) != (
-        _STAGE2_SAMPLER_SIDECAR_FIELDS
-    ):
+    if not isinstance(payload, dict) or "global_step" not in payload:
         raise ValueError(f"invalid Stage 2 sampler identity schema: {path}")
     global_step = payload["global_step"]
     if type(global_step) is not int or global_step < 0:
@@ -300,6 +379,8 @@ def validate_stage2_sampler_resume_identity(
         raise TypeError("expected must be a Stage2SamplerIdentity")
     actual = read_stage2_sampler_sidecar(Path(checkpoint))
     for field in (
+        "policy",
+        "gradient_accumulation_steps",
         "seed",
         "world_size",
         "dataset_size",
@@ -313,3 +394,21 @@ def validate_stage2_sampler_resume_identity(
                 f"Stage 2 sampler resume identity mismatch for {field}: "
                 f"checkpoint={checkpoint_value!r}, current={current_value!r}"
             )
+
+
+def select_stage2_sampler_policy(requested, *, profile, config, resume):
+    """Resolve fresh V-off reproduction versus immutable saved sampling semantics."""
+    if requested not in ("auto", "latent_balanced", "reference_random"):
+        raise ValueError("unknown Stage 2 sampler policy")
+    if resume is not None and profile.world_size > 1:
+        saved = read_stage2_sampler_sidecar(Path(resume)).policy
+        if requested != "auto" and requested != saved:
+            raise ValueError(f"Stage 2 sampler resume policy mismatch: checkpoint={saved}, current={requested}")
+        return saved
+    if requested != "auto":
+        return requested
+    if (profile.world_size == 4 and profile.enabled and profile.zero_stage == 2
+            and config is not None and config.is_context_preference
+            and config.visual_only_context_preference and config.prefix_mode == "clean_prefix"):
+        return "reference_random"
+    return "latent_balanced"
