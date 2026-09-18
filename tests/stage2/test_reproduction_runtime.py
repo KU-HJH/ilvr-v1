@@ -196,12 +196,31 @@ def test_observer_records_full_full_partial_vectors_and_real_adam_deltas(tmp_pat
     trainer=N(deepspeed_runtime_profile=N(zero_stage=2),state=N(global_step=0),
               args=N(per_device_train_batch_size=1,gradient_accumulation_steps=4),
               model_accepts_loss_kwargs=False,compute_loss_func=None)
-    observer=module().ReproductionObserver(trainer,N(module=model,optimizer=zero),'results/probe')
+    # This arithmetic boundary fixture now includes real output-hook managers;
+    # the separate engine-hooks test exercises the actual DS engine callbacks.
+    from deepspeed.runtime.utils import register_output_backward_hooks
+    class ArithmeticEngine(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.module=model
+            self.optimizer=zero
+            self._running_engine_backward=False
+            zero._backward_active_depth=0
+        def _backward_prologue(self):
+            pass
+        def _backward_prologue_per_tensor(self,grad):
+            return grad
+        def forward(self,value):
+            result=self.module(value)
+            register_output_backward_hooks(result,self._backward_prologue,self._backward_prologue_per_tensor)
+            return result
+    engine=ArithmeticEngine()
+    observer=module().ReproductionObserver(trainer,engine,'results/probe')
     for update,count in enumerate((4,4,1)):
         optimizer.zero_grad(set_to_none=True)
         optimizer.param_groups[0]['lr']=update*.01
         for i in range(count):
-            loss=(i+1)*p.sum()
+            loss=(i+1)*engine(torch.ones(1,1)).sum()
             observer.observe_loss(loss,{'sample_ids':[f'{update}-{i}'],'input_ids':torch.ones(1,i+2,dtype=torch.long)})
             (loss/4).backward()
         observer.before_step()

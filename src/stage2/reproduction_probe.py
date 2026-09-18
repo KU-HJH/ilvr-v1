@@ -113,12 +113,60 @@ class ReproductionObserver:
             self.clip_factors.append(max(1.,(value/float(zero.loss_scale)+1e-6)/float(zero.clip_grad))*float(zero.loss_scale))
             return original_clip(gradients,norm)
         zero.unscale_and_clip_grads = observe_clip
+        self._reference_output_managers = []
+        self._output_capture_hook = engine.register_forward_hook(self._capture_output_hooks)
         self.write(dict(event='init',rank=self.rank,world_size=self.world,
             model_accepts_loss_kwargs=trainer.model_accepts_loss_kwargs,
             compute_loss_func_present=trainer.compute_loss_func is not None,
             parameter_names=[name for name,_ in self.named],parameter_elements=count,
             reference='same production forward numerator, not an external-model oracle',
             full_run_authorized=False))
+
+    def _capture_output_hooks(self, engine, args, outputs):
+        # DeepSpeed attaches each manager to its first output, which need not
+        # contribute to the trainer's composed loss. Keep managers, not tensors.
+        def visit(value):
+            if isinstance(value, torch.Tensor):
+                for manager in getattr(value, '_backward_hook_managers', ()):
+                    if not any(manager is old for old in self._reference_output_managers):
+                        self._reference_output_managers.append(manager)
+            elif isinstance(value, dict):
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, (tuple, list)):
+                for child in value:
+                    visit(child)
+            elif value is not None and not isinstance(value, (bool, int, float, str)):
+                raise RuntimeError('unsupported DeepSpeed output hook container')
+        visit(outputs)
+
+    def _reference_gradients(self, loss):
+        from deepspeed.runtime.utils import OutputBackwardHookManager
+        managers = self._reference_output_managers
+        saved = []
+        try:
+            if (not managers or self.engine._running_engine_backward
+                    or self.engine.optimizer._backward_active_depth != 0):
+                raise RuntimeError('unsupported DeepSpeed output hook backward state')
+            for manager in managers:
+                if (type(manager) is not OutputBackwardHookManager
+                        or manager.preprocess_done is not False
+                        or manager.preprocess_once_fn != self.engine._backward_prologue
+                        or manager.preprocess_per_tensor_fn != self.engine._backward_prologue_per_tensor
+                        or not manager.hook_handles):
+                    raise RuntimeError('unsupported DeepSpeed output hook manager')
+                saved.append((manager, manager.preprocess_done, manager.preprocess_per_tensor_fn))
+            # autograd.grad skips leaf accumulation, but still visits output
+            # hooks. Bypass their prologue and GAS scaling only for this pass.
+            for manager, _, _ in saved:
+                manager.preprocess_done = True
+                manager.preprocess_per_tensor_fn = None
+            return reference_gradients(loss, self.parameters)
+        finally:
+            for manager, done, per_tensor in saved:
+                manager.preprocess_done = done
+                manager.preprocess_per_tensor_fn = per_tensor
+            managers.clear()
 
     def write(self,record):
         self.stream.write(json.dumps(record,allow_nan=False)+'\n')
@@ -131,7 +179,7 @@ class ReproductionObserver:
         if not isinstance(ids,(tuple,list)) or len(ids)!=1 or not isinstance(ids[0],str):
             raise ValueError('probe requires one actual sample ID')
         previous_calls = self.hook_calls
-        gradients = reference_gradients(loss,self.parameters)
+        gradients = self._reference_gradients(loss)
         if self.hook_calls != previous_calls:
             raise RuntimeError('reference backward invoked ZeRO reduction hooks')
         if not all(bool(torch.isfinite(g).all()) for g in gradients):
