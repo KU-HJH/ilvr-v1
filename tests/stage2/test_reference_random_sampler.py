@@ -145,6 +145,94 @@ def cpu_trainer(tmp_path, gas, policy='reference_random', max_steps=-1):
     return trainer
 
 
+def actual_reference_trainer(tmp_path, model, dataset, config, monkeypatch):
+    """Construct the real Trainer under its four-rank runtime contract."""
+    from deepspeed_runtime import DeepSpeedRuntimeProfile
+    monkeypatch.setattr(TrainingArguments, 'world_size', property(lambda self: 4))
+    args = TrainingArguments(output_dir=str(tmp_path), use_cpu=True, report_to=[],
+        per_device_train_batch_size=1, gradient_accumulation_steps=4,
+        num_train_epochs=1, disable_tqdm=True)
+    return Stage2Trainer(model=model, args=args, train_dataset=dataset,
+        stage2_sampler_policy='reference_random', step_preference_config=config,
+        deepspeed_runtime_profile=DeepSpeedRuntimeProfile(True, 2, None, None, 4))
+
+
+def test_ce_only_reference_trainer_preserves_tail_update_and_fixed_denominator(tmp_path, monkeypatch):
+    # Catches rejecting CE-only, changing global order, or renormalizing the partial tail.
+    trainer = actual_reference_trainer(tmp_path, ScalarModel(),
+        [{'input_ids': torch.tensor([1])}] * 19, StepPreferenceConfig(), monkeypatch)
+    assert trainer.step_preference_config.enabled is False
+    assert trainer.model_accepts_loss_kwargs is False
+    sampler = trainer._get_train_sampler()
+    shards = [list(BatchSamplerShard(BatchSampler(sampler, 1, False), num_processes=4,
+        process_index=rank, even_batches=False)) for rank in range(4)]
+    global_order = [batch[0] for row in zip(*shards) for batch in row]
+    assert [len(shard) for shard in shards] == [5] * 4
+    update_groups = (global_order[:16], global_order[16:])
+    assert [len(group) for group in update_groups] == [16, 4]
+    assert sorted(index for index in global_order if index >= 0) == list(range(19))
+    assert [trainer.train_dataset[index].weight
+        for index in update_groups[-1]] == [1., 1., 1., 0.]
+    rank_zero_loader = DataLoader(trainer.train_dataset,
+        batch_sampler=BatchSamplerShard(BatchSampler(sampler, 1, False), num_processes=4,
+            process_index=0, even_batches=False))
+    values = trainer.set_initial_training_values(trainer.args, rank_zero_loader, 16)
+    assert values[1] == 2
+    assert values[6] == 2
+
+    rank_gradients = []
+    for weight in (1., 1., 1., 0.):
+        trainer.model.zero_grad(set_to_none=True)
+        loss = trainer.training_step(trainer.model, {
+            'input_ids': torch.tensor([[1]]), 'stage2_sample_weight': weight,
+            'stage2_sample_index': 0 if weight else -1,
+            'stage2_sample_latent_block_count': 1,
+        })
+        assert float(loss) == pytest.approx(.25 if weight else 0.)
+        rank_gradients.append(trainer.model.weight.grad.detach().clone())
+    torch.testing.assert_close(
+        torch.stack(rank_gradients).mean(), torch.tensor(3 * 2 / 16))
+
+
+def test_ce_only_reference_trainer_matches_voff_clean_ce_without_sidecars(tmp_path, monkeypatch):
+    # Catches a hidden preference/entropy route or sidecar work changing ordinary clean CE.
+    from step_preference.shared_prefix_measurement import RuntimeCounters, tiny_measurement_case
+    model, batch = tiny_measurement_case(steps=1, total_target_tokens=2, device='cpu')
+    batch['step_preference']['steps'] = tuple(
+        {'span': span} for span in batch['reasoning_step_spans'])
+    voff_model = copy.deepcopy(model)
+    ce = actual_reference_trainer(tmp_path/'ce', model, [batch] * 19,
+        StepPreferenceConfig(), monkeypatch)
+    voff_config = replace(context_config(), lambda_preference=0., lambda_entropy=0.,
+        shared_prefix_enabled=True, visual_off_suppress_latent_boundaries=False)
+    voff = actual_reference_trainer(tmp_path/'voff', voff_model, [batch] * 19,
+        voff_config, monkeypatch)
+
+    ce_batch = {name: copy.deepcopy(batch[name])
+        for name in ('input_ids', 'attention_mask', 'labels')}
+    with RuntimeCounters(model) as ce_counters:
+        ce_loss, ce_outputs = ce.compute_loss(model, ce_batch, return_outputs=True)
+        ce_counters.phase = 'backward'
+        ce_loss.backward()
+    with RuntimeCounters(voff_model) as voff_counters:
+        voff_loss = voff.compute_loss(voff_model, copy.deepcopy(batch))
+        voff_counters.phase = 'backward'
+        voff_loss.backward()
+
+    torch.testing.assert_close(ce_loss, voff_loss, atol=1e-6, rtol=1e-6)
+    for (ce_name, ce_parameter), (voff_name, voff_parameter) in zip(
+            model.named_parameters(), voff_model.named_parameters()):
+        assert ce_name == voff_name
+        if ce_parameter.grad is not None or voff_parameter.grad is not None:
+            assert ce_parameter.grad is not None and voff_parameter.grad is not None
+            torch.testing.assert_close(ce_parameter.grad, voff_parameter.grad, atol=1e-6, rtol=1e-6)
+    assert ce_outputs.stage2_sidecar_results is None
+    assert ce_counters.counts.get('sidecar_chunks_forward', 0) == 0
+    assert ce._step_preference_metric_batches == 0
+    assert ce._runtime_objective_observation_counts == {}
+    assert voff_counters.counts['sidecar_chunks_forward'] > 0
+
+
 @pytest.mark.parametrize('gas,updates', [(2, 423), (4, 212)])
 def test_real_trainer_epoch_budget_and_linear_schedule_include_tail(tmp_path, gas, updates):
     # Catches schedule max_steps retaining the inherited floor after sampler repair.
@@ -233,7 +321,11 @@ def test_fresh_voff_zero2_selects_reference_but_saved_legacy_is_preserved(tmp_pa
         select('reference_random', profile=profile, config=config, resume=tmp_path)
 
 
-@pytest.mark.parametrize('zero,config', [(3, context_config()), (2, StepPreferenceConfig())])
+@pytest.mark.parametrize('zero,config', [
+    (3, context_config()),
+    (3, StepPreferenceConfig()),
+    (2, StepPreferenceConfig(enabled=True, mode='stage2a')),
+])
 def test_explicit_reference_policy_rejects_outside_voff_zero2(tmp_path, zero, config):
     from deepspeed_runtime import DeepSpeedRuntimeProfile
     with pytest.raises(ValueError, match='reference_random requires'):

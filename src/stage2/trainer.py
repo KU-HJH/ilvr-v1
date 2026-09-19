@@ -303,10 +303,17 @@ class Stage2Trainer(Trainer):
         if stage2_sampler_policy == "reference_random":
             config = step_preference_config
             profile = deepspeed_runtime_profile
+            eligible_config = not config.enabled or (
+                config.is_context_preference
+                and config.visual_only_context_preference
+                and config.prefix_mode == "clean_prefix"
+            )
             if not (profile.enabled and profile.zero_stage == 2 and profile.world_size == 4
-                    and config.is_context_preference and config.visual_only_context_preference
-                    and config.prefix_mode == "clean_prefix"):
-                raise ValueError("reference_random requires V-off clean-prefix context preference and four-rank ZeRO2")
+                    and eligible_config):
+                raise ValueError(
+                    "reference_random requires disabled CE-only or V-off clean-prefix "
+                    "context preference and four-rank ZeRO2"
+                )
             if kwargs.get("compute_loss_func") is not None:
                 raise ValueError("reference_random requires the fixed Trainer accumulation denominator")
             dataset = kwargs.get("train_dataset")
