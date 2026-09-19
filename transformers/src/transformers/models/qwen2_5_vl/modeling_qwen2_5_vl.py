@@ -2542,31 +2542,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                and stage2_shared_prefix_inputs.get("prefix_mode", "clean_prefix") == "clean_prefix"
                and any(stage2_shared_prefix_inputs["plan"].groups) else {}),
         )
-        sidecar_results, sidecar_stats = None, None
-        if shared:
-            if stage2_shared_prefix_inputs.get("prefix_mode") == "v_off_insertion":
-                from .stage2_v_off_insertion import score_v_off_insertion
-
-                sidecar_results, sidecar_stats = score_v_off_insertion(
-                    self, stage2_shared_prefix_inputs, input_ids,
-                    base_inputs_embeds, image_grid_thw,
-                )
-            elif stage2_shared_prefix_inputs.get("prefix_mode") == "evidence_replacement":
-                from .stage2_evidence_replacement import score_evidence_replacement
-
-                sidecar_results, sidecar_stats = score_evidence_replacement(
-                    self, stage2_shared_prefix_inputs, input_ids,
-                    base_inputs_embeds, rollout.final_inputs_embeds,
-                    full_position_ids, image_grid_thw,
-                )
-            else:
-                from .stage2_shared_prefix import score_sidecars
-
-                sidecar_results, sidecar_stats = score_sidecars(
-                    self, stage2_shared_prefix_inputs, input_ids,
-                    rollout.final_inputs_embeds, full_position_ids,
-                    getattr(final_outputs, "stage2_key_values", ()),
-                )
         selected_logits = None
         if stage2_loss_only:
             shift_labels = labels[..., 1:].contiguous().view(-1).to(
@@ -2609,6 +2584,32 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 loss = CrossEntropyLoss()(shift_logits, shift_labels)
             if selected_positions is not None:
                 selected_logits = logits.index_select(1, selected_positions)
+
+        sidecar_results, sidecar_stats = None, None
+        if shared:
+            if stage2_shared_prefix_inputs.get("prefix_mode") == "v_off_insertion":
+                from .stage2_v_off_insertion import score_v_off_insertion
+
+                sidecar_results, sidecar_stats = score_v_off_insertion(
+                    self, stage2_shared_prefix_inputs, input_ids,
+                    base_inputs_embeds, image_grid_thw,
+                )
+            elif stage2_shared_prefix_inputs.get("prefix_mode") == "evidence_replacement":
+                from .stage2_evidence_replacement import score_evidence_replacement
+
+                sidecar_results, sidecar_stats = score_evidence_replacement(
+                    self, stage2_shared_prefix_inputs, input_ids,
+                    base_inputs_embeds, rollout.final_inputs_embeds,
+                    full_position_ids, image_grid_thw,
+                )
+            else:
+                from .stage2_shared_prefix import score_sidecars
+
+                sidecar_results, sidecar_stats = score_sidecars(
+                    self, stage2_shared_prefix_inputs, input_ids,
+                    rollout.final_inputs_embeds, full_position_ids,
+                    getattr(final_outputs, "stage2_key_values", ()),
+                )
 
         diagnostics = None
         if rollout.diagnostics is not None:

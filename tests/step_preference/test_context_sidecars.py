@@ -424,9 +424,9 @@ def test_first_prediction_changes_without_propagating_to_clean_or_other_sidecars
         "step-1-textual-off",
     ]
     for output, head_outputs in zip(outputs, projected):
-        # The observed row counts distinguish the two grouped sidecar projections
-        # from the full clean projection and establish their runtime order.
-        assert [head.shape[1] for head in head_outputs] == [7, 7, 16]
+        # The full clean projection precedes the two grouped sidecar projections.
+        # Keep the row-count witness so sidecar indices cannot alias clean logits.
+        assert [head.shape[1] for head in head_outputs] == [16, 7, 7]
         assert [
             result["name"] for result in output.stage2_sidecar_results
         ] == expected_result_order
@@ -434,7 +434,7 @@ def test_first_prediction_changes_without_propagating_to_clean_or_other_sidecars
             offset = 0
             for span in batch["reasoning_step_spans"]:
                 target_count = span.target_text_end - span.target_text_start
-                logits = head_outputs[observed_group][0, offset : offset + target_count]
+                logits = head_outputs[observed_group + 1][0, offset : offset + target_count]
                 targets = batch["input_ids"][0, span.target_text_start : span.target_text_end]
                 log_probs = logits.float().log_softmax(-1)
                 result = {
@@ -451,7 +451,7 @@ def test_first_prediction_changes_without_propagating_to_clean_or_other_sidecars
                 offset += target_count
 
     first_token_change = torch.linalg.vector_norm(
-        projected[0][group_index][0, 0] - projected[1][group_index][0, 0]
+        projected[0][group_index + 1][0, 0] - projected[1][group_index + 1][0, 0]
     )
     assert first_token_change > 1e-8
     torch.testing.assert_close(outputs[0].logits, outputs[1].logits)
@@ -619,8 +619,8 @@ def test_suppressed_boundary_logits_ignore_both_control_token_embeddings():
             )
         finally:
             handle.remove()
-        assert [call.shape[1] for call in calls] == [2, 7]
-        return calls[0], output.logits
+        assert [call.shape[1] for call in calls] == [7, 2]
+        return calls[1], output.logits
 
     baseline_sidecar, baseline_clean = projected(model)
     altered_sidecar, altered_clean = projected(altered)

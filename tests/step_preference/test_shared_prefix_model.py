@@ -86,8 +86,11 @@ def test_dense_shared_matches_independent_two_layer_oracle_all_gradients(checkpo
                 stage2_shared_prefix_inputs=dict(plan=plan, backend="dense", query_budget=20, checkpoint=checkpoint))
     hook.remove()
     expected, expected_logits = oracle(reference, ids, spans, steps)
+    # The first projection is clean; each subsequent projection is one sidecar group.
+    assert len(projected_logits) == 1 + len(plan.groups)
+    torch.testing.assert_close(projected_logits[0], out.logits, atol=0, rtol=0)
     logit_errors = []
-    for group, projected in zip(plan.groups, projected_logits):
+    for group, projected in zip(plan.groups, projected_logits[1:]):
         offset = 0
         for branch in group:
             length = len(branch.target_token_ids)
