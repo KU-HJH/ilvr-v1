@@ -170,14 +170,36 @@ def map_reasoning_step_spans(
         for span in plan_char_spans
         for boundary in (span.start, span.end)
     }
+    all_text_join_boundaries = {
+        assistant_start + left.end
+        for left, right in zip(plan_char_spans, plan_char_spans[1:])
+        if left.step_type == right.step_type == "text" and left.end == right.start
+    }
     if preference_target_scope == "until_next_latent":
-        # Consecutive concatenated text entries form one target extent. Their
-        # internal source-plan boundary need not be a tokenizer boundary.
-        boundaries.difference_update(
+        text_join_boundaries = all_text_join_boundaries
+    else:
+        strict_boundaries = {
+            assistant_start,
+            assistant_start + len(assistant_text),
+            *(
+                assistant_start + boundary
+                for span in plan_char_spans
+                if span.step_type != "text"
+                for boundary in (span.start, span.end)
+            ),
+        }
+        text_join_boundaries = {
             assistant_start + left.end
             for left, right in zip(plan_char_spans, plan_char_spans[1:])
-            if left.step_type == right.step_type == "text" and left.end == right.start
-        )
+            if (
+                left.step_type == right.step_type == "text"
+                and left.start < left.end == right.start < right.end
+                and assistant_start + left.end not in strict_boundaries
+            )
+        }
+    # Until-next-latent preserves its historical internal joins. Immediate-text
+    # validates and excludes crossing tokens only at its stricter eligible joins.
+    boundaries.difference_update(text_join_boundaries)
     for span in plan_char_spans:
         if span.step_type != "latent":
             continue
@@ -201,17 +223,50 @@ def map_reasoning_step_spans(
     if not reasoning_steps:
         return ()
 
-    def token_interval(char_start: int, char_end: int) -> tuple[int, int]:
+    def token_interval(
+        char_start: int,
+        char_end: int,
+        *,
+        allow_text_join_crossing: bool = False,
+    ) -> tuple[int, int]:
         selected = [
             index
             for index, (start, end) in enumerate(offsets)
             if end > start and start >= char_start and end <= char_end
         ]
-        if (
-            not selected
-            or selected != list(range(selected[0], selected[-1] + 1))
-            or offsets[selected[0]][0] != char_start
-            or offsets[selected[-1]][1] != char_end
+
+        if not selected or selected != list(range(selected[0], selected[-1] + 1)):
+            raise ValueError(
+                "character span does not map to an exact contiguous token interval"
+            )
+
+        def endpoint_is_exact_or_excluded_join(
+            boundary: int, selected_index: int, *, at_start: bool
+        ) -> bool:
+            actual = offsets[selected_index][0 if at_start else 1]
+            if actual == boundary:
+                return True
+            if not allow_text_join_crossing or boundary not in text_join_boundaries:
+                return False
+            crossing = [
+                index
+                for index, (start, end) in enumerate(offsets)
+                if end > start and start < boundary < end
+            ]
+            crossing_index = selected_index - 1 if at_start else selected_index + 1
+            crossing_edge = 1 if at_start else 0
+            return (
+                crossing == [crossing_index]
+                and offsets[crossing_index][crossing_edge] == actual
+            )
+
+        if not (
+            endpoint_is_exact_or_excluded_join(
+                char_start, selected[0], at_start=True
+            )
+            and endpoint_is_exact_or_excluded_join(
+                char_end, selected[-1], at_start=False
+            )
         ):
             raise ValueError(
                 "character span does not map to an exact contiguous token interval"
@@ -223,6 +278,7 @@ def map_reasoning_step_spans(
         prev_start, prev_end = token_interval(
             assistant_start + step.prev_text.start,
             assistant_start + step.prev_text.end,
+            allow_text_join_crossing=preference_target_scope == "immediate_text",
         )
         latent_start, latent_end = token_interval(
             assistant_start + step.latent.start + len(LATENT_START_TOKEN),
@@ -239,6 +295,7 @@ def map_reasoning_step_spans(
         target_start, target_end = token_interval(
             assistant_start + step.target_text.start,
             assistant_start + target_char_end,
+            allow_text_join_crossing=preference_target_scope == "immediate_text",
         )
         if any(
             token_id != latent_pad_token_id

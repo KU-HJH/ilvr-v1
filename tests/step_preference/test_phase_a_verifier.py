@@ -8,6 +8,7 @@ import pytest
 from transformers import Qwen2_5_VLConfig
 
 import main as training_main
+from deepspeed_runtime import DeepSpeedRuntimeProfile
 from scripts import verify_step_preference_phase_a as verifier
 from step_preference.config import StepPreferenceConfig
 from step_preference.negatives import StepNegative, write_negative_artifact
@@ -508,7 +509,7 @@ def test_run_stage2_publishes_phase_a_summary_once_after_training(monkeypatch):
     monkeypatch.setattr(
         training_main,
         "bind_deepspeed_runtime_profile",
-        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: DeepSpeedRuntimeProfile(False, None, None, None, 1),
     )
     monkeypatch.setattr(
         training_main,
@@ -597,7 +598,7 @@ def test_context_stage2_completion_skips_legacy_summary_and_reaches_evidence_and
     monkeypatch.setattr(
         training_main,
         "bind_deepspeed_runtime_profile",
-        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: DeepSpeedRuntimeProfile(False, None, None, None, 1),
     )
     monkeypatch.setattr(
         training_main,
