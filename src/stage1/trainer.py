@@ -29,6 +29,11 @@ from .ema import (
     Stage1EmaTeacher,
     _decode_ema_state,
 )
+from .equivalence import (
+    SampleStableStage1Dropout,
+    Stage1StochasticContext,
+    activate_stage1_stochastic_context,
+)
 from .targets import Stage1TeacherTargetBuilder
 from .types import Stage1BatchMetadata, Stage1TeacherTargets
 
@@ -340,6 +345,38 @@ class CustomTrainerStage1(SFTTrainer):
             if any(bool(getattr(item, "use_dora", False)) for item in configs)
             else "lora"
         )
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Keep sample-keyed dropout active through Trainer's backward replay."""
+        sites = tuple(
+            module.site_name
+            for module in model.modules()
+            if isinstance(module, SampleStableStage1Dropout)
+        )
+        if not sites:
+            return super().training_step(model, inputs, num_items_in_batch)
+
+        metadata = inputs.get("stage1_batch_metadata")
+        if not isinstance(metadata, Stage1BatchMetadata):
+            raise TypeError(
+                "stage1_batch_metadata must be a Stage1BatchMetadata instance"
+            )
+        context = Stage1StochasticContext(
+            base_seed=self.args.seed,
+            optimizer_global_step=self.state.global_step,
+            rows=tuple(
+                (
+                    sample.source_index
+                    if sample.canonical_slot_id is None
+                    else sample.canonical_slot_id,
+                    sample.unpadded_length,
+                )
+                for sample in metadata.samples
+            ),
+            expected_sites=sites,
+        )
+        with activate_stage1_stochastic_context(context):
+            return super().training_step(model, inputs, num_items_in_batch)
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
