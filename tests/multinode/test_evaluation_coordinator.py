@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
+import shlex
 import subprocess
 
 import pytest
@@ -185,6 +186,23 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
         ]
         for worker in commands.workers
     } == {"1.05"}
+
+
+def test_remote_evaluation_workers_start_in_canonical_repository():
+    commands = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(stage="stage1"), commit="b" * 40
+    )
+
+    for worker in commands.workers[:2]:
+        assert worker.assignment.shard_index in (0, 1)
+        remote = shlex.split(worker.launch[-1])
+        assert remote[:2] == ["/usr/bin/docker", "exec"]
+        assert remote[remote.index("--workdir") + 1] == str(REPO_ROOT)
+
+    for worker in commands.workers[2:]:
+        assert worker.assignment.shard_index in (2, 3)
+        assert worker.launch[0] == "/usr/bin/tmux"
+        assert "/usr/bin/docker" not in worker.launch
 
 
 def test_stage1_workers_publish_unique_runtime_identities_and_pull_remote_files():

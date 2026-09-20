@@ -1320,7 +1320,11 @@ def _build_evaluation_commands_for_stage(
             "/usr/bin/tmux", "new-session", "-d", "-s",
             assignment.session_name, "--", *isolated,
         )
-        launch = tuple(build_remote_exec(tmux)) if assignment.node == "remote" else tmux
+        launch = (
+            tuple(build_remote_exec(tmux, working_directory=repository))
+            if assignment.node == "remote"
+            else tmux
+        )
         workers.append(
             EvaluationWorkerCommand(
                 assignment=assignment,
