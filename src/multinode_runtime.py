@@ -1268,7 +1268,15 @@ def _build_evaluation_commands_for_stage(
         ]
         if plan.base_model_dir is not None:
             evaluator_command.extend(("--base_model_dir", str(plan.base_model_dir)))
-        if stage == "stage2":
+        if stage == "stage1":
+            runtime_identity_path = (
+                plan.output_dir
+                / f"evaluation-runtime-identity-shard{assignment.shard_index}.json"
+            )
+            evaluator_command.extend(
+                ("--runtime_identity_path", str(runtime_identity_path))
+            )
+        else:
             evaluator_command.extend(("--vision-ablation", plan.vision_ablation))
         evaluator_command.extend(
             (

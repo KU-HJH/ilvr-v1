@@ -187,6 +187,38 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
     } == {"1.05"}
 
 
+def test_stage1_workers_publish_unique_runtime_identities_and_pull_remote_files():
+    plan = _plan()
+    stage1 = build_evaluation_commands(
+        plan, inference_manifest=_manifest(stage="stage1"), commit="b" * 40
+    )
+
+    runtime_identity_paths = []
+    for worker in stage1.workers:
+        command = worker.node_spec.command
+        option = command.index("--runtime_identity_path")
+        runtime_identity_paths.append(command[option + 1])
+    assert runtime_identity_paths == [
+        str(plan.output_dir / f"evaluation-runtime-identity-shard{shard}.json")
+        for shard in range(4)
+    ]
+    assert len(set(runtime_identity_paths)) == 4
+
+    stage2 = build_evaluation_commands(
+        plan, inference_manifest=_manifest(stage="stage2"), commit="b" * 40
+    )
+    assert all(
+        "--runtime_identity_path" not in worker.node_spec.command
+        for worker in stage2.workers
+    )
+    assert stage1.remote_files_payload == (
+        b"shard-0.jsonl\0shard-0.jsonl.manifest.json\0"
+        b"shard-1.jsonl\0shard-1.jsonl.manifest.json\0"
+        b"evaluation-runtime-identity-shard0.json\0"
+        b"evaluation-runtime-identity-shard1.json\0"
+    )
+
+
 def test_worker_commands_forward_external_generation_limit_policy():
     """Losing the coordinator option would silently restore bounded generation."""
     plan = dataclasses.replace(
@@ -713,6 +745,8 @@ def test_remote_result_pull_is_fixed_container_rsync_with_explicit_nul_list():
     assert payload == (
         b"shard-0.jsonl\0shard-0.jsonl.manifest.json\0"
         b"shard-1.jsonl\0shard-1.jsonl.manifest.json\0"
+        b"evaluation-runtime-identity-shard0.json\0"
+        b"evaluation-runtime-identity-shard1.json\0"
     )
     assert command == (
         "/usr/bin/rsync",
@@ -989,6 +1023,8 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
         "shard-0.jsonl.manifest.json",
         "shard-1.jsonl",
         "shard-1.jsonl.manifest.json",
+        "evaluation-runtime-identity-shard0.json",
+        "evaluation-runtime-identity-shard1.json",
     ]
     for commands in payload["worker_commands_by_observed_stage"].values():
         for command in commands:

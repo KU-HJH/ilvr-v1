@@ -57,6 +57,8 @@ _EVALUATION_REMOTE_FILES = (
     "shard-0.jsonl.manifest.json",
     "shard-1.jsonl",
     "shard-1.jsonl.manifest.json",
+    "evaluation-runtime-identity-shard0.json",
+    "evaluation-runtime-identity-shard1.json",
 )
 
 
