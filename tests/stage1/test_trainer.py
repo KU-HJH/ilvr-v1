@@ -44,17 +44,33 @@ from stage1.trainer import (
 import stage1.trainer as stage1_trainer_module
 
 
-@pytest.mark.parametrize("checkpointed", [False, True])
-@pytest.mark.parametrize("scheduled", [False, True])
+@pytest.mark.parametrize(
+    ("scenario", "checkpointed", "scheduled"),
+    (
+        pytest.param("success", False, False, id="success-ordinary-rows"),
+        pytest.param("success", False, True, id="success-canonical-rows"),
+        pytest.param(
+            "success", True, False, id="success-recompute-ordinary-rows"
+        ),
+        pytest.param(
+            "success", True, True, id="success-recompute-canonical-rows"
+        ),
+        pytest.param("forward_failure", False, False, id="forward-failure"),
+        pytest.param(
+            "recompute_failure", True, False, id="recompute-backward-failure"
+        ),
+    ),
+)
 def test_training_step_owns_dropout_context_through_backward(
-    tmp_path, checkpointed, scheduled
+    tmp_path, monkeypatch, scenario, checkpointed, scheduled
 ):
-    """Catches absent context, wrong row keys, or closing before recomputation."""
+    """Catches wrong row keys, early close, or leaked context after failure."""
     from dataclasses import replace
 
     from transformers import Trainer, TrainingArguments
 
     from stage1.equivalence import (
+        SampleStableStage1Dropout,
         Stage1StochasticContext,
         activate_stage1_stochastic_context,
         stage1_checkpoint_context_fn,
@@ -91,38 +107,75 @@ def test_training_step_owns_dropout_context_through_backward(
         ),
     )
     trainer.state.global_step = 17
-    context = Stage1StochasticContext(
-        base_seed=73,
-        optimizer_global_step=17,
-        rows=((100, 8), (101, 8)) if scheduled else ((0, 8), (1, 8)),
-        expected_sites=trainer.model.stage1_stochastic_sites,
-    )
-    torch.manual_seed(98)
-    with activate_stage1_stochastic_context(context):
-        expected = Trainer.training_step(
-            trainer, trainer.model, clone_batch(batch)
+
+    if scenario == "forward_failure":
+        def fail_forward(*args, **kwargs):
+            del args, kwargs
+            stage1_checkpoint_context_fn()
+            raise RuntimeError("injected Stage 1 forward failure")
+
+        monkeypatch.setattr(trainer.model, "forward", fail_forward)
+        with pytest.raises(RuntimeError, match="injected Stage 1 forward failure"):
+            trainer.training_step(trainer.model, clone_batch(batch))
+    elif scenario == "recompute_failure":
+        dropout = next(
+            module
+            for module in trainer.model.modules()
+            if isinstance(module, SampleStableStage1Dropout)
         )
-    expected_grads = {
-        name: parameter.grad.clone()
-        for name, parameter in trainer.model.named_parameters()
-        if parameter.grad is not None
-    }
-    trainer.model.zero_grad(set_to_none=True)
+        original_forward = dropout.forward
+        invocations = 0
 
-    torch.manual_seed(98)
-    actual = trainer.training_step(trainer.model, clone_batch(batch))
+        def fail_during_recompute(hidden_states):
+            nonlocal invocations
+            result = original_forward(hidden_states)
+            invocations += 1
+            if invocations == 2:
+                raise RuntimeError("injected Stage 1 recompute failure")
+            return result
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert expected_grads
-    assert all(torch.isfinite(gradient).all() for gradient in expected_grads.values())
-    assert any(gradient.abs().sum() > 0 for gradient in expected_grads.values())
-    for name, parameter in trainer.model.named_parameters():
-        if name in expected_grads:
-            torch.testing.assert_close(
-                parameter.grad, expected_grads[name], rtol=0, atol=0
+        monkeypatch.setattr(dropout, "forward", fail_during_recompute)
+        with pytest.raises(RuntimeError, match="injected Stage 1 recompute failure"):
+            trainer.training_step(trainer.model, clone_batch(batch))
+        assert invocations == 2
+    else:
+        context = Stage1StochasticContext(
+            base_seed=73,
+            optimizer_global_step=17,
+            rows=((100, 8), (101, 8)) if scheduled else ((0, 8), (1, 8)),
+            expected_sites=trainer.model.stage1_stochastic_sites,
+        )
+        torch.manual_seed(98)
+        with activate_stage1_stochastic_context(context):
+            expected = Trainer.training_step(
+                trainer, trainer.model, clone_batch(batch)
             )
-        else:
-            assert parameter.grad is None
+        expected_grads = {
+            name: parameter.grad.clone()
+            for name, parameter in trainer.model.named_parameters()
+            if parameter.grad is not None
+        }
+        trainer.model.zero_grad(set_to_none=True)
+
+        torch.manual_seed(98)
+        actual = trainer.training_step(trainer.model, clone_batch(batch))
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert expected_grads
+        assert all(
+            torch.isfinite(gradient).all()
+            for gradient in expected_grads.values()
+        )
+        assert any(
+            gradient.abs().sum() > 0 for gradient in expected_grads.values()
+        )
+        for name, parameter in trainer.model.named_parameters():
+            if name in expected_grads:
+                torch.testing.assert_close(
+                    parameter.grad, expected_grads[name], rtol=0, atol=0
+                )
+            else:
+                assert parameter.grad is None
     with pytest.raises(RuntimeError, match="missing Stage 1 stochastic context"):
         stage1_checkpoint_context_fn()
 
