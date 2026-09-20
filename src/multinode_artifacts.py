@@ -57,6 +57,8 @@ _EVALUATION_REMOTE_FILES = (
     "shard-0.jsonl.manifest.json",
     "shard-1.jsonl",
     "shard-1.jsonl.manifest.json",
+)
+_STAGE1_EVALUATION_RUNTIME_IDENTITY_FILES = (
     "evaluation-runtime-identity-shard0.json",
     "evaluation-runtime-identity-shard1.json",
 )
@@ -1927,9 +1929,15 @@ def inference_model_identity(manifest: NodeArtifactManifest) -> str:
     return f"task6:{hashlib.sha256(payload).hexdigest()}"
 
 
-def evaluation_result_files_bytes() -> bytes:
-    """Encode only remote shard 0/1 JSONL and Task 7 sidecars."""
-    return b"".join(name.encode("utf-8") + b"\0" for name in _EVALUATION_REMOTE_FILES)
+def evaluation_result_files_bytes(*, stage: str) -> bytes:
+    """Encode the exact remote result files produced by one evaluation stage."""
+    if stage == "stage1":
+        names = _EVALUATION_REMOTE_FILES + _STAGE1_EVALUATION_RUNTIME_IDENTITY_FILES
+    elif stage == "stage2":
+        names = _EVALUATION_REMOTE_FILES
+    else:
+        raise ValueError("stage must be stage1 or stage2")
+    return b"".join(name.encode("utf-8") + b"\0" for name in names)
 
 
 def build_evaluation_pull_command(

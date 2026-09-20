@@ -219,6 +219,22 @@ def test_stage1_workers_publish_unique_runtime_identities_and_pull_remote_files(
     )
 
 
+def test_stage2_remote_payload_excludes_stage1_runtime_identities():
+    commands = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(stage="stage2"), commit="b" * 40
+    )
+
+    assert commands.remote_files_payload == (
+        b"shard-0.jsonl\0shard-0.jsonl.manifest.json\0"
+        b"shard-1.jsonl\0shard-1.jsonl.manifest.json\0"
+    )
+
+
+def test_evaluation_result_payload_rejects_unknown_stage():
+    with pytest.raises(ValueError, match="stage must be stage1 or stage2"):
+        evaluation_result_files_bytes(stage="stage3")
+
+
 def test_worker_commands_forward_external_generation_limit_policy():
     """Losing the coordinator option would silently restore bounded generation."""
     plan = dataclasses.replace(
@@ -569,7 +585,7 @@ def test_production_runner_transfer_publishes_exact_list_before_fake_rsync(
 
     runner.pull_remote_results(commands)
 
-    assert files_path.read_bytes() == evaluation_result_files_bytes()
+    assert files_path.read_bytes() == evaluation_result_files_bytes(stage="stage1")
     assert calls == [commands.remote_pull]
     assert "--secluded-args" in calls[0]
     assert calls[0][calls[0].index("--rsync-path") + 1] == (
@@ -737,7 +753,7 @@ def test_remote_result_pull_is_fixed_container_rsync_with_explicit_nul_list():
         / "logs/multinode/eval-four-gpu/initial/evaluation-pull.files"
     )
 
-    payload = evaluation_result_files_bytes()
+    payload = evaluation_result_files_bytes(stage="stage1")
     command = build_evaluation_pull_command(
         output_dir, files_from=files_path
     )

@@ -1343,7 +1343,7 @@ def _build_evaluation_commands_for_stage(
         shard_jsonls=shard_jsonls,
         shard_manifests=shard_manifests,
         remote_files_path=remote_files_path,
-        remote_files_payload=evaluation_result_files_bytes(),
+        remote_files_payload=evaluation_result_files_bytes(stage=stage),
         remote_pull=build_evaluation_pull_command(
             plan.output_dir, files_from=remote_files_path
         ),
