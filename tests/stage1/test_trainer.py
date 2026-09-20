@@ -1579,6 +1579,47 @@ def test_unsupported_deepspeed_prepare_lifecycle_fails_closed():
         trainer._install_deepspeed_step_adapter()
 
 
+def test_deepspeed_prepare_accepts_pinned_runtime_versions(monkeypatch):
+    """Catches the trainer rejecting the runtime accepted by preflight."""
+    import deepspeed.runtime.engine as engine_module
+    import deepspeed.runtime.zero.stage_1_and_2 as zero12_module
+
+    mask = torch.tensor([[False, True, False]])
+    trainer = make_trainer(
+        CountingStudent(),
+        CountingTargetBuilder(torch.tensor([[1.0]]), mask, ((1,),)),
+    )
+    optimizer = FakeZero12Optimizer(partition_gradients=False)
+    engine = SimpleNamespace(
+        optimizer=optimizer,
+        step=lambda: None,
+        is_gradient_accumulation_boundary=lambda: True,
+        was_step_applied=lambda: True,
+    )
+    monkeypatch.setattr(engine_module, "DeepSpeedEngine", type(engine))
+    monkeypatch.setattr(
+        zero12_module, "DeepSpeedZeroOptimizer", FakeZero12Optimizer
+    )
+    monkeypatch.setattr(
+        stage1_trainer_module.importlib_metadata,
+        "version",
+        lambda package: {
+            "accelerate": "1.10.1",
+            "deepspeed": "0.18.7",
+        }[package],
+    )
+    trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
+        True, 1, None, None, 2
+    )
+    trainer.model_wrapped = engine
+    trainer.accelerator.distributed_type = DistributedType.DEEPSPEED
+    trainer.accelerator.deepspeed_engine_wrapped = DeepSpeedEngineWrapper(engine)
+
+    trainer._install_deepspeed_step_adapter()
+
+    assert trainer._deepspeed_step_adapter.engine is engine
+
+
 @pytest.mark.parametrize("zero_stage", [1, 2, 3])
 def test_deepspeed_prepare_accepts_optimizer_for_bound_zero_stage(
     monkeypatch, zero_stage
@@ -1616,7 +1657,7 @@ def test_deepspeed_prepare_accepts_optimizer_for_bound_zero_stage(
         "version",
         lambda package: {
             "accelerate": "1.10.1",
-            "deepspeed": "0.18.0",
+            "deepspeed": "0.18.7",
         }[package],
     )
     trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
@@ -1660,7 +1701,7 @@ def test_deepspeed_prepare_rejects_optimizer_mismatched_to_bound_stage(monkeypat
         "version",
         lambda package: {
             "accelerate": "1.10.1",
-            "deepspeed": "0.18.0",
+            "deepspeed": "0.18.7",
         }[package],
     )
     trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
