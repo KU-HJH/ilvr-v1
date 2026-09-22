@@ -14,7 +14,9 @@ import json
 from pathlib import Path
 import random
 import sys
+import threading
 from types import SimpleNamespace
+import weakref
 
 from scripts import verify_voff_model_path as baseline
 
@@ -115,7 +117,8 @@ def compare_tensors(left, right):
 
 def model_identity(left, right):
     import torch
-    a, b = left.state_dict(), right.state_dict()
+    # Runtime buffers such as RoPE inv_freq can be nonpersistent in state_dict.
+    a, b = [dict(itertools.chain(m.named_parameters(), m.named_buffers())) for m in (left, right)]
     differences = [n for n in sorted(a.keys() | b.keys()) if n not in a or n not in b
         or a[n].shape != b[n].shape or a[n].dtype != b[n].dtype or not torch.equal(a[n], b[n])]
     trainable = [[n for n, p in m.named_parameters() if p.requires_grad] for m in (left, right)]
@@ -173,13 +176,48 @@ def plan_metadata(value):
 
 class DispatchObserver:
     """Read Python call/return events; never replace a model or objective function."""
-    def __init__(self, roots):
+    def __init__(self, roots, *, model=None):
         self.roots = tuple(str(Path(p).resolve()) + "/" for p in roots)
         self.phase = "forward"
         self.counts = Counter()
         self.components = {}
         self.backward_calls = 0
         self.recomputes = 0
+        self.model = model
+        self.regions = {}
+        self.recomputed = set()
+        self.recompute_threads = set()
+        self.native_before = None
+        self.native_after = None
+
+    def observe_module(self, module, inputs):
+        """Module hooks execute on the calling worker, unlike sys.setprofile.
+
+        Weak checkpoint references prevent recycled Python frame IDs from merging
+        distinct calls, without retaining checkpoint graphs or activations.
+        """
+        frame = sys._getframe(1)
+        try:
+            while frame is not None:
+                if frame.f_code.co_filename.endswith("torch/utils/checkpoint.py"):
+                    local = frame.f_locals
+                    if frame.f_code.co_name == "checkpoint":
+                        generator = local.get("gen")
+                        generator_frame = getattr(generator, "gi_frame", None)
+                        checkpoint_frame = None if generator_frame is None else generator_frame.f_locals.get("new_frame")
+                        if checkpoint_frame is not None:
+                            key = weakref.ref(checkpoint_frame)
+                            function = local.get("function")
+                            code = getattr(function, "__code__", None)
+                            self.regions.setdefault(key, {"file": None if code is None else code.co_filename,
+                                "function": type(function).__name__ if code is None else code.co_qualname})
+                    elif frame.f_code.co_name == "unpack_hook" and "gid" in local and "frame" in local:
+                        key = weakref.ref(local["frame"])
+                        self.recomputed.add((key, local["gid"]))
+                        self.recompute_threads.add(threading.get_ident())
+                frame = frame.f_back
+        finally:
+            del frame
 
     def observe(self, frame, event, arg):
         code = frame.f_code
@@ -202,14 +240,40 @@ class DispatchObserver:
         if self.previous is not None:
             raise RuntimeError("native dispatch observer requires no existing Python profiler")
         sys.setprofile(self.observe)
+        self.hooks = [] if self.model is None else [
+            module.register_forward_pre_hook(self.observe_module) for module in self.model.modules()]
         return self
 
     def __exit__(self, *exc):
         sys.setprofile(self.previous)
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
 
     def report(self):
-        return {"observer": "sys.setprofile call/return events; forward hook observes output only",
-                "backward_calls": self.backward_calls, "checkpoint_recompute_calls": self.recomputes,
+        module_count = len(self.recomputed)
+        recomputed_regions = {key for key, graph_task in self.recomputed}
+        native_delta = None if self.native_before is None or self.native_after is None else self.native_after - self.native_before
+        native_matches = None if native_delta is None else native_delta == module_count
+        complete = (bool(self.regions) and set(self.regions) == recomputed_regions
+                    and native_matches is not False)
+        return {"observer": "Caller-thread sys.setprofile plus nonmutating module prehooks observing checkpoint stacks on execution threads",
+                "backward_calls": self.backward_calls,
+                "checkpoint_recompute_calls": module_count if complete else self.recomputes,
+                "checkpoint_recompute_count_status": "module_regions_witnessed" if complete else "caller_thread_lower_bound_only",
+                "caller_thread_checkpoint_recompute_calls": self.recomputes,
+                "module_checkpoint_recompute_calls": module_count,
+                "native_counter_before_backward": self.native_before,
+                "native_counter_after_backward": self.native_after,
+                "native_counter_matches_module_witness": native_matches,
+                "checkpoint_coverage": {
+                    "complete_for_observed_module_regions": complete,
+                    "forward_module_checkpoint_regions": len(self.regions),
+                    "recomputed_module_checkpoint_regions": len(recomputed_regions),
+                    "module_recompute_thread_ids": sorted(self.recompute_threads),
+                    "regions": list(self.regions.values()),
+                    "scope": "Nonreentrant checkpoints reaching model module boundaries; caller Python profiler remains thread-local",
+                    "limitation": "Pure tensor checkpoints without module boundaries are not covered; absent/mismatching region or native-counter evidence is incomplete"},
                 "calls": [dict(file=f, line=l, function=n, phase=p, count=c)
                           for (f, l, n, p), c in sorted(self.counts.items())]}
 
@@ -258,14 +322,17 @@ def run_repetitions(model, trainer, batch, device, *, repeats=3, observer_roots=
                     output_values[name] = value.detach().cpu().clone()
         hook = model.register_forward_hook(capture)
         prehook = model.register_forward_pre_hook(capture_request, with_kwargs=True)
-        observer = DispatchObserver(observer_roots)
+        observer = DispatchObserver(observer_roots, model=model)
         cleared = all(p.grad is None for p in model.parameters())
         try:
             with observer, torch.autocast(device_type=torch.device(device).type, enabled=False):
                 loss = trainer.compute_loss(model, prepared, return_outputs=False)
                 output_values["loss"] = loss.detach().cpu().clone()
+                native_stats = getattr(trainer, "_latest_step_preference_compute_stats", None)
+                observer.native_before = getattr(native_stats, "checkpoint_recompute_calls", None)
                 observer.phase = "backward"
                 (loss / 4).backward()
+                observer.native_after = getattr(native_stats, "checkpoint_recompute_calls", None)
         finally:
             hook.remove()
             prehook.remove()
@@ -398,6 +465,9 @@ def run(args):
             for a, b in itertools.product(range(3), repeat=2)
             for key in ("model_inputs", "selected_predictor_positions", "selected_target_ids"))
         cross_allowed = cross_allowed and observed_coordinate_equal
+        checkpoint_coverage_verified = all(r["dispatch"]["checkpoint_coverage"]["complete_for_observed_module_regions"]
+                                           for side in records for r in side)
+        cross_allowed = cross_allowed and checkpoint_coverage_verified
         source_after = {str(p): baseline.sha(p) for p in root.rglob("*.py")}
         unchanged = source_before == source_after and inventory_before == baseline.inventory(root)
         if not unchanged:
@@ -426,8 +496,9 @@ def run(args):
             "runtime_models": runtime, "initial_model_identity": identity,
             "inputs": inputs, "input_tensors_equal": input_equal, "targets_equal": target_equal,
             "observed_forward_coordinates_equal": observed_coordinate_equal,
+            "checkpoint_coverage_verified": checkpoint_coverage_verified,
             "isolated_cross_comparison_allowed": cross_allowed,
-            "cross_comparison_block_reason": None if cross_allowed else "input, target, initial-state, or observed logit-coordinate inequality",
+            "cross_comparison_block_reason": None if cross_allowed else "input, target, initial-state, logit-coordinate inequality or incomplete checkpoint observation",
             "preparation_dispatch": preparation_observer.report(), "runs": records,
             "comparisons": comparisons(gradients, values, cross_allowed=cross_allowed),
             "external_files_unchanged": unchanged, "external_source_hashes": source_before,

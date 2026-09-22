@@ -1,5 +1,6 @@
 """Behavioral witnesses for the native diagnostic, with no training or GPU use."""
 import importlib.util
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,6 +93,37 @@ def test_identity_and_tensor_mismatch_are_reported_without_coercing_coordinates(
     assert d.tensor_record(None)["connected"] is False
 
 
+def test_identity_rejects_different_nonpersistent_rope_buffers():
+    # state_dict omits these buffers although they change runtime rotary positions.
+    d = diagnostic()
+    left, right = StatefulModel(), StatefulModel()
+    left.register_buffer("inv_freq", torch.tensor([1., .1]), persistent=False)
+    right.register_buffer("inv_freq", torch.tensor([1., .2]), persistent=False)
+    assert left.state_dict().keys() == right.state_dict().keys()
+    identity = d.model_identity(left, right)
+    assert not identity["all_state_exact_equal"]
+    assert "inv_freq" in identity["state_differences"]
+
+
+def test_checkpoint_worker_thread_has_module_witness_even_without_profile_events():
+    # sys.setprofile alone misses this valid backward on a different Python thread.
+    d = diagnostic()
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Sigmoid())
+    observer = d.DispatchObserver([str(Path(__file__).parent)], model=model)
+    with observer:
+        value = checkpoint(model, torch.ones(1, 2), use_reentrant=False)
+        observer.phase = "backward"
+        worker = threading.Thread(target=lambda: value.sum().backward())
+        worker.start()
+        worker.join()
+    assert model[0].weight.grad is not None
+    report = observer.report()
+    assert report["caller_thread_checkpoint_recompute_calls"] == 0
+    assert report["module_checkpoint_recompute_calls"] == 1
+    assert report["checkpoint_coverage"]["complete_for_observed_module_regions"] is True
+    assert report["checkpoint_coverage"]["module_recompute_thread_ids"] != [threading.get_ident()]
+
+
 def test_each_native_trainer_runs_its_own_objective_and_checkpoint_backward(tmp_path):
     # Replacing either compute_loss with a common reducer loses the native source witness.
     d = diagnostic()
@@ -137,3 +169,6 @@ def test_each_native_trainer_runs_its_own_objective_and_checkpoint_backward(tmp_
             assert record["forward_request"]["stage2_loss_only"] is True
             assert record["forward_request"]["selected_predictor_positions"] == [10, 11, 16, 17, 18, 19]
             assert record["forward_request"]["native_sidecar_plan"]
+            assert record["dispatch"]["checkpoint_coverage"]["complete_for_observed_module_regions"] is True
+            if index == 1:
+                assert record["dispatch"]["native_counter_matches_module_witness"] is True
