@@ -14,6 +14,10 @@ import sys
 from evaluation.vision_block_metrics import CONDITIONS, summarize
 
 
+MATH_POLICY = dict(sdpa_math=True, sdpa_flash=False, sdpa_mem_efficient=False,
+                   sdpa_cudnn=False, tf32_matmul=False, tf32_cudnn=False)
+
+
 def _repository_root():
     return Path(__file__).resolve().parents[2]
 
@@ -77,6 +81,7 @@ def _processor_identity(processor):
 def _load_runtime(args):
     import torch
     from eval import load_evaluation_artifacts
+    from evaluation.vision_block_runtime import numerical_policy_identity
     from stage2.peft import resolve_stage2_qwen_model
     from stage2.attention_backend import validate_qwen2_5_vl_attention_backends
 
@@ -103,7 +108,10 @@ def _load_runtime(args):
         'visible_devices': os.environ['CUDA_VISIBLE_DEVICES'],
         'language_backend': qwen.config._attn_implementation,
         'vision_backend': qwen.visual.config._attn_implementation,
-        'stage': qwen.config.stage, 'latent_size': qwen.config.latent_size}
+        'stage': qwen.config.stage, 'latent_size': qwen.config.latent_size,
+        'numerical_policy': numerical_policy_identity(),
+        'execution_strategy': 'full_length_v2',
+        'decoder_layers': len(qwen.model.layers)}
     return model, processor, runtime
 
 
@@ -146,19 +154,21 @@ def _analyze(model, sample, repeat_clean=False):
                 for condition in CONDITIONS:
                     embeds, positions, mask = build_replay_inputs(state, site, condition)
                     length = state.embeds.shape[1]
-                    columns = list(range(site.end, site.target_positions[-1]))
-                    if not torch.equal(positions, state.positions[:, :, columns]):
+                    if not torch.equal(positions, state.positions):
                         raise ValueError('replay changed original position columns')
                     blocked = set(range(site.body_start, site.body_end)) if condition in ('body_mask', 'full_mask') else set()
                     if condition in ('boundary_mask', 'full_mask'):
                         blocked.add(site.start)
-                    root = [i < site.end and i not in blocked for i in range(length)]
-                    expected = torch.tensor([root + [j <= i for j in range(len(columns))]
-                                             for i in range(len(columns))], device=mask.device)
+                    expected = torch.tensor([
+                        [key <= query and (query < site.end or key not in blocked)
+                         for key in range(length)]
+                        for query in range(length)], device=mask.device)
                     if not torch.equal(torch.isfinite(mask[0, 0]), expected):
                         raise ValueError('replay visibility differs from literal site contract')
-                    end = torch.zeros_like(embeds[:, 0]) if condition in ('boundary_mask', 'full_mask') else state.embeds[:, site.end]
-                    if not torch.equal(embeds[:, 0], end):
+                    expected_embeds = state.embeds.clone()
+                    if condition in ('boundary_mask', 'full_mask'):
+                        expected_embeds[:, site.end] = 0
+                    if not torch.equal(embeds, expected_embeds):
                         raise ValueError('replayed END embedding differs from condition contract')
             del state
         rows, witness = analyze_sample(model, sample, repeat_clean=repeat_clean)
@@ -167,16 +177,44 @@ def _analyze(model, sample, repeat_clean=False):
         return rows, witness
 
 
-def _validate_witness(witness, repeat=False):
+def _site_field(site, name):
+    return site[name] if isinstance(site, dict) else getattr(site, name)
+
+
+def _validate_prefix_records(records, sites, layers, conditions):
+    expected = {(_site_field(site, 'plan_index'), condition): _site_field(site, 'end')
+                for condition in conditions for site in sites}
+    if not isinstance(records, list):
+        raise ValueError('incomplete prefix identity coverage')
+    try:
+        actual = {(record['plan_index'], record['condition']): record for record in records}
+    except (KeyError, TypeError):
+        raise ValueError('incomplete prefix identity coverage') from None
+    if len(actual) != len(records) or actual.keys() != expected.keys():
+        raise ValueError('incomplete prefix identity coverage')
+    for key, end in expected.items():
+        record = actual[key]
+        if (record.get('prefix_length') != end or record.get('layers') != layers
+                or record.get('kv_comparisons') != 2 * layers or record.get('exact') is not True):
+            raise ValueError('failed prefix identity witness')
+
+
+def _validate_witness(witness, *, sites, layers, repeat=False):
     if witness.get('finite') is not True:
         raise ValueError('nonfinite or missing runtime witness')
     if witness['positions_shape'] != [3, 1, witness['embeds_shape'][1]]:
         raise ValueError('invalid three-axis position witness')
+    if witness.get('execution_strategy') != 'full_length_v2':
+        raise ValueError('invalid execution strategy witness')
+    if witness.get('numerical_policy') != MATH_POLICY:
+        raise ValueError('invalid numerical policy witness')
+    _validate_prefix_records(witness.get('prefix_identity'), sites, layers, CONDITIONS)
     names = ['normal_vs_captured', 'normal_vs_replay', 'captured_vs_replay']
     if repeat:
         names += ['repeat_clean', 'repeat_normal', 'repeat_captured']
         if witness.get('visibility_positions') is not True:
             raise ValueError('missing visibility/position assertions')
+        _validate_prefix_records(witness.get('repeat_prefix_identity'), sites, layers, ('clean',))
     for name in names:
         comparison = witness.get(name)
         if not comparison or comparison['tokens'] <= 0 or comparison['argmax_mismatches'] != 0:
@@ -204,7 +242,7 @@ def _check_protocol(manifest):
         raise ValueError('manifest does not preserve fixed 100-sample selection')
 
 
-def _smoke(args, manifest, model, processor, identity):
+def _smoke(args, manifest, model, processor, identity, layers):
     single = multi = None
     ordered = dict(manifest, samples=sorted(manifest['samples'], key=lambda s: s['source_index']))
     for sample in _samples(ordered, processor, args.image_root):
@@ -220,7 +258,7 @@ def _smoke(args, manifest, model, processor, identity):
     cases = []
     for label, sample in [('single', single), ('multi', multi)]:
         rows, witness = _analyze(model, sample, repeat_clean=True)
-        _validate_witness(witness, repeat=True)
+        _validate_witness(witness, sites=sample.sites, layers=layers, repeat=True)
         summarize(rows, _case_expected(sample))
         cases.append({'case': label, 'source_index': sample.source_index,
                       'plan_indices': [s.plan_index for s in sample.sites], 'witness': witness})
@@ -238,8 +276,6 @@ def _validate_gate(gate, identity, manifest_hash, manifest):
         raise ValueError('smoke lacks both required cases')
     if len(cases[0]['plan_indices']) != 1 or len(cases[1]['plan_indices']) < 2:
         raise ValueError('smoke case site counts are invalid')
-    for case in cases:
-        _validate_witness(case['witness'], repeat=True)
     ordered = sorted(manifest['samples'], key=lambda s: s['source_index'])
     multi = next((s for s in ordered if len(s['sites']) > 1), None)
     single = next((s for s in ordered if len(s['sites']) == 1), multi)
@@ -249,6 +285,12 @@ def _validate_gate(gate, identity, manifest_hash, manifest):
                       (multi['source_index'], [s['plan_index'] for s in multi['sites']])]
     if [(c['source_index'], c['plan_indices']) for c in cases] != expected_cases:
         raise ValueError('smoke tested different manifest sites')
+    layers = identity.get('runtime', {}).get('decoder_layers')
+    if type(layers) is not int or layers <= 0:
+        raise ValueError('invalid decoder layer identity')
+    expected_sites = ([single['sites'][0]], multi['sites'])
+    for case, sites in zip(cases, expected_sites):
+        _validate_witness(case['witness'], sites=sites, layers=layers, repeat=True)
 
 
 def _report(args, manifest, expected):
@@ -347,41 +389,46 @@ def main(argv=None):
             gate = _read(_within(args.smoke_report, root/'results'))
             if gate.get('status') != 'passed' or gate.get('manifest_sha256') != _hash(args.manifest):
                 raise ValueError('smoke gate failed or manifest identity changed')
-        model, processor, runtime = _load_runtime(args)
-        if _processor_identity(processor) != manifest['processor']:
-            raise ValueError('manifest processor identity changed')
-        identity = _execution_identity(args, processor, runtime)
-        _write(args.output_dir/'identity.json', identity)
-        if args.command == 'smoke':
-            _smoke(args, manifest, model, processor, identity)
-        else:
-            _validate_gate(gate, identity, _hash(args.manifest), manifest)
-            all_rows, completed_sites = [], 0
-            with (args.output_dir/'tokens.jsonl').open('x', encoding='utf-8') as tokens, \
-                 (args.output_dir/'sites.jsonl').open('x', encoding='utf-8') as sites:
-                for completed, sample in enumerate(_samples(manifest, processor, args.image_root), 1):
-                    rows, witness = _analyze(model, sample)
-                    _validate_witness(witness)
-                    for row in rows:
-                        tokens.write(json.dumps(row, allow_nan=False) + '\n')
-                    tokens.flush()
-                    all_rows.extend(rows)
-                    for site in sample.sites:
-                        site_rows = [r for r in rows if r['plan_index'] == site.plan_index]
-                        site_summary = summarize(site_rows, {(sample.source_index, site.plan_index):
-                                                       tuple(zip(site.target_positions, site.target_ids))})
-                        sites.write(json.dumps({'source_index': sample.source_index, 'plan_index': site.plan_index,
-                                                'metrics': site_summary, 'witness': witness}, allow_nan=False) + '\n')
-                    sites.flush()
-                    completed_sites += len(sample.sites)
-                    progress = f'samples={completed}/{len(manifest["samples"])} sites={completed_sites}/{manifest["S"]}'
-                    print(progress, flush=True)
-                    with log_path.open('a') as log:
-                        log.write(progress + '\n')
-            summarize(all_rows, expected)
-            _write(args.output_dir/'exclusions.json', manifest['exclusions'])
-            _write(args.output_dir/'status.json', {'status': 'completed', 'manifest_sha256': _hash(args.manifest),
-                'samples': len(manifest['samples']), 'S': manifest['S'], 'N': manifest['N']})
+        from evaluation.vision_block_runtime import numerical_policy
+        with numerical_policy():
+            model, processor, runtime = _load_runtime(args)
+            if _processor_identity(processor) != manifest['processor']:
+                raise ValueError('manifest processor identity changed')
+            identity = _execution_identity(args, processor, runtime)
+            _write(args.output_dir/'identity.json', identity)
+            layers = runtime.get('decoder_layers')
+            if type(layers) is not int or layers <= 0:
+                raise ValueError('invalid decoder layer identity')
+            if args.command == 'smoke':
+                _smoke(args, manifest, model, processor, identity, layers)
+            else:
+                _validate_gate(gate, identity, _hash(args.manifest), manifest)
+                all_rows, completed_sites = [], 0
+                with (args.output_dir/'tokens.jsonl').open('x', encoding='utf-8') as tokens, \
+                     (args.output_dir/'sites.jsonl').open('x', encoding='utf-8') as sites:
+                    for completed, sample in enumerate(_samples(manifest, processor, args.image_root), 1):
+                        rows, witness = _analyze(model, sample)
+                        _validate_witness(witness, sites=sample.sites, layers=layers)
+                        for row in rows:
+                            tokens.write(json.dumps(row, allow_nan=False) + '\n')
+                        tokens.flush()
+                        all_rows.extend(rows)
+                        for site in sample.sites:
+                            site_rows = [r for r in rows if r['plan_index'] == site.plan_index]
+                            site_summary = summarize(site_rows, {(sample.source_index, site.plan_index):
+                                                           tuple(zip(site.target_positions, site.target_ids))})
+                            sites.write(json.dumps({'source_index': sample.source_index, 'plan_index': site.plan_index,
+                                                    'metrics': site_summary, 'witness': witness}, allow_nan=False) + '\n')
+                        sites.flush()
+                        completed_sites += len(sample.sites)
+                        progress = f'samples={completed}/{len(manifest["samples"])} sites={completed_sites}/{manifest["S"]}'
+                        print(progress, flush=True)
+                        with log_path.open('a') as log:
+                            log.write(progress + '\n')
+                summarize(all_rows, expected)
+                _write(args.output_dir/'exclusions.json', manifest['exclusions'])
+                _write(args.output_dir/'status.json', {'status': 'completed', 'manifest_sha256': _hash(args.manifest),
+                    'samples': len(manifest['samples']), 'S': manifest['S'], 'N': manifest['N']})
         with log_path.open('a') as log:
             log.write(f'{args.command} completed\n')
         return 0

@@ -1,6 +1,8 @@
 """CLI orchestration tests; replace only GPU/model and processor work."""
 import copy
+from contextlib import contextmanager
 from dataclasses import asdict
+import importlib
 import json
 from pathlib import Path
 import subprocess
@@ -10,6 +12,10 @@ import pytest
 
 from evaluation import vision_block_analysis as cli
 from evaluation.vision_block_inputs import PreparedSample, Site
+
+
+MATH_POLICY = dict(sdpa_math=True, sdpa_flash=False, sdpa_mem_efficient=False,
+                   sdpa_cudnn=False, tf32_matmul=False, tf32_cudnn=False)
 
 
 def read(path):
@@ -41,9 +47,13 @@ def cohort(tmp_path, monkeypatch):
         args.manifest.write_text(json.dumps(manifest))
         return manifest
     monkeypatch.setattr(cli, '_prepare', prepare)
-    monkeypatch.setattr(cli, '_load_runtime', lambda args: (object(), object(), {'dtype': 'bf16'}))
+    runtime_identity = {'parameter_dtypes': {'torch.bfloat16': 1},
+                        'numerical_policy': copy.deepcopy(MATH_POLICY),
+                        'execution_strategy': 'full_length_v2', 'decoder_layers': 2}
+    monkeypatch.setattr(cli, '_load_runtime', lambda args: (object(), object(), copy.deepcopy(runtime_identity)))
     monkeypatch.setattr(cli, '_processor_identity', lambda processor: {'sha256': 'processor'})
-    identity = {'model': 'model-v1', 'code': 'code-v1', 'software': 'software-v1'}
+    identity = {'model': 'model-v1', 'code': 'code-v1', 'software': 'software-v1',
+                'runtime': copy.deepcopy(runtime_identity)}
     monkeypatch.setattr(cli, '_execution_identity', lambda *args: copy.deepcopy(identity))
     monkeypatch.setattr(cli, '_samples', lambda *args: iter(samples))
     def analyze(model, sample, repeat_clean=False):
@@ -59,8 +69,15 @@ def cohort(tmp_path, monkeypatch):
                           max_nll_abs_diff=0., mean_nll_abs_diff=0.)
         witness = {key: comparison for key in ('normal_vs_captured', 'normal_vs_replay',
                    'captured_vs_replay', 'repeat_clean', 'repeat_normal', 'repeat_captured')}
+        records = [dict(plan_index=site.plan_index, condition=condition,
+                        prefix_length=site.end, layers=2, kv_comparisons=4, exact=True)
+                   for condition in ('clean', 'body_mask', 'boundary_mask', 'full_mask')
+                   for site in sample.sites]
         witness.update(finite=True, visibility_positions=True, source_index=sample.source_index,
-                       positions_shape=[3, 1, 24], embeds_shape=[1, 24, 8])
+                       positions_shape=[3, 1, 24], embeds_shape=[1, 24, 8],
+                       execution_strategy='full_length_v2', numerical_policy=copy.deepcopy(MATH_POLICY),
+                       prefix_identity=records,
+                       repeat_prefix_identity=[record for record in records if record['condition'] == 'clean'])
         return rows, witness
     monkeypatch.setattr(cli, '_analyze', analyze)
     common = ['--model-dir', str(model), '--base-model-dir', str(model),
@@ -77,6 +94,79 @@ def cohort(tmp_path, monkeypatch):
     return tmp_path, manifest, samples, identity, invoke, analyze
 
 
+@pytest.mark.parametrize('mutation', [
+    'missing_prefix', 'duplicate_prefix', 'wrong_comparisons', 'inexact_prefix',
+    'missing_repeat_prefix', 'old_strategy', 'math_disabled', 'flash_enabled',
+    'mem_efficient_enabled', 'cudnn_enabled', 'matmul_tf32_enabled', 'cudnn_tf32_enabled',
+])
+def test_witness_rejects_incomplete_or_wrong_v2_identity(cohort, mutation):
+    # Catches accepting an old/partial smoke as authorization for the main run.
+    _, _, samples, _, _, analyze = cohort
+    _, witness = analyze(None, samples[0], repeat_clean=True)
+    if mutation == 'missing_prefix':
+        witness['prefix_identity'].pop()
+    elif mutation == 'duplicate_prefix':
+        witness['prefix_identity'][-1] = copy.deepcopy(witness['prefix_identity'][0])
+    elif mutation == 'wrong_comparisons':
+        witness['prefix_identity'][-1]['kv_comparisons'] = 3
+    elif mutation == 'inexact_prefix':
+        witness['prefix_identity'][-1]['exact'] = False
+    elif mutation == 'missing_repeat_prefix':
+        witness['repeat_prefix_identity'].pop()
+    elif mutation == 'old_strategy':
+        witness['execution_strategy'] = 'short_suffix_v1'
+    else:
+        flag, value = {
+            'math_disabled': ('sdpa_math', False),
+            'flash_enabled': ('sdpa_flash', True),
+            'mem_efficient_enabled': ('sdpa_mem_efficient', True),
+            'cudnn_enabled': ('sdpa_cudnn', True),
+            'matmul_tf32_enabled': ('tf32_matmul', True),
+            'cudnn_tf32_enabled': ('tf32_cudnn', True),
+        }[mutation]
+        witness['numerical_policy'][flag] = value
+    with pytest.raises(ValueError):
+        cli._validate_witness(witness, sites=samples[0].sites, layers=2, repeat=True)
+
+
+def test_inference_policy_covers_loading_identity_and_analysis(cohort, monkeypatch):
+    # Catches a policy entered only inside replay, after model loading/identity capture.
+    _, _, _, _, invoke, _ = cohort
+    assert invoke('prepare') == 0
+    runtime = importlib.import_module('evaluation.vision_block_runtime')
+    active = []
+
+    @contextmanager
+    def policy():
+        active.append(True)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    monkeypatch.setattr(runtime, 'numerical_policy', policy)
+    for name in ('_load_runtime', '_execution_identity', '_analyze'):
+        original = getattr(cli, name)
+        def checked(*args, _original=original, **kwargs):
+            assert active
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(cli, name, checked)
+    assert invoke('smoke', 'smoke') == 0
+    assert active == []
+
+
+@pytest.mark.parametrize('two_sites', [False, True])
+def test_actual_analyze_uses_full_length_v2_witnesses(two_sites):
+    # Catches a correct runtime hidden behind stale CLI shape/visibility assertions.
+    from tests.evaluation.test_vision_block_runtime import image_case
+
+    model, sample = image_case(two_sites)
+    rows, witness = cli._analyze(model, sample, repeat_clean=True)
+    assert len(rows) == 4 * sum(len(site.target_ids) for site in sample.sites)
+    cli._validate_witness(witness, sites=sample.sites, layers=2, repeat=True)
+    assert witness['visibility_positions'] is True
+
+
 def test_unknown_command_fails_before_loading_model():
     with pytest.raises(SystemExit) as error:
         cli.main(['unknown-analysis'])
@@ -89,6 +179,9 @@ def test_prepare_smoke_run_and_offline_metrics(cohort):
     assert invoke('smoke', 'smoke') == 0
     gate = read(root/'results/smoke/smoke.json')
     assert gate['status'] == 'passed'
+    assert gate['identity']['runtime']['numerical_policy'] == MATH_POLICY
+    assert gate['identity']['runtime']['execution_strategy'] == 'full_length_v2'
+    assert gate['identity']['runtime']['decoder_layers'] == 2
     assert [(c['source_index'], c['plan_indices']) for c in gate['cases']] == [(2, [1]), (4, [1, 3])]
     assert invoke('run') == 0
     assert invoke('summarize') == 0
@@ -103,12 +196,20 @@ def test_prepare_smoke_run_and_offline_metrics(cohort):
     assert len((root/'results/main/sites.jsonl').read_text().splitlines()) == 3
 
 
-@pytest.mark.parametrize('change', ['model', 'code', 'manifest', 'failed'])
+@pytest.mark.parametrize('change', [
+    'model', 'code', 'policy', 'strategy', 'layers', 'manifest', 'failed',
+])
 def test_changed_identity_or_failed_gate_blocks_run(cohort, change):
     root, _, _, identity, invoke, _ = cohort
     invoke('prepare'); invoke('smoke', 'smoke')
     if change in identity:
         identity[change] = 'changed'
+    elif change == 'policy':
+        identity['runtime']['numerical_policy']['sdpa_flash'] = True
+    elif change == 'strategy':
+        identity['runtime']['execution_strategy'] = 'short_suffix_v1'
+    elif change == 'layers':
+        identity['runtime']['decoder_layers'] = 3
     elif change == 'manifest':
         manifest = read(root/'data/manifest.json')
         manifest['exclusions'] = [{'reason': 'changed'}]
