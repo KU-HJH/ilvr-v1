@@ -316,3 +316,30 @@ def test_loader_rejects_non_integer_persisted_site_field(tmp_path, processor):
 
     with pytest.raises(ValueError, match="identity changed"):
         list(load_prepared_samples(manifest, processor, tmp_path))
+
+
+def test_manifest_denominators_count_sites_and_target_tokens(tmp_path, processor, monkeypatch):
+    """Catches confusing 100 samples, 101 sites and 203 target tokens."""
+    import evaluation.vision_block_inputs as inputs
+    from evaluation.vision_block_inputs import PreparedSample, Site
+
+    rows = [{"image_input": [f"{category}/original.png"]}
+            for category, count in inputs.EXPECTED_CATEGORY_COUNTS.items()
+            for _ in range(count)]
+    data = tmp_path / "TEST.jsonl"
+    data.write_text("\n".join(json.dumps(row) for row in rows))
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps({"selection": {"requested_indices": list(range(100))}}))
+    monkeypatch.setattr(inputs, "_sha256", lambda path: inputs.EXPECTED_DATA_SHA256
+                        if path == data else inputs.EXPECTED_SELECTION_SHA256)
+
+    def prepared(row, index, processor, image_root):
+        sites = [Site(index, 1, 0, 1, 9, 9, (10, 11), (21, 22))]
+        if index == 0:
+            sites.append(Site(index, 3, 12, 13, 21, 21, (22, 23, 24), (31, 32, 33)))
+        return PreparedSample(index, {}, tuple(sites)), []
+
+    monkeypatch.setattr(inputs, "prepare_sample", prepared)
+    manifest = prepare_manifest(data, selection, processor, tmp_path, tmp_path / "manifest.json")
+    assert manifest["S"] == 101
+    assert manifest["N"] == 203

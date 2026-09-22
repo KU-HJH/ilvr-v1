@@ -373,8 +373,8 @@ def prepare_manifest(data_path, selection_path, processor, image_root, output_pa
         "processor": _processor_identity(processor),
         "samples": samples,
         "exclusions": exclusions,
-        "S": len(samples),
-        "N": sum(len(sample["sites"]) for sample in samples),
+        "S": sum(len(sample["sites"]) for sample in samples),
+        "N": sum(len(site["target_positions"]) for sample in samples for site in sample["sites"]),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
