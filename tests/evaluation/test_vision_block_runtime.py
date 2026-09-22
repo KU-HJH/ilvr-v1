@@ -18,6 +18,28 @@ def runtime():
     return importlib.import_module("evaluation.vision_block_runtime")
 
 
+@pytest.mark.parametrize('condition', ['clean', 'body_mask', 'boundary_mask', 'full_mask'])
+def test_full_length_v2_geometry(runtime, condition):
+    # Catches shortened query scope, rebased axes and mutation of the clean inputs.
+    p = torch.arange(14)[None, None, :]
+    state = runtime.CleanState(torch.ones(1, 14, 8), torch.cat((p, 2*p, 3*p)), (), {}, {})
+    site = Site(0, 1, 2, 3, 11, 11, (12, 13), (7, 8))
+    embeds, positions, mask = runtime.build_replay_inputs(state, site, condition)
+    assert embeds.shape == state.embeds.shape
+    assert torch.equal(positions, state.positions)
+    blocked = set(range(3, 11)) if condition in ('body_mask', 'full_mask') else set()
+    if condition in ('boundary_mask', 'full_mask'):
+        blocked.add(2)
+    expected = torch.tensor([[k <= q and (q < 11 or k not in blocked)
+                              for k in range(14)] for q in range(14)])
+    assert torch.equal(torch.isfinite(mask[0, 0]), expected)
+    expected_embeds = state.embeds.clone()
+    if condition in ('boundary_mask', 'full_mask'):
+        expected_embeds[:, 11] = 0
+    assert torch.equal(embeds, expected_embeds)
+    assert torch.equal(state.embeds, torch.ones_like(state.embeds))
+
+
 def image_case(two_sites=False):
     torch.manual_seed(481)
     config = _tiny_model().config
@@ -43,30 +65,16 @@ def image_case(two_sites=False):
 
 @torch.inference_mode()
 def production_logits(runtime, model, state, site, condition):
-    embeds, positions, mask = runtime.build_replay_inputs(state, site, condition)
-    hidden = model.model(inputs_embeds=embeds, position_ids=positions,
-                         attention_mask=mask, stage2_prefix_key_values=state.prefix_kv,
-                         generate_mode=True, use_cache=False, return_dict=True).last_hidden_state
-    return model.lm_head(hidden).float()
-
-
-@pytest.mark.parametrize("condition,root", [
-    ("clean", list(range(11))), ("body_mask", [0, 1, 2]),
-    ("boundary_mask", [0, 1, *range(3, 11)]), ("full_mask", [0, 1]),
-])
-def test_literal_visibility_keeps_axes_and_only_replayed_end(runtime, condition, root):
-    assert runtime is not None, "capture/replay runtime is missing"
-    # Catches wrong boundaries, root END leakage, renumbered mRoPE and shared mutation.
-    p = torch.arange(14)[None, None, :]
-    state = runtime.CleanState(torch.ones(1, 14, 8), torch.cat((p, 2*p, 3*p)), (), {}, {})
-    site = Site(0, 1, 2, 3, 11, 11, (12, 13), (7, 8))
-    embeds, positions, mask = runtime.build_replay_inputs(state, site, condition)
-    assert torch.equal(positions, state.positions[:, :, 11:13])
-    visible = mask[0, 0] == 0
-    assert visible[0, :14].nonzero().flatten().tolist() == root
-    assert visible[:, 14:].tolist() == [[True, False], [True, True]]
-    assert bool(torch.count_nonzero(embeds[:, 0]) == 0) == (condition in ("boundary_mask", "full_mask"))
-    assert torch.equal(state.embeds, torch.ones_like(state.embeds))
+    """Observe logits from the actual public replay call."""
+    outputs = []
+    handle = model.model.register_forward_hook(
+        lambda module, args, output: outputs.append(model.lm_head(output.last_hidden_state).float()))
+    try:
+        runtime.replay_site(model, state, site, condition)
+    finally:
+        handle.remove()
+    assert len(outputs) == 1
+    return outputs[0]
 
 
 @pytest.mark.parametrize("two_sites", [False, True])
@@ -97,7 +105,8 @@ def test_real_capture_matches_ordinary_oracle_and_existing_body_path(runtime, tw
         for condition in ("clean", "body_mask", "boundary_mask", "full_mask"):
             actual = production_logits(runtime, model, state, site, condition)
             expected = reference_logits(model, state, site, condition)
-            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(actual[:, site.end:site.target_positions[-1]], expected,
+                                       atol=1e-5, rtol=1e-5)
             rows = runtime.replay_site(model, state, site, condition)
             for row, target, token_id in zip(rows, site.target_positions, site.target_ids):
                 logits = expected[0, target - 1 - site.end]
@@ -117,7 +126,9 @@ def test_real_capture_matches_ordinary_oracle_and_existing_body_path(runtime, tw
             hidden = model.model(inputs_embeds=embeds, position_ids=positions, attention_mask=mask,
                 stage2_prefix_key_values=state.prefix_kv, use_cache=False, return_dict=True).last_hidden_state
             expected = model.lm_head(hidden).float()
-        torch.testing.assert_close(production_logits(runtime, model, state, site, "body_mask"), expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            production_logits(runtime, model, state, site, "body_mask")[:, site.end:site.target_positions[-1]],
+            expected, atol=1e-5, rtol=1e-5)
     rows, witness = runtime.analyze_sample(model, sample, repeat_clean=True)
     assert len(rows) == 4 * sum(len(site.target_ids) for site in sample.sites)
     assert [row["condition"] for row in rows] == [c for c in ("clean", "body_mask", "boundary_mask", "full_mask") for site in sample.sites for _ in site.target_ids]
@@ -125,35 +136,249 @@ def test_real_capture_matches_ordinary_oracle_and_existing_body_path(runtime, tw
         assert witness[name]["argmax_mismatches"] == 0
         assert witness[name]["max_nll_abs_diff"] < 1e-5
     assert witness["finite"] is True
+    assert witness["execution_strategy"] == "full_length_v2"
+    assert witness["numerical_policy"] == MATH_POLICY
+    expected = [{"plan_index": site.plan_index, "condition": condition,
+                 "prefix_length": site.end, "layers": 2, "kv_comparisons": 4, "exact": True}
+                for condition in ("clean", "body_mask", "boundary_mask", "full_mask")
+                for site in sample.sites]
+    assert witness["prefix_identity"] == expected
+    assert witness["repeat_prefix_identity"] == [row for row in expected if row["condition"] == "clean"]
+
+
+@pytest.mark.parametrize("two_sites", [False, True])
+def test_actual_full_decoder_and_attention_edges(runtime, two_sites):
+    # Catches a correct builder wired to a shortened/cached or wrongly masked decoder.
+    model, sample = image_case(two_sites)
+    state = runtime.capture_clean(model, sample)
+    length = state.embeds.shape[1]
+    for site in sample.sites:
+        for condition in ("clean", "body_mask", "boundary_mask", "full_mask"):
+            decoder_calls, attention_calls = [], []
+            handles = [model.model.register_forward_pre_hook(
+                lambda module, args, kwargs: decoder_calls.append(dict(kwargs)), with_kwargs=True)]
+            handles += [layer.self_attn.register_forward_pre_hook(
+                lambda module, args, kwargs: attention_calls.append(dict(kwargs)), with_kwargs=True)
+                for layer in model.model.layers]
+            try:
+                runtime.replay_site(model, state, site, condition)
+            finally:
+                for handle in handles:
+                    handle.remove()
+            assert len(decoder_calls) == 1
+            call = decoder_calls[0]
+            assert call["inputs_embeds"].shape == state.embeds.shape
+            assert torch.equal(call["position_ids"], state.positions)
+            assert call["stage2_capture_kv"] is True
+            assert call.get("stage2_prefix_key_values") is None
+            assert len(attention_calls) == 2
+            for attention in attention_calls:
+                assert attention["hidden_states"].shape == state.embeds.shape
+                assert torch.equal(attention["position_ids"], state.positions)
+                assert attention.get("stage2_prefix_key_value") is None
+                mask = attention["attention_mask"][0, 0]
+                assert mask.shape == (length, length)
+                for query in range(length):
+                    for key in range(length):
+                        visible = key <= query
+                        if query >= site.end:
+                            if condition in ("body_mask", "full_mask") and site.body_start <= key < site.body_end:
+                                visible = False
+                            if condition in ("boundary_mask", "full_mask") and key == site.start:
+                                visible = False
+                        assert bool(torch.isfinite(mask[query, key])) == visible
 
 
 @pytest.mark.parametrize("condition,source", [
     ("body_mask", "body"), ("full_mask", "body"),
     ("boundary_mask", "start"), ("full_mask", "start"),
-    *[(condition, "tail") for condition in ("clean", "body_mask", "boundary_mask", "full_mask")],
+    *[(condition, "future") for condition in ("clean", "body_mask", "boundary_mask", "full_mask")],
+    ("boundary_mask", "body"),
 ])
-def test_blocked_captured_sources_cannot_change_logits(runtime, condition, source):
-    assert runtime is not None, "capture/replay runtime is missing"
-    # Decisive first nail: a leaked blocked key/value changes off logits.
+def test_live_last_layer_values_obey_direct_edges(runtime, condition, source):
+    # Catches leaked direct edges and a disconnected visible-Body positive control.
+    # Inspect direct decoder logits: a live K/V intervention intentionally violates
+    # the separate prefix-fidelity guard, so do not mistake rejection for no influence.
     model, sample = image_case(True)
     state = runtime.capture_clean(model, sample)
     site = sample.sites[0]
-    before = production_logits(runtime, model, state, site, condition)
+    embeds, positions, mask = runtime.build_replay_inputs(state, site, condition)
+
+    @torch.inference_mode()
+    def logits():
+        output = model.model(inputs_embeds=embeds, position_ids=positions,
+            attention_mask=mask, stage2_capture_kv=True,
+            generate_mode=True, use_cache=False, return_dict=True)
+        return model.lm_head(output.last_hidden_state[:, [p-1 for p in site.target_positions]]).float()
+
+    with runtime.numerical_policy():
+        before = logits()
+        region = {"body": slice(site.body_start, site.body_end),
+                  "start": slice(site.start, site.start+1),
+                  "future": slice(site.target_positions[-1], None)}[source]
+        calls = []
+        def intervene(module, args, output):
+            calls.append(output.shape)
+            changed = output.clone()
+            changed[:, region] += torch.linspace(-53, 37, output.shape[-1])
+            return changed
+        handle = model.model.layers[-1].self_attn.v_proj.register_forward_hook(intervene)
+        try:
+            after = logits()
+        finally:
+            handle.remove()
+    assert calls == [torch.Size((1, state.embeds.shape[1], model.model.layers[-1].self_attn.v_proj.out_features))]
+    if condition == "boundary_mask" and source == "body":
+        targets = torch.tensor(site.target_ids)[None, :, None]
+        before_nll = -before.log_softmax(-1).gather(-1, targets)
+        after_nll = -after.log_softmax(-1).gather(-1, targets)
+        assert float((before_nll-after_nll).abs().max()) > 1e-3
+    else:
+        torch.testing.assert_close(after, before, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("condition", ["clean", "body_mask", "boundary_mask", "full_mask"])
+def test_corrupt_clean_prefix_is_rejected_even_without_witness(runtime, condition):
+    # This tests reference checking only, not causal influence from cached inputs.
+    model, sample = image_case()
+    state = runtime.capture_clean(model, sample)
     bank = tuple(tuple(t.clone() for t in pair) for pair in state.prefix_kv)
-    region = {"body": slice(site.body_start, site.body_end),
-              "start": slice(site.start, site.start+1), "tail": slice(site.end, None)}[source]
-    for key, value in bank:
-        key[:, :, region] += 37
-        value[:, :, region] -= 53
-    changed = replace(state, prefix_kv=bank)
-    torch.testing.assert_close(production_logits(runtime, model, changed, site, condition), before, atol=0, rtol=0)
-    if source == "body":
-        visible_before = production_logits(runtime, model, state, site, "boundary_mask")
-        visible_after = production_logits(runtime, model, changed, site, "boundary_mask")
-        assert float((visible_before-visible_after).abs().max()) > 1e-3
-    second_before = production_logits(runtime, model, state, sample.sites[1], "clean")
-    runtime.replay_site(model, state, site, "full_mask")
-    torch.testing.assert_close(production_logits(runtime, model, state, sample.sites[1], "clean"), second_before, atol=0, rtol=0)
+    bank[0][0][0, 0, 0, 0] += 1
+    with pytest.raises(ValueError, match="full-length prefix K/V changed"):
+        runtime.replay_site(model, replace(state, prefix_kv=bank), sample.sites[0], condition)
+
+
+def test_site_order_and_witness_coverage_preserve_shared_clean_state(runtime):
+    # Catches state mutation, site contamination and records with wrong coverage.
+    model, sample = image_case(True)
+    state = runtime.capture_clean(model, sample)
+    tensors = (state.embeds, state.positions, *(t for pair in state.prefix_kv for t in pair))
+    saved = tuple(t.clone() for t in tensors)
+    def passes(sites):
+        witness, rows = [], {}
+        for site in sites:
+            for condition in ("clean", "body_mask", "boundary_mask", "full_mask"):
+                rows[(site.plan_index, condition)] = runtime.replay_site(
+                    model, state, site, condition, prefix_witness=witness)
+        return rows, witness
+    forward, witness = passes(sample.sites)
+    reverse, reverse_witness = passes(reversed(sample.sites))
+    assert forward == reverse
+    expected = [{"plan_index": site.plan_index, "condition": condition,
+                 "prefix_length": site.end, "layers": 2, "kv_comparisons": 4, "exact": True}
+                for site in sample.sites for condition in ("clean", "body_mask", "boundary_mask", "full_mask")]
+    assert witness == expected
+    assert sorted(reverse_witness, key=lambda item: (item["plan_index"], item["condition"])) == sorted(
+        expected, key=lambda item: (item["plan_index"], item["condition"]))
+    assert all(torch.equal(t, original) for t, original in zip(tensors, saved))
+
+
+def active_numerical_flags():
+    return dict(sdpa_math=torch.backends.cuda.math_sdp_enabled(),
+                sdpa_flash=torch.backends.cuda.flash_sdp_enabled(),
+                sdpa_mem_efficient=torch.backends.cuda.mem_efficient_sdp_enabled(),
+                sdpa_cudnn=torch.backends.cuda.cudnn_sdp_enabled(),
+                tf32_matmul=torch.backends.cuda.matmul.allow_tf32,
+                tf32_cudnn=torch.backends.cudnn.allow_tf32)
+
+
+MATH_POLICY = dict(sdpa_math=True, sdpa_flash=False, sdpa_mem_efficient=False,
+                   sdpa_cudnn=False, tf32_matmul=False, tf32_cudnn=False)
+
+
+@pytest.mark.parametrize("entrypoint", ["capture", "replay", "analyze"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_public_calls_apply_and_restore_numerical_policy(runtime, entrypoint, fail):
+    # Catches missing policy on ordinary rollout, direct replay, scoring or exceptions.
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    model, sample = image_case()
+    state = runtime.capture_clean(model, sample)
+    flags, lengths, scored = [], [], []
+    def observe(module, args, kwargs):
+        flags.append(active_numerical_flags())
+        lengths.append(kwargs["inputs_embeds"].shape[1])
+        if fail:
+            raise RuntimeError("policy injected failure")
+    handle = model.model.register_forward_pre_hook(observe, with_kwargs=True)
+    head = model.lm_head.register_forward_pre_hook(lambda module, args: scored.append(active_numerical_flags()))
+    saved = active_numerical_flags()
+    try:
+        with sdpa_kernel([SDPBackend.MATH, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            ambient = active_numerical_flags()
+            def invoke():
+                if entrypoint == "capture":
+                    return runtime.capture_clean(model, sample)
+                if entrypoint == "replay":
+                    return runtime.replay_site(model, state, sample.sites[0], "clean")
+                return runtime.analyze_sample(model, sample, repeat_clean=True)
+            if fail:
+                with pytest.raises(RuntimeError, match="policy injected failure"):
+                    invoke()
+            else:
+                invoke()
+                assert scored and all(value == MATH_POLICY for value in scored)
+                if entrypoint != "replay":
+                    assert any(length < state.embeds.shape[1] for length in lengths)
+            assert flags and all(value == MATH_POLICY for value in flags)
+            assert active_numerical_flags() == ambient
+    finally:
+        handle.remove()
+        head.remove()
+        torch.backends.cuda.matmul.allow_tf32 = saved["tf32_matmul"]
+        torch.backends.cudnn.allow_tf32 = saved["tf32_cudnn"]
+    assert active_numerical_flags() == saved
+
+
+def test_numerical_policy_nesting_restores_outer_context_on_exception(runtime):
+    saved = active_numerical_flags()
+    with runtime.numerical_policy():
+        assert active_numerical_flags() == MATH_POLICY
+        assert runtime.numerical_policy_identity() == MATH_POLICY
+        with pytest.raises(RuntimeError, match="nested"):
+            with runtime.numerical_policy():
+                assert active_numerical_flags() == MATH_POLICY
+                raise RuntimeError("nested")
+        assert active_numerical_flags() == MATH_POLICY
+    assert active_numerical_flags() == saved
+
+
+@pytest.mark.parametrize("defect", ["layers", "pair", "rank", "sequence", "heads", "head_dim", "dtype", "nonfinite"])
+def test_malformed_prefix_bank_fails_closed(runtime, defect):
+    # Catches broadcasted/truncated comparisons that could certify an invalid bank.
+    model, sample = image_case()
+    state = runtime.capture_clean(model, sample)
+    bank = [list(pair) for pair in state.prefix_kv]
+    if defect == "layers":
+        bank.pop()
+    elif defect == "pair":
+        bank[0].pop()
+    elif defect == "rank":
+        bank[0][0] = bank[0][0][0]
+    elif defect == "sequence":
+        bank[0][0] = bank[0][0][:, :, :-1]
+    elif defect == "heads":
+        bank[0][0] = bank[0][0][:, :0]
+    elif defect == "head_dim":
+        bank[0][0] = bank[0][0][..., :-1]
+    elif defect == "dtype":
+        bank[0][0] = bank[0][0].double()
+    else:
+        bank[0][0] = bank[0][0].clone()
+        bank[0][0][0, 0, 0, 0] = float("nan")
+    witness = []
+    with pytest.raises(ValueError, match="K/V"):
+        runtime.replay_site(model, replace(state, prefix_kv=tuple(tuple(p) for p in bank)),
+                            sample.sites[0], "clean", prefix_witness=witness)
+    assert witness == []
+
+
+def test_capture_rejects_config_layer_count_mismatch(runtime):
+    model, sample = image_case()
+    model.config.num_hidden_layers += 1
+    with pytest.raises(ValueError, match="layer count"):
+        runtime.capture_clean(model, sample)
 
 
 def test_capture_removes_observers_after_decoder_error(runtime):
@@ -178,8 +403,8 @@ def test_unscored_suffix_rows_are_retained(runtime):
     state = runtime.capture_clean(model, sample)
     site = replace(sample.sites[0], target_positions=(17,), target_ids=(14,))
     embeds, positions, _ = runtime.build_replay_inputs(state, site, "clean")
-    assert embeds.shape[1] == 2
-    assert torch.equal(positions, state.positions[:, :, 15:17])
+    assert embeds.shape == state.embeds.shape
+    assert torch.equal(positions, state.positions)
     row = runtime.replay_site(model, state, site, "clean")[0]
     assert row["nll"] == pytest.approx(state.normal_scores[(site.plan_index, 17)][1], abs=1e-5)
 
