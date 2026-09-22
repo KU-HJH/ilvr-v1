@@ -3,14 +3,28 @@
 import math
 
 
+DEFAULT_PROFILE = "block-local-v2"
+IMAGE_PROFILE = "image-local-v1"
 CONDITIONS = ("clean", "body_mask", "boundary_mask", "full_mask")
+IMAGE_CONDITIONS = ("clean", "image_mask", "image_body_mask")
+
+
+def conditions_for_profile(analysis_profile: str) -> tuple[str, ...]:
+    if analysis_profile == DEFAULT_PROFILE:
+        return CONDITIONS
+    if analysis_profile == IMAGE_PROFILE:
+        return IMAGE_CONDITIONS
+    raise ValueError(f"unknown analysis profile: {analysis_profile!r}")
 
 
 def summarize(
     rows: list[dict],
     expected: dict[tuple[int, int], tuple[tuple[int, int], ...]],
+    *,
+    analysis_profile: str = DEFAULT_PROFILE,
 ) -> dict:
     """Summarize condition changes and token-weighted NLL values."""
+    conditions_for_analysis = conditions_for_profile(analysis_profile)
     if not expected:
         raise ValueError("expected must contain at least one site")
 
@@ -19,7 +33,7 @@ def summarize(
         if not targets:
             raise ValueError("each expected site must contain at least one token")
         for position, target_id in targets:
-            for condition in CONDITIONS:
+            for condition in conditions_for_analysis:
                 key = (*site, position, condition)
                 if key in expected_rows:
                     raise ValueError("expected token positions must be unique per site")
@@ -53,7 +67,7 @@ def summarize(
             raise ValueError("index and token fields must be integers")
 
         condition = row["condition"]
-        if not isinstance(condition, str) or condition not in CONDITIONS:
+        if not isinstance(condition, str) or condition not in conditions_for_analysis:
             raise ValueError(f"unknown condition: {condition!r}")
 
         nll = row["nll"]
@@ -84,7 +98,7 @@ def summarize(
 
     token_count = sum(len(targets) for targets in expected.values())
     conditions = {}
-    for condition in CONDITIONS:
+    for condition in conditions_for_analysis:
         condition_rows = [
             indexed_rows[(*site, position, condition)]
             for site, targets in expected.items()

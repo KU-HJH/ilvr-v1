@@ -1,16 +1,23 @@
+import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image
 import pytest
+import torch
 from transformers import AutoProcessor
 
+import evaluation.vision_block_inputs as inputs
 from evaluation.vision_block_inputs import (
+    PreparedSample,
+    Site,
     _sample_identity,
     load_prepared_samples,
     prepare_manifest,
     prepare_sample,
 )
+from evaluation.vision_block_metrics import IMAGE_CONDITIONS, IMAGE_PROFILE
 from stage2.data import prepare_stage2_example
 from step_preference.spans import expand_qwen_image_placeholders
 
@@ -38,6 +45,218 @@ def _row(sequence_plan, *, final_answer="1"):
 
 def _latent():
     return {"type": "latent", "helper_image": "must-not-be-loaded.png"}
+
+
+def _geometry_sample(
+    *, input_ids=None, attention_mask=None, image_grid_thw=None, sites=None
+):
+    ids = input_ids
+    if ids is None:
+        ids = torch.tensor([[10, 20, 21, 21, 22, 30, 91, *([90] * 8), 92, 40]])
+    if attention_mask is None:
+        attention_mask = torch.ones_like(ids)
+    if image_grid_thw is None:
+        image_grid_thw = torch.tensor([[1, 1, 2]])
+    if sites is None:
+        sites = (Site(0, 1, 6, 7, 15, 15, (16,), (40,)),)
+    return PreparedSample(
+        0,
+        {
+            "input_ids": ids,
+            "attention_mask": attention_mask,
+            "image_grid_thw": image_grid_thw,
+        },
+        sites,
+    )
+
+
+def _geometry_contract():
+    return dict(
+        image_token_id=21,
+        vision_start_token_id=20,
+        vision_end_token_id=22,
+        merge_size=1,
+    )
+
+
+def test_processor_image_contract_uses_tokenizer_and_image_processor(processor):
+    assert inputs.processor_image_contract(processor) == {
+        "image_token_id": processor.tokenizer.convert_tokens_to_ids(
+            processor.image_token
+        ),
+        "vision_start_token_id": processor.tokenizer.convert_tokens_to_ids(
+            "<|vision_start|>"
+        ),
+        "vision_end_token_id": processor.tokenizer.convert_tokens_to_ids(
+            "<|vision_end|>"
+        ),
+        "merge_size": processor.image_processor.merge_size,
+    }
+
+
+@pytest.mark.parametrize(
+    ("image_id", "start_id", "end_id", "merge_size"),
+    [
+        (-1, 2, 3, 1),
+        (True, 2, 3, 1),
+        (1.5, 2, 3, 1),
+        (999, 2, 3, 1),
+        (1, 1, 3, 1),
+        (1, 2, 2, 1),
+        (1, 2, 3, 0),
+        (1, 2, 3, -1),
+        (1, 2, 3, True),
+        (1, 2, 3, 1.5),
+    ],
+)
+def test_processor_image_contract_rejects_invalid_values(
+    image_id, start_id, end_id, merge_size
+):
+    token_ids = {
+        "image": image_id,
+        "<|vision_start|>": start_id,
+        "<|vision_end|>": end_id,
+    }
+    tokenizer = SimpleNamespace(
+        unk_token_id=999,
+        convert_tokens_to_ids=lambda token: token_ids.get(token, 999),
+    )
+    candidate = SimpleNamespace(
+        image_token="image",
+        tokenizer=tokenizer,
+        image_processor=SimpleNamespace(merge_size=merge_size),
+    )
+
+    with pytest.raises(ValueError):
+        inputs.processor_image_contract(candidate)
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        SimpleNamespace(
+            tokenizer=SimpleNamespace(
+                unk_token_id=999, convert_tokens_to_ids=lambda token: 1
+            ),
+            image_processor=SimpleNamespace(merge_size=1),
+        ),
+        SimpleNamespace(
+            image_token="image",
+            tokenizer=SimpleNamespace(
+                unk_token_id=999, convert_tokens_to_ids=lambda token: 1
+            ),
+        ),
+    ],
+)
+def test_processor_image_contract_rejects_missing_values(candidate):
+    with pytest.raises(ValueError):
+        inputs.processor_image_contract(candidate)
+
+
+def test_image_payload_positions_exclude_boundaries():
+    sample = _geometry_sample()
+    contract = _geometry_contract()
+
+    assert inputs.original_image_positions(sample, **contract) == (2, 3)
+
+    bad_grid = dict(
+        sample.model_inputs, image_grid_thw=torch.tensor([[1, 1, 3]])
+    )
+    with pytest.raises(ValueError):
+        inputs.original_image_positions(
+            PreparedSample(0, bad_grid, sample.sites), **contract
+        )
+    for column, value in [(1, 10), (4, 21), (5, 21)]:
+        bad = sample.model_inputs["input_ids"].clone()
+        bad[0, column] = value
+        with pytest.raises(ValueError):
+            inputs.original_image_positions(
+                PreparedSample(
+                    0, dict(sample.model_inputs, input_ids=bad), sample.sites
+                ),
+                **contract,
+            )
+
+
+@pytest.mark.parametrize(
+    "grid",
+    [
+        torch.tensor([[0, 1, 2]]),
+        torch.tensor([[-1, 1, 2]]),
+        torch.tensor([[1.5, 1.0, 2.0]]),
+        torch.tensor([[True, True, True]]),
+        torch.tensor([1, 1, 2]),
+        torch.tensor([[1, 1, 1], [1, 1, 1]]),
+    ],
+)
+def test_original_image_positions_rejects_malformed_grid(grid):
+    with pytest.raises(ValueError):
+        inputs.original_image_positions(
+            _geometry_sample(image_grid_thw=grid), **_geometry_contract()
+        )
+
+
+@pytest.mark.parametrize("marker", [20, 22])
+def test_original_image_positions_rejects_multiple_markers(marker):
+    sample = _geometry_sample()
+    bad = sample.model_inputs["input_ids"].clone()
+    bad[0, 0 if marker == 20 else 5] = marker
+
+    with pytest.raises(ValueError):
+        inputs.original_image_positions(
+            PreparedSample(0, dict(sample.model_inputs, input_ids=bad), sample.sites),
+            **_geometry_contract(),
+        )
+
+
+def test_original_image_positions_rejects_missing_payload():
+    ids = torch.tensor([[10, 20, 22, 30, 91, *([90] * 8), 92, 40]])
+
+    with pytest.raises(ValueError):
+        inputs.original_image_positions(
+            _geometry_sample(input_ids=ids, image_grid_thw=torch.tensor([[1, 1, 1]])),
+            **_geometry_contract(),
+        )
+
+
+def test_original_image_positions_rejects_image_at_or_after_first_latent_start():
+    sample = _geometry_sample(
+        sites=(Site(0, 1, 3, 4, 12, 12, (13,), (40,)),)
+    )
+
+    with pytest.raises(ValueError):
+        inputs.original_image_positions(sample, **_geometry_contract())
+
+
+@pytest.mark.parametrize("merge_size", [0, -1, True, 1.5, 3])
+def test_original_image_positions_rejects_invalid_merge(merge_size):
+    with pytest.raises(ValueError):
+        inputs.original_image_positions(
+            _geometry_sample(), **dict(_geometry_contract(), merge_size=merge_size)
+        )
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        _geometry_sample(
+            input_ids=torch.tensor(
+                [
+                    [10, 20, 21, 21, 22, 30, 91, *([90] * 8), 92, 40],
+                    [10, 20, 21, 21, 22, 30, 91, *([90] * 8), 92, 40],
+                ]
+            )
+        ),
+        _geometry_sample(
+            attention_mask=torch.tensor(
+                [[1, 1, 1, 1, 1, 1, 1, *([1] * 8), 1, 0]]
+            )
+        ),
+    ],
+)
+def test_original_image_positions_rejects_padded_or_non_batch_one_inputs(sample):
+    with pytest.raises(ValueError):
+        inputs.original_image_positions(sample, **_geometry_contract())
 
 
 def test_blank_final_answer_keeps_reasoning_site(tmp_path, processor):
@@ -383,3 +602,203 @@ def test_manifest_denominators_count_sites_and_target_tokens(tmp_path, processor
     manifest = prepare_manifest(data, selection, processor, tmp_path, tmp_path / "manifest.json")
     assert manifest["S"] == 101
     assert manifest["N"] == 203
+    assert manifest["analysis_profile"] == "block-local-v2"
+    assert manifest["condition_order"] == [
+        "clean",
+        "body_mask",
+        "boundary_mask",
+        "full_mask",
+    ]
+
+
+def test_image_profile_manifest_records_contract_and_payload_positions(
+    tmp_path, processor, monkeypatch
+):
+    """Catches image-profile preparation omitting replay-critical geometry."""
+    import evaluation.vision_block_inputs as inputs
+
+    rows = [
+        {"image_input": [f"{category}/original.png"]}
+        for category, count in inputs.EXPECTED_CATEGORY_COUNTS.items()
+        for _ in range(count)
+    ]
+    data = tmp_path / "TEST.jsonl"
+    data.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    selection = tmp_path / "selection.json"
+    selection.write_text(
+        json.dumps({"selection": {"requested_indices": list(range(100))}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        inputs,
+        "_sha256",
+        lambda path: inputs.EXPECTED_DATA_SHA256
+        if path == data
+        else inputs.EXPECTED_SELECTION_SHA256,
+    )
+    contract = inputs.processor_image_contract(processor)
+    merge_size = contract["merge_size"]
+    input_ids = torch.tensor(
+        [
+            [
+                contract["vision_start_token_id"],
+                contract["image_token_id"],
+                contract["image_token_id"],
+                contract["vision_end_token_id"],
+                90,
+                90,
+                40,
+            ]
+        ]
+    )
+
+    def prepared(row, index, processor, image_root):
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "image_grid_thw": torch.tensor([[1, merge_size, 2 * merge_size]]),
+        }
+        site = Site(index, 1, 4, 5, 5, 5, (6,), (40,))
+        return PreparedSample(index, model_inputs, (site,)), []
+
+    monkeypatch.setattr(inputs, "prepare_sample", prepared)
+
+    manifest = prepare_manifest(
+        data,
+        selection,
+        processor,
+        tmp_path,
+        tmp_path / "manifest.json",
+        analysis_profile=IMAGE_PROFILE,
+    )
+
+    assert manifest["analysis_profile"] == IMAGE_PROFILE
+    assert manifest["condition_order"] == list(IMAGE_CONDITIONS)
+    assert manifest["image_token_contract"] == contract
+    assert all(
+        record["original_image_positions"] == [1, 2]
+        for record in manifest["samples"]
+    )
+
+
+def _real_image_replay_manifest(tmp_path, processor, monkeypatch):
+    image_dir = tmp_path / "creation"
+    image_dir.mkdir()
+    Image.new("RGB", (56, 56)).save(image_dir / "original.png")
+    row = _row(
+        [
+            {"type": "text", "content": "Before."},
+            _latent(),
+            {"type": "text", "content": "Reason."},
+        ]
+    )
+    row["image_input"] = ["creation/original.png"]
+    sample, exclusions = prepare_sample(row, 0, processor, tmp_path)
+    assert sample is not None and not exclusions
+
+    data = tmp_path / "TEST.jsonl"
+    data.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    selection = tmp_path / "selection.json"
+    selection.write_text(
+        json.dumps({"selection": {"requested_indices": [0]}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(inputs, "EXPECTED_DATA_SHA256", inputs._sha256(data))
+    monkeypatch.setattr(
+        inputs, "EXPECTED_SELECTION_SHA256", inputs._sha256(selection)
+    )
+    monkeypatch.setattr(inputs, "EXPECTED_CATEGORY_COUNTS", {"creation": 1})
+    monkeypatch.setattr(inputs, "_validate_selection", lambda indices, row_count: (0,))
+    manifest = prepare_manifest(
+        data,
+        selection,
+        processor,
+        tmp_path,
+        tmp_path / "manifest.json",
+        analysis_profile=IMAGE_PROFILE,
+    )
+    assert manifest["samples"][0]["identity"] == _sample_identity(sample)
+    assert tuple(
+        inputs._load_site_record(site) for site in manifest["samples"][0]["sites"]
+    ) == sample.sites
+    return sample, manifest
+
+
+def test_image_profile_loader_round_trip_preserves_identity_and_sites(
+    tmp_path, processor, monkeypatch
+):
+    """Catches image replay changing the pre-existing sample identity contract."""
+    sample, manifest = _real_image_replay_manifest(tmp_path, processor, monkeypatch)
+
+    loaded = list(load_prepared_samples(manifest, processor, tmp_path))
+
+    assert len(loaded) == 1
+    assert _sample_identity(loaded[0]) == _sample_identity(sample)
+    assert loaded[0].sites == sample.sites
+
+    legacy = copy.deepcopy(manifest)
+    legacy.pop("analysis_profile")
+    legacy.pop("condition_order")
+    legacy.pop("image_token_contract")
+    legacy["samples"][0].pop("original_image_positions")
+    legacy_loaded = list(load_prepared_samples(legacy, processor, tmp_path))
+    assert _sample_identity(legacy_loaded[0]) == _sample_identity(sample)
+    assert legacy_loaded[0].sites == sample.sites
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "duplicate", "moved", "bool", "string"],
+)
+def test_image_profile_loader_rejects_malformed_persisted_positions(
+    tmp_path, processor, monkeypatch, mutation
+):
+    """Catches trusting a persisted image list despite unchanged input hashes."""
+    _, manifest = _real_image_replay_manifest(tmp_path, processor, monkeypatch)
+    record = manifest["samples"][0]
+    positions = record["original_image_positions"]
+    if mutation == "missing":
+        record.pop("original_image_positions")
+    elif mutation == "duplicate":
+        record["original_image_positions"] = [positions[0], positions[0], *positions[2:]]
+    elif mutation == "moved":
+        record["original_image_positions"] = [positions[0] + 1, *positions[1:]]
+    elif mutation == "bool":
+        record["original_image_positions"] = [True, *positions[1:]]
+    else:
+        record["original_image_positions"] = [str(positions[0]), *positions[1:]]
+
+    with pytest.raises(ValueError, match="image"):
+        list(load_prepared_samples(manifest, processor, tmp_path))
+
+
+def test_image_profile_loader_rejects_changed_processor_contract(
+    tmp_path, processor, monkeypatch
+):
+    """Catches replaying image positions under a different token contract."""
+    _, manifest = _real_image_replay_manifest(tmp_path, processor, monkeypatch)
+    manifest["image_token_contract"]["image_token_id"] += 1
+
+    with pytest.raises(ValueError, match="image"):
+        list(load_prepared_samples(manifest, processor, tmp_path))
+
+
+@pytest.mark.parametrize("profile", [None, "block-local-v2"])
+def test_loader_rejects_image_metadata_under_legacy_or_default_profile(
+    tmp_path, processor, monkeypatch, profile
+):
+    """Catches treating image-profile replay metadata as a legacy manifest."""
+    _, manifest = _real_image_replay_manifest(tmp_path, processor, monkeypatch)
+    if profile is None:
+        manifest.pop("analysis_profile")
+        manifest.pop("condition_order")
+    else:
+        manifest["analysis_profile"] = profile
+        manifest["condition_order"] = [
+            "clean",
+            "body_mask",
+            "boundary_mask",
+            "full_mask",
+        ]
+
+    with pytest.raises(ValueError, match="image.*profile"):
+        list(load_prepared_samples(manifest, processor, tmp_path))

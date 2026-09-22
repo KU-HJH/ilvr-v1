@@ -34,6 +34,48 @@ def test_common_denominators_and_token_weighted_nll():
     assert got["mean_nll"] == 0.5 and got["delta_nll"] == -0.5
 
 
+def test_image_profile_metrics_use_full_clean():
+    expected = {(0, 1): ((5, 7),), (1, 1): ((9, 8), (10, 9))}
+    rows = []
+    for condition in ("clean", "image_mask", "image_body_mask"):
+        for (source, plan), targets in expected.items():
+            for position, target in targets:
+                changed = condition != "clean" and source == 1 and position == 10
+                rows.append(
+                    dict(
+                        source_index=source,
+                        plan_index=plan,
+                        target_position=position,
+                        target_id=target,
+                        condition=condition,
+                        argmax_id=99 if changed else target,
+                        nll={
+                            "clean": 2.0,
+                            "image_mask": 1.0,
+                            "image_body_mask": 3.0,
+                        }[condition],
+                    )
+                )
+
+    out = summarize(rows, expected, analysis_profile="image-local-v1")
+
+    assert (out["sites"], out["tokens"]) == (2, 3)
+    assert out["conditions"]["image_mask"] == dict(
+        first_changed=0,
+        any_changed=1,
+        tokens_changed=1,
+        mean_nll=1.0,
+        delta_nll=-1.0,
+    )
+    assert out["conditions"]["image_body_mask"]["delta_nll"] == 1.0
+    with pytest.raises(ValueError):
+        summarize(rows[:-1], expected, analysis_profile="image-local-v1")
+    with pytest.raises(ValueError):
+        summarize(rows, expected)
+    with pytest.raises(ValueError):
+        summarize(rows, expected, analysis_profile="typo")
+
+
 def _fixture():
     expected = {(0, 1): ((5, 7),), (1, 1): ((5, 7), (6, 8), (7, 9))}
     rows = [
