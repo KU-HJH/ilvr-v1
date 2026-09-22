@@ -277,6 +277,46 @@ def test_loader_tf32_side_effect_is_reenforced_before_identity(cohort, monkeypat
         torch.backends.cuda.matmul.allow_tf32 = original_ambient
 
 
+def test_real_loader_rejects_model_image_contract_before_analysis(cohort, monkeypatch):
+    # Catches _load_runtime mapping the wrong Qwen config field into image-profile evidence.
+    import torch
+    import eval as eval_module
+    from stage2 import attention_backend, peft
+
+    root, _, _, identity, invoke, _ = cohort
+    assert invoke('prepare', extra=['--analysis-profile', IMAGE_PROFILE]) == 0
+    weight = torch.zeros(1, dtype=torch.bfloat16)
+    qwen = SimpleNamespace(
+        config=SimpleNamespace(stage='stage2', latent_size=8, _attn_implementation='sdpa',
+            image_token_id=81, vision_start_token_id=78, vision_end_token_id=79,
+            vision_config=SimpleNamespace(spatial_merge_size=1)),
+        visual=SimpleNamespace(config=SimpleNamespace(_attn_implementation='flash_attention_2')),
+        model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=weight), layers=[object(), object()]))
+
+    class BoundaryModel:
+        def eval(self):
+            return self
+
+        def parameters(self):
+            return iter((weight,))
+
+    monkeypatch.setattr(cli, '_load_runtime', REAL_LOAD_RUNTIME)
+    monkeypatch.setattr(eval_module, 'load_evaluation_artifacts', lambda **kwargs: (BoundaryModel(), object()))
+    monkeypatch.setattr(peft, 'resolve_stage2_qwen_model', lambda loaded: qwen)
+    monkeypatch.setattr(attention_backend, 'validate_qwen2_5_vl_attention_backends', lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 1)
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda index: 'test-gpu')
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')
+    monkeypatch.setattr(cli, '_execution_identity', lambda args, processor, runtime: {
+        **copy.deepcopy(identity), 'runtime': copy.deepcopy(runtime)})
+    monkeypatch.setattr(cli, '_analyze', lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError('model contract must reject before analysis')))
+    assert invoke('smoke', 'smoke', ['--analysis-profile', IMAGE_PROFILE]) == 1
+    failed = read(root/'results/smoke/smoke.json')
+    assert failed['status'] == 'failed'
+    assert 'image token contract differs from manifest' in failed['error']
+
+
 def test_clean_case_witness_cannot_redeem_wrong_runtime_identity(cohort):
     # Catches smoke passing when runtime identity says TF32 despite clean case witnesses.
     root, _, _, identity, invoke, _ = cohort
@@ -425,6 +465,46 @@ raise SystemExit(cli.main(["summarize", "--manifest", %r, "--output-dir", %r,
     report = (output/'report.md').read_text()
     assert '/actual/checkpoints/model' in report
     assert '원본 이미지 직접 접근은 차단' in report
+
+
+def test_offline_legacy_summary_uses_explicit_unavailable_model_label(tmp_path):
+    # Catches legacy completed artifacts becoming unsummarizable or acquiring an invented model identity.
+    root = tmp_path
+    for name in ('data', 'results', 'logs', 'checkpoints', 'shadow'):
+        (root/name).mkdir()
+    manifest = {
+        'schema_version': 1, 'S': 1, 'N': 1, 'exclusions': [],
+        'samples': [{'source_index': 0, 'sites': [{'source_index': 0, 'plan_index': 1,
+            'target_positions': [7], 'target_ids': [8]}]}],
+    }
+    manifest_path = root/'data/manifest.json'
+    manifest_path.write_text(json.dumps(manifest))
+    output = root/'results/legacy'
+    output.mkdir()
+    output.joinpath('status.json').write_text(json.dumps({
+        'status': 'completed', 'manifest_sha256': cli._hash(manifest_path),
+    }))
+    output.joinpath('tokens.jsonl').write_text('\n'.join(json.dumps({
+        'source_index': 0, 'plan_index': 1, 'target_position': 7, 'target_id': 8,
+        'condition': condition, 'argmax_id': 8, 'nll': 1.0 + index,
+    }) for index, condition in enumerate(conditions_for_profile(DEFAULT_PROFILE))) + '\n')
+    (root/'shadow/torch.py').write_text('raise RuntimeError("torch must stay unloaded")\n')
+    source_root = Path(__file__).resolve().parents[2]
+    code = '''
+from pathlib import Path
+from evaluation import vision_block_analysis as cli
+cli._repository_root = lambda: Path(%r)
+raise SystemExit(cli.main(["summarize", "--manifest", %r, "--output-dir", %r]))
+''' % (str(root), str(manifest_path), str(output))
+    environment = dict(os.environ, PYTHONPATH=os.pathsep.join([
+        str(root/'shadow'), str(source_root/'transformers/src'), str(source_root/'src'), str(source_root)]))
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                            env=environment)
+    assert result.returncode == 0, result.stderr
+    summary = read(output/'summary.json')
+    assert summary['analysis_profile'] == DEFAULT_PROFILE
+    assert summary['model_label'] == 'unavailable (legacy run)'
+    assert 'unavailable (legacy run)' in (output/'report.md').read_text()
 
 
 def test_unknown_command_fails_before_loading_model():
