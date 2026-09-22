@@ -12,7 +12,10 @@ import torch
 
 from stage2.data import Stage2DataCollator, prepare_stage2_example
 from step_preference.spans import expand_qwen_image_placeholders, map_reasoning_step_spans
-from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
+    LatentStructureError,
+    LatentTokenIds,
+)
 
 
 EXPECTED_DATA_SHA256 = "6a1dccf32bb5196d09941adfd8ea79e29b58c34316f286673b557ed29dc69618"
@@ -118,13 +121,23 @@ def prepare_sample(
         assistant_plan_rendering="concatenated-v1",
     )
     token_ids = _latent_token_ids(processor.tokenizer)
-    batch = Stage2DataCollator(
-        processor=processor,
-        token_ids=token_ids,
-        latent_size=8,
-        supervise_latent_boundaries=True,
-        step_preference_enabled=False,
-    )([prepared])
+    try:
+        batch = Stage2DataCollator(
+            processor=processor,
+            token_ids=token_ids,
+            latent_size=8,
+            supervise_latent_boundaries=True,
+            step_preference_enabled=False,
+        )([prepared])
+    except LatentStructureError as error:
+        return None, [
+            _exclusion(
+                source_index,
+                None,
+                "sample_latent_structure_invalid",
+                str(error),
+            )
+        ]
 
     model_inputs = {
         key: value

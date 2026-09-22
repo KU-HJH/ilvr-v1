@@ -93,6 +93,46 @@ def test_valid_first_site_survives_ineligible_later_site(tmp_path, processor):
     ]
 
 
+def test_malformed_latent_tokens_exclude_the_sample_once(tmp_path, processor):
+    """Catches a stray latent token escaping as a collator exception."""
+    Image.new("RGB", (56, 56)).save(tmp_path / "original.png")
+    row = _row(
+        [
+            {"type": "text", "content": "Before <|latent_pad|>."},
+            _latent(),
+            {"type": "text", "content": "Reason."},
+        ]
+    )
+
+    sample, exclusions = prepare_sample(row, 11, processor, tmp_path)
+
+    assert sample is None
+    assert exclusions == [
+        {
+            "source_index": 11,
+            "plan_index": None,
+            "reason": "sample_latent_structure_invalid",
+            "explanation": "latent_pad outside latent block",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("image_input", "message"),
+    [
+        (["missing.png"], "missing original image"),
+        (["../outside.png"], "safe relative path"),
+    ],
+)
+def test_operational_image_errors_propagate(tmp_path, processor, image_input, message):
+    """Catches structural exclusion handling swallowing image-operation failures."""
+    row = _row([{"type": "text", "content": "Before."}, _latent()])
+    row["image_input"] = image_input
+
+    with pytest.raises((FileNotFoundError, ValueError), match=message):
+        prepare_sample(row, 12, processor, tmp_path)
+
+
 def test_adjacent_final_answer_and_crossing_token_are_not_site_targets(
     tmp_path, processor
 ):
