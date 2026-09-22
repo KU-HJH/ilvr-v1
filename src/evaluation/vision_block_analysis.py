@@ -69,6 +69,8 @@ def _expected(manifest):
 
 def _require_profile(document, analysis_profile):
     """Bind persisted analysis evidence to its explicit condition profile."""
+    if not isinstance(document, dict):
+        raise ValueError('persisted evidence must be an object')
     wanted = conditions_for_profile(analysis_profile)
     stored = document.get('analysis_profile', DEFAULT_PROFILE)
     if stored != analysis_profile:

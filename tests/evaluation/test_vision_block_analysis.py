@@ -166,6 +166,25 @@ def test_profile_binding_never_upgrades_legacy_document():
         cli._require_profile(good, DEFAULT_PROFILE)
 
 
+@pytest.mark.parametrize('document', [[], 'malformed', None, 7])
+def test_profile_binding_rejects_malformed_persisted_documents(document):
+    # Catches malformed JSON evidence escaping the CLI's controlled ValueError path.
+    with pytest.raises(ValueError):
+        cli._require_profile(document, DEFAULT_PROFILE)
+
+
+def test_run_rejects_malformed_smoke_evidence_before_model_work(cohort, monkeypatch):
+    # Catches malformed persisted smoke evidence raising outside the CLI handler.
+    root, _, _, _, invoke, _ = cohort
+    assert invoke('prepare') == 0
+    assert invoke('smoke', 'smoke') == 0
+    (root/'results/smoke/smoke.json').write_text('[]')
+    monkeypatch.setattr(cli, '_load_runtime', lambda *args: (_ for _ in ()).throw(
+        AssertionError('malformed smoke evidence must reject before model work')))
+    assert invoke('run') == 1
+    assert (root/'logs/main/execution.log').read_text().startswith('run starting\nValueError:')
+
+
 @pytest.mark.parametrize('mutation', [
     'missing_prefix', 'duplicate_prefix', 'wrong_comparisons', 'inexact_prefix',
     'missing_repeat_prefix', 'old_strategy', 'math_disabled', 'flash_enabled',
