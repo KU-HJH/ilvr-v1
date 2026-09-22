@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from evaluation.vision_block_inputs import PreparedSample, Site, _sample_identity
+from evaluation.vision_block_metrics import DEFAULT_PROFILE
 from step_preference.equivalence import _tiny_model
 from tests.evaluation.vision_block_reference import reference_logits
 
@@ -64,13 +65,13 @@ def image_case(two_sites=False):
 
 
 @torch.inference_mode()
-def production_logits(runtime, model, state, site, condition):
+def production_logits(runtime, model, state, site, condition, *, analysis_profile=DEFAULT_PROFILE):
     """Observe logits from the actual public replay call."""
     outputs = []
     handle = model.model.register_forward_hook(
         lambda module, args, output: outputs.append(model.lm_head(output.last_hidden_state).float()))
     try:
-        runtime.replay_site(model, state, site, condition)
+        runtime.replay_site(model, state, site, condition, analysis_profile=analysis_profile)
     finally:
         handle.remove()
     assert len(outputs) == 1
@@ -544,3 +545,238 @@ def test_capture_calls_loaded_dora_wrapper_and_preserves_adapter_outputs(runtime
     assert len(rows) == 8
     assert witness["normal_vs_replay"]["argmax_mismatches"] == 0
     assert resolve_stage2_qwen_model(wrapped) is model
+
+
+IMAGE_PROFILE = "image-local-v1"
+IMAGE_CONDITIONS = ("clean", "image_mask", "image_body_mask")
+
+
+@pytest.mark.parametrize("two_sites", [False, True])
+def test_image_profile_keeps_every_embedding_and_prefix(runtime, two_sites):
+    # Catches shortened geometry, END mutation, other-site masking and state reuse.
+    model, sample = image_case(two_sites)
+    state = runtime.capture_clean(model, sample, analysis_profile=IMAGE_PROFILE)
+    assert state.image_positions == (2, 3)
+    assert state.image_token_contract == dict(image_token_id=80,
+        vision_start_token_id=78, vision_end_token_id=79, merge_size=1)
+    tensors = (state.embeds, state.positions, *(t for pair in state.prefix_kv for t in pair))
+    saved = tuple(t.clone() for t in tensors)
+    results = []
+    for sites in (sample.sites, reversed(sample.sites)):
+        rows_by_site = {}
+        for site in sites:
+            for condition in IMAGE_CONDITIONS:
+                embeds, positions, mask = runtime.build_replay_inputs(
+                    state, site, condition, analysis_profile=IMAGE_PROFILE)
+                blocked = set() if condition == "clean" else {2, 3}
+                if condition == "image_body_mask":
+                    blocked.update(range(site.body_start, site.body_end))
+                length = embeds.shape[1]
+                expected = torch.tensor([[k <= q and (q < site.end or k not in blocked)
+                                          for k in range(length)] for q in range(length)])
+                assert torch.equal(torch.isfinite(mask[0, 0]), expected)
+                assert torch.equal(embeds, saved[0])
+                assert torch.equal(positions, saved[1])
+                prefixes, visibility = [], []
+                rows = runtime.replay_site(model, state, site, condition,
+                    analysis_profile=IMAGE_PROFILE, prefix_witness=prefixes,
+                    visibility_witness=visibility)
+                assert len(rows) == len(site.target_ids)
+                assert prefixes == [dict(plan_index=site.plan_index, condition=condition,
+                    prefix_length=site.end, layers=2, kv_comparisons=4, exact=True)]
+                assert visibility == [dict(plan_index=site.plan_index, condition=condition,
+                    query_start=site.end, query_stop=site.target_positions[-1],
+                    blocked_positions=sorted(blocked), layers_observed=2,
+                    exact=True, embeddings_unchanged=True)]
+                rows_by_site[site.plan_index, condition] = rows
+        results.append(rows_by_site)
+    assert results[0] == results[1]
+    assert all(torch.equal(t, original) for t, original in zip(tensors, saved))
+
+
+@pytest.mark.parametrize("two_sites", [False, True])
+def test_image_profile_independent_oracle_and_target_minus_one(runtime, two_sites):
+    # Catches wrong score alignment and masks which merely agree with their builder.
+    model, sample = image_case(two_sites)
+    state = runtime.capture_clean(model, sample, analysis_profile=IMAGE_PROFILE)
+    for site in sample.sites:
+        for condition in IMAGE_CONDITIONS:
+            actual = production_logits(runtime, model, state, site, condition,
+                                       analysis_profile=IMAGE_PROFILE)
+            expected = reference_logits(model, state, site, condition,
+                                        analysis_profile=IMAGE_PROFILE)
+            torch.testing.assert_close(actual[:, site.end:site.target_positions[-1]],
+                                       expected, atol=1e-5, rtol=1e-5)
+            rows = runtime.replay_site(model, state, site, condition, analysis_profile=IMAGE_PROFILE)
+            for row, target, token in zip(rows, site.target_positions, site.target_ids):
+                logits = expected[0, target - 1 - site.end]
+                assert row["argmax_id"] == int(logits.argmax())
+                assert row["nll"] == pytest.approx(float(-logits.log_softmax(-1)[token]), abs=1e-5)
+
+
+@pytest.mark.parametrize("two_sites", [False, True])
+@pytest.mark.parametrize("source", ["image", "body"])
+def test_image_masks_live_sdpa_suffix_value_intervention(runtime, monkeypatch, two_sites, source):
+    # Catches ineffective masking in actual attention while preserving prefix K/V.
+    model, sample = image_case(two_sites)
+    state = runtime.capture_clean(model, sample, analysis_profile=IMAGE_PROFILE)
+    saved_bank = tuple(tuple(t.clone() for t in pair) for pair in state.prefix_kv)
+    original = torch.nn.functional.scaled_dot_product_attention
+    for site in sample.sites:
+        for condition in IMAGE_CONDITIONS:
+            before = production_logits(runtime, model, state, site, condition,
+                                       analysis_profile=IMAGE_PROFILE)
+            calls = []
+            def probe(*args, **kwargs):
+                options = dict(kwargs)
+                names = ("query", "key", "value", "attn_mask", "dropout_p", "is_causal")
+                options.update(zip(names, args))
+                query, key, value = (options.pop(name) for name in names[:3])
+                length = state.embeds.shape[1]
+                assert query.shape[-2] == length
+                blocked_keys = set() if condition == "clean" else {2, 3}
+                if condition == "image_body_mask":
+                    blocked_keys.update(range(site.body_start, site.body_end))
+                expected = torch.tensor([[k <= q and (q < site.end or k not in blocked_keys)
+                                          for k in range(length)] for q in range(length)])
+                assert options["attn_mask"].shape == (1, 1, length, length)
+                assert torch.equal(torch.isfinite(options["attn_mask"][0, 0]), expected)
+                calls.append(query.shape)
+                ordinary = original(query, key, value, **options)
+                changed_value = value.clone()
+                chosen = 2 if source == "image" else site.body_start
+                changed_value[..., chosen, :] = torch.linspace(-53, 37, value.shape[-1])
+                changed = original(query, key, changed_value, **options)
+                return torch.cat((ordinary[..., :site.end, :], changed[..., site.end:, :]), dim=-2)
+            with monkeypatch.context() as patch:
+                patch.setattr(torch.nn.functional, "scaled_dot_product_attention", probe)
+                after = production_logits(runtime, model, state, site, condition,
+                                          analysis_profile=IMAGE_PROFILE)
+            assert len(calls) == 2
+            columns = [p-1 for p in site.target_positions]
+            blocked = condition != "clean" if source == "image" else condition == "image_body_mask"
+            if blocked:
+                torch.testing.assert_close(after[:, columns], before[:, columns], atol=0, rtol=0)
+            else:
+                assert float((after[:, columns] - before[:, columns]).abs().max()) > 1e-3
+    assert all(torch.equal(t, original) for pair, saved in zip(state.prefix_kv, saved_bank)
+               for t, original in zip(pair, saved))
+
+
+@pytest.mark.parametrize("positions", [(), (2, 2), (-1, 2), (2, 99)])
+def test_image_replay_rejects_invalid_payload_positions(runtime, positions):
+    model, sample = image_case()
+    state = runtime.capture_clean(model, sample, analysis_profile=IMAGE_PROFILE)
+    with pytest.raises(ValueError, match="image.*positions"):
+        runtime.build_replay_inputs(replace(state, image_positions=positions), sample.sites[0],
+                                   "clean", analysis_profile=IMAGE_PROFILE)
+
+
+@pytest.mark.parametrize("profile,condition", [(IMAGE_PROFILE, "body_mask"),
+    ("block-local-v2", "image_mask"), ("unknown", "clean")])
+def test_runtime_rejects_foreign_profile_conditions(runtime, profile, condition):
+    model, sample = image_case()
+    state = runtime.capture_clean(model, sample)
+    with pytest.raises(ValueError, match="profile|condition"):
+        runtime.build_replay_inputs(state, sample.sites[0], condition, analysis_profile=profile)
+
+
+@pytest.mark.parametrize("defect", ["image_id", "marker_id", "grid", "merge"])
+def test_image_capture_validates_model_contract_before_rollout(runtime, defect):
+    model, sample = image_case()
+    if defect == "image_id":
+        model.config.image_token_id = 81
+    elif defect == "marker_id":
+        model.config.vision_start_token_id = 77
+    elif defect == "grid":
+        sample.model_inputs["image_grid_thw"] = torch.tensor([[1, 1, 3]])
+    else:
+        model.config.vision_config.spatial_merge_size = 2
+    calls = []
+    handle = model.register_forward_pre_hook(lambda module, args: calls.append(1))
+    try:
+        with pytest.raises(ValueError, match="image"):
+            runtime.capture_clean(model, sample, analysis_profile=IMAGE_PROFILE)
+    finally:
+        handle.remove()
+    assert calls == []
+
+
+@pytest.mark.parametrize("defect", ["mask", "unscored_mask", "embeds", "positions", "duplicate", "missing"])
+def test_image_visibility_witness_observes_execution_and_cleans_hooks(runtime, monkeypatch, defect):
+    # Catches planner-only certifications and incomplete/duplicated runtime coverage.
+    model, sample = image_case()
+    state = runtime.capture_clean(model, sample, analysis_profile=IMAGE_PROFILE)
+    site = replace(sample.sites[0], target_positions=(17,), target_ids=(14,))
+    layer = model.model.layers[0]
+    before = [len(item.self_attn._forward_pre_hooks) for item in model.model.layers]
+    handles = []
+    if defect in ("mask", "unscored_mask"):
+        original = model.model._update_causal_mask
+        def corrupt(*args, **kwargs):
+            mask = original(*args, **kwargs).clone()
+            mask[..., site.end if defect == "unscored_mask" else 16, 2] = 0
+            return mask
+        monkeypatch.setattr(model.model, "_update_causal_mask", corrupt)
+    elif defect in ("embeds", "positions"):
+        def corrupt(module, args, kwargs):
+            key = "inputs_embeds" if defect == "embeds" else "position_ids"
+            kwargs[key] = kwargs[key].clone() + 1
+            return args, kwargs
+        handles.append(model.model.register_forward_pre_hook(corrupt, with_kwargs=True))
+    elif defect == "duplicate":
+        active = False
+        def duplicate(module, args, kwargs):
+            nonlocal active
+            if not active:
+                active = True
+                try:
+                    module(*args, **kwargs)
+                finally:
+                    active = False
+        handles.append(layer.self_attn.register_forward_pre_hook(duplicate, with_kwargs=True))
+    else:
+        # Bypass Module.__call__, preserving outputs but skipping its registered hooks.
+        monkeypatch.setattr(type(layer.self_attn), "__call__", type(layer.self_attn).forward)
+    prefixes, visibility = [], []
+    try:
+        with pytest.raises(ValueError, match="visibility|embeddings|positions|layer"):
+            runtime.replay_site(model, state, site, "image_mask", analysis_profile=IMAGE_PROFILE,
+                                prefix_witness=prefixes, visibility_witness=visibility)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert prefixes == visibility == []
+    assert [len(item.self_attn._forward_pre_hooks) for item in model.model.layers] == before
+
+
+def test_image_repeat_compares_two_captured_runs(runtime, monkeypatch):
+    # Distinct sub-tolerance scores expose the wrong pair without a threshold trick.
+    model, sample = image_case()
+    capture, compare = runtime.capture_clean, runtime._comparison
+    states, operands = [], []
+    def perturbed(*args, **kwargs):
+        state = capture(*args, **kwargs)
+        delta = .0001 if not states else .0003
+        state = replace(state, captured_scores={key: (argmax, nll + delta)
+            for key, (argmax, nll) in state.captured_scores.items()})
+        states.append(state)
+        return state
+    def observed(left, right):
+        operands.append((left, right))
+        return compare(left, right)
+    monkeypatch.setattr(runtime, "capture_clean", perturbed)
+    monkeypatch.setattr(runtime, "_comparison", observed)
+    rows, witness = runtime.analyze_sample(model, sample, repeat_clean=True,
+                                           analysis_profile=IMAGE_PROFILE)
+    assert any(left is states[0].captured_scores and right is states[1].captured_scores
+               for left, right in operands)
+    assert any(left is states[1].normal_scores and right is states[1].captured_scores
+               for left, right in operands)
+    assert witness["repeat_captured"]["mean_nll_abs_diff"] == pytest.approx(.0002)
+    assert witness["analysis_profile"] == IMAGE_PROFILE
+    assert witness["condition_order"] == list(IMAGE_CONDITIONS)
+    assert witness["original_image_positions"] == [2, 3]
+    assert witness["image_token_contract"] == states[0].image_token_contract
+    assert len(witness["visibility_identity"]) == 3
+    assert len(rows) == 6

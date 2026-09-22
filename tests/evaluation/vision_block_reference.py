@@ -1,9 +1,11 @@
 """Independent edge oracle; shares decoder weights/math, not replay planning."""
 import torch
 
+from evaluation.vision_block_metrics import DEFAULT_PROFILE, IMAGE_PROFILE
+
 
 @torch.inference_mode()
-def reference_logits(qwen, state, site, condition):
+def reference_logits(qwen, state, site, condition, *, analysis_profile=DEFAULT_PROFILE):
     columns = list(range(site.end, site.target_positions[-1]))
     hidden = state.embeds[:, columns].clone()
     positions = state.positions[:, :, columns]
@@ -20,6 +22,11 @@ def reference_logits(qwen, state, site, condition):
                     allowed = False
                 if condition in ("boundary_mask", "full_mask") and key == site.start:
                     allowed = False
+                if analysis_profile == IMAGE_PROFILE:
+                    if condition in ("image_mask", "image_body_mask") and key in state.image_positions:
+                        allowed = False
+                    if condition == "image_body_mask" and site.body_start <= key < site.body_end:
+                        allowed = False
             else:
                 allowed = key - root_length <= query
             if allowed:
