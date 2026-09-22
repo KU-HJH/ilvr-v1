@@ -38,9 +38,33 @@ def summarize(
     for row in rows:
         if not isinstance(row, dict) or not required_fields.issubset(row):
             raise ValueError("each row must contain all required fields")
+
+        integer_fields = (
+            "source_index",
+            "plan_index",
+            "target_position",
+            "target_id",
+            "argmax_id",
+        )
+        if any(
+            not isinstance(row[field], int) or isinstance(row[field], bool)
+            for field in integer_fields
+        ):
+            raise ValueError("index and token fields must be integers")
+
         condition = row["condition"]
-        if condition not in CONDITIONS:
+        if not isinstance(condition, str) or condition not in CONDITIONS:
             raise ValueError(f"unknown condition: {condition!r}")
+
+        nll = row["nll"]
+        if (
+            not isinstance(nll, (int, float))
+            or isinstance(nll, bool)
+            or not math.isfinite(nll)
+            or nll < 0
+        ):
+            raise ValueError("NLL must be finite and nonnegative")
+
         key = (
             row["source_index"],
             row["plan_index"],
@@ -53,9 +77,6 @@ def summarize(
             raise ValueError(f"unexpected row: {key!r}")
         if row["target_id"] != expected_rows[key]:
             raise ValueError(f"target ID does not match expected row: {key!r}")
-        nll = row["nll"]
-        if not isinstance(nll, (int, float)) or not math.isfinite(nll) or nll < 0:
-            raise ValueError("NLL must be finite and nonnegative")
         indexed_rows[key] = row
 
     if indexed_rows.keys() != expected_rows.keys():
@@ -71,8 +92,9 @@ def summarize(
         ]
         site_changes = {
             site: [
-                indexed_rows[(*site, position, condition)]["argmax_id"] != target_id
-                for position, target_id in targets
+                indexed_rows[(*site, position, condition)]["argmax_id"]
+                != indexed_rows[(*site, position, "clean")]["argmax_id"]
+                for position, _ in targets
             ]
             for site, targets in expected.items()
         }

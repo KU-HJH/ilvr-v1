@@ -104,3 +104,51 @@ def test_nll_mean_is_weighted_by_tokens_not_sites():
     assert out["conditions"]["clean"]["mean_nll"] == 3.25
     assert out["conditions"]["body_mask"]["mean_nll"] == 4.0
     assert out["conditions"]["body_mask"]["delta_nll"] == 0.75
+
+
+def test_argmax_changes_are_relative_to_corresponding_clean_predictions():
+    rows, expected = _fixture()
+    for row in rows:
+        if row["source_index"] == 1:
+            row["argmax_id"] = 99
+        if (
+            row["source_index"] == 1
+            and row["condition"] == "body_mask"
+            and row["target_position"] == 6
+        ):
+            row["argmax_id"] = row["target_id"]
+
+    out = summarize(rows, expected)
+
+    clean = out["conditions"]["clean"]
+    body_mask = out["conditions"]["body_mask"]
+    assert (clean["first_changed"], clean["any_changed"], clean["tokens_changed"]) == (
+        0,
+        0,
+        0,
+    )
+    assert (
+        body_mask["first_changed"],
+        body_mask["any_changed"],
+        body_mask["tokens_changed"],
+    ) == (0, 1, 1)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_index", False),
+        ("plan_index", True),
+        ("target_position", []),
+        ("target_id", True),
+        ("argmax_id", False),
+        ("condition", 1),
+        ("nll", True),
+    ],
+)
+def test_typed_malformed_rows_raise_value_error(field, value):
+    rows, expected = _fixture()
+    rows[0][field] = value
+
+    with pytest.raises(ValueError):
+        summarize(rows, expected)
