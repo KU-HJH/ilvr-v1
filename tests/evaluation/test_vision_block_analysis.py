@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ from evaluation import vision_block_analysis as cli
 from evaluation.vision_block_inputs import PreparedSample, Site
 
 
+REAL_LOAD_RUNTIME = cli._load_runtime
 MATH_POLICY = dict(sdpa_math=True, sdpa_flash=False, sdpa_mem_efficient=False,
                    sdpa_cudnn=False, tf32_matmul=False, tf32_cudnn=False)
 
@@ -49,6 +51,7 @@ def cohort(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, '_prepare', prepare)
     runtime_identity = {'parameter_dtypes': {'torch.bfloat16': 1},
                         'numerical_policy': copy.deepcopy(MATH_POLICY),
+                        'tf32_matmul': False, 'tf32_cudnn': False,
                         'execution_strategy': 'full_length_v2', 'decoder_layers': 2}
     monkeypatch.setattr(cli, '_load_runtime', lambda args: (object(), object(), copy.deepcopy(runtime_identity)))
     monkeypatch.setattr(cli, '_processor_identity', lambda processor: {'sha256': 'processor'})
@@ -145,6 +148,7 @@ def test_inference_policy_covers_loading_identity_and_analysis(cohort, monkeypat
             active.pop()
 
     monkeypatch.setattr(runtime, 'numerical_policy', policy)
+    monkeypatch.setattr(runtime, 'numerical_policy_identity', lambda: copy.deepcopy(MATH_POLICY))
     for name in ('_load_runtime', '_execution_identity', '_analyze'):
         original = getattr(cli, name)
         def checked(*args, _original=original, **kwargs):
@@ -153,6 +157,63 @@ def test_inference_policy_covers_loading_identity_and_analysis(cohort, monkeypat
         monkeypatch.setattr(cli, name, checked)
     assert invoke('smoke', 'smoke') == 0
     assert active == []
+
+
+def test_loader_tf32_side_effect_is_reenforced_before_identity(cohort, monkeypatch):
+    # Catches eval.load_model enabling TF32 after the outer policy was entered.
+    import torch
+    import eval as eval_module
+    from stage2 import attention_backend, peft
+
+    root, _, _, identity, invoke, _ = cohort
+    assert invoke('prepare') == 0
+    weight = torch.zeros(1, dtype=torch.bfloat16)
+    qwen = SimpleNamespace(
+        config=SimpleNamespace(stage='stage2', latent_size=8, _attn_implementation='sdpa'),
+        visual=SimpleNamespace(config=SimpleNamespace(_attn_implementation='flash_attention_2')),
+        model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=weight), layers=[object(), object()]))
+
+    class BoundaryModel:
+        def eval(self):
+            return self
+
+        def parameters(self):
+            return iter((weight,))
+
+    model = BoundaryModel()
+    def load_artifacts(**kwargs):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        return model, object()
+
+    monkeypatch.setattr(cli, '_load_runtime', REAL_LOAD_RUNTIME)
+    monkeypatch.setattr(eval_module, 'load_evaluation_artifacts', load_artifacts)
+    monkeypatch.setattr(peft, 'resolve_stage2_qwen_model', lambda loaded: qwen)
+    monkeypatch.setattr(attention_backend, 'validate_qwen2_5_vl_attention_backends', lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 1)
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda index: 'test-gpu')
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')
+    monkeypatch.setattr(cli, '_execution_identity', lambda args, processor, runtime: {
+        **copy.deepcopy(identity), 'runtime': copy.deepcopy(runtime)})
+    ambient = torch.backends.cuda.matmul.allow_tf32
+    try:
+        assert invoke('smoke', 'smoke') == 0
+        runtime_identity = read(root/'results/smoke/identity.json')['runtime']
+        assert runtime_identity['numerical_policy'] == MATH_POLICY
+        assert runtime_identity['tf32_matmul'] is False
+        assert runtime_identity['tf32_cudnn'] is False
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = ambient
+    assert torch.backends.cuda.matmul.allow_tf32 is ambient
+
+
+def test_clean_case_witness_cannot_redeem_wrong_runtime_identity(cohort):
+    # Catches smoke passing when runtime identity says TF32 despite clean case witnesses.
+    root, _, _, identity, invoke, _ = cohort
+    assert invoke('prepare') == 0
+    identity['runtime']['tf32_matmul'] = True
+    identity['runtime']['numerical_policy']['tf32_matmul'] = True
+    assert invoke('smoke', 'smoke') == 1
+    assert read(root/'results/smoke/smoke.json')['status'] == 'failed'
 
 
 @pytest.mark.parametrize('two_sites', [False, True])

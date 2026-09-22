@@ -81,7 +81,6 @@ def _processor_identity(processor):
 def _load_runtime(args):
     import torch
     from eval import load_evaluation_artifacts
-    from evaluation.vision_block_runtime import numerical_policy_identity
     from stage2.peft import resolve_stage2_qwen_model
     from stage2.attention_backend import validate_qwen2_5_vl_attention_backends
 
@@ -102,17 +101,29 @@ def _load_runtime(args):
     for parameter in model.parameters():
         dtype = str(parameter.dtype)
         dtypes[dtype] = dtypes.get(dtype, 0) + parameter.numel()
-    runtime = {'parameter_dtypes': dtypes, 'tf32_matmul': torch.backends.cuda.matmul.allow_tf32,
-        'tf32_cudnn': torch.backends.cudnn.allow_tf32, 'cuda': torch.version.cuda,
+    runtime = {'parameter_dtypes': dtypes, 'cuda': torch.version.cuda,
         'cudnn': torch.backends.cudnn.version(), 'gpu': torch.cuda.get_device_name(0),
         'visible_devices': os.environ['CUDA_VISIBLE_DEVICES'],
         'language_backend': qwen.config._attn_implementation,
         'vision_backend': qwen.visual.config._attn_implementation,
         'stage': qwen.config.stage, 'latent_size': qwen.config.latent_size,
-        'numerical_policy': numerical_policy_identity(),
         'execution_strategy': 'full_length_v2',
         'decoder_layers': len(qwen.model.layers)}
     return model, processor, runtime
+
+
+def _record_runtime_policy(runtime):
+    from evaluation.vision_block_runtime import numerical_policy_identity
+    policy = numerical_policy_identity()
+    runtime.update(numerical_policy=policy, tf32_matmul=policy['tf32_matmul'],
+                   tf32_cudnn=policy['tf32_cudnn'])
+
+
+def _validate_runtime_policy(runtime):
+    if (not isinstance(runtime, dict) or runtime.get('numerical_policy') != MATH_POLICY
+            or runtime.get('tf32_matmul') is not False
+            or runtime.get('tf32_cudnn') is not False):
+        raise ValueError('runtime numerical policy is not MATH-only with TF32 disabled')
 
 
 def _directory_identity(path):
@@ -271,6 +282,7 @@ def _validate_gate(gate, identity, manifest_hash, manifest):
         raise ValueError('smoke gate did not pass')
     if gate.get('identity') != identity or gate.get('manifest_sha256') != manifest_hash:
         raise ValueError('smoke execution/manifest identity changed')
+    _validate_runtime_policy(gate.get('identity', {}).get('runtime'))
     cases = gate.get('cases', [])
     if len(cases) != 2 or [case['case'] for case in cases] != ['single', 'multi']:
         raise ValueError('smoke lacks both required cases')
@@ -392,43 +404,49 @@ def main(argv=None):
         from evaluation.vision_block_runtime import numerical_policy
         with numerical_policy():
             model, processor, runtime = _load_runtime(args)
-            if _processor_identity(processor) != manifest['processor']:
-                raise ValueError('manifest processor identity changed')
-            identity = _execution_identity(args, processor, runtime)
-            _write(args.output_dir/'identity.json', identity)
-            layers = runtime.get('decoder_layers')
-            if type(layers) is not int or layers <= 0:
-                raise ValueError('invalid decoder layer identity')
-            if args.command == 'smoke':
-                _smoke(args, manifest, model, processor, identity, layers)
-            else:
-                _validate_gate(gate, identity, _hash(args.manifest), manifest)
-                all_rows, completed_sites = [], 0
-                with (args.output_dir/'tokens.jsonl').open('x', encoding='utf-8') as tokens, \
-                     (args.output_dir/'sites.jsonl').open('x', encoding='utf-8') as sites:
-                    for completed, sample in enumerate(_samples(manifest, processor, args.image_root), 1):
-                        rows, witness = _analyze(model, sample)
-                        _validate_witness(witness, sites=sample.sites, layers=layers)
-                        for row in rows:
-                            tokens.write(json.dumps(row, allow_nan=False) + '\n')
-                        tokens.flush()
-                        all_rows.extend(rows)
-                        for site in sample.sites:
-                            site_rows = [r for r in rows if r['plan_index'] == site.plan_index]
-                            site_summary = summarize(site_rows, {(sample.source_index, site.plan_index):
-                                                           tuple(zip(site.target_positions, site.target_ids))})
-                            sites.write(json.dumps({'source_index': sample.source_index, 'plan_index': site.plan_index,
-                                                    'metrics': site_summary, 'witness': witness}, allow_nan=False) + '\n')
-                        sites.flush()
-                        completed_sites += len(sample.sites)
-                        progress = f'samples={completed}/{len(manifest["samples"])} sites={completed_sites}/{manifest["S"]}'
-                        print(progress, flush=True)
-                        with log_path.open('a') as log:
-                            log.write(progress + '\n')
-                summarize(all_rows, expected)
-                _write(args.output_dir/'exclusions.json', manifest['exclusions'])
-                _write(args.output_dir/'status.json', {'status': 'completed', 'manifest_sha256': _hash(args.manifest),
-                    'samples': len(manifest['samples']), 'S': manifest['S'], 'N': manifest['N']})
+            # Loading may mutate process-global TF32 flags; re-enter and retain the
+            # policy before observing identity or running any sample computation.
+            with numerical_policy():
+                _record_runtime_policy(runtime)
+                _validate_runtime_policy(runtime)
+                if _processor_identity(processor) != manifest['processor']:
+                    raise ValueError('manifest processor identity changed')
+                identity = _execution_identity(args, processor, runtime)
+                _validate_runtime_policy(identity.get('runtime'))
+                _write(args.output_dir/'identity.json', identity)
+                layers = runtime.get('decoder_layers')
+                if type(layers) is not int or layers <= 0:
+                    raise ValueError('invalid decoder layer identity')
+                if args.command == 'smoke':
+                    _smoke(args, manifest, model, processor, identity, layers)
+                else:
+                    _validate_gate(gate, identity, _hash(args.manifest), manifest)
+                    all_rows, completed_sites = [], 0
+                    with (args.output_dir/'tokens.jsonl').open('x', encoding='utf-8') as tokens, \
+                         (args.output_dir/'sites.jsonl').open('x', encoding='utf-8') as sites:
+                        for completed, sample in enumerate(_samples(manifest, processor, args.image_root), 1):
+                            rows, witness = _analyze(model, sample)
+                            _validate_witness(witness, sites=sample.sites, layers=layers)
+                            for row in rows:
+                                tokens.write(json.dumps(row, allow_nan=False) + '\n')
+                            tokens.flush()
+                            all_rows.extend(rows)
+                            for site in sample.sites:
+                                site_rows = [r for r in rows if r['plan_index'] == site.plan_index]
+                                site_summary = summarize(site_rows, {(sample.source_index, site.plan_index):
+                                                               tuple(zip(site.target_positions, site.target_ids))})
+                                sites.write(json.dumps({'source_index': sample.source_index, 'plan_index': site.plan_index,
+                                                        'metrics': site_summary, 'witness': witness}, allow_nan=False) + '\n')
+                            sites.flush()
+                            completed_sites += len(sample.sites)
+                            progress = f'samples={completed}/{len(manifest["samples"])} sites={completed_sites}/{manifest["S"]}'
+                            print(progress, flush=True)
+                            with log_path.open('a') as log:
+                                log.write(progress + '\n')
+                    summarize(all_rows, expected)
+                    _write(args.output_dir/'exclusions.json', manifest['exclusions'])
+                    _write(args.output_dir/'status.json', {'status': 'completed', 'manifest_sha256': _hash(args.manifest),
+                        'samples': len(manifest['samples']), 'S': manifest['S'], 'N': manifest['N']})
         with log_path.open('a') as log:
             log.write(f'{args.command} completed\n')
         return 0
