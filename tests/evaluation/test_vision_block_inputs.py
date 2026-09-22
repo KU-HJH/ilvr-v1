@@ -153,6 +153,27 @@ def test_processor_image_contract_rejects_missing_values(candidate):
         inputs.processor_image_contract(candidate)
 
 
+@pytest.mark.parametrize("image_token", ["missing", None, ""])
+def test_processor_image_contract_rejects_missing_or_empty_image_token(image_token):
+    """Catches accepting a missing processor image token via a permissive tokenizer."""
+    tokenizer = SimpleNamespace(
+        unk_token_id=999,
+        convert_tokens_to_ids=lambda token: {
+            "<|vision_start|>": 2,
+            "<|vision_end|>": 3,
+        }.get(token, 1),
+    )
+    candidate = SimpleNamespace(
+        tokenizer=tokenizer,
+        image_processor=SimpleNamespace(merge_size=1),
+    )
+    if image_token != "missing":
+        candidate.image_token = image_token
+
+    with pytest.raises(ValueError):
+        inputs.processor_image_contract(candidate)
+
+
 def test_image_payload_positions_exclude_boundaries():
     sample = _geometry_sample()
     contract = _geometry_contract()

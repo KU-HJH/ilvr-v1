@@ -52,34 +52,63 @@ class PreparedSample:
     sites: tuple[Site, ...]
 
 
-def processor_image_contract(processor) -> dict[str, int]:
-    """Resolve and validate the processor's image-token geometry contract."""
-    tokenizer = getattr(processor, "tokenizer", None)
-    image_token = getattr(processor, "image_token", None)
-    image_processor = getattr(processor, "image_processor", None)
-    if tokenizer is None or not isinstance(image_token, str) or image_processor is None:
-        raise ValueError("processor lacks the image token contract")
+_IMAGE_CONTRACT_FIELDS = (
+    "image_token_id",
+    "vision_start_token_id",
+    "vision_end_token_id",
+    "merge_size",
+)
 
-    converter = getattr(tokenizer, "convert_tokens_to_ids", None)
-    if not callable(converter):
-        raise ValueError("processor tokenizer cannot resolve image token IDs")
-    token_ids = {
-        "image_token_id": converter(image_token),
-        "vision_start_token_id": converter("<|vision_start|>"),
-        "vision_end_token_id": converter("<|vision_end|>"),
+
+def _valid_token_id(value) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _validate_image_contract_values(
+    *, image_token_id, vision_start_token_id, vision_end_token_id, merge_size
+) -> dict[str, int]:
+    contract = {
+        "image_token_id": image_token_id,
+        "vision_start_token_id": vision_start_token_id,
+        "vision_end_token_id": vision_end_token_id,
+        "merge_size": merge_size,
     }
-    unknown_id = getattr(tokenizer, "unk_token_id", None)
-    if (
-        any(type(value) is not int or value < 0 for value in token_ids.values())
-        or (type(unknown_id) is int and unknown_id in token_ids.values())
-        or len(set(token_ids.values())) != len(token_ids)
-    ):
-        raise ValueError("processor image token IDs are missing or invalid")
-
-    merge_size = getattr(image_processor, "merge_size", None)
+    token_ids = tuple(contract[field] for field in _IMAGE_CONTRACT_FIELDS[:3])
+    if not all(_valid_token_id(value) for value in token_ids):
+        raise ValueError("image token IDs must be nonnegative integers")
+    if len(set(token_ids)) != len(token_ids):
+        raise ValueError("image token IDs must be distinct")
     if type(merge_size) is not int or merge_size <= 0:
-        raise ValueError("processor image merge size must be a positive integer")
-    return {**token_ids, "merge_size": merge_size}
+        raise ValueError("image merge size must be a positive integer")
+    return contract
+
+
+def processor_image_contract(processor) -> dict[str, int]:
+    """Resolve and validate the processor-specific original-image token contract."""
+    try:
+        tokenizer = processor.tokenizer
+        image_token = processor.image_token
+        image_processor = processor.image_processor
+        converter = tokenizer.convert_tokens_to_ids
+        merge_size = image_processor.merge_size
+    except (AttributeError, TypeError) as error:
+        raise ValueError("processor lacks an image token contract") from error
+    if type(image_token) is not str or not image_token or not callable(converter):
+        raise ValueError("processor lacks an image token contract")
+    image_token_id = converter(image_token)
+    vision_start_token_id = converter("<|vision_start|>")
+    vision_end_token_id = converter("<|vision_end|>")
+
+    contract = _validate_image_contract_values(
+        image_token_id=image_token_id,
+        vision_start_token_id=vision_start_token_id,
+        vision_end_token_id=vision_end_token_id,
+        merge_size=merge_size,
+    )
+    unknown_id = getattr(tokenizer, "unk_token_id", None)
+    if any(value == unknown_id for value in tuple(contract.values())[:3]):
+        raise ValueError("processor image token contract contains an unknown token")
+    return contract
 
 
 def original_image_positions(
@@ -90,71 +119,61 @@ def original_image_positions(
     vision_end_token_id: int,
     merge_size: int,
 ) -> tuple[int, ...]:
-    """Return the validated original-image payload positions without its markers."""
-    token_ids = (image_token_id, vision_start_token_id, vision_end_token_id)
-    if (
-        any(type(value) is not int or value < 0 for value in token_ids)
-        or len(set(token_ids)) != len(token_ids)
-        or type(merge_size) is not int
-        or merge_size <= 0
-    ):
-        raise ValueError("invalid original image token contract")
-
-    ids = sample.model_inputs.get("input_ids")
-    attention_mask = sample.model_inputs.get("attention_mask")
-    integral_dtypes = {
-        torch.uint8,
-        torch.int8,
-        torch.int16,
-        torch.int32,
-        torch.int64,
-    }
+    """Return the original-image payload positions after validating image geometry."""
+    _validate_image_contract_values(
+        image_token_id=image_token_id,
+        vision_start_token_id=vision_start_token_id,
+        vision_end_token_id=vision_end_token_id,
+        merge_size=merge_size,
+    )
+    if type(sample) is not PreparedSample:
+        raise ValueError("original image sample is invalid")
+    inputs = sample.model_inputs
+    ids = inputs.get("input_ids") if type(inputs) is dict else None
+    attention_mask = inputs.get("attention_mask") if type(inputs) is dict else None
+    grid = inputs.get("image_grid_thw") if type(inputs) is dict else None
     if (
         not isinstance(ids, torch.Tensor)
         or ids.ndim != 2
         or ids.shape[0] != 1
-        or ids.dtype not in integral_dtypes
         or not isinstance(attention_mask, torch.Tensor)
         or attention_mask.shape != ids.shape
         or not bool(torch.all(attention_mask == 1))
     ):
-        raise ValueError("original image inputs must be an unpadded batch of one")
-
-    grid = sample.model_inputs.get("image_grid_thw")
+        raise ValueError("original image requires unpadded batch-one input IDs")
     if (
         not isinstance(grid, torch.Tensor)
-        or grid.shape != (1, 3)
-        or grid.dtype not in integral_dtypes
+        or grid.ndim != 2
+        or tuple(grid.shape) != (1, 3)
+        or grid.dtype == torch.bool
+        or grid.is_floating_point()
+        or grid.is_complex()
     ):
-        raise ValueError("original image grid must contain one integral THW row")
+        raise ValueError("original image grid must be one integral THW row")
     t, h, w = (int(value) for value in grid[0].tolist())
-    if any(value <= 0 for value in (t, h, w)) or h % merge_size or w % merge_size:
+    if min(t, h, w) <= 0 or h % merge_size or w % merge_size:
         raise ValueError("original image grid is incompatible with merge size")
 
-    start_positions = tuple(
-        torch.nonzero(ids[0] == vision_start_token_id, as_tuple=False)
-        .flatten()
-        .tolist()
-    )
-    end_positions = tuple(
-        torch.nonzero(ids[0] == vision_end_token_id, as_tuple=False).flatten().tolist()
-    )
+    start_positions = torch.nonzero(
+        ids[0] == vision_start_token_id, as_tuple=False
+    ).flatten().tolist()
+    end_positions = torch.nonzero(
+        ids[0] == vision_end_token_id, as_tuple=False).flatten().tolist()
+    if len(start_positions) != 1 or len(end_positions) != 1:
+        raise ValueError("original image requires exactly one marker pair")
+    start, end = start_positions[0], end_positions[0]
+    if start >= end:
+        raise ValueError("original image markers are unordered")
     payload = tuple(
         torch.nonzero(ids[0] == image_token_id, as_tuple=False).flatten().tolist()
     )
-    if len(start_positions) != 1 or len(end_positions) != 1:
-        raise ValueError("invalid original image markers")
-    start, end = start_positions[0], end_positions[0]
     expected = tuple(range(start + 1, end))
-    if (
-        not sample.sites
-        or not payload
-        or payload != expected
-        or end >= min(site.start for site in sample.sites)
-    ):
+    if not payload or payload != expected:
         raise ValueError("invalid original image span")
     if len(payload) != t * h * w // (merge_size**2):
         raise ValueError("original image payload/grid mismatch")
+    if not sample.sites or end >= min(site.start for site in sample.sites):
+        raise ValueError("original image must precede the first latent start")
     return payload
 
 
@@ -455,11 +474,11 @@ def prepare_manifest(
     image_root,
     output_path,
     *,
-    analysis_profile=DEFAULT_PROFILE,
+    analysis_profile: str = DEFAULT_PROFILE,
 ) -> dict:
     """Prepare the immutable selected cohort and write its replay manifest."""
-    condition_order = conditions_for_profile(analysis_profile)
-    image_token_contract = (
+    condition_order = list(conditions_for_profile(analysis_profile))
+    image_contract = (
         processor_image_contract(processor)
         if analysis_profile == IMAGE_PROFILE
         else None
@@ -497,15 +516,15 @@ def prepare_manifest(
                 "sites": [asdict(site) for site in sample.sites],
                 "identity": _sample_identity(sample),
             }
-            if image_token_contract is not None:
+            if image_contract is not None:
                 record["original_image_positions"] = list(
-                    original_image_positions(sample, **image_token_contract)
+                    original_image_positions(sample, **image_contract)
                 )
             samples.append(record)
     manifest = {
         "schema_version": 1,
         "analysis_profile": analysis_profile,
-        "condition_order": list(condition_order),
+        "condition_order": condition_order,
         "source": {"path": str(data_path.resolve()), "sha256": data_hash},
         "selection": {
             "path": str(selection_path.resolve()),
@@ -519,49 +538,73 @@ def prepare_manifest(
         "S": sum(len(sample["sites"]) for sample in samples),
         "N": sum(len(site["target_positions"]) for sample in samples for site in sample["sites"]),
     }
-    if image_token_contract is not None:
-        manifest["image_token_contract"] = image_token_contract
+    if image_contract is not None:
+        manifest["image_token_contract"] = image_contract
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
 
 
+def _manifest_profile(manifest: dict) -> str:
+    profile = manifest.get("analysis_profile")
+    condition_order = manifest.get("condition_order")
+    has_image_metadata = "image_token_contract" in manifest or any(
+        "original_image_positions" in record
+        for record in manifest.get("samples", [])
+        if type(record) is dict
+    )
+    if profile is None:
+        if condition_order is not None:
+            raise ValueError("manifest profile metadata is incomplete")
+        if has_image_metadata:
+            raise ValueError("image metadata requires the image profile")
+        return DEFAULT_PROFILE
+    expected_order = list(conditions_for_profile(profile))
+    if condition_order != expected_order:
+        raise ValueError("manifest condition order does not match its analysis profile")
+    if profile == IMAGE_PROFILE:
+        return profile
+    if has_image_metadata:
+        raise ValueError("image metadata requires the image profile")
+    return profile
+
+
+def _persisted_image_contract(manifest: dict, processor) -> dict[str, int]:
+    persisted = manifest.get("image_token_contract")
+    if type(persisted) is not dict or set(persisted) != set(_IMAGE_CONTRACT_FIELDS):
+        raise ValueError("image token contract is missing or malformed")
+    try:
+        persisted = _validate_image_contract_values(**persisted)
+    except (TypeError, ValueError) as error:
+        raise ValueError("image token contract is malformed") from error
+    actual = processor_image_contract(processor)
+    if persisted != actual:
+        raise ValueError("image token contract changed")
+    return actual
+
+
+def _persisted_image_positions(record: dict) -> tuple[int, ...]:
+    positions = record.get("original_image_positions")
+    if (
+        type(positions) is not list
+        or not positions
+        or any(type(position) is not int or position < 0 for position in positions)
+        or positions != sorted(set(positions))
+    ):
+        raise ValueError("persisted image positions are malformed")
+    return tuple(positions)
+
+
 def load_prepared_samples(manifest, processor, image_root) -> Iterator[PreparedSample]:
     """Re-prepare manifest samples and reject any changed input or target identity."""
-    if manifest.get("schema_version") != 1:
+    if type(manifest) is not dict or manifest.get("schema_version") != 1:
         raise ValueError("unsupported vision-block manifest schema")
-    analysis_profile = manifest.get("analysis_profile", DEFAULT_PROFILE)
-    condition_order = conditions_for_profile(analysis_profile)
-    persisted_order = manifest.get("condition_order")
-    if persisted_order is not None and (
-        type(persisted_order) is not list or tuple(persisted_order) != condition_order
-    ):
-        raise ValueError("manifest condition order does not match analysis profile")
-
-    sample_records = manifest.get("samples", [])
-    has_image_metadata = "image_token_contract" in manifest or (
-        isinstance(sample_records, list)
-        and any(
-            isinstance(record, dict) and "original_image_positions" in record
-            for record in sample_records
-        )
+    analysis_profile = _manifest_profile(manifest)
+    image_contract = (
+        _persisted_image_contract(manifest, processor)
+        if analysis_profile == IMAGE_PROFILE
+        else None
     )
-    if analysis_profile != IMAGE_PROFILE and has_image_metadata:
-        raise ValueError("image metadata requires the image analysis profile")
-
-    image_token_contract = None
-    if analysis_profile == IMAGE_PROFILE:
-        if persisted_order is None:
-            raise ValueError("image profile manifest lacks condition order")
-        image_token_contract = processor_image_contract(processor)
-        persisted_contract = manifest.get("image_token_contract")
-        if (
-            type(persisted_contract) is not dict
-            or set(persisted_contract) != set(image_token_contract)
-            or any(type(value) is not int for value in persisted_contract.values())
-            or persisted_contract != image_token_contract
-        ):
-            raise ValueError("image token contract changed")
     if "rows" in manifest:
         rows = manifest["rows"]
     else:
@@ -592,15 +635,14 @@ def load_prepared_samples(manifest, processor, image_root) -> Iterator[PreparedS
             or persisted_sites != sample.sites
         ):
             raise ValueError(f"input/span/target identity changed for source index {index}")
-        if image_token_contract is not None:
-            persisted_positions = record.get("original_image_positions")
-            actual_positions = original_image_positions(sample, **image_token_contract)
-            if (
-                type(persisted_positions) is not list
-                or any(type(position) is not int for position in persisted_positions)
-                or tuple(persisted_positions) != actual_positions
-            ):
+        if image_contract is not None:
+            try:
+                persisted_positions = _persisted_image_positions(record)
+                actual_positions = original_image_positions(sample, **image_contract)
+            except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(
-                    f"original image positions changed for source index {index}"
-                )
+                    f"image identity changed for source index {index}"
+                ) from error
+            if persisted_positions != actual_positions:
+                raise ValueError(f"image identity changed for source index {index}")
         yield sample
