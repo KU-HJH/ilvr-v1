@@ -218,7 +218,7 @@ def real_cases(args, processor):
     return cases
 
 
-def real_models(args, processor, supplied):
+def real_models(args, processor, supplied, *, verify_initial_state=True):
     import torch
     from stage2.attention_backend import load_qwen2_5_vl_with_attention
     from stage2.checkpointing import configure_stage2_metadata
@@ -244,7 +244,8 @@ def real_models(args, processor, supplied):
         model.gradient_checkpointing_disable()
         models.append(model.train())
     # Fail rather than copy over a loading mismatch and conceal it.
-    verify_model_identity(*models)
+    if verify_initial_state:
+        verify_model_identity(*models)
     # Actual DeepSpeed BF16 initialization casts the whole module, including PEFT adapters.
     return [model.to(device=args.device, dtype=torch.bfloat16) for model in models]
 
