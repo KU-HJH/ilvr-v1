@@ -167,6 +167,27 @@ def prepare_sample(
                 )
             ]
 
+    mapping_kwargs = {
+        "rendered_text": expanded_text,
+        "assistant_text": prepared.conversation[1]["content"][0]["text"],
+        "plan_char_spans": prepared.plan_char_spans,
+        "offset_mapping": offsets,
+        "input_ids": batch["input_ids"],
+        "latent_pad_token_id": token_ids.pad_token_id,
+        "preference_target_scope": "immediate_text",
+    }
+    try:
+        map_reasoning_step_spans(reasoning_steps=(), **mapping_kwargs)
+    except ValueError as error:
+        return None, [
+            _exclusion(
+                source_index,
+                None,
+                "sample_span_mapping_invalid",
+                str(error),
+            )
+        ]
+
     eligible = {step.latent.plan_index: step for step in prepared.reasoning_steps}
     exclusions = []
     sites = []
@@ -186,14 +207,8 @@ def prepare_sample(
             continue
         try:
             mapped = map_reasoning_step_spans(
-                rendered_text=expanded_text,
-                assistant_text=prepared.conversation[1]["content"][0]["text"],
-                plan_char_spans=prepared.plan_char_spans,
                 reasoning_steps=(step,),
-                offset_mapping=offsets,
-                input_ids=batch["input_ids"],
-                latent_pad_token_id=token_ids.pad_token_id,
-                preference_target_scope="immediate_text",
+                **mapping_kwargs,
             )[0]
         except ValueError as error:
             exclusions.append(
@@ -281,6 +296,34 @@ def _category(row: dict) -> str:
     return matches[0]
 
 
+def _load_site_record(record: dict) -> Site:
+    scalar_fields = (
+        "source_index",
+        "plan_index",
+        "start",
+        "body_start",
+        "body_end",
+        "end",
+    )
+    sequence_fields = ("target_positions", "target_ids")
+    if (
+        type(record) is not dict
+        or set(record) != set(scalar_fields + sequence_fields)
+        or any(type(record[field]) is not int for field in scalar_fields)
+        or any(type(record[field]) not in (list, tuple) for field in sequence_fields)
+        or any(
+            type(value) is not int
+            for field in sequence_fields
+            for value in record[field]
+        )
+    ):
+        raise ValueError("persisted site has invalid fields or types")
+    return Site(
+        **{field: record[field] for field in scalar_fields},
+        **{field: tuple(record[field]) for field in sequence_fields},
+    )
+
+
 def prepare_manifest(data_path, selection_path, processor, image_root, output_path) -> dict:
     """Prepare the immutable selected cohort and write its replay manifest."""
     data_path, selection_path, output_path = map(
@@ -359,6 +402,17 @@ def load_prepared_samples(manifest, processor, image_root) -> Iterator[PreparedS
         sample, _ = prepare_sample(rows[index], index, processor, image_root)
         actual = _sample_identity(sample) if sample is not None else None
         expected = record.get("identity")
-        if not isinstance(expected, dict) or actual != expected:
+        try:
+            persisted_sites = tuple(_load_site_record(site) for site in record["sites"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"input/span/target identity changed for source index {index}"
+            ) from error
+        if (
+            not isinstance(expected, dict)
+            or actual != expected
+            or sample is None
+            or persisted_sites != sample.sites
+        ):
             raise ValueError(f"input/span/target identity changed for source index {index}")
         yield sample
