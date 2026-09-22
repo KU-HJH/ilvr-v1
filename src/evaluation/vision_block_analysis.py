@@ -11,7 +11,12 @@ from pathlib import Path
 import subprocess
 import sys
 
-from evaluation.vision_block_metrics import CONDITIONS, summarize
+from evaluation.vision_block_metrics import (
+    DEFAULT_PROFILE,
+    IMAGE_PROFILE,
+    conditions_for_profile,
+    summarize,
+)
 
 
 MATH_POLICY = dict(sdpa_math=True, sdpa_flash=False, sdpa_mem_efficient=False,
@@ -62,15 +67,45 @@ def _expected(manifest):
     return expected
 
 
+def _require_profile(document, analysis_profile):
+    """Bind persisted analysis evidence to its explicit condition profile."""
+    wanted = conditions_for_profile(analysis_profile)
+    stored = document.get('analysis_profile', DEFAULT_PROFILE)
+    if stored != analysis_profile:
+        raise ValueError('analysis profile mismatch')
+    order = document.get('condition_order')
+    if order is None and analysis_profile == DEFAULT_PROFILE:
+        return
+    if order != list(wanted):
+        raise ValueError('analysis condition order mismatch')
+
+
+def _image_truth(manifest, source_index):
+    if manifest.get('analysis_profile') != IMAGE_PROFILE:
+        return None, None
+    record = next((sample for sample in manifest['samples']
+                   if sample['source_index'] == source_index), None)
+    if record is None:
+        raise ValueError('sample does not belong to image manifest')
+    positions = record.get('original_image_positions')
+    contract = manifest.get('image_token_contract')
+    if (type(positions) is not list or not positions
+            or any(type(position) is not int or position < 0 for position in positions)
+            or positions != sorted(set(positions)) or type(contract) is not dict):
+        raise ValueError('image manifest truth is malformed')
+    return positions, contract
+
+
 def _load_processor(args):
     from transformers import AutoProcessor
     return AutoProcessor.from_pretrained(str(args.model_dir), local_files_only=True,
                                         cache_dir=str(_repository_root()/'data/cache'))
 
 
-def _prepare(args, processor):
+def _prepare(args, processor, *, analysis_profile=DEFAULT_PROFILE):
     from evaluation.vision_block_inputs import prepare_manifest
-    return prepare_manifest(args.data, args.selection, processor, args.image_root, args.manifest)
+    return prepare_manifest(args.data, args.selection, processor, args.image_root, args.manifest,
+                            analysis_profile=analysis_profile)
 
 
 def _processor_identity(processor):
@@ -101,6 +136,16 @@ def _load_runtime(args):
     for parameter in model.parameters():
         dtype = str(parameter.dtype)
         dtypes[dtype] = dtypes.get(dtype, 0) + parameter.numel()
+    image_contract = None
+    try:
+        image_contract = {
+            'image_token_id': qwen.config.image_token_id,
+            'vision_start_token_id': qwen.config.vision_start_token_id,
+            'vision_end_token_id': qwen.config.vision_end_token_id,
+            'merge_size': qwen.config.vision_config.spatial_merge_size,
+        }
+    except AttributeError:
+        pass
     runtime = {'parameter_dtypes': dtypes, 'cuda': torch.version.cuda,
         'cudnn': torch.backends.cudnn.version(), 'gpu': torch.cuda.get_device_name(0),
         'visible_devices': os.environ['CUDA_VISIBLE_DEVICES'],
@@ -108,7 +153,7 @@ def _load_runtime(args):
         'vision_backend': qwen.visual.config._attn_implementation,
         'stage': qwen.config.stage, 'latent_size': qwen.config.latent_size,
         'execution_strategy': 'full_length_v2',
-        'decoder_layers': len(qwen.model.layers)}
+        'decoder_layers': len(qwen.model.layers), 'image_token_contract': image_contract}
     return model, processor, runtime
 
 
@@ -154,22 +199,29 @@ def _samples(manifest, processor, image_root):
     return load_prepared_samples(manifest, processor, image_root)
 
 
-def _analyze(model, sample, repeat_clean=False):
+def _analyze(model, sample, repeat_clean=False, *, analysis_profile=DEFAULT_PROFILE):
     import torch
     from evaluation.vision_block_runtime import analyze_sample, capture_clean, build_replay_inputs
+    conditions = conditions_for_profile(analysis_profile)
     with torch.inference_mode():
         if repeat_clean:
             # Verify masks and original position columns on real captured GPU tensors.
-            state = capture_clean(model, sample)
+            state = capture_clean(model, sample, analysis_profile=analysis_profile)
             for site in sample.sites:
-                for condition in CONDITIONS:
-                    embeds, positions, mask = build_replay_inputs(state, site, condition)
+                for condition in conditions:
+                    embeds, positions, mask = build_replay_inputs(
+                        state, site, condition, analysis_profile=analysis_profile)
                     length = state.embeds.shape[1]
                     if not torch.equal(positions, state.positions):
                         raise ValueError('replay changed original position columns')
-                    blocked = set(range(site.body_start, site.body_end)) if condition in ('body_mask', 'full_mask') else set()
-                    if condition in ('boundary_mask', 'full_mask'):
-                        blocked.add(site.start)
+                    if analysis_profile == IMAGE_PROFILE:
+                        blocked = set() if condition == 'clean' else set(state.image_positions)
+                        if condition == 'image_body_mask':
+                            blocked.update(range(site.body_start, site.body_end))
+                    else:
+                        blocked = set(range(site.body_start, site.body_end)) if condition in ('body_mask', 'full_mask') else set()
+                        if condition in ('boundary_mask', 'full_mask'):
+                            blocked.add(site.start)
                     expected = torch.tensor([
                         [key <= query and (query < site.end or key not in blocked)
                          for key in range(length)]
@@ -177,12 +229,13 @@ def _analyze(model, sample, repeat_clean=False):
                     if not torch.equal(torch.isfinite(mask[0, 0]), expected):
                         raise ValueError('replay visibility differs from literal site contract')
                     expected_embeds = state.embeds.clone()
-                    if condition in ('boundary_mask', 'full_mask'):
+                    if analysis_profile != IMAGE_PROFILE and condition in ('boundary_mask', 'full_mask'):
                         expected_embeds[:, site.end] = 0
                     if not torch.equal(embeds, expected_embeds):
                         raise ValueError('replayed END embedding differs from condition contract')
             del state
-        rows, witness = analyze_sample(model, sample, repeat_clean=repeat_clean)
+        rows, witness = analyze_sample(model, sample, repeat_clean=repeat_clean,
+                                       analysis_profile=analysis_profile)
         if repeat_clean:
             witness['visibility_positions'] = True
         return rows, witness
@@ -210,7 +263,39 @@ def _validate_prefix_records(records, sites, layers, conditions):
             raise ValueError('failed prefix identity witness')
 
 
-def _validate_witness(witness, *, sites, layers, repeat=False):
+def _validate_image_visibility(records, sites, layers, image_positions):
+    expected = {}
+    for condition in conditions_for_profile(IMAGE_PROFILE):
+        for site in sites:
+            blocked = set() if condition == 'clean' else set(image_positions)
+            if condition == 'image_body_mask':
+                blocked.update(range(_site_field(site, 'body_start'), _site_field(site, 'body_end')))
+            expected[(_site_field(site, 'plan_index'), condition)] = {
+                'query_start': _site_field(site, 'end'),
+                'query_stop': _site_field(site, 'target_positions')[-1],
+                'blocked_positions': sorted(blocked),
+            }
+    if not isinstance(records, list):
+        raise ValueError('incomplete image visibility coverage')
+    try:
+        actual = {(record['plan_index'], record['condition']): record for record in records}
+    except (KeyError, TypeError):
+        raise ValueError('incomplete image visibility coverage') from None
+    if len(actual) != len(records) or actual.keys() != expected.keys():
+        raise ValueError('incomplete image visibility coverage')
+    for key, wanted in expected.items():
+        record = actual[key]
+        if (record.get('query_start') != wanted['query_start']
+                or record.get('query_stop') != wanted['query_stop']
+                or record.get('blocked_positions') != wanted['blocked_positions']
+                or record.get('layers_observed') != layers or record.get('exact') is not True
+                or record.get('embeddings_unchanged') is not True):
+            raise ValueError('failed image visibility witness')
+
+
+def _validate_witness(witness, *, sites, layers, repeat=False,
+                      analysis_profile=DEFAULT_PROFILE, image_positions=None,
+                      image_token_contract=None):
     if witness.get('finite') is not True:
         raise ValueError('nonfinite or missing runtime witness')
     if witness['positions_shape'] != [3, 1, witness['embeds_shape'][1]]:
@@ -219,10 +304,20 @@ def _validate_witness(witness, *, sites, layers, repeat=False):
         raise ValueError('invalid execution strategy witness')
     if witness.get('numerical_policy') != MATH_POLICY:
         raise ValueError('invalid numerical policy witness')
-    _validate_prefix_records(witness.get('prefix_identity'), sites, layers, CONDITIONS)
+    conditions = conditions_for_profile(analysis_profile)
+    _validate_prefix_records(witness.get('prefix_identity'), sites, layers, conditions)
+    if analysis_profile == IMAGE_PROFILE:
+        _require_profile(witness, analysis_profile)
+        if witness.get('original_image_positions') != image_positions:
+            raise ValueError('image witness positions differ from manifest')
+        if witness.get('image_token_contract') != image_token_contract:
+            raise ValueError('image witness token contract differs from manifest')
+        _validate_image_visibility(witness.get('visibility_identity'), sites, layers, image_positions)
     names = ['normal_vs_captured', 'normal_vs_replay', 'captured_vs_replay']
     if repeat:
         names += ['repeat_clean', 'repeat_normal', 'repeat_captured']
+        if analysis_profile == IMAGE_PROFILE:
+            names += ['repeat_normal_vs_captured']
         if witness.get('visibility_positions') is not True:
             raise ValueError('missing visibility/position assertions')
         _validate_prefix_records(witness.get('repeat_prefix_identity'), sites, layers, ('clean',))
@@ -253,7 +348,7 @@ def _check_protocol(manifest):
         raise ValueError('manifest does not preserve fixed 100-sample selection')
 
 
-def _smoke(args, manifest, model, processor, identity, layers):
+def _smoke(args, manifest, model, processor, identity, layers, *, analysis_profile=DEFAULT_PROFILE):
     single = multi = None
     ordered = dict(manifest, samples=sorted(manifest['samples'], key=lambda s: s['source_index']))
     for sample in _samples(ordered, processor, args.image_root):
@@ -268,16 +363,22 @@ def _smoke(args, manifest, model, processor, identity, layers):
         single = replace(multi, sites=multi.sites[:1])
     cases = []
     for label, sample in [('single', single), ('multi', multi)]:
-        rows, witness = _analyze(model, sample, repeat_clean=True)
-        _validate_witness(witness, sites=sample.sites, layers=layers, repeat=True)
-        summarize(rows, _case_expected(sample))
+        positions, contract = _image_truth(manifest, sample.source_index)
+        rows, witness = _analyze(model, sample, repeat_clean=True, analysis_profile=analysis_profile)
+        _validate_witness(witness, sites=sample.sites, layers=layers, repeat=True,
+                          analysis_profile=analysis_profile, image_positions=positions,
+                          image_token_contract=contract)
+        summarize(rows, _case_expected(sample), analysis_profile=analysis_profile)
         cases.append({'case': label, 'source_index': sample.source_index,
                       'plan_indices': [s.plan_index for s in sample.sites], 'witness': witness})
-    _write(args.output_dir/'smoke.json', {'status': 'passed', 'identity': identity,
+    _write(args.output_dir/'smoke.json', {'status': 'passed', 'analysis_profile': analysis_profile,
+        'condition_order': list(conditions_for_profile(analysis_profile)), 'identity': identity,
         'manifest_sha256': _hash(args.manifest), 'single_site_fallback': fallback, 'cases': cases})
 
 
-def _validate_gate(gate, identity, manifest_hash, manifest):
+def _validate_gate(gate, identity, manifest_hash, manifest, *, analysis_profile=DEFAULT_PROFILE):
+    _require_profile(gate, analysis_profile)
+    _require_profile(gate.get('identity', {}), analysis_profile)
     if gate.get('status') != 'passed':
         raise ValueError('smoke gate did not pass')
     if gate.get('identity') != identity or gate.get('manifest_sha256') != manifest_hash:
@@ -302,23 +403,42 @@ def _validate_gate(gate, identity, manifest_hash, manifest):
         raise ValueError('invalid decoder layer identity')
     expected_sites = ([single['sites'][0]], multi['sites'])
     for case, sites in zip(cases, expected_sites):
-        _validate_witness(case['witness'], sites=sites, layers=layers, repeat=True)
+        positions, contract = _image_truth(manifest, case['source_index'])
+        _validate_witness(case['witness'], sites=sites, layers=layers, repeat=True,
+                          analysis_profile=analysis_profile, image_positions=positions,
+                          image_token_contract=contract)
 
 
-def _report(args, manifest, expected):
+def _report(args, manifest, expected, *, analysis_profile=DEFAULT_PROFILE):
     status = _read(args.output_dir/'status.json')
     if status.get('status') != 'completed' or status.get('manifest_sha256') != _hash(args.manifest):
         raise ValueError('offline summary requires completed inference for the same manifest')
+    _require_profile(manifest, analysis_profile)
+    _require_profile(status, analysis_profile)
+    identity = status.get('identity')
+    if identity is None and analysis_profile == DEFAULT_PROFILE:
+        model_label = 'unavailable (legacy run)'
+    else:
+        _require_profile(identity or {}, analysis_profile)
+        model = (identity or {}).get('model', {})
+        model_label = model.get('path') if isinstance(model, dict) else None
+        if not isinstance(model_label, str) or not model_label:
+            model_label = 'unavailable'
     rows = [json.loads(line) for line in (args.output_dir/'tokens.jsonl').read_text().splitlines() if line.strip()]
-    summary = summarize(rows, expected)
+    summary = summarize(rows, expected, analysis_profile=analysis_profile)
     summary['exclusions'] = manifest['exclusions']
+    summary['analysis_profile'] = analysis_profile
+    summary['condition_order'] = list(conditions_for_profile(analysis_profile))
+    summary['model_label'] = model_label
     _write(args.output_dir/'summary.json', summary)
     with (args.output_dir/'summary.csv').open('w', newline='', encoding='utf-8') as stream:
         writer = csv.writer(stream)
         writer.writerow(['condition', 'S', 'N', 'first_changed', 'any_changed', 'tokens_changed', 'mean_nll', 'delta_nll'])
         for condition, metrics in summary['conditions'].items():
-            writer.writerow([condition, summary['sites'], summary['tokens'], *metrics.values()])
-    lines = ['# CE vision-block 분석', '',
+            writer.writerow([condition, summary['sites'], summary['tokens'],
+                             metrics['first_changed'], metrics['any_changed'], metrics['tokens_changed'],
+                             metrics['mean_nll'], metrics['delta_nll']])
+    lines = ['# Vision analysis', '', f'Profile: {analysis_profile}; model: {model_label}.', '',
              f"S={summary['sites']} 사이트, N={summary['tokens']} 토큰; 제외 항목={len(manifest['exclusions'])}.", '',
              '| 조건 | 첫 토큰 변화 | 사이트 내 하나 이상 변화 | 전체 토큰 변화 | 평균 NLL (nat) | ΔNLL (clean 대비) |',
              '|---|---:|---:|---:|---:|---:|']
@@ -329,7 +449,9 @@ def _report(args, manifest, expected):
         lines.append(f"| {condition} | {' | '.join(fractions)} | {metrics['mean_nll']:.6f} | {metrics['delta_nll']:+.6f} |")
     lines += ['', '각 사이트는 동일한 clean prefix와 정답 토큰을 사용하여 독립적으로 teacher forcing했습니다. '
               'NLL은 FP32 log-softmax의 자연로그 토큰 평균이며 ΔNLL은 조건 평균 − clean 평균입니다.', '',
-              '원본 이미지 접근은 유지되며, 앞선 hidden/KV 및 다른 Body의 이미지 정보는 남아 있습니다. '
+              ('원본 이미지 직접 접근은 차단되지만 clean 이력의 간접 정보는 남아 있습니다. '
+               if analysis_profile == IMAGE_PROFILE else
+               '원본 이미지 접근은 유지되며, 앞선 hidden/KV 및 다른 Body의 이미지 정보는 남아 있습니다. '),
               '따라서 국소 attention 차단은 전체 이미지 정보 제거를 뜻하지 않습니다. '
               'Body는 clean 실행에서 한 번 생성한 이력을 재사용하며 조건별로 재생성하지 않습니다.', '']
     (args.output_dir/'report.md').write_text('\n'.join(lines), encoding='utf-8')
@@ -342,6 +464,8 @@ def _parser():
     for name in ('prepare', 'smoke', 'run', 'summarize'):
         command = commands.add_parser(name)
         command.add_argument('--manifest', type=Path, required=True)
+        command.add_argument('--analysis-profile', default=DEFAULT_PROFILE,
+                             choices=(DEFAULT_PROFILE, IMAGE_PROFILE))
         if name != 'summarize':
             command.add_argument('--model-dir', type=Path, required=True)
             command.add_argument('--base-model-dir', type=Path, required=True)
@@ -375,7 +499,8 @@ def main(argv=None):
             if args.manifest.exists():
                 raise ValueError('manifest already exists; use a fresh run ID')
             args.manifest.parent.mkdir(parents=True, exist_ok=True)
-            manifest = _prepare(args, _load_processor(args))
+            manifest = _prepare(args, _load_processor(args), analysis_profile=args.analysis_profile)
+            _require_profile(manifest, args.analysis_profile)
             _expected(manifest)
             print(json.dumps({'S': manifest['S'], 'N': manifest['N'], 'exclusions': len(manifest['exclusions'])}))
             return 0
@@ -383,9 +508,10 @@ def main(argv=None):
         relative = args.output_dir.relative_to((root/'results').resolve())
         args.log_dir = _within(args.log_dir or root/'logs'/relative, root/'logs')
         manifest = _read(args.manifest)
+        _require_profile(manifest, args.analysis_profile)
         expected = _expected(manifest)
         if args.command == 'summarize':
-            _report(args, manifest, expected)
+            _report(args, manifest, expected, analysis_profile=args.analysis_profile)
             return 0
         _check_protocol(manifest)
         for directory in (args.output_dir, args.log_dir):
@@ -397,8 +523,13 @@ def main(argv=None):
         owned_output = True
         log_path.write_text(f'{args.command} starting\n', encoding='utf-8')
         if args.command == 'run':
-            _write(args.output_dir/'status.json', {'status': 'incomplete', 'manifest_sha256': _hash(args.manifest)})
+            _write(args.output_dir/'status.json', {'status': 'incomplete',
+                'analysis_profile': args.analysis_profile,
+                'condition_order': list(conditions_for_profile(args.analysis_profile)),
+                'manifest_sha256': _hash(args.manifest)})
             gate = _read(_within(args.smoke_report, root/'results'))
+            _require_profile(gate, args.analysis_profile)
+            _require_profile(gate.get('identity', {}), args.analysis_profile)
             if gate.get('status') != 'passed' or gate.get('manifest_sha256') != _hash(args.manifest):
                 raise ValueError('smoke gate failed or manifest identity changed')
         from evaluation.vision_block_runtime import numerical_policy
@@ -412,21 +543,33 @@ def main(argv=None):
                 if _processor_identity(processor) != manifest['processor']:
                     raise ValueError('manifest processor identity changed')
                 identity = _execution_identity(args, processor, runtime)
+                identity.update(analysis_profile=args.analysis_profile,
+                                condition_order=list(conditions_for_profile(args.analysis_profile)))
                 _validate_runtime_policy(identity.get('runtime'))
+                if args.analysis_profile == IMAGE_PROFILE:
+                    contract = manifest.get('image_token_contract')
+                    if runtime.get('image_token_contract') != contract:
+                        raise ValueError('loaded model image token contract differs from manifest')
                 _write(args.output_dir/'identity.json', identity)
                 layers = runtime.get('decoder_layers')
                 if type(layers) is not int or layers <= 0:
                     raise ValueError('invalid decoder layer identity')
                 if args.command == 'smoke':
-                    _smoke(args, manifest, model, processor, identity, layers)
+                    _smoke(args, manifest, model, processor, identity, layers,
+                           analysis_profile=args.analysis_profile)
                 else:
-                    _validate_gate(gate, identity, _hash(args.manifest), manifest)
+                    _validate_gate(gate, identity, _hash(args.manifest), manifest,
+                                   analysis_profile=args.analysis_profile)
                     all_rows, completed_sites = [], 0
                     with (args.output_dir/'tokens.jsonl').open('x', encoding='utf-8') as tokens, \
                          (args.output_dir/'sites.jsonl').open('x', encoding='utf-8') as sites:
                         for completed, sample in enumerate(_samples(manifest, processor, args.image_root), 1):
-                            rows, witness = _analyze(model, sample)
-                            _validate_witness(witness, sites=sample.sites, layers=layers)
+                            positions, contract = _image_truth(manifest, sample.source_index)
+                            rows, witness = _analyze(model, sample, analysis_profile=args.analysis_profile)
+                            _validate_witness(witness, sites=sample.sites, layers=layers,
+                                              analysis_profile=args.analysis_profile,
+                                              image_positions=positions,
+                                              image_token_contract=contract)
                             for row in rows:
                                 tokens.write(json.dumps(row, allow_nan=False) + '\n')
                             tokens.flush()
@@ -434,7 +577,8 @@ def main(argv=None):
                             for site in sample.sites:
                                 site_rows = [r for r in rows if r['plan_index'] == site.plan_index]
                                 site_summary = summarize(site_rows, {(sample.source_index, site.plan_index):
-                                                               tuple(zip(site.target_positions, site.target_ids))})
+                                    tuple(zip(site.target_positions, site.target_ids))},
+                                    analysis_profile=args.analysis_profile)
                                 sites.write(json.dumps({'source_index': sample.source_index, 'plan_index': site.plan_index,
                                                         'metrics': site_summary, 'witness': witness}, allow_nan=False) + '\n')
                             sites.flush()
@@ -443,9 +587,12 @@ def main(argv=None):
                             print(progress, flush=True)
                             with log_path.open('a') as log:
                                 log.write(progress + '\n')
-                    summarize(all_rows, expected)
+                    summarize(all_rows, expected, analysis_profile=args.analysis_profile)
                     _write(args.output_dir/'exclusions.json', manifest['exclusions'])
-                    _write(args.output_dir/'status.json', {'status': 'completed', 'manifest_sha256': _hash(args.manifest),
+                    _write(args.output_dir/'status.json', {'status': 'completed',
+                        'analysis_profile': args.analysis_profile,
+                        'condition_order': list(conditions_for_profile(args.analysis_profile)),
+                        'identity': identity, 'manifest_sha256': _hash(args.manifest),
                         'samples': len(manifest['samples']), 'S': manifest['S'], 'N': manifest['N']})
         with log_path.open('a') as log:
             log.write(f'{args.command} completed\n')

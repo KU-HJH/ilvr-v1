@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 import importlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -13,6 +14,12 @@ import pytest
 
 from evaluation import vision_block_analysis as cli
 from evaluation.vision_block_inputs import PreparedSample, Site
+from evaluation.vision_block_metrics import (
+    DEFAULT_PROFILE,
+    IMAGE_CONDITIONS,
+    IMAGE_PROFILE,
+    conditions_for_profile,
+)
 
 
 REAL_LOAD_RUNTIME = cli._load_runtime
@@ -33,7 +40,11 @@ def cohort(tmp_path, monkeypatch):
              Site(4, 3, 12, 13, 21, 21, (22,), (30,)))
     samples = [PreparedSample(4, {}, sites),
                PreparedSample(2, {}, (Site(2, 1, 0, 1, 9, 9, (10,), (10,)),))]
-    manifest = {'schema_version': 1, 'S': 3, 'N': 4, 'exclusions': [],
+    image_contract = dict(image_token_id=80, vision_start_token_id=78,
+                          vision_end_token_id=79, merge_size=1)
+    manifest = {'schema_version': 1, 'analysis_profile': DEFAULT_PROFILE,
+                'condition_order': list(conditions_for_profile(DEFAULT_PROFILE)),
+                'S': 3, 'N': 4, 'exclusions': [],
                 'source': {'sha256': '6a1dccf32bb5196d09941adfd8ea79e29b58c34316f286673b557ed29dc69618'},
                 'selection': {'sha256': 'fb1f15fef5339abde6ba74d140e5f9a1f8823cedafe8aef1d4bb245a8e0286aa',
                               'requested_indices': list(range(100)),
@@ -45,42 +56,70 @@ def cohort(tmp_path, monkeypatch):
     model = tmp_path / 'checkpoints/model'
     model.mkdir()
     monkeypatch.setattr(cli, '_load_processor', lambda args: object())
-    def prepare(args, processor):
+    def prepare(args, processor, *, analysis_profile=DEFAULT_PROFILE):
+        manifest['analysis_profile'] = analysis_profile
+        manifest['condition_order'] = list(conditions_for_profile(analysis_profile))
+        if analysis_profile == IMAGE_PROFILE:
+            manifest['image_token_contract'] = copy.deepcopy(image_contract)
+            for record in manifest['samples']:
+                record['original_image_positions'] = [2, 3]
+        else:
+            manifest.pop('image_token_contract', None)
+            for record in manifest['samples']:
+                record.pop('original_image_positions', None)
         args.manifest.write_text(json.dumps(manifest))
         return manifest
     monkeypatch.setattr(cli, '_prepare', prepare)
     runtime_identity = {'parameter_dtypes': {'torch.bfloat16': 1},
                         'numerical_policy': copy.deepcopy(MATH_POLICY),
                         'tf32_matmul': False, 'tf32_cudnn': False,
-                        'execution_strategy': 'full_length_v2', 'decoder_layers': 2}
+                        'execution_strategy': 'full_length_v2', 'decoder_layers': 2,
+                        'image_token_contract': copy.deepcopy(image_contract)}
     monkeypatch.setattr(cli, '_load_runtime', lambda args: (object(), object(), copy.deepcopy(runtime_identity)))
     monkeypatch.setattr(cli, '_processor_identity', lambda processor: {'sha256': 'processor'})
     identity = {'model': 'model-v1', 'code': 'code-v1', 'software': 'software-v1',
                 'runtime': copy.deepcopy(runtime_identity)}
     monkeypatch.setattr(cli, '_execution_identity', lambda *args: copy.deepcopy(identity))
     monkeypatch.setattr(cli, '_samples', lambda *args: iter(samples))
-    def analyze(model, sample, repeat_clean=False):
+    def analyze(model, sample, repeat_clean=False, *, analysis_profile=DEFAULT_PROFILE):
         rows = []
-        for condition in ('clean', 'body_mask', 'boundary_mask', 'full_mask'):
+        conditions = conditions_for_profile(analysis_profile)
+        for condition in conditions:
             for site in sample.sites:
                 for pos, target in zip(site.target_positions, site.target_ids):
                     rows.append(dict(source_index=sample.source_index, plan_index=site.plan_index,
                         target_position=pos, target_id=target, condition=condition,
-                        argmax_id=target + int(condition == 'full_mask'),
-                        nll=1.0 + int(condition == 'full_mask')))
-        comparison = dict(tokens=len(rows)//4, argmax_mismatches=0,
+                        argmax_id=target + int(condition in ('full_mask', 'image_body_mask')),
+                        nll=1.0 + int(condition in ('full_mask', 'image_body_mask'))))
+        comparison = dict(tokens=len(rows)//len(conditions), argmax_mismatches=0,
                           max_nll_abs_diff=0., mean_nll_abs_diff=0.)
         witness = {key: comparison for key in ('normal_vs_captured', 'normal_vs_replay',
                    'captured_vs_replay', 'repeat_clean', 'repeat_normal', 'repeat_captured')}
         records = [dict(plan_index=site.plan_index, condition=condition,
                         prefix_length=site.end, layers=2, kv_comparisons=4, exact=True)
-                   for condition in ('clean', 'body_mask', 'boundary_mask', 'full_mask')
+                   for condition in conditions
                    for site in sample.sites]
         witness.update(finite=True, visibility_positions=True, source_index=sample.source_index,
                        positions_shape=[3, 1, 24], embeds_shape=[1, 24, 8],
                        execution_strategy='full_length_v2', numerical_policy=copy.deepcopy(MATH_POLICY),
                        prefix_identity=records,
                        repeat_prefix_identity=[record for record in records if record['condition'] == 'clean'])
+        if analysis_profile == IMAGE_PROFILE:
+            visibility = []
+            for condition in conditions:
+                for site in sample.sites:
+                    blocked = [] if condition == 'clean' else [2, 3]
+                    if condition == 'image_body_mask':
+                        blocked += list(range(site.body_start, site.body_end))
+                    visibility.append(dict(plan_index=site.plan_index, condition=condition,
+                        query_start=site.end, query_stop=site.target_positions[-1],
+                        blocked_positions=sorted(set(blocked)), layers_observed=2, exact=True,
+                        embeddings_unchanged=True))
+            witness.update(analysis_profile=IMAGE_PROFILE, condition_order=list(IMAGE_CONDITIONS),
+                           original_image_positions=[2, 3],
+                           image_token_contract=copy.deepcopy(image_contract),
+                           visibility_identity=visibility,
+                           repeat_normal_vs_captured=comparison)
         return rows, witness
     monkeypatch.setattr(cli, '_analyze', analyze)
     common = ['--model-dir', str(model), '--base-model-dir', str(model),
@@ -95,6 +134,36 @@ def cohort(tmp_path, monkeypatch):
             args += ['--smoke-report', str(tmp_path/'results/smoke/smoke.json')]
         return cli.main([*args, *extra])
     return tmp_path, manifest, samples, identity, invoke, analyze
+
+
+@pytest.mark.parametrize('command', ['prepare', 'smoke', 'run', 'summarize'])
+def test_all_commands_parse_image_profile(command):
+    # Catches a command silently falling back to the legacy condition set.
+    argv = [command, '--manifest', 'data/test/manifest.json',
+            '--analysis-profile', IMAGE_PROFILE]
+    if command != 'summarize':
+        argv += ['--model-dir', 'checkpoints/model', '--base-model-dir',
+                 'checkpoints/base', '--image-root', 'data']
+    if command == 'prepare':
+        argv += ['--data', 'data/TEST.jsonl', '--selection', 'results/selection.json']
+    else:
+        argv += ['--output-dir', 'results/test']
+    if command == 'run':
+        argv += ['--smoke-report', 'results/test-smoke/smoke.json']
+    assert cli._parser().parse_args(argv).analysis_profile == IMAGE_PROFILE
+
+
+def test_profile_binding_never_upgrades_legacy_document():
+    # Catches a legacy four-condition manifest authorizing the three-condition image run.
+    cli._require_profile({}, DEFAULT_PROFILE)
+    with pytest.raises(ValueError):
+        cli._require_profile({}, IMAGE_PROFILE)
+    good = dict(analysis_profile=IMAGE_PROFILE, condition_order=list(IMAGE_CONDITIONS))
+    cli._require_profile(good, IMAGE_PROFILE)
+    with pytest.raises(ValueError):
+        cli._require_profile(dict(good, condition_order=['clean']), IMAGE_PROFILE)
+    with pytest.raises(ValueError):
+        cli._require_profile(good, DEFAULT_PROFILE)
 
 
 @pytest.mark.parametrize('mutation', [
@@ -228,6 +297,134 @@ def test_actual_analyze_uses_full_length_v2_witnesses(two_sites):
     assert len(rows) == 4 * sum(len(site.target_ids) for site in sample.sites)
     cli._validate_witness(witness, sites=sample.sites, layers=2, repeat=True)
     assert witness['visibility_positions'] is True
+
+
+@pytest.mark.parametrize('two_sites', [False, True])
+def test_actual_analyze_binds_image_profile_to_live_witnesses(two_sites):
+    # Catches CLI replaying legacy conditions or trusting planner-only image evidence.
+    from tests.evaluation.test_vision_block_runtime import image_case
+
+    model, sample = image_case(two_sites)
+    rows, witness = cli._analyze(model, sample, repeat_clean=True,
+                                 analysis_profile=IMAGE_PROFILE)
+    target_count = sum(len(site.target_ids) for site in sample.sites)
+    assert len(rows) == 3 * target_count
+    assert witness['analysis_profile'] == IMAGE_PROFILE
+    assert witness['condition_order'] == list(IMAGE_CONDITIONS)
+    assert witness['original_image_positions'] == [2, 3]
+    assert witness['image_token_contract'] == dict(image_token_id=80,
+        vision_start_token_id=78, vision_end_token_id=79, merge_size=1)
+    assert len(witness['visibility_identity']) == 3 * len(sample.sites)
+    assert all(record['layers_observed'] == 2 and record['exact'] is True
+               and record['embeddings_unchanged'] is True
+               for record in witness['visibility_identity'])
+    assert witness['repeat_prefix_identity'] == [dict(plan_index=site.plan_index,
+        condition='clean', prefix_length=site.end, layers=2, kv_comparisons=4, exact=True)
+        for site in sample.sites]
+    assert witness['repeat_clean']['argmax_mismatches'] == 0
+    cli._validate_witness(witness, sites=sample.sites, layers=2, repeat=True,
+                          analysis_profile=IMAGE_PROFILE, image_positions=[2, 3],
+                          image_token_contract=witness['image_token_contract'])
+
+
+@pytest.mark.parametrize('mutation', [
+    'missing_visibility', 'duplicate_visibility', 'wrong_first_query',
+    'wrong_blocked_positions', 'missing_layer_observations', 'changed_embeddings',
+    'false_policy', 'wrong_contract',
+])
+def test_image_witness_rejects_mutated_live_evidence(cohort, mutation):
+    # Catches individual image witnesses being self-certified rather than checked against manifest truth.
+    _, _, samples, _, _, analyze = cohort
+    _, witness = analyze(None, samples[0], repeat_clean=True, analysis_profile=IMAGE_PROFILE)
+    if mutation == 'missing_visibility':
+        witness['visibility_identity'].pop()
+    elif mutation == 'duplicate_visibility':
+        witness['visibility_identity'][-1] = copy.deepcopy(witness['visibility_identity'][0])
+    elif mutation == 'wrong_first_query':
+        witness['visibility_identity'][0]['query_start'] += 1
+    elif mutation == 'wrong_blocked_positions':
+        witness['visibility_identity'][-1]['blocked_positions'] = [2]
+    elif mutation == 'missing_layer_observations':
+        witness['visibility_identity'][0]['layers_observed'] = 1
+    elif mutation == 'changed_embeddings':
+        witness['visibility_identity'][0]['embeddings_unchanged'] = False
+    elif mutation == 'false_policy':
+        witness['numerical_policy']['sdpa_math'] = False
+    else:
+        witness['image_token_contract']['image_token_id'] = 81
+    with pytest.raises(ValueError):
+        cli._validate_witness(witness, sites=samples[0].sites, layers=2, repeat=True,
+                              analysis_profile=IMAGE_PROFILE, image_positions=[2, 3],
+                              image_token_contract=dict(image_token_id=80,
+                                  vision_start_token_id=78, vision_end_token_id=79,
+                                  merge_size=1))
+
+
+def test_image_smoke_requires_matching_profile_before_model_work(cohort, monkeypatch):
+    # Catches a passed legacy smoke report authorizing an image-profile rollout.
+    root, _, _, _, invoke, _ = cohort
+    assert invoke('prepare', extra=['--analysis-profile', IMAGE_PROFILE]) == 0
+    assert invoke('smoke', 'smoke', ['--analysis-profile', IMAGE_PROFILE]) == 0
+    gate_path = root/'results/smoke/smoke.json'
+    gate = read(gate_path)
+    gate['analysis_profile'] = DEFAULT_PROFILE
+    gate['condition_order'] = list(conditions_for_profile(DEFAULT_PROFILE))
+    gate_path.write_text(json.dumps(gate))
+    monkeypatch.setattr(cli, '_load_runtime', lambda *args: (_ for _ in ()).throw(
+        AssertionError('profile gate must reject before loading a model')))
+    assert invoke('run', extra=['--analysis-profile', IMAGE_PROFILE]) == 1
+    assert read(root/'results/main/status.json')['status'] == 'incomplete'
+
+
+def test_offline_image_summary_does_not_import_torch_and_uses_execution_identity(tmp_path):
+    # Catches offline reporting importing model dependencies or inventing a model label/profile.
+    root = tmp_path
+    for name in ('data', 'results', 'logs', 'checkpoints', 'shadow'):
+        (root/name).mkdir()
+    manifest = {
+        'schema_version': 1, 'analysis_profile': IMAGE_PROFILE,
+        'condition_order': list(IMAGE_CONDITIONS), 'S': 1, 'N': 1, 'exclusions': [],
+        'samples': [{'source_index': 0, 'sites': [{'source_index': 0, 'plan_index': 1,
+            'target_positions': [7], 'target_ids': [8]}]}],
+    }
+    manifest_path = root/'data/manifest.json'
+    manifest_path.write_text(json.dumps(manifest))
+    output = root/'results/image'
+    output.mkdir()
+    output.joinpath('status.json').write_text(json.dumps({
+        'status': 'completed', 'manifest_sha256': cli._hash(manifest_path),
+        'analysis_profile': IMAGE_PROFILE, 'condition_order': list(IMAGE_CONDITIONS),
+        'identity': {'analysis_profile': IMAGE_PROFILE,
+                     'condition_order': list(IMAGE_CONDITIONS),
+                     'model': {'path': '/actual/checkpoints/model'}},
+    }))
+    output.joinpath('tokens.jsonl').write_text('\n'.join(json.dumps({
+        'source_index': 0, 'plan_index': 1, 'target_position': 7, 'target_id': 8,
+        'condition': condition, 'argmax_id': 8, 'nll': 1.0 + index,
+    }) for index, condition in enumerate(IMAGE_CONDITIONS)) + '\n')
+    (root/'shadow/torch.py').write_text('raise RuntimeError("torch must stay unloaded")\n')
+    source_root = Path(__file__).resolve().parents[2]
+    code = '''
+from pathlib import Path
+from evaluation import vision_block_analysis as cli
+cli._repository_root = lambda: Path(%r)
+raise SystemExit(cli.main(["summarize", "--manifest", %r, "--output-dir", %r,
+                           "--analysis-profile", "image-local-v1"]))
+''' % (str(root), str(manifest_path), str(output))
+    environment = dict(os.environ, PYTHONPATH=os.pathsep.join([
+        str(root/'shadow'), str(source_root/'transformers/src'), str(source_root/'src'), str(source_root)]))
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                            env=environment)
+    assert result.returncode == 0, result.stderr
+    summary = read(output/'summary.json')
+    assert summary['analysis_profile'] == IMAGE_PROFILE
+    assert summary['model_label'] == '/actual/checkpoints/model'
+    assert summary['condition_order'] == list(IMAGE_CONDITIONS)
+    assert set(summary['conditions']['image_body_mask']) == {
+        'first_changed', 'any_changed', 'tokens_changed', 'mean_nll', 'delta_nll'}
+    report = (output/'report.md').read_text()
+    assert '/actual/checkpoints/model' in report
+    assert '원본 이미지 직접 접근은 차단' in report
 
 
 def test_unknown_command_fails_before_loading_model():
