@@ -194,16 +194,18 @@ def test_loader_tf32_side_effect_is_reenforced_before_identity(cohort, monkeypat
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')
     monkeypatch.setattr(cli, '_execution_identity', lambda args, processor, runtime: {
         **copy.deepcopy(identity), 'runtime': copy.deepcopy(runtime)})
-    ambient = torch.backends.cuda.matmul.allow_tf32
+    original_ambient = torch.backends.cuda.matmul.allow_tf32
     try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        assert torch.backends.cuda.matmul.allow_tf32 is False
         assert invoke('smoke', 'smoke') == 0
+        assert torch.backends.cuda.matmul.allow_tf32 is False
         runtime_identity = read(root/'results/smoke/identity.json')['runtime']
         assert runtime_identity['numerical_policy'] == MATH_POLICY
         assert runtime_identity['tf32_matmul'] is False
         assert runtime_identity['tf32_cudnn'] is False
     finally:
-        torch.backends.cuda.matmul.allow_tf32 = ambient
-    assert torch.backends.cuda.matmul.allow_tf32 is ambient
+        torch.backends.cuda.matmul.allow_tf32 = original_ambient
 
 
 def test_clean_case_witness_cannot_redeem_wrong_runtime_identity(cohort):
