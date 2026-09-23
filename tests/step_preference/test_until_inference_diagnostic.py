@@ -110,6 +110,15 @@ def test_failed_rotary_first_nail_stops_attribution():
 
     assert result['status'] == 'failed'
     assert result['causal_attribution_allowed'] is False
+    with pytest.raises(RuntimeError, match='first nail failed'):
+        d.require_rotary_success({'status': 'failed_first_nail'})
+
+
+def test_rotary_mode_is_explicit_opt_in():
+    d = probe()
+    common = ['--output-dir', 'results/x', '--log-dir', 'logs/x']
+    assert d.parse_args(common).rotary_crossover is False
+    assert d.parse_args([*common, '--rotary-crossover']).rotary_crossover is True
 
 
 def test_selection_is_first_two_manifest_entries_not_sorted_by_effect():
@@ -127,7 +136,9 @@ def test_preflight_rejects_cpu_before_any_model_loading(tmp_path):
 
 
 @pytest.mark.parametrize('one_site', [False, True])
-def test_actual_mask_paths_and_layer_witnesses_on_separately_initialized_models(one_site):
+def test_actual_mask_paths_and_layer_witnesses_on_separately_initialized_models(
+    one_site, tmp_path, monkeypatch
+):
     d = probe()
     from scripts.verify_until_native import ExternalSource
     from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
@@ -191,11 +202,16 @@ def test_actual_mask_paths_and_layer_witnesses_on_separately_initialized_models(
                 states = d.common_state(local, local_native, sample, runtime)
                 own_report, own_logits = d.score_local_bank(
                     local, sample, states, runtime)
+                external_report, external_logits = d.score_external_bank(
+                    other, sample, other_native, external)
                 result = d.compare_paths(local, other, sample, states, runtime, external, backend='math')
         assert own_report['clean']['five_metrics']['delta_nll'] == 0
         assert own_report['body_mask']['first_end_changed'] == own_report['body_mask']['five_metrics']['first_changed']
         assert own_report['clean_repeat']['logits']['exact_equal']
         assert set(own_logits) == {'clean', 'body_mask'}
+        assert external_report['body_mask']['first_end_changed'] == external_report['body_mask']['five_metrics']['first_changed']
+        assert external_report['clean_repeat']['logits']['exact_equal']
+        assert set(external_logits) == {'clean', 'body_mask'}
         assert result['factors'] == {'backend': 'math', 'external_batching': ['per_site', 'packed_sites']}
         assert result['local']['clean_repeat']['logits']['exact_equal']
         assert result['external']['clean_repeat']['logits']['exact_equal']
@@ -215,6 +231,20 @@ def test_actual_mask_paths_and_layer_witnesses_on_separately_initialized_models(
         assert other.model.embed_tokens._forward_hooks == {}
         assert local.visual._forward_hooks == {}
         assert other.visual._forward_hooks == {}
+        if one_site:
+            grad_flags = []
+            real_rollout = d.native_rollout
+            def observed_rollout(*args, **kwargs):
+                grad_flags.append(torch.is_grad_enabled())
+                return real_rollout(*args, **kwargs)
+            monkeypatch.setattr(d, 'native_rollout', observed_rollout)
+            crossover = d.run_rotary_crossover(
+                local, other, [(sample, sample, {})], external, runtime,
+                tmp_path, lambda message: None)
+            assert crossover['status'] == 'failed_first_nail'
+            with pytest.raises(RuntimeError, match='first nail failed'):
+                d.require_rotary_success(crossover)
+            assert grad_flags and not any(grad_flags)
         import json
         json.dumps(result, allow_nan=False)
 
