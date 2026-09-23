@@ -420,3 +420,52 @@ def test_component_forward_values_must_reproduce_within_repeat_variation():
     assert result["gradient_reconstruction_within_observed_repeat_spread"] is True
     assert result["forward_reconstruction_within_observed_repeat_spread"] is False
     assert result["reconstruction_within_observed_repeat_spread"] is False
+
+
+@pytest.mark.parametrize("case", ["native_disconnected", "connected_without_checkpoints", "missing_capture"])
+def test_component_cell_preserves_validated_native_disconnection_but_rejects_invalid_measurement(case):
+    # A real reducer's detached preference must survive aggregation; broken instrumentation must not.
+    d = diagnostic()
+    reducer = native_reducer_fixture()
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Linear(1, 1, bias=False)
+            with torch.no_grad():
+                self.layer.weight.fill_(2.)
+        def forward(self, input_ids):
+            x = input_ids.float()
+            value = (self.layer(x) if case == "connected_without_checkpoints" else
+                     checkpoint(self.layer, x, use_reentrant=False))
+            score = value.sum() if case == "connected_without_checkpoints" else torch.tensor(2.)
+            return SimpleNamespace(loss=value.square().sum(), score=score)
+    class Trainer:
+        step_preference_config = reducer.step_preference_config
+        _reduce_context_objective = type(reducer)._reduce_context_objective
+        def compute_loss(self, model, inputs, return_outputs=False):
+            output = model(**inputs)
+            if case == "missing_capture":
+                return output.loss
+            return self._reduce_context_objective(output.loss, [output.score], [output.score.reshape(1)*0],
+                {(0, "visual"): {"mean_logp": -output.score, "entropies": output.score.reshape(1)*0}})[0]
+    model = Model()
+    batch = {"input_ids": torch.tensor([[1]])}
+    if case != "native_disconnected":
+        with pytest.raises(ValueError, match="coverage" if case == "connected_without_checkpoints" else "capture"):
+            d.run_component_cell(model, Trainer(), batch, "cpu", [])
+        return
+    result = d.run_component_cell(model, Trainer(), batch, "cpu", [])
+    assert all(len(rows) == 3 for rows in result["runs"].values())
+    for row in result["runs"]["preference"]:
+        assert row["component_capture"]["identity_validated"] is True
+        assert row["component_capture"]["native_graph_status"]["preference"] == "native_requires_grad_false"
+        assert row["dispatch"]["backward_calls"] == 0
+        assert row["component_checkpoint_coverage"] is None
+        assert all(g["connected"] is False for g in row["gradients"].values())
+    assert all(row["component_checkpoint_coverage"]["total_coverage_verified"] for row in result["runs"]["total"])
+    assert result["measurements"]["reconstruction_status"] == "inconclusive_native_disconnection"
+    assert result["measurements"]["native_disconnected_components"] == ["preference"]
+    assert result["measurements"]["reconstruction_within_observed_repeat_spread"] is False
+    screen = d.screen_initializers({"e1": result, "e3": result})
+    assert screen["status"] == "inconclusive"
+    assert screen["source_expansion_candidate"] is False

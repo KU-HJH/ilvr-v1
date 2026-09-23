@@ -674,6 +674,7 @@ def component_measurements(records, gradients):
     flat = [r for rows in records.values() for r in rows]
     if set(records) != {"ce", "preference", "total"} or any(len(rows) != 3 for rows in records.values()):
         raise ValueError("three repeats per component required")
+    disconnected = set()
     for row in flat:
         if row["initial_state_sha256"] != flat[0]["initial_state_sha256"]:
             raise ValueError("component initializer coordinates changed")
@@ -683,7 +684,17 @@ def component_measurements(records, gradients):
             raise ValueError("native input/target coordinates or RNG differ")
         if any(g["finite"] is False for g in row["gradients"].values()):
             raise ValueError("nonfinite native gradient")
-        if row["component_checkpoint_coverage"] is None:
+        component = row.get("component")
+        capture = row.get("component_capture") or {}
+        native_disconnected = (component in ("ce", "preference") and capture.get("identity_validated") is True
+            and capture.get("requires_grad", {}).get(component) is False
+            and capture.get("native_graph_status", {}).get(component) == "native_requires_grad_false")
+        if native_disconnected:
+            if (row["component_checkpoint_coverage"] is not None or row["dispatch"]["backward_calls"] != 0
+                    or any(g["connected"] for g in row["gradients"].values())):
+                raise ValueError("native disconnected component has unexpected backward or gradient evidence")
+            disconnected.add(component)
+        elif row["component_checkpoint_coverage"] is None:
             raise ValueError("native graph or checkpoint coverage unverified")
     geometry = [gradient_geometry(*(gradients[k][i] for k in ("ce", "preference", "total"))) for i in range(3)]
     spreads = {}
@@ -725,13 +736,15 @@ def component_measurements(records, gradients):
         forward_metrics[key] = {"repeat_spreads": spans, "max_cross_component_difference": cross,
                                 "within_observed_repeat_spread": cross <= sum(spans.values())}
     forward_valid = all(value["within_observed_repeat_spread"] for value in forward_metrics.values())
-    valid = gradient_valid and forward_valid
+    valid = gradient_valid and forward_valid and not disconnected
     return {"geometry": geometry, "repeat_gradient_l2_spread": spreads, "sum_repeat_spread_bound": bound,
+            "native_disconnected_components": sorted(disconnected),
             "forward_value_comparisons": forward_metrics,
             "forward_reconstruction_within_observed_repeat_spread": forward_valid,
             "gradient_reconstruction_within_observed_repeat_spread": gradient_valid,
             "reconstruction_within_observed_repeat_spread": valid,
-            "reconstruction_status": "within_observed_repeat_spread" if valid else "unresolved_beyond_observed_repeat_spread",
+            "reconstruction_status": "inconclusive_native_disconnection" if disconnected else (
+                "within_observed_repeat_spread" if valid else "unresolved_beyond_observed_repeat_spread"),
             "interpretation": "Beyond-spread residual is unresolved, not a code-error diagnosis"}
 
 
