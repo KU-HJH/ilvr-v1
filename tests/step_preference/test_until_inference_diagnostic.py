@@ -1,5 +1,6 @@
 """Independent small CPU witnesses for the inference-only source differential."""
 import importlib.util
+import importlib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,6 +74,42 @@ def test_external_model_load_options_enable_its_split_attention_protocol():
     assert external['stage2_split_attention'] is True
     assert local['local_files_only'] is external['local_files_only'] is True
     assert local['torch_dtype'] is external['torch_dtype'] is torch.bfloat16
+
+
+def test_rotary_substitution_observes_dispatch_and_restores_after_exception():
+    """Catches a silent or leaked temporary vision rotary substitution."""
+    d = probe()
+    module = importlib.import_module(
+        'transformers.models.qwen2_5_vl.modeling_qwen2_5_vl')
+    original = module.apply_rotary_pos_emb_vision
+    calls = []
+    def substitute(q, k, cos, sin):
+        calls.append(1)
+        return original(q, k, cos, sin)
+    q = k = torch.arange(8, dtype=torch.float32).reshape(2, 1, 4)
+    cos = torch.ones(2, 4)
+    sin = torch.zeros(2, 4)
+
+    with pytest.raises(RuntimeError, match='injected'):
+        with d.temporary_vision_rotary(module, substitute) as witness:
+            module.apply_rotary_pos_emb_vision(q, k, cos, sin)
+            assert witness['dispatch_count'] == 1
+            raise RuntimeError('injected')
+
+    assert calls == [1]
+    assert module.apply_rotary_pos_emb_vision is original
+
+
+def test_failed_rotary_first_nail_stops_attribution():
+    """Catches scoring a crossover whose image output did not reproduce E."""
+    d = probe()
+    result = d.rotary_first_nail(
+        {'image_embeddings': torch.tensor([1.])},
+        {'image_embeddings': torch.tensor([2.])},
+        dispatch_count=1)
+
+    assert result['status'] == 'failed'
+    assert result['causal_attribution_allowed'] is False
 
 
 def test_selection_is_first_two_manifest_entries_not_sorted_by_effect():
@@ -152,7 +189,13 @@ def test_actual_mask_paths_and_layer_witnesses_on_separately_initialized_models(
                 'image', 'latent', 'nonlatent_nonimage'}
             with runtime.numerical_policy():
                 states = d.common_state(local, local_native, sample, runtime)
+                own_report, own_logits = d.score_local_bank(
+                    local, sample, states, runtime)
                 result = d.compare_paths(local, other, sample, states, runtime, external, backend='math')
+        assert own_report['clean']['five_metrics']['delta_nll'] == 0
+        assert own_report['body_mask']['first_end_changed'] == own_report['body_mask']['five_metrics']['first_changed']
+        assert own_report['clean_repeat']['logits']['exact_equal']
+        assert set(own_logits) == {'clean', 'body_mask'}
         assert result['factors'] == {'backend': 'math', 'external_batching': ['per_site', 'packed_sites']}
         assert result['local']['clean_repeat']['logits']['exact_equal']
         assert result['external']['clean_repeat']['logits']['exact_equal']

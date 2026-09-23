@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Two fixed samples, final Stage2 weights, actual local/external inference paths."""
 import argparse
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict
 import importlib
 import inspect
@@ -338,8 +338,55 @@ def decode_external(model, state, sample, items, external, condition):
     return [value.detach().float().cpu() for value in output]
 
 
+def score_local_bank(model, sample, state, runtime):
+    """Score clean/body against one branch's independently regenerated clean bank."""
+    import torch
+    targets = [torch.tensor(site.target_ids) for site in sample.sites]
+    values = {}
+    for condition in ('clean', 'body_mask', 'clean_repeat'):
+        intervention = 'clean' if condition == 'clean_repeat' else condition
+        values[condition] = [
+            decode_local(model, state, site, runtime, intervention, 'math')[0]
+            for site in sample.sites]
+    report = {}
+    for condition, current in values.items():
+        metrics = five_metrics(values['clean'], current, targets)
+        report[condition] = {
+            'five_metrics': metrics,
+            'first_end_changed': metrics['first_changed'],
+            'logits': comparison(torch.cat(values['clean']), torch.cat(current)),
+        }
+    return report, {name: torch.cat(values[name]) for name in ('clean', 'body_mask')}
+
+
 def comparison(left, right):
     return native.compare_tensors(left, right)
+
+
+@contextmanager
+def temporary_vision_rotary(module, substitute):
+    """Route one module's vision rotary through a counted temporary callable."""
+    original = module.apply_rotary_pos_emb_vision
+    witness = {'dispatch_count': 0}
+    def observed(*args, **kwargs):
+        witness['dispatch_count'] += 1
+        return substitute(*args, **kwargs)
+    module.apply_rotary_pos_emb_vision = observed
+    try:
+        yield witness
+    finally:
+        module.apply_rotary_pos_emb_vision = original
+
+
+def rotary_first_nail(crossover_trace, external_trace, *, dispatch_count):
+    image = comparison(
+        crossover_trace.get('image_embeddings'),
+        external_trace.get('image_embeddings'))
+    passed = dispatch_count > 0 and image.get('exact_equal') is True
+    return {'status': 'passed' if passed else 'failed',
+            'causal_attribution_allowed': passed,
+            'substitute_dispatch_count': dispatch_count,
+            'crossover_vs_external_image_embeddings': image}
 
 
 def native_factor(backend, effective_numerics, local, native_other, common_other):
@@ -434,6 +481,77 @@ def compare_native_traces(left, right, *, image_token_id, latent_pad_token_id):
         for name, mask in regions.items()
     }
     result['earliest_difference'] = earliest
+    return result
+
+
+def run_rotary_crossover(local, external_model, prepared, external, runtime, output, progress):
+    """Run the approved same-model A/B vision-rotary crossover under MATH."""
+    import torch
+    local_module = importlib.import_module(type(qwen(local)).__module__)
+    substitute = external.model.apply_rotary_pos_emb_flashatt
+    result = {'status': 'incomplete', 'backend': 'math', 'samples': []}
+    with runtime.numerical_policy():
+        for ordinal, (sample, _ext_sample, _witness) in enumerate(prepared):
+            progress(f'sample {sample.source_index}: rotary crossover A/B own-bank scoring')
+            a_native = native_rollout(local, sample, 'local', external, runtime)
+            with temporary_vision_rotary(local_module, substitute) as dispatch:
+                b_native = native_rollout(local, sample, 'local', external, runtime)
+            restored_native = native_rollout(local, sample, 'local', external, runtime)
+            restoration = {
+                'final_embeddings': comparison(a_native['embeds'], restored_native['embeds']),
+            }
+            if restoration['final_embeddings'].get('exact_equal') is not True:
+                raise ValueError('local vision rotary restoration changed clean embeddings')
+            entry = {'source_index': sample.source_index,
+                     'substitute_dispatch_count': dispatch['dispatch_count'],
+                     'a_restoration': restoration}
+            if ordinal == 0:
+                e_native = native_rollout(
+                    external_model, sample, 'external', external, runtime)
+                gate = rotary_first_nail(
+                    b_native['trace'], e_native['trace'],
+                    dispatch_count=dispatch['dispatch_count'])
+                result['first_nail'] = gate
+                entry['first_nail'] = gate
+                if not gate['causal_attribution_allowed']:
+                    result['samples'].append(entry)
+                    result['status'] = 'failed_first_nail'
+                    return result
+            a_state = common_state(local, a_native, sample, runtime)
+            a_report, a_logits = score_local_bank(local, sample, a_state, runtime)
+            b_state = common_state(local, b_native, sample, runtime)
+            b_report, b_logits = score_local_bank(local, sample, b_state, runtime)
+            restored_state = common_state(local, restored_native, sample, runtime)
+            restored_report, restored_logits = score_local_bank(
+                local, sample, restored_state, runtime)
+            restoration.update({
+                'clean_logits': comparison(a_logits['clean'], restored_logits['clean']),
+                'clean_repeat': restored_report['clean_repeat'],
+            })
+            if restoration['clean_logits'].get('exact_equal') is not True:
+                raise ValueError('local vision rotary restoration changed clean replay')
+            logits_path = output / f'rotary-crossover-sample-{sample.source_index}-logits.pt'
+            torch.save({'source_index': sample.source_index,
+                        'A': a_logits, 'B': b_logits}, logits_path)
+            a_body, b_body = a_report['body_mask']['five_metrics'], b_report['body_mask']['five_metrics']
+            entry.update({
+                'A': a_report,
+                'B': b_report,
+                'A_vs_B_native_trace': compare_native_traces(
+                    a_native['trace'], b_native['trace'],
+                    image_token_id=qwen(local).config.image_token_id,
+                    latent_pad_token_id=qwen(local).config.latent_pad_token_id),
+                'body_effect_B_minus_A': {
+                    key: b_body[key] - a_body[key]
+                    for key in ('first_changed', 'any_changed', 'tokens_changed',
+                                'mean_nll', 'delta_nll')},
+                'selected_logits': {'path': logits_path.name,
+                                    'sha256': native.baseline.sha(logits_path)},
+            })
+            result['samples'].append(entry)
+            del a_state, b_state, restored_state
+            del a_native, b_native, restored_native
+    result['status'] = 'completed'
     return result
 
 
@@ -648,6 +766,9 @@ def run(args):
                         save()
                     del local_native,ext_native,common_external
                     del math_local_native,math_ext_native,math_common_external
+            report['rotary_crossover'] = run_rotary_crossover(
+                models[0], models[1], prepared, external, runtime, output, progress)
+            save()
             report['loaded_modules'] = {name:{'path':module.__file__, 'sha256':native.baseline.sha(module.__file__),
                 'supplied':Path(module.__file__).resolve().is_relative_to(Path(args.external_source).resolve())}
                 for name,module in tuple(sys.modules.items()) if getattr(module,'__file__',None)
