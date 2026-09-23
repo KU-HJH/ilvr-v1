@@ -321,16 +321,23 @@ def build_sidecar_flex_block_mask(root_length, branches, device):
         offset += length
     if not rows:
         raise ValueError("Flex sidecars require at least one query row")
-    metadata = torch.tensor(rows, device=device, dtype=torch.long)
+    starts, ancestors, blocked_starts, blocked_ends = torch.tensor(
+        tuple(zip(*rows)), device=device, dtype=torch.long
+    ).unbind()
     query_length = offset
     kv_length = root_length + query_length
+    # Flex's PyTorch 2.7 lowering expects tensor captures, not dynamic SymInt
+    # arithmetic. Keep scalar bounds and per-query metadata as device tensors.
+    query_count, root_count, key_count = torch.tensor(
+        [query_length, root_length, kv_length], device=device, dtype=torch.long
+    ).unbind()
 
     def mask_mod(batch, head, query, key):
         # create_block_mask probes whole blocks beyond unpadded Q/KV lengths.
-        start, ancestor, blocked_start, blocked_end = metadata[query.clamp(max=query_length-1)].unbind(-1)
-        root_edge = (key < ancestor) & ~((key >= blocked_start) & (key < blocked_end))
-        suffix_edge = (key >= root_length + start) & (key <= root_length + query)
-        return (query < query_length) & (key < kv_length) & (root_edge | suffix_edge)
+        row = query.minimum(query_count - 1)
+        root_edge = (key < ancestors[row]) & ~((key >= blocked_starts[row]) & (key < blocked_ends[row]))
+        suffix_edge = (key >= root_count + starts[row]) & (key <= root_count + query)
+        return (query < query_count) & (key < key_count) & (root_edge | suffix_edge)
 
     return create_block_mask(mask_mod, B=1, H=None, Q_LEN=query_length,
                              KV_LEN=kv_length, device=device)
