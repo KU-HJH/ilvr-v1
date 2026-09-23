@@ -67,6 +67,22 @@ def summarize(records):
                 clean_mean_nll=clean_nll/total, mean_nll=nll/total, delta_nll=(nll-clean_nll)/total)
 
 
+def write_per_sample(path, records):
+    """Publish separate sample aggregates; retain token sums and denominators."""
+    grouped = {}
+    for row in records:
+        grouped.setdefault(row['sample_id'], []).append(row)
+    with Path(path).open('w') as handle:
+        for sample_id, sites in grouped.items():
+            metrics = summarize(sites)
+            clean_sum = -math.fsum(v for site in sites for v in site['clean_target_logps'])
+            masked_sum = -math.fsum(v for site in sites for v in site['target_logps'])
+            row = dict(sample_id=sample_id, test_index=sites[0]['test_index'],
+                       condition='mask_attention', **metrics, clean_nll_sum=clean_sum,
+                       nll_sum=masked_sum, delta_nll_sum=masked_sum-clean_sum)
+            handle.write(json.dumps(row)+'\n')
+
+
 @contextmanager
 def numerical_policy():
     import torch
@@ -293,6 +309,7 @@ def run(args):
             print(json.dumps(dict(completed_samples=indices.index(index)+1, test_index=index)), flush=True)
     summary = dict(metadata, status='complete', mask_attention=summarize(records),
                    clean=summarize([dict(r, target_logps=r['clean_target_logps'], top1_ids=r['clean_top1_ids']) for r in records]))
+    write_per_sample(output/'per_sample.jsonl', records)
     (output/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
     return summary
 

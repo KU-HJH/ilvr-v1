@@ -72,3 +72,30 @@ def test_native_bank_noop_and_body_key_dispatch_with_real_decoder():
     assert torch.equal(bank['embeds'], saved_embeds)
     assert torch.equal(bank['positions'], saved_positions)
     assert not torch.equal(changed['logps'], clean['logps'])
+
+
+def test_per_sample_output_weights_unequal_blocks_and_preserves_global_token_weighting(tmp_path):
+    import json
+    from scripts.evaluate_until_body_mask import write_per_sample
+    records = [
+        dict(sample_id='a', test_index=12, block_index=0,
+             clean_target_logps=[-1.], target_logps=[-3.], clean_top1_ids=[2], top1_ids=[3]),
+        dict(sample_id='b', test_index=4, block_index=0,
+             clean_target_logps=[-8., -8.], target_logps=[-10., -10.],
+             clean_top1_ids=[7, 8], top1_ids=[7, 8]),
+        dict(sample_id='a', test_index=12, block_index=1,
+             clean_target_logps=[-2., -2., -2.], target_logps=[-2., -4., -3.],
+             clean_top1_ids=[4, 4, 4], top1_ids=[4, 5, 4]),
+    ]
+    path = tmp_path / 'per_sample.jsonl'
+    write_per_sample(path, records)
+    a, b = [json.loads(line) for line in path.read_text().splitlines()]
+    assert (a['sample_id'], a['test_index'], a['condition']) == ('a', 12, 'mask_attention')
+    assert (a['sites'], a['tokens'], a['first_changed'], a['any_changed'], a['tokens_changed']) == (2, 4, 1, 2, 2)
+    assert (a['clean_nll_sum'], a['nll_sum'], a['delta_nll_sum']) == (7., 12., 5.)
+    assert (a['clean_mean_nll'], a['mean_nll'], a['delta_nll']) == (1.75, 3., 1.25)
+    assert (b['sample_id'], b['sites'], b['tokens'], b['clean_nll_sum'], b['nll_sum']) == ('b', 1, 2, 16., 20.)
+    assert (b['clean_mean_nll'], b['mean_nll'], b['delta_nll']) == (8., 10., 2.)
+    # Global weighting remains across six tokens, not an equal average over samples.
+    assert summarize(records)['mean_nll'] == pytest.approx(32/6)
+    assert summarize(records)['delta_nll'] == pytest.approx(9/6)

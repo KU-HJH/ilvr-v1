@@ -41,8 +41,8 @@
     "Final artifact/GPU runtime and actual100 evaluation after approved training gates; CPU witness does not establish GPU/model equivalence"
   ],
   "hashes": {
-    "scripts/evaluate_until_body_mask.py": "1dd1c72ecd5e6646ebc92abde21390a0136ddffaece44d517bb0182b4a1cddda",
-    "tests/stage2/test_until_body_evaluation.py": "26a9d67a6972dd24beec47f8bfe77ecc55575b8cc92a56829477715f2fe1b86d",
+    "scripts/evaluate_until_body_mask.py": "b71e5b537cee5329b3dc5355bcd00e2574b206d4b66a671f589603eee8ea84c4",
+    "tests/stage2/test_until_body_evaluation.py": "b167f5a4152090ace4dac0361ae5b615db9f61282d8bbfb9dc58e2eea2e9f701",
     "data/until-temp2-alignment-20260923/evaluation-targets.json": "590cc341d0813c95547d0f4e294b1f197d3421548e9bacbbe494e84e5cdc3e2b"
   },
   "logs": {
@@ -50,6 +50,15 @@
     "logs/until-temp2-alignment-20260923/evaluation-green.log": "9099ecb61f468c59675388ef7744e6be2e8909d84005c3ead62fbb5b2f22250a",
     "logs/until-temp2-alignment-20260923/evaluation-cohort-cpu.log": "4893785ba03ecbc733911c7208136b15ae4193e637f181c3989e7e01014da73a",
     "logs/until-temp2-alignment-20260923/evaluation-cli-help.log": "79b3ee0558942161ee0114a32841f44865f8a903cf07bcf8c0f36d733ae94ec9",
-    "logs/until-temp2-alignment-20260923/evaluation-red.log": "4d10eb26920b5512cc84bb89db07b76be42e013c6a1d7a63576f722cc3b1f61b"
+    "logs/until-temp2-alignment-20260923/evaluation-red.log": "4d10eb26920b5512cc84bb89db07b76be42e013c6a1d7a63576f722cc3b1f61b",
+    "logs/until-temp2-alignment-20260923/evaluation-per-sample-red.log": "bd955a3b830a0bd5e6f475a8be1201155f0815278ac597b335b597530a3531cb",
+    "logs/until-temp2-alignment-20260923/evaluation-per-sample-green.log": "31828c509be55e5a52483b47e57695ed1bd5ea4051c8d4aa4c2f210884258f03"
+  },
+  "review_fix": {
+    "request": "Independent integrated review: publish separate per-sample aggregates",
+    "implementation": "per_sample.jsonl from identical per-block records; raw changed/site/token denominators, clean/masked/paired NLL sums and token-weighted means; global summary unchanged",
+    "red": "evaluation-per-sample-red.log: one causal heterogeneous fixture failed on missing write_per_sample",
+    "green": "evaluation-per-sample-green.log: 4 focused tests passed; git diff --check passed",
+    "gpu": "not run"
   }
 }
