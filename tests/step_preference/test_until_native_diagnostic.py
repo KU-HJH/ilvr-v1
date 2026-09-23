@@ -184,3 +184,239 @@ def test_external_stage2_objective_dependency_is_supplied_not_local(tmp_path):
     with diagnostic().ExternalSource(tmp_path) as source:
         assert source.translated("stage2_objective.config") != "stage2_objective.config"
         assert source.module("stage2.probe").run() == 137
+
+
+def native_reducer_fixture():
+    from step_preference.config import StepPreferenceConfig
+    from step_preference.equivalence import _trainer
+    trainer = _trainer(StepPreferenceConfig(enabled=True, mode="stage2b", direct_from_stage1=True,
+        visual_only_context_preference=True, beta=.5, lambda_preference=1., lambda_entropy=0.))
+    return trainer
+
+
+def test_component_capture_uses_connected_native_reducer_tensors():
+    # Detached log metrics or CE substituted for preference breaks these analytic derivatives.
+    d = diagnostic()
+    trainer = native_reducer_fixture()
+    weight = torch.tensor(2., requires_grad=True)
+    capture = d.NativeComponents(trainer)
+    with d.DispatchObserver([str(Path(__file__).parents[2] / "src")], capture=capture):
+        total, _ = trainer._reduce_context_objective(weight.square(), [weight], [weight.reshape(1)*0],
+            {(0, "visual"): {"mean_logp": -weight, "entropies": weight.reshape(1)*0}})
+    capture.validate(total)
+    assert float(capture.scores[0]["clean"][0]) == 2.
+    assert float(capture.scores[0]["off"][0]) == -2.
+    assert torch.autograd.grad(capture.select("ce"), weight, retain_graph=True)[0].item() == 4.
+    assert torch.autograd.grad(capture.select("preference"), weight, retain_graph=True)[0].item() == pytest.approx(-.11920292)
+    assert torch.autograd.grad(capture.select("total"), weight)[0].item() == pytest.approx(3.88079708)
+
+
+def test_component_capture_rejects_missing_or_detached_instrumentation():
+    # A hook that misses the reducer or replaces captured tensors with detached metrics must fail closed.
+    d = diagnostic()
+    capture = d.NativeComponents(native_reducer_fixture())
+    with pytest.raises(ValueError, match="capture"):
+        capture.validate(torch.tensor(1., requires_grad=True))
+    weight = torch.tensor(2., requires_grad=True)
+    with d.DispatchObserver([str(Path(__file__).parents[2] / "src")], capture=capture):
+        total, _ = capture.trainer._reduce_context_objective(weight.square(), [weight], [weight.reshape(1)*0],
+            {(0, "visual"): {"mean_logp": -weight, "entropies": weight.reshape(1)*0}})
+    capture.tensors["preference"] = capture.tensors["preference"].detach()
+    with pytest.raises(ValueError, match="capture"):
+        capture.validate(total)
+
+
+def test_gradient_decomposition_detects_wrong_component_and_preserves_none_vs_zero():
+    # An incorrect preference gradient changes the residual even when loss scalars agree.
+    d = diagnostic()
+    ce = {"layer.weight": torch.tensor([2., 0.]), "unused": None, "zero": torch.tensor(0.)}
+    pref = {"layer.weight": torch.tensor([-1., 1.]), "unused": None, "zero": None}
+    total = {"layer.weight": torch.tensor([1., 1.]), "unused": None, "zero": torch.tensor(0.)}
+    report = d.gradient_geometry(ce, pref, total)
+    assert report["sum_residual_l2"] == 0.
+    assert report["cosine"] == pytest.approx(-2 ** -.5)
+    assert report["preference_ce_norm_ratio"] == pytest.approx(2 ** -.5)
+    assert report["connectivity"]["zero"] == {"ce": True, "preference": False, "total": True}
+    total["layer.weight"] = torch.tensor([1., 2.])
+    assert d.gradient_geometry(ce, pref, total)["sum_residual_l2"] == 1.
+    total["zero"] = None
+    assert d.gradient_geometry(ce, pref, total)["connection_mismatches"] == ["zero"]
+
+
+def test_component_mode_defaults_local_and_requires_explicit_external_source():
+    # Local-first must not silently load an obsolete exported source bundle.
+    d = diagnostic()
+    args = d.parse_args(["--mode", "components"])
+    assert args.side == "local"
+    assert args.initializer == "both"
+    assert args.external_source is None
+    with pytest.raises(ValueError, match="explicit.*external"):
+        d.validate_component_args(d.parse_args(["--mode", "components", "--side", "external"]))
+
+
+def test_component_checkpoint_coverage_allows_unused_sidecar_but_rejects_unknown_region():
+    # CE legitimately skips sidecar recomputation; a recomputation absent from forward is invalid.
+    d = diagnostic()
+    model = torch.nn.ModuleList([torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)])
+    observer = d.DispatchObserver([], model=model)
+    with observer:
+        ce = checkpoint(model[0], torch.ones(1, 2), use_reentrant=False).square().sum()
+        off = checkpoint(model[1], torch.ones(1, 2), use_reentrant=False).square().sum()
+        observer.phase = "backward"
+        ce.backward()
+    record = d.component_checkpoint_coverage(observer, "ce")
+    assert record["observed_component_valid"] is True
+    assert record["omitted_forward_regions"] == 1
+    assert record["total_coverage_verified"] is False
+    with pytest.raises(ValueError, match="coverage"):
+        d.component_checkpoint_coverage(observer, "total")
+    observer.recomputed.add(("unobserved-region", 999))
+    with pytest.raises(ValueError, match="coverage"):
+        d.component_checkpoint_coverage(observer, "ce")
+
+
+def test_repeat_component_selects_native_preference_and_restores_state():
+    # Selecting total for every backward would yield 3.88/4 instead of -0.119/4.
+    d = diagnostic()
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.))
+        def forward(self, input_ids):
+            return SimpleNamespace(loss=self.weight.square(), score=self.weight)
+    reducer = native_reducer_fixture()
+    class Trainer:
+        step_preference_config = reducer.step_preference_config
+        _reduce_context_objective = type(reducer)._reduce_context_objective
+        def compute_loss(self, model, inputs, return_outputs=False):
+            output = model(**inputs)
+            return self._reduce_context_objective(output.loss, [output.score], [output.score.reshape(1)*0],
+                {(0, "visual"): {"mean_logp": -output.score, "entropies": output.score.reshape(1)*0}})[0]
+    model = Model()
+    before = d.state_digest(model)
+    records, grads, _ = d.run_repetitions(model, Trainer(), {"input_ids": torch.tensor([[1, 2]])},
+                                        "cpu", component="preference")
+    assert len(records) == 3
+    assert all(g["weight"].item() == pytest.approx(-.11920292 / 4) for g in grads)
+    assert all(r["component_capture"]["identity_validated"] for r in records)
+    assert d.state_digest(model) == before
+    assert model.weight.grad is None
+
+
+def measurement_fixture():
+    from copy import deepcopy
+    row = dict(initial_state_sha256="unchanged", state_after_backward_sha256="unchanged",
+               forward_request={"selected_target_ids": [1]}, rng_before={"cpu": "fixed"},
+               gradients={"w": {"finite": True}}, component_checkpoint_coverage={"observed_component_valid": True},
+               component_capture={"identity_validated": True, "values": {"ce": 2., "preference": 1., "total": 3.},
+                                  "scores": [{"clean": [2.], "off": [1.]}]})
+    records = {key: [deepcopy(row) for _ in range(3)] for key in ("ce", "preference", "total")}
+    gradients = {"ce": [{"w": torch.tensor([2.])} for _ in range(3)],
+                 "preference": [{"w": torch.tensor([-1.])} for _ in range(3)],
+                 "total": [{"w": torch.tensor([1.])} for _ in range(3)]}
+    return records, gradients
+
+
+def test_measurement_rejects_coordinate_mutation_and_leaves_beyond_repeat_residual_unresolved():
+    # A blanket BF16 tolerance would conceal this small missing preference gradient.
+    d = diagnostic()
+    records, gradients = measurement_fixture()
+    result = d.component_measurements(records, gradients)
+    assert result["reconstruction_within_observed_repeat_spread"] is True
+    gradients["total"] = [{"w": torch.tensor([1.001])} for _ in range(3)]
+    result = d.component_measurements(records, gradients)
+    assert result["sum_repeat_spread_bound"] == 0.
+    assert result["reconstruction_within_observed_repeat_spread"] is False
+    records["ce"][0]["forward_request"] = {"selected_target_ids": [2]}
+    with pytest.raises(ValueError, match="coordinates"):
+        d.component_measurements(records, gradients)
+    records, gradients = measurement_fixture()
+    records["ce"][0]["state_after_backward_sha256"] = "mutated"
+    with pytest.raises(ValueError, match="mutat"):
+        d.component_measurements(records, gradients)
+
+
+def test_screen_requires_reconstruction_before_comparing_mechanisms():
+    # Disjoint intervals must not authorize expansion when gradient reconstruction is unresolved.
+    d = diagnostic()
+    def cell(cosines, ratios, valid=True):
+        return {"measurements": {"reconstruction_within_observed_repeat_spread": valid,
+                "geometry": [{"cosine": c, "preference_ce_norm_ratio": r} for c, r in zip(cosines, ratios)]}}
+    cells = {"e1": cell([-.9, -.8, -.85], [1., 1.1, 1.]),
+             "e3": cell([-.4, -.3, -.35], [2., 2.1, 2.])}
+    assert d.screen_initializers(cells)["opposition_candidate"] is True
+    assert d.screen_initializers(cells)["scale_candidate"] is True
+    cells["e3"]["measurements"]["reconstruction_within_observed_repeat_spread"] = False
+    assert d.screen_initializers(cells)["source_expansion_candidate"] is False
+    cells["e3"] = cell([-.85, -.7, -.75], [1.05, 1.15, 1.1])
+    assert d.screen_initializers(cells)["source_expansion_candidate"] is False
+
+
+def test_native_tiny_component_cell_executes_fresh_forward_per_backward(tmp_path, capsys):
+    # Reusing a freed graph, substituting a common loss, or CE-sidecar coverage conflation breaks this native path.
+    d = diagnostic()
+    from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl
+    class Tokenizer:
+        def __len__(self): return 128
+        def convert_tokens_to_ids(self, token):
+            return dict(zip(("<|latent_pad|>", "<|latent_start|>", "<|latent_end|>",
+                             "<|image_pad|>", "<|vision_start|>", "<|video_pad|>"),
+                            (90, 91, 92, 80, 81, 82)))[token]
+    models, _ = d.baseline.tiny_models(Tokenizer(), modeling_qwen2_5_vl)
+    case = d.baseline.tiny_cases(Tokenizer())[1]
+    spans = case["spans"]
+    batch = dict(case["inputs"], sample_ids=["tiny"], reasoning_step_spans=spans,
+                 step_preference={"steps": [{"span": span} for span in spans]})
+    trainer = d.make_trainers([models[0]], None, tmp_path, "cpu", backend="dense")[0]
+    result = d.run_component_cell(models[0], trainer, batch, "cpu", [str(Path(__file__).parents[2] / "src")])
+    assert set(result["runs"]) == {"ce", "preference", "total"}
+    assert all(len(rows) == 3 for rows in result["runs"].values())
+    assert all(row["dispatch"]["backward_calls"] == 1 for rows in result["runs"].values() for row in rows)
+    assert all(row["component_capture"]["identity_validated"] for rows in result["runs"].values() for row in rows)
+    assert all(row["component_checkpoint_coverage"]["total_coverage_verified"] for row in result["runs"]["total"])
+    assert any(row["component_checkpoint_coverage"]["omitted_forward_regions"] for row in result["runs"]["ce"])
+    assert all(row["component_capture"]["scores"] for rows in result["runs"].values() for row in rows)
+    import json
+    captured = capsys.readouterr()
+    progress = [json.loads(line) for line in captured.err.splitlines() if line.startswith('{"progress"')]
+    assert len(progress) == 9
+    assert {row["component"] for row in progress} == {"ce", "preference", "total"}
+    assert not captured.out
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
+    json.dumps(result, allow_nan=False)  # No graph/gradient/model tensors escape into output.
+
+
+def test_component_runner_refuses_cpu_real_checkpoint_execution():
+    # Accidental production-model loading before CUDA/resource validation is forbidden.
+    d = diagnostic()
+    with pytest.raises(ValueError, match="CUDA"):
+        d.run_components(d.parse_args(["--mode", "components", "--device", "cpu"]))
+
+
+def test_capture_distinguishes_genuine_native_disconnection_from_instrumentation_failure():
+    # A native detached preference is observable, whereas a detached observer copy is invalid.
+    d = diagnostic()
+    trainer = native_reducer_fixture()
+    capture = d.NativeComponents(trainer)
+    weight = torch.tensor(2., requires_grad=True)
+    with d.DispatchObserver([], capture=capture):
+        total, _ = trainer._reduce_context_objective(weight.square(), [torch.tensor(2.)], [torch.zeros(1)],
+            {(0, "visual"): {"mean_logp": torch.tensor(-2.), "entropies": torch.zeros(1)}})
+    result = capture.validate(total)
+    assert result["native_graph_status"]["preference"] == "native_requires_grad_false"
+    assert result["native_graph_status"]["ce"] == "connected_to_native_total"
+
+
+def test_component_forward_values_must_reproduce_within_repeat_variation():
+    # Identical gradients do not rescue component forwards that observed different scores.
+    from copy import deepcopy
+    d = diagnostic()
+    records, gradients = measurement_fixture()
+    records = deepcopy(records)
+    records["preference"][0]["component_capture"]["scores"] = [{"clean": [2.], "off": [1.2]}]
+    records["preference"][1]["component_capture"]["scores"] = [{"clean": [2.], "off": [1.2]}]
+    records["preference"][2]["component_capture"]["scores"] = [{"clean": [2.], "off": [1.2]}]
+    result = d.component_measurements(records, gradients)
+    assert result["gradient_reconstruction_within_observed_repeat_spread"] is True
+    assert result["forward_reconstruction_within_observed_repeat_spread"] is False
+    assert result["reconstruction_within_observed_repeat_spread"] is False

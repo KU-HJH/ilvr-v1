@@ -2,6 +2,7 @@
 """TRAIN2046 native loss/backward repetitions; shared framework, no optimizer or saves."""
 import argparse
 import builtins
+from contextlib import nullcontext
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, fields, is_dataclass, replace
@@ -176,9 +177,114 @@ def plan_metadata(value):
     return value
 
 
+class NativeComponents:
+    """Retain the actual native reducer graph, never reconstructed log objectives."""
+    def __init__(self, trainer):
+        self.trainer = trainer
+        self.tensors, self.native, self.scores = {}, {}, []
+        name = ("_reduce_context_objective" if hasattr(trainer, "_reduce_context_objective")
+                else "_reduce_step_preference_components")
+        self.reducer_code = getattr(trainer, name).__func__.__code__
+        self.reducer_calls = 0
+
+    def observe(self, frame, event, arg):
+        if event != "return":
+            return
+        local = frame.f_locals
+        if frame.f_code.co_name == "context_preference_loss" and "clean_logps" in local:
+            # Both native implementations use this primitive; preserve its actual inputs.
+            self.scores.append({key: local[name].detach().float().cpu().reshape(-1).tolist()
+                                for key, name in (("clean", "clean_logps"), ("off", "ablated_logps"))})
+        if frame.f_code is not self.reducer_code or local.get("self") is not self.trainer:
+            return
+        self.reducer_calls += 1
+        if not isinstance(arg, tuple) or len(arg) < 2:
+            raise ValueError("native component capture: unexpected reducer return")
+        ce = local.get("clean_ce", local.get("ce_loss"))
+        pref = local["preference"] if "clean_ce" in local else local["preference_all"]
+        self.native = {"ce": ce, "preference": pref, "total": arg[0]}
+        self.tensors = dict(self.native)
+
+    def validate(self, total):
+        import torch
+        if self.reducer_calls != 1 or not self.scores or self.native.get("total") is not total:
+            raise ValueError("native component capture missing or ambiguous")
+        if any(self.tensors.get(k) is not v for k, v in self.native.items()):
+            raise ValueError("native component capture identity changed")
+        config = self.trainer.step_preference_config
+        if (config.beta, config.lambda_preference, config.lambda_entropy) != (.5, 1., 0.):
+            raise ValueError("native component capture requires beta0.5/preference1/entropy0")
+        for value in self.tensors.values():
+            if not isinstance(value, torch.Tensor) or value.numel() != 1 or not bool(torch.isfinite(value)):
+                raise ValueError("native component capture missing or nonfinite scalar")
+        # This tests graph membership, independently of scalar reconstruction. A detached
+        # genuine native component is reported separately and cannot become a valid screen.
+        connected = [self.tensors[k] for k in ("ce", "preference") if self.tensors[k].requires_grad]
+        if not total.requires_grad:
+            raise ValueError("native total is graph-disconnected; screen invalid")
+        coefficients = torch.autograd.grad(total, connected, retain_graph=True, allow_unused=True)
+        if any(c is None or not torch.equal(c, torch.ones_like(c)) for c in coefficients):
+            raise ValueError("native component capture not connected to total with unit weight")
+        residual = float((total.detach().double() - self.tensors["ce"].detach().double()
+                          - self.tensors["preference"].detach().double()).abs())
+        tolerance = 4 * torch.finfo(total.dtype).eps * max(1., abs(float(total.detach())))
+        if residual > tolerance:
+            raise ValueError("native scalar loss reconstruction failed")
+        return {"identity_validated": True, "scalar_sum_residual": residual,
+                "scalar_roundoff_bound": tolerance,
+                "requires_grad": {k: v.requires_grad for k, v in self.tensors.items()},
+                "native_graph_status": {k: "connected_to_native_total" if v.requires_grad
+                                        else "native_requires_grad_false" for k, v in self.tensors.items()},
+                "values": {k: float(v.detach().float()) for k, v in self.tensors.items()},
+                "scores": self.scores}
+
+    def select(self, component):
+        if component not in self.tensors:
+            raise ValueError("unknown or missing native component capture")
+        return self.tensors[component]
+
+
+def gradient_geometry(ce, preference, total):
+    """Double-precision scalar measurements only; None remains distinct from zero."""
+    import torch
+    if ce.keys() != preference.keys() or ce.keys() != total.keys():
+        raise ValueError("gradient parameter coordinates differ")
+    sums = dict(ce=0., preference=0., total=0., dot=0., residual=0.)
+    layers, connectivity, mismatches = {}, {}, []
+    for name in ce:
+        values = dict(ce=ce[name], preference=preference[name], total=total[name])
+        connectivity[name] = {k: v is not None for k, v in values.items()}
+        if (ce[name] is not None or preference[name] is not None) != (total[name] is not None):
+            mismatches.append(name)
+        live = [v for v in values.values() if v is not None]
+        if not live:
+            continue
+        if any(v.shape != live[0].shape or not bool(torch.isfinite(v).all()) for v in live):
+            raise ValueError("nonfinite gradient or changed parameter coordinates")
+        a, b, t = [torch.zeros_like(live[0], dtype=torch.float64) if values[k] is None
+                   else values[k].double() for k in ("ce", "preference", "total")]
+        measures = dict(ce=float(a.square().sum()), preference=float(b.square().sum()),
+                        total=float(t.square().sum()), dot=float((a*b).sum()),
+                        residual=float((t-a-b).square().sum()))
+        parts = name.split(".")
+        layer = ".".join(parts[:parts.index("layers")+2]) if "layers" in parts else name.rsplit(".", 1)[0]
+        group = layers.setdefault(layer, dict.fromkeys(sums, 0.))
+        for key, value in measures.items():
+            sums[key] += value
+            group[key] += value
+    def finish(group):
+        a, b = group["ce"] ** .5, group["preference"] ** .5
+        return {"ce_norm": a, "preference_norm": b, "total_norm": group["total"] ** .5,
+                "cosine": group["dot"] / (a*b) if a*b else None,
+                "preference_ce_norm_ratio": b/a if a else None,
+                "sum_residual_l2": group["residual"] ** .5}
+    return {**finish(sums), "layers": {k: finish(v) for k, v in layers.items()},
+            "connectivity": connectivity, "connection_mismatches": mismatches}
+
+
 class DispatchObserver:
     """Read Python call/return events; never replace a model or objective function."""
-    def __init__(self, roots, *, model=None):
+    def __init__(self, roots, *, model=None, capture=None):
         self.roots = tuple(str(Path(p).resolve()) + "/" for p in roots)
         self.phase = "forward"
         self.counts = Counter()
@@ -191,6 +297,7 @@ class DispatchObserver:
         self.recompute_threads = set()
         self.native_before = None
         self.native_after = None
+        self.capture = capture
 
     def observe_module(self, module, inputs):
         """Module hooks execute on the calling worker, unlike sys.setprofile.
@@ -222,6 +329,8 @@ class DispatchObserver:
             del frame
 
     def observe(self, frame, event, arg):
+        if self.capture is not None and self.phase == "forward":
+            self.capture.observe(frame, event, arg)
         code = frame.f_code
         filename, name = code.co_filename, code.co_name
         if event == "call":
@@ -280,7 +389,21 @@ class DispatchObserver:
                           for (f, l, n, p), c in sorted(self.counts.items())]}
 
 
-def run_repetitions(model, trainer, batch, device, *, repeats=3, observer_roots=()):
+def component_checkpoint_coverage(observer, component):
+    report = observer.report()
+    observed = {key for key, _ in observer.recomputed}
+    known = set(observer.regions)
+    complete = report["checkpoint_coverage"]["complete_for_observed_module_regions"]
+    valid = bool(observed) and observed <= known and report["native_counter_matches_module_witness"] is not False
+    if not valid or (component == "total" and not complete):
+        raise ValueError("native checkpoint coverage unverified")
+    return {"observed_component_valid": valid, "total_coverage_verified": complete if component == "total" else False,
+            "omitted_forward_regions": len(known - observed),
+            "omitted_regions": [observer.regions[key] for key in known - observed],
+            "scope": "Observed component subset only; total coverage and gradient reconstruction are separate gates"}
+
+
+def run_repetitions(model, trainer, batch, device, *, repeats=3, observer_roots=(), component=None):
     import numpy as np
     import torch
     parameters = {n: p.detach().cpu().clone() for n, p in model.named_parameters()}
@@ -324,16 +447,20 @@ def run_repetitions(model, trainer, batch, device, *, repeats=3, observer_roots=
                     output_values[name] = value.detach().cpu().clone()
         hook = model.register_forward_hook(capture)
         prehook = model.register_forward_pre_hook(capture_request, with_kwargs=True)
-        observer = DispatchObserver(observer_roots, model=model)
+        component_capture = None if component is None else NativeComponents(trainer)
+        observer = DispatchObserver(observer_roots, model=model, capture=component_capture)
         cleared = all(p.grad is None for p in model.parameters())
         try:
             with observer, torch.autocast(device_type=torch.device(device).type, enabled=False):
                 loss = trainer.compute_loss(model, prepared, return_outputs=False)
+                component_record = None if component_capture is None else component_capture.validate(loss)
+                backward_value = loss if component_capture is None else component_capture.select(component)
                 output_values["loss"] = loss.detach().cpu().clone()
                 native_stats = getattr(trainer, "_latest_step_preference_compute_stats", None)
                 observer.native_before = getattr(native_stats, "checkpoint_recompute_calls", None)
                 observer.phase = "backward"
-                (loss / 4).backward()
+                if component_capture is None or backward_value.requires_grad:
+                    (backward_value / 4).backward()
                 observer.native_after = getattr(native_stats, "checkpoint_recompute_calls", None)
         finally:
             hook.remove()
@@ -343,14 +470,28 @@ def run_repetitions(model, trainer, batch, device, *, repeats=3, observer_roots=
         records.append({"repetition": repetition, "initial_state_sha256": initial,
             "state_after_backward_sha256": state_digest(model), "gradients_cleared": cleared,
             "rng_before": rng_before, "rng_after": rng_record(device),
-            "loss": float(loss.detach().float()), "backward_loss": float((loss.detach() / 4).float()),
+            "loss": float(loss.detach().float()), "backward_loss": float((backward_value.detach() / 4).float()),
+            "component": component, "component_capture": component_record,
+            "component_checkpoint_coverage": component_checkpoint_coverage(observer, component)
+                if component is not None and observer.regions and backward_value.requires_grad else None,
             "loss_components": observer.components, "dispatch": observer.report(),
             "forward_request": request,
             "gradients": {n: tensor_record(g) for n, g in grads.items()},
             "output_tensors": {n: tensor_record(v) for n, v in output_values.items()}})
         gradients.append(grads)
         values.append(output_values)
+        if component is not None:
+            print(json.dumps({"progress": "component_repeat", "component": component,
+                              "repetition": repetition, "loss": records[-1]["backward_loss"]}), file=sys.stderr, flush=True)
         del loss, prepared
+        # Every component call must leave the identical initializer for the next call.
+    if component is not None:
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                p.copy_(parameters[n])
+            for n, p in model.named_buffers():
+                p.copy_(buffers[n])
+        model.zero_grad(set_to_none=True)
     return records, gradients, values
 
 
@@ -361,11 +502,17 @@ def make_trainers(models, external, output_dir, device, *, backend="flex"):
     configs = [StepPreferenceConfig(enabled=True, mode="stage2b", target_scope="until_next_latent",
         beta=.5, lambda_preference=1., lambda_entropy=0., shared_prefix_enabled=True,
         visual_only_context_preference=True, visual_off_suppress_latent_boundaries=False,
-        direct_from_stage1=True, sidecar_attention_backend=backend, sidecar_query_budget=1024),
-        external.config.StepPreferenceConfig(enabled=True, beta=.5, lambda_preference=1.,
-                                            lambda_entropy=0., modalities="visual")]
+        direct_from_stage1=True, sidecar_attention_backend=backend, sidecar_query_budget=1024)]
+    classes = [Stage2Trainer]
+    if external is not None:
+        configs.append(external.config.StepPreferenceConfig(enabled=True, beta=.5, lambda_preference=1.,
+                                            lambda_entropy=0., modalities="visual"))
+        classes.append(external.trainer.Stage2Trainer)
     result = []
-    for index, (model, cls, config) in enumerate(zip(models, (Stage2Trainer, external.trainer.Stage2Trainer), configs)):
+    for index, (model, cls, config) in enumerate(zip(models, classes, configs)):
+        if model is None:
+            result.append(None)
+            continue
         args = TrainingArguments(output_dir=str(Path(output_dir) / ("local" if index == 0 else "external")),
             use_cpu=device == "cpu", report_to=[], save_strategy="no", logging_first_step=True,
             per_device_train_batch_size=1, gradient_accumulation_steps=4, seed=42,
@@ -401,12 +548,12 @@ def prepare_batches(args, processor, external):
     ids = baseline.token_ids(processor.tokenizer)[:3]
     local = data.prepare_stage2_example(sample, image_root=Path(args.image_root), latent_size=8,
         assistant_plan_rendering="concatenated-v1", require_reasoning_units=True)
-    supplied = external.data.prepare_stage2_example(sample, image_root=Path(args.image_root), latent_size=8)
-    collators = [data.Stage2DataCollator(processor, LatentTokenIds(*ids), 8, True,
-                    step_preference_enabled=True, preference_target_scope="until_next_latent"),
-                external.data.Stage2DataCollator(processor, external.rollout.LatentTokenIds(*ids), 8, True,
-                                                context_preference_enabled=True)]
-    batches = [collator([example]) for collator, example in zip(collators, (local, supplied))]
+    batches = [data.Stage2DataCollator(processor, LatentTokenIds(*ids), 8, True,
+                    step_preference_enabled=True, preference_target_scope="until_next_latent")([local])]
+    if external is not None:
+        supplied = external.data.prepare_stage2_example(sample, image_root=Path(args.image_root), latent_size=8)
+        batches.append(external.data.Stage2DataCollator(processor, external.rollout.LatentTokenIds(*ids), 8, True,
+                                                context_preference_enabled=True)([supplied]))
     if batches[0]["input_ids"].shape[1] != manifest["lengths"][2046]:
         raise ValueError("local TRAIN2046 length differs from retained manifest")
     return batches
@@ -432,13 +579,15 @@ def comparisons(gradients, values, *, cross_allowed):
 
 
 def run(args):
+    if args.mode == "components":
+        return run_components(args)
     import torch
     from transformers import AutoProcessor
     if not args.device.startswith("cuda") or not torch.cuda.is_available():
         raise ValueError("native TRAIN2046 diagnostic requires CUDA")
     if torch.distributed.is_initialized():
         raise ValueError("diagnostic must not join an active distributed process group")
-    root = Path(args.external_source).resolve(strict=True)
+    root = Path(args.external_source or baseline.SOURCE).resolve(strict=True)
     source_before = {str(p): baseline.sha(p) for p in root.rglob("*.py")}
     inventory_before = baseline.inventory(root)
     torch.set_num_threads(2)
@@ -514,9 +663,198 @@ def run(args):
             "data_sha256": baseline.sha(args.data), "manifest_sha256": baseline.sha(args.manifest)}
 
 
+def validate_component_args(args):
+    if args.side == "external" and not args.external_source:
+        raise ValueError("component mode requires an explicit --external-source for external execution")
+
+
+def component_measurements(records, gradients):
+    """Require observed repeat evidence, never an invented dtype tolerance."""
+    import math
+    flat = [r for rows in records.values() for r in rows]
+    if set(records) != {"ce", "preference", "total"} or any(len(rows) != 3 for rows in records.values()):
+        raise ValueError("three repeats per component required")
+    for row in flat:
+        if row["initial_state_sha256"] != flat[0]["initial_state_sha256"]:
+            raise ValueError("component initializer coordinates changed")
+        if row["state_after_backward_sha256"] != row["initial_state_sha256"]:
+            raise ValueError("native model state mutated")
+        if row["forward_request"] != flat[0]["forward_request"] or row["rng_before"] != flat[0]["rng_before"]:
+            raise ValueError("native input/target coordinates or RNG differ")
+        if any(g["finite"] is False for g in row["gradients"].values()):
+            raise ValueError("nonfinite native gradient")
+        if row["component_checkpoint_coverage"] is None:
+            raise ValueError("native graph or checkpoint coverage unverified")
+    geometry = [gradient_geometry(*(gradients[k][i] for k in ("ce", "preference", "total"))) for i in range(3)]
+    spreads = {}
+    for key, repeats in gradients.items():
+        distances = []
+        for left, right in itertools.combinations(repeats, 2):
+            squared = 0.
+            for name in left:
+                if (left[name] is None) != (right[name] is None):
+                    raise ValueError("native connectivity varies across identical repeats")
+                if left[name] is not None:
+                    squared += float((left[name].double()-right[name].double()).square().sum())
+            distances.append(squared ** .5)
+        spreads[key] = max(distances)
+    bound = sum(spreads.values())
+    gradient_valid = all(not row["connection_mismatches"] and row["sum_residual_l2"] <= bound for row in geometry)
+    forward = {}
+    for component, rows in records.items():
+        forward[component] = []
+        for row in rows:
+            capture = row.get("component_capture")
+            if not capture or not capture["identity_validated"] or not capture["scores"]:
+                raise ValueError("native forward component capture missing")
+            values = dict(capture["values"])
+            for group, pair in enumerate(capture["scores"]):
+                for side in ("clean", "off"):
+                    values.update({f"score.{group}.{side}.{i}": value for i, value in enumerate(pair[side])})
+            if any(not math.isfinite(value) for value in values.values()):
+                raise ValueError("nonfinite native forward value")
+            forward[component].append(values)
+    keys = forward["total"][0].keys()
+    if any(values.keys() != keys for rows in forward.values() for values in rows):
+        raise ValueError("native forward score coordinates differ")
+    forward_metrics = {}
+    for key in keys:
+        spans = {component: max(v[key] for v in rows)-min(v[key] for v in rows) for component, rows in forward.items()}
+        cross = max(abs(a[key]-b[key]) for left, right in itertools.combinations(forward.values(), 2)
+                    for a, b in itertools.product(left, right))
+        forward_metrics[key] = {"repeat_spreads": spans, "max_cross_component_difference": cross,
+                                "within_observed_repeat_spread": cross <= sum(spans.values())}
+    forward_valid = all(value["within_observed_repeat_spread"] for value in forward_metrics.values())
+    valid = gradient_valid and forward_valid
+    return {"geometry": geometry, "repeat_gradient_l2_spread": spreads, "sum_repeat_spread_bound": bound,
+            "forward_value_comparisons": forward_metrics,
+            "forward_reconstruction_within_observed_repeat_spread": forward_valid,
+            "gradient_reconstruction_within_observed_repeat_spread": gradient_valid,
+            "reconstruction_within_observed_repeat_spread": valid,
+            "reconstruction_status": "within_observed_repeat_spread" if valid else "unresolved_beyond_observed_repeat_spread",
+            "interpretation": "Beyond-spread residual is unresolved, not a code-error diagnosis"}
+
+
+def screen_initializers(cells):
+    if set(cells) != {"e1", "e3"} or not all(c["measurements"]["reconstruction_within_observed_repeat_spread"] for c in cells.values()):
+        return {"status": "inconclusive", "source_expansion_candidate": False,
+                "reason": "Both cells and native gradient reconstruction required"}
+    intervals = {}
+    for key in ("cosine", "preference_ce_norm_ratio"):
+        intervals[key] = {}
+        for name, cell in cells.items():
+            values = [r[key] for r in cell["measurements"]["geometry"]]
+            if any(value is None for value in values):
+                return {"status": "inconclusive", "source_expansion_candidate": False,
+                        "reason": "Zero/disconnected gradient makes cosine or ratio undefined"}
+            intervals[key][name] = [min(values), max(values)]
+    def gap(pair):
+        a, b = pair["e1"], pair["e3"]
+        return max(a[0]-b[1], b[0]-a[1])
+    cosine, ratio = intervals["cosine"], intervals["preference_ce_norm_ratio"]
+    opposition = gap(cosine) > 0 and all(v[1] < 0 for v in cosine.values())
+    scale = gap(ratio) > max(v[1]-v[0] for v in ratio.values())
+    return {"status": "exploratory_candidate" if opposition or scale else "inconclusive",
+            "opposition_candidate": opposition, "scale_candidate": scale, "intervals": intervals,
+            "source_expansion_candidate": opposition or scale,
+            "interpretation": "Initial single-sample geometry does not establish late-collapse causality"}
+
+
+def run_component_cell(model, trainer, batch, device, roots):
+    records, gradients = {}, {}
+    for component in ("total", "ce", "preference"):
+        records[component], gradients[component], _ = run_repetitions(
+            model, trainer, batch, device, observer_roots=roots, component=component)
+    return {"runs": records, "measurements": component_measurements(records, gradients)}
+
+
+def run_components(args):
+    import gc
+    import torch
+    validate_component_args(args)
+    if not args.device.startswith("cuda") or not torch.cuda.is_available() or torch.distributed.is_initialized():
+        raise ValueError("component diagnostic requires independent CUDA execution")
+    from stage2.attention_backend import load_qwen2_5_vl_with_attention
+    from stage2.checkpointing import configure_stage2_metadata
+    from stage2.peft import Stage2TuningConfig, load_stage1_dora_for_fresh_stage2
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
+    torch.set_num_threads(2)
+    root = Path(args.external_source).resolve(strict=True) if args.side == "external" else None
+    before = None if root is None else baseline.inventory(root)
+    hashes = {} if root is None else {str(p): baseline.sha(p) for p in root.rglob("*.py")}
+    selected = {"e1": args.stage1, "e3": args.stage1_e3}
+    if args.initializer != "both":
+        selected = {args.initializer: selected[args.initializer]}
+    cells, common_input = {}, None
+    with (ExternalSource(root) if root is not None else nullcontext()) as source:
+        external = None if source is None else external_modules(source)
+        for name, checkpoint in selected.items():
+            print(json.dumps({"progress": "initializer", "side": args.side, "initializer": name,
+                              "checkpoint": checkpoint}), file=sys.stderr, flush=True)
+            options = SimpleNamespace(**vars(args))
+            options.stage1 = checkpoint
+            processor = AutoProcessor.from_pretrained(checkpoint, local_files_only=True)
+            batches = prepare_batches(options, processor, external)
+            if external is not None:
+                local, supplied = map(describe_batch, batches)
+                if local["tensors"] != supplied["tensors"] or local["targets"] != supplied["targets"]:
+                    raise ValueError("external input/target coordinates differ from local")
+            batch = batches[-1]
+            description = describe_batch(batch)
+            if common_input is not None and description != common_input:
+                raise ValueError("initializer input/target coordinates differ")
+            common_input = description
+            # Follow baseline.real_models' validated loading and attention path, with
+            # only one selected class loaded. Never transfer state between implementations.
+            torch.manual_seed(42)
+            cls = Qwen2_5_VLForConditionalGeneration if external is None else external.model.Qwen2_5_VLForConditionalGeneration
+            kwargs = dict(torch_dtype=torch.bfloat16, local_files_only=True)
+            if external is not None:
+                kwargs["stage2_split_attention"] = True
+            base = load_qwen2_5_vl_with_attention(args.base, attention_implementation="sdpa",
+                vision_attention_implementation="flash_attention_2", config_load_kwargs={"local_files_only": True},
+                model_load_kwargs=kwargs, load_model=cls.from_pretrained)
+            model = load_stage1_dora_for_fresh_stage2(base, processor, checkpoint,
+                Stage2TuningConfig("dora", 32, 64, .05, baseline.TARGETS), requested_base_model_reference=args.base)
+            configure_stage2_metadata(base.config, LatentTokenIds(*baseline.token_ids(processor.tokenizer)[:3]),
+                latent_size=8, supervise_latent_boundaries=True, latent_activation_checkpointing=True)
+            base.config.use_cache = False
+            model.gradient_checkpointing_disable()
+            model = model.to(device=args.device, dtype=torch.bfloat16).train()
+            runtime = baseline.runtime_model_metadata(model, production=True)
+            trainer = make_trainers([model] if external is None else [None, model], external,
+                                    Path(args.log_dir) / name, args.device)[-1]
+            roots = [str(Path("src").resolve()), str(Path("transformers").resolve())] + ([] if root is None else [str(root)])
+            cells[name] = {"checkpoint": str(Path(checkpoint).resolve()), "runtime": runtime,
+                           "input": description, **run_component_cell(model, trainer, batch, args.device, roots)}
+            del model, base, trainer, batch, batches, processor
+            gc.collect()
+            torch.cuda.empty_cache()
+        if root is not None and (before != baseline.inventory(root) or hashes != {str(p): baseline.sha(p) for p in root.rglob("*.py")}):
+            raise ValueError("external source mutated during component diagnostic")
+    return {"mode": "components", "side": args.side, "train_index": 2046, "cells": cells,
+            "screen": screen_initializers(cells), "beta": .5, "preference_weight": 1., "entropy_weight": 0.,
+            "common_backward_divisor": 4, "optimizer_steps": 0, "repetitions_per_component": 3,
+            "base": args.base, "external_source": None if root is None else str(root),
+            "external_source_hashes": hashes, "external_files_unchanged": None if root is None else True,
+            "diagnostic_sha256": baseline.sha(__file__), "loader_sha256": baseline.sha(baseline.__file__),
+            "data_sha256": baseline.sha(args.data), "manifest_sha256": baseline.sha(args.manifest),
+            "numerics": {"torch": torch.__version__, "cuda": torch.version.cuda, "device": args.device,
+                         "hardware": torch.cuda.get_device_name(args.device), "dtype": "bfloat16", "autocast": False},
+            "limitations": ["No optimizer or DDP/ZeRO execution; native loss/4 backward only",
+                            "Three repeats and one initial sample cannot establish historical late-collapse causality",
+                            "Original external weights and historical intermediate checkpoints unavailable",
+                            "External expansion is a controller decision; this script never launches another side"]}
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    for name, default in (("external-source", baseline.SOURCE), ("stage1", baseline.STAGE1),
+    parser.add_argument("--mode", choices=("native", "components"), default="native")
+    parser.add_argument("--side", choices=("local", "external"), default="local")
+    parser.add_argument("--initializer", choices=("e1", "e3", "both"), default="both")
+    parser.add_argument("--stage1-e3", default="checkpoints/stage1-dora-egb16-e3-s648-lr5e5-20260920-03/checkpoint-648")
+    for name, default in (("external-source", None), ("stage1", baseline.STAGE1),
                           ("base", baseline.BASE), ("manifest", baseline.MANIFEST),
                           ("data", "data/TRAIN.jsonl"), ("image-root", "data"), ("device", "cuda:0"),
                           ("log-dir", "logs/until-native-v2-20260922")):
