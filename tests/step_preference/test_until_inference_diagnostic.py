@@ -129,6 +129,25 @@ def test_actual_mask_paths_and_layer_witnesses_on_separately_initialized_models(
             assert trace['decoder_calls'][0]['latent_ordinal'] == 0
             assert trace['decoder_calls'][-1]['kind'] == 'final'
             assert trace['earliest_difference'] is None
+            assert trace['image_embeddings']['status'] == 'not_applicable'
+            missing_left = dict(local_native['trace'], image_expected=True)
+            missing_right = dict(other_native['trace'], image_expected=True,
+                                 image_embeddings=torch.ones(1, 8))
+            missing = d.compare_native_traces(
+                missing_left, missing_right,
+                image_token_id=80, latent_pad_token_id=90)
+            assert missing['earliest_difference'] == {
+                'stage': 'image_embeddings', 'reason': 'observation_missing'}
+            assert missing['image_embeddings']['observation_present'] == [False, True]
+            nonfinite = dict(local_native['trace'])
+            nonfinite['token_embeddings'] = nonfinite['token_embeddings'].clone()
+            nonfinite['token_embeddings'][0, 0, 0] = float('nan')
+            with pytest.raises(ValueError, match='nonfinite native trace observation'):
+                d.compare_native_traces(
+                    nonfinite, other_native['trace'],
+                    image_token_id=80, latent_pad_token_id=90)
+            assert trace['token_embeddings']['exact_equal']
+            assert trace['reconstructed_base_inputs']['exact_equal']
             assert set(trace['final_embedding_regions']) == {
                 'image', 'latent', 'nonlatent_nonimage'}
             with runtime.numerical_policy():

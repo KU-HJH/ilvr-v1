@@ -208,13 +208,24 @@ def native_rollout(model, sample, side, external, runtime):
         raise ValueError('native ordinary final decoder capture was not unique/ordinary')
     if len(token_embeddings) != 1 or any('output' not in call for call in decoder_calls):
         raise ValueError('native trace did not observe one base embedding and complete decoder calls')
+    image_expected = batch.get('pixel_values') is not None
+    if len(image_embeddings) != int(image_expected):
+        raise ValueError('native trace image observation does not match image inputs')
+    observed_tensors = [*token_embeddings, *image_embeddings]
+    observed_tensors.extend(
+        call[key] for call in decoder_calls for key in ('inputs', 'positions', 'output'))
+    if any(tensor.is_floating_point() and not bool(torch.isfinite(tensor).all())
+           for tensor in observed_tensors):
+        raise ValueError('native trace contains a nonfinite observation')
     base = token_embeddings[0]
     if image_embeddings:
-        if len(image_embeddings) != 1:
-            raise ValueError('native trace did not observe one image embedding output')
         image_mask = (batch['input_ids'] == resolved.config.image_token_id).unsqueeze(-1).expand_as(base)
         base = base.masked_scatter(image_mask, image_embeddings[0].to(base.device, base.dtype))
-    captured[0]['trace'] = {'base_inputs': base, 'image_embeddings': image_embeddings[0] if image_embeddings else None,
+    captured[0]['trace'] = {'token_embeddings': token_embeddings[0],
+                            'reconstructed_base_inputs': base,
+                            'reconstructed_base_provenance': 'actual token embedding output with actual image output scattered at image-token positions',
+                            'image_expected': image_expected,
+                            'image_embeddings': image_embeddings[0] if image_embeddings else None,
                             'decoder_calls': decoder_calls,
                             'input_ids': batch['input_ids'].detach().clone()}
     return captured[0]
@@ -349,18 +360,48 @@ def native_factor(backend, effective_numerics, local, native_other, common_other
 
 def compare_native_traces(left, right, *, image_token_id, latent_pad_token_id):
     """Localize the first observed difference across actual native rollout boundaries."""
+    def image_comparison():
+        expected = [left['image_expected'], right['image_expected']]
+        present = [left['image_embeddings'] is not None, right['image_embeddings'] is not None]
+        if expected == [False, False] and present == [False, False]:
+            return {'status': 'not_applicable', 'reason': 'image_free',
+                    'observation_present': present}
+        if expected != [True, True] or present != [True, True]:
+            return {'status': 'invalid', 'reason': 'observation_missing',
+                    'image_expected': expected, 'observation_present': present}
+        return {'status': 'observed', **comparison(
+            left['image_embeddings'], right['image_embeddings'])}
+    for side, trace in (('left', left), ('right', right)):
+        tensors = [('token_embeddings', trace['token_embeddings']),
+                   ('reconstructed_base_inputs', trace['reconstructed_base_inputs'])]
+        if trace['image_embeddings'] is not None:
+            tensors.append(('image_embeddings', trace['image_embeddings']))
+        tensors.extend((f'decoder_calls[{index}].{key}', call[key])
+                       for index, call in enumerate(trace['decoder_calls'])
+                       for key in ('inputs', 'positions', 'output'))
+        for name, tensor in tensors:
+            if tensor.is_floating_point() and not bool(tensor.isfinite().all()):
+                raise ValueError(f'nonfinite native trace observation: {side}.{name}')
     result = {
-        'image_embeddings': comparison(left['image_embeddings'], right['image_embeddings']),
-        'base_inputs': comparison(left['base_inputs'], right['base_inputs']),
+        'image_embeddings': image_comparison(),
+        'token_embeddings': comparison(left['token_embeddings'], right['token_embeddings']),
+        'reconstructed_base_inputs': comparison(
+            left['reconstructed_base_inputs'], right['reconstructed_base_inputs']),
+        'reconstructed_base_provenance': left['reconstructed_base_provenance'],
         'decoder_calls': [],
     }
     earliest = None
     def differs(value):
-        return value.get('comparable') is False or value.get('exact_equal') is False
+        return (value.get('status') == 'invalid' or value.get('comparable') is False
+                or value.get('connected') is False or value.get('finite') is False
+                or ('exact_equal' in value and value.get('exact_equal') is not True))
     if differs(result['image_embeddings']):
-        earliest = {'stage': 'image_embeddings'}
-    elif differs(result['base_inputs']):
-        earliest = {'stage': 'base_inputs'}
+        earliest = {'stage': 'image_embeddings',
+                    'reason': result['image_embeddings'].get('reason', 'values_differ')}
+    elif differs(result['token_embeddings']):
+        earliest = {'stage': 'token_embeddings'}
+    elif differs(result['reconstructed_base_inputs']):
+        earliest = {'stage': 'reconstructed_base_inputs'}
     if len(left['decoder_calls']) != len(right['decoder_calls']):
         if earliest is None:
             earliest = {'stage': 'decoder_call_count'}
