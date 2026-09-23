@@ -241,3 +241,22 @@ def test_external_dynamic_cache_flex_suffix_matches_dense_scores_and_gradients(m
         assert (actual.grad is None) == (expected.grad is None), name
         if actual.grad is not None:
             torch.testing.assert_close(actual.grad, expected.grad, atol=1e-6, rtol=1e-4, msg=name)
+
+
+def test_profile_parsing_passes_real_reproduced_stage1_handoff_preflight():
+    # Catches profile normalization silently changing the checkpoint's ORDERED
+    # module contract after an operator supplies the correct CLI ordering.
+    from pathlib import Path
+    import main
+    from utils_deepseed import parse_args
+    checkpoint = Path('/root/workspace/ILVR/checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431')
+    source = Path('/root/workspace/ILVR/data/TRAIN.jsonl')
+    if not checkpoint.is_dir() or not source.is_file():
+        pytest.skip('requires reproduced Stage1 checkpoint431 and current TRAIN metadata')
+    args = parse_args(['--stage', 'stage2', '--stage2_execution_profile', 'latest_external_until',
+        '--data_path', str(source), '--image_root', str(source.parent), '--max_train_samples', '1',
+        '--lora_target_modules', 'q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj'])
+    admitted = main.preflight_stage2b_artifacts(args)
+    assert admitted.stage1_peft_preflight.artifact_dir == checkpoint.resolve()
+    assert admitted.stage1_peft_preflight.tuning_method == 'dora'
+    assert len(admitted.prepared_examples) == 1

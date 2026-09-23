@@ -246,7 +246,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             stage2_total_steps=212, max_steps=212, gradient_accumulation_steps=4,
             per_device_train_batch_size=1, epochs=1., learning_rate=5e-5, warm_up_steps=10, seed=42,
             tuning_method="dora", tuning_method_explicit=True, lora_r=32, lora_alpha=64,
-            lora_dropout=.05, lora_target_modules="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj",
+            lora_dropout=.05, lora_target_modules="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
             latent_size=8, attention_implementation="sdpa",
             vision_attention_implementation="flash_attention_2", step_sidecar_attention_backend="flex",
             step_sidecar_query_budget=1024, gradient_checkpointing=False,
