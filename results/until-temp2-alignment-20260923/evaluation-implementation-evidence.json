@@ -1,0 +1,55 @@
+{
+  "scope": "Approved alignment v2 final100 local-only evaluation implementation; no GPU or model load performed",
+  "skills": [
+    "superpowers:test-driven-development",
+    "writing-good-tests reference",
+    "superpowers:verification-before-completion"
+  ],
+  "red": "evaluation-red.log: collection failed because required evaluator module did not exist",
+  "green": "evaluation-green.log: 3 passed",
+  "fresh_verification": "evaluation-verification.log: 3 passed; CLI --help succeeded",
+  "cpu_integration": {
+    "samples": 100,
+    "sites": 306,
+    "tokens": 12492,
+    "max_sequence_length": 16704,
+    "exact": [
+      "sample IDs",
+      "block IDs",
+      "body positions",
+      "target start/end",
+      "target count",
+      "gold target IDs"
+    ],
+    "processor": "reproduced Stage1 checkpoint431 processor; final artifact processor revalidated by evaluator before loading model"
+  },
+  "protocol": {
+    "clean_bank": "captured actual native final decoder inputs; fixed throughout all replay",
+    "replay": "full length, SDPA MATH, TF32 off",
+    "decoder": "FP32",
+    "vision": "BF16 FlashAttention2 with restored latest_external_until profile",
+    "native_clean_identity": {
+      "max_token_logp_atol": 0.001,
+      "max_site_nll_atol": 0.0001
+    },
+    "clean_noop_identity": "exact token logps and argmax",
+    "metrics": "first_changed/sites, any_changed/sites, tokens_changed/tokens, summed gold NLL/tokens, paired (masked-clean) summed NLL/tokens"
+  },
+  "remaining": [
+    "Independent specification/quality review by root-assigned reviewer",
+    "Root integrated full suite",
+    "Final artifact/GPU runtime and actual100 evaluation after approved training gates; CPU witness does not establish GPU/model equivalence"
+  ],
+  "hashes": {
+    "scripts/evaluate_until_body_mask.py": "1dd1c72ecd5e6646ebc92abde21390a0136ddffaece44d517bb0182b4a1cddda",
+    "tests/stage2/test_until_body_evaluation.py": "26a9d67a6972dd24beec47f8bfe77ecc55575b8cc92a56829477715f2fe1b86d",
+    "data/until-temp2-alignment-20260923/evaluation-targets.json": "590cc341d0813c95547d0f4e294b1f197d3421548e9bacbbe494e84e5cdc3e2b"
+  },
+  "logs": {
+    "logs/until-temp2-alignment-20260923/evaluation-verification.log": "224a89eacef8d510a0aa5cf9200b0b582e23b54815eb8c7f083da51589eacc1d",
+    "logs/until-temp2-alignment-20260923/evaluation-green.log": "9099ecb61f468c59675388ef7744e6be2e8909d84005c3ead62fbb5b2f22250a",
+    "logs/until-temp2-alignment-20260923/evaluation-cohort-cpu.log": "4893785ba03ecbc733911c7208136b15ae4193e637f181c3989e7e01014da73a",
+    "logs/until-temp2-alignment-20260923/evaluation-cli-help.log": "79b3ee0558942161ee0114a32841f44865f8a903cf07bcf8c0f36d733ae94ec9",
+    "logs/until-temp2-alignment-20260923/evaluation-red.log": "4d10eb26920b5512cc84bb89db07b76be42e013c6a1d7a63576f722cc3b1f61b"
+  }
+}
