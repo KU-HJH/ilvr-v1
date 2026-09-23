@@ -195,3 +195,49 @@ def test_explicit_profile_overrides_stale_adapter_target_environment():
         '--lora_target_modules', 'q_proj'])
     assert set(args.lora_target_modules.split(',')) == {
         'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'}
+
+
+@pytest.mark.parametrize('decoder_backend', ['sdpa', 'eager'])
+def test_external_dynamic_cache_flex_suffix_matches_dense_scores_and_gradients(monkeypatch, decoder_backend):
+    # Catches passing a BlockMask into ordinary Tensor slicing after cache append.
+    # Only the CUDA compiler boundary is replaced: execute PyTorch's real Flex
+    # operator on CPU, retaining the production planner, mask, cache, and backward.
+    from dataclasses import replace
+    from torch.nn.attention.flex_attention import BlockMask, flex_attention
+    from transformers.integrations import flex_attention as integration
+    from step_preference.shared_prefix_measurement import tiny_measurement_case
+    from step_preference.equivalence import _trainer
+    from step_preference.config import StepPreferenceConfig
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+    template, batch = tiny_measurement_case(steps=2, total_target_tokens=4, device='cpu')
+    config = copy.deepcopy(template.config)
+    config._attn_implementation = decoder_backend
+    config.stage2_execution_profile = 'latest_external_until'
+    model = Qwen2_5_VLForConditionalGeneration(config).float().train()
+    model.load_state_dict(template.state_dict())
+    model.visual.requires_grad_(False)
+    reference = copy.deepcopy(model)
+    batch['step_preference']['steps'] = tuple({'span': s} for s in batch['reasoning_step_spans'])
+    config = StepPreferenceConfig(enabled=True, mode='stage2b', stage2a_checkpoint_path='tiny',
+        sidecar_attention_backend='flex', beta=.5, lambda_preference=1.,
+        visual_only_context_preference=True, target_scope='until_next_latent')
+    observed = []
+    def cpu_flex(q, k, v, **kwargs):
+        assert isinstance(kwargs['block_mask'], BlockMask)
+        assert kwargs.pop('external_until') is True
+        observed.append((q.shape[-2], k.shape[-2]))
+        return flex_attention(q, k, v, **kwargs)
+    monkeypatch.setattr(integration, 'compile_friendly_flex_attention', cpu_flex)
+    losses = []
+    for current, backend in ((model, 'flex'), (reference, 'dense')):
+        trainer = _trainer(replace(config, sidecar_attention_backend=backend))
+        trainer.stage2_execution_profile = 'latest_external_until'
+        loss = trainer.compute_loss(current, copy.deepcopy(batch))
+        loss.backward()
+        losses.append(loss.detach())
+    assert observed and all(k == batch['input_ids'].shape[1] + q for q,k in observed)
+    torch.testing.assert_close(losses[0], losses[1], atol=1e-6, rtol=1e-5)
+    for (name, actual), (_, expected) in zip(model.named_parameters(), reference.named_parameters()):
+        assert (actual.grad is None) == (expected.grad is None), name
+        if actual.grad is not None:
+            torch.testing.assert_close(actual.grad, expected.grad, atol=1e-6, rtol=1e-4, msg=name)

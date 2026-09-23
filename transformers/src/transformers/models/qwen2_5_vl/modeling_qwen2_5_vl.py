@@ -820,7 +820,8 @@ class Qwen2_5_VLAttention(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # repeat k/v heads if n_kv_heads < n_heads
-        if stage2_prefix_key_value is not None and _is_block_mask(attention_mask):
+        # Both tuple prefixes and DynamicCache suffixes carry rectangular BlockMasks.
+        if _is_block_mask(attention_mask):
             from ...integrations.flex_attention import flex_attention_forward
             attn_output, _ = flex_attention_forward(
                 self, query_states, key_states, value_states, attention_mask,
@@ -1285,7 +1286,8 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        if stage2_prefix_key_value is not None and _is_block_mask(attention_mask):
+        # Both tuple prefixes and DynamicCache suffixes carry rectangular BlockMasks.
+        if _is_block_mask(attention_mask):
             from ...integrations.flex_attention import flex_attention_forward
             attn_output, _ = flex_attention_forward(
                 self, query_states, key_states, value_states, attention_mask,
