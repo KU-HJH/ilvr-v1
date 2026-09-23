@@ -267,6 +267,69 @@ class AlignmentObserver(ReproductionObserver):
         self.totals = {'preference':None,'total':None}
 
 
+class MemoryDiagnosticObserver(AlignmentObserver):
+    """Detached forward witnesses only; ordinary Trainer backward owns gradients."""
+    def memory(self, event, **fields):
+        record = dict(event=event, rank=self.rank, micro=self.micro,
+            allocated=torch.cuda.memory_allocated(self.engine.device),
+            peak_allocated=torch.cuda.max_memory_allocated(self.engine.device))
+        record.update(fields)
+        self.write(record)
+
+    def observe(self, total, preference, inputs, scores):
+        self.micro += 1
+        expected_id = self.replay['sample_ids'][self.micro*4+self.rank]
+        if self.micro >= 8 or list(inputs['sample_ids']) != [expected_id]:
+            raise ValueError('memory diagnostic replay differs')
+        self.save(f'micro-{self.micro}-scores', scores)
+        self.save(f'micro-{self.micro}-rng', {'cpu':torch.get_rng_state(),
+            'cuda':torch.cuda.get_rng_state(self.engine.device)})
+        self._reference_output_managers.clear()
+        self.memory('forward', sample_id=expected_id, tokens=int(inputs['input_ids'].shape[-1]),
+                    loss=float(total.detach()))
+
+    def before_step(self):
+        self.lr = [float(group['lr']) for group in self.engine.optimizer.optimizer.param_groups]
+
+    def after_step(self):
+        self.update += 1
+        self.memory('memory_update', probe_optimizer_step=self.update, lr=self.lr)
+
+
+def check_memory_runtime(records, replay):
+    """Capacity witness only: no numerical-equivalence or full-training approval."""
+    failures = []
+    initial = [r for r in records if r['event']=='init']
+    hosts = [r.get('hostname') for r in initial]
+    if (sorted(r['rank'] for r in initial)!=list(range(4)) or len(set(hosts))!=2
+            or any(hosts.count(h)!=2 for h in hosts)):
+        failures.append('four ranks on two nodes required')
+    for r in initial:
+        if tuple(r.get(k) for k in ('world_size','microbatch','gas','zero_stage','schedule_steps','warmup_steps')) != (4,1,4,2,212,10):
+            failures.append('runtime profile differs')
+    for rank in range(4):
+        local = [r for r in records if r['rank']==rank]
+        for event in ('micro_entry','forward','backward'):
+            rows = [r for r in local if r['event']==event]
+            if [r['micro'] for r in rows] != list(range(8)):
+                failures.append(f'rank{rank} missing {event}')
+            for row in rows:
+                if (row.get('sample_id')!=replay['sample_ids'][row['micro']*4+rank]
+                        or not 0 <= row.get('allocated',-1) <= row.get('peak_allocated',-1)):
+                    failures.append('input identity or memory evidence differs')
+                if event=='backward' and row.get('actual_backward_hooks',0)<=0:
+                    failures.append('ordinary backward not witnessed')
+        updates = [r for r in local if r['event']=='memory_update']
+        if [r['probe_optimizer_step'] for r in updates] != [1,2] or [r['lr'] for r in updates] != [[0.],[5e-6]]:
+            failures.append('two scheduled optimizer events required')
+        compiler = [r for r in local if r['event']=='compiler']
+        calls = [c for r in compiler for c in r['calls'] if c['callable']=='torch.nn.attention.flex_attention.flex_attention']
+        if len(compiler)!=1 or not calls or any(c.get('dynamic') is not True or c.get('donated_buffer') is not False for c in calls):
+            failures.append('compiler profile differs')
+    return {'complete':not failures, 'comparison_pass':False, 'full212_authorized':False,
+            'failures':failures, 'scope':'first two replay groups ordinary-backward capacity only'}
+
+
 def check_runtime(records, replay):
     """Recompute event/weight acceptance from evidence, never trust a pass flag."""
     import math

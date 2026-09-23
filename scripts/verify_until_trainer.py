@@ -14,7 +14,7 @@ from pathlib import Path
 from scripts.verify_until_native import ExternalSource, external_modules, describe_batch, state_digest
 from scripts import verify_voff_model_path as baseline
 from stage2.until_alignment_probe import (
-    NUMERICAL_PROTOCOL, AlignmentObserver, check_runtime, compare_snapshot,
+    NUMERICAL_PROTOCOL, AlignmentObserver, MemoryDiagnosticObserver, check_memory_runtime, check_runtime, compare_snapshot,
     freeze_envelope, select_windows, tensor_destination, required_snapshots, expected_snapshots,
 )
 
@@ -66,8 +66,25 @@ def authenticate_source(spec):
     return root
 
 
+def memory_diagnostic(spec):
+    mode = spec.get('mode', 'comparison')
+    if mode not in ('comparison', 'ordinary_backward_memory'):
+        raise ValueError('unknown gate mode')
+    if mode == 'ordinary_backward_memory' and spec.get('path') != 'external':
+        raise ValueError('memory diagnostic requires external source')
+    return mode == 'ordinary_backward_memory'
+
+
+def snapshot_inventory(spec, ranks=range(4)):
+    if memory_diagnostic(spec):
+        return {f'rank-{rank}/micro-{micro}-{kind}.pt' for rank in ranks
+                for micro in range(8) for kind in ('scores','rng')}
+    return expected_snapshots(ranks)
+
+
 def load_spec(path):
     spec=json.loads(Path(path).read_text())
+    memory_diagnostic(spec)
     if spec.get('path') not in ('external','aligned'):
         raise ValueError('gate path must be external or aligned')
     for key in ('result_dir','tensor_dir','external_manifest','manifest','data','image_root','base','stage1'):
@@ -164,12 +181,15 @@ def probed_trainer_class(base, spec, replay):
     from transformers import Trainer,TrainerCallback
     from torch.utils.data import SequentialSampler
     from peft.tuners.lora.dora import DoraLinearLayer
+    diagnostic = memory_diagnostic(spec)
+    stop_steps = 2 if diagnostic else 5
 
     class ProbeCallback(TrainerCallback):
         def on_train_begin(self,args,state,control,**kwargs):
             trainer=self.owner
             engine=trainer.accelerator.deepspeed_engine_wrapped.engine
-            trainer.gate_observer=AlignmentObserver(trainer,engine,spec,replay)
+            observer_class = MemoryDiagnosticObserver if diagnostic else AlignmentObserver
+            trainer.gate_observer=observer_class(trainer,engine,spec,replay)
             original=engine.step
             def step(*a,**kw):
                 boundary=engine.is_gradient_accumulation_boundary()
@@ -185,10 +205,10 @@ def probed_trainer_class(base, spec, replay):
             engine.step=step
             return control
         def on_step_end(self,args,state,control,**kwargs):
-            if state.global_step==5:
+            if state.global_step==stop_steps:
                 control.should_training_stop=True
-            if state.global_step>5:
-                raise RuntimeError('bounded probe exceeded five updates')
+            if state.global_step>stop_steps:
+                raise RuntimeError('bounded probe exceeded requested updates')
             return control
 
     class Probed(base):
@@ -230,9 +250,17 @@ def probed_trainer_class(base, spec, replay):
             description=describe_batch(inputs)
             # Names of implementation-specific metadata differ; actual tensors and targets may not.
             coordinates={k:description[k] for k in ('tensors','sample_ids','targets')}
+            if diagnostic:
+                self.gate_observer.memory('micro_entry', micro=self.gate_observer.micro+1,
+                    sample_id=inputs['sample_ids'][0], coordinates=coordinates)
             before=self.gate_observer.hook_calls
             value=super().training_step(model,inputs,num_items_in_batch)
             observer=self.gate_observer
+            if diagnostic:
+                observer.memory('backward', sample_id=inputs['sample_ids'][0], coordinates=coordinates,
+                    actual_backward_hooks=observer.hook_calls-before,
+                    dora_scope_cleaned=all('forward' not in m.__dict__ for m in self._magnitude_modules))
+                return value
             observer.save(f'micro-{observer.micro}-dora-norms',self._norms)
             observer.write(dict(event='backward',rank=observer.rank,micro=observer.micro,
                 coordinates=coordinates,dora_norm_calls=self._norm_calls,
@@ -297,6 +325,7 @@ def run_from_training_args(args, spec_path):
     from stage2.trainer import Stage2Trainer
     from step_preference.config import StepPreferenceConfig
     spec=load_spec(spec_path)
+    diagnostic=memory_diagnostic(spec)
     spec_sha256=baseline.sha(spec_path)
     run_id=Path(args.save_model_path).name
     if int(os.environ.get('WORLD_SIZE','1'))!=4:
@@ -351,8 +380,10 @@ def run_from_training_args(args, spec_path):
             source_manifest_sha256=baseline.sha(spec['external_manifest']),rank=rank,
             envelope_sha256=baseline.sha(spec['envelope']) if spec['path']=='aligned' else None,
             source_adaptations=['frozen parent Trainer and frozen Flex callable; shared remaining framework dependencies and Stage1 loader','reference grouping2 stream replay sharded by Accelerator over4 ranks',
-                'fixed Trainer GAS4 denominator and ceil replay epoch accounting','schedule212/warmup10; stop callback after5 updates',
+                'fixed Trainer GAS4 denominator and ceil replay epoch accounting',
+                f'schedule212/warmup10; stop callback after{2 if diagnostic else 5} updates',
                 'gate-only AOT donated_buffer=False before compilation for retained observer gradients; restored on exit'],
+            memory_diagnostic=diagnostic,
             probe_compiler_config={'donated_buffer':functorch_config.donated_buffer},
             runtime_origins=runtime_origins(trainer,source,external_flex),
             final_tail_scope='actual partial optimizer event for original212 IDs, not historical optimizer state212')
@@ -377,13 +408,13 @@ def run_from_training_args(args, spec_path):
             flex_dynamic_true=bool(flex_calls) and all(call['dynamic'] is True for call in flex_calls)))
         if not flex_calls or any(call['dynamic'] is not True for call in flex_calls):
             raise RuntimeError('actual Flex compiler dynamic=True dispatch was not witnessed')
-        if trainer.state.global_step!=5 or trainer.gate_observer.micro!=16:
+        if trainer.state.global_step!=(2 if diagnostic else 5) or trainer.gate_observer.micro!=(7 if diagnostic else 16):
             raise RuntimeError('bounded event count differs')
         authenticate_source(spec)
         trainer.accelerator.wait_for_everyone()
         if baseline.sha(spec_path)!=spec_sha256:
             raise ValueError('gate spec changed during execution')
-        completion=dict(kind='until_alignment_probe',run_id=run_id,rank=rank,
+        completion=dict(kind='until_memory_diagnostic' if diagnostic else 'until_alignment_probe',run_id=run_id,rank=rank,
             commit=os.environ['ILVR_REPOSITORY_COMMIT'],spec_sha256=spec_sha256,
             schedule_steps=212,probe_optimizer_steps=trainer.state.global_step,
             microsteps=trainer.gate_observer.micro+1,status='complete')
@@ -420,6 +451,8 @@ def structural_identity(directory):
 
 def freeze(control_dirs,output):
     controls=[metadata(d) for d in control_dirs]
+    if any(memory_diagnostic(c['spec']) for c in controls):
+        raise ValueError('memory diagnostic cannot serve as a comparison control')
     identities=[structural_identity(d) for d in control_dirs]
     if any(i!=identities[0] for i in identities[1:]):
         raise ValueError('control inputs, rank initial states or sources differ')
@@ -487,9 +520,9 @@ def compare(envelope_path,aligned_dir):
             'full212_authorized':False,'scope':'bounded comparison only; controller must assess gate before launching full212'}
 
 
-def validate_node_entry_names(kind, entries, ranks):
+def validate_node_entry_names(kind, entries, ranks, spec=None):
     if kind=='tensors':
-        expected=expected_snapshots(ranks)
+        expected=snapshot_inventory(spec or {},ranks)
     elif kind=='results':
         expected={f'{prefix}{rank}{suffix}' for rank in ranks for prefix,suffix in (
             ('rank-','.jsonl'),('metadata-rank-','.json'),('completion-rank-','.json'))}
@@ -504,10 +537,11 @@ def _completion_records(spec_path, *, ranks, run_id, commit, spec_sha256):
     if baseline.sha(spec_path)!=spec_sha256:
         raise ValueError('alignment completion spec digest differs')
     spec=json.loads(Path(spec_path).read_text())
+    diagnostic=memory_diagnostic(spec)
     for rank in ranks:
         payload=json.loads((Path(spec['result_dir'])/f'completion-rank-{rank}.json').read_text())
-        expected=dict(kind='until_alignment_probe',run_id=run_id,rank=rank,commit=commit,
-            spec_sha256=spec_sha256,schedule_steps=212,probe_optimizer_steps=5,microsteps=17,status='complete')
+        expected=dict(kind='until_memory_diagnostic' if diagnostic else 'until_alignment_probe',run_id=run_id,rank=rank,commit=commit,
+            spec_sha256=spec_sha256,schedule_steps=212,probe_optimizer_steps=2 if diagnostic else 5,microsteps=8 if diagnostic else 17,status='complete')
         if payload!=expected:
             raise ValueError('alignment terminal completion differs from five-step probe')
         meta=json.loads((Path(spec['result_dir'])/f'metadata-rank-{rank}.json').read_text())
@@ -522,7 +556,7 @@ def node_evidence(spec_path, *, ranks, run_id, commit, spec_sha256):
     result={'ranks':ranks,'spec_sha256':spec_sha256}
     for kind,field in (('results','result_dir'),('tensors','tensor_dir')):
         root=Path(spec[field])
-        names=expected_snapshots(ranks) if kind=='tensors' else {
+        names=snapshot_inventory(spec,ranks) if kind=='tensors' else {
             f'{prefix}{rank}{suffix}' for rank in ranks for prefix,suffix in (
                 ('rank-','.jsonl'),('metadata-rank-','.json'),('completion-rank-','.json'))}
         entries=[]
@@ -533,13 +567,20 @@ def node_evidence(spec_path, *, ranks, run_id, commit, spec_sha256):
             with path.open('rb') as stream:
                 digest=hashlib.file_digest(stream,'sha256').hexdigest()
             entries.append({'path':name,'size':path.stat().st_size,'sha256':digest})
-        validate_node_entry_names(kind,entries,ranks)
+        validate_node_entry_names(kind,entries,ranks,spec)
         result[kind]=entries
     return result
 
 
 def validate_collected_completion(spec_path, *, run_id, commit, spec_sha256):
     spec=_completion_records(spec_path,ranks=range(4),run_id=run_id,commit=commit,spec_sha256=spec_sha256)
+    if memory_diagnostic(spec):
+        if {str(p.relative_to(spec['tensor_dir'])) for p in Path(spec['tensor_dir']).glob('rank-*/*.pt')} != snapshot_inventory(spec):
+            raise ValueError('memory diagnostic tensor inventory differs')
+        report=check_memory_runtime(records(spec['result_dir']),metadata(spec['result_dir'])['replay'])
+        if not report['complete']:
+            raise ValueError(f'memory diagnostic runtime witness failed: {report["failures"]}')
+        return report
     required_snapshots({str(p.relative_to(spec['tensor_dir'])) for p in Path(spec['tensor_dir']).glob('rank-*/*.pt')})
     report=check_runtime(records(spec['result_dir']),metadata(spec['result_dir'])['replay'])
     if not report['pass']:

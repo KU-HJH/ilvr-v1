@@ -1827,6 +1827,9 @@ def validate_alignment_gate_launch(spec_path, *, plan, result_root, schedule_ste
         raise ValueError("alignment gate requires Stage2 DoRA ZeRO2 world4 schedule212")
     if spec.get("path") not in ("external", "aligned"):
         raise ValueError("alignment gate path must be external or aligned")
+    if (spec.get("mode", "comparison") not in ("comparison", "ordinary_backward_memory")
+            or (spec.get("mode") == "ordinary_backward_memory" and spec["path"] != "external")):
+        raise ValueError("memory diagnostic mode requires external source")
     for field, root in (("tensor_dir", _CHECKPOINT_ROOT / plan.run_id),
                         ("result_dir", Path(result_root) / plan.run_id)):
         target = Path(spec.get(field, ""))
@@ -2238,7 +2241,7 @@ class SubprocessCoordinatorRunner:
     def collect_alignment_gate(self, spec_path, *, exit_codes, schedule_steps,
                                expected_spec_sha256, result_root):
         """Collect completed rank-owned probe evidence, never a fabricated checkpoint."""
-        from scripts.verify_until_trainer import node_evidence, validate_collected_completion
+        from scripts.verify_until_trainer import node_evidence, validate_collected_completion, memory_diagnostic
         from src.multinode_artifacts import _rsync_prefix
         if dict(exit_codes) != {0: 0, 1: 0}:
             raise ValueError("alignment probe collection requires zero owned exits")
@@ -2247,6 +2250,7 @@ class SubprocessCoordinatorRunner:
         if launch["sha256"] != expected_spec_sha256:
             raise ValueError("alignment gate spec changed since preflight")
         spec = launch["spec"]
+        diagnostic = memory_diagnostic(spec)
         arguments = (str(_REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"),
             "-m", "scripts.verify_until_trainer", "node-evidence", "--spec", str(spec_path),
             "--ranks", "0", "1", "--run-id", self.plan.run_id,
@@ -2264,7 +2268,7 @@ class SubprocessCoordinatorRunner:
             entries = remote[kind]
             # The exporter admits only the exact fixed per-rank probe file set.
             from scripts.verify_until_trainer import validate_node_entry_names
-            validate_node_entry_names(kind, entries, [0, 1])
+            validate_node_entry_names(kind, entries, [0, 1], spec)
             for entry in entries:
                 target = root / entry["path"]
                 if (target.exists() or target.is_symlink()
@@ -2287,10 +2291,11 @@ class SubprocessCoordinatorRunner:
                         raise ValueError("collected alignment artifact checksum differs")
         report = validate_collected_completion(spec_path, run_id=self.plan.run_id,
                     commit=self.commit_value, spec_sha256=expected_spec_sha256)
-        witness = Path(result_root) / self.plan.run_id / f"{self.plan.attempt_id}-probe-witness.json"
-        payload = {"kind": "until_alignment_probe", "run_id": self.plan.run_id,
+        suffix = 'memory-diagnostic-witness' if diagnostic else 'probe-witness'
+        witness = Path(result_root) / self.plan.run_id / f"{self.plan.attempt_id}-{suffix}.json"
+        payload = {"kind": "until_memory_diagnostic" if diagnostic else "until_alignment_probe", "run_id": self.plan.run_id,
             "attempt_id": self.plan.attempt_id, "commit": self.commit_value,
-            "schedule_steps": 212, "probe_optimizer_steps": 5, "exit_codes": dict(exit_codes),
+            "schedule_steps": 212, "probe_optimizer_steps": 2 if diagnostic else 5, "exit_codes": dict(exit_codes),
             "spec_sha256": expected_spec_sha256, "runtime": report,
             "rank_artifact_counts": {"remote": len(remote["tensors"]), "local": len(local["tensors"])},
             "training_checkpoint": None, "full212_authorized": False}

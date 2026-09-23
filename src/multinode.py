@@ -1926,7 +1926,9 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 Path(gate_spec_path), exit_codes=exit_codes, schedule_steps=212,
                 expected_spec_sha256=gate_launch["sha256"], result_root=result_root,
             )
-            print(json.dumps({"alignment_probe_witness": str(witness)}, sort_keys=True))
+            witness_key = ("memory_diagnostic_witness" if gate_launch["spec"].get("mode") == "ordinary_backward_memory"
+                           else "alignment_probe_witness")
+            print(json.dumps({witness_key: str(witness)}, sort_keys=True))
             return 0
         ordinary_stage1 = (
             stage == "stage1"

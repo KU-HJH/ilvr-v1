@@ -7,12 +7,14 @@ import src.multinode as coordinator
 import src.multinode_runtime as runtime
 
 
-def test_owned_coordinator_collects_probe_after_zero_exits_without_checkpoint212(tmp_path,monkeypatch,capsys):
+@pytest.mark.parametrize('diagnostic',[False,True])
+def test_owned_coordinator_collects_probe_after_zero_exits_without_checkpoint212(tmp_path,monkeypatch,capsys,diagnostic):
     run_id='until-gate-coordinator-test'
     repository=coordinator._REPOSITORY_ROOT
     spec_path=tmp_path/'spec.json'
     spec_path.write_text(json.dumps({'path':'external','result_dir':str(repository/'results'/run_id),
-        'tensor_dir':str(repository/'checkpoints'/run_id/'gate-tensors')}))
+        'tensor_dir':str(repository/'checkpoints'/run_id/'gate-tensors'),
+        'mode':'ordinary_backward_memory' if diagnostic else 'comparison'}))
     for key,value in {'STAGE1_CHECKPOINT':'/models/base','DATA_PATH':'/data/train.jsonl',
         'IMAGE_ROOT':'/data','TUNING_METHOD':'dora','STAGE2_EXECUTION_PROFILE':'latest_external_until',
         'ILVR_UNTIL_ALIGNMENT_GATE_SPEC':str(spec_path)}.items():
@@ -40,7 +42,8 @@ def test_owned_coordinator_collects_probe_after_zero_exits_without_checkpoint212
     assert coordinator._training_main('stage2',['--run-id',run_id,'--zero-stage','2',
         '--main-process-port','29631','--max_steps','212','--save_steps','212'])==0
     assert events==['preflight','preflight','owned-start','owned-monitor','collect-real-probe5']
-    assert json.loads(capsys.readouterr().out)['alignment_probe_witness']==str(witness)
+    key='memory_diagnostic_witness' if diagnostic else 'alignment_probe_witness'
+    assert json.loads(capsys.readouterr().out)[key]==str(witness)
 
 
 def test_probe_launch_paths_must_belong_to_owned_run(tmp_path):
@@ -107,11 +110,13 @@ def test_completion_requires_actual_five_step_markers_and_four_rank_runtime(tmp_
 
 
 @pytest.mark.parametrize('corrupt',[False,True])
-def test_real_collector_gathers_remote_tensors_and_rejects_transport_corruption(tmp_path,monkeypatch,corrupt):
+@pytest.mark.parametrize('diagnostic',[False,True])
+def test_real_collector_gathers_remote_tensors_and_rejects_transport_corruption(tmp_path,monkeypatch,corrupt,diagnostic):
     import shutil
     import subprocess
     from scripts.verify_until_trainer import node_evidence
-    path,spec,digest=_completed_artifacts(tmp_path,'our-gate')
+    builder=_completed_memory_artifacts if diagnostic else _completed_artifacts
+    path,spec,digest=builder(tmp_path,'our-gate')
     remote=node_evidence(path,ranks=[0,1],run_id='our-gate',commit='a'*40,spec_sha256=digest)
     holding=tmp_path/'remote'; holding.mkdir()
     for kind,field in (('results','result_dir'),('tensors','tensor_dir')):
@@ -142,7 +147,55 @@ def test_real_collector_gathers_remote_tensors_and_rejects_transport_corruption(
     else:
         witness=runner.collect_alignment_gate(path,**kwargs)
         report=json.loads(witness.read_text())
-        assert report['probe_optimizer_steps']==5 and report['schedule_steps']==212
-        assert report['runtime']['pass'] and report['training_checkpoint'] is None
-        assert report['rank_artifact_counts']=={'remote':240,'local':240}
+        assert report['probe_optimizer_steps']==(2 if diagnostic else 5) and report['schedule_steps']==212
+        assert report['runtime']['complete' if diagnostic else 'pass'] and report['training_checkpoint'] is None
+        count=32 if diagnostic else 240
+        assert report['rank_artifact_counts']=={'remote':count,'local':count}
+        if diagnostic:
+            assert witness.name=='initial-memory-diagnostic-witness.json'
+            assert report['kind']=='until_memory_diagnostic'
+            assert report['runtime']['comparison_pass'] is False and report['full212_authorized'] is False
         assert not (tmp_path/'checkpoints'/'our-gate'/'checkpoint-212').exists()
+
+
+def _completed_memory_artifacts(tmp_path,run_id):
+    path,spec,_ = _completed_artifacts(tmp_path,run_id)
+    spec['mode']='ordinary_backward_memory'
+    path.write_text(json.dumps(spec))
+    import hashlib
+    digest=hashlib.sha256(path.read_bytes()).hexdigest()
+    root=Path(spec['result_dir']); tensors=Path(spec['tensor_dir'])
+    for rank in range(4):
+        meta=root/f'metadata-rank-{rank}.json'
+        payload=json.loads(meta.read_text()); payload['spec']=spec; meta.write_text(json.dumps(payload))
+        marker=root/f'completion-rank-{rank}.json'
+        payload=json.loads(marker.read_text()); payload.update(kind='until_memory_diagnostic',probe_optimizer_steps=2,microsteps=8,spec_sha256=digest)
+        marker.write_text(json.dumps(payload))
+        entries=[dict(event='init',rank=rank,hostname=f'host{rank//2}',world_size=4,gas=4,microbatch=1,zero_stage=2,schedule_steps=212,warmup_steps=10),
+                 dict(event='compiler',rank=rank,calls=[dict(callable='torch.nn.attention.flex_attention.flex_attention',dynamic=True,donated_buffer=False)])]
+        for micro in range(8):
+            for event in ['micro_entry','forward','backward']:
+                entries.append(dict(event=event,rank=rank,micro=micro,sample_id=f's{micro*4+rank}',allocated=100,peak_allocated=120,actual_backward_hooks=3,coordinates={'targets':[7]}))
+        entries.extend(dict(event='memory_update',rank=rank,probe_optimizer_step=step,lr=[(step-1)*5e-6]) for step in [1,2])
+        (root/f'rank-{rank}.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in entries))
+    for tensor in tensors.glob('rank-*/*.pt'):
+        name=tensor.name
+        keep=any(name==f'micro-{m}-{k}.pt' for m in range(8) for k in ['scores','rng'])
+        if not keep: tensor.unlink()
+    return path,spec,digest
+
+
+def test_memory_completion_is_separate_and_cannot_pass_alignment_gate(tmp_path):
+    from scripts.verify_until_trainer import validate_collected_completion, node_evidence
+    path,spec,digest=_completed_memory_artifacts(tmp_path,'memory-test')
+    root=Path(spec['result_dir'])
+    kwargs=dict(run_id='memory-test',commit='a'*40,spec_sha256=digest)
+    report=validate_collected_completion(path,**kwargs)
+    assert report['complete'] is True and report['comparison_pass'] is False
+    assert len(node_evidence(path,ranks=[0,1],**kwargs)['tensors'])==32
+    # A missing ordinary backward is not a completed memory diagnosis.
+    target=root/'rank-0.jsonl'
+    rows=[json.loads(x) for x in target.read_text().splitlines()]
+    target.write_text(''.join(json.dumps(x)+'\n' for x in rows if not(x['event']=='backward' and x.get('micro')==4)))
+    with pytest.raises(ValueError,match='memory diagnostic'):
+        validate_collected_completion(path,**kwargs)

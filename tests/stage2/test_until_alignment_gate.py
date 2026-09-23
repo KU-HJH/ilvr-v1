@@ -213,3 +213,42 @@ def test_gate_scope_allows_compiled_retained_gradients_and_restores_config(monke
             assert config.donated_buffer is True
     finally:
         torch._dynamo.reset()
+
+
+def test_memory_diagnostic_observes_without_extra_gradients_and_keeps_backward(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    p = probe()
+    assert hasattr(p, 'MemoryDiagnosticObserver'), 'ordinary-backward observer missing'
+    observer = p.MemoryDiagnosticObserver.__new__(p.MemoryDiagnosticObserver)
+    observer.micro, observer.rank, observer.update = -1, 0, 0
+    observer.replay = {'sample_ids': ['s0'], 'source_updates': [1, 2]}
+    observer.engine = SimpleNamespace(device='cpu')
+    observer._reference_output_managers = []
+    observer.stream = (tmp_path/'memory.jsonl').open('w')
+    observer.tensor_dir = tmp_path
+    monkeypatch.setattr(torch.cuda, 'memory_allocated', lambda device: 100)
+    monkeypatch.setattr(torch.cuda, 'max_memory_allocated', lambda device: 120)
+    monkeypatch.setattr(torch.cuda, 'get_rng_state', lambda device: torch.tensor([1],dtype=torch.uint8))
+    monkeypatch.setattr(torch.autograd, 'grad', lambda *a, **k: pytest.fail('diagnostic ran extra autograd.grad'))
+    parameter = torch.tensor(2., requires_grad=True)
+    total = parameter.square()
+    observer.memory('micro_entry', sample_id='s0', micro=0, coordinates={'targets': [7]})
+    observer.observe(total, total/2, {'sample_ids':['s0'], 'input_ids':torch.tensor([[7]])}, {'ce':total.detach()})
+    # Flushed before ordinary backward: available even if backward OOMs.
+    events = [__import__('json').loads(x) for x in (tmp_path/'memory.jsonl').read_text().splitlines()]
+    assert [x['event'] for x in events] == ['micro_entry', 'forward']
+    assert parameter.grad is None
+    total.backward()
+    assert parameter.grad.item() == 4.
+    assert sorted(x.name for x in tmp_path.glob('*.pt')) == ['micro-0-rng.pt','micro-0-scores.pt']
+    observer.stream.close()
+
+
+def test_memory_diagnostic_mode_is_external_only_and_unknown_modes_fail():
+    from scripts.verify_until_trainer import memory_diagnostic
+    assert memory_diagnostic({'path':'external', 'mode':'ordinary_backward_memory'})
+    assert not memory_diagnostic({'path':'external'})
+    with pytest.raises(ValueError, match='external'):
+        memory_diagnostic({'path':'aligned', 'mode':'ordinary_backward_memory'})
+    with pytest.raises(ValueError, match='mode'):
+        memory_diagnostic({'path':'external', 'mode':'typo'})
