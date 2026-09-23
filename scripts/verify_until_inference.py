@@ -159,12 +159,37 @@ def native_rollout(model, sample, side, external, runtime):
     batch = {k: v.to(device) for k, v in sample.model_inputs.items()}
     length = batch['input_ids'].shape[1]
     captured = []
+    token_embeddings, image_embeddings, decoder_calls = [], [], []
+    latent_ordinal = 0
+    def token_output(module, args, output):
+        if args and args[0].shape == batch['input_ids'].shape:
+            token_embeddings.append(output.detach().clone())
+    def image_output(module, args, output):
+        image_embeddings.append(output.detach().clone())
     def observe(module, args, kwargs):
+        nonlocal latent_ordinal
         value = kwargs.get('inputs_embeds')
-        if value is not None and value.shape[1] == length:
-            captured.append({'embeds': value.detach().clone(), 'positions': kwargs['position_ids'].detach().clone(),
-                             'capture_kv': kwargs.get('stage2_capture_kv', False)})
-    handle = resolved.model.register_forward_pre_hook(observe, with_kwargs=True)
+        if value is None:
+            return
+        final = value.shape[1] == length
+        call = {'kind': 'final' if final else 'latent_prefix',
+                'latent_ordinal': None if final else latent_ordinal,
+                'inputs': value.detach().clone(),
+                'positions': kwargs['position_ids'].detach().clone(),
+                'capture_kv': kwargs.get('stage2_capture_kv', False)}
+        latent_ordinal += int(not final)
+        decoder_calls.append(call)
+        if final:
+            captured.append({'embeds': call['inputs'], 'positions': call['positions'],
+                             'capture_kv': call['capture_kv']})
+    def observe_output(module, args, kwargs, output):
+        decoder_calls[-1]['output'] = output.last_hidden_state.detach().clone()
+    handles = [
+        resolved.model.embed_tokens.register_forward_hook(token_output),
+        resolved.visual.register_forward_hook(image_output),
+        resolved.model.register_forward_pre_hook(observe, with_kwargs=True),
+        resolved.model.register_forward_hook(observe_output, with_kwargs=True),
+    ]
     try:
         predictors = sorted({p-1 for site in sample.sites for p in site.target_positions})
         if side == 'local':
@@ -177,9 +202,21 @@ def native_rollout(model, sample, side, external, runtime):
             score[0, predictors] = True
             external.ablation._forward_prepared(resolved, dict(batch, prepared_base_inputs_embeds=base), score)
     finally:
-        handle.remove()
+        for handle in handles:
+            handle.remove()
     if len(captured) != 1 or captured[0]['capture_kv']:
         raise ValueError('native ordinary final decoder capture was not unique/ordinary')
+    if len(token_embeddings) != 1 or any('output' not in call for call in decoder_calls):
+        raise ValueError('native trace did not observe one base embedding and complete decoder calls')
+    base = token_embeddings[0]
+    if image_embeddings:
+        if len(image_embeddings) != 1:
+            raise ValueError('native trace did not observe one image embedding output')
+        image_mask = (batch['input_ids'] == resolved.config.image_token_id).unsqueeze(-1).expand_as(base)
+        base = base.masked_scatter(image_mask, image_embeddings[0].to(base.device, base.dtype))
+    captured[0]['trace'] = {'base_inputs': base, 'image_embeddings': image_embeddings[0] if image_embeddings else None,
+                            'decoder_calls': decoder_calls,
+                            'input_ids': batch['input_ids'].detach().clone()}
     return captured[0]
 
 
@@ -308,6 +345,55 @@ def native_factor(backend, effective_numerics, local, native_other, common_other
             'positions': comparison(local['positions'], common_other['positions']),
         },
     }
+
+
+def compare_native_traces(left, right, *, image_token_id, latent_pad_token_id):
+    """Localize the first observed difference across actual native rollout boundaries."""
+    result = {
+        'image_embeddings': comparison(left['image_embeddings'], right['image_embeddings']),
+        'base_inputs': comparison(left['base_inputs'], right['base_inputs']),
+        'decoder_calls': [],
+    }
+    earliest = None
+    def differs(value):
+        return value.get('comparable') is False or value.get('exact_equal') is False
+    if differs(result['image_embeddings']):
+        earliest = {'stage': 'image_embeddings'}
+    elif differs(result['base_inputs']):
+        earliest = {'stage': 'base_inputs'}
+    if len(left['decoder_calls']) != len(right['decoder_calls']):
+        if earliest is None:
+            earliest = {'stage': 'decoder_call_count'}
+    for ordinal, (a, b) in enumerate(zip(left['decoder_calls'], right['decoder_calls'])):
+        call = {'ordinal': ordinal, 'kind': a['kind'],
+                'latent_ordinal': a['latent_ordinal'],
+                'inputs': comparison(a['inputs'], b['inputs']),
+                'positions': comparison(a['positions'], b['positions']),
+                'output_last_hidden': comparison(a['output'], b['output'])}
+        if (a['kind'], a['latent_ordinal']) != (b['kind'], b['latent_ordinal']):
+            call['call_identity_equal'] = False
+        else:
+            call['call_identity_equal'] = True
+        if earliest is None:
+            for field in ('inputs', 'positions', 'output_last_hidden'):
+                if not call['call_identity_equal'] or differs(call[field]):
+                    earliest = {'stage': a['kind'], 'call_ordinal': ordinal,
+                                'latent_ordinal': a['latent_ordinal'], 'field': field}
+                    break
+        result['decoder_calls'].append(call)
+    ids = left['input_ids'][0]
+    regions = {
+        'image': ids == image_token_id,
+        'latent': ids == latent_pad_token_id,
+    }
+    regions['nonlatent_nonimage'] = ~(regions['image'] | regions['latent'])
+    result['final_embedding_regions'] = {
+        name: comparison(left['decoder_calls'][-1]['inputs'][:, mask],
+                         right['decoder_calls'][-1]['inputs'][:, mask])
+        for name, mask in regions.items()
+    }
+    result['earliest_difference'] = earliest
+    return result
 
 
 def compare_observations(left, right):
@@ -480,6 +566,10 @@ def run(args):
                     default_native = native_factor(
                         'default', runtime.numerical_policy_identity(),
                         local_native, ext_native, common_external)
+                    default_native['common_input_trace'] = compare_native_traces(
+                        local_native['trace'], common_external['trace'],
+                        image_token_id=qwen(models[0]).config.image_token_id,
+                        latent_pad_token_id=qwen(models[0]).config.latent_pad_token_id)
                     with runtime.numerical_policy():
                         math_local_native = native_rollout(
                             models[0],sample,'local',external,runtime)
@@ -490,6 +580,10 @@ def run(args):
                         math_native = native_factor(
                             'math', runtime.numerical_policy_identity(),
                             math_local_native, math_ext_native, math_common_external)
+                        math_native['common_input_trace'] = compare_native_traces(
+                            math_local_native['trace'], math_common_external['trace'],
+                            image_token_id=qwen(models[0]).config.image_token_id,
+                            latent_pad_token_id=qwen(models[0]).config.latent_pad_token_id)
                     entry = {'source_index':sample.source_index,
                         'native_input_rollout': default_native['native_input_rollout'],
                         'common_input_rollout':default_native['common_input_rollout'],
@@ -523,6 +617,7 @@ def run(args):
                 'Shared available framework, processor, genuine local Stage2 loader and token-row helpers; supplied model/data/factorial dependencies isolated.',
                 'Local numerical decorators unwrapped to expose backend as a separate explicit factor; function bodies unchanged.',
                 'Layer/KV comparisons cover reported selected coordinates, not every hidden element.',
+                'Native tracing localizes observed runtime differences but does not assign causality to known source-level vision rotary helper differences.',
                 'Inference-only evidence does not settle training Flex, checkpointing, gradient or optimizer equivalence.']
             unsupported_default = any(
                 sample['controls']['default']['status'] == 'unsupported_control'

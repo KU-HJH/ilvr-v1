@@ -121,6 +121,16 @@ def test_actual_mask_paths_and_layer_witnesses_on_separately_initialized_models(
             local_native = d.native_rollout(local, sample, 'local', external, runtime)
             other_native = d.native_rollout(other, sample, 'external', external, runtime)
             assert local_native['embeds'].shape == other_native['embeds'].shape == (1,25,8)
+            trace = d.compare_native_traces(
+                local_native['trace'], other_native['trace'],
+                image_token_id=80, latent_pad_token_id=90)
+            assert len(trace['decoder_calls']) == 17
+            assert trace['decoder_calls'][0]['kind'] == 'latent_prefix'
+            assert trace['decoder_calls'][0]['latent_ordinal'] == 0
+            assert trace['decoder_calls'][-1]['kind'] == 'final'
+            assert trace['earliest_difference'] is None
+            assert set(trace['final_embedding_regions']) == {
+                'image', 'latent', 'nonlatent_nonimage'}
             with runtime.numerical_policy():
                 states = d.common_state(local, local_native, sample, runtime)
                 result = d.compare_paths(local, other, sample, states, runtime, external, backend='math')
@@ -139,6 +149,10 @@ def test_actual_mask_paths_and_layer_witnesses_on_separately_initialized_models(
         assert result['cross']['clean']['sites'][0]['layers']
         assert local.model._forward_hooks == {}
         assert other.model._forward_hooks == {}
+        assert local.model.embed_tokens._forward_hooks == {}
+        assert other.model.embed_tokens._forward_hooks == {}
+        assert local.visual._forward_hooks == {}
+        assert other.visual._forward_hooks == {}
         import json
         json.dumps(result, allow_nan=False)
 
