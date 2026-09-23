@@ -76,6 +76,17 @@ def memory_diagnostic(spec):
     return mode == 'ordinary_backward_memory'
 
 
+def representation_inspection(spec):
+    enabled = spec.get('representation_inspection', False)
+    if type(enabled) is not bool:
+        raise ValueError('representation_inspection must be boolean')
+    if enabled and (spec.get('path') != 'external' or spec.get('save_on_cpu', False)
+                    or not isinstance(spec.get('native_prefix_reference'), dict)
+                    or memory_diagnostic(spec)):
+        raise ValueError('representation inspection requires native comparison, no offload, and strict prefix reference')
+    return enabled
+
+
 def snapshot_inventory(spec, ranks=range(4)):
     if memory_diagnostic(spec):
         return {f'rank-{rank}/micro-{micro}-{kind}.pt' for rank in ranks
@@ -86,6 +97,7 @@ def snapshot_inventory(spec, ranks=range(4)):
 def load_spec(path):
     spec=json.loads(Path(path).read_text())
     memory_diagnostic(spec)
+    representation_inspection(spec)
     if spec.get('path') not in ('external','aligned'):
         raise ValueError('gate path must be external or aligned')
     for key in ('result_dir','tensor_dir','external_manifest','manifest','data','image_root','base','stage1'):
@@ -242,6 +254,7 @@ def probed_trainer_class(base, spec, replay):
     from torch.utils.data import SequentialSampler
     from peft.tuners.lora.dora import DoraLinearLayer
     diagnostic = memory_diagnostic(spec)
+    inspect_representations = representation_inspection(spec)
     stop_steps = 2 if diagnostic else 5
 
     class ProbeCallback(TrainerCallback):
@@ -249,6 +262,9 @@ def probed_trainer_class(base, spec, replay):
             trainer=self.owner
             engine=trainer.accelerator.deepspeed_engine_wrapped.engine
             observer_class = MemoryDiagnosticObserver if diagnostic else AlignmentObserver
+            if inspect_representations:
+                from stage2.until_representation import RepresentationObserver
+                observer_class = RepresentationObserver
             trainer.gate_observer=observer_class(trainer,engine,spec,replay)
             trainer._native_prefix_check = None
             if spec.get('native_prefix_reference') is not None:
@@ -259,6 +275,12 @@ def probed_trainer_class(base, spec, replay):
                     save(label, values)
                     trainer._native_prefix_check.snapshot(label, values)
                 trainer.gate_observer.save = checked_save
+            if inspect_representations:
+                from stage2.until_representation import RepresentationTrace
+                from stage2.peft import resolve_stage2_qwen_model
+                trace = RepresentationTrace(spec['result_dir'], rank=trainer.gate_observer.rank)
+                trainer.representation_trace = trainer.gate_observer.representation_trace = trace
+                trace.install(resolve_stage2_qwen_model(trainer.model), trainer._representation_external)
             original=engine.step
             def step(*a,**kw):
                 boundary=engine.is_gradient_accumulation_boundary()
@@ -459,6 +481,7 @@ def run_from_training_args(args, spec_path):
         trainer=cls(model=model,args=train_args,train_dataset=dataset,data_collator=collator,
             processing_class=processor,step_preference_config=config,
             deepspeed_runtime_profile=bind_deepspeed_runtime_profile(args,world_size=4),**extra)
+        trainer._representation_external = external
         rank=trainer.args.process_index
         # Both paths start from exactly the same per-rank RNG state, reset after all construction.
         set_seed(42+rank)
@@ -472,6 +495,7 @@ def run_from_training_args(args, spec_path):
                 f'schedule212/warmup10; stop callback after{2 if diagnostic else 5} updates',
                 'gate-only AOT donated_buffer=False before compilation for retained observer gradients; restored on exit'],
             memory_diagnostic=diagnostic,
+            representation_inspection=representation_inspection(spec),
             save_on_cpu=spec.get('save_on_cpu', False),
             resolved_dataloader=dict(num_workers=train_args.dataloader_num_workers,
                 persistent_workers=train_args.dataloader_persistent_workers,
@@ -498,8 +522,19 @@ def run_from_training_args(args, spec_path):
             trainer.train()
             if trainer._native_prefix_check is not None:
                 trainer._native_prefix_check.finish()
+        except BaseException as error:
+            trace = getattr(trainer, 'representation_trace', None)
+            if trace is not None:
+                from stage2.until_representation import finish_representation_inspection
+                trace.optimizer_updates = trainer.state.global_step
+                finish_representation_inspection(trace, trainer.accelerator, error)
+            raise
         finally:
             torch.compile=original_compile
+            trace = getattr(trainer, 'representation_trace', None)
+            if trace is not None:
+                trace.optimizer_updates = trainer.state.global_step
+                trace.close()
         flex_calls=[call for call in compiler_calls if call['callable']=='torch.nn.attention.flex_attention.flex_attention']
         trainer.gate_observer.write(dict(event='compiler',rank=rank,calls=compiler_calls,
             flex_dynamic_true=bool(flex_calls) and all(call['dynamic'] is True for call in flex_calls)))
