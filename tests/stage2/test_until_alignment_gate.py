@@ -155,3 +155,61 @@ def test_reference_uses_frozen_parent_trainer_and_flex_callable():
         assert Path(inspect.getfile(actual)).resolve()==source_root/'transformers/src/transformers/integrations/flex_attention.py'
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         assert actual is not ALL_ATTENTION_FUNCTIONS['flex_attention']
+
+
+def test_gate_scope_allows_compiled_retained_gradients_and_restores_config(monkeypatch):
+    """Removing the gate-only compiler scope breaks warmed AOT retained backward."""
+    from types import SimpleNamespace
+    from torch._functorch import config
+    import scripts.verify_until_trainer as runner
+
+    class ProbeCompleted(Exception):
+        pass
+
+    class CpuSourceBoundary:
+        def __init__(self, root):
+            pass
+
+        def __enter__(self):
+            # AOT eager uses real compiled autograd, without a CUDA/kernel dependency.
+            # Warm an ordinary backward first: otherwise lazy compilation notices
+            # retain_graph and removes the donated-buffer metadata automatically.
+            torch._dynamo.reset()
+            compiled = torch.compile(lambda x, w: (x @ w).sin().sum(),
+                                     backend='aot_eager', fullgraph=True)
+            x = torch.tensor([[.2, .4], [.6, .8]], requires_grad=True)
+            w = torch.tensor([[.1, .3], [.5, .7]], requires_grad=True)
+            compiled(x, w).backward()
+            x.grad = w.grad = None
+            value = compiled(x, w)
+            expected = torch.autograd.grad((x @ w).sin().sum(), (x, w))
+            rng = torch.get_rng_state().clone()
+            for _ in range(2):
+                observed = torch.autograd.grad(value, (x, w), retain_graph=True)
+                for actual, target in zip(observed, expected):
+                    torch.testing.assert_close(actual, target)
+                assert x.grad is None and w.grad is None
+                assert torch.equal(torch.get_rng_state(), rng)
+            value.backward()
+            torch.testing.assert_close(x.grad, expected[0])
+            torch.testing.assert_close(w.grad, expected[1])
+            raise ProbeCompleted
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setenv('WORLD_SIZE', '4')
+    monkeypatch.setattr(runner, 'load_spec', lambda path: {'stage1': '/same-stage1'})
+    monkeypatch.setattr(runner.baseline, 'sha', lambda path: 'unused-cpu-boundary')
+    monkeypatch.setattr(runner, 'authenticate_source', lambda spec: '/unused-source')
+    monkeypatch.setattr(runner, 'TrainerExternalSource', CpuSourceBoundary)
+    args = SimpleNamespace(save_model_path='/checkpoints/cpu-probe',
+                           stage2_execution_profile='latest_external_until',
+                           load_model_path='/same-stage1')
+    try:
+        with config.patch(donated_buffer=True):
+            with pytest.raises(ProbeCompleted):
+                runner.run_from_training_args(args, '/unused-spec')
+            assert config.donated_buffer is True
+    finally:
+        torch._dynamo.reset()

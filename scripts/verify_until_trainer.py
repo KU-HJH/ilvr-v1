@@ -290,6 +290,7 @@ def run_from_training_args(args, spec_path):
     """Called by src/main.py only for an explicitly requested gate spec."""
     import os
     import torch
+    from torch._functorch import config as functorch_config
     from transformers import AutoProcessor,set_seed
     from main import build_stage2_training_arguments
     from deepspeed_runtime import bind_deepspeed_runtime_profile
@@ -307,7 +308,11 @@ def run_from_training_args(args, spec_path):
         if Path(getattr(args,'stage1_adapter_path','') or '.').resolve()!=Path(spec['stage1']).resolve():
             raise ValueError('launch Stage1 initializer differs from gate spec')
     root=authenticate_source(spec)
-    with TrainerExternalSource(root) as source:
+    # The observer retains each compiled graph for two gradient reads before
+    # ordinary Trainer backward. Disable one-use saved-buffer donation before
+    # either source can compile; restore the process setting even on failure.
+    # This adaptation belongs only to the diagnostic gate, never full training.
+    with functorch_config.patch(donated_buffer=False), TrainerExternalSource(root) as source:
         external=external_modules(source)
         external_flex=bind_external_flex(source,external)
         processor=AutoProcessor.from_pretrained(spec['stage1'],local_files_only=True)
@@ -346,7 +351,9 @@ def run_from_training_args(args, spec_path):
             source_manifest_sha256=baseline.sha(spec['external_manifest']),rank=rank,
             envelope_sha256=baseline.sha(spec['envelope']) if spec['path']=='aligned' else None,
             source_adaptations=['frozen parent Trainer and frozen Flex callable; shared remaining framework dependencies and Stage1 loader','reference grouping2 stream replay sharded by Accelerator over4 ranks',
-                'fixed Trainer GAS4 denominator and ceil replay epoch accounting','schedule212/warmup10; stop callback after5 updates'],
+                'fixed Trainer GAS4 denominator and ceil replay epoch accounting','schedule212/warmup10; stop callback after5 updates',
+                'gate-only AOT donated_buffer=False before compilation for retained observer gradients; restored on exit'],
+            probe_compiler_config={'donated_buffer':functorch_config.donated_buffer},
             runtime_origins=runtime_origins(trainer,source,external_flex),
             final_tail_scope='actual partial optimizer event for original212 IDs, not historical optimizer state212')
         with (result_dir/f'metadata-rank-{rank}.json').open('x') as f:
@@ -357,7 +364,8 @@ def run_from_training_args(args, spec_path):
         def observed_compile(function=None,*a,**kw):
             if function is not None:
                 compiler_calls.append({'callable':getattr(function,'__module__','')+'.'+getattr(function,'__name__',type(function).__name__),
-                                       'dynamic':kw.get('dynamic')})
+                                       'dynamic':kw.get('dynamic'),
+                                       'donated_buffer':functorch_config.donated_buffer})
             return original_compile(function,*a,**kw)
         torch.compile=observed_compile
         try:
