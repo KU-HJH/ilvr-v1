@@ -29,12 +29,14 @@ class ExternalSource(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         self.prefix = "until_supplied_" + hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
         self.mapping = {
             "stage2": self.prefix + "_stage2",
+            "stage2_objective": self.prefix + "_objective",
             "step_preference": self.prefix + "_step",
             "artifact_paths": self.prefix + "_artifact_paths",
             "transformers.models.qwen2_5_vl": "transformers.models." + self.prefix + "_qwen",
         }
         self.folders = {
             self.mapping["stage2"]: self.root / "src/stage2",
+            self.mapping["stage2_objective"]: self.root / "src/stage2_objective",
             self.mapping["step_preference"]: self.root / "src/step_preference",
             self.mapping["artifact_paths"]: self.root / "src/artifact_paths",
             self.mapping["transformers.models.qwen2_5_vl"]:

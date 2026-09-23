@@ -172,3 +172,15 @@ def test_each_native_trainer_runs_its_own_objective_and_checkpoint_backward(tmp_
             assert record["dispatch"]["checkpoint_coverage"]["complete_for_observed_module_regions"] is True
             if index == 1:
                 assert record["dispatch"]["native_counter_matches_module_witness"] is True
+
+
+def test_external_stage2_objective_dependency_is_supplied_not_local(tmp_path):
+    for folder in ("stage2", "stage2_objective"):
+        (tmp_path / "src" / folder).mkdir(parents=True)
+        (tmp_path / "src" / folder / "__init__.py").write_text("")
+    (tmp_path / "src/stage2_objective/config.py").write_text("VALUE = 137\n")
+    (tmp_path / "src/stage2/probe.py").write_text(
+        "from stage2_objective.config import VALUE\ndef run(): return VALUE\n")
+    with diagnostic().ExternalSource(tmp_path) as source:
+        assert source.translated("stage2_objective.config") != "stage2_objective.config"
+        assert source.module("stage2.probe").run() == 137

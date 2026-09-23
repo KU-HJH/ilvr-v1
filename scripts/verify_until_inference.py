@@ -1,0 +1,468 @@
+#!/usr/bin/env python
+"""Two fixed samples, final Stage2 weights, actual local/external inference paths."""
+import argparse
+from contextlib import ExitStack, nullcontext
+from dataclasses import asdict
+import importlib
+import inspect
+import json
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+
+from scripts import verify_until_native as native
+
+CE_ROOT = Path('/root/workspace/ILVR/.worktrees/ce-block-analysis-20260921')
+EXTERNAL = '/raid/workspace/temp/ILVR/.worktrees/ours1'
+MANIFEST = CE_ROOT/'data/ce-vision-block-analysis/until-b05-block-main100-20260922-141735/manifest.json'
+ARTIFACT = '/root/workspace/ILVR/checkpoints/evaluation-staging/voff-until-mask-b05-gb16-20260919-094938/prepared-checkpoint-212'
+
+
+def ce_source(root):
+    source = native.ExternalSource(root)
+    source.mapping = {'evaluation': source.prefix + '_evaluation'}
+    source.folders = {source.mapping['evaluation']: Path(root)/'src/evaluation'}
+    return source
+
+
+def external_modules(source):
+    return SimpleNamespace(model=source.module('transformers.models.qwen2_5_vl.modeling_qwen2_5_vl'),
+        data=source.module('stage2.data'), spans=source.module('step_preference.spans'),
+        rollout=source.module('transformers.models.qwen2_5_vl.stage2_latent_rollout'),
+        factorial=source.module('stage2.context_factorial'),
+        runner=source.module('stage2.context_factorial_runner'),
+        ablation=source.module('stage2.context_ablation_runner'))
+
+
+def checkpoint_tensors(restored, saved):
+    """Compare actual loaded values to artifact values, showing every dtype cast."""
+    import torch
+    result = {}
+    for name in sorted(restored.keys() | saved.keys()):
+        actual, expected = restored.get(name), saved.get(name)
+        match = (actual is not None and expected is not None and actual.shape == expected.shape
+                 and torch.equal(actual.detach().cpu(), expected.to(dtype=actual.dtype, device='cpu')))
+        result[name] = {'equal_after_explicit_cast': match,
+            'checkpoint_dtype': None if expected is None else str(expected.dtype),
+            'restored_dtype': None if actual is None else str(actual.dtype),
+            'checkpoint': native.tensor_record(expected), 'restored': native.tensor_record(actual)}
+    return {'all_equal_after_explicit_cast': bool(result) and all(v['equal_after_explicit_cast'] for v in result.values()),
+            'tensors': result}
+
+
+def artifact_witness(model, artifact):
+    from peft import get_peft_model_state_dict
+    from safetensors.torch import load_file
+    from stage1.token_rows import find_sparse_output_token_rows
+    adapter = checkpoint_tensors(get_peft_model_state_dict(model, save_embedding_layers=False),
+                                 load_file(str(Path(artifact)/'adapter_model.safetensors')))
+    rows = find_sparse_output_token_rows(model)
+    saved = load_file(str(Path(artifact)/'ilvr_token_rows.safetensors'))
+    import torch
+    actual = {'output_delta': rows.output_delta,
+              'token_ids': torch.tensor(tuple(rows.token_ids), dtype=torch.int64)}
+    sparse = checkpoint_tensors(actual, saved)
+    return {'adapter_including_input_rows': adapter, 'sparse_output_rows': sparse,
+            'all_restored': adapter['all_equal_after_explicit_cast'] and sparse['all_equal_after_explicit_cast']}
+
+
+def selected_indices(manifest):
+    indices = [record['source_index'] for record in manifest['samples'][:2]]
+    if len(indices) != 2 or len(set(indices)) != 2:
+        raise ValueError('diagnostic requires first two distinct manifest samples')
+    return indices
+
+
+def five_metrics(clean, changed, targets):
+    import torch
+    if not clean or len(clean) != len(changed) or len(clean) != len(targets):
+        raise ValueError('metrics require aligned nonempty sites')
+    first = any_count = changed_tokens = total = 0
+    nll = clean_nll = 0.
+    for left, right, target in zip(clean, changed, targets):
+        if left.shape != right.shape or left.shape[0] != target.numel() or not target.numel():
+            raise ValueError('unaligned target/logit geometry')
+        if not bool(torch.isfinite(left).all() and torch.isfinite(right).all()):
+            raise ValueError('nonfinite logits')
+        difference = left.argmax(-1) != right.argmax(-1)
+        first += int(difference[0]); any_count += int(difference.any())
+        changed_tokens += int(difference.sum()); total += target.numel()
+        index = target.cpu().long()[:, None]
+        clean_nll += float(-left.float().cpu().log_softmax(-1).gather(-1, index).sum())
+        nll += float(-right.float().cpu().log_softmax(-1).gather(-1, index).sum())
+    return dict(S=len(clean), N=total, first_changed=first, any_changed=any_count,
+                tokens_changed=changed_tokens, mean_nll=nll/total, delta_nll=(nll-clean_nll)/total)
+
+
+def preflight(args):
+    if not args.device.startswith('cuda'):
+        raise ValueError('production diagnostic requires CUDA; CPU guards run before loading')
+    for path in (args.external_source, args.ce_root, args.artifact, args.base, args.manifest, args.data, args.image_root):
+        if not Path(path).exists():
+            raise ValueError(f'missing input: {path}')
+    if not (Path(args.artifact)/'stage2_peft_metadata.json').is_file():
+        raise ValueError('requires genuine final Stage2 PEFT metadata')
+    selected_indices(json.loads(Path(args.manifest).read_text()))
+    root = Path(__file__).resolve().parents[1]
+    for path, tree in ((args.output_dir, root/'results'), (args.log_dir, root/'logs')):
+        resolved = Path(path).resolve()
+        if not resolved.is_relative_to(tree.resolve()) or resolved == tree.resolve():
+            raise ValueError(f'output must be below {tree}')
+        if resolved.exists() and any(resolved.iterdir()):
+            raise ValueError(f'use a fresh empty output directory: {resolved}')
+
+
+def load_models(args, processor, external):
+    import torch
+    from stage2.peft import load_stage2_model_for_inference
+    from stage2.attention_backend import load_qwen2_5_vl_with_attention
+    from transformers import Qwen2_5_VLForConditionalGeneration
+    models = []
+    for cls in (Qwen2_5_VLForConditionalGeneration, external.model.Qwen2_5_VLForConditionalGeneration):
+        torch.manual_seed(42)
+        def load(source, **kwargs):
+            return load_qwen2_5_vl_with_attention(source, attention_implementation='sdpa',
+                vision_attention_implementation='flash_attention_2',
+                config_load_kwargs={'local_files_only': True},
+                model_load_kwargs={'local_files_only': True, 'torch_dtype': torch.bfloat16},
+                load_model=cls.from_pretrained)
+        model = load_stage2_model_for_inference(args.base, args.artifact, processor,
+            source_provenance_kwargs={'local_files_only': True}, load_model=load)
+        model.eval().requires_grad_(False)
+        models.append(model.to(args.device))
+    return models
+
+
+def qwen(model):
+    from peft_common import resolve_qwen2_5_vl_model
+    return resolve_qwen2_5_vl_model(model)
+
+
+def native_rollout(model, sample, side, external, runtime):
+    """Observe the native ordinary final decoder call without replacing embeddings."""
+    import torch
+    resolved = qwen(model)
+    device = next(model.parameters()).device
+    batch = {k: v.to(device) for k, v in sample.model_inputs.items()}
+    length = batch['input_ids'].shape[1]
+    captured = []
+    def observe(module, args, kwargs):
+        value = kwargs.get('inputs_embeds')
+        if value is not None and value.shape[1] == length:
+            captured.append({'embeds': value.detach().clone(), 'positions': kwargs['position_ids'].detach().clone(),
+                             'capture_kv': kwargs.get('stage2_capture_kv', False)})
+    handle = resolved.model.register_forward_pre_hook(observe, with_kwargs=True)
+    try:
+        predictors = sorted({p-1 for site in sample.sites for p in site.target_positions})
+        if side == 'local':
+            model(**batch, labels=None, stage2_shared_prefix_inputs=None, stage2_selective_logits_only=True,
+                  stage2_logit_positions=torch.tensor(predictors, device=device), use_cache=False, return_dict=True)
+        else:
+            base = resolved.prepare_stage2_base_inputs_embeds(input_ids=batch['input_ids'],
+                pixel_values=batch.get('pixel_values'), image_grid_thw=batch.get('image_grid_thw'))
+            score = torch.zeros_like(batch['input_ids'], dtype=torch.bool)
+            score[0, predictors] = True
+            external.ablation._forward_prepared(resolved, dict(batch, prepared_base_inputs_embeds=base), score)
+    finally:
+        handle.remove()
+    if len(captured) != 1 or captured[0]['capture_kv']:
+        raise ValueError('native ordinary final decoder capture was not unique/ordinary')
+    return captured[0]
+
+
+def common_state(model, bank, sample, runtime):
+    """One observed local latent bank becomes the explicit forced-common variable."""
+    output = qwen(model).model(inputs_embeds=bank['embeds'], position_ids=bank['positions'],
+        attention_mask=sample.model_inputs['attention_mask'].to(bank['embeds'].device),
+        generate_mode=True, stage2_capture_kv=True, use_cache=False, return_dict=True)
+    return runtime.CleanState(bank['embeds'], bank['positions'], output.stage2_key_values, {}, {})
+
+
+class Observation:
+    """Read-only decoder hooks plus Python attention-return K/V observation."""
+    def __init__(self, model, site):
+        self.model, self.site = qwen(model), site
+        self.positions = sorted(set(range(site.start, site.end+1)) | {p-1 for p in site.target_positions})
+        self.layers, self.kv, self.masks, self.dispatch, self.logits = {}, {}, {}, {}, []
+        self.handles = []
+
+    def __enter__(self):
+        def decoder(module, args, kwargs):
+            self.dispatch = {'capture_kv': kwargs.get('stage2_capture_kv', False),
+                'prefix_kv': kwargs.get('stage2_prefix_key_values') is not None,
+                'generate_mode': kwargs.get('generate_mode'),
+                'position_ids': native.tensor_record(kwargs['position_ids']),
+                'embeds': native.tensor_record(kwargs['inputs_embeds'])}
+        self.handles.append(self.model.model.register_forward_pre_hook(decoder, with_kwargs=True))
+        for index, layer in enumerate(self.model.model.layers):
+            def hidden(module, args, output, index=index):
+                self.layers[index] = output[0][:, self.positions].detach().cpu().clone()
+            def mask(module, args, kwargs, index=index):
+                value = kwargs.get('attention_mask')
+                if value is None:
+                    self.masks[index] = {'none': True}
+                else:
+                    matrix = value.detach()[0,0]
+                    key = self.site.body_start
+                    self.masks[index] = {'shape': list(value.shape), 'dtype': str(value.dtype),
+                        'visible_sha256': native.baseline.tensor_digest(value == 0),
+                        'blocked_values': [str(float(v)) for v in matrix[matrix != 0].unique().cpu()],
+                        'blocked_rows_for_body_key': (matrix[self.site.end:,key] != 0).nonzero().flatten().add(self.site.end).cpu().tolist()}
+            self.handles.append(layer.register_forward_hook(hidden))
+            self.handles.append(layer.self_attn.register_forward_pre_hook(mask, with_kwargs=True))
+        self.previous = sys.getprofile()
+        if self.previous is not None:
+            raise RuntimeError('diagnostic needs no existing profiler')
+        self.attention_ids = {id(layer.self_attn): i for i, layer in enumerate(self.model.model.layers)}
+        self.calls = set()
+        def profile(frame, event, arg):
+            if event != 'return':
+                return
+            index = self.attention_ids.get(id(frame.f_locals.get('self')))
+            if index is None:
+                return
+            self.calls.add((index, frame.f_code.co_filename, frame.f_code.co_name))
+            key, value = frame.f_locals.get('key_states'), frame.f_locals.get('value_states')
+            if key is not None and value is not None and key.ndim == 4 and key.shape[2] > max(self.positions):
+                self.kv[index] = (key[:,:,self.positions].detach().cpu().clone(),
+                                  value[:,:,self.positions].detach().cpu().clone())
+        sys.setprofile(profile)
+        return self
+
+    def __exit__(self, *exc):
+        sys.setprofile(self.previous)
+        for handle in self.handles:
+            handle.remove()
+        self.dispatch['executed_attention'] = [dict(layer=i, file=f, function=n) for i,f,n in sorted(self.calls)]
+
+
+def external_items(sample, external):
+    import torch
+    return tuple(external.data.StepPreferenceBatchItem(sample_id=str(sample.source_index),
+        span=external.spans.ReasoningStepSpan(step_id=i, prev_text_start=0, prev_text_end=s.start,
+            latent_start=s.body_start, latent_end=s.body_end, target_text_start=s.end+1,
+            target_text_end=s.target_positions[-1]+1, helper_image_idx=None),
+        chosen_predictor_positions=torch.tensor([p-1 for p in s.target_positions]),
+        chosen_target_ids=torch.tensor(s.target_ids)) for i,s in enumerate(sample.sites))
+
+
+def decode_local(model, state, site, runtime, condition, backend):
+    """Use the actual replay body; unwrap its policy only to control the explicit factor."""
+    import torch
+    captured = []
+    def projection(module, args, output):
+        captured.append(output.detach().float().cpu())
+    hook = qwen(model).lm_head.register_forward_hook(projection)
+    observation = Observation(model, site)
+    try:
+        with observation:
+            replay = runtime.replay_site if backend == 'math' else inspect.unwrap(runtime.replay_site)
+            replay(model, state, site, condition)
+    finally:
+        hook.remove()
+    return torch.cat(captured), observation
+
+
+def decode_external(model, state, sample, items, external, condition):
+    inputs = sample.model_inputs
+    ids = inputs['input_ids'].to(state.embeds.device)
+    mask = inputs['attention_mask'].to(state.embeds.device)
+    if condition == 'clean':
+        branches = external.runner._clean_branches(ids, mask, state.embeds, items)
+    else:
+        branches = external.factorial.build_length_preserving_branches(input_ids=ids, attention_mask=mask,
+            clean_final_inputs_embeds=state.embeds, items=items, scope='body',
+            neutral_embedding=state.embeds[0,0])  # unused for body-only masking
+    output = external.runner._decode_branches(qwen(model), branches, state.positions.expand(-1,len(items),-1))
+    return [value.detach().float().cpu() for value in output]
+
+
+def comparison(left, right):
+    return native.compare_tensors(left, right)
+
+
+def compare_observations(left, right):
+    layers = []
+    first = None
+    for index in sorted(left.layers.keys() | right.layers.keys()):
+        item = {'layer': index, 'hidden': comparison(left.layers.get(index), right.layers.get(index))}
+        for offset, name in enumerate(('key', 'value')):
+            item[name] = comparison(left.kv[index][offset] if index in left.kv else None,
+                                    right.kv[index][offset] if index in right.kv else None)
+        if first is None and any(item[name].get('exact_equal') is False for name in ('hidden','key','value')):
+            first = index
+        layers.append(item)
+    return {'layers': layers, 'first_observed_divergent_layer': first,
+            'layer_coordinate_scope': left.positions,
+            'kv_scope': 'actual attention-return locals, post-RoPE/repeat where exposed; shape mismatch is explicit',
+            'local_dispatch': left.dispatch, 'external_dispatch': right.dispatch,
+            'mask_geometry': {'local_blocked_rows_for_body_key': left.masks[0].get('blocked_rows_for_body_key'),
+                'external_blocked_rows_for_body_key': right.masks[0].get('blocked_rows_for_body_key'),
+                'local_per_layer': left.masks, 'external_per_layer': right.masks}}
+
+
+def compare_paths(local, other, sample, state, runtime, external, backend):
+    import torch
+    result = {'factors': {'backend': backend, 'external_batching': ['per_site', 'packed_sites']},
+              'local': {}, 'external': {}, 'cross': {}}
+    targets = [torch.tensor(s.target_ids) for s in sample.sites]
+    items = external_items(sample, external)
+    values = {side: {} for side in ('local','external')}
+    policy = runtime.numerical_policy() if backend == 'math' else nullcontext()
+    with policy:
+        result['effective_numerics'] = runtime.numerical_policy_identity()
+        for condition in ('clean', 'body_mask', 'clean_repeat'):
+            intervention = 'clean' if condition == 'clean_repeat' else condition
+            a_values, b_values, site_reports = [], [], []
+            for site, item in zip(sample.sites, items):
+                a, a_observation = decode_local(local, state, site, runtime, intervention, backend)
+                with Observation(other, site) as b_observation:
+                    b = decode_external(other, state, sample, (item,), external, intervention)[0]
+                a_values.append(a); b_values.append(b)
+                report = compare_observations(a_observation, b_observation)
+                report.update(plan_index=site.plan_index, logits=comparison(a,b),
+                              metrics=five_metrics([a],[b],[torch.tensor(site.target_ids)]))
+                site_reports.append(report)
+            values['local'][condition] = a_values
+            values['external'][condition] = b_values
+            result['cross'][condition] = {'sites': site_reports,
+                'five_metrics': five_metrics(a_values,b_values,targets)}
+            for side in values:
+                current = values[side][condition]
+                baseline = values[side]['clean']
+                result[side][condition] = {'five_metrics': five_metrics(baseline,current,targets),
+                    'logits': comparison(torch.cat(baseline),torch.cat(current))}
+        result['external']['batching'] = {}
+        for condition in ('clean','body_mask'):
+            duplicate = len(items) == 1
+            packed_items = items*2 if duplicate else items
+            baseline = values['external'][condition]*2 if duplicate else values['external'][condition]
+            packed = decode_external(other, state, sample, packed_items, external, condition)
+            result['external']['batching'][condition] = {
+                'batch_size': len(packed_items), 'duplicate_control_only': duplicate,
+                'unique_sites': len(items),
+                'logits': comparison(torch.cat(baseline),torch.cat(packed)),
+                'five_metrics': five_metrics(baseline,packed,targets*2 if duplicate else targets)}
+    return result
+
+
+def prepare_native(row, index, processor, image_root, ce_inputs, external):
+    import torch
+    local, exclusions = ce_inputs.prepare_sample(row,index,processor,image_root)
+    if local is None:
+        raise ValueError(f'preselected sample has no local sites: {index}: {exclusions}')
+    token_ids = external.rollout.LatentTokenIds(*native.baseline.token_ids(processor.tokenizer)[:3])
+    example = external.data.prepare_stage2_example(row,image_root=Path(image_root),latent_size=8)
+    batch = external.data.Stage2DataCollator(processor,token_ids,8,True,
+        context_preference_enabled=True,target_scope='immediate_text')([example])
+    model_inputs = {key: value for key,value in batch.items()
+                    if isinstance(value,torch.Tensor) and key in ('input_ids','attention_mask','pixel_values','image_grid_thw')}
+    sites = tuple(ce_inputs.Site(index,i, item.span.prev_text_end,item.span.latent_start,item.span.latent_end,
+                item.span.target_text_start-1,tuple(int(x)+1 for x in item.chosen_predictor_positions),
+                tuple(int(x) for x in item.chosen_target_ids)) for i,item in enumerate(batch['step_preference_items']))
+    other = ce_inputs.PreparedSample(index,model_inputs,sites)
+    witness = {'local': {'input_ids':local.model_inputs['input_ids'].tolist(), 'sites':[asdict(s) for s in local.sites], 'exclusions':exclusions},
+        'external': {'input_ids':model_inputs['input_ids'].tolist(), 'sites':[asdict(s) for s in sites]},
+        'input_comparisons': {key:comparison(local.model_inputs.get(key),model_inputs.get(key))
+                              for key in local.model_inputs.keys() | model_inputs.keys()},
+        'target_positions_equal': [s.target_positions for s in local.sites] == [s.target_positions for s in sites],
+        'target_ids_equal': [s.target_ids for s in local.sites] == [s.target_ids for s in sites]}
+    return local,other,witness
+
+
+def run(args):
+    preflight(args)
+    import torch
+    from transformers import AutoProcessor
+    output, logs = Path(args.output_dir), Path(args.log_dir)
+    output.mkdir(parents=True); logs.mkdir(parents=True)
+    def progress(message):
+        print(message, flush=True)
+        with (logs/'progress.log').open('a') as stream:
+            stream.write(message+'\n')
+    report = {'status':'incomplete','scope':'first two manifest samples; no optimizer/backward; shared local final weights, not historical external weights',
+              'manifest_sha256':native.baseline.sha(args.manifest), 'samples':[], 'optimizer_steps':0,
+              'selection':selected_indices(json.loads(Path(args.manifest).read_text()))}
+    def save():
+        (output/'evidence.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
+    save()
+    try:
+        with native.ExternalSource(args.external_source) as source, ce_source(args.ce_root) as ce:
+            external = external_modules(source)
+            runtime = ce.module('evaluation.vision_block_runtime')
+            ce_inputs = ce.module('evaluation.vision_block_inputs')
+            processor = AutoProcessor.from_pretrained(args.artifact,local_files_only=True)
+            rows = [json.loads(line) for line in Path(args.data).read_text().splitlines() if line.strip()]
+            prepared = [prepare_native(rows[index],index,processor,args.image_root,ce_inputs,external) for index in report['selection']]
+            report['native_preparation'] = [witness for _,_,witness in prepared]
+            relative = 'transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py'
+            report['local_model_source'] = {'target_sha256':native.baseline.sha(Path(__file__).resolve().parents[1]/relative),
+                                          'ce_sha256':native.baseline.sha(Path(args.ce_root)/relative)}
+            report['local_model_source']['byte_identical'] = len(set(report['local_model_source'].values())) == 1
+            save(); progress('CPU native preparation recorded; loading two independently restored Stage2 models')
+            models = load_models(args,processor,external)
+            report['artifact_restoration'] = [artifact_witness(model,args.artifact) for model in models]
+            report['model_identity'] = native.model_identity(*models)
+            save()
+            if not all(w['all_restored'] for w in report['artifact_restoration']):
+                raise ValueError('artifact restoration witness failed')
+            if not report['model_identity']['all_state_exact_equal']:
+                raise ValueError('separately loaded model parameter/buffer values differ; inspect evidence')
+            with torch.inference_mode():
+                for sample,ext_sample,witness in prepared:
+                    progress(f'sample {sample.source_index}: native rollout before common latent forcing')
+                    local_native = native_rollout(models[0],sample,'local',external,runtime)
+                    ext_native = native_rollout(models[1],ext_sample,'external',external,runtime)
+                    common_external = native_rollout(models[1],sample,'external',external,runtime)
+                    entry = {'source_index':sample.source_index,
+                        'native_input_rollout': {'embeds':comparison(local_native['embeds'],ext_native['embeds']),
+                                                'positions':comparison(local_native['positions'],ext_native['positions'])},
+                        'common_input_rollout':{'embeds':comparison(local_native['embeds'],common_external['embeds']),
+                                               'positions':comparison(local_native['positions'],common_external['positions'])},
+                        'forced_common':{'origin':'local ordinary clean rollout; same bank for both implementations and backend factors',
+                                         'embeds':native.tensor_record(local_native['embeds']),
+                                         'positions':local_native['positions'].cpu().tolist(),
+                                         'input_ids':sample.model_inputs['input_ids'].tolist(),
+                                         'sites':[asdict(s) for s in sample.sites]}, 'controls':{}}
+                    report['samples'].append(entry); save()
+                    # Capture and branch replay share each separately labelled kernel policy.
+                    for backend in ('math','default'):
+                        progress(f'sample {sample.source_index}: {backend} local/external clean/body/repeat/batching')
+                        with runtime.numerical_policy() if backend == 'math' else nullcontext():
+                            state = common_state(models[0],local_native,sample,runtime)
+                            entry['controls'][backend] = compare_paths(*models,sample,state,runtime,external,backend)
+                        del state
+                        save()
+                    del local_native,ext_native,common_external
+            report['loaded_modules'] = {name:{'path':module.__file__, 'sha256':native.baseline.sha(module.__file__),
+                'supplied':Path(module.__file__).resolve().is_relative_to(Path(args.external_source).resolve())}
+                for name,module in tuple(sys.modules.items()) if getattr(module,'__file__',None)
+                and str(module.__file__).endswith('.py') and Path(module.__file__).is_file()
+                and (name.startswith((source.prefix,ce.prefix,'stage2','stage1','peft','transformers.models.qwen2_5_vl')))}
+            report['redirects'] = sorted(source.redirects)
+            report['limitations'] = ['No external historical weights or historical runtime authentication.',
+                'Shared available framework, processor, genuine local Stage2 loader and token-row helpers; supplied model/data/factorial dependencies isolated.',
+                'Local numerical decorators unwrapped to expose backend as a separate explicit factor; function bodies unchanged.',
+                'Layer/KV comparisons cover reported selected coordinates, not every hidden element.',
+                'Inference-only evidence does not settle training Flex, checkpointing, gradient or optimizer equivalence.']
+            report['status']='completed'; save(); progress('two-sample diagnostic completed')
+    except Exception as error:
+        report['error']=f'{type(error).__name__}: {error}'; save(); progress(report['error'])
+        raise
+    return report
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name,default in (('external-source',EXTERNAL),('ce-root',str(CE_ROOT)),('artifact',ARTIFACT),
+        ('base','/root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct'),
+        ('manifest',str(MANIFEST)),('data','/root/workspace/ILVR/data/TEST.jsonl'),
+        ('image-root','/root/workspace/ILVR/data'),('device','cuda:0')):
+        parser.add_argument('--'+name,default=default)
+    parser.add_argument('--output-dir',required=True)
+    parser.add_argument('--log-dir',required=True)
+    return parser.parse_args(argv)
+
+
+if __name__ == '__main__':
+    run(parse_args())
