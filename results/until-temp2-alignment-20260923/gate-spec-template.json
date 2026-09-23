@@ -1,0 +1,12 @@
+{
+  "path": "external",
+  "external_manifest": "/root/workspace/ILVR/results/until-causal-audit-20260923/alignment-external-source-v2.json",
+  "external_root": "/root/workspace/ILVR/.cache/until-temp2-alignment-20260923/reference-source",
+  "manifest": "/root/workspace/ILVR/.worktrees/voff-reproduction-20260917/results/voff-reproduction-full212-20260918-043839/stage2-length-manifest.json",
+  "data": "/raid/workspace/ILVR/data/TRAIN.jsonl",
+  "image_root": "/raid/workspace/ILVR/data",
+  "base": "/root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct",
+  "stage1": "/root/workspace/ILVR/checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431",
+  "tensor_dir": "/root/workspace/ILVR/.worktrees/until-temp2-alignment-20260923/checkpoints/until-alignment-gate-external-1",
+  "result_dir": "/root/workspace/ILVR/.worktrees/until-temp2-alignment-20260923/results/until-alignment-gate-external-1"
+}

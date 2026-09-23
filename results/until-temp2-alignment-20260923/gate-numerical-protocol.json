@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "metrics": {
+    "relative_l2": "norm(a-b)/max(norm(a),norm(b))",
+    "relative_linf": "max(abs(a-b))/max(max(abs(a)),max(abs(b)))"
+  },
+  "controls": 3,
+  "control_maximum": 0.01,
+  "multiplier": 2.0,
+  "absolute_cap": 0.02,
+  "zero_rule": "zero denominator requires exact zero error; zero envelope requires exact equality",
+  "structural": "names, shapes, dtypes, connectivity, input IDs, RNG, weights exactly equal",
+  "ordering": "freeze external-only controls before opening aligned artifacts",
+  "scope": "bounded common-runtime comparison; not statistical or historical trajectory proof",
+  "controller_adjudication": "2026-09-23 root messages before runtime or cross-source inspection",
+  "arithmetic_oracle": {
+    "formula": "sum of frozen-external-selected per-example raw total gradients /16 versus actual ZeRO accumulated gradient",
+    "acceptance": "finite global relative L2 <=0.02; expected zero requires exact zero; raw per-tensor and coordinate failures retained",
+    "scope": "BF16 collective arithmetic only; cross-source tensor thresholds use the independent repeat envelope"
+  },
+  "replay": {
+    "presentations": 68,
+    "per_rank_microsteps": 17,
+    "actual_optimizer_events": 5,
+    "source_groups": "first three groups, manifest proxy maximum full group, actual original212 four-real-example tail",
+    "cost_proxy": "sum(sequence_length^2*(1+latent_count))",
+    "schedule_updates": 212,
+    "warmup_updates": 10,
+    "stop_callback_step": 5,
+    "tail_coefficient": 0.0625,
+    "historical_optimizer_state212": false,
+    "challenge_is_proved_global_memory_maximum": false
+  },
+  "execution": {
+    "entrypoint": "existing run_multinode_stage2_training.sh -> normal src/main.py -> opt-in gate env",
+    "env": "ILVR_UNTIL_ALIGNMENT_GATE_SPEC",
+    "order": [
+      "external control1",
+      "external control2",
+      "external control3",
+      "freeze",
+      "aligned",
+      "compare"
+    ],
+    "training_status": "not launched; independent review and controller launch required"
+  }
+}
