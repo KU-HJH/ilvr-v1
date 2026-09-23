@@ -94,6 +94,13 @@ def five_metrics(clean, changed, targets):
                 tokens_changed=changed_tokens, mean_nll=nll/total, delta_nll=(nll-clean_nll)/total)
 
 
+def first_end_count(logits, latent_end_token_id):
+    """Count sites whose first unfiltered prediction is the latent END token."""
+    if not logits:
+        raise ValueError('first END count requires nonempty site logits')
+    return sum(int(site[0].argmax(-1) == latent_end_token_id) for site in logits)
+
+
 def preflight(args):
     if not args.device.startswith('cuda'):
         raise ValueError('production diagnostic requires CUDA; CPU guards run before loading')
@@ -349,11 +356,13 @@ def score_local_bank(model, sample, state, runtime):
             decode_local(model, state, site, runtime, intervention, 'math')[0]
             for site in sample.sites]
     report = {}
+    end_token_id = qwen(model).config.latent_end_token_id
     for condition, current in values.items():
         metrics = five_metrics(values['clean'], current, targets)
         report[condition] = {
             'five_metrics': metrics,
-            'first_end_changed': metrics['first_changed'],
+            'first_end_count': first_end_count(current, end_token_id),
+            'first_end_token_id': end_token_id,
             'logits': comparison(torch.cat(values['clean']), torch.cat(current)),
         }
     return report, {name: torch.cat(values[name]) for name in ('clean', 'body_mask')}
@@ -371,11 +380,13 @@ def score_external_bank(model, sample, bank, external):
             model, state, sample, items, external, intervention)
     targets = [torch.tensor(site.target_ids) for site in sample.sites]
     report = {}
+    end_token_id = qwen(model).config.latent_end_token_id
     for condition, current in values.items():
         metrics = five_metrics(values['clean'], current, targets)
         report[condition] = {
             'five_metrics': metrics,
-            'first_end_changed': metrics['first_changed'],
+            'first_end_count': first_end_count(current, end_token_id),
+            'first_end_token_id': end_token_id,
             'logits': comparison(torch.cat(values['clean']), torch.cat(current)),
         }
     return report, {name: torch.cat(values[name]) for name in ('clean', 'body_mask')}

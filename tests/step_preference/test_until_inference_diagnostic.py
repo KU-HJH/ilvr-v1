@@ -43,6 +43,17 @@ def test_metrics_are_site_and_token_weighted_with_signed_delta():
     assert result['delta_nll'] == pytest.approx(4/3)
 
 
+def test_first_end_count_is_independent_of_generic_first_prediction_change():
+    d = probe()
+    clean = [torch.tensor([[0., 4., 1.]])]
+    changed_non_end = [torch.tensor([[4., 0., 1.]])]
+    metrics = d.five_metrics(clean, changed_non_end, [torch.tensor([1])])
+
+    assert metrics['first_changed'] == 1
+    assert d.first_end_count(clean, latent_end_token_id=2) == 0
+    assert d.first_end_count(changed_non_end, latent_end_token_id=2) == 0
+
+
 def test_native_factor_records_effective_policy_and_both_input_comparisons():
     """Catches labelling a requested backend without its effective native policy."""
     d = probe()
@@ -206,10 +217,12 @@ def test_actual_mask_paths_and_layer_witnesses_on_separately_initialized_models(
                     other, sample, other_native, external)
                 result = d.compare_paths(local, other, sample, states, runtime, external, backend='math')
         assert own_report['clean']['five_metrics']['delta_nll'] == 0
-        assert own_report['body_mask']['first_end_changed'] == own_report['body_mask']['five_metrics']['first_changed']
+        assert own_report['body_mask']['first_end_token_id'] == 92
+        assert isinstance(own_report['body_mask']['first_end_count'], int)
         assert own_report['clean_repeat']['logits']['exact_equal']
         assert set(own_logits) == {'clean', 'body_mask'}
-        assert external_report['body_mask']['first_end_changed'] == external_report['body_mask']['five_metrics']['first_changed']
+        assert external_report['body_mask']['first_end_token_id'] == 92
+        assert isinstance(external_report['body_mask']['first_end_count'], int)
         assert external_report['clean_repeat']['logits']['exact_equal']
         assert set(external_logits) == {'clean', 'body_mask'}
         assert result['factors'] == {'backend': 'math', 'external_batching': ['per_site', 'packed_sites']}
