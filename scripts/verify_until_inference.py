@@ -112,19 +112,32 @@ def preflight(args):
             raise ValueError(f'use a fresh empty output directory: {resolved}')
 
 
+def diagnostic_model_load_kwargs(*, external):
+    import torch
+    options = {'local_files_only': True, 'torch_dtype': torch.bfloat16}
+    if external:
+        options['stage2_split_attention'] = True
+    return options
+
+
 def load_models(args, processor, external):
     import torch
     from stage2.peft import load_stage2_model_for_inference
     from stage2.attention_backend import load_qwen2_5_vl_with_attention
     from transformers import Qwen2_5_VLForConditionalGeneration
     models = []
-    for cls in (Qwen2_5_VLForConditionalGeneration, external.model.Qwen2_5_VLForConditionalGeneration):
+    classes = (
+        (Qwen2_5_VLForConditionalGeneration, False),
+        (external.model.Qwen2_5_VLForConditionalGeneration, True),
+    )
+    for cls, external_protocol in classes:
         torch.manual_seed(42)
         def load(source, **kwargs):
             return load_qwen2_5_vl_with_attention(source, attention_implementation='sdpa',
                 vision_attention_implementation='flash_attention_2',
                 config_load_kwargs={'local_files_only': True},
-                model_load_kwargs={'local_files_only': True, 'torch_dtype': torch.bfloat16},
+                model_load_kwargs=diagnostic_model_load_kwargs(
+                    external=external_protocol),
                 load_model=cls.from_pretrained)
         model = load_stage2_model_for_inference(args.base, args.artifact, processor,
             source_provenance_kwargs={'local_files_only': True}, load_model=load)
@@ -281,6 +294,22 @@ def comparison(left, right):
     return native.compare_tensors(left, right)
 
 
+def native_factor(backend, effective_numerics, local, native_other, common_other):
+    """Record one native rollout factor without conflating native/common inputs."""
+    return {
+        'backend': backend,
+        'effective_numerics': dict(effective_numerics),
+        'native_input_rollout': {
+            'embeds': comparison(local['embeds'], native_other['embeds']),
+            'positions': comparison(local['positions'], native_other['positions']),
+        },
+        'common_input_rollout': {
+            'embeds': comparison(local['embeds'], common_other['embeds']),
+            'positions': comparison(local['positions'], common_other['positions']),
+        },
+    }
+
+
 def compare_observations(left, right):
     layers = []
     first = None
@@ -308,30 +337,62 @@ def compare_paths(local, other, sample, state, runtime, external, backend):
     targets = [torch.tensor(s.target_ids) for s in sample.sites]
     items = external_items(sample, external)
     values = {side: {} for side in ('local','external')}
+    observations = {}
+    local_error = None
     policy = runtime.numerical_policy() if backend == 'math' else nullcontext()
     with policy:
         result['effective_numerics'] = runtime.numerical_policy_identity()
         for condition in ('clean', 'body_mask', 'clean_repeat'):
             intervention = 'clean' if condition == 'clean_repeat' else condition
-            a_values, b_values, site_reports = [], [], []
+            a_values, b_values, site_observations = [], [], []
             for site, item in zip(sample.sites, items):
-                a, a_observation = decode_local(local, state, site, runtime, intervention, backend)
+                if local_error is None:
+                    try:
+                        a, a_observation = decode_local(
+                            local, state, site, runtime, intervention, backend)
+                    except ValueError as error:
+                        if (backend == 'default' and type(error) is ValueError
+                                and str(error) == 'full-length prefix K/V changed'):
+                            local_error = f'{type(error).__name__}: {error}'
+                        else:
+                            raise
+                    else:
+                        a_values.append(a)
+                        site_observations.append(a_observation)
                 with Observation(other, site) as b_observation:
                     b = decode_external(other, state, sample, (item,), external, intervention)[0]
-                a_values.append(a); b_values.append(b)
-                report = compare_observations(a_observation, b_observation)
-                report.update(plan_index=site.plan_index, logits=comparison(a,b),
-                              metrics=five_metrics([a],[b],[torch.tensor(site.target_ids)]))
-                site_reports.append(report)
+                b_values.append(b)
+                if local_error is None:
+                    site_observations[-1] = (site, site_observations[-1], b_observation)
             values['local'][condition] = a_values
             values['external'][condition] = b_values
-            result['cross'][condition] = {'sites': site_reports,
-                'five_metrics': five_metrics(a_values,b_values,targets)}
-            for side in values:
-                current = values[side][condition]
-                baseline = values[side]['clean']
-                result[side][condition] = {'five_metrics': five_metrics(baseline,current,targets),
-                    'logits': comparison(torch.cat(baseline),torch.cat(current))}
+            observations[condition] = site_observations
+        for condition in ('clean', 'body_mask', 'clean_repeat'):
+            current = values['external'][condition]
+            baseline = values['external']['clean']
+            result['external'][condition] = {
+                'five_metrics': five_metrics(baseline,current,targets),
+                'logits': comparison(torch.cat(baseline),torch.cat(current))}
+        if local_error is None:
+            for condition in ('clean', 'body_mask', 'clean_repeat'):
+                a_values, b_values = values['local'][condition], values['external'][condition]
+                site_reports = []
+                for (site, a_observation, b_observation), a, b in zip(
+                        observations[condition], a_values, b_values):
+                    report = compare_observations(a_observation, b_observation)
+                    report.update(plan_index=site.plan_index, logits=comparison(a,b),
+                                  metrics=five_metrics([a],[b],[torch.tensor(site.target_ids)]))
+                    site_reports.append(report)
+                result['cross'][condition] = {'sites': site_reports,
+                    'five_metrics': five_metrics(a_values,b_values,targets)}
+                baseline = values['local']['clean']
+                result['local'][condition] = {
+                    'five_metrics': five_metrics(baseline,a_values,targets),
+                    'logits': comparison(torch.cat(baseline),torch.cat(a_values))}
+        else:
+            unsupported = {'status': 'unsupported', 'error': local_error}
+            result['local'] = dict(unsupported)
+            result['cross'] = dict(unsupported)
         result['external']['batching'] = {}
         for condition in ('clean','body_mask'):
             duplicate = len(items) == 1
@@ -343,6 +404,8 @@ def compare_paths(local, other, sample, state, runtime, external, backend):
                 'unique_sites': len(items),
                 'logits': comparison(torch.cat(baseline),torch.cat(packed)),
                 'five_metrics': five_metrics(baseline,packed,targets*2 if duplicate else targets)}
+    result['status'] = ('unsupported_control' if local_error else
+                        'supported_primary' if backend == 'math' else 'supported_control')
     return result
 
 
@@ -414,11 +477,26 @@ def run(args):
                     local_native = native_rollout(models[0],sample,'local',external,runtime)
                     ext_native = native_rollout(models[1],ext_sample,'external',external,runtime)
                     common_external = native_rollout(models[1],sample,'external',external,runtime)
+                    default_native = native_factor(
+                        'default', runtime.numerical_policy_identity(),
+                        local_native, ext_native, common_external)
+                    with runtime.numerical_policy():
+                        math_local_native = native_rollout(
+                            models[0],sample,'local',external,runtime)
+                        math_ext_native = native_rollout(
+                            models[1],ext_sample,'external',external,runtime)
+                        math_common_external = native_rollout(
+                            models[1],sample,'external',external,runtime)
+                        math_native = native_factor(
+                            'math', runtime.numerical_policy_identity(),
+                            math_local_native, math_ext_native, math_common_external)
                     entry = {'source_index':sample.source_index,
-                        'native_input_rollout': {'embeds':comparison(local_native['embeds'],ext_native['embeds']),
-                                                'positions':comparison(local_native['positions'],ext_native['positions'])},
-                        'common_input_rollout':{'embeds':comparison(local_native['embeds'],common_external['embeds']),
-                                               'positions':comparison(local_native['positions'],common_external['positions'])},
+                        'native_input_rollout': default_native['native_input_rollout'],
+                        'common_input_rollout':default_native['common_input_rollout'],
+                        'native_rollout_factors': {
+                            'default': default_native,
+                            'math': math_native,
+                        },
                         'forced_common':{'origin':'local ordinary clean rollout; same bank for both implementations and backend factors',
                                          'embeds':native.tensor_record(local_native['embeds']),
                                          'positions':local_native['positions'].cpu().tolist(),
@@ -434,6 +512,7 @@ def run(args):
                         del state
                         save()
                     del local_native,ext_native,common_external
+                    del math_local_native,math_ext_native,math_common_external
             report['loaded_modules'] = {name:{'path':module.__file__, 'sha256':native.baseline.sha(module.__file__),
                 'supplied':Path(module.__file__).resolve().is_relative_to(Path(args.external_source).resolve())}
                 for name,module in tuple(sys.modules.items()) if getattr(module,'__file__',None)
@@ -445,7 +524,16 @@ def run(args):
                 'Local numerical decorators unwrapped to expose backend as a separate explicit factor; function bodies unchanged.',
                 'Layer/KV comparisons cover reported selected coordinates, not every hidden element.',
                 'Inference-only evidence does not settle training Flex, checkpointing, gradient or optimizer equivalence.']
-            report['status']='completed'; save(); progress('two-sample diagnostic completed')
+            unsupported_default = any(
+                sample['controls']['default']['status'] == 'unsupported_control'
+                for sample in report['samples'])
+            report['completion'] = {
+                'math_primary': 'supported',
+                'default_control': 'unsupported' if unsupported_default else 'supported',
+            }
+            report['status'] = ('completed_with_unsupported_control'
+                                if unsupported_default else 'completed')
+            save(); progress('two-sample diagnostic completed')
     except Exception as error:
         report['error']=f'{type(error).__name__}: {error}'; save(); progress(report['error'])
         raise
