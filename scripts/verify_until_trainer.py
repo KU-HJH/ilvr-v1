@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import math
+from contextlib import nullcontext
 from pathlib import Path
 
 from scripts.verify_until_native import ExternalSource, external_modules, describe_batch, state_digest
@@ -176,6 +177,65 @@ def build_model(spec, processor, external):
     return model.to(dtype=torch.bfloat16).train()
 
 
+class NativePrefixCheck:
+    """Exact frozen native-prefix checks, before the observer can continue."""
+    def __init__(self, reference, observer, *, workers):
+        self.observer, self.reference, self.workers = observer, reference, workers
+        self.rows = reference['ranks'][str(observer.rank)]
+        self.directory = Path(reference['tensor_dir']) / f'rank-{observer.rank}'
+        self.checked = set()
+        if not self.rows:
+            raise ValueError('native prefix inventory is empty')
+        for micro, row in self.rows.items():
+            if not row['kinds'] or not row['coordinates']:
+                raise ValueError('native prefix inventory lacks witnesses')
+            for kind in row['kinds']:
+                path = self.directory / f'micro-{micro}-{kind}.pt'
+                if baseline.sha(path) != row['sha256'][kind]:
+                    raise ValueError(f'native prefix reference hash differs: {path}')
+
+    def enter(self, micro, coordinates):
+        for previous, row in self.rows.items():
+            if int(previous) < micro and any((previous, kind) not in self.checked for kind in row['kinds']):
+                raise ValueError('native prefix checks incomplete before next microbatch')
+        row = self.rows.get(str(micro))
+        if row is not None and row['coordinates'] != coordinates:
+            raise ValueError(f'native prefix coordinates differ at micro {micro}')
+
+    def snapshot(self, label, values):
+        import torch
+        pieces = label.split('-', 2)
+        if len(pieces) != 3 or pieces[0] != 'micro':
+            return
+        _, micro, kind = pieces
+        row = self.rows.get(micro)
+        if row is None or kind not in row['kinds']:
+            return
+        path = self.directory / f'{label}.pt'
+        # Hash again at consumption: a stale or edited reference is not evidence.
+        if baseline.sha(path) != row['sha256'][kind]:
+            raise ValueError(f'native prefix reference hash differs: {path}')
+        expected = torch.load(path, map_location='cpu', weights_only=True)
+        if not isinstance(values, dict) or set(values) != set(expected):
+            raise ValueError(f'native prefix named keys differ: {label}')
+        for name, target in expected.items():
+            actual = values[name]
+            if target is None and actual is None:
+                continue
+            if (not isinstance(target, torch.Tensor) or not isinstance(actual, torch.Tensor)
+                    or target.dtype != actual.dtype or target.shape != actual.shape
+                    or not torch.equal(target, actual.detach().cpu())):
+                raise ValueError(f'native prefix tensor differs: {label}/{name}')
+        self.checked.add((micro, kind))
+        self.observer.write(dict(event='native_prefix_snapshot', rank=self.observer.rank,
+            micro=int(micro), kind=kind, reference_sha256=row['sha256'][kind],
+            reference_workers=self.reference['dataloader_num_workers'], workers=self.workers,
+            checked_snapshots=len(self.checked), exact=True))
+
+    def finish(self):
+        self.enter(max(map(int, self.rows)) + 1, {})
+
+
 def probed_trainer_class(base, spec, replay):
     import torch
     from transformers import Trainer,TrainerCallback
@@ -190,6 +250,15 @@ def probed_trainer_class(base, spec, replay):
             engine=trainer.accelerator.deepspeed_engine_wrapped.engine
             observer_class = MemoryDiagnosticObserver if diagnostic else AlignmentObserver
             trainer.gate_observer=observer_class(trainer,engine,spec,replay)
+            trainer._native_prefix_check = None
+            if spec.get('native_prefix_reference') is not None:
+                trainer._native_prefix_check = NativePrefixCheck(spec['native_prefix_reference'],
+                    trainer.gate_observer, workers=args.dataloader_num_workers)
+                save = trainer.gate_observer.save
+                def checked_save(label, values):
+                    save(label, values)
+                    trainer._native_prefix_check.snapshot(label, values)
+                trainer.gate_observer.save = checked_save
             original=engine.step
             def step(*a,**kw):
                 boundary=engine.is_gradient_accumulation_boundary()
@@ -203,6 +272,13 @@ def probed_trainer_class(base, spec, replay):
                     trainer.gate_observer.after_step()
                 return value
             engine.step=step
+            return control
+        def on_log(self,args,state,control,logs=None,**kwargs):
+            observer = self.owner.gate_observer
+            if observer is not None:
+                observer.write(dict(event='trainer_log', rank=observer.rank,
+                    step=state.global_step, logs=logs,
+                    scope='four-rank last-microbatch preference means; framework loss unchanged'))
             return control
         def on_step_end(self,args,state,control,**kwargs):
             if state.global_step==stop_steps:
@@ -250,6 +326,8 @@ def probed_trainer_class(base, spec, replay):
             description=describe_batch(inputs)
             # Names of implementation-specific metadata differ; actual tensors and targets may not.
             coordinates={k:description[k] for k in ('tensors','sample_ids','targets')}
+            if self._native_prefix_check is not None:
+                self._native_prefix_check.enter(self.gate_observer.micro+1, coordinates)
             if diagnostic:
                 self.gate_observer.memory('micro_entry', micro=self.gate_observer.micro+1,
                     sample_id=inputs['sample_ids'][0], coordinates=coordinates)
@@ -268,7 +346,10 @@ def probed_trainer_class(base, spec, replay):
                 actual_backward_hooks=observer.hook_calls-before))
             return value
         def compute_loss(self,model,inputs,return_outputs=False,num_items_in_batch=None):
-            value=super().compute_loss(model,inputs,return_outputs=return_outputs,num_items_in_batch=num_items_in_batch)
+            # Diagnostic observer only: native forward saves tensors on CPU;
+            # retained gradient reads and ordinary Trainer backward remain outside.
+            with torch.autograd.graph.save_on_cpu(pin_memory=False) if spec.get('save_on_cpu', False) else nullcontext():
+                value=super().compute_loss(model,inputs,return_outputs=return_outputs,num_items_in_batch=num_items_in_batch)
             if self._gate_capture is None:
                 raise RuntimeError('native preference reducer was not observed')
             preference,scores=self._gate_capture
@@ -293,6 +374,18 @@ def probed_trainer_class(base, spec, replay):
             self._gate_capture=(value[1]['loss/context_preference_all'],scores)
             return value
     return Probed
+
+
+def configure_probe_training_args(train_args):
+    """Preserve production workers; collect one native log in the bounded gate."""
+    train_args.max_steps = 212
+    train_args.warmup_steps = 10
+    train_args.save_strategy = 'no'
+    train_args.logging_strategy = 'steps'
+    train_args.logging_steps = 20
+    train_args.logging_first_step = True
+    train_args.stage2_debugging = False
+    train_args.learning_rate = 5e-5
 
 
 def runtime_origins(trainer,source,external_flex):
@@ -350,12 +443,7 @@ def run_from_training_args(args, spec_path):
         initial_digest=state_digest(model)
         train_args=build_stage2_training_arguments(args)
         train_args.output_dir=str(tensor_destination(Path(spec['tensor_dir'])/'trainer'))
-        train_args.max_steps=212
-        train_args.warmup_steps=10
-        train_args.save_strategy='no'
-        train_args.logging_strategy='no'
-        train_args.learning_rate=5e-5
-        train_args.dataloader_num_workers=0
+        configure_probe_training_args(train_args)
         if spec['path']=='external':
             base=external.trainer.Stage2Trainer
             config=external.config.StepPreferenceConfig(enabled=True,beta=.5,lambda_preference=1.,lambda_entropy=0.,modalities='visual')
@@ -384,6 +472,13 @@ def run_from_training_args(args, spec_path):
                 f'schedule212/warmup10; stop callback after{2 if diagnostic else 5} updates',
                 'gate-only AOT donated_buffer=False before compilation for retained observer gradients; restored on exit'],
             memory_diagnostic=diagnostic,
+            save_on_cpu=spec.get('save_on_cpu', False),
+            resolved_dataloader=dict(num_workers=train_args.dataloader_num_workers,
+                persistent_workers=train_args.dataloader_persistent_workers,
+                prefetch_factor=train_args.dataloader_prefetch_factor),
+            diagnostic_logging=dict(strategy=str(train_args.logging_strategy), steps=train_args.logging_steps,
+                first_step=train_args.logging_first_step, debugging=train_args.stage2_debugging,
+                scope='four-rank last-microbatch means; first-step enabled only for this bounded witness'),
             probe_compiler_config={'donated_buffer':functorch_config.donated_buffer},
             runtime_origins=runtime_origins(trainer,source,external_flex),
             final_tail_scope='actual partial optimizer event for original212 IDs, not historical optimizer state212')
@@ -401,6 +496,8 @@ def run_from_training_args(args, spec_path):
         torch.compile=observed_compile
         try:
             trainer.train()
+            if trainer._native_prefix_check is not None:
+                trainer._native_prefix_check.finish()
         finally:
             torch.compile=original_compile
         flex_calls=[call for call in compiler_calls if call['callable']=='torch.nn.attention.flex_attention.flex_attention']

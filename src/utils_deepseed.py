@@ -250,7 +250,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             latent_size=8, attention_implementation="sdpa",
             vision_attention_implementation="flash_attention_2", step_sidecar_attention_backend="flex",
             step_sidecar_query_budget=1024, gradient_checkpointing=False,
-            stage2_latent_activation_checkpointing=True, max_seq_length_train=8192, dataloader_num_workers=0)
+            stage2_latent_activation_checkpointing=True, max_seq_length_train=8192, dataloader_num_workers=4)
         for name, value in resolved.items():
             setattr(args, name, value)
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:

@@ -862,6 +862,8 @@ def build_stage2_training_arguments(args) -> SFTConfig:
     dataloader_kwargs = {"dataloader_num_workers": dataloader_num_workers}
     if dataloader_num_workers > 0:
         dataloader_kwargs["dataloader_prefetch_factor"] = 2
+        if getattr(args, "stage2_execution_profile", "legacy") == "latest_external_until":
+            dataloader_kwargs["dataloader_persistent_workers"] = True
     checkpointing_kwargs = _stage2_gradient_checkpointing_kwargs(
         gradient_checkpointing=args.gradient_checkpointing,
         tuning_method=args.tuning_method,

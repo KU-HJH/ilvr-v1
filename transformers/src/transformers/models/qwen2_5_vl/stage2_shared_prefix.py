@@ -15,7 +15,7 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
         raise TypeError("stage2_shared_prefix_inputs must be a mapping")
     shared_option_names = {
         "plan", "backend", "query_budget", "checkpoint", "prefix_mode",
-        "branch_mode", "block_original_image",
+        "branch_mode", "block_original_image", "compute_entropy",
     }
     replacement_option_names = {
         "sample_id", "replacement_seed", "replacement_version",
@@ -141,6 +141,8 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
         raise ValueError("shared-prefix backend must be dense or flex")
     if options.get("backend") == "flex" and model.training and model.config.attention_dropout:
         raise ValueError("Flex sidecars require zero attention dropout; adapter dropout remains independent")
+    if type(options.get("compute_entropy", True)) is not bool:
+        raise ValueError("shared-prefix compute_entropy must be a bool")
     if type(options.get("checkpoint", True)) is not bool:
         raise ValueError("shared-prefix checkpoint must be a bool")
     chunk_sidecar_branches((), options.get("query_budget", 1024))
@@ -191,7 +193,7 @@ def _branch_inputs(model, branch, input_ids, clean_embeds, clean_positions):
     return model.model.embed_tokens(token_ids), positions.index_select(2, logical)
 
 
-def _score_chunk(model, branches, embeds, positions, mask, flat_prefix):
+def _score_chunk(model, branches, embeds, positions, mask, flat_prefix, *, compute_entropy=True):
     """Factory binds metadata per chunk, including during delayed backward replay."""
     selected = []
     targets = []
@@ -222,17 +224,21 @@ def _score_chunk(model, branches, embeds, positions, mask, flat_prefix):
             inputs_embeds=embeds, position_ids=positions, attention_mask=mask,
             return_dict=True, **cache_args,
         ).last_hidden_state
-        return score_selected_hidden(model, hidden, selected, targets, lengths)
+        return score_selected_hidden(model, hidden, selected, targets, lengths, compute_entropy=compute_entropy)
 
     return score, (embeds, positions, *flat_prefix)
 
 
-def score_selected_hidden(model, hidden, selected, targets, lengths):
+def score_selected_hidden(model, hidden, selected, targets, lengths, *, compute_entropy=True):
     """Project only predictor rows and preserve existing per-target reductions."""
-    logits = model.lm_head(hidden.index_select(1, selected))[0].float()
+    if getattr(model.config, "stage2_execution_profile", "legacy") == "latest_external_until":
+        # Supplied source projects the full OFF suffix before indexing scores.
+        logits = model.lm_head(hidden)[0].index_select(0, selected).float()
+    else:
+        logits = model.lm_head(hidden.index_select(1, selected))[0].float()
     log_probs = logits.log_softmax(-1)
     target_log_probs = log_probs.gather(-1, targets[:, None]).squeeze(-1)
-    entropies = -(log_probs.exp() * log_probs).sum(-1)
+    entropies = -(log_probs.exp() * log_probs).sum(-1) if compute_entropy else logits.new_empty(0)
     reduced, start = [], 0
     for length in lengths:
         reduced.extend((target_log_probs[start:start+length].mean(), entropies[start:start+length]))
@@ -373,13 +379,15 @@ def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, pre
                 visible = sidecar_dense_visibility(plan.root_length, branches, device=embeds.device)
                 mask = torch.zeros(visible.shape, dtype=embeds.dtype, device=embeds.device)
                 mask = mask.masked_fill(~visible, torch.finfo(embeds.dtype).min)[None, None]
-            score, args = _score_chunk(model, branches, embeds, positions, mask, flat_prefix)
+            score, args = _score_chunk(model, branches, embeds, positions, mask, flat_prefix,
+                                       compute_entropy=options.get("compute_entropy", True))
             values = checkpoint(score, *args, use_reentrant=False, preserve_rng_state=True) if options.get("checkpoint", True) else score(*args)
             for index, branch in enumerate(branches):
                 results.append(dict(name=branch.name, kind=branch.kind, step_id=branch.step_id,
                                     mean_logp=values[index*2], entropies=values[index*2+1]))
                 key = "rejected_scored_rows" if branch.rejected_model_inputs is not None else "entropy_scored_rows"
-                stats[key] += len(branch.target_token_ids)
+                if key != "entropy_scored_rows" or options.get("compute_entropy", True):
+                    stats[key] += len(branch.target_token_ids)
                 stats["oversized_branches"] += len(branch.token_ids) > budget
             stats["chunks"] += 1
             stats["query_rows"] += embeds.shape[1]

@@ -598,7 +598,43 @@ class Stage2Trainer(Trainer):
             label="Stage 2 checkpoint sampler identity publication",
         )
 
+    def _needs_context_entropy(self) -> bool:
+        return (getattr(self, "stage2_execution_profile", "legacy") != "latest_external_until"
+                or self.step_preference_config.lambda_entropy != 0
+                or getattr(getattr(self, "args", None), "stage2_debugging", False))
+
+    def _record_external_until_diagnostics(self, values) -> None:
+        # Match the supplied source's sync-boundary/next-update cadence. These
+        # are four rank-last examples, not the historical two rank-last examples.
+        self._latest_external_until_diagnostics = None
+        accelerator = getattr(self, "accelerator", None)
+        args = getattr(self, "args", None)
+        if accelerator is None or args is None or not accelerator.sync_gradients:
+            return
+        next_step = self.state.global_step + 1
+        if not ((args.logging_first_step and next_step == 1)
+                or next_step % args.logging_steps == 0):
+            return
+        names = (
+            "loss/ce", "loss/context_preference_all", "loss/entropy_all", "loss/total",
+            "loss/context_preference_visual", "loss/context_preference_text",
+            "loss/entropy_visual", "loss/entropy_text", "stats/context_margin_visual",
+            "stats/context_margin_text", "stats/entropy_clean", "stats/entropy_visual_off",
+            "stats/entropy_text_off",
+        )
+        source_names = {"loss/context_preference_all": "loss/context_preference",
+                        "loss/entropy_all": "loss/entropy"}
+        diagnostics = torch.stack(tuple(
+            values[source_names.get(name, name)].detach().float().reshape(())
+            for name in names
+        ))
+        diagnostics = accelerator.reduce(diagnostics, reduction="mean")
+        self._latest_external_until_diagnostics = dict(zip(names, diagnostics.unbind(), strict=True))
+
     def _accumulate_step_preference_metrics(self, values) -> None:
+        if getattr(self, "stage2_execution_profile", "legacy") == "latest_external_until":
+            self._record_external_until_diagnostics(values)
+            return
         if getattr(self, "_stage2_padding_active", False):
             return
         totals = getattr(self, "_step_preference_metric_totals", None)
@@ -660,32 +696,35 @@ class Stage2Trainer(Trainer):
                 pref[modality] = context_preference_loss(
                     clean, off, config.beta, config.preference_margin
                 )
-                sidecar_entropies = [
-                    results[(step_id, modality)]["entropies"]
-                    for step_id in range(len(clean_scores))
-                ]
-                if any(
-                    sidecar.shape != clean_entropy.shape
-                    for sidecar, clean_entropy in zip(
-                        sidecar_entropies, clean_entropies
-                    )
-                ):
-                    raise ValueError("sidecar entropy rows must match clean target rows")
-                ent[modality] = torch.stack(
-                    [
-                        F.relu(
-                            config.entropy_margin - (sidecar - clean_entropy)
-                        ).mean()
-                        for clean_entropy, sidecar in zip(
-                            clean_entropies, sidecar_entropies
-                        )
-                    ]
-                ).mean()
                 margins[modality] = (clean - off).mean()
                 off_logps[modality] = off.mean()
-                off_entropies[modality] = torch.stack(
-                    [entropy.mean() for entropy in sidecar_entropies]
-                ).mean()
+                if not self._needs_context_entropy():
+                    ent[modality] = off_entropies[modality] = zero
+                else:
+                    sidecar_entropies = [
+                        results[(step_id, modality)]["entropies"]
+                        for step_id in range(len(clean_scores))
+                    ]
+                    if any(
+                        sidecar.shape != clean_entropy.shape
+                        for sidecar, clean_entropy in zip(
+                            sidecar_entropies, clean_entropies
+                        )
+                    ):
+                        raise ValueError("sidecar entropy rows must match clean target rows")
+                    ent[modality] = torch.stack(
+                        [
+                            F.relu(
+                                config.entropy_margin - (sidecar - clean_entropy)
+                            ).mean()
+                            for clean_entropy, sidecar in zip(
+                                clean_entropies, sidecar_entropies
+                            )
+                        ]
+                    ).mean()
+                    off_entropies[modality] = torch.stack(
+                        [entropy.mean() for entropy in sidecar_entropies]
+                    ).mean()
         preference = torch.stack(
             [pref[modality] for modality in active_modalities]
         ).mean()
@@ -844,7 +883,8 @@ class Stage2Trainer(Trainer):
                 prefix_mode=config.prefix_mode,
                 branch_mode=config.branch_mode,
                 block_original_image=config.block_original_image,
-                **({"checkpoint": False} if getattr(self, "stage2_execution_profile", "legacy") == "latest_external_until" else {}),
+                **({"checkpoint": False, "compute_entropy": self._needs_context_entropy()}
+                   if getattr(self, "stage2_execution_profile", "legacy") == "latest_external_until" else {}),
                 **(
                     {
                         "sample_id": sample_ids[0],
@@ -936,7 +976,8 @@ class Stage2Trainer(Trainer):
                 clean_entropies.append(evidence_on[span.step_id]["entropies"])
             else:
                 clean_scores.append(_mean_selected_logp(logits, targets))
-                clean_entropies.append(_selected_entropies(logits))
+                if self._needs_context_entropy():
+                    clean_entropies.append(_selected_entropies(logits))
             offset += count
         total, metrics = self._reduce_context_objective(
             clean_ce, clean_scores, clean_entropies, results
@@ -1711,6 +1752,16 @@ class Stage2Trainer(Trainer):
             adjacent = diagnostics["adjacent_cosine_similarities"]
             if adjacent.numel():
                 logs["stage2/adjacent_cosine_mean"] = float(adjacent.mean().item())
+        preference_diagnostics = getattr(self, "_latest_external_until_diagnostics", None)
+        self._latest_external_until_diagnostics = None
+        if preference_diagnostics is not None:
+            logs = dict(logs)
+            needs_entropy = (self.step_preference_config.lambda_entropy != 0
+                             or getattr(self.args, "stage2_debugging", False))
+            logs.update({name: float(value.item()) for name, value in preference_diagnostics.items()
+                         if needs_entropy or "entropy" not in name})
+            logs["stage2/debugging"] = int(getattr(self.args, "stage2_debugging", False))
+            logs["stage2/entropy_computed"] = int(needs_entropy)
         metric_batches = getattr(self, "_step_preference_metric_batches", 0)
         if metric_batches:
             logs = dict(logs)
