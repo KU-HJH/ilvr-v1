@@ -1,0 +1,33 @@
+{
+  "phase": "delegated review fix ready for independent re-review",
+  "agent": "/root/until_alignment_gate_impl",
+  "finding": "Successful bounded gate fell through mandatory coordinator checkpoint212 and producer-evidence collection despite five-step stop and disabled saves.",
+  "root_cause": "Coordinator terminal validation assumed every successful training process produced max_steps checkpoint; explicit gate env had no completion contract.",
+  "skills_executed": [
+    "receiving-code-review: confirmed real entrypoint terminal flow",
+    "systematic-debugging: traced normal worker return into unconditional checkpoint collection",
+    "test-driven-development: actual coordinator command-flow RED then explicit gate completion GREEN",
+    "verification-before-completion: focused113 pass"
+  ],
+  "scope": "Same coordinator preflight/readiness/owned process monitoring and exit-zero requirements; gate-only completion branch, strict rank terminals and owned artifact collection. Ordinary training path preserved.",
+  "red": "logs/until-temp2-alignment-20260923/coordinator-gate-red.log",
+  "verification": {
+    "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:transformers/src:. OMP_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q tests/multinode/test_until_alignment_completion.py tests/multinode/test_coordinator.py tests/stage2/test_until_alignment_gate.py tests/stage2/test_reference_sampler_probe.py",
+    "result": "113 passed in 7.03s",
+    "log": "logs/until-temp2-alignment-20260923/coordinator-gate-focused-final.log",
+    "diff_check": "git diff --check passed"
+  },
+  "files_sha256": {
+    "scripts/verify_until_trainer.py": "e1483138f65a6d3a11708e13d7c9e30d8fdc5d05cc7752e1e7429ff4bea4eb6b",
+    "src/multinode.py": "9b5899b9c701921ccc9702358f02fe19c127448c2e48de3c4d6b08d0d689df80",
+    "src/multinode_runtime.py": "f666dd99756dd104f88ac2ba7468bfbf222ea90c7c18025e9b8b09ced7651792",
+    "src/stage2/until_alignment_probe.py": "a3c547e10b2f929d01519457db0ffe3716dd437f669e0e57194667682cbc390c",
+    "tests/multinode/test_until_alignment_completion.py": "a5e95fa0653c229d2d7d7f52cad5ab2fddefd77f914794707b0c8d67796c383b"
+  },
+  "limits": [
+    "No GPU launch",
+    "No real SSH/rsync transfer performed; transfer boundary exercised with controlled filesystem inputs and corruption",
+    "Full suite and independent re-review pending root",
+    "Probe witness reports schedule212 / actualsteps5; never checkpoint212 or full212 authorization"
+  ]
+}

@@ -315,10 +315,15 @@ def check_runtime(records, replay):
     return {'pass':not failures,'failures':failures,'scope':'five actual optimizer events, projected original212 tail; no historical state212 claim'}
 
 
-def required_snapshots(observed):
-    expected = {f'rank-{rank}/micro-{micro}-{kind}.pt' for rank in range(4) for micro in range(17)
+def expected_snapshots(ranks=range(4)):
+    expected = {f'rank-{rank}/micro-{micro}-{kind}.pt' for rank in ranks for micro in range(17)
                 for kind in ('scores','rng','preference','total','dora-norms')}
-    expected |= {f'rank-{rank}/update-{step}-{kind}.pt' for rank in range(4) for step in range(1,6)
+    expected |= {f'rank-{rank}/update-{step}-{kind}.pt' for rank in ranks for step in range(1,6)
                  for kind in ('preference-oracle','total-oracle','total-actual','master-before','bf16-before','master-delta','bf16-delta')}
+    return expected
+
+
+def required_snapshots(observed):
+    expected = expected_snapshots()
     if observed != expected:
         raise ValueError(f'tensor inventory differs: missing={sorted(expected-observed)}, extra={sorted(observed-expected)}')

@@ -15,7 +15,7 @@ from scripts.verify_until_native import ExternalSource, external_modules, descri
 from scripts import verify_voff_model_path as baseline
 from stage2.until_alignment_probe import (
     NUMERICAL_PROTOCOL, AlignmentObserver, check_runtime, compare_snapshot,
-    freeze_envelope, select_windows, tensor_destination, required_snapshots,
+    freeze_envelope, select_windows, tensor_destination, required_snapshots, expected_snapshots,
 )
 
 
@@ -296,6 +296,8 @@ def run_from_training_args(args, spec_path):
     from stage2.trainer import Stage2Trainer
     from step_preference.config import StepPreferenceConfig
     spec=load_spec(spec_path)
+    spec_sha256=baseline.sha(spec_path)
+    run_id=Path(args.save_model_path).name
     if int(os.environ.get('WORLD_SIZE','1'))!=4:
         raise ValueError('launch gate with existing two-node four-rank coordinator')
     if getattr(args,'stage2_execution_profile','legacy')!='latest_external_until':
@@ -370,6 +372,15 @@ def run_from_training_args(args, spec_path):
         if trainer.state.global_step!=5 or trainer.gate_observer.micro!=16:
             raise RuntimeError('bounded event count differs')
         authenticate_source(spec)
+        trainer.accelerator.wait_for_everyone()
+        if baseline.sha(spec_path)!=spec_sha256:
+            raise ValueError('gate spec changed during execution')
+        completion=dict(kind='until_alignment_probe',run_id=run_id,rank=rank,
+            commit=os.environ['ILVR_REPOSITORY_COMMIT'],spec_sha256=spec_sha256,
+            schedule_steps=212,probe_optimizer_steps=trainer.state.global_step,
+            microsteps=trainer.gate_observer.micro+1,status='complete')
+        with (result_dir/f'completion-rank-{rank}.json').open('x') as stream:
+            json.dump(completion,stream,indent=2)
         trainer.accelerator.wait_for_everyone()
     return None
 
@@ -468,12 +479,77 @@ def compare(envelope_path,aligned_dir):
             'full212_authorized':False,'scope':'bounded comparison only; controller must assess gate before launching full212'}
 
 
+def validate_node_entry_names(kind, entries, ranks):
+    if kind=='tensors':
+        expected=expected_snapshots(ranks)
+    elif kind=='results':
+        expected={f'{prefix}{rank}{suffix}' for rank in ranks for prefix,suffix in (
+            ('rank-','.jsonl'),('metadata-rank-','.json'),('completion-rank-','.json'))}
+    else:
+        raise ValueError('unknown alignment artifact kind')
+    names=[e.get('path') for e in entries]
+    if len(names)!=len(expected) or set(names)!=expected:
+        raise ValueError('alignment node artifact inventory differs')
+
+
+def _completion_records(spec_path, *, ranks, run_id, commit, spec_sha256):
+    if baseline.sha(spec_path)!=spec_sha256:
+        raise ValueError('alignment completion spec digest differs')
+    spec=json.loads(Path(spec_path).read_text())
+    for rank in ranks:
+        payload=json.loads((Path(spec['result_dir'])/f'completion-rank-{rank}.json').read_text())
+        expected=dict(kind='until_alignment_probe',run_id=run_id,rank=rank,commit=commit,
+            spec_sha256=spec_sha256,schedule_steps=212,probe_optimizer_steps=5,microsteps=17,status='complete')
+        if payload!=expected:
+            raise ValueError('alignment terminal completion differs from five-step probe')
+        meta=json.loads((Path(spec['result_dir'])/f'metadata-rank-{rank}.json').read_text())
+        if meta['rank']!=rank or meta['spec']!=spec:
+            raise ValueError('alignment metadata differs from owned spec')
+    return spec
+
+
+def node_evidence(spec_path, *, ranks, run_id, commit, spec_sha256):
+    """Export only closed, complete rank-owned metrics and tensor inventory."""
+    spec=_completion_records(spec_path,ranks=ranks,run_id=run_id,commit=commit,spec_sha256=spec_sha256)
+    result={'ranks':ranks,'spec_sha256':spec_sha256}
+    for kind,field in (('results','result_dir'),('tensors','tensor_dir')):
+        root=Path(spec[field])
+        names=expected_snapshots(ranks) if kind=='tensors' else {
+            f'{prefix}{rank}{suffix}' for rank in ranks for prefix,suffix in (
+                ('rank-','.jsonl'),('metadata-rank-','.json'),('completion-rank-','.json'))}
+        entries=[]
+        for name in sorted(names):
+            path=root/name
+            if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root.resolve()):
+                raise ValueError('alignment artifact is missing or escapes its owned directory')
+            with path.open('rb') as stream:
+                digest=hashlib.file_digest(stream,'sha256').hexdigest()
+            entries.append({'path':name,'size':path.stat().st_size,'sha256':digest})
+        validate_node_entry_names(kind,entries,ranks)
+        result[kind]=entries
+    return result
+
+
+def validate_collected_completion(spec_path, *, run_id, commit, spec_sha256):
+    spec=_completion_records(spec_path,ranks=range(4),run_id=run_id,commit=commit,spec_sha256=spec_sha256)
+    required_snapshots({str(p.relative_to(spec['tensor_dir'])) for p in Path(spec['tensor_dir']).glob('rank-*/*.pt')})
+    report=check_runtime(records(spec['result_dir']),metadata(spec['result_dir'])['replay'])
+    if not report['pass']:
+        raise ValueError(f'alignment runtime witness failed: {report["failures"]}')
+    return report
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     commands=parser.add_subparsers(dest='command',required=True)
     f=commands.add_parser('freeze'); f.add_argument('--controls',nargs=3,required=True); f.add_argument('--output',required=True)
     c=commands.add_parser('compare'); c.add_argument('--envelope',required=True); c.add_argument('--aligned',required=True); c.add_argument('--output',required=True)
+    n=commands.add_parser('node-evidence'); n.add_argument('--spec',required=True); n.add_argument('--ranks',nargs='+',type=int,required=True)
+    n.add_argument('--run-id',required=True); n.add_argument('--commit',required=True); n.add_argument('--spec-sha256',required=True)
     args=parser.parse_args()
+    if args.command=='node-evidence':
+        print(json.dumps(node_evidence(args.spec,ranks=args.ranks,run_id=args.run_id,commit=args.commit,spec_sha256=args.spec_sha256)))
+        return
     result=freeze(args.controls,args.output) if args.command=='freeze' else compare(args.envelope,args.aligned)
     if args.command=='compare':
         with Path(args.output).open('x') as f:

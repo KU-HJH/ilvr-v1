@@ -46,6 +46,7 @@ from src.multinode_runtime import (
     validate_ownership,
     validate_node_config_digest,
     validate_preflight,
+    validate_alignment_gate_launch,
     validate_stage1_arguments,
     validate_stage2_arguments,
     validate_resume_path,
@@ -1748,6 +1749,15 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             main_process_port=args.main_process_port,
             attempt_id=args.attempt_id,
         )
+        gate_spec_path = stage_environment.get("ILVR_UNTIL_ALIGNMENT_GATE_SPEC")
+        gate_launch = None
+        if gate_spec_path:
+            if resume_requested or stage_environment.get("STAGE2_EXECUTION_PROFILE") != "latest_external_until":
+                raise ValueError("alignment gate requires a fresh explicit execution profile")
+            gate_launch = validate_alignment_gate_launch(
+                gate_spec_path, plan=plan, result_root=result_root,
+                schedule_steps=int(_argument_value(forwarded, "--max_steps") or "0"),
+            )
         commit = _repository_git_stdout(("rev-parse", "HEAD"))
         commands = build_owned_tmux_commands(
             plan,
@@ -1808,8 +1818,12 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                     )
                     if stage_environment.get(name)
                 )
+        if gate_launch is not None:
+            input_paths += (Path(gate_spec_path),)
         artifact_roots = (checkpoint_root, result_root, _REPOSITORY_ROOT / "logs")
         run_paths = [control_directory, witness_path, stage_log_file]
+        if gate_launch is not None:
+            run_paths.append(Path(gate_launch["spec"]["result_dir"]))
         if commands.finite_loss_evidence_path is not None:
             run_paths.append(commands.finite_loss_evidence_path)
         if not resume_requested:
@@ -1907,6 +1921,13 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         )
         if exit_codes != {0: 0, 1: 0}:
             raise RuntimeError(f"multi-node training failed: exit_codes={exit_codes}")
+        if gate_launch is not None:
+            witness = runner.collect_alignment_gate(
+                Path(gate_spec_path), exit_codes=exit_codes, schedule_steps=212,
+                expected_spec_sha256=gate_launch["sha256"], result_root=result_root,
+            )
+            print(json.dumps({"alignment_probe_witness": str(witness)}, sort_keys=True))
+            return 0
         ordinary_stage1 = (
             stage == "stage1"
             and _argument_value(forwarded, "--benchmark-run-config") is None

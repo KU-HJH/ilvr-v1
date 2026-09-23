@@ -1816,6 +1816,26 @@ def _subprocess_command_runner(
     )
 
 
+def validate_alignment_gate_launch(spec_path, *, plan, result_root, schedule_steps):
+    """Bind the explicit bounded probe to the coordinator's existing owned run."""
+    path = Path(spec_path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("alignment gate spec must be an absolute path")
+    raw = path.read_bytes()
+    spec = json.loads(raw)
+    if (plan.stage, plan.tuning_method, plan.zero_stage, plan.world_size, schedule_steps) != ("stage2", "dora", 2, 4, 212):
+        raise ValueError("alignment gate requires Stage2 DoRA ZeRO2 world4 schedule212")
+    if spec.get("path") not in ("external", "aligned"):
+        raise ValueError("alignment gate path must be external or aligned")
+    for field, root in (("tensor_dir", _CHECKPOINT_ROOT / plan.run_id),
+                        ("result_dir", Path(result_root) / plan.run_id)):
+        target = Path(spec.get(field, ""))
+        if (not target.is_absolute() or ".." in target.parts
+                or not target.resolve().is_relative_to(root.parent.resolve() / root.name)):
+            raise ValueError(f"alignment gate {field} must be run-owned")
+    return {"spec": spec, "sha256": hashlib.sha256(raw).hexdigest()}
+
+
 class SubprocessCoordinatorRunner:
     """Execute fixed coordinator commands through an injectable subprocess boundary."""
 
@@ -2214,6 +2234,68 @@ class SubprocessCoordinatorRunner:
         if not raw or len(raw) > 1024 * 1024:
             raise ValueError("remote Stage 1 training evidence size is invalid")
         return raw
+
+    def collect_alignment_gate(self, spec_path, *, exit_codes, schedule_steps,
+                               expected_spec_sha256, result_root):
+        """Collect completed rank-owned probe evidence, never a fabricated checkpoint."""
+        from scripts.verify_until_trainer import node_evidence, validate_collected_completion
+        from src.multinode_artifacts import _rsync_prefix
+        if dict(exit_codes) != {0: 0, 1: 0}:
+            raise ValueError("alignment probe collection requires zero owned exits")
+        launch = validate_alignment_gate_launch(spec_path, plan=self.plan,
+            result_root=result_root, schedule_steps=schedule_steps)
+        if launch["sha256"] != expected_spec_sha256:
+            raise ValueError("alignment gate spec changed since preflight")
+        spec = launch["spec"]
+        arguments = (str(_REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"),
+            "-m", "scripts.verify_until_trainer", "node-evidence", "--spec", str(spec_path),
+            "--ranks", "0", "1", "--run-id", self.plan.run_id,
+            "--commit", self.commit_value, "--spec-sha256", expected_spec_sha256)
+        completed = self._run_artifact_transfer(build_remote_exec(
+            ("env", f"PYTHONPATH={_REPOSITORY_ROOT}:{_REPOSITORY_ROOT / 'src'}", *arguments),
+            working_directory=_REPOSITORY_ROOT))
+        remote = json.loads(completed.stdout)
+        local = node_evidence(spec_path, ranks=[2, 3], run_id=self.plan.run_id,
+                              commit=self.commit_value, spec_sha256=expected_spec_sha256)
+        if remote.get("ranks") != [0, 1] or remote.get("spec_sha256") != expected_spec_sha256:
+            raise ValueError("remote alignment completion identity differs")
+        for kind, field in (("results", "result_dir"), ("tensors", "tensor_dir")):
+            root = Path(spec[field])
+            entries = remote[kind]
+            # The exporter admits only the exact fixed per-rank probe file set.
+            from scripts.verify_until_trainer import validate_node_entry_names
+            validate_node_entry_names(kind, entries, [0, 1])
+            for entry in entries:
+                target = root / entry["path"]
+                if (target.exists() or target.is_symlink()
+                        or not target.parent.resolve().is_relative_to(root.resolve())):
+                    raise ValueError("alignment collection destination already exists or escapes its owned root")
+            listing = self.log_root / self.plan.run_id / self.plan.attempt_id / f"gate-{kind}.files"
+            publish_small_file(listing, b"".join(e["path"].encode()+b"\0" for e in entries))
+            prefix = _rsync_prefix(listing)
+            command = (*prefix[:-1], "--rsync-path", "/usr/bin/docker exec -i llm_kd /usr/bin/rsync", "--",
+                       f"{_REMOTE_HOST}:{root}/", f"{root}/")
+            self._run_artifact_transfer(command)
+            for entry in entries:
+                target = root / entry["path"]
+                if (target.is_symlink() or not target.is_file()
+                        or not target.resolve().is_relative_to(root.resolve())
+                        or target.stat().st_size != entry["size"]):
+                    raise ValueError("collected alignment artifact differs")
+                with target.open("rb") as stream:
+                    if hashlib.file_digest(stream, "sha256").hexdigest() != entry["sha256"]:
+                        raise ValueError("collected alignment artifact checksum differs")
+        report = validate_collected_completion(spec_path, run_id=self.plan.run_id,
+                    commit=self.commit_value, spec_sha256=expected_spec_sha256)
+        witness = Path(result_root) / self.plan.run_id / f"{self.plan.attempt_id}-probe-witness.json"
+        payload = {"kind": "until_alignment_probe", "run_id": self.plan.run_id,
+            "attempt_id": self.plan.attempt_id, "commit": self.commit_value,
+            "schedule_steps": 212, "probe_optimizer_steps": 5, "exit_codes": dict(exit_codes),
+            "spec_sha256": expected_spec_sha256, "runtime": report,
+            "rank_artifact_counts": {"remote": len(remote["tensors"]), "local": len(local["tensors"])},
+            "training_checkpoint": None, "full212_authorized": False}
+        publish_small_file(witness, _canonical_json_bytes(payload)+b"\n")
+        return witness
 
     def cleanup_owned(self, machine_rank: int, *, timeout_seconds: float) -> bool:
         """Signal only an exactly revalidated owner, then boundedly observe exit."""
