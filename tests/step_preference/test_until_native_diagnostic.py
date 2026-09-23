@@ -469,3 +469,150 @@ def test_component_cell_preserves_validated_native_disconnection_but_rejects_inv
     screen = d.screen_initializers({"e1": result, "e3": result})
     assert screen["status"] == "inconclusive"
     assert screen["source_expansion_candidate"] is False
+
+
+def test_fp32_control_rejects_unapproved_mode_side_or_initializer_before_loading():
+    # An ignored dtype flag or a broadened runner would execute an unapproved cell.
+    d = diagnostic()
+    assert d.parse_args([]).decoder_dtype == "bfloat16"
+    allowed = d.parse_args(["--mode", "components", "--initializer", "e1", "--decoder-dtype", "float32"])
+    d.validate_component_args(allowed)
+    for extra in ([], ["--mode", "components"],
+                  ["--mode", "components", "--initializer", "e3"],
+                  ["--mode", "components", "--initializer", "e1", "--side", "external", "--external-source", "/absent"]):
+        with pytest.raises(ValueError, match="FP32.*local.*e1.*component"):
+            d.run(d.parse_args(["--decoder-dtype", "float32", *extra]))
+
+
+def precision_tiny_fixture():
+    from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl
+    from peft_common import resolve_qwen2_5_vl_model
+    class Tokenizer:
+        def __len__(self): return 128
+        def convert_tokens_to_ids(self, token):
+            return dict(zip(("<|latent_pad|>", "<|latent_start|>", "<|latent_end|>",
+                             "<|image_pad|>", "<|vision_start|>", "<|video_pad|>"),
+                            (90, 91, 92, 80, 81, 82)))[token]
+    d = diagnostic()
+    models, _ = d.baseline.tiny_models(Tokenizer(), modeling_qwen2_5_vl)
+    return d, models[0], resolve_qwen2_5_vl_model(models[0]), d.baseline.tiny_cases(Tokenizer())[1]
+
+
+def test_fp32_promotion_preserves_bf16_rounded_values_wrappers_and_parameter_identity():
+    # Loading original FP32 values or casting only the decoder misses wrapper parameters.
+    d, model, qwen, _ = precision_tiny_fixture()
+    before = {n: p.detach().clone() for n, p in list(model.named_parameters()) + list(model.named_buffers())}
+    identities = {n: id(p) for n, p in model.named_parameters()}
+    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+    embedding = qwen.model.embed_tokens
+    head = qwen.lm_head
+    runtime = d.prepare_component_precision(model, "float32", production=False)
+    for name, value in list(model.named_parameters()) + list(model.named_buffers()):
+        expected_dtype = torch.bfloat16 if ".visual." in name else torch.float32
+        if value.is_floating_point():
+            assert value.dtype == expected_dtype
+        assert torch.equal(value, before[name].to(value.dtype)), name
+    assert identities == {n: id(p) for n, p in model.named_parameters()}
+    assert trainable == [n for n, p in model.named_parameters() if p.requires_grad]
+    assert qwen.model.embed_tokens is embedding and qwen.lm_head is head
+    assert not any(p.requires_grad for p in qwen.visual.parameters())
+    assert runtime["precision_control"]["promoted_state_exact"] is True
+    assert runtime["precision_control"]["expected_promoted_sha256"] == runtime["precision_control"]["actual_promoted_sha256"]
+    assert set(runtime["trainable_parameter_dtypes"].values()) == {"torch.float32"}
+    assert runtime["precision_control"]["float32_matmul_precision"] == "highest"
+    assert runtime["precision_control"]["cuda_matmul_allow_tf32"] is False
+    with pytest.raises(ValueError, match="vision attention"):
+        d.baseline.runtime_model_metadata(model, production=True)
+
+
+@pytest.mark.parametrize("broken", ["vision_trainable", "initial_fp32", "decoder_attention", "production_vision", "tf32"])
+def test_fp32_authentication_rejects_wrong_starting_profile_without_fallback(broken):
+    # The control must never bless another initial precision, trainable vision, or backend.
+    d, model, qwen, _ = precision_tiny_fixture()
+    old_precision = torch.get_float32_matmul_precision()
+    try:
+        if broken == "vision_trainable":
+            next(qwen.visual.parameters()).requires_grad_(True)
+        elif broken == "initial_fp32":
+            qwen.lm_head.float()
+        elif broken == "decoder_attention":
+            qwen.model.layers[0].self_attn = torch.nn.Identity()
+        elif broken == "tf32":
+            torch.set_float32_matmul_precision("high")
+        with pytest.raises(ValueError):
+            d.prepare_component_precision(model, "float32", production=broken == "production_vision")
+    finally:
+        torch.set_float32_matmul_precision(old_precision)
+
+
+def test_default_precision_keeps_original_bf16_state_and_runtime_authentication():
+    # Default callers must retain their original dtype and strict production profile gate.
+    d, model, _, _ = precision_tiny_fixture()
+    before = d.state_digest(model)
+    runtime = d.prepare_component_precision(model, "bfloat16", production=False)
+    assert d.state_digest(model) == before
+    assert runtime["parameter_dtypes"] == ["torch.bfloat16"]
+    assert "precision_control" not in runtime
+    with pytest.raises(ValueError, match="vision attention"):
+        d.prepare_component_precision(model, "bfloat16", production=True)
+
+
+def test_fp32_native_cell_promotes_before_nine_fresh_backwards_and_observes_actual_dtypes(tmp_path):
+    # Wiring promotion after a forward, omitting it, or assuming parameter dtype proves activation dtype fails here.
+    d, model, qwen, case = precision_tiny_fixture()
+    spans = case["spans"]
+    batch = dict(case["inputs"], sample_ids=["tiny"], reasoning_step_spans=spans,
+                 step_preference={"steps": [{"span": span} for span in spans]})
+    trainer = d.make_trainers([model], None, tmp_path, "cpu", backend="dense")[0]
+    original = d.state_digest(model)
+    result = d.run_component_cell(model, trainer, batch, "cpu", [str(Path(__file__).parents[2] / "src")],
+                                  decoder_dtype="float32", production=False)
+    assert result["runtime"]["precision_control"]["initial_bf16_state_sha256"] == original
+    rows = [row for group in result["runs"].values() for row in group]
+    assert len(rows) == 9
+    assert all(row["dispatch"]["backward_calls"] == 1 for row in rows)
+    assert len({row["initial_state_sha256"] for row in rows}) == 1
+    assert all(row["forward_request"] == rows[0]["forward_request"] for row in rows)
+    assert all(row["component_capture"]["identity_validated"] for row in rows)
+    assert all(row["component_checkpoint_coverage"]["total_coverage_verified"] for row in result["runs"]["total"])
+    for row in rows:
+        witness = row["dispatch"]["precision_activations"]
+        assert witness["vision"]["output_dtypes"] == ["torch.bfloat16"]
+        assert witness["embedding"]["output_dtypes"] == ["torch.float32"]
+        assert witness["head"]["output_dtypes"] == ["torch.float32"]
+        for i in range(3):
+            assert witness[f"attention.{i}"]["input_dtypes"] == ["torch.float32"]
+            assert witness[f"attention.{i}"]["output_dtypes"] == ["torch.float32"]
+        assert {g["dtype"] for g in row["gradients"].values() if g["connected"]} == {"torch.float32"}
+    assert all(p.grad is None for p in model.parameters())
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
+
+
+def test_precision_observer_rejects_actual_wrong_activation_dtype_and_removes_hooks():
+    # A cast in the real output path must be caught even when parameters have the requested dtype.
+    d, model, qwen, _ = precision_tiny_fixture()
+    d.prepare_component_precision(model, "float32", production=False)
+    wrong = qwen.lm_head.register_forward_hook(lambda module, args, output: output.bfloat16())
+    counts = [len(module._forward_hooks) for module in model.modules()]
+    try:
+        with pytest.raises(ValueError, match="activation dtype"):
+            with d.DispatchObserver([], model=model, precision=True):
+                qwen.lm_head(torch.zeros(1, 2, 8))
+        assert counts == [len(module._forward_hooks) for module in model.modules()]
+    finally:
+        wrong.remove()
+
+
+def test_gradient_residual_reports_both_normalizations_without_relaxing_screen():
+    # Reporting only CE-normalized residual can hide a large error relative to preference.
+    d = diagnostic()
+    geometry = d.gradient_geometry({"w": torch.tensor([4.])}, {"w": torch.tensor([2.])}, {"w": torch.tensor([7.])})
+    assert geometry["residual_ce_norm_ratio"] == .25
+    assert geometry["residual_preference_norm_ratio"] == .5
+    zero = d.gradient_geometry({"w": torch.zeros(1)}, {"w": None}, {"w": torch.ones(1)})
+    assert zero["residual_ce_norm_ratio"] is None
+    assert zero["residual_preference_norm_ratio"] is None
+    records, gradients = measurement_fixture()
+    for repeat in gradients["total"]:
+        repeat["w"] += 1
+    assert d.component_measurements(records, gradients)["reconstruction_within_observed_repeat_spread"] is False

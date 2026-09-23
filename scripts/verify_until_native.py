@@ -277,6 +277,8 @@ def gradient_geometry(ce, preference, total):
         return {"ce_norm": a, "preference_norm": b, "total_norm": group["total"] ** .5,
                 "cosine": group["dot"] / (a*b) if a*b else None,
                 "preference_ce_norm_ratio": b/a if a else None,
+                "residual_ce_norm_ratio": group["residual"] ** .5/a if a else None,
+                "residual_preference_norm_ratio": group["residual"] ** .5/b if b else None,
                 "sum_residual_l2": group["residual"] ** .5}
     return {**finish(sums), "layers": {k: finish(v) for k, v in layers.items()},
             "connectivity": connectivity, "connection_mismatches": mismatches}
@@ -284,7 +286,7 @@ def gradient_geometry(ce, preference, total):
 
 class DispatchObserver:
     """Read Python call/return events; never replace a model or objective function."""
-    def __init__(self, roots, *, model=None, capture=None):
+    def __init__(self, roots, *, model=None, capture=None, precision=False):
         self.roots = tuple(str(Path(p).resolve()) + "/" for p in roots)
         self.phase = "forward"
         self.counts = Counter()
@@ -298,6 +300,34 @@ class DispatchObserver:
         self.native_before = None
         self.native_after = None
         self.capture = capture
+        self.precision_modules = {}
+        self.precision_activations = {}
+        if precision:
+            from peft_common import resolve_qwen2_5_vl_model
+            qwen = resolve_qwen2_5_vl_model(model)
+            self.precision_modules = {qwen.visual: "vision", qwen.model.embed_tokens: "embedding", qwen.lm_head: "head",
+                **{layer.self_attn: f"attention.{i}" for i, layer in enumerate(qwen.model.layers)}}
+
+    def observe_precision(self, module, args, kwargs, output):
+        import torch
+        def floating_dtypes(value):
+            if isinstance(value, torch.Tensor):
+                return {str(value.dtype)} if value.is_floating_point() else set()
+            if isinstance(value, Mapping):
+                value = value.values()
+            elif not isinstance(value, (tuple, list)):
+                return set()
+            return set().union(*(floating_dtypes(item) for item in value))
+        role = self.precision_modules[module]
+        inputs = floating_dtypes((args, kwargs))
+        outputs = floating_dtypes(output)
+        expected = "torch.bfloat16" if role == "vision" else "torch.float32"
+        if (inputs | outputs) - {expected} or not outputs:
+            raise ValueError(f"diagnostic activation dtype mismatch: {role}")
+        record = self.precision_activations.setdefault(role, {"calls": 0, "input_dtypes": [], "output_dtypes": []})
+        record["calls"] += 1
+        record["input_dtypes"] = sorted(set(record["input_dtypes"]) | inputs)
+        record["output_dtypes"] = sorted(set(record["output_dtypes"]) | outputs)
 
     def observe_module(self, module, inputs):
         """Module hooks execute on the calling worker, unlike sys.setprofile.
@@ -353,6 +383,8 @@ class DispatchObserver:
         sys.setprofile(self.observe)
         self.hooks = [] if self.model is None else [
             module.register_forward_pre_hook(self.observe_module) for module in self.model.modules()]
+        self.hooks += [module.register_forward_hook(self.observe_precision, with_kwargs=True)
+                       for module in self.precision_modules]
         return self
 
     def __exit__(self, *exc):
@@ -362,13 +394,16 @@ class DispatchObserver:
         self.hooks.clear()
 
     def report(self):
+        if self.precision_modules and set(self.precision_activations) != set(self.precision_modules.values()):
+            raise ValueError("diagnostic activation dtype witness missing")
         module_count = len(self.recomputed)
         recomputed_regions = {key for key, graph_task in self.recomputed}
         native_delta = None if self.native_before is None or self.native_after is None else self.native_after - self.native_before
         native_matches = None if native_delta is None else native_delta == module_count
         complete = (bool(self.regions) and set(self.regions) == recomputed_regions
                     and native_matches is not False)
-        return {"observer": "Caller-thread sys.setprofile plus nonmutating module prehooks observing checkpoint stacks on execution threads",
+        return {**({"precision_activations": self.precision_activations} if self.precision_modules else {}),
+                "observer": "Caller-thread sys.setprofile plus nonmutating module prehooks observing checkpoint stacks on execution threads",
                 "backward_calls": self.backward_calls,
                 "checkpoint_recompute_calls": module_count if complete else self.recomputes,
                 "checkpoint_recompute_count_status": "module_regions_witnessed" if complete else "caller_thread_lower_bound_only",
@@ -403,7 +438,7 @@ def component_checkpoint_coverage(observer, component):
             "scope": "Observed component subset only; total coverage and gradient reconstruction are separate gates"}
 
 
-def run_repetitions(model, trainer, batch, device, *, repeats=3, observer_roots=(), component=None):
+def run_repetitions(model, trainer, batch, device, *, repeats=3, observer_roots=(), component=None, precision=False):
     import numpy as np
     import torch
     parameters = {n: p.detach().cpu().clone() for n, p in model.named_parameters()}
@@ -448,7 +483,7 @@ def run_repetitions(model, trainer, batch, device, *, repeats=3, observer_roots=
         hook = model.register_forward_hook(capture)
         prehook = model.register_forward_pre_hook(capture_request, with_kwargs=True)
         component_capture = None if component is None else NativeComponents(trainer)
-        observer = DispatchObserver(observer_roots, model=model, capture=component_capture)
+        observer = DispatchObserver(observer_roots, model=model, capture=component_capture, precision=precision)
         cleared = all(p.grad is None for p in model.parameters())
         try:
             with observer, torch.autocast(device_type=torch.device(device).type, enabled=False):
@@ -467,6 +502,8 @@ def run_repetitions(model, trainer, batch, device, *, repeats=3, observer_roots=
             prehook.remove()
         grads = {n: None if p.grad is None else p.grad.detach().cpu().clone()
                  for n, p in model.named_parameters() if p.requires_grad}
+        if precision and any(g is not None and g.dtype != torch.float32 for g in grads.values()):
+            raise ValueError("diagnostic gradient dtype mismatch")
         records.append({"repetition": repetition, "initial_state_sha256": initial,
             "state_after_backward_sha256": state_digest(model), "gradients_cleared": cleared,
             "rng_before": rng_before, "rng_after": rng_record(device),
@@ -579,6 +616,8 @@ def comparisons(gradients, values, *, cross_allowed):
 
 
 def run(args):
+    if args.decoder_dtype == "float32":
+        validate_component_args(args)
     if args.mode == "components":
         return run_components(args)
     import torch
@@ -664,8 +703,63 @@ def run(args):
 
 
 def validate_component_args(args):
+    if args.decoder_dtype == "float32" and (args.mode, args.side, args.initializer) != ("components", "local", "e1"):
+        raise ValueError("FP32 diagnostic requires local e1 component mode")
     if args.side == "external" and not args.external_source:
         raise ValueError("component mode requires an explicit --external-source for external execution")
+
+
+def prepare_component_precision(model, decoder_dtype, *, production=True):
+    """Authenticate the BF16 initializer before an explicitly diagnostic promotion."""
+    import torch
+    from peft_common import resolve_qwen2_5_vl_model
+    runtime = baseline.runtime_model_metadata(model, production=production)
+    if decoder_dtype == "bfloat16":
+        return runtime
+    if decoder_dtype != "float32":
+        raise ValueError("unsupported diagnostic decoder dtype")
+    qwen = resolve_qwen2_5_vl_model(model)
+    if any(p.dtype != torch.bfloat16 for p in model.parameters()):
+        raise ValueError("FP32 control requires an all-BF16 rounded initializer")
+    if any(p.requires_grad for p in qwen.visual.parameters()):
+        raise ValueError("FP32 control requires frozen vision")
+    if torch.get_float32_matmul_precision() != "highest" or torch.backends.cuda.matmul.allow_tf32:
+        raise ValueError("FP32 control requires highest matmul precision and TF32 disabled")
+    vision_ids = {id(v) for v in itertools.chain(qwen.visual.parameters(), qwen.visual.buffers())}
+    identities = {n: id(p) for n, p in model.named_parameters()}
+    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+    initial = state_digest(model)
+    expected = hashlib.sha256()
+    vision_names = set()
+    for kind, pairs in (("parameter", model.named_parameters()), ("buffer", model.named_buffers())):
+        for name, value in pairs:
+            if id(value) in vision_ids:
+                vision_names.add(name)
+            elif value.is_floating_point():
+                value = value.float()
+            expected.update((kind + name + baseline.tensor_digest(value)).encode())
+    # Preserve PEFT wrapper objects, shared parameters and the BF16 visual module.
+    qwen.model.float()
+    qwen.lm_head.float()
+    for name, value in itertools.chain(model.named_parameters(), model.named_buffers()):
+        dtype = torch.bfloat16 if name in vision_names else torch.float32
+        if value.is_floating_point() and value.dtype != dtype:
+            raise ValueError(f"diagnostic precision partition mismatch: {name}")
+    if identities != {n: id(p) for n, p in model.named_parameters()} or trainable != [n for n, p in model.named_parameters() if p.requires_grad]:
+        raise ValueError("diagnostic promotion changed parameter identity or trainability")
+    actual = state_digest(model)
+    if actual != expected.hexdigest():
+        raise ValueError("diagnostic promotion changed BF16-rounded state values")
+    runtime.update(parameter_dtypes=sorted({str(p.dtype) for p in model.parameters()}),
+        trainable_parameter_dtypes={n: str(p.dtype) for n, p in model.named_parameters() if p.requires_grad},
+        precision_control={"initial_bf16_state_sha256": initial,
+            "expected_promoted_sha256": expected.hexdigest(), "actual_promoted_sha256": actual,
+            "promoted_state_exact": True, "parameter_identity_preserved": True,
+            "vision_frozen": True, "vision_dtype": "torch.bfloat16", "decoder_dtype": "torch.float32",
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "scope": "BF16-rounded parameters promoted exactly; module dtypes do not establish kernel internals"})
+    return runtime
 
 
 def component_measurements(records, gradients):
@@ -773,12 +867,13 @@ def screen_initializers(cells):
             "interpretation": "Initial single-sample geometry does not establish late-collapse causality"}
 
 
-def run_component_cell(model, trainer, batch, device, roots):
+def run_component_cell(model, trainer, batch, device, roots, *, decoder_dtype=None, production=True):
+    runtime = {} if decoder_dtype is None else {"runtime": prepare_component_precision(model, decoder_dtype, production=production)}
     records, gradients = {}, {}
     for component in ("total", "ce", "preference"):
         records[component], gradients[component], _ = run_repetitions(
-            model, trainer, batch, device, observer_roots=roots, component=component)
-    return {"runs": records, "measurements": component_measurements(records, gradients)}
+            model, trainer, batch, device, observer_roots=roots, component=component, precision=decoder_dtype == "float32")
+    return {**runtime, "runs": records, "measurements": component_measurements(records, gradients)}
 
 
 def run_components(args):
@@ -835,12 +930,11 @@ def run_components(args):
             base.config.use_cache = False
             model.gradient_checkpointing_disable()
             model = model.to(device=args.device, dtype=torch.bfloat16).train()
-            runtime = baseline.runtime_model_metadata(model, production=True)
             trainer = make_trainers([model] if external is None else [None, model], external,
                                     Path(args.log_dir) / name, args.device)[-1]
             roots = [str(Path("src").resolve()), str(Path("transformers").resolve())] + ([] if root is None else [str(root)])
-            cells[name] = {"checkpoint": str(Path(checkpoint).resolve()), "runtime": runtime,
-                           "input": description, **run_component_cell(model, trainer, batch, args.device, roots)}
+            cells[name] = {"checkpoint": str(Path(checkpoint).resolve()), "input": description,
+                           **run_component_cell(model, trainer, batch, args.device, roots, decoder_dtype=args.decoder_dtype)}
             del model, base, trainer, batch, batches, processor
             gc.collect()
             torch.cuda.empty_cache()
@@ -854,7 +948,9 @@ def run_components(args):
             "diagnostic_sha256": baseline.sha(__file__), "loader_sha256": baseline.sha(baseline.__file__),
             "data_sha256": baseline.sha(args.data), "manifest_sha256": baseline.sha(args.manifest),
             "numerics": {"torch": torch.__version__, "cuda": torch.version.cuda, "device": args.device,
-                         "hardware": torch.cuda.get_device_name(args.device), "dtype": "bfloat16", "autocast": False},
+                         "hardware": torch.cuda.get_device_name(args.device), "dtype": args.decoder_dtype, "autocast": False,
+                         "float32_matmul_precision": torch.get_float32_matmul_precision(),
+                         "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32},
             "limitations": ["No optimizer or DDP/ZeRO execution; native loss/4 backward only",
                             "Three repeats and one initial sample cannot establish historical late-collapse causality",
                             "Original external weights and historical intermediate checkpoints unavailable",
@@ -864,6 +960,7 @@ def run_components(args):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("native", "components"), default="native")
+    parser.add_argument("--decoder-dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--side", choices=("local", "external"), default="local")
     parser.add_argument("--initializer", choices=("e1", "e3", "both"), default="both")
     parser.add_argument("--stage1-e3", default="checkpoints/stage1-dora-egb16-e3-s648-lr5e5-20260920-03/checkpoint-648")
