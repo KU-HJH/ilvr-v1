@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 
 import pytest
 import torch
@@ -138,15 +137,15 @@ def test_vision_flash_attention_uses_native_rotary_then_varlen_flash(
     assert calls[0][2:] == (3, 3)
 
 
-def test_generated_and_modular_vision_flash_paths_stay_native_and_synchronized():
-    repository = Path(__file__).resolve().parents[2]
-    model_dir = repository / "transformers/src/transformers/models/qwen2_5_vl"
-
-    for filename in ("modeling_qwen2_5_vl.py", "modular_qwen2_5_vl.py"):
-        source = (model_dir / filename).read_text()
-        flash_class = source.split(
-            "class Qwen2_5_VLVisionFlashAttention2", maxsplit=1
-        )[1].split("\nclass ", maxsplit=1)[0]
-        assert "q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)" in flash_class
-        assert "apply_rotary_pos_emb_flashatt" not in source
-        assert "from flash_attn.layers.rotary import apply_rotary_emb" not in source
+@pytest.mark.parametrize("module_name", QWEN_MODULES)
+def test_legacy_vision_flash_never_uses_external_rotary(monkeypatch, module_name):
+    module = importlib.import_module(module_name)
+    def forbidden(*args, **kwargs):
+        pytest.fail("legacy vision routed through the external profile rotary")
+    monkeypatch.setattr(module, "apply_rotary_pos_emb_flashatt", forbidden)
+    monkeypatch.setattr(module, "flash_attn_varlen_func", lambda q,k,v,*args: v)
+    attention = module.Qwen2_5_VLVisionFlashAttention2(dim=8, num_heads=2)
+    cos, sin = _duplicated_position_embeddings(2, 4)
+    output = attention(torch.randn(2, 8), torch.tensor([0,2], dtype=torch.int32),
+        position_embeddings=(cos,sin))
+    assert output.shape == (2,8) and torch.isfinite(output).all()

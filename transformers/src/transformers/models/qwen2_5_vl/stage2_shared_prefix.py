@@ -206,10 +206,21 @@ def _score_chunk(model, branches, embeds, positions, mask, flat_prefix):
     targets = torch.tensor(targets, dtype=torch.long, device=embeds.device)
 
     def score(embeds, positions, *prefix_tensors):
+        external = getattr(model.config, "stage2_execution_profile", "legacy") == "latest_external_until"
+        pairs = tuple(zip(prefix_tensors[::2], prefix_tensors[1::2]))
+        if external:
+            from ...cache_utils import DynamicCache
+            cache = DynamicCache()
+            for index, (key, value) in enumerate(pairs):
+                cache.update(key, value, index)
+            cache_args = dict(past_key_values=cache, use_cache=True,
+                cache_position=torch.arange(pairs[0][0].shape[2],
+                    pairs[0][0].shape[2] + embeds.shape[1], device=embeds.device))
+        else:
+            cache_args = dict(stage2_prefix_key_values=pairs, use_cache=False)
         hidden = model.model(
             inputs_embeds=embeds, position_ids=positions, attention_mask=mask,
-            stage2_prefix_key_values=tuple(zip(prefix_tensors[::2], prefix_tensors[1::2])),
-            use_cache=False, return_dict=True,
+            return_dict=True, **cache_args,
         ).last_hidden_state
         return score_selected_hidden(model, hidden, selected, targets, lengths)
 
@@ -321,7 +332,9 @@ def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, pre
     plan = options["plan"]
     budget = options.get("query_budget", 1024)
     # The final clean decoder may contain right padding; never expose padded K/V.
-    flat_prefix = tuple(tensor[:, :, :plan.root_length] for pair in prefix_kv for tensor in pair)
+    external = getattr(model.config, "stage2_execution_profile", "legacy") == "latest_external_until"
+    flat_prefix = tuple(tensor if external and tensor.shape[2] == plan.root_length
+                        else tensor[:, :, :plan.root_length] for pair in prefix_kv for tensor in pair)
     results = []
     stats = dict(logical_groups=1 + sum(bool(group) for group in plan.groups), chunks=0,
                  oversized_branches=0, query_rows=0, entropy_scored_rows=0,

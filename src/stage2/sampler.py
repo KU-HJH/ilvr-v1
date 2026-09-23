@@ -40,6 +40,8 @@ class Stage2SamplerIdentity:
     policy: str = "latent_balanced"
     gradient_accumulation_steps: int | None = None
 
+    reference_grouping: int | None = None
+
     def to_dict(self) -> dict[str, object]:
         payload = {
             "schema_version": self.schema_version,
@@ -54,10 +56,28 @@ class Stage2SamplerIdentity:
         if self.policy == "reference_random":
             payload.update(policy=self.policy, gradient_accumulation_steps=self.gradient_accumulation_steps,
                            update_accounting="ceil", padding_weight=0)
+        if self.policy == "external_until_balanced":
+            payload.update(policy=self.policy, gradient_accumulation_steps=self.gradient_accumulation_steps,
+                           update_accounting="ceil", padding_weight=1, reference_grouping=2)
         return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "Stage2SamplerIdentity":
+        if isinstance(payload, dict) and payload.get("schema_version") == 3:
+            expected = _STAGE2_SAMPLER_IDENTITY_FIELDS | {"policy", "gradient_accumulation_steps",
+                "update_accounting", "padding_weight", "reference_grouping"}
+            if (set(payload) != expected or payload["policy"] != "external_until_balanced"
+                    or payload["world_size"] != 4 or payload["reference_grouping"] != 2
+                    or payload["gradient_accumulation_steps"] != 4
+                    or payload["update_accounting"] != "ceil" or payload["padding_weight"] != 1):
+                raise ValueError("invalid external_until_balanced sampler identity")
+            legacy = {k: payload[k] for k in _STAGE2_SAMPLER_IDENTITY_FIELDS}
+            legacy.update(schema_version=1, world_size=2)
+            parsed = cls.from_dict(legacy)
+            if (parsed.dataset_size + parsed.padded_samples) % 4:
+                raise ValueError("external grouping2 stream must divide into four actual ranks")
+            return cls(3, parsed.seed, 4, parsed.dataset_size, parsed.bucket_sizes,
+                       parsed.padded_samples, "external_until_balanced", 4, 2)
         reference = isinstance(payload, dict) and payload.get("schema_version") == 2
         fields = _STAGE2_SAMPLER_IDENTITY_FIELDS | (
             {"policy", "gradient_accumulation_steps", "update_accounting", "padding_weight"} if reference else set()
@@ -216,6 +236,26 @@ class LatentBlockBalancedSampler(Sampler[int]):
         if type(epoch) is not int or epoch < 0:
             raise ValueError("epoch must be non-negative")
         self.epoch = epoch
+
+
+class ExternalUntilBalancedSampler(LatentBlockBalancedSampler):
+    """Frozen external grouping-two stream, sharded by Accelerate over four ranks."""
+
+    def __init__(self, dataset, *, num_replicas, seed, gradient_accumulation_steps):
+        if num_replicas != 4 or gradient_accumulation_steps != 4:
+            raise ValueError("external_until_balanced requires four ranks and accumulation4")
+        super().__init__(dataset, num_replicas=2, seed=seed)
+        source = self.identity
+        if len(self) % 4:
+            raise ValueError("external grouping2 stream must divide into four actual ranks")
+        self.num_replicas = 4
+        self.identity = Stage2SamplerIdentity(3, seed, 4, len(dataset), source.bucket_sizes,
+            source.padded_samples, "external_until_balanced", 4, 2)
+
+    def __iter__(self):
+        source = LatentBlockBalancedSampler(self.dataset, num_replicas=2, seed=self.seed)
+        source.set_epoch(self.epoch)
+        return iter(source)
 
 
 
@@ -381,6 +421,7 @@ def validate_stage2_sampler_resume_identity(
     for field in (
         "policy",
         "gradient_accumulation_steps",
+        "reference_grouping",
         "seed",
         "world_size",
         "dataset_size",
@@ -398,7 +439,7 @@ def validate_stage2_sampler_resume_identity(
 
 def select_stage2_sampler_policy(requested, *, profile, config, resume):
     """Resolve fresh V-off reproduction versus immutable saved sampling semantics."""
-    if requested not in ("auto", "latent_balanced", "reference_random"):
+    if requested not in ("auto", "latent_balanced", "reference_random", "external_until_balanced"):
         raise ValueError("unknown Stage 2 sampler policy")
     if resume is not None and profile.world_size > 1:
         saved = read_stage2_sampler_sidecar(Path(resume)).policy

@@ -680,6 +680,12 @@ def build_stage2_training_components(
         tuning_method=decision.tuning.method,
         deepspeed_runtime_profile=bind_deepspeed_runtime_profile(args),
     )
+    execution_profile = getattr(args, "stage2_execution_profile", "legacy")
+    if execution_profile != "legacy":
+        base_model.config.stage2_execution_profile = execution_profile
+        base_model.config.vision_config.stage2_execution_profile = execution_profile
+        for block in base_model.visual.blocks:
+            block.attn.stage2_execution_profile = execution_profile
     base_model.visual.requires_grad_(False)
     fresh_resolved_target_names = (
         stage1_metadata.resolved_target_names
@@ -1068,6 +1074,11 @@ def publish_step_preference_phase_a_summary(args, *, trainer, train_result):
 def run_stage2(args):
     """Run the existing Stage 2 path without importing Stage 1 Trainer code."""
 
+    gate_spec = os.environ.get("ILVR_UNTIL_ALIGNMENT_GATE_SPEC")
+    if gate_spec:
+        from scripts.verify_until_trainer import run_from_training_args
+        return run_from_training_args(args, gate_spec)
+
     profile = bind_deepspeed_runtime_profile(
         args, world_size=int(os.environ.get("WORLD_SIZE", "1"))
     )
@@ -1097,8 +1108,10 @@ def run_stage2(args):
     sampler_policy = select_stage2_sampler_policy(
         getattr(args, "stage2_sampler_policy", "auto"), profile=profile,
         config=components.step_preference_config, resume=components.trainer_resume_path)
-    if sampler_policy == "reference_random":
+    if sampler_policy in ("reference_random", "external_until_balanced"):
         trainer_kwargs["stage2_sampler_policy"] = sampler_policy
+    if getattr(args, "stage2_execution_profile", "legacy") != "legacy":
+        trainer_kwargs["stage2_execution_profile"] = args.stage2_execution_profile
     if getattr(args, "stage2_reference_sampler_probe_dir", ""):
         trainer_kwargs["stage2_reference_sampler_probe_dir"] = args.stage2_reference_sampler_probe_dir
     if (

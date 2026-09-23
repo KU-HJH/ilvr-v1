@@ -71,6 +71,19 @@ class WrappedFlexAttention:
         return self._compiled_flex_attention
 
 
+class ExternalUntilFlexAttention(WrappedFlexAttention):
+    """Separate compiler cache: opting in never changes a legacy model's kernel."""
+    _instance = None
+    _is_flex_compiled = False
+    _compiled_flex_attention = None
+
+    @torch.compiler.disable(recursive=False)
+    def __init__(self):
+        if self._is_flex_compiled is False:
+            self._compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
+            self._is_flex_compiled = True
+
+
 def make_flex_block_causal_mask(attention_mask_2d: torch.Tensor) -> "BlockMask":
     """
     Create a block causal document mask for a batch of sequences, both packed and unpacked.
@@ -135,7 +148,8 @@ def compile_friendly_flex_attention(
     **kwargs,
 ) -> torch.Tensor:
     # First call initialise singleton wrapper object, second call invokes the object method to return compiled flex attention
-    flex_attention_compiled = WrappedFlexAttention()()
+    external_until = kwargs.pop("external_until", False)
+    flex_attention_compiled = (ExternalUntilFlexAttention if external_until else WrappedFlexAttention)()()
     return flex_attention_compiled(
         query,
         key,
@@ -186,6 +200,8 @@ def flex_attention_forward(
         # Last time checked on PyTorch == 2.5.1: Flex Attention always computes the lse regardless.
         # For simplification, we thus always return it as no additional computations are introduced.
         return_lse=True,
+        **({"external_until": True} if getattr(getattr(module, "config", None),
+             "stage2_execution_profile", "legacy") == "latest_external_until" else {}),
         **({"kernel_options": kernel_options} if kernel_options is not None else {}),
     )
     # lse is returned in float32

@@ -541,6 +541,7 @@ class Stage2InferencePreflightWitness:
     adapter_safetensors: bytes
     sparse_safetensors: bytes | None
     adapter_tensor_contract: tuple[tuple[str, tuple[int, ...]], ...]
+    execution_profile: str = "legacy"
 
 
 def _canonical_json(value: Mapping[str, object]) -> bytes:
@@ -674,6 +675,22 @@ def _preflight_stage2_inference_artifact(
     if tokenizer is None:
         raise ValueError("Stage 2 processor must expose its tokenizer")
     artifact = metadata_snapshot.artifact_dir
+    # Capture runtime selection before loading the base, alongside other immutable
+    # inference witnesses. Older adapter artifacts may omit config.json entirely.
+    execution_profile = "legacy"
+    saved_config = artifact / "config.json"
+    if saved_config.exists() or saved_config.is_symlink():
+        from .checkpointing import _read_stage2_regular_payload
+        try:
+            payload = json.loads(_read_stage2_regular_payload(saved_config,
+                label="Stage 2 saved runtime config"))
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError("invalid Stage 2 saved runtime config") from error
+        if not isinstance(payload, dict):
+            raise ValueError("Stage 2 saved runtime config must be an object")
+        execution_profile = payload.get("stage2_execution_profile", "legacy")
+        if execution_profile not in ("legacy", "latest_external_until"):
+            raise ValueError("unknown Stage 2 saved execution profile")
     adapter_config_json = inspection.adapter_config_json
     adapter_safetensors = inspection.adapter_safetensors
     if adapter_config_json is None or adapter_safetensors is None:
@@ -773,6 +790,7 @@ def _preflight_stage2_inference_artifact(
         adapter_safetensors=adapter_safetensors,
         sparse_safetensors=sparse_safetensors,
         adapter_tensor_contract=adapter_tensor_contract,
+        execution_profile=execution_profile,
     )
 
 
@@ -948,6 +966,11 @@ def load_stage2_model_for_inference(
         apply_sparse_token_rows_state(
             wrapped, witness.sparse_safetensors, ordered_ids
         )
+    if witness.execution_profile != "legacy":
+        base_model.config.stage2_execution_profile = witness.execution_profile
+        base_model.config.vision_config.stage2_execution_profile = witness.execution_profile
+        for block in base_model.visual.blocks:
+            block.attn.stage2_execution_profile = witness.execution_profile
     wrapped.requires_grad_(False)
     wrapped.eval()
     validate_stage2_parameter_boundary(

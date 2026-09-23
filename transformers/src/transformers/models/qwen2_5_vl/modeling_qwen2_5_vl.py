@@ -55,6 +55,7 @@ from .stage2_latent_rollout import LatentRolloutEngine, parse_latent_spans, vali
 
 
 if is_flash_attn_2_available():
+    from flash_attn.layers.rotary import apply_rotary_emb
     from flash_attn import flash_attn_varlen_func
 
 else:
@@ -174,6 +175,40 @@ class Qwen2_5_VLPatchMerger(nn.Module):
         return x
 
 
+_VISION_FLASH_ROTARY_MAX_SEQLEN = 524_280
+
+
+def apply_rotary_pos_emb_flashatt(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply the historical Qwen vision RoPE without oversized launches."""
+    cos_half = cos.chunk(2, dim=-1)[0].contiguous().float()
+    sin_half = sin.chunk(2, dim=-1)[0].contiguous().float()
+    q_chunks = []
+    k_chunks = []
+    for start in range(0, q.shape[0], _VISION_FLASH_ROTARY_MAX_SEQLEN):
+        end = min(start + _VISION_FLASH_ROTARY_MAX_SEQLEN, q.shape[0])
+        q_chunks.append(
+            apply_rotary_emb(
+                q[start:end].unsqueeze(0).float(),
+                cos_half[start:end],
+                sin_half[start:end],
+            )
+            .type_as(q)
+            .squeeze(0)
+        )
+        k_chunks.append(
+            apply_rotary_emb(
+                k[start:end].unsqueeze(0).float(),
+                cos_half[start:end],
+                sin_half[start:end],
+            )
+            .type_as(k)
+            .squeeze(0)
+        )
+    return torch.cat(q_chunks, dim=0), torch.cat(k_chunks, dim=0)
+
+
 class Qwen2_5_VLVisionFlashAttention2(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
@@ -203,7 +238,9 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
             sin = emb.sin()
         else:
             cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        rotary = (apply_rotary_pos_emb_flashatt if getattr(self, "stage2_execution_profile", "legacy")
+                  == "latest_external_until" else apply_rotary_pos_emb_vision)
+        q, k = rotary(q, k, cos, sin)
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         self._vision_flash_attention_forward_count += 1
@@ -343,6 +380,7 @@ class Qwen2_5_VLVisionBlock(nn.Module):
         self.attn = QWEN2_5_VL_VISION_ATTENTION_CLASSES[attn_implementation](
             config.hidden_size, num_heads=config.num_heads
         )
+        self.attn.stage2_execution_profile = getattr(config, "stage2_execution_profile", "legacy")
         self.mlp = Qwen2_5_VLMLP(config, bias=True)
 
     def forward(
@@ -1376,6 +1414,13 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
                 stage2_prefix_key_value=stage2_prefix_key_value,
             )
             hidden_states, self_attn_weights, present_key_value = attention_outputs[:3]
+        elif (_is_block_mask(attention_mask) and past_key_value is not None
+              and getattr(self.self_attn.config, "stage2_execution_profile", "legacy") == "latest_external_until"):
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states, attention_mask=attention_mask,
+                position_ids=position_ids, past_key_value=past_key_value,
+                output_attentions=output_attentions, use_cache=use_cache,
+                cache_position=cache_position, position_embeddings=position_embeddings)
         elif _is_block_mask(attention_mask):
             if past_key_value is not None:
                 raise ValueError("packed Stage 2 FlexAttention does not support past_key_value")
@@ -2530,15 +2575,17 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 2, logical_position_sources
             )
 
+        external_cache = (shared and getattr(self.config, "stage2_execution_profile", "legacy")
+                          == "latest_external_until")
         final_outputs = language_model(
             inputs_embeds=final_inputs_embeds,
             attention_mask=final_attention_mask,
             position_ids=final_position_ids,
-            use_cache=False,
+            use_cache=external_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
-            **({"stage2_capture_kv": True} if shared
+            **({"stage2_capture_kv": True} if shared and not external_cache
                and stage2_shared_prefix_inputs.get("prefix_mode", "clean_prefix") == "clean_prefix"
                and any(stage2_shared_prefix_inputs["plan"].groups) else {}),
         )
@@ -2608,7 +2655,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 sidecar_results, sidecar_stats = score_sidecars(
                     self, stage2_shared_prefix_inputs, input_ids,
                     rollout.final_inputs_embeds, full_position_ids,
-                    getattr(final_outputs, "stage2_key_values", ()),
+                    (tuple(final_outputs.past_key_values) if external_cache else
+                     getattr(final_outputs, "stage2_key_values", ())),
                 )
 
         diagnostics = None

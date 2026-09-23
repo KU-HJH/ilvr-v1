@@ -24,7 +24,9 @@ from deepspeed_runtime import (
 from peft_common import resolve_qwen2_5_vl_model
 from stage1.trainer import collect_deepspeed_pre_step_norm
 from .checkpointing import save_stage2_peft_metadata
+from .dora import dora_microbatch_scope
 from .sampler import (
+    ExternalUntilBalancedSampler,
     LatentBlockBalancedSampler,
     ReferenceRandomDataset,
     ReferenceRandomSampler,
@@ -255,6 +257,7 @@ class Stage2Trainer(Trainer):
         stage2_diagnostics_interval: int = 0,
         stage2_reproduction_probe_dir: str = "",
         stage2_sampler_policy: str = "latent_balanced",
+        stage2_execution_profile: str = "legacy",
         stage2_reference_sampler_probe_dir: str = "",
         step_preference_config: StepPreferenceConfig | None = None,
         **kwargs,
@@ -280,7 +283,12 @@ class Stage2Trainer(Trainer):
             )
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
             raise TypeError("Stage 2 trainer requires a DeepSpeed runtime profile")
-        if stage2_sampler_policy not in ("latent_balanced", "reference_random"):
+        if stage2_execution_profile not in ("legacy", "latest_external_until"):
+            raise ValueError("unknown Stage 2 execution profile")
+        if (stage2_execution_profile == "latest_external_until") != (stage2_sampler_policy == "external_until_balanced"):
+            raise ValueError("external-until execution and sampler profiles must be selected together")
+        self.stage2_execution_profile = stage2_execution_profile
+        if stage2_sampler_policy not in ("latent_balanced", "reference_random", "external_until_balanced"):
             raise ValueError("unknown Stage 2 sampler policy")
         if stage2_reproduction_probe_dir and stage2_reference_sampler_probe_dir:
             raise ValueError("select only one Stage 2 reproduction observer")
@@ -300,7 +308,7 @@ class Stage2Trainer(Trainer):
         if not isinstance(step_preference_config, StepPreferenceConfig):
             raise TypeError("step_preference_config must be a StepPreferenceConfig")
         self.step_preference_config = step_preference_config
-        if stage2_sampler_policy == "reference_random":
+        if stage2_sampler_policy in ("reference_random", "external_until_balanced"):
             config = step_preference_config
             profile = deepspeed_runtime_profile
             eligible_config = not config.enabled or (
@@ -319,7 +327,8 @@ class Stage2Trainer(Trainer):
             dataset = kwargs.get("train_dataset")
             if dataset is None:
                 raise ValueError("reference_random requires an explicit train_dataset")
-            kwargs["train_dataset"] = ReferenceRandomDataset(dataset)
+            if stage2_sampler_policy == "reference_random":
+                kwargs["train_dataset"] = ReferenceRandomDataset(dataset)
         self._step_preference_metric_totals: dict[str, float] = {}
         self._step_preference_metric_batches = 0
         self._stage2_microbatch_index = 0
@@ -334,7 +343,7 @@ class Stage2Trainer(Trainer):
         callbacks.append(_ObservedOptimizerStep(self))
         kwargs["callbacks"] = callbacks
         super().__init__(*args, **kwargs)
-        if stage2_sampler_policy == "reference_random":
+        if stage2_sampler_policy in ("reference_random", "external_until_balanced"):
             if self.args.world_size != 4:
                 raise ValueError("reference_random requires four actual ranks")
             if self.args.per_device_train_batch_size != 1 or self.args.dataloader_drop_last:
@@ -346,7 +355,7 @@ class Stage2Trainer(Trainer):
 
     def set_initial_training_values(self, args, dataloader, total_train_batch_size):
         values = list(super().set_initial_training_values(args, dataloader, total_train_batch_size))
-        if getattr(self, "stage2_sampler_policy", "latent_balanced") != "reference_random":
+        if getattr(self, "stage2_sampler_policy", "latent_balanced") not in ("reference_random", "external_until_balanced"):
             return tuple(values)
         length = values[5]
         if length is None or length < 1:
@@ -411,7 +420,9 @@ class Stage2Trainer(Trainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         padding = float(inputs.get("stage2_sample_weight", 1.)) == 0.
-        with self._padding_rng_context(padding):
+        enabled = (getattr(self, "stage2_execution_profile", "legacy") == "latest_external_until"
+                   and not self.is_fsdp_enabled and self.deepspeed_runtime_profile.zero_stage != 3)
+        with self._padding_rng_context(padding), dora_microbatch_scope(model, enabled=enabled):
             loss = super().training_step(
                 model, inputs, num_items_in_batch=num_items_in_batch
             )
@@ -455,12 +466,14 @@ class Stage2Trainer(Trainer):
             self.stage2_sampler_identity = None
             self._stage2_train_sampler = None
             return None
-        reference = getattr(self, "stage2_sampler_policy", "latent_balanced") == "reference_random"
+        policy = getattr(self, "stage2_sampler_policy", "latent_balanced")
+        reference = policy in ("reference_random", "external_until_balanced")
         if reference and self.args.world_size != 4:
             raise ValueError("reference_random requires four actual ranks")
         seed = (getattr(self.args, "data_seed", None) if reference else None)
         seed = self.args.seed if seed is None else seed
-        sampler_type = ReferenceRandomSampler if reference else LatentBlockBalancedSampler
+        sampler_type = (ExternalUntilBalancedSampler if policy == "external_until_balanced" else
+                        ReferenceRandomSampler if reference else LatentBlockBalancedSampler)
         sampler = getattr(self, "_stage2_train_sampler", None)
         if (
             not isinstance(sampler, sampler_type)
@@ -831,6 +844,7 @@ class Stage2Trainer(Trainer):
                 prefix_mode=config.prefix_mode,
                 branch_mode=config.branch_mode,
                 block_original_image=config.block_original_image,
+                **({"checkpoint": False} if getattr(self, "stage2_execution_profile", "legacy") == "latest_external_until" else {}),
                 **(
                     {
                         "sample_id": sample_ids[0],
