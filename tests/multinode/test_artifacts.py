@@ -1590,6 +1590,8 @@ class FakeProductionTransferRunner(FakeTransferRunner):
         assert machine_rank == 1
         self.events.append("local-post-manifest" if self.pulled else "local-manifest")
         if not self.pulled:
+            if canonical_owner:
+                raise RuntimeError("partial local checkpoint lacks canonical metadata")
             assert not canonical_owner
             return strict_manifest(1)
         assert canonical_owner
@@ -1629,8 +1631,34 @@ def test_production_resume_redistribution_uses_same_immediate_canonical_path():
     assert runner.events == [
         "remote-canonical-manifest",
         "local-manifest",
+        "local-manifest",
         "resume-destination",
         "resume-pull",
+        "local-post-manifest",
+    ]
+
+
+def test_production_resume_retry_accepts_completed_local_replica_without_transfer():
+    runner = FakeProductionTransferRunner()
+    runner.pulled = True
+    checkpoint = (
+        Path("/root/workspace/ILVR/checkpoints")
+        / identity()["run_id"]
+        / "checkpoint-2"
+    )
+
+    entries = redistribute_resume_checkpoint(
+        runner,
+        checkpoint_path=checkpoint,
+        checkpoint_identity=identity(),
+        requested_identity=identity(),
+        destination=checkpoint,
+    )
+
+    assert {entry.process_rank for entry in entries} == {None, 0, 1, 2, 3}
+    assert runner.events == [
+        "remote-canonical-manifest",
+        "local-post-manifest",
         "local-post-manifest",
     ]
 

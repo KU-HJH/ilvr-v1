@@ -3276,9 +3276,14 @@ def redistribute_resume_checkpoint(
     validate_canonical_checkpoint_manifest(
         manifest, expected_identity=checkpoint_identity
     )
-    local = getattr(runner, "read_artifact_manifest")(
-        1, checkpoint, checkpoint_identity
-    )
+    try:
+        local = getattr(runner, "read_artifact_manifest")(
+            1, checkpoint, checkpoint_identity, canonical_owner=True
+        )
+    except RuntimeError:
+        local = getattr(runner, "read_artifact_manifest")(
+            1, checkpoint, checkpoint_identity
+        )
     required, missing = resume_entry_delta(manifest, local)
     if missing:
         runner.validate_resume_destination(missing, target)
