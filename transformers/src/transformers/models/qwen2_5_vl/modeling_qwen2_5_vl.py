@@ -2485,6 +2485,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             latent_spans=latent_spans,
             retain_latent_grads=retain_stage2_latent_grads,
             collect_diagnostics=collect_stage2_diagnostics,
+            latent_activation_checkpointing=getattr(
+                self.config, "stage2_latent_activation_checkpointing", False
+            ),
         )
 
         final_inputs_embeds = rollout.final_inputs_embeds

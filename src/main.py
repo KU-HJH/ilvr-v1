@@ -450,11 +450,15 @@ def configure_stage2_model_backend(
     model,
     *,
     gradient_checkpointing: bool,
+    latent_activation_checkpointing: bool = False,
     tuning_method: str = "full",
     deepspeed_runtime_profile=None,
 ) -> None:
     """Apply Stage 2 cache/checkpoint settings outside the latent recurrence."""
+    if gradient_checkpointing and latent_activation_checkpointing:
+        raise ValueError("native gradient checkpointing conflicts with latent activation checkpointing")
     model.config.use_cache = False
+    model.config.stage2_latent_activation_checkpointing = latent_activation_checkpointing
     if gradient_checkpointing:
         if deepspeed_runtime_profile is None:
             from deepspeed_runtime import DeepSpeedRuntimeProfile

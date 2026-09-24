@@ -631,6 +631,10 @@ class Stage2Trainer(Trainer):
                 prefix_mode=config.prefix_mode,
                 branch_mode=config.branch_mode,
                 block_original_image=config.block_original_image,
+                checkpoint=getattr(
+                    resolve_qwen2_5_vl_model(model).config,
+                    "stage2_sidecar_activation_checkpointing", True,
+                ),
             ),
         )
         if plan.root_selected_positions:
@@ -841,7 +845,11 @@ class Stage2Trainer(Trainer):
         call = dict(clean_inputs, use_cache=False, stage2_loss_only=not return_outputs,
             collect_stage2_diagnostics=collect_diagnostics,
             stage2_shared_prefix_inputs=dict(plan=plan, backend=config.sidecar_attention_backend,
-                                            query_budget=config.sidecar_query_budget))
+                                            query_budget=config.sidecar_query_budget,
+                                            checkpoint=getattr(
+                                                resolve_qwen2_5_vl_model(model).config,
+                                                "stage2_sidecar_activation_checkpointing", True,
+                                            )))
         if plan.root_selected_positions:
             call["stage2_logit_positions"] = torch.tensor(plan.root_selected_positions,
                 dtype=torch.long, device=input_ids.device)

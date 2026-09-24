@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.utils.checkpoint
 
 
 class LatentStructureError(ValueError):
@@ -193,6 +194,7 @@ class LatentRolloutEngine:
         latent_spans: tuple[LatentSpan, ...],
         retain_latent_grads: bool = False,
         collect_diagnostics: bool = False,
+        latent_activation_checkpointing: bool = False,
     ) -> LatentRolloutResult:
         if base_inputs_embeds.ndim != 3:
             raise ValueError("base_inputs_embeds must have shape [batch, sequence, hidden]")
@@ -209,16 +211,25 @@ class LatentRolloutEngine:
         replacements = []
         for span in latent_spans:
             for position in span.latent_positions:
-                outputs = language_model(
-                    inputs_embeds=_assemble_latent_inputs(
-                        base_inputs_embeds, replacements, stop=position
-                    ),
-                    attention_mask=attention_mask[:, :position],
-                    position_ids=full_position_ids[..., :position],
-                    use_cache=False,
-                    return_dict=True,
-                )
-                latent = outputs.last_hidden_state[:, -1, :]
+                prefix_inputs = _assemble_latent_inputs(base_inputs_embeds, replacements, stop=position)
+                prefix_mask = attention_mask[:, :position]
+                prefix_positions = full_position_ids[..., :position]
+
+                def predict_last_hidden(bound_inputs, bound_mask, bound_positions):
+                    outputs = language_model(
+                        inputs_embeds=bound_inputs, attention_mask=bound_mask,
+                        position_ids=bound_positions, use_cache=False, return_dict=True,
+                    )
+                    return outputs.last_hidden_state[:, -1, :]
+
+                if latent_activation_checkpointing and torch.is_grad_enabled():
+                    with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+                        latent = torch.utils.checkpoint.checkpoint(
+                            predict_last_hidden, prefix_inputs, prefix_mask, prefix_positions,
+                            use_reentrant=False, preserve_rng_state=True,
+                        )
+                else:
+                    latent = predict_last_hidden(prefix_inputs, prefix_mask, prefix_positions)
                 if retain_latent_grads:
                     latent.retain_grad()
                 states.append(latent)
