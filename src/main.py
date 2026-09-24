@@ -45,7 +45,7 @@ _DIRECT_MAIN_PROFILE = (
 )
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from types import MappingProxyType, SimpleNamespace
 
 from step_preference import packed_admission as packed_admission_artifacts
@@ -100,6 +100,7 @@ from stage2.peft import (
     validate_stage2_parameter_boundary,
 )
 from step_preference.config import StepPreferenceConfig
+from step_preference.execution import resolve_stage2_execution
 from step_preference.negatives import (
     inspect_stage2a_checkpoint_identity,
     load_negative_store,
@@ -277,6 +278,27 @@ def validate_packed_admission_inputs(args, config):
     return manifest
 
 
+def _resolve_stage2_execution_args(args, config, *, saved=None):
+    """Publish one resolved config before rendering, model setup and Trainer setup."""
+    if saved is not None:
+        if not isinstance(saved, Mapping) or "target_scope" not in saved:
+            raise ValueError("missing saved execution settings; cannot safely resume")
+        requested = getattr(args, "_step_preference_target_scope_requested",
+                            getattr(args, "step_preference_target_scope", None))
+        if requested is not None and requested != saved["target_scope"]:
+            raise ValueError("saved target scope conflicts with requested scope")
+        config = replace(config, target_scope=saved["target_scope"])
+    settings = resolve_stage2_execution(
+        config, native_checkpointing=args.gradient_checkpointing,
+        latent_checkpointing=getattr(args, "stage2_latent_activation_checkpointing", None),
+        saved=saved,
+    )
+    args.step_preference_config = config
+    args.step_preference_target_scope = config.target_scope
+    args.stage2_execution_settings = settings
+    return config, settings
+
+
 def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     """Validate Stage 2B source, checkpoint, and negatives without runtime writes."""
     config = getattr(args, "step_preference_config", None)
@@ -285,6 +307,7 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     if not isinstance(config, StepPreferenceConfig) or not config.is_stage2b:
         raise ValueError("Stage 2B artifact preflight requires Stage 2B configuration")
     _require_stage2b_attention_contract(args)
+    config, execution = _resolve_stage2_execution_args(args, config)
 
     admission = (
         validate_packed_admission_inputs(args, config)
@@ -305,7 +328,7 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
             image_root=Path(args.image_root),
             latent_size=args.latent_size,
             require_reasoning_units=True,
-            assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+            assistant_plan_rendering=execution.assistant_plan_rendering,
         )
         for item in selected_examples
     )
@@ -499,11 +522,6 @@ def build_stage2_training_components(
         raise TypeError("step_preference_config must be a StepPreferenceConfig")
     if step_preference_config.is_stage2b:
         _require_stage2b_attention_contract(args)
-    assistant_plan_rendering = (
-        ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
-        if step_preference_config.enabled
-        else ASSISTANT_PLAN_RENDERING_CONCATENATED
-    )
     stage2b_preflight = getattr(args, "_stage2b_preflight", None)
     if step_preference_config.is_stage2b:
         if stage2b_preflight is None:
@@ -548,6 +566,19 @@ def build_stage2_training_components(
             resume_from_checkpoint_path=args.resume_from_checkpoint_path,
             **decision_kwargs,
         )
+    saved_execution = None
+    if decision.trainer_resume_path is not None:
+        resume_config = source_dependencies.load_config(decision.trainer_resume_path)
+        saved_execution = getattr(resume_config, "stage2_preference_execution", None)
+        if saved_execution is None and step_preference_config.enabled:
+            raise ValueError(
+                "preference resume is missing saved execution settings "
+                "(stage2_preference_execution); use a checkpoint with recorded settings"
+            )
+    step_preference_config, execution = _resolve_stage2_execution_args(
+        args, step_preference_config, saved=saved_execution
+    )
+    assistant_plan_rendering = execution.assistant_plan_rendering
     sparse_resume = (
         decision.peft_metadata is not None
         and decision.peft_metadata.token_row_source == "sparse_adapter"
@@ -665,10 +696,15 @@ def build_stage2_training_components(
     )
     configure_stage2_model_backend(
         base_model,
-        gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing=execution.native_checkpointing,
+        latent_activation_checkpointing=execution.latent_checkpointing,
         tuning_method=decision.tuning.method,
         deepspeed_runtime_profile=bind_deepspeed_runtime_profile(args),
     )
+    base_model.config.stage2_sidecar_activation_checkpointing = execution.sidecar_checkpointing
+    base_model.config.stage2_preference_execution = {
+        "target_scope": step_preference_config.target_scope, **asdict(execution),
+    }
     base_model.visual.requires_grad_(False)
     fresh_resolved_target_names = (
         stage1_metadata.resolved_target_names
@@ -845,14 +881,19 @@ def build_stage2_training_arguments(args) -> SFTConfig:
     dataloader_kwargs = {"dataloader_num_workers": dataloader_num_workers}
     if dataloader_num_workers > 0:
         dataloader_kwargs["dataloader_prefetch_factor"] = 2
-    checkpointing_kwargs = _stage2_gradient_checkpointing_kwargs(
-        gradient_checkpointing=args.gradient_checkpointing,
-        tuning_method=args.tuning_method,
-        deepspeed_runtime_profile=bind_deepspeed_runtime_profile(args),
-    )
     step_preference_config = getattr(args, "step_preference_config", None)
     if step_preference_config is None:
         step_preference_config = StepPreferenceConfig.from_args(args)
+    execution = getattr(args, "stage2_execution_settings", None)
+    if execution is None:
+        if getattr(args, "resume_from_checkpoint_path", None) is not None:
+            raise ValueError("resolve saved execution in Stage 2 components before Trainer arguments")
+        step_preference_config, execution = _resolve_stage2_execution_args(args, step_preference_config)
+    checkpointing_kwargs = _stage2_gradient_checkpointing_kwargs(
+        gradient_checkpointing=execution.native_checkpointing,
+        tuning_method=args.tuning_method,
+        deepspeed_runtime_profile=bind_deepspeed_runtime_profile(args),
+    )
     phase_steps = step_preference_config.phase_steps
     return SFTConfig(
         output_dir=args.save_model_path,
@@ -875,7 +916,7 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         dataset_kwargs={"skip_prepare_dataset": True},
         max_seq_length=args.max_seq_length_train,
         max_steps=args.max_steps if phase_steps is None else phase_steps,
-        gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing=execution.native_checkpointing,
         gradient_checkpointing_kwargs=checkpointing_kwargs,
         deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False,

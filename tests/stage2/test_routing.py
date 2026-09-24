@@ -966,6 +966,8 @@ def test_stage2_peft_resume_validates_stage1_before_mutation_and_preserves_sidec
     adapter = build_stage2_tuned_model(adapter_base, tuning)
     with pytest.warns(UserWarning, match="Could not find a config file"):
         adapter.save_pretrained(tmp_path)
+    # Stage2Trainer also persists the underlying Qwen config beside the adapter.
+    adapter_base.config.save_pretrained(tmp_path)
     metadata = build_stage2_peft_metadata(
         tuning=tuning,
         base_model_reference="original/stage1-base",
@@ -1277,6 +1279,7 @@ def test_direct_stage1_preflight_uses_fresh_dora_resolution_without_stage2a(
         direct_from_stage1=True,
     )
     args = stage2_args(
+        gradient_checkpointing=False,
         data_path=str(source),
         image_root=str(tmp_path / "images"),
         stage1_adapter_path="stage1-adapter",
@@ -1334,6 +1337,7 @@ def test_direct_stage1_preflight_rejects_invalid_adapter_payload_before_return(
         direct_from_stage1=True,
     )
     args = stage2_args(
+        gradient_checkpointing=False,
         data_path=str(source),
         image_root=str(tmp_path / "images"),
         stage1_adapter_path="stage1-adapter",

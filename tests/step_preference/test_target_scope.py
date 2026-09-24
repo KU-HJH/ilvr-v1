@@ -162,7 +162,7 @@ def test_training_assembly_passes_target_scope_to_real_collator(monkeypatch, sco
     monkeypatch.setattr(main, "build_prepared_example_length_measure", lambda p: None)
     monkeypatch.setattr(main, "filter_stage2_examples", lambda **kwargs: ([], None))
     components = main.build_stage2_training_components(
-        stage2_args(step_preference_config=config,
+        stage2_args(step_preference_config=config, gradient_checkpointing=False,
                     _stage2b_preflight=main.Stage2BPreflight((), None)),
         source_dependencies=main.Stage2SourceDependencies(
             find_adapter_config=lambda *args, **kwargs: None,

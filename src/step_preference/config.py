@@ -68,7 +68,7 @@ class StepPreferenceConfig:
     enabled: bool = False
     mode: StepPreferenceMode = "stage2a"
     objective: StepPreferenceObjective = "context_preference"
-    target_scope: str = "immediate_text"
+    target_scope: str | None = None
     beta: float = 0.1
     lambda_ce: float = 1.0
     lambda_dpo: float = 1.0
@@ -102,6 +102,9 @@ class StepPreferenceConfig:
     packed_admission_verification_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        if self.target_scope is None:
+            object.__setattr__(self, "target_scope",
+                "until_next_latent" if self.is_context_preference else "immediate_text")
         normalize_preference_target_scope(self.target_scope)
         if self.visual_only_context_preference is None:
             object.__setattr__(
@@ -319,7 +322,7 @@ class StepPreferenceConfig:
             enabled=getattr(args, "step_preference_enabled", False),
             mode=getattr(args, "step_preference_mode", "stage2a"),
             objective=getattr(args, "step_preference_objective", "context_preference"),
-            target_scope=getattr(args, "step_preference_target_scope", "immediate_text"),
+            target_scope=getattr(args, "step_preference_target_scope", None),
             beta=getattr(args, "step_dpo_beta", 0.1),
             lambda_ce=getattr(args, "ce_weight", 1.0),
             lambda_dpo=getattr(args, "step_dpo_weight", 1.0),

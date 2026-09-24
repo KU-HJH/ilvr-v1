@@ -76,7 +76,22 @@ PER_DEVICE_TRAIN_BATCH_SIZE=1
 
 STEP_PREFERENCE_ENABLED=${STEP_PREFERENCE_ENABLED:-false}
 STEP_PREFERENCE_OBJECTIVE=${STEP_PREFERENCE_OBJECTIVE:-context_preference}
-STEP_PREFERENCE_TARGET_SCOPE=${STEP_PREFERENCE_TARGET_SCOPE:-immediate_text}
+step_preference_target_scope_explicit=false
+if [[ -v STEP_PREFERENCE_TARGET_SCOPE ]]; then
+  step_preference_target_scope_explicit=true
+elif [[ -z "${RESUME_CHECKPOINT:-}" && "$STEP_PREFERENCE_ENABLED" == true && "${STEP_PREFERENCE_MODE:-stage2a}" == stage2b && "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
+  STEP_PREFERENCE_TARGET_SCOPE=until_next_latent
+else
+  STEP_PREFERENCE_TARGET_SCOPE=immediate_text
+fi
+# Keep omission on resume for Python's saved-execution resolver.
+if [[ ! -v STAGE2_LATENT_ACTIVATION_CHECKPOINTING && -z "${RESUME_CHECKPOINT:-}" ]]; then
+  if [[ "$STEP_PREFERENCE_TARGET_SCOPE" == until_next_latent ]]; then
+    STAGE2_LATENT_ACTIVATION_CHECKPOINTING=true
+  else
+    STAGE2_LATENT_ACTIVATION_CHECKPOINTING=false
+  fi
+fi
 STEP_PREFERENCE_PREFIX_MODE=${STEP_PREFERENCE_PREFIX_MODE:-clean_prefix}
 STEP_PREFERENCE_BRANCH_MODE=${STEP_PREFERENCE_BRANCH_MODE:-independent}
 case "$STEP_PREFERENCE_PREFIX_MODE" in
@@ -212,6 +227,9 @@ fi
 case "$STEP_PREFERENCE_ENABLED" in
   true)
     ASSISTANT_PLAN_RENDERING=adjacent-text-space-lf-v1
+    if [[ "$STEP_PREFERENCE_TARGET_SCOPE" == until_next_latent ]]; then
+      ASSISTANT_PLAN_RENDERING=concatenated-v1
+    fi
     STEP_PREFERENCE_MODE=${STEP_PREFERENCE_MODE:-stage2a}
     STEP_DPO_BETA=${STEP_DPO_BETA:-0.1}
     STEP_DPO_WEIGHT=${STEP_DPO_WEIGHT:-1.0}
@@ -258,10 +276,12 @@ case "$STEP_PREFERENCE_ENABLED" in
       --stage2a_ratio "$STAGE2A_RATIO"
     )
     if [[ "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
+      if [[ "$step_preference_target_scope_explicit" == true || -z "${RESUME_CHECKPOINT:-}" ]]; then
+        STEP_PREFERENCE_ARGS+=(--step_preference_target_scope "$STEP_PREFERENCE_TARGET_SCOPE")
+      fi
       STEP_PREFERENCE_ARGS+=(
         --step_preference_beta "$STEP_PREFERENCE_BETA"
         --step_preference_weight "$STEP_PREFERENCE_WEIGHT"
-        --step_preference_target_scope "$STEP_PREFERENCE_TARGET_SCOPE"
         --step_preference_prefix_mode "$STEP_PREFERENCE_PREFIX_MODE"
         --step_preference_branch_mode "$STEP_PREFERENCE_BRANCH_MODE"
         --step_preference_margin "$STEP_PREFERENCE_MARGIN"
@@ -534,6 +554,8 @@ MANAGED_OPTIONS=(
   --vision_attention_implementation
   --gradient_checkpointing
   --no-gradient_checkpointing
+  --stage2_latent_activation_checkpointing
+  --no-stage2_latent_activation_checkpointing
   --max_seq_length_train
   --deepspeed_config
   --resume_from_checkpoint_path
@@ -777,6 +799,19 @@ case "$GRADIENT_CHECKPOINTING" in
     exit 2
     ;;
 esac
+
+if [[ -v STAGE2_LATENT_ACTIVATION_CHECKPOINTING ]]; then
+  case "$STAGE2_LATENT_ACTIVATION_CHECKPOINTING" in
+    true) CHECKPOINTING_ARGS+=(--stage2_latent_activation_checkpointing) ;;
+    false) CHECKPOINTING_ARGS+=(--no-stage2_latent_activation_checkpointing) ;;
+    *) printf 'STAGE2_LATENT_ACTIVATION_CHECKPOINTING must be true or false\n' >&2; exit 2 ;;
+  esac
+fi
+if [[ -z "${RESUME_CHECKPOINT:-}" && "$GRADIENT_CHECKPOINTING" == true ]] &&
+   [[ "$STEP_PREFERENCE_TARGET_SCOPE" == until_next_latent || "${STAGE2_LATENT_ACTIVATION_CHECKPOINTING:-false}" == true ]]; then
+  printf 'native checkpointing conflicts with until/latent checkpointing\n' >&2
+  exit 2
+fi
 
 case "$ATTENTION_IMPLEMENTATION" in
   eager|sdpa|flash_attention_2) ;;

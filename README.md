@@ -149,6 +149,8 @@ entire visual tower is frozen and is encoded once per rank-local batch.
 
 #### Stage 2B context preference
 
+For this ours1 checkout, see [fresh until defaults and saved execution settings](documents/ours1-raid-until-default.md).
+
 Context preference is the default Stage 2B objective. With real Stage 1 and
 Stage 2A checkpoints and dataset paths, launch it in this form:
 
@@ -178,7 +180,7 @@ separately. The default context route performs zero reference forwards,
 negative generations, rejected-branch scorings, or preference rollouts.
 
 Context-preference Stage 2B defaults to the selected V-only configuration: the
-preference target is `immediate_text`, and the visual-off comparison suppresses
+preference target is `until_next_latent`, and the visual-off comparison suppresses
 the current latent control boundaries. No extra settings are required.
 
 To restore the former V+T comparison, or to keep the latent boundaries visible

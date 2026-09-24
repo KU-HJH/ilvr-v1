@@ -88,6 +88,7 @@ def test_context_launcher_can_keep_boundaries_without_disabling_v_only():
                 "STEP_PREFERENCE_MODE": "stage2b",
                 "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
                 "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES": "false",
+                "STEP_PREFERENCE_TARGET_SCOPE": "immediate_text",
             }
         )
     )
@@ -407,6 +408,7 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "--vision_attention_implementation",
         "sdpa",
         "--no-gradient_checkpointing",
+        "--no-stage2_latent_activation_checkpointing",
         "--max_seq_length_train",
         "8192",
         "--tuning_method",
@@ -1108,3 +1110,39 @@ def test_stage2_launcher_has_valid_bash_syntax():
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_new_context_defaults_and_ce_only_are_launchable():
+    context = {"STEP_PREFERENCE_ENABLED": "true", "STEP_PREFERENCE_MODE": "stage2b",
+               "STAGE2A_CHECKPOINT_PATH": "/models/stage2a"}
+    tokens = dry_run_tokens(run_launcher(env_overrides=context))
+    assert option_value(tokens, "--step_preference_target_scope") == "until_next_latent"
+    assert "ASSISTANT_PLAN_RENDERING=concatenated-v1" in tokens
+    assert "--stage2_latent_activation_checkpointing" in tokens
+    assert "--no-gradient_checkpointing" in tokens
+    assert run_launcher().returncode == 0
+    explicit = dry_run_tokens(run_launcher(env_overrides={
+        **context, "STEP_PREFERENCE_TARGET_SCOPE": "immediate_text"}))
+    assert option_value(explicit, "--step_preference_target_scope") == "immediate_text"
+    assert "ASSISTANT_PLAN_RENDERING=adjacent-text-space-lf-v1" in explicit
+    assert "--no-stage2_latent_activation_checkpointing" in explicit
+    conflict = run_launcher(env_overrides={**context, "GRADIENT_CHECKPOINTING": "true"})
+    assert conflict.returncode != 0
+
+
+def test_latent_checkpoint_option_is_managed_and_preserves_resume_omission():
+    assert run_launcher("--stage2_latent_activation_checkpointing").returncode == 2
+    assert run_launcher("--no-stage2_latent_activation_checkpointing").returncode == 2
+    tokens = dry_run_tokens(run_launcher(env_overrides={"RESUME_CHECKPOINT": "/models/resume"}))
+    assert "--stage2_latent_activation_checkpointing" not in tokens
+    assert "--no-stage2_latent_activation_checkpointing" not in tokens
+    tokens = dry_run_tokens(run_launcher(env_overrides={
+        "RESUME_CHECKPOINT": "/models/resume", "STAGE2_LATENT_ACTIVATION_CHECKPOINTING": "true"}))
+    assert "--stage2_latent_activation_checkpointing" in tokens
+
+
+@pytest.mark.parametrize("value", ["omitted", "", "1", "invalid"])
+def test_latent_checkpoint_environment_rejects_non_boolean_values(value):
+    result = run_launcher(env_overrides={"STAGE2_LATENT_ACTIVATION_CHECKPOINTING": value})
+    assert result.returncode == 2
+    assert "STAGE2_LATENT_ACTIVATION_CHECKPOINTING must be true or false" in result.stderr

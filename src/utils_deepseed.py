@@ -62,8 +62,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step_preference_weight", type=float, default=1.0)
     parser.add_argument(
         "--step_preference_target_scope",
-        choices=("immediate_text", "until_next_latent"), default="immediate_text",
-        help="Preference target: next text entry (default), or all text until the next latent block.",
+        choices=("immediate_text", "until_next_latent"), default=None,
+        help="Preference target: defaults to until_next_latent for context-preference Stage 2B.",
     )
     parser.add_argument("--step_preference_margin", type=float, default=0.0)
     parser.add_argument("--step_preference_prefix_mode",
@@ -172,6 +172,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--benchmark_smoke_resume_witness")
     parser.add_argument("--training_evidence_path")
     parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--stage2_latent_activation_checkpointing",
+                        action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
         "--gradient_checkpointing",
         action=argparse.BooleanOptionalAction,
@@ -225,7 +227,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("gradient_accumulation_steps must be at least 1")
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
+    args._step_preference_target_scope_requested = args.step_preference_target_scope
     args.step_preference_config = StepPreferenceConfig.from_args(args)
+    args.step_preference_target_scope = args.step_preference_config.target_scope
     args.step_visual_only_context_preference = (
         args.step_preference_config.visual_only_context_preference
     )

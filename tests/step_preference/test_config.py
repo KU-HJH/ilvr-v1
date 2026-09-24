@@ -90,7 +90,7 @@ def test_context_preference_defaults_to_winning_v_only_configuration():
         ]
     )
 
-    assert args.step_preference_config.target_scope == "immediate_text"
+    assert args.step_preference_config.target_scope == "until_next_latent"
     assert args.step_preference_config.visual_only_context_preference is True
     assert args.step_preference_config.visual_off_suppress_latent_boundaries is True
 
@@ -103,7 +103,7 @@ def test_direct_context_config_defaults_to_winning_v_only_configuration():
         stage2a_checkpoint_path="checkpoint",
     )
 
-    assert config.target_scope == "immediate_text"
+    assert config.target_scope == "until_next_latent"
     assert config.visual_only_context_preference is True
     assert config.visual_off_suppress_latent_boundaries is True
 

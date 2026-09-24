@@ -274,8 +274,11 @@ class Stage2DataCollator:
         negative_store=None,
         packed_admission_records_by_sample_id=None,
         max_packed_sequence_length=4608,
-        preference_target_scope="immediate_text",
+        preference_target_scope=None,
     ):
+        if preference_target_scope is None:
+            preference_target_scope = ("until_next_latent"
+                if step_preference_enabled and negative_store is None else "immediate_text")
         self.preference_target_scope = normalize_preference_target_scope(preference_target_scope)
         if self.preference_target_scope != "immediate_text" and (
             not step_preference_enabled or negative_store is not None
