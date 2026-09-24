@@ -2644,8 +2644,7 @@ class SubprocessCoordinatorRunner:
         files_path = (
             self.log_root
             / self.plan.run_id
-            / self.plan.attempt_id
-            / "artifact-resume-rank1.files"
+            / f"artifact-resume-{self.plan.attempt_id}-rank1.files"
         )
         publish_files_list(files_path, entries)  # type: ignore[arg-type]
         self._run_artifact_transfer(

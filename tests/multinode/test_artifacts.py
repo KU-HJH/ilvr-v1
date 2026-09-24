@@ -1888,6 +1888,59 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
     } | {b"prepared-model.manifest.json"}
 
 
+def test_resume_transfer_leaves_attempt_available_for_exclusive_plan_reservation(
+    tmp_path, monkeypatch
+):
+    import src.multinode_artifacts as artifacts_module
+    import src.multinode_runtime as runtime_module
+
+    repository = tmp_path / "repo"
+    checkpoint_root = repository / "checkpoints"
+    checkpoint = checkpoint_root / "resume-ordering" / "checkpoint-423"
+    checkpoint.mkdir(parents=True)
+    monkeypatch.setattr(artifacts_module, "_LOCAL_REPOSITORY", repository)
+    monkeypatch.setattr(runtime_module, "_CHECKPOINT_ROOT", checkpoint_root)
+
+    plan = build_launch_plan(
+        stage="stage2", tuning_method="dora", zero_stage=2,
+        run_id="resume-ordering", attempt_id="resume-epoch2-retry1",
+        main_process_port=29631,
+    )
+    entry = ArtifactEntry(Path("rng_state_2.pth"), 3, 0)
+    manifest = NodeArtifactManifest(
+        schema_version=1, run_id=plan.run_id, node_rank=0,
+        process_ranks=(0, 1, 2, 3), entries=(entry,), runtime_identity={},
+    )
+    log_root = tmp_path / "logs"
+    transfer_lists = []
+
+    def fake_command(command, *, input_bytes=None, timeout_seconds=None):
+        if command[0] == "/usr/bin/rsync":
+            transfer_lists.append(Path(command[command.index("--files-from") + 1]))
+            (checkpoint / entry.relative_path).write_bytes(b"rng")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    runner = SubprocessCoordinatorRunner(
+        plan, commands=None,
+        commit="b" * 40, log_root=log_root,
+        checkpoint_root=checkpoint_root, command_runner=fake_command,
+    )
+    runner.validate_resume_destination((entry,), checkpoint)
+    runner.pull_resume_artifacts(manifest, (entry,), checkpoint)
+
+    attempt = log_root / plan.run_id / plan.attempt_id
+    assert not attempt.exists()
+    assert len(transfer_lists) == 1
+    assert transfer_lists[0].parent == attempt.parent
+    assert transfer_lists[0].read_bytes() == b"rng_state_2.pth\0"
+    with pytest.raises(FileExistsError):
+        publish_files_list(transfer_lists[0], (entry,))
+    runner.prepare_plan(plan)
+    assert (attempt / "launch-plan.json").is_file()
+    with pytest.raises(FileExistsError):
+        runner.prepare_plan(plan)
+
+
 def test_subprocess_runner_executes_resume_and_inference_file_lists(
     tmp_path, monkeypatch
 ):
