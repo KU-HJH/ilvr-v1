@@ -102,6 +102,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands(target_sco
     source.update(
         {
             "STEP_PREFERENCE_OBJECTIVE": "context_preference",
+            "GRADIENT_CHECKPOINTING": "false" if target_scope == "until_next_latent" else "true",
             "STEP_PREFERENCE_BETA": "0.37",
             "STEP_PREFERENCE_TARGET_SCOPE": target_scope,
             "STEP_PREFERENCE_WEIGHT": "1.7",
@@ -121,6 +122,9 @@ def test_context_preference_settings_reach_both_owned_worker_commands(target_sco
 
     for spec in commands.node_specs:
         worker_env = dict(spec.environment)
+        assert worker_env["GRADIENT_CHECKPOINTING"] == (
+            "false" if target_scope == "until_next_latent" else "true"
+        )
         assert {
             name: worker_env.get(name)
             for name in (
@@ -173,6 +177,7 @@ def test_direct_stage1_setting_reaches_both_owned_worker_commands():
     source.update(
         {
             "STEP_PREFERENCE_OBJECTIVE": "context_preference",
+            "GRADIENT_CHECKPOINTING": "false",
             "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "true",
             "STAGE2B_DIRECT_FROM_STAGE1": "true",
             "STAGE1_ADAPTER_PATH": "/models/stage1-adapter",
@@ -189,6 +194,7 @@ def test_direct_stage1_setting_reaches_both_owned_worker_commands():
 
     for spec in commands.node_specs:
         worker_env = dict(spec.environment)
+        assert worker_env["GRADIENT_CHECKPOINTING"] == "false"
         assert worker_env["STAGE2B_DIRECT_FROM_STAGE1"] == "true"
         stage_command = spec.command[spec.command.index("--") + 1:]
         result = subprocess.run(

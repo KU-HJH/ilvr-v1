@@ -16,6 +16,7 @@ def test_insertion_mode_reaches_both_workers_and_config(mode):
     source.pop('STEP_NEGATIVE_PATH')
     source.pop('STEP_NEGATIVE_MANIFEST')
     source.update(STEP_PREFERENCE_OBJECTIVE='context_preference',
+        GRADIENT_CHECKPOINTING='false',
         STEP_VISUAL_ONLY_CONTEXT_PREFERENCE='true',
         STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES='false',
         STEP_PREFERENCE_PREFIX_MODE='v_off_insertion', STEP_PREFERENCE_BRANCH_MODE=mode)
@@ -28,6 +29,7 @@ def test_insertion_mode_reaches_both_workers_and_config(mode):
     commands = build_owned_tmux_commands(plan, commit='a'*40, stage_environment=environment)
     for spec in commands.node_specs:
         worker_env = dict(spec.environment)
+        assert worker_env['GRADIENT_CHECKPOINTING'] == 'false'
         assert worker_env.get('STEP_PREFERENCE_BRANCH_MODE') == mode
         command = spec.command[spec.command.index('--')+1:]
         result = subprocess.run(command, cwd=REPO, capture_output=True, text=True,

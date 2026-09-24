@@ -937,7 +937,7 @@ def test_main_sparse_stage2_resume_is_independent_of_stage1_source(
     )
 
     assert processor_sources == [str(stage2_dir)]
-    assert config_sources == ["tiny/original-qwen"]
+    assert config_sources == ["tiny/original-qwen", str(stage2_dir)]
     assert model_sources == ["tiny/original-qwen"]
     assert components.trainer_resume_path == str(stage2_dir)
     assert components.peft_metadata == metadata
@@ -1019,12 +1019,16 @@ def test_sparse_resume_default_loaders_share_one_source_provenance(
     assert [name for name, _, _ in calls] == [
         "finder",
         "config",
+        "config",
         "processor",
         "model",
     ]
-    assert calls[0][1] == calls[1][1] == calls[3][1] == str(original_base)
-    assert calls[2][1] == str(stage2_dir)
-    for name, _, kwargs in calls:
+    assert calls[0][1] == calls[1][1] == calls[4][1] == str(original_base)
+    assert calls[2][1] == calls[3][1] == str(stage2_dir)
+    for name, source, kwargs in calls:
+        if name == "config" and source == str(stage2_dir):
+            assert kwargs == {}
+            continue
         source_kwargs = {
             key: kwargs[key] for key in expected_source_kwargs
         }
@@ -1035,8 +1039,9 @@ def test_sparse_resume_default_loaders_share_one_source_provenance(
         ), name
     assert calls[0][2] == expected_source_kwargs
     assert calls[1][2] == expected_source_kwargs
-    assert calls[2][2] == expected_source_kwargs
-    assert calls[3][2] == {
+    assert calls[2][2] == {}
+    assert calls[3][2] == expected_source_kwargs
+    assert calls[4][2] == {
         **expected_source_kwargs,
         "attn_implementation": "sdpa",
     }
@@ -1096,19 +1101,19 @@ def test_sparse_resume_injected_source_dependencies_share_provenance(
     observed = []
 
     def finder(source, **kwargs):
-        observed.append(("finder", kwargs))
+        observed.append(("finder", source, kwargs))
         return None
 
     def config(source, **kwargs):
-        observed.append(("config", kwargs))
+        observed.append(("config", source, kwargs))
         return tiny_tag_free_original_qwen().config
 
     def processor_loader(source, **kwargs):
-        observed.append(("processor", kwargs))
+        observed.append(("processor", source, kwargs))
         return processor
 
     def model_loader(source, **kwargs):
-        observed.append(("model", kwargs))
+        observed.append(("model", source, kwargs))
         return tiny_tag_free_original_qwen()
 
     source_dependencies = main.Stage2SourceDependencies(
@@ -1123,18 +1128,26 @@ def test_sparse_resume_injected_source_dependencies_share_provenance(
         args, source_dependencies=source_dependencies
     )
 
-    assert [name for name, _ in observed] == [
+    assert [name for name, _, _ in observed] == [
         "finder",
+        "config",
         "config",
         "processor",
         "model",
     ]
-    for name, kwargs in observed[:-1]:
+    assert [source for _, source, _ in observed] == [
+        "org/clean-original-base", "org/clean-original-base",
+        str(stage2_dir), str(stage2_dir), "org/clean-original-base",
+    ]
+    for name, source, kwargs in observed[:-1]:
+        if name == "config" and source == str(stage2_dir):
+            assert kwargs == {}
+            continue
         assert kwargs == expected_source_kwargs, name
         assert all(
             kwargs[key] is expected for key, expected in expected_source_kwargs.items()
         ), name
-    assert observed[-1][1] == {
+    assert observed[-1][2] == {
         **expected_source_kwargs,
         "attn_implementation": "sdpa",
     }

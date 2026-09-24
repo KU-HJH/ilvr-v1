@@ -31,6 +31,11 @@ def test_normalization_replaces_only_six_values_and_rejects_noise():
         with pytest.raises(ValueError): m.normalize_command(raw, ids[0], (1,0,0), ids)
 
 
+def test_phase_reporter_rejects_duplicate_epoch_options():
+    with pytest.raises(ValueError, match="exactly one --epochs"):
+        reporter().option_value(["--epochs", "1", "--epochs", "2"], "--epochs")
+
+
 def test_competition_ranks_preserve_ties_and_markdown_is_deterministic():
     m = reporter(); runs = [dict(arm=a, coverage_accuracy=s, correct=int(s*400),
         valid_gold_accuracy=s, invalid_gold_count=0, average_inference_time_sec=1.0)
@@ -188,11 +193,15 @@ def test_real_launcher_phase_budget_is_rejected_at_freeze_and_reopen(ablation_fi
         result=subprocess.run(["bash",str(launcher),"--epochs","2","--warm_up_steps","10","--save_steps","612"],
             env=environment,check=True,capture_output=True,text=True)
         command=json.loads(result.stdout)
+        epoch_index=command.index("--epochs")
+        assert command[epoch_index+1] == "1"
+        del command[epoch_index:epoch_index+2]
+        assert command.count("--epochs") == 1
         parsed=parse_args(command[command.index(str(tmp_path/"src/main.py"))+1:])
         effective=training_main.build_stage2_training_arguments(parsed)
         assert parsed.step_preference_config.phase_steps == effective.max_steps == 2
         assert effective.num_train_epochs == 2
-        setattr(args,arm+"_command_json",result.stdout)
+        setattr(args,arm+"_command_json",json.dumps(command))
     with pytest.raises(ValueError,match="step|phase"):
         m.freeze_launches(args,tmp_path)
     assert not Path(args.comparison_dir).exists()

@@ -896,6 +896,8 @@ def test_stage1_coordinator_uses_training_evidence_step_without_max_steps(
             str(result_root),
             "--method",
             "lora",
+            "--ema-tau",
+            "0.999",
             "--epochs",
             "3",
             "--micro-batch",

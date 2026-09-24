@@ -17,6 +17,7 @@ def test_evidence_gain_options_reach_both_workers(mode, blocked):
     source.pop('STEP_NEGATIVE_PATH')
     source.pop('STEP_NEGATIVE_MANIFEST')
     source.update(STEP_PREFERENCE_OBJECTIVE='context_preference',
+        GRADIENT_CHECKPOINTING='false',
         STEP_VISUAL_ONLY_CONTEXT_PREFERENCE='true',
         STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES='false',
         STEP_PREFERENCE_PREFIX_MODE=mode, STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE=blocked)
@@ -29,6 +30,7 @@ def test_evidence_gain_options_reach_both_workers(mode, blocked):
     commands = build_owned_tmux_commands(plan, commit='a'*40, stage_environment=environment)
     for spec in commands.node_specs:
         worker_env = dict(spec.environment)
+        assert worker_env['GRADIENT_CHECKPOINTING'] == 'false'
         assert worker_env.get('STEP_PREFERENCE_PREFIX_MODE') == mode
         assert worker_env.get('STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE') == blocked
         command = spec.command[spec.command.index('--')+1:]
