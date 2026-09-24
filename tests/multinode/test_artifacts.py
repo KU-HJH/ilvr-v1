@@ -28,6 +28,7 @@ from src.multinode_artifacts import (
     publish_files_list,
     publish_node_manifest,
     reserve_inference_destination,
+    resume_entry_delta,
     derive_model_state_layout,
     observe_checkpoint_identity,
     select_inference_entries,
@@ -910,6 +911,26 @@ def test_resume_selection_retains_loader_artifacts_and_only_local_ds_shards():
         "rng_state_3.pth",
     } <= names
     assert {item.process_rank for item in selected} == {None, 0, 1, 2, 3}
+
+
+def test_resume_delta_rejects_extra_file_in_completed_local_replica():
+    canonical = dataclasses.replace(
+        strict_manifest(0),
+        process_ranks=(0, 1, 2, 3),
+        entries=tuple(
+            dataclasses.replace(item, node_rank=0)
+            for item in validate_collection(strict_manifests(), world_size=4)
+        ),
+    )
+    local = dataclasses.replace(
+        canonical,
+        node_rank=1,
+        entries=tuple(dataclasses.replace(item, node_rank=1) for item in canonical.entries)
+        + (ArtifactEntry(Path("unexpected.bin"), 7, 1),),
+    )
+
+    with pytest.raises(ValueError, match="extra.*resume"):
+        resume_entry_delta(canonical, local)
 
 
 @pytest.mark.parametrize(

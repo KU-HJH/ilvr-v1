@@ -1504,6 +1504,9 @@ def resume_entry_delta(
         raise ValueError("resume node-local manifests have different identity")
     required = select_resume_entries(canonical_manifest)
     local_by_path = {entry.relative_path: entry for entry in local_manifest.entries}
+    extra_paths = local_by_path.keys() - {entry.relative_path for entry in required}
+    if extra_paths:
+        raise ValueError(f"extra local resume file: {min(extra_paths)}")
     missing: list[ArtifactEntry] = []
     for entry in required:
         present = local_by_path.get(entry.relative_path)
