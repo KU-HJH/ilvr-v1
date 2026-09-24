@@ -143,6 +143,14 @@ case "${STEP_PREFERENCE_PACKING-}" in
     ;;
 esac
 STEP_PREFERENCE_ARGS=()
+case "${STEP_OFF_ACTIVATION_CHECKPOINTING-}" in
+  ""|0|false|False) ;;
+  1|true|True) STEP_PREFERENCE_ARGS+=(--step_off_activation_checkpointing) ;;
+  *)
+    printf 'STEP_OFF_ACTIVATION_CHECKPOINTING must be 0, 1, false, or true\n' >&2
+    exit 2
+    ;;
+esac
 case "${STEP_SHARED_PREFIX_ENABLED-}" in
   ""|0|false|False) step_shared_prefix_enabled=false ;;
   1|true|True) step_shared_prefix_enabled=true ;;

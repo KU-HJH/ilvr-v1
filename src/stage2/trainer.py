@@ -883,7 +883,7 @@ class Stage2Trainer(Trainer):
                 prefix_mode=config.prefix_mode,
                 branch_mode=config.branch_mode,
                 block_original_image=config.block_original_image,
-                **({"checkpoint": False, "compute_entropy": self._needs_context_entropy()}
+                **({"checkpoint": config.off_activation_checkpointing, "compute_entropy": self._needs_context_entropy()}
                    if getattr(self, "stage2_execution_profile", "legacy") == "latest_external_until" else {}),
                 **(
                     {

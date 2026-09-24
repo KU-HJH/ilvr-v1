@@ -94,6 +94,7 @@ class StepPreferenceConfig:
     resume_from_checkpoint_path: str | None = None
     packing_enabled: bool = False
     shared_prefix_enabled: bool = False
+    off_activation_checkpointing: bool = False
     sidecar_attention_backend: str = "flex"
     sidecar_query_budget: int = 1024
     replacement_seed: int = 42
@@ -161,6 +162,8 @@ class StepPreferenceConfig:
             raise ValueError("packing_enabled must be a boolean")
         if type(self.shared_prefix_enabled) is not bool:
             raise ValueError("shared_prefix_enabled must be a boolean")
+        if type(self.off_activation_checkpointing) is not bool:
+            raise ValueError("off_activation_checkpointing must be a boolean")
         if type(self.visual_only_context_preference) is not bool:
             raise ValueError("visual_only_context_preference must be a boolean")
         if type(self.visual_off_suppress_latent_boundaries) is not bool:
@@ -377,6 +380,7 @@ class StepPreferenceConfig:
             ),
             packing_enabled=getattr(args, "step_preference_packing", False),
             shared_prefix_enabled=getattr(args, "step_shared_prefix_enabled", False),
+            off_activation_checkpointing=getattr(args, "step_off_activation_checkpointing", False),
             sidecar_attention_backend=getattr(args, "step_sidecar_attention_backend", "flex"),
             sidecar_query_budget=getattr(args, "step_sidecar_query_budget", 1024),
             replacement_seed=getattr(args, "seed", 42),

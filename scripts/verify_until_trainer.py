@@ -9,7 +9,7 @@ import argparse
 import hashlib
 import json
 import math
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from pathlib import Path
 
 from scripts.verify_until_native import ExternalSource, external_modules, describe_batch, state_digest
@@ -72,8 +72,35 @@ def memory_diagnostic(spec):
     if mode not in ('comparison', 'ordinary_backward_memory'):
         raise ValueError('unknown gate mode')
     if mode == 'ordinary_backward_memory' and spec.get('path') != 'external':
-        raise ValueError('memory diagnostic requires external source')
+        updates=spec.get('source_updates')
+        if (spec.get('path')!='aligned' or not isinstance(updates,list) or len(updates)!=2
+                or any(type(i) is not int or not 1<=i<=211 for i in updates) or len(set(updates))!=2
+                or type(spec.get('off_activation_checkpointing')) is not bool or spec.get('save_on_cpu',False)):
+            raise ValueError('external memory diagnostic or aligned no-offload probe with two distinct full source updates required')
     return mode == 'ordinary_backward_memory'
+
+
+def probe_compiler_context(spec):
+    from torch._functorch import config
+    if memory_diagnostic(spec) and spec['path']=='aligned':
+        return nullcontext()  # Ordinary backward has no retained observer graph.
+    return config.patch(donated_buffer=False)
+
+
+@contextmanager
+def off_replay_witness(trainer, model):
+    """Count actual OFF decoder entry on the aligned ordinary probe only."""
+    from stage2.peft import resolve_stage2_qwen_model
+    counts={'forward':0,'backward':0}
+    trainer._off_forward_done=False
+    def entered(module,args,kwargs):
+        if kwargs.get('past_key_values') is not None:
+            counts['backward' if trainer._off_forward_done else 'forward']+=1
+    handle=resolve_stage2_qwen_model(model).model.register_forward_pre_hook(entered,with_kwargs=True)
+    try:
+        yield counts
+    finally:
+        handle.remove()
 
 
 def representation_inspection(spec):
@@ -89,8 +116,12 @@ def representation_inspection(spec):
 
 def snapshot_inventory(spec, ranks=range(4)):
     if memory_diagnostic(spec):
-        return {f'rank-{rank}/micro-{micro}-{kind}.pt' for rank in ranks
-                for micro in range(8) for kind in ('scores','rng')}
+        ranks=tuple(ranks)
+        inventory={f'rank-{rank}/micro-{micro}-{kind}.pt' for rank in ranks
+                   for micro in range(8) for kind in ('scores','rng')}
+        if spec['path']=='aligned':
+            inventory.update(f'rank-{rank}/update-{step}-total-actual.pt' for rank in ranks for step in (1,2))
+        return inventory
     return expected_snapshots(ranks)
 
 
@@ -103,7 +134,7 @@ def load_spec(path):
     for key in ('result_dir','tensor_dir','external_manifest','manifest','data','image_root','base','stage1'):
         if not isinstance(spec.get(key),str) or not spec[key]:
             raise ValueError(f'missing gate field: {key}')
-    if spec['path']=='aligned':
+    if spec['path']=='aligned' and not memory_diagnostic(spec):
         envelope=Path(spec.get('envelope',''))
         if not envelope.is_file():
             raise ValueError('freeze external controls before aligned execution')
@@ -141,7 +172,8 @@ def build_inputs(spec, processor, external, source):
     if aligned!=order:
         raise ValueError('aligned full212 stream differs from independent frozen-source sampler')
     replay=select_windows(order,[manifest['lengths'][i] for i in retained],
-                          [manifest['latent_block_counts'][i] for i in retained])
+                          [manifest['latent_block_counts'][i] for i in retained],
+                          source_updates=spec.get('source_updates') if memory_diagnostic(spec) and spec['path']=='aligned' else None)
     replay['sample_ids']=[supplied[i].sample_id for i in replay['indices']]
     replay['full_stream_sha256']=hashlib.sha256(json.dumps(order).encode()).hexdigest()
     replay['retained_indices_sha256']=hashlib.sha256(json.dumps(retained).encode()).hexdigest()
@@ -352,13 +384,19 @@ def probed_trainer_class(base, spec, replay):
                 self._native_prefix_check.enter(self.gate_observer.micro+1, coordinates)
             if diagnostic:
                 self.gate_observer.memory('micro_entry', micro=self.gate_observer.micro+1,
-                    sample_id=inputs['sample_ids'][0], coordinates=coordinates)
+                    sample_id=inputs['sample_ids'][0], coordinates=coordinates,
+                    original_update_index=replay['source_updates'][(self.gate_observer.micro+1)//4],
+                    tokens=int(inputs['input_ids'].shape[-1]),latent_blocks=len(inputs.get('reasoning_step_spans',())))
             before=self.gate_observer.hook_calls
-            value=super().training_step(model,inputs,num_items_in_batch)
+            with off_replay_witness(self,model) if diagnostic and spec['path']=='aligned' else nullcontext() as off_calls:
+                value=super().training_step(model,inputs,num_items_in_batch)
             observer=self.gate_observer
             if diagnostic:
                 observer.memory('backward', sample_id=inputs['sample_ids'][0], coordinates=coordinates,
                     actual_backward_hooks=observer.hook_calls-before,
+                    off_decoder_calls=off_calls,
+                    original_update_index=replay['source_updates'][observer.micro//4],
+                    tokens=int(inputs['input_ids'].shape[-1]),latent_blocks=len(inputs.get('reasoning_step_spans',())),
                     dora_scope_cleaned=all('forward' not in m.__dict__ for m in self._magnitude_modules))
                 return value
             observer.save(f'micro-{observer.micro}-dora-norms',self._norms)
@@ -372,6 +410,7 @@ def probed_trainer_class(base, spec, replay):
             # retained gradient reads and ordinary Trainer backward remain outside.
             with torch.autograd.graph.save_on_cpu(pin_memory=False) if spec.get('save_on_cpu', False) else nullcontext():
                 value=super().compute_loss(model,inputs,return_outputs=return_outputs,num_items_in_batch=num_items_in_batch)
+            self._off_forward_done=True
             if self._gate_capture is None:
                 raise RuntimeError('native preference reducer was not observed')
             preference,scores=self._gate_capture
@@ -456,7 +495,7 @@ def run_from_training_args(args, spec_path):
     # ordinary Trainer backward. Disable one-use saved-buffer donation before
     # either source can compile; restore the process setting even on failure.
     # This adaptation belongs only to the diagnostic gate, never full training.
-    with functorch_config.patch(donated_buffer=False), TrainerExternalSource(root) as source:
+    with probe_compiler_context(spec), TrainerExternalSource(root) as source:
         external=external_modules(source)
         external_flex=bind_external_flex(source,external)
         processor=AutoProcessor.from_pretrained(spec['stage1'],local_files_only=True)
@@ -475,6 +514,7 @@ def run_from_training_args(args, spec_path):
             config=StepPreferenceConfig(enabled=True,mode='stage2b',target_scope='until_next_latent',
                 beta=.5,lambda_preference=1.,lambda_entropy=0.,shared_prefix_enabled=True,
                 visual_only_context_preference=True,visual_off_suppress_latent_boundaries=False,
+                off_activation_checkpointing=spec.get('off_activation_checkpointing',False),
                 direct_from_stage1=True,sidecar_attention_backend='flex',sidecar_query_budget=1024)
             extra=dict(stage2_execution_profile='latest_external_until',stage2_sampler_policy='external_until_balanced')
         cls=probed_trainer_class(base,spec,replay)
@@ -489,14 +529,16 @@ def run_from_training_args(args, spec_path):
         result_dir.mkdir(parents=True,exist_ok=True)
         metadata=dict(spec=spec,protocol=NUMERICAL_PROTOCOL,replay=replay,initial_digest=initial_digest,
             source_manifest_sha256=baseline.sha(spec['external_manifest']),rank=rank,
-            envelope_sha256=baseline.sha(spec['envelope']) if spec['path']=='aligned' else None,
+            envelope_sha256=baseline.sha(spec['envelope']) if spec['path']=='aligned' and not diagnostic else None,
             source_adaptations=['frozen parent Trainer and frozen Flex callable; shared remaining framework dependencies and Stage1 loader','reference grouping2 stream replay sharded by Accelerator over4 ranks',
                 'fixed Trainer GAS4 denominator and ceil replay epoch accounting',
                 f'schedule212/warmup10; stop callback after{2 if diagnostic else 5} updates',
-                'gate-only AOT donated_buffer=False before compilation for retained observer gradients; restored on exit'],
+                ('production AOT donation unchanged; ordinary backward only' if diagnostic and spec['path']=='aligned' else
+                 'gate-only AOT donated_buffer=False before compilation for retained observer gradients; restored on exit')],
             memory_diagnostic=diagnostic,
             representation_inspection=representation_inspection(spec),
             save_on_cpu=spec.get('save_on_cpu', False),
+            off_activation_checkpointing=getattr(config,'off_activation_checkpointing',False),
             resolved_dataloader=dict(num_workers=train_args.dataloader_num_workers,
                 persistent_workers=train_args.dataloader_persistent_workers,
                 prefetch_factor=train_args.dataloader_prefetch_factor),

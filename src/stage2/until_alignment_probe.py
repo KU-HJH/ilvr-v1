@@ -63,7 +63,7 @@ def compare_snapshot(reference, candidate, envelope):
     return {'pass': all(m['pass'] for m in results.values()), 'tensors': results}
 
 
-def select_windows(order, lengths, latent_counts):
+def select_windows(order, lengths, latent_counts, *, source_updates=None):
     """Select first three groups, a manifest-cost challenge, and real tail."""
     if len(order) < 52 or len(order)%16 != 4:
         raise ValueError('bounded replay requires three full groups and a four-real-example tail')
@@ -72,9 +72,17 @@ def select_windows(order, lengths, latent_counts):
     costs = [sum(lengths[i]**2*(1+latent_counts[i]) for i in group) for group in groups[:-1]]
     challenge = max(range(len(costs)), key=lambda i:(costs[i],-i))
     selected = [0,1,2,challenge,len(groups)-1]
+    if source_updates is not None:
+        if (not isinstance(source_updates,list) or len(source_updates)!=2
+                or any(type(i) is not int or not 1<=i<len(groups) for i in source_updates)
+                or len(set(source_updates))!=2):
+            raise ValueError('memory probe requires two distinct full source updates')
+        selected = [i-1 for i in source_updates]
+    indices = [j for i in selected for j in groups[i]]
     return {'source_updates': [i+1 for i in selected],
-            'indices': [j for i in selected for j in groups[i]],
-            'coefficients': [1/16]*68, 'challenge_source_update': challenge+1,
+            'indices': indices,
+            'lengths': [lengths[i] for i in indices], 'latent_counts': [latent_counts[i] for i in indices],
+            'coefficients': [1/16]*len(indices), 'challenge_source_update': challenge+1,
             'challenge_proxy': 'sum(length^2*(1+latent_count))',
             'historical_optimizer_state_reproduced': False}
 
@@ -268,7 +276,17 @@ class AlignmentObserver(ReproductionObserver):
 
 
 class MemoryDiagnosticObserver(AlignmentObserver):
-    """Detached forward witnesses only; ordinary Trainer backward owns gradients."""
+    """Ordinary Trainer backward owns gradients; optional detached boundary reads."""
+    def __init__(self, trainer, engine, spec, replay):
+        super().__init__(trainer,engine,spec,replay)
+        self.capture_ordinary_gradients = spec['path']=='aligned'
+        if self.capture_ordinary_gradients:
+            from torch._functorch import config
+            if spec.get('save_on_cpu',False) or engine.optimizer.cpu_offload:
+                raise ValueError('aligned ordinary probe prohibits CPU offload')
+            self.write(dict(event='ordinary_probe_config',rank=self.rank,
+                off_activation_checkpointing=trainer.step_preference_config.off_activation_checkpointing,
+                save_on_cpu=False,optimizer_cpu_offload=False,donated_buffer=config.donated_buffer))
     def memory(self, event, **fields):
         record = dict(event=event, rank=self.rank, micro=self.micro,
             allocated=torch.cuda.memory_allocated(self.engine.device),
@@ -286,14 +304,36 @@ class MemoryDiagnosticObserver(AlignmentObserver):
             'cuda':torch.cuda.get_rng_state(self.engine.device)})
         self._reference_output_managers.clear()
         self.memory('forward', sample_id=expected_id, tokens=int(inputs['input_ids'].shape[-1]),
-                    loss=float(total.detach()))
+                    loss=float(total.detach()),original_update_index=self.replay['source_updates'][self.micro//4],
+                    latent_blocks=len(inputs.get('reasoning_step_spans', ())))
 
     def before_step(self):
         self.lr = [float(group['lr']) for group in self.engine.optimizer.optimizer.param_groups]
+        if getattr(self,'capture_ordinary_gradients',False):
+            from deepspeed.utils import safe_get_full_grad,safe_get_full_fp32_param
+            actual={name:_cpu(safe_get_full_grad(p)) for name,p in self.named}
+            self.save(f'update-{self.update+1}-total-actual',actual)
+            # One connected nonzero parameter suffices to witness a real master
+            # update without retaining another model-sized snapshot inventory.
+            self.master_witness_name,self.master_parameter=next(
+                (name,p) for name,p in self.named if actual[name] is not None and bool(actual[name].abs().max()>0))
+            self.master_before=_cpu(safe_get_full_fp32_param(self.master_parameter))
+            if self.master_before is None:
+                raise RuntimeError('ordinary probe FP32 master witness unavailable')
 
     def after_step(self):
         self.update += 1
-        self.memory('memory_update', probe_optimizer_step=self.update, lr=self.lr)
+        fields={}
+        if getattr(self,'capture_ordinary_gradients',False):
+            from deepspeed.utils import safe_get_full_fp32_param
+            after=_cpu(safe_get_full_fp32_param(self.master_parameter))
+            fields=dict(master_witness_name=self.master_witness_name,
+                        master_changed=not torch.equal(self.master_before,after))
+            self.master_before=None
+        self.memory('memory_update', probe_optimizer_step=self.update, lr=self.lr,
+            original_update_index=self.replay['source_updates'][self.update-1],
+            ordinary_gradient_snapshot=(f'update-{self.update}-total-actual.pt'
+                if getattr(self,'capture_ordinary_gradients',False) else None),**fields)
 
 
 def check_memory_runtime(records, replay):
@@ -309,6 +349,13 @@ def check_memory_runtime(records, replay):
             failures.append('runtime profile differs')
     for rank in range(4):
         local = [r for r in records if r['rank']==rank]
+        aligned=any(r.get('path')=='aligned' for r in local if r['event']=='init')
+        settings=[r for r in local if r['event']=='ordinary_probe_config']
+        if aligned and (len(settings)!=1 or settings[0].get('save_on_cpu') is not False
+                        or settings[0].get('optimizer_cpu_offload') is not False
+                        or type(settings[0].get('off_activation_checkpointing')) is not bool
+                        or type(settings[0].get('donated_buffer')) is not bool):
+            failures.append('aligned ordinary runtime settings missing or offloaded')
         for event in ('micro_entry','forward','backward'):
             rows = [r for r in local if r['event']==event]
             if [r['micro'] for r in rows] != list(range(8)):
@@ -319,15 +366,35 @@ def check_memory_runtime(records, replay):
                     failures.append('input identity or memory evidence differs')
                 if event=='backward' and row.get('actual_backward_hooks',0)<=0:
                     failures.append('ordinary backward not witnessed')
+                if aligned:
+                    index=row['micro']*4+rank
+                    if (row.get('original_update_index')!=replay['source_updates'][row['micro']//4]
+                            or row.get('tokens')!=replay['lengths'][index]
+                            or row.get('latent_blocks')!=replay['latent_counts'][index]):
+                        failures.append('selected source geometry differs')
+                    if event=='backward':
+                        counts=row.get('off_decoder_calls') or {}
+                        enabled=settings[0].get('off_activation_checkpointing') if settings else None
+                        if (counts.get('forward')!=1 or type(counts.get('backward')) is not int
+                                or (counts.get('backward',0)>0)!=enabled or row.get('dora_scope_cleaned') is not True):
+                            failures.append('actual OFF replay or DoRA cleanup missing')
         updates = [r for r in local if r['event']=='memory_update']
         if [r['probe_optimizer_step'] for r in updates] != [1,2] or [r['lr'] for r in updates] != [[0.],[5e-6]]:
             failures.append('two scheduled optimizer events required')
+        if aligned:
+            for row in updates:
+                step=row['probe_optimizer_step']
+                if (row.get('original_update_index')!=replay['source_updates'][step-1]
+                        or row.get('ordinary_gradient_snapshot')!=f'update-{step}-total-actual.pt'
+                        or not row.get('master_witness_name') or row.get('master_changed') is not (step==2)):
+                    failures.append('ordinary gradient or real master update witness missing')
         compiler = [r for r in local if r['event']=='compiler']
         calls = [c for r in compiler for c in r['calls'] if c['callable']=='torch.nn.attention.flex_attention.flex_attention']
-        if len(compiler)!=1 or not calls or any(c.get('dynamic') is not True or c.get('donated_buffer') is not False for c in calls):
+        donation=settings[0].get('donated_buffer') if aligned and settings else False
+        if len(compiler)!=1 or not calls or any(c.get('dynamic') is not True or c.get('donated_buffer') is not donation for c in calls):
             failures.append('compiler profile differs')
     return {'complete':not failures, 'comparison_pass':False, 'full212_authorized':False,
-            'failures':failures, 'scope':'first two replay groups ordinary-backward capacity only'}
+            'failures':failures, 'scope':'two selected replay groups ordinary-backward capacity and gradient observations only'}
 
 
 def check_runtime(records, replay):

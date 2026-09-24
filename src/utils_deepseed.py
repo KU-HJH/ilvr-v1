@@ -35,6 +35,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step_preference_enabled", action="store_true")
     parser.add_argument("--step_preference_packing", action="store_true")
     parser.add_argument("--step_shared_prefix_enabled", action="store_true")
+    parser.add_argument("--step_off_activation_checkpointing", action="store_true",
+                        help="Opt into OFF score activation checkpointing for latest_external_until")
     parser.add_argument("--step_sidecar_attention_backend", choices=("dense", "flex"), default="flex")
     parser.add_argument("--step_sidecar_query_budget", type=int, default=1024)
     parser.add_argument(
