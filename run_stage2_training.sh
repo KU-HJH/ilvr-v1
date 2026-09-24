@@ -703,7 +703,7 @@ PY
   fi
 }
 
-require_number_equal_one() {
+require_number_zero_or_one() {
   local name=$1
   local value=$2
   if ! "$REPO_ROOT/venv/ilvr-venv/bin/python" - "$value" <<'PY'
@@ -714,10 +714,10 @@ try:
     value = float(sys.argv[1])
 except (OverflowError, ValueError):
     raise SystemExit(1)
-raise SystemExit(0 if math.isfinite(value) and value == 1.0 else 1)
+raise SystemExit(0 if value in (0.0, 1.0) else 1)
 PY
   then
-    printf 'Context preference requires %s=1\n' "$name" >&2
+    printf 'Context preference requires %s=0 (preference only) or 1\n' "$name" >&2
     exit 2
   fi
 }
@@ -736,7 +736,7 @@ if [[ "$STEP_PREFERENCE_ENABLED" == true ]]; then
     require_finite_non_negative_number STEP_PREFERENCE_WEIGHT "$STEP_PREFERENCE_WEIGHT"
     require_finite_number STEP_PREFERENCE_MARGIN "$STEP_PREFERENCE_MARGIN"
     if [[ "$STEP_PREFERENCE_MODE" == stage2b ]]; then
-      require_number_equal_one CE_WEIGHT "$CE_WEIGHT"
+      require_number_zero_or_one CE_WEIGHT "$CE_WEIGHT"
     fi
   else
     require_finite_positive_number STEP_DPO_BETA "$STEP_DPO_BETA"

@@ -248,8 +248,10 @@ class StepPreferenceConfig:
             else:
                 split_stage2_budget(self.total_steps, self.stage2a_ratio)
         if self.is_context_preference:
-            if self.lambda_ce != 1.0:
-                raise ValueError("context preference requires ce_weight=1")
+            if self.lambda_ce not in (0.0, 1.0):
+                raise ValueError("context preference requires ce_weight 0 (preference only) or 1")
+            if self.lambda_ce == 0.0 and self.prefix_mode != "clean_prefix":
+                raise ValueError("ce_weight 0 is supported only with the clean_prefix context objective")
             if self.negative_path is not None or self.negative_manifest is not None:
                 raise ValueError(
                     "context preference does not consume negative artifacts; "

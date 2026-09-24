@@ -747,7 +747,7 @@ class Stage2Trainer(Trainer):
             [ent[modality] for modality in active_modalities]
         ).mean()
         total = (
-            clean_ce
+            config.lambda_ce * clean_ce
             + config.lambda_preference * preference
             + config.lambda_entropy * entropy
         )

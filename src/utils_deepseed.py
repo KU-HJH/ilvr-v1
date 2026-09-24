@@ -239,6 +239,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.stage != "stage2":
             raise ValueError("latest_external_until requires Stage 2")
         if not args.resume_from_checkpoint_path:
+            ce_weight_explicit = any(item == "--ce_weight" or item.startswith("--ce_weight=")
+                                     for item in raw_argv)
             # The profile pins the unsorted stream unless the RAID length-paired one is explicit.
             sampler_policy = (args.stage2_sampler_policy
                               if args.stage2_sampler_policy == "external_until_length_paired"
@@ -249,7 +251,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             step_preference_branch_mode="independent", step_preference_block_original_image=False,
             step_visual_only_context_preference=True, step_visual_off_suppress_latent_boundaries=False,
             step_shared_prefix_enabled=True, step_preference_packing=False,
-            step_dpo_beta=.5, step_preference_weight=1., step_entropy_weight=0., ce_weight=1.,
+            step_dpo_beta=.5, step_preference_weight=1., step_entropy_weight=0.,
+            ce_weight=(args.ce_weight if ce_weight_explicit else 1.),
             step_preference_margin=0., supervise_latent_boundaries=True,
             stage2b_direct_from_stage1=True, stage2_assistant_plan_rendering="concatenated-v1",
             load_model_path="/root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct",
