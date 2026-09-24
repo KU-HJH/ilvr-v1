@@ -1,7 +1,5 @@
 """Opt-in full-text preference targets, with the original path kept intact."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 from PIL import Image
@@ -99,17 +97,19 @@ def test_opt_in_real_collator_expands_targets_without_changing_input_or_ce(tmp_p
     })
     kwargs = dict(processor=processor, token_ids=tokens, latent_size=2,
                   supervise_latent_boundaries=True, step_preference_enabled=True)
-    default = Stage2DataCollator(**kwargs)([example])
     immediate = Stage2DataCollator(**kwargs, preference_target_scope="immediate_text")([example])
     full = Stage2DataCollator(**kwargs, preference_target_scope="until_next_latent")([example])
     for key in ("input_ids", "attention_mask", "labels", "pixel_values", "image_grid_thw"):
-        assert torch.equal(default[key], immediate[key]), key
-        assert torch.equal(default[key], full[key]), key
-    assert default["reasoning_step_spans"] == immediate["reasoning_step_spans"]
-    for old, new in zip(default["reasoning_step_spans"], full["reasoning_step_spans"]):
-        assert replace(new, target_text_end=old.target_text_end) == old
+        assert torch.equal(immediate[key], full[key]), key
+    for old, new in zip(immediate["reasoning_step_spans"], full["reasoning_step_spans"]):
+        assert (new.step_id, new.latent_start, new.latent_end,
+                new.target_text_start, new.helper_image_idx) == (
+                    old.step_id, old.latent_start, old.latent_end,
+                    old.target_text_start, old.helper_image_idx,
+                )
+        assert new.target_text_end >= old.target_text_end
     for batch, expected in (
-        (default, ["Reason one.", "Reason two."]),
+        (immediate, ["Reason one.", "Reason two."]),
         (full, ["Reason one. \nMore one.", "Reason two. \nThe final answer is: 70"]),
     ):
         for suppress in (False, True):

@@ -156,6 +156,8 @@ def map_reasoning_step_spans(
         for span in plan_char_spans
         for boundary in (span.start, span.end)
     }
+    if preference_target_scope == "until_next_latent":
+        boundaries = {assistant_start, assistant_start + len(assistant_text)}
     for span in plan_char_spans:
         if span.step_type != "latent":
             continue
@@ -169,6 +171,8 @@ def map_reasoning_step_spans(
             )
         boundaries.add(assistant_start + span.start + len(LATENT_START_TOKEN))
         boundaries.add(assistant_start + span.end - len(LATENT_END_TOKEN))
+        if preference_target_scope == "until_next_latent":
+            boundaries.update((assistant_start + span.start, assistant_start + span.end))
 
     for token_index, (start, end) in enumerate(offsets):
         if start == end:
@@ -196,6 +200,48 @@ def map_reasoning_step_spans(
             )
         return selected[0], selected[-1] + 1
 
+    if preference_target_scope == "until_next_latent":
+        assistant_begin, assistant_end = token_interval(
+            assistant_start, assistant_start + len(assistant_text)
+        )
+        if len(reasoning_steps) != sum(
+            span.step_type == "latent" for span in plan_char_spans
+        ):
+            raise ValueError("reasoning step count must match latent block count")
+        blocks = []
+        for step in reasoning_steps:
+            start, after_end = token_interval(
+                assistant_start + step.latent.start,
+                assistant_start + step.latent.end,
+            )
+            body_start, end = start + 1, after_end - 1
+            if not (
+                ids[start] != latent_pad_token_id
+                and ids[end] != latent_pad_token_id
+                and body_start < end
+            ):
+                raise ValueError("latent block delimiters or body are invalid")
+            if any(token != latent_pad_token_id for token in ids[body_start:end]):
+                raise ValueError("latent token interval contains a non-latent-pad token")
+            blocks.append((start, body_start, end))
+        mapped = []
+        previous_end = assistant_begin
+        for index, (start, body_start, end) in enumerate(blocks):
+            target_start = end + 1
+            target_end = blocks[index + 1][0] if index + 1 < len(blocks) else assistant_end
+            if not (previous_end < start < body_start < end < target_end <= assistant_end):
+                raise ValueError("complete reasoning step requires non-empty previous and target text")
+            step = reasoning_steps[index]
+            mapped.append(ReasoningStepSpan(
+                step_id=step.step_id,
+                prev_text_start=previous_end, prev_text_end=start,
+                latent_start=body_start, latent_end=end,
+                target_text_start=target_start, target_text_end=target_end,
+                helper_image_idx=step.helper_image_idx,
+            ))
+            previous_end = target_start
+        return tuple(mapped)
+
     mapped: list[ReasoningStepSpan] = []
     for step in reasoning_steps:
         prev_start, prev_end = token_interval(
@@ -206,17 +252,9 @@ def map_reasoning_step_spans(
             assistant_start + step.latent.start + len(LATENT_START_TOKEN),
             assistant_start + step.latent.end - len(LATENT_END_TOKEN),
         )
-        target_char_end = step.target_text.end
-        if preference_target_scope == "until_next_latent":
-            # Preserve rendering and previous-text ablation; extend only the target.
-            target_char_end = next(
-                (span.start for span in plan_char_spans
-                 if span.step_type == "latent" and span.start >= step.latent.end),
-                len(assistant_text),
-            )
         target_start, target_end = token_interval(
             assistant_start + step.target_text.start,
-            assistant_start + target_char_end,
+            assistant_start + step.target_text.end,
         )
         if any(
             token_id != latent_pad_token_id
