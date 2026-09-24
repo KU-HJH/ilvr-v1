@@ -340,7 +340,7 @@ case "$STEP_PREFERENCE_ENABLED" in
         }
         STEP_PREFERENCE_ARGS+=(--stage2b_direct_from_stage1 --stage1_adapter_path "$STAGE1_ADAPTER_PATH")
         processor_source=$STAGE1_ADAPTER_PATH
-      else
+      elif [[ -z "${RESUME_CHECKPOINT:-}" ]]; then
         [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]] || {
           printf 'Stage 2B requires STAGE2A_CHECKPOINT_PATH\n' >&2
           exit 2
@@ -356,12 +356,14 @@ case "$STEP_PREFERENCE_ENABLED" in
           exit 2
         }
       fi
-      if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+      if [[ -n "${RESUME_CHECKPOINT:-}" && ( "$stage2b_direct_from_stage1" == true || -n "${STAGE2A_CHECKPOINT_PATH:-}" || -n "${STAGE1_ADAPTER_PATH:-}" ) ]]; then
         printf 'Stage 2B Stage 2A initialization and RESUME_CHECKPOINT are mutually exclusive\n' >&2
         exit 2
       fi
-      stage2b_checkpoint_initialization=true
-      if [[ "$stage2b_direct_from_stage1" == false ]]; then
+      if [[ -z "${RESUME_CHECKPOINT:-}" ]]; then
+        stage2b_checkpoint_initialization=true
+      fi
+      if [[ "$stage2b_direct_from_stage1" == false && -z "${RESUME_CHECKPOINT:-}" ]]; then
         processor_source=$STAGE2A_CHECKPOINT_PATH
       fi
       if [[ "$STEP_PREFERENCE_OBJECTIVE" == legacy_dpo ]]; then
@@ -370,7 +372,7 @@ case "$STEP_PREFERENCE_ENABLED" in
           --step_negative_manifest "$STEP_NEGATIVE_MANIFEST"
         )
       fi
-      if [[ "$stage2b_direct_from_stage1" == false ]]; then
+      if [[ "$stage2b_direct_from_stage1" == false && -z "${RESUME_CHECKPOINT:-}" ]]; then
         STEP_PREFERENCE_ARGS+=(--stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH")
       fi
     elif [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]]; then

@@ -242,7 +242,7 @@ class StepPreferenceConfig:
         if not 0.0 < ratio < 1.0:
             raise ValueError("stage2a_ratio must be a finite number in (0, 1)")
         if self.total_steps is not None:
-            if self.direct_from_stage1:
+            if self.direct_from_stage1 or (self.is_stage2b and self.resume_from_checkpoint_path is not None):
                 if isinstance(self.total_steps, bool) or not isinstance(self.total_steps, int) or self.total_steps <= 0:
                     raise ValueError("stage2_total_steps must be a positive integer")
             else:
@@ -285,13 +285,28 @@ class StepPreferenceConfig:
                 "context-preference Stage 2B"
             )
         if self.is_stage2b:
+            if self.resume_from_checkpoint_path is not None and (
+                self.direct_from_stage1 or self.stage2a_checkpoint_path is not None
+            ):
+                raise ValueError(
+                    "--stage2a_checkpoint_path and --resume_from_checkpoint_path "
+                    "are mutually exclusive for Stage 2B"
+                )
+            if self.resume_from_checkpoint_path is not None and not (
+                self.is_context_preference
+                and self.visual_only_context_preference
+                and self.target_scope == "until_next_latent"
+            ):
+                raise ValueError(
+                    "Stage 2B resume requires V-only context preference with until_next_latent"
+                )
             if self.direct_from_stage1:
                 if self.stage2a_checkpoint_path is not None:
                     raise ValueError(
                         "--stage2b_direct_from_stage1 cannot use "
                         "--stage2a_checkpoint_path"
                     )
-            required = [] if self.direct_from_stage1 else [
+            required = [] if self.direct_from_stage1 or self.resume_from_checkpoint_path is not None else [
                 ("stage2a_checkpoint_path", "--stage2a_checkpoint_path")
             ]
             if not self.is_context_preference:
@@ -304,11 +319,6 @@ class StepPreferenceConfig:
                     raise ValueError(f"Stage 2B requires {option}")
             if self.attention_implementation not in ("eager", "sdpa"):
                 raise ValueError("Stage 2B attention implementation must be eager or sdpa")
-            if self.resume_from_checkpoint_path is not None:
-                raise ValueError(
-                    "--stage2a_checkpoint_path and --resume_from_checkpoint_path "
-                    "are mutually exclusive for Stage 2B"
-                )
             if self.packing_enabled and (
                 isinstance(self.max_packed_sequence_length, bool)
                 or not isinstance(self.max_packed_sequence_length, int)
@@ -332,7 +342,7 @@ class StepPreferenceConfig:
     def phase_steps(self) -> int | None:
         if not self.enabled or self.total_steps is None:
             return None
-        if self.direct_from_stage1:
+        if self.direct_from_stage1 or (self.is_stage2b and self.resume_from_checkpoint_path is not None):
             return self.total_steps
         stage2a, stage2b = split_stage2_budget(
             self.total_steps, self.stage2a_ratio

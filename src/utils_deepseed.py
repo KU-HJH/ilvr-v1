@@ -233,9 +233,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.stage2_execution_profile == "latest_external_until":
         if args.stage != "stage2":
             raise ValueError("latest_external_until requires Stage 2")
-        if args.resume_from_checkpoint_path:
-            raise ValueError("latest_external_until is a fresh-run profile; do not rewrite saved resume settings")
-        resolved = dict(stage2_sampler_policy="external_until_balanced", step_preference_enabled=True,
+        if not args.resume_from_checkpoint_path:
+            resolved = dict(stage2_sampler_policy="external_until_balanced", step_preference_enabled=True,
             step_preference_mode="stage2b", step_preference_objective="context_preference",
             step_preference_target_scope="until_next_latent", step_preference_prefix_mode="clean_prefix",
             step_preference_branch_mode="independent", step_preference_block_original_image=False,
@@ -256,8 +255,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             vision_attention_implementation="flash_attention_2", step_sidecar_attention_backend="flex",
             step_sidecar_query_budget=1024, gradient_checkpointing=False,
             stage2_latent_activation_checkpointing=True, max_seq_length_train=8192, dataloader_num_workers=4)
-        for name, value in resolved.items():
-            setattr(args, name, value)
+            for name, value in resolved.items():
+                setattr(args, name, value)
     elif args.stage2_external_global_batch_size != 16:
         raise ValueError("stage2_external_global_batch_size=8 requires latest_external_until")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:

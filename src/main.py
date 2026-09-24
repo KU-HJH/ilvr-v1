@@ -324,6 +324,26 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     )
     reject_duplicate_sample_ids(example.sample_id for example in prepared)
 
+    if config.resume_from_checkpoint_path is not None:
+        source_dependencies = _default_stage2_source_dependencies()
+        resolve_stage2_load_decision(
+            load_model_path=args.load_model_path,
+            resume_from_checkpoint_path=config.resume_from_checkpoint_path,
+            load_config=source_dependencies.load_config,
+            discover_adapter_config=source_dependencies.find_adapter_config,
+            source_provenance_kwargs=build_stage2_source_provenance_kwargs(args),
+            latent_size=args.latent_size,
+            supervise_latent_boundaries=args.supervise_latent_boundaries,
+            latent_activation_checkpointing=getattr(args, "stage2_latent_activation_checkpointing", False),
+            tuning_method=args.tuning_method,
+            tuning_method_explicit=args.tuning_method_explicit,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_target_modules=args.lora_target_modules,
+        )
+        return Stage2BPreflight(prepared_examples=prepared, negative_store=None)
+
     if config.direct_from_stage1:
         source_dependencies = _default_stage2_source_dependencies()
         decision = resolve_stage2_load_decision(
@@ -543,7 +563,12 @@ def build_stage2_training_components(
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
     )
-    if step_preference_config.direct_from_stage1:
+    if getattr(args, "resume_from_checkpoint_path", None):
+        decision = resolve_stage2_load_decision(
+            resume_from_checkpoint_path=args.resume_from_checkpoint_path,
+            **decision_kwargs,
+        )
+    elif step_preference_config.direct_from_stage1:
         decision = resolve_stage2_load_decision(
             resume_from_checkpoint_path=None,
             **decision_kwargs,
@@ -884,7 +909,7 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         logging_steps=20,
         save_strategy="steps",
         save_steps=args.save_steps,
-        save_total_limit=1,
+        save_total_limit=2 if getattr(args, "resume_from_checkpoint_path", None) else 1,
         optim="adamw_torch",
         bf16=True,
         seed=getattr(args, "seed", 42),
