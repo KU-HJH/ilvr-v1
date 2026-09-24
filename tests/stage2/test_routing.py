@@ -867,7 +867,7 @@ def test_stage2_components_select_length_manifest_indices_without_remeasuring_im
         main,
         "validate_stage2_length_manifest",
         lambda **kwargs: SimpleNamespace(
-            manifest=SimpleNamespace(retained_indices=(2, 0)),
+            manifest=SimpleNamespace(retained_indices=(2, 0), lengths=(10, 20, 30)),
             raw_examples=(1, 2, 3),
             prepared_examples=(1, 2, 3),
         ),
@@ -885,6 +885,8 @@ def test_stage2_components_select_length_manifest_indices_without_remeasuring_im
 
     assert calls.filtered is None
     assert components.train_dataset == [3, 1]
+    # Length-paired sampling reads lengths in exactly the train_dataset order.
+    assert components.train_sequence_lengths == (30, 10)
 
 
 @pytest.mark.parametrize(
@@ -927,7 +929,7 @@ def test_stage2_manifest_indices_respect_max_train_samples(
         main,
         "validate_stage2_length_manifest",
         lambda **kwargs: SimpleNamespace(
-            manifest=SimpleNamespace(retained_indices=(0, 2)),
+            manifest=SimpleNamespace(retained_indices=(0, 2), lengths=(10, 20, 30)),
             raw_examples=(1, 2, 3),
             prepared_examples=(1, 2, 3),
         ),
@@ -945,6 +947,7 @@ def test_stage2_manifest_indices_respect_max_train_samples(
     )
 
     assert components.train_dataset == expected_examples
+    assert components.train_sequence_lengths == tuple(10 * example for example in expected_examples)
 
 
 def test_stage2_peft_resume_validates_stage1_before_mutation_and_preserves_sidecar(

@@ -30,7 +30,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage2_reproduction_probe_dir", type=str, default="")
     parser.add_argument("--stage2_execution_profile", choices=("legacy", "latest_external_until"), default="legacy")
     parser.add_argument("--stage2_external_global_batch_size", type=int, choices=(8, 16), default=16)
-    parser.add_argument("--stage2_sampler_policy", choices=("auto", "latent_balanced", "reference_random", "external_until_balanced"), default="auto")
+    parser.add_argument("--stage2_sampler_policy", choices=("auto", "latent_balanced", "reference_random", "external_until_balanced", "external_until_length_paired"), default="auto")
+    parser.add_argument("--stage2_dora_norm_cache", choices=("on", "off"), default="on",
+                        help="off uses PEFT's per-call DoRA weight norm instead of the microbatch cache")
     parser.add_argument("--stage2_reference_sampler_probe_dir", type=str, default="")
     parser.add_argument("--stage2_diagnostics_interval", type=int, default=0)
     parser.add_argument("--step_preference_enabled", action="store_true")
@@ -230,11 +232,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or item.startswith("--lora_target_modules=")
         for item in raw_argv
     )
+    if (args.stage2_sampler_policy == "external_until_length_paired"
+            and args.stage2_execution_profile != "latest_external_until"):
+        raise ValueError("external_until_length_paired requires latest_external_until")
     if args.stage2_execution_profile == "latest_external_until":
         if args.stage != "stage2":
             raise ValueError("latest_external_until requires Stage 2")
         if not args.resume_from_checkpoint_path:
-            resolved = dict(stage2_sampler_policy="external_until_balanced", step_preference_enabled=True,
+            # The profile pins the unsorted stream unless the RAID length-paired one is explicit.
+            sampler_policy = (args.stage2_sampler_policy
+                              if args.stage2_sampler_policy == "external_until_length_paired"
+                              else "external_until_balanced")
+            resolved = dict(stage2_sampler_policy=sampler_policy, step_preference_enabled=True,
             step_preference_mode="stage2b", step_preference_objective="context_preference",
             step_preference_target_scope="until_next_latent", step_preference_prefix_mode="clean_prefix",
             step_preference_branch_mode="independent", step_preference_block_original_image=False,

@@ -1,9 +1,10 @@
 """Distributed Stage 2 sampling with aligned latent decoder work."""
 
+import hashlib
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -27,6 +28,9 @@ _STAGE2_SAMPLER_SIDECAR_FIELDS = (
     _STAGE2_SAMPLER_IDENTITY_FIELDS | {"global_step"}
 )
 _MAX_STAGE2_SAMPLER_BYTES = 16 * 1024
+EXTERNAL_UNTIL_SAMPLER_POLICIES = ("external_until_balanced", "external_until_length_paired")
+FIXED_DENOMINATOR_SAMPLER_POLICIES = ("reference_random", *EXTERNAL_UNTIL_SAMPLER_POLICIES)
+_LENGTH_PAIRED_FIELDS = {"length_order": "sorted_adjacent_pairs", "padding_source": "longest"}
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,7 @@ class Stage2SamplerIdentity:
     gradient_accumulation_steps: int | None = None
 
     reference_grouping: int | None = None
+    lengths_sha256: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = {
@@ -56,30 +61,39 @@ class Stage2SamplerIdentity:
         if self.policy == "reference_random":
             payload.update(policy=self.policy, gradient_accumulation_steps=self.gradient_accumulation_steps,
                            update_accounting="ceil", padding_weight=0)
-        if self.policy == "external_until_balanced":
+        if self.policy in EXTERNAL_UNTIL_SAMPLER_POLICIES:
             payload.update(policy=self.policy, gradient_accumulation_steps=self.gradient_accumulation_steps,
                            update_accounting="ceil", padding_weight=1, reference_grouping=2)
+        if self.policy == "external_until_length_paired":
+            payload.update(_LENGTH_PAIRED_FIELDS, lengths_sha256=self.lengths_sha256)
         return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "Stage2SamplerIdentity":
         if isinstance(payload, dict) and payload.get("schema_version") == 3:
+            policy = payload.get("policy")
             expected = _STAGE2_SAMPLER_IDENTITY_FIELDS | {"policy", "gradient_accumulation_steps",
                 "update_accounting", "padding_weight", "reference_grouping"}
-            if (set(payload) != expected or payload["policy"] != "external_until_balanced"
+            if policy == "external_until_length_paired":
+                expected |= set(_LENGTH_PAIRED_FIELDS) | {"lengths_sha256"}
+            digest = payload.get("lengths_sha256")
+            if (set(payload) != expected or policy not in EXTERNAL_UNTIL_SAMPLER_POLICIES
+                    or any(payload.get(key, value) != value for key, value in _LENGTH_PAIRED_FIELDS.items())
                     or payload["world_size"] != 4 or payload["reference_grouping"] != 2
                     or type(payload["gradient_accumulation_steps"]) is not int
                     or payload["gradient_accumulation_steps"] not in (2, 4)
-                    or payload["update_accounting"] != "ceil" or payload["padding_weight"] != 1):
-                raise ValueError("invalid external_until_balanced sampler identity")
+                    or payload["update_accounting"] != "ceil" or payload["padding_weight"] != 1
+                    or (digest is not None and (type(digest) is not str or len(digest) != 64
+                                                or set(digest) - set("0123456789abcdef")))):
+                raise ValueError(f"invalid {policy} sampler identity")
             legacy = {k: payload[k] for k in _STAGE2_SAMPLER_IDENTITY_FIELDS}
             legacy.update(schema_version=1, world_size=2)
             parsed = cls.from_dict(legacy)
             if (parsed.dataset_size + parsed.padded_samples) % 4:
                 raise ValueError("external grouping2 stream must divide into four actual ranks")
             return cls(3, parsed.seed, 4, parsed.dataset_size, parsed.bucket_sizes,
-                       parsed.padded_samples, "external_until_balanced",
-                       payload["gradient_accumulation_steps"], 2)
+                       parsed.padded_samples, policy,
+                       payload["gradient_accumulation_steps"], 2, digest)
         reference = isinstance(payload, dict) and payload.get("schema_version") == 2
         fields = _STAGE2_SAMPLER_IDENTITY_FIELDS | (
             {"policy", "gradient_accumulation_steps", "update_accounting", "padding_weight"} if reference else set()
@@ -176,14 +190,36 @@ def _bucket_indices(dataset) -> dict[int, list[int]]:
     return buckets
 
 
-class LatentBlockBalancedSampler(Sampler[int]):
-    """Yield a global stream whose replica-sized groups share one block count."""
+def sequence_lengths_sha256(sequence_lengths: tuple[int, ...]) -> str:
+    """Digest pinning the per-item lengths a length-paired stream depends on."""
+    return hashlib.sha256(json.dumps(list(sequence_lengths)).encode()).hexdigest()
 
-    def __init__(self, dataset, *, num_replicas: int, seed: int):
+
+def _validate_sequence_lengths(dataset, sequence_lengths) -> None:
+    if (
+        not isinstance(sequence_lengths, tuple)
+        or len(sequence_lengths) != len(dataset)
+        or any(type(length) is not int or length < 1 for length in sequence_lengths)
+    ):
+        raise ValueError("sequence lengths must be positive integers matching the dataset length")
+
+
+class LatentBlockBalancedSampler(Sampler[int]):
+    """Yield a global stream whose replica-sized groups share one block count.
+
+    With ``sequence_lengths`` (RAID Sept-17 semantics), each shuffled bucket is
+    stably sorted by length so replica groups pair similar lengths, and the
+    bucket's longest item fills its padding; group order is still shuffled.
+    """
+
+    def __init__(self, dataset, *, num_replicas: int, seed: int, sequence_lengths=None):
         if type(num_replicas) is not int or num_replicas < 2:
             raise ValueError("balanced sampler requires at least two replicas")
         if type(seed) is not int:
             raise ValueError("balanced sampler seed must be an integer")
+        if sequence_lengths is not None:
+            _validate_sequence_lengths(dataset, sequence_lengths)
+        self.sequence_lengths = sequence_lengths
         self.dataset = dataset
         self.num_replicas = num_replicas
         self.seed = seed
@@ -215,11 +251,16 @@ class LatentBlockBalancedSampler(Sampler[int]):
                 len(original), generator=generator
             ).tolist()
             indices = [original[position] for position in order]
+            if self.sequence_lengths is not None:
+                indices.sort(key=self.sequence_lengths.__getitem__)
             needed = (-len(indices)) % self.num_replicas
             base = tuple(indices)
-            indices.extend(
-                base[position % len(base)] for position in range(needed)
-            )
+            if self.sequence_lengths is None:
+                indices.extend(
+                    base[position % len(base)] for position in range(needed)
+                )
+            else:
+                indices.extend(base[-1] for _ in range(needed))
             groups.extend(
                 indices[offset : offset + self.num_replicas]
                 for offset in range(0, len(indices), self.num_replicas)
@@ -256,9 +297,25 @@ class ExternalUntilBalancedSampler(LatentBlockBalancedSampler):
             source.padded_samples, "external_until_balanced", gradient_accumulation_steps, 2)
 
     def __iter__(self):
-        source = LatentBlockBalancedSampler(self.dataset, num_replicas=2, seed=self.seed)
+        source = LatentBlockBalancedSampler(self.dataset, num_replicas=2, seed=self.seed,
+                                            sequence_lengths=self.sequence_lengths)
         source.set_epoch(self.epoch)
         return iter(source)
+
+
+class ExternalUntilLengthPairedSampler(ExternalUntilBalancedSampler):
+    """The RAID Sept-17 stream: grouping two with length-sorted buckets."""
+
+    def __init__(self, dataset, *, num_replicas, seed, gradient_accumulation_steps,
+                 sequence_lengths=None):
+        if sequence_lengths is None:
+            raise ValueError("external_until_length_paired requires sequence lengths")
+        _validate_sequence_lengths(dataset, sequence_lengths)
+        super().__init__(dataset, num_replicas=num_replicas, seed=seed,
+                         gradient_accumulation_steps=gradient_accumulation_steps)
+        self.sequence_lengths = sequence_lengths
+        self.identity = replace(self.identity, policy="external_until_length_paired",
+                                lengths_sha256=sequence_lengths_sha256(sequence_lengths))
 
 
 
@@ -425,6 +482,7 @@ def validate_stage2_sampler_resume_identity(
         "policy",
         "gradient_accumulation_steps",
         "reference_grouping",
+        "lengths_sha256",
         "seed",
         "world_size",
         "dataset_size",
@@ -442,7 +500,7 @@ def validate_stage2_sampler_resume_identity(
 
 def select_stage2_sampler_policy(requested, *, profile, config, resume):
     """Resolve fresh V-off reproduction versus immutable saved sampling semantics."""
-    if requested not in ("auto", "latent_balanced", "reference_random", "external_until_balanced"):
+    if requested not in ("auto", "latent_balanced", *FIXED_DENOMINATOR_SAMPLER_POLICIES):
         raise ValueError("unknown Stage 2 sampler policy")
     if resume is not None and profile.world_size > 1:
         saved = read_stage2_sampler_sidecar(Path(resume)).policy

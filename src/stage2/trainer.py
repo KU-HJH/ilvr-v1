@@ -26,7 +26,10 @@ from stage1.trainer import collect_deepspeed_pre_step_norm
 from .checkpointing import save_stage2_peft_metadata
 from .dora import dora_microbatch_scope
 from .sampler import (
+    EXTERNAL_UNTIL_SAMPLER_POLICIES,
+    FIXED_DENOMINATOR_SAMPLER_POLICIES,
     ExternalUntilBalancedSampler,
+    ExternalUntilLengthPairedSampler,
     LatentBlockBalancedSampler,
     ReferenceRandomDataset,
     ReferenceRandomSampler,
@@ -259,6 +262,8 @@ class Stage2Trainer(Trainer):
         stage2_sampler_policy: str = "latent_balanced",
         stage2_execution_profile: str = "legacy",
         stage2_reference_sampler_probe_dir: str = "",
+        stage2_sampler_lengths: tuple[int, ...] | None = None,
+        stage2_dora_norm_cache: str = "on",
         step_preference_config: StepPreferenceConfig | None = None,
         **kwargs,
     ):
@@ -285,11 +290,17 @@ class Stage2Trainer(Trainer):
             raise TypeError("Stage 2 trainer requires a DeepSpeed runtime profile")
         if stage2_execution_profile not in ("legacy", "latest_external_until"):
             raise ValueError("unknown Stage 2 execution profile")
-        if (stage2_execution_profile == "latest_external_until") != (stage2_sampler_policy == "external_until_balanced"):
+        if (stage2_execution_profile == "latest_external_until") != (stage2_sampler_policy in EXTERNAL_UNTIL_SAMPLER_POLICIES):
             raise ValueError("external-until execution and sampler profiles must be selected together")
         self.stage2_execution_profile = stage2_execution_profile
-        if stage2_sampler_policy not in ("latent_balanced", "reference_random", "external_until_balanced"):
+        if stage2_sampler_policy not in ("latent_balanced", *FIXED_DENOMINATOR_SAMPLER_POLICIES):
             raise ValueError("unknown Stage 2 sampler policy")
+        if (stage2_sampler_policy == "external_until_length_paired") != (stage2_sampler_lengths is not None):
+            raise ValueError("external_until_length_paired requires sequence lengths, and only it accepts them")
+        if stage2_dora_norm_cache not in ("on", "off"):
+            raise ValueError("stage2_dora_norm_cache must be on or off")
+        self.stage2_sampler_lengths = stage2_sampler_lengths
+        self.stage2_dora_norm_cache = stage2_dora_norm_cache
         if stage2_reproduction_probe_dir and stage2_reference_sampler_probe_dir:
             raise ValueError("select only one Stage 2 reproduction observer")
         if stage2_reference_sampler_probe_dir and stage2_sampler_policy != "reference_random":
@@ -308,7 +319,7 @@ class Stage2Trainer(Trainer):
         if not isinstance(step_preference_config, StepPreferenceConfig):
             raise TypeError("step_preference_config must be a StepPreferenceConfig")
         self.step_preference_config = step_preference_config
-        if stage2_sampler_policy in ("reference_random", "external_until_balanced"):
+        if stage2_sampler_policy in FIXED_DENOMINATOR_SAMPLER_POLICIES:
             config = step_preference_config
             profile = deepspeed_runtime_profile
             eligible_config = not config.enabled or (
@@ -343,7 +354,7 @@ class Stage2Trainer(Trainer):
         callbacks.append(_ObservedOptimizerStep(self))
         kwargs["callbacks"] = callbacks
         super().__init__(*args, **kwargs)
-        if stage2_sampler_policy in ("reference_random", "external_until_balanced"):
+        if stage2_sampler_policy in FIXED_DENOMINATOR_SAMPLER_POLICIES:
             if self.args.world_size != 4:
                 raise ValueError("reference_random requires four actual ranks")
             if self.args.per_device_train_batch_size != 1 or self.args.dataloader_drop_last:
@@ -355,7 +366,7 @@ class Stage2Trainer(Trainer):
 
     def set_initial_training_values(self, args, dataloader, total_train_batch_size):
         values = list(super().set_initial_training_values(args, dataloader, total_train_batch_size))
-        if getattr(self, "stage2_sampler_policy", "latent_balanced") not in ("reference_random", "external_until_balanced"):
+        if getattr(self, "stage2_sampler_policy", "latent_balanced") not in FIXED_DENOMINATOR_SAMPLER_POLICIES:
             return tuple(values)
         length = values[5]
         if length is None or length < 1:
@@ -421,6 +432,7 @@ class Stage2Trainer(Trainer):
     def training_step(self, model, inputs, num_items_in_batch=None):
         padding = float(inputs.get("stage2_sample_weight", 1.)) == 0.
         enabled = (getattr(self, "stage2_execution_profile", "legacy") == "latest_external_until"
+                   and getattr(self, "stage2_dora_norm_cache", "on") == "on"
                    and not self.is_fsdp_enabled and self.deepspeed_runtime_profile.zero_stage != 3)
         with self._padding_rng_context(padding), dora_microbatch_scope(model, enabled=enabled):
             loss = super().training_step(
@@ -467,16 +479,17 @@ class Stage2Trainer(Trainer):
             self._stage2_train_sampler = None
             return None
         policy = getattr(self, "stage2_sampler_policy", "latent_balanced")
-        reference = policy in ("reference_random", "external_until_balanced")
+        reference = policy in FIXED_DENOMINATOR_SAMPLER_POLICIES
         if reference and self.args.world_size != 4:
             raise ValueError("reference_random requires four actual ranks")
         seed = (getattr(self.args, "data_seed", None) if reference else None)
         seed = self.args.seed if seed is None else seed
-        sampler_type = (ExternalUntilBalancedSampler if policy == "external_until_balanced" else
+        sampler_type = (ExternalUntilLengthPairedSampler if policy == "external_until_length_paired" else
+                        ExternalUntilBalancedSampler if policy == "external_until_balanced" else
                         ReferenceRandomSampler if reference else LatentBlockBalancedSampler)
         sampler = getattr(self, "_stage2_train_sampler", None)
         if (
-            not isinstance(sampler, sampler_type)
+            type(sampler) is not sampler_type
             or sampler.dataset is not self.train_dataset
             or sampler.num_replicas != self.args.world_size
             or sampler.seed != seed
@@ -488,6 +501,8 @@ class Stage2Trainer(Trainer):
                 num_replicas=self.args.world_size,
                 seed=seed,
                 **({"gradient_accumulation_steps": self.args.gradient_accumulation_steps} if reference else {}),
+                **({"sequence_lengths": self.stage2_sampler_lengths}
+                   if policy == "external_until_length_paired" else {}),
             )
             self._stage2_train_sampler = sampler
         self.stage2_sampler_identity = sampler.identity

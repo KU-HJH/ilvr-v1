@@ -284,6 +284,15 @@ def _image_identity(path: str) -> Stage2ImageIdentity:
     )
 
 
+def retained_sequence_lengths(manifest, *, available: int) -> tuple[int, ...]:
+    """Lengths aligned with the retained train dataset built from ``available`` rows."""
+    return tuple(
+        manifest.lengths[index]
+        for index in manifest.retained_indices
+        if index < available
+    )
+
+
 def validate_stage2_length_manifest(
     *,
     path: str | Path,

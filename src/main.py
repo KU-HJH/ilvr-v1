@@ -88,8 +88,8 @@ from stage2.data import (
     load_jsonl_examples,
     prepare_stage2_example,
 )
-from stage2.length_manifest import validate_stage2_length_manifest
-from stage2.sampler import select_stage2_sampler_policy
+from stage2.length_manifest import retained_sequence_lengths, validate_stage2_length_manifest
+from stage2.sampler import FIXED_DENOMINATOR_SAMPLER_POLICIES, select_stage2_sampler_policy
 from stage2.attention_backend import (
     load_qwen2_5_vl_with_attention,
     validate_qwen2_5_vl_attention_backends,
@@ -163,6 +163,7 @@ class Stage2TrainingComponents:
     trainer_resume_path: str | None
     peft_metadata: Stage2PeftMetadata | None
     step_preference_config: StepPreferenceConfig | None = None
+    train_sequence_lengths: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -807,6 +808,7 @@ def build_stage2_training_components(
             ),
         )
 
+    train_sequence_lengths = None
     if stage2b_preflight is not None and stage2b_preflight.packed_admission is not None:
         kept = stage2b_preflight.prepared_examples
     elif manifest_snapshot is None:
@@ -847,6 +849,9 @@ def build_stage2_training_components(
             for index in manifest_snapshot.manifest.retained_indices
             if index < len(prepared)
         ]
+        train_sequence_lengths = retained_sequence_lengths(
+            manifest_snapshot.manifest, available=len(prepared)
+        )
 
     negative_store = (
         stage2b_preflight.negative_store
@@ -876,6 +881,7 @@ def build_stage2_training_components(
         trainer_resume_path=decision.trainer_resume_path,
         peft_metadata=peft_metadata,
         step_preference_config=step_preference_config,
+        train_sequence_lengths=train_sequence_lengths,
     )
 
 
@@ -1098,6 +1104,18 @@ def publish_step_preference_phase_a_summary(args, *, trainer, train_result):
     return summary
 
 
+def stage2_sampler_trainer_kwargs(sampler_policy, *, train_sequence_lengths):
+    """Trainer kwargs selecting a fixed-denominator sampler and, if paired, its lengths."""
+    if sampler_policy not in FIXED_DENOMINATOR_SAMPLER_POLICIES:
+        return {}
+    kwargs = {"stage2_sampler_policy": sampler_policy}
+    if sampler_policy == "external_until_length_paired":
+        if train_sequence_lengths is None:
+            raise ValueError("external_until_length_paired requires a validated Stage 2 length manifest")
+        kwargs["stage2_sampler_lengths"] = train_sequence_lengths
+    return kwargs
+
+
 def run_stage2(args):
     """Run the existing Stage 2 path without importing Stage 1 Trainer code."""
 
@@ -1135,8 +1153,10 @@ def run_stage2(args):
     sampler_policy = select_stage2_sampler_policy(
         getattr(args, "stage2_sampler_policy", "auto"), profile=profile,
         config=components.step_preference_config, resume=components.trainer_resume_path)
-    if sampler_policy in ("reference_random", "external_until_balanced"):
-        trainer_kwargs["stage2_sampler_policy"] = sampler_policy
+    trainer_kwargs.update(stage2_sampler_trainer_kwargs(
+        sampler_policy, train_sequence_lengths=getattr(components, "train_sequence_lengths", None)))
+    if getattr(args, "stage2_dora_norm_cache", "on") != "on":
+        trainer_kwargs["stage2_dora_norm_cache"] = args.stage2_dora_norm_cache
     if getattr(args, "stage2_execution_profile", "legacy") != "legacy":
         trainer_kwargs["stage2_execution_profile"] = args.stage2_execution_profile
     if getattr(args, "stage2_reference_sampler_probe_dir", ""):

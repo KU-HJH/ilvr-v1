@@ -61,6 +61,14 @@ STAGE2_DIAGNOSTICS_INTERVAL=${STAGE2_DIAGNOSTICS_INTERVAL:-0}
 STAGE2_REPRODUCTION_PROBE_DIR=${STAGE2_REPRODUCTION_PROBE_DIR:-}
 STAGE2_SAMPLER_POLICY=${STAGE2_SAMPLER_POLICY:-auto}
 STAGE2_EXECUTION_PROFILE=${STAGE2_EXECUTION_PROFILE:-legacy}
+STAGE2_DORA_NORM_CACHE=${STAGE2_DORA_NORM_CACHE:-on}
+case "$STAGE2_DORA_NORM_CACHE" in
+  on|off) ;;
+  *)
+    printf 'STAGE2_DORA_NORM_CACHE must be on or off\n' >&2
+    exit 2
+    ;;
+esac
 STAGE2_EXTERNAL_GLOBAL_BATCH_SIZE=${STAGE2_EXTERNAL_GLOBAL_BATCH_SIZE:-16}
 STAGE2_REFERENCE_SAMPLER_PROBE_DIR=${STAGE2_REFERENCE_SAMPLER_PROBE_DIR:-}
 SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
@@ -532,6 +540,7 @@ MANAGED_OPTIONS=(
   --stage2_diagnostics_interval
   --stage2_reproduction_probe_dir
   --stage2_sampler_policy
+  --stage2_dora_norm_cache
   --stage2_reference_sampler_probe_dir
   --stage2_assistant_plan_rendering
   --stage2_latent_activation_checkpointing
@@ -932,6 +941,9 @@ if [[ "$STAGE2_EXTERNAL_GLOBAL_BATCH_SIZE" != 16 ]]; then
 fi
 if [[ "$STAGE2_SAMPLER_POLICY" != auto ]]; then
   SAMPLER_ARGS+=(--stage2_sampler_policy "$STAGE2_SAMPLER_POLICY")
+fi
+if [[ "$STAGE2_DORA_NORM_CACHE" != on ]]; then
+  SAMPLER_ARGS+=(--stage2_dora_norm_cache "$STAGE2_DORA_NORM_CACHE")
 fi
 if [[ -n "$STAGE2_REFERENCE_SAMPLER_PROBE_DIR" ]]; then
   SAMPLER_ARGS+=(--stage2_reference_sampler_probe_dir "$STAGE2_REFERENCE_SAMPLER_PROBE_DIR")
