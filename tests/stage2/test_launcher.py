@@ -55,8 +55,46 @@ def test_context_default_launch_needs_no_negatives():
     assert option_value(tokens, "--step_preference_objective") == "context_preference"
     assert option_value(tokens, "--step_preference_weight") == "1"
     assert option_value(tokens, "--step_sidecar_attention_backend") == "dense"
+    assert "--step_visual_only_context_preference" in tokens
+    assert "--step_visual_off_suppress_latent_boundaries" in tokens
     assert "--step_negative_path" not in tokens
     assert "--step_negative_manifest" not in tokens
+
+
+def test_context_launcher_forwards_explicit_previous_behavior_opt_outs():
+    """Catches false environment overrides being confused with omitted defaults."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+                "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "false",
+                "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES": "false",
+            }
+        )
+    )
+
+    assert "--no-step_visual_only_context_preference" in tokens
+    assert "--no-step_visual_off_suppress_latent_boundaries" in tokens
+
+
+def test_context_launcher_can_keep_boundaries_without_disabling_v_only():
+    """Catches the boundary opt-out accidentally disabling V-only preference."""
+    tokens = dry_run_tokens(
+        run_launcher(
+            env_overrides={
+                "STEP_PREFERENCE_ENABLED": "true",
+                "STEP_PREFERENCE_MODE": "stage2b",
+                "STAGE2A_CHECKPOINT_PATH": "/models/stage2a",
+                "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES": "false",
+            }
+        )
+    )
+
+    assert option_value(tokens, "--step_preference_target_scope") == "immediate_text"
+    assert "--step_visual_only_context_preference" in tokens
+    assert "--no-step_visual_off_suppress_latent_boundaries" in tokens
 
 
 def test_visual_only_context_launcher_validates_and_forwards_boolean():
@@ -102,8 +140,10 @@ def test_visual_off_boundary_suppression_launcher_validates_and_forwards_boolean
     assert invalid.returncode == 2
     assert "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES" in invalid.stderr
 
-    wrong_scope = dict(environment)
-    wrong_scope.pop("STEP_VISUAL_ONLY_CONTEXT_PREFERENCE")
+    wrong_scope = {
+        **environment,
+        "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE": "false",
+    }
     rejected = run_launcher(env_overrides=wrong_scope)
     assert rejected.returncode == 2
     assert "requires visual-only context-preference Stage 2B" in rejected.stderr
@@ -335,6 +375,8 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
     assert tokens[5:] == [
         "--stage",
         "stage2",
+        "--epochs",
+        "1",
         "--load_model_path",
         REQUIRED_ENV["STAGE1_CHECKPOINT"],
         "--data_path",
@@ -355,9 +397,9 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "1.0",
         "--supervise_latent_boundaries",
         "--learning_rate",
-        "1e-5",
+        "5e-5",
         "--gradient_accumulation_steps",
-        "8",
+        "2",
         "--per_device_train_batch_size",
         "1",
         "--attention_implementation",

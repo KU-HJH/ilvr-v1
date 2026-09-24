@@ -74,8 +74,11 @@ class StepPreferenceConfig:
     lambda_dpo: float = 1.0
     lambda_preference: float = 1.0
     preference_margin: float = 0.0
-    visual_only_context_preference: bool = False
-    visual_off_suppress_latent_boundaries: bool = False
+    prefix_mode: str = "clean_prefix"
+    branch_mode: str = "independent"
+    block_original_image: bool = False
+    visual_only_context_preference: bool | None = None
+    visual_off_suppress_latent_boundaries: bool | None = None
     lambda_entropy: float = 0.1
     entropy_margin: float = 0.1
     negative_path: str | None = None
@@ -100,6 +103,36 @@ class StepPreferenceConfig:
 
     def __post_init__(self) -> None:
         normalize_preference_target_scope(self.target_scope)
+        if self.visual_only_context_preference is None:
+            object.__setattr__(
+                self,
+                "visual_only_context_preference",
+                self.is_context_preference,
+            )
+        if self.visual_off_suppress_latent_boundaries is None:
+            object.__setattr__(
+                self,
+                "visual_off_suppress_latent_boundaries",
+                self.is_context_preference and self.visual_only_context_preference,
+            )
+        if self.prefix_mode not in ("clean_prefix", "v_off_prefix", "v_off_insertion"):
+            raise ValueError("unknown preference prefix_mode")
+        if self.branch_mode not in ("independent", "cumulative"):
+            raise ValueError("branch_mode must be independent or cumulative")
+        if self.branch_mode == "cumulative" and self.prefix_mode != "v_off_insertion":
+            raise ValueError("cumulative branch_mode requires v_off_insertion")
+        if self.prefix_mode == "v_off_insertion" and not self.shared_prefix_enabled:
+            raise ValueError("v_off_insertion requires shared-prefix execution")
+        if type(self.block_original_image) is not bool:
+            raise ValueError("block_original_image must be a boolean")
+        if self.block_original_image and self.prefix_mode != "v_off_prefix":
+            raise ValueError("block_original_image requires v_off_prefix")
+        if self.prefix_mode in ("v_off_prefix", "v_off_insertion") and (
+            not self.is_context_preference
+            or not self.visual_only_context_preference
+            or self.visual_off_suppress_latent_boundaries
+        ):
+            raise ValueError(f"{self.prefix_mode} requires V-only context preference with START/END kept")
         if self.target_scope != "immediate_text" and not self.is_context_preference:
             raise ValueError("full preference target scope requires context-preference Stage 2B")
         if not isinstance(self.enabled, bool):
@@ -292,11 +325,14 @@ class StepPreferenceConfig:
             lambda_dpo=getattr(args, "step_dpo_weight", 1.0),
             lambda_preference=getattr(args, "step_preference_weight", 1.0),
             preference_margin=getattr(args, "step_preference_margin", 0.0),
+            prefix_mode=getattr(args, "step_preference_prefix_mode", "clean_prefix"),
+            branch_mode=getattr(args, "step_preference_branch_mode", "independent"),
+            block_original_image=getattr(args, "step_preference_block_original_image", False),
             visual_only_context_preference=getattr(
-                args, "step_visual_only_context_preference", False
+                args, "step_visual_only_context_preference", None
             ),
             visual_off_suppress_latent_boundaries=getattr(
-                args, "step_visual_off_suppress_latent_boundaries", False
+                args, "step_visual_off_suppress_latent_boundaries", None
             ),
             lambda_entropy=getattr(args, "step_entropy_weight", 0.1),
             entropy_margin=getattr(args, "step_entropy_margin", 0.1),

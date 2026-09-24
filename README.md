@@ -169,23 +169,30 @@ bash run_stage2_training.sh
 ```
 
 Set `OUTPUT_DIR` to a distinct run directory below the current worktree's
-`checkpoints/` symlink. The context objective shares the clean prefix and
-scores the clean, visual-off (V), and textual-off (T) contexts in at most
-three scoring decoder calls per local microbatch. Existing clean latent
-decoder calls and backward checkpoint recomputation are counted and reported
+`checkpoints/` symlink. The context objective shares the clean prefix. Its
+default V-only route scores the clean and visual-off (V) contexts; the V+T
+opt-out additionally scores the textual-off (T) context, for at most three
+scoring decoder calls per local microbatch. Existing clean latent decoder
+calls and backward checkpoint recomputation are counted and reported
 separately. The default context route performs zero reference forwards,
 negative generations, rejected-branch scorings, or preference rollouts.
 
-To train the V-only variant while also suppressing the current latent control
-boundaries, add both settings to the Stage 2B launch:
+Context-preference Stage 2B defaults to the selected V-only configuration: the
+preference target is `immediate_text`, and the visual-off comparison suppresses
+the current latent control boundaries. No extra settings are required.
+
+To restore the former V+T comparison, or to keep the latent boundaries visible
+in a V-only run, use the corresponding explicit opt-out:
 
 ```bash
-STEP_VISUAL_ONLY_CONTEXT_PREFERENCE=true \
-STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES=true \
+STEP_VISUAL_ONLY_CONTEXT_PREFERENCE=false \
+bash run_stage2_training.sh
+
+STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES=false \
 bash run_stage2_training.sh
 ```
 
-The second setting is valid only with V-only context preference. Its V-off
+Boundary suppression is valid only with V-only context preference. Its V-off
 sidecar blocks root attention to `<|latent_start|>`, every current latent
 state, and `<|latent_end|>`, and replaces the replayed `<|latent_end|>` query
 embedding with a fixed zero vector. Clean scoring, including ordinary latent

@@ -239,7 +239,11 @@ def test_context_matches_literal_loss_and_all_trainable_gradients(checkpoint):
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
 
-    actual, output = _trainer(context_config()).compute_loss(
+    full_context = context_config(
+        visual_only_context_preference=False,
+        visual_off_suppress_latent_boundaries=False,
+    )
+    actual, output = _trainer(full_context).compute_loss(
         model, batch, return_outputs=True
     )
     expected, clean, scores = literal_context_oracle(reference, batch)
@@ -340,7 +344,12 @@ def test_runtime_prefix_bank_identity_and_mrope_reuse():
 
     handle = model.model.register_forward_hook(observe, with_kwargs=True)
     try:
-        _trainer(context_config()).compute_loss(model, batch)
+        _trainer(
+            context_config(
+                visual_only_context_preference=False,
+                visual_off_suppress_latent_boundaries=False,
+            )
+        ).compute_loss(model, batch)
     finally:
         handle.remove()
 
