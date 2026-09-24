@@ -199,3 +199,42 @@ def test_memory_completion_is_separate_and_cannot_pass_alignment_gate(tmp_path):
     target.write_text(''.join(json.dumps(x)+'\n' for x in rows if not(x['event']=='backward' and x.get('micro')==4)))
     with pytest.raises(ValueError,match='memory diagnostic'):
         validate_collected_completion(path,**kwargs)
+
+
+@pytest.mark.parametrize('checkpoint',[False,True])
+def test_aligned_ordinary_probe_reaches_real_coordinator_dry_run(tmp_path,monkeypatch,capsys,checkpoint):
+    """The approved worker mode must survive the coordinator's launch validator."""
+    run_id='off-checkpoint-coordinator-dry-run'
+    repository=coordinator._REPOSITORY_ROOT
+    spec_path=tmp_path/'spec.json'
+    spec_path.write_text(json.dumps(dict(path='aligned',mode='ordinary_backward_memory',
+        source_updates=[60,61],off_activation_checkpointing=checkpoint,save_on_cpu=False,
+        result_dir=str(repository/'results'/run_id),tensor_dir=str(repository/'checkpoints'/run_id/'tensors'))))
+    for key,value in dict(STAGE1_CHECKPOINT='/models/stage1',DATA_PATH='/data/train.jsonl',IMAGE_ROOT='/data',
+        TUNING_METHOD='dora',STAGE2_EXECUTION_PROFILE='latest_external_until',
+        STEP_OFF_ACTIVATION_CHECKPOINTING=str(checkpoint).lower(),ILVR_UNTIL_ALIGNMENT_GATE_SPEC=str(spec_path)).items():
+        monkeypatch.setenv(key,value)
+    assert coordinator._training_main('stage2',['--run-id',run_id,'--zero-stage','2',
+        '--main-process-port','29631','--max_steps','212','--save_steps','212','--dry-run'])==0
+    output=json.loads(capsys.readouterr().out)
+    assert output['remote'] and output['local']
+    assert output['plan']['world_size']==4
+
+
+@pytest.mark.parametrize('change',[
+    {'mode':'unknown'}, {'source_updates':None}, {'source_updates':[1,1]},
+    {'source_updates':[1,212]}, {'source_updates':[True,2]},
+    {'off_activation_checkpointing':1}, {'save_on_cpu':True},
+])
+def test_aligned_ordinary_launch_rejects_unsupported_replay_or_offload(tmp_path,change):
+    run_id='off-checkpoint-invalid'
+    repository=coordinator._REPOSITORY_ROOT
+    spec=dict(path='aligned',mode='ordinary_backward_memory',source_updates=[1,2],
+        off_activation_checkpointing=True,save_on_cpu=False,
+        result_dir=str(repository/'results'/run_id),tensor_dir=str(repository/'checkpoints'/run_id/'tensors'))
+    spec.update(change)
+    path=tmp_path/'spec.json';path.write_text(json.dumps(spec))
+    plan=coordinator.build_launch_plan(stage='stage2',tuning_method='dora',zero_stage=2,
+                                    run_id=run_id,main_process_port=29631)
+    with pytest.raises(ValueError):
+        runtime.validate_alignment_gate_launch(path,plan=plan,result_root=repository/'results',schedule_steps=212)

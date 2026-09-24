@@ -1828,9 +1828,17 @@ def validate_alignment_gate_launch(spec_path, *, plan, result_root, schedule_ste
         raise ValueError("alignment gate requires Stage2 DoRA ZeRO2 world4 schedule212")
     if spec.get("path") not in ("external", "aligned"):
         raise ValueError("alignment gate path must be external or aligned")
-    if (spec.get("mode", "comparison") not in ("comparison", "ordinary_backward_memory")
-            or (spec.get("mode") == "ordinary_backward_memory" and spec["path"] != "external")):
-        raise ValueError("memory diagnostic mode requires external source")
+    mode = spec.get("mode", "comparison")
+    if mode not in ("comparison", "ordinary_backward_memory"):
+        raise ValueError("unknown alignment gate mode")
+    if mode == "ordinary_backward_memory" and spec["path"] == "aligned":
+        updates = spec.get("source_updates")
+        if (not isinstance(updates, list) or len(updates) != 2
+                or any(type(i) is not int or not 1 <= i <= 211 for i in updates)
+                or len(set(updates)) != 2
+                or type(spec.get("off_activation_checkpointing")) is not bool
+                or spec.get("save_on_cpu", False)):
+            raise ValueError("aligned ordinary probe requires two distinct full source updates, explicit checkpoint mode, and no CPU offload")
     for field, root in (("tensor_dir", _CHECKPOINT_ROOT / plan.run_id),
                         ("result_dir", Path(result_root) / plan.run_id)):
         target = Path(spec.get(field, ""))
