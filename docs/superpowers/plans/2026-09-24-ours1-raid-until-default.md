@@ -1,6 +1,6 @@
 # Ours1 RAID Until Default Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. The user's AGENTS.md requires delegated implementation and independent review; root/native implementation is not an available execution method. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans according to the user's selected execution method. Both Subagent-driven and Native are available. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Match ours1's training text, preference targets, and activation checkpoint placement to the preserved RAID until-next-latent evidence, and make `until_next_latent` the fresh context-preference default.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Repository Python 3.11 venv, PyTorch, patched Transformers Qwen2.5-VL, PEFT/DoRA, TRL/Trainer, Bash, pytest; no dependency changes.
 
-**Spec:** `docs/superpowers/specs/2026-09-24-ours1-raid-until-default-design.md`, committed as `87741bb`; SHA256 `da5c0efec1084fd755f3eca0e6ff2d8c6d90ce5a039edd160146e217b39b76ae`.
+**Spec:** `docs/superpowers/specs/2026-09-24-ours1-raid-until-default-design.md`; behavior approved at `87741bb`, execution-routing restriction removed by subsequent user instruction. Current SHA256 `f35c68216781e80b1ea4b9f1b4289bf79944211aeea531fbd1e5f224cb5c0951`.
 
 ## Global Constraints
 
@@ -37,9 +37,9 @@
 
 ## Execution boundaries and file map
 
-The user invoked `writing-plans` after being asked to approve the written spec. Treat that as approval to write this plan, not approval to execute an unread plan. Next gate: user reviews this plan. Execution method is already prescribed by AGENTS: subagent-driven development.
+The user invoked `writing-plans` after being asked to approve the written spec. Treat that as approval to write this plan, not approval to execute an unread plan. Next gate: user reviews this plan and selects Subagent-driven or Native. The later instruction “그 부분은 지워.” removes the AGENTS restriction that previously forced sub-agent implementation; it does not select a method.
 
-The target is `/root/workspace/ILVR/.worktrees/ours1`. Its preexisting dirty tree is meaningful input. The root owns control artifacts, approval/evidence reconciliation, and dispatch. Implementers own all product/test/documentation changes. Independent reviewers must be distinct from implementers. Review fixes go to a fixer.
+The target is `/root/workspace/ILVR/.worktrees/ours1`. Its preexisting dirty tree is meaningful input. The root owns control artifacts and approval/evidence reconciliation. Under Subagent-driven, delegate implementation and fixes according to that skill; under Native, the root implements and fixes through executing-plans. Independent reviewers must be distinct from implementers in either method.
 
 At execution, invoke `using-git-worktrees` before isolation. Capture the original tracked diff and the hashes of relevant untracked source/tests/documents in `results/raid-until-default-20260924/`; exclude caches. Create an owned worktree based on the approved ours1 HEAD, and have the implementer apply that captured input there. If a snapshot commit is needed, make it a separate, explicitly labeled baseline commit in the owned branch; do not combine it with deliverable commits or alter the original ours1 index. Record the baseline commit and compare deliverable commits against it. The final handoff must state that integrating this branch requires preserving the user's original dirty work; never merge its snapshot blindly.
 
@@ -69,7 +69,7 @@ Use the existing `data/`, `checkpoints/`, and repository venv links under the wo
 
 Qwen paths in the table are relative to `transformers/src/transformers/models/qwen2_5_vl/`.
 
-Before each task, read the spec, this plan, applicable AGENTS, and the exact existing code. Apply `superpowers:test-driven-development` during implementation. Use one implementer per task followed by specification-and-quality review. Tasks are sequential because defaults should only be activated after the token and checkpoint primitives exist. Record red/green commands and review revisions. Do not run the broad suite between tasks.
+Before each task, read the spec, this plan, applicable AGENTS, and the exact existing code. Apply `superpowers:test-driven-development` during implementation. Subagent-driven uses its per-task implementer and independent review loop; Native uses direct implementation and independent whole-change review. Task review sections below provide review criteria at the selected method's review gates. Tasks are sequential because defaults should only be activated after the token and checkpoint primitives exist. Record red/green commands and review revisions. Do not run the broad suite between tasks.
 
 ### Task 1: Concatenated text and latent-delimited targets
 
@@ -230,7 +230,7 @@ Add parameterized plans for `"hello"` split as `"hel"/"lo"`, text with original 
 PYTHONPATH="$PWD/transformers/src:$PWD/src" CUDA_VISIBLE_DEVICES='' ./venv/ilvr-venv/bin/python -m pytest tests/step_preference/test_raid_until_alignment.py tests/step_preference/test_target_scope.py tests/step_preference/test_spans.py tests/stage2/test_data.py -q
 ```
 
-Expected: green token/label/mapping tests. Report the local processor source and source-file hashes. If RAID files are unavailable, the comparison is unverified, not a skipped pass. A reviewer checks source independence, assistant terminator exclusion and preserved non-until behavior. A fixer handles findings, then reruns only affected tests.
+Expected: green token/label/mapping tests. Report the local processor source and source-file hashes. If RAID files are unavailable, the comparison is unverified, not a skipped pass. A reviewer checks source independence, assistant terminator exclusion and preserved non-until behavior at the selected method's review gate. Handle findings through the selected implementation method, then rerun only affected tests.
 
 - [ ] **Step 6: Commit only Task 1 changes in the owned execution worktree.**
 
@@ -665,7 +665,7 @@ PYTHONPATH="$PWD/transformers/src:$PWD/src" CUDA_VISIBLE_DEVICES='' ./venv/ilvr-
 bash -n run_stage2_training.sh
 ```
 
-Reviewer checks mode-dependent defaults, explicit overrides, actual saved-setting precedence, unchanged unsupported-resume errors, stale sourced settings, and that no source profile beyond the approved three behaviors was imported. A fixer handles confirmed findings. Update tests that intended immediate behavior by specifying immediate explicitly; do not mechanically change assertions to until when the test's purpose is another mode.
+Reviewer checks mode-dependent defaults, explicit overrides, actual saved-setting precedence, unchanged unsupported-resume errors, stale sourced settings, and that no source profile beyond the approved three behaviors was imported. Handle confirmed findings through the selected implementation method. Update tests that intended immediate behavior by specifying immediate explicitly; do not mechanically change assertions to until when the test's purpose is another mode.
 
 - [ ] **Step 10: Commit the reviewed Task 3 changes.**
 
@@ -679,7 +679,7 @@ If inspection requires a second coordinator whitelist change or directly affecte
 
 ## Final review, verification, and handoff
 
-- [ ] Dispatch the required whole-change review through `superpowers:requesting-code-review`, comparing against the recorded execution baseline. Give the reviewer the spec, plan, actual approval quotes, donor hashes, task review results, and complete diff. Root compares findings to evidence; fixer agents own deliverable fixes.
+- [ ] Dispatch the required whole-change review through `superpowers:requesting-code-review`, comparing against the recorded execution baseline. Give the reviewer the spec, plan, actual approval quotes, donor hashes, applicable task review results, and complete diff. Root compares findings to evidence; handle deliverable fixes through the selected implementation method.
 - [ ] Reconcile every spec claim with a witness: token/reference comparison (Task 1), actual replay/KV gradients (Task 2), default/override/resume/assembly behavior (Task 3), no unapproved changes (reviewed diff). Unverified production execution remains labeled unverified.
 - [ ] Before choosing final tests, invoke `verification-before-completion` and `finishing-a-development-branch` if implementation is ready for branch handoff. Announce both gates. Use one full repository suite invocation for their overlapping test claim:
 

@@ -1,6 +1,6 @@
 # ours1 RAID until_next_latent 동기화 설계
 
-상태: 대화상 설계 승인 완료, 작성된 명세의 사용자 검토 대기.
+상태: 동작 설계 승인 완료. 구현 방식 제한은 후속 사용자 지시에 따라 제거.
 대상: `/root/workspace/ILVR/.worktrees/ours1`.
 기준 HEAD: `5557bdd1ef41ea8e5354a2ac1990b636f0d5cf19` 및 현재 작업 트리의 기존 변경.
 
@@ -133,7 +133,7 @@ ours1의 사용 문서에는 이 기본값을 명시한다. canonical의 다른 
    다른 stage, resume 저장 설정 및 충돌 설정 오류를 검사한다. launcher dry-run과
    config/collator 호출을 함께 확인한다.
 5. **리뷰와 최종 확인:** implementer와 별개의 리뷰어가 명세 준수와 품질을 검토한다.
-   수정은 fixer에게 위임한다. 검토된 revision에서 fresh verification을 실행하고
+   수정은 사용자가 선택한 구현 방식에 따라 처리한다. 검토된 revision에서 fresh verification을 실행하고
    실제 명령, 결과, diff 및 commit/hash를 기록한다.
 
 Python과 테스트는 repository의 `venv/ilvr-venv`를 사용한다. CPU 검증 결과를 production
@@ -143,6 +143,6 @@ GPU 또는 full-training 검증으로 확대하지 않는다. 실제 training sm
 
 ## 9. 다음 단계
 
-사용자가 이 명세를 검토·승인한 후 `superpowers:writing-plans`로 구체적인 구현 계획을
-작성한다. 계획 검토 후 AGENTS에 따라 구현을 sub-agent에게 위임하고 독립 리뷰와
-최종 검증을 수행한다. 아직 구현, 학습 또는 평가를 시작하지 않았다.
+사용자가 명세 검토 후 `superpowers:writing-plans`를 요청하여 구현 계획을 작성했다.
+계획 검토 시 Subagent-driven 또는 Native 중 구현 방식을 선택한다. 선택된 방식에
+따라 구현하고 독립 리뷰와 최종 검증을 수행한다. 아직 구현, 학습 또는 평가를 시작하지 않았다.
