@@ -16,6 +16,7 @@ from step_preference.sidecar import build_context_sidecar_plan
 from step_preference.spans import (
     ASSISTANT_PLAN_RENDERING_CONCATENATED,
     ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    build_assistant_plan, map_reasoning_step_spans,
 )
 from tests.step_preference.test_spans import STAGE2A_CHECKPOINT
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
@@ -82,6 +83,40 @@ def test_until_keeps_join_token_and_final_answer(tmp_path):
         spans[-1].target_text_start:spans[-1].target_text_end
     ].tolist()
     assert all(ids[s.target_text_start:s.target_text_end].numel() > 0 for s in spans)
+
+
+@pytest.mark.parametrize("delimiter", ["start", "end"])
+def test_until_rejects_wrong_latent_delimiter_id(delimiter):
+    """Catches a non-PAD replacement at either latent delimiter position."""
+    tokenizer = AutoProcessor.from_pretrained(
+        STAGE2A_CHECKPOINT, local_files_only=True,
+    ).tokenizer
+    assistant, plan_spans, steps = build_assistant_plan(
+        [{"type": "text", "content": "Before."},
+         {"type": "latent", "helper_image": "helper.png"},
+         {"type": "text", "content": "After."}],
+        2, require_reasoning_units=True,
+    )
+    encoded = tokenizer(
+        [assistant], add_special_tokens=False, return_tensors="pt",
+        return_offsets_mapping=True,
+    )
+    ids = encoded["input_ids"].clone()
+    token_ids = _token_ids(tokenizer)
+    original = getattr(token_ids, f"{delimiter}_token_id")
+    positions = (ids[0] == original).nonzero(as_tuple=True)[0]
+    assert positions.numel() == 1
+    ids[0, positions[0]] = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    with pytest.raises(ValueError, match="latent block delimiters"):
+        map_reasoning_step_spans(
+            rendered_text=assistant, assistant_text=assistant,
+            plan_char_spans=plan_spans, reasoning_steps=steps,
+            offset_mapping=encoded["offset_mapping"], input_ids=ids,
+            latent_pad_token_id=token_ids.pad_token_id,
+            latent_start_token_id=token_ids.start_token_id,
+            latent_end_token_id=token_ids.end_token_id,
+            preference_target_scope="until_next_latent",
+        )
 
 
 @pytest.mark.parametrize("plan,expected", [

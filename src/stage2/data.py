@@ -372,6 +372,8 @@ class Stage2DataCollator:
                 offset_mapping=offset_mapping,
                 input_ids=batch["input_ids"],
                 latent_pad_token_id=self.token_ids.pad_token_id,
+                latent_start_token_id=self.token_ids.start_token_id,
+                latent_end_token_id=self.token_ids.end_token_id,
                 preference_target_scope=self.preference_target_scope,
             )
             batch["sample_ids"] = (example.sample_id,)

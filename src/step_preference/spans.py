@@ -133,6 +133,8 @@ def map_reasoning_step_spans(
     input_ids,
     latent_pad_token_id: int,
     preference_target_scope: str = "immediate_text",
+    latent_start_token_id: int | None = None,
+    latent_end_token_id: int | None = None,
 ) -> tuple[ReasoningStepSpan, ...]:
     """Map assistant character plans onto half-open full-sequence token spans."""
     preference_target_scope = normalize_preference_target_scope(preference_target_scope)
@@ -201,6 +203,8 @@ def map_reasoning_step_spans(
         return selected[0], selected[-1] + 1
 
     if preference_target_scope == "until_next_latent":
+        if latent_start_token_id is None or latent_end_token_id is None:
+            raise ValueError("until_next_latent requires latent START and END token IDs")
         assistant_begin, assistant_end = token_interval(
             assistant_start, assistant_start + len(assistant_text)
         )
@@ -215,11 +219,9 @@ def map_reasoning_step_spans(
                 assistant_start + step.latent.end,
             )
             body_start, end = start + 1, after_end - 1
-            if not (
-                ids[start] != latent_pad_token_id
-                and ids[end] != latent_pad_token_id
-                and body_start < end
-            ):
+            if not (ids[start] == latent_start_token_id
+                    and ids[end] == latent_end_token_id
+                    and body_start < end):
                 raise ValueError("latent block delimiters or body are invalid")
             if any(token != latent_pad_token_id for token in ids[body_start:end]):
                 raise ValueError("latent token interval contains a non-latent-pad token")
