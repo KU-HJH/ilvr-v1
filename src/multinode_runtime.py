@@ -847,6 +847,7 @@ def validate_stage1_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
 
 _STAGE2_ENVIRONMENT_ALLOWLIST = {
     "STAGE2_EXECUTION_PROFILE",
+    "STAGE2_EXTERNAL_GLOBAL_BATCH_SIZE",
     "ILVR_UNTIL_ALIGNMENT_GATE_SPEC",
     "STAGE1_CHECKPOINT",
     "DATA_PATH",

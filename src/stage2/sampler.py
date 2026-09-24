@@ -68,7 +68,8 @@ class Stage2SamplerIdentity:
                 "update_accounting", "padding_weight", "reference_grouping"}
             if (set(payload) != expected or payload["policy"] != "external_until_balanced"
                     or payload["world_size"] != 4 or payload["reference_grouping"] != 2
-                    or payload["gradient_accumulation_steps"] != 4
+                    or type(payload["gradient_accumulation_steps"]) is not int
+                    or payload["gradient_accumulation_steps"] not in (2, 4)
                     or payload["update_accounting"] != "ceil" or payload["padding_weight"] != 1):
                 raise ValueError("invalid external_until_balanced sampler identity")
             legacy = {k: payload[k] for k in _STAGE2_SAMPLER_IDENTITY_FIELDS}
@@ -77,7 +78,8 @@ class Stage2SamplerIdentity:
             if (parsed.dataset_size + parsed.padded_samples) % 4:
                 raise ValueError("external grouping2 stream must divide into four actual ranks")
             return cls(3, parsed.seed, 4, parsed.dataset_size, parsed.bucket_sizes,
-                       parsed.padded_samples, "external_until_balanced", 4, 2)
+                       parsed.padded_samples, "external_until_balanced",
+                       payload["gradient_accumulation_steps"], 2)
         reference = isinstance(payload, dict) and payload.get("schema_version") == 2
         fields = _STAGE2_SAMPLER_IDENTITY_FIELDS | (
             {"policy", "gradient_accumulation_steps", "update_accounting", "padding_weight"} if reference else set()
@@ -242,15 +244,16 @@ class ExternalUntilBalancedSampler(LatentBlockBalancedSampler):
     """Frozen external grouping-two stream, sharded by Accelerate over four ranks."""
 
     def __init__(self, dataset, *, num_replicas, seed, gradient_accumulation_steps):
-        if num_replicas != 4 or gradient_accumulation_steps != 4:
-            raise ValueError("external_until_balanced requires four ranks and accumulation4")
+        if num_replicas != 4 or type(gradient_accumulation_steps) is not int \
+                or gradient_accumulation_steps not in (2, 4):
+            raise ValueError("external_until_balanced requires four ranks and accumulation2 or4")
         super().__init__(dataset, num_replicas=2, seed=seed)
         source = self.identity
         if len(self) % 4:
             raise ValueError("external grouping2 stream must divide into four actual ranks")
         self.num_replicas = 4
         self.identity = Stage2SamplerIdentity(3, seed, 4, len(dataset), source.bucket_sizes,
-            source.padded_samples, "external_until_balanced", 4, 2)
+            source.padded_samples, "external_until_balanced", gradient_accumulation_steps, 2)
 
     def __iter__(self):
         source = LatentBlockBalancedSampler(self.dataset, num_replicas=2, seed=self.seed)

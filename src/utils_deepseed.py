@@ -29,6 +29,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--latent_size", type=int, default=8)
     parser.add_argument("--stage2_reproduction_probe_dir", type=str, default="")
     parser.add_argument("--stage2_execution_profile", choices=("legacy", "latest_external_until"), default="legacy")
+    parser.add_argument("--stage2_external_global_batch_size", type=int, choices=(8, 16), default=16)
     parser.add_argument("--stage2_sampler_policy", choices=("auto", "latent_balanced", "reference_random", "external_until_balanced"), default="auto")
     parser.add_argument("--stage2_reference_sampler_probe_dir", type=str, default="")
     parser.add_argument("--stage2_diagnostics_interval", type=int, default=0)
@@ -245,7 +246,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             stage2b_direct_from_stage1=True, stage2_assistant_plan_rendering="concatenated-v1",
             load_model_path="/root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct",
             stage1_adapter_path="/root/workspace/ILVR/checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431",
-            stage2_total_steps=212, max_steps=212, gradient_accumulation_steps=4,
+            stage2_total_steps=(423 if args.stage2_external_global_batch_size == 8 else 212),
+            max_steps=(423 if args.stage2_external_global_batch_size == 8 else 212),
+            gradient_accumulation_steps=(2 if args.stage2_external_global_batch_size == 8 else 4),
             per_device_train_batch_size=1, epochs=1., learning_rate=5e-5, warm_up_steps=10, seed=42,
             tuning_method="dora", tuning_method_explicit=True, lora_r=32, lora_alpha=64,
             lora_dropout=.05, lora_target_modules="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
@@ -255,6 +258,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             stage2_latent_activation_checkpointing=True, max_seq_length_train=8192, dataloader_num_workers=4)
         for name, value in resolved.items():
             setattr(args, name, value)
+    elif args.stage2_external_global_batch_size != 16:
+        raise ValueError("stage2_external_global_batch_size=8 requires latest_external_until")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         raise ValueError("Learning rate must be finite and positive")
     if args.lora_r <= 0 or args.lora_alpha <= 0:
