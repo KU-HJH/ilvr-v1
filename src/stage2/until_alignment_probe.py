@@ -79,12 +79,15 @@ def select_windows(order, lengths, latent_counts, *, source_updates=None):
             raise ValueError('memory probe requires two distinct full source updates')
         selected = [i-1 for i in source_updates]
     indices = [j for i in selected for j in groups[i]]
-    return {'source_updates': [i+1 for i in selected],
+    replay = {'source_updates': [i+1 for i in selected],
             'indices': indices,
-            'lengths': [lengths[i] for i in indices], 'latent_counts': [latent_counts[i] for i in indices],
             'coefficients': [1/16]*len(indices), 'challenge_source_update': challenge+1,
             'challenge_proxy': 'sum(length^2*(1+latent_count))',
             'historical_optimizer_state_reproduced': False}
+    if source_updates is not None:
+        replay.update(lengths=[lengths[i] for i in indices],
+                      latent_counts=[latent_counts[i] for i in indices])
+    return replay
 
 
 def tensor_destination(path):

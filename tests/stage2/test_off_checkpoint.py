@@ -190,3 +190,14 @@ def test_aligned_capacity_acceptance_requires_real_replay_gradients_and_nonzero_
         row=next(r for r in reversed(altered) if r['event']==event)
         row[key]=value
         assert not check_memory_runtime(altered,replay)['complete'],(event,key)
+
+
+def test_default_replay_preserves_frozen_strict_envelope_schema():
+    """Unrequested geometry keys invalidate previously frozen structural identity."""
+    from stage2.until_alignment_probe import select_windows
+    order=list(range(84));lengths=[10]*84;lengths[65]=100
+    # Baseline frozen schema and hand-selected first three/challenge/tail groups.
+    expected={'source_updates':[1,2,3,5,6],'indices':list(range(48))+list(range(64,84)),
+        'coefficients':[1/16]*68,'challenge_source_update':5,
+        'challenge_proxy':'sum(length^2*(1+latent_count))','historical_optimizer_state_reproduced':False}
+    assert select_windows(order,lengths,[1]*84)==expected
