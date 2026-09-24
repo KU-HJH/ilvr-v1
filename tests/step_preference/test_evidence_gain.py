@@ -137,7 +137,8 @@ def test_invalid_prefix_or_image_policy_fails_closed(kwargs):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='Flex integration needs CUDA')
 @pytest.mark.parametrize('blocked', [False, True])
-def test_cuda_flex_checkpoint_matches_dense_loss_and_gradients(blocked):
+def test_cuda_flex_checkpoint_matches_dense_loss_and_gradients(blocked, monkeypatch):
+    monkeypatch.setattr(torch.backends.cuda.matmul, 'allow_tf32', False)
     model, batch = case()
     model = model.cuda()
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
