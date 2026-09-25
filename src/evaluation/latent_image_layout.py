@@ -5,6 +5,12 @@ SINK, TEMPLATE, IMAGE, QUESTION, REASONING, LATENT = range(6)
 PREV_BLOCK, CURRENT_BLOCK = 5, 6
 REGION_NAMES = ("sink", "template", "image", "question", "reasoning", "prev_block", "current_block")
 
+# R26: sub-classification of CURRENT_BLOCK keys for a LATENT-group query (see
+# `current_block_subcodes`).
+CB_SELF, CB_CUR_START, CB_CUR_PREV, CB_OUTSIDE = range(4)
+CB_SUBCODE_NAMES = ("self", "cur_start", "cur_prev", "outside")
+CB_SUBCODES = tuple(zip(CB_SUBCODE_NAMES, range(4)))
+
 
 @dataclass(frozen=True)
 class LayoutTokenIds:
@@ -127,3 +133,24 @@ def query_regions(layout, query):
             code = CURRENT_BLOCK if own >= 0 and layout.block_of[key] == own else PREV_BLOCK
         codes.append(code)
     return codes
+
+
+def current_block_subcodes(layout, query):
+    """R26: sub-classification of the query's own CURRENT_BLOCK keys (see `query_regions`)
+    into SELF (the query's own diagonal position), CUR_START (the block's START token, only
+    when the query itself is not START), and CUR_PREV (earlier same-block pads: pad1..pad(k-1)
+    for query pad k, all pads for the END query). Every other visible key -- including every
+    non-CURRENT_BLOCK region -- is OUTSIDE. Meant for a LATENT-group query (START/pad/END);
+    for a query outside any block (`layout.block_of[query] < 0`) every key is OUTSIDE except
+    the query's own diagonal position (still SELF). Returns one sub-code per key 0..query."""
+    if not 0 <= query < layout.length:
+        raise ValueError("query outside sequence")
+    own = layout.block_of[query]
+    sub = [CB_OUTSIDE] * (query + 1)
+    if own >= 0:
+        b = layout.blocks[own]
+        for key in (b.start, *b.pads):
+            if key < query:
+                sub[key] = CB_CUR_START if key == b.start else CB_CUR_PREV
+    sub[query] = CB_SELF
+    return sub

@@ -2,6 +2,7 @@ import pytest
 from evaluation.latent_image_layout import (
     LayoutTokenIds, build_layout, query_regions, latent_query_positions,
     SINK, TEMPLATE, IMAGE, QUESTION, REASONING, LATENT, PREV_BLOCK, CURRENT_BLOCK,
+    current_block_subcodes, CB_SELF, CB_CUR_START, CB_CUR_PREV, CB_OUTSIDE,
 )
 
 T = LayoutTokenIds(image=80, vision_start=81, vision_end=83, im_end=84,
@@ -60,3 +61,68 @@ def test_malformed_block_raises():
     s = suffix([91, 90, 92], [84])
     with pytest.raises(ValueError, match="latent block"):
         build_layout(PROMPT + s, len(PROMPT), T, latent_size=2)
+
+
+# ---------------------------------------------------------------------------
+# R26: current-block sub-classification (SELF / CUR_START / CUR_PREV / OUTSIDE)
+# ---------------------------------------------------------------------------
+
+def _cb_layout():
+    s = suffix([10], [91, 90, 90, 92], [13], [91, 90, 90, 92], [70, 71, 5], [84])
+    return build_layout(PROMPT + s, len(PROMPT), T, latent_size=2, control_k=8)
+
+
+def test_current_block_subcodes_start_query_is_self_only():
+    # Only SELF is possible in-block for the START query: no earlier same-block key exists.
+    lay = _cb_layout()
+    b = lay.blocks[0]
+    codes = current_block_subcodes(lay, b.start)
+    assert len(codes) == b.start + 1
+    assert codes[b.start] == CB_SELF
+    assert CB_CUR_START not in codes and CB_CUR_PREV not in codes
+
+
+def test_current_block_subcodes_pad1_is_self_and_cur_start_only():
+    lay = _cb_layout()
+    b = lay.blocks[0]
+    codes = current_block_subcodes(lay, b.pads[0])
+    assert codes[b.start] == CB_CUR_START
+    assert codes[b.pads[0]] == CB_SELF
+    assert CB_CUR_PREV not in codes
+
+
+def test_current_block_subcodes_pad2_sees_pad1_as_cur_prev():
+    lay = _cb_layout()
+    b = lay.blocks[0]
+    codes = current_block_subcodes(lay, b.pads[1])
+    assert codes[b.start] == CB_CUR_START
+    assert codes[b.pads[0]] == CB_CUR_PREV
+    assert codes[b.pads[1]] == CB_SELF
+
+
+def test_current_block_subcodes_end_query_sees_all_pads_as_cur_prev():
+    lay = _cb_layout()
+    b = lay.blocks[0]
+    codes = current_block_subcodes(lay, b.end)
+    assert codes[b.start] == CB_CUR_START
+    assert all(codes[p] == CB_CUR_PREV for p in b.pads)
+    assert codes[b.end] == CB_SELF
+
+
+def test_current_block_subcodes_every_non_block_key_is_outside():
+    lay = _cb_layout()
+    b = lay.blocks[1]
+    codes = current_block_subcodes(lay, b.end)
+    own = {b.start, *b.pads, b.end}
+    for key in range(b.end + 1):
+        if key not in own:
+            assert codes[key] == CB_OUTSIDE
+    # includes keys from a different block (PREV_BLOCK region) and non-latent regions.
+    assert codes[lay.blocks[0].start] == CB_OUTSIDE
+    assert codes[0] == CB_OUTSIDE                  # sink
+
+
+def test_current_block_subcodes_query_outside_sequence_raises():
+    lay = _cb_layout()
+    with pytest.raises(ValueError, match="outside sequence"):
+        current_block_subcodes(lay, lay.length)

@@ -5,11 +5,12 @@ from pathlib import Path
 import numpy as np
 
 from evaluation import latent_image_stats as st
-from evaluation.latent_image_layout import IMAGE, REGION_NAMES
+from evaluation.latent_image_layout import IMAGE, REGION_NAMES, CB_SUBCODES
 
 GROUPS = ("pad", "start", "end", "pre", "post")
 PALETTE = {"pad": "#2a78d6", "start": "#eb6834", "end": "#1baf7a", "pre": "#eda100", "post": "#e87ba4"}
 PATCH_PALETTE = {"total": "#2a78d6", "direct": "#eb6834", "indirect": "#1baf7a"}
+CB_PALETTE = {"self": "#2a78d6", "cur_start": "#eb6834", "cur_prev": "#1baf7a", "outside": "#9a9a92"}
 MATCHED_SCOPE = "size-matched blocks only"
 RATIO_LABELS = {"direct_ratio_latent_cos_first_block": "primary (first perturbed block only, no propagation)",
                 "direct_ratio_latent_cos": "all blocks, includes propagation",
@@ -192,6 +193,89 @@ def attention_topk(run_dir):
         layers = sample["top1_region"].shape[1]
     return {"status": "RUN", "evidence": "descriptive",
             "k1": _k1_section(npz, meta, layers), "k5": _k5_section(npz, meta, layers)}
+
+
+# ---------------------------------------------------------------------------
+# R26: current-block sub-classification detail (SELF / CUR_START / CUR_PREV / OUTSIDE)
+# ---------------------------------------------------------------------------
+
+CB_TOP1_VARIANTS = {"raw": "cb_top1_raw", "nosink": "cb_top1_nosink", "vw": "cb_top1_vw"}
+CB_TOP5_VARIANTS = {"raw": "cb_top5_raw", "nosink": "cb_top5_nosink", "vw": "cb_top5_vw"}
+CB_NPZ_KEYS = tuple(CB_TOP1_VARIANTS.values()) + tuple(CB_TOP5_VARIANTS.values()) + ("cb_mass", "cb_vw_share")
+
+
+def _cb_slot_units(npz, meta, field, value_fn):
+    """{slot: {subcode_name: {(question, block): [layers] value}}} for LATENT-group rows only
+    (R26): individual slots (start, pad1..padN, end) plus a "pad" pooled group across all
+    pads, one pass over the npz files, question-equal weighting applied later by the callers
+    of `_bootstrap_curves`/`_question_equal_mean` (rows are averaged into their (question,
+    block) unit first, exactly as `_units` does for the existing sections). `value_fn(arr_row,
+    code)` maps one row's raw [layers, heads, ...] array (already float32) and a sub-code to a
+    [layers] value; non-LATENT rows carry no sub-classification data and are skipped."""
+    units = {}
+    for q, path in npz.items():
+        with np.load(path) as data:
+            arr = data[field].astype(np.float32)
+        specs = json.loads(meta[q].read_text())["specs"]
+        for row, spec in enumerate(specs):
+            if spec["group"] != "latent":
+                continue
+            slots = (spec["slot"], "pad") if spec["slot"].startswith("pad") else (spec["slot"],)
+            for name, code in CB_SUBCODES:
+                value = value_fn(arr[row], code)
+                for slot in slots:
+                    units.setdefault(slot, {}).setdefault(name, {}).setdefault(
+                        (q, spec["block"]), []).append(value)
+    return {slot: {name: {k: np.mean(v, 0) for k, v in d.items()} for name, d in names.items()}
+            for slot, names in units.items()}
+
+
+def _cb_curves_and_means(units_by_subcode, layers):
+    return {"by_layer": _bootstrap_curves(units_by_subcode, layers),
+            "overall": _question_equal_mean(units_by_subcode)}
+
+
+_CB_SLOT_ORDER = {"start": (0, 0), "pad": (1, -1), "end": (2, 0)}
+
+
+def _cb_slot_sort_key(slot):
+    if slot in _CB_SLOT_ORDER:
+        return _CB_SLOT_ORDER[slot]
+    if slot.startswith("pad"):
+        return (1, int(slot[3:]))
+    return (3, slot)
+
+
+def current_block_detail(run_dir):
+    npz, meta = _files(run_dir, "attention", "npz"), _files(run_dir, "attention", "json")
+    if not npz:
+        return {"status": "NOT RUN"}
+    with np.load(next(iter(npz.values()))) as sample:
+        if not all(key in sample.files for key in CB_NPZ_KEYS):
+            return {"status": "NOT RUN"}
+        layers = sample["cb_top1_raw"].shape[1]
+
+    top1 = {v: _cb_slot_units(npz, meta, field, lambda a, code: (a == code).mean(-1))
+            for v, field in CB_TOP1_VARIANTS.items()}
+    top5_mean = {v: _cb_slot_units(npz, meta, field, lambda a, code: a[..., code].mean(-1))
+                for v, field in CB_TOP5_VARIANTS.items()}
+    top5_contains = {v: _cb_slot_units(npz, meta, field, lambda a, code: (a[..., code] >= 1).mean(-1))
+                     for v, field in CB_TOP5_VARIANTS.items()}
+    mass = _cb_slot_units(npz, meta, "cb_mass", lambda a, code: a[..., code].mean(-1))
+    vw_share = _cb_slot_units(npz, meta, "cb_vw_share", lambda a, code: a[..., code].mean(-1))
+
+    slots = sorted({s for d in (*top1.values(), *top5_mean.values(), mass) for s in d}, key=_cb_slot_sort_key)
+    result = {}
+    for slot in slots:
+        result[slot] = {
+            "k1": {v: _cb_curves_and_means(top1[v].get(slot, {}), layers) for v in CB_TOP1_VARIANTS},
+            "k5": {v: {"mean_count": _cb_curves_and_means(top5_mean[v].get(slot, {}), layers),
+                       "contains_share": _cb_curves_and_means(top5_contains[v].get(slot, {}), layers)}
+                  for v in CB_TOP5_VARIANTS},
+            "mass": _cb_curves_and_means(mass.get(slot, {}), layers),
+            "vw_share": _cb_curves_and_means(vw_share.get(slot, {}), layers),
+        }
+    return {"status": "RUN", "evidence": "descriptive", "slots": result}
 
 
 def _question_means(docs, name, metric, first_block=False, keep=None):
@@ -394,6 +478,8 @@ def _markdown(summary):
     titles = {
         "attention": "③ Attention (evidence level: technical/descriptive)",
         "attention_topk": "③b Attention top-1/top-5 region attribution (evidence level: technical/descriptive)",
+        "current_block_detail": "③c Current-block sub-classification: SELF/CUR_START/CUR_PREV/OUTSIDE "
+                               "(evidence level: technical/descriptive)",
         "knockout": "① Knockout (evidence level: causal)",
         "patching": "② Image patching (evidence level: causal)",
         "content": "B. Latent information content (evidence level: information content)",
@@ -414,7 +500,7 @@ def _markdown(summary):
         section = summary[key]
         status = section.get("status", "RUN") if isinstance(section, dict) else "RUN"
         lines += [f"## {title}", "", f"Status: **{status}**", ""]
-        if status == "GATE FAILED" and key in ("attention", "attention_topk"):
+        if status == "GATE FAILED" and key in ("attention", "attention_topk", "current_block_detail"):
             lines += [f"{'/'.join(section.get('gate_failures', []))} exceeded its tolerance for at least one "
                       "analysed question; this section's numbers are **GATE FAILED** and should not be "
                       "trusted as descriptive evidence.", ""]
@@ -513,6 +599,32 @@ def write_figures(run_dir, summary):
         fig.savefig(figures / "attention_topk_layers.png", dpi=150)
         plt.close(fig)
 
+    detail = summary.get("current_block_detail", {})
+    if isinstance(detail, dict) and detail.get("status") == "RUN":
+        slots_order = sorted((s for s in detail["slots"] if s != "pad"), key=_cb_slot_sort_key)
+        names = [name for name, _ in CB_SUBCODES]
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        width = 0.8 / len(names)
+        xs = np.arange(len(slots_order))
+        for i, name in enumerate(names):
+            offset = xs + (i - (len(names) - 1) / 2) * width
+            k1_vals = [detail["slots"][s]["k1"]["nosink"]["overall"].get(name, 0.0) for s in slots_order]
+            ax1.bar(offset, k1_vals, width=width, color=CB_PALETTE[name], label=name)
+            k5_vals = [detail["slots"][s]["k5"]["nosink"]["mean_count"]["overall"].get(name, 0.0)
+                      for s in slots_order]
+            ax2.bar(offset, k5_vals, width=width, color=CB_PALETTE[name], label=name)
+        ax1.set_xticks(xs); ax1.set_xticklabels(slots_order)
+        ax1.set_ylabel("share"); ax1.set_title("Top-1 sub-code share (nosink)")
+        ax2.set_xticks(xs); ax2.set_xticklabels(slots_order)
+        ax2.set_ylabel("mean count (0-5)"); ax2.set_title("Top-5 sub-code mean count (nosink)")
+        for ax in (ax1, ax2):
+            ax.set_xlabel("latent slot")
+            ax.legend(frameon=False)
+            ax.spines[["top", "right"]].set_visible(False)
+        fig.tight_layout()
+        fig.savefig(figures / "current_block_detail.png", dpi=150)
+        plt.close(fig)
+
     patching = summary.get("patching", {})
     if isinstance(patching, dict) and patching.get("status") == "RUN":
         kinds = list(patching.get("by_corruption", {}))
@@ -570,6 +682,7 @@ def build_report(run_dir, provenance=None):
     run_dir = Path(run_dir)
     knockout, patching, content = intervention_sections(run_dir)
     summary = {"attention": attention_section(run_dir), "attention_topk": attention_topk(run_dir),
+               "current_block_detail": current_block_detail(run_dir),
                "knockout": knockout, "patching": patching,
                "content": content, "sensitivity_excluding_truncated": truncation_sensitivity_section(run_dir),
                "freegen": freegen_section(run_dir), "gates": gates_section(run_dir)}
@@ -579,7 +692,7 @@ def build_report(run_dir, provenance=None):
             if summary[key].get("status") == "RUN":
                 summary[key]["status"] = "GATE FAILED"
     failures = attention_gate_failures(summary["gates"])
-    for key in ("attention", "attention_topk"):
+    for key in ("attention", "attention_topk", "current_block_detail"):
         if failures and summary[key].get("status") == "RUN":
             summary[key].update(status="GATE FAILED", gate_failures=failures)
     summary = json.loads(json.dumps(summary, default=float))

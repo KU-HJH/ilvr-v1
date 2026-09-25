@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from evaluation.latent_image_layout import IMAGE, SINK, TEMPLATE
+from evaluation.latent_image_layout import IMAGE, SINK, TEMPLATE, CB_SELF, CB_CUR_START
 
 LAYERS, HEADS, HIDDEN = 4, 2, 6
 KNOCKOUT = ("reference", "noop_repeat", "k_all", "k_heads", "k_random")
@@ -12,13 +12,27 @@ PATCH = tuple(f"{k}_{n}" for k in ("blur", "mean", "swap") for n in ("dual_clean
 CANDS = ("cand1", "cand2", "cand3", "cand4")
 
 
+def _cb_one_hot_dominant(codes, dominant=0.7, n_sub=4):
+    """[*, n_sub] mass/share array that puts `dominant` on each entry's own top-1 sub-code
+    and splits the remainder evenly across the other 3 -- keeps the R26 synthetic fixture's
+    mass/vw_share internally consistent with its cb_top1_* arrays without extra randomness."""
+    out = np.full(codes.shape + (n_sub,), (1 - dominant) / (n_sub - 1), dtype=np.float32)
+    for c in range(n_sub):
+        out[..., c] = np.where(codes == c, dominant, out[..., c])
+    return out.astype(np.float16)
+
+
 def write_synthetic_run(run_dir, questions=3, blocks=2, with_freegen=False, image_boost=0.3,
                          omit_post=False, omit_k_random=False, stop_reasons=None, eval_matches=None,
-                         with_topk=False, topk_image_boost=0.6):
+                         with_topk=False, topk_image_boost=0.6, with_cb_detail=False, cb_pad_boost=0.7):
     """`blocks` is an int (same for every question) or a per-question sequence.
     `stop_reasons` / `eval_matches` optionally override the per-question eval metadata.
     `with_topk` adds the R25-addendum top1/top5 npz keys (region codes / booleans / counts),
-    with `topk_image_boost` the probability that a boosted (pad-row) head lands on IMAGE."""
+    with `topk_image_boost` the probability that a boosted (pad-row) head lands on IMAGE.
+    `with_cb_detail` adds the R26 current-block sub-classification npz keys (cb_top1_*,
+    cb_top5_*, cb_mass, cb_vw_share; LATENT-group rows only, matching `capture_attention`'s
+    sentinel-255/zero defaults elsewhere), with `cb_pad_boost` the probability that a pad
+    row's sub-code is forced to CUR_START (vs. uniform random) so pad/start/end differ."""
     run_dir, rng = Path(run_dir), np.random.default_rng(0)
     per_q_blocks = [blocks] * questions if isinstance(blocks, int) else list(blocks)
     stop_reasons = stop_reasons or ["eos"] * questions
@@ -59,6 +73,33 @@ def write_synthetic_run(run_dir, questions=3, blocks=2, with_freegen=False, imag
             arrays.update(top1_region=region, top1_region_nosink=region_nosink, top1_vw_region=vw_region,
                          top5_image=(region == IMAGE).astype(np.uint8), top5_image_nosink=top5_image_nosink,
                          top5_image_count=top5_image_count, top5_vw_image=(vw_region == IMAGE).astype(np.uint8))
+        if with_cb_detail:
+            shape = (rows, LAYERS, HEADS)
+
+            def cb_codes():
+                codes = rng.integers(0, 4, size=shape).astype(np.uint8)
+                for r, spec in enumerate(specs):
+                    if spec["group"] == "latent" and spec["slot"].startswith("pad"):
+                        codes[r][rng.random((LAYERS, HEADS)) < cb_pad_boost] = CB_CUR_START
+                    elif spec["group"] != "latent":
+                        codes[r] = 255                            # sentinel: non-LATENT rows
+                return codes
+            cb_top1_raw, cb_top1_nosink, cb_top1_vw = cb_codes(), cb_codes(), cb_codes()
+
+            def cb_top5(top1):
+                counts = np.zeros(shape + (4,), dtype=np.uint8)
+                for c in range(4):
+                    counts[..., c] = np.where(top1 == c, 5, 0)
+                counts[top1 == 255] = 0                            # sentinel rows: zeros, not counts
+                return counts
+            cb_mass = _cb_one_hot_dominant(cb_top1_raw)
+            cb_vw_share = _cb_one_hot_dominant(cb_top1_vw)
+            non_latent = [r for r, spec in enumerate(specs) if spec["group"] != "latent"]
+            cb_mass[non_latent] = 0
+            cb_vw_share[non_latent] = 0
+            arrays.update(cb_top1_raw=cb_top1_raw, cb_top1_nosink=cb_top1_nosink, cb_top1_vw=cb_top1_vw,
+                         cb_top5_raw=cb_top5(cb_top1_raw), cb_top5_nosink=cb_top5(cb_top1_nosink),
+                         cb_top5_vw=cb_top5(cb_top1_vw), cb_mass=cb_mass, cb_vw_share=cb_vw_share)
         np.savez(run_dir / "attention" / f"q{q}.npz", **arrays)
         (run_dir / "attention" / f"q{q}.json").write_text(json.dumps(
             {"specs": specs, "g1": 1e-3, "g1b": 5e-4, "g2": 1e-4, "g5": {"excluded": False, "rate": 1.0},

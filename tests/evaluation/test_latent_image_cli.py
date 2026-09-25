@@ -2,11 +2,13 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from evaluation import latent_image_cli as cli
 from evaluation.latent_image_interventions import ConditionResult
 from evaluation.latent_image_layout import LayoutTokenIds, build_layout
+from tests.evaluation.test_latent_image_interventions import tiny, trajectory  # noqa: F401  (fixture reuse)
 
 T = LayoutTokenIds(80, 81, 83, 84, 91, 90, 92, (70, 71))
 PROMPT = [1, 2, 81, 80, 80, 83, 5, 6, 84, 7, 8]
@@ -604,6 +606,48 @@ def test_stage_attention_excludes_over_budget_question_without_running_model(tmp
     for idx in indices:
         doc = json.loads((run_dir / "attention" / "excluded" / f"q{idx}.json").read_text())
         assert doc == {"excluded": True, "reason": "length_budget", "dual_length": 8500}
+
+
+def test_stage_attention_writes_current_block_subcode_keys(tmp_path, monkeypatch, tiny):
+    # R26: the CLI's npz writer must actually include the current-block sub-classification
+    # arrays `capture_attention` now produces -- catches a plumbing regression that a
+    # capture_attention-only unit test (see test_latent_image_attention.py) cannot.
+    import evaluation.latent_image_interventions as li
+    import evaluation.latent_image_trajectory as lt
+    data_path = tmp_path / "TEST.jsonl"
+    _write_jsonl(data_path, [{"image_input": ["x"]}])
+    selection_path = tmp_path / "metadata.json"
+    selection_path.write_text(json.dumps({"selection": {"requested_indices": [0]}}))
+    eval_rows_path = tmp_path / "merged.jsonl"
+    _write_jsonl(eval_rows_path, [{"index": 0, "stop_reason": "eos"}])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    cli.write_json_atomic(run_dir / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(run_dir / "swaps.json", {"questions": {"0": {"category": "deletion", "swaps": []}}})
+    monkeypatch.setattr(cli, "_teacher_forced_setup", lambda args: (tiny, None, T))
+    monkeypatch.setattr(lt, "build_trajectory", lambda *a, **k: trajectory())
+    monkeypatch.setattr(cli, "heatmap_questions", lambda selection, categories: ())
+    monkeypatch.setattr(cli, "g5_for", lambda reference, traj: {
+        "excluded": False, "reason": None, "rate": 1.0, "first_mismatch": None})
+    real_run_condition = li.run_condition
+
+    def run_condition_mid0(model, traj, condition, **kwargs):
+        # `reference` is run with mid_layer=18 (the real model's layer count) by default;
+        # force mid_layer=0 to match the 2-layer tiny model, same as capture_attention's own
+        # internal "noop" call.
+        kwargs.setdefault("mid_layer", 0)
+        return real_run_condition(model, traj, condition, **kwargs)
+    monkeypatch.setattr(li, "run_condition", run_condition_mid0)
+    args = _stage_args("attention", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+    assert cli.stage_attention(args) == 0
+    with np.load(run_dir / "attention" / "q0.npz") as data:
+        for key in ("cb_top1_raw", "cb_top1_nosink", "cb_top1_vw", "cb_top5_raw", "cb_top5_nosink",
+                   "cb_top5_vw", "cb_mass", "cb_vw_share"):
+            assert key in data.files, f"{key} missing from the written npz"
+        assert data["cb_top1_raw"].dtype == np.uint8
+        assert data["cb_top5_raw"].shape[-1] == 4 and data["cb_mass"].shape[-1] == 4
 
 
 def test_attention_meta_records_eval_stop_reason():

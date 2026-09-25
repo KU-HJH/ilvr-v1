@@ -1,7 +1,7 @@
 import json
 import numpy as np
 from evaluation.latent_image_report import build_report
-from evaluation.latent_image_layout import REGION_NAMES
+from evaluation.latent_image_layout import REGION_NAMES, CB_SUBCODE_NAMES, CB_SELF, CB_CUR_START
 from tests.evaluation.latent_image_fixtures import write_synthetic_run
 
 
@@ -217,7 +217,8 @@ def test_report_md_has_complete_json_and_noise_floor_note(tmp_path):
 def test_report_md_never_truncates_large_sections(tmp_path):
     from evaluation.latent_image_report import _markdown
     big = {"status": "RUN", "values": list(range(20000))}
-    summary = {k: {"status": "NOT RUN"} for k in ("attention", "attention_topk", "knockout", "patching", "content",
+    summary = {k: {"status": "NOT RUN"} for k in ("attention", "attention_topk", "current_block_detail",
+                                                  "knockout", "patching", "content",
                                                   "sensitivity_excluding_truncated", "freegen", "gates")}
     summary["content"] = big
     text = _markdown(summary)
@@ -313,3 +314,73 @@ def test_attention_topk_gate_failure_mirrors_attention(tmp_path):
     assert summary["attention"]["status"] == "GATE FAILED"
     assert summary["attention_topk"]["status"] == "GATE FAILED"
     assert summary["attention_topk"]["gate_failures"] == ["G2"]
+
+
+# ---------------------------------------------------------------------------
+# R26: current_block_detail (SELF / CUR_START / CUR_PREV / OUTSIDE sub-classification)
+# ---------------------------------------------------------------------------
+
+def test_current_block_detail_not_run_without_cb_keys(tmp_path):
+    write_synthetic_run(tmp_path, questions=3, blocks=2)                 # no with_cb_detail
+    summary = build_report(tmp_path)
+    assert summary["current_block_detail"] == {"status": "NOT RUN"}
+    assert "NOT RUN" in (tmp_path / "report.md").read_text()
+
+
+def test_current_block_detail_reports_per_slot_and_pooled_pad(tmp_path):
+    write_synthetic_run(tmp_path, questions=12, blocks=2, with_cb_detail=True, cb_pad_boost=0.95)
+    summary = build_report(tmp_path)
+    detail = summary["current_block_detail"]
+    assert detail["status"] == "RUN" and detail["evidence"] == "descriptive"
+    slots = detail["slots"]
+    assert set(slots) >= {"start", "pad1", "pad2", "pad", "end"}
+    for slot in slots:
+        assert set(slots[slot]) == {"k1", "k5", "mass", "vw_share"}
+        for variant in ("raw", "nosink", "vw"):
+            assert set(CB_SUBCODE_NAMES) <= set(slots[slot]["k1"][variant]["overall"])
+            assert len(slots[slot]["k1"][variant]["by_layer"]["self"]) == 4     # LAYERS fixture
+            assert set(CB_SUBCODE_NAMES) <= set(slots[slot]["k5"][variant]["mean_count"]["overall"])
+            assert set(CB_SUBCODE_NAMES) <= set(slots[slot]["k5"][variant]["contains_share"]["overall"])
+        assert set(CB_SUBCODE_NAMES) <= set(slots[slot]["mass"]["overall"])
+        assert set(CB_SUBCODE_NAMES) <= set(slots[slot]["vw_share"]["overall"])
+    # pad rows are boosted toward CUR_START; start rows are not -> pooled "pad" shows more
+    # CUR_START than "start", across k1 (nosink, the primary variant), k5 mean count, and mass.
+    assert slots["pad"]["k1"]["nosink"]["overall"]["cur_start"] > slots["start"]["k1"]["nosink"]["overall"]["cur_start"]
+    assert (slots["pad"]["k5"]["nosink"]["mean_count"]["overall"]["cur_start"]
+           > slots["start"]["k5"]["nosink"]["mean_count"]["overall"]["cur_start"])
+    assert slots["pad"]["mass"]["overall"]["cur_start"] > slots["start"]["mass"]["overall"]["cur_start"]
+    assert (tmp_path / "figures" / "current_block_detail.png").exists()
+
+
+def test_current_block_detail_pad_pooling_weights_rows_then_block_then_question(tmp_path):
+    # R26: "pad" pools rows -> block -> question, question-equal. A single question/block with
+    # pad1 all-SELF and pad2 all-CUR_START must pool to an even 0.5/0.5 split, not some other
+    # row-count-weighted mix (both pads have the same row count here, so this also guards
+    # against an accidental block-only or layer-collapsing average elsewhere).
+    write_synthetic_run(tmp_path, questions=1, blocks=1, with_cb_detail=True)
+    path = tmp_path / "attention" / "q0.npz"
+    meta = json.loads((tmp_path / "attention" / "q0.json").read_text())
+    with np.load(path) as data:
+        arrays = {k: data[k] for k in data.files}
+    pad1_rows = [i for i, s in enumerate(meta["specs"]) if s["slot"] == "pad1"]
+    pad2_rows = [i for i, s in enumerate(meta["specs"]) if s["slot"] == "pad2"]
+    arrays["cb_top1_nosink"][pad1_rows] = CB_SELF
+    arrays["cb_top1_nosink"][pad2_rows] = CB_CUR_START
+    np.savez(path, **arrays)
+    detail = build_report(tmp_path)["current_block_detail"]
+    pad_k1 = detail["slots"]["pad"]["k1"]["nosink"]["overall"]
+    assert np.isclose(pad_k1["self"], 0.5) and np.isclose(pad_k1["cur_start"], 0.5)
+    assert np.isclose(pad_k1["cur_prev"], 0.0) and np.isclose(pad_k1["outside"], 0.0)
+
+
+def test_current_block_detail_gate_failure_mirrors_attention(tmp_path):
+    write_synthetic_run(tmp_path, questions=3, blocks=2, with_cb_detail=True)
+    assert build_report(tmp_path)["current_block_detail"]["status"] == "RUN"
+    path = tmp_path / "attention" / "q1.json"
+    doc = json.loads(path.read_text())
+    doc["g2"] = 5e-3
+    path.write_text(json.dumps(doc))
+    summary = build_report(tmp_path)
+    assert summary["attention"]["status"] == "GATE FAILED"
+    assert summary["current_block_detail"]["status"] == "GATE FAILED"
+    assert summary["current_block_detail"]["gate_failures"] == ["G2"]

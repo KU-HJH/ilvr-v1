@@ -542,7 +542,12 @@ def stage_attention(args):
                      "top1_region": capture.top1_region, "top1_region_nosink": capture.top1_region_nosink,
                      "top1_vw_region": capture.top1_vw_region, "top5_image": capture.top5_image,
                      "top5_image_nosink": capture.top5_image_nosink, "top5_image_count": capture.top5_image_count,
-                     "top5_vw_image": capture.top5_vw_image}
+                     "top5_vw_image": capture.top5_vw_image,
+                     # R26: current-block sub-classification (SELF/CUR_START/CUR_PREV/OUTSIDE).
+                     "cb_top1_raw": capture.cb_top1_raw, "cb_top1_nosink": capture.cb_top1_nosink,
+                     "cb_top1_vw": capture.cb_top1_vw, "cb_top5_raw": capture.cb_top5_raw,
+                     "cb_top5_nosink": capture.cb_top5_nosink, "cb_top5_vw": capture.cb_top5_vw,
+                     "cb_mass": capture.cb_mass, "cb_vw_share": capture.cb_vw_share}
             if capture.image_probs is not None:
                 arrays["image_probs"] = capture.image_probs
             savez_atomic(args.run_dir / "attention" / f"q{idx}.npz", **arrays)

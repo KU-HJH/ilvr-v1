@@ -7,7 +7,9 @@ import numpy as np
 import torch
 
 from evaluation.latent_image_interventions import Condition, run_condition
-from evaluation.latent_image_layout import IMAGE, REGION_NAMES, query_regions
+from evaluation.latent_image_layout import (
+    IMAGE, REGION_NAMES, query_regions, current_block_subcodes, CB_SUBCODE_NAMES,
+)
 from stage2.peft import resolve_stage2_qwen_model
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb, repeat_kv
 
@@ -37,9 +39,18 @@ class AttentionCapture:
     top5_image_nosink: np.ndarray
     top5_image_count: np.ndarray
     top5_vw_image: np.ndarray
+    cb_top1_raw: np.ndarray
+    cb_top1_nosink: np.ndarray
+    cb_top1_vw: np.ndarray
+    cb_top5_raw: np.ndarray
+    cb_top5_nosink: np.ndarray
+    cb_top5_vw: np.ndarray
+    cb_mass: np.ndarray
+    cb_vw_share: np.ndarray
 
 
 NOSINK_SENTINEL = 255
+N_CB_SUBCODES = len(CB_SUBCODE_NAMES)
 
 
 def _row_topk(p_row, w_row, code):
@@ -76,6 +87,54 @@ def _row_topk(p_row, w_row, code):
             top5_image_count, top5_vw_image)
 
 
+def _row_current_block(p_row, w_row, subcode):
+    """Sub-code partition (R26) of the top-1/top-5 attended keys for one LATENT-group query
+    row, all heads at once -- the same shape of computation as `_row_topk`, but classifying
+    every visible key into SELF/CUR_START/CUR_PREV/OUTSIDE (see `current_block_subcodes`)
+    instead of the 7 region codes.
+
+    `p_row` / `w_row`: [heads, n_visible] raw probs / probs*contrib (unnormalized), restricted
+    to the row's visible keys, exactly as passed to `_row_topk`. `subcode`: [n_visible] R26
+    sub-code per key (0 SELF, 1 CUR_START, 2 CUR_PREV, 3 OUTSIDE; key 0 is always the sink,
+    which is always OUTSIDE in practice but that is not assumed here).
+
+    Returns (top1, top1_nosink, top1_vw, top5, top5_nosink, top5_vw, mass, vw_mass):
+    - top1/top1_nosink/top1_vw: [heads] uint8 sub-code of the top-1 key (raw / nosink / vw;
+      NOSINK_SENTINEL when key 0 is the row's only visible key, as in `_row_topk`).
+    - top5/top5_nosink/top5_vw: [heads, 4] uint8 counts of the top-5 keys landing in each
+      sub-code (sums to min(5, candidates); top5_nosink is all-zero in the only-sink case).
+    - mass: [heads, 4] float32 raw-probability mass per sub-code (unnormalized, like `_row_topk`
+      callers' `p_row`; mass[..., :3].sum(-1) equals the row's existing CURRENT_BLOCK region
+      mass and mass.sum(-1) equals p_row.sum(-1)).
+    - vw_mass: [heads, 4] float32 unnormalized value-weighted mass per sub-code; the caller
+      normalizes it into a share, exactly as for the existing 7-region `vw_share`.
+    """
+    heads, n_visible = p_row.shape
+    device = p_row.device
+    n_sub = N_CB_SUBCODES
+
+    def top5_counts(p, sub):
+        k = min(5, p.shape[-1])
+        picked = sub[p.topk(k, dim=-1).indices]                              # [heads, k]
+        return torch.zeros(heads, n_sub, device=device, dtype=torch.int64).scatter_add_(
+            1, picked, torch.ones_like(picked)).to(torch.uint8)
+
+    top1 = subcode[p_row.argmax(-1)].to(torch.uint8)
+    top1_vw = subcode[w_row.argmax(-1)].to(torch.uint8)
+    top5 = top5_counts(p_row, subcode)
+    top5_vw = top5_counts(w_row, subcode)
+    mass = torch.zeros(heads, n_sub, device=device).index_add_(1, subcode, p_row)
+    vw_mass = torch.zeros(heads, n_sub, device=device).index_add_(1, subcode, w_row)
+    if n_visible > 1:
+        p_nosink, sub_nosink = p_row[:, 1:], subcode[1:]
+        top1_nosink = sub_nosink[p_nosink.argmax(-1)].to(torch.uint8)
+        top5_nosink = top5_counts(p_nosink, sub_nosink)
+    else:
+        top1_nosink = torch.full((heads,), NOSINK_SENTINEL, dtype=torch.uint8, device=device)
+        top5_nosink = torch.zeros(heads, n_sub, dtype=torch.uint8, device=device)
+    return top1, top1_nosink, top1_vw, top5, top5_nosink, top5_vw, mass, vw_mass
+
+
 def query_specs(layout):
     specs = []
     for b in layout.blocks:
@@ -93,6 +152,10 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
     specs = query_specs(layout)
     rows = [s.position for s in specs]              # single-image layout: physical == logical
     codes = [torch.tensor(query_regions(layout, p)) for p in rows]
+    # R26: sub-classification of the CURRENT_BLOCK keys, LATENT-group rows only (None
+    # elsewhere -- see `_row_current_block`'s docstring and the module docstring §1).
+    subcodes = [torch.tensor(current_block_subcodes(layout, p), dtype=torch.int64) if s.group == "latent" else None
+               for s, p in zip(specs, rows)]
     n_layers, heads = len(qwen.model.layers), qwen.config.num_attention_heads
     mass = np.zeros((len(rows), n_layers, heads, len(REGION_NAMES)), np.float32)
     vw = np.zeros_like(mass)
@@ -106,6 +169,17 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
     top5_image_nosink = np.zeros(topk_shape, np.uint8)
     top5_image_count = np.zeros(topk_shape, np.uint8)
     top5_vw_image = np.zeros(topk_shape, np.uint8)
+    # R26: non-LATENT rows keep the documented defaults (255 sentinel / 0) and are never
+    # written into below.
+    cb_top1_raw = np.full(topk_shape, NOSINK_SENTINEL, np.uint8)
+    cb_top1_nosink = np.full(topk_shape, NOSINK_SENTINEL, np.uint8)
+    cb_top1_vw = np.full(topk_shape, NOSINK_SENTINEL, np.uint8)
+    cb5_shape = topk_shape + (N_CB_SUBCODES,)
+    cb_top5_raw = np.zeros(cb5_shape, np.uint8)
+    cb_top5_nosink = np.zeros(cb5_shape, np.uint8)
+    cb_top5_vw = np.zeros(cb5_shape, np.uint8)
+    cb_mass = np.zeros(cb5_shape, np.float32)
+    cb_vw_share = np.zeros(cb5_shape, np.float32)
     worst = {"g1": 0.0, "g1b": 0.0, "g2": 0.0}
 
     def layer_hooks(index, attn):
@@ -176,6 +250,18 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
                 top5_image_nosink[i, index] = t5n.cpu().numpy()
                 top5_image_count[i, index] = t5c.cpu().numpy()
                 top5_vw_image[i, index] = t5v.cpu().numpy()
+                sub = subcodes[i]
+                if sub is not None:
+                    sub = sub.to(x.device)
+                    cb1, cb1n, cb1v, cb5, cb5n, cb5v, cbm, cbw = _row_current_block(p_row, w_row, sub)
+                    cb_top1_raw[i, index] = cb1.cpu().numpy()
+                    cb_top1_nosink[i, index] = cb1n.cpu().numpy()
+                    cb_top1_vw[i, index] = cb1v.cpu().numpy()
+                    cb_top5_raw[i, index] = cb5.cpu().numpy()
+                    cb_top5_nosink[i, index] = cb5n.cpu().numpy()
+                    cb_top5_vw[i, index] = cb5v.cpu().numpy()
+                    cb_mass[i, index] = cbm.cpu().numpy()
+                    cb_vw_share[i, index] = (cbw / cbw.sum(-1, keepdim=True).clamp_min(1e-12)).cpu().numpy()
                 if image_probs is not None:
                     image_probs[i, index] = probs[:, i, list(layout.image_positions)].mean(0).cpu().numpy()
             seen.clear()
@@ -197,4 +283,6 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
     run_condition(model, trajectory, Condition("noop"), final_observer=observer, mid_layer=0)
     return AttentionCapture(specs, mass.astype(np.float16), vw.astype(np.float16), enrich, image_probs,
                             worst["g1"], worst["g1b"], worst["g2"], top1_region, top1_region_nosink,
-                            top1_vw_region, top5_image, top5_image_nosink, top5_image_count, top5_vw_image)
+                            top1_vw_region, top5_image, top5_image_nosink, top5_image_count, top5_vw_image,
+                            cb_top1_raw, cb_top1_nosink, cb_top1_vw, cb_top5_raw, cb_top5_nosink, cb_top5_vw,
+                            cb_mass.astype(np.float16), cb_vw_share.astype(np.float16))

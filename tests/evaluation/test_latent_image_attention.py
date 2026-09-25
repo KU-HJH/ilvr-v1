@@ -1,7 +1,10 @@
 import numpy as np
+import pytest
 import torch
 from evaluation import latent_image_attention as la
-from evaluation.latent_image_layout import IMAGE, SINK, TEMPLATE
+from evaluation.latent_image_layout import (
+    IMAGE, SINK, TEMPLATE, CURRENT_BLOCK, CB_SELF, CB_CUR_START, CB_CUR_PREV, CB_OUTSIDE,
+)
 from step_preference.equivalence import _tiny_model
 from tests.evaluation.test_latent_image_interventions import tiny, trajectory  # noqa: F401  (fixture reuse)
 
@@ -131,6 +134,70 @@ def test_row_topk_fewer_than_five_visible_keys():
     assert t5c.tolist() == [1]
 
 
+# ---------------------------------------------------------------------------
+# R26: current-block sub-classification (SELF / CUR_START / CUR_PREV / OUTSIDE)
+# ---------------------------------------------------------------------------
+
+def _sub(*codes):
+    return torch.tensor(codes, dtype=torch.int64)
+
+
+def test_row_current_block_picks_argmax_subcode_and_nosink_excludes_key0():
+    # key 0 (highest raw prob) is OUTSIDE; excluding it (nosink) leaves SELF as the argmax.
+    p = torch.tensor([[0.7, 0.2, 0.1]])                       # [heads=1, n_visible=3]
+    w = p.clone()
+    sub = _sub(CB_OUTSIDE, CB_SELF, CB_CUR_START)
+    top1, top1n, top1v, top5, top5n, top5v, mass, vw = la._row_current_block(p, w, sub)
+    assert top1.tolist() == [CB_OUTSIDE]
+    assert top1n.tolist() == [CB_SELF]
+    assert top1v.tolist() == [CB_OUTSIDE]
+
+
+def test_row_current_block_nosink_sentinel_when_only_key0_visible():
+    p = torch.tensor([[1.0], [1.0]])                          # heads=2, n_visible=1
+    w = p.clone()
+    sub = _sub(CB_SELF)
+    top1, top1n, top1v, top5, top5n, top5v, mass, vw = la._row_current_block(p, w, sub)
+    assert top1.tolist() == [CB_SELF, CB_SELF]
+    assert top1n.tolist() == [la.NOSINK_SENTINEL, la.NOSINK_SENTINEL]
+    assert top5n.tolist() == [[0, 0, 0, 0], [0, 0, 0, 0]]
+
+
+def test_row_current_block_top5_counts_and_vw_uses_weighted():
+    # 6 visible keys: OUTSIDE, 3x SELF/CUR_START/CUR_PREV (one each), 2x OUTSIDE. Raw probs
+    # rank key0 (OUTSIDE) highest, then the 3 in-block keys, then the 2 remaining OUTSIDE keys
+    # -> nosink top-5 (k=5) contains all 3 in-block keys plus 2 OUTSIDE keys. The weighted (vw)
+    # row reorders so the argmax is CUR_PREV instead of the sink, proving vw uses `w_row`.
+    p = torch.tensor([[0.30, 0.25, 0.20, 0.15, 0.06, 0.04]])
+    w = torch.tensor([[0.10, 0.10, 0.15, 0.40, 0.20, 0.05]])   # index 3 (CUR_PREV) dominates
+    sub = _sub(CB_OUTSIDE, CB_SELF, CB_CUR_START, CB_CUR_PREV, CB_OUTSIDE, CB_OUTSIDE)
+    top1, top1n, top1v, top5, top5n, top5v, mass, vw = la._row_current_block(p, w, sub)
+    assert top1.tolist() == [CB_OUTSIDE]
+    assert top1n.tolist() == [CB_SELF]
+    assert top1v.tolist() == [CB_CUR_PREV]
+    assert top5.tolist() == [[1, 1, 1, 2]]           # SELF, CUR_START, CUR_PREV, 2x OUTSIDE
+    assert top5n.tolist() == [[1, 1, 1, 2]]          # same 5 keys once key 0 is excluded (n=5)
+    assert top5v.tolist() == [[1, 1, 1, 2]]
+
+
+def test_row_current_block_fewer_than_five_visible_keys():
+    p = torch.tensor([[0.5, 0.3, 0.2]])
+    w = p.clone()
+    sub = _sub(CB_OUTSIDE, CB_SELF, CB_CUR_START)
+    top1, top1n, top1v, top5, top5n, top5v, mass, vw = la._row_current_block(p, w, sub)
+    assert top5.tolist() == [[1, 1, 0, 1]]
+    assert top5n.tolist() == [[1, 1, 0, 0]]          # only 2 nosink candidates
+
+
+def test_row_current_block_mass_partitions_raw_probs():
+    p = torch.tensor([[0.4, 0.3, 0.2, 0.1]])
+    w = p.clone()
+    sub = _sub(CB_SELF, CB_CUR_START, CB_CUR_PREV, CB_OUTSIDE)
+    *_, mass, vw = la._row_current_block(p, w, sub)
+    np.testing.assert_allclose(mass.numpy(), [[0.4, 0.3, 0.2, 0.1]], atol=1e-6)
+    assert mass[:, :3].sum().item() == pytest.approx(0.9)
+
+
 def test_capture_topk_fields_shapes_and_nosink_excludes_sink(tiny):
     tr = trajectory()
     cap = la.capture_attention(tiny, tr)
@@ -152,3 +219,47 @@ def test_capture_topk_fields_shapes_and_nosink_excludes_sink(tiny):
     imaged = cap.top1_region_nosink == IMAGE
     assert (cap.top5_image_nosink[imaged] == 1).all()
     assert (cap.top5_image_count[imaged] >= 1).all()
+
+
+def test_capture_current_block_fields_shapes_sentinels_and_mass_consistency(tiny):
+    tr = trajectory()
+    cap = la.capture_attention(tiny, tr)
+    layers, heads = tiny.config.num_hidden_layers, tiny.config.num_attention_heads
+    shape = (len(cap.specs), layers, heads)
+    shape5 = shape + (4,)
+    for field in ("cb_top1_raw", "cb_top1_nosink", "cb_top1_vw"):
+        arr = getattr(cap, field)
+        assert arr.shape == shape and arr.dtype == np.uint8
+    for field in ("cb_top5_raw", "cb_top5_nosink", "cb_top5_vw"):
+        arr = getattr(cap, field)
+        assert arr.shape == shape5 and arr.dtype == np.uint8
+    for field in ("cb_mass", "cb_vw_share"):
+        arr = getattr(cap, field)
+        assert arr.shape == shape5 and arr.dtype == np.float16
+
+    latent_rows = [i for i, s in enumerate(cap.specs) if s.group == "latent"]
+    other_rows = [i for i, s in enumerate(cap.specs) if s.group != "latent"]
+    assert other_rows                       # the trajectory fixture has pre/post-text rows too
+    # non-LATENT rows carry only the documented sentinel / zero defaults (R26 brief §1).
+    assert (cap.cb_top1_raw[other_rows] == la.NOSINK_SENTINEL).all()
+    assert (cap.cb_top1_nosink[other_rows] == la.NOSINK_SENTINEL).all()
+    assert (cap.cb_top1_vw[other_rows] == la.NOSINK_SENTINEL).all()
+    assert (cap.cb_top5_raw[other_rows] == 0).all()
+    assert (cap.cb_mass[other_rows] == 0).all()
+    assert (cap.cb_vw_share[other_rows] == 0).all()
+
+    # LATENT rows: the 4 sub-code top-5 counts sum to 5 (every latent query here sees >= 5
+    # keys), and cb_mass[...,:3] sums to the existing CURRENT_BLOCK region mass.
+    assert (cap.cb_top5_raw[latent_rows].sum(-1) == 5).all()
+    cb_inblock_mass = cap.cb_mass[latent_rows].astype(np.float32)[..., :3].sum(-1)
+    current_block_mass = cap.mass[latent_rows].astype(np.float32)[..., CURRENT_BLOCK]
+    np.testing.assert_allclose(cb_inblock_mass, current_block_mass, atol=2e-3)
+    np.testing.assert_allclose(cap.cb_vw_share.astype(np.float32).sum(-1)[latent_rows], 1, atol=2e-3)
+
+    # START rows: only SELF is possible in-block (R26 spec), so nosink top-1 is SELF or
+    # OUTSIDE only, and the top-5 counts for CUR_START/CUR_PREV are always 0.
+    start_rows = [i for i, s in enumerate(cap.specs) if s.group == "latent" and s.slot == "start"]
+    assert start_rows
+    assert np.isin(cap.cb_top1_raw[start_rows], [CB_SELF, CB_OUTSIDE]).all()
+    assert (cap.cb_top5_raw[start_rows][..., CB_CUR_START] == 0).all()
+    assert (cap.cb_top5_raw[start_rows][..., CB_CUR_PREV] == 0).all()
