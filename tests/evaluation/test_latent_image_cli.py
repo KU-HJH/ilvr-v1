@@ -674,28 +674,82 @@ def test_stage_report_allows_different_commit_but_checks_inputs(tmp_path):
         cli.require_manifest(run_dir, {**manifest["inputs"], "data": "other"}, "x", allow_commit_change=True)
 
 
-def test_stage_freegen_records_eval_match(tmp_path, monkeypatch):
-    import sys
-    from types import ModuleType
+def _freegen_fixture(tmp_path, monkeypatch, n=2, trajectory_skipped=None):
+    import evaluation.latent_image_trajectories_gen as gen
     data_path = tmp_path / "TEST.jsonl"
-    _write_jsonl(data_path, [{"image_input": ["x"]}, {"image_input": ["y"]}])
+    _write_jsonl(data_path, [{"image_input": [str(i)]} for i in range(n)])
     selection_path = tmp_path / "metadata.json"
-    selection_path.write_text(json.dumps({"selection": {"requested_indices": [0, 1]}}))
+    selection_path.write_text(json.dumps({"selection": {"requested_indices": list(range(n))}}))
     eval_rows_path = tmp_path / "merged.jsonl"
-    _write_jsonl(eval_rows_path, [{"index": 0, "match": True}, {"index": 1, "match": False}])
+    _write_jsonl(eval_rows_path, [{"index": i, "match": i == 0} for i in range(n) if i not in (trajectory_skipped or ())])
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     model_dir, base_model_dir = _model_dirs(tmp_path)
-    _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
-    fake_eval = ModuleType("eval")
-    fake_eval.load_evaluation_artifacts = lambda **kwargs: (None, None)
-    monkeypatch.setitem(sys.modules, "eval", fake_eval)
-    monkeypatch.setattr(cli, "question_freegen", lambda *a: {"match": True, "stop_reason": "eos"})
+    manifest = _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    if trajectory_skipped is not None:
+        cli.write_json_atomic(run_dir / "manifest.json", {**manifest, "trajectory_skipped": list(trajectory_skipped)})
+    calls = {"setup": 0, "precision": [], "generated": [], "tf32": []}
+
+    def setup(args):
+        calls["setup"] += 1
+        return "model", "processor", T
+    monkeypatch.setattr(cli, "_teacher_forced_setup", setup)
+
+    def apply(model, precision):
+        calls["precision"].append((model, precision))
+        return {"language": "torch.float32", "visual": "torch.bfloat16"}
+    monkeypatch.setattr(cli, "apply_precision", apply)
+
+    def generate(model, processor, test_row, data_root, *, mode=None, expected_prompt_identity=None):
+        calls["generated"].append((int(test_row["image_input"][0]), mode))
+        calls["tf32"].append(torch.backends.cuda.matmul.allow_tf32)
+        if test_row["image_input"][0] == "2":
+            return {"skipped": "length_budget", "prompt_token_length": 9000, "image_tokens": 1,
+                    "prompt_dual_length": 9001}
+        return {"match": True, "stop_reason": "eos"}
+    monkeypatch.setattr(gen, "generate_question", generate)
     args = _stage_args("freegen", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+    return args, run_dir, calls
+
+
+def test_stage_freegen_records_eval_match(tmp_path, monkeypatch):
+    args, run_dir, _ = _freegen_fixture(tmp_path, monkeypatch)
     assert cli.stage_freegen(args) == 0
     for mode in ("causal_mask", "latent_mask"):
         assert json.loads((run_dir / "freegen" / mode / "q0.json").read_text())["eval_match"] is True
         assert json.loads((run_dir / "freegen" / mode / "q1.json").read_text())["eval_match"] is False
+
+
+def test_stage_freegen_uses_analysis_numerics_and_records_precision(tmp_path, monkeypatch):
+    args, run_dir, calls = _freegen_fixture(tmp_path, monkeypatch)
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        assert cli.stage_freegen(args) == 0
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+    assert calls["setup"] == 1 and calls["precision"] == [("model", "fp32")]
+    assert calls["tf32"] and not any(calls["tf32"])                 # generated inside numerical_policy()
+    assert sorted(calls["generated"]) == [(0, "causal_mask"), (0, "latent_mask"), (1, "causal_mask"),
+                                          (1, "latent_mask")]
+    doc = json.loads((run_dir / "freegen" / "causal_mask" / "q0.json").read_text())
+    assert doc["precision"] == {"language": "torch.float32", "visual": "torch.bfloat16"}
+
+
+def test_stage_freegen_skips_length_budget_questions(tmp_path, monkeypatch):
+    # q2: prompt over budget (skip record from generation); q3: skipped by trajectory regeneration.
+    args, run_dir, calls = _freegen_fixture(tmp_path, monkeypatch, n=4, trajectory_skipped=[3])
+    assert cli.stage_freegen(args) == 0
+    assert all(idx != 3 for idx, _ in calls["generated"])
+    for mode in ("causal_mask", "latent_mask"):
+        assert sorted(cli.question_files(run_dir / "freegen" / mode, "json")) == [0, 1]
+        skipped = cli.question_files(run_dir / "freegen" / mode / "skipped", "json")
+        assert sorted(skipped) == [2, 3]
+        assert json.loads(skipped[2].read_text())["skipped"] == "length_budget"
+        assert json.loads(skipped[3].read_text()) == {"skipped": "length_budget", "source": "trajectories_skipped"}
+    calls["generated"].clear()
+    assert cli.stage_freegen(args) == 0                              # resume: skip records count as done
+    assert calls["generated"] == []
 
 
 # ---------------------------------------------------------------------------

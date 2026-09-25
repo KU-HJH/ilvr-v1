@@ -325,39 +325,6 @@ def heatmap_questions(selection, categories):
     return tuple(chosen + [i for i in selection if i not in chosen][:2])
 
 
-def question_freegen(model, processor, test_row, data_root, mode):
-    from eval import extract_assistant_content
-    from evaluation.latent_image_trajectory import _open_images
-    from evaluation.runtime import prepare_evaluation_input
-    from evaluation.scoring import score_answer
-    from evaluation.visual_interventions import VisualIntervention
-    from stage2.inference import Stage2InferenceController, build_stage2_generation_config
-    from stage2.peft import resolve_stage2_qwen_model
-    from stage2.checkpointing import resolve_latent_token_ids  # same helper eval.py uses
-    qwen = resolve_stage2_qwen_model(model)
-    images, _ = _open_images(test_row, data_root)
-    prepared = prepare_evaluation_input(processor, test_row, images)
-    device = qwen.model.embed_tokens.weight.device
-    inputs = {k: v.to(device) for k, v in prepared.tensors.items()}
-    config = build_stage2_generation_config(
-        model_config=qwen.config, model_generation_config=getattr(qwen, "generation_config", None),
-        tokenizer=processor.tokenizer,
-        generation_kwargs={"max_new_tokens": 4096, "temperature": 0.0, "top_p": 1.0, "repetition_penalty": 1.0,
-                           "max_sequence_length": 128000, "generation_limit_policy": "external_full_latent_block"})
-    with torch.inference_mode():
-        result = Stage2InferenceController().generate(
-            model=qwen, input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
-            token_ids=resolve_latent_token_ids(processor.tokenizer, qwen.config), generation_config=config,
-            pixel_values=inputs["pixel_values"], image_grid_thw=inputs["image_grid_thw"],
-            intervention=VisualIntervention(mode, qwen.config.image_token_id))
-    suffix = result.sequences[:, prepared.prompt_token_length:]
-    assistant = extract_assistant_content(processor.batch_decode(suffix, skip_special_tokens=False)[0].strip())
-    score = score_answer(assistant, test_row.get("original_final_answer"))
-    return {"match": bool(score.match), "extracted_final_answer": score.prediction.extracted,
-            "latent_block_count": int(result.latent_block_count), "stop_reason": result.stop_reason,
-            "generated_suffix_token_ids": suffix[0].tolist(), "prompt_identity": prepared.prompt_identity}
-
-
 # ---------------------------------------------------------------------------
 # I/O helpers used by the stage drivers
 # ---------------------------------------------------------------------------
@@ -643,26 +610,45 @@ def stage_interventions(args):
 
 
 def stage_freegen(args):
-    from evaluation.latent_image_trajectory import load_selection
+    """Free generation under both image masks with the analysis numerics (R24):
+    teacher-forced loading, `apply_precision` and `numerical_policy()`. Prompts over
+    the length budget, and questions the trajectory regeneration skipped, get a
+    record under `freegen/<mode>/skipped/` instead of a generation."""
+    from evaluation import latent_image_trajectories_gen as gen
+    from evaluation.latent_image_trajectory import load_eval_rows, load_selection
+    from evaluation.vision_block_runtime import numerical_policy
     manifest = require_manifest(args.run_dir, _current_inputs(args), git_commit())
     require_model_identity(manifest, args)
-    from eval import load_evaluation_artifacts
-    from evaluation.latent_image_trajectory import load_eval_rows
     test_rows = load_test_rows(args.data)
     eval_rows = load_eval_rows(args.eval_rows)
-    selection = load_selection(args.selection)
-    owned = shard_items(selection, args.shard, args.num_shards)
-    model, processor = load_evaluation_artifacts(
-        model_dir=str(args.model_dir), base_model_dir=str(args.base_model_dir), cache_dir="data/cache")
+    owned = shard_items(load_selection(args.selection), args.shard, args.num_shards)
+    skipped = trajectory_skipped(manifest)
+    pending = []
     for mode in ("causal_mask", "latent_mask"):
+        out_dir = args.run_dir / "freegen" / mode
         for idx in owned:
-            out_json = args.run_dir / "freegen" / mode / f"q{idx}.json"
-            if skip_existing(out_json):
+            if skip_existing(out_dir / f"q{idx}.json", out_dir / "skipped" / f"q{idx}.json"):
                 continue
-            result = question_freegen(model, processor, test_rows[idx], args.data_root, mode)
+            if idx in skipped:
+                write_json_atomic(out_dir / "skipped" / f"q{idx}.json",
+                                  {"skipped": "length_budget", "source": "trajectories_skipped"})
+                continue
+            pending.append((mode, idx))
+    if not pending:
+        return 0
+    model, processor, _ = _teacher_forced_setup(args)
+    precision_record = apply_precision(model, args.precision)
+    with numerical_policy():
+        for mode, idx in pending:
+            out_dir = args.run_dir / "freegen" / mode
+            result = gen.generate_question(model, processor, test_rows[idx], args.data_root, mode=mode,
+                                           expected_prompt_identity=eval_rows.get(idx, {}).get("prompt_identity"))
+            if "skipped" in result:
+                write_json_atomic(out_dir / "skipped" / f"q{idx}.json", result)
+                continue
             result["eval_match"] = bool(eval_rows[idx]["match"])      # R19: eval baseline over this set
-            result["precision"] = "not_applicable"     # R22: freegen keeps eval numerics; never cast
-            write_json_atomic(out_json, result)
+            result["precision"] = precision_record
+            write_json_atomic(out_dir / f"q{idx}.json", result)
     return 0
 
 
