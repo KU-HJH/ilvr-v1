@@ -19,6 +19,32 @@ def _files(run_dir, sub, suffix):
     return {int(p.stem[1:]): p for p in sorted((run_dir / sub).glob(f"q*.{suffix}"))}
 
 
+def _safe_paired(a_map, b_map, reason="empty paired set"):
+    """paired_cluster_bootstrap over the (a_map & b_map) key intersection, guarded against
+    an empty intersection (e.g. a control group with no text in every block — see Review
+    Focus). Reused by every question-keyed paired bootstrap so the empty check lives in
+    one place instead of being repeated at each call site."""
+    qs = sorted(set(a_map) & set(b_map))
+    if not qs:
+        return {"status": "NO DATA", "reason": reason}
+    return st.paired_cluster_bootstrap([a_map[q] for q in qs], [b_map[q] for q in qs], np.array(qs))
+
+
+def _paired_layer_diff(a_dict, b_dict, layers, reason="empty paired set"):
+    """Per-layer paired_cluster_bootstrap over the (a_dict & b_dict) key intersection
+    (keys are (question, block) units, values are per-layer arrays), guarded the same way
+    as `_safe_paired`. Returns a per-layer list normally, or a single {"status": "NO DATA"}
+    dict when the intersection is empty (e.g. no post-text after the last block in any
+    question)."""
+    keys = sorted(set(a_dict) & set(b_dict))
+    if not keys:
+        return {"status": "NO DATA", "reason": reason}
+    a = np.stack([a_dict[k] for k in keys])
+    b = np.stack([b_dict[k] for k in keys])
+    clusters = np.array([k[0] for k in keys])
+    return [st.paired_cluster_bootstrap(a[:, l], b[:, l], clusters) for l in range(layers)]
+
+
 def _units(npz, meta, field, region_axis=True):
     """(question, block) units: per-group mean over rows of `field`, averaged over heads.
 
@@ -49,21 +75,20 @@ def attention_section(run_dir):
             continue
         values, clusters = np.stack([data[k] for k in keys]), np.array([k[0] for k in keys])
         curves[group] = [st.cluster_bootstrap(values[:, l], clusters) for l in range(layers)]
-    diffs, significant = {}, []
-    for control in ("pre", "post"):
-        keys = sorted(set(units["pad"]) & set(units[control]))
-        a = np.stack([units["pad"][k] for k in keys])
-        b = np.stack([units[control][k] for k in keys])
-        clusters = np.array([k[0] for k in keys])
-        diffs[f"pad_minus_{control}"] = [st.paired_cluster_bootstrap(a[:, l], b[:, l], clusters) for l in range(layers)]
-    for l in range(layers):
-        if all(diffs[f"pad_minus_{c}"][l]["lo"] > 0 for c in ("pre", "post")):
-            significant.append(l)
+    diffs = {f"pad_minus_{control}": _paired_layer_diff(
+                 units["pad"], units[control], layers, reason=f"no {control}-text units in any block")
+             for control in ("pre", "post")}
+    missing_controls = [c for c in ("pre", "post") if isinstance(diffs[f"pad_minus_{c}"], dict)]
+    significant = []
+    if not missing_controls:
+        for l in range(layers):
+            if all(diffs[f"pad_minus_{c}"][l]["lo"] > 0 for c in ("pre", "post")):
+                significant.append(l)
     mass = _units(npz, meta, "mass")
     enrichment = _units(npz, meta, "enrichment", region_axis=False)
     heads = json.loads((run_dir / "heads.json").read_text()) if (run_dir / "heads.json").exists() else None
     return {"status": "RUN", "evidence": "descriptive", "vw_image_share": curves, "differences": diffs,
-            "significant_layers": significant,
+            "significant_layers": significant, "significant_layers_missing_controls": missing_controls,
             "mass_image_mean": {g: float(np.mean([v.mean() for v in d.values()])) for g, d in mass.items() if d},
             "enrichment_mean": {g: float(np.mean([v.mean() for v in d.values()])) for g, d in enrichment.items() if d},
             "heads": heads["heads"] if heads else None}
@@ -131,9 +156,8 @@ def intervention_sections(run_dir):
     knockout = {"status": "RUN", "evidence": "causal", "note": ALL_BLOCK_NOTE,
                 "table": _table(docs, ("noop_repeat", "k_all", "k_heads", "k_random"))}
     a, b = _question_means(docs, "k_all", "latent_cos"), _question_means(docs, "k_random", "latent_cos")
-    qs = sorted(set(a) & set(b))
-    knockout["k_all_minus_k_random_latent_cos"] = st.paired_cluster_bootstrap(
-        [a[q] for q in qs], [b[q] for q in qs], np.array(qs))
+    knockout["k_all_minus_k_random_latent_cos"] = _safe_paired(
+        a, b, reason="no question has both k_all and k_random latent_cos")
     patching = {"status": "RUN", "evidence": "causal", "note": ALL_BLOCK_NOTE, "by_corruption": {}}
     for kind in ("blur", "mean", "swap"):
         names = tuple(f"{kind}_{n}" for n in ("total", "direct", "indirect"))
@@ -147,9 +171,8 @@ def intervention_sections(run_dir):
         lat = _question_means(docs, f"{kind}_total", "latent_cos")
         ctl = {q: d["control_cos"][f"{kind}_total"] for q, d in docs.items()
                if d["control_cos"].get(f"{kind}_total") is not None}
-        qs = sorted(set(lat) & set(ctl))
-        content["sensitivity"][kind] = st.paired_cluster_bootstrap(
-            [lat[q] for q in qs], [ctl[q] for q in qs], np.array(qs)) if qs else None
+        content["sensitivity"][kind] = _safe_paired(
+            lat, ctl, reason=f"no question has both {kind}_total latent_cos and control_cos")
     arrays = {q: np.load(p) for q, p in _files(run_dir, "interventions", "npz").items()}
     for label, body, image in (("mid", "mid_body", "image_mid"), ("final", "final_body", "image_final")):
         per_q = [st.identification_accuracy(a[body].mean(1)[None], a[image][None]) for a in arrays.values()]

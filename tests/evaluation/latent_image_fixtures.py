@@ -10,7 +10,8 @@ PATCH = tuple(f"{k}_{n}" for k in ("blur", "mean", "swap") for n in ("dual_clean
 CANDS = ("cand1", "cand2", "cand3", "cand4")
 
 
-def write_synthetic_run(run_dir, questions=3, blocks=2, with_freegen=False, image_boost=0.3):
+def write_synthetic_run(run_dir, questions=3, blocks=2, with_freegen=False, image_boost=0.3,
+                         omit_post=False, omit_k_random=False):
     run_dir, rng = Path(run_dir), np.random.default_rng(0)
     (run_dir / "manifest.json").write_text(json.dumps({"inputs": {}, "commit": "c"}))
     (run_dir / "heads.json").write_text(json.dumps({"heads": [[0, 1]], "share": np.zeros((LAYERS, HEADS)).tolist()}))
@@ -21,8 +22,8 @@ def write_synthetic_run(run_dir, questions=3, blocks=2, with_freegen=False, imag
         for b in range(blocks):
             specs += [{"position": 0, "group": "latent", "block": b, "slot": s}
                       for s in ("start", "pad1", "pad2", "end")]
-            specs += [{"position": 0, "group": g, "block": b, "slot": s}
-                      for g, s in (("pre_text", "pre"), ("post_text", "post"))]
+            control_specs = [("pre_text", "pre")] if omit_post else [("pre_text", "pre"), ("post_text", "post")]
+            specs += [{"position": 0, "group": g, "block": b, "slot": s} for g, s in control_specs]
         rows = len(specs)
         share = rng.dirichlet(np.ones(7), size=(rows, LAYERS, HEADS)).astype(np.float16)
         for r, spec in enumerate(specs):          # latent pads look more at the image (region 2)
@@ -34,7 +35,7 @@ def write_synthetic_run(run_dir, questions=3, blocks=2, with_freegen=False, imag
         (run_dir / "attention" / f"q{q}.json").write_text(json.dumps(
             {"specs": specs, "g1": 1e-3, "g1b": 5e-4, "g2": 1e-4, "g5": {"excluded": False, "rate": 1.0},
              "category": "deletion", "n_blocks": blocks, "eval_match": bool(q % 2)}))
-        names = KNOCKOUT + PATCH + CANDS
+        names = tuple(n for n in KNOCKOUT + PATCH + CANDS if not (omit_k_random and n == "k_random"))
         out = {key: {} for key in ("latent_cos", "latent_cos_pads", "post_dnll", "post_flip",
                                    "answer_dnll", "answer_flip", "control_cos")}
         for name in names:
