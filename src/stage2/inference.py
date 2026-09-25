@@ -32,6 +32,7 @@ class Stage2InferenceController(ContinuousLatentController):
         image_grid_thw: torch.LongTensor | None = None,
         return_latent_states: bool = False,
         disable_latent_generation: bool = False,
+        intervention=None,
     ) -> Stage2GenerationResult:
         return super().generate(
             model=model,
@@ -43,5 +44,5 @@ class Stage2InferenceController(ContinuousLatentController):
             image_grid_thw=image_grid_thw,
             return_latent_states=return_latent_states,
             disable_latent_generation=disable_latent_generation,
-            intervention=None,
+            intervention=intervention,
         )

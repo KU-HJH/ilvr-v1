@@ -64,7 +64,12 @@ def test_stage2_generation_result_retains_legacy_two_field_construction():
 
 
 def test_stage2_controller_retains_its_original_generate_signature():
-    """Catches neutral-only evidence arguments leaking into Stage 2's API."""
+    """Catches unintended evidence arguments leaking into Stage 2's API.
+
+    `intervention` is the one deliberate passthrough: Stage2InferenceController
+    forwards it to the neutral controller unchanged, defaulting to None so
+    every existing caller (including eval.py) is unaffected.
+    """
     signature = inspect.signature(Stage2InferenceController.generate)
 
     assert tuple(
@@ -120,6 +125,11 @@ def test_stage2_controller_retains_its_original_generate_signature():
             "disable_latent_generation",
             inspect.Parameter.KEYWORD_ONLY,
             False,
+        ),
+        (
+            "intervention",
+            inspect.Parameter.KEYWORD_ONLY,
+            None,
         ),
     )
 

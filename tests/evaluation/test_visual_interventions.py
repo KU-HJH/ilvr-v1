@@ -5,6 +5,7 @@ from evaluation.continuous_latent import (
     ContinuousLatentGenerationConfig,
 )
 from evaluation.visual_interventions import VisualIntervention, build_image_attention_mask
+from stage2.inference import Stage2GenerationConfig, Stage2InferenceController
 from tests.evaluation.test_continuous_latent import TOKENS, scripted_model
 
 
@@ -68,3 +69,41 @@ def test_intervention_wraps_rollout_decoder_and_registers_every_latent_span():
     rollout_records = [r for r in intervention.forward_records if r["role"] == "latent_rollout"]
     assert rollout_records
     assert all(attn.ndim == 4 for _, attn, _ in model.model.calls)
+
+
+def test_stage2_inference_controller_forwards_intervention_to_parent():
+    """Stage2InferenceController must accept and pass intervention through, not swallow it."""
+    model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
+    intervention = VisualIntervention("latent_mask", image_token_id=80)
+    input_ids = torch.tensor([[80, 1]])
+
+    result = Stage2InferenceController().generate(
+        model=model,
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        token_ids=TOKENS,
+        generation_config=Stage2GenerationConfig(max_new_tokens=1),
+        intervention=intervention,
+    )
+
+    # begin() is only invoked by ContinuousLatentController.generate when it
+    # actually received this intervention instance, so a non-empty
+    # forward_records here proves the argument reached the parent instead of
+    # being dropped by the Stage2InferenceController override.
+    assert intervention.forward_records
+    assert result.latent_start_count == 1
+
+
+def test_stage2_inference_controller_omitted_intervention_matches_none():
+    """Callers that omit intervention (eval.py) must behave exactly as before."""
+    model = scripted_model(latent_size=2, emitted_ids=[3])
+
+    result = Stage2InferenceController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=Stage2GenerationConfig(max_new_tokens=1, eos_token_id=3),
+    )
+
+    assert result.stop_reason == "eos"
