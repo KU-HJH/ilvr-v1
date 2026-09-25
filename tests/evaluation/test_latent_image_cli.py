@@ -183,6 +183,7 @@ def test_prepare_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "EXPECTED_SHA256", {
         "data": cli.sha256(fixture["data"]), "selection": cli.sha256(fixture["selection"]),
         "eval_rows": cli.sha256(fixture["eval_rows"])})
+    monkeypatch.setattr(cli, "git_status_porcelain", lambda: "")   # tests run from a working tree
     run_dir = tmp_path / "run"
 
     code = cli.main([
@@ -228,6 +229,7 @@ def test_prepare_rejects_hash_mismatch(tmp_path, monkeypatch):
     fixture = _build_prepare_fixture(tmp_path)
     monkeypatch.setattr(cli, "EXPECTED_SHA256", {
         "data": "0" * 64, "selection": cli.sha256(fixture["selection"]), "eval_rows": cli.sha256(fixture["eval_rows"])})
+    monkeypatch.setattr(cli, "git_status_porcelain", lambda: "")
     run_dir = tmp_path / "run"
     with pytest.raises(ValueError, match="sha256"):
         cli.main([
@@ -616,3 +618,71 @@ def test_stage_freegen_records_eval_match(tmp_path, monkeypatch):
     for mode in ("causal_mask", "latent_mask"):
         assert json.loads((run_dir / "freegen" / mode / "q0.json").read_text())["eval_match"] is True
         assert json.loads((run_dir / "freegen" / mode / "q1.json").read_text())["eval_match"] is False
+
+
+# ---------------------------------------------------------------------------
+# R20 minor fixes: dirty-tree prepare, manifest-last prepare, temp-file globs
+# ---------------------------------------------------------------------------
+
+def _prepare_argv(fixture, run_dir):
+    return ["prepare", "--model-dir", str(fixture["model_dir"]), "--base-model-dir", str(fixture["base_model_dir"]),
+            "--data", str(fixture["data"]), "--selection", str(fixture["selection"]),
+            "--eval-rows", str(fixture["eval_rows"]), "--data-root", str(fixture["data_root"]),
+            "--run-dir", str(run_dir)]
+
+
+def _expect_fixture_hashes(monkeypatch, fixture):
+    monkeypatch.setattr(cli, "EXPECTED_SHA256", {
+        "data": cli.sha256(fixture["data"]), "selection": cli.sha256(fixture["selection"]),
+        "eval_rows": cli.sha256(fixture["eval_rows"])})
+
+
+def test_prepare_refuses_dirty_tracked_tree(tmp_path, monkeypatch):
+    fixture = _build_prepare_fixture(tmp_path)
+    _expect_fixture_hashes(monkeypatch, fixture)
+    monkeypatch.setattr(cli, "git_status_porcelain", lambda: " M src/evaluation/latent_image_cli.py")
+    run_dir = tmp_path / "run"
+    with pytest.raises(RuntimeError, match="dirty"):
+        cli.main(_prepare_argv(fixture, run_dir))
+    assert not (run_dir / "manifest.json").exists()
+
+
+def test_prepare_records_clean_status(tmp_path, monkeypatch):
+    fixture = _build_prepare_fixture(tmp_path)
+    _expect_fixture_hashes(monkeypatch, fixture)
+    monkeypatch.setattr(cli, "git_status_porcelain", lambda: "")
+    run_dir = tmp_path / "run"
+    assert cli.main(_prepare_argv(fixture, run_dir)) == 0
+    assert json.loads((run_dir / "manifest.json").read_text())["git_status"] == ""
+
+
+def test_failed_swap_computation_leaves_no_manifest(tmp_path, monkeypatch):
+    fixture = _build_prepare_fixture(tmp_path)
+    _expect_fixture_hashes(monkeypatch, fixture)
+    monkeypatch.setattr(cli, "git_status_porcelain", lambda: "")
+
+    def boom(*a, **k):
+        raise KeyError("category lookup failed")
+    monkeypatch.setattr(cli, "question_category", boom)
+    run_dir = tmp_path / "run"
+    with pytest.raises(KeyError):
+        cli.main(_prepare_argv(fixture, run_dir))
+    assert not (run_dir / "manifest.json").exists()
+
+
+def test_stage_heads_ignores_leftover_temp_npz(tmp_path):
+    import numpy as np
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path)
+    specs = [{"position": 0, "group": "latent", "block": 0, "slot": "pad1"}]
+    vw = np.full((1, 2, 2, 7), 0.5, dtype=np.float32)
+    cli.savez_atomic(run_dir / "attention" / "q0.npz", mass=vw, vw_share=vw, enrichment=np.zeros((1, 2, 2)))
+    cli.write_json_atomic(run_dir / "attention" / "q0.json", {"specs": specs})
+    (run_dir / "attention" / "q5.tmp.npz").write_bytes(b"partial")
+    (run_dir / "attention" / "excluded").mkdir()
+    (run_dir / "attention" / "excluded" / "q6.json.tmp").write_text("{")
+    assert cli.question_files(run_dir / "attention", "npz") == {0: run_dir / "attention" / "q0.npz"}
+    assert cli.excluded_indices(run_dir) == set()
+    assert cli.stage_heads(_stage_args("heads", data_path, selection_path, eval_rows_path, run_dir)) == 0

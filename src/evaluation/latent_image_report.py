@@ -21,7 +21,9 @@ ALL_BLOCK_NOTE = ("all blocks, includes propagation: patching \"direct\"/\"indir
 
 
 def _files(run_dir, sub, suffix):
-    return {int(p.stem[1:]): p for p in sorted((run_dir / sub).glob(f"q*.{suffix}"))}
+    """{question index: path} for q{idx}.{suffix}, ignoring leftover temp files (".tmp")."""
+    return {int(p.name[1:-len(suffix) - 1]): p for p in sorted((Path(run_dir) / sub).glob(f"q*.{suffix}"))
+            if ".tmp" not in p.name}
 
 
 def _safe_paired(a_map, b_map, reason="empty paired set"):
@@ -223,6 +225,10 @@ def intervention_sections(run_dir):
             lat, ctl, reason=f"no question has both {kind}_total latent_cos and control_cos")
     arrays = {q: np.load(p) for q, p in _files(run_dir, "interventions", "npz").items()}
     for label, body, image in (("mid", "mid_body", "image_mid"), ("final", "final_body", "image_final")):
+        if not arrays:
+            content["identification"][label] = {"status": "NO DATA", "reason": "no interventions/q*.npz arrays",
+                                                "chance": 0.2}
+            continue
         per_q = [st.identification_accuracy(a[body].mean(1)[None], a[image][None]) for a in arrays.values()]
         content["identification"][label] = st.cluster_bootstrap(np.array(per_q), np.array(list(arrays)))
         content["identification"][label]["chance"] = 0.2
@@ -250,8 +256,8 @@ def freegen_section(run_dir):
     modes = ("causal_mask", "latent_mask")
     if not all((run_dir / "freegen" / m).is_dir() for m in modes):
         return {"status": "NOT RUN"}
-    results = {m: {int(p.stem[1:]): json.loads(p.read_text())["match"]
-                   for p in (run_dir / "freegen" / m).glob("q*.json")} for m in modes}
+    results = {m: {q: json.loads(p.read_text())["match"] for q, p in _files(run_dir, f"freegen/{m}", "json").items()}
+               for m in modes}
     qs = sorted(set(results["causal_mask"]) & set(results["latent_mask"]))
     causal_only = sum(results["causal_mask"][q] and not results["latent_mask"][q] for q in qs)
     latent_only = sum(results["latent_mask"][q] and not results["causal_mask"][q] for q in qs)
@@ -272,8 +278,7 @@ def gates_section(run_dir):
     attention = {q: json.loads(p.read_text()) for q, p in _files(run_dir, "attention", "json").items()}
     interventions = {q: json.loads(p.read_text()) for q, p in _files(run_dir, "interventions", "json").items()}
     gates_only = {q: d.get("gates", {}) for q, d in interventions.items()}
-    excluded = {int(p.stem[1:]): json.loads(p.read_text())
-                for p in sorted((run_dir / "attention" / "excluded").glob("q*.json"))}
+    excluded = {q: json.loads(p.read_text()) for q, p in _files(run_dir, "attention/excluded", "json").items()}
     smoke = run_dir / "smoke" / "gates.json"
     matched_values = [v for d in interventions.values() for v in d.get("random_matched", {}).values()]
     random_matched = ({"n": len(matched_values), "mean": float(np.mean(matched_values)),
@@ -316,7 +321,8 @@ def _markdown(summary):
         "gates": "Gates and exclusions",
     }
     notes = {
-        "knockout": "Metrics below cover all perturbed blocks unless suffixed `_first_block` "
+        "knockout": "`noop_repeat` is the noise floor: under the analysis numerical policy (SDPA MATH, TF32 "
+                    "off) teacher-forced runs are deterministic, so its effects are expected 0. Metrics below cover all perturbed blocks unless suffixed `_first_block` "
                     "(first perturbed block only). Whole-trajectory numbers are " + ALL_BLOCK_NOTE + ".",
         "patching": "Direct/indirect are edge-routing effects over the whole trajectory: for later "
                     "blocks, \"direct\" includes propagation through earlier perturbed latents. Metrics "
@@ -337,7 +343,8 @@ def _markdown(summary):
         if key in notes and status not in ("NOT RUN",):
             lines += [notes[key], ""]
         if status != "NOT RUN":
-            lines += ["```json", json.dumps(section, indent=1)[:20000], "```", ""]
+            # Full JSON, never cut mid-object (summary.json holds the same content).
+            lines += ["```json", json.dumps(section, indent=1), "```", ""]
     return "\n".join(lines)
 
 
@@ -346,6 +353,20 @@ def _ci_arrays(entries):
     lo = [e["lo"] for e in entries]
     hi = [e["hi"] for e in entries]
     return mean, lo, hi
+
+
+def _patch_bars(patching):
+    """Bars for the patching figure: one per available (corruption, part) latent_cos stat;
+    missing stats get no bar (never a zero bar)."""
+    bars = []
+    by = patching.get("by_corruption", {})
+    for part in ("total", "direct", "indirect"):
+        for kind in by:
+            row = by[kind]["table"].get(f"{kind}_{part}")
+            stat = row.get("latent_cos") if row else None
+            if stat and stat.get("mean") is not None:
+                bars.append({"kind": kind, "part": part, "mean": stat["mean"], "lo": stat["lo"], "hi": stat["hi"]})
+    return bars
 
 
 def write_figures(run_dir, summary):
@@ -391,18 +412,14 @@ def write_figures(run_dir, summary):
             fig, ax = plt.subplots(figsize=(8, 5))
             width = 0.25
             xs = np.arange(len(kinds))
+            bars = _patch_bars(patching)
             for i, part in enumerate(("total", "direct", "indirect")):
-                means, err_lo, err_hi = [], [], []
-                for kind in kinds:
-                    row = patching["by_corruption"][kind]["table"].get(f"{kind}_{part}")
-                    stat = row.get("latent_cos") if row else None
-                    mean = stat["mean"] if stat else 0.0
-                    means.append(mean)
-                    err_lo.append(mean - stat["lo"] if stat else 0.0)
-                    err_hi.append(stat["hi"] - mean if stat else 0.0)
-                offset = xs + (i - 1) * width
-                ax.bar(offset, means, width=width, color=PATCH_PALETTE[part], label=part,
-                       yerr=[err_lo, err_hi], capsize=3)
+                mine = [b for b in bars if b["part"] == part]
+                if not mine:
+                    continue
+                offset = [xs[kinds.index(b["kind"])] + (i - 1) * width for b in mine]
+                ax.bar(offset, [b["mean"] for b in mine], width=width, color=PATCH_PALETTE[part], label=part,
+                       yerr=[[b["mean"] - b["lo"] for b in mine], [b["hi"] - b["mean"] for b in mine]], capsize=3)
             ax.set_xticks(xs)
             ax.set_xticklabels(kinds)
             ax.set_ylabel("latent_cos mean (all blocks, includes propagation)")

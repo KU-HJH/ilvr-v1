@@ -390,6 +390,9 @@ def stage_prepare(args):
     manifest_path = args.run_dir / "manifest.json"
     if manifest_path.exists():
         raise ValueError(f"manifest already exists at {manifest_path}; use a fresh run directory")
+    status = git_status_porcelain()
+    if status:
+        raise RuntimeError(f"refusing to prepare from a dirty tracked tree; commit or revert first:\n{status}")
     inputs = _current_inputs(args)
     for key, path in (("data", args.data), ("selection", args.selection), ("eval_rows", args.eval_rows)):
         if inputs[key] != EXPECTED_SHA256[key]:
@@ -398,13 +401,13 @@ def stage_prepare(args):
     prepared_manifest = Path(str(args.model_dir) + ".manifest.json")
     adapter = args.model_dir / "adapter_model.safetensors"
     manifest = {
-        "inputs": inputs, "commit": git_commit(),
+        "inputs": inputs, "commit": git_commit(), "git_status": status,
         "model_dir": str(args.model_dir), "base_model_dir": str(args.base_model_dir),
         "prepared_manifest_sha256": sha256(prepared_manifest), "adapter_sha256": sha256(adapter),
         "created": datetime.now(timezone.utc).isoformat(),
     }
-    write_json_atomic(manifest_path, manifest)
 
+    # Swaps are computed before the manifest is written, so a failed prepare leaves no manifest.
     test_rows = load_test_rows(args.data)
     selection = load_selection(args.selection)
     categories = {idx: question_category(test_rows[idx]["image_input"], args.data_root) for idx in selection}
@@ -416,6 +419,7 @@ def stage_prepare(args):
         swaps = select_swaps(idx, categories[idx], pool)
         questions[str(idx)] = {"category": categories[idx], "swaps": list(swaps)}
     write_json_atomic(args.run_dir / "swaps.json", {"pool": pool, "questions": questions})
+    write_json_atomic(manifest_path, manifest)
     return 0
 
 

@@ -77,8 +77,9 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
             scores = (q[:, :, r].float() @ kk.float().transpose(-1, -2)) / math.sqrt(hd)
             scores = scores + mask[:, :, r, :length].float()
             probs = scores.softmax(-1)[0]                                      # [H, R, L]
-            out = (probs.to(vv.dtype) @ vv[0]).transpose(0, 1).reshape(len(rows), -1)
-            mine = attn.o_proj(out).float()
+            # fp32 probs @ fp32 values; only the head outputs are cast back for o_proj.
+            out = (probs @ vv[0].float()).transpose(0, 1).reshape(len(rows), -1)
+            mine = attn.o_proj(out.to(vv.dtype)).float()
             actual = output[0][0, r].float()
             worst["g1"] = max(worst["g1"], float(((mine - actual).norm(dim=-1) / actual.norm(dim=-1).clamp_min(1e-6)).max()))
             # One head at a time bounds memory at [L, heads*hd] for the 3B model.

@@ -57,3 +57,12 @@ def test_capture_handles_dora_adapter_linearly():
     cap = la.capture_attention(model, tr)
     assert cap.g1_max_rel < 1e-3
     assert cap.g1b_linear_rel < 1e-3
+
+
+def test_capture_g1_holds_for_bf16_model(tiny):
+    # R20: the G1 reproduction multiplies fp32 probabilities by fp32 values (no bf16 cast
+    # of probs), so it stays within the 1e-2 gate for a bf16 model.
+    import copy
+    model = copy.deepcopy(tiny).to(torch.bfloat16)
+    cap = la.capture_attention(model, trajectory())
+    assert cap.g1_max_rel <= 1e-2

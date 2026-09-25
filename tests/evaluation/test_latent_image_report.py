@@ -196,3 +196,59 @@ def test_gates_separate_length_budget_exclusions(tmp_path):
     gates = build_report(tmp_path)["gates"]
     assert gates["excluded_length_budget"] == [7] and gates["excluded_g5_count"] == 1
     assert gates["excluded_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# R20 minor fixes
+# ---------------------------------------------------------------------------
+
+def test_report_md_has_complete_json_and_noise_floor_note(tmp_path):
+    import re
+    write_synthetic_run(tmp_path, questions=3, blocks=2)
+    summary = build_report(tmp_path)
+    text = (tmp_path / "report.md").read_text()
+    blocks = re.findall(r"```json\n(.*?)\n```", text, flags=re.S)
+    parsed = [json.loads(b) for b in blocks]
+    assert summary["attention"] in parsed and summary["knockout"] in parsed
+    assert "noop_repeat" in text and "deterministic" in text and "expected 0" in text
+
+
+def test_report_md_never_truncates_large_sections(tmp_path):
+    from evaluation.latent_image_report import _markdown
+    big = {"status": "RUN", "values": list(range(20000))}
+    summary = {k: {"status": "NOT RUN"} for k in ("attention", "knockout", "patching", "content",
+                                                  "sensitivity_excluding_truncated", "freegen", "gates")}
+    summary["content"] = big
+    text = _markdown(summary)
+    import re
+    parsed = [json.loads(b) for b in re.findall(r"```json\n(.*?)\n```", text, flags=re.S)]
+    assert big in parsed
+
+
+def test_patch_bars_skip_missing_stats():
+    from evaluation.latent_image_report import _patch_bars
+    stat = {"mean": 0.5, "lo": 0.4, "hi": 0.7}
+    patching = {"by_corruption": {
+        "blur": {"table": {"blur_total": {"latent_cos": stat}, "blur_direct": {"latent_cos": None},
+                           "blur_indirect": {"latent_cos": stat}}},
+        "mean": {"table": {"mean_total": {"latent_cos": stat}}}}}
+    bars = _patch_bars(patching)
+    assert [(b["kind"], b["part"]) for b in bars] == [("blur", "total"), ("mean", "total"), ("blur", "indirect")]
+    assert all(b["mean"] == 0.5 for b in bars)
+
+
+def test_identification_without_arrays_is_no_data(tmp_path):
+    write_synthetic_run(tmp_path, questions=3, blocks=1)
+    for p in (tmp_path / "interventions").glob("q*.npz"):
+        p.unlink()
+    ident = build_report(tmp_path)["content"]["identification"]
+    assert ident["mid"]["status"] == "NO DATA" and ident["final"]["status"] == "NO DATA"
+
+
+def test_report_ignores_leftover_temp_files(tmp_path):
+    write_synthetic_run(tmp_path, questions=3, blocks=1)
+    for sub in ("attention", "interventions"):
+        (tmp_path / sub / "q5.tmp.npz").write_bytes(b"partial")
+        (tmp_path / sub / "q5.json.tmp").write_text("{")
+    summary = build_report(tmp_path)
+    assert summary["attention"]["vw_image_share"]["pad"][0]["n_clusters"] == 3
