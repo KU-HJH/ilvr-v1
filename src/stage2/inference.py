@@ -43,4 +43,5 @@ class Stage2InferenceController(ContinuousLatentController):
             image_grid_thw=image_grid_thw,
             return_latent_states=return_latent_states,
             disable_latent_generation=disable_latent_generation,
+            intervention=None,
         )

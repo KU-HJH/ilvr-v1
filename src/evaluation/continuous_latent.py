@@ -172,6 +172,7 @@ class ContinuousLatentController:
         return_latent_states: bool = False,
         return_post_end_logits: bool = False,
         disable_latent_generation: bool = False,
+        intervention=None,
     ) -> ContinuousLatentGenerationResult:
         self._validate_inputs(
             model=model,
@@ -188,6 +189,10 @@ class ContinuousLatentController:
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
+        decoder = partial(model.model, generate_mode=True)
+        if intervention is not None:
+            intervention.begin(input_ids, token_ids)
+            decoder = intervention.wrap_decoder(decoder)
         latent_blocks: list[tuple[torch.Tensor, ...]] = []
         post_end_logits: list[torch.Tensor] = []
         latent_start_count = 0
@@ -217,13 +222,12 @@ class ContinuousLatentController:
             position_ids, _ = model.get_rope_index(
                 sequences, image_grid_thw=image_grid_thw, attention_mask=mask
             )
-            outputs = model.model(
+            outputs = decoder(
                 inputs_embeds=inputs_embeds,
                 attention_mask=mask,
                 position_ids=position_ids,
                 use_cache=False,
                 return_dict=True,
-                generate_mode=True,
             )
             logits = model.lm_head(outputs.last_hidden_state[:, -1, :]).clone()
             logits = repetition_processor(sequences, logits)
@@ -298,8 +302,10 @@ class ContinuousLatentController:
                     ),
                     end_position=block_start + model.config.latent_size + 1,
                 )
+                if intervention is not None:
+                    intervention.register_latent_span(span)
                 rollout = model.stage2_rollout_engine.rollout(
-                    language_model=partial(model.model, generate_mode=True),
+                    language_model=decoder,
                     base_inputs_embeds=inputs_embeds,
                     attention_mask=mask,
                     full_position_ids=full_position_ids,
@@ -307,13 +313,12 @@ class ContinuousLatentController:
                 )
                 inputs_embeds = rollout.final_inputs_embeds
                 if return_post_end_logits:
-                    post_end_outputs = model.model(
+                    post_end_outputs = decoder(
                         inputs_embeds=inputs_embeds,
                         attention_mask=mask,
                         position_ids=full_position_ids,
                         use_cache=False,
                         return_dict=True,
-                        generate_mode=True,
                     )
                     post_end_logits.append(
                         model.lm_head(post_end_outputs.last_hidden_state[:, -1, :])
