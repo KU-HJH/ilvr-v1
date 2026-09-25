@@ -508,12 +508,14 @@ def apply_smoke_from(run_dir, source_run, manifest):
     run's inputs, model identity (model_dir/base_model_dir/adapter_sha256/
     prepared_manifest_sha256), precision and trajectory provenance (source and, when recorded,
     its manifest sha256) to equal the current run's manifest exactly; only the commit may
-    differ. Writes smoke/provenance.json ({"source_run", "source_commit", "copied_at"}) and
-    then smoke/gates.json (a verbatim copy of the prior gate), each atomically; provenance is
-    written first so gates.json -- the file `require_smoke_pass` trusts -- only ever exists
-    once its provenance is on disk too (the stage_attention guard redoes the copy whenever
-    either file is missing, so an interruption between the two writes self-heals instead of
-    leaving a run with a "complete"-looking gate but no record of where it came from)."""
+    differ. Writes, each atomically and in order: smoke/smoke-from.pending (an explicit
+    in-progress marker), smoke/provenance.json ({"source_run", "source_commit", "copied_at"}),
+    smoke/gates.json (a verbatim copy of the prior gate), then removes the pending marker.
+    stage_attention's guard redoes the copy whenever gates.json is missing or the pending
+    marker is present, so an interruption anywhere in this sequence self-heals. A gates.json
+    present with no pending marker is trusted and never touched -- whether it is a genuine
+    local `stage_smoke` result (which never creates the marker) or an already-completed
+    --smoke-from copy -- so this never silently overwrites a real local smoke result."""
     source_run = Path(source_run)
     source_gates_path = source_run / "smoke" / "gates.json"
     if not source_gates_path.exists():
@@ -528,10 +530,13 @@ def apply_smoke_from(run_dir, source_run, manifest):
     mismatched = [key for key in SMOKE_FROM_KEYS if source_manifest.get(key) != manifest.get(key)]
     if mismatched:
         raise ValueError(f"--smoke-from {source_run}: prior manifest differs from the current run on {mismatched}")
+    pending_path = Path(run_dir) / "smoke" / "smoke-from.pending"
+    write_json_atomic(pending_path, {"source_run": str(source_run)})
     write_json_atomic(Path(run_dir) / "smoke" / "provenance.json", {
         "source_run": str(source_run), "source_commit": source_manifest.get("commit"),
         "copied_at": datetime.now(timezone.utc).isoformat()})
     write_json_atomic(Path(run_dir) / "smoke" / "gates.json", source_gates)
+    pending_path.unlink()
 
 
 def stage_attention(args):
@@ -543,13 +548,12 @@ def stage_attention(args):
     require_model_identity(manifest, args)
     if getattr(args, "smoke_from", None):
         gates_path = args.run_dir / "smoke" / "gates.json"
-        provenance_path = args.run_dir / "smoke" / "provenance.json"
-        # Either file missing counts as incomplete: a gates.json with no provenance.json can
-        # only be a genuine local (non-smoke-from) gate or a smoke-from copy interrupted
-        # between its two writes -- either way, redoing the copy is safe (apply_smoke_from
-        # re-validates the manifest match and the prior gate's "pass" every time) and heals
-        # the interrupted case instead of leaving it without provenance forever.
-        if not gates_path.exists() or not provenance_path.exists():
+        pending_path = args.run_dir / "smoke" / "smoke-from.pending"
+        # Redo only when gates.json is missing, or the pending marker shows a prior copy was
+        # interrupted mid-sequence. A gates.json present with no pending marker is trusted as
+        # complete -- whether it is a genuine local `stage_smoke` result (which never creates
+        # the marker) or an already-finished --smoke-from copy -- and is never overwritten.
+        if not gates_path.exists() or pending_path.exists():
             apply_smoke_from(args.run_dir, args.smoke_from, manifest)
     require_smoke_pass(args.run_dir)
     test_rows = load_test_rows(args.data)

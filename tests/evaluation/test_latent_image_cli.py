@@ -543,11 +543,34 @@ def test_stage_attention_uses_smoke_from_without_running_the_model(tmp_path, mon
     assert prov["source_run"] == str(source_run) and prov["source_commit"] == "a-different-commit"
 
 
-def test_stage_attention_smoke_from_does_not_override_a_complete_existing_local_gate(tmp_path, monkeypatch):
-    # A *complete* local smoke/gates.json (one that already carries its own provenance.json,
-    # e.g. from an earlier --smoke-from copy) is never re-copied, even if it failed and
-    # --smoke-from points at a different, passing prior run: the guard only redoes an
-    # *incomplete* pair (see the interrupted-state test below), never a complete one.
+def test_stage_attention_smoke_from_does_not_override_a_genuine_local_gate(tmp_path, monkeypatch):
+    # R-smoke-from fix round 2: a genuine local smoke/gates.json (e.g. from a real
+    # `stage_smoke` run) never has a smoke/provenance.json or smoke/smoke-from.pending marker;
+    # --smoke-from must never silently replace it with a borrowed gate, even if it failed and
+    # the prior run passed. This is what the "gates.json present, no provenance.json" guard
+    # from fix round 1 incorrectly redid; the pending marker is now the sole "redo" signal.
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    cli.write_json_atomic(run_dir / "smoke" / "gates.json", {"pass": False})    # local gate already failed
+    source_run = tmp_path / "source"
+    cli.write_json_atomic(source_run / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(source_run / "manifest.json", {})
+    args = _stage_args("attention", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+    args.smoke_from = source_run
+    with pytest.raises(RuntimeError, match="smoke"):
+        cli.stage_attention(args)
+    assert json.loads((run_dir / "smoke" / "gates.json").read_text()) == {"pass": False}
+    assert not (run_dir / "smoke" / "provenance.json").exists()
+    assert not (run_dir / "smoke" / "smoke-from.pending").exists()
+
+
+def test_stage_attention_smoke_from_does_not_override_a_completed_prior_copy(tmp_path, monkeypatch):
+    # A gates.json that already carries its own provenance.json (from an earlier --smoke-from
+    # copy) and no pending marker is complete and is never re-copied either, even if it failed
+    # and --smoke-from points at a different, passing prior run.
     data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0])
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -567,12 +590,12 @@ def test_stage_attention_smoke_from_does_not_override_a_complete_existing_local_
     assert json.loads((run_dir / "smoke" / "provenance.json").read_text())["source_run"] == "elsewhere"
 
 
-def test_stage_attention_smoke_from_redoes_an_interrupted_copy(tmp_path, monkeypatch):
-    # R-smoke-from fix round 1 (joint atomicity): a run that has smoke/gates.json but no
-    # smoke/provenance.json -- exactly what an interruption between apply_smoke_from's two
-    # writes would leave behind -- must not be trusted as complete; --smoke-from redoes the
-    # copy so the run ends up with a matching, freshly-written pair instead of a gate with no
-    # record of where it came from forever.
+def test_stage_attention_smoke_from_redoes_a_copy_interrupted_via_pending_marker(tmp_path, monkeypatch):
+    # R-smoke-from fix round 2: the explicit smoke-from.pending marker -- not provenance.json
+    # presence -- is what marks an incomplete/interrupted copy, since a genuine local gate
+    # never has provenance.json either (see the "does not override" tests above). Simulate a
+    # crash mid-sequence: the marker is present (whatever else the sequence got to -- here
+    # gates.json also happens to be a stale leftover from the interrupted attempt).
     from types import SimpleNamespace
     import evaluation.latent_image_interventions as li
     import evaluation.latent_image_trajectory as lt
@@ -586,9 +609,8 @@ def test_stage_attention_smoke_from_redoes_an_interrupted_copy(tmp_path, monkeyp
     run_dir.mkdir()
     model_dir, base_model_dir = _model_dirs(tmp_path)
     manifest = _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
-    # Simulates the interrupted state directly: gates.json present (e.g. left over from a
-    # crash right after it was written), provenance.json absent.
     cli.write_json_atomic(run_dir / "smoke" / "gates.json", {"pass": True, "stale": True})
+    cli.write_json_atomic(run_dir / "smoke" / "smoke-from.pending", {"source_run": "somewhere-old"})
     source_run = tmp_path / "source"
     cli.write_json_atomic(source_run / "smoke" / "gates.json", {"pass": True, "stale": False})
     cli.write_json_atomic(source_run / "manifest.json",
@@ -609,6 +631,18 @@ def test_stage_attention_smoke_from_redoes_an_interrupted_copy(tmp_path, monkeyp
     assert json.loads((run_dir / "smoke" / "gates.json").read_text()) == {"pass": True, "stale": False}
     prov = json.loads((run_dir / "smoke" / "provenance.json").read_text())
     assert prov["source_run"] == str(source_run) and prov["source_commit"] == "a-different-commit"
+    assert not (run_dir / "smoke" / "smoke-from.pending").exists()
+
+
+def test_apply_smoke_from_removes_pending_marker_after_success(tmp_path):
+    source = tmp_path / "source"
+    cli.write_json_atomic(source / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(source / "manifest.json", {"inputs": {"data": "a"}})
+    run_dir = tmp_path / "run"
+    cli.apply_smoke_from(run_dir, source, {"inputs": {"data": "a"}})
+    assert not (run_dir / "smoke" / "smoke-from.pending").exists()
+    assert json.loads((run_dir / "smoke" / "gates.json").read_text()) == {"pass": True}
+    assert (run_dir / "smoke" / "provenance.json").exists()
 
 
 def test_smoke_from_defaults_to_none_and_other_stages_lack_the_flag():
