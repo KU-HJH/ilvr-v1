@@ -28,6 +28,7 @@ class AttentionCapture:
     enrichment: np.ndarray
     image_probs: object
     g1_max_rel: float
+    g1b_linear_rel: float
     g2_max_abs: float
 
 
@@ -53,7 +54,7 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
     vw = np.zeros_like(mass)
     enrich = np.zeros((len(rows), n_layers, heads), np.float32)
     image_probs = np.zeros((len(rows), n_layers, len(layout.image_positions)), np.float32) if keep_image_probs else None
-    worst = {"g1": 0.0, "g2": 0.0}
+    worst = {"g1": 0.0, "g1b": 0.0, "g2": 0.0}
 
     def layer_hooks(index, attn):
         seen = {}
@@ -92,10 +93,19 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
                 summed = projected if summed is None else summed + projected
                 total += block
             linear_err = float((attn.o_proj(total).float() - summed).abs().max() / summed.abs().max().clamp_min(1e-6))
-            worst["g1"] = max(worst["g1"], linear_err)
+            worst["g1b"] = max(worst["g1b"], linear_err)
             weighted = probs * contrib[:, None, :]
             for i, code in enumerate(codes):
                 code = code.to(x.device)
+                # Independent partition check: the visible-key count from the actual hooked
+                # mask (head 0; Condition("noop") has no per-head mask) must equal the code
+                # count, and no key beyond the code range may be visible. Without this,
+                # index_add_ trivially makes m.sum() == p_row.sum() regardless of whether the
+                # codes are the right labels or cover the right keys.
+                visible = torch.isfinite(mask[0, 0, r[i], :length])
+                n_visible = int(visible.sum())
+                if n_visible != code.numel() or bool(visible[code.numel():].any()):
+                    worst["g2"] = max(worst["g2"], float(abs(n_visible - code.numel())) + 1.0)
                 p_row, w_row = probs[:, i, :code.numel()], weighted[:, i, :code.numel()]
                 m = torch.zeros(heads, len(REGION_NAMES), device=x.device).index_add_(1, code, p_row)
                 w = torch.zeros_like(m).index_add_(1, code, w_row)
@@ -104,9 +114,10 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
                                   float((p_row.sum(-1) - probs[:, i].sum(-1)).abs().max()))
                 mass[i, index], vw[i, index] = m.cpu().numpy(), w.cpu().numpy()
                 n_img = int((code == IMAGE).sum())
-                enrich[i, index] = (m[:, IMAGE] / (n_img / code.numel())).cpu().numpy()
+                enrich[i, index] = (m[:, IMAGE] / (n_img / max(n_visible, 1))).cpu().numpy()
                 if image_probs is not None:
                     image_probs[i, index] = probs[:, i, list(layout.image_positions)].mean(0).cpu().numpy()
+            seen.clear()
         return pre, post
 
     @contextmanager
@@ -124,4 +135,4 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
 
     run_condition(model, trajectory, Condition("noop"), final_observer=observer, mid_layer=0)
     return AttentionCapture(specs, mass.astype(np.float16), vw.astype(np.float16), enrich, image_probs,
-                            worst["g1"], worst["g2"])
+                            worst["g1"], worst["g1b"], worst["g2"])
