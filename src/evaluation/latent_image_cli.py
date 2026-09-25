@@ -154,6 +154,11 @@ def g5_exclusion_count(run_dir):
     return sum(1 for doc in _exclusions(run_dir).values() if doc.get("reason") != "length_budget")
 
 
+def trajectory_skipped(manifest):
+    """R24: questions the trajectory regeneration skipped (length budget); absent from eval rows."""
+    return set(manifest.get("trajectory_skipped", ()))
+
+
 def require_smoke_pass(run_dir):
     path = Path(run_dir) / "smoke" / "gates.json"
     if not path.exists():
@@ -413,6 +418,26 @@ def _current_inputs(args):
 # Stage drivers (Step 8)
 # ---------------------------------------------------------------------------
 
+def trajectory_provenance(args, inputs):
+    """R24: `--eval-rows` is either the original eval rows (Global Constraints hash) or a
+    regenerated `merged.jsonl` whose sibling `trajectories-manifest.json` vouches for
+    exactly this file, model, precision, selection and data."""
+    if inputs["eval_rows"] == EXPECTED_SHA256["eval_rows"]:
+        return {"trajectory_source": "original", "trajectory_skipped": []}
+    path = Path(args.eval_rows).parent / "trajectories-manifest.json"
+    if not path.exists():
+        raise ValueError(f"eval_rows sha256 {inputs['eval_rows']} is not the original eval rows "
+                         f"({EXPECTED_SHA256['eval_rows']}) and no trajectories manifest exists at {path}")
+    recorded = json.loads(path.read_text())
+    expected = {**model_identity(args), "merged_sha256": inputs["eval_rows"],
+                "selection_sha256": inputs["selection"], "data_sha256": inputs["data"]}
+    mismatched = sorted(key for key in expected if recorded.get(key) != expected[key])
+    if mismatched:
+        raise ValueError(f"trajectories manifest {path} does not match the current inputs on {mismatched}")
+    return {"trajectory_source": "regenerated", "trajectories_manifest_sha256": sha256(path),
+            "trajectory_skipped": sorted(int(r["index"]) for r in recorded["skipped"])}
+
+
 def stage_prepare(args):
     from evaluation.latent_image_corruptions import select_swaps
     from evaluation.latent_image_trajectory import load_selection
@@ -423,18 +448,13 @@ def stage_prepare(args):
     if status:
         raise RuntimeError(f"refusing to prepare from a dirty tracked tree; commit or revert first:\n{status}")
     inputs = _current_inputs(args)
-    for key, path in (("data", args.data), ("selection", args.selection), ("eval_rows", args.eval_rows)):
+    for key, path in (("data", args.data), ("selection", args.selection)):
         if inputs[key] != EXPECTED_SHA256[key]:
             raise ValueError(f"{key} sha256 {inputs[key]} does not match the expected Global Constraints "
                              f"value {EXPECTED_SHA256[key]}; refusing to prepare with unverified inputs ({path})")
-    prepared_manifest = Path(str(args.model_dir) + ".manifest.json")
-    adapter = args.model_dir / "adapter_model.safetensors"
     manifest = {
-        "inputs": inputs, "commit": git_commit(), "git_status": status,
-        "model_dir": str(args.model_dir), "base_model_dir": str(args.base_model_dir),
-        "prepared_manifest_sha256": sha256(prepared_manifest), "adapter_sha256": sha256(adapter),
-        "precision": args.precision,
-        "created": datetime.now(timezone.utc).isoformat(),
+        "inputs": inputs, "commit": git_commit(), "git_status": status, **model_identity(args),
+        **trajectory_provenance(args, inputs), "created": datetime.now(timezone.utc).isoformat(),
     }
 
     # Swaps are computed before the manifest is written, so a failed prepare leaves no manifest.
@@ -478,9 +498,11 @@ def stage_smoke(args):
     model, processor, token_ids = _teacher_forced_setup(args)
     precision_record = apply_precision(model, args.precision)
 
+    skipped = trajectory_skipped(manifest)
+
     def candidates():
         for idx in selection:
-            if eval_rows[idx].get("stop_reason") != "eos":
+            if idx in skipped or eval_rows[idx].get("stop_reason") != "eos":
                 continue
             trajectory = build_trajectory(processor, test_rows[idx], eval_rows[idx], idx, args.data_root, token_ids)
             yield {"idx": idx, "n_blocks": len(trajectory.layout.blocks), "stop_reason": "eos",
@@ -524,6 +546,7 @@ def stage_attention(args):
     categories = {int(i): entry["category"] for i, entry in swaps["questions"].items()}
     heatmap_set = set(heatmap_questions(selection, categories))
     owned = shard_items(selection, args.shard, args.num_shards)
+    skipped = trajectory_skipped(manifest)
     model, processor, token_ids = _teacher_forced_setup(args)
     precision_record = apply_precision(model, args.precision)
     with numerical_policy():
@@ -531,6 +554,10 @@ def stage_attention(args):
             out_json = args.run_dir / "attention" / f"q{idx}.json"
             excl_json = args.run_dir / "attention" / "excluded" / f"q{idx}.json"
             if skip_existing(out_json, excl_json):
+                continue
+            if idx in skipped:      # R24: never generated (prompt over budget), so no eval row exists
+                write_json_atomic(excl_json, {"excluded": True, "reason": "length_budget",
+                                              "source": "trajectories_skipped"})
                 continue
             trajectory = build_trajectory(processor, test_rows[idx], eval_rows[idx], idx, args.data_root, token_ids)
             over_budget = length_budget_exclusion(trajectory.layout)

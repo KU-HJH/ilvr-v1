@@ -764,3 +764,100 @@ def test_stage_heads_ignores_leftover_temp_npz(tmp_path):
     assert cli.question_files(run_dir / "attention", "npz") == {0: run_dir / "attention" / "q0.npz"}
     assert cli.excluded_indices(run_dir) == set()
     assert cli.stage_heads(_stage_args("heads", data_path, selection_path, eval_rows_path, run_dir)) == 0
+
+
+# ---------------------------------------------------------------------------
+# R24: prepare accepts regenerated (fp32) trajectories with a matching manifest
+# ---------------------------------------------------------------------------
+
+def _regenerated_fixture(tmp_path, monkeypatch, **overrides):
+    """Prepare fixture whose --eval-rows is a regenerated merged.jsonl with a sibling manifest."""
+    fixture = _build_prepare_fixture(tmp_path)
+    monkeypatch.setattr(cli, "EXPECTED_SHA256", {
+        "data": cli.sha256(fixture["data"]), "selection": cli.sha256(fixture["selection"]), "eval_rows": "0" * 64})
+    monkeypatch.setattr(cli, "git_status_porcelain", lambda: "")
+    regenerated = tmp_path / "traj" / "merged.jsonl"
+    regenerated.parent.mkdir()
+    _write_jsonl(regenerated, [{"index": i} for i in fixture["indices"][1:]])
+    args = cli._parser().parse_args(_prepare_argv(fixture, tmp_path / "unused"))
+    manifest = {**cli.model_identity(args), "merged_sha256": cli.sha256(regenerated),
+                "selection_sha256": cli.sha256(fixture["selection"]), "data_sha256": cli.sha256(fixture["data"]),
+                "skipped": [{"index": fixture["indices"][0], "skipped": "length_budget"}], **overrides}
+    cli.write_json_atomic(regenerated.parent / "trajectories-manifest.json", manifest)
+    fixture["eval_rows"] = regenerated
+    return fixture
+
+
+def test_prepare_accepts_regenerated_trajectories_with_matching_manifest(tmp_path, monkeypatch):
+    fixture = _regenerated_fixture(tmp_path, monkeypatch)
+    run_dir = tmp_path / "run"
+    assert cli.main(_prepare_argv(fixture, run_dir)) == 0
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["trajectory_source"] == "regenerated"
+    assert manifest["trajectories_manifest_sha256"] == cli.sha256(
+        fixture["eval_rows"].parent / "trajectories-manifest.json")
+    assert manifest["trajectory_skipped"] == [fixture["indices"][0]]
+    assert manifest["inputs"]["eval_rows"] == cli.sha256(fixture["eval_rows"])
+
+
+@pytest.mark.parametrize("override", [
+    {"merged_sha256": "f" * 64}, {"precision": "bf16"}, {"model_dir": "/elsewhere"}, {"adapter_sha256": "a" * 64},
+    {"selection_sha256": "b" * 64}, {"data_sha256": "c" * 64}])
+def test_prepare_rejects_mismatching_trajectories_manifest(tmp_path, monkeypatch, override):
+    fixture = _regenerated_fixture(tmp_path, monkeypatch, **override)
+    run_dir = tmp_path / "run"
+    with pytest.raises(ValueError, match="trajectories manifest"):
+        cli.main(_prepare_argv(fixture, run_dir))
+    assert not (run_dir / "manifest.json").exists()
+
+
+def test_prepare_rejects_unknown_eval_rows_without_trajectories_manifest(tmp_path, monkeypatch):
+    fixture = _regenerated_fixture(tmp_path, monkeypatch)
+    (fixture["eval_rows"].parent / "trajectories-manifest.json").unlink()
+    with pytest.raises(ValueError, match="trajectories manifest"):
+        cli.main(_prepare_argv(fixture, tmp_path / "run"))
+
+
+def test_prepare_with_original_eval_rows_records_original_source(tmp_path, monkeypatch):
+    fixture = _build_prepare_fixture(tmp_path)
+    _expect_fixture_hashes(monkeypatch, fixture)
+    monkeypatch.setattr(cli, "git_status_porcelain", lambda: "")
+    run_dir = tmp_path / "run"
+    assert cli.main(_prepare_argv(fixture, run_dir)) == 0
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["trajectory_source"] == "original" and manifest["trajectory_skipped"] == []
+
+
+def test_stage_attention_excludes_trajectory_skipped_question_missing_from_eval_rows(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import evaluation.latent_image_interventions as li
+    import evaluation.latent_image_trajectory as lt
+    data_path = tmp_path / "TEST.jsonl"
+    _write_jsonl(data_path, [{"image_input": ["x"]} for _ in range(4)])
+    selection_path = tmp_path / "metadata.json"
+    selection_path.write_text(json.dumps({"selection": {"requested_indices": [0, 1, 2, 3]}}))
+    eval_rows_path = tmp_path / "merged.jsonl"
+    _write_jsonl(eval_rows_path, [{"index": i, "stop_reason": "eos", "match": True} for i in (1, 2, 3)])  # 0 skipped
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    manifest = _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    cli.write_json_atomic(run_dir / "manifest.json", {**manifest, "trajectory_skipped": [0]})
+    cli.write_json_atomic(run_dir / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(run_dir / "swaps.json", {"questions": {
+        str(i): {"category": c, "swaps": []} for i, c in enumerate(["creation", "deletion", "selection", "update"])}})
+    monkeypatch.setattr(cli, "_teacher_forced_setup", lambda args: (None, None, T))
+    monkeypatch.setattr(cli, "apply_precision", lambda model, precision: {})
+    built = []
+
+    def build(processor, test_row, eval_row, idx, *a, **k):
+        built.append(idx)
+        return SimpleNamespace(layout=SimpleNamespace(length=9000, image_positions=()))
+    monkeypatch.setattr(lt, "build_trajectory", build)
+    monkeypatch.setattr(li, "run_condition", lambda *a, **k: pytest.fail("model must not run"))
+    args = _stage_args("attention", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+    assert cli.stage_attention(args) == 0
+    assert built == [1, 2, 3]
+    doc = json.loads((run_dir / "attention" / "excluded" / "q0.json").read_text())
+    assert doc["reason"] == "length_budget" and doc["source"] == "trajectories_skipped"
+    assert cli.g5_exclusion_count(run_dir) == 0
