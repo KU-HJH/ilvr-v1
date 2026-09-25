@@ -10,6 +10,11 @@ from evaluation.latent_image_layout import IMAGE
 GROUPS = ("pad", "start", "end", "pre", "post")
 PALETTE = {"pad": "#2a78d6", "start": "#eb6834", "end": "#1baf7a", "pre": "#eda100", "post": "#e87ba4"}
 PATCH_PALETTE = {"total": "#2a78d6", "direct": "#eb6834", "indirect": "#1baf7a"}
+MATCHED_SCOPE = "size-matched blocks only"
+RATIO_LABELS = {"direct_ratio_latent_cos_first_block": "primary (first perturbed block only, no propagation)",
+                "direct_ratio_latent_cos": "all blocks, includes propagation",
+                "direct_ratio_answer_dnll": "answer span (trajectory level, includes propagation)"}
+SENSITIVITY_NAMES = ("k_all",) + tuple(f"{k}_{p}" for k in ("blur", "mean", "swap") for p in ("direct", "total"))
 ALL_BLOCK_NOTE = ("all blocks, includes propagation: patching \"direct\"/\"indirect\" route edges over the whole "
                   "trajectory, so later-block \"direct\" effects include propagation through earlier perturbed "
                   "latents; `*_first_block` variants isolate the first perturbed block only")
@@ -30,19 +35,29 @@ def _safe_paired(a_map, b_map, reason="empty paired set"):
     return st.paired_cluster_bootstrap([a_map[q] for q in qs], [b_map[q] for q in qs], np.array(qs))
 
 
+def _by_question(unit_dict, keys=None):
+    """R14: collapse (question, block) units to one value per question (mean over the
+    question's blocks; each block is already a mean over its rows)."""
+    grouped = {}
+    for key in (sorted(unit_dict) if keys is None else keys):
+        grouped.setdefault(key[0], []).append(unit_dict[key])
+    return {q: np.mean(v, 0) for q, v in grouped.items()}
+
+
 def _paired_layer_diff(a_dict, b_dict, layers, reason="empty paired set"):
     """Per-layer paired_cluster_bootstrap over the (a_dict & b_dict) key intersection
     (keys are (question, block) units, values are per-layer arrays), guarded the same way
-    as `_safe_paired`. Returns a per-layer list normally, or a single {"status": "NO DATA"}
-    dict when the intersection is empty (e.g. no post-text after the last block in any
-    question)."""
+    as `_safe_paired`. Units are averaged within question first (R14) so every question
+    carries equal weight. Returns a per-layer list normally, or a single
+    {"status": "NO DATA"} dict when the intersection is empty (e.g. no post-text after the
+    last block in any question)."""
     keys = sorted(set(a_dict) & set(b_dict))
     if not keys:
         return {"status": "NO DATA", "reason": reason}
-    a = np.stack([a_dict[k] for k in keys])
-    b = np.stack([b_dict[k] for k in keys])
-    clusters = np.array([k[0] for k in keys])
-    return [st.paired_cluster_bootstrap(a[:, l], b[:, l], clusters) for l in range(layers)]
+    a_q, b_q = _by_question(a_dict, keys), _by_question(b_dict, keys)
+    qs = sorted(a_q)
+    a, b = np.stack([a_q[q] for q in qs]), np.stack([b_q[q] for q in qs])
+    return [st.paired_cluster_bootstrap(a[:, l], b[:, l], np.array(qs)) for l in range(layers)]
 
 
 def _units(npz, meta, field, region_axis=True):
@@ -70,10 +85,11 @@ def attention_section(run_dir):
     layers = next(iter(units["pad"].values())).shape[0]
     curves = {}
     for group, data in units.items():
-        keys = sorted(data)
-        if not keys:
+        per_q = _by_question(data)
+        if not per_q:
             continue
-        values, clusters = np.stack([data[k] for k in keys]), np.array([k[0] for k in keys])
+        qs = sorted(per_q)
+        values, clusters = np.stack([per_q[q] for q in qs]), np.array(qs)
         curves[group] = [st.cluster_bootstrap(values[:, l], clusters) for l in range(layers)]
     diffs = {f"pad_minus_{control}": _paired_layer_diff(
                  units["pad"], units[control], layers, reason=f"no {control}-text units in any block")
@@ -89,45 +105,68 @@ def attention_section(run_dir):
     heads = json.loads((run_dir / "heads.json").read_text()) if (run_dir / "heads.json").exists() else None
     return {"status": "RUN", "evidence": "descriptive", "vw_image_share": curves, "differences": diffs,
             "significant_layers": significant, "significant_layers_missing_controls": missing_controls,
-            "mass_image_mean": {g: float(np.mean([v.mean() for v in d.values()])) for g, d in mass.items() if d},
-            "enrichment_mean": {g: float(np.mean([v.mean() for v in d.values()])) for g, d in enrichment.items() if d},
+            "mass_image_mean": {g: float(np.mean([v.mean() for v in _by_question(d).values()]))
+                                for g, d in mass.items() if d},
+            "enrichment_mean": {g: float(np.mean([v.mean() for v in _by_question(d).values()]))
+                                for g, d in enrichment.items() if d},
             "heads": heads["heads"] if heads else None}
 
 
-def _metric_units(docs, name, metric, first_block=False):
-    values, clusters = [], []
+def _question_means(docs, name, metric, first_block=False, keep=None):
+    """R14: one value per question. Per-block (list) metrics are averaged over the
+    question's blocks (only block 0 when `first_block`); trajectory-level (scalar) metrics
+    are taken as is. `keep` ({question: {block: bool}}) restricts per-block metrics to the
+    kept blocks and admits a scalar metric only when every block of the question is kept
+    (used for the R13 size-matched k_random rows)."""
+    out = {}
     for q, doc in docs.items():
         v = doc[metric].get(name)
         if v is None:
             continue
-        v = v[:1] if first_block and isinstance(v, list) else v
-        for x in (v if isinstance(v, list) else [v]):
-            if x is not None:
-                values.append(x)
-                clusters.append(q)
-    return np.array(values, dtype=np.float64), np.array(clusters)
+        if isinstance(v, list):
+            items = list(enumerate(v))[:1] if first_block else list(enumerate(v))
+            if keep is not None:
+                items = [(b, x) for b, x in items if keep.get(q, {}).get(b, False)]
+            xs = [x for _, x in items if x is not None]
+        else:
+            if keep is not None and not (keep.get(q) and all(keep[q].values())):
+                continue
+            xs = [v]
+        if xs:
+            out[q] = float(np.mean(xs))
+    return out
 
 
-def _table(docs, names):
-    """Knockout/patching table. R5: lead each row with first-block metrics (isolate the
-    first perturbed block); all-block metrics follow and are labeled in report.md."""
+def _boot(per_question):
+    if not per_question:
+        return None
+    qs = sorted(per_question)
+    return st.cluster_bootstrap([per_question[q] for q in qs], np.array(qs))
+
+
+def _table(docs, names, keep=None):
+    """Knockout/patching table, one unit per question (R14). R5: lead each row with
+    first-block metrics (isolate the first perturbed block); all-block metrics follow and
+    are labeled in report.md."""
     table = {}
     for name in names:
         row = {}
         for metric in ("latent_cos", "post_dnll"):
-            v, c = _metric_units(docs, name, metric, first_block=True)
-            row[f"{metric}_first_block"] = st.cluster_bootstrap(v, c) if len(v) else None
+            row[f"{metric}_first_block"] = _boot(_question_means(docs, name, metric, True, keep))
         for metric in ("latent_cos", "post_dnll", "post_flip", "answer_dnll", "answer_flip"):
-            v, c = _metric_units(docs, name, metric)
-            row[metric] = st.cluster_bootstrap(v, c) if len(v) else None
+            row[metric] = _boot(_question_means(docs, name, metric, False, keep))
         table[name] = row
     return table
 
 
-def _question_means(docs, name, metric):
-    return {q: float(np.mean([x for x in (d[metric][name] if isinstance(d[metric][name], list) else [d[metric][name]])
-                              if x is not None]))
-            for q, d in docs.items() if d[metric].get(name) is not None}
+def _size_matched(docs):
+    """R13: {question: {block: random_matched == 1.0}} for questions with a k_random result,
+    plus matched/total block counts."""
+    keep = {q: {int(b): float(v) == 1.0 for b, v in d.get("random_matched", {}).items()}
+            for q, d in docs.items() if d["latent_cos"].get("k_random") is not None}
+    counts = {"matched_blocks": sum(sum(m.values()) for m in keep.values()),
+              "total_blocks": sum(len(m) for m in keep.values())}
+    return keep, counts
 
 
 def _safe_ratio(num_map, den_map):
@@ -153,18 +192,27 @@ def intervention_sections(run_dir):
     if not paths:
         return ({"status": "NOT RUN"},) * 3
     docs = {q: json.loads(p.read_text()) for q, p in paths.items()}
-    knockout = {"status": "RUN", "evidence": "causal", "note": ALL_BLOCK_NOTE,
-                "table": _table(docs, ("noop_repeat", "k_all", "k_heads", "k_random"))}
-    a, b = _question_means(docs, "k_all", "latent_cos"), _question_means(docs, "k_random", "latent_cos")
-    knockout["k_all_minus_k_random_latent_cos"] = _safe_paired(
-        a, b, reason="no question has both k_all and k_random latent_cos")
+    keep, counts = _size_matched(docs)
+    table = _table(docs, ("noop_repeat", "k_all", "k_heads"))
+    table["k_random"] = {"scope": MATCHED_SCOPE, **counts, **_table(docs, ("k_random",), keep)["k_random"]}
+    table["k_random_all_blocks_not_size_matched"] = {"scope": "all blocks, not size-matched",
+                                                     **_table(docs, ("k_random",))["k_random"]}
+    knockout = {"status": "RUN", "evidence": "causal", "note": ALL_BLOCK_NOTE, "table": table}
+    a = _question_means(docs, "k_all", "latent_cos", keep=keep)
+    b = _question_means(docs, "k_random", "latent_cos", keep=keep)
+    knockout["k_all_minus_k_random_latent_cos"] = {"scope": MATCHED_SCOPE, **counts, **_safe_paired(
+        a, b, reason="no question has both k_all and k_random latent_cos")}
     patching = {"status": "RUN", "evidence": "causal", "note": ALL_BLOCK_NOTE, "by_corruption": {}}
     for kind in ("blur", "mean", "swap"):
         names = tuple(f"{kind}_{n}" for n in ("total", "direct", "indirect"))
         entry = {"table": _table(docs, names)}
+        d = _question_means(docs, f"{kind}_direct", "latent_cos", first_block=True)
+        t = _question_means(docs, f"{kind}_total", "latent_cos", first_block=True)
+        entry["direct_ratio_latent_cos_first_block"] = _safe_ratio(d, t)
         for metric in ("latent_cos", "answer_dnll"):
             d, t = _question_means(docs, f"{kind}_direct", metric), _question_means(docs, f"{kind}_total", metric)
             entry[f"direct_ratio_{metric}"] = _safe_ratio(d, t)
+        entry["labels"] = RATIO_LABELS
         patching["by_corruption"][kind] = entry
     content = {"status": "RUN", "evidence": "information content", "sensitivity": {}, "identification": {}}
     for kind in ("blur", "mean", "swap"):
@@ -181,6 +229,23 @@ def intervention_sections(run_dir):
     return knockout, patching, content
 
 
+def truncation_sensitivity_section(run_dir):
+    """R14: latent_cos / answer_dnll for k_all and each *_direct/*_total recomputed without
+    questions whose eval stop_reason was "max_new_tokens" (recorded in attention/q*.json)."""
+    paths = _files(run_dir, "interventions", "json")
+    if not paths:
+        return {"status": "NOT RUN"}
+    docs = {q: json.loads(p.read_text()) for q, p in paths.items()}
+    meta = {q: json.loads(p.read_text()) for q, p in _files(run_dir, "attention", "json").items()}
+    truncated = sorted(q for q in docs if meta.get(q, {}).get("stop_reason") == "max_new_tokens")
+    missing = sorted(q for q in docs if "stop_reason" not in meta.get(q, {}))
+    kept = {q: d for q, d in docs.items() if q not in truncated}
+    return {"status": "RUN", "evidence": "sensitivity", "excluded_truncated": truncated,
+            "stop_reason_missing": missing, "questions": len(kept),
+            "table": {name: {m: _boot(_question_means(kept, name, m)) for m in ("latent_cos", "answer_dnll")}
+                      for name in SENSITIVITY_NAMES}}
+
+
 def freegen_section(run_dir):
     modes = ("causal_mask", "latent_mask")
     if not all((run_dir / "freegen" / m).is_dir() for m in modes):
@@ -192,14 +257,15 @@ def freegen_section(run_dir):
     latent_only = sum(results["latent_mask"][q] and not results["causal_mask"][q] for q in qs)
     # R10: free generation covers all selected questions regardless of G5 exclusions; report
     # the question count per mode as well as the paired (intersection) count used for McNemar.
-    attn_meta = {q: json.loads(p.read_text()) for q, p in _files(run_dir, "attention", "json").items()}
-    eval_correct = sum(1 for m in attn_meta.values() if m.get("eval_match"))
+    # R19: the eval baseline is counted over the same freegen question set (causal_mask files).
+    baseline = [json.loads(p.read_text()).get("eval_match") for p in _files(run_dir, "freegen/causal_mask", "json").values()]
+    baseline = [m for m in baseline if m is not None]
     return {"status": "RUN", "evidence": "accuracy", "questions": len(qs),
             "questions_per_mode": {m: len(results[m]) for m in modes},
             "correct": {m: int(sum(results[m][q] for q in qs)) for m in modes},
             "discordant": {"causal_only": causal_only, "latent_only": latent_only},
             "mcnemar_p": st.exact_mcnemar(causal_only, latent_only),
-            "eval_baseline_correct": eval_correct, "eval_baseline_questions": len(attn_meta)}
+            "eval_baseline_correct": int(sum(baseline)), "eval_baseline_questions": len(baseline)}
 
 
 def gates_section(run_dir):
@@ -225,13 +291,24 @@ def gates_section(run_dir):
             "random_matched": random_matched}
 
 
+ATTENTION_GATES = (("G1", "g1_max", 1e-2), ("G1b", "g1b_max", 1e-2), ("G2", "g2_max", 1e-3))
+
+
+def attention_gate_failures(gates):
+    """R18: attention gates over the analysed questions."""
+    return [name for name, key, limit in ATTENTION_GATES if gates.get(key) is not None and gates[key] > limit]
+
+
 def _markdown(summary):
     lines = ["# Latent image attention analysis", ""]
+    if "report_commit" in summary:
+        lines += [f"Report commit: `{summary['report_commit']}` (dirty tracked tree: {summary.get('report_dirty')})", ""]
     titles = {
         "attention": "③ Attention (evidence level: technical/descriptive)",
         "knockout": "① Knockout (evidence level: causal)",
         "patching": "② Image patching (evidence level: causal)",
         "content": "B. Latent information content (evidence level: information content)",
+        "sensitivity_excluding_truncated": "Sensitivity excluding max_new_tokens-truncated questions",
         "freegen": "Free generation (evidence level: answer accuracy)",
         "gates": "Gates and exclusions",
     }
@@ -247,7 +324,11 @@ def _markdown(summary):
         section = summary[key]
         status = section.get("status", "RUN") if isinstance(section, dict) else "RUN"
         lines += [f"## {title}", "", f"Status: **{status}**", ""]
-        if status == "GATE FAILED":
+        if status == "GATE FAILED" and key == "attention":
+            lines += [f"{'/'.join(section.get('gate_failures', []))} exceeded its tolerance for at least one "
+                      "analysed question; this section's numbers are **GATE FAILED** and should not be "
+                      "trusted as descriptive evidence.", ""]
+        elif status == "GATE FAILED":
             lines += ["G3/G4 failed for at least one question; this section's numbers are **GATE FAILED** "
                       "and should not be trusted as causal evidence.", ""]
         if key in notes and status not in ("NOT RUN",):
@@ -356,15 +437,21 @@ def write_figures(run_dir, summary):
             plt.close(fig)
 
 
-def build_report(run_dir):
+def build_report(run_dir, provenance=None):
+    """`provenance` (e.g. {"report_commit", "report_dirty"}) is merged into summary.json."""
     run_dir = Path(run_dir)
     knockout, patching, content = intervention_sections(run_dir)
     summary = {"attention": attention_section(run_dir), "knockout": knockout, "patching": patching,
-               "content": content, "freegen": freegen_section(run_dir), "gates": gates_section(run_dir)}
+               "content": content, "sensitivity_excluding_truncated": truncation_sensitivity_section(run_dir),
+               "freegen": freegen_section(run_dir), "gates": gates_section(run_dir)}
+    summary.update(provenance or {})
     if summary["gates"]["g3_fail"] or summary["gates"]["g4_fail"]:
-        for key in ("knockout", "patching", "content"):
+        for key in ("knockout", "patching", "content", "sensitivity_excluding_truncated"):
             if summary[key].get("status") == "RUN":
                 summary[key]["status"] = "GATE FAILED"
+    failures = attention_gate_failures(summary["gates"])
+    if failures and summary["attention"].get("status") == "RUN":
+        summary["attention"].update(status="GATE FAILED", gate_failures=failures)
     summary = json.loads(json.dumps(summary, default=float))
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=1))
     (run_dir / "report.md").write_text(_markdown(summary))

@@ -11,13 +11,19 @@ CANDS = ("cand1", "cand2", "cand3", "cand4")
 
 
 def write_synthetic_run(run_dir, questions=3, blocks=2, with_freegen=False, image_boost=0.3,
-                         omit_post=False, omit_k_random=False):
+                         omit_post=False, omit_k_random=False, stop_reasons=None, eval_matches=None):
+    """`blocks` is an int (same for every question) or a per-question sequence.
+    `stop_reasons` / `eval_matches` optionally override the per-question eval metadata."""
     run_dir, rng = Path(run_dir), np.random.default_rng(0)
+    per_q_blocks = [blocks] * questions if isinstance(blocks, int) else list(blocks)
+    stop_reasons = stop_reasons or ["eos"] * questions
+    eval_matches = eval_matches or [bool(q % 2) for q in range(questions)]
     (run_dir / "manifest.json").write_text(json.dumps({"inputs": {}, "commit": "c"}))
     (run_dir / "heads.json").write_text(json.dumps({"heads": [[0, 1]], "share": np.zeros((LAYERS, HEADS)).tolist()}))
     for sub in ("attention", "interventions"):
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
     for q in range(questions):
+        blocks = per_q_blocks[q]
         specs = []
         for b in range(blocks):
             specs += [{"position": 0, "group": "latent", "block": b, "slot": s}
@@ -34,7 +40,8 @@ def write_synthetic_run(run_dir, questions=3, blocks=2, with_freegen=False, imag
                  image_grid_thw=np.array([[1, 2, 2]]))
         (run_dir / "attention" / f"q{q}.json").write_text(json.dumps(
             {"specs": specs, "g1": 1e-3, "g1b": 5e-4, "g2": 1e-4, "g5": {"excluded": False, "rate": 1.0},
-             "category": "deletion", "n_blocks": blocks, "eval_match": bool(q % 2)}))
+             "category": "deletion", "n_blocks": blocks, "eval_match": eval_matches[q],
+             "stop_reason": stop_reasons[q]}))
         names = tuple(n for n in KNOCKOUT + PATCH + CANDS if not (omit_k_random and n == "k_random"))
         out = {key: {} for key in ("latent_cos", "latent_cos_pads", "post_dnll", "post_flip",
                                    "answer_dnll", "answer_flip", "control_cos")}
@@ -59,4 +66,5 @@ def write_synthetic_run(run_dir, questions=3, blocks=2, with_freegen=False, imag
             (run_dir / "freegen" / mode).mkdir(parents=True, exist_ok=True)
             for q in range(questions):
                 (run_dir / "freegen" / mode / f"q{q}.json").write_text(
-                    json.dumps({"match": mode == "causal_mask" or q == 0}))
+                    json.dumps({"match": mode == "causal_mask" or q == 0, "eval_match": eval_matches[q],
+                                "stop_reason": stop_reasons[q]}))
