@@ -1,0 +1,542 @@
+"""Staged CLI, gates and per-question drivers for latent image attention analysis.
+
+Seven stages, run in order against a shared `--run-dir`:
+`prepare`, `smoke`, `attention`, `heads`, `interventions`, `freegen`, `report`.
+`prepare` records input hashes and the git commit in `manifest.json`; every
+later stage aborts if the current inputs or commit differ (`require_manifest`).
+"""
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from evaluation.latent_image_stats import cosine_distance
+
+STAGES = ("prepare", "smoke", "attention", "heads", "interventions", "freegen", "report")
+
+# Global Constraints values (compared against `prepare`'s computed hashes). Tests
+# monkeypatch this dict since synthetic tmp_path inputs never match these hashes.
+EXPECTED_SHA256 = {
+    "data": "6a1dccf32bb5196d09941adfd8ea79e29b58c34316f286673b557ed29dc69618",
+    "selection": "fb1f15fef5339abde6ba74d140e5f9a1f8823cedafe8aef1d4bb245a8e0286aa",
+    "eval_rows": "76380b6e01bc6cf7e6bd44c551cf99a8ed18b0745dbd1314c8378fe2af9396d5",
+}
+
+DEFAULT_MODEL_DIR = Path(
+    "checkpoints/evaluation-staging/stage2-ce-matched-gb16-s212-20260919-155759/prepared-checkpoint-212")
+DEFAULT_BASE_MODEL_DIR = Path("checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct")
+DEFAULT_DATA = Path("data/TEST.jsonl")
+DEFAULT_DATA_ROOT = Path("data")
+
+
+# ---------------------------------------------------------------------------
+# Helpers (Step 3)
+# ---------------------------------------------------------------------------
+
+def shard_items(items, shard, num_shards):
+    return tuple(x for i, x in enumerate(items) if i % num_shards == shard)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_commit():
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+
+
+def require_manifest(run_dir, inputs, commit):
+    manifest = json.loads((Path(run_dir) / "manifest.json").read_text())
+    if manifest["inputs"] != inputs or manifest["commit"] != commit:
+        raise ValueError("manifest inputs or commit differ from the current execution")
+    return manifest
+
+
+def g5_verdict(matches, first_block_offset):
+    rate = sum(matches) / len(matches)
+    first_bad = next((i for i, ok in enumerate(matches) if not ok), None)
+    if first_bad is not None and first_bad < first_block_offset:
+        return {"excluded": True, "reason": "mismatch_before_first_block", "rate": rate, "first_mismatch": first_bad}
+    if rate < 0.99:
+        return {"excluded": True, "reason": "match_rate_below_0.99", "rate": rate, "first_mismatch": first_bad}
+    return {"excluded": False, "reason": None, "rate": rate, "first_mismatch": first_bad}
+
+
+def require_exclusion_budget(count, limit=10):
+    if count > limit:
+        raise RuntimeError(f"{count} trajectory exclusions exceed the limit of {limit}")
+
+
+def select_heads(share, fraction=0.05):
+    count = int(round(share.size * fraction))          # 576 * 0.05 = 28.8 -> 29
+    order = np.argsort(-share, axis=None, kind="stable")[:count]
+    return [tuple(int(v) for v in np.unravel_index(i, share.shape)) for i in order]
+
+
+# ---------------------------------------------------------------------------
+# Per-question logic (Step 6)
+# ---------------------------------------------------------------------------
+
+def compare_runs(a, b, tol=1e-2):
+    tokens = sorted(b.scores)
+    mismatches = sum(a.scores[p][0] != b.scores[p][0] for p in tokens)
+    max_dnll = max(abs(a.scores[p][1] - b.scores[p][1]) for p in tokens)
+    rel = float(((a.latents - b.latents).norm(dim=-1) / b.latents.norm(dim=-1).clamp_min(1e-6)).max())
+    return {"argmax_mismatches": int(mismatches), "max_abs_dnll": float(max_dnll), "max_latent_rel": rel,
+            "pass": mismatches == 0 and max_dnll <= tol and rel <= tol}
+
+
+def g5_for(reference, trajectory):
+    ids = trajectory.input_ids[0].tolist()
+    scored = trajectory.layout.scored_positions
+    matches = [reference.scores[p][0] == ids[p] for p in scored]
+    return g5_verdict(matches, scored.index(trajectory.layout.blocks[0].start))
+
+
+def summarize_question(results, layout, matched):
+    base = results["noop"]
+    out = {key: {} for key in ("latent_cos", "latent_cos_pads", "post_dnll", "post_flip",
+                               "answer_dnll", "answer_flip", "control_cos")}
+    out.update(random_matched=matched, answer_status=layout.answer_status)
+    controls = sorted(base.last_hidden)
+
+    def delta(result, positions):
+        if not positions:
+            return None, None
+        d = [result.scores[p][1] - base.scores[p][1] for p in positions]
+        f = [result.scores[p][0] != base.scores[p][0] for p in positions]
+        return float(np.mean(d)), float(np.mean(f))
+
+    for name, result in results.items():
+        if name == "noop":
+            continue
+        pads = cosine_distance(result.latents.numpy(), base.latents.numpy())
+        out["latent_cos_pads"][name] = pads.tolist()
+        out["latent_cos"][name] = pads.mean(1).tolist()
+        post = [delta(result, span) for span in layout.post_span]
+        out["post_dnll"][name] = [p[0] for p in post]
+        out["post_flip"][name] = [p[1] for p in post]
+        answer = delta(result, layout.answer_positions) if layout.answer_status == "ok" else (None, None)
+        out["answer_dnll"][name], out["answer_flip"][name] = answer
+        out["control_cos"][name] = (float(np.mean([cosine_distance(result.last_hidden[p].numpy(),
+                                                                   base.last_hidden[p].numpy()) for p in controls]))
+                                    if controls else None)
+    return out
+
+
+def question_interventions(model, processor, trajectory, heads, swap_images):
+    from evaluation.latent_image_corruptions import (blur_image, mean_image, pixel_inputs,
+                                                     require_same_grid, resized_swap)
+    from evaluation.latent_image_interventions import Condition, random_key_sets, run_condition
+    original = trajectory.images[0]
+
+    def pix(image, label):
+        values, grid = pixel_inputs(processor, image)
+        require_same_grid(trajectory.image_grid_thw, grid, label)
+        return values, grid
+
+    ip = processor.image_processor
+    alts = {"blur": pix(blur_image(original), "blur"), "mean": pix(mean_image(original), "mean"),
+            "swap": pix(resized_swap(swap_images[0], original, ip), "swap")}
+    candidates = [pix(resized_swap(image, original, ip), f"cand{i + 1}") for i, image in enumerate(swap_images)]
+    random_sets, matched = random_key_sets(trajectory.layout, source_index=trajectory.source_index)
+    results = {}
+
+    def run(condition, **kwargs):
+        results[condition.name] = run_condition(model, trajectory, condition, **kwargs)
+
+    run(Condition("reference", native=True))
+    run(Condition("noop"))
+    run(Condition("noop_repeat"))
+    run(Condition("k_all", latent_source="none"))
+    run(Condition("k_heads", head_subset=tuple(tuple(h) for h in heads)))
+    run(Condition("k_random", random_keys=True), random_blocked=random_sets)
+    for kind, (values, grid) in alts.items():
+        for name, text, latent in (("dual_clean", "clean", "clean"), ("total", "alt", "alt"),
+                                   ("direct", "clean", "alt"), ("indirect", "alt", "clean")):
+            run(Condition(f"{kind}_{name}", text, latent), alt_pixel_values=values, alt_grid=grid)
+    for i, (values, grid) in enumerate(candidates):
+        run(Condition(f"cand{i + 1}"), pixel_override=(values, grid))
+    gates = {"G3": compare_runs(results["noop"], results["reference"]),
+             "G4": compare_runs(results["blur_dual_clean"], results["noop"]),
+             "G5": g5_for(results["reference"], trajectory)}
+    return results, matched, gates
+
+
+def content_arrays(results):
+    names = ["noop", "cand1", "cand2", "cand3", "cand4"]
+    return {key: np.stack([getattr(results[n], key).numpy() for n in names]).astype(np.float32)
+            for key in ("mid_body", "final_body", "image_mid", "image_final")}
+
+
+def heatmap_questions(selection, categories):
+    chosen = [next(i for i in selection if categories[i] == c) for c in ("creation", "deletion", "selection", "update")]
+    return tuple(chosen + [i for i in selection if i not in chosen][:2])
+
+
+def question_freegen(model, processor, test_row, data_root, mode):
+    from eval import extract_assistant_content
+    from evaluation.latent_image_trajectory import _open_images
+    from evaluation.runtime import prepare_evaluation_input
+    from evaluation.scoring import score_answer
+    from evaluation.visual_interventions import VisualIntervention
+    from stage2.inference import Stage2InferenceController, build_stage2_generation_config
+    from stage2.peft import resolve_stage2_qwen_model
+    from stage2.checkpointing import resolve_latent_token_ids  # same helper eval.py uses
+    qwen = resolve_stage2_qwen_model(model)
+    images, _ = _open_images(test_row, data_root)
+    prepared = prepare_evaluation_input(processor, test_row, images)
+    device = qwen.model.embed_tokens.weight.device
+    inputs = {k: v.to(device) for k, v in prepared.tensors.items()}
+    config = build_stage2_generation_config(
+        model_config=qwen.config, model_generation_config=getattr(qwen, "generation_config", None),
+        tokenizer=processor.tokenizer,
+        generation_kwargs={"max_new_tokens": 4096, "temperature": 0.0, "top_p": 1.0, "repetition_penalty": 1.0,
+                           "max_sequence_length": 128000, "generation_limit_policy": "external_full_latent_block"})
+    with torch.inference_mode():
+        result = Stage2InferenceController().generate(
+            model=qwen, input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+            token_ids=resolve_latent_token_ids(processor.tokenizer, qwen.config), generation_config=config,
+            pixel_values=inputs["pixel_values"], image_grid_thw=inputs["image_grid_thw"],
+            intervention=VisualIntervention(mode, qwen.config.image_token_id))
+    suffix = result.sequences[:, prepared.prompt_token_length:]
+    assistant = extract_assistant_content(processor.batch_decode(suffix, skip_special_tokens=False)[0].strip())
+    score = score_answer(assistant, test_row.get("original_final_answer"))
+    return {"match": bool(score.match), "extracted_final_answer": score.prediction.extracted,
+            "latent_block_count": int(result.latent_block_count), "stop_reason": result.stop_reason,
+            "generated_suffix_token_ids": suffix[0].tolist(), "prompt_identity": prepared.prompt_identity}
+
+
+# ---------------------------------------------------------------------------
+# I/O helpers used by the stage drivers
+# ---------------------------------------------------------------------------
+
+def load_test_rows(path):
+    """TEST.jsonl rows indexed by 0-based line number (the `index` used everywhere else)."""
+    rows = []
+    with open(path) as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def write_json_atomic(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def savez_atomic(path, **arrays):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.stem + ".tmp.npz")
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
+
+
+def skip_existing(*paths):
+    return any(Path(p).exists() for p in paths)
+
+
+def question_category(image_input, data_root):
+    from multinode_evaluation import resolve_evaluation_image_paths
+    root = Path(data_root).resolve()
+    resolved = resolve_evaluation_image_paths(image_input, root)
+    return Path(resolved[0]).resolve().relative_to(root).parts[1]
+
+
+def open_swap_images(swap_indices, test_rows, data_root):
+    from eval import open_images
+    from multinode_evaluation import resolve_evaluation_image_paths
+    root = Path(data_root).resolve()
+    images = []
+    for j in swap_indices:
+        paths = resolve_evaluation_image_paths(test_rows[j]["image_input"], root)
+        images.append(open_images(paths[:1])[0])
+    return images
+
+
+def _current_inputs(args):
+    return {"data": sha256(args.data), "selection": sha256(args.selection), "eval_rows": sha256(args.eval_rows)}
+
+
+# ---------------------------------------------------------------------------
+# Stage drivers (Step 8)
+# ---------------------------------------------------------------------------
+
+def stage_prepare(args):
+    from evaluation.latent_image_corruptions import select_swaps
+    from evaluation.latent_image_trajectory import load_selection
+    manifest_path = args.run_dir / "manifest.json"
+    if manifest_path.exists():
+        raise ValueError(f"manifest already exists at {manifest_path}; use a fresh run directory")
+    inputs = _current_inputs(args)
+    for key, path in (("data", args.data), ("selection", args.selection), ("eval_rows", args.eval_rows)):
+        if inputs[key] != EXPECTED_SHA256[key]:
+            raise ValueError(f"{key} sha256 {inputs[key]} does not match the expected Global Constraints "
+                             f"value {EXPECTED_SHA256[key]}; refusing to prepare with unverified inputs ({path})")
+    prepared_manifest = Path(str(args.model_dir) + ".manifest.json")
+    adapter = args.model_dir / "adapter_model.safetensors"
+    manifest = {
+        "inputs": inputs, "commit": git_commit(),
+        "model_dir": str(args.model_dir), "base_model_dir": str(args.base_model_dir),
+        "prepared_manifest_sha256": sha256(prepared_manifest), "adapter_sha256": sha256(adapter),
+        "created": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json_atomic(manifest_path, manifest)
+
+    test_rows = load_test_rows(args.data)
+    selection = load_selection(args.selection)
+    categories = {idx: question_category(test_rows[idx]["image_input"], args.data_root) for idx in selection}
+    pool = {}
+    for idx in selection:
+        pool.setdefault(categories[idx], []).append(idx)
+    questions = {}
+    for idx in selection:
+        swaps = select_swaps(idx, categories[idx], pool)
+        questions[str(idx)] = {"category": categories[idx], "swaps": list(swaps)}
+    write_json_atomic(args.run_dir / "swaps.json", {"pool": pool, "questions": questions})
+    return 0
+
+
+def _teacher_forced_setup(args):
+    """Load the model/processor once under the analysis numerical policy."""
+    from evaluation.vision_block_analysis import _load_runtime
+    from evaluation.vision_block_runtime import numerical_policy
+    from evaluation.latent_image_trajectory import layout_token_ids
+    from stage2.peft import resolve_stage2_qwen_model
+    with numerical_policy():
+        model, processor, runtime = _load_runtime(args)
+    token_ids = layout_token_ids(processor, resolve_stage2_qwen_model(model).config)
+    return model, processor, token_ids
+
+
+def stage_smoke(args):
+    from evaluation.latent_image_attention import capture_attention
+    from evaluation.latent_image_trajectory import build_trajectory, load_eval_rows, load_selection
+    from evaluation.vision_block_runtime import numerical_policy
+    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    test_rows = load_test_rows(args.data)
+    eval_rows = load_eval_rows(args.eval_rows)
+    selection = load_selection(args.selection)
+    swaps = json.loads((args.run_dir / "swaps.json").read_text())
+    model, processor, token_ids = _teacher_forced_setup(args)
+    chosen = {}
+    with numerical_policy():
+        for idx in selection:
+            if "single" in chosen and "multi" in chosen:
+                break
+            trajectory = build_trajectory(processor, test_rows[idx], eval_rows[idx], idx, args.data_root, token_ids)
+            n_blocks = len(trajectory.layout.blocks)
+            if n_blocks == 1 and "single" not in chosen:
+                chosen["single"] = (idx, trajectory)
+            elif n_blocks >= 3 and "multi" not in chosen:
+                chosen["multi"] = (idx, trajectory)
+        if "single" not in chosen or "multi" not in chosen:
+            raise RuntimeError("selection lacks a 1-block question and a >=3-block question for smoke")
+        gates, all_pass = {}, True
+        for idx, trajectory in chosen.values():
+            capture = capture_attention(model, trajectory)
+            swap_entry = swaps["questions"][str(idx)]
+            swap_images = open_swap_images(swap_entry["swaps"], test_rows, args.data_root)
+            _, _, cond_gates = question_interventions(model, processor, trajectory, [], swap_images)
+            entry = {
+                "G1": capture.g1_max_rel <= 1e-2, "G1b": capture.g1b_linear_rel <= 1e-2,
+                "G2": capture.g2_max_abs <= 1e-3, "G3": cond_gates["G3"]["pass"], "G4": cond_gates["G4"]["pass"],
+                "G5": not cond_gates["G5"]["excluded"],
+                "detail": {"g1_max_rel": capture.g1_max_rel, "g1b_linear_rel": capture.g1b_linear_rel,
+                          "g2_max_abs": capture.g2_max_abs, "G3": cond_gates["G3"], "G4": cond_gates["G4"],
+                          "G5": cond_gates["G5"]},
+            }
+            gates[str(idx)] = entry
+            all_pass = all_pass and all(entry[k] for k in ("G1", "G1b", "G2", "G3", "G4", "G5"))
+        gates["pass"] = all_pass
+    write_json_atomic(args.run_dir / "smoke" / "gates.json", gates)
+    return 0 if all_pass else 1
+
+
+def stage_attention(args):
+    from evaluation.latent_image_attention import capture_attention
+    from evaluation.latent_image_interventions import Condition, run_condition
+    from evaluation.latent_image_trajectory import build_trajectory, load_eval_rows, load_selection
+    from evaluation.vision_block_runtime import numerical_policy
+    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    test_rows = load_test_rows(args.data)
+    eval_rows = load_eval_rows(args.eval_rows)
+    selection = load_selection(args.selection)
+    swaps = json.loads((args.run_dir / "swaps.json").read_text())
+    categories = {int(i): entry["category"] for i, entry in swaps["questions"].items()}
+    heatmap_set = set(heatmap_questions(selection, categories))
+    owned = shard_items(selection, args.shard, args.num_shards)
+    model, processor, token_ids = _teacher_forced_setup(args)
+    with numerical_policy():
+        for idx in owned:
+            out_json = args.run_dir / "attention" / f"q{idx}.json"
+            excl_json = args.run_dir / "attention" / "excluded" / f"q{idx}.json"
+            if skip_existing(out_json, excl_json):
+                continue
+            trajectory = build_trajectory(processor, test_rows[idx], eval_rows[idx], idx, args.data_root, token_ids)
+            reference = run_condition(model, trajectory, Condition("reference", native=True))
+            g5 = g5_for(reference, trajectory)
+            if g5["excluded"]:
+                write_json_atomic(excl_json, {"reason": g5["reason"], "g5": g5})
+                continue
+            capture = capture_attention(model, trajectory, keep_image_probs=idx in heatmap_set)
+            arrays = {"mass": capture.mass, "vw_share": capture.vw_share, "enrichment": capture.enrichment,
+                     "image_grid_thw": trajectory.image_grid_thw.numpy()}
+            if capture.image_probs is not None:
+                arrays["image_probs"] = capture.image_probs
+            savez_atomic(args.run_dir / "attention" / f"q{idx}.npz", **arrays)
+            write_json_atomic(out_json, {
+                "specs": [dict(position=s.position, group=s.group, block=s.block, slot=s.slot)
+                         for s in capture.specs],
+                "g1": capture.g1_max_rel, "g1b": capture.g1b_linear_rel, "g2": capture.g2_max_abs, "g5": g5,
+                "category": trajectory.category, "n_blocks": len(trajectory.layout.blocks),
+                "eval_match": trajectory.eval_match})
+    excluded_dir = args.run_dir / "attention" / "excluded"
+    require_exclusion_budget(len(list(excluded_dir.glob("q*.json"))))
+    return 0
+
+
+def stage_heads(args):
+    from evaluation.latent_image_layout import IMAGE
+    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    totals, count = None, 0
+    for npz_path in sorted((args.run_dir / "attention").glob("q*.npz")):
+        idx = int(npz_path.stem[1:])
+        meta = json.loads((args.run_dir / "attention" / f"q{idx}.json").read_text())
+        pad_rows = [i for i, spec in enumerate(meta["specs"]) if spec["slot"].startswith("pad")]
+        if not pad_rows:
+            continue
+        with np.load(npz_path) as data:
+            share = data["vw_share"][pad_rows][..., IMAGE].astype(np.float64)
+        if totals is None:
+            totals = np.zeros(share.shape[1:], dtype=np.float64)
+        totals += share.sum(axis=0)
+        count += share.shape[0]
+    if totals is None or count == 0:
+        raise RuntimeError("no attention output available; run the attention stage first")
+    mean_share = totals / count
+    heads = select_heads(mean_share)
+    write_json_atomic(args.run_dir / "heads.json", {"heads": [list(h) for h in heads], "share": mean_share.tolist()})
+    return 0
+
+
+def stage_interventions(args):
+    from evaluation.latent_image_trajectory import build_trajectory, load_eval_rows, load_selection
+    from evaluation.vision_block_runtime import numerical_policy
+    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    heads_path = args.run_dir / "heads.json"
+    if not heads_path.exists():
+        raise RuntimeError("interventions requires heads.json; run the heads stage first")
+    heads = [tuple(h) for h in json.loads(heads_path.read_text())["heads"]]
+    swaps = json.loads((args.run_dir / "swaps.json").read_text())
+    test_rows = load_test_rows(args.data)
+    eval_rows = load_eval_rows(args.eval_rows)
+    selection = load_selection(args.selection)
+    owned = shard_items(selection, args.shard, args.num_shards)
+    excluded_dir = args.run_dir / "attention" / "excluded"
+    excluded = {int(p.stem[1:]) for p in excluded_dir.glob("q*.json")}
+    model, processor, token_ids = _teacher_forced_setup(args)
+    with numerical_policy():
+        for idx in owned:
+            if idx in excluded:
+                continue
+            out_json = args.run_dir / "interventions" / f"q{idx}.json"
+            out_npz = args.run_dir / "interventions" / f"q{idx}.npz"
+            if skip_existing(out_json):
+                continue
+            trajectory = build_trajectory(processor, test_rows[idx], eval_rows[idx], idx, args.data_root, token_ids)
+            swap_entry = swaps["questions"][str(idx)]
+            swap_images = open_swap_images(swap_entry["swaps"], test_rows, args.data_root)
+            results, matched, gates = question_interventions(model, processor, trajectory, heads, swap_images)
+            summary = summarize_question(results, trajectory.layout, matched)
+            savez_atomic(out_npz, **content_arrays(results))
+            write_json_atomic(out_json, {**summary, "gates": gates})
+    return 0
+
+
+def stage_freegen(args):
+    from evaluation.latent_image_trajectory import load_selection
+    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    from eval import load_evaluation_artifacts
+    test_rows = load_test_rows(args.data)
+    selection = load_selection(args.selection)
+    owned = shard_items(selection, args.shard, args.num_shards)
+    model, processor = load_evaluation_artifacts(
+        model_dir=str(args.model_dir), base_model_dir=str(args.base_model_dir), cache_dir="data/cache")
+    for mode in ("causal_mask", "latent_mask"):
+        for idx in owned:
+            out_json = args.run_dir / "freegen" / mode / f"q{idx}.json"
+            if skip_existing(out_json):
+                continue
+            result = question_freegen(model, processor, test_rows[idx], args.data_root, mode)
+            write_json_atomic(out_json, result)
+    return 0
+
+
+def stage_report(args):
+    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    from evaluation.latent_image_report import build_report
+    build_report(args.run_dir)
+    return 0
+
+
+STAGE_HANDLERS = {
+    "prepare": stage_prepare, "smoke": stage_smoke, "attention": stage_attention, "heads": stage_heads,
+    "interventions": stage_interventions, "freegen": stage_freegen, "report": stage_report,
+}
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _common_parser():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--base-model-dir", type=Path, default=DEFAULT_BASE_MODEL_DIR)
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    parser.add_argument("--selection", type=Path, required=True)
+    parser.add_argument("--eval-rows", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    return parser
+
+
+def _parser():
+    parser = argparse.ArgumentParser(
+        description="Staged CLI for the latent image attention analysis (see task-8-brief.md).")
+    commands = parser.add_subparsers(dest="stage", required=True)
+    common = _common_parser()
+    for name in STAGES:
+        commands.add_parser(name, parents=[common])
+    return parser
+
+
+def main(argv=None):
+    args = _parser().parse_args(argv)
+    if args.num_shards < 1 or not (0 <= args.shard < args.num_shards):
+        raise ValueError("--shard must be within [0, --num-shards)")
+    args.run_dir.mkdir(parents=True, exist_ok=True)
+    code = STAGE_HANDLERS[args.stage](args)
+    return int(code) if code else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
