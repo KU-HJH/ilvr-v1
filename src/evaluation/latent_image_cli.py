@@ -498,6 +498,38 @@ def stage_smoke(args):
     return 0 if all_pass else 1
 
 
+SMOKE_FROM_KEYS = ("inputs", "model_dir", "base_model_dir", "adapter_sha256", "prepared_manifest_sha256",
+                   "precision", "trajectory_source", "trajectories_manifest_sha256")
+
+
+def apply_smoke_from(run_dir, source_run, manifest):
+    """Reuse a prior run's passing smoke gate instead of re-running the smoke stage (avoids a
+    redundant smoke run when nothing that smoke exercises has changed). Requires the prior
+    run's inputs, model identity (model_dir/base_model_dir/adapter_sha256/
+    prepared_manifest_sha256), precision and trajectory provenance (source and, when recorded,
+    its manifest sha256) to equal the current run's manifest exactly; only the commit may
+    differ. Writes smoke/gates.json (a verbatim copy of the prior gate) and
+    smoke/provenance.json ({"source_run", "source_commit", "copied_at"}), both atomically."""
+    source_run = Path(source_run)
+    source_gates_path = source_run / "smoke" / "gates.json"
+    if not source_gates_path.exists():
+        raise ValueError(f"--smoke-from {source_run}: no smoke/gates.json found")
+    source_gates = json.loads(source_gates_path.read_text())
+    if not source_gates.get("pass"):
+        raise ValueError(f"--smoke-from {source_run}: prior smoke/gates.json did not pass")
+    source_manifest_path = source_run / "manifest.json"
+    if not source_manifest_path.exists():
+        raise ValueError(f"--smoke-from {source_run}: no manifest.json found")
+    source_manifest = json.loads(source_manifest_path.read_text())
+    mismatched = [key for key in SMOKE_FROM_KEYS if source_manifest.get(key) != manifest.get(key)]
+    if mismatched:
+        raise ValueError(f"--smoke-from {source_run}: prior manifest differs from the current run on {mismatched}")
+    write_json_atomic(Path(run_dir) / "smoke" / "gates.json", source_gates)
+    write_json_atomic(Path(run_dir) / "smoke" / "provenance.json", {
+        "source_run": str(source_run), "source_commit": source_manifest.get("commit"),
+        "copied_at": datetime.now(timezone.utc).isoformat()})
+
+
 def stage_attention(args):
     from evaluation.latent_image_attention import capture_attention
     from evaluation.latent_image_interventions import Condition, run_condition
@@ -505,6 +537,8 @@ def stage_attention(args):
     from evaluation.vision_block_runtime import numerical_policy
     manifest = require_manifest(args.run_dir, _current_inputs(args), git_commit())
     require_model_identity(manifest, args)
+    if getattr(args, "smoke_from", None) and not (args.run_dir / "smoke" / "gates.json").exists():
+        apply_smoke_from(args.run_dir, args.smoke_from, manifest)
     require_smoke_pass(args.run_dir)
     test_rows = load_test_rows(args.data)
     eval_rows = load_eval_rows(args.eval_rows)
@@ -712,6 +746,11 @@ def _parser():
         stage = commands.add_parser(name, parents=[model])
         stage.add_argument("--eval-rows", type=Path, required=True)
         stage.add_argument("--run-dir", type=Path, required=True)
+        if name == "attention":
+            stage.add_argument("--smoke-from", type=Path, default=None,
+                               help="reuse a prior run's passing smoke/gates.json instead of "
+                                    "re-running the smoke stage (requires matching inputs, "
+                                    "model identity, precision and trajectory provenance)")
     for name in TRAJECTORY_STAGES:          # standalone: run before `prepare`, no run dir
         stage = commands.add_parser(name, parents=[model])
         stage.add_argument("--out-dir", type=Path, required=True)

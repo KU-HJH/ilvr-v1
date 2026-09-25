@@ -437,6 +437,128 @@ def test_stage_attention_refuses_without_passing_smoke_gate(tmp_path):
         cli.stage_attention(args)
 
 
+# --- --smoke-from: reuse a prior run's passing smoke gate -------------------
+
+def test_apply_smoke_from_copies_passing_gate_when_manifest_matches(tmp_path):
+    source = tmp_path / "source"
+    cli.write_json_atomic(source / "smoke" / "gates.json", {"pass": True, "detail": "x"})
+    source_manifest = {"inputs": {"data": "a"}, "commit": "old-commit", "model_dir": "m",
+                       "base_model_dir": "b", "adapter_sha256": "ad", "prepared_manifest_sha256": "pm",
+                       "precision": "fp32", "trajectory_source": "original"}
+    cli.write_json_atomic(source / "manifest.json", source_manifest)
+    current_manifest = {**source_manifest, "commit": "new-commit"}      # commit may differ
+    run_dir = tmp_path / "run"
+    cli.apply_smoke_from(run_dir, source, current_manifest)
+    assert json.loads((run_dir / "smoke" / "gates.json").read_text()) == {"pass": True, "detail": "x"}
+    prov = json.loads((run_dir / "smoke" / "provenance.json").read_text())
+    assert prov["source_run"] == str(source) and prov["source_commit"] == "old-commit"
+    assert "copied_at" in prov
+
+
+def test_apply_smoke_from_rejects_prior_smoke_that_did_not_pass(tmp_path):
+    source = tmp_path / "source"
+    cli.write_json_atomic(source / "smoke" / "gates.json", {"pass": False})
+    cli.write_json_atomic(source / "manifest.json", {"inputs": {}})
+    with pytest.raises(ValueError, match="smoke-from"):
+        cli.apply_smoke_from(tmp_path / "run", source, {"inputs": {}})
+
+
+def test_apply_smoke_from_rejects_missing_source_gates(tmp_path):
+    with pytest.raises(ValueError, match="smoke-from"):
+        cli.apply_smoke_from(tmp_path / "run", tmp_path / "does-not-exist", {"inputs": {}})
+
+
+def test_apply_smoke_from_rejects_precision_mismatch(tmp_path):
+    source = tmp_path / "source"
+    cli.write_json_atomic(source / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(source / "manifest.json", {"inputs": {"data": "a"}, "precision": "fp32"})
+    with pytest.raises(ValueError, match="smoke-from"):
+        cli.apply_smoke_from(tmp_path / "run", source, {"inputs": {"data": "a"}, "precision": "bf16"})
+
+
+def test_apply_smoke_from_rejects_adapter_sha_mismatch(tmp_path):
+    source = tmp_path / "source"
+    cli.write_json_atomic(source / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(source / "manifest.json", {"inputs": {"data": "a"}, "adapter_sha256": "x"})
+    with pytest.raises(ValueError, match="smoke-from"):
+        cli.apply_smoke_from(tmp_path / "run", source, {"inputs": {"data": "a"}, "adapter_sha256": "y"})
+
+
+def test_apply_smoke_from_rejects_input_hash_mismatch(tmp_path):
+    source = tmp_path / "source"
+    cli.write_json_atomic(source / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(source / "manifest.json", {"inputs": {"data": "a"}})
+    with pytest.raises(ValueError, match="smoke-from"):
+        cli.apply_smoke_from(tmp_path / "run", source, {"inputs": {"data": "b"}})
+
+
+def test_stage_attention_uses_smoke_from_without_running_the_model(tmp_path, monkeypatch):
+    # Mirrors test_stage_attention_excludes_over_budget_question_without_running_model's trick
+    # (an 8000-length fake layout, well over LENGTH_BUDGET) so this stays a CPU-only test: the
+    # question is excluded before any model call, letting us isolate --smoke-from's effect on
+    # the smoke gate check that precedes it.
+    from types import SimpleNamespace
+    import evaluation.latent_image_interventions as li
+    import evaluation.latent_image_trajectory as lt
+    data_path = tmp_path / "TEST.jsonl"
+    _write_jsonl(data_path, [{"image_input": ["x"]}])
+    selection_path = tmp_path / "metadata.json"
+    selection_path.write_text(json.dumps({"selection": {"requested_indices": [0]}}))
+    eval_rows_path = tmp_path / "merged.jsonl"
+    _write_jsonl(eval_rows_path, [{"index": 0, "stop_reason": "eos"}])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    manifest = _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    source_run = tmp_path / "source"
+    cli.write_json_atomic(source_run / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(source_run / "manifest.json",
+                          {**{k: manifest.get(k) for k in cli.SMOKE_FROM_KEYS}, "commit": "a-different-commit"})
+    cli.write_json_atomic(run_dir / "swaps.json", {"questions": {"0": {"category": "deletion", "swaps": []}}})
+    monkeypatch.setattr(cli, "_teacher_forced_setup", lambda args: (None, None, T))
+    monkeypatch.setattr(cli, "apply_precision", lambda model, precision: {"language": precision, "visual": "bf16"})
+    monkeypatch.setattr(cli, "heatmap_questions", lambda selection, categories: ())
+    layout = SimpleNamespace(length=8000, image_positions=tuple(range(500)))
+    monkeypatch.setattr(lt, "build_trajectory", lambda *a, **k: SimpleNamespace(layout=layout))
+
+    def boom(*a, **k):
+        raise AssertionError("the model must not run for an over-budget question")
+    monkeypatch.setattr(li, "run_condition", boom)
+    args = _stage_args("attention", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+    args.smoke_from = source_run
+    assert not (run_dir / "smoke" / "gates.json").exists()
+    assert cli.stage_attention(args) == 0
+    assert json.loads((run_dir / "smoke" / "gates.json").read_text()) == {"pass": True}
+    prov = json.loads((run_dir / "smoke" / "provenance.json").read_text())
+    assert prov["source_run"] == str(source_run) and prov["source_commit"] == "a-different-commit"
+
+
+def test_stage_attention_smoke_from_does_not_override_an_existing_local_gate(tmp_path, monkeypatch):
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    cli.write_json_atomic(run_dir / "smoke" / "gates.json", {"pass": False})    # local gate already failed
+    source_run = tmp_path / "source"
+    cli.write_json_atomic(source_run / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(source_run / "manifest.json", {})
+    args = _stage_args("attention", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+    args.smoke_from = source_run
+    with pytest.raises(RuntimeError, match="smoke"):
+        cli.stage_attention(args)
+    assert json.loads((run_dir / "smoke" / "gates.json").read_text()) == {"pass": False}
+    assert not (run_dir / "smoke" / "provenance.json").exists()
+
+
+def test_smoke_from_defaults_to_none_and_other_stages_lack_the_flag():
+    args = _stage_args("attention", Path("d"), Path("s"), Path("e"), Path("r"))
+    assert args.smoke_from is None
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(["heads", "--data", "d", "--selection", "s", "--eval-rows", "e",
+                                  "--run-dir", "r", "--smoke-from", "x"])
+
+
 # --- fix 3: attention completeness -----------------------------------------
 
 def test_require_attention_complete(tmp_path):
