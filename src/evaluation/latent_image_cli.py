@@ -6,6 +6,10 @@ Seven stages, run in order against a shared `--run-dir`:
 later stage aborts if the current inputs or commit differ (`require_manifest`),
 except `report`, which only re-checks the inputs and records its own commit.
 
+Two standalone stages, `trajectories` and `merge-trajectories` (R24), run before
+`prepare` and regenerate the analysed greedy trajectories under the analysis
+numerics into `--out-dir` (see `evaluation.latent_image_trajectories_gen`).
+
 Questions whose dual-image sequence exceeds `LENGTH_BUDGET` are excluded by the
 attention stage without running the model (reason "length_budget"); such
 exclusions do not count toward the G5 exclusion budget.
@@ -24,6 +28,9 @@ import torch
 from evaluation.latent_image_stats import cosine_distance
 
 STAGES = ("prepare", "smoke", "attention", "heads", "interventions", "freegen", "report")
+# R24: standalone stages that regenerate the analysed trajectories before `prepare`
+# (see evaluation.latent_image_trajectories_gen).
+TRAJECTORY_STAGES = ("trajectories", "merge-trajectories")
 
 # Global Constraints values (compared against `prepare`'s computed hashes). Tests
 # monkeypatch this dict since synthetic tmp_path inputs never match these hashes.
@@ -78,18 +85,22 @@ def require_manifest(run_dir, inputs, commit, *, allow_commit_change=False):
     return manifest
 
 
+def model_identity(args):
+    """The model `args` selects: directories, on-disk adapter/prepared-manifest content and precision."""
+    return {
+        "model_dir": str(args.model_dir), "base_model_dir": str(args.base_model_dir),
+        "prepared_manifest_sha256": sha256(Path(str(args.model_dir) + ".manifest.json")),
+        "adapter_sha256": sha256(args.model_dir / "adapter_model.safetensors"),
+        "precision": getattr(args, "precision", None),
+    }
+
+
 def require_model_identity(manifest, args):
     """Every model-loading stage (smoke/attention/interventions/freegen) must resume
     against the exact model `prepare` recorded: same directories, same on-disk
     content (an adapter or prepared-manifest edit in place would go undetected by
     path comparison alone), and the same `--precision` (R22)."""
-    prepared_manifest = Path(str(args.model_dir) + ".manifest.json")
-    adapter = args.model_dir / "adapter_model.safetensors"
-    current = {
-        "model_dir": str(args.model_dir), "base_model_dir": str(args.base_model_dir),
-        "prepared_manifest_sha256": sha256(prepared_manifest), "adapter_sha256": sha256(adapter),
-        "precision": getattr(args, "precision", None),
-    }
+    current = model_identity(args)
     expected = {key: manifest.get(key) for key in current}
     if current != expected:
         raise ValueError("manifest model identity (model_dir, base_model_dir, adapter_sha256, "
@@ -636,9 +647,20 @@ def stage_report(args):
     return 0
 
 
+def stage_trajectories(args):
+    from evaluation.latent_image_trajectories_gen import stage_trajectories as run
+    return run(args)
+
+
+def stage_merge_trajectories(args):
+    from evaluation.latent_image_trajectories_gen import stage_merge_trajectories as run
+    return run(args)
+
+
 STAGE_HANDLERS = {
     "prepare": stage_prepare, "smoke": stage_smoke, "attention": stage_attention, "heads": stage_heads,
     "interventions": stage_interventions, "freegen": stage_freegen, "report": stage_report,
+    "trajectories": stage_trajectories, "merge-trajectories": stage_merge_trajectories,
 }
 
 
@@ -646,15 +668,13 @@ STAGE_HANDLERS = {
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def _common_parser():
+def _model_parser():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--base-model-dir", type=Path, default=DEFAULT_BASE_MODEL_DIR)
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
     parser.add_argument("--selection", type=Path, required=True)
-    parser.add_argument("--eval-rows", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
@@ -665,9 +685,16 @@ def _parser():
     parser = argparse.ArgumentParser(
         description="Staged CLI for the latent image attention analysis (see task-8-brief.md).")
     commands = parser.add_subparsers(dest="stage", required=True)
-    common = _common_parser()
+    model = _model_parser()
     for name in STAGES:
-        commands.add_parser(name, parents=[common])
+        stage = commands.add_parser(name, parents=[model])
+        stage.add_argument("--eval-rows", type=Path, required=True)
+        stage.add_argument("--run-dir", type=Path, required=True)
+    for name in TRAJECTORY_STAGES:          # standalone: run before `prepare`, no run dir
+        stage = commands.add_parser(name, parents=[model])
+        stage.add_argument("--out-dir", type=Path, required=True)
+        stage.add_argument("--eval-rows", type=Path, default=None,
+                           help="optional original eval rows; only their prompt_identity is checked")
     return parser
 
 
@@ -675,7 +702,8 @@ def main(argv=None):
     args = _parser().parse_args(argv)
     if args.num_shards < 1 or not (0 <= args.shard < args.num_shards):
         raise ValueError("--shard must be within [0, --num-shards)")
-    args.run_dir.mkdir(parents=True, exist_ok=True)
+    if args.stage in STAGES:
+        args.run_dir.mkdir(parents=True, exist_ok=True)
     code = STAGE_HANDLERS[args.stage](args)
     return int(code) if code else 0
 
