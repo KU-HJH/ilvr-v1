@@ -468,6 +468,16 @@ def test_apply_smoke_from_rejects_missing_source_gates(tmp_path):
         cli.apply_smoke_from(tmp_path / "run", tmp_path / "does-not-exist", {"inputs": {}})
 
 
+def test_apply_smoke_from_rejects_missing_source_manifest(tmp_path):
+    # The source run's smoke/gates.json passes, but it has no manifest.json to validate the
+    # inputs/model-identity/precision/trajectory-provenance match against.
+    source = tmp_path / "source"
+    cli.write_json_atomic(source / "smoke" / "gates.json", {"pass": True})
+    with pytest.raises(ValueError, match="smoke-from"):
+        cli.apply_smoke_from(tmp_path / "run", source, {"inputs": {}})
+    assert not (tmp_path / "run" / "smoke" / "gates.json").exists()
+
+
 def test_apply_smoke_from_rejects_precision_mismatch(tmp_path):
     source = tmp_path / "source"
     cli.write_json_atomic(source / "smoke" / "gates.json", {"pass": True})
@@ -533,13 +543,19 @@ def test_stage_attention_uses_smoke_from_without_running_the_model(tmp_path, mon
     assert prov["source_run"] == str(source_run) and prov["source_commit"] == "a-different-commit"
 
 
-def test_stage_attention_smoke_from_does_not_override_an_existing_local_gate(tmp_path, monkeypatch):
+def test_stage_attention_smoke_from_does_not_override_a_complete_existing_local_gate(tmp_path, monkeypatch):
+    # A *complete* local smoke/gates.json (one that already carries its own provenance.json,
+    # e.g. from an earlier --smoke-from copy) is never re-copied, even if it failed and
+    # --smoke-from points at a different, passing prior run: the guard only redoes an
+    # *incomplete* pair (see the interrupted-state test below), never a complete one.
     data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0])
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     model_dir, base_model_dir = _model_dirs(tmp_path)
     _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
     cli.write_json_atomic(run_dir / "smoke" / "gates.json", {"pass": False})    # local gate already failed
+    cli.write_json_atomic(run_dir / "smoke" / "provenance.json", {"source_run": "elsewhere",
+                                                                   "source_commit": "c0", "copied_at": "t0"})
     source_run = tmp_path / "source"
     cli.write_json_atomic(source_run / "smoke" / "gates.json", {"pass": True})
     cli.write_json_atomic(source_run / "manifest.json", {})
@@ -548,7 +564,51 @@ def test_stage_attention_smoke_from_does_not_override_an_existing_local_gate(tmp
     with pytest.raises(RuntimeError, match="smoke"):
         cli.stage_attention(args)
     assert json.loads((run_dir / "smoke" / "gates.json").read_text()) == {"pass": False}
-    assert not (run_dir / "smoke" / "provenance.json").exists()
+    assert json.loads((run_dir / "smoke" / "provenance.json").read_text())["source_run"] == "elsewhere"
+
+
+def test_stage_attention_smoke_from_redoes_an_interrupted_copy(tmp_path, monkeypatch):
+    # R-smoke-from fix round 1 (joint atomicity): a run that has smoke/gates.json but no
+    # smoke/provenance.json -- exactly what an interruption between apply_smoke_from's two
+    # writes would leave behind -- must not be trusted as complete; --smoke-from redoes the
+    # copy so the run ends up with a matching, freshly-written pair instead of a gate with no
+    # record of where it came from forever.
+    from types import SimpleNamespace
+    import evaluation.latent_image_interventions as li
+    import evaluation.latent_image_trajectory as lt
+    data_path = tmp_path / "TEST.jsonl"
+    _write_jsonl(data_path, [{"image_input": ["x"]}])
+    selection_path = tmp_path / "metadata.json"
+    selection_path.write_text(json.dumps({"selection": {"requested_indices": [0]}}))
+    eval_rows_path = tmp_path / "merged.jsonl"
+    _write_jsonl(eval_rows_path, [{"index": 0, "stop_reason": "eos"}])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    manifest = _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    # Simulates the interrupted state directly: gates.json present (e.g. left over from a
+    # crash right after it was written), provenance.json absent.
+    cli.write_json_atomic(run_dir / "smoke" / "gates.json", {"pass": True, "stale": True})
+    source_run = tmp_path / "source"
+    cli.write_json_atomic(source_run / "smoke" / "gates.json", {"pass": True, "stale": False})
+    cli.write_json_atomic(source_run / "manifest.json",
+                          {**{k: manifest.get(k) for k in cli.SMOKE_FROM_KEYS}, "commit": "a-different-commit"})
+    cli.write_json_atomic(run_dir / "swaps.json", {"questions": {"0": {"category": "deletion", "swaps": []}}})
+    monkeypatch.setattr(cli, "_teacher_forced_setup", lambda args: (None, None, T))
+    monkeypatch.setattr(cli, "apply_precision", lambda model, precision: {"language": precision, "visual": "bf16"})
+    monkeypatch.setattr(cli, "heatmap_questions", lambda selection, categories: ())
+    layout = SimpleNamespace(length=8000, image_positions=tuple(range(500)))
+    monkeypatch.setattr(lt, "build_trajectory", lambda *a, **k: SimpleNamespace(layout=layout))
+
+    def boom(*a, **k):
+        raise AssertionError("the model must not run for an over-budget question")
+    monkeypatch.setattr(li, "run_condition", boom)
+    args = _stage_args("attention", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+    args.smoke_from = source_run
+    assert cli.stage_attention(args) == 0
+    assert json.loads((run_dir / "smoke" / "gates.json").read_text()) == {"pass": True, "stale": False}
+    prov = json.loads((run_dir / "smoke" / "provenance.json").read_text())
+    assert prov["source_run"] == str(source_run) and prov["source_commit"] == "a-different-commit"
 
 
 def test_smoke_from_defaults_to_none_and_other_stages_lack_the_flag():

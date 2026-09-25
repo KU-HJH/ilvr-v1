@@ -256,7 +256,7 @@ def test_capture_current_block_fields_shapes_sentinels_and_mass_consistency(tiny
     np.testing.assert_allclose(cb_inblock_mass, current_block_mass, atol=2e-3)
     np.testing.assert_allclose(cap.cb_vw_share.astype(np.float32).sum(-1)[latent_rows], 1, atol=2e-3)
 
-    # START rows: only SELF is possible in-block (R26 spec), so nosink top-1 is SELF or
+    # START rows: only SELF is possible in-block (R26 spec), so raw top-1 is SELF or
     # OUTSIDE only, and the top-5 counts for CUR_START/CUR_PREV are always 0.
     start_rows = [i for i, s in enumerate(cap.specs) if s.group == "latent" and s.slot == "start"]
     assert start_rows
