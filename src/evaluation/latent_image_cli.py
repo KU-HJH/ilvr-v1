@@ -62,6 +62,47 @@ def require_manifest(run_dir, inputs, commit):
     return manifest
 
 
+def require_model_identity(manifest, args):
+    """Every model-loading stage (smoke/attention/interventions/freegen) must resume
+    against the exact model `prepare` recorded: same directories and same on-disk
+    content (an adapter or prepared-manifest edit in place would go undetected by
+    path comparison alone)."""
+    prepared_manifest = Path(str(args.model_dir) + ".manifest.json")
+    adapter = args.model_dir / "adapter_model.safetensors"
+    current = {
+        "model_dir": str(args.model_dir), "base_model_dir": str(args.base_model_dir),
+        "prepared_manifest_sha256": sha256(prepared_manifest), "adapter_sha256": sha256(adapter),
+    }
+    expected = {key: manifest.get(key) for key in current}
+    if current != expected:
+        raise ValueError("manifest model identity (model_dir, base_model_dir, adapter_sha256, "
+                         "prepared_manifest_sha256) differs from the current execution")
+
+
+def excluded_indices(run_dir):
+    excluded_dir = Path(run_dir) / "attention" / "excluded"
+    return {int(p.stem[1:]) for p in excluded_dir.glob("q*.json")}
+
+
+def require_smoke_pass(run_dir):
+    path = Path(run_dir) / "smoke" / "gates.json"
+    if not path.exists():
+        raise RuntimeError("attention requires a passing smoke/gates.json; run the smoke stage first")
+    gates = json.loads(path.read_text())
+    if not gates.get("pass"):
+        raise RuntimeError("smoke gate did not pass; resolve the smoke failures before running attention")
+    return gates
+
+
+def require_attention_complete(run_dir, selection):
+    run_dir = Path(run_dir)
+    missing = [idx for idx in selection
+              if not ((run_dir / "attention" / f"q{idx}.json").exists()
+                      or (run_dir / "attention" / "excluded" / f"q{idx}.json").exists())]
+    if missing:
+        raise RuntimeError(f"attention stage incomplete; missing questions: {sorted(missing)}")
+
+
 def g5_verdict(matches, first_block_offset):
     rate = sum(matches) / len(matches)
     first_bad = next((i for i, ok in enumerate(matches) if not ok), None)
@@ -328,7 +369,8 @@ def stage_smoke(args):
     from evaluation.latent_image_attention import capture_attention
     from evaluation.latent_image_trajectory import build_trajectory, load_eval_rows, load_selection
     from evaluation.vision_block_runtime import numerical_policy
-    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    manifest = require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    require_model_identity(manifest, args)
     test_rows = load_test_rows(args.data)
     eval_rows = load_eval_rows(args.eval_rows)
     selection = load_selection(args.selection)
@@ -373,7 +415,9 @@ def stage_attention(args):
     from evaluation.latent_image_interventions import Condition, run_condition
     from evaluation.latent_image_trajectory import build_trajectory, load_eval_rows, load_selection
     from evaluation.vision_block_runtime import numerical_policy
-    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    manifest = require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    require_model_identity(manifest, args)
+    require_smoke_pass(args.run_dir)
     test_rows = load_test_rows(args.data)
     eval_rows = load_eval_rows(args.eval_rows)
     selection = load_selection(args.selection)
@@ -406,14 +450,16 @@ def stage_attention(args):
                 "g1": capture.g1_max_rel, "g1b": capture.g1b_linear_rel, "g2": capture.g2_max_abs, "g5": g5,
                 "category": trajectory.category, "n_blocks": len(trajectory.layout.blocks),
                 "eval_match": trajectory.eval_match})
-    excluded_dir = args.run_dir / "attention" / "excluded"
-    require_exclusion_budget(len(list(excluded_dir.glob("q*.json"))))
+    require_exclusion_budget(len(excluded_indices(args.run_dir)))
     return 0
 
 
 def stage_heads(args):
     from evaluation.latent_image_layout import IMAGE
+    from evaluation.latent_image_trajectory import load_selection
     require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    require_exclusion_budget(len(excluded_indices(args.run_dir)))
+    require_attention_complete(args.run_dir, load_selection(args.selection))
     totals, count = None, 0
     for npz_path in sorted((args.run_dir / "attention").glob("q*.npz")):
         idx = int(npz_path.stem[1:])
@@ -438,7 +484,11 @@ def stage_heads(args):
 def stage_interventions(args):
     from evaluation.latent_image_trajectory import build_trajectory, load_eval_rows, load_selection
     from evaluation.vision_block_runtime import numerical_policy
-    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    manifest = require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    require_model_identity(manifest, args)
+    selection = load_selection(args.selection)
+    require_exclusion_budget(len(excluded_indices(args.run_dir)))
+    require_attention_complete(args.run_dir, selection)
     heads_path = args.run_dir / "heads.json"
     if not heads_path.exists():
         raise RuntimeError("interventions requires heads.json; run the heads stage first")
@@ -446,10 +496,8 @@ def stage_interventions(args):
     swaps = json.loads((args.run_dir / "swaps.json").read_text())
     test_rows = load_test_rows(args.data)
     eval_rows = load_eval_rows(args.eval_rows)
-    selection = load_selection(args.selection)
     owned = shard_items(selection, args.shard, args.num_shards)
-    excluded_dir = args.run_dir / "attention" / "excluded"
-    excluded = {int(p.stem[1:]) for p in excluded_dir.glob("q*.json")}
+    excluded = excluded_indices(args.run_dir)
     model, processor, token_ids = _teacher_forced_setup(args)
     with numerical_policy():
         for idx in owned:
@@ -471,7 +519,8 @@ def stage_interventions(args):
 
 def stage_freegen(args):
     from evaluation.latent_image_trajectory import load_selection
-    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    manifest = require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    require_model_identity(manifest, args)
     from eval import load_evaluation_artifacts
     test_rows = load_test_rows(args.data)
     selection = load_selection(args.selection)

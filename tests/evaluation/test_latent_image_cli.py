@@ -1,4 +1,7 @@
+import argparse
 import json
+from pathlib import Path
+
 import pytest
 import torch
 from evaluation import latent_image_cli as cli
@@ -233,3 +236,233 @@ def test_prepare_rejects_hash_mismatch(tmp_path, monkeypatch):
             "--eval-rows", str(fixture["eval_rows"]), "--data-root", str(fixture["data_root"]),
             "--run-dir", str(run_dir)])
     assert not (run_dir / "manifest.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: stage-ordering guards (smoke gate, exclusion budget, attention
+# completeness, model identity on resume).
+# ---------------------------------------------------------------------------
+
+def _model_dirs(tmp_path):
+    model_dir = tmp_path / "model" / "prepared-checkpoint-1"
+    model_dir.mkdir(parents=True)
+    (model_dir / "adapter_model.safetensors").write_bytes(b"weights")
+    (tmp_path / "model" / "prepared-checkpoint-1.manifest.json").write_text("{}")
+    base_model_dir = tmp_path / "base"
+    base_model_dir.mkdir()
+    return model_dir, base_model_dir
+
+
+def _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir=None, base_model_dir=None):
+    inputs = {"data": cli.sha256(data_path), "selection": cli.sha256(selection_path),
+             "eval_rows": cli.sha256(eval_rows_path)}
+    manifest = {"inputs": inputs, "commit": cli.git_commit()}
+    if model_dir is not None:
+        manifest.update(
+            model_dir=str(model_dir), base_model_dir=str(base_model_dir),
+            prepared_manifest_sha256=cli.sha256(Path(str(model_dir) + ".manifest.json")),
+            adapter_sha256=cli.sha256(model_dir / "adapter_model.safetensors"))
+    cli.write_json_atomic(run_dir / "manifest.json", manifest)
+    return manifest
+
+
+def _minimal_inputs(tmp_path, indices):
+    data_path = tmp_path / "TEST.jsonl"
+    data_path.write_text("{}\n")
+    selection_path = tmp_path / "metadata.json"
+    selection_path.write_text(json.dumps({"selection": {"requested_indices": indices}}))
+    eval_rows_path = tmp_path / "merged.jsonl"
+    eval_rows_path.write_text("")
+    return data_path, selection_path, eval_rows_path
+
+
+def _stage_args(stage, data_path, selection_path, eval_rows_path, run_dir, model_dir=None, base_model_dir=None):
+    argv = [stage, "--data", str(data_path), "--selection", str(selection_path),
+           "--eval-rows", str(eval_rows_path), "--run-dir", str(run_dir)]
+    if model_dir is not None:
+        argv += ["--model-dir", str(model_dir), "--base-model-dir", str(base_model_dir)]
+    return cli._parser().parse_args(argv)
+
+
+# --- fix 4: model identity -------------------------------------------------
+
+def test_require_model_identity_accepts_matching_state(tmp_path):
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    manifest = {
+        "model_dir": str(model_dir), "base_model_dir": str(base_model_dir),
+        "adapter_sha256": cli.sha256(model_dir / "adapter_model.safetensors"),
+        "prepared_manifest_sha256": cli.sha256(Path(str(model_dir) + ".manifest.json")),
+    }
+    args = argparse.Namespace(model_dir=model_dir, base_model_dir=base_model_dir)
+    cli.require_model_identity(manifest, args)  # does not raise
+
+
+def test_require_model_identity_rejects_different_model_dir(tmp_path):
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    manifest = {
+        "model_dir": str(model_dir), "base_model_dir": str(base_model_dir),
+        "adapter_sha256": cli.sha256(model_dir / "adapter_model.safetensors"),
+        "prepared_manifest_sha256": cli.sha256(Path(str(model_dir) + ".manifest.json")),
+    }
+    other_dir = tmp_path / "model" / "prepared-checkpoint-2"
+    other_dir.mkdir(parents=True)
+    (other_dir / "adapter_model.safetensors").write_bytes(b"weights")
+    (tmp_path / "model" / "prepared-checkpoint-2.manifest.json").write_text("{}")
+    args = argparse.Namespace(model_dir=other_dir, base_model_dir=base_model_dir)
+    with pytest.raises(ValueError, match="manifest"):
+        cli.require_model_identity(manifest, args)
+
+
+def test_require_model_identity_rejects_changed_adapter_hash(tmp_path):
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    manifest = {
+        "model_dir": str(model_dir), "base_model_dir": str(base_model_dir),
+        "adapter_sha256": cli.sha256(model_dir / "adapter_model.safetensors"),
+        "prepared_manifest_sha256": cli.sha256(Path(str(model_dir) + ".manifest.json")),
+    }
+    args = argparse.Namespace(model_dir=model_dir, base_model_dir=base_model_dir)
+    cli.require_model_identity(manifest, args)  # matches before the edit
+
+    (model_dir / "adapter_model.safetensors").write_bytes(b"a-different-checkpoint-entirely")
+    with pytest.raises(ValueError, match="manifest"):
+        cli.require_model_identity(manifest, args)
+
+
+# --- fix 1: smoke gate required before attention ---------------------------
+
+def test_require_smoke_pass(tmp_path):
+    with pytest.raises(RuntimeError, match="smoke"):
+        cli.require_smoke_pass(tmp_path)
+    cli.write_json_atomic(tmp_path / "smoke" / "gates.json", {"pass": False})
+    with pytest.raises(RuntimeError, match="smoke"):
+        cli.require_smoke_pass(tmp_path)
+    cli.write_json_atomic(tmp_path / "smoke" / "gates.json", {"pass": True})
+    cli.require_smoke_pass(tmp_path)  # does not raise
+
+
+def test_stage_attention_refuses_without_passing_smoke_gate(tmp_path):
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    args = _stage_args("attention", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+
+    with pytest.raises(RuntimeError, match="smoke"):
+        cli.stage_attention(args)
+
+    cli.write_json_atomic(run_dir / "smoke" / "gates.json", {"pass": False})
+    with pytest.raises(RuntimeError, match="smoke"):
+        cli.stage_attention(args)
+
+
+# --- fix 3: attention completeness -----------------------------------------
+
+def test_require_attention_complete(tmp_path):
+    cli.write_json_atomic(tmp_path / "attention" / "q0.json", {})
+    cli.write_json_atomic(tmp_path / "attention" / "excluded" / "q1.json", {})
+    cli.require_attention_complete(tmp_path, [0, 1])  # does not raise
+    with pytest.raises(RuntimeError, match="incomplete"):
+        cli.require_attention_complete(tmp_path, [0, 1, 2])
+
+
+def test_excluded_indices(tmp_path):
+    cli.write_json_atomic(tmp_path / "attention" / "excluded" / "q3.json", {})
+    cli.write_json_atomic(tmp_path / "attention" / "excluded" / "q7.json", {})
+    assert cli.excluded_indices(tmp_path) == {3, 7}
+
+
+def test_stage_heads_refuses_incomplete_attention(tmp_path):
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0, 1, 2])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path)
+    # only question 0 is present; 1 and 2 are neither attended nor excluded.
+    cli.write_json_atomic(run_dir / "attention" / "q0.json",
+                          {"specs": [], "g1": 0.0, "g1b": 0.0, "g2": 0.0, "g5": {},
+                           "category": "x", "n_blocks": 1, "eval_match": True})
+    args = _stage_args("heads", data_path, selection_path, eval_rows_path, run_dir)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        cli.stage_heads(args)
+
+
+def test_stage_interventions_refuses_incomplete_attention(tmp_path):
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0, 1, 2])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    cli.write_json_atomic(run_dir / "attention" / "excluded" / "q0.json", {"reason": "match_rate_below_0.99"})
+    # 1 and 2 are missing entirely.
+    args = _stage_args("interventions", data_path, selection_path, eval_rows_path, run_dir,
+                       model_dir, base_model_dir)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        cli.stage_interventions(args)
+
+
+# --- fix 2: exclusion budget enforced downstream too ------------------------
+
+def test_stage_heads_refuses_over_exclusion_budget(tmp_path):
+    indices = list(range(11))
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, indices)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path)
+    for idx in indices:
+        cli.write_json_atomic(run_dir / "attention" / "excluded" / f"q{idx}.json", {"reason": "match_rate_below_0.99"})
+    args = _stage_args("heads", data_path, selection_path, eval_rows_path, run_dir)
+    with pytest.raises(RuntimeError, match="exclusions"):
+        cli.stage_heads(args)
+
+
+def test_stage_interventions_refuses_over_exclusion_budget(tmp_path):
+    indices = list(range(11))
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, indices)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    for idx in indices:
+        cli.write_json_atomic(run_dir / "attention" / "excluded" / f"q{idx}.json", {"reason": "match_rate_below_0.99"})
+    args = _stage_args("interventions", data_path, selection_path, eval_rows_path, run_dir,
+                       model_dir, base_model_dir)
+    with pytest.raises(RuntimeError, match="exclusions"):
+        cli.stage_interventions(args)
+
+
+# --- bonus: stage_heads pooling arithmetic on fabricated npz/json files ----
+
+def test_stage_heads_pools_pad_rows_across_questions(tmp_path):
+    import numpy as np
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0, 1, 2, 3, 4])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path)
+
+    attention_dir = run_dir / "attention"
+    layers, heads_n, regions = 2, 2, 7
+    specs = [{"position": 0, "group": "latent", "block": 0, "slot": "start"},
+            {"position": 1, "group": "latent", "block": 0, "slot": "pad1"},
+            {"position": 2, "group": "post_text", "block": 0, "slot": "post"}]
+
+    def write_question(idx, pad_value):
+        vw = np.zeros((3, layers, heads_n, regions), dtype=np.float32)
+        vw[1, ..., 2] = pad_value  # pad1 row's IMAGE-region (index 2) share
+        cli.savez_atomic(attention_dir / f"q{idx}.npz", mass=vw, vw_share=vw,
+                         enrichment=np.zeros((3, layers, heads_n), dtype=np.float32))
+        cli.write_json_atomic(attention_dir / f"q{idx}.json",
+                              {"specs": specs, "g1": 0.0, "g1b": 0.0, "g2": 0.0, "g5": {},
+                               "category": "creation", "n_blocks": 1, "eval_match": True})
+
+    write_question(0, 0.9)
+    write_question(1, 0.3)
+    for idx in (2, 3, 4):
+        cli.write_json_atomic(attention_dir / "excluded" / f"q{idx}.json", {"reason": "match_rate_below_0.99"})
+
+    args = _stage_args("heads", data_path, selection_path, eval_rows_path, run_dir)
+    assert cli.stage_heads(args) == 0
+
+    heads_doc = json.loads((run_dir / "heads.json").read_text())
+    share = np.array(heads_doc["share"])
+    assert share.shape == (layers, heads_n)
+    assert np.allclose(share, 0.6)  # (0.9 + 0.3) / 2, uniform across layers/heads
