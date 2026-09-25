@@ -288,6 +288,9 @@ def gates_section(run_dir):
             "g4_fail": [q for q, g in gates_only.items() if not g.get("G4", {}).get("pass", False)],
             "g5_rate_min": min(g5_rates) if g5_rates else None,
             "excluded": excluded, "excluded_count": len(excluded),
+            # R12: length-budget exclusions are reported separately and are not G5 exclusions.
+            "excluded_length_budget": sorted(q for q, d in excluded.items() if d.get("reason") == "length_budget"),
+            "excluded_g5_count": sum(1 for d in excluded.values() if d.get("reason") != "length_budget"),
             "random_matched": random_matched}
 
 

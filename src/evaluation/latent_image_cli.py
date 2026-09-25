@@ -3,7 +3,12 @@
 Seven stages, run in order against a shared `--run-dir`:
 `prepare`, `smoke`, `attention`, `heads`, `interventions`, `freegen`, `report`.
 `prepare` records input hashes and the git commit in `manifest.json`; every
-later stage aborts if the current inputs or commit differ (`require_manifest`).
+later stage aborts if the current inputs or commit differ (`require_manifest`),
+except `report`, which only re-checks the inputs and records its own commit.
+
+Questions whose dual-image sequence exceeds `LENGTH_BUDGET` are excluded by the
+attention stage without running the model (reason "length_budget"); such
+exclusions do not count toward the G5 exclusion budget.
 """
 import argparse
 import hashlib
@@ -27,6 +32,10 @@ EXPECTED_SHA256 = {
     "selection": "fb1f15fef5339abde6ba74d140e5f9a1f8823cedafe8aef1d4bb245a8e0286aa",
     "eval_rows": "76380b6e01bc6cf7e6bd44c551cf99a8ed18b0745dbd1314c8378fe2af9396d5",
 }
+
+# R12: SDPA MATH materialises fp32 [heads, L, L] scores; dual-image interventions add one
+# image span, so the dual length (sequence + image tokens) is capped for the 94 GB GPUs.
+LENGTH_BUDGET = 8192
 
 DEFAULT_MODEL_DIR = Path(
     "checkpoints/evaluation-staging/stage2-ce-matched-gb16-s212-20260919-155759/prepared-checkpoint-212")
@@ -55,9 +64,16 @@ def git_commit():
     return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 
 
-def require_manifest(run_dir, inputs, commit):
+def git_status_porcelain():
+    """Tracked-file changes only (untracked files are ignored)."""
+    return subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], text=True).strip()
+
+
+def require_manifest(run_dir, inputs, commit, *, allow_commit_change=False):
+    """Input hashes must always match; the commit must match unless `allow_commit_change`
+    (R17: only the CPU-only `report` stage, which records its own commit instead)."""
     manifest = json.loads((Path(run_dir) / "manifest.json").read_text())
-    if manifest["inputs"] != inputs or manifest["commit"] != commit:
+    if manifest["inputs"] != inputs or (manifest["commit"] != commit and not allow_commit_change):
         raise ValueError("manifest inputs or commit differ from the current execution")
     return manifest
 
@@ -79,9 +95,34 @@ def require_model_identity(manifest, args):
                          "prepared_manifest_sha256) differs from the current execution")
 
 
+def dual_length(layout):
+    """Sequence length of the dual-image interventions: the trajectory plus one extra image span."""
+    return layout.length + len(layout.image_positions)
+
+
+def length_budget_exclusion(layout, budget=LENGTH_BUDGET):
+    n = dual_length(layout)
+    return {"excluded": True, "reason": "length_budget", "dual_length": n} if n > budget else None
+
+
+def question_files(directory, suffix):
+    """{question index: path} for q{idx}.{suffix}, ignoring leftover temp files."""
+    return {int(p.name[1:-len(suffix) - 1]): p for p in sorted(Path(directory).glob(f"q*.{suffix}"))
+            if ".tmp" not in p.name}
+
+
+def _exclusions(run_dir):
+    return {idx: json.loads(p.read_text())
+            for idx, p in question_files(Path(run_dir) / "attention" / "excluded", "json").items()}
+
+
 def excluded_indices(run_dir):
-    excluded_dir = Path(run_dir) / "attention" / "excluded"
-    return {int(p.stem[1:]) for p in excluded_dir.glob("q*.json")}
+    return set(_exclusions(run_dir))
+
+
+def g5_exclusion_count(run_dir):
+    """Exclusions that count toward the G5 budget (length-budget exclusions do not)."""
+    return sum(1 for doc in _exclusions(run_dir).values() if doc.get("reason") != "length_budget")
 
 
 def require_smoke_pass(run_dir):
@@ -116,6 +157,23 @@ def g5_verdict(matches, first_block_offset):
 def require_exclusion_budget(count, limit=10):
     if count > limit:
         raise RuntimeError(f"{count} trajectory exclusions exceed the limit of {limit}")
+
+
+def select_smoke_questions(candidates, budget=LENGTH_BUDGET):
+    """R15: first candidate with exactly 1 block and first with 3-5 blocks, both with eval
+    stop_reason "eos" and within the length budget. `candidates` yields dicts with idx,
+    n_blocks, stop_reason and dual_length; it is consumed lazily and only until both are found."""
+    chosen = {}
+    for cand in candidates:
+        if cand["stop_reason"] != "eos" or cand["dual_length"] > budget:
+            continue
+        if cand["n_blocks"] == 1:
+            chosen.setdefault("single", cand)
+        elif 3 <= cand["n_blocks"] <= 5:
+            chosen.setdefault("multi", cand)
+        if len(chosen) == 2:
+            return chosen
+    raise RuntimeError("selection lacks an eos, within-budget 1-block question and 3-5-block question for smoke")
 
 
 def select_heads(share, fraction=0.05):
@@ -218,6 +276,14 @@ def content_arrays(results):
     names = ["noop", "cand1", "cand2", "cand3", "cand4"]
     return {key: np.stack([getattr(results[n], key).numpy() for n in names]).astype(np.float32)
             for key in ("mid_body", "final_body", "image_mid", "image_final")}
+
+
+def attention_meta(capture, trajectory, g5, eval_row):
+    return {"specs": [dict(position=s.position, group=s.group, block=s.block, slot=s.slot) for s in capture.specs],
+            "g1": capture.g1_max_rel, "g1b": capture.g1b_linear_rel, "g2": capture.g2_max_abs, "g5": g5,
+            "category": trajectory.category, "n_blocks": len(trajectory.layout.blocks),
+            "eval_match": trajectory.eval_match, "stop_reason": eval_row.get("stop_reason"),
+            "dual_length": dual_length(trajectory.layout)}
 
 
 def heatmap_questions(selection, categories):
@@ -376,21 +442,19 @@ def stage_smoke(args):
     selection = load_selection(args.selection)
     swaps = json.loads((args.run_dir / "swaps.json").read_text())
     model, processor, token_ids = _teacher_forced_setup(args)
-    chosen = {}
-    with numerical_policy():
+
+    def candidates():
         for idx in selection:
-            if "single" in chosen and "multi" in chosen:
-                break
+            if eval_rows[idx].get("stop_reason") != "eos":
+                continue
             trajectory = build_trajectory(processor, test_rows[idx], eval_rows[idx], idx, args.data_root, token_ids)
-            n_blocks = len(trajectory.layout.blocks)
-            if n_blocks == 1 and "single" not in chosen:
-                chosen["single"] = (idx, trajectory)
-            elif n_blocks >= 3 and "multi" not in chosen:
-                chosen["multi"] = (idx, trajectory)
-        if "single" not in chosen or "multi" not in chosen:
-            raise RuntimeError("selection lacks a 1-block question and a >=3-block question for smoke")
+            yield {"idx": idx, "n_blocks": len(trajectory.layout.blocks), "stop_reason": "eos",
+                   "dual_length": dual_length(trajectory.layout), "trajectory": trajectory}
+
+    with numerical_policy():
+        chosen = select_smoke_questions(candidates())
         gates, all_pass = {}, True
-        for idx, trajectory in chosen.values():
+        for idx, trajectory in ((c["idx"], c["trajectory"]) for c in chosen.values()):
             capture = capture_attention(model, trajectory)
             swap_entry = swaps["questions"][str(idx)]
             swap_images = open_swap_images(swap_entry["swaps"], test_rows, args.data_root)
@@ -433,6 +497,10 @@ def stage_attention(args):
             if skip_existing(out_json, excl_json):
                 continue
             trajectory = build_trajectory(processor, test_rows[idx], eval_rows[idx], idx, args.data_root, token_ids)
+            over_budget = length_budget_exclusion(trajectory.layout)
+            if over_budget:
+                write_json_atomic(excl_json, over_budget)
+                continue
             reference = run_condition(model, trajectory, Condition("reference", native=True))
             g5 = g5_for(reference, trajectory)
             if g5["excluded"]:
@@ -444,13 +512,8 @@ def stage_attention(args):
             if capture.image_probs is not None:
                 arrays["image_probs"] = capture.image_probs
             savez_atomic(args.run_dir / "attention" / f"q{idx}.npz", **arrays)
-            write_json_atomic(out_json, {
-                "specs": [dict(position=s.position, group=s.group, block=s.block, slot=s.slot)
-                         for s in capture.specs],
-                "g1": capture.g1_max_rel, "g1b": capture.g1b_linear_rel, "g2": capture.g2_max_abs, "g5": g5,
-                "category": trajectory.category, "n_blocks": len(trajectory.layout.blocks),
-                "eval_match": trajectory.eval_match})
-    require_exclusion_budget(len(excluded_indices(args.run_dir)))
+            write_json_atomic(out_json, attention_meta(capture, trajectory, g5, eval_rows[idx]))
+    require_exclusion_budget(g5_exclusion_count(args.run_dir))
     return 0
 
 
@@ -458,24 +521,20 @@ def stage_heads(args):
     from evaluation.latent_image_layout import IMAGE
     from evaluation.latent_image_trajectory import load_selection
     require_manifest(args.run_dir, _current_inputs(args), git_commit())
-    require_exclusion_budget(len(excluded_indices(args.run_dir)))
+    require_exclusion_budget(g5_exclusion_count(args.run_dir))
     require_attention_complete(args.run_dir, load_selection(args.selection))
-    totals, count = None, 0
-    for npz_path in sorted((args.run_dir / "attention").glob("q*.npz")):
-        idx = int(npz_path.stem[1:])
+    per_question = []
+    for idx, npz_path in question_files(args.run_dir / "attention", "npz").items():
         meta = json.loads((args.run_dir / "attention" / f"q{idx}.json").read_text())
         pad_rows = [i for i, spec in enumerate(meta["specs"]) if spec["slot"].startswith("pad")]
         if not pad_rows:
             continue
         with np.load(npz_path) as data:
             share = data["vw_share"][pad_rows][..., IMAGE].astype(np.float64)
-        if totals is None:
-            totals = np.zeros(share.shape[1:], dtype=np.float64)
-        totals += share.sum(axis=0)
-        count += share.shape[0]
-    if totals is None or count == 0:
+        per_question.append(share.mean(axis=0))            # R14: each question weighs equally
+    if not per_question:
         raise RuntimeError("no attention output available; run the attention stage first")
-    mean_share = totals / count
+    mean_share = np.mean(per_question, axis=0)
     heads = select_heads(mean_share)
     write_json_atomic(args.run_dir / "heads.json", {"heads": [list(h) for h in heads], "share": mean_share.tolist()})
     return 0
@@ -487,7 +546,7 @@ def stage_interventions(args):
     manifest = require_manifest(args.run_dir, _current_inputs(args), git_commit())
     require_model_identity(manifest, args)
     selection = load_selection(args.selection)
-    require_exclusion_budget(len(excluded_indices(args.run_dir)))
+    require_exclusion_budget(g5_exclusion_count(args.run_dir))
     require_attention_complete(args.run_dir, selection)
     heads_path = args.run_dir / "heads.json"
     if not heads_path.exists():
@@ -522,7 +581,9 @@ def stage_freegen(args):
     manifest = require_manifest(args.run_dir, _current_inputs(args), git_commit())
     require_model_identity(manifest, args)
     from eval import load_evaluation_artifacts
+    from evaluation.latent_image_trajectory import load_eval_rows
     test_rows = load_test_rows(args.data)
+    eval_rows = load_eval_rows(args.eval_rows)
     selection = load_selection(args.selection)
     owned = shard_items(selection, args.shard, args.num_shards)
     model, processor = load_evaluation_artifacts(
@@ -533,14 +594,16 @@ def stage_freegen(args):
             if skip_existing(out_json):
                 continue
             result = question_freegen(model, processor, test_rows[idx], args.data_root, mode)
+            result["eval_match"] = bool(eval_rows[idx]["match"])      # R19: eval baseline over this set
             write_json_atomic(out_json, result)
     return 0
 
 
 def stage_report(args):
-    require_manifest(args.run_dir, _current_inputs(args), git_commit())
+    commit = git_commit()
+    require_manifest(args.run_dir, _current_inputs(args), commit, allow_commit_change=True)
     from evaluation.latent_image_report import build_report
-    build_report(args.run_dir)
+    build_report(args.run_dir, provenance={"report_commit": commit, "report_dirty": bool(git_status_porcelain())})
     return 0
 
 

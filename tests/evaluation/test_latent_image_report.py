@@ -185,3 +185,14 @@ def test_eval_baseline_counts_freegen_question_set(tmp_path):
     (tmp_path / "attention" / "q3.npz").unlink()
     fg = build_report(tmp_path)["freegen"]
     assert fg["eval_baseline_correct"] == 3 and fg["eval_baseline_questions"] == 4
+
+
+def test_gates_separate_length_budget_exclusions(tmp_path):
+    write_synthetic_run(tmp_path, questions=3, blocks=1)
+    (tmp_path / "attention" / "excluded").mkdir()
+    (tmp_path / "attention" / "excluded" / "q7.json").write_text(
+        json.dumps({"excluded": True, "reason": "length_budget", "dual_length": 9000}))
+    (tmp_path / "attention" / "excluded" / "q8.json").write_text(json.dumps({"reason": "match_rate_below_0.99"}))
+    gates = build_report(tmp_path)["gates"]
+    assert gates["excluded_length_budget"] == [7] and gates["excluded_g5_count"] == 1
+    assert gates["excluded_count"] == 2

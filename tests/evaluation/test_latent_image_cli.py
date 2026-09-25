@@ -466,3 +466,153 @@ def test_stage_heads_pools_pad_rows_across_questions(tmp_path):
     share = np.array(heads_doc["share"])
     assert share.shape == (layers, heads_n)
     assert np.allclose(share, 0.6)  # (0.9 + 0.3) / 2, uniform across layers/heads
+
+
+# ---------------------------------------------------------------------------
+# Final-review fix wave: length budget (R12), question-equal heads (R14),
+# smoke selection (R15), report commit (R17), freegen eval_match (R19).
+# ---------------------------------------------------------------------------
+
+def test_dual_length_and_length_budget_exclusion():
+    lay = build_layout(PROMPT + [10, 91, 90, 90, 92, 13, 84], len(PROMPT), T, latent_size=2)
+    assert cli.dual_length(lay) == lay.length + 2          # two image tokens in PROMPT
+    assert cli.length_budget_exclusion(lay, budget=cli.dual_length(lay)) is None
+    assert cli.length_budget_exclusion(lay, budget=cli.dual_length(lay) - 1) == {
+        "excluded": True, "reason": "length_budget", "dual_length": cli.dual_length(lay)}
+    assert cli.LENGTH_BUDGET == 8192
+
+
+def test_length_budget_exclusions_do_not_count_toward_g5_budget(tmp_path):
+    for idx in range(11):
+        cli.write_json_atomic(tmp_path / "attention" / "excluded" / f"q{idx}.json",
+                              {"excluded": True, "reason": "length_budget", "dual_length": 9000})
+    cli.write_json_atomic(tmp_path / "attention" / "excluded" / "q20.json", {"reason": "match_rate_below_0.99"})
+    assert cli.g5_exclusion_count(tmp_path) == 1
+    assert cli.excluded_indices(tmp_path) == set(range(11)) | {20}
+    cli.require_exclusion_budget(cli.g5_exclusion_count(tmp_path))  # does not raise
+    cli.require_attention_complete(tmp_path, list(range(11)) + [20])  # excluded files count as present
+
+
+def test_stage_attention_excludes_over_budget_question_without_running_model(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import evaluation.latent_image_interventions as li
+    import evaluation.latent_image_trajectory as lt
+    indices = list(range(11))
+    data_path = tmp_path / "TEST.jsonl"
+    _write_jsonl(data_path, [{"image_input": ["x"]} for _ in indices])
+    selection_path = tmp_path / "metadata.json"
+    selection_path.write_text(json.dumps({"selection": {"requested_indices": indices}}))
+    eval_rows_path = tmp_path / "merged.jsonl"
+    _write_jsonl(eval_rows_path, [{"index": i, "stop_reason": "eos", "match": True} for i in indices])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    cli.write_json_atomic(run_dir / "smoke" / "gates.json", {"pass": True})
+    cli.write_json_atomic(run_dir / "swaps.json", {"questions": {str(i): {"category": c, "swaps": []} for i, c in
+                                                                zip(indices, ["creation", "deletion", "selection",
+                                                                              "update"] * 3)}})
+    monkeypatch.setattr(cli, "_teacher_forced_setup", lambda args: (None, None, T))
+    layout = SimpleNamespace(length=8000, image_positions=tuple(range(500)))
+    monkeypatch.setattr(lt, "build_trajectory", lambda *a, **k: SimpleNamespace(layout=layout))
+
+    def boom(*a, **k):
+        raise AssertionError("the model must not run for an over-budget question")
+    monkeypatch.setattr(li, "run_condition", boom)
+    args = _stage_args("attention", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+    assert cli.stage_attention(args) == 0         # 11 exclusions, none counted toward the G5 budget
+    for idx in indices:
+        doc = json.loads((run_dir / "attention" / "excluded" / f"q{idx}.json").read_text())
+        assert doc == {"excluded": True, "reason": "length_budget", "dual_length": 8500}
+
+
+def test_attention_meta_records_eval_stop_reason():
+    from types import SimpleNamespace
+    capture = SimpleNamespace(specs=(), g1_max_rel=1e-4, g1b_linear_rel=1e-5, g2_max_abs=1e-6)
+    lay = build_layout(PROMPT + [10, 91, 90, 90, 92, 13, 84], len(PROMPT), T, latent_size=2)
+    trajectory = SimpleNamespace(category="deletion", layout=lay, eval_match=True)
+    meta = cli.attention_meta(capture, trajectory, {"excluded": False}, {"stop_reason": "max_new_tokens"})
+    assert meta["stop_reason"] == "max_new_tokens" and meta["n_blocks"] == 1
+    assert meta["dual_length"] == cli.dual_length(lay)
+
+
+def test_select_smoke_questions():
+    def c(idx, n_blocks, stop="eos", length=1000):
+        return {"idx": idx, "n_blocks": n_blocks, "stop_reason": stop, "dual_length": length}
+    candidates = [c(1, 1, stop="max_new_tokens"), c(2, 1, length=9000), c(3, 6), c(4, 2), c(5, 1), c(6, 3), c(7, 4)]
+    chosen = cli.select_smoke_questions(candidates)
+    assert chosen["single"]["idx"] == 5 and chosen["multi"]["idx"] == 6
+    consumed = []
+
+    def lazy():
+        for cand in candidates:
+            consumed.append(cand["idx"])
+            yield cand
+    cli.select_smoke_questions(lazy())
+    assert consumed == [1, 2, 3, 4, 5, 6]       # stops once both are found
+    with pytest.raises(RuntimeError, match="smoke"):
+        cli.select_smoke_questions([c(1, 1), c(3, 6), c(4, 3, stop="max_new_tokens"), c(8, 5, length=8193)])
+
+
+def test_stage_heads_weights_questions_equally(tmp_path):
+    # R14: q0 has three pad rows (0.9), q1 one pad row (0.3). Question-equal mean = 0.6,
+    # row-weighted would be 0.75.
+    import numpy as np
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0, 1])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path)
+    for idx, (n_pads, value) in enumerate(((3, 0.9), (1, 0.3))):
+        specs = [{"position": i, "group": "latent", "block": 0, "slot": f"pad{i + 1}"} for i in range(n_pads)]
+        vw = np.zeros((n_pads, 2, 2, 7), dtype=np.float32)
+        vw[..., 2] = value
+        cli.savez_atomic(run_dir / "attention" / f"q{idx}.npz", mass=vw, vw_share=vw,
+                         enrichment=np.zeros((n_pads, 2, 2), dtype=np.float32))
+        cli.write_json_atomic(run_dir / "attention" / f"q{idx}.json", {"specs": specs})
+    assert cli.stage_heads(_stage_args("heads", data_path, selection_path, eval_rows_path, run_dir)) == 0
+    share = np.array(json.loads((run_dir / "heads.json").read_text())["share"])
+    assert np.allclose(share, 0.6)
+
+
+def test_stage_report_allows_different_commit_but_checks_inputs(tmp_path):
+    from tests.evaluation.latent_image_fixtures import write_synthetic_run
+    data_path, selection_path, eval_rows_path = _minimal_inputs(tmp_path, [0])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_synthetic_run(run_dir, questions=1, blocks=1)
+    manifest = _write_manifest(run_dir, data_path, selection_path, eval_rows_path)
+    manifest["commit"] = "an-older-prepare-commit"
+    cli.write_json_atomic(run_dir / "manifest.json", manifest)
+    args = _stage_args("report", data_path, selection_path, eval_rows_path, run_dir)
+    with pytest.raises(ValueError, match="manifest"):
+        cli.stage_heads(_stage_args("heads", data_path, selection_path, eval_rows_path, run_dir))
+    assert cli.stage_report(args) == 0
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert summary["report_commit"] == cli.git_commit()
+    assert summary["report_dirty"] == bool(cli.git_status_porcelain())
+    with pytest.raises(ValueError, match="manifest"):
+        cli.require_manifest(run_dir, {**manifest["inputs"], "data": "other"}, "x", allow_commit_change=True)
+
+
+def test_stage_freegen_records_eval_match(tmp_path, monkeypatch):
+    import sys
+    from types import ModuleType
+    data_path = tmp_path / "TEST.jsonl"
+    _write_jsonl(data_path, [{"image_input": ["x"]}, {"image_input": ["y"]}])
+    selection_path = tmp_path / "metadata.json"
+    selection_path.write_text(json.dumps({"selection": {"requested_indices": [0, 1]}}))
+    eval_rows_path = tmp_path / "merged.jsonl"
+    _write_jsonl(eval_rows_path, [{"index": 0, "match": True}, {"index": 1, "match": False}])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_dir, base_model_dir)
+    fake_eval = ModuleType("eval")
+    fake_eval.load_evaluation_artifacts = lambda **kwargs: (None, None)
+    monkeypatch.setitem(sys.modules, "eval", fake_eval)
+    monkeypatch.setattr(cli, "question_freegen", lambda *a: {"match": True, "stop_reason": "eos"})
+    args = _stage_args("freegen", data_path, selection_path, eval_rows_path, run_dir, model_dir, base_model_dir)
+    assert cli.stage_freegen(args) == 0
+    for mode in ("causal_mask", "latent_mask"):
+        assert json.loads((run_dir / "freegen" / mode / "q0.json").read_text())["eval_match"] is True
+        assert json.loads((run_dir / "freegen" / mode / "q1.json").read_text())["eval_match"] is False
