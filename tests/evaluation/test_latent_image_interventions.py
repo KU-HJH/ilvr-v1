@@ -105,3 +105,33 @@ def test_head_subset_single_head_is_between(tiny):
     noop = li.run_condition(tiny, tr, li.Condition("noop"), mid_layer=0)
     one = li.run_condition(tiny, tr, li.Condition("k_one", head_subset=((0, 1),)), mid_layer=0)
     assert not torch.allclose(one.latents, noop.latents)
+
+
+def test_run_condition_requires_sdpa():
+    # _tiny_model() defaults to attn_implementation="eager"; the decoder's generate_mode
+    # branch for non-SDPA implementations bypasses nn.Module hooks, so interventions
+    # must refuse it rather than silently no-op head_subset masking.
+    torch.manual_seed(0)
+    model = _tiny_model().eval()
+    tr = trajectory()
+    with pytest.raises(ValueError, match="SDPA"):
+        li.run_condition(model, tr, li.Condition("noop"), mid_layer=0)
+
+
+class _FakeHandle:
+    def remove(self):
+        pass
+
+
+def test_head_subset_requires_hook_to_fire(tiny):
+    # Simulate a decoder path that never invokes the registered pre-hook (e.g. a
+    # non-hook-compatible attention dispatch); run_condition must not silently
+    # treat the head_subset condition as a no-op.
+    tr = trajectory()
+    layer = tiny.model.layers[0].self_attn
+    layer.register_forward_pre_hook = lambda *a, **k: _FakeHandle()
+    try:
+        with pytest.raises(ValueError, match="fire"):
+            li.run_condition(tiny, tr, li.Condition("broken", head_subset=((0, 0),)), mid_layer=0)
+    finally:
+        del layer.register_forward_pre_hook

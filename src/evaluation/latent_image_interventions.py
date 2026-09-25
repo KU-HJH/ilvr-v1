@@ -121,12 +121,14 @@ def _head_masks(qwen, base_allowed, none_allowed, head_subset, dtype):
         by_layer.setdefault(layer, set()).add(head)
     heads = qwen.config.num_attention_heads
     handles = []
+    fired = {index: False for index in by_layer}
 
     def hook(index):
         chosen = torch.zeros(heads, dtype=torch.bool, device=base_allowed.device)
         chosen[list(by_layer[index])] = True
 
         def pre(module, args, kwargs):
+            fired[index] = True
             incoming = kwargs["attention_mask"]
             p = incoming.shape[-1]
             if not torch.equal(torch.isfinite(incoming[0, 0]), base_allowed[:p, :p]):
@@ -140,6 +142,8 @@ def _head_masks(qwen, base_allowed, none_allowed, head_subset, dtype):
         for index in by_layer:
             handles.append(qwen.model.layers[index].self_attn.register_forward_pre_hook(hook(index), with_kwargs=True))
         yield
+        if not all(fired.values()):
+            raise ValueError("head_subset pre-hook did not fire for every hooked layer")
     finally:
         for handle in handles:
             handle.remove()
@@ -174,6 +178,8 @@ def run_condition(model, trajectory, condition, *, alt_pixel_values=None, alt_gr
     if alt_pixel_values is not None and pixel_override is not None:
         raise ValueError("alt image and pixel override are exclusive")
     qwen = resolve_stage2_qwen_model(model)
+    if qwen.config._attn_implementation != "sdpa":
+        raise ValueError("latent image interventions require SDPA language attention")
     layout = trajectory.layout
     phys = build_physical_layout(layout, with_alt=alt_pixel_values is not None)
     embeds, positions, physical_ids = _physical_embeds(qwen, trajectory, phys, alt_pixel_values, alt_grid, pixel_override)
