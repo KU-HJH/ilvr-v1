@@ -102,7 +102,7 @@ image token은 image와 그 앞 prefix만 보므로 image KV는 이미지만의 
 ## 5. 보조분석 B와 자유 생성
 
 - 민감도: ②의 total run에서 latent 변화와 대조 text 변화 (같은 정의의 hidden cosine 거리)를 비교한다. latent가 text보다 유의하게 크게 변하면 latent가 이미지 의존 정보를 더 싣는다는 증거로 본다.
-- 식별 가능성: 각 문항에서 원본 + 같은 카테고리 swap 후보 4개 (N=5, resize 방식)로 latent를 계산한다 (궤적 고정, 해당 이미지로 전체 재계산). 각 조건의 Body 평균 hidden (마지막 layer 및 중간 layer 18)이 자기 이미지 조건의 표현과 가장 가까운지 nearest-neighbor 정확도를 우연 수준 1/5과 비교한다. 문항 내 비교이므로 질문 text 효과는 상쇄된다.
+- 식별 가능성: 각 문항에서 원본 + 같은 카테고리 swap 후보 4개 (N=5, resize 방식)로 각각 전체 run을 계산한다 (궤적 고정). 후보 i마다 latent 표현 z_i (Body 평균 hidden)와 이미지 표현 r_i (같은 layer에서 image token 위치 평균 hidden)를 얻는다. 문항 안에서 후보 평균을 빼 질문 공통 성분을 제거한 뒤, z_i와 cosine이 가장 큰 r_j가 j=i인 비율을 우연 수준 1/5과 비교한다 (layer 18과 마지막 layer). latent의 이미지 간 차이가 이미지 표현의 차이와 정렬되는지 묻는 지표다.
 - 자유 생성: latent 생성 구간 (START 이후 END까지)의 query에서만 원본 image key를 차단한 greedy 생성. 100문항, 기본 평가 설정. clean 대비 exact McNemar. ours1-visual-causal `src/evaluation/visual_interventions.py`의 E3 mask 로직만 가져와 이 branch의 생성 경로에 맞춘다.
 
 ## 6. 검증 게이트
