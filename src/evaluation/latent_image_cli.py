@@ -80,19 +80,37 @@ def require_manifest(run_dir, inputs, commit, *, allow_commit_change=False):
 
 def require_model_identity(manifest, args):
     """Every model-loading stage (smoke/attention/interventions/freegen) must resume
-    against the exact model `prepare` recorded: same directories and same on-disk
+    against the exact model `prepare` recorded: same directories, same on-disk
     content (an adapter or prepared-manifest edit in place would go undetected by
-    path comparison alone)."""
+    path comparison alone), and the same `--precision` (R22)."""
     prepared_manifest = Path(str(args.model_dir) + ".manifest.json")
     adapter = args.model_dir / "adapter_model.safetensors"
     current = {
         "model_dir": str(args.model_dir), "base_model_dir": str(args.base_model_dir),
         "prepared_manifest_sha256": sha256(prepared_manifest), "adapter_sha256": sha256(adapter),
+        "precision": getattr(args, "precision", None),
     }
     expected = {key: manifest.get(key) for key in current}
     if current != expected:
         raise ValueError("manifest model identity (model_dir, base_model_dir, adapter_sha256, "
-                         "prepared_manifest_sha256) differs from the current execution")
+                         "prepared_manifest_sha256, precision) differs from the current execution")
+
+
+def apply_precision(model, precision):
+    """R22: teacher-forced stages load a BF16 checkpoint via `_load_runtime`; when
+    `precision == "fp32"`, cast the language model (decoder stack + lm_head) up to
+    fp32 to avoid length-dependent BF16 rounding in the dual-image gate. `qwen.visual`
+    is left untouched (FlashAttention2 requires BF16). Returns the effective
+    {"language", "visual"} dtypes for provenance recording."""
+    from stage2.peft import resolve_stage2_qwen_model
+    if precision not in ("fp32", "bf16"):
+        raise ValueError(f"unknown precision {precision!r}; expected 'fp32' or 'bf16'")
+    qwen = resolve_stage2_qwen_model(model)
+    if precision == "fp32":
+        qwen.model.to(torch.float32)
+        qwen.lm_head.to(torch.float32)
+    return {"language": str(next(qwen.model.parameters()).dtype),
+            "visual": str(next(qwen.visual.parameters()).dtype)}
 
 
 def dual_length(layout):
@@ -404,6 +422,7 @@ def stage_prepare(args):
         "inputs": inputs, "commit": git_commit(), "git_status": status,
         "model_dir": str(args.model_dir), "base_model_dir": str(args.base_model_dir),
         "prepared_manifest_sha256": sha256(prepared_manifest), "adapter_sha256": sha256(adapter),
+        "precision": args.precision,
         "created": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -446,6 +465,7 @@ def stage_smoke(args):
     selection = load_selection(args.selection)
     swaps = json.loads((args.run_dir / "swaps.json").read_text())
     model, processor, token_ids = _teacher_forced_setup(args)
+    precision_record = apply_precision(model, args.precision)
 
     def candidates():
         for idx in selection:
@@ -469,7 +489,7 @@ def stage_smoke(args):
                 "G5": not cond_gates["G5"]["excluded"],
                 "detail": {"g1_max_rel": capture.g1_max_rel, "g1b_linear_rel": capture.g1b_linear_rel,
                           "g2_max_abs": capture.g2_max_abs, "G3": cond_gates["G3"], "G4": cond_gates["G4"],
-                          "G5": cond_gates["G5"]},
+                          "G5": cond_gates["G5"], "precision": precision_record},
             }
             gates[str(idx)] = entry
             all_pass = all_pass and all(entry[k] for k in ("G1", "G1b", "G2", "G3", "G4", "G5"))
@@ -494,6 +514,7 @@ def stage_attention(args):
     heatmap_set = set(heatmap_questions(selection, categories))
     owned = shard_items(selection, args.shard, args.num_shards)
     model, processor, token_ids = _teacher_forced_setup(args)
+    precision_record = apply_precision(model, args.precision)
     with numerical_policy():
         for idx in owned:
             out_json = args.run_dir / "attention" / f"q{idx}.json"
@@ -516,7 +537,9 @@ def stage_attention(args):
             if capture.image_probs is not None:
                 arrays["image_probs"] = capture.image_probs
             savez_atomic(args.run_dir / "attention" / f"q{idx}.npz", **arrays)
-            write_json_atomic(out_json, attention_meta(capture, trajectory, g5, eval_rows[idx]))
+            meta = attention_meta(capture, trajectory, g5, eval_rows[idx])
+            meta["precision"] = precision_record
+            write_json_atomic(out_json, meta)
     require_exclusion_budget(g5_exclusion_count(args.run_dir))
     return 0
 
@@ -562,6 +585,7 @@ def stage_interventions(args):
     owned = shard_items(selection, args.shard, args.num_shards)
     excluded = excluded_indices(args.run_dir)
     model, processor, token_ids = _teacher_forced_setup(args)
+    apply_precision(model, args.precision)
     with numerical_policy():
         for idx in owned:
             if idx in excluded:
@@ -599,6 +623,7 @@ def stage_freegen(args):
                 continue
             result = question_freegen(model, processor, test_rows[idx], args.data_root, mode)
             result["eval_match"] = bool(eval_rows[idx]["match"])      # R19: eval baseline over this set
+            result["precision"] = "not_applicable"     # R22: freegen keeps eval numerics; never cast
             write_json_atomic(out_json, result)
     return 0
 
@@ -630,6 +655,7 @@ def _common_parser():
     parser.add_argument("--eval-rows", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     return parser

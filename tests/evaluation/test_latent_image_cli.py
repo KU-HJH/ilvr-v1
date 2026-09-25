@@ -241,6 +241,82 @@ def test_prepare_rejects_hash_mismatch(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# R22: fp32 language model precision for teacher-forced stages.
+# ---------------------------------------------------------------------------
+
+def test_prepare_records_precision_default_and_explicit(tmp_path, monkeypatch):
+    fixture = _build_prepare_fixture(tmp_path)
+    monkeypatch.setattr(cli, "EXPECTED_SHA256", {
+        "data": cli.sha256(fixture["data"]), "selection": cli.sha256(fixture["selection"]),
+        "eval_rows": cli.sha256(fixture["eval_rows"])})
+    monkeypatch.setattr(cli, "git_status_porcelain", lambda: "")
+
+    run_dir = tmp_path / "run-default"
+    code = cli.main([
+        "prepare", "--model-dir", str(fixture["model_dir"]), "--base-model-dir", str(fixture["base_model_dir"]),
+        "--data", str(fixture["data"]), "--selection", str(fixture["selection"]),
+        "--eval-rows", str(fixture["eval_rows"]), "--data-root", str(fixture["data_root"]),
+        "--run-dir", str(run_dir)])
+    assert code == 0
+    assert json.loads((run_dir / "manifest.json").read_text())["precision"] == "fp32"
+
+    run_dir_bf16 = tmp_path / "run-bf16"
+    code = cli.main([
+        "prepare", "--model-dir", str(fixture["model_dir"]), "--base-model-dir", str(fixture["base_model_dir"]),
+        "--data", str(fixture["data"]), "--selection", str(fixture["selection"]),
+        "--eval-rows", str(fixture["eval_rows"]), "--data-root", str(fixture["data_root"]),
+        "--run-dir", str(run_dir_bf16), "--precision", "bf16"])
+    assert code == 0
+    assert json.loads((run_dir_bf16 / "manifest.json").read_text())["precision"] == "bf16"
+
+
+def test_require_model_identity_rejects_precision_mismatch(tmp_path):
+    model_dir, base_model_dir = _model_dirs(tmp_path)
+    manifest = {
+        "model_dir": str(model_dir), "base_model_dir": str(base_model_dir),
+        "adapter_sha256": cli.sha256(model_dir / "adapter_model.safetensors"),
+        "prepared_manifest_sha256": cli.sha256(Path(str(model_dir) + ".manifest.json")),
+        "precision": "fp32",
+    }
+    matching = argparse.Namespace(model_dir=model_dir, base_model_dir=base_model_dir, precision="fp32")
+    cli.require_model_identity(manifest, matching)  # does not raise
+
+    mismatched = argparse.Namespace(model_dir=model_dir, base_model_dir=base_model_dir, precision="bf16")
+    with pytest.raises(ValueError, match="manifest"):
+        cli.require_model_identity(manifest, mismatched)
+
+
+def test_apply_precision_fp32_casts_language_only_leaves_visual():
+    from step_preference.equivalence import _tiny_model
+    from stage2.peft import resolve_stage2_qwen_model
+    model = _tiny_model().to(dtype=torch.bfloat16)
+    record = cli.apply_precision(model, "fp32")
+    qwen = resolve_stage2_qwen_model(model)
+    assert all(p.dtype == torch.float32 for p in qwen.model.parameters())
+    assert all(p.dtype == torch.float32 for p in qwen.lm_head.parameters())
+    assert all(p.dtype == torch.bfloat16 for p in qwen.visual.parameters())
+    assert record == {"language": "torch.float32", "visual": "torch.bfloat16"}
+
+
+def test_apply_precision_bf16_is_a_noop():
+    from step_preference.equivalence import _tiny_model
+    from stage2.peft import resolve_stage2_qwen_model
+    model = _tiny_model().to(dtype=torch.bfloat16)
+    record = cli.apply_precision(model, "bf16")
+    qwen = resolve_stage2_qwen_model(model)
+    assert all(p.dtype == torch.bfloat16 for p in qwen.model.parameters())
+    assert all(p.dtype == torch.bfloat16 for p in qwen.visual.parameters())
+    assert record == {"language": "torch.bfloat16", "visual": "torch.bfloat16"}
+
+
+def test_apply_precision_rejects_unknown_value():
+    from step_preference.equivalence import _tiny_model
+    model = _tiny_model()
+    with pytest.raises(ValueError, match="precision"):
+        cli.apply_precision(model, "fp16")
+
+
+# ---------------------------------------------------------------------------
 # Fix round 1: stage-ordering guards (smoke gate, exclusion budget, attention
 # completeness, model identity on resume).
 # ---------------------------------------------------------------------------
@@ -263,7 +339,8 @@ def _write_manifest(run_dir, data_path, selection_path, eval_rows_path, model_di
         manifest.update(
             model_dir=str(model_dir), base_model_dir=str(base_model_dir),
             prepared_manifest_sha256=cli.sha256(Path(str(model_dir) + ".manifest.json")),
-            adapter_sha256=cli.sha256(model_dir / "adapter_model.safetensors"))
+            adapter_sha256=cli.sha256(model_dir / "adapter_model.safetensors"),
+            precision="fp32")   # matches the `--precision` default `_stage_args` leaves unset
     cli.write_json_atomic(run_dir / "manifest.json", manifest)
     return manifest
 
@@ -515,6 +592,7 @@ def test_stage_attention_excludes_over_budget_question_without_running_model(tmp
                                                                 zip(indices, ["creation", "deletion", "selection",
                                                                               "update"] * 3)}})
     monkeypatch.setattr(cli, "_teacher_forced_setup", lambda args: (None, None, T))
+    monkeypatch.setattr(cli, "apply_precision", lambda model, precision: {"language": precision, "visual": "bf16"})
     layout = SimpleNamespace(length=8000, image_positions=tuple(range(500)))
     monkeypatch.setattr(lt, "build_trajectory", lambda *a, **k: SimpleNamespace(layout=layout))
 

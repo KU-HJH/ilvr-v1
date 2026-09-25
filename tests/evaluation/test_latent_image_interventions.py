@@ -123,6 +123,30 @@ class _FakeHandle:
         pass
 
 
+def test_mixed_precision_language_fp32_visual_bf16_runs_condition():
+    # R22: apply_precision leaves qwen.visual in BF16 (FlashAttention2 requires it) and
+    # casts only the language model to fp32; run_condition must handle the mixed dtypes
+    # for both a single-image (noop) and dual-image condition without a dtype error.
+    from evaluation.latent_image_cli import apply_precision
+    torch.manual_seed(0)
+    config = _tiny_model().config
+    config.num_hidden_layers = 2
+    config.vision_end_token_id = 83
+    config._attn_implementation = "sdpa"
+    model = type(_tiny_model())(config).eval()
+    model.to(torch.bfloat16)
+    record = apply_precision(model, "fp32")
+    assert record == {"language": "torch.float32", "visual": "torch.bfloat16"}
+
+    tr = trajectory()
+    noop = li.run_condition(model, tr, li.Condition("noop"), mid_layer=0)
+    alt_pixels = torch.randn(4, 12, generator=torch.Generator().manual_seed(5))
+    dual = li.run_condition(model, tr, li.Condition("dual_clean"), alt_pixel_values=alt_pixels,
+                            alt_grid=tr.image_grid_thw, mid_layer=0)
+    assert noop.latents.dtype == torch.float32
+    assert dual.latents.dtype == torch.float32
+
+
 def test_head_subset_requires_hook_to_fire(tiny):
     # Simulate a decoder path that never invokes the registered pre-hook (e.g. a
     # non-hook-compatible attention dispatch); run_condition must not silently
