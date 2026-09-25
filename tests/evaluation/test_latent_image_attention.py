@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from evaluation import latent_image_attention as la
-from evaluation.latent_image_layout import IMAGE
+from evaluation.latent_image_layout import IMAGE, SINK, TEMPLATE
 from step_preference.equivalence import _tiny_model
 from tests.evaluation.test_latent_image_interventions import tiny, trajectory  # noqa: F401  (fixture reuse)
 
@@ -66,3 +66,89 @@ def test_capture_g1_holds_for_bf16_model(tiny):
     model = copy.deepcopy(tiny).to(torch.bfloat16)
     cap = la.capture_attention(model, trajectory())
     assert cap.g1_max_rel <= 1e-2
+
+
+# ---------------------------------------------------------------------------
+# Top-1 / top-5 region labels (R25 addendum)
+# ---------------------------------------------------------------------------
+
+def _code(*regions):
+    return torch.tensor(regions, dtype=torch.int64)
+
+
+def test_row_topk_picks_argmax_region_including_sink():
+    # key 0 (sink) has the largest raw prob -> top1_region is SINK; the second-largest is
+    # the image key, so excluding key 0 (nosink) must select it instead.
+    p = torch.tensor([[0.7, 0.1, 0.2]])                       # [heads=1, n_visible=3]
+    w = p.clone()
+    code = _code(SINK, TEMPLATE, IMAGE)
+    t1, t1n, t1v, t5, t5n, t5c, t5v = la._row_topk(p, w, code)
+    assert t1.tolist() == [SINK]
+    assert t1n.tolist() == [IMAGE]
+    assert t1v.tolist() == [SINK]
+
+
+def test_row_topk_nosink_sentinel_when_only_sink_visible():
+    # A single visible key (the sink itself, query == 0): the nosink pool is empty, so the
+    # nosink outputs are the documented sentinels (255 region, no image in top-5, count 0).
+    p = torch.tensor([[1.0], [1.0]])                          # heads=2, n_visible=1
+    w = p.clone()
+    code = _code(SINK)
+    t1, t1n, t1v, t5, t5n, t5c, t5v = la._row_topk(p, w, code)
+    assert t1.tolist() == [SINK, SINK]
+    assert t1n.tolist() == [255, 255]
+    assert t5n.tolist() == [False, False]
+    assert t5c.tolist() == [0, 0]
+
+
+def test_row_topk_top5_counts_image_keys_and_vw_uses_weighted():
+    # 6 visible keys: sink, 3 image keys, 2 template keys. Raw probs rank sink highest, then
+    # the 3 image keys, then the 2 template keys -> nosink top-5 (k=5) contains all 3 image
+    # keys plus the 2 template keys, so top5_image_count == 3. The weighted (vw) row reorders
+    # so the argmax is a template key instead of the sink, proving vw uses `w_row`, not `p_row`.
+    p = torch.tensor([[0.30, 0.25, 0.20, 0.15, 0.06, 0.04]])   # sink, img, img, img, tmpl, tmpl
+    w = torch.tensor([[0.10, 0.20, 0.15, 0.10, 0.40, 0.05]])   # template key 4 now dominates
+    code = _code(SINK, IMAGE, IMAGE, IMAGE, TEMPLATE, TEMPLATE)
+    t1, t1n, t1v, t5, t5n, t5c, t5v = la._row_topk(p, w, code)
+    assert t1.tolist() == [SINK]
+    assert t1n.tolist() == [IMAGE]
+    assert t1v.tolist() == [TEMPLATE]
+    assert t5.tolist() == [True]
+    assert t5n.tolist() == [True]
+    assert t5c.tolist() == [3]
+    assert t5v.tolist() == [True]                              # image keys still in the 5-of-6 vw top-5
+
+
+def test_row_topk_fewer_than_five_visible_keys():
+    # n_visible == 3 (sink + 2 keys): k = min(5, n_visible) == 3 so top-5 degenerates to "any
+    # visible key"; nosink pool has 2 keys so k5n == 2 as well.
+    p = torch.tensor([[0.5, 0.3, 0.2]])
+    w = p.clone()
+    code = _code(SINK, TEMPLATE, IMAGE)
+    t1, t1n, t1v, t5, t5n, t5c, t5v = la._row_topk(p, w, code)
+    assert t5.tolist() == [True]        # image key visible among the (only 3) candidates
+    assert t5n.tolist() == [True]
+    assert t5c.tolist() == [1]
+
+
+def test_capture_topk_fields_shapes_and_nosink_excludes_sink(tiny):
+    tr = trajectory()
+    cap = la.capture_attention(tiny, tr)
+    layers, heads = tiny.config.num_hidden_layers, tiny.config.num_attention_heads
+    shape = (len(cap.specs), layers, heads)
+    for field in ("top1_region", "top1_region_nosink", "top1_vw_region"):
+        arr = getattr(cap, field)
+        assert arr.shape == shape and arr.dtype == np.uint8
+    for field in ("top5_image", "top5_image_nosink", "top5_image_count", "top5_vw_image"):
+        arr = getattr(cap, field)
+        assert arr.shape == shape and arr.dtype == np.uint8
+    # R25 section 1: nosink must never resolve to the sink region (key 0 is always excluded
+    # from the nosink candidate pool once at least one other key is visible; every query here
+    # sees more than just the sink since row 0 already includes prompt tokens after position 0).
+    assert (cap.top1_region_nosink != SINK).all()
+    assert set(np.unique(cap.top1_region_nosink)) <= set(range(7)) | {255}     # valid codes or sentinel only
+    # top1_region_nosink == IMAGE must imply top5_image_nosink is also true for that
+    # (row, layer, head): the argmax key is trivially inside its own top-5.
+    imaged = cap.top1_region_nosink == IMAGE
+    assert (cap.top5_image_nosink[imaged] == 1).all()
+    assert (cap.top5_image_count[imaged] >= 1).all()

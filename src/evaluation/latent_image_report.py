@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from evaluation import latent_image_stats as st
-from evaluation.latent_image_layout import IMAGE
+from evaluation.latent_image_layout import IMAGE, REGION_NAMES
 
 GROUPS = ("pad", "start", "end", "pre", "post")
 PALETTE = {"pad": "#2a78d6", "start": "#eb6834", "end": "#1baf7a", "pre": "#eda100", "post": "#e87ba4"}
@@ -62,29 +62,29 @@ def _paired_layer_diff(a_dict, b_dict, layers, reason="empty paired set"):
     return [st.paired_cluster_bootstrap(a[:, l], b[:, l], np.array(qs)) for l in range(layers)]
 
 
-def _units(npz, meta, field, region_axis=True):
+def _units(npz, meta, field, region_axis=True, transform=None):
     """(question, block) units: per-group mean over rows of `field`, averaged over heads.
 
     `mass`/`vw_share` carry a trailing region axis (index into it with IMAGE); `enrichment`
     is already an image-specific ratio with no region axis, so it is only averaged over heads.
+    `transform`, when given, replaces that built-in reduction: it maps the raw per-question
+    array `data[field]` ([rows, layers, heads, ...]) straight to [rows, layers] (e.g. an
+    IMAGE-region indicator averaged over heads for the R25 top-k fields).
     """
     units = {g: {} for g in GROUPS}
     for q, path in npz.items():
         with np.load(path) as data:
-            arr = data[field].astype(np.float32)
-        values = arr[..., IMAGE].mean(-1) if region_axis else arr.mean(-1)      # [rows, layers]
+            arr = data[field]
+            values = transform(arr) if transform is not None else (
+                arr.astype(np.float32)[..., IMAGE].mean(-1) if region_axis else arr.astype(np.float32).mean(-1))
         for row, spec in enumerate(json.loads(meta[q].read_text())["specs"]):
             group = "pad" if spec["slot"].startswith("pad") else spec["slot"]
             units[group].setdefault((q, spec["block"]), []).append(values[row])
     return {g: {k: np.mean(v, 0) for k, v in d.items()} for g, d in units.items()}
 
 
-def attention_section(run_dir):
-    npz, meta = _files(run_dir, "attention", "npz"), _files(run_dir, "attention", "json")
-    if not npz:
-        return {"status": "NOT RUN"}
-    units = _units(npz, meta, "vw_share")
-    layers = next(iter(units["pad"].values())).shape[0]
+def _bootstrap_curves(units, layers):
+    """Per-layer cluster_bootstrap curves, one list per group (R14 question-equal weighting)."""
     curves = {}
     for group, data in units.items():
         per_q = _by_question(data)
@@ -93,6 +93,21 @@ def attention_section(run_dir):
         qs = sorted(per_q)
         values, clusters = np.stack([per_q[q] for q in qs]), np.array(qs)
         curves[group] = [st.cluster_bootstrap(values[:, l], clusters) for l in range(layers)]
+    return curves
+
+
+def _question_equal_mean(units):
+    """R14 question-equal point mean per group (no CI)."""
+    return {g: float(np.mean([v.mean() for v in _by_question(d).values()])) for g, d in units.items() if d}
+
+
+def attention_section(run_dir):
+    npz, meta = _files(run_dir, "attention", "npz"), _files(run_dir, "attention", "json")
+    if not npz:
+        return {"status": "NOT RUN"}
+    units = _units(npz, meta, "vw_share")
+    layers = next(iter(units["pad"].values())).shape[0]
+    curves = _bootstrap_curves(units, layers)
     diffs = {f"pad_minus_{control}": _paired_layer_diff(
                  units["pad"], units[control], layers, reason=f"no {control}-text units in any block")
              for control in ("pre", "post")}
@@ -107,11 +122,76 @@ def attention_section(run_dir):
     heads = json.loads((run_dir / "heads.json").read_text()) if (run_dir / "heads.json").exists() else None
     return {"status": "RUN", "evidence": "descriptive", "vw_image_share": curves, "differences": diffs,
             "significant_layers": significant, "significant_layers_missing_controls": missing_controls,
-            "mass_image_mean": {g: float(np.mean([v.mean() for v in _by_question(d).values()]))
-                                for g, d in mass.items() if d},
-            "enrichment_mean": {g: float(np.mean([v.mean() for v in _by_question(d).values()]))
-                                for g, d in enrichment.items() if d},
+            "mass_image_mean": _question_equal_mean(mass), "enrichment_mean": _question_equal_mean(enrichment),
             "heads": heads["heads"] if heads else None}
+
+
+# ---------------------------------------------------------------------------
+# R25 addendum §3: top-1 / top-5 attended-key region attribution
+# ---------------------------------------------------------------------------
+
+TOPK_VARIANTS = {"raw": "top1_region", "nosink": "top1_region_nosink", "vw": "top1_vw_region"}
+TOP5_VARIANTS = {"raw": "top5_image", "nosink": "top5_image_nosink", "vw": "top5_vw_image"}
+TOPK_NPZ_KEYS = tuple(TOPK_VARIANTS.values()) + tuple(TOP5_VARIANTS.values()) + ("top5_image_count",)
+
+
+def _image_share_units(npz, meta, field):
+    return _units(npz, meta, field, transform=lambda arr: (arr == IMAGE).mean(-1).astype(np.float32))
+
+
+def _bool_share_units(npz, meta, field):
+    return _units(npz, meta, field, transform=lambda arr: (arr == 1).mean(-1).astype(np.float32))
+
+
+def _paired_group_diffs(units, layers):
+    diffs = {f"pad_minus_{control}": _paired_layer_diff(
+                 units["pad"], units[control], layers, reason=f"no {control}-text units in any block")
+             for control in ("pre", "post")}
+    return diffs
+
+
+def _region_distribution_nosink(npz, meta):
+    """R25 §3: full top-1 (nosink) region distribution per group, averaged over layers, as a
+    question-equal point share per region name (no CI; the sentinel-only-sink-visible row, if
+    it occurs, contributes to no region and is silently dropped from the distribution)."""
+    dist = {}
+    for code, name in enumerate(REGION_NAMES):
+        units = _units(npz, meta, "top1_region_nosink",
+                       transform=lambda arr, code=code: (arr == code).mean(-1).astype(np.float32))
+        for group, share in _question_equal_mean(units).items():
+            dist.setdefault(group, {})[name] = share
+    return dist
+
+
+def _k1_section(npz, meta, layers):
+    units = {v: _image_share_units(npz, meta, field) for v, field in TOPK_VARIANTS.items()}
+    return {"image_share_by_layer": {v: _bootstrap_curves(units[v], layers) for v in TOPK_VARIANTS},
+            "image_share_overall": {v: _question_equal_mean(units[v]) for v in TOPK_VARIANTS},
+            "differences_nosink": _paired_group_diffs(units["nosink"], layers),
+            "region_distribution_nosink": _region_distribution_nosink(npz, meta)}
+
+
+def _k5_section(npz, meta, layers):
+    units = {v: _bool_share_units(npz, meta, field) for v, field in TOP5_VARIANTS.items()}
+    fraction = _units(npz, meta, "top5_image_count",
+                      transform=lambda arr: (arr.astype(np.float32) / 5.0).mean(-1))
+    return {"contains_image_by_layer": {v: _bootstrap_curves(units[v], layers) for v in TOP5_VARIANTS},
+            "contains_image_overall": {v: _question_equal_mean(units[v]) for v in TOP5_VARIANTS},
+            "differences_nosink": _paired_group_diffs(units["nosink"], layers),
+            "image_fraction_nosink_by_layer": _bootstrap_curves(fraction, layers),
+            "image_fraction_nosink_overall": _question_equal_mean(fraction)}
+
+
+def attention_topk(run_dir):
+    npz, meta = _files(run_dir, "attention", "npz"), _files(run_dir, "attention", "json")
+    if not npz:
+        return {"status": "NOT RUN"}
+    with np.load(next(iter(npz.values()))) as sample:
+        if not all(key in sample.files for key in TOPK_NPZ_KEYS):
+            return {"status": "NOT RUN"}
+        layers = sample["top1_region"].shape[1]
+    return {"status": "RUN", "evidence": "descriptive",
+            "k1": _k1_section(npz, meta, layers), "k5": _k5_section(npz, meta, layers)}
 
 
 def _question_means(docs, name, metric, first_block=False, keep=None):
@@ -313,6 +393,7 @@ def _markdown(summary):
         lines += [f"Report commit: `{summary['report_commit']}` (dirty tracked tree: {summary.get('report_dirty')})", ""]
     titles = {
         "attention": "③ Attention (evidence level: technical/descriptive)",
+        "attention_topk": "③b Attention top-1/top-5 region attribution (evidence level: technical/descriptive)",
         "knockout": "① Knockout (evidence level: causal)",
         "patching": "② Image patching (evidence level: causal)",
         "content": "B. Latent information content (evidence level: information content)",
@@ -333,7 +414,7 @@ def _markdown(summary):
         section = summary[key]
         status = section.get("status", "RUN") if isinstance(section, dict) else "RUN"
         lines += [f"## {title}", "", f"Status: **{status}**", ""]
-        if status == "GATE FAILED" and key == "attention":
+        if status == "GATE FAILED" and key in ("attention", "attention_topk"):
             lines += [f"{'/'.join(section.get('gate_failures', []))} exceeded its tolerance for at least one "
                       "analysed question; this section's numbers are **GATE FAILED** and should not be "
                       "trusted as descriptive evidence.", ""]
@@ -405,6 +486,33 @@ def write_figures(run_dir, summary):
         fig.savefig(figures / "attention_layers.png", dpi=150)
         plt.close(fig)
 
+    topk = summary.get("attention_topk", {})
+    if isinstance(topk, dict) and topk.get("status") == "RUN":
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        panels = ((axes[0], topk["k1"]["image_share_by_layer"]["nosink"], "top-1 IMAGE share (nosink)"),
+                  (axes[1], topk["k5"]["contains_image_by_layer"]["nosink"], "top-5 contains-image share (nosink)"))
+        for ax, curves, title in panels:
+            n_layers = max((len(v) for v in curves.values()), default=0)
+            for group in GROUPS:
+                entries = curves.get(group)
+                if not entries:
+                    continue
+                mean, lo, hi = _ci_arrays(entries)
+                x = list(range(len(entries)))
+                ax.plot(x, mean, color=PALETTE[group], linewidth=2, label=group)
+                ax.fill_between(x, lo, hi, color=PALETTE[group], alpha=0.2, linewidth=0)
+            ax.set_xlabel("layer")
+            ax.set_ylabel("share")
+            ax.set_title(title)
+            if n_layers:
+                step = max(1, n_layers // 12)
+                ax.set_xticks(list(range(0, n_layers, step)))
+            ax.legend(frameon=False)
+            ax.spines[["top", "right"]].set_visible(False)
+        fig.tight_layout()
+        fig.savefig(figures / "attention_topk_layers.png", dpi=150)
+        plt.close(fig)
+
     patching = summary.get("patching", {})
     if isinstance(patching, dict) and patching.get("status") == "RUN":
         kinds = list(patching.get("by_corruption", {}))
@@ -461,7 +569,8 @@ def build_report(run_dir, provenance=None):
     """`provenance` (e.g. {"report_commit", "report_dirty"}) is merged into summary.json."""
     run_dir = Path(run_dir)
     knockout, patching, content = intervention_sections(run_dir)
-    summary = {"attention": attention_section(run_dir), "knockout": knockout, "patching": patching,
+    summary = {"attention": attention_section(run_dir), "attention_topk": attention_topk(run_dir),
+               "knockout": knockout, "patching": patching,
                "content": content, "sensitivity_excluding_truncated": truncation_sensitivity_section(run_dir),
                "freegen": freegen_section(run_dir), "gates": gates_section(run_dir)}
     summary.update(provenance or {})
@@ -470,8 +579,9 @@ def build_report(run_dir, provenance=None):
             if summary[key].get("status") == "RUN":
                 summary[key]["status"] = "GATE FAILED"
     failures = attention_gate_failures(summary["gates"])
-    if failures and summary["attention"].get("status") == "RUN":
-        summary["attention"].update(status="GATE FAILED", gate_failures=failures)
+    for key in ("attention", "attention_topk"):
+        if failures and summary[key].get("status") == "RUN":
+            summary[key].update(status="GATE FAILED", gate_failures=failures)
     summary = json.loads(json.dumps(summary, default=float))
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=1))
     (run_dir / "report.md").write_text(_markdown(summary))

@@ -30,6 +30,50 @@ class AttentionCapture:
     g1_max_rel: float
     g1b_linear_rel: float
     g2_max_abs: float
+    top1_region: np.ndarray
+    top1_region_nosink: np.ndarray
+    top1_vw_region: np.ndarray
+    top5_image: np.ndarray
+    top5_image_nosink: np.ndarray
+    top5_image_count: np.ndarray
+    top5_vw_image: np.ndarray
+
+
+NOSINK_SENTINEL = 255
+
+
+def _row_topk(p_row, w_row, code):
+    """Top-1/top-5 region labels for one query row, all heads at once (R25 addendum §3).
+
+    `p_row` / `w_row`: [heads, n_visible] raw probs / probs*contrib (unnormalized),
+    restricted to the row's visible keys 0..query (key index == absolute position, since the
+    visible slice is always the causal prefix). `code`: [n_visible] region code per key (the
+    same codes used for the mass partition; key 0 is always the sink).
+
+    Returns (top1_region, top1_region_nosink, top1_vw_region, top5_image, top5_image_nosink,
+    top5_image_count, top5_vw_image), one [heads]-shaped tensor each. The nosink outputs use
+    the documented sentinels (region 255, False, 0) when key 0 is the row's only visible key.
+    """
+    heads, n_visible = p_row.shape
+    device = p_row.device
+    top1_region = code[p_row.argmax(-1)].to(torch.uint8)
+    top1_vw_region = code[w_row.argmax(-1)].to(torch.uint8)
+    k5 = min(5, n_visible)
+    top5_image = (code[p_row.topk(k5, dim=-1).indices] == IMAGE).any(-1)
+    top5_vw_image = (code[w_row.topk(k5, dim=-1).indices] == IMAGE).any(-1)
+    if n_visible > 1:
+        p_nosink, w_nosink, code_nosink = p_row[:, 1:], w_row[:, 1:], code[1:]
+        top1_region_nosink = code_nosink[p_nosink.argmax(-1)].to(torch.uint8)
+        k5n = min(5, n_visible - 1)
+        top5n_regions = code_nosink[p_nosink.topk(k5n, dim=-1).indices] == IMAGE
+        top5_image_nosink = top5n_regions.any(-1)
+        top5_image_count = top5n_regions.sum(-1).to(torch.uint8)
+    else:
+        top1_region_nosink = torch.full((heads,), NOSINK_SENTINEL, dtype=torch.uint8, device=device)
+        top5_image_nosink = torch.zeros(heads, dtype=torch.bool, device=device)
+        top5_image_count = torch.zeros(heads, dtype=torch.uint8, device=device)
+    return (top1_region, top1_region_nosink, top1_vw_region, top5_image, top5_image_nosink,
+            top5_image_count, top5_vw_image)
 
 
 def query_specs(layout):
@@ -54,6 +98,14 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
     vw = np.zeros_like(mass)
     enrich = np.zeros((len(rows), n_layers, heads), np.float32)
     image_probs = np.zeros((len(rows), n_layers, len(layout.image_positions)), np.float32) if keep_image_probs else None
+    topk_shape = (len(rows), n_layers, heads)
+    top1_region = np.zeros(topk_shape, np.uint8)
+    top1_region_nosink = np.zeros(topk_shape, np.uint8)
+    top1_vw_region = np.zeros(topk_shape, np.uint8)
+    top5_image = np.zeros(topk_shape, np.uint8)
+    top5_image_nosink = np.zeros(topk_shape, np.uint8)
+    top5_image_count = np.zeros(topk_shape, np.uint8)
+    top5_vw_image = np.zeros(topk_shape, np.uint8)
     worst = {"g1": 0.0, "g1b": 0.0, "g2": 0.0}
 
     def layer_hooks(index, attn):
@@ -116,6 +168,14 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
                 mass[i, index], vw[i, index] = m.cpu().numpy(), w.cpu().numpy()
                 n_img = int((code == IMAGE).sum())
                 enrich[i, index] = (m[:, IMAGE] / (n_img / max(n_visible, 1))).cpu().numpy()
+                t1, t1n, t1v, t5, t5n, t5c, t5v = _row_topk(p_row, w_row, code)
+                top1_region[i, index] = t1.cpu().numpy()
+                top1_region_nosink[i, index] = t1n.cpu().numpy()
+                top1_vw_region[i, index] = t1v.cpu().numpy()
+                top5_image[i, index] = t5.cpu().numpy()
+                top5_image_nosink[i, index] = t5n.cpu().numpy()
+                top5_image_count[i, index] = t5c.cpu().numpy()
+                top5_vw_image[i, index] = t5v.cpu().numpy()
                 if image_probs is not None:
                     image_probs[i, index] = probs[:, i, list(layout.image_positions)].mean(0).cpu().numpy()
             seen.clear()
@@ -136,4 +196,5 @@ def capture_attention(model, trajectory, *, keep_image_probs=False):
 
     run_condition(model, trajectory, Condition("noop"), final_observer=observer, mid_layer=0)
     return AttentionCapture(specs, mass.astype(np.float16), vw.astype(np.float16), enrich, image_probs,
-                            worst["g1"], worst["g1b"], worst["g2"])
+                            worst["g1"], worst["g1b"], worst["g2"], top1_region, top1_region_nosink,
+                            top1_vw_region, top5_image, top5_image_nosink, top5_image_count, top5_vw_image)

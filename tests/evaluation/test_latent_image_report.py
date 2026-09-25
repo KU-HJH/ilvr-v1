@@ -1,6 +1,7 @@
 import json
 import numpy as np
 from evaluation.latent_image_report import build_report
+from evaluation.latent_image_layout import REGION_NAMES
 from tests.evaluation.latent_image_fixtures import write_synthetic_run
 
 
@@ -216,7 +217,7 @@ def test_report_md_has_complete_json_and_noise_floor_note(tmp_path):
 def test_report_md_never_truncates_large_sections(tmp_path):
     from evaluation.latent_image_report import _markdown
     big = {"status": "RUN", "values": list(range(20000))}
-    summary = {k: {"status": "NOT RUN"} for k in ("attention", "knockout", "patching", "content",
+    summary = {k: {"status": "NOT RUN"} for k in ("attention", "attention_topk", "knockout", "patching", "content",
                                                   "sensitivity_excluding_truncated", "freegen", "gates")}
     summary["content"] = big
     text = _markdown(summary)
@@ -252,3 +253,63 @@ def test_report_ignores_leftover_temp_files(tmp_path):
         (tmp_path / sub / "q5.json.tmp").write_text("{")
     summary = build_report(tmp_path)
     assert summary["attention"]["vw_image_share"]["pad"][0]["n_clusters"] == 3
+
+
+# ---------------------------------------------------------------------------
+# R25 addendum: attention_topk (top-1 / top-5 region attribution)
+# ---------------------------------------------------------------------------
+
+def test_attention_topk_not_run_without_new_npz_keys(tmp_path):
+    write_synthetic_run(tmp_path, questions=3, blocks=2)     # no with_topk
+    summary = build_report(tmp_path)
+    assert summary["attention_topk"] == {"status": "NOT RUN"}
+    assert "NOT RUN" in (tmp_path / "report.md").read_text()
+
+
+def test_attention_topk_detects_image_preference_for_pad(tmp_path):
+    write_synthetic_run(tmp_path, questions=12, blocks=2, with_topk=True, topk_image_boost=0.9)
+    summary = build_report(tmp_path)
+    topk = summary["attention_topk"]
+    assert topk["status"] == "RUN" and topk["evidence"] == "descriptive"
+    k1, k5 = topk["k1"], topk["k5"]
+    for variant in ("raw", "nosink", "vw"):
+        assert set(k1["image_share_overall"][variant]) >= {"pad", "start", "end", "pre", "post"}
+        assert k1["image_share_overall"][variant]["pad"] > k1["image_share_overall"][variant]["pre"]
+        assert len(k1["image_share_by_layer"][variant]["pad"]) == 4       # LAYERS from the fixture
+    assert isinstance(k1["differences_nosink"]["pad_minus_pre"], list)
+    assert isinstance(k1["differences_nosink"]["pad_minus_post"], list)
+    assert all(k1["differences_nosink"]["pad_minus_pre"][l]["mean"] > 0 for l in range(4))
+    dist = k1["region_distribution_nosink"]["pad"]
+    assert set(dist) == set(REGION_NAMES)
+    assert abs(sum(dist.values()) - 1.0) < 1e-6
+    assert dist["image"] > dist["template"]
+    for variant in ("raw", "nosink", "vw"):
+        assert k5["contains_image_overall"][variant]["pad"] > k5["contains_image_overall"][variant]["pre"]
+    assert k5["image_fraction_nosink_overall"]["pad"] > k5["image_fraction_nosink_overall"]["pre"]
+    assert isinstance(k5["differences_nosink"]["pad_minus_pre"], list)
+    assert (tmp_path / "figures" / "attention_topk_layers.png").exists()
+
+
+def test_attention_topk_handles_empty_post_control(tmp_path):
+    write_synthetic_run(tmp_path, questions=3, blocks=2, with_topk=True, omit_post=True)
+    summary = build_report(tmp_path)
+    topk = summary["attention_topk"]
+    assert topk["status"] == "RUN"
+    assert topk["k1"]["differences_nosink"]["pad_minus_post"] == {
+        "status": "NO DATA", "reason": "no post-text units in any block"}
+    assert topk["k5"]["differences_nosink"]["pad_minus_post"] == {
+        "status": "NO DATA", "reason": "no post-text units in any block"}
+    assert isinstance(topk["k1"]["differences_nosink"]["pad_minus_pre"], list)
+
+
+def test_attention_topk_gate_failure_mirrors_attention(tmp_path):
+    write_synthetic_run(tmp_path, questions=3, blocks=2, with_topk=True)
+    assert build_report(tmp_path)["attention_topk"]["status"] == "RUN"
+    path = tmp_path / "attention" / "q1.json"
+    doc = json.loads(path.read_text())
+    doc["g2"] = 5e-3
+    path.write_text(json.dumps(doc))
+    summary = build_report(tmp_path)
+    assert summary["attention"]["status"] == "GATE FAILED"
+    assert summary["attention_topk"]["status"] == "GATE FAILED"
+    assert summary["attention_topk"]["gate_failures"] == ["G2"]

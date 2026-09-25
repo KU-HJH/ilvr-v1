@@ -538,7 +538,11 @@ def stage_attention(args):
                 continue
             capture = capture_attention(model, trajectory, keep_image_probs=idx in heatmap_set)
             arrays = {"mass": capture.mass, "vw_share": capture.vw_share, "enrichment": capture.enrichment,
-                     "image_grid_thw": trajectory.image_grid_thw.numpy()}
+                     "image_grid_thw": trajectory.image_grid_thw.numpy(),
+                     "top1_region": capture.top1_region, "top1_region_nosink": capture.top1_region_nosink,
+                     "top1_vw_region": capture.top1_vw_region, "top5_image": capture.top5_image,
+                     "top5_image_nosink": capture.top5_image_nosink, "top5_image_count": capture.top5_image_count,
+                     "top5_vw_image": capture.top5_vw_image}
             if capture.image_probs is not None:
                 arrays["image_probs"] = capture.image_probs
             savez_atomic(args.run_dir / "attention" / f"q{idx}.npz", **arrays)
