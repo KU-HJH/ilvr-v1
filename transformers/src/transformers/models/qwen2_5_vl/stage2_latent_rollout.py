@@ -219,13 +219,16 @@ class LatentRolloutEngine:
         current = base_inputs_embeds
         states = []
         prefix_lengths = []
-        intervention_kwargs = (
-            {"stage2_ablation": stage2_ablation}
-            if stage2_ablation is not None
-            else {}
-        )
         for span in latent_spans:
             for position in span.latent_positions:
+                # This call contains queries [0, position). Before END enters
+                # that prefix, ablation has no edges to block. Keep the normal
+                # decoder path (including SDPA dispatch) until it is needed.
+                intervention_kwargs = (
+                    {"stage2_ablation": stage2_ablation}
+                    if stage2_ablation is not None and position > stage2_ablation[1]
+                    else {}
+                )
                 outputs = language_model(
                     inputs_embeds=current[:, :position],
                     attention_mask=attention_mask[:, :position],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import math
 
 import torch
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
@@ -195,3 +196,32 @@ def autocast_for(dtype):
 
 def decoder(model):
     return resolve_qwen2_5_vl_model(model).model
+
+
+def compare_cuda_bf16_likelihoods(full, packed):
+    """Apply approved CUDA budget v1, separately to every block and token.
+
+    Inputs are aligned per-target log probabilities, not raw vocabulary logits.
+    This diagnostic budget does not replace the strict CPU equivalence tests.
+    """
+    if not full or len(full) != len(packed):
+        raise ValueError("likelihood vectors must be nonempty and aligned")
+    if not all(math.isfinite(value) for value in (*full, *packed)):
+        raise ValueError("likelihoods must be finite")
+    full_mean = math.fsum(full) / len(full)
+    packed_mean = math.fsum(packed) / len(packed)
+    errors = [abs(left - right) for left, right in zip(full, packed)]
+    block_error = abs(full_mean - packed_mean)
+    failed = [index for index, error in enumerate(errors) if error > 0.10]
+    block_passed = block_error <= 0.05
+    return {
+        "passed": block_passed and not failed,
+        "block_passed": block_passed,
+        "tokens_passed": not failed,
+        "full_mean": full_mean,
+        "packed_mean": packed_mean,
+        "block_abs_error": block_error,
+        "token_abs_errors": errors,
+        "token_max_abs_error": max(errors),
+        "failed_token_indices": failed,
+    }

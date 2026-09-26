@@ -218,6 +218,43 @@ choose the desired mode before creating or resuming the run. The three wrapper
 examples above are the supported packed opt-in path. Direct coordinator users
 may pass `--stage2_m_execution packed_suffix`; pass `full_replay` to opt out.
 
+Full-replay M omits the ablation argument during latent-prefix calls that contain
+no query at/after the selected END. A prefix of length `position` has queries
+`[0, position)`, so the restriction is passed only when `position > end`.
+This keeps causally unaffected rollout calls on the normal SDPA dispatch path;
+later prefix calls and the final M forward retain the original ablation mask.
+Normal F/reference latent generation and packed execution are unchanged.
+This narrow correction does not establish CUDA BF16 packed/full numerical
+equivalence: prior probes also observed attention/projection shape-dependent
+differences. Do not infer equivalence from finite training or CPU tests.
+
+CUDA BF16 likelihood budget v1 (user-approved 2026-09-16) compares full replay
+and packed M on identical post targets. Each block's token-mean `S_M` must have
+absolute error at most **0.05 nat**, and every individual target-token
+log-likelihood must have absolute error at most **0.10 nat**. Both checks must
+pass; no relative tolerance, cross-block averaging, or automatic widening is
+allowed. Raw vocabulary logits are retained as diagnostics, not this CUDA
+acceptance gate. This is a numerical budget, not proof of task-performance
+safety. With the same `S_F`, the unweighted softplus Vision loss difference is
+bounded by the `S_M` difference; any configured auxiliary weight applies after
+that bound. Existing strict CPU comparisons, leakage, prefix, gradient and
+frozen-reference requirements remain unchanged. Earlier strict CUDA failures
+remain failures under their original criteria.
+
+The forward-only CLI `tests/stage2/integration/check_packed_m_bf16.py` takes
+`--base-model`, `--adapter`, `--data`, `--images`, and a fresh `--output` directory
+under the current worktree's `results/`. Run using the repository venv and
+`PYTHONPATH="$PWD/transformers/src:$PWD/src:$PWD"`; `--prepare-only` creates only
+the sample manifest on CPU and is not a numerical validation. It freezes its sample manifest
+before model inference: previous samples 920/1838 plus eight separate samples
+(two per valid block count 1–4, seed 42 shuffled source order). It compares all
+blocks/tokens with post-window 2, latent size 8, SDPA, train-mode DoRA and BF16
+autocast, under `no_grad`; it does not train, update checkpoints, or deploy code.
+Finite over-budget results do not prevent the remaining selected samples from
+being measured, and cause a nonzero exit. Nonfinite values or runtime errors
+terminate the probe without a pass. The manifest and JSON reports delimit the
+verified scope; this is not an all-data, all-window or task evaluation claim.
+
 Packed mode leaves normal Stage 2 latent recurrence and the F/reference call
 schedules unchanged. When Vision has valid blocks, it captures the unchanged
 final F cache and runs one graph-free decoder call for all M suffixes. For a

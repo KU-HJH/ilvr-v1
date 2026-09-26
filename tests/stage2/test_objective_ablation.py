@@ -69,6 +69,61 @@ def _forward_with_generated_delta(model, *, delta, stage2_ablation=None):
         )
 
 
+@pytest.mark.parametrize("ablation", [(2, 5), (8, 11)])
+@pytest.mark.parametrize("bf16", [False, True])
+def test_ablation_keeps_unaffected_rollout_sdpa_path_and_blocks_later_queries(ablation, bf16):
+    """Catch no-op ablation changing prefix dispatch, or disabling later blocking."""
+    from stage2.rng import capture_rng_state, replay_rng_state
+
+    model = _dora_model(attn_implementation="sdpa")
+    decoder = model.get_base_model().model
+    input_ids, attention_mask = _two_block_inputs()
+    records = []
+
+    def observe_mask(_module, _args, kwargs):
+        mask = kwargs["attention_mask"]
+        records.append({
+            "length": kwargs["position_ids"].shape[-1],
+            "mask": None if mask is None else mask.detach().clone(),
+        })
+
+    def observe_output(_module, _args, output):
+        records[-1]["hidden"] = output.last_hidden_state.detach().clone()
+
+    handles = [
+        decoder.layers[0].register_forward_pre_hook(observe_mask, with_kwargs=True),
+        decoder.register_forward_hook(observe_output),
+    ]
+    rng = capture_rng_state()
+    try:
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
+            with replay_rng_state(rng):
+                model(input_ids=input_ids, attention_mask=attention_mask)
+            normal = records[:]
+            records.clear()
+            with replay_rng_state(rng):
+                model(input_ids=input_ids, attention_mask=attention_mask, stage2_ablation=ablation)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert [item["length"] for item in normal] == [3, 4, 9, 10, 14]
+    assert [item["length"] for item in records] == [3, 4, 9, 10, 14]
+    start, end = ablation
+    for f, m in zip(normal, records, strict=True):
+        if m["length"] <= end:
+            assert f["mask"] is None
+            assert m["mask"] is None, "No ablated query exists in this prefix"
+            assert torch.equal(m["hidden"], f["hidden"])
+        else:
+            mask = m["mask"]
+            assert mask is not None
+            minimum = torch.finfo(mask.dtype).min
+            assert torch.all(mask[0, 0, end:, start + 1:end] == minimum)
+            assert torch.all(mask[0, 0, end:, start] == 0)
+            assert torch.all(mask[0, 0, end - 1, start + 1:end] == 0)
+
+
 def test_selected_generated_latents_affect_f_but_not_masked_m():
     """Catches missing q>=e to s<j<e blocking, including end-mediated leakage."""
     torch.manual_seed(17)
