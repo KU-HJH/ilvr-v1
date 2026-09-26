@@ -2,7 +2,7 @@
 
 Status: frozen before any arm is trained. Written 2026-09-26.
 Seed: `seed_c0c2cf91e4a2` v1.0.2 (interview `interview_20260925_105946`).
-Implementation commit: `d8fe9c1`; training deploys this pre-registration commit (which adds only this document and the launch wrapper) on `feat/stage2-entropy-vision`.
+Implementation commit: `d8fe9c1`; training deploys `af2a644` (this document, the launch wrapper, and the full-replay rollout fix) on `feat/stage2-entropy-vision`.
 
 This experiment asks whether the Vision gain term engages its intended
 mechanism. It makes no task-improvement claim. All verdicts are provisional
@@ -107,9 +107,9 @@ ablation. If TEST400 does not complete for an arm, its (d) is `undecided`.
   combined objective; entropy × margin interaction is not testable.
 - Training batch-mean S_F/S_M/G logs are not used for verdicts (batch noise
   ~0.4 nats between steps in the smoke run).
-- Uncommitted worktree edits (including a `stage2_latent_rollout.py` change to
-  full-replay prefix calls) are **not** part of `d8fe9c1` and therefore not part
-  of the trained code unless separately committed before launch.
+- The full-replay rollout change (ablation passed only to prefix calls past the
+  selected END) is included in the trained code as commit `af2a644`, per the
+  user decision of 2026-09-26. The budget v1 check above ran with this change present.
 
 ## Deliverables
 
