@@ -105,7 +105,7 @@ thresholds and stop rules are unchanged.
   Builder: `scripts/stage2/build_probe_manifest.py`; manifest:
   `results/stage2-vision-gain-probe/probe_manifest.json`.
 - Checkpoints probed: step0 (Stage 1 checkpoint-431), CE control
-  (`checkpoints/stage2-ce-matched-gb16-s212-20260919-155759/checkpoint-212`),
+  (adapter: `checkpoints/evaluation-staging/stage2-ce-matched-gb16-s212-20260919-155759/prepared-checkpoint-212`; the canonical checkpoint-212 holds weights only on the remote node),
   and each arm's checkpoint-212.
 - S_M is always computed with `full_replay` in eval mode (no dropout), for every
   checkpoint, regardless of the training M mode. post_window=1.
@@ -143,8 +143,8 @@ ablation. If TEST400 does not complete for an arm, its (d) is `undecided`.
 
 ## Known confounds and limits (declared in advance)
 
-- The CE-only control is reused, not retrained. It ran on commit `1a63667`
-  (voff-reproduction worktree) with ZeRO-2, gradient checkpointing off,
+- The CE-only control is reused, not retrained. It was trained and evaluated on
+  voff-reproduction commit `f8f80be` (`1a63667` plus a sampler guard) with ZeRO-2, gradient checkpointing off,
   `reference_random` sampler and `concatenated-v1` assistant rendering. The arms
   use native DDP, gradient checkpointing on, the default sampler and this
   branch's rendering (vision FA2 and latent activation checkpointing now match,
