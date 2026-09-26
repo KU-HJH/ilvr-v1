@@ -30,7 +30,7 @@ def snapshot(node, rank):
         python_version="3.11",
         torch_version="2.7.1+cu128",
         accelerate_version="1.10.1",
-        deepspeed_version="0.18.0",
+        deepspeed_version="0.18.7",
         torchrun_ok=True,
         gpu_names=("NVIDIA H100 NVL", "NVIDIA H100 NVL"),
         interface="bond1.102",
@@ -48,6 +48,20 @@ def test_preflight_accepts_symmetric_clean_nodes():
 
     assert report.world_size == 4
     assert report.commit == "a" * 40
+
+
+@pytest.mark.parametrize("stale_node", ["remote", "local"])
+def test_preflight_rejects_deepspeed_0180_on_either_node(stale_node):
+    """Catches either node silently retaining the pre-recovery DeepSpeed version."""
+    remote = snapshot("remote", 0)
+    local = snapshot("local", 1)
+    if stale_node == "remote":
+        remote = dataclasses.replace(remote, deepspeed_version="0.18.0")
+    else:
+        local = dataclasses.replace(local, deepspeed_version="0.18.0")
+
+    with pytest.raises(ValueError, match=f"{stale_node}: environment versions"):
+        validate_preflight(remote, local)
 
 
 def test_stage2_peft_zero3_preflight_uses_dedicated_config_on_both_nodes():

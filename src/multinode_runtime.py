@@ -3964,7 +3964,7 @@ def _validate_snapshot(node: NodeSnapshot) -> None:
         not _is_python_311(node.python_version)
         or node.torch_version != "2.7.1+cu128"
         or node.accelerate_version != "1.10.1"
-        or node.deepspeed_version != "0.18.0"
+        or node.deepspeed_version != "0.18.7"
         or not node.torchrun_ok
     ):
         raise ValueError(f"{node.node}: environment versions or torchrun mismatch")
