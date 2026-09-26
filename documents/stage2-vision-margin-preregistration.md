@@ -20,7 +20,7 @@ on base `checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct`.
 | `combined-mv05` | 1.0 | 1.0 | 0.5 | Stage 1 checkpoint-431 |
 
 Common to every arm: `vision_token_reduction=score_mean`, `post_window=1`,
-`pre_window=1`, `gamma_H=0`, `entropy_eps=1e-6`, `stage2_m_execution=full_replay`,
+`pre_window=1`, `gamma_H=0`, `entropy_eps=1e-6`, `stage2_m_execution=packed_suffix` (Amendment 1; originally `full_replay`),
 seed 42, LR 5e-5, warmup 10 updates, linear schedule, AdamW, weight decay 0.01,
 max grad norm 1.0, 4 ranks × microbatch 1 × accumulation 4 = global batch 16,
 212 updates (`--max_steps 212 --save_steps 212`), DoRA r32/alpha64/dropout 0.05,
@@ -45,6 +45,25 @@ real TRAIN.jsonl data, local H100 NVL, train-mode dropout replay):
 one failing block, sample 3207 block 1), token max abs error 0.0841 nat (limit 0.10).
 Result: **FAIL → `full_replay` for all three arms.** Record:
 `results/stage2-vision-gain-probe/m_mode_budget_v1.json`.
+
+## Amendment 1 (2026-09-26, user decision, before any arm completed an update)
+
+The first launch `stage2-visiononly-mv05-gb16-s212-20260926-050608` (visiononly-mv05, `full_replay`) failed with
+CUDA OOM on local rank 2 before completing any optimizer update: the
+full-replay M forward re-runs the vision encoder, whose SDPA attention tried to
+allocate 24.85 GiB while about 89 GiB was already in use (H100 NVL, 93 GiB).
+Under the stop rule this run is recorded as `FAILED`; it is not retried with the
+same settings.
+
+Because `full_replay` re-encodes images for every M branch, it cannot fit this
+execution path. The user chose to train all three arms with
+`stage2_m_execution=packed_suffix`, which reuses the F vision embeddings and
+passed the earlier two-node smoke. This deviates from the M-mode rule above:
+budget v1 failed by 0.0014 nat on one of 25 blocks (block error 0.0514 vs 0.05;
+token error 0.084 within 0.10). That numerical gap between training-time S_M and
+full-replay S_M is a declared limitation. The probe is unchanged: S_M is still
+computed with `full_replay` in eval mode for every checkpoint, so verdicts do not
+depend on the training M mode. All other settings and thresholds are unchanged.
 
 ## Probe (diagnostic only)
 

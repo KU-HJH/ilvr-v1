@@ -49,7 +49,7 @@ objective_arguments=(
   --pre_window 1
   --post_window 1
   --vision_token_reduction score_mean
-  --stage2_m_execution full_replay
+  --stage2_m_execution packed_suffix
 )
 if [[ $lambda_dyn != 0 ]]; then
   objective_arguments+=(--reference_model_path "$stage1")
