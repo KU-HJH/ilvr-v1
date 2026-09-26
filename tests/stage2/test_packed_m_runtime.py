@@ -50,7 +50,8 @@ def test_packed_execution_is_an_explicit_opt_in_runtime_mode():
 
 
 def _run_runtime(model, inputs, *, mode, retain_latents=False, post_only=False,
-                 tokens=TOKENS, text_vocabulary=TEXT_VOCABULARY):
+                 tokens=TOKENS, text_vocabulary=TEXT_VOCABULARY,
+                 reduction="score_mean"):
     import stage2.objective_runtime as objective_runtime
 
     config = Stage2ObjectiveConfig(
@@ -58,6 +59,7 @@ def _run_runtime(model, inputs, *, mode, retain_latents=False, post_only=False,
         lambda_vis=1.0,
         stage2_m_execution=mode,
         post_window=2,
+        vision_token_reduction=reduction,
     )
     runtime = Stage2ObjectiveRuntime(config, tokens, 2, text_vocabulary, None)
     selection = runtime.select(inputs)
@@ -175,6 +177,54 @@ def test_actual_runtime_packed_matches_full_loss_scores_and_gradients(
     assert packed_result.metric_sums["decoder_forwards_F"] == full_result.metric_sums["decoder_forwards_F"]
     for name, value in packed.state_dict().items():
         torch.testing.assert_close(value, full.state_dict()[name], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mode", ["full_replay", "packed_suffix"])
+def test_token_loss_mean_applies_vision_softplus_per_post_token(mode):
+    """Catches token_loss_mean still averaging token scores inside softplus."""
+    torch.manual_seed(311)
+    model = make_packed_model()
+    # Sharpen the tiny head so per-token gains spread enough to separate the reductions.
+    with torch.no_grad():
+        resolve_qwen2_5_vl_model(model).lm_head.weight.mul_(300.0)
+    inputs = make_packed_inputs(blocks=2)
+    with replay_rng_state(capture_rng_state()):
+        result, _, m_logits, _, _, _ = _run_runtime(
+            model, inputs, mode=mode, reduction="token_loss_mean"
+        )
+    selection = Stage2ObjectiveRuntime(
+        Stage2ObjectiveConfig(True, 0, 1, post_window=2), TOKENS, 2, TEXT_VOCABULARY, None
+    ).select(inputs)
+
+    per_token = torch.zeros(())
+    block_score = torch.zeros(())
+    offset = 0
+    for block in selection.blocks:
+        count = len(block.post_positions)
+        assert count == 2
+        targets = torch.tensor(block.target_ids).unsqueeze(-1)
+        f_scores = torch.log_softmax(
+            result.outputs.logits[block.batch_index, list(block.post_positions)].detach().float(), -1
+        ).gather(-1, targets).squeeze(-1)
+        m_scores = torch.log_softmax(
+            m_logits[offset:offset + count].float(), -1
+        ).gather(-1, targets).squeeze(-1)
+        per_token = per_token + torch.nn.functional.softplus(-(f_scores - m_scores)).mean()
+        block_score = block_score + torch.nn.functional.softplus(
+            -(f_scores.mean() - m_scores.mean())
+        )
+        offset += count
+
+    torch.testing.assert_close(result.vis_sum.detach(), per_token, atol=1e-6, rtol=1e-5)
+    assert abs(per_token.item() - block_score.item()) > 1e-2
+    torch.testing.assert_close(
+        result.metric_sums["G"], sum(
+            (torch.log_softmax(result.outputs.logits[b.batch_index, list(b.post_positions)].detach().float(), -1)
+             .gather(-1, torch.tensor(b.target_ids).unsqueeze(-1)).mean())
+            for b in selection.blocks
+        ) - result.metric_sums["S_M"],
+        atol=1e-5, rtol=1e-5,
+    )
 
 
 def test_post_only_packed_loss_has_independent_retained_latent_gradients():

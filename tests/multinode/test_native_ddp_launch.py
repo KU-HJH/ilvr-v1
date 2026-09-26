@@ -136,6 +136,7 @@ def test_resolve_stage2_objective_config_uses_training_parser_defaults_and_value
             "--pre_window", "2",
             "--post_window=3",
             "--stage2_m_execution", "packed_suffix",
+            "--vision_token_reduction", "token_loss_mean",
         ),
         supervise_latent_boundaries=True,
     )
@@ -151,6 +152,7 @@ def test_resolve_stage2_objective_config_uses_training_parser_defaults_and_value
         "pre_window": 2,
         "post_window": 3,
         "stage2_m_execution": "packed_suffix",
+        "vision_token_reduction": "token_loss_mean",
     }
 
 
@@ -177,6 +179,7 @@ def test_stage2_objective_arguments_are_forwarded_by_the_coordinator_allowlist()
         "--pre_window", "2",
         "--post_window=3",
         "--stage2_m_execution", "packed_suffix",
+        "--vision_token_reduction", "token_loss_mean",
     )
 
     assert runtime.validate_stage2_arguments(arguments) == arguments

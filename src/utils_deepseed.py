@@ -122,6 +122,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("full_replay", "packed_suffix"),
         default="full_replay",
     )
+    parser.add_argument(
+        "--vision_token_reduction",
+        choices=("score_mean", "token_loss_mean"),
+        default="score_mean",
+    )
     # global_pad_to 已存在，保留
 # 其余不变
 

@@ -632,3 +632,26 @@ def test_reference_rejects_incompatible_tokenizer_or_output_layout(checkpoint_di
             tokenizer=TinyStage1Processor.from_pretrained(reference_path).tokenizer,
             source_dependencies=_dependencies(),
         )
+
+
+def test_objective_resume_defaults_missing_token_reduction_to_score_mean(tmp_path):
+    """Catches old resumes silently switching to per-token Vision softplus."""
+    reference_api = _api()
+    checkpoint = tmp_path / "legacy-reduction"
+    config = {"enable_stage2_objective": True, "lambda_vis": 1.0,
+              "stage2_m_execution": "full_replay",
+              "vision_token_reduction": "score_mean"}
+    reference = {"source": "fixed"}
+    vocabulary = {"output_size": 8, "token_ids": [1, 2]}
+    reference_api.save_objective_identity(checkpoint, config, reference, vocabulary)
+    sidecar = checkpoint / "stage2_objective.json"
+    payload = json.loads(sidecar.read_text())
+    del payload["config"]["vision_token_reduction"]
+    sidecar.write_text(json.dumps(payload))
+
+    reference_api.validate_objective_resume(checkpoint, config, reference, vocabulary)
+    with pytest.raises(ValueError, match="configuration mismatch"):
+        reference_api.validate_objective_resume(
+            checkpoint, {**config, "vision_token_reduction": "token_loss_mean"},
+            reference, vocabulary,
+        )

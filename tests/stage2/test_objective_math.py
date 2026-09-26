@@ -81,6 +81,39 @@ def test_vision_gain_has_hand_checked_value_and_detached_m_branch():
     assert s_m.grad is None
 
 
+def test_vision_gain_tokens_applies_softplus_per_token_before_the_mean():
+    """Catches averaging token scores inside softplus (score_mean would give log 2)."""
+    objective = _objective()
+    s_f = torch.tensor([0.0, -2.0], requires_grad=True)
+    s_m = torch.tensor([-1.0, -1.0], requires_grad=True)
+
+    scores = objective.vision_gain_tokens(s_f, s_m, m_V=0.0)
+
+    assert scores["loss_vis"].shape == ()
+    assert scores["loss_vis"].item() == pytest.approx(0.81326169, abs=1e-6)
+    assert scores["S_F"].item() == pytest.approx(-1.0)
+    assert scores["S_M"].item() == pytest.approx(-1.0)
+    assert scores["G"].item() == pytest.approx(0.0)
+    assert not scores["S_M"].requires_grad
+    scores["loss_vis"].backward()
+    torch.testing.assert_close(
+        s_f.grad, torch.tensor([-0.13447071, -0.36552929]), atol=1e-6, rtol=0
+    )
+    assert s_m.grad is None
+
+
+def test_vision_gain_tokens_rejects_mismatched_or_empty_token_scores():
+    objective = _objective()
+    with pytest.raises(ValueError, match="identical shapes"):
+        objective.vision_gain_tokens(torch.zeros(2), torch.zeros(3), m_V=0.0)
+    with pytest.raises(ValueError, match="at least one token"):
+        objective.vision_gain_tokens(torch.zeros(0), torch.zeros(0), m_V=0.0)
+    with pytest.raises(ValueError, match="s_m"):
+        objective.vision_gain_tokens(
+            torch.zeros(2), torch.tensor([0.0, float("nan")]), m_V=0.0
+        )
+
+
 def test_text_entropy_renormalizes_selected_rows_and_ignores_control_logits():
     objective = _objective()
     logits = torch.tensor(

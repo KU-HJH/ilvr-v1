@@ -26,6 +26,19 @@ loss_total = loss_ce_F
            + lambda_vis * mean_k(loss_vis[k])
 ```
 
+`--vision_token_reduction` selects where the post-window token mean sits in
+the Vision term. `score_mean` (default, and the value assumed for older
+checkpoints without the field) is the formula above. `token_loss_mean` applies
+the margin per target token, because F and M score identical target positions:
+
+```text
+loss_vis[k] = mean_j softplus(m_V - (log p_F(y_kj) - stop_gradient(log p_M(y_kj))))
+```
+
+The block mean over `K`, the reported `S_F`/`S_M`/`G` token means, and the
+entropy term are unchanged. With `post_window=1` both modes are identical. A
+resume must keep its saved mode.
+
 `F` is the normal student forward. `M_k` is an independent forward of the
 current student in training mode and under `no_grad`, with only block `k`'s
 latent-slot access ablated. The frozen reference is a separate Stage 1 model in

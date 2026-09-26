@@ -9,7 +9,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from peft_common import resolve_qwen2_5_vl_model
-from .objective import Stage2ObjectiveConfig, entropy_transition, text_entropy, target_log_likelihood, vision_gain
+from .objective import Stage2ObjectiveConfig, entropy_transition, text_entropy, target_log_likelihood, vision_gain, vision_gain_tokens
 from .objective_windows import select_objective_windows, WindowSelection
 from .packed_m import PackedMPrefixCapture, score_packed_m
 from .rng import capture_rng_state, replay_rng_state
@@ -202,16 +202,20 @@ class Stage2ObjectiveRuntime:
                     add("low_reference_entropy", (ref_pre_tokens < self.config.entropy_eps).sum() + (ref_post_tokens < self.config.entropy_eps).sum(), 0)
                 if self.config.lambda_vis:
                     targets = torch.tensor(block.target_ids, device=post_logits.device)
-                    score_f = target_log_likelihood(post_logits, targets).mean()
+                    token_f = target_log_likelihood(post_logits, targets)
                     if packed_scores is not None:
-                        score_m = packed_scores.scores[packed_index]
+                        token_m = packed_scores.token_scores[packed_index]
                     else:
                         with torch.no_grad(), replay_rng_state(rng):
                             masked, calls = counted_forward(current_student, auxiliary_inputs,
                                                              stage2_ablation=(block.start_position, block.end_position))
-                            score_m = target_log_likelihood(masked.logits[block.batch_index, list(block.post_positions)], targets).mean()
+                            token_m = target_log_likelihood(masked.logits[block.batch_index, list(block.post_positions)], targets)
                         del masked
-                    metrics = vision_gain(score_f, score_m.detach(), m_V=self.config.m_V)
+                    if self.config.vision_token_reduction == "token_loss_mean":
+                        # Softplus per target token first; F and M share identical target positions.
+                        metrics = vision_gain_tokens(token_f, token_m.detach(), m_V=self.config.m_V)
+                    else:
+                        metrics = vision_gain(token_f.mean(), token_m.detach().mean(), m_V=self.config.m_V)
                     result.vis_sum = result.vis_sum + metrics["loss_vis"]
                     for name, value in metrics.items():
                         add(name, value)

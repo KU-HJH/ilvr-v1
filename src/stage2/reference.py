@@ -378,9 +378,10 @@ def _objective_payload(
 
 
 def _objective_config_for_comparison(config_dict: Mapping[str, Any]) -> dict[str, Any]:
-    """Treat older objective sidecars as the historical full-replay mode."""
+    """Treat older objective sidecars as the historical full-replay, score-mean mode."""
     config = dict(config_dict)
     config.setdefault("stage2_m_execution", "full_replay")
+    config.setdefault("vision_token_reduction", "score_mean")
     return config
 
 

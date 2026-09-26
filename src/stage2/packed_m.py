@@ -30,6 +30,7 @@ class PackedMScores:
     """Per-block graph-free scores and observed packed decoder geometry."""
 
     scores: tuple[torch.Tensor, ...]
+    token_scores: tuple[torch.Tensor, ...]
     decoder_calls: int
     query_rows: int
 
@@ -527,7 +528,7 @@ def score_packed_m(
     """Score all independent M suffixes with one direct, graph-free decoder call."""
     blocks = tuple(blocks)
     if not blocks:
-        return PackedMScores(scores=(), decoder_calls=0, query_rows=0)
+        return PackedMScores(scores=(), token_scores=(), decoder_calls=0, query_rows=0)
     if not isinstance(capture, PackedMPrefixCapture) or not capture.ready:
         raise ValueError("packed M requires a completed, inactive prefix capture")
     base = resolve_qwen2_5_vl_model(model)
@@ -605,6 +606,7 @@ def score_packed_m(
         )
 
     scores = []
+    token_scores = []
     selected_offset = 0
     labels = inputs["labels"]
     for block in blocks:
@@ -613,8 +615,13 @@ def score_packed_m(
         targets = labels[0, [position + 1 for position in block.post_positions]].to(
             logits.device
         )
-        scores.append(target_log_likelihood(logits, targets).mean().detach())
+        block_token_scores = target_log_likelihood(logits, targets).detach()
+        token_scores.append(block_token_scores)
+        scores.append(block_token_scores.mean())
         selected_offset += count
     return PackedMScores(
-        scores=tuple(scores), decoder_calls=decoder_calls, query_rows=query_rows
+        scores=tuple(scores),
+        token_scores=tuple(token_scores),
+        decoder_calls=decoder_calls,
+        query_rows=query_rows,
     )

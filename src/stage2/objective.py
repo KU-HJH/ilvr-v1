@@ -40,6 +40,7 @@ class Stage2ObjectiveConfig:
     pre_window: int = 1
     post_window: int = 1
     stage2_m_execution: str = "full_replay"
+    vision_token_reduction: str = "score_mean"
 
     @classmethod
     def from_args(cls, args) -> "Stage2ObjectiveConfig":
@@ -54,6 +55,7 @@ class Stage2ObjectiveConfig:
             pre_window=args.pre_window,
             post_window=args.post_window,
             stage2_m_execution=getattr(args, "stage2_m_execution", "full_replay"),
+            vision_token_reduction=getattr(args, "vision_token_reduction", "score_mean"),
         )
 
     @property
@@ -87,6 +89,10 @@ class Stage2ObjectiveConfig:
         if self.stage2_m_execution not in ("full_replay", "packed_suffix"):
             raise ValueError(
                 "stage2_m_execution must be 'full_replay' or 'packed_suffix'"
+            )
+        if self.vision_token_reduction not in ("score_mean", "token_loss_mean"):
+            raise ValueError(
+                "vision_token_reduction must be 'score_mean' or 'token_loss_mean'"
             )
         if not self.enable_stage2_objective:
             return
@@ -161,6 +167,33 @@ def vision_gain(
     _require_finite_tensor(gain, "G")
     _require_finite_tensor(loss_vis, "loss_vis")
     return {"S_F": s_f, "S_M": s_m.detach(), "G": gain, "loss_vis": loss_vis}
+
+
+def vision_gain_tokens(
+    s_f: torch.Tensor,
+    s_m: torch.Tensor,
+    *,
+    m_V: float,
+) -> dict[str, torch.Tensor]:
+    """Apply the counterfactual margin per target token, then average the losses."""
+    margin = _require_finite_number(m_V, "m_V")
+    _require_finite_tensor(s_f, "s_f")
+    _require_finite_tensor(s_m, "s_m")
+    if s_f.shape != s_m.shape:
+        raise ValueError("s_f and s_m must have identical shapes")
+    if s_f.numel() == 0:
+        raise ValueError("vision_gain_tokens requires at least one token")
+    token_gain = s_f - s_m.detach()
+    loss_vis = F.softplus(margin - token_gain).mean()
+    gain = token_gain.mean()
+    _require_finite_tensor(gain, "G")
+    _require_finite_tensor(loss_vis, "loss_vis")
+    return {
+        "S_F": s_f.mean(),
+        "S_M": s_m.detach().mean(),
+        "G": gain,
+        "loss_vis": loss_vis,
+    }
 
 
 def text_entropy(logits: torch.Tensor, text_token_ids: tuple[int, ...]) -> torch.Tensor:

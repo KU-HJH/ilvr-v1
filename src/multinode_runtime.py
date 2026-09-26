@@ -964,6 +964,7 @@ _STAGE2_VALUE_OPTIONS = {
     "--pre_window",
     "--post_window",
     "--stage2_m_execution",
+    "--vision_token_reduction",
 }
 _STAGE2_BOOLEAN_OPTIONS = {
     "--save_final_model",
