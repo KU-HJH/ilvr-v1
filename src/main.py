@@ -81,6 +81,10 @@ from stage2.data import (
     prepare_stage2_example,
 )
 from stage2.evidence import observe_stage2_checkpoint_artifact
+from stage2.attention_backend import (
+    load_qwen2_5_vl_with_attention,
+    validate_qwen2_5_vl_attention_backends,
+)
 from stage2.peft import (
     build_stage2_tuned_model,
     load_stage1_dora_for_fresh_stage2,
@@ -267,14 +271,32 @@ def build_stage2_training_components(
         stage1_metadata = decode_stage1_peft_metadata_snapshot(
             decision.stage1_metadata_snapshot
         )
-    model_only_kwargs = {
-        "attn_implementation": args.attention_implementation,
-    }
-    base_model = source_dependencies.load_model(
-        decision.base_model_source,
-        **sparse_source_kwargs,
-        **model_only_kwargs,
+    vision_attention_implementation = getattr(
+        args, "vision_attention_implementation", None
     )
+    use_mixed_attention = (
+        vision_attention_implementation is not None
+        and vision_attention_implementation != args.attention_implementation
+    )
+    if use_mixed_attention:
+        base_model = load_qwen2_5_vl_with_attention(
+            decision.base_model_source,
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=vision_attention_implementation,
+            config_load_kwargs=sparse_source_kwargs,
+            model_load_kwargs=sparse_source_kwargs,
+            load_config=source_dependencies.load_config,
+            load_model=source_dependencies.load_model,
+        )
+    else:
+        model_only_kwargs = {
+            "attn_implementation": args.attention_implementation,
+        }
+        base_model = source_dependencies.load_model(
+            decision.base_model_source,
+            **sparse_source_kwargs,
+            **model_only_kwargs,
+        )
     if decision.stage1_adapter_source is not None:
         model = load_stage1_dora_for_fresh_stage2(
             base_model,
@@ -310,6 +332,9 @@ def build_stage2_training_components(
         token_ids,
         latent_size=decision.latent_size,
         supervise_latent_boundaries=decision.supervise_latent_boundaries,
+        latent_activation_checkpointing=getattr(
+            args, "stage2_latent_activation_checkpointing", False
+        ),
     )
     configure_stage2_model_backend(
         base_model,
@@ -353,6 +378,12 @@ def build_stage2_training_components(
                 adapter_path=decision.adapter_source,
                 is_trainable=True,
             )
+    if use_mixed_attention:
+        validate_qwen2_5_vl_attention_backends(
+            resolve_qwen2_5_vl_model(model),
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=vision_attention_implementation,
+        )
     sparse_continuation = (
         decision.stage1_adapter_source is not None
         or decision.peft_metadata is not None

@@ -35,6 +35,8 @@ SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-8}
 ATTENTION_IMPLEMENTATION=${ATTENTION_IMPLEMENTATION:-sdpa}
+VISION_ATTENTION_IMPLEMENTATION=${VISION_ATTENTION_IMPLEMENTATION:-$ATTENTION_IMPLEMENTATION}
+STAGE2_LATENT_ACTIVATION_CHECKPOINTING=${STAGE2_LATENT_ACTIVATION_CHECKPOINTING:-false}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 MAX_SEQUENCE_LENGTH=${MAX_SEQUENCE_LENGTH:-8192}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
@@ -170,6 +172,9 @@ MANAGED_OPTIONS=(
   --gradient_accumulation_steps
   --per_device_train_batch_size
   --attention_implementation
+  --vision_attention_implementation
+  --stage2_latent_activation_checkpointing
+  --no-stage2_latent_activation_checkpointing
   --gradient_checkpointing
   --no-gradient_checkpointing
   --max_seq_length_train
@@ -309,6 +314,24 @@ case "$ATTENTION_IMPLEMENTATION" in
     ;;
 esac
 
+LATENT_CHECKPOINTING_ARGS=()
+case "$STAGE2_LATENT_ACTIVATION_CHECKPOINTING" in
+  true) LATENT_CHECKPOINTING_ARGS+=(--stage2_latent_activation_checkpointing) ;;
+  false) LATENT_CHECKPOINTING_ARGS+=(--no-stage2_latent_activation_checkpointing) ;;
+  *)
+    printf 'STAGE2_LATENT_ACTIVATION_CHECKPOINTING must be true or false\n' >&2
+    exit 2
+    ;;
+esac
+
+case "$VISION_ATTENTION_IMPLEMENTATION" in
+  eager|sdpa|flash_attention_2) ;;
+  *)
+    printf 'VISION_ATTENTION_IMPLEMENTATION must be eager, sdpa, or flash_attention_2\n' >&2
+    exit 2
+    ;;
+esac
+
 RESUME_ARGS=()
 if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
   RESUME_ARGS+=(--resume_from_checkpoint_path "$RESUME_CHECKPOINT")
@@ -348,6 +371,8 @@ TRAINING_ARGS=(
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
   --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE"
   --attention_implementation "$ATTENTION_IMPLEMENTATION"
+  --vision_attention_implementation "$VISION_ATTENTION_IMPLEMENTATION"
+  "${LATENT_CHECKPOINTING_ARGS[@]}"
   "${CHECKPOINTING_ARGS[@]}"
   --max_seq_length_train "$MAX_SEQUENCE_LENGTH"
   "${TUNING_ARGS[@]}"

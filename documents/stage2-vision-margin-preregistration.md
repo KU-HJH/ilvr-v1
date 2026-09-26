@@ -22,7 +22,7 @@ on base `checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct`.
 Common to every arm: `vision_token_reduction=score_mean`, `post_window=1`,
 `pre_window=1`, `gamma_H=0`, `entropy_eps=1e-6`, `stage2_m_execution=packed_suffix` (Amendment 1; originally `full_replay`),
 seed 42, LR 5e-5, warmup 10 updates, linear schedule, AdamW, weight decay 0.01,
-max grad norm 1.0, 4 ranks × microbatch 1 × accumulation 4 = global batch 16,
+max grad norm 1.0, decoder SDPA + vision FlashAttention2 and latent activation checkpointing (Amendment 2), 4 ranks × microbatch 1 × accumulation 4 = global batch 16,
 212 updates (`--max_steps 212 --save_steps 212`), DoRA r32/alpha64/dropout 0.05,
 latent size 8, supervised latent boundaries, BF16, max sequence 8192, TRAIN.jsonl
 (3,379 retained samples), native DDP, non-reentrant gradient checkpointing,
@@ -64,6 +64,37 @@ token error 0.084 within 0.10). That numerical gap between training-time S_M and
 full-replay S_M is a declared limitation. The probe is unchanged: S_M is still
 computed with `full_replay` in eval mode for every checkpoint, so verdicts do not
 depend on the training M mode. All other settings and thresholds are unchanged.
+
+## Amendment 2 (2026-09-26, user decisions, before any arm completed training)
+
+The packed-suffix relaunch `stage2-visiononly-mv05-gb16-s212-20260926-052315`
+reached update 33/212 (~57 s/update) and then OOMed on remote rank 0 in the
+**F** branch's vision encoder (SDPA attention allocating 43.67 GiB for a large
+image). It is recorded `FAILED`. This path OOMs independently of the Vision
+objective.
+
+Two memory changes were ported, each with tests, per the user's decisions:
+
+1. Split attention backend: decoder SDPA, vision encoder FlashAttention2
+   (from `c70a620`), for the student and the frozen reference. The CE control
+   also used vision FA2.
+2. Selective latent activation checkpointing (from `b92bdb0`): every
+   gradient-carrying latent-prefix decoder call is wrapped in non-reentrant
+   checkpointing with preserved RNG. CPU tests show identical CE, Vision loss,
+   M scores, parameter and latent gradients with and without it (DoRA, full,
+   BF16). The CE control also used latent activation checkpointing.
+
+Before relaunch, at the user's request, the heaviest arm configuration
+(`combined-mv05`: reference + packed M) was run for one optimizer step on each
+of the 7 worst retained samples on one H100 NVL (top 6 by token length and top
+6 by largest image patch count; max 8,095 tokens, 30,888 patches). All 7
+completed; peak GPU memory 64.7 GiB of 93 GiB (without latent checkpointing the
+same probe OOMed). Report: `results/stage2-vision-gain-probe/worst_memory_samples.json`;
+logs: `logs/stage2-vision-margin-oom-probe/`.
+
+All arms therefore also set `VISION_ATTENTION_IMPLEMENTATION=flash_attention_2`
+and `STAGE2_LATENT_ACTIVATION_CHECKPOINTING=true`. Objective settings, data,
+thresholds and stop rules are unchanged.
 
 ## Probe (diagnostic only)
 
@@ -113,11 +144,12 @@ ablation. If TEST400 does not complete for an arm, its (d) is `undecided`.
 ## Known confounds and limits (declared in advance)
 
 - The CE-only control is reused, not retrained. It ran on commit `1a63667`
-  (voff-reproduction worktree) with ZeRO-2, gradient checkpointing off, vision
-  FlashAttention2, latent activation checkpointing, `reference_random` sampler,
-  and `concatenated-v1` assistant rendering. This branch has none of those
-  sampler/rendering/activation-checkpointing features, so CE comparisons mix
-  objective effects with execution-path, data-order and rendering differences.
+  (voff-reproduction worktree) with ZeRO-2, gradient checkpointing off,
+  `reference_random` sampler and `concatenated-v1` assistant rendering. The arms
+  use native DDP, gradient checkpointing on, the default sampler and this
+  branch's rendering (vision FA2 and latent activation checkpointing now match,
+  Amendment 2). CE comparisons therefore mix objective effects with
+  execution-path, data-order and rendering differences.
 - Without `reference_random` padding, 212 × 16 = 3,392 presentations exceed the
   3,379 retained samples, so the Trainer revisits 13 samples at the start of a
   second pass.

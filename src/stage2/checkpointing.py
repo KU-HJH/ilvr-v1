@@ -1280,8 +1280,14 @@ def configure_stage2_metadata(
     *,
     latent_size: int,
     supervise_latent_boundaries: bool,
+    latent_activation_checkpointing: bool | None = None,
 ) -> None:
-    """Write the complete, backwards-compatible Stage 2 config metadata."""
+    """Write the complete, backwards-compatible Stage 2 config metadata.
+
+    ``latent_activation_checkpointing=None`` leaves an existing value unchanged.
+    """
+    if latent_activation_checkpointing is not None:
+        config.stage2_latent_activation_checkpointing = latent_activation_checkpointing
     config.stage = "stage2"
     config.latent_size = latent_size
     config.supervise_latent_boundaries = supervise_latent_boundaries

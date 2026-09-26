@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.utils.checkpoint
 
 
 class LatentStructureError(ValueError):
@@ -183,6 +184,7 @@ class LatentRolloutEngine:
         stage2_ablation: tuple[int, int] | None = None,
         retain_latent_grads: bool = False,
         collect_diagnostics: bool = False,
+        latent_activation_checkpointing: bool = False,
     ) -> LatentRolloutResult:
         if base_inputs_embeds.ndim != 3:
             raise ValueError("base_inputs_embeds must have shape [batch, sequence, hidden]")
@@ -229,15 +231,37 @@ class LatentRolloutEngine:
                     if stage2_ablation is not None and position > stage2_ablation[1]
                     else {}
                 )
-                outputs = language_model(
-                    inputs_embeds=current[:, :position],
-                    attention_mask=attention_mask[:, :position],
-                    position_ids=full_position_ids[..., :position],
-                    use_cache=False,
-                    return_dict=True,
-                    **intervention_kwargs,
+
+                def predict_last_hidden(
+                    bound_inputs, bound_mask, bound_positions, kwargs=intervention_kwargs
+                ):
+                    outputs = language_model(
+                        inputs_embeds=bound_inputs,
+                        attention_mask=bound_mask,
+                        position_ids=bound_positions,
+                        use_cache=False,
+                        return_dict=True,
+                        **kwargs,
+                    )
+                    return outputs.last_hidden_state[:, -1, :]
+
+                prefix = (
+                    current[:, :position],
+                    attention_mask[:, :position],
+                    full_position_ids[..., :position],
                 )
-                latent = outputs.last_hidden_state[:, -1, :]
+                if latent_activation_checkpointing and torch.is_grad_enabled():
+                    # Keep only this prefix call's inputs; replay it in backward
+                    # with the saved RNG state so dropout masks are identical.
+                    with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+                        latent = torch.utils.checkpoint.checkpoint(
+                            predict_last_hidden,
+                            *prefix,
+                            use_reentrant=False,
+                            preserve_rng_state=True,
+                        )
+                else:
+                    latent = predict_last_hidden(*prefix)
                 if retain_latent_grads:
                     latent.retain_grad()
                 states.append(latent)

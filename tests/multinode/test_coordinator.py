@@ -2195,3 +2195,19 @@ def test_signal_owned_uses_pidfd_and_never_os_kill(tmp_path, monkeypatch):
     ]
     with pytest.raises(OSError):
         os.fstat(pidfd)
+
+
+def test_stage2_forwards_split_vision_attention_environment():
+    """Catches the coordinator silently dropping the vision attention backend."""
+    environment = validated_stage2_environment(
+        {
+            "STAGE1_CHECKPOINT": "/models/stage1",
+            "DATA_PATH": "/data/train.jsonl",
+            "IMAGE_ROOT": "/data/images",
+            "VISION_ATTENTION_IMPLEMENTATION": "flash_attention_2",
+        },
+        output_dir="/root/workspace/ILVR/checkpoints/stage2-vision-fa2",
+        log_file="/root/workspace/ILVR/logs/zero-stage-compatibility/stage2-vision-fa2/train.log",
+        deepspeed_config="/root/workspace/ILVR/configs/deepspeed_zero2.json",
+    )
+    assert environment["VISION_ATTENTION_IMPLEMENTATION"] == "flash_attention_2"

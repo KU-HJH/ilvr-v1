@@ -100,6 +100,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("eager", "sdpa", "flash_attention_2"),
         default="sdpa",
     )
+    parser.add_argument(
+        "--stage2_latent_activation_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--vision_attention_implementation",
+        choices=("eager", "sdpa", "flash_attention_2"),
+    )
     parser.add_argument("--deepspeed_config")
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--use_cpu", action="store_true")
@@ -132,6 +141,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
+    if args.vision_attention_implementation is None:
+        args.vision_attention_implementation = args.attention_implementation
     if args.log_file is None:
         try:
             paths = resolve_run_artifact_paths(Path(args.save_model_path).name)

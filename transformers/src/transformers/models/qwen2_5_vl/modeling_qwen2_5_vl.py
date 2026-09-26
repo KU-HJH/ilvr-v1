@@ -2075,6 +2075,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             stage2_ablation=stage2_ablation,
             retain_latent_grads=retain_stage2_latent_grads,
             collect_diagnostics=collect_stage2_diagnostics,
+            latent_activation_checkpointing=getattr(
+                self.config, "stage2_latent_activation_checkpointing", False
+            ),
         )
 
         final_outputs = language_model(

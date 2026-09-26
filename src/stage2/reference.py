@@ -22,6 +22,10 @@ from stage2.checkpointing import (
     resolve_latent_token_ids,
     resolve_stage2_load_decision,
 )
+from stage2.attention_backend import (
+    load_qwen2_5_vl_with_attention,
+    validate_qwen2_5_vl_attention_backends,
+)
 from stage2.peft import Stage2TuningConfig, load_stage1_dora_for_fresh_stage2
 from stage2.rng import capture_rng_state, replay_rng_state
 
@@ -284,12 +288,28 @@ def load_frozen_reference(
         processor = source_dependencies.load_processor(
             decision.processor_source, **selectors
         )
-        model = source_dependencies.load_model(
-            decision.base_model_source,
-            **selectors,
-            attn_implementation=args.attention_implementation,
-            torch_dtype=dtype,
+        vision_attention = getattr(args, "vision_attention_implementation", None)
+        mixed_attention = (
+            vision_attention is not None
+            and vision_attention != args.attention_implementation
         )
+        if mixed_attention:
+            model = load_qwen2_5_vl_with_attention(
+                decision.base_model_source,
+                attention_implementation=args.attention_implementation,
+                vision_attention_implementation=vision_attention,
+                config_load_kwargs=selectors,
+                model_load_kwargs={**selectors, "torch_dtype": dtype},
+                load_config=source_dependencies.load_config,
+                load_model=source_dependencies.load_model,
+            )
+        else:
+            model = source_dependencies.load_model(
+                decision.base_model_source,
+                **selectors,
+                attn_implementation=args.attention_implementation,
+                torch_dtype=dtype,
+            )
         if decision.stage1_adapter_source is not None:
             model = load_stage1_dora_for_fresh_stage2(
                 model,
@@ -299,6 +319,12 @@ def load_frozen_reference(
                 requested_base_model_reference=decision.base_model_source,
             )
         reference_qwen = resolve_qwen2_5_vl_model(model)
+        if mixed_attention:
+            validate_qwen2_5_vl_attention_backends(
+                reference_qwen,
+                attention_implementation=args.attention_implementation,
+                vision_attention_implementation=vision_attention,
+            )
         reference_token_ids = resolve_latent_token_ids(
             processor.tokenizer, reference_qwen.config
         )

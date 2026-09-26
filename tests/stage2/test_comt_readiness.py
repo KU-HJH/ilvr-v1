@@ -65,6 +65,9 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         "1",
         "--attention_implementation",
         "sdpa",
+        "--vision_attention_implementation",
+        "sdpa",
+        "--no-stage2_latent_activation_checkpointing",
         "--no-gradient_checkpointing",
         "--max_seq_length_train",
         "8192",
@@ -99,7 +102,7 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         )
     )
 
-    assert arguments[-18:] == [
+    assert arguments[-21:] == [
         "--latent_size",
         "12",
         "--no-supervise_latent_boundaries",
@@ -111,6 +114,9 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         "1",
         "--attention_implementation",
         "flash_attention_2",
+        "--vision_attention_implementation",
+        "flash_attention_2",
+        "--no-stage2_latent_activation_checkpointing",
         "--gradient_checkpointing",
         "--max_seq_length_train",
         "4096",

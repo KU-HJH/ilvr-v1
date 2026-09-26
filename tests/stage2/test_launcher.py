@@ -279,6 +279,9 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "1",
         "--attention_implementation",
         "sdpa",
+        "--vision_attention_implementation",
+        "sdpa",
+        "--no-stage2_latent_activation_checkpointing",
         "--no-gradient_checkpointing",
         "--max_seq_length_train",
         "8192",
@@ -472,3 +475,17 @@ def test_stage2_launcher_has_valid_bash_syntax():
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_stage2_launcher_forwards_split_vision_attention_backend():
+    """Catches the worker dropping FA2 vision attention or changing the default."""
+    default_tokens = dry_run_tokens(run_launcher())
+    assert option_value(default_tokens, "--vision_attention_implementation") == "sdpa"
+    tokens = dry_run_tokens(
+        run_launcher(env_overrides={"VISION_ATTENTION_IMPLEMENTATION": "flash_attention_2"})
+    )
+    assert option_value(tokens, "--attention_implementation") == "sdpa"
+    assert option_value(tokens, "--vision_attention_implementation") == "flash_attention_2"
+    rejected = run_launcher(env_overrides={"VISION_ATTENTION_IMPLEMENTATION": "flex"})
+    assert rejected.returncode == 2
+    assert "VISION_ATTENTION_IMPLEMENTATION must be" in rejected.stderr
