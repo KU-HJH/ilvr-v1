@@ -17,7 +17,12 @@ mkdir -p "$out" "$repo/logs/$run"
 if [[ ! -d $local_tree ]]; then git -C "$repo" worktree add --detach "$local_tree" "$eval_commit" -q; fi
 [[ $(git -C "$local_tree" rev-parse --short=8 HEAD) == "$eval_commit" ]]
 ssh -o BatchMode=yes "$remote" "docker exec llm_kd bash -lc 'git -C $repo/.worktrees/voff-reproduction-20260917 rev-parse --short=8 HEAD'" | grep -qx "$eval_commit"
-rsync -a --mkpath "$adapter/" "$remote:/raid/workspace/ILVR/checkpoints/${adapter#$repo/checkpoints/}/"
+# The remote node already holds the source checkpoint; copy the same allowlisted
+# files inside the container (root) and verify byte identity with the local copy.
+source_ckpt=$repo/checkpoints/$(basename "$(dirname "$adapter")")/checkpoint-212
+files=$(cd "$adapter" && ls | tr "\n" " ")
+ssh -o BatchMode=yes "$remote" "docker exec llm_kd bash -lc 'mkdir -p $adapter && cd $source_ckpt && cp -n $files $adapter/ && cd $adapter && sha256sum $files'" > "$repo/logs/$run/remote-adapter.sha256"
+(cd "$adapter" && sha256sum $files) | diff - "$repo/logs/$run/remote-adapter.sha256"
 ssh -o BatchMode=yes "$remote" "docker exec llm_kd bash -lc 'mkdir -p $out $repo/logs/$run'"
 
 worker() {  # tree shard gpu
