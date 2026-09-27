@@ -136,6 +136,36 @@ def parse_latent_spans(
     return tuple(spans)
 
 
+def normalize_stage2_ablation(value) -> tuple[tuple[int, int], ...]:
+    """Return the hidden latent spans as ordered (start, end) pairs.
+
+    Accepts one ``(start, end)`` pair or a tuple of such pairs. For every pair,
+    queries at or after ``end`` cannot attend the block's latent slots
+    ``start < key < end``; the markers stay visible.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, tuple):
+        raise ValueError("stage2_ablation must be an integer (start, end) tuple or a tuple of them")
+    pairs = (value,) if len(value) == 2 and all(isinstance(item, int) for item in value) else value
+    if not pairs:
+        raise ValueError("stage2_ablation must contain at least one span")
+    for pair in pairs:
+        if (
+            not isinstance(pair, tuple)
+            or len(pair) != 2
+            or any(not isinstance(position, int) or isinstance(position, bool) for position in pair)
+            or not 0 <= pair[0] < pair[1]
+        ):
+            raise ValueError("stage2_ablation must be an integer (start, end) tuple or a tuple of them")
+    ordered = tuple(sorted(pairs))
+    if len(set(ordered)) != len(ordered) or any(
+        later[0] <= earlier[1] for earlier, later in zip(ordered, ordered[1:])
+    ):
+        raise ValueError("stage2_ablation spans must be distinct and non-overlapping")
+    return ordered
+
+
 @dataclass(frozen=True)
 class LatentRolloutResult:
     final_inputs_embeds: torch.Tensor
@@ -181,7 +211,7 @@ class LatentRolloutEngine:
         attention_mask: torch.Tensor,
         full_position_ids: torch.Tensor,
         latent_spans: tuple[LatentSpan, ...],
-        stage2_ablation: tuple[int, int] | None = None,
+        stage2_ablation: tuple | None = None,
         retain_latent_grads: bool = False,
         collect_diagnostics: bool = False,
         latent_activation_checkpointing: bool = False,
@@ -195,28 +225,20 @@ class LatentRolloutEngine:
             raise ValueError("attention_mask must match the embedding batch and sequence dimensions")
         if full_position_ids.ndim != 3 or full_position_ids.shape[-2:] != sequence_shape:
             raise ValueError("full_position_ids must match the embedding batch and sequence dimensions")
-        if stage2_ablation is not None:
-            if (
-                not isinstance(stage2_ablation, tuple)
-                or len(stage2_ablation) != 2
-                or any(
-                    not isinstance(position, int) or isinstance(position, bool)
-                    for position in stage2_ablation
-                )
-            ):
-                raise ValueError("stage2_ablation must be an integer (start, end) tuple")
+        spans_to_hide = normalize_stage2_ablation(stage2_ablation)
+        for start, end in spans_to_hide:
             matching_spans = tuple(
                 span
                 for span in latent_spans
-                if (span.start_position, span.end_position) == stage2_ablation
+                if (span.start_position, span.end_position) == (start, end)
             )
             if len(matching_spans) != 1 or not matching_spans[0].latent_positions:
                 raise ValueError("stage2_ablation must match one parsed nonempty latent span")
-            start, end = stage2_ablation
             if end >= sequence_shape[1]:
                 raise ValueError("stage2_ablation end marker must be inside the sequence")
             if not torch.all(attention_mask[0, start : end + 1] != 0):
                 raise ValueError("stage2_ablation latent span must not be padding")
+        first_hidden_end = min((end for _, end in spans_to_hide), default=None)
 
         current = base_inputs_embeds
         states = []
@@ -228,7 +250,7 @@ class LatentRolloutEngine:
                 # decoder path (including SDPA dispatch) until it is needed.
                 intervention_kwargs = (
                     {"stage2_ablation": stage2_ablation}
-                    if stage2_ablation is not None and position > stage2_ablation[1]
+                    if first_hidden_end is not None and position > first_hidden_end
                     else {}
                 )
 

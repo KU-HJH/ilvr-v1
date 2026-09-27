@@ -967,6 +967,10 @@ _STAGE2_VALUE_OPTIONS = {
     "--post_window",
     "--stage2_m_execution",
     "--vision_token_reduction",
+    "--vision_token_selection",
+    "--vision_selection_path",
+    "--vision_selection_sha256",
+    "--vision_mask_scope",
 }
 _STAGE2_BOOLEAN_OPTIONS = {
     "--save_final_model",

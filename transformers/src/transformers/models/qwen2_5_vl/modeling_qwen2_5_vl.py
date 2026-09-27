@@ -50,7 +50,12 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
-from .stage2_latent_rollout import LatentRolloutEngine, parse_latent_spans, validate_stage2_config
+from .stage2_latent_rollout import (
+    LatentRolloutEngine,
+    normalize_stage2_ablation,
+    parse_latent_spans,
+    validate_stage2_config,
+)
 
 
 if is_flash_attn_2_available():
@@ -1342,7 +1347,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         generate_mode: Optional[bool] = False,
-        stage2_ablation: Optional[Tuple[int, int]] = None,
+        stage2_ablation: Optional[tuple] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1463,7 +1468,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         cache_position: torch.Tensor,
         past_key_values: Cache,
         output_attentions: bool,
-        stage2_ablation: Optional[Tuple[int, int]] = None,
+        stage2_ablation: Optional[tuple] = None,
     ):
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and past_key_values is not None:
@@ -1542,14 +1547,17 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if stage2_ablation is not None:
             if causal_mask is None or causal_mask.dim() != 4:
                 raise RuntimeError("Stage 2 ablation requires an additive decoder mask")
-            start, end = stage2_ablation
             query_positions = torch.arange(sequence_length, device=device)[:, None]
             key_positions = torch.arange(causal_mask.shape[-1], device=device)[None, :]
-            blocked = (
-                (query_positions >= end)
-                & (key_positions > start)
-                & (key_positions < end)
+            blocked = torch.zeros(
+                (sequence_length, causal_mask.shape[-1]), dtype=torch.bool, device=device
             )
+            for start, end in normalize_stage2_ablation(stage2_ablation):
+                blocked |= (
+                    (query_positions >= end)
+                    & (key_positions > start)
+                    & (key_positions < end)
+                )
             causal_mask = causal_mask.clone().masked_fill(
                 blocked[None, None], min_dtype
             )
@@ -2010,7 +2018,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         return_stage2_latent_states: bool,
         collect_stage2_diagnostics: bool,
         retain_stage2_latent_grads: bool,
-        stage2_ablation: Optional[Tuple[int, int]],
+        stage2_ablation: Optional[tuple],
         stage2_finite_ce: bool,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         if input_ids is None:
@@ -2171,7 +2179,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         return_stage2_latent_states: bool = False,
         collect_stage2_diagnostics: bool = False,
         retain_stage2_latent_grads: bool = False,
-        stage2_ablation: Optional[Tuple[int, int]] = None,
+        stage2_ablation: Optional[tuple] = None,
         stage2_finite_ce: bool = False,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""

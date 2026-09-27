@@ -136,6 +136,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("score_mean", "token_loss_mean"),
         default="score_mean",
     )
+    parser.add_argument(
+        "--vision_token_selection",
+        choices=("post_window", "step0_entropy"),
+        default="post_window",
+    )
+    parser.add_argument("--vision_selection_path", type=str, default=None)
+    parser.add_argument("--vision_selection_sha256", type=str, default=None)
+    parser.add_argument(
+        "--vision_mask_scope",
+        choices=("independent", "cumulative"),
+        default="independent",
+    )
     # global_pad_to 已存在，保留
 # 其余不变
 

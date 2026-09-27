@@ -408,6 +408,10 @@ def _objective_config_for_comparison(config_dict: Mapping[str, Any]) -> dict[str
     config = dict(config_dict)
     config.setdefault("stage2_m_execution", "full_replay")
     config.setdefault("vision_token_reduction", "score_mean")
+    config.setdefault("vision_token_selection", "post_window")
+    config.setdefault("vision_selection_path", None)
+    config.setdefault("vision_selection_sha256", None)
+    config.setdefault("vision_mask_scope", "independent")
     return config
 
 

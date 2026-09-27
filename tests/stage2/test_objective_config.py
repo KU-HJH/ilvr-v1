@@ -38,6 +38,10 @@ def test_objective_cli_defaults_are_opt_in_and_json_serializable():
         "post_window": 1,
         "stage2_m_execution": "full_replay",
         "vision_token_reduction": "score_mean",
+        "vision_token_selection": "post_window",
+        "vision_selection_path": None,
+        "vision_selection_sha256": None,
+        "vision_mask_scope": "independent",
     }
     assert config.active is False
     json.dumps(config.to_dict())
@@ -88,6 +92,10 @@ def test_objective_cli_parses_all_explicit_values():
         "post_window": 3,
         "stage2_m_execution": "packed_suffix",
         "vision_token_reduction": "token_loss_mean",
+        "vision_token_selection": "post_window",
+        "vision_selection_path": None,
+        "vision_selection_sha256": None,
+        "vision_mask_scope": "independent",
     }
 
 

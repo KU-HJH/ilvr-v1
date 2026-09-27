@@ -158,6 +158,13 @@ class WindowBlock:
     pre_positions: tuple[int, ...]
     post_positions: tuple[int, ...]
     target_ids: tuple[int, ...]
+    # Latent blocks M hides (queries at/after each END lose that block's slots).
+    # Empty means this block alone; the M suffix always starts at end_position.
+    hidden_spans: tuple[tuple[int, int], ...] = ()
+
+    @property
+    def ablation(self) -> tuple[tuple[int, int], ...]:
+        return self.hidden_spans or ((self.start_position, self.end_position),)
 
 
 @dataclass(frozen=True)

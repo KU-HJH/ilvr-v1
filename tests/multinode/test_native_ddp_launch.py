@@ -153,6 +153,10 @@ def test_resolve_stage2_objective_config_uses_training_parser_defaults_and_value
         "post_window": 3,
         "stage2_m_execution": "packed_suffix",
         "vision_token_reduction": "token_loss_mean",
+        "vision_token_selection": "post_window",
+        "vision_selection_path": None,
+        "vision_selection_sha256": None,
+        "vision_mask_scope": "independent",
     }
 
 

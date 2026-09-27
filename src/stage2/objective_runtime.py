@@ -9,7 +9,9 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from peft_common import resolve_qwen2_5_vl_model
-from .objective import Stage2ObjectiveConfig, entropy_transition, text_entropy, target_log_likelihood, vision_gain, vision_gain_tokens
+from .entropy_selection import VisionTokenSelectionTable, build_vision_token_units, token_count
+from .objective import (Stage2ObjectiveConfig, entropy_transition, text_entropy, target_log_likelihood, vision_gain,
+                        vision_gain_token_terms, vision_gain_tokens)
 from .objective_windows import select_objective_windows, WindowSelection
 from .packed_m import PackedMPrefixCapture, score_packed_m
 from .rng import capture_rng_state, replay_rng_state
@@ -107,8 +109,25 @@ class Stage2ObjectiveRuntime:
         self.reference = reference
         if config.lambda_dyn and reference is None:
             raise ValueError("entropy objective requires a frozen reference")
+        self.token_level = config.vision_token_selection == "step0_entropy"
+        self.selection_table = None
+        if self.token_level:
+            self.selection_table = VisionTokenSelectionTable.load(config.vision_selection_path)
+            if self.selection_table.sha256 != config.vision_selection_sha256:
+                raise ValueError("vision selection file does not match vision_selection_sha256")
+
+    def units(self, selection: WindowSelection) -> int:
+        """Loss normalization units: selected tokens (token level) or blocks."""
+        return token_count(selection) if self.token_level else len(selection.blocks)
 
     def select(self, inputs) -> WindowSelection:
+        if self.token_level:
+            return build_vision_token_units(
+                inputs["input_ids"], inputs["labels"], inputs["attention_mask"],
+                inputs["stage2_text_segments"], token_ids=self.token_ids, latent_size=self.latent_size,
+                selected_targets=self.selection_table.selected_targets(inputs["input_ids"][0]),
+                scope=self.config.vision_mask_scope,
+            )
         return select_objective_windows(
             inputs["input_ids"], inputs["labels"], inputs["attention_mask"],
             inputs["stage2_text_segments"], token_ids=self.token_ids,
@@ -139,7 +158,7 @@ class Stage2ObjectiveRuntime:
             outputs, decoder_calls = counted_forward(model, clean, student=current_student,
                                                      collect_stage2_diagnostics=True, stage2_finite_ce=True)
         zero = outputs.loss * 0.0
-        result = ObjectiveBatchResult(outputs, outputs.loss, zero, zero, len(selection.blocks), {}, {})
+        result = ObjectiveBatchResult(outputs, outputs.loss, zero, zero, self.units(selection), {}, {})
 
         def add(name, value, count=1):
             detached = value.detach() if isinstance(value, torch.Tensor) else value
@@ -149,8 +168,11 @@ class Stage2ObjectiveRuntime:
         add("loss_ce", outputs.loss)
         add("model_forwards_F", 1, 0)
         add("decoder_forwards_F", decoder_calls, 0)
-        add("valid_blocks", result.count, 0)
-        add("excluded_blocks", int(outputs.stage2_diagnostics["block_count"].item()) - result.count, 0)
+        if self.token_level:
+            add("vision_tokens", result.count, 0)
+        else:
+            add("valid_blocks", result.count, 0)
+            add("excluded_blocks", int(outputs.stage2_diagnostics["block_count"].item()) - result.count, 0)
         for reason, count in selection.excluded.items():
             add("excluded_" + reason, count, 0)
         if not selection.blocks:
@@ -207,10 +229,23 @@ class Stage2ObjectiveRuntime:
                         token_m = packed_scores.token_scores[packed_index]
                     else:
                         with torch.no_grad(), replay_rng_state(rng):
+                            ablation = block.hidden_spans or (block.start_position, block.end_position)
                             masked, calls = counted_forward(current_student, auxiliary_inputs,
-                                                             stage2_ablation=(block.start_position, block.end_position))
+                                                             stage2_ablation=ablation)
                             token_m = target_log_likelihood(masked.logits[block.batch_index, list(block.post_positions)], targets)
                         del masked
+                    if self.token_level:
+                        # Summed here; the Trainer divides by the global selected-token count.
+                        terms = vision_gain_token_terms(token_f, token_m.detach(), m_V=self.config.m_V)
+                        result.vis_sum = result.vis_sum + terms["loss_vis"].sum()
+                        count = terms["G"].numel()
+                        for name in ("S_F", "S_M", "G", "loss_vis"):
+                            add(name, terms[name].sum(), count)
+                        add("G_gt_0", (terms["G"] > 0).float().sum(), count)
+                        if packed_scores is None:
+                            add("model_forwards_M", 1, 0)
+                            add("decoder_forwards_M", calls, 0)
+                        continue
                     if self.config.vision_token_reduction == "token_loss_mean":
                         # Softplus per target token first; F and M share identical target positions.
                         metrics = vision_gain_tokens(token_f, token_m.detach(), m_V=self.config.m_V)

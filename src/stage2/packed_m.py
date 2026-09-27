@@ -18,6 +18,7 @@ from transformers.cache_utils import DynamicCache
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     apply_multimodal_rotary_pos_emb,
 )
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import normalize_stage2_ablation
 
 from peft_common import ALLOWED_QWEN_DECODER_SUFFIXES, resolve_qwen2_5_vl_model
 from stage1.token_rows import SparseOutputTokenRows
@@ -404,6 +405,9 @@ def _packed_layout(
             raise ValueError("packed M WindowBlocks must contain post_positions")
         if not (0 <= block.start_position < block.end_position < capture.root_length):
             raise ValueError("packed M WindowBlock marker positions are invalid")
+        if normalize_stage2_ablation(block.ablation)[0] != (block.start_position, block.end_position):
+            # Root keys before END come from F; an earlier hidden block would leak through them.
+            raise ValueError("packed M suffix must start at the first hidden latent END")
         maximum = max(block.post_positions)
         if maximum < block.end_position or maximum >= capture.root_length:
             raise ValueError("packed M WindowBlock post positions are invalid")
@@ -431,17 +435,18 @@ def _packed_layout(
     offset = 0
     for block, rows in zip(blocks, branch_rows, strict=True):
         length = len(rows)
-        allowed_root = active_root & (root_positions < block.end_position)
-        allowed_root &= ~(
-            (root_positions > block.start_position)
-            & (root_positions < block.end_position)
-        )
-        visible[offset : offset + length, : capture.root_length] = allowed_root
+        allowed_root = (active_root & (root_positions < block.end_position)).expand(length, -1).clone()
         suffix_active = attention_mask[0, list(rows)].bool()
         allowed_suffix = torch.ones(
             (length, length), dtype=torch.bool, device=input_ids.device
         ).tril()
         allowed_suffix &= suffix_active.unsqueeze(0)
+        query_positions = torch.tensor(rows, device=input_ids.device)
+        for start, end in block.ablation:
+            queries = (query_positions >= end).unsqueeze(1)
+            allowed_root &= ~(queries & ((root_positions > start) & (root_positions < end)))
+            allowed_suffix &= ~(queries & ((query_positions > start) & (query_positions < end)))
+        visible[offset : offset + length, : capture.root_length] = allowed_root
         visible[
             offset : offset + length,
             capture.root_length + offset : capture.root_length + offset + length,

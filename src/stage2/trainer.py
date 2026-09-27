@@ -43,7 +43,7 @@ _OBJECTIVE_METRICS = (
     "H_pre", "H_post", "H_ref_pre", "H_ref_post",
     "r_pre", "r_post", "D", "S_F", "S_M", "G",
     "r_pre_gt_1", "r_post_lt_1", "G_gt_0",
-    "valid_blocks", "excluded_blocks",
+    "valid_blocks", "excluded_blocks", "vision_tokens", "excluded_pre_first_block_tokens",
     "excluded_empty_pre", "excluded_empty_post",
     "excluded_overlap_empty_pre", "excluded_overlap_empty_post",
     "low_reference_entropy",
@@ -180,7 +180,7 @@ class Stage2Trainer(Trainer):
         samples, num_items_in_batch = super().get_batch_samples(epoch_iterator, num_batches)
         if self.stage2_objective_config.active:
             selected = [self.stage2_objective_runtime.select(sample) for sample in samples]
-            valid_count = self._global_objective_count(sum(len(window.blocks) for window in selected))
+            valid_count = self._global_objective_count(sum(self.stage2_objective_runtime.units(window) for window in selected))
             for sample, window in zip(samples, selected):
                 sample["_stage2_objective_selection"] = window
                 sample["_stage2_objective_global_count"] = valid_count

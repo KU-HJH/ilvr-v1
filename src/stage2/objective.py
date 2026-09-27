@@ -41,6 +41,12 @@ class Stage2ObjectiveConfig:
     post_window: int = 1
     stage2_m_execution: str = "full_replay"
     vision_token_reduction: str = "score_mean"
+    # "post_window": first post_window targets after each block (historical).
+    # "step0_entropy": precomputed per-response high-entropy targets, one global token mean.
+    vision_token_selection: str = "post_window"
+    vision_selection_path: str | None = None
+    vision_selection_sha256: str | None = None
+    vision_mask_scope: str = "independent"
 
     @classmethod
     def from_args(cls, args) -> "Stage2ObjectiveConfig":
@@ -56,6 +62,10 @@ class Stage2ObjectiveConfig:
             post_window=args.post_window,
             stage2_m_execution=getattr(args, "stage2_m_execution", "full_replay"),
             vision_token_reduction=getattr(args, "vision_token_reduction", "score_mean"),
+            vision_token_selection=getattr(args, "vision_token_selection", "post_window"),
+            vision_selection_path=getattr(args, "vision_selection_path", None),
+            vision_selection_sha256=getattr(args, "vision_selection_sha256", None),
+            vision_mask_scope=getattr(args, "vision_mask_scope", "independent"),
         )
 
     @property
@@ -94,6 +104,19 @@ class Stage2ObjectiveConfig:
             raise ValueError(
                 "vision_token_reduction must be 'score_mean' or 'token_loss_mean'"
             )
+        if self.vision_token_selection not in ("post_window", "step0_entropy"):
+            raise ValueError("vision_token_selection must be 'post_window' or 'step0_entropy'")
+        if self.vision_mask_scope not in ("independent", "cumulative"):
+            raise ValueError("vision_mask_scope must be 'independent' or 'cumulative'")
+        if self.vision_token_selection == "step0_entropy":
+            if not self.vision_selection_path or not self.vision_selection_sha256:
+                raise ValueError("step0_entropy selection requires vision_selection_path and vision_selection_sha256")
+            if self.lambda_dyn != 0.0:
+                raise ValueError("step0_entropy selection requires lambda_dyn=0")
+            if self.vision_token_reduction != "token_loss_mean":
+                raise ValueError("step0_entropy selection requires vision_token_reduction=token_loss_mean")
+        elif self.vision_mask_scope != "independent" or self.vision_selection_path or self.vision_selection_sha256:
+            raise ValueError("vision_mask_scope and vision_selection_* require step0_entropy selection")
         if not self.enable_stage2_objective:
             return
         if stage != "stage2":
@@ -194,6 +217,25 @@ def vision_gain_tokens(
         "G": gain,
         "loss_vis": loss_vis,
     }
+
+
+def vision_gain_token_terms(
+    s_f: torch.Tensor,
+    s_m: torch.Tensor,
+    *,
+    m_V: float,
+) -> dict[str, torch.Tensor]:
+    """Per-token G_t = S_F,t - sg(S_M,t) and softplus(m_V - G_t), unreduced."""
+    margin = _require_finite_number(m_V, "m_V")
+    _require_finite_tensor(s_f, "s_f")
+    _require_finite_tensor(s_m, "s_m")
+    if s_f.shape != s_m.shape or s_f.ndim != 1 or s_f.numel() == 0:
+        raise ValueError("s_f and s_m must be equal nonempty vectors")
+    gain = s_f - s_m.detach()
+    loss_vis = F.softplus(margin - gain)
+    _require_finite_tensor(gain, "G")
+    _require_finite_tensor(loss_vis, "loss_vis")
+    return {"S_F": s_f, "S_M": s_m.detach(), "G": gain, "loss_vis": loss_vis}
 
 
 def text_entropy(logits: torch.Tensor, text_token_ids: tuple[int, ...]) -> torch.Tensor:

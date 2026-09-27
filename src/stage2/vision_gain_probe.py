@@ -66,6 +66,55 @@ def probe_batches(model, batches, *, token_ids, latent_size, text_vocabulary,
     }
 
 
+def probe_token_batches(model, batches, *, selection_table, scope, token_ids, latent_size,
+                        autocast_dtype=None):
+    """Token-level probe: step0-selected targets, M hiding per ``scope`` (full replay)."""
+    from .entropy_selection import build_vision_token_units
+
+    if model.training:
+        raise ValueError("the probe requires an eval mode model")
+    rows = []
+    excluded = 0
+    device = next(model.parameters()).device
+    for batch_index, cpu_inputs in enumerate(batches):
+        inputs = {key: value.to(device) if isinstance(value, torch.Tensor) else value
+                  for key, value in cpu_inputs.items()}
+        selection = build_vision_token_units(
+            inputs["input_ids"].cpu(), inputs["labels"].cpu(), inputs["attention_mask"].cpu(),
+            inputs["stage2_text_segments"], token_ids=token_ids, latent_size=latent_size,
+            selected_targets=selection_table.selected_targets(inputs["input_ids"][0]), scope=scope,
+        )
+        excluded += selection.excluded.get("pre_first_block_tokens", 0)
+        if not selection.blocks:
+            continue
+        clean = {key: value for key, value in model_inputs(inputs).items() if key != "labels"}
+        context = (torch.autocast(device.type, dtype=autocast_dtype)
+                   if autocast_dtype is not None else torch.autocast(device.type, enabled=False))
+        with torch.no_grad(), context:
+            clean_logits = model(**clean).logits
+            for block in selection.blocks:
+                targets = torch.tensor(block.target_ids, device=device)
+                s_f = target_log_likelihood(clean_logits[0, list(block.post_positions)], targets)
+                masked = model(**clean, stage2_ablation=block.ablation)
+                s_m = target_log_likelihood(masked.logits[0, list(block.post_positions)], targets)
+                del masked
+                for position, f_value, m_value in zip(block.post_positions, s_f.tolist(), s_m.tolist()):
+                    rows.append({"batch": batch_index, "block": block.block_index, "target": position + 1,
+                                 "S_F": f_value, "S_M": m_value, "G": f_value - m_value})
+        del clean_logits
+    if not rows:
+        raise ValueError("no valid probe tokens")
+    count = len(rows)
+    s_f = sum(row["S_F"] for row in rows) / count
+    s_m = sum(row["S_M"] for row in rows) / count
+    return {
+        "unit": "token", "tokens": count, "excluded_pre_first_block_tokens": excluded,
+        "S_F": s_f, "S_M": s_m, "G_mean": s_f - s_m,
+        "G_gt_0": sum(row["G"] > 0 for row in rows) / count,
+        "mask_scope": scope, "s_m_mode": "full_replay", "model_mode": "eval", "per_token": rows,
+    }
+
+
 def _load(kind, checkpoint, base_model, device, dtype):
     from transformers import AutoConfig, AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
@@ -110,7 +159,11 @@ def main() -> int:
     parser.add_argument("--image-root", type=Path, required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--selection", type=Path, help="step0 selection file: token-level probe")
+    parser.add_argument("--mask-scope", choices=("independent", "cumulative"))
     args = parser.parse_args()
+    if (args.selection is None) != (args.mask_scope is None):
+        parser.error("--selection and --mask-scope go together")
 
     manifest = json.loads(args.manifest.read_text())
     raw = args.test.read_bytes()
@@ -126,8 +179,16 @@ def main() -> int:
     collator = Stage2DataCollator(processor, token_ids, 8, True, enable_stage2_objective=True)
     batches = [collator([prepare_stage2_example(samples[row], image_root=args.image_root, latent_size=8)])
                for row in manifest["selected_row_ids"]]
-    report = probe_batches(model, batches, token_ids=token_ids, latent_size=8,
-                           text_vocabulary=vocabulary, autocast_dtype=dtype)
+    if args.selection is not None:
+        from .entropy_selection import VisionTokenSelectionTable
+
+        table = VisionTokenSelectionTable.load(args.selection)
+        report = probe_token_batches(model, batches, selection_table=table, scope=args.mask_scope,
+                                     token_ids=token_ids, latent_size=8, autocast_dtype=dtype)
+        report.update({"selection": str(args.selection), "selection_sha256": table.sha256})
+    else:
+        report = probe_batches(model, batches, token_ids=token_ids, latent_size=8,
+                               text_vocabulary=vocabulary, autocast_dtype=dtype)
     report.update({"label": args.label, "kind": args.kind, "checkpoint": str(args.checkpoint),
                    "base_model": str(args.base_model), "manifest": str(args.manifest),
                    "test_jsonl_sha256": manifest["test_jsonl_sha256"],
@@ -136,7 +197,7 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x") as stream:
         stream.write(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({k: report[k] for k in ("label", "blocks", "S_F", "S_M", "G_mean", "G_gt_0")}))
+    print(json.dumps({k: report.get(k) for k in ("label", "blocks", "tokens", "S_F", "S_M", "G_mean", "G_gt_0")}))
     return 0
 
 
