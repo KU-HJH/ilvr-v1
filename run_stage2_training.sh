@@ -224,6 +224,16 @@ case "$STEP_PREFERENCE_ENABLED" in
     STEP_ENTROPY_WEIGHT=${STEP_ENTROPY_WEIGHT:-0.1}
     STEP_ENTROPY_MARGIN=${STEP_ENTROPY_MARGIN:-0.1}
     STAGE2A_RATIO=${STAGE2A_RATIO:-0.5}
+    STEP_PREFERENCE_LOSS_TYPE=${STEP_PREFERENCE_LOSS_TYPE:-dpo}
+    STEP_PREFERENCE_LAMBDA_TOPK_MASS=${STEP_PREFERENCE_LAMBDA_TOPK_MASS:-0}
+    STEP_PREFERENCE_ENTROPY_SOURCE=${STEP_PREFERENCE_ENTROPY_SOURCE:-clean}
+    if [[ "$STEP_PREFERENCE_OBJECTIVE" != context_preference ]] &&
+       [[ "$STEP_PREFERENCE_LOSS_TYPE" != dpo || -n "${STEP_PREFERENCE_TOPK:-}" ||
+          -n "${STEP_PREFERENCE_ENTROPY_TOP_PERCENT:-}" ||
+          "$STEP_PREFERENCE_LAMBDA_TOPK_MASS" != 0 ||
+          "$STEP_PREFERENCE_ENTROPY_SOURCE" != clean ]]; then
+      printf 'DIL preference settings require context_preference\n' >&2; exit 2
+    fi
     case "$STEP_PREFERENCE_MODE" in
       stage2a|stage2b) ;;
       *)
@@ -263,6 +273,17 @@ case "$STEP_PREFERENCE_ENABLED" in
       --stage2a_ratio "$STAGE2A_RATIO"
     )
     if [[ "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
+      STEP_PREFERENCE_ARGS+=(
+        --step_preference_loss_type "$STEP_PREFERENCE_LOSS_TYPE"
+        --step_preference_lambda_topk_mass "$STEP_PREFERENCE_LAMBDA_TOPK_MASS"
+        --step_preference_entropy_source "$STEP_PREFERENCE_ENTROPY_SOURCE"
+      )
+      if [[ -n "${STEP_PREFERENCE_TOPK:-}" ]]; then
+        STEP_PREFERENCE_ARGS+=(--step_preference_topk "$STEP_PREFERENCE_TOPK")
+      fi
+      if [[ -n "${STEP_PREFERENCE_ENTROPY_TOP_PERCENT:-}" ]]; then
+        STEP_PREFERENCE_ARGS+=(--step_preference_entropy_top_percent "$STEP_PREFERENCE_ENTROPY_TOP_PERCENT")
+      fi
       STEP_PREFERENCE_ARGS+=(
         --step_preference_beta "$STEP_PREFERENCE_BETA"
         --step_preference_weight "$STEP_PREFERENCE_WEIGHT"
