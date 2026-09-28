@@ -101,6 +101,7 @@ from stage2.peft import (
     validate_stage2_parameter_boundary,
 )
 from step_preference.config import StepPreferenceConfig
+from step_preference.dil_config import validate_dil_runtime
 from step_preference.negatives import (
     inspect_stage2a_checkpoint_identity,
     load_negative_store,
@@ -494,6 +495,22 @@ def validate_stage2_distributed_settings(
         )
 
 
+def validate_stage2_dil_model(
+    config: StepPreferenceConfig, model, *, supervise_latent_boundaries: bool
+) -> None:
+    """Validate DIL against the resolved output head before its first forward."""
+    if config.preference_loss_type == "dpo":
+        return
+    output_head = model.get_output_embeddings()
+    if output_head is None or not hasattr(output_head, "weight"):
+        raise ValueError("DIL-BCE requires model output embeddings")
+    validate_dil_runtime(
+        config,
+        vocab_size=int(output_head.weight.shape[0]),
+        supervise_latent_boundaries=supervise_latent_boundaries,
+    )
+
+
 def build_stage2_training_components(
     args, *, source_dependencies: Stage2SourceDependencies | None = None
 ) -> Stage2TrainingComponents:
@@ -716,6 +733,11 @@ def build_stage2_training_components(
                 adapter_path=decision.adapter_source,
                 is_trainable=True,
             )
+    validate_stage2_dil_model(
+        step_preference_config,
+        model,
+        supervise_latent_boundaries=decision.supervise_latent_boundaries,
+    )
     if use_mixed_attention:
         validate_qwen2_5_vl_attention_backends(
             resolve_qwen2_5_vl_model(model),

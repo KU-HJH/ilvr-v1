@@ -10,6 +10,7 @@ from typing import Literal
 
 from step_preference.spans import normalize_preference_target_scope
 from step_preference.replacement import EVIDENCE_REPLACEMENT_SAMPLING_VERSION
+from step_preference.dil_config import validate_dil_config
 
 
 StepPreferenceMode = Literal["stage2a", "stage2b"]
@@ -75,6 +76,11 @@ class StepPreferenceConfig:
     lambda_dpo: float = 1.0
     lambda_preference: float = 1.0
     preference_margin: float = 0.0
+    preference_loss_type: str = "dpo"
+    preference_topk: int | None = None
+    lambda_topk_mass: float = 0.0
+    preference_entropy_top_percent: float | None = None
+    preference_entropy_source: str = "clean"
     prefix_mode: str = "clean_prefix"
     branch_mode: str = "independent"
     block_original_image: bool = False
@@ -316,6 +322,7 @@ class StepPreferenceConfig:
                 )
         elif self.packing_enabled:
             raise ValueError("step preference packing is only valid for Stage 2B")
+        validate_dil_config(self)
 
     @property
     def is_stage2b(self) -> bool:
@@ -354,6 +361,11 @@ class StepPreferenceConfig:
             lambda_dpo=getattr(args, "step_dpo_weight", 1.0),
             lambda_preference=getattr(args, "step_preference_weight", 1.0),
             preference_margin=getattr(args, "step_preference_margin", 0.0),
+            preference_loss_type=getattr(args, "step_preference_loss_type", "dpo"),
+            preference_topk=getattr(args, "step_preference_topk", None),
+            lambda_topk_mass=getattr(args, "step_preference_lambda_topk_mass", 0.0),
+            preference_entropy_top_percent=getattr(args, "step_preference_entropy_top_percent", None),
+            preference_entropy_source=getattr(args, "step_preference_entropy_source", "clean"),
             prefix_mode=getattr(args, "step_preference_prefix_mode", "clean_prefix"),
             branch_mode=getattr(args, "step_preference_branch_mode", "independent"),
             block_original_image=getattr(args, "step_preference_block_original_image", False),
