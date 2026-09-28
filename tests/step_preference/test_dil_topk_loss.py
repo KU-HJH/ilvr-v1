@@ -69,18 +69,28 @@ def test_no_mass_skips_mass_terms_and_keeps_negative():
         assert getattr(terms, field).item() == 0.
 
 
-def test_extreme_fp32_zero_probability_and_bf16_are_finite():
-    """Catches unstable group gaps, zero-probability NaNs, and unsupported BF16 inputs."""
+def test_extreme_fp32_zero_probability_and_bf16_match_mathematical_oracles():
+    """Catches finite but wrong group KL or BF16 token terms."""
     clean = torch.tensor([[1000., -1000., 0., -900.]], dtype=torch.float32)
     off = torch.tensor([[-1000., 1000., 0., -900.]], dtype=torch.float32, requires_grad=True)
     terms = topk_token_terms(clean, off, torch.tensor([1]), beta=.5, k=2)
     assert all(bool(torch.isfinite(value).all()) for value in terms)
+    # OFF support is {1, 2}. Its conditional q is (1, 0), clean mass is 0,
+    # and the OFF complement sits 1900 logit units below the selected group.
+    extreme_expected = (math.log(2.), 1900., 0., 0., 1., 1., 1.)
+    for got, want in zip(terms, extreme_expected, strict=True):
+        torch.testing.assert_close(got, torch.tensor([want]), atol=1e-4, rtol=1e-6)
     terms.mass_loss.sum().backward()
     assert bool(torch.isfinite(off.grad).all())
     bf_clean = torch.tensor([[.25, -.75, 1., -.1]], dtype=torch.bfloat16)
     bf_off = torch.tensor([[.5, .1, -.2, .3]], dtype=torch.bfloat16)
     bf_terms = topk_token_terms(bf_clean, bf_off, torch.tensor([0]), beta=.5, k=2)
     assert all(value.dtype == torch.float32 and bool(torch.isfinite(value).all()) for value in bf_terms)
+    # Compare against FP64 probability arithmetic on the actual BF16-quantized
+    # values, rather than the unrepresentable decimal constructor literals.
+    bf_expected = _oracle(bf_clean.double(), bf_off.double(), torch.tensor([0]), .5, 2)
+    for got, want in zip(bf_terms, bf_expected, strict=True):
+        torch.testing.assert_close(got.double(), want, atol=2e-5, rtol=2e-4)
 
 
 @pytest.mark.parametrize('k', [0, 1, 4, 1.5, True])
