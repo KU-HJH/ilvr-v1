@@ -622,9 +622,31 @@ class Stage2Trainer(Trainer):
         self._step_preference_metric_batches += 1
 
     def _reduce_context_objective(
-        self, clean_ce, clean_scores, clean_entropies, results
+        self, clean_ce, clean_scores, clean_entropies, results, *, clean_token_logps=None, spans=None
     ):
         config = self.step_preference_config
+        if config.preference_loss_type != "dpo":
+            from step_preference.dil_config import uses_entropy_selection
+            from step_preference.dil_reduction import reduce_dil_context_loss
+
+            ordered = [results[(span.step_id, "visual")] for span in spans]
+            topk = config.preference_loss_type == "dil_bce_rf_topk"
+            selection = None
+            if uses_entropy_selection(config):
+                selection = (clean_entropies if config.preference_entropy_source == "clean"
+                             else [row["entropies"] for row in ordered])
+            total, metrics = reduce_dil_context_loss(
+                clean_ce, clean_token_logps,
+                [row["target_logps"] if topk else row["mean_logp"].reshape(1) for row in ordered],
+                config=config, topk_terms=[row["dil_tokens"] for row in ordered] if topk else None,
+                selection_entropies=selection,
+            )
+            zero = clean_ce * 0.
+            metrics["stats/entropy_clean"] = (torch.stack([e.mean() for e in clean_entropies]).mean()
+                                               if clean_entropies else zero)
+            metrics["stats/entropy_visual_off"] = (torch.stack([r["entropies"].mean() for r in ordered]).mean()
+                                                    if ordered else zero)
+            return total, metrics
         zero = clean_ce * 0.0
         pref, ent, margins, off_logps, off_entropies = {}, {}, {}, {}, {}
         active_modalities = (
@@ -842,6 +864,10 @@ class Stage2Trainer(Trainer):
                 ),
             ),
         )
+        if config.preference_loss_type == "dil_bce_rf_topk":
+            call["stage2_shared_prefix_inputs"]["dil_objective"] = {
+                "loss_type": config.preference_loss_type, "beta": config.beta, "k": config.preference_topk,
+            }
         if plan.root_selected_positions:
             call["stage2_logit_positions"] = torch.tensor(
                 plan.root_selected_positions,
@@ -908,7 +934,7 @@ class Stage2Trainer(Trainer):
             for modality in expected_modalities
         }:
             raise ValueError("context sidecar layout mismatch")
-        clean_scores, clean_entropies, offset = [], [], 0
+        clean_scores, clean_entropies, clean_token_logps, offset = [], [], [], 0
         if config.prefix_mode in ("v_off_prefix", "v_off_insertion") and set(evidence_on) != {s.step_id for s in spans}:
             raise ValueError("evidence-on score layout mismatch")
         for span in spans:
@@ -917,6 +943,14 @@ class Stage2Trainer(Trainer):
             targets = clean_inputs["input_ids"][
                 :, span.target_text_start : span.target_text_end
             ]
+            if config.preference_loss_type != "dpo":
+                clean_token_logps.append(logits[0].float().log_softmax(-1).gather(-1, targets[0, :, None]).squeeze(-1))
+                if config.preference_loss_type == "dil_bce_rf_topk":
+                    result = results[(span.step_id, "visual")]
+                    if (result.get("name") != f"step-{span.step_id}-visual-off"
+                            or result.get("predictor_positions") != tuple(range(span.target_text_start-1, span.target_text_end-1))
+                            or not torch.equal(result.get("target_ids"), targets[0])):
+                        raise ValueError("DIL sidecar step/target identity alignment mismatch")
             if config.prefix_mode in ("v_off_prefix", "v_off_insertion"):
                 clean_scores.append(evidence_on[span.step_id]["mean_logp"])
                 clean_entropies.append(evidence_on[span.step_id]["entropies"])
@@ -925,7 +959,8 @@ class Stage2Trainer(Trainer):
                 clean_entropies.append(_selected_entropies(logits))
             offset += count
         total, metrics = self._reduce_context_objective(
-            clean_ce, clean_scores, clean_entropies, results
+            clean_ce, clean_scores, clean_entropies, results,
+            clean_token_logps=clean_token_logps, spans=spans,
         )
         if config.prefix_mode in ("v_off_prefix", "v_off_insertion"):
             metrics["stats/logp_evidence_on"] = metrics["stats/logp_clean"]
@@ -1602,6 +1637,17 @@ class Stage2Trainer(Trainer):
         return torch.random.fork_rng(devices=devices)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        config = getattr(self, "step_preference_config", None)
+        if isinstance(config, StepPreferenceConfig) and config.preference_loss_type != "dpo":
+            from step_preference.dil_config import validate_dil_runtime
+
+            resolved_model = model
+            while hasattr(resolved_model, "module"):
+                resolved_model = resolved_model.module
+            validate_dil_runtime(
+                config, vocab_size=resolved_model.get_output_embeddings().weight.shape[0],
+                supervise_latent_boundaries=getattr(resolved_model.config, "supervise_latent_boundaries", None),
+            )
         weight = float(inputs.get("stage2_sample_weight", 1.))
         if weight not in (0., 1.):
             raise ValueError("Stage 2 sample weight must be 0 or 1")
@@ -1702,6 +1748,9 @@ class Stage2Trainer(Trainer):
             logs = dict(logs)
             totals = self._step_preference_metric_totals
             config = self.step_preference_config
+            if config.preference_loss_type != "dpo":
+                logs["stats/preference_loss_type"] = config.preference_loss_type
+                logs["stats/entropy_source"] = config.preference_entropy_source
             if config.prefix_mode == "evidence_replacement":
                 logs.update({name: totals[name] / metric_batches for name in totals})
                 for source in ("", "donor_", "image_"):

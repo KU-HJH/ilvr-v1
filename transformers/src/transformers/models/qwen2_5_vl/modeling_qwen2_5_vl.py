@@ -2605,10 +2605,17 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             else:
                 from .stage2_shared_prefix import score_sidecars
 
+                if (stage2_shared_prefix_inputs.get("dil_objective") is not None
+                        and stage2_shared_prefix_inputs["plan"].root_selected_positions
+                        and (selected_positions is None or tuple(selected_positions.tolist())
+                             != stage2_shared_prefix_inputs["plan"].root_selected_positions)):
+                    raise ValueError("DIL clean predictor alignment mismatch")
                 sidecar_results, sidecar_stats = score_sidecars(
                     self, stage2_shared_prefix_inputs, input_ids,
                     rollout.final_inputs_embeds, full_position_ids,
                     getattr(final_outputs, "stage2_key_values", ()),
+                    **({"dil_clean_logits": selected_logits}
+                       if stage2_shared_prefix_inputs.get("dil_objective") is not None else {}),
                 )
 
         diagnostics = None

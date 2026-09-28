@@ -15,7 +15,7 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
         raise TypeError("stage2_shared_prefix_inputs must be a mapping")
     shared_option_names = {
         "plan", "backend", "query_budget", "checkpoint", "prefix_mode",
-        "branch_mode", "block_original_image",
+        "branch_mode", "block_original_image", "dil_objective",
     }
     replacement_option_names = {
         "sample_id", "replacement_seed", "replacement_version",
@@ -30,6 +30,34 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
     if not isinstance(options.get("plan"), SidecarPlan):
         raise ValueError("shared-prefix inputs require a SidecarPlan")
     plan = options["plan"]
+    dil = options.get("dil_objective")
+    if dil is not None:
+        import math
+        if (not isinstance(dil, Mapping) or set(dil) != {"loss_type", "beta", "k"}
+                or dil["loss_type"] != "dil_bce_rf_topk"
+                or type(dil["beta"]) not in (int, float)
+                or not math.isfinite(dil["beta"]) or dil["beta"] <= 0
+                or type(dil["k"]) is not int
+                or not 2 <= dil["k"] < model.get_output_embeddings().weight.shape[0]):
+            raise ValueError("invalid DIL objective options")
+        if (not plan.context_preference or plan.groups[1]
+                or prefix_mode != "clean_prefix"
+                or options.get("branch_mode", "independent") != "independent"
+                or options.get("block_original_image", False)
+                or any(b.zero_first_embedding for b in plan.groups[0])):
+            raise ValueError("DIL requires V-only independent clean-prefix branches")
+        aligned_positions = []
+        for step_id, branch in enumerate(plan.groups[0]):
+            predictor_positions = tuple(branch.logical_positions[i] for i in branch.selected_positions)
+            if (branch.step_id != step_id or branch.name != f"step-{step_id}-visual-off"
+                    or branch.clean_embedding_sources != branch.logical_positions
+                    or branch.token_ids != tuple(int(input_ids[0, p]) for p in branch.logical_positions)
+                    or any(p < 0 or p+1 >= plan.root_length for p in predictor_positions)
+                    or branch.target_token_ids != tuple(int(input_ids[0, p+1]) for p in predictor_positions)):
+                raise ValueError("DIL branch identity/target alignment mismatch")
+            aligned_positions.extend(predictor_positions)
+        if tuple(aligned_positions) != plan.root_selected_positions:
+            raise ValueError("DIL root predictor alignment mismatch")
     if prefix_mode not in ("clean_prefix", "v_off_prefix", "v_off_insertion", "evidence_replacement"):
         raise ValueError("unknown preference prefix_mode")
     branch_mode = options.get("branch_mode", "independent")
@@ -191,7 +219,7 @@ def _branch_inputs(model, branch, input_ids, clean_embeds, clean_positions):
     return model.model.embed_tokens(token_ids), positions.index_select(2, logical)
 
 
-def _score_chunk(model, branches, embeds, positions, mask, flat_prefix):
+def _score_chunk(model, branches, embeds, positions, mask, flat_prefix, *, dil_objective=None, dil_clean_logits=None):
     """Factory binds metadata per chunk, including during delayed backward replay."""
     selected = []
     targets = []
@@ -205,15 +233,34 @@ def _score_chunk(model, branches, embeds, positions, mask, flat_prefix):
     selected = torch.tensor(selected, dtype=torch.long, device=embeds.device)
     targets = torch.tensor(targets, dtype=torch.long, device=embeds.device)
 
-    def score(embeds, positions, *prefix_tensors):
+    def score(embeds, positions, *tensor_inputs):
+        clean_logits = tensor_inputs[0] if dil_objective is not None else None
+        prefix_tensors = tensor_inputs[1:] if dil_objective is not None else tensor_inputs
         hidden = model.model(
             inputs_embeds=embeds, position_ids=positions, attention_mask=mask,
             stage2_prefix_key_values=tuple(zip(prefix_tensors[::2], prefix_tensors[1::2])),
             use_cache=False, return_dict=True,
         ).last_hidden_state
-        return score_selected_hidden(model, hidden, selected, targets, lengths)
+        if dil_objective is None:
+            return score_selected_hidden(model, hidden, selected, targets, lengths)
+        from step_preference.dil_topk_loss import topk_token_terms
 
-    return score, (embeds, positions, *flat_prefix)
+        logits = model.lm_head(hidden.index_select(1, selected))[0].float()
+        log_probs = logits.log_softmax(-1)
+        target_logps = log_probs.gather(-1, targets[:, None]).squeeze(-1)
+        entropies = -(log_probs.exp() * log_probs).sum(-1)
+        terms = topk_token_terms(clean_logits, logits, targets,
+                                beta=dil_objective["beta"], k=dil_objective["k"])
+        reduced, start = [], 0
+        for length in lengths:
+            stop = start + length
+            reduced.extend((target_logps[start:stop].mean(), entropies[start:stop],
+                            target_logps[start:stop], *(value[start:stop] for value in terms)))
+            start = stop
+        return tuple(reduced)
+
+    extra = (dil_clean_logits,) if dil_objective is not None else ()
+    return score, (embeds, positions, *extra, *flat_prefix)
 
 
 def score_selected_hidden(model, hidden, selected, targets, lengths):
@@ -311,7 +358,7 @@ def score_evidence_gain(model, options, input_ids, clean_embeds, clean_positions
     return tuple(results), stats
 
 
-def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, prefix_kv):
+def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, prefix_kv, *, dil_clean_logits=None):
     if options.get("prefix_mode", "clean_prefix") == "v_off_prefix":
         return score_evidence_gain(model, options, input_ids, clean_embeds, clean_positions)
     from step_preference.sidecar import (
@@ -319,6 +366,13 @@ def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, pre
     )
 
     plan = options["plan"]
+    dil = options.get("dil_objective")
+    if dil is not None and plan.root_selected_positions:
+        if (not isinstance(dil_clean_logits, torch.Tensor) or dil_clean_logits.ndim != 3
+                or dil_clean_logits.shape[:2] != (1, len(plan.root_selected_positions))
+                or dil_clean_logits.shape[2] != model.get_output_embeddings().weight.shape[0]):
+            raise ValueError("DIL clean selected logits alignment mismatch")
+        clean_row_by_position = {p: i for i, p in enumerate(plan.root_selected_positions)}
     budget = options.get("query_budget", 1024)
     # The final clean decoder may contain right padding; never expose padded K/V.
     flat_prefix = tuple(tensor[:, :, :plan.root_length] for pair in prefix_kv for tensor in pair)
@@ -360,11 +414,26 @@ def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, pre
                 visible = sidecar_dense_visibility(plan.root_length, branches, device=embeds.device)
                 mask = torch.zeros(visible.shape, dtype=embeds.dtype, device=embeds.device)
                 mask = mask.masked_fill(~visible, torch.finfo(embeds.dtype).min)[None, None]
-            score, args = _score_chunk(model, branches, embeds, positions, mask, flat_prefix)
+            clean_chunk = None
+            if dil is not None:
+                indices = [clean_row_by_position[branch.logical_positions[i]]
+                           for branch in branches for i in branch.selected_positions]
+                clean_chunk = dil_clean_logits[0].detach().index_select(
+                    0, torch.tensor(indices, device=dil_clean_logits.device))
+            score, args = _score_chunk(model, branches, embeds, positions, mask, flat_prefix,
+                                      dil_objective=dil, dil_clean_logits=clean_chunk)
             values = checkpoint(score, *args, use_reentrant=False, preserve_rng_state=True) if options.get("checkpoint", True) else score(*args)
             for index, branch in enumerate(branches):
-                results.append(dict(name=branch.name, kind=branch.kind, step_id=branch.step_id,
-                                    mean_logp=values[index*2], entropies=values[index*2+1]))
+                stride = 10 if dil is not None else 2
+                result = dict(name=branch.name, kind=branch.kind, step_id=branch.step_id,
+                              mean_logp=values[index*stride], entropies=values[index*stride+1])
+                if dil is not None:
+                    from step_preference.dil_topk_loss import TopkTokenResult
+                    result.update(target_logps=values[index*stride+2],
+                                  dil_tokens=TopkTokenResult(*values[index*stride+3:index*stride+10]),
+                                  target_ids=torch.tensor(branch.target_token_ids, device=embeds.device),
+                                  predictor_positions=tuple(branch.logical_positions[i] for i in branch.selected_positions))
+                results.append(result)
                 key = "rejected_scored_rows" if branch.rejected_model_inputs is not None else "entropy_scored_rows"
                 stats[key] += len(branch.target_token_ids)
                 stats["oversized_branches"] += len(branch.token_ids) > budget
