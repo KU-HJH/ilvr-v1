@@ -65,7 +65,7 @@ def _optional_path_hash_pair(path_name: str, path: str | None, hash_name: str, s
 
 @dataclass(frozen=True)
 class StepPreferenceConfig:
-    """One validated configuration for ordinary Stage 2 or fresh Stage 2B."""
+    """Validated Stage 2 configuration, including same-run DIL Stage 2B resume."""
 
     enabled: bool = False
     mode: StepPreferenceMode = "stage2a"
@@ -288,13 +288,21 @@ class StepPreferenceConfig:
                 "context-preference Stage 2B"
             )
         if self.is_stage2b:
+            if self.is_dil_resume:
+                if self.direct_from_stage1 or self.stage2a_checkpoint_path is not None:
+                    raise ValueError("DIL resume and fresh Stage 1/Stage 2A initialization are mutually exclusive")
+                if self.total_steps is not None:
+                    raise ValueError(
+                        "DIL resume requires saved --max_steps, not --stage2_total_steps; "
+                        "do not recompute the saved phase allocation"
+                    )
             if self.direct_from_stage1:
                 if self.stage2a_checkpoint_path is not None:
                     raise ValueError(
                         "--stage2b_direct_from_stage1 cannot use "
                         "--stage2a_checkpoint_path"
                     )
-            required = [] if self.direct_from_stage1 else [
+            required = [] if self.direct_from_stage1 or self.is_dil_resume else [
                 ("stage2a_checkpoint_path", "--stage2a_checkpoint_path")
             ]
             if not self.is_context_preference:
@@ -307,7 +315,7 @@ class StepPreferenceConfig:
                     raise ValueError(f"Stage 2B requires {option}")
             if self.attention_implementation not in ("eager", "sdpa"):
                 raise ValueError("Stage 2B attention implementation must be eager or sdpa")
-            if self.resume_from_checkpoint_path is not None:
+            if self.resume_from_checkpoint_path is not None and not self.is_dil_resume:
                 raise ValueError(
                     "--stage2a_checkpoint_path and --resume_from_checkpoint_path "
                     "are mutually exclusive for Stage 2B"
@@ -331,6 +339,14 @@ class StepPreferenceConfig:
     @property
     def is_context_preference(self) -> bool:
         return self.is_stage2b and self.objective == "context_preference"
+
+    @property
+    def is_dil_resume(self) -> bool:
+        return (
+            self.is_context_preference
+            and self.preference_loss_type in ("dil_bce_rf", "dil_bce_rf_topk")
+            and self.resume_from_checkpoint_path is not None
+        )
 
     @property
     def phase_steps(self) -> int | None:

@@ -12,7 +12,7 @@ from src.multinode_runtime import build_owned_tmux_commands, validated_stage2_en
 REPO = Path(__file__).resolve().parents[2]
 
 
-def worker_commands(settings):
+def worker_commands(settings, stage_arguments=()):
     plan = multinode.build_launch_plan(
         stage="stage2", tuning_method="dora", zero_stage=2,
         run_id="dil-forwarding-test", main_process_port=29631,
@@ -46,7 +46,7 @@ def worker_commands(settings):
         log_file=str(REPO / "logs" / plan.run_id / "train.log"),
         deepspeed_config=str(plan.deepspeed_config),
     )
-    commands = build_owned_tmux_commands(plan, commit="a" * 40, stage_environment=environment)
+    commands = build_owned_tmux_commands(plan, commit="a" * 40, stage_environment=environment, stage_arguments=stage_arguments)
     for rank, spec in enumerate(commands.node_specs):
         worker_env = dict(spec.environment)
         result = subprocess.run(
@@ -110,3 +110,36 @@ def test_invalid_dil_combination_fails_in_worker_dry_run(settings):
     for _, _, result in worker_commands(settings):
         assert result.returncode != 0
         assert "top-k" in result.stderr.lower() or "preference" in result.stderr.lower()
+
+
+@pytest.mark.parametrize("selector,topk", [("dil_bce_rf", ""), ("dil_bce_rf_topk", "8")])
+def test_dil_resume_reaches_both_worker_argv_without_fresh_initialization(selector, topk):
+    checkpoint = str(REPO / "checkpoints" / "dil-forwarding-test" / "checkpoint-1")
+    settings = {"STEP_PREFERENCE_LOSS_TYPE": selector, "STEP_PREFERENCE_TOPK": topk,
+                "STAGE2B_DIRECT_FROM_STAGE1": "false", "STAGE1_ADAPTER_PATH": "",
+                "RESUME_CHECKPOINT": checkpoint}
+    for rank, worker_env, result in worker_commands(settings, ("--max_steps", "212")):
+        assert result.returncode == 0, result.stderr
+        argv = json.loads(result.stdout)
+        assert argv[argv.index("--resume_from_checkpoint_path") + 1] == checkpoint
+        assert argv[argv.index("--max_steps") + 1] == "212"
+        assert argv[argv.index("--machine_rank") + 1] == str(rank)
+        assert argv[argv.index("--step_preference_loss_type") + 1] == selector
+        assert argv[argv.index("--step_preference_beta") + 1] == "0.5"
+        assert argv[argv.index("--step_preference_weight") + 1] == "1.0"
+        assert "--stage2b_direct_from_stage1" not in argv
+        assert "--stage1_adapter_path" not in argv
+        assert "--stage2a_checkpoint_path" not in argv
+
+
+@pytest.mark.parametrize("mixed", [
+    {"STAGE2B_DIRECT_FROM_STAGE1": "true"}, {"STAGE1_ADAPTER_PATH": "/fresh"},
+    {"STAGE2A_CHECKPOINT_PATH": "/fresh"}, {"STAGE2_TOTAL_STEPS": "212"},
+])
+def test_worker_rejects_mixed_dil_resume_initialization(mixed):
+    settings = {"STEP_PREFERENCE_LOSS_TYPE": "dil_bce_rf",
+                "STAGE2B_DIRECT_FROM_STAGE1": "false", "STAGE1_ADAPTER_PATH": "",
+                "RESUME_CHECKPOINT": "/saved/checkpoint-1", **mixed}
+    for _, _, result in worker_commands(settings):
+        assert result.returncode != 0
+        assert "RESUME_CHECKPOINT" in result.stderr

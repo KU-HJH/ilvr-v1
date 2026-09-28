@@ -97,3 +97,41 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK="$k_pct1" STE
 ```
 
 For inference, prepare the completed PEFT artifact with the existing `src.multinode prepare-inference` path under `checkpoints/evaluation-staging/<run-id>/`; use the original Qwen2.5-VL-3B base. Then run the existing `run_multinode_evaluation.sh` entrypoint. The default TEST400 evaluation is greedy (`temperature=0`, `top_p=1`), max new tokens 4096, max sequence 128000, repetition penalty 1, no vision ablation, and `external_full_latent_block`. Follow [the operator guide](multinode-training.md) for the exact preparation and evaluation command arguments. A prepared inference copy is not a training resume checkpoint.
+
+### Same-run DIL resume
+
+Use the interrupted run's saved environment and CLI settings, with the same run ID, original base, data, length manifest, objective, sampler, checkpointing, optimizer and schedule settings on both nodes. Do not source `dil_bce_profile.sh`: it is for fresh runs. Resume requires the complete training checkpoint (including trainer, optimizer, scheduler, RNG, sampler/runtime sidecars and ZeRO state), not the final adapter or inference copy. The coordinator requires a new attempt ID and the same run's immediate `checkpoint-N` path.
+
+The initialization flags and `STAGE2_TOTAL_STEPS` are fresh-run selectors. Remove them after sourcing saved settings. Pass the already-resolved budget from `trainer_state.json` as `--max_steps`; this preserves both direct Stage 1 and phased Stage 2A/B allocations. DIL resume rejects an ambiguous total-step allocation or a changed resolved budget before model loading. Keep all remaining saved CLI options, including warmup and save cadence. In the example below, `saved_cli` must contain those original non-initialization CLI options (for the fresh recipes above, `--warm_up_steps 10`).
+
+```bash
+# Set these to the interrupted run and its saved settings before executing.
+: "${run_id:?set the original run ID}"
+: "${saved_run_env:?set the saved environment file for that run}"
+: "${resume_step:?set the saved checkpoint step}"
+set -a
+source "$saved_run_env"
+set +a
+export PYTHONPATH="$PWD/transformers/src:$PWD/src:$PWD"
+: "${STAGE1_CHECKPOINT:?saved environment must identify the original Qwen base}"
+export RESUME_CHECKPOINT="$PWD/checkpoints/$run_id/checkpoint-$resume_step"
+unset STAGE2B_DIRECT_FROM_STAGE1 STAGE1_ADAPTER_PATH STAGE2A_CHECKPOINT_PATH STAGE2_TOTAL_STEPS
+saved_max_steps=$(./venv/ilvr-venv/bin/python - "$RESUME_CHECKPOINT/trainer_state.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as handle:
+    budget = json.load(handle)["max_steps"]
+if type(budget) is not int or budget <= 0:
+    raise ValueError("saved trainer_state.max_steps must be a positive integer")
+print(budget)
+PY
+)
+# Restore the original additional CLI settings; remove any fresh-init/total-step flags.
+saved_cli=(--warm_up_steps 10)
+./run_multinode_stage2_training.sh --dry-run --run-id "$run_id" \
+  --attempt-id "resume-$(date -u +%Y%m%d-%H%M%S)" \
+  --zero-stage 2 --main-process-port 29631 \
+  --max_steps "$saved_max_steps" "${saved_cli[@]}"
+```
+
+Inspect both node commands and worker dry-run JSON before an independently authorized launch. The actual entry path verifies the saved DIL identity and budget, original-base/PEFT provenance, sparse token rows and vocabulary/boundary contract. The trainer repeats the identity check before delegating state restoration to the existing Trainer/DeepSpeed path. Missing or changed DIL identity is rejected; DPO Stage 2B resume acceptance remains unchanged.

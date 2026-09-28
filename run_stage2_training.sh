@@ -133,6 +133,7 @@ esac
 SEED=${SEED:-42}
 STEP_MAX_PACKED_SEQUENCE_LENGTH=${STEP_MAX_PACKED_SEQUENCE_LENGTH:-4608}
 stage2b_checkpoint_initialization=false
+dil_stage2b_resume=false
 case "${STEP_PREFERENCE_PACKING-}" in
   ""|0|false|False) step_preference_packing=false ;;
   1|true|True) step_preference_packing=true ;;
@@ -332,7 +333,19 @@ case "$STEP_PREFERENCE_ENABLED" in
         printf "Stage 2B requires ATTENTION_IMPLEMENTATION=sdpa and VISION_ATTENTION_IMPLEMENTATION=flash_attention_2\n" >&2
         exit 2
       fi
-      if [[ "$stage2b_direct_from_stage1" == true ]]; then
+      if [[ -n "${RESUME_CHECKPOINT:-}" && "$STEP_PREFERENCE_OBJECTIVE" == context_preference &&
+            ( "$STEP_PREFERENCE_LOSS_TYPE" == dil_bce_rf || "$STEP_PREFERENCE_LOSS_TYPE" == dil_bce_rf_topk ) ]]; then
+        dil_stage2b_resume=true
+        if [[ "$stage2b_direct_from_stage1" == true || -n "${STAGE1_ADAPTER_PATH:-}" || -n "${STAGE2A_CHECKPOINT_PATH:-}" ]]; then
+          printf 'DIL RESUME_CHECKPOINT cannot use fresh Stage 1/Stage 2A initialization\n' >&2
+          exit 2
+        fi
+        if [[ -n "${STAGE2_TOTAL_STEPS:-}" ]]; then
+          printf 'DIL RESUME_CHECKPOINT requires saved --max_steps; unset STAGE2_TOTAL_STEPS\n' >&2
+          exit 2
+        fi
+        processor_source=$RESUME_CHECKPOINT
+      elif [[ "$stage2b_direct_from_stage1" == true ]]; then
         if [[ "$STEP_PREFERENCE_OBJECTIVE" != context_preference || "$step_visual_only_context_preference" != true ]]; then
           printf 'STAGE2B_DIRECT_FROM_STAGE1 requires visual-only context-preference Stage 2B\n' >&2
           exit 2
@@ -367,12 +380,12 @@ case "$STEP_PREFERENCE_ENABLED" in
           exit 2
         }
       fi
-      if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+      if [[ -n "${RESUME_CHECKPOINT:-}" && "$dil_stage2b_resume" == false ]]; then
         printf 'Stage 2B Stage 2A initialization and RESUME_CHECKPOINT are mutually exclusive\n' >&2
         exit 2
       fi
       stage2b_checkpoint_initialization=true
-      if [[ "$stage2b_direct_from_stage1" == false ]]; then
+      if [[ "$stage2b_direct_from_stage1" == false && "$dil_stage2b_resume" == false ]]; then
         processor_source=$STAGE2A_CHECKPOINT_PATH
       fi
       if [[ "$STEP_PREFERENCE_OBJECTIVE" == legacy_dpo ]]; then
@@ -381,7 +394,7 @@ case "$STEP_PREFERENCE_ENABLED" in
           --step_negative_manifest "$STEP_NEGATIVE_MANIFEST"
         )
       fi
-      if [[ "$stage2b_direct_from_stage1" == false ]]; then
+      if [[ "$stage2b_direct_from_stage1" == false && "$dil_stage2b_resume" == false ]]; then
         STEP_PREFERENCE_ARGS+=(--stage2a_checkpoint_path "$STAGE2A_CHECKPOINT_PATH")
       fi
     elif [[ -n "${STAGE2A_CHECKPOINT_PATH:-}" ]]; then
@@ -623,7 +636,7 @@ reject_managed_arguments() {
   done
 }
 
-if [[ "$stage2b_direct_from_stage1" == true ]]; then
+if [[ "$stage2b_direct_from_stage1" == true || "$dil_stage2b_resume" == true ]]; then
   MANAGED_OPTIONS+=(--stage1_adapter_path)
 fi
 reject_managed_arguments "$@"

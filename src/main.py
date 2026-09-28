@@ -102,6 +102,7 @@ from stage2.peft import (
 )
 from step_preference.config import StepPreferenceConfig
 from step_preference.dil_config import validate_dil_runtime
+from step_preference.dil_identity import validate_dil_resume
 from step_preference.negatives import (
     inspect_stage2a_checkpoint_identity,
     load_negative_store,
@@ -325,17 +326,27 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
     )
     reject_duplicate_sample_ids(example.sample_id for example in prepared)
 
-    if config.direct_from_stage1:
+    if config.is_dil_resume:
+        validate_dil_resume(Path(config.resume_from_checkpoint_path), config)
+        saved_state = json.loads(
+            (Path(config.resume_from_checkpoint_path) / "trainer_state.json").read_text()
+        )
+        saved_max_steps = saved_state.get("max_steps")
+        if type(saved_max_steps) is not int or saved_max_steps <= 0 or args.max_steps != saved_max_steps:
+            raise ValueError("DIL resume --max_steps must match positive saved trainer_state.json max_steps")
+
+    if config.direct_from_stage1 or config.is_dil_resume:
         source_dependencies = _default_stage2_source_dependencies()
         decision = resolve_stage2_load_decision(
             load_model_path=args.load_model_path,
             stage1_adapter_path=args.stage1_adapter_path,
-            resume_from_checkpoint_path=None,
+            resume_from_checkpoint_path=config.resume_from_checkpoint_path,
             load_config=source_dependencies.load_config,
             discover_adapter_config=source_dependencies.find_adapter_config,
             source_provenance_kwargs=build_stage2_source_provenance_kwargs(args),
             latent_size=args.latent_size,
             supervise_latent_boundaries=args.supervise_latent_boundaries,
+            latent_activation_checkpointing=getattr(args, "stage2_latent_activation_checkpointing", False),
             tuning_method=args.tuning_method,
             tuning_method_explicit=args.tuning_method_explicit,
             lora_r=args.lora_r,
@@ -344,6 +355,10 @@ def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
             lora_target_modules=args.lora_target_modules,
         )
         processor = source_dependencies.load_processor(decision.processor_source)
+        if config.is_dil_resume:
+            if decision.peft_metadata is not None and decision.peft_metadata.token_row_source == "sparse_adapter":
+                validate_stage2_sparse_processor(processor.tokenizer, decision.peft_metadata)
+            return Stage2BPreflight(prepared_examples=prepared, negative_store=None)
         stage1_preflight = preflight_stage1_peft_artifact(
             processor,
             source_dependencies.load_config(decision.base_model_source),
@@ -560,7 +575,12 @@ def build_stage2_training_components(
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
     )
-    if step_preference_config.direct_from_stage1:
+    if step_preference_config.is_dil_resume:
+        decision = resolve_stage2_load_decision(
+            resume_from_checkpoint_path=step_preference_config.resume_from_checkpoint_path,
+            **decision_kwargs,
+        )
+    elif step_preference_config.direct_from_stage1:
         decision = resolve_stage2_load_decision(
             resume_from_checkpoint_path=None,
             **decision_kwargs,
