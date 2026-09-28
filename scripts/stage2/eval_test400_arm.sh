@@ -19,7 +19,8 @@ if [[ ! -d $local_tree ]]; then git -C "$repo" worktree add --detach "$local_tre
 ssh -o BatchMode=yes "$remote" "docker exec llm_kd bash -lc 'git -C $repo/.worktrees/voff-reproduction-20260917 rev-parse --short=8 HEAD'" | grep -qx "$eval_commit"
 # The remote node already holds the source checkpoint; copy the same allowlisted
 # files inside the container (root) and verify byte identity with the local copy.
-source_ckpt=$repo/checkpoints/$(basename "$(dirname "$adapter")")/checkpoint-212
+step=$(basename "$adapter"); step=${step##*-}
+source_ckpt=$repo/checkpoints/$(basename "$(dirname "$adapter")")/checkpoint-$step
 files=$(cd "$adapter" && ls | tr "\n" " ")
 ssh -o BatchMode=yes "$remote" "docker exec llm_kd bash -lc 'mkdir -p $adapter && cd $source_ckpt && cp -n $files $adapter/ && cd $adapter && sha256sum $files'" > "$repo/logs/$run/remote-adapter.sha256"
 (cd "$adapter" && sha256sum $files) | diff - "$repo/logs/$run/remote-adapter.sha256"
