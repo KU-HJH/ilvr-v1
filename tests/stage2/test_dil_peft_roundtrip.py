@@ -4,7 +4,7 @@ import json
 
 import pytest
 import torch
-from transformers import Trainer, TrainingArguments
+from transformers import Qwen2_5_VLForConditionalGeneration, Trainer, TrainingArguments
 
 from peft_common import resolve_qwen2_5_vl_model
 from stage2.peft import load_stage2_model_for_inference
@@ -16,6 +16,7 @@ from tests.stage2.test_stage1_checkpoint_handoff import (
     tiny_tag_free_original_qwen,
     write_sparse_stage2_artifact,
 )
+from tests.stage2.helpers import tiny_stage2_qwen
 
 
 def bce_config():
@@ -142,3 +143,20 @@ def test_inference_rejects_symlinked_identity_config_before_base_load(bce_artifa
             load_model=lambda *args, **kwargs: model_loads.append((args, kwargs)),
         )
     assert model_loads == []
+
+
+def test_bce_full_model_save_reload_preserves_identity(tmp_path):
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    trainer = Stage2Trainer(
+        model=model,
+        args=TrainingArguments(output_dir=str(tmp_path), report_to=[], use_cpu=True),
+        step_preference_config=bce_config(),
+    )
+
+    trainer.save_model(tmp_path)
+    restored = Qwen2_5_VLForConditionalGeneration.from_pretrained(tmp_path)
+
+    assert restored.config.ilvr_context_preference == build_dil_identity(bce_config())
+    torch.testing.assert_close(restored.lm_head.weight, model.lm_head.weight)
+    assert (tmp_path / "model.safetensors").is_file()

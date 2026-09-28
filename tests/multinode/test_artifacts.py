@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +42,8 @@ from src.multinode_artifacts import (
     validate_loader_artifact,
 )
 from src.multinode_runtime import collect_checkpoint_artifacts
+from step_preference.config import StepPreferenceConfig
+from step_preference.dil_identity import build_dil_identity, read_dil_identity
 from src.multinode_runtime import (
     prepare_inference_artifacts,
     redistribute_resume_checkpoint,
@@ -2492,17 +2495,38 @@ def test_stage2_inference_manifest_retains_dil_config_without_optimizer_state(tm
     write_loader_artifact(artifact, stage="stage2", method="lora")
     config_path = artifact / "config.json"
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    payload["ilvr_context_preference"] = {"schema_version": 1, "loss_type": "dil_bce_rf"}
+    objective = StepPreferenceConfig(
+        enabled=True, mode="stage2b", objective="context_preference",
+        preference_loss_type="dil_bce_rf", beta=0.5,
+        lambda_entropy=0.0, direct_from_stage1=True,
+        shared_prefix_enabled=True,
+        visual_off_suppress_latent_boundaries=False,
+    )
+    identity_payload = build_dil_identity(objective)
+    payload["ilvr_context_preference"] = identity_payload
     config_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     (artifact / "optimizer.pt").write_bytes(b"optimizer")
     manifest = loader_manifest(artifact, stage="stage2", method="lora")
-
     selected = build_inference_manifest(artifact, manifest)
+
+    class LocalTransfer:
+        def validate_inference_manifest(self, candidate):
+            assert candidate == selected
+
+        def pull_inference_artifacts(self, candidate, destination):
+            for entry in candidate.entries:
+                target = destination / entry.relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(artifact / entry.relative_path, target)
+
+    prepared = prepare_inference_copy(selected, tmp_path / "prepared", LocalTransfer())
 
     names = {entry.relative_path.name for entry in selected.entries}
     assert "config.json" in names
     assert "optimizer.pt" not in names
-    assert json.loads(config_path.read_text())["ilvr_context_preference"] == payload["ilvr_context_preference"]
+    assert not (prepared / "optimizer.pt").exists()
+    copied = json.loads((prepared / "config.json").read_text(encoding="utf-8"))
+    assert read_dil_identity(copied) == identity_payload
 
 
 def test_prepare_inference_help_is_local_and_side_effect_free(tmp_path):
