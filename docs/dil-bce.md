@@ -7,6 +7,7 @@ Source any old environment first, then source the fresh profile. The profile rej
 ```bash
 # common setup: source once before one of the named variant commands
 source ./scripts/stage2/dil_bce_profile.sh
+export PYTHONPATH="$PWD/transformers/src:$PWD/src:$PWD"
 run_stamp=$(date -u +%Y%m%d-%H%M%S)
 dil_vocab_size=$(./venv/ilvr-venv/bin/python - "$STAGE1_ADAPTER_PATH" <<'PY'
 from pathlib import Path

@@ -42,3 +42,25 @@ For every row and both machine ranks, worker argv contains two machines/four pro
 Self-review found that an initial negative test failed due to unrelated Stage 2B admission rules, so its fixture was corrected to provide a valid legacy DPO initialization and negative inputs. The final RED then established silent acceptance of DIL selector with legacy objective; the targeted guard fixes it. The shell relies on existing Python DIL validation for numeric and mode checks, avoiding a second incompatible validator. Full training, remote-node compatibility, PEFT preparation, and evaluation were not run or authorized in this task. No run directories or model artifacts were created by the profile or dry-run tests. Existing untracked `src/__pycache__/` directories were left unstaged.
 
 Commit: `feat: expose DIL-BCE variants through multinode launchers` (this commit).
+
+## Review fix round 1 (base `895920267b428d17f1636c3207b55dcfab53eb53`)
+
+Independent review found that the published common setup imported `stage1.checkpointing` without setting `PYTHONPATH`. The original examples test inherited the test runner's module path and masked the missing setup. Direct reproduction from this worktree:
+
+```bash
+env -u PYTHONPATH ./venv/ilvr-venv/bin/python -c 'from stage1.checkpointing import read_stage1_peft_metadata_snapshot'
+```
+
+Exit 1: `ModuleNotFoundError: No module named 'stage1'`. The new focused test runs the actual published common bash block with inherited `PYTHONPATH` removed. RED command used the shared pytest environment prefix above, followed by:
+
+```bash
+./venv/ilvr-venv/bin/python -m pytest -p no:cacheprovider -q tests/step_preference/test_dil_examples.py -k common_setup --basetemp="$PWD/checkpoints/dil-bce-port-cpu/task-5-fix1"
+```
+
+Exit 1, one failed and eleven deselected; exact stderr in `logs/dil-bce-port-workflow/task-5-fix1-red.log`. The only recipe change adds `export PYTHONPATH="$PWD/transformers/src:$PWD/src:$PWD"` immediately after sourcing the profile. The examples matrix now also removes inherited `PYTHONPATH` from each recipe's environment. GREEN command used the same prefix with:
+
+```bash
+./venv/ilvr-venv/bin/python -m pytest -p no:cacheprovider -q tests/step_preference/test_dil_examples.py --basetemp="$PWD/checkpoints/dil-bce-port-cpu/task-5-fix1"
+```
+
+Exit 0, 12 passed in 90.91s; full output in `logs/dil-bce-port-workflow/task-5-fix1-green.log`. This covers the common metadata import and all eight documented variants plus voff using no inherited module path. No training, GPU or network launch occurred. Real model vocabulary compatibility remains a launch preflight requirement, not a claim of this CPU dry-run.

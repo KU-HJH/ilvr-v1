@@ -62,6 +62,20 @@ def bash_blocks():
     return common, examples
 
 
+def test_common_setup_loads_stage1_metadata_without_inherited_pythonpath():
+    """The published setup must import Stage 1 metadata in a clean shell."""
+    common, _ = bash_blocks()
+    environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    result = subprocess.run(
+        ["bash", "-c", "set -euo pipefail\n" + common], cwd=REPO,
+        env={**environment, "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1",
+             "TRANSFORMERS_OFFLINE": "1"},
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Stage1 resized_vocab_size=151668; floor(1%)=1516; floor(10%)=15166" in result.stderr
+
+
 VARIANTS = {
     "bce": ("dil_bce_rf", None, "0", None, "clean"),
     "topk-k8": ("dil_bce_rf_topk", "8", "0", None, "clean"),
@@ -96,9 +110,10 @@ def test_documented_variant_runs_coordinator_and_both_worker_dry_runs(name, tmp_
         "source ./scripts/stage2/dil_bce_profile.sh",
         'source ./scripts/stage2/dil_bce_profile.sh\nexport STAGE1_ADAPTER_PATH="$1"',
     )
+    environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     result = subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + common + "\n" + examples[name], "bash", str(fixture)],
-        cwd=REPO, env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+        cwd=REPO, env={**environment, "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
         text=True, capture_output=True,
     )
     assert result.returncode == 0, result.stderr
