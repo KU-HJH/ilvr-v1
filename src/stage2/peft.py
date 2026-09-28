@@ -797,6 +797,7 @@ def load_stage2_model_for_inference(
         attach_sparse_output_token_rows,
     )
     from .checkpointing import (
+        _read_stage2_regular_payload,
         configure_stage2_metadata,
         prepare_stage2_sparse_token_base,
         resolve_latent_token_ids,
@@ -837,10 +838,29 @@ def load_stage2_model_for_inference(
         load_config=load_config,
         artifact_inspection=artifact_inspection,
     )
+    from step_preference.dil_identity import NAMESPACE, read_dil_identity
+
+    config_path = witness.artifact_dir / "config.json"
+    if config_path.exists() or config_path.is_symlink():
+        try:
+            artifact_config = json.loads(_read_stage2_regular_payload(
+                config_path, label="Stage 2 objective identity config"
+            ))
+            dil_identity = read_dil_identity(artifact_config)
+        except (OSError, json.JSONDecodeError, TypeError) as error:
+            raise ValueError("invalid Stage 2 DIL objective identity config") from error
+    else:
+        dil_identity = None
     base_model = load_model(
         str(base_model_path), **source_kwargs, **model_kwargs
     )
     metadata, adapter_config = _decode_stage2_inference_witness(witness)
+    qwen_config = resolve_qwen2_5_vl_model(base_model).config
+    if dil_identity is None:
+        if hasattr(qwen_config, NAMESPACE):
+            delattr(qwen_config, NAMESPACE)
+    else:
+        setattr(qwen_config, NAMESPACE, dil_identity)
     tokenizer = getattr(processor, "tokenizer", None)
     if (
         _canonical_source_reference(base_model_path) != witness.base_model_source

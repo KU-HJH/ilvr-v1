@@ -2487,6 +2487,24 @@ def test_full_inference_accepts_standard_qwen_config_without_custom_stage(
     }
 
 
+def test_stage2_inference_manifest_retains_dil_config_without_optimizer_state(tmp_path):
+    artifact = tmp_path / "stage2-lora"
+    write_loader_artifact(artifact, stage="stage2", method="lora")
+    config_path = artifact / "config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["ilvr_context_preference"] = {"schema_version": 1, "loss_type": "dil_bce_rf"}
+    config_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    (artifact / "optimizer.pt").write_bytes(b"optimizer")
+    manifest = loader_manifest(artifact, stage="stage2", method="lora")
+
+    selected = build_inference_manifest(artifact, manifest)
+
+    names = {entry.relative_path.name for entry in selected.entries}
+    assert "config.json" in names
+    assert "optimizer.pt" not in names
+    assert json.loads(config_path.read_text())["ilvr_context_preference"] == payload["ilvr_context_preference"]
+
+
 def test_prepare_inference_help_is_local_and_side_effect_free(tmp_path):
     marker = tmp_path / "remote-called"
     completed = subprocess.run(

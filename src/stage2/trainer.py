@@ -41,6 +41,7 @@ from step_preference.ablation import (
     build_additive_step_attention_mask,
 )
 from step_preference.config import StepPreferenceConfig
+from step_preference.dil_identity import attach_dil_identity, validate_dil_resume
 from step_preference.dpo_loss import aggregate_step_dpo, context_preference_loss
 from step_preference.negatives import StepNegative
 from step_preference.packing import build_packed_tree_plan
@@ -559,6 +560,10 @@ class Stage2Trainer(Trainer):
                 raise TypeError(
                     "Stage 2 resume_from_checkpoint must be a path, True, or None"
                 )
+            validate_dil_resume(
+                Path(resume_from_checkpoint),
+                getattr(self, "step_preference_config", StepPreferenceConfig()),
+            )
             validate_deepspeed_resume_identity(
                 Path(resume_from_checkpoint), self.deepspeed_runtime_profile
             )
@@ -1786,6 +1791,16 @@ class Stage2Trainer(Trainer):
 
         model = self.accelerator.unwrap_model(self.model)
         attach_evidence_replacement_identity(model, self.step_preference_config)
+        if self.step_preference_config.preference_loss_type != "dpo":
+            from step_preference.dil_config import validate_dil_runtime
+
+            resolved = resolve_qwen2_5_vl_model(model)
+            validate_dil_runtime(
+                self.step_preference_config,
+                vocab_size=resolved.get_output_embeddings().weight.shape[0],
+                supervise_latent_boundaries=getattr(resolved.config, "supervise_latent_boundaries", None),
+            )
+        attach_dil_identity(model, self.step_preference_config)
         if not isinstance(model, PeftModel):
             return super()._save(output_dir, state_dict=state_dict)
 
