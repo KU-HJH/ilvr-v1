@@ -980,6 +980,10 @@ _STAGE2_BOOLEAN_OPTIONS = {
     "--use_cpu",
     "--enable_stage2_objective",
     "--no-enable_stage2_objective",
+    "--stage2_zero_dropout",
+    "--no-stage2_zero_dropout",
+    "--stage2_m_prefix_cut",
+    "--no-stage2_m_prefix_cut",
 }
 _STAGE2_COORDINATOR_OPTIONS = {
     "--stage",

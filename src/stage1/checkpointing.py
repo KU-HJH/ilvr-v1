@@ -450,6 +450,23 @@ class Stage1PeftMetadata:
         if not isinstance(payload, Mapping):
             raise ValueError("Stage 1 PEFT metadata must be a JSON object")
         schema_version = payload.get("schema_version")
+        if schema_version == 3:
+            # Schema 3 (ours1/temp2 Stage 1) only adds Stage 1 teacher-training
+            # provenance, which Stage 2 loading does not use. Validate, then read
+            # the remaining fields as schema 2.
+            payload = dict(payload)
+            provenance = {
+                name: payload.pop(name, None)
+                for name in ("ema_setting", "teacher_target_mode", "training_implementation_version")
+            }
+            if (
+                provenance["ema_setting"] not in ("moving", "frozen")
+                or provenance["teacher_target_mode"] not in ("legacy_unrecorded", "sample_isolated")
+                or type(provenance["training_implementation_version"]) is not int
+                or provenance["training_implementation_version"] < 0
+            ):
+                raise ValueError(f"invalid Stage 1 PEFT schema 3 provenance: {provenance}")
+            payload["schema_version"] = schema_version = 2
         if type(schema_version) is not int or schema_version not in (
             1,
             STAGE1_PEFT_SCHEMA_VERSION,

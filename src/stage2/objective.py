@@ -47,6 +47,8 @@ class Stage2ObjectiveConfig:
     vision_selection_path: str | None = None
     vision_selection_sha256: str | None = None
     vision_mask_scope: str = "independent"
+    # Cut full-replay M forwards at the last scored predictor when score-preserving (ours1).
+    stage2_m_prefix_cut: bool = False
 
     @classmethod
     def from_args(cls, args) -> "Stage2ObjectiveConfig":
@@ -66,6 +68,7 @@ class Stage2ObjectiveConfig:
             vision_selection_path=getattr(args, "vision_selection_path", None),
             vision_selection_sha256=getattr(args, "vision_selection_sha256", None),
             vision_mask_scope=getattr(args, "vision_mask_scope", "independent"),
+            stage2_m_prefix_cut=getattr(args, "stage2_m_prefix_cut", False),
         )
 
     @property
@@ -104,6 +107,8 @@ class Stage2ObjectiveConfig:
             raise ValueError(
                 "vision_token_reduction must be 'score_mean' or 'token_loss_mean'"
             )
+        if not isinstance(self.stage2_m_prefix_cut, bool):
+            raise ValueError("stage2_m_prefix_cut must be boolean")
         if self.vision_token_selection not in ("post_window", "step0_entropy"):
             raise ValueError("vision_token_selection must be 'post_window' or 'step0_entropy'")
         if self.vision_mask_scope not in ("independent", "cumulative"):

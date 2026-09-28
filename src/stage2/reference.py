@@ -412,6 +412,7 @@ def _objective_config_for_comparison(config_dict: Mapping[str, Any]) -> dict[str
     config.setdefault("vision_selection_path", None)
     config.setdefault("vision_selection_sha256", None)
     config.setdefault("vision_mask_scope", "independent")
+    config.setdefault("stage2_m_prefix_cut", False)
     return config
 
 

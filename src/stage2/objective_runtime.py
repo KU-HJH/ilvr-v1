@@ -9,6 +9,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from peft_common import resolve_qwen2_5_vl_model
+from .dropout_policy import has_active_dropout
 from .entropy_selection import VisionTokenSelectionTable, build_vision_token_units, token_count
 from .objective import (Stage2ObjectiveConfig, entropy_transition, text_entropy, target_log_likelihood, vision_gain,
                         vision_gain_token_terms, vision_gain_tokens)
@@ -87,6 +88,28 @@ def counted_forward(model, inputs, *, student=None, **kwargs):
     finally:
         handle.remove()
     return output, calls
+
+
+def m_prefix_inputs(inputs, block, *, image_token_id, dropout_active):
+    """Cut an M forward at its last scored predictor when that cannot change scores.
+
+    Causal attention makes rows <= the cutoff independent of later tokens. The cut
+    is skipped when an image token lies after it (its vision features would no
+    longer line up), when a hidden span ends after it, or when dropout is active
+    (the replayed masks are shaped by the full sequence).
+    """
+    ids = inputs["input_ids"]
+    cutoff = max(block.post_positions) + 1
+    spans = block.hidden_spans or ((block.start_position, block.end_position),)
+    if (dropout_active or cutoff >= ids.shape[1] or any(end >= cutoff for _, end in spans)
+            or image_token_id is None or bool((ids[:, cutoff:] == image_token_id).any())):
+        return inputs
+    trimmed = dict(inputs, input_ids=ids[:, :cutoff])
+    if inputs.get("attention_mask") is not None:
+        trimmed["attention_mask"] = inputs["attention_mask"][:, :cutoff]
+    if inputs.get("position_ids") is not None:
+        trimmed["position_ids"] = inputs["position_ids"][..., :cutoff]
+    return trimmed
 
 
 @dataclass
@@ -179,6 +202,8 @@ class Stage2ObjectiveRuntime:
             return result
 
         auxiliary_inputs = {key: value for key, value in clean.items() if key != "labels"}
+        image_token_id = getattr(resolve_qwen2_5_vl_model(current_student).config, "image_token_id", None)
+        dropout_active = has_active_dropout(current_student)
         ref_outputs = None
         if self.config.lambda_dyn:
             with torch.no_grad():
@@ -230,7 +255,10 @@ class Stage2ObjectiveRuntime:
                     else:
                         with torch.no_grad(), replay_rng_state(rng):
                             ablation = block.hidden_spans or (block.start_position, block.end_position)
-                            masked, calls = counted_forward(current_student, auxiliary_inputs,
+                            m_inputs = m_prefix_inputs(
+                                auxiliary_inputs, block, image_token_id=image_token_id,
+                                dropout_active=dropout_active or not self.config.stage2_m_prefix_cut)
+                            masked, calls = counted_forward(current_student, m_inputs,
                                                              stage2_ablation=ablation)
                             token_m = target_log_likelihood(masked.logits[block.batch_index, list(block.post_positions)], targets)
                         del masked

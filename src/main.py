@@ -400,6 +400,15 @@ def build_stage2_training_components(
         parameter_report.trainable_parameters,
         parameter_report.resolved_target_names,
     )
+    if getattr(args, "stage2_zero_dropout", False):
+        from stage2.dropout_policy import apply_zero_dropout_policy
+
+        zeroed = apply_zero_dropout_policy(model)
+        logging.info(
+            "Stage 2 zero-dropout policy: %d sites set to 0 (original adapter p=%s)",
+            len(zeroed),
+            sorted({value for name, value in zeroed.items() if ".lora_dropout." in name}),
+        )
     peft_metadata = decision.peft_metadata
     if peft_metadata is None and decision.tuning.is_peft:
         peft_metadata = build_stage2_peft_metadata(

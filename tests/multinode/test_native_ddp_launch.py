@@ -157,6 +157,7 @@ def test_resolve_stage2_objective_config_uses_training_parser_defaults_and_value
         "vision_selection_path": None,
         "vision_selection_sha256": None,
         "vision_mask_scope": "independent",
+        "stage2_m_prefix_cut": False,
     }
 
 

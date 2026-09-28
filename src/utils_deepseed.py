@@ -106,6 +106,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
+        "--stage2_zero_dropout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="zero every student dropout site after loading (ours1 policy)",
+    )
+    parser.add_argument(
         "--vision_attention_implementation",
         choices=("eager", "sdpa", "flash_attention_2"),
     )
@@ -143,6 +149,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--vision_selection_path", type=str, default=None)
     parser.add_argument("--vision_selection_sha256", type=str, default=None)
+    parser.add_argument(
+        "--stage2_m_prefix_cut",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--vision_mask_scope",
         choices=("independent", "cumulative"),

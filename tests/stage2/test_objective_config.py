@@ -42,6 +42,7 @@ def test_objective_cli_defaults_are_opt_in_and_json_serializable():
         "vision_selection_path": None,
         "vision_selection_sha256": None,
         "vision_mask_scope": "independent",
+        "stage2_m_prefix_cut": False,
     }
     assert config.active is False
     json.dumps(config.to_dict())
@@ -96,6 +97,7 @@ def test_objective_cli_parses_all_explicit_values():
         "vision_selection_path": None,
         "vision_selection_sha256": None,
         "vision_mask_scope": "independent",
+        "stage2_m_prefix_cut": False,
     }
 
 
