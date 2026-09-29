@@ -5,6 +5,7 @@ if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
   printf 'Fresh DIL profile refuses RESUME_CHECKPOINT; use saved resume settings\n' >&2
   return 2 2>/dev/null || exit 2
 fi
+unset RESUME_CHECKPOINT
 _dil_repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 export STAGE1_CHECKPOINT="$_dil_repo_root/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct"
 export STAGE1_ADAPTER_PATH="$_dil_repo_root/checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431"

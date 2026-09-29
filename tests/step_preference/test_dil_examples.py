@@ -43,12 +43,29 @@ def test_fresh_profile_overrides_stale_source():
         "LEARNING_RATE": "5e-5", "SEED": "42",
     }
     assert {key: values.get(key) for key in expected} == expected
+    assert "RESUME_CHECKPOINT" not in values
 
 
 def test_fresh_profile_rejects_resume():
     result, _ = source_profile({"RESUME_CHECKPOINT": "/checkpoint/old"})
     assert result.returncode != 0
     assert "RESUME_CHECKPOINT" in result.stderr
+
+
+def test_empty_exported_resume_keeps_fresh_coordinator_mode():
+    """An empty stale resume variable must not request a coordinator resume."""
+    result = subprocess.run(
+        ["bash", "-c", 'set -euo pipefail; source "$1"; "$2" --dry-run '
+         '--run-id dil-empty-resume-profile-test --zero-stage 2 '
+         '--main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS"',
+         "bash", str(PROFILE), str(REPO / "run_multinode_stage2_training.sh")],
+        cwd=REPO,
+        env={**os.environ, "RESUME_CHECKPOINT": "", "CUDA_VISIBLE_DEVICES": "",
+             "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["plan"]["attempt_id"] == "initial"
 
 
 def bash_blocks():
@@ -112,12 +129,18 @@ def test_documented_variant_runs_coordinator_and_both_worker_dry_runs(name, tmp_
     )
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     result = subprocess.run(
-        ["bash", "-c", "set -euo pipefail\n" + common + "\n" + examples[name], "bash", str(fixture)],
+        ["bash", "-c", "set -euo pipefail\n" + common + "\nPS4='+ '\nset -x\n" + examples[name], "bash", str(fixture)],
         cwd=REPO, env={**environment, "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
         text=True, capture_output=True,
     )
     assert result.returncode == 0, result.stderr
     assert "Stage1 resized_vocab_size=151668; floor(1%)=1516; floor(10%)=15166" in result.stderr
+    coordinator_line = next(
+        line for line in result.stderr.splitlines()
+        if line.startswith("+ env ") and "./run_multinode_stage2_training.sh" in line
+    )
+    coordinator_argv = shlex.split(coordinator_line[2:])
+    coordinator_budget = coordinator_argv[coordinator_argv.index("--max_steps") + 1]
     command_plan = json.loads(result.stdout)
     assert command_plan["plan"]["world_size"] == 4
     remote = shlex.split(shlex.split(command_plan["remote"][-1])[-1])
@@ -158,6 +181,7 @@ def test_documented_variant_runs_coordinator_and_both_worker_dry_runs(name, tmp_
             expected["--step_preference_entropy_top_percent"] = percent
         for option, value in expected.items():
             assert argv[argv.index(option) + 1] == value
+        assert coordinator_budget == argv[argv.index("--stage2_total_steps") + 1]
         if k is None:
             assert "--step_preference_topk" not in argv
         if percent is None:

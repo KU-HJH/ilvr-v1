@@ -29,7 +29,7 @@ The strict Stage 1 metadata loader validates provenance and reads `resized_vocab
 ```bash
 env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf \
   ./run_multinode_stage2_training.sh --dry-run --run-id "dil-bce-$run_stamp" \
-  --zero-stage 2 --main-process-port 29631 --warm_up_steps 10
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
 ```
 
 ### topk-k8
@@ -37,7 +37,7 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf \
 ```bash
 env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK=8 \
   ./run_multinode_stage2_training.sh --dry-run --run-id "dil-topk-k8-$run_stamp" \
-  --zero-stage 2 --main-process-port 29631 --warm_up_steps 10
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
 ```
 
 ### topk-k5-mass
@@ -45,7 +45,7 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK=8 \
 ```bash
 env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK=5 STEP_PREFERENCE_LAMBDA_TOPK_MASS=1 \
   ./run_multinode_stage2_training.sh --dry-run --run-id "dil-topk-k5-mass-$run_stamp" \
-  --zero-stage 2 --main-process-port 29631 --warm_up_steps 10
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
 ```
 
 ### topk-k8-mass
@@ -53,7 +53,7 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK=5 STEP_PREFER
 ```bash
 env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK=8 STEP_PREFERENCE_LAMBDA_TOPK_MASS=1 \
   ./run_multinode_stage2_training.sh --dry-run --run-id "dil-topk-k8-mass-$run_stamp" \
-  --zero-stage 2 --main-process-port 29631 --warm_up_steps 10
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
 ```
 
 ### topk-k50-mass
@@ -61,7 +61,7 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK=8 STEP_PREFER
 ```bash
 env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK=50 STEP_PREFERENCE_LAMBDA_TOPK_MASS=1 \
   ./run_multinode_stage2_training.sh --dry-run --run-id "dil-topk-k50-mass-$run_stamp" \
-  --zero-stage 2 --main-process-port 29631 --warm_up_steps 10
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
 ```
 
 ### topk-pct1-mass
@@ -69,7 +69,7 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK=50 STEP_PREFE
 ```bash
 env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK="$k_pct1" STEP_PREFERENCE_LAMBDA_TOPK_MASS=1 \
   ./run_multinode_stage2_training.sh --dry-run --run-id "dil-topk-pct1-mass-$run_stamp" \
-  --zero-stage 2 --main-process-port 29631 --warm_up_steps 10
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
 ```
 
 ### topk-pct10-mass
@@ -77,7 +77,7 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK="$k_pct1" STE
 ```bash
 env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK="$k_pct10" STEP_PREFERENCE_LAMBDA_TOPK_MASS=1 \
   ./run_multinode_stage2_training.sh --dry-run --run-id "dil-topk-pct10-mass-$run_stamp" \
-  --zero-stage 2 --main-process-port 29631 --warm_up_steps 10
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
 ```
 
 ### topk-pct1-mass-entropy20
@@ -85,7 +85,7 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK="$k_pct10" ST
 ```bash
 env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK="$k_pct1" STEP_PREFERENCE_LAMBDA_TOPK_MASS=1 STEP_PREFERENCE_ENTROPY_TOP_PERCENT=20 \
   ./run_multinode_stage2_training.sh --dry-run --run-id "dil-topk-pct1-mass-entropy20-$run_stamp" \
-  --zero-stage 2 --main-process-port 29631 --warm_up_steps 10
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
 ```
 
 For the explicit visual-off entropy source ablation, use the same final command with `STEP_PREFERENCE_ENTROPY_SOURCE=voff` and a fresh run ID:
@@ -93,7 +93,7 @@ For the explicit visual-off entropy source ablation, use the same final command 
 ```bash
 env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK="$k_pct1" STEP_PREFERENCE_LAMBDA_TOPK_MASS=1 STEP_PREFERENCE_ENTROPY_TOP_PERCENT=20 STEP_PREFERENCE_ENTROPY_SOURCE=voff \
   ./run_multinode_stage2_training.sh --dry-run --run-id "dil-topk-pct1-mass-entropy20-voff-$run_stamp" \
-  --zero-stage 2 --main-process-port 29631 --warm_up_steps 10
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
 ```
 
 For inference, prepare the completed PEFT artifact with the existing `src.multinode prepare-inference` path under `checkpoints/evaluation-staging/<run-id>/`; use the original Qwen2.5-VL-3B base. Then run the existing `run_multinode_evaluation.sh` entrypoint. The default TEST400 evaluation is greedy (`temperature=0`, `top_p=1`), max new tokens 4096, max sequence 128000, repetition penalty 1, no vision ablation, and `external_full_latent_block`. Follow [the operator guide](multinode-training.md) for the exact preparation and evaluation command arguments. A prepared inference copy is not a training resume checkpoint.
