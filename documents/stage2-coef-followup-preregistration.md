@@ -3,7 +3,7 @@
 Status: frozen before training. Written 2026-09-29.
 User request: "coefficient를 0.3, margin을 0.0으로 해서 visiononly, heint-independent,
 heint-cumulative를 측정해봐". User decisions: keep every other setting of the original arms;
-evaluate TEST400 with both the CE-matched and the paper-aligned profile.
+evaluate TEST400 only with the paper-aligned profile (upstream ILVR `eval.py` semantics).
 
 ## Arms (only λ_vis and m_V change)
 
@@ -21,13 +21,15 @@ No new memory check: the objective path and samples are unchanged, and λ/m_V do
 
 ## Evaluation
 
-- TEST400, CE-matched profile (as the originals) and paper-aligned profile (`EVAL_PROFILE=paper`).
-- The old CE control is also evaluated with the paper profile for a matched reference.
+- TEST400 with the paper-aligned profile only (`EVAL_PROFILE=paper`: bounded, repetition penalty
+  1.05, max sequence 32768, `f8f80be`), for the three arms and the old CE control
+  (`stage2-ce-matched-gb16-s212-20260919-155759`, same Stage 1 source) as the matched reference.
 - Probes as in the original experiments: block-level probe for `visiononly-l03m0`; token-level probe
   with the arm's scope for the hient arms; same step0/CE probe files as before.
 
 ## Comparisons (all reported; single seed, provisional)
 
-1. Each new arm vs its original arm (paired McNemar, both profiles where available).
-2. Each new arm vs the CE control (the original pre-registered thresholds (a)–(d)).
+1. Each new arm vs the CE control under the paper profile (thresholds (a)–(d); (d) uses the
+   paper-profile CE result).
+2. Each new arm vs its original arm: probe deltas only (the originals have no paper-profile TEST400).
 Stop rules as before (OOM, non-finite loss, 3× first-10-update pace → FAILED; no retry with changes).
