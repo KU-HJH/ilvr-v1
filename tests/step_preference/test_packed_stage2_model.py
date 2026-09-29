@@ -172,6 +172,7 @@ def _independent_selected_logits(model, clean_ids, rejected_ids, span, plan):
     return clean, torch.cat(selected, dim=1)
 
 
+@pytest.mark.gpu
 def test_packed_stage2_matches_independent_forwards_with_one_rollout_and_final_decode():
     """Catches packed sidecars drifting from eager forwards or repeating Stage 2 work."""
     assert torch.cuda.is_available(), "packed Stage 2 requires a real CUDA FlexAttention run"
@@ -241,6 +242,7 @@ def test_packed_stage2_matches_independent_forwards_with_one_rollout_and_final_d
     assert torch.isfinite(q_proj_grad).all() and q_proj_grad.abs().sum() > 0
 
 
+@pytest.mark.gpu
 def test_packed_stage2_accepts_matching_latent_end_rejected_branch_start():
     """Catches valid target-adjacent rejected branches being rejected as control leakage."""
     assert torch.cuda.is_available(), "packed Stage 2 requires CUDA"
@@ -284,6 +286,7 @@ def test_packed_stage2_accepts_matching_latent_end_rejected_branch_start():
     )
 
 
+@pytest.mark.gpu
 def test_packed_stage2_rejects_latent_end_with_nonmatching_logical_source():
     """Catches broad latent-end exemptions that can conceal malformed sidecars."""
     assert torch.cuda.is_available(), "packed Stage 2 requires CUDA"
@@ -327,6 +330,7 @@ def _packed_call(model, clean_ids, packed_inputs, positions, **kwargs):
     )
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
@@ -462,6 +466,7 @@ def test_packed_stage2_rejects_malformed_packed_boundaries(
         )
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     ("positions", "message"),
     (
@@ -484,6 +489,7 @@ def test_packed_stage2_rejects_invalid_selected_positions(
         _packed_call(model, clean_ids, packed_inputs, positions)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     ("option", "message"),
     (
@@ -514,6 +520,7 @@ def test_packed_stage2_rejects_incompatible_decoder_options(
         )
 
 
+@pytest.mark.gpu
 def test_packed_stage2_gradient_checkpointing_matches_plain():
     """Catches packed checkpointing drift or loss of backward recomputation."""
     assert torch.cuda.is_available(), "packed Stage 2 requires a real CUDA FlexAttention run"

@@ -121,6 +121,9 @@ def test_capacity_final_adapter_save_defers_processor_but_numbered_save_does_not
     from step_preference.capacity_evidence import CapacitySampleRecorder
     events=[]
     class Model:
+        model = object()
+        lm_head = object()
+        config = N(save_pretrained=lambda target: None)
         def save_pretrained(self,target,**kw):events.append(("weights",target.name))
     model=Model();trainer=object.__new__(module.Stage2Trainer)
     trainer.model=model;trainer.accelerator=N(unwrap_model=lambda m:m)
@@ -129,7 +132,6 @@ def test_capacity_final_adapter_save_defers_processor_but_numbered_save_does_not
     trainer.data_collator=CapacitySampleRecorder(lambda rows:rows,"a")
     trainer.processing_class=N(save_pretrained=lambda target:events.append(("processor",target.name)))
     monkeypatch.setattr(module,"PeftModel",Model)
-    monkeypatch.setattr(module,"resolve_qwen2_5_vl_model",lambda m:N(config=N(save_pretrained=lambda target:None)))
     monkeypatch.setattr(torch,"save",lambda *a:None)
     trainer._save(tmp_path/"checkpoint-2");trainer._save(tmp_path)
     assert events == [("weights","checkpoint-2"),("processor","checkpoint-2"),("weights",tmp_path.name)]

@@ -74,6 +74,7 @@ def _load_tiny_mixed_model():
     return model, config, config_calls, model_calls
 
 
+@pytest.mark.gpu
 def test_mixed_loader_constructs_real_flash_vision_and_sdpa_language_attention():
     """Catches Transformers flattening the requested mixed pair onto one backend."""
     model, config, config_calls, model_calls = _load_tiny_mixed_model()
@@ -92,6 +93,7 @@ def test_mixed_loader_constructs_real_flash_vision_and_sdpa_language_attention()
     )
 
 
+@pytest.mark.gpu
 def test_mixed_loader_binds_default_transformers_loaders_at_call_time(monkeypatch):
     """Catches import-time loader binding defeating production/test replacement seams."""
     import stage2.attention_backend as backend
@@ -125,6 +127,7 @@ def test_mixed_loader_binds_default_transformers_loaders_at_call_time(monkeypatc
     assert calls[1][2]["config"] is config
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -180,6 +183,7 @@ def test_mixed_loader_rejects_unsupported_distinct_backend_pairs(language, visio
         )
 
 
+@pytest.mark.gpu
 def test_attention_counters_increment_at_real_kernel_dispatch(monkeypatch):
     import transformers.models.qwen2_5_vl.modeling_qwen2_5_vl as module
     model, *_ = _load_tiny_mixed_model()

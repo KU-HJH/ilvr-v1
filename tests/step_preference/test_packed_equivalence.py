@@ -151,6 +151,7 @@ def test_bf16_diagnostic_evidence_has_no_fitted_acceptance_threshold():
     }
 
 
+@pytest.mark.gpu
 def test_tiny_fp32_naive_and_packed_match_all_trainable_gradients():
     """Catches packed loss or autograd drift against the independent naive graph."""
     assert torch.cuda.is_available(), "packed equivalence requires CUDA"
@@ -161,6 +162,7 @@ def test_tiny_fp32_naive_and_packed_match_all_trainable_gradients():
     assert set(result.gradients) == set(result.trainable_parameters)
 
 
+@pytest.mark.gpu
 def test_multistep_ragged_fp32_tree_matches_all_trainable_gradients():
     """Catches topology drift hidden by the one-step equivalence fixture."""
     assert torch.cuda.is_available(), "packed equivalence requires CUDA"

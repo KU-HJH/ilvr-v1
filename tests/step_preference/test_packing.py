@@ -136,6 +136,7 @@ def test_tree_visibility_preserves_ancestors_blocks_one_edge_and_isolates_sideca
     assert visible[254, 254] and not visible[254, 253]
 
 
+@pytest.mark.gpu
 def test_flex_block_mask_is_cuda_only_and_skips_at_least_one_block():
     """Catches replacing the packed tree with a dense additive attention mask."""
     clean_ids, spans, joined = _two_step_fixture()

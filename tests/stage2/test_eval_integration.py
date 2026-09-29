@@ -59,6 +59,7 @@ def restore_evaluator_backend_precision():
 MODULE_NAMES = ("eval", "evaluate_deepseed")
 
 
+@pytest.mark.gpu
 def test_evaluation_runtime_sidecar_counts_concrete_blocks_exclusively(monkeypatch, tmp_path):
     module = importlib.import_module("eval")
     from tests.stage2.test_attention_backend import _load_tiny_mixed_model
