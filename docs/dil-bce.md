@@ -98,6 +98,25 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK="$k_pct1" STE
 
 For inference, prepare the completed PEFT artifact with the existing `src.multinode prepare-inference` path under `checkpoints/evaluation-staging/<run-id>/`; use the original Qwen2.5-VL-3B base. Then run the existing `run_multinode_evaluation.sh` entrypoint. The default TEST400 evaluation is greedy (`temperature=0`, `top_p=1`), max new tokens 4096, max sequence 128000, repetition penalty 1, no vision ablation, and `external_full_latent_block`. Follow [the operator guide](multinode-training.md) for the exact preparation and evaluation command arguments. A prepared inference copy is not a training resume checkpoint.
 
+### Planned checkpoint stop for a bounded resume probe
+
+For an independently authorized three-update DIL smoke, one fresh run can stop after a complete checkpoint 2 and resume to the original budget 3. Keep the approved dataset and profile. This optional diagnostic requires enabled DIL `context_preference` Stage 2B and a positive integer strictly below the resolved total budget. Both coordinator and workers receive the option; the coordinator also requires explicit `--max_steps`.
+
+```bash
+# After the fresh profile, use the separately approved smoke input and run ID.
+: "${run_id:?set a fresh smoke run ID}"
+: "${smoke_data:?set the approved smoke dataset}"
+export DATA_PATH="$smoke_data" STAGE2_TOTAL_STEPS=3
+export STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf
+./run_multinode_stage2_training.sh --dry-run --run-id "$run_id" \
+  --zero-stage 2 --main-process-port 29631 --max_steps 3 --save_steps 3 \
+  --warm_up_steps 10 --stage2_stop_after_checkpoint 2
+```
+
+After a separately authorized launch, every rank requests a normal full checkpoint at optimizer step 2. The Trainer stops after saving and the existing sidecar publication barriers; `trainer_state.json` retains `global_step=2` and `max_steps=3`. The coordinator waits for both node exits to be zero, then applies its unchanged four-rank collector to checkpoint 2. The attempt witness records `planned_stop` with `budget_complete=false`. Missing/incomplete checkpoint state or mismatched producer steps fail validation.
+
+Use canonical checkpoint 2 in the same-run resume recipe below, with a fresh attempt ID, saved `max_steps=3`, and `saved_cli=(--save_steps 3 --warm_up_steps 10)`. Omit `--stage2_stop_after_checkpoint` from resume settings: it is fresh-run only. The ordinary resume restores state and performs update 3. Do not edit trainer state, change the budget, signal workers, or collect after nonzero exits. CPU lifecycle tests cover full save/restore and another update; actual four-rank ZeRO restoration remains a separately authorized GPU smoke claim.
+
 ### Same-run DIL resume
 
 Use the interrupted run's saved environment and CLI settings, with the same run ID, original base, data, length manifest, objective, sampler, checkpointing, optimizer and schedule settings on both nodes. Do not source `dil_bce_profile.sh`: it is for fresh runs. Resume requires the complete training checkpoint (including trainer, optimizer, scheduler, RNG, sampler/runtime sidecars and ZeRO state), not the final adapter or inference copy. The coordinator requires a new attempt ID and the same run's immediate `checkpoint-N` path.

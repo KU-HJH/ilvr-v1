@@ -1725,6 +1725,16 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 benchmark_evidence_path=str(producer_evidence),
             )
             resume_requested = "RESUME_CHECKPOINT" in stage_environment
+        planned_stop = _argument_value(forwarded, "--stage2_stop_after_checkpoint") if stage == "stage2" else None
+        planned_stop_max_steps = None
+        if planned_stop is not None:
+            budget = _argument_value(forwarded, "--max_steps")
+            if not (planned_stop.isdecimal() and budget is not None and budget.isdecimal()
+                    and 0 < int(planned_stop) < int(budget)):
+                raise ValueError("stage2_stop_after_checkpoint requires 0 < stop < explicit max_steps")
+            if resume_requested:
+                raise ValueError("stage2_stop_after_checkpoint is fresh-run only")
+            planned_stop_max_steps = int(budget)
         if resume_requested and args.attempt_id == "initial":
             raise ValueError("resume requires a fresh --attempt-id, not 'initial'")
         if stage == "stage1" and resume_requested:
@@ -1974,7 +1984,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 raise ValueError(
                     f"{step_option} must identify the final checkpoint step"
                 )
-            final_step = int(step_value)
+            final_step = int(planned_stop) if planned_stop is not None else int(step_value)
         checkpoint_path = checkpoint_run_path / f"checkpoint-{final_step}"
         artifact_identity = _checkpoint_artifact_identity(
             plan,
@@ -2002,6 +2012,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 batch_per_gpu=batch_per_gpu,
                 finite_loss_evidence_path=commands.finite_loss_evidence_path,
                 expected_global_step=final_step,
+                **({"planned_stop_max_steps": planned_stop_max_steps} if planned_stop is not None else {}),
             )
         except ValueError as error:
             incomplete = write_incomplete_attempt(

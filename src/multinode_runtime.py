@@ -962,6 +962,7 @@ _STAGE2_VALUE_OPTIONS = {
     "--save_steps",
     "--max_train_samples",
     "--max_steps",
+    "--stage2_stop_after_checkpoint",
     "--seed",
 }
 _STAGE2_BOOLEAN_OPTIONS = {
@@ -3528,6 +3529,8 @@ def _finite_loss_reference(
         producer_checkpoint = payload.get("checkpoint_path")
         if type(global_step) is not int or type(producer_checkpoint) is not str:
             raise ValueError("Stage 2 producer evidence identity is invalid")
+        if expected_global_step is not None and global_step != expected_global_step:
+            raise ValueError("Stage 2 producer global_step differs from expected checkpoint step")
         from stage2.evidence import decode_stage2_producer_evidence
 
         decoded = decode_stage2_producer_evidence(
@@ -3643,6 +3646,7 @@ def write_training_witness(
     batch_per_gpu: int,
     finite_loss_evidence_path: str | Path | None = None,
     expected_global_step: int | None = None,
+    planned_stop_max_steps: int | None = None,
 ) -> Path:
     """Exclusively publish one attempt witness without inventing loss evidence."""
     if dict(exit_codes) != {0: 0, 1: 0}:
@@ -3690,6 +3694,12 @@ def write_training_witness(
         "checkpoint_path": str(checkpoint),
         "finite_loss_evidence": finite_loss,
     }
+    if planned_stop_max_steps is not None:
+        if not (type(expected_global_step) is int and type(planned_stop_max_steps) is int
+                and 0 < expected_global_step < planned_stop_max_steps):
+            raise ValueError("planned stop must precede the full training budget")
+        payload["planned_stop"] = {"global_step": expected_global_step,
+                                   "max_steps": planned_stop_max_steps, "budget_complete": False}
     return _publish_bytes_no_replace(path, _canonical_json_bytes(payload) + b"\n")
 
 

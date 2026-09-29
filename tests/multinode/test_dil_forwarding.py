@@ -143,3 +143,15 @@ def test_worker_rejects_mixed_dil_resume_initialization(mixed):
     for _, _, result in worker_commands(settings):
         assert result.returncode != 0
         assert "RESUME_CHECKPOINT" in result.stderr
+
+
+def test_planned_stop_reaches_both_workers_with_unchanged_total_budget():
+    for rank, _, result in worker_commands(
+        {'STEP_PREFERENCE_LOSS_TYPE': 'dil_bce_rf'},
+        ('--max_steps', '3', '--stage2_stop_after_checkpoint', '2'),
+    ):
+        assert result.returncode == 0, result.stderr
+        argv = json.loads(result.stdout)
+        assert argv[argv.index('--stage2_stop_after_checkpoint') + 1] == '2'
+        assert argv[argv.index('--max_steps') + 1] == '3'
+        assert argv[argv.index('--machine_rank') + 1] == str(rank)

@@ -181,6 +181,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--image_root", required=False)
     parser.add_argument("--max_train_samples", type=int)
     parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--stage2_stop_after_checkpoint", type=int)
     parser.add_argument("--benchmark_run_config")
     parser.add_argument("--benchmark_evidence_path")
     parser.add_argument("--benchmark_source_data_path")
@@ -246,6 +247,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
     args.step_preference_config = StepPreferenceConfig.from_args(args)
+    from stage2.planned_stop import validate_planned_checkpoint_stop
+    validate_planned_checkpoint_stop(
+        args.stage2_stop_after_checkpoint, config=args.step_preference_config,
+        max_steps=(args.step_preference_config.phase_steps
+                   if args.step_preference_config.phase_steps is not None else args.max_steps),
+        resume=args.resume_from_checkpoint_path, stage=args.stage,
+    )
+    if (args.stage2_stop_after_checkpoint is not None
+            and args.step_preference_config.phase_steps is not None
+            and args.max_steps != args.step_preference_config.phase_steps):
+        raise ValueError("planned stop --max_steps must match the resolved phase budget")
     args.step_visual_only_context_preference = (
         args.step_preference_config.visual_only_context_preference
     )

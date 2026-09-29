@@ -254,6 +254,7 @@ class Stage2Trainer(Trainer):
         deepspeed_runtime_profile: DeepSpeedRuntimeProfile | None = None,
         stage2_peft_metadata=None,
         stage2_diagnostics_interval: int = 0,
+        stage2_stop_after_checkpoint: int | None = None,
         stage2_reproduction_probe_dir: str = "",
         stage2_sampler_policy: str = "latent_balanced",
         stage2_reference_sampler_probe_dir: str = "",
@@ -333,6 +334,18 @@ class Stage2Trainer(Trainer):
         self._stage2_deepspeed_gradient_adapter = None
         callbacks = list(kwargs.pop("callbacks", ()) or ())
         callbacks.append(_ObservedOptimizerStep(self))
+        self.stage2_stop_after_checkpoint = stage2_stop_after_checkpoint
+        if stage2_stop_after_checkpoint is not None:
+            from .planned_stop import PlannedCheckpointStop, validate_planned_checkpoint_stop
+            training_args = kwargs.get("args") if "args" in kwargs else args[1]
+            validate_planned_checkpoint_stop(
+                stage2_stop_after_checkpoint, config=step_preference_config,
+                max_steps=training_args.max_steps,
+                resume=step_preference_config.resume_from_checkpoint_path,
+            )
+            if training_args.save_only_model:
+                raise ValueError("stage2_stop_after_checkpoint requires full checkpoint state")
+            callbacks.append(PlannedCheckpointStop(stage2_stop_after_checkpoint))
         kwargs["callbacks"] = callbacks
         super().__init__(*args, **kwargs)
         if stage2_sampler_policy == "reference_random":
@@ -543,6 +556,8 @@ class Stage2Trainer(Trainer):
         return dataloader
 
     def train(self, *args, resume_from_checkpoint=None, **kwargs):
+        if getattr(self, "stage2_stop_after_checkpoint", None) is not None and resume_from_checkpoint:
+            raise ValueError("stage2_stop_after_checkpoint is fresh-run only; omit it when resuming")
         self._publish_deepspeed_runtime_identity(
             Path(self.args.output_dir), label="Stage 2 runtime identity publication"
         )

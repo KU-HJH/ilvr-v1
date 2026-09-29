@@ -1136,6 +1136,8 @@ def run_stage2(args):
         deepspeed_runtime_profile=profile,
         stage2_diagnostics_interval=args.stage2_diagnostics_interval,
     )
+    if getattr(args, "stage2_stop_after_checkpoint", None) is not None:
+        trainer_kwargs["stage2_stop_after_checkpoint"] = args.stage2_stop_after_checkpoint
     sampler_policy = select_stage2_sampler_policy(
         getattr(args, "stage2_sampler_policy", "auto"), profile=profile,
         config=components.step_preference_config, resume=components.trainer_resume_path)
