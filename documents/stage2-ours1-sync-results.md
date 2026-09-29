@@ -64,8 +64,8 @@ sync-vision 45/34, p 0.130.
 - Remaining differences from ours1: native DDP on 4 GPUs instead of ZeRO-2 on 2 (data order
   differs), native gradient checkpointing on (off OOMed on H100 NVL 93 GiB), rewritten base path in
   the copied Stage 1 metadata (byte-identical base model).
-- The probe is diagnostic only. ours1 has no TEST400 record for its Vision models, so no direct
-  comparison with ours1 accuracy is possible.
+- The probe is diagnostic only. (Correction: an earlier version said ours1 had no TEST400 record;
+  it does — see "Paper-aligned re-evaluation" below.)
 - The venv's editable Transformers pointed at the canonical checkout (`57d7c55`) during evaluation.
 
 ## Artifacts
@@ -77,3 +77,35 @@ sync-vision 45/34, p 0.130.
 - Logs: `logs/stage2-ours1sync-{oom-probe,stage1-copy,dry-run,deploy-20260928,arms-20260928,post}/`.
 - Deployment: both canonical repositories restored byte-identically; named stashes
   `stage2-ours1sync-20260928-local` and `stage2-ours1sync-20260928-remote` are kept.
+
+## Paper-aligned re-evaluation (2026-09-29, added after the verdicts)
+
+ours1 did evaluate its models on TEST400 with its own `run_eval.py`
+(`/raid/workspace/temp2/ILVR/results/stage2-evaluation/stage2-objective-full*-comt-test400-20260919`):
+ce 0.5125, vision-body 0.5075, vision-fullblock 0.520. Both that controller and the CE-matched
+profile above use no repetition penalty and complete a latent block past the limit; upstream ILVR
+`eval.py` uses HF `generate` (bounded) with the checkpoint's repetition penalty (Qwen default 1.05).
+All five models were therefore re-evaluated with this repository's paper-aligned profile
+(`EVAL_PROFILE=paper`: bounded, repetition penalty 1.05, max sequence 32768, `f8f80be`
+Transformers on both nodes). ours1 staging copies were converted from metadata schema 7 to 4 for
+loading only (`logs/stage2-paper-eval-ours1-staging/`).
+
+| Model | CE-matched / ours1 eval | Paper-aligned |
+|---|---|---|
+| sync-ce | 0.5200 | 0.5275 |
+| sync-vision | 0.5025 | 0.5150 |
+| ours1-ce | 0.5125 | 0.5125 |
+| ours1-vision-body | 0.5075 | 0.5075 |
+| ours1-vision-fullblock | 0.5200 | 0.5225 |
+
+Paired, paper-aligned (only-first / only-second correct, exact two-sided McNemar p):
+sync-ce vs sync-vision 27/22, p 0.57; ours1-ce vs ours1-vision-body 21/19, p 0.88;
+ours1-ce vs ours1-vision-fullblock 13/17, p 0.59; ours1-ce vs sync-ce 30/36, p 0.54;
+ours1-vision-body vs sync-vision 27/30, p 0.79.
+
+Under one evaluation the two repositories agree in direction: body-masked Vision is slightly
+below CE (−1.25 pp here, −0.5 pp ours1), full-block Vision slightly above (+1.0 pp, ours1 only);
+none is significant. Changing only the evaluation profile flips 63–72 of 400 item outcomes per
+model, so ±1–2 pp accuracy differences are within evaluation noise.
+TEST400 outputs: `results/eval-stage2-*-paper-test400-20260929-*/merged.jsonl`;
+logs `logs/stage2-paper-eval-20260929/`.
