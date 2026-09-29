@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -659,6 +660,48 @@ def test_peft_resume_rejects_cli_base_source_mismatch_before_external_loads(tmp_
     )
 
 
+@pytest.mark.parametrize(
+    "teacher_target_mode,training_implementation_version",
+    [("legacy_unrecorded", 0), ("sample_isolated", 1)],
+)
+def test_stage1_training_resume_rejects_schema3_before_external_loads(
+    teacher_target_mode, training_implementation_version
+):
+    root = Path("checkpoints/test-stage1-schema3-resume")
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=root) as temporary:
+        args = stage1_args(Path(temporary))
+        checkpoint, metadata, processor = _write_peft_resume_checkpoint(args)
+        args.resume_from_checkpoint_path = str(checkpoint)
+        metadata_path = checkpoint / STAGE1_PEFT_METADATA_FILENAME
+        payload = json.loads(metadata_path.read_text())
+        payload.update(
+            schema_version=3,
+            ema_setting="frozen",
+            teacher_target_mode=teacher_target_mode,
+            training_implementation_version=training_implementation_version,
+        )
+        metadata_path.write_text(json.dumps(payload) + "\n")
+        events = []
+        deps, _, _, _ = fake_dependencies(
+            events, processor=processor, metadata=metadata
+        )
+        deps = replace(
+            deps,
+            resolve_resume=resolve_stage1_resume,
+            load_peft_metadata=read_stage1_peft_metadata_snapshot,
+            decode_peft_metadata=decode_stage1_peft_metadata_snapshot,
+        )
+
+        with pytest.raises(ValueError, match="schema 3.*Stage 1 training resume"):
+            build_stage1_training_components(args, dependencies=deps)
+
+        assert not any(
+            event[0] in {"processor", "config", "model", "preflight"}
+            for event in events
+        )
+
+
 def test_peft_resume_canonicalizes_training_config_before_base_load(tmp_path):
     """Catches remote inference defaults reaching resumed teacher construction."""
 
@@ -869,6 +912,7 @@ def test_resume_composition_preserves_checkpoint_token_ids_without_readding(
     for token, token_id in zip(LATENT_TOKEN_STRINGS, (12, 13, 14)):
         processor.tokenizer.vocab[token] = token_id
     metadata = SimpleNamespace(
+        schema_version=2,
         base_model_reference="Qwen/Qwen2.5-VL-3B-Instruct",
         base_vocab_size=12,
         resized_vocab_size=15,
@@ -954,6 +998,7 @@ def test_peft_resume_rejects_semantic_mismatch_before_any_large_load(
         _fake_metadata_snapshot(checkpoint),
     )
     metadata_values = {
+        "schema_version": 2,
         "base_model_reference": "Qwen/Qwen2.5-VL-3B-Instruct",
         "base_vocab_size": 12,
         "resized_vocab_size": 15,
@@ -1009,6 +1054,7 @@ def test_peft_artifact_preflight_failure_prevents_large_model_load(
     for token, token_id in zip(LATENT_TOKEN_STRINGS, (12, 13, 14)):
         processor.tokenizer.vocab[token] = token_id
     metadata = SimpleNamespace(
+        schema_version=2,
         base_model_reference="Qwen/Qwen2.5-VL-3B-Instruct",
         base_vocab_size=12,
         resized_vocab_size=15,

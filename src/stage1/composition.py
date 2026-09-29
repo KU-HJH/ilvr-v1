@@ -322,6 +322,8 @@ def _validate_resume_tuning(
 
 
 def _validate_resume_semantics(args, metadata: Stage1PeftMetadata) -> None:
+    if metadata.schema_version == 3:
+        raise ValueError("schema 3 Stage 1 training resume is unsupported")
     if args.model != metadata.base_model_reference:
         raise ValueError(
             "Stage 1 PEFT base source mismatch: "
