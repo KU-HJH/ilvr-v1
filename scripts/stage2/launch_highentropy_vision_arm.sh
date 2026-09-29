@@ -6,7 +6,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 {hient-independent|hient-cumulative} --main-process-port PORT [--run-id ID] [--launch]" >&2
+  echo "usage: $0 {hient-independent|hient-cumulative|hient-independent-l03m0|hient-cumulative-l03m0} --main-process-port PORT [--run-id ID] [--launch]" >&2
   exit 2
 }
 
@@ -25,9 +25,13 @@ while [[ $# -gt 0 ]]; do
 done
 [[ $port =~ ^[0-9]+$ ]] || usage
 
+lambda_vis=1.0; m_v=0.5
 case $arm in
   hient-independent) scope=independent ;;
   hient-cumulative) scope=cumulative ;;
+  # Coefficient/margin follow-up (2026-09-29): ours1 values, all else unchanged.
+  hient-independent-l03m0) scope=independent; lambda_vis=0.3; m_v=0.0 ;;
+  hient-cumulative-l03m0) scope=cumulative; lambda_vis=0.3; m_v=0.0 ;;
   *) usage ;;
 esac
 
@@ -43,8 +47,8 @@ run_id=${run_id:-stage2-$arm-gb16-s212-$(date -u +%Y%m%d-%H%M%S)}
 objective_arguments=(
   --enable_stage2_objective
   --lambda_dyn 0
-  --lambda_vis 1.0
-  --m_V 0.5
+  --lambda_vis "$lambda_vis"
+  --m_V "$m_v"
   --gamma_H 0
   --entropy_eps 1e-6
   --pre_window 1

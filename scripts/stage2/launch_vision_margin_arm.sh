@@ -6,7 +6,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 {visiononly-mv05|combined-mv0|combined-mv05} --main-process-port PORT [--run-id ID] [--launch]" >&2
+  echo "usage: $0 {visiononly-mv05|combined-mv0|combined-mv05|visiononly-l03m0} --main-process-port PORT [--run-id ID] [--launch]" >&2
   exit 2
 }
 
@@ -25,8 +25,11 @@ while [[ $# -gt 0 ]]; do
 done
 [[ $port =~ ^[0-9]+$ ]] || usage
 
+lambda_vis=1.0
 case $arm in
   visiononly-mv05) lambda_dyn=0; m_v=0.5 ;;
+  # Coefficient/margin follow-up (2026-09-29): ours1 values, all else as visiononly-mv05.
+  visiononly-l03m0) lambda_dyn=0; m_v=0.0; lambda_vis=0.3 ;;
   combined-mv0) lambda_dyn=1.0; m_v=0.0 ;;
   combined-mv05) lambda_dyn=1.0; m_v=0.5 ;;
   *) usage ;;
@@ -42,7 +45,7 @@ run_id=${run_id:-stage2-$arm-gb16-s212-$(date -u +%Y%m%d-%H%M%S)}
 objective_arguments=(
   --enable_stage2_objective
   --lambda_dyn "$lambda_dyn"
-  --lambda_vis 1.0
+  --lambda_vis "$lambda_vis"
   --m_V "$m_v"
   --gamma_H 0
   --entropy_eps 1e-6
