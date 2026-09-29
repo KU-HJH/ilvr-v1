@@ -35,10 +35,12 @@ step=$(basename "$adapter"); step=${step##*-}
 source_ckpt=$repo/checkpoints/$(basename "$(dirname "$adapter")")/checkpoint-$step
 files=$(cd "$adapter" && ls | tr "\n" " ")
 if [[ $profile == paper ]]; then
-  host_adapter=/raid/workspace/ILVR/${adapter#$repo/}
-  ssh -o BatchMode=yes "$remote" "mkdir -p $host_adapter"
-  rsync -a "$adapter/" "$remote:$host_adapter/"
-  ssh -o BatchMode=yes "$remote" "docker exec llm_kd bash -lc 'cd $adapter && sha256sum $files'" > "$repo/logs/$run/remote-adapter.sha256"
+  # evaluation-staging is root-owned on the remote host: push to this run's
+  # (user-writable) log directory, then copy into place inside the container.
+  push=/home/korea/Workspace/hjh/workspace/ILVR/logs/$run/adapter-push
+  ssh -o BatchMode=yes "$remote" "mkdir -p $push"
+  rsync -a "$adapter/" "$remote:$push/"
+  ssh -o BatchMode=yes "$remote" "docker exec llm_kd bash -lc 'mkdir -p $adapter && cp -n $repo/logs/$run/adapter-push/* $adapter/ && cd $adapter && sha256sum $files'" > "$repo/logs/$run/remote-adapter.sha256"
 else
   ssh -o BatchMode=yes "$remote" "docker exec llm_kd bash -lc 'mkdir -p $adapter && cd $source_ckpt && cp -n $files $adapter/ && cd $adapter && sha256sum $files'" > "$repo/logs/$run/remote-adapter.sha256"
 fi
