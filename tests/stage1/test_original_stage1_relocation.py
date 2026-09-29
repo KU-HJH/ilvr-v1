@@ -28,6 +28,9 @@ def make_fixture(root):
         base.mkdir()
         (base / "config.json").write_text('{"model_type":"qwen2_5_vl"}')
         (base / "model.safetensors").write_bytes(b"base-model-weights")
+        cache = base / ".cache" / "huggingface" / "download"
+        cache.mkdir(parents=True)
+        (cache / "config.json.metadata").write_bytes(b"same-cache-metadata")
     payload = sample_metadata().to_dict()
     payload.update(
         schema_version=3,
@@ -71,6 +74,9 @@ def test_preparation_preserves_weights_and_original_provenance(artifact_root):
     assert manifest["source_metadata_sha256"] == hashlib.sha256(
         (source / "stage1_peft_metadata.json").read_bytes()
     ).hexdigest()
+    assert manifest["base_file_sha256"][".cache/huggingface/download/config.json.metadata"] == (
+        hashlib.sha256(b"same-cache-metadata").hexdigest()
+    )
     assert json.loads((destination / "original_stage1_provenance.json").read_text()) == manifest
 
 

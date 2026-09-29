@@ -49,7 +49,11 @@ def _base_file_hashes(source_base: Path, local_base: Path) -> dict[str, str]:
             raise ValueError(f"base model directory is missing or linked: {root}")
         found = {}
         for path in root.rglob("*"):
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink():
+                raise ValueError(f"base model contains a non-regular file: {path}")
+            if path.is_dir():
+                continue
+            if not path.is_file():
                 raise ValueError(f"base model contains a non-regular file: {path}")
             found[str(path.relative_to(root))] = path
         return found
