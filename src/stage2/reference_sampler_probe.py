@@ -7,7 +7,8 @@ import socket
 
 import torch
 
-from .reproduction_probe import ReproductionObserver, compare_vectors
+from .reproduction_probe import (ReproductionObserver, compare_vectors,
+    describe_collective_slices, install_collective_observation)
 
 
 def compare_fixed_gradient(expected, actual):
@@ -18,30 +19,6 @@ def compare_fixed_gradient(expected, actual):
     relative = (error / norm if norm else (0. if error == 0. else None)) if error is not None else None
     return {'pass': bool(coordinate.get('finite') and relative is not None and relative <= .02),
             'relative_l2': relative, 'relative_l2_limit': .02, 'coordinate': coordinate}
-
-
-def describe_collective_slices(flat, layout, tensors):
-    """Map actual reduction views back to ordered parameter portions, before copying."""
-    result = []
-    if sum(item['numel'] for item in layout) != flat.numel():
-        raise RuntimeError('IPG layout does not cover its actual tensor')
-    for tensor in tensors:
-        delta = tensor.data_ptr() - flat.data_ptr()
-        if (tensor.dtype != flat.dtype or tensor.device != flat.device or not tensor.is_contiguous()
-                or delta < 0 or delta % flat.element_size()):
-            raise RuntimeError('collective tensor is outside observed IPG storage')
-        start = delta // flat.element_size()
-        end = start + tensor.numel()
-        if end > flat.numel():
-            raise RuntimeError('collective tensor is outside observed IPG storage')
-        position = 0
-        for item in layout:
-            stop = position + item['numel']
-            left, right = max(position, start), min(stop, end)
-            if left < right:
-                result.append(dict(name=item['name'], offset=left-position, numel=right-left))
-            position = stop
-    return result
 
 
 def check_records(records, expected_order):
@@ -137,42 +114,7 @@ class ReferenceSamplerObserver(ReproductionObserver):
         zero = engine.optimizer
         if not zero.reduce_scatter or not zero.contiguous_gradients or float(zero.loss_scale) != 1.:
             raise ValueError('sampler witness requires contiguous reduce-scatter BF16 ZeRO2')
-        original_process = zero.process_gradients
-        def process(parameter, group):
-            self.hook_calls += 1
-            grad = zero.get_gradient_for_reduction(parameter)
-            if grad is None:
-                raise RuntimeError('actual backward hook has no gradient')
-            # Inspect before ZeRO partitions/reduces/clears local contributions.
-            self.actual_gradients[self.names[id(parameter)]] = (
-                bool(torch.isfinite(grad).all()), float(grad.detach().abs().max()))
-            return original_process(parameter, group)
-        zero.process_gradients = process
-        original_average, original_allreduce = zero.average_tensor, zero.allreduce_bucket
-        self._active_ipg = None
-        def average(tensor, communication_data_type):
-            bucket = zero.ipg_buckets[communication_data_type]
-            layout = []
-            for group,index,_ in bucket.params:
-                parameter = zero.bit16_groups[group][index]
-                layout.append(dict(name=self.names[id(parameter)],shape=list(parameter.shape),
-                                   dtype=str(parameter.dtype),numel=parameter.numel()))
-            self._active_ipg = (tensor,layout)
-            try:
-                return original_average(tensor,communication_data_type)
-            finally:
-                self._active_ipg = None
-        def allreduce(bucket, communication_data_type, rank=None, log=None, divide=True, process_group=None):
-            if self._active_ipg is None:
-                raise RuntimeError('reduction lacks its actual IPG layout')
-            flat,layout = self._active_ipg
-            slices = describe_collective_slices(flat,layout,bucket)
-            self.write(dict(event='collective',rank=self.rank,micro=self.micro,sequence=self.sequence,
-                            layout=layout,slices=slices,tensor_shapes=[list(t.shape) for t in bucket],
-                            communication_dtype=str(communication_data_type),reduce_rank=rank))
-            self.sequence += 1
-            return original_allreduce(bucket,communication_data_type,rank=rank,log=log,divide=divide,process_group=process_group)
-        zero.average_tensor, zero.allreduce_bucket = average, allreduce
+        install_collective_observation(self, zero)
         self.write(dict(event='init',rank=self.rank,world_size=self.world,hostname=socket.gethostname(),
                         gas=2,microbatch=1,fixed_denominator=8,zero_stage=2,
                         reference='same production forward weighted numerator; independent summation/fixed divisor',

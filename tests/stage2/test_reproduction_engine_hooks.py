@@ -84,11 +84,12 @@ def observer_factory(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
     monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 4)
     streams=[]
-    def make(engine, name):
+    def make(engine, name, historical=False):
         engine.optimizer.unscale_and_clip_grads=lambda gradients,norm: None
         trainer=SimpleNamespace(deepspeed_runtime_profile=SimpleNamespace(zero_stage=2),
             args=SimpleNamespace(per_device_train_batch_size=1,gradient_accumulation_steps=4),
-            state=SimpleNamespace(global_step=0),model_accepts_loss_kwargs=False,compute_loss_func=None)
+            state=SimpleNamespace(global_step=0),model_accepts_loss_kwargs=False,compute_loss_func=None,
+            stage2_sampler_policy='historical_balanced_2rank' if historical else 'latent_balanced')
         observer=ReproductionObserver(trainer,engine,tmp_path/'results'/name)
         streams.append(observer.stream)
         return observer

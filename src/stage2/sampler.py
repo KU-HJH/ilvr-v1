@@ -1,6 +1,7 @@
 """Distributed Stage 2 sampling with aligned latent decoder work."""
 
 import json
+import hashlib
 import os
 import tempfile
 from dataclasses import dataclass
@@ -27,6 +28,12 @@ _STAGE2_SAMPLER_SIDECAR_FIELDS = (
     _STAGE2_SAMPLER_IDENTITY_FIELDS | {"global_step"}
 )
 _MAX_STAGE2_SAMPLER_BYTES = 16 * 1024
+HISTORICAL_BALANCED_POLICY = "historical_balanced_2rank"
+HISTORICAL_ORDERING_VERSION = "latent-block-balanced-v1-seed-plus-epoch"
+_HISTORICAL_IDENTITY_FIELDS = _STAGE2_SAMPLER_IDENTITY_FIELDS | {
+    "policy", "gradient_accumulation_steps", "update_accounting", "padding_weight",
+    "logical_group_size", "ordering_version", "ordered_dataset_sha256",
+}
 
 
 @dataclass(frozen=True)
@@ -39,6 +46,9 @@ class Stage2SamplerIdentity:
     padded_samples: int
     policy: str = "latent_balanced"
     gradient_accumulation_steps: int | None = None
+    logical_group_size: int | None = None
+    ordering_version: str | None = None
+    ordered_dataset_sha256: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = {
@@ -54,12 +64,17 @@ class Stage2SamplerIdentity:
         if self.policy == "reference_random":
             payload.update(policy=self.policy, gradient_accumulation_steps=self.gradient_accumulation_steps,
                            update_accounting="ceil", padding_weight=0)
+        if self.policy == HISTORICAL_BALANCED_POLICY:
+            payload.update(policy=self.policy, gradient_accumulation_steps=self.gradient_accumulation_steps,
+                update_accounting="ceil", padding_weight=1, logical_group_size=self.logical_group_size,
+                ordering_version=self.ordering_version, ordered_dataset_sha256=self.ordered_dataset_sha256)
         return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "Stage2SamplerIdentity":
         reference = isinstance(payload, dict) and payload.get("schema_version") == 2
-        fields = _STAGE2_SAMPLER_IDENTITY_FIELDS | (
+        historical = isinstance(payload, dict) and payload.get("schema_version") == 3
+        fields = _HISTORICAL_IDENTITY_FIELDS if historical else _STAGE2_SAMPLER_IDENTITY_FIELDS | (
             {"policy", "gradient_accumulation_steps", "update_accounting", "padding_weight"} if reference else set()
         )
         if not isinstance(payload, dict) or set(payload) != fields:
@@ -72,7 +87,7 @@ class Stage2SamplerIdentity:
         padded_samples = payload["padded_samples"]
         if (
             type(schema_version) is not int
-            or schema_version != (2 if reference else STAGE2_SAMPLER_SCHEMA_VERSION)
+            or schema_version != (3 if historical else 2 if reference else STAGE2_SAMPLER_SCHEMA_VERSION)
         ):
             raise ValueError("unsupported Stage 2 sampler identity schema")
         if type(seed) is not int:
@@ -83,6 +98,18 @@ class Stage2SamplerIdentity:
             raise ValueError("invalid Stage 2 sampler identity dataset_size")
         if type(padded_samples) is not int or padded_samples < 0:
             raise ValueError("invalid Stage 2 sampler identity padded_samples")
+        if historical:
+            digest = payload["ordered_dataset_sha256"]
+            required = {"policy": HISTORICAL_BALANCED_POLICY, "world_size": 4,
+                "logical_group_size": 2, "gradient_accumulation_steps": 4,
+                "update_accounting": "ceil", "padding_weight": 1,
+                "ordering_version": HISTORICAL_ORDERING_VERSION}
+            if (any(type(payload[key]) is not type(value) or payload[key] != value
+                    for key,value in required.items())
+                    or type(digest) is not str or len(digest) != 64
+                    or any(c not in "0123456789abcdef" for c in digest)
+                    or (dataset_size + padded_samples) % 4):
+                raise ValueError("invalid historical_balanced_2rank sampler geometry or identity")
         if reference:
             gas = payload["gradient_accumulation_steps"]
             if (payload["policy"] != "reference_random" or payload["update_accounting"] != "ceil"
@@ -114,7 +141,7 @@ class Stage2SamplerIdentity:
                 "Stage 2 sampler bucket_sizes do not match dataset_size"
             )
         expected_padding = sum(
-            (-size) % world_size for _, size in restored_buckets
+            (-size) % (2 if historical else world_size) for _, size in restored_buckets
         )
         if padded_samples != expected_padding:
             raise ValueError(
@@ -127,6 +154,9 @@ class Stage2SamplerIdentity:
             dataset_size=dataset_size,
             bucket_sizes=tuple(restored_buckets),
             padded_samples=padded_samples,
+            **(dict(policy=HISTORICAL_BALANCED_POLICY, gradient_accumulation_steps=4,
+                logical_group_size=2, ordering_version=HISTORICAL_ORDERING_VERSION,
+                ordered_dataset_sha256=payload["ordered_dataset_sha256"]) if historical else {}),
         )
 
 
@@ -216,6 +246,42 @@ class LatentBlockBalancedSampler(Sampler[int]):
         if type(epoch) is not int or epoch < 0:
             raise ValueError("epoch must be non-negative")
         self.epoch = epoch
+
+
+class HistoricalBalanced2RankSampler(Sampler[int]):
+    """Replay logical pairs unchanged through four actual Accelerate shards.
+
+    Padding is the balanced iterator's ordinary repeated real presentation; it
+    is never a zero slot. Logical width only controls ordering, not loss scaling.
+    """
+    def __init__(self, dataset, *, num_replicas, seed, gradient_accumulation_steps):
+        if (type(num_replicas) is not int or num_replicas != 4
+                or type(gradient_accumulation_steps) is not int or gradient_accumulation_steps != 4):
+            raise ValueError("historical_balanced_2rank requires actual world4/GAS4")
+        self.logical_sampler = LatentBlockBalancedSampler(dataset, num_replicas=2, seed=seed)
+        if len(self.logical_sampler) % 4:
+            raise ValueError("historical logical stream must be divisible by four; no extra padding allowed")
+        pairs = []
+        for index in range(len(dataset)):
+            item = dataset[index]
+            sample_id = getattr(item, "sample_id", None)
+            if type(sample_id) is not str or not sample_id:
+                raise ValueError("historical sampler requires nonempty sample_id")
+            pairs.append((sample_id, item.latent_block_count))
+        self.dataset, self.num_replicas, self.seed = dataset, num_replicas, seed
+        logical = self.logical_sampler.identity
+        digest = hashlib.sha256(json.dumps(pairs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+        self.identity = Stage2SamplerIdentity(3, seed, 4, len(dataset), logical.bucket_sizes,
+            logical.padded_samples, HISTORICAL_BALANCED_POLICY, 4, 2, HISTORICAL_ORDERING_VERSION, digest)
+
+    def __len__(self):
+        return len(self.logical_sampler)
+
+    def __iter__(self):
+        return iter(self.logical_sampler)
+
+    def set_epoch(self, epoch):
+        self.logical_sampler.set_epoch(epoch)
 
 
 
@@ -386,6 +452,10 @@ def validate_stage2_sampler_resume_identity(
         "dataset_size",
         "bucket_sizes",
         "padded_samples",
+        "schema_version",
+        "logical_group_size",
+        "ordering_version",
+        "ordered_dataset_sha256",
     ):
         checkpoint_value = getattr(actual, field)
         current_value = getattr(expected, field)
@@ -398,7 +468,7 @@ def validate_stage2_sampler_resume_identity(
 
 def select_stage2_sampler_policy(requested, *, profile, config, resume):
     """Resolve fresh V-off reproduction versus immutable saved sampling semantics."""
-    if requested not in ("auto", "latent_balanced", "reference_random"):
+    if requested not in ("auto", "latent_balanced", "reference_random", HISTORICAL_BALANCED_POLICY):
         raise ValueError("unknown Stage 2 sampler policy")
     if resume is not None and profile.world_size > 1:
         saved = read_stage2_sampler_sidecar(Path(resume)).policy

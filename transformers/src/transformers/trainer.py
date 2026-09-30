@@ -2515,7 +2515,7 @@ class Trainer:
                 for i, inputs in enumerate(batch_samples):
                     step += 1
                     boundary_step = step + 1
-                    if getattr(self, "stage2_sampler_policy", None) == "reference_random":
+                    if getattr(self, "stage2_sampler_policy", None) in ("reference_random", "historical_balanced_2rank"):
                         # Resume restarts `step` after skipped batches. Keep the
                         # final partial update at its absolute epoch boundary.
                         boundary_step += steps_skipped

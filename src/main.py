@@ -1141,7 +1141,7 @@ def run_stage2(args):
     sampler_policy = select_stage2_sampler_policy(
         getattr(args, "stage2_sampler_policy", "auto"), profile=profile,
         config=components.step_preference_config, resume=components.trainer_resume_path)
-    if sampler_policy == "reference_random":
+    if sampler_policy in ("reference_random", "historical_balanced_2rank"):
         trainer_kwargs["stage2_sampler_policy"] = sampler_policy
     if getattr(args, "stage2_reference_sampler_probe_dir", ""):
         trainer_kwargs["stage2_reference_sampler_probe_dir"] = args.stage2_reference_sampler_probe_dir

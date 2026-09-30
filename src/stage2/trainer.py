@@ -26,6 +26,8 @@ from stage1.trainer import collect_deepspeed_pre_step_norm
 from .checkpointing import save_stage2_peft_metadata
 from .sampler import (
     LatentBlockBalancedSampler,
+    HistoricalBalanced2RankSampler,
+    HISTORICAL_BALANCED_POLICY,
     ReferenceRandomDataset,
     ReferenceRandomSampler,
     Stage2SamplerIdentity,
@@ -282,7 +284,7 @@ class Stage2Trainer(Trainer):
             )
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
             raise TypeError("Stage 2 trainer requires a DeepSpeed runtime profile")
-        if stage2_sampler_policy not in ("latent_balanced", "reference_random"):
+        if stage2_sampler_policy not in ("latent_balanced", "reference_random", HISTORICAL_BALANCED_POLICY):
             raise ValueError("unknown Stage 2 sampler policy")
         if stage2_reproduction_probe_dir and stage2_reference_sampler_probe_dir:
             raise ValueError("select only one Stage 2 reproduction observer")
@@ -302,6 +304,21 @@ class Stage2Trainer(Trainer):
         if not isinstance(step_preference_config, StepPreferenceConfig):
             raise TypeError("step_preference_config must be a StepPreferenceConfig")
         self.step_preference_config = step_preference_config
+        if stage2_sampler_policy == HISTORICAL_BALANCED_POLICY:
+            config, profile = step_preference_config, deepspeed_runtime_profile
+            training_args = kwargs.get("args") if "args" in kwargs else args[1]
+            if not (profile.enabled and profile.zero_stage == 2 and profile.world_size == 4
+                    and config.enabled and config.is_context_preference
+                    and config.visual_only_context_preference and config.prefix_mode == "clean_prefix"
+                    and config.preference_loss_type in ("dil_bce_rf", "dil_bce_rf_topk")
+                    and training_args.gradient_accumulation_steps == 4
+                    and training_args.per_device_train_batch_size == 1
+                    and not training_args.dataloader_drop_last):
+                raise ValueError("historical_balanced_2rank requires V-only clean-prefix DIL, four-rank ZeRO2 micro1/GAS4/drop_last=False")
+            if kwargs.get("compute_loss_func") is not None:
+                raise ValueError("historical_balanced_2rank requires the fixed Trainer accumulation denominator")
+            if kwargs.get("train_dataset") is None:
+                raise ValueError("historical_balanced_2rank requires an explicit train_dataset")
         if stage2_sampler_policy == "reference_random":
             config = step_preference_config
             profile = deepspeed_runtime_profile
@@ -348,9 +365,9 @@ class Stage2Trainer(Trainer):
             callbacks.append(PlannedCheckpointStop(stage2_stop_after_checkpoint))
         kwargs["callbacks"] = callbacks
         super().__init__(*args, **kwargs)
-        if stage2_sampler_policy == "reference_random":
+        if stage2_sampler_policy in ("reference_random", HISTORICAL_BALANCED_POLICY):
             if self.args.world_size != 4:
-                raise ValueError("reference_random requires four actual ranks")
+                raise ValueError(f"{stage2_sampler_policy} requires four actual ranks")
             if self.args.per_device_train_batch_size != 1 or self.args.dataloader_drop_last:
                 raise ValueError("reference_random requires microbatch 1 and drop_last=False")
             self.accelerator.even_batches = False
@@ -360,7 +377,7 @@ class Stage2Trainer(Trainer):
 
     def set_initial_training_values(self, args, dataloader, total_train_batch_size):
         values = list(super().set_initial_training_values(args, dataloader, total_train_batch_size))
-        if getattr(self, "stage2_sampler_policy", "latent_balanced") != "reference_random":
+        if getattr(self, "stage2_sampler_policy", "latent_balanced") not in ("reference_random", HISTORICAL_BALANCED_POLICY):
             return tuple(values)
         length = values[5]
         if length is None or length < 1:
@@ -470,25 +487,26 @@ class Stage2Trainer(Trainer):
             self._stage2_train_sampler = None
             return None
         reference = getattr(self, "stage2_sampler_policy", "latent_balanced") == "reference_random"
-        if reference and self.args.world_size != 4:
-            raise ValueError("reference_random requires four actual ranks")
+        historical = getattr(self, "stage2_sampler_policy", "latent_balanced") == HISTORICAL_BALANCED_POLICY
+        if (reference or historical) and self.args.world_size != 4:
+            raise ValueError("explicit Stage 2 sampler requires four actual ranks")
         seed = (getattr(self.args, "data_seed", None) if reference else None)
         seed = self.args.seed if seed is None else seed
-        sampler_type = ReferenceRandomSampler if reference else LatentBlockBalancedSampler
+        sampler_type = HistoricalBalanced2RankSampler if historical else ReferenceRandomSampler if reference else LatentBlockBalancedSampler
         sampler = getattr(self, "_stage2_train_sampler", None)
         if (
             not isinstance(sampler, sampler_type)
             or sampler.dataset is not self.train_dataset
             or sampler.num_replicas != self.args.world_size
             or sampler.seed != seed
-            or (reference and sampler.identity.gradient_accumulation_steps != self.args.gradient_accumulation_steps)
+            or ((reference or historical) and sampler.identity.gradient_accumulation_steps != self.args.gradient_accumulation_steps)
             or sampler.identity.dataset_size != len(self.train_dataset)
         ):
             sampler = sampler_type(
                 self.train_dataset,
                 num_replicas=self.args.world_size,
                 seed=seed,
-                **({"gradient_accumulation_steps": self.args.gradient_accumulation_steps} if reference else {}),
+                **({"gradient_accumulation_steps": self.args.gradient_accumulation_steps} if reference or historical else {}),
             )
             self._stage2_train_sampler = sampler
         self.stage2_sampler_identity = sampler.identity
@@ -582,6 +600,10 @@ class Stage2Trainer(Trainer):
             validate_deepspeed_resume_identity(
                 Path(resume_from_checkpoint), self.deepspeed_runtime_profile
             )
+            if self.stage2_sampler_policy == HISTORICAL_BALANCED_POLICY:
+                # A prepared dataset can be reordered in place after a prior
+                # sampler read. Recompute its ordered identity before state load.
+                self._stage2_train_sampler = None
             sampler_identity = self._ensure_stage2_sampler_identity()
             if sampler_identity is not None:
                 validate_stage2_sampler_resume_identity(
