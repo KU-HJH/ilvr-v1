@@ -261,7 +261,7 @@ class RealControllerCapModel(ModelWhoseGenerateRaises):
 def _import_entry_point(module_name, monkeypatch):
     module = importlib.import_module(module_name)
     monkeypatch.setattr(module.torch.cuda, "is_available", lambda: False)
-    if module_name == "eval":
+    if hasattr(module, "load_qwen2_5_vl_with_attention"):
         monkeypatch.setattr(
             module,
             "load_qwen2_5_vl_with_attention",
@@ -931,12 +931,12 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
         "from_pretrained",
         load_model,
     )
-    if module_name == "eval":
-        monkeypatch.setattr(
-            module,
-            "validate_qwen2_5_vl_attention_backends",
-            lambda selected, **kwargs: validations.append((selected, kwargs)),
-        )
+    monkeypatch.setattr(
+        module,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda selected, **kwargs: validations.append((selected, kwargs)),
+        raising=False,
+    )
 
     model, loaded_processor = module.load_evaluation_artifacts(
         model_dir=str(artifact_dir),
@@ -949,37 +949,51 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
     assert processor_sources == [str(artifact_dir)]
     assert model_sources == [str(base_dir)]
     assert resolve_stage2_qwen_model(model).config.stage == "stage2"
-    if module_name == "eval":
-        assert validations[-1] == (
+    assert validations == [
+        (
             resolve_stage2_qwen_model(model),
             {
                 "attention_implementation": "sdpa",
                 "vision_attention_implementation": "flash_attention_2",
             },
         )
+    ] * 2
 
 
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
 def test_eval_load_model_requires_fixed_mixed_backend_and_validates_runtime(
-    monkeypatch,
+    module_name, monkeypatch,
 ):
     """Catches evaluation flattening both towers onto one attention backend."""
-    module = _import_entry_point("eval", monkeypatch)
+    module = _import_entry_point(module_name, monkeypatch)
     model = tiny_stage2_qwen()
     loads = []
+    direct_loads = []
     validations = []
 
     def load_mixed(source, **kwargs):
         loads.append((source, kwargs))
         return model
 
-    monkeypatch.setattr(module, "load_qwen2_5_vl_with_attention", load_mixed)
+    monkeypatch.setattr(
+        module, "load_qwen2_5_vl_with_attention", load_mixed, raising=False
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **kwargs: direct_loads.append((source, kwargs)) or model,
+    )
     monkeypatch.setattr(
         module,
         "validate_qwen2_5_vl_attention_backends",
         lambda selected, **kwargs: validations.append((selected, kwargs)),
+        raising=False,
     )
 
     assert module.load_model("model", "cache") is model
+    assert model.training is False
+    assert torch.backends.cuda.matmul.allow_tf32 is True
+    assert direct_loads == [], "loader bypassed the authenticated mixed backend"
     assert loads[0][0] == "model"
     assert loads[0][1]["attention_implementation"] == "sdpa"
     assert loads[0][1]["vision_attention_implementation"] == "flash_attention_2"
@@ -1001,6 +1015,7 @@ def test_eval_load_model_requires_fixed_mixed_backend_and_validates_runtime(
     ]
 
 
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
 @pytest.mark.parametrize(
     "failure",
     [
@@ -1010,10 +1025,10 @@ def test_eval_load_model_requires_fixed_mixed_backend_and_validates_runtime(
     ids=("initialization", "class-resolution"),
 )
 def test_eval_mixed_backend_failure_propagates_without_eager_retry(
-    monkeypatch, failure
+    module_name, monkeypatch, failure
 ):
     """Catches evaluation retrying an unauthenticated eager model after mixed failure."""
-    module = _import_entry_point("eval", monkeypatch)
+    module = _import_entry_point(module_name, monkeypatch)
     calls = []
 
     def fail_mixed(source, **kwargs):
@@ -1026,13 +1041,144 @@ def test_eval_mixed_backend_failure_propagates_without_eager_retry(
         )
         raise failure
 
-    monkeypatch.setattr(module, "load_qwen2_5_vl_with_attention", fail_mixed)
+    monkeypatch.setattr(
+        module, "load_qwen2_5_vl_with_attention", fail_mixed, raising=False
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
 
     with pytest.raises(type(failure), match=str(failure)) as raised:
         module.load_model("model", "cache")
 
     assert raised.value is failure
     assert calls == [("model", "sdpa", "flash_attention_2")]
+
+
+def _use_cpu_mixed_loader(module, monkeypatch):
+    """Keep construction/validation real; bypass only CUDA availability and disk weights."""
+    from stage2.attention_backend import (
+        load_qwen2_5_vl_with_attention,
+        validate_qwen2_5_vl_attention_backends,
+    )
+    from transformers import AutoConfig
+
+    def construct(source, **kwargs):
+        config = kwargs.get("config")
+        if config is None:
+            config = AutoConfig.from_pretrained(source)
+            config._attn_implementation = "sdpa"
+            config._attn_implementation_autoset = True
+            config.vision_config._attn_implementation = "flash_attention_2"
+            config.vision_config._attn_implementation_autoset = True
+        return module.Qwen2_5_VLForConditionalGeneration(config)
+
+    monkeypatch.setattr(
+        module, "load_qwen2_5_vl_with_attention", load_qwen2_5_vl_with_attention,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module, "validate_qwen2_5_vl_attention_backends",
+        validate_qwen2_5_vl_attention_backends, raising=False,
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "_check_and_enable_flash_attn_2",
+        lambda config, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        construct,
+    )
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("tower", ["vision", "language"])
+def test_full_eval_rejects_runtime_backend_mismatch_with_correct_config(
+    module_name, tower, monkeypatch, tmp_path
+):
+    """Config strings cannot authenticate a wrong actual attention module."""
+    module = _import_entry_point(module_name, monkeypatch)
+    _use_cpu_mixed_loader(module, monkeypatch)
+    full_dir = tmp_path / "full"
+    _save_exact_base_source(tiny_stage2_qwen(), full_dir)
+    construct = module.Qwen2_5_VLForConditionalGeneration.from_pretrained
+
+    def load_wrong_runtime(source, **kwargs):
+        model = construct(source, **kwargs)
+        # Even the legacy loader receives correct strings in this negative control.
+        model.config._attn_implementation = "sdpa"
+        model.config.vision_config._attn_implementation = "flash_attention_2"
+        if tower == "vision":
+            model.visual.blocks[-1].attn = nn.Identity()
+        else:
+            model.model.layers[-1].self_attn = nn.Identity()
+        return model
+
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration, "from_pretrained", load_wrong_runtime
+    )
+    monkeypatch.setattr(
+        module.AutoProcessor, "from_pretrained", lambda *_a, **_k: FakeProcessor()
+    )
+
+    with pytest.raises(ValueError, match=f"{tower} attention backend mismatch"):
+        module.load_evaluation_artifacts(
+            model_dir=str(full_dir), base_model_dir=None, cache_dir="cache"
+        )
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize(
+    "tower", [None, "vision", "language"],
+    ids=["valid", "wrong-vision", "wrong-language"],
+)
+def test_peft_eval_authenticates_resolved_backend_after_real_restore(
+    module_name, tower, monkeypatch, tmp_path
+):
+    """Omitting validation after real PEFT restoration must accept a wrong backend."""
+    module = _import_entry_point(module_name, monkeypatch)
+    _use_cpu_mixed_loader(module, monkeypatch)
+    artifact_dir, fresh_base = _saved_adapter_artifact(tmp_path)
+    base_dir = tmp_path / "stage1"
+    _save_exact_base_source(fresh_base, base_dir)
+    processor = FakeProcessor()
+    monkeypatch.setattr(
+        module.AutoProcessor, "from_pretrained", lambda *_a, **_k: processor
+    )
+    restore = module.load_stage2_model_for_inference
+    restored_models = []
+
+    def restore_then_mutate(*args, **kwargs):
+        model = restore(*args, **kwargs)
+        assert isinstance(model, PeftModel)
+        restored_models.append(model)
+        resolved = resolve_stage2_qwen_model(model)
+        assert resolved.config._attn_implementation == "sdpa"
+        assert resolved.config.vision_config._attn_implementation == "flash_attention_2"
+        if tower == "vision":
+            resolved.visual.blocks[-1].attn = nn.Identity()
+        elif tower == "language":
+            resolved.model.layers[-1].self_attn = nn.Identity()
+        return model
+
+    monkeypatch.setattr(module, "load_stage2_model_for_inference", restore_then_mutate)
+    if tower is None:
+        model, loaded_processor = module.load_evaluation_artifacts(
+            model_dir=str(artifact_dir), base_model_dir=str(base_dir), cache_dir="cache"
+        )
+        assert model is restored_models[0]
+        assert loaded_processor is processor
+        assert not model.training
+    else:
+        with pytest.raises(ValueError, match=f"{tower} attention backend mismatch"):
+            module.load_evaluation_artifacts(
+                model_dir=str(artifact_dir), base_model_dir=str(base_dir), cache_dir="cache"
+            )
+    assert len(restored_models) == 1
 
 
 def test_stage1_eval_loads_validated_stage1_dora_adapter(monkeypatch, tmp_path):
@@ -1457,7 +1603,7 @@ def test_peft_eval_requires_base_before_loading_or_iterating(
         )
 
 
-@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
 @pytest.mark.parametrize(
     "error_type,error_message",
     [
@@ -1509,7 +1655,7 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
     original_error = error_type(error_message)
 
     def fail_load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
+        calls.append(_source)
         raise original_error
 
     monkeypatch.setattr(
@@ -1521,10 +1667,10 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
     with pytest.raises(error_type, match=error_message) as raised:
         module.load_model("model", "cache")
     assert raised.value is original_error
-    assert calls == ["flash_attention_2"]
+    assert calls == ["model"]
 
 
-@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
 @pytest.mark.parametrize("nested", [False, True], ids=("direct", "nested"))
 @pytest.mark.parametrize(
     "error_message",
@@ -1537,7 +1683,7 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
 def test_near_flash_attn_module_name_does_not_retry_eager(
     module_name, nested, error_message, monkeypatch
 ):
-    """Substring package-name matching must fail this actual-loader test."""
+    """Near-package errors remain visible without an evaluator retry."""
     module = _import_entry_point(module_name, monkeypatch)
     calls = []
     near_name_error = ImportError(error_message)
@@ -1548,7 +1694,7 @@ def test_near_flash_attn_module_name_does_not_retry_eager(
         original_error = near_name_error
 
     def fail_load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
+        calls.append(_source)
         raise original_error
 
     monkeypatch.setattr(
@@ -1560,21 +1706,21 @@ def test_near_flash_attn_module_name_does_not_retry_eager(
     with pytest.raises(type(original_error)) as raised:
         module.load_model("model", "cache")
     assert raised.value is original_error
-    assert calls == ["flash_attention_2"]
+    assert calls == ["model"]
 
 
-@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
 def test_nested_non_backend_error_does_not_combine_classifier_signals(
     module_name, monkeypatch
 ):
-    """Combining classifier signals across exceptions must fail this test."""
+    """Nested configuration errors remain visible without an evaluator retry."""
     module = _import_entry_point(module_name, monkeypatch)
     calls = []
     original_error = RuntimeError("FlashAttention adapter load failed")
     original_error.__cause__ = ValueError("adapter dtype config mismatch")
 
     def fail_load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
+        calls.append(_source)
         raise original_error
 
     monkeypatch.setattr(
@@ -1586,20 +1732,19 @@ def test_nested_non_backend_error_does_not_combine_classifier_signals(
     with pytest.raises(RuntimeError, match="adapter load failed") as raised:
         module.load_model("model", "cache")
     assert raised.value is original_error
-    assert calls == ["flash_attention_2"]
+    assert calls == ["model"]
 
 
-@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
 @pytest.mark.parametrize("nesting", ["direct", "cause", "context"])
 @pytest.mark.parametrize(
     "failure", ["unsupported-model", "missing-package"]
 )
-def test_real_transformers_flash_attention_error_retries_eager(
+def test_real_transformers_flash_attention_error_propagates_without_retry(
     module_name, nesting, failure, monkeypatch
 ):
-    """Ignoring the real Transformers traceback provenance must fail this test."""
+    """Even an authentic FA2 initialization failure must remain visible."""
     module = _import_entry_point(module_name, monkeypatch)
-    model = tiny_stage2_qwen()
     calls = []
     backend_error = _capture_transformers_flash_attention_error(
         module.Qwen2_5_VLForConditionalGeneration, monkeypatch, failure
@@ -1614,10 +1759,8 @@ def test_real_transformers_flash_attention_error_retries_eager(
         original_error = backend_error
 
     def load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
-        if kwargs["attn_implementation"] == "flash_attention_2":
-            raise original_error
-        return model
+        calls.append(_source)
+        raise original_error
 
     monkeypatch.setattr(
         module.Qwen2_5_VLForConditionalGeneration,
@@ -1625,11 +1768,13 @@ def test_real_transformers_flash_attention_error_retries_eager(
         load,
     )
 
-    assert module.load_model("model", "cache") is model
-    assert calls == ["flash_attention_2", "eager"]
+    with pytest.raises(type(original_error)) as raised:
+        module.load_model("model", "cache")
+    assert raised.value is original_error
+    assert calls == ["model"]
 
 
-@pytest.mark.parametrize("module_name", ("evaluate_deepseed",))
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
 @pytest.mark.parametrize("nesting", ["direct", "cause", "context"])
 @pytest.mark.parametrize(
     "failure", ["unsupported-model", "missing-package"]
@@ -1637,7 +1782,7 @@ def test_real_transformers_flash_attention_error_retries_eager(
 def test_identical_flash_attention_text_without_transformers_provenance_does_not_retry(
     module_name, nesting, failure, monkeypatch
 ):
-    """Restoring message-based classification must fail this test."""
+    """Fabricated backend errors remain visible without an evaluator retry."""
     module = _import_entry_point(module_name, monkeypatch)
     calls = []
     backend_error = _capture_transformers_flash_attention_error(
@@ -1654,7 +1799,7 @@ def test_identical_flash_attention_text_without_transformers_provenance_does_not
         original_error = fabricated_error
 
     def fail_load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
+        calls.append(_source)
         raise original_error
 
     monkeypatch.setattr(
@@ -1666,7 +1811,7 @@ def test_identical_flash_attention_text_without_transformers_provenance_does_not
     with pytest.raises(type(original_error)) as raised:
         module.load_model("model", "cache")
     assert raised.value is original_error
-    assert calls == ["flash_attention_2"]
+    assert calls == ["model"]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

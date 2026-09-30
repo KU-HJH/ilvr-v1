@@ -10,14 +10,17 @@ from typing import List, Dict, Any, Union
 
 import torch
 from PIL import Image
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoConfig, AutoProcessor
 
 from stage2.checkpointing import (
     Stage2ArtifactKind,
     inspect_stage2_artifact,
     resolve_latent_token_ids,
 )
-from stage2.backend_fallback import is_flash_attention_initialization_error
+from stage2.attention_backend import (
+    load_qwen2_5_vl_with_attention,
+    validate_qwen2_5_vl_attention_backends,
+)
 from stage2.inference import (
     Stage2InferenceController,
     build_stage2_generation_config,
@@ -92,26 +95,25 @@ def load_processor(model_dir: str, cache_dir: str):
         return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
 
 def load_model(model_dir: str, cache_dir: str):
-
-    try:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_dir,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
-            attn_implementation="flash_attention_2"
-        )
-    except Exception as e:
-        if not is_flash_attention_initialization_error(e):
-            raise
-        logging.warning(f"flash_attention_2 initialization failed ({e}), falling back to eager.")
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_dir,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
-            attn_implementation="eager"
-        )
+    """Load the fixed authenticated SDPA-language/FlashAttention2-vision pair."""
+    model = load_qwen2_5_vl_with_attention(
+        model_dir,
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
+        config_load_kwargs={"cache_dir": cache_dir},
+        model_load_kwargs={
+            "device_map": "auto",
+            "torch_dtype": torch.bfloat16,
+            "cache_dir": cache_dir,
+        },
+        load_config=AutoConfig.from_pretrained,
+        load_model=Qwen2_5_VLForConditionalGeneration.from_pretrained,
+    )
+    validate_qwen2_5_vl_attention_backends(
+        model,
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
+    )
     model.eval()
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -142,6 +144,11 @@ def load_evaluation_artifacts(
             source, selectors["cache_dir"]
         ),
         artifact_inspection=artifact_inspection,
+    )
+    validate_qwen2_5_vl_attention_backends(
+        resolve_stage2_qwen_model(model),
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
     )
     return model, processor
 
