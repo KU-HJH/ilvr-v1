@@ -537,7 +537,7 @@ def validate_rank_record(record, run_id, manifest_sha256, variant):
                 or [len(group) for group in rows] != prescribed["branch_target_counts"]):
             raise ValueError("missing actual case/batch/logical-row/repeated differentiation witness")
         for step, group in enumerate(rows):
-            if any(not isinstance(row, list) or len(row) != 4 or row[0] != case["sample_id"]
+            if any(not isinstance(row, (list, tuple)) or len(row) != 4 or row[0] != case["sample_id"]
                    or row[1] != step or any(type(value) is not int or value < 0 for value in row[1:]) for row in group):
                 raise ValueError("invalid logical target row identity")
         tensors = case.get("batch_tensors", {})

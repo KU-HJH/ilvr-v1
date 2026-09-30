@@ -411,3 +411,25 @@ def test_complete_comparison_accepts_tolerated_repeat_metric_drift(tmp_path):
     assert result["pass"] and result["ranks_covered"] == [2] and not result["global_coverage_complete"]
     repeat = result["cases"][0]["comparisons"][1]["left_repeat"]["objective"]
     assert repeat["max_abs_error"] == pytest.approx(5e-6) and repeat["relative_l2"] > 0
+
+
+@pytest.mark.parametrize("json_roundtrip", [False, True])
+def test_native_logical_rows_validate_before_publication_and_after_json(json_roundtrip):
+    import json
+    p = probe()
+    record = full_rank_record(2)
+    case = record["cases"][0]
+    case["logical_rows"] = p.logical_rows({
+        "sample_ids": [case["sample_id"]], "input_ids": torch.full((1, 31), 7),
+        "reasoning_step_spans": [SimpleNamespace(step_id=0, target_text_start=1, target_text_end=31)],
+    })
+    assert isinstance(case["logical_rows"][0][0], tuple)
+    if json_roundtrip:
+        record = json.loads(p.json_bytes(record))
+        assert isinstance(record["cases"][0]["logical_rows"][0][0], list)
+    assert set(p.validate_rank_record(record, "probe-contract", "a"*64, "portTorch")) == {"weight", "unused"}
+    # Native tuple acceptance must retain the same sample-identity checks.
+    rows = record["cases"][0]["logical_rows"][0]
+    rows[0] = ("wrong-sample", *rows[0][1:])
+    with pytest.raises(ValueError, match="invalid logical target row identity"):
+        p.validate_rank_record(record, "probe-contract", "a"*64, "portTorch")
