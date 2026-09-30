@@ -604,10 +604,10 @@ def _decode_stage2_adapter_config(payload: bytes) -> PeftConfig:
 def _decode_stage2_inference_witness(witness):
     from .checkpointing import (
         Stage2PeftMetadataSnapshot,
-        decode_stage2_peft_metadata_snapshot,
+        decode_stage2_inference_metadata_snapshot,
     )
 
-    metadata = decode_stage2_peft_metadata_snapshot(
+    metadata = decode_stage2_inference_metadata_snapshot(
         Stage2PeftMetadataSnapshot(
             artifact_dir=witness.artifact_dir,
             metadata_json=witness.metadata_json,
@@ -639,7 +639,7 @@ def _preflight_stage2_inference_artifact(
         Stage2ArtifactInspection,
         Stage2ArtifactKind,
         configure_stage2_metadata,
-        decode_stage2_peft_metadata_snapshot,
+        decode_stage2_inference_metadata_snapshot,
         inspect_stage2_artifact,
         resolve_latent_token_ids,
         validate_stage2_adapter_tensor_contract,
@@ -649,7 +649,7 @@ def _preflight_stage2_inference_artifact(
     )
 
     if artifact_inspection is None:
-        inspection = inspect_stage2_artifact(stage2_artifact_path)
+        inspection = inspect_stage2_artifact(stage2_artifact_path, for_inference=True)
     else:
         if type(artifact_inspection) is not Stage2ArtifactInspection:
             raise TypeError(
@@ -664,7 +664,7 @@ def _preflight_stage2_inference_artifact(
     requested_artifact = Path(stage2_artifact_path).resolve(strict=False)
     if requested_artifact != metadata_snapshot.artifact_dir:
         raise ValueError("Stage 2 artifact inspection path witness mismatch")
-    metadata = decode_stage2_peft_metadata_snapshot(metadata_snapshot)
+    metadata = decode_stage2_inference_metadata_snapshot(metadata_snapshot)
     if metadata.peft_version != peft.__version__:
         raise ValueError(
             "Stage 2 PEFT version mismatch: "

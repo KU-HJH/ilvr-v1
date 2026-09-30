@@ -222,7 +222,7 @@ def load_evaluation_artifacts(
         model.eval()
         return model, processor
 
-    artifact_inspection = inspect_stage2_artifact(model_dir)
+    artifact_inspection = inspect_stage2_artifact(model_dir, for_inference=True)
     if artifact_inspection.artifact_kind is Stage2ArtifactKind.FULL:
         if base_model_dir is not None:
             raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")

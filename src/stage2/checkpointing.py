@@ -115,13 +115,17 @@ def _read_stage2_regular_payload(path: Path, *, label: str) -> bytes:
         raise ValueError(f"invalid {label} payload file: {path}") from error
 
 
-def inspect_stage2_artifact(directory: str | Path) -> Stage2ArtifactInspection:
+def inspect_stage2_artifact(
+    directory: str | Path, *, for_inference: bool = False
+) -> Stage2ArtifactInspection:
     """Classify once while retaining exact metadata and sparse payload bytes.
 
     Non-local references are left to ``from_pretrained`` and classified as full
     because their remote files cannot be inspected here. Local full artifacts
     follow Task 9's standalone/indexed-family contract; this repository's PEFT
     publication contract remains the unsharded safetensors marker set above.
+    Historical schema7 requires explicit inference opt-in; ordinary inspection
+    and training consumers retain the strict current-schema contract.
     """
     candidate = Path(directory)
     if not candidate.exists():
@@ -183,7 +187,12 @@ def inspect_stage2_artifact(directory: str | Path) -> Stage2ArtifactInspection:
                 f"{invalid_files}"
             )
         metadata_snapshot = read_stage2_peft_metadata_snapshot(path)
-        metadata = decode_stage2_peft_metadata_snapshot(metadata_snapshot)
+        decode_metadata = (
+            decode_stage2_inference_metadata_snapshot
+            if for_inference
+            else decode_stage2_peft_metadata_snapshot
+        )
+        metadata = decode_metadata(metadata_snapshot)
         adapter_config_json = _read_stage2_regular_payload(
             path / "adapter_config.json", label="Stage 2 adapter config"
         )
@@ -711,6 +720,50 @@ def decode_stage2_peft_metadata_snapshot(
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid Stage 2 PEFT metadata bytes") from error
     return Stage2PeftMetadata.from_dict(payload)
+
+
+def decode_stage2_inference_metadata_snapshot(
+    snapshot: Stage2PeftMetadataSnapshot,
+) -> Stage2PeftMetadata:
+    """Decode native metadata or the audited historical schema7 for inference.
+
+    This is a structural view, not a migration or a serializable training
+    identity. Keep the source schema7 and the immutable snapshot unchanged;
+    every execution extension must match the audited no-cache profile.
+    """
+    if not isinstance(snapshot, Stage2PeftMetadataSnapshot):
+        raise TypeError("snapshot must be a Stage2PeftMetadataSnapshot")
+    try:
+        payload = json.loads(snapshot.metadata_json.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid Stage 2 PEFT metadata bytes") from error
+    if not isinstance(payload, Mapping) or type(payload.get("schema_version")) is not int:
+        return Stage2PeftMetadata.from_dict(payload)
+    if payload["schema_version"] != 7:
+        return Stage2PeftMetadata.from_dict(payload)
+
+    historical_extensions = {
+        "rollout_backend": "no_cache",
+        "prefix_dropout_semantics": "resample_per_prefix",
+        "stage2_cache_activation_checkpointing": False,
+        "execution_backend": "shared_prefix_3pass",
+    }
+    expected_fields = _V4_STAGE2_PEFT_FIELDS | historical_extensions.keys()
+    actual_fields = set(payload)
+    if actual_fields != expected_fields:
+        raise ValueError(
+            "invalid historical schema7 inference metadata fields: "
+            f"missing={sorted(expected_fields - actual_fields)}, "
+            f"unknown={sorted(actual_fields - expected_fields)}"
+        )
+    for name, expected in historical_extensions.items():
+        if type(payload[name]) is not type(expected) or payload[name] != expected:
+            raise ValueError(
+                f"unsupported historical schema7 inference {name}: "
+                f"expected={expected!r}, actual={payload[name]!r}"
+            )
+    shared = {name: payload[name] for name in _V4_STAGE2_PEFT_FIELDS}
+    return replace(_parse_stage2_metadata_v4(shared), schema_version=7)
 
 
 def load_stage2_peft_metadata(directory: str | Path) -> Stage2PeftMetadata:

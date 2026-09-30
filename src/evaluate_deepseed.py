@@ -124,7 +124,7 @@ def load_evaluation_artifacts(
     *, model_dir: str, base_model_dir: str | None, cache_dir: str
 ):
     """Load either one full Stage 2 artifact or a Stage 1 base plus adapter."""
-    artifact_inspection = inspect_stage2_artifact(model_dir)
+    artifact_inspection = inspect_stage2_artifact(model_dir, for_inference=True)
     if artifact_inspection.artifact_kind is Stage2ArtifactKind.FULL:
         if base_model_dir is not None:
             raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
