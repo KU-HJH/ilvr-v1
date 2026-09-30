@@ -225,12 +225,13 @@ def state_record(model):
 
 def snapshot(value):
     import torch
+    from collections.abc import Mapping
     from dataclasses import fields, is_dataclass
     if isinstance(value, torch.Tensor):
         return tensor_record(value)
     if is_dataclass(value):
         return {field.name: snapshot(getattr(value, field.name)) for field in fields(value)}
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): snapshot(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [snapshot(item) for item in value]

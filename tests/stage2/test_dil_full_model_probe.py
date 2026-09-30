@@ -433,3 +433,38 @@ def test_native_logical_rows_validate_before_publication_and_after_json(json_rou
     rows[0] = ("wrong-sample", *rows[0][1:])
     with pytest.raises(ValueError, match="invalid logical target row identity"):
         p.validate_rank_record(record, "probe-contract", "a"*64, "portTorch")
+
+
+def test_snapshot_observes_native_batchfeature_without_mutation():
+    from dataclasses import asdict
+    from collections.abc import Mapping
+    from transformers.feature_extraction_utils import BatchFeature
+    from step_preference.spans import ReasoningStepSpan
+    p = probe()
+    span = ReasoningStepSpan(0, 0, 1, 1, 3, 3, 5, None)
+    ids = torch.tensor([[1, 2, 3, 7, 7]])
+    pixels = torch.tensor([[.25, .5]], requires_grad=True)
+    spans = [[span]]
+    batch = BatchFeature({"input_ids": ids, "pixel_values": pixels,
+                          "sample_ids": [p.CASES[0]["sample_id"]], "reasoning_step_spans": spans,
+                          "nested": {"target_rows": ((p.CASES[0]["sample_id"], 0, 2, 7),)}})
+    assert isinstance(batch, Mapping) and not isinstance(batch, dict)
+    original_data = batch.data
+    original_ids, original_pixels = ids.clone(), pixels.detach().clone()
+    rng = torch.get_rng_state().clone()
+    expected = p.snapshot(batch.data)
+    actual = p.snapshot(batch)
+    assert actual == expected
+    assert actual["reasoning_step_spans"] == [[asdict(span)]]
+    assert actual["input_ids"] == p.tensor_record(ids)
+    assert actual["pixel_values"] == p.tensor_record(pixels)
+    assert batch.data is original_data and batch["input_ids"] is ids and batch["pixel_values"] is pixels
+    assert batch["reasoning_step_spans"] is spans and spans[0][0] is span
+    assert torch.equal(ids, original_ids) and torch.equal(pixels, original_pixels)
+    assert pixels.requires_grad and pixels.grad is None
+    assert torch.equal(rng, torch.get_rng_state())
+
+
+def test_snapshot_still_rejects_unsupported_metadata_objects():
+    with pytest.raises(ValueError, match="unsupported collator metadata"):
+        probe().snapshot({"unsupported": object()})
