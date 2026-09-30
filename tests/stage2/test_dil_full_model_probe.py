@@ -13,20 +13,43 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def full_rank_record(rank, digest="a"*64, variant="portTorch"):
-    state = {"weight": {"shape": [1], "dtype": "torch.float32", "sha256": "b"*64, "trainable": True}}
-    observations = [{"repeat": repeat, "loss": 1., "gradients": {"weight": {key: value for key, value in state["weight"].items() if key != "trainable"}},
-                     "tensor_path": str(ROOT / f"checkpoints/probe-contract/diagnostic-tensors/rank-{rank}/case-{index}-repeat-{repeat}.pt"),
-                     "tensor_sha256": "b"*64, "objective": {"components": [{"loss/total": 1.}], "selections": [{"rows": [["sample", 0, 1, 7]]}],
-                                                                       "support": [{"phase": "forward", "rows": [["sample", 0, 1, 7]], "ids": [[1, 2]]}]}}
-                    for index in (727, 2046) for repeat in (0, 1)]
+    """Synthetic CPU contract metadata, never asserted as actual GPU evidence."""
+    import copy
+    p = probe()
+    tensor = {"shape": [1], "dtype": "torch.float32", "sha256": "b"*64}
+    state = {"weight": {**tensor, "trainable": True}, "unused": {**tensor, "trainable": True}}
+    rng = {phase: {device: {"shape": [1], "dtype": "torch.uint8", "sha256": "b"*64}
+                   for device in ("cpu", "cuda")} for phase in ("pre_forward", "post_forward", "post_backward")}
+    cases = []
+    for case in p.CASES:
+        rows = [[[case["sample_id"], step, position, 7] for position in range(count)]
+                for step, count in enumerate(case["branch_target_counts"])]
+        selected = [group[0] for group in rows]
+        keys = (["loss/ce", "loss/dil_positive", "loss/dil_negative", "loss/topk_mass", "loss/context_preference", "loss/total"]
+                if variant == "portTorch" else ["loss/ce", "loss/dil_bce_positive", "loss/dil_bce_negative_topk",
+                                               "loss/topk_mass_kl", "loss/topk_mass_weighted", "loss/context_preference_all", "loss/total"])
+        objective = {"components": [{key: 1. for key in keys}],
+                     "selections": [{"rows": selected, "inputs": [tensor], "masks": [[True]+[False]*(len(group)-1) for group in rows]}],
+                     "support": [{"phase": "forward", "rows": selected, "targets": [7]*len(selected), "ids": [[1, 2]]*len(selected)}],
+                     "original_step_denominator": case["blocks"], "support_mapping_unresolved": []}
+        observations = []
+        for repeat in (0, 1):
+            obs = {"repeat": repeat, "loss": 1., "gradients": {"weight": tensor, "unused": None}, "rng": rng,
+                   "tensor_path": str(ROOT / f"checkpoints/probe-contract/diagnostic-tensors/rank-{rank}/case-{case['raw_index']}-repeat-{repeat}.pt"),
+                   "tensor_sha256": "b"*64, "objective": copy.deepcopy(objective)}
+            if repeat:
+                obs.update(repeat_comparison=p.compare_gradients({"weight": torch.ones(1), "unused": None}, {"weight": torch.ones(1), "unused": None}),
+                           repeat_loss_pass=True, repeat_rng_equal=True, repeat_observation_equal=True,
+                           repeat_objective_comparison=p.compare_repeat_objectives(objective, objective))
+            observations.append(obs)
+        cases.append({"raw_index": case["raw_index"], "sample_id": case["sample_id"], "repeats": [0, 1], "observations": observations,
+                      "batch": {"sample_ids": [case["sample_id"]]}, "logical_rows": rows,
+                      "batch_tensors": {key: tensor for key in ("input_ids", "labels", "attention_mask", "pixel_values", "image_grid_thw")}})
     return {"kind": "dil-full-model-probe-rank", "schema": 1, "run_id": "probe-contract",
             "manifest_sha256": digest, "variant": variant, "rank": rank, "world_size": 4,
             "machine_rank": rank//2, "local_rank": rank%2, "device": rank%2, "host": "remote" if rank < 2 else "local",
             "status": "complete", "model_state_unchanged": True, "deepspeed_engine_prepared": False,
-            "loaded_state": state, "bf16_cast_state": state,
-            "cases": [{"raw_index": index, "repeats": [0, 1], "observations": observations[ordinal*2:ordinal*2+2],
-                       "batch_tensors": {key: state["weight"] for key in ("input_ids", "labels", "attention_mask", "pixel_values", "image_grid_thw")}}
-                      for ordinal, index in enumerate((727, 2046))]}
+            "loaded_state": state, "bf16_cast_state": state, "profile": p.PROFILE, "comparator": p.COMPARATOR, "cases": cases}
 
 
 def probe():
@@ -288,3 +311,103 @@ assert len(observed['original_callable_sha256'])==len(observed['replacement_call
                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "CUDA_VISIBLE_DEVICES": ""},
                                text=True, capture_output=True)
     assert completed.returncode == 0, completed.stderr
+
+
+def comparison_fixture(tmp_path):
+    import json
+    p = probe()
+    records = [full_rank_record(2, variant=variant) for variant in ("sourceFlash", "sourceTorch")]
+    paths = []
+    for record in records:
+        for case in record["cases"]:
+            for obs in case["observations"]:
+                path = tmp_path / "checkpoints" / record["variant"] / f"{case['raw_index']}-{obs['repeat']}.pt"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                raw = {"weight": torch.ones(1), "unused": None}
+                torch.save(raw, path)
+                obs.update(tensor_path=str(path), tensor_sha256=p.sha256(path),
+                           gradients={name: None if value is None else p.tensor_record(value) for name, value in raw.items()})
+                if obs["repeat"]:
+                    obs["repeat_comparison"] = p.compare_gradients(raw, raw)
+        path = tmp_path / (record["variant"]+".json")
+        paths.append(path)
+    args = SimpleNamespace(left=str(paths[0]), right=str(paths[1]), repository=str(tmp_path), output=str(tmp_path / "results/comparison.json"))
+    def write():
+        for path, record in zip(paths, records):
+            path.write_text(json.dumps(record))
+    write()
+    return p, records, args, write
+
+
+def test_valid_headers_without_substantive_evidence_cannot_pass(tmp_path):
+    p, records, args, write = comparison_fixture(tmp_path)
+    for record in records:
+        for name in ("loaded_state", "bf16_cast_state", "model_state_unchanged"):
+            record.pop(name)
+        for case in record["cases"]:
+            case.pop("batch_tensors")
+            for obs in case["observations"]:
+                obs.update(rng={}, gradients={})
+                obs["objective"].update(selections=[], support=[], original_step_denominator=None)
+    write()
+    with pytest.raises(ValueError):
+        p.compare_results(args)
+
+
+@pytest.mark.parametrize("missing", ["rng", "repeat_comparison", "repeat_loss_pass", "repeat_rng_equal", "repeat_objective_comparison"])
+def test_rank_validator_requires_rng_and_repeat_evidence(missing):
+    p = probe()
+    record = full_rank_record(2)
+    record["cases"][0]["observations"][1].pop(missing)
+    with pytest.raises(ValueError):
+        p.validate_rank_record(record, "probe-contract", "a"*64, "portTorch")
+
+
+@pytest.mark.parametrize("mutation", ["empty", "renamed", "dtype", "shape", "none", "bytes"])
+def test_comparison_validates_raw_derivatives_against_complete_witness(tmp_path, mutation):
+    p, records, args, write = comparison_fixture(tmp_path)
+    obs = records[0]["cases"][0]["observations"][0]
+    raw = {"weight": torch.ones(1), "unused": None}
+    if mutation == "empty": raw = {}
+    if mutation == "renamed": raw = {"other": torch.ones(1), "unused": None}
+    if mutation == "dtype": raw["weight"] = torch.ones(1, dtype=torch.float64)
+    if mutation == "shape": raw["weight"] = torch.ones(1, 1)
+    if mutation == "none": raw["unused"] = torch.ones(1)
+    if mutation == "bytes": raw["weight"] = torch.zeros(1)
+    torch.save(raw, obs["tensor_path"])
+    obs["tensor_sha256"] = p.sha256(obs["tensor_path"])
+    write()
+    with pytest.raises(ValueError):
+        p.compare_results(args)
+
+
+def test_repeat_components_use_fixed_tolerance_and_exact_discrete_evidence():
+    import copy
+    p = probe()
+    left = full_rank_record(2)["cases"][0]["observations"][0]["objective"]
+    right = copy.deepcopy(left)
+    right["components"][0]["loss/ce"] += 5e-6
+    result = p.compare_repeat_objectives(left, right)
+    assert result["pass"] and result["max_abs_error"] == pytest.approx(5e-6)
+    assert result["relative_l2"] > 0
+    right["components"][0]["loss/ce"] += 1e-3
+    assert not p.compare_repeat_objectives(left, right)["pass"]
+    right = copy.deepcopy(left)
+    right["selections"][0]["masks"][0][0] = False
+    assert not p.compare_repeat_objectives(left, right)["discrete_equal"]
+
+
+def test_complete_comparison_accepts_tolerated_repeat_metric_drift(tmp_path):
+    import json
+    p, records, args, write = comparison_fixture(tmp_path)
+    for record in records:
+        for case in record["cases"]:
+            before, after = case["observations"]
+            after["objective"]["components"][0]["loss/ce"] += 5e-6
+            after["repeat_objective_comparison"] = p.compare_repeat_objectives(before["objective"], after["objective"])
+    write()
+    p.compare_results(args)
+    result = json.loads(Path(args.output).read_text())
+    assert result["pass"] and result["ranks_covered"] == [2] and not result["global_coverage_complete"]
+    repeat = result["cases"][0]["comparisons"][1]["left_repeat"]["objective"]
+    assert repeat["max_abs_error"] == pytest.approx(5e-6) and repeat["relative_l2"] > 0

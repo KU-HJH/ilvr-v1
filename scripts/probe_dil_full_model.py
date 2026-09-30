@@ -485,53 +485,179 @@ def rotary_scope(repository, variant, observation):
     return scope()
 
 
+def validate_tensor_record(value):
+    if (not isinstance(value, dict) or not isinstance(value.get("shape"), list)
+            or any(type(size) is not int or size < 0 for size in value["shape"])
+            or not isinstance(value.get("dtype"), str) or not value["dtype"].startswith("torch.")
+            or not re.fullmatch("[a-f0-9]{64}", value.get("sha256", ""))):
+        raise ValueError("missing tensor shape/dtype/bytes witness")
+
+
+def validate_rank_record(record, run_id, manifest_sha256, variant):
+    """Shared substantive validation of one actual rank; never invent other ranks."""
+    rank = record.get("rank")
+    if type(rank) is not int or rank not in range(4) or variant not in VARIANTS:
+        raise ValueError("invalid fixed runtime/global rank")
+    expected = {"kind": "dil-full-model-probe-rank", "schema": SCHEMA, "run_id": run_id,
+                "manifest_sha256": manifest_sha256, "variant": variant, "world_size": 4,
+                "status": "complete", "machine_rank": rank//2, "local_rank": rank%2, "device": rank%2,
+                "profile": PROFILE, "comparator": COMPARATOR}
+    if (any(record.get(name) != value for name, value in expected.items())
+            or not isinstance(run_id, str) or not run_id
+            or not isinstance(manifest_sha256, str) or not re.fullmatch("[a-f0-9]{64}", manifest_sha256)
+            or not isinstance(record.get("host"), str) or not record["host"]):
+        raise ValueError("incompatible probe runtime/rank identity or worker error")
+    state = record.get("bf16_cast_state")
+    loaded = record.get("loaded_state")
+    if (record.get("model_state_unchanged") is not True or record.get("deepspeed_engine_prepared") is not False
+            or not isinstance(loaded, dict) or not loaded or not isinstance(state, dict) or set(state) != set(loaded)):
+        raise ValueError("missing independently loaded model state or no-optimizer witness")
+    for name in state:
+        if not isinstance(name, str) or not name:
+            raise ValueError("invalid witnessed parameter name")
+        for witness in (loaded[name], state[name]):
+            validate_tensor_record(witness)
+            if type(witness.get("trainable")) is not bool:
+                raise ValueError("missing trainability witness")
+        if any(loaded[name][key] != state[name][key] for key in ("shape", "trainable")):
+            raise ValueError("loaded/cast parameter identity changed")
+    trainable = {name: value for name, value in state.items() if value["trainable"]}
+    if not trainable:
+        raise ValueError("missing trainable model state")
+    cases = record.get("cases", [])
+    if [case.get("raw_index") for case in cases] != [727, 2046]:
+        raise ValueError("incomplete diagnostic cases/repeats")
+    for case, prescribed in zip(cases, CASES):
+        observations = case.get("observations", [])
+        rows = case.get("logical_rows")
+        if (case.get("sample_id") != prescribed["sample_id"] or case.get("repeats") != [0, 1]
+                or [obs.get("repeat") for obs in observations] != [0, 1]
+                or not isinstance(case.get("batch"), dict) or not case["batch"]
+                or not isinstance(rows, list) or len(rows) != prescribed["blocks"]
+                or [len(group) for group in rows] != prescribed["branch_target_counts"]):
+            raise ValueError("missing actual case/batch/logical-row/repeated differentiation witness")
+        for step, group in enumerate(rows):
+            if any(not isinstance(row, list) or len(row) != 4 or row[0] != case["sample_id"]
+                   or row[1] != step or any(type(value) is not int or value < 0 for value in row[1:]) for row in group):
+                raise ValueError("invalid logical target row identity")
+        tensors = case.get("batch_tensors", {})
+        if not {"input_ids", "labels", "attention_mask", "pixel_values", "image_grid_thw"}.issubset(tensors):
+            raise ValueError("missing actual multimodal collated input witness")
+        for value in tensors.values():
+            validate_tensor_record(value)
+        logical = {tuple(row) for group in rows for row in group}
+        for obs in observations:
+            loss, gradients, objective = obs.get("loss"), obs.get("gradients", {}), obs.get("objective", {})
+            if (type(loss) not in (int, float) or not math.isfinite(loss)
+                    or not isinstance(gradients, dict) or set(gradients) != set(trainable)
+                    or not any(value is not None for value in gradients.values())
+                    or not isinstance(obs.get("tensor_path"), str) or not obs["tensor_path"]
+                    or not re.fullmatch("[a-f0-9]{64}", obs.get("tensor_sha256", ""))):
+                raise ValueError("missing all-parameter derivatives or finite scalar")
+            for name, gradient in gradients.items():
+                if gradient is not None:
+                    validate_tensor_record(gradient)
+                    if any(gradient[key] != trainable[name][key] for key in ("shape", "dtype")):
+                        raise ValueError("trainable parameter derivative shape/dtype mismatch")
+            rng = obs.get("rng", {})
+            if set(rng) != {"pre_forward", "post_forward", "post_backward"}:
+                raise ValueError("missing pre/forward/backward RNG evidence")
+            for phase in rng.values():
+                if not isinstance(phase, dict) or set(phase) != {"cpu", "cuda"}:
+                    raise ValueError("missing CPU/CUDA RNG evidence")
+                for value in phase.values():
+                    validate_tensor_record(value)
+                    if value["dtype"] != "torch.uint8" or len(value["shape"]) != 1 or value["shape"][0] <= 0:
+                        raise ValueError("invalid RNG state tensor witness")
+            if (len(objective.get("components", [])) != 1 or not objective.get("selections") or not objective.get("support")
+                    or type(objective.get("original_step_denominator")) is not int
+                    or objective["original_step_denominator"] != prescribed["blocks"]
+                    or not isinstance(objective.get("support_mapping_unresolved"), list)):
+                raise ValueError("missing native objective/selection/support/step denominator")
+            metrics = objective["components"][0]
+            if not metrics or any(type(value) not in (int, float) or not math.isfinite(value) for value in metrics.values()):
+                raise ValueError("missing finite native component metrics")
+            # Both fixed native schemas must contain every mapped loss component.
+            try:
+                self_comparison = compare_objectives(objective, objective)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("incomplete native component/support schema") from error
+            if not self_comparison["support_exact"]:
+                raise ValueError("missing complete forward logical support evidence")
+            for selection in objective["selections"]:
+                inputs, masks, selected = selection.get("inputs"), selection.get("masks"), selection.get("rows")
+                if (not isinstance(inputs, (list, dict)) or not inputs or not isinstance(masks, (list, dict)) or not masks
+                        or not isinstance(selected, list) or not selected or any(tuple(row) not in logical for row in selected)):
+                    raise ValueError("missing native selection input/mask/row evidence")
+                for value in (inputs.values() if isinstance(inputs, dict) else inputs):
+                    validate_tensor_record(value)
+                groups = list(masks.values()) if isinstance(masks, dict) else masks
+                if (len(groups) != len(rows) or [len(group) for group in groups] != prescribed["branch_target_counts"]
+                        or sum(sum(group) for group in groups) != len(selected)
+                        or any(not isinstance(group, list) or not group or any(type(value) is not bool for value in group) for group in groups)):
+                    raise ValueError("invalid discrete entropy masks")
+            for chunk in objective["support"]:
+                ids, targets, mapped = chunk.get("ids"), chunk.get("targets"), chunk.get("rows")
+                if (chunk.get("phase") not in ("forward", "backward_replay") or not isinstance(ids, list) or not ids
+                        or not isinstance(targets, list) or len(targets) != len(ids)
+                        or any(type(target) is not int or target < 0 for target in targets)
+                        or any(not isinstance(group, list) or not group or group != sorted(set(group))
+                               or any(type(value) is not int or value < 0 for value in group) for group in ids)
+                        or (mapped is not None and (len(mapped) != len(ids) or any(tuple(row) not in logical or row[3] != target
+                                                                                              for row, target in zip(mapped, targets))))):
+                    raise ValueError("invalid native support row/target/id evidence")
+            if obs["repeat"] == 1:
+                for field in ("repeat_loss_pass", "repeat_rng_equal", "repeat_observation_equal"):
+                    if type(obs.get(field)) is not bool:
+                        raise ValueError("missing repeat scalar/RNG/discrete evidence")
+                for field in ("repeat_comparison", "repeat_objective_comparison"):
+                    value = obs.get(field)
+                    if (not isinstance(value, dict) or type(value.get("pass")) is not bool
+                            or "max_abs_error" not in value or "relative_l2" not in value):
+                        raise ValueError("missing numeric repeat error evidence")
+                    for metric in ("max_abs_error", "relative_l2"):
+                        if value[metric] is not None and (type(value[metric]) not in (int, float) or not math.isfinite(value[metric]) or value[metric] < 0):
+                            raise ValueError("invalid repeat numeric error evidence")
+                derivative_repeat = obs["repeat_comparison"]
+                objective_repeat = obs["repeat_objective_comparison"]
+                if (derivative_repeat.get("comparator") != COMPARATOR
+                        or set(derivative_repeat.get("parameters", {})) != set(trainable)
+                        or any(type(value.get("pass")) is not bool for value in derivative_repeat["parameters"].values())
+                        or objective_repeat.get("comparator") != COMPARATOR
+                        or type(objective_repeat.get("discrete_equal")) is not bool
+                        or type(objective_repeat.get("component_names_exact")) is not bool
+                        or set(objective_repeat.get("components", {})) != set(metrics)
+                        or any(type(value.get("pass")) is not bool or "max_abs_error" not in value
+                               for value in objective_repeat["components"].values())):
+                    raise ValueError("incomplete named derivative/component repeat evidence")
+    return trainable
+
+
 def validate_rank_records(records, run_id, manifest_sha256, variant):
     if len(records) != 4 or {record.get("rank") for record in records} != {0, 1, 2, 3}:
         raise ValueError("probe requires four actual global rank records")
-    devices = set()
     for record in records:
-        rank = record["rank"]
-        if type(rank) is not int:
-            raise ValueError("global rank must be an integer")
-        expected = {"kind": "dil-full-model-probe-rank", "schema": SCHEMA, "run_id": run_id,
-                    "manifest_sha256": manifest_sha256, "variant": variant, "world_size": 4,
-                    "status": "complete", "machine_rank": rank//2, "local_rank": rank%2, "device": rank%2}
-        if any(record.get(name) != value for name, value in expected.items()):
-            raise ValueError("incompatible probe runtime/rank identity or worker error")
-        cases = record.get("cases", [])
-        if [case.get("raw_index") for case in cases] != [727, 2046] or any(case.get("repeats") != [0, 1] for case in cases):
-            raise ValueError("incomplete diagnostic cases/repeats")
-        state = record.get("bf16_cast_state")
-        if (record.get("model_state_unchanged") is not True or record.get("deepspeed_engine_prepared") is not False
-                or not record.get("loaded_state") or not isinstance(state, dict) or not state):
-            raise ValueError("missing independently loaded model state or no-optimizer witness")
-        trainable = {name: value for name, value in state.items() if value.get("trainable") is True}
-        if not trainable:
-            raise ValueError("missing trainable model state")
-        for case in cases:
-            observations = case.get("observations", [])
-            if [observation.get("repeat") for observation in observations] != [0, 1]:
-                raise ValueError("missing actual repeated differentiation")
-            if not {"input_ids", "labels", "attention_mask", "pixel_values", "image_grid_thw"}.issubset(case.get("batch_tensors", {})):
-                raise ValueError("missing actual multimodal collated input witness")
-            for observation in observations:
-                loss = observation.get("loss")
-                gradients = observation.get("gradients", {})
-                objective = observation.get("objective", {})
-                if (type(loss) not in (int, float) or not math.isfinite(loss)
-                        or set(gradients) != set(trainable) or not any(value is not None for value in gradients.values())
-                        or len(objective.get("components", [])) != 1 or not objective.get("selections") or not objective.get("support")
-                        or not re.fullmatch("[a-f0-9]{64}", observation.get("tensor_sha256", ""))):
-                    raise ValueError("missing native objective/selection/support/all-parameter derivatives")
-                for name, gradient in gradients.items():
-                    if gradient is not None and (gradient.get("shape") != trainable[name]["shape"] or gradient.get("dtype") != trainable[name]["dtype"]):
-                        raise ValueError("trainable parameter derivative shape/dtype mismatch")
-        devices.add((record.get("host"), record["device"]))
-    if len(devices) != 4:
+        validate_rank_record(record, run_id, manifest_sha256, variant)
+    if len({(record["host"], record["device"]) for record in records}) != 4:
         raise ValueError("four distinct actual host/devices not witnessed")
     return {"kind": "dil-full-model-probe", "schema": SCHEMA, "run_id": run_id,
             "manifest_sha256": manifest_sha256, "variant": variant, "world_size": 4,
             "arithmetic": "unscaled composed scalar autograd; no optimizer/ZeRO reduction", "ranks": sorted(records, key=lambda r: r["rank"])}
+
+
+def validate_raw_gradients(raw, metadata, trainable):
+    import torch
+    if not isinstance(raw, dict) or set(raw) != set(trainable) or set(metadata) != set(trainable):
+        raise ValueError("raw derivatives do not cover every witnessed trainable name")
+    for name, value in raw.items():
+        witness = metadata[name]
+        if value is None:
+            if witness is not None:
+                raise ValueError("raw derivative None identity mismatch")
+        elif (not isinstance(value, torch.Tensor) or witness is None
+              or list(value.shape) != trainable[name]["shape"] or str(value.dtype) != trainable[name]["dtype"]
+              or not bool(torch.isfinite(value).all()) or tensor_record(value) != witness):
+            raise ValueError("raw derivative shape/dtype/None/bytes mismatch")
 
 
 def publish_json(path, value):
@@ -650,7 +776,8 @@ def worker(args):
                     data["repeat_comparison"] = compare_gradients(previous, gradients)
                     data["repeat_loss_pass"] = abs(repeats[0]["loss"]-loss) <= COMPARATOR["atol"]+COMPARATOR["rtol"]*abs(repeats[0]["loss"])
                     data["repeat_rng_equal"] = repeats[0]["rng"] == rng
-                    data["repeat_observation_equal"] = repeats[0]["objective"] == details
+                    data["repeat_objective_comparison"] = compare_repeat_objectives(repeats[0]["objective"], details)
+                    data["repeat_observation_equal"] = data["repeat_objective_comparison"]["pass"]
                 repeats.append(data)
                 previous = gradients
                 trainer.accelerator.wait_for_everyone()
@@ -660,20 +787,15 @@ def worker(args):
     if manifest["variant"] == "sourceTorch" and rotary.get("calls", 0) <= 0:
         raise ValueError("sourceTorch did not witness the controlled native rotary call")
     record["model_state_unchanged"] = state_record(model) == cast_state
+    validate_rank_record(record, args.run_id, args.manifest_sha256, manifest["variant"])
     publish_json(repository / "results" / args.run_id / f"probe-rank-{actual_rank}.json", record)
 
 
 def compare_results(args):
     import torch
     left, right = read_json(args.left), read_json(args.right)
-    for record in (left, right):
-        if (record.get("kind") != "dil-full-model-probe-rank" or record.get("schema") != SCHEMA
-                or record.get("status") != "complete" or record.get("world_size") != 4
-                or record.get("rank") not in range(4) or record.get("variant") not in VARIANTS
-                or [case.get("raw_index") for case in record.get("cases", [])] != [727, 2046]
-                or any(case.get("repeats") != [0, 1] or [obs.get("repeat") for obs in case.get("observations", [])] != [0, 1]
-                       for case in record.get("cases", []))):
-            raise ValueError("incomplete fixed rank/case/repeat comparison inputs")
+    trainable = [validate_rank_record(record, record.get("run_id"), record.get("manifest_sha256"), record.get("variant"))
+                 for record in (left, right)]
     if left["rank"] != right["rank"] or left["variant"] == right["variant"]:
         raise ValueError("comparison requires same actual rank and distinct fixed runtime variants")
     result = {"comparator": COMPARATOR, "pass": True, "cases": [], "discrete_mismatches": [],
@@ -687,27 +809,61 @@ def compare_results(args):
     for lcase, rcase in zip(left["cases"], right["cases"]):
         if any(lcase.get(key) != rcase.get(key) for key in ("raw_index", "sample_id", "batch_tensors", "logical_rows")):
             result["discrete_mismatches"].append(f"case-{lcase['raw_index']}-input")
-        comparisons = []
+        comparisons, previous = [], None
         for lobs, robs in zip(lcase["observations"], rcase["observations"]):
-            for obs in (lobs, robs):
+            raw = []
+            for obs, names in zip((lobs, robs), trainable):
                 contained(obs["tensor_path"], Path(args.repository)/"checkpoints")
                 if sha256(obs["tensor_path"]) != obs["tensor_sha256"]:
                     raise ValueError("raw derivative bytes changed")
-            gradients = compare_gradients(torch.load(lobs["tensor_path"], map_location="cpu", weights_only=True),
-                                          torch.load(robs["tensor_path"], map_location="cpu", weights_only=True))
+                values = torch.load(obs["tensor_path"], map_location="cpu", weights_only=True)
+                validate_raw_gradients(values, obs["gradients"], names)
+                raw.append(values)
+            gradients = compare_gradients(*raw)
             objective = compare_objectives(lobs["objective"], robs["objective"])
             loss_pass = abs(lobs["loss"]-robs["loss"]) <= COMPARATOR["atol"]+COMPARATOR["rtol"]*abs(lobs["loss"])
+            repeat_checks = []
+            if previous is not None:
+                for current, before, values, old_values in zip((lobs, robs), previous[0], raw, previous[1]):
+                    repeat_checks.append({"gradients": compare_gradients(old_values, values),
+                                          "objective": compare_repeat_objectives(before["objective"], current["objective"]),
+                                          "loss_pass": abs(before["loss"]-current["loss"]) <= COMPARATOR["atol"]+COMPARATOR["rtol"]*abs(before["loss"]),
+                                          "loss_abs_error": abs(before["loss"]-current["loss"]),
+                                          "rng_equal": before["rng"] == current["rng"]})
             comparisons.append({"repeat": lobs["repeat"], "gradients": gradients, "objective": objective,
                                 "loss_pass": loss_pass, "loss_abs_error": abs(lobs["loss"]-robs["loss"]),
-                                "rng_equal": lobs["rng"] == robs["rng"], "left_repeat": lobs.get("repeat_comparison"),
-                                "right_repeat": robs.get("repeat_comparison")})
-            repeat_pass = all(obs.get("repeat_comparison", {"pass": True})["pass"]
-                              and obs.get("repeat_loss_pass", True) and obs.get("repeat_rng_equal", True)
-                              and obs.get("repeat_observation_equal", True) for obs in (lobs, robs))
+                                "rng_equal": lobs["rng"] == robs["rng"],
+                                "left_repeat": repeat_checks[0] if repeat_checks else None,
+                                "right_repeat": repeat_checks[1] if repeat_checks else None})
+            repeat_pass = all(check["gradients"]["pass"] and check["objective"]["pass"]
+                              and check["loss_pass"] and check["rng_equal"] for check in repeat_checks)
             result["pass"] &= gradients["pass"] and objective["pass"] and loss_pass and lobs["rng"] == robs["rng"] and repeat_pass
+            previous = ((lobs, robs), raw)
         result["cases"].append({"raw_index": lcase["raw_index"], "comparisons": comparisons})
     result["pass"] &= not result["discrete_mismatches"]
     publish_json(contained(args.output, Path(args.repository)/"results"), result)
+
+
+def compare_repeat_objectives(left, right):
+    """Fixed scalar tolerance for all repeat metrics; exact other observations."""
+    lc, rc = left["components"], right["components"]
+    identity = len(lc) == len(rc) == 1 and set(lc[0]) == set(rc[0])
+    numeric, squared, norm2, maximum = {}, 0., 0., 0.
+    if identity:
+        for name, value in lc[0].items():
+            other = rc[0][name]
+            error = abs(value-other)
+            finite = math.isfinite(value) and math.isfinite(other)
+            passed = finite and error <= COMPARATOR["atol"]+COMPARATOR["rtol"]*abs(value)
+            numeric[name] = {"pass": passed, "left": value, "right": other, "max_abs_error": error if finite else None}
+            squared += error*error
+            norm2 += value*value
+            maximum = max(maximum, error)
+    discrete = {key: value for key, value in left.items() if key != "components"} == {key: value for key, value in right.items() if key != "components"}
+    return {"pass": identity and discrete and all(value["pass"] for value in numeric.values()),
+            "comparator": COMPARATOR, "component_names_exact": identity, "discrete_equal": discrete, "components": numeric,
+            "max_abs_error": maximum if identity and math.isfinite(maximum) else None,
+            "relative_l2": math.sqrt(squared/norm2) if identity and norm2 and math.isfinite(squared) else (0. if identity and squared == 0 else None)}
 
 
 def compare_objectives(left, right):
