@@ -236,8 +236,7 @@ def test_schema7_evaluator_routes_load_real_model_from_immutable_inspection(
         # Replace only GPU/FlashAttention policy; the real CPU base and PEFT loader run.
         monkeypatch.setattr(module, "load_model", lambda source, cache:
                             Qwen2_5_VLForConditionalGeneration.from_pretrained(source))
-        if module_name == "eval":
-            monkeypatch.setattr(module, "validate_qwen2_5_vl_attention_backends", lambda *a, **kw: None)
+        monkeypatch.setattr(module, "validate_qwen2_5_vl_attention_backends", lambda *a, **kw: None)
         loaded, loaded_processor = module.load_evaluation_artifacts(
             model_dir=str(path), base_model_dir=str(artifact.base), cache_dir="cache",
         )

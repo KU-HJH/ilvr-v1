@@ -1509,6 +1509,7 @@ def test_stage2_resume_rejects_sampler_identity_before_parent_train(
         SimpleNamespace(latent_block_count=count) for count in (1, 1, 1, 2, 2)
     ]
     trainer.stage2_sampler_identity = None
+    trainer.stage2_sampler_policy = "latent_balanced"
     trainer.deepspeed_runtime_profile = runtime_profile(2, world_size=2)
     trainer.accelerator = SimpleNamespace(
         device=torch.device("cpu"),
@@ -1571,6 +1572,7 @@ def test_stage2_resume_reuses_validated_sampler_for_parent_dataloader(
     )
     trainer.train_dataset = dataset
     trainer.stage2_sampler_identity = None
+    trainer.stage2_sampler_policy = "latent_balanced"
     trainer.deepspeed_runtime_profile = profile
     trainer.accelerator = SimpleNamespace(
         device=torch.device("cpu"),
