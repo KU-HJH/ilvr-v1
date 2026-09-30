@@ -1658,7 +1658,104 @@ def _checkpoint_artifact_identity(
     }
 
 
+def _dil_full_model_probe_main(argv: list[str]) -> int:
+    """Fixed diagnostic terminal; ordinary training outputs are never consulted."""
+    from scripts.probe_dil_full_model import load_manifest, validate_rank_records
+    from src.multinode_runtime import build_dil_full_model_probe_commands, publish_small_file, _publish_bytes_no_replace
+
+    parser = argparse.ArgumentParser(prog="train-stage2 --dil-full-model-probe", allow_abbrev=False)
+    parser.add_argument("--dil-full-model-probe", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", choices=("initial",), default="initial")
+    parser.add_argument("--zero-stage", type=int, choices=(2,), required=True)
+    parser.add_argument("--main-process-port", type=int, required=True)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        if any(os.environ.get(name) for name in ("RESUME_CHECKPOINT", "RESUME_FROM_CHECKPOINT", "STAGE2_STOP_AFTER_CHECKPOINT")):
+            raise ValueError("full-model diagnostic rejects training resume/update settings")
+        manifest_path = Path(args.dil_full_model_probe)
+        manifest = load_manifest(manifest_path, _REPOSITORY_ROOT)
+        digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        plan = build_launch_plan(stage="stage2", tuning_method="dora", zero_stage=2, run_id=args.run_id,
+                                 main_process_port=args.main_process_port)
+        commit = _repository_git_stdout(("rev-parse", "HEAD"))
+        commands = build_dil_full_model_probe_commands(plan, commit=commit, manifest=manifest_path, manifest_sha256=digest)
+        from scripts.probe_dil_full_model import SOURCE_LOCAL, SOURCE_REMOTE
+        selected_source = SOURCE_LOCAL if manifest["variant"] != "portTorch" else _REPOSITORY_ROOT
+        remote_source = SOURCE_REMOTE if manifest["variant"] != "portTorch" else _REPOSITORY_ROOT
+        common_inputs = (manifest_path, _REPOSITORY_ROOT / "scripts/probe_dil_full_model.py", plan.deepspeed_config,
+                         Path(manifest["data_path"]), Path(manifest["image_root"]),
+                         Path(manifest["initializer"]), Path(manifest["base"]))
+        roots = (_REPOSITORY_ROOT / "checkpoints", _REPOSITORY_ROOT / "results", _REPOSITORY_ROOT / "logs")
+        run_paths = (_REPOSITORY_ROOT / "checkpoints" / plan.run_id,
+                     _REPOSITORY_ROOT / "results" / plan.run_id,
+                     _REPOSITORY_ROOT / "logs/multinode" / plan.run_id / plan.attempt_id)
+        sessions = tuple(f"ilvr-{plan.run_id}-initial-rank{rank}" for rank in (0, 1))
+        # Common ordinary node resource preflight; source root identity has a
+        # node-specific authenticated preflight immediately before owned launch.
+        preflight = build_preflight_commands(plan, input_paths=common_inputs, artifact_roots=roots,
+                                            remote_run_paths=run_paths, local_run_paths=run_paths,
+                                            remote_tmux_sessions=(sessions[0],), local_tmux_sessions=(sessions[1],))
+        preflight_commands = []
+        from src.multinode_runtime import build_remote_exec
+        for machine_rank in (0, 1):
+            command = (str(_REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"),
+                       str(_REPOSITORY_ROOT / "scripts/probe_dil_full_model.py"), "preflight",
+                       "--repository", str(_REPOSITORY_ROOT), "--manifest", str(manifest_path),
+                       "--manifest-sha256", digest, "--machine-rank", str(machine_rank))
+            preflight_commands.append(tuple(build_remote_exec(command)) if machine_rank == 0 else command)
+        if args.dry_run:
+            print(json.dumps({"kind": "dil-full-model-probe", "manifest_sha256": digest, "variant": manifest["variant"],
+                              "profile": manifest["profile"], "comparator": manifest["comparator"],
+                              "local": commands.local, "remote": commands.remote, "plan": _json_ready(plan),
+                              "local_source": str(selected_source), "remote_source": str(remote_source),
+                              "identity_preflight": preflight_commands, "resource_preflight": _json_ready(preflight)}, sort_keys=True))
+            return 0
+        def run(command):
+            return subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
+        remote = collect_node_snapshot(plan, node="remote", runner=run, commands=preflight,
+                                       input_paths=common_inputs, artifact_roots=roots, run_paths=run_paths,
+                                       tmux_sessions=(sessions[0],), repository=plan.cluster.remote_repo_root)
+        local = collect_node_snapshot(plan, node="local", runner=run, commands=preflight,
+                                      input_paths=common_inputs, artifact_roots=roots, run_paths=run_paths,
+                                      tmux_sessions=(sessions[1],), repository=plan.cluster.remote_repo_root)
+        if validate_preflight(remote, local).commit != commit:
+            raise ValueError("probe preflight commit changed")
+        for command in preflight_commands:
+            completed = run(command)
+            if completed.returncode:
+                raise RuntimeError(f"probe identity preflight failed: {completed.stderr}")
+            observed = json.loads(completed.stdout)
+            if observed["manifest_sha256"] != digest or observed["variant"] != manifest["variant"]:
+                raise ValueError("probe identity preflight changed")
+        runner = SubprocessCoordinatorRunner(plan, commands=commands, commit=commit,
+                                             log_root=_REPOSITORY_ROOT / "logs/multinode")
+        start_rank0_then_rank1(plan, runner, commands=commands, ready_timeout_seconds=600)
+        exits = monitor_owned_jobs(plan, runner, expected_commit=commit,
+                                   expected_command_digests={0: commands.command_digests[0], 1: commands.command_digests[1]})
+        if exits != {0: 0, 1: 0}:
+            raise RuntimeError(f"full-model diagnostic failed: {exits}")
+        records = [json.loads(runner.read_dil_full_model_probe_record(rank)) for rank in range(4)]
+        witness = validate_rank_records(records, plan.run_id, digest, manifest["variant"])
+        result_dir = _REPOSITORY_ROOT / "results" / plan.run_id
+        for rank in (0, 1):
+            _publish_bytes_no_replace(result_dir / f"probe-rank-{rank}.json", json.dumps(records[rank], sort_keys=True).encode())
+        witness_path = result_dir / "initial-probe-witness.json"
+        # Four rank files remain the full evidence; keep the terminal metadata bounded.
+        witness["ranks"] = [{key: record[key] for key in ("rank", "host", "device", "machine_rank", "local_rank")}
+                            for record in witness["ranks"]]
+        publish_small_file(witness_path, json.dumps(witness, sort_keys=True).encode())
+        print(json.dumps({"probe_witness": str(witness_path)}, sort_keys=True))
+        return 0
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    return 2
+
+
 def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
+    if stage == "stage2" and any(value == "--dil-full-model-probe" or value.startswith("--dil-full-model-probe=") for value in argv):
+        return _dil_full_model_probe_main(argv)
     parser = argparse.ArgumentParser(
         prog=f"python -m src.multinode train-{stage}", allow_abbrev=False
     )

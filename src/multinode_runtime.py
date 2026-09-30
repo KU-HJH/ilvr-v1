@@ -1516,6 +1516,52 @@ def _node_shell_command(
     )
 
 
+def build_dil_full_model_probe_commands(
+    plan: "LaunchPlan", *, commit: str, manifest: str | Path,
+    manifest_sha256: str, log_root: str | Path = _LOG_ROOT,
+) -> OwnedTmuxCommands:
+    """The one approved diagnostic entrypoint, under the normal owned supervisor."""
+    if (plan.stage != "stage2" or plan.tuning_method != "dora" or plan.zero_stage != 2
+            or plan.world_size != 4 or plan.cluster.num_machines != 2
+            or plan.cluster.num_processes != 4 or plan.cluster.gpus_per_node != 2
+            or plan.cluster.remote_rank != 0 or plan.cluster.local_rank != 1
+            or plan.cluster.master_addr != "10.1.102.41"
+            or plan.cluster.socket_ifname != "bond1.102" or plan.attempt_id != "initial"):
+        raise ValueError("DIL probe requires fresh two-node/four-rank DoRA ZeRO2 profile")
+    _require_digest("manifest_sha256", manifest_sha256)
+    if not re.fullmatch(r"[a-f0-9]{40}", commit):
+        raise ValueError("invalid probe commit")
+    manifest = _trusted_absolute_path(manifest)
+    repository = plan.cluster.remote_repo_root
+    commands, digests, specs = [], [], []
+    for machine_rank in (0, 1):
+        environment = {
+            **_MINIMAL_EXEC_ENVIRONMENT, **_distributed_environment(plan, machine_rank),
+            "MASTER_ADDR": "10.1.102.41", "GLOO_SOCKET_IFNAME": "bond1.102", "NCCL_SOCKET_IFNAME": "bond1.102",
+            "PYTHONDONTWRITEBYTECODE": "1", "ILVR_REPOSITORY_COMMIT": commit,
+            "PYTHONPATH": f"{repository}:{repository / 'src'}",
+        }
+        command = (
+            str(repository / "venv/ilvr-venv/bin/accelerate"), "launch",
+            "--num_machines", "2", "--num_processes", "4", "--machine_rank", str(machine_rank),
+            "--main_process_ip", "10.1.102.41", "--main_process_port", str(plan.main_process_port),
+            "--mixed_precision", "bf16", "--use_deepspeed", "--deepspeed_multinode_launcher", "standard",
+            "--deepspeed_config_file", str(plan.deepspeed_config),
+            str(repository / "scripts/probe_dil_full_model.py"), "run", "--repository", str(repository),
+            "--manifest", str(manifest), "--manifest-sha256", manifest_sha256, "--run-id", plan.run_id,
+        )
+        supervisor, digest, spec = _node_shell_command(
+            plan, machine_rank=machine_rank, commit=commit, stage_command=command,
+            environment=environment, log_root=Path(log_root), require_bash_launcher=False,
+        )
+        tmux = ("/usr/bin/tmux", "new-session", "-d", "-s", f"ilvr-{plan.run_id}-initial-rank{machine_rank}", "--", *supervisor)
+        commands.append(tuple(build_remote_exec(tmux)) if machine_rank == 0 else tmux)
+        digests.append(digest)
+        specs.append(spec)
+    return OwnedTmuxCommands(remote=commands[0], local=commands[1], command_digests=tuple(digests),
+                             node_specs=tuple(specs), finite_loss_evidence_path=None)
+
+
 def build_owned_lifecycle_harness_commands(
     plan: "LaunchPlan",
     *,
@@ -2187,6 +2233,24 @@ class SubprocessCoordinatorRunner:
         raw = completed.stdout.encode("utf-8")
         if not raw or len(raw) > 1024 * 1024:
             raise ValueError("remote lifecycle evidence size is invalid")
+        return raw
+
+    def read_dil_full_model_probe_record(self, rank: int) -> bytes:
+        """Read only a fixed rank's metadata after exact-owned process completion."""
+        if rank not in (0, 1, 2, 3):
+            raise ValueError("invalid probe global rank")
+        repository = self.plan.cluster.remote_repo_root
+        if rank >= 2:
+            return _read_regular_file(repository / "results" / self.plan.run_id / f"probe-rank-{rank}.json",
+                                      maximum_size=16 * 1024 * 1024)
+        completed = self._run(build_remote_exec((
+            str(repository / "venv/ilvr-venv/bin/python"),
+            str(repository / "scripts/probe_dil_full_model.py"), "record-show",
+            "--repository", str(repository), "--run-id", self.plan.run_id, "--rank", str(rank),
+        ), working_directory=repository))
+        raw = completed.stdout.encode()
+        if not raw or len(raw) > 16 * 1024 * 1024:
+            raise ValueError("invalid probe rank record size")
         return raw
 
     def read_stage1_training_evidence(self, path: Path) -> bytes:
