@@ -131,6 +131,13 @@ class StepPreferenceConfig:
                     beta = saved["beta"] if beta is None else beta
                     ce = saved["lambda_ce"] if ce is None else ce
                     margin = saved["preference_margin"] if margin is None else margin
+        if (self.resume_from_checkpoint_path and ce is None
+                and self.preference_loss_type == "dpo"
+                and not (self.enabled and self.mode == "stage2b")):
+            raise ValueError(
+                "resume requires explicit saved --ce_weight when the checkpoint "
+                "has no supported CE coefficient evidence"
+            )
         beta, margin = resolve_preference_defaults(self.preference_loss_type, beta, margin)
         object.__setattr__(self, "beta", beta)
         object.__setattr__(self, "lambda_ce", 0.1 if ce is None else ce)

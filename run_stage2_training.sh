@@ -81,7 +81,11 @@ PY
   CE_WEIGHT=${CE_WEIGHT:-$saved_ce_weight}
   STEP_DPO_BETA=${STEP_DPO_BETA:-$saved_preference_beta}
 fi
-CE_WEIGHT=${CE_WEIGHT:-0.1}
+if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+  CE_WEIGHT=${CE_WEIGHT:-}
+else
+  CE_WEIGHT=${CE_WEIGHT:-0.1}
+fi
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-2}
 ATTENTION_IMPLEMENTATION=${ATTENTION_IMPLEMENTATION:-sdpa}
 if [[ -n "${VISION_ATTENTION_IMPLEMENTATION:-}" ]]; then
@@ -241,7 +245,7 @@ case "$STEP_PREFERENCE_ENABLED" in
         default_preference_beta=1.0; default_preference_margin=0.0 ;;
       *) default_preference_beta=10.0; default_preference_margin=0.5 ;;
     esac
-    STEP_DPO_BETA=${STEP_DPO_BETA:-$default_preference_beta}
+    STEP_DPO_BETA=${STEP_DPO_BETA:-${STEP_PREFERENCE_BETA:-$default_preference_beta}}
     STEP_DPO_WEIGHT=${STEP_DPO_WEIGHT:-1.0}
     STEP_PREFERENCE_BETA=${STEP_PREFERENCE_BETA:-$STEP_DPO_BETA}
     STEP_PREFERENCE_WEIGHT=${STEP_PREFERENCE_WEIGHT:-1.0}
@@ -767,7 +771,9 @@ require_positive_integer MAX_SEQUENCE_LENGTH "$MAX_SEQUENCE_LENGTH"
 require_non_negative_integer DATALOADER_NUM_WORKERS "$DATALOADER_NUM_WORKERS"
 require_positive_integer LORA_R "$LORA_R"
 require_positive_integer LORA_ALPHA "$LORA_ALPHA"
-require_finite_non_negative_number CE_WEIGHT "$CE_WEIGHT"
+if [[ -n "$CE_WEIGHT" ]]; then
+  require_finite_non_negative_number CE_WEIGHT "$CE_WEIGHT"
+fi
 if [[ "$STEP_PREFERENCE_ENABLED" == true ]]; then
   if [[ "$STEP_PREFERENCE_OBJECTIVE" == context_preference ]]; then
     require_finite_positive_number STEP_PREFERENCE_BETA "$STEP_PREFERENCE_BETA"
@@ -975,6 +981,10 @@ if [[ -n "$STAGE2_REFERENCE_SAMPLER_PROBE_DIR" ]]; then
   SAMPLER_ARGS+=(--stage2_reference_sampler_probe_dir "$STAGE2_REFERENCE_SAMPLER_PROBE_DIR")
 fi
 
+CE_WEIGHT_ARGS=()
+if [[ -n "$CE_WEIGHT" ]]; then
+  CE_WEIGHT_ARGS=(--ce_weight "$CE_WEIGHT")
+fi
 TRAINING_ARGS=(
   --stage stage2
   --epochs 1
@@ -991,7 +1001,7 @@ TRAINING_ARGS=(
   "${SAMPLER_ARGS[@]}"
   --stage2_assistant_plan_rendering "$ASSISTANT_PLAN_RENDERING"
   "${STEP_PREFERENCE_ARGS[@]}"
-  --ce_weight "$CE_WEIGHT"
+  "${CE_WEIGHT_ARGS[@]}"
   "${BOUNDARY_ARGS[@]}"
   --learning_rate "$LEARNING_RATE"
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"

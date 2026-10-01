@@ -509,7 +509,7 @@ def test_stage2_launcher_propagates_explicit_dora_settings():
 
 def test_stage2_launcher_maps_resume_without_reinterpreting_stage1_origin():
     """Catches resume replacing the explicit Stage 1 provenance argument."""
-    result = run_launcher(env_overrides={"RESUME_CHECKPOINT": "/resume/checkpoint 10"})
+    result = run_launcher(env_overrides={"RESUME_CHECKPOINT": "/resume/checkpoint 10", "CE_WEIGHT": "1"})
 
     tokens = dry_run_tokens(result)
     load_index = tokens.index("--load_model_path")
@@ -524,6 +524,7 @@ def test_stage2_launcher_resume_without_explicit_method_omits_all_tuning_options
         run_launcher(
             env_overrides={
                 "RESUME_CHECKPOINT": "/resume/checkpoint 10",
+                "CE_WEIGHT": "1",
                 "LORA_R": "16",
                 "LORA_ALPHA": "32",
                 "LORA_DROPOUT": "0.1",
@@ -548,6 +549,7 @@ def test_stage2_launcher_resume_with_explicit_method_forwards_complete_settings(
         run_launcher(
             env_overrides={
                 "RESUME_CHECKPOINT": "/resume/checkpoint 10",
+                "CE_WEIGHT": "1",
                 "TUNING_METHOD": "lora",
                 "LORA_R": "16",
                 "LORA_ALPHA": "32",
