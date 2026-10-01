@@ -332,6 +332,9 @@ def compare_boundaries(left, lraw, right, rraw, comparator):
     validate_raw(right, rraw)
     li, ri = ({item["key"]: item for item in record.get("records", [])} for record in (left, right))
     unmapped = sorted(set(li) ^ set(ri))
+    absent_cotangents = sorted({key for records in (li, ri) for key, item in records.items()
+                               if item.get("cotangent") is None})
+    unmapped.extend(key + "/cotangent-unavailable" for key in absent_cotangents)
     results, mismatches = {}, {"forward": [], "cotangent": []}
     for key in sorted(set(li) & set(ri)):
         a, b = li[key], ri[key]
@@ -341,10 +344,17 @@ def compare_boundaries(left, lraw, right, rraw, comparator):
         values = {}
         comparable = a.get("gradient_kind") == b.get("gradient_kind")
         for field in ("forward", "cotangent"):
+            aw, bw = a.get(field), b.get(field)
+            if field == "cotangent" and (aw is None or bw is None):
+                # A native unused tensor or replay can legitimately deliver no
+                # derivative. Preserve that observation without equating two
+                # absences or inventing zeros/a numerical mismatch frontier.
+                values[field] = None
+                values["cotangent_availability"] = [a.get("cotangent_status"), b.get("cotangent_status")]
+                continue
             if field == "cotangent" and not comparable:
                 values[field] = None
                 continue
-            aw, bw = a.get(field), b.get(field)
             if aw is not None and bw is not None and any(aw[identity] != bw[identity] for identity in ("shape", "dtype")):
                 values[field] = None
                 unmapped.append(key + "/" + field + "-shape-dtype")
@@ -360,7 +370,7 @@ def compare_boundaries(left, lraw, right, rraw, comparator):
             values["cotangent_comparable"] = False
             unmapped.append(key + "/cotangent-semantics")
         else:
-            values["cotangent_comparable"] = True
+            values["cotangent_comparable"] = values.get("cotangent") is not None
         results[key] = values
     def frontier(field):
         items = mismatches[field]
@@ -369,10 +379,13 @@ def compare_boundaries(left, lraw, right, rraw, comparator):
         first = min(_stage(item, field == "cotangent") for item in items)
         return sorted(item["key"] for item in items if _stage(item, field == "cotangent") == first)
     forward_pass = not mismatches["forward"]
-    cotangent_pass = not mismatches["cotangent"]
+    cotangent_pass = (not mismatches["cotangent"] and not absent_cotangents
+                      and bool(results) and len(results) == len(li) == len(ri)
+                      and all(value["cotangent_comparable"] for value in results.values()))
     return {"pass": bool(li) and bool(ri) and not unmapped and forward_pass and cotangent_pass,
             "forward_pass": forward_pass, "cotangent_pass": cotangent_pass,
             "unmapped_or_incomparable": unmapped, "boundaries": results,
+            "unavailable_cotangents": absent_cotangents,
             "earliest_forward_frontier": frontier("forward"), "earliest_cotangent_frontier": frontier("cotangent"),
             "causal_limit": "Grouped by traced dependency stage, never callback order; parallel paths can share the first frontier."}
 

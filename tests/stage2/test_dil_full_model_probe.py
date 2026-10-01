@@ -779,15 +779,17 @@ def observed_comparison_fixture(tmp_path):
                         prefix = {"identity": f"prefix:{position}:0", "phase": "forward"}
                         observer.calls.append({**prefix, "status": "returned"})
                         observer.capture("prefix.hidden_tail", x, prefix, rows=latent_rows)
+                    head_leaves = []
                     for role in ("clean_ce", "clean_target", "off_target"):
                         row_ids = [row for group in case["logical_rows"] for row in group]
                         y = torch.ones(len(row_ids), 2, requires_grad=True)
+                        head_leaves.append(y)
                         head = {"identity": role+":0", "phase": "forward"}
                         observer.calls.append({**head, "status": "returned"})
                         for name in ("head.hidden", "head.logits"):
                             observer.capture(name, y, head, rows=row_ids)
                         loss = loss + y.sum()
-                    torch.autograd.grad(loss, [x, y], allow_unused=True)
+                    torch.autograd.grad(loss, [x, *head_leaves], allow_unused=True)
                 path = tmp_path / "checkpoints" / record["variant"] / f"boundary-{case['raw_index']}-{obs['repeat']}.pt"
                 torch.save(observer.raw, path)
                 obs["boundaries"] = {**observer.record(), "tensor_path": str(path), "tensor_sha256": p.sha256(path)}
@@ -898,3 +900,73 @@ def test_boundary_required_records_link_to_native_calls_and_rollout_positions(tm
             item["key"] = "other_rollout:0/forward/latent.0"
     with pytest.raises(ValueError, match="boundary"):
         p.boundary_api().validate_trace(trace, p.CASES[0], 0)
+
+
+def test_boundary_positive_fixture_delivers_every_head_cotangent(tmp_path):
+    # Break caught: autograd prunes clean head leaves from the promised positive witness.
+    p, records, args, write = observed_comparison_fixture(tmp_path)
+    for record in records:
+        for case in record["cases"]:
+            for obs in case["observations"]:
+                heads = [item for item in obs["boundaries"]["records"] if item["name"] in ("head.hidden", "head.logits")]
+                assert len(heads) == 6
+                assert all(item["cotangent_status"] == "delivered" and item["cotangent"] is not None for item in heads)
+
+
+@pytest.mark.parametrize("missing", [
+    "clean_ce:0/forward/head.hidden", "clean_ce:0/forward/head.logits",
+    "clean_target:0/forward/head.hidden", "clean_target:0/forward/head.logits",
+    "off_target:0/forward/head.hidden", "off_target:0/forward/head.logits",
+    "clean:0/forward/clean.key", "clean:0/forward/clean.value", "rollout:0/forward/latent.0", "all",
+])
+def test_boundary_bilateral_absent_cotangent_is_unavailable_at_native_comparison_entrypoint(tmp_path, missing):
+    # Break caught: None/None is called observed derivative equality after semantic validation.
+    import json
+    p, records, args, write = observed_comparison_fixture(tmp_path)
+    api = boundary_api()
+    for record in records:
+        trace = record["cases"][0]["observations"][0]["boundaries"]
+        raw = torch.load(trace["tensor_path"], map_location="cpu", weights_only=True)
+        for item in trace["records"]:
+            if item["key"] == missing or missing == "all":
+                item.update(cotangent=None, cotangent_status="not_delivered", gradient_callbacks=0)
+                raw[item["key"] + "/cotangent"] = None
+        # Absence can be a legitimate native unused/replay observation. Keep
+        # inspection usable; it must never become measured derivative agreement.
+        api.validate_trace(trace, p.CASES[0], 0)
+        api.validate_raw(trace, raw)
+        torch.save(raw, trace["tensor_path"])
+        trace["tensor_sha256"] = p.sha256(trace["tensor_path"])
+    write()
+    p.compare_results(args)
+    result = json.loads(Path(args.output).read_text())["cases"][0]["comparisons"][0]["boundaries"]
+    assert not result["pass"] and not result["cotangent_pass"]
+    assert result["unmapped_or_incomparable"]
+    assert result["earliest_cotangent_frontier"] == []
+    key = missing if missing != "all" else "clean_ce:0/forward/head.hidden"
+    assert result["boundaries"][key]["cotangent"] is None
+    assert result["boundaries"][key]["cotangent_comparable"] is False
+
+
+def test_boundary_delivered_zero_is_comparable_but_unused_replay_is_unavailable():
+    # Break caught: an observed zero is treated as absence or unused replay is claimed equal.
+    api = boundary_api()
+    observers = []
+    for repeat in (0, 1):
+        observer = api.BoundaryObservation(727, repeat)
+        with observer:
+            x = torch.ones(1, requires_grad=True)
+            observer.capture("head.hidden", x, {"identity": "clean_ce:0", "phase": "forward"})
+            torch.autograd.grad((x*0).sum(), x)
+        observers.append(observer)
+    result = api.compare_boundaries(observers[0].record(), observers[0].raw, observers[1].record(), observers[1].raw, probe().compare_gradients)
+    assert result["pass"] and result["cotangent_pass"]
+    assert result["boundaries"]["clean_ce:0/forward/head.hidden"]["cotangent_comparable"]
+    for observer in observers:
+        with observer:
+            unused = torch.ones(1, requires_grad=True)
+            observer.capture("head.hidden", unused, {"identity": "off_target:0", "phase": "replay"})
+    result = api.compare_boundaries(observers[0].record(), observers[0].raw, observers[1].record(), observers[1].raw, probe().compare_gradients)
+    assert not result["pass"] and not result["cotangent_pass"]
+    assert result["boundaries"]["off_target:0/replay/head.hidden"]["cotangent"] is None
+    assert result["earliest_cotangent_frontier"] == []
