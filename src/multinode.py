@@ -1684,7 +1684,9 @@ def _dil_full_model_probe_main(argv: list[str]) -> int:
         from scripts.probe_dil_full_model import SOURCE_LOCAL, SOURCE_REMOTE
         selected_source = SOURCE_LOCAL if manifest["variant"] != "portTorch" else _REPOSITORY_ROOT
         remote_source = SOURCE_REMOTE if manifest["variant"] != "portTorch" else _REPOSITORY_ROOT
-        common_inputs = (manifest_path, _REPOSITORY_ROOT / "scripts/probe_dil_full_model.py", plan.deepspeed_config,
+        common_inputs = (manifest_path, _REPOSITORY_ROOT / "scripts/probe_dil_full_model.py",
+                         *((_REPOSITORY_ROOT / "scripts/dil_boundary_observation.py",) if manifest.get("boundary_observation", False) else ()),
+                         plan.deepspeed_config,
                          Path(manifest["data_path"]), Path(manifest["image_root"]),
                          Path(manifest["initializer"]), Path(manifest["base"]))
         roots = (_REPOSITORY_ROOT / "checkpoints", _REPOSITORY_ROOT / "results", _REPOSITORY_ROOT / "logs")
@@ -1737,7 +1739,8 @@ def _dil_full_model_probe_main(argv: list[str]) -> int:
         if exits != {0: 0, 1: 0}:
             raise RuntimeError(f"full-model diagnostic failed: {exits}")
         records = [json.loads(runner.read_dil_full_model_probe_record(rank)) for rank in range(4)]
-        witness = validate_rank_records(records, plan.run_id, digest, manifest["variant"])
+        witness = validate_rank_records(records, plan.run_id, digest, manifest["variant"],
+                                        boundary_observation=manifest.get("boundary_observation", False))
         result_dir = _REPOSITORY_ROOT / "results" / plan.run_id
         for rank in (0, 1):
             _publish_bytes_no_replace(result_dir / f"probe-rank-{rank}.json", json.dumps(records[rank], sort_keys=True).encode())

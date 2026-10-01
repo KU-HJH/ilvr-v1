@@ -468,3 +468,372 @@ def test_snapshot_observes_native_batchfeature_without_mutation():
 def test_snapshot_still_rejects_unsupported_metadata_objects():
     with pytest.raises(ValueError, match="unsupported collator metadata"):
         probe().snapshot({"unsupported": object()})
+
+
+def boundary_api():
+    p = probe()
+    factory = getattr(p, "boundary_api", None)
+    assert callable(factory), "optional native boundary observation is missing"
+    return factory()
+
+
+def test_boundary_native_calls_preserve_outputs_cotangents_rng_and_exception_cleanup():
+    # Break caught: wrapping a native call replaces its graph, output, gradient or state.
+    api = boundary_api()
+    layer = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Dropout(.2))
+    original = layer.forward
+    x = torch.tensor([[1., 2.]], requires_grad=True)
+    state = {k: v.clone() for k, v in layer.state_dict().items()}
+    rng = torch.get_rng_state().clone()
+    plain = layer(x)
+    plain_grad = torch.autograd.grad(plain.sum(), x)[0]
+    after_rng = torch.get_rng_state().clone()
+    torch.set_rng_state(rng)
+    observer = api.BoundaryObservation(727, 0)
+    returned = []
+    def observe(args, kwargs, output, call):
+        returned.append(output)
+        observer.capture("head.hidden", args[0], call, gradient_kind="tensor_total")
+        observer.capture("head.logits", output, call, gradient_kind="tensor_total")
+    with observer:
+        observer.watch_module(layer, "clean", observe)
+        output = layer(x)
+        assert output is returned[0]
+        grad = torch.autograd.grad(output.sum(), x)[0]
+    assert torch.equal(output, plain) and torch.equal(grad, plain_grad)
+    assert torch.equal(torch.get_rng_state(), after_rng)
+    assert all(torch.equal(state[k], v) for k, v in layer.state_dict().items())
+    raw, metadata = observer.raw, observer.record()
+    assert torch.equal(raw["clean:0/forward/head.logits/cotangent"], torch.ones(1, 2))
+    assert metadata["case"] == 727 and metadata["repeat"] == 0
+    assert layer.forward == original and not x._backward_hooks
+    failed = api.BoundaryObservation(727, 1)
+    with pytest.raises(RuntimeError, match="abort"):
+        with failed:
+            failed.watch_module(layer, "clean", observe)
+            raise RuntimeError("abort")
+    assert layer.forward == original
+
+
+def test_boundary_nonreentrant_replay_keeps_call_identity_and_early_stop_explicit():
+    # Break caught: replay observations get a new causal identity or abort leaks wrapper state.
+    from torch.utils.checkpoint import checkpoint
+    api = boundary_api()
+    class Native(torch.nn.Module):
+        def forward(self, x):
+            return torch.sin(x).cos()
+    layer = Native()
+    original = layer.forward
+    observer = api.BoundaryObservation(2046, 1)
+    def observe(args, kwargs, output, call):
+        observer.capture("hidden", output, call, gradient_kind="tensor_total")
+    with observer:
+        observer.watch_module(layer, "prefix:8", observe)
+        x = torch.tensor([.3], requires_grad=True)
+        y = checkpoint(layer, x, use_reentrant=False)
+        observer.phase = "replay"
+        torch.autograd.grad(y.sum(), x)
+    calls = observer.record()["calls"]
+    assert [call["identity"] for call in calls] == ["prefix:8:0", "prefix:8:0"]
+    assert [call["phase"] for call in calls] == ["forward", "replay"]
+    assert calls[0]["status"] == "returned" and calls[1]["status"] == "checkpoint_early_stop"
+    assert layer.forward == original
+    assert torch.equal(observer.raw["prefix:8:0/forward/hidden/cotangent"], torch.ones(1))
+
+
+def test_boundary_comparison_detects_changed_derivative_and_missing_evidence():
+    # Break caught: equal forward values hide a changed derivative or a missing tensor.
+    api = boundary_api()
+    def run(scale):
+        observer = api.BoundaryObservation(727, 0)
+        class Changed(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                return x.clone()
+            @staticmethod
+            def backward(ctx, grad):
+                return grad * scale
+        x = torch.tensor([2.], requires_grad=True)
+        with observer:
+            call = {"identity": "clean:0", "phase": "forward"}
+            observer.capture("head.hidden", x, call, gradient_kind="tensor_total")
+            y = Changed.apply(x)
+            observer.capture("head.logits", y, call, gradient_kind="tensor_total")
+            torch.autograd.grad(y.sum(), x)
+        return observer
+    left, right = run(1.), run(2.)
+    result = api.compare_boundaries(left.record(), left.raw, right.record(), right.raw, probe().compare_gradients)
+    assert not result["pass"]
+    assert result["earliest_cotangent_frontier"] == ["clean:0/forward/head.hidden"]
+    assert result["forward_pass"] and not result["cotangent_pass"]
+    missing = dict(right.raw)
+    missing.pop("clean:0/forward/head.logits/cotangent")
+    with pytest.raises(ValueError, match="boundary"):
+        api.compare_boundaries(left.record(), left.raw, right.record(), missing, probe().compare_gradients)
+    assert not api.compare_boundaries(left.record(), left.raw, {"records": []}, {}, probe().compare_gradients)["pass"]
+
+
+def test_boundary_profiler_records_executed_sdpa_dispatch_without_backend_forcing():
+    # Break caught: reporting configured 'sdpa' as actual dispatched kernel evidence.
+    api = boundary_api()
+    x = torch.ones(1, 1, 2, 2, requires_grad=True)
+    observer = api.BoundaryObservation(727, 0)
+    with observer:
+        y = torch.nn.functional.scaled_dot_product_attention(x, x, x)
+        torch.autograd.grad(y.sum(), x)
+    events = observer.record()["attention_events"]
+    assert any("scaled_dot_product" in event["name"] for event in events)
+    assert any("backward" in event["name"] for event in events)
+    assert observer.record()["observer_effect_disclosure"]
+
+
+def test_boundary_manifest_opt_in_preserves_unobserved_default(tmp_path):
+    # Break caught: optional mode rejected, ambiguous opt-in accepted or ordinary mode changed.
+    from tests.multinode.test_dil_full_model_probe import manifest_fixture
+    import json
+    p = probe()
+    repository, path, value = manifest_fixture(tmp_path)
+    assert "boundary_observation" not in p.load_manifest(path, repository)
+    value["boundary_observation"] = True
+    path.write_text(json.dumps(value))
+    assert p.load_manifest(path, repository)["boundary_observation"] is True
+    value["boundary_observation"] = "yes"
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError):
+        p.load_manifest(path, repository)
+
+
+@pytest.mark.parametrize("variant", ["sourceTorch", "portTorch"])
+def test_boundary_adapter_observes_real_rollout_clean_cache_and_head_calls(variant):
+    # Break caught: adapter misses native source cache or port KV, latent/call/row mapping.
+    from functools import partial
+    from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentRolloutEngine, LatentSpan
+    api = boundary_api()
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2)
+        def forward(self, *, inputs_embeds, **kwargs):
+            hidden = self.linear(inputs_embeds).sin()
+            key, value = hidden.unsqueeze(1), (hidden * 2).unsqueeze(1)
+            fields = {"last_hidden_state": hidden}
+            if kwargs.get("stage2_capture_kv"):
+                fields["stage2_key_values"] = ((key, value),)
+            if kwargs.get("use_cache"):
+                fields["past_key_values"] = SimpleNamespace(key_cache=[key], value_cache=[value])
+            return SimpleNamespace(**fields)
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Decoder()
+            self.lm_head = torch.nn.Linear(2, 3)
+            self.stage2_rollout_engine = LatentRolloutEngine()
+    model = Model()
+    batch = {"input_ids": torch.tensor([[1, 1, 1, 2, 2]]), "labels": torch.tensor([[-100, -100, -100, 2, 2]]),
+             "sample_ids": ["sample"], "reasoning_step_spans": [SimpleNamespace(step_id=0, target_text_start=3, target_text_end=5)]}
+    observer = api.BoundaryObservation(727, 0)
+    base = torch.ones(1, 5, 2, requires_grad=True)
+    original = model.model.forward
+    with observer:
+        observer.bind_native(model, batch, variant)
+        rollout = model.stage2_rollout_engine.rollout(language_model=partial(model.model, generate_mode=True),
+            base_inputs_embeds=base, attention_mask=torch.ones(1, 5), full_position_ids=torch.zeros(3, 1, 5, dtype=torch.long),
+            latent_spans=(LatentSpan(0, (1, 2), 3),), latent_activation_checkpointing=True)
+        outputs = model.model(inputs_embeds=rollout.final_inputs_embeds,
+            stage2_capture_kv=variant == "portTorch", use_cache=variant != "portTorch")
+        def _stage2_selected_logits(hidden_states, score_token_mask):
+            selected_hidden = hidden_states[score_token_mask].reshape(1, -1, 2)
+            return model.lm_head(selected_hidden)
+        clean = _stage2_selected_logits(outputs.last_hidden_state, torch.tensor([[False, False, True, True, False]]))
+        pair = outputs.stage2_key_values[-1] if variant == "portTorch" else (outputs.past_key_values.key_cache[-1], outputs.past_key_values.value_cache[-1])
+        loss = clean.sum() + pair[0].sum() + pair[1].sum()
+        observer.phase = "replay"
+        torch.autograd.grad(loss, list(model.parameters()), allow_unused=True)
+    names = {record["name"] for record in observer.record()["records"]}
+    assert {"decoder.hidden", "clean.key", "clean.value", "latent.0", "latent.1", "head.hidden", "head.logits"} <= names
+    head = next(record for record in observer.record()["records"] if record["name"] == "head.logits")
+    assert head["rows"] == [["sample", 0, 2, 2], ["sample", 0, 3, 2]]
+    assert head["call"] == "clean_target:0" and head["phase"] == "forward"
+    assert model.model.forward == original
+    assert len([call for call in observer.record()["calls"] if call["phase"] == "replay"]) == 2
+
+
+def test_boundary_rank_validator_rejects_opt_in_without_trace_and_control():
+    # Break caught: complete ordinary rank headers silently pass missing opted-in evidence.
+    p = probe()
+    record = full_rank_record(2)
+    record["boundary_observation"] = True
+    with pytest.raises(ValueError, match="boundary"):
+        p.validate_rank_record(record, "probe-contract", "a"*64, "portTorch")
+
+
+def test_boundary_observation_effect_reports_changed_envelope_despite_scalar_agreement():
+    # Break caught: equal scalar objectives are mislabeled observer noninterference.
+    p = probe()
+    compare = getattr(p, "compare_observation_effect", None)
+    assert callable(compare), "observation-effect control comparison is missing"
+    objective = full_rank_record(2)["cases"][0]["observations"][0]["objective"]
+    meta = {"loss": 1., "rng": {"fixed": 1}, "objective": objective}
+    controls = [(meta, {"x": torch.tensor([1.])}), (meta, {"x": torch.tensor([1.])})]
+    observed = [(meta, {"x": torch.tensor([1.])}), (meta, {"x": torch.tensor([1.001])})]
+    result = compare(controls, observed, 727)
+    assert result["scalar_agreement"] and result["repeat_envelope_changed"]
+    assert result["exact_one_block_gradient_mismatch"]
+    assert not result["matched_under_fixed_comparator"]
+    assert result["noninterference_proven"] is False
+
+
+def test_boundary_comparator_marks_fanin_and_missing_replay_incomparable():
+    # Break caught: per-suffix view and shared-tensor total get a spurious causal mismatch.
+    api = boundary_api()
+    observers = []
+    for kind, value in (("shared_tensor_total", 1.), ("distinct_view_contribution", 2.)):
+        observer = api.BoundaryObservation(2046, 0)
+        with observer:
+            x = torch.tensor([1.], requires_grad=True)
+            observer.capture("suffix.input_key", x, {"identity": "suffix:0", "phase": "forward"}, gradient_kind=kind)
+            torch.autograd.grad((x*value).sum(), x)
+        observers.append(observer)
+    result = api.compare_boundaries(observers[0].record(), observers[0].raw, observers[1].record(), observers[1].raw, probe().compare_gradients)
+    assert not result["pass"] and result["unmapped_or_incomparable"]
+    assert result["earliest_cotangent_frontier"] == []
+    assert result["boundaries"]["suffix:0/forward/suffix.input_key"]["cotangent"] is None
+
+
+def test_boundary_result_comparison_cannot_silently_ignore_mixed_observation_modes(tmp_path):
+    # Break caught: an observed/unobserved pair declares complete intermediate comparison.
+    p, records, args, write = comparison_fixture(tmp_path)
+    records[0]["boundary_observation"] = False
+    records[1]["boundary_observation"] = False
+    write()
+    p.compare_results(args)
+    import json
+    result = json.loads(Path(args.output).read_text())
+    assert result.get("boundary_status") == "not_requested"
+
+
+def test_boundary_comparison_rejects_zero_for_missing_cotangent_and_unmapped_rows():
+    # Break caught: a nonexistent derivative gets normalized to an observed zero.
+    api = boundary_api()
+    left, right = api.BoundaryObservation(727, 0), api.BoundaryObservation(727, 0)
+    for observer, used in ((left, False), (right, True)):
+        with observer:
+            x = torch.tensor([1.], requires_grad=True)
+            observer.capture("head.logits", x, {"identity": "clean:0", "phase": "forward"}, rows=[["sample", 0, 1, 2]])
+            if used:
+                torch.autograd.grad((x*0).sum(), x)
+    result = api.compare_boundaries(left.record(), left.raw, right.record(), right.raw, probe().compare_gradients)
+    assert not result["pass"] and not result["cotangent_pass"]
+    import copy
+    unmapped = copy.deepcopy(right.record())
+    unmapped["records"][0]["rows"] = None
+    result = api.compare_boundaries(left.record(), left.raw, unmapped, right.raw, probe().compare_gradients)
+    assert not result["pass"] and result["unmapped_or_incomparable"]
+
+
+def test_boundary_native_exception_cleans_tensor_hooks_and_owned_forward():
+    # Break caught: a native exception leaves tensor hooks or an instance patch active.
+    api = boundary_api()
+    class Fails(torch.nn.Module):
+        def forward(self, x):
+            raise RuntimeError("native failed")
+    layer = Fails()
+    original = layer.forward
+    layer.forward = original
+    x = torch.tensor([1.], requires_grad=True)
+    observer = api.BoundaryObservation(727, 0)
+    with pytest.raises(RuntimeError, match="native failed"):
+        with observer:
+            observer.watch_module(layer, "clean", lambda *args: None,
+                before=lambda args, kwargs, call: observer.capture("head.hidden", args[0], call))
+            layer(x)
+    assert layer.forward is original and not x._backward_hooks
+    assert observer.record()["calls"][0]["status"] == "raised"
+
+
+def observed_comparison_fixture(tmp_path):
+    import copy
+    p, records, args, write = comparison_fixture(tmp_path)
+    api = boundary_api()
+    for record in records:
+        record["boundary_observation"] = True
+        for case in record["cases"]:
+            case["unobserved_controls"] = copy.deepcopy(case["observations"])
+            case["observation_effect"] = {"noninterference_proven": False}
+            for obs in case["observations"]:
+                observer = api.BoundaryObservation(case["raw_index"], obs["repeat"])
+                with observer:
+                    x = torch.ones(1, 1, 2, 2, requires_grad=True)
+                    loss = torch.nn.functional.scaled_dot_product_attention(x, x, x).sum()
+                    call = {"identity": "clean:0", "phase": "forward"}
+                    observer.calls.append({**call, "status": "returned"})
+                    for name in ("decoder.hidden", "clean.key", "clean.value"):
+                        observer.capture(name, x, call)
+                    for index in range(len(case["logical_rows"])*8):
+                        observer.capture(f"latent.{index}", x, {"identity": "rollout:0", "phase": "forward"})
+                        observer.capture("prefix.hidden_tail", x, {"identity": f"prefix:{index}:0", "phase": "forward"})
+                    for role in ("clean_ce", "clean_target", "off_target"):
+                        row_ids = [row for group in case["logical_rows"] for row in group]
+                        y = torch.ones(len(row_ids), 2, requires_grad=True)
+                        head = {"identity": role+":0", "phase": "forward"}
+                        for name in ("head.hidden", "head.logits"):
+                            observer.capture(name, y, head, rows=row_ids)
+                        loss = loss + y.sum()
+                    torch.autograd.grad(loss, [x, y], allow_unused=True)
+                path = tmp_path / "checkpoints" / record["variant"] / f"boundary-{case['raw_index']}-{obs['repeat']}.pt"
+                torch.save(observer.raw, path)
+                obs["boundaries"] = {**observer.record(), "tensor_path": str(path), "tensor_sha256": p.sha256(path)}
+    write()
+    return p, records, args, write
+
+
+def test_boundary_observed_results_validate_raw_snapshots_controls_and_repeat_comparisons(tmp_path):
+    # Critical CPU integration: opt-in records through actual file loader/comparator.
+    import json
+    p, records, args, write = observed_comparison_fixture(tmp_path)
+    p.compare_results(args)
+    result = json.loads(Path(args.output).read_text())
+    assert result["pass"] and result["boundary_status"] == "observed_partial_mapping"
+    repeat = result["cases"][1]["comparisons"][1]
+    assert repeat["boundaries"]["pass"] and repeat["left_boundary_repeat"]["pass"]
+    assert result["cases"][0]["observation_effect"][0]["noninterference_proven"] is False
+    trace = records[0]["cases"][0]["observations"][0]["boundaries"]
+    raw = torch.load(trace["tensor_path"], weights_only=True)
+    raw.pop(next(iter(raw)))
+    torch.save(raw, trace["tensor_path"])
+    trace["tensor_sha256"] = p.sha256(trace["tensor_path"])
+    write()
+    with pytest.raises(ValueError, match="boundary"):
+        p.compare_results(args)
+
+
+@pytest.mark.parametrize("missing", ["records", "calls", "attention_events"])
+def test_boundary_observed_rank_rejects_missing_trace_evidence(tmp_path, missing):
+    p, records, args, write = observed_comparison_fixture(tmp_path)
+    records[0]["cases"][0]["observations"][0]["boundaries"].pop(missing)
+    with pytest.raises(ValueError, match="boundary|attention"):
+        p.validate_rank_record(records[0], "probe-contract", "a"*64, "sourceFlash")
+
+
+def test_boundary_four_rank_terminal_requires_manifest_requested_observation():
+    # Break caught: an opted-in coordinator accepts ordinary unobserved rank files.
+    p = probe()
+    with pytest.raises(ValueError, match="boundary"):
+        p.validate_rank_records([full_rank_record(rank) for rank in range(4)], "probe-contract", "a"*64,
+                                "portTorch", boundary_observation=True)
+
+
+def test_boundary_shape_mismatch_is_incomparable_instead_of_numeric_frontier():
+    # Break caught: an unmappable shape is reported as a measured numerical mismatch.
+    api = boundary_api()
+    observers = []
+    for size in (1, 2):
+        observer = api.BoundaryObservation(727, 0)
+        with observer:
+            x = torch.ones(size, requires_grad=True)
+            observer.capture("head.hidden", x, {"identity": "clean:0", "phase": "forward"})
+            torch.autograd.grad(x.sum(), x)
+        observers.append(observer)
+    result = api.compare_boundaries(observers[0].record(), observers[0].raw, observers[1].record(), observers[1].raw, probe().compare_gradients)
+    assert not result["pass"] and result["unmapped_or_incomparable"]
+    assert result["earliest_forward_frontier"] == result["earliest_cotangent_frontier"] == []

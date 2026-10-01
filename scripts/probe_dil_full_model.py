@@ -92,7 +92,9 @@ def load_manifest(path, repository):
     manifest = read_json(path)
     required = {"schema", "variant", "data_path", "data_sha256", "image_root", "base", "initializer",
                 "initializer_files", "base_files", "source_files", "port_files", "package_files", "cases", "profile", "comparator"}
-    if set(manifest) != required or manifest["schema"] != SCHEMA or manifest["variant"] not in VARIANTS:
+    optional = {"boundary_observation"}
+    if (set(manifest) - optional != required or manifest["schema"] != SCHEMA or manifest["variant"] not in VARIANTS
+            or ("boundary_observation" in manifest and type(manifest["boundary_observation"]) is not bool)):
         raise ValueError("incompatible fixed probe manifest")
     if manifest["profile"] != PROFILE or manifest["comparator"] != COMPARATOR or manifest["cases"] != list(CASES):
         raise ValueError("fixed probe cases/profile/comparator differ")
@@ -111,6 +113,41 @@ def load_manifest(path, repository):
             if not isinstance(digest, str) or not re.fullmatch("[a-f0-9]{64}", digest):
                 raise ValueError("invalid identity hash")
     return manifest
+
+
+def boundary_api():
+    # Load by this authenticated coordinator script's path even when bootstrap
+    # selected the separate source runtime. The helper imports no runtime tree.
+    import importlib.util
+    path = Path(__file__).with_name("dil_boundary_observation.py")
+    spec = importlib.util.spec_from_file_location("dil_boundary_observation", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def compare_observation_effect(controls, observed, case):
+    """Same-runtime controls; scalar agreement never establishes noninterference."""
+    import torch
+    comparisons = []
+    for (plain, praw), (instrumented, iraw) in zip(controls, observed):
+        gradients = compare_gradients(praw, iraw)
+        exact = set(praw) == set(iraw) and all(
+            (praw[name] is None and iraw[name] is None) if praw[name] is None or iraw[name] is None
+            else torch.equal(praw[name], iraw[name]) for name in praw)
+        comparisons.append({"gradients": gradients, "gradients_exact": exact,
+                            "loss_pass": abs(plain["loss"]-instrumented["loss"]) <= COMPARATOR["atol"]+COMPARATOR["rtol"]*abs(plain["loss"]),
+                            "rng_equal": plain["rng"] == instrumented["rng"],
+                            "objective": compare_repeat_objectives(plain["objective"], instrumented["objective"])})
+    plain_repeat = compare_gradients(controls[0][1], controls[1][1])
+    observed_repeat = compare_gradients(observed[0][1], observed[1][1])
+    return {"comparisons": comparisons, "unobserved_repeat": plain_repeat, "observed_repeat": observed_repeat,
+            "scalar_agreement": all(item["loss_pass"] for item in comparisons),
+            "matched_under_fixed_comparator": all(item["gradients"]["pass"] and item["loss_pass"]
+                and item["rng_equal"] and item["objective"]["pass"] for item in comparisons),
+            "repeat_envelope_changed": plain_repeat != observed_repeat,
+            "exact_one_block_gradient_mismatch": case == 727 and any(not item["gradients_exact"] for item in comparisons),
+            "noninterference_proven": False, "disclosure": boundary_api().DISCLOSURE}
 
 
 def authenticate(manifest, repository, machine_rank):
@@ -497,6 +534,8 @@ def validate_tensor_record(value):
 def validate_rank_record(record, run_id, manifest_sha256, variant):
     """Shared substantive validation of one actual rank; never invent other ranks."""
     rank = record.get("rank")
+    if "boundary_observation" in record and type(record["boundary_observation"]) is not bool:
+        raise ValueError("invalid boundary observation mode")
     if type(rank) is not int or rank not in range(4) or variant not in VARIANTS:
         raise ValueError("invalid fixed runtime/global rank")
     expected = {"kind": "dil-full-model-probe-rank", "schema": SCHEMA, "run_id": run_id,
@@ -530,6 +569,23 @@ def validate_rank_record(record, run_id, manifest_sha256, variant):
         raise ValueError("incomplete diagnostic cases/repeats")
     for case, prescribed in zip(cases, CASES):
         observations = case.get("observations", [])
+        if record.get("boundary_observation", False):
+            api = boundary_api()
+            controls = case.get("unobserved_controls", [])
+            if ([item.get("repeat") for item in controls] != [0, 1]
+                    or not isinstance(case.get("observation_effect"), dict)):
+                raise ValueError("missing boundary observation control")
+            # Apply all original native scalar/objective/parameter/RNG checks to
+            # control repeats too, without recursively requiring observations.
+            plain = {**record, "boundary_observation": False,
+                     "cases": [{**item, "observations": item.get("unobserved_controls", [])} for item in cases]}
+            validate_rank_record(plain, run_id, manifest_sha256, variant)
+            for obs in observations:
+                trace = obs.get("boundaries", {})
+                api.validate_trace(trace, prescribed, obs.get("repeat"))
+                if (not isinstance(trace.get("tensor_path"), str) or not trace["tensor_path"]
+                        or not re.fullmatch("[a-f0-9]{64}", trace.get("tensor_sha256", ""))):
+                    raise ValueError("missing boundary raw tensor artifact")
         rows = case.get("logical_rows")
         if (case.get("sample_id") != prescribed["sample_id"] or case.get("repeats") != [0, 1]
                 or [obs.get("repeat") for obs in observations] != [0, 1]
@@ -634,16 +690,20 @@ def validate_rank_record(record, run_id, manifest_sha256, variant):
     return trainable
 
 
-def validate_rank_records(records, run_id, manifest_sha256, variant):
+def validate_rank_records(records, run_id, manifest_sha256, variant, boundary_observation=None):
     if len(records) != 4 or {record.get("rank") for record in records} != {0, 1, 2, 3}:
         raise ValueError("probe requires four actual global rank records")
     for record in records:
+        if boundary_observation is not None and record.get("boundary_observation", False) != boundary_observation:
+            raise ValueError("missing manifest-requested boundary observation mode")
         validate_rank_record(record, run_id, manifest_sha256, variant)
     if len({(record["host"], record["device"]) for record in records}) != 4:
         raise ValueError("four distinct actual host/devices not witnessed")
     return {"kind": "dil-full-model-probe", "schema": SCHEMA, "run_id": run_id,
             "manifest_sha256": manifest_sha256, "variant": variant, "world_size": 4,
-            "arithmetic": "unscaled composed scalar autograd; no optimizer/ZeRO reduction", "ranks": sorted(records, key=lambda r: r["rank"])}
+            "arithmetic": "unscaled composed scalar autograd; no optimizer/ZeRO reduction",
+            **({"boundary_observation": boundary_observation} if boundary_observation is not None else {}),
+            "ranks": sorted(records, key=lambda r: r["rank"])}
 
 
 def validate_raw_gradients(raw, metadata, trainable):
@@ -727,6 +787,10 @@ def worker(args):
               "precision": "explicit BF16 probe cast after independent native load; unscaled autograd"}
     output = tensor_directory(repository, args.run_id) / f"rank-{actual_rank}"
     output.mkdir(parents=True, exist_ok=False)
+    observed_mode = manifest.get("boundary_observation", False)
+    boundary_module = boundary_api() if observed_mode else None
+    if observed_mode:
+        record["boundary_observation"] = True
     examples = {example.sample_id: example for example in components.train_dataset}
     rotary = {}
     with rotary_scope(repository, manifest["variant"], rotary):
@@ -750,17 +814,28 @@ def worker(args):
             saved_cpu = torch.get_rng_state().clone()
             saved_cuda = torch.cuda.get_rng_state().clone()
             repeats, previous = [], None
-            for repeat in (0, 1):
+            controls, observed_values, previous_boundaries = [], [], None
+            # Exactly the existing unobserved diagnostic first, followed by
+            # observed repeats with matching reset inputs/state/RNG. No optimizer.
+            schedule = [(False, 0), (False, 1), (True, 0), (True, 1)] if observed_mode else [(False, 0), (False, 1)]
+            for instrumented, repeat in schedule:
+                if repeat == 0:
+                    repeats, previous = [], None
                 trainer.accelerator.wait_for_everyone()
                 torch.set_rng_state(saved_cpu)
                 torch.cuda.set_rng_state(saved_cuda)
                 rng = {"pre_forward": {"cpu": tensor_record(saved_cpu), "cuda": tensor_record(saved_cuda)}}
                 dora = {}
-                with ObjectiveObservation(trainer, manifest["variant"], batch) as observation:
+                boundary = boundary_module.BoundaryObservation(case["raw_index"], repeat) if instrumented else None
+                with ObjectiveObservation(trainer, manifest["variant"], batch) as observation, (boundary if boundary else nullcontext()):
+                    if boundary:
+                        boundary.bind_native(model, batch, manifest["variant"])
                     def phase(name):
                         rng[name] = {"cpu": tensor_record(torch.get_rng_state()), "cuda": tensor_record(torch.cuda.get_rng_state())}
                         if name == "post_forward":
                             observation.phase = "backward_replay"
+                            if boundary:
+                                boundary.phase = "replay"
                     with trainer.accelerator.autocast():
                         loss, gradients = differentiate(trainer, model, batch, native_dora_scope(model, manifest["variant"], dora), phase)
                     details = observation.record()
@@ -768,7 +843,8 @@ def worker(args):
                     raise ValueError("nonfinite diagnostic loss/gradient")
                 if state_record(model) != cast_state or any(parameter.grad is not None for parameter in model.parameters()):
                     raise ValueError("diagnostic modified model state or accumulated gradients")
-                tensor_file = output / f"case-{case['raw_index']}-repeat-{repeat}.pt"
+                prefix = "control-" if observed_mode and not instrumented else ""
+                tensor_file = output / f"{prefix}case-{case['raw_index']}-repeat-{repeat}.pt"
                 torch.save(gradients, tensor_file)
                 data = {"repeat": repeat, "loss": loss, "objective": details, "rng": rng, "dora": dora,
                         "gradients": {name: None if gradient is None else tensor_record(gradient) for name, gradient in gradients.items()},
@@ -779,11 +855,27 @@ def worker(args):
                     data["repeat_rng_equal"] = repeats[0]["rng"] == rng
                     data["repeat_objective_comparison"] = compare_repeat_objectives(repeats[0]["objective"], details)
                     data["repeat_observation_equal"] = data["repeat_objective_comparison"]["pass"]
+                if boundary:
+                    boundary_file = output / f"boundaries-case-{case['raw_index']}-repeat-{repeat}.pt"
+                    torch.save(boundary.raw, boundary_file)
+                    data["boundaries"] = {**boundary.record(), "tensor_path": str(boundary_file),
+                                          "tensor_sha256": sha256(boundary_file)}
+                    if previous_boundaries is not None:
+                        data["boundary_repeat_comparison"] = boundary_module.compare_boundaries(
+                            previous_boundaries[0], previous_boundaries[1], data["boundaries"], boundary.raw, compare_gradients)
+                    previous_boundaries = (data["boundaries"], boundary.raw)
+                    observed_values.append((data, gradients))
+                elif observed_mode:
+                    controls.append((data, gradients))
                 repeats.append(data)
                 previous = gradients
                 trainer.accelerator.wait_for_everyone()
-            record["cases"].append({"raw_index": case["raw_index"], "sample_id": case["sample_id"], "repeats": [0, 1],
-                                    "batch": batch_record, "batch_tensors": batch_tensors, "logical_rows": rows, "observations": repeats})
+            case_record = {"raw_index": case["raw_index"], "sample_id": case["sample_id"], "repeats": [0, 1],
+                           "batch": batch_record, "batch_tensors": batch_tensors, "logical_rows": rows, "observations": repeats}
+            if observed_mode:
+                case_record.update(unobserved_controls=[item[0] for item in controls],
+                                   observation_effect=compare_observation_effect(controls, observed_values, case["raw_index"]))
+            record["cases"].append(case_record)
     record["rotary"] = rotary
     if manifest["variant"] == "sourceTorch" and rotary.get("calls", 0) <= 0:
         raise ValueError("sourceTorch did not witness the controlled native rotary call")
@@ -799,11 +891,16 @@ def compare_results(args):
                  for record in (left, right)]
     if left["rank"] != right["rank"] or left["variant"] == right["variant"]:
         raise ValueError("comparison requires same actual rank and distinct fixed runtime variants")
+    modes = [record.get("boundary_observation", False) for record in (left, right)]
+    if modes[0] != modes[1]:
+        raise ValueError("boundary observation modes are incomparable")
+    boundary_module = boundary_api() if modes[0] else None
     result = {"comparator": COMPARATOR, "pass": True, "cases": [], "discrete_mismatches": [],
               "ranks_covered": [left["rank"]], "runtime_pair": [left["variant"], right["variant"]],
               "runs": [left["run_id"], right["run_id"]], "cases_covered": [727, 2046], "repeats_covered": [0, 1],
-              "global_coverage_complete": False,
-              "coverage": "native objective/components/selected support/all trainable derivatives; intermediate activation/cache claims deferred"}
+              "global_coverage_complete": False, "boundary_status": "observed_partial_mapping" if modes[0] else "not_requested",
+              "coverage": ("native objective/components/selected support/all trainable derivatives; fixed intermediate boundaries with explicit replay/fan-in mapping limits"
+                           if modes[0] else "native objective/components/selected support/all trainable derivatives; intermediate activation/cache claims deferred")}
     for name in ("loaded_state", "bf16_cast_state", "model_state_unchanged", "profile"):
         if left.get(name) != right.get(name):
             result["discrete_mismatches"].append(name)
@@ -811,6 +908,8 @@ def compare_results(args):
         if any(lcase.get(key) != rcase.get(key) for key in ("raw_index", "sample_id", "batch_tensors", "logical_rows")):
             result["discrete_mismatches"].append(f"case-{lcase['raw_index']}-input")
         comparisons, previous = [], None
+        previous_boundaries = None
+        control_pairs = [[], []]
         for lobs, robs in zip(lcase["observations"], rcase["observations"]):
             raw = []
             for obs, names in zip((lobs, robs), trainable):
@@ -831,16 +930,48 @@ def compare_results(args):
                                           "loss_pass": abs(before["loss"]-current["loss"]) <= COMPARATOR["atol"]+COMPARATOR["rtol"]*abs(before["loss"]),
                                           "loss_abs_error": abs(before["loss"]-current["loss"]),
                                           "rng_equal": before["rng"] == current["rng"]})
-            comparisons.append({"repeat": lobs["repeat"], "gradients": gradients, "objective": objective,
+            entry = {"repeat": lobs["repeat"], "gradients": gradients, "objective": objective,
                                 "loss_pass": loss_pass, "loss_abs_error": abs(lobs["loss"]-robs["loss"]),
                                 "rng_equal": lobs["rng"] == robs["rng"],
                                 "left_repeat": repeat_checks[0] if repeat_checks else None,
-                                "right_repeat": repeat_checks[1] if repeat_checks else None})
+                     "right_repeat": repeat_checks[1] if repeat_checks else None}
+            if boundary_module:
+                boundary_values = []
+                for obs in (lobs, robs):
+                    trace = obs["boundaries"]
+                    contained(trace["tensor_path"], Path(args.repository)/"checkpoints")
+                    if sha256(trace["tensor_path"]) != trace["tensor_sha256"]:
+                        raise ValueError("raw boundary bytes changed")
+                    tensors = torch.load(trace["tensor_path"], map_location="cpu", weights_only=True)
+                    boundary_module.validate_raw(trace, tensors)
+                    boundary_values.append(tensors)
+                entry["boundaries"] = boundary_module.compare_boundaries(lobs["boundaries"], boundary_values[0],
+                    robs["boundaries"], boundary_values[1], compare_gradients)
+                if previous_boundaries:
+                    for index, name in enumerate(("left_boundary_repeat", "right_boundary_repeat")):
+                        entry[name] = boundary_module.compare_boundaries(previous[0][index]["boundaries"], previous_boundaries[index],
+                            (lobs, robs)[index]["boundaries"], boundary_values[index], compare_gradients)
+                previous_boundaries = boundary_values
+                # Reload and validate the unchanged controls instead of trusting
+                # a published effect summary or parameter hash alone.
+                for index, native_case in enumerate((lcase, rcase)):
+                    control = native_case["unobserved_controls"][lobs["repeat"]]
+                    contained(control["tensor_path"], Path(args.repository)/"checkpoints")
+                    if sha256(control["tensor_path"]) != control["tensor_sha256"]:
+                        raise ValueError("raw observation control bytes changed")
+                    values = torch.load(control["tensor_path"], map_location="cpu", weights_only=True)
+                    validate_raw_gradients(values, control["gradients"], trainable[index])
+                    control_pairs[index].append(((control, values), ((lobs, robs)[index], raw[index])))
+            comparisons.append(entry)
             repeat_pass = all(check["gradients"]["pass"] and check["objective"]["pass"]
                               and check["loss_pass"] and check["rng_equal"] for check in repeat_checks)
             result["pass"] &= gradients["pass"] and objective["pass"] and loss_pass and lobs["rng"] == robs["rng"] and repeat_pass
             previous = ((lobs, robs), raw)
-        result["cases"].append({"raw_index": lcase["raw_index"], "comparisons": comparisons})
+        case_result = {"raw_index": lcase["raw_index"], "comparisons": comparisons}
+        if boundary_module:
+            case_result["observation_effect"] = [compare_observation_effect([item[0] for item in pairs],
+                [item[1] for item in pairs], lcase["raw_index"]) for pairs in control_pairs]
+        result["cases"].append(case_result)
     result["pass"] &= not result["discrete_mismatches"]
     publish_json(contained(args.output, Path(args.repository)/"results"), result)
 
