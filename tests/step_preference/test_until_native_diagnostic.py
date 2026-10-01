@@ -190,7 +190,8 @@ def native_reducer_fixture():
     from step_preference.config import StepPreferenceConfig
     from step_preference.equivalence import _trainer
     trainer = _trainer(StepPreferenceConfig(enabled=True, mode="stage2b", direct_from_stage1=True,
-        visual_only_context_preference=True, beta=.5, lambda_preference=1., lambda_entropy=0.))
+        visual_only_context_preference=True, beta=.5, lambda_ce=1., preference_margin=0.,
+        lambda_preference=1., lambda_entropy=0.))
     return trainer
 
 
@@ -368,6 +369,9 @@ def test_native_tiny_component_cell_executes_fresh_forward_per_backward(tmp_path
     batch = dict(case["inputs"], sample_ids=["tiny"], reasoning_step_spans=spans,
                  step_preference={"steps": [{"span": span} for span in spans]})
     trainer = d.make_trainers([models[0]], None, tmp_path, "cpu", backend="dense")[0]
+    # This diagnostic reproduces the historical unit-CE, zero-margin protocol.
+    config = trainer.step_preference_config
+    assert (config.lambda_ce, config.beta, config.preference_margin) == (1., .5, 0.)
     result = d.run_component_cell(models[0], trainer, batch, "cpu", [str(Path(__file__).parents[2] / "src")])
     assert set(result["runs"]) == {"ce", "preference", "total"}
     assert all(len(rows) == 3 for rows in result["runs"].values())

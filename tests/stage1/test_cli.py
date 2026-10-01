@@ -100,6 +100,8 @@ def test_stage1_explicit_target_order_is_preserved_after_normalization():
                 "/a",
                 "--resume_from_checkpoint_path",
                 "/b",
+                "--ce_weight",
+                "1",
             ],
             "mutually exclusive",
         ),

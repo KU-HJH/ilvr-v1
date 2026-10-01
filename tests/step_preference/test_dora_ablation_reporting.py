@@ -166,11 +166,14 @@ def test_real_launcher_phase_budget_is_rejected_at_freeze_and_reopen(ablation_fi
     shutil.copyfile(repository/"configs/deepspeed_zero2.json",tmp_path/"configs/deepspeed_zero2.json")
     identity=manifest.identity
     environment={"PATH":os.environ["PATH"],"STAGE2_DRY_RUN":"true","STAGE2_DRY_RUN_FORMAT":"json",
+        "PYTHONDONTWRITEBYTECODE":"1","CUDA_VISIBLE_DEVICES":"","OMP_NUM_THREADS":"1","MKL_NUM_THREADS":"1",
+        "HF_HUB_OFFLINE":"1","TRANSFORMERS_OFFLINE":"1",
         "STAGE2_TOTAL_STEPS":"4","STAGE1_CHECKPOINT":identity.checkpoint_path,
         "STAGE2A_CHECKPOINT_PATH":identity.checkpoint_path,"DATA_PATH":identity.retained_data_path,
         "IMAGE_ROOT":identity.image_root_path,"STEP_NEGATIVE_PATH":identity.negative_path,
         "STEP_NEGATIVE_MANIFEST":identity.negative_manifest_path,"STEP_PREFERENCE_ENABLED":"true",
         "STEP_PREFERENCE_MODE":"stage2b","STEP_PREFERENCE_OBJECTIVE":"legacy_dpo","STEP_PREFERENCE_PACKING":"true",
+        "STEP_DPO_BETA":"0.1","STEP_PREFERENCE_MARGIN":"0",
         "STEP_PACKED_ADMISSION_MANIFEST":summary.admission_manifest_path,
         "STEP_PACKED_ADMISSION_MANIFEST_SHA256":summary.admission_manifest_sha256,
         "STEP_PACKED_ADMISSION_VERIFICATION":summary.verification_path,

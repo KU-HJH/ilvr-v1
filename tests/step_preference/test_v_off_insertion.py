@@ -215,6 +215,7 @@ def insertion_config(**kwargs):
     values = dict(enabled=True, mode='stage2b', stage2a_checkpoint_path='tiny-stage2a',
         shared_prefix_enabled=True, visual_only_context_preference=True,
         visual_off_suppress_latent_boundaries=False, prefix_mode='v_off_insertion',
+        beta=.1, lambda_ce=1., preference_margin=0.,
         lambda_preference=10., lambda_entropy=0., sidecar_attention_backend='dense')
     values.update(kwargs)
     return StepPreferenceConfig(**values)

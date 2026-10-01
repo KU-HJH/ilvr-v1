@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import shutil
+import uuid
 
 import pytest
 import src.multinode as coordinator
@@ -15,8 +17,13 @@ from tests.multinode.test_artifacts import strict_manifest
 @pytest.fixture
 def coordinator_paths():
     repo = Path(__file__).resolve().parents[2]
-    with tempfile.TemporaryDirectory(prefix='planned-stop-test-', dir=repo / 'checkpoints') as state, tempfile.TemporaryDirectory(prefix='planned-stop-test-', dir=repo / 'results') as results:
-        yield Path(state), Path(results)
+    state = repo / 'checkpoints' / f'planned-stop-test-{uuid.uuid4().hex}'
+    state.mkdir()
+    try:
+        with tempfile.TemporaryDirectory(prefix='planned-stop-test-', dir=repo / 'results') as results:
+            yield state, Path(results)
+    finally:
+        shutil.rmtree(state)
 
 
 @pytest.mark.parametrize('stop,problem,expected', [

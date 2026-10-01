@@ -361,6 +361,8 @@ def test_stage2_resume_leaves_omitted_method_for_sidecar_resolution():
             "stage2",
             "--resume_from_checkpoint_path",
             "checkpoint-7",
+            "--ce_weight",
+            "1",
         ]
     )
 
@@ -513,6 +515,7 @@ def stage2_args(**overrides):
     values = dict(
         load_model_path="stage1/model",
         resume_from_checkpoint_path=None,
+        ce_weight=1.,
         attention_implementation="sdpa",
         vision_attention_implementation="sdpa",
         latent_size=4,

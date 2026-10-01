@@ -396,6 +396,7 @@ def _stage1_args(
     image_root.mkdir(exist_ok=True)
     argv = [
         "--stage", "stage1",
+        "--ce_weight", "1",
         "--model", "tiny/original-qwen",
         "--data_path", str(data_path),
         "--image_root", str(image_root),

@@ -160,7 +160,7 @@ def actual_reference_trainer(tmp_path, model, dataset, config, monkeypatch):
 def test_ce_only_reference_trainer_preserves_tail_update_and_fixed_denominator(tmp_path, monkeypatch):
     # Catches rejecting CE-only, changing global order, or renormalizing the partial tail.
     trainer = actual_reference_trainer(tmp_path, ScalarModel(),
-        [{'input_ids': torch.tensor([1])}] * 19, StepPreferenceConfig(), monkeypatch)
+        [{'input_ids': torch.tensor([1])}] * 19, StepPreferenceConfig(lambda_ce=1.), monkeypatch)
     assert trainer.step_preference_config.enabled is False
     assert trainer.model_accepts_loss_kwargs is False
     sampler = trainer._get_train_sampler()

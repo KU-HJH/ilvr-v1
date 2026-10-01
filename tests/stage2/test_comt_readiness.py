@@ -23,7 +23,10 @@ REQUIRED_ENV = {
 
 
 def run_launcher(*args, env_overrides=None):
-    env = {"PATH": os.environ["PATH"], "STAGE2_DRY_RUN": "true", **REQUIRED_ENV}
+    env = {"PATH": os.environ["PATH"], "STAGE2_DRY_RUN": "true", **REQUIRED_ENV,
+           "PYTHONDONTWRITEBYTECODE": "1", "CUDA_VISIBLE_DEVICES": "",
+           "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+           "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
@@ -67,7 +70,7 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         "--stage2_assistant_plan_rendering",
         "concatenated-v1",
         "--ce_weight",
-        "1.0",
+        "0.1",
         "--supervise_latent_boundaries",
         "--learning_rate",
         "5e-5",
@@ -130,6 +133,7 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
                 "MAX_SEQUENCE_LENGTH": "4096",
                 "DEEPSPEED_CONFIG": "/configs/zero 3.json",
                 "RESUME_CHECKPOINT": "/outputs/checkpoint 20",
+                "CE_WEIGHT": "1.0",
             }
         )
     )

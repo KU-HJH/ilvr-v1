@@ -31,7 +31,7 @@ def case():
 def config(**kwargs):
     return StepPreferenceConfig(enabled=True, mode='stage2b',
         stage2a_checkpoint_path='tiny-stage2a', visual_only_context_preference=True,
-        visual_off_suppress_latent_boundaries=False, lambda_preference=10.,
+        visual_off_suppress_latent_boundaries=False, beta=.1, lambda_ce=1., preference_margin=0., lambda_preference=10.,
         lambda_entropy=0., sidecar_attention_backend='dense', **kwargs)
 
 

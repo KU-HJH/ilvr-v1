@@ -155,6 +155,8 @@ def stage1_args(tmp_path, *extra, method="dora"):
         [
             "--stage",
             "stage1",
+            "--ce_weight",
+            "1",
             *tuning_args,
             "--model",
             "Qwen/Qwen2.5-VL-3B-Instruct",

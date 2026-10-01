@@ -537,7 +537,7 @@ def make_trainers(models, external, output_dir, device, *, backend="flex"):
     from step_preference.config import StepPreferenceConfig
     from transformers import TrainingArguments
     configs = [StepPreferenceConfig(enabled=True, mode="stage2b", target_scope="until_next_latent",
-        beta=.5, lambda_preference=1., lambda_entropy=0., shared_prefix_enabled=True,
+        beta=.5, lambda_ce=1., preference_margin=0., lambda_preference=1., lambda_entropy=0., shared_prefix_enabled=True,
         visual_only_context_preference=True, visual_off_suppress_latent_boundaries=False,
         direct_from_stage1=True, sidecar_attention_backend=backend, sidecar_query_budget=1024)]
     classes = [Stage2Trainer]
