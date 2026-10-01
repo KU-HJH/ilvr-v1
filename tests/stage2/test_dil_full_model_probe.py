@@ -700,8 +700,8 @@ def test_boundary_comparator_marks_fanin_and_missing_replay_incomparable():
     assert result["boundaries"]["suffix:0/forward/suffix.input_key"]["cotangent"] is None
 
 
-def test_boundary_result_comparison_cannot_silently_ignore_mixed_observation_modes(tmp_path):
-    # Break caught: an observed/unobserved pair declares complete intermediate comparison.
+def test_boundary_unobserved_result_marks_boundaries_not_requested(tmp_path):
+    # Break caught: an unobserved pair claims an intermediate comparison.
     p, records, args, write = comparison_fixture(tmp_path)
     records[0]["boundary_observation"] = False
     records[1]["boundary_observation"] = False
@@ -769,13 +769,21 @@ def observed_comparison_fixture(tmp_path):
                     observer.calls.append({**call, "status": "returned"})
                     for name in ("decoder.hidden", "clean.key", "clean.value"):
                         observer.capture(name, x, call)
+                    suffix = {"identity": "suffix:0", "phase": "forward"}
+                    observer.calls.append({**suffix, "status": "returned"})
+                    observer.capture("decoder.hidden", x, suffix)
                     for index in range(len(case["logical_rows"])*8):
-                        observer.capture(f"latent.{index}", x, {"identity": "rollout:0", "phase": "forward"})
-                        observer.capture("prefix.hidden_tail", x, {"identity": f"prefix:{index}:0", "phase": "forward"})
+                        position = index + 1
+                        latent_rows = [[case["sample_id"], "latent_position", position]]
+                        observer.capture(f"latent.{index}", x, {"identity": "rollout:0", "phase": "forward"}, rows=latent_rows)
+                        prefix = {"identity": f"prefix:{position}:0", "phase": "forward"}
+                        observer.calls.append({**prefix, "status": "returned"})
+                        observer.capture("prefix.hidden_tail", x, prefix, rows=latent_rows)
                     for role in ("clean_ce", "clean_target", "off_target"):
                         row_ids = [row for group in case["logical_rows"] for row in group]
                         y = torch.ones(len(row_ids), 2, requires_grad=True)
                         head = {"identity": role+":0", "phase": "forward"}
+                        observer.calls.append({**head, "status": "returned"})
                         for name in ("head.hidden", "head.logits"):
                             observer.capture(name, y, head, rows=row_ids)
                         loss = loss + y.sum()
@@ -837,3 +845,56 @@ def test_boundary_shape_mismatch_is_incomparable_instead_of_numeric_frontier():
     result = api.compare_boundaries(observers[0].record(), observers[0].raw, observers[1].record(), observers[1].raw, probe().compare_gradients)
     assert not result["pass"] and result["unmapped_or_incomparable"]
     assert result["earliest_forward_frontier"] == result["earliest_cotangent_frontier"] == []
+
+
+@pytest.mark.parametrize("removed", [
+    "clean_ce:0/forward/head.hidden", "clean_ce:0/forward/head.logits",
+    "clean_target:0/forward/head.hidden", "clean_target:0/forward/head.logits",
+    "off_target:0/forward/head.hidden", "off_target:0/forward/head.logits",
+    "clean:0/forward/decoder.hidden", "clean:0/forward/clean.key", "clean:0/forward/clean.value",
+    "rollout:0/forward/latent.0", "prefix:1:0/forward/prefix.hidden_tail",
+])
+def test_boundary_bilateral_required_record_removal_rejected_before_comparison(tmp_path, removed):
+    # Break caught: aggregate name/symmetric-difference checks hide missing required evidence.
+    p, records, args, write = observed_comparison_fixture(tmp_path)
+    api = boundary_api()
+    traces = []
+    for record in records:
+        trace = record["cases"][0]["observations"][0]["boundaries"]
+        raw = torch.load(trace["tensor_path"], map_location="cpu", weights_only=True)
+        trace["records"] = [item for item in trace["records"] if item["key"] != removed]
+        for suffix in ("/forward", "/cotangent"):
+            raw.pop(removed + suffix)
+        # Raw dictionaries still match the reduced metadata; semantic completeness
+        # must be enforced by the required native trace gate.
+        api.validate_raw(trace, raw)
+        torch.save(raw, trace["tensor_path"])
+        trace["tensor_sha256"] = p.sha256(trace["tensor_path"])
+        traces.append(trace)
+    write()
+    for trace in traces:
+        with pytest.raises(ValueError, match="boundary"):
+            api.validate_trace(trace, p.CASES[0], 0)
+    with pytest.raises(ValueError, match="boundary"):
+        p.compare_results(args)
+
+
+@pytest.mark.parametrize("mutation", ["head_call", "clean_call", "prefix_call", "record_identity", "prefix_position", "rollout_call"])
+def test_boundary_required_records_link_to_native_calls_and_rollout_positions(tmp_path, mutation):
+    # Break caught: correct tensor names attached to nonexistent/wrong calls pass the trace gate.
+    p, records, args, write = observed_comparison_fixture(tmp_path)
+    trace = records[0]["cases"][0]["observations"][0]["boundaries"]
+    if mutation.endswith("_call") and mutation != "rollout_call":
+        identity = {"head_call": "off_target:0", "clean_call": "clean:0", "prefix_call": "prefix:1:0"}[mutation]
+        trace["calls"] = [item for item in trace["calls"] if item["identity"] != identity]
+    else:
+        item = next(item for item in trace["records"] if item["key"] == "rollout:0/forward/latent.0")
+        if mutation == "record_identity":
+            item["name"] = "latent.99"
+        elif mutation == "prefix_position":
+            item["rows"][0][2] = 999
+        else:
+            item["call"] = "other_rollout:0"
+            item["key"] = "other_rollout:0/forward/latent.0"
+    with pytest.raises(ValueError, match="boundary"):
+        p.boundary_api().validate_trace(trace, p.CASES[0], 0)

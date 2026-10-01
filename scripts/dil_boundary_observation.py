@@ -391,19 +391,48 @@ def validate_trace(record, prescribed, repeat):
         raise ValueError("missing actual attention backward profiler evidence")
     if len({item["key"] for item in items}) != len(items):
         raise ValueError("duplicate boundary identities")
+    call_map = {(item.get("phase"), item.get("identity")): item for item in calls}
+    if len(call_map) != len(calls):
+        raise ValueError("duplicate native boundary call identities")
+    for item in items:
+        if item.get("key") != f"{item.get('call')}/{item.get('phase')}/{item.get('name')}":
+            raise ValueError("inconsistent native boundary record identity")
+        # Latents are observed at the native rollout return, outside a decoder
+        # forward wrapper. Their separate representation is linked below to
+        # the actual corresponding prefix position/call, not an invented call.
+        rollout_return = item.get("call") == "rollout:0" and item.get("name", "").startswith("latent.")
+        if not rollout_return and (item.get("phase"), item.get("call")) not in call_map:
+            raise ValueError("missing native boundary call linkage")
     forward = [item for item in items if item.get("phase") == "forward"]
-    names = {item.get("name") for item in forward}
-    required = {"decoder.hidden", "clean.key", "clean.value", "head.hidden", "head.logits"}
-    required.update(f"latent.{index}" for index in range(prescribed["blocks"] * 8))
-    if not required <= names:
-        raise ValueError("missing required native boundary tensor")
-    heads = [item for item in forward if item.get("name") == "head.logits"]
-    if {item.get("call") for item in heads} != {"clean_ce:0", "clean_target:0", "off_target:0"}:
-        raise ValueError("missing clean/OFF native head boundary")
+    by_boundary = {(item["call"], item["name"]): item for item in forward}
+    head_calls = ("clean_ce:0", "clean_target:0", "off_target:0")
+    required = {(call, name) for call in head_calls for name in ("head.hidden", "head.logits")}
+    required.update(("clean:0", name) for name in ("decoder.hidden", "clean.key", "clean.value"))
+    required.update(("rollout:0", f"latent.{index}") for index in range(prescribed["blocks"] * 8))
+    if not required <= by_boundary.keys():
+        raise ValueError("missing required native forward boundary identity")
+    heads = [by_boundary[call, name] for call in head_calls for name in ("head.hidden", "head.logits")]
     if any(item.get("rows") is None or len(item["rows"]) != item["forward"]["shape"][0] for item in heads):
         raise ValueError("unmapped native head boundary rows")
-    if len([item for item in forward if item.get("name") == "prefix.hidden_tail"]) != prescribed["blocks"] * 8:
+    prefix_positions = []
+    for index in range(prescribed["blocks"] * 8):
+        latent = by_boundary["rollout:0", f"latent.{index}"]
+        rows = latent.get("rows")
+        if (not isinstance(rows, list) or len(rows) != 1 or len(rows[0]) != 3
+                or rows[0][:2] != [prescribed["sample_id"], "latent_position"]
+                or type(rows[0][2]) is not int or rows[0][2] <= 0):
+            raise ValueError("missing native rollout boundary position")
+        position = rows[0][2]
+        prefix = by_boundary.get((f"prefix:{position}:0", "prefix.hidden_tail"))
+        if prefix is None or prefix.get("rows") != rows:
+            raise ValueError("missing native rollout/prefix boundary linkage")
+        prefix_positions.append(position)
+    if prefix_positions != sorted(set(prefix_positions)):
+        raise ValueError("invalid native rollout boundary order")
+    if len([item for item in forward if item.get("name") == "prefix.hidden_tail"]) != len(prefix_positions):
         raise ValueError("missing native latent prefix boundary")
+    if any(call["phase"] == "forward" and call["status"] != "returned" for call in calls):
+        raise ValueError("missing returned forward native boundary call")
     for item in items:
         if item.get("cotangent_status") not in ("delivered", "not_delivered"):
             raise ValueError("missing boundary cotangent status")
