@@ -98,6 +98,14 @@ env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk STEP_PREFERENCE_TOPK="$k_pct1" STE
 
 For inference, prepare the completed PEFT artifact with the existing `src.multinode prepare-inference` path under `checkpoints/evaluation-staging/<run-id>/`; use the original Qwen2.5-VL-3B base. Then run the existing `run_multinode_evaluation.sh` entrypoint. The default TEST400 evaluation is greedy (`temperature=0`, `top_p=1`), max new tokens 4096, max sequence 128000, repetition penalty 1, no vision ablation, and `external_full_latent_block`. Follow [the operator guide](multinode-training.md) for the exact preparation and evaluation command arguments. A prepared inference copy is not a training resume checkpoint.
 
+### Reversed chosen/rejected reductions
+
+Select `STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk_reverse` (CLI: `--step_preference_loss_type dil_bce_rf_topk_reverse`) for the separately versioned reduction variant. For each original step with selected positions `T`, its chosen loss is `mean_t softplus(-beta * clean_GT_logp_t)` and its rejected loss is `softplus(beta * mean_t sum_v q_t(v) * log(q_t(v)))`. The OFF distribution `q` is renormalized over the detached OFF top-k support; its probabilities and expectation remain differentiable. Both the candidate expectation and selected-position mean precede the single rejected softplus. The existing live top-k entropy statistic supplies the expectation as `-H(q)`.
+
+Sum each component over steps and divide by the original step count. A step with no selected positions contributes zero, including no `softplus(0)`. Metrics `loss/dil_positive` and `loss/dil_negative` report these actual chosen and rejected losses; log-probability metrics keep their existing meaning. CE, clean-detached group-mass KL, entropy selection and step weighting follow the existing top-k path.
+
+For the approved experiment, keep top-k 1516 (1%), sample-level clean full-vocabulary entropy top20, beta 0.5, preference/CE/mass weights 1, entropy weight 0, and `until_next_latent`. Change only the loss selector in the approved saved fresh-run profile and use a fresh run ID with the existing coordinator. The original `dil_bce_rf_topk` formulas and `dpo` default are preserved. Checkpoints save formula version `dil_bce_rf_topk_reverse_v1`; resuming an original top-k run with this selector, or the reverse, is rejected.
+
 ### Planned checkpoint stop for a bounded resume probe
 
 For an independently authorized three-update DIL smoke, one fresh run can stop after a complete checkpoint 2 and resume to the original budget 3. Keep the approved dataset and profile. This optional diagnostic requires enabled DIL `context_preference` Stage 2B and a positive integer strictly below the resolved total budget. Both coordinator and workers receive the option; the coordinator also requires explicit `--max_steps`.

@@ -41,7 +41,8 @@ def test_sidecar_rejects_permuted_step_identity(corruption):
 
 
 @pytest.mark.parametrize("mass_only", [False, True])
-def test_dil_checkpoint_replay_preserves_gradients(mass_only):
+@pytest.mark.parametrize("kind", ["dil_bce_rf_topk", "dil_bce_rf_topk_reverse"])
+def test_dil_checkpoint_replay_preserves_gradients(mass_only, kind):
     model, batch = dil_case()
     baseline = copy.deepcopy(model)
     outcomes = []
@@ -58,7 +59,7 @@ def test_dil_checkpoint_replay_preserves_gradients(mass_only):
         pre = current.register_forward_pre_hook(options, with_kwargs=True)
         hook = current.model.register_forward_hook(capture, with_kwargs=True)
         try:
-            loss, out, _ = observed_forward(current, batch, dil_config(lambda_preference=0. if mass_only else 1.))
+            loss, out, _ = observed_forward(current, batch, dil_config(kind, lambda_preference=0. if mass_only else 1.))
             (loss-out.loss).backward()
         finally:
             hook.remove(); pre.remove()

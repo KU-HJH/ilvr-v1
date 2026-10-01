@@ -9,15 +9,16 @@ from step_preference.equivalence import _trainer
 
 
 @pytest.mark.parametrize("source", ["clean", "voff"])
-def test_entropy_100_matches_disabled(source, monkeypatch):
+@pytest.mark.parametrize("kind", ["dil_bce_rf_topk", "dil_bce_rf_topk_reverse"])
+def test_entropy_100_matches_disabled(source, monkeypatch, kind):
     import step_preference.entropy_selection as selection
     def forbidden(*args, **kwargs):
         pytest.fail("100%/disabled must bypass selection")
     monkeypatch.setattr(selection, "select_entropy_masks", forbidden)
     model, batch = dil_case()
     reference = copy.deepcopy(model)
-    actual, a, _ = observed_forward(model, batch, dil_config(preference_entropy_top_percent=100, preference_entropy_source=source))
-    expected, b, _ = observed_forward(reference, batch, dil_config())
+    actual, a, _ = observed_forward(model, batch, dil_config(kind, preference_entropy_top_percent=100, preference_entropy_source=source))
+    expected, b, _ = observed_forward(reference, batch, dil_config(kind))
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(a.logits, b.logits, atol=0, rtol=0)
     actual.backward(); expected.backward()

@@ -344,7 +344,7 @@ class StepPreferenceConfig:
     def is_dil_resume(self) -> bool:
         return (
             self.is_context_preference
-            and self.preference_loss_type in ("dil_bce_rf", "dil_bce_rf_topk")
+            and self.preference_loss_type in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
             and self.resume_from_checkpoint_path is not None
         )
 

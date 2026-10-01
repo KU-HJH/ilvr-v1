@@ -21,13 +21,18 @@ def fresh_argv():
     return argv + ['--stage2b_direct_from_stage1', '--stage1_adapter_path', 'stage1']
 
 
-def test_parser_accepts_stop_only_before_resolved_budget():
-    args = parse_args(fresh_argv() + ['--stage2_stop_after_checkpoint', '2'])
+@pytest.mark.parametrize('kind', ['dil_bce_rf', 'dil_bce_rf_topk_reverse'])
+def test_parser_accepts_stop_only_before_resolved_budget(kind):
+    argv = fresh_argv()
+    argv[argv.index('--step_preference_loss_type') + 1] = kind
+    if kind == 'dil_bce_rf_topk_reverse':
+        argv += ['--step_preference_topk', '8']
+    args = parse_args(argv + ['--stage2_stop_after_checkpoint', '2'])
     assert args.stage2_stop_after_checkpoint == 2
     assert args.max_steps == 3
     # Explicit phase allocation wins over raw max_steps.
     with pytest.raises(ValueError, match='stop_after_checkpoint'):
-        parse_args(fresh_argv() + ['--stage2_total_steps', '2', '--stage2_stop_after_checkpoint', '2'])
+        parse_args(argv + ['--stage2_total_steps', '2', '--stage2_stop_after_checkpoint', '2'])
 
 
 @pytest.mark.parametrize('value', ['0', '-1', '3', '4', 'true', '2.5'])

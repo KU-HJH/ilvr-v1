@@ -334,7 +334,7 @@ case "$STEP_PREFERENCE_ENABLED" in
         exit 2
       fi
       if [[ -n "${RESUME_CHECKPOINT:-}" && "$STEP_PREFERENCE_OBJECTIVE" == context_preference &&
-            ( "$STEP_PREFERENCE_LOSS_TYPE" == dil_bce_rf || "$STEP_PREFERENCE_LOSS_TYPE" == dil_bce_rf_topk ) ]]; then
+            ( "$STEP_PREFERENCE_LOSS_TYPE" == dil_bce_rf || "$STEP_PREFERENCE_LOSS_TYPE" == dil_bce_rf_topk || "$STEP_PREFERENCE_LOSS_TYPE" == dil_bce_rf_topk_reverse ) ]]; then
         dil_stage2b_resume=true
         if [[ "$stage2b_direct_from_stage1" == true || -n "${STAGE1_ADAPTER_PATH:-}" || -n "${STAGE2A_CHECKPOINT_PATH:-}" ]]; then
           printf 'DIL RESUME_CHECKPOINT cannot use fresh Stage 1/Stage 2A initialization\n' >&2

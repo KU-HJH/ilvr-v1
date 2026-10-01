@@ -19,25 +19,32 @@ from tests.stage2.test_stage1_checkpoint_handoff import (
 from tests.stage2.helpers import tiny_stage2_qwen
 
 
-def bce_config():
+def bce_config(kind="dil_bce_rf"):
     return StepPreferenceConfig(
         enabled=True, mode="stage2b", objective="context_preference",
-        preference_loss_type="dil_bce_rf", beta=0.5,
+        preference_loss_type=kind, beta=0.5,
+        preference_topk=8 if kind == "dil_bce_rf_topk_reverse" else None,
+        lambda_topk_mass=1. if kind == "dil_bce_rf_topk_reverse" else 0.,
         lambda_entropy=0.0, direct_from_stage1=True,
         shared_prefix_enabled=True,
         visual_off_suppress_latent_boundaries=False,
     )
 
 
+@pytest.fixture(params=["dil_bce_rf", "dil_bce_rf_topk_reverse"])
+def bce_kind(request):
+    return request.param
+
+
 @pytest.fixture
-def bce_artifact(tmp_path):
+def bce_artifact(tmp_path, bce_kind):
     stage1, artifact, base = (tmp_path / name for name in ("stage1", "stage2", "base"))
     processor, _, metadata, trained = write_sparse_stage2_artifact(stage1, artifact)
     Stage2Trainer(
         model=trained,
         args=TrainingArguments(output_dir=str(artifact), report_to=[], use_cpu=True),
         stage2_peft_metadata=metadata,
-        step_preference_config=bce_config(),
+        step_preference_config=bce_config(bce_kind),
     ).save_model(artifact)
     tiny_tag_free_original_qwen().save_pretrained(base)
     source_config = base / "config.json"
@@ -48,9 +55,9 @@ def bce_artifact(tmp_path):
 
 
 @pytest.mark.filterwarnings("ignore:Could not find a config file.*:UserWarning")
-def test_bce_peft_save_reload_preserves_identity_logits_and_latents(bce_artifact):
+def test_bce_peft_save_reload_preserves_identity_logits_and_latents(bce_artifact, bce_kind):
     processor, trained, artifact, base = bce_artifact
-    identity = build_dil_identity(bce_config())
+    identity = build_dil_identity(bce_config(bce_kind))
     assert json.loads((artifact / "config.json").read_text())["ilvr_context_preference"] == identity
     assert not (artifact / "optimizer.pt").exists()
     reloaded = load_stage2_model_for_inference(base, artifact, processor)
@@ -84,18 +91,19 @@ def test_malformed_identity_rejected_before_base_weight_load(bce_artifact, tmp_p
 
 
 def test_train_resume_normalizes_true_false_and_path_before_trainer_restore(
-    bce_artifact, monkeypatch
+    bce_artifact, bce_kind, monkeypatch
 ):
     _, trained, artifact, _ = bce_artifact
+    config = bce_config(bce_kind)
     numbered = artifact / "checkpoint-1"
     saver = Stage2Trainer(
         model=trained,
         args=TrainingArguments(output_dir=str(artifact), report_to=[], use_cpu=True),
-        step_preference_config=bce_config(),
+        step_preference_config=config,
     )
     saver.save_model(numbered)
     write_deepspeed_runtime_sidecar(numbered, saver.deepspeed_runtime_profile)
-    assert json.loads((numbered / "config.json").read_text())["ilvr_context_preference"] == build_dil_identity(bce_config())
+    assert json.loads((numbered / "config.json").read_text())["ilvr_context_preference"] == build_dil_identity(config)
     calls = []
     monkeypatch.setattr(Trainer, "train", lambda self, *args, resume_from_checkpoint=None, **kwargs:
                         calls.append(resume_from_checkpoint))

@@ -10,7 +10,8 @@ if TYPE_CHECKING:
     from step_preference.config import StepPreferenceConfig
 
 
-_DIL_LOSS_TYPES = ("dil_bce_rf", "dil_bce_rf_topk")
+_DIL_LOSS_TYPES = ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
+_TOPK_LOSS_TYPES = ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
 
 
 def _finite(name: str, value: Real) -> float:
@@ -25,7 +26,7 @@ def _finite(name: str, value: Real) -> float:
 def uses_entropy_selection(config: StepPreferenceConfig) -> bool:
     """Whether a top-k objective selects fewer than all eligible steps."""
     return (
-        config.preference_loss_type == "dil_bce_rf_topk"
+        config.preference_loss_type in _TOPK_LOSS_TYPES
         and config.preference_entropy_top_percent is not None
         and config.preference_entropy_top_percent < 100.0
     )
@@ -51,12 +52,12 @@ def validate_dil_config(config: StepPreferenceConfig) -> None:
     if percent is None and config.preference_entropy_source != "clean":
         raise ValueError("step_preference_entropy_source requires entropy selection")
 
-    if loss_type != "dil_bce_rf_topk" and (
+    if loss_type not in _TOPK_LOSS_TYPES and (
         k is not None or mass != 0 or percent is not None
     ):
         raise ValueError("top-k options require dil_bce_rf_topk")
-    if loss_type == "dil_bce_rf_topk" and k is None:
-        raise ValueError("dil_bce_rf_topk requires step_preference_topk")
+    if loss_type in _TOPK_LOSS_TYPES and k is None:
+        raise ValueError(f"{loss_type} requires step_preference_topk")
     if loss_type == "dpo":
         return
 
@@ -85,5 +86,5 @@ def validate_dil_runtime(
         raise ValueError("DIL-BCE requires supervised latent boundaries")
     if type(vocab_size) is not int or vocab_size < 2:
         raise ValueError("DIL-BCE requires a valid output vocabulary size")
-    if config.preference_loss_type == "dil_bce_rf_topk" and config.preference_topk >= vocab_size:
+    if config.preference_loss_type in _TOPK_LOSS_TYPES and config.preference_topk >= vocab_size:
         raise ValueError("step_preference_topk must be smaller than output vocab size")
