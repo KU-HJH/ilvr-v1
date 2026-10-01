@@ -108,6 +108,7 @@ def dpo_pair_losses(
     reference_rejected: torch.Tensor,
     *,
     beta: float,
+    margin: float = 0.0,
 ) -> torch.Tensor:
     """Return one detached-reference DPO hinge-free loss per valid pair."""
     beta = _require_positive_finite("beta", beta)
@@ -116,7 +117,9 @@ def dpo_pair_losses(
     )
     policy_margin = policy_chosen - policy_rejected
     reference_margin = reference_chosen.detach() - reference_rejected.detach()
-    return -F.logsigmoid(beta * (policy_margin - reference_margin))
+    if isinstance(margin, bool) or not isinstance(margin, Real) or not math.isfinite(margin):
+        raise ValueError("margin must be finite")
+    return -F.logsigmoid(beta * (policy_margin - reference_margin) - float(margin))
 
 
 def context_preference_loss(
@@ -137,7 +140,7 @@ def context_preference_loss(
     ):
         raise ValueError("margin must be finite")
     delta = clean_logps - ablated_logps
-    return -F.logsigmoid(beta * (delta - float(margin))).mean()
+    return -F.logsigmoid(beta * delta - float(margin)).mean()
 
 
 def _validate_aggregate_inputs(
@@ -174,6 +177,7 @@ def aggregate_step_dpo(
     valid_visual: torch.Tensor,
     valid_textual: torch.Tensor,
     beta: float,
+    margin: float = 0.0,
 ) -> StepDPOResult:
     """Aggregate valid visual/textual pairs with one global pair denominator."""
     beta = _require_positive_finite("beta", beta)
@@ -203,7 +207,7 @@ def aggregate_step_dpo(
         visual_values = selected_pair_values(
             valid_visual, policy_visual_rejected, reference_visual_rejected
         )
-        visual_losses = dpo_pair_losses(*visual_values, beta=beta)
+        visual_losses = dpo_pair_losses(*visual_values, beta=beta, margin=margin)
         visual_loss = visual_losses.mean()
         visual_margin = (
             (visual_values[0] - visual_values[1])
@@ -218,7 +222,7 @@ def aggregate_step_dpo(
         textual_values = selected_pair_values(
             valid_textual, policy_textual_rejected, reference_textual_rejected
         )
-        textual_losses = dpo_pair_losses(*textual_values, beta=beta)
+        textual_losses = dpo_pair_losses(*textual_values, beta=beta, margin=margin)
         textual_loss = textual_losses.mean()
         textual_margin = (
             (textual_values[0] - textual_values[1])

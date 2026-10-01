@@ -19,7 +19,9 @@ REQUIRED_ENV = {
 
 
 def run_launcher(*args, env_overrides=None, cwd=None):
-    env = {"PATH": os.environ["PATH"], "STAGE2_DRY_RUN": "true", **REQUIRED_ENV}
+    env = {"PATH": os.environ["PATH"], "STAGE2_DRY_RUN": "true", **REQUIRED_ENV,
+           "PYTHONDONTWRITEBYTECODE": "1", "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+           "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
@@ -443,7 +445,7 @@ def test_stage2_launcher_resolves_repo_runtime_and_propagates_arguments(tmp_path
         "--stage2_assistant_plan_rendering",
         "concatenated-v1",
         "--ce_weight",
-        "1.0",
+        "0.1",
         "--supervise_latent_boundaries",
         "--learning_rate",
         "5e-5",

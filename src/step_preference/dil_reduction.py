@@ -79,7 +79,7 @@ def reduce_dil_context_loss(
             sums["negative"] = sums["negative"] + F.softplus(config.beta*off_score)
     means = {name: value/count if count else value for name, value in sums.items()}
     preference = means["positive"] + means["negative"]
-    total = clean_ce + config.lambda_preference*preference + config.lambda_topk_mass*means["mass"]
+    total = config.lambda_ce*clean_ce + config.lambda_preference*preference + config.lambda_topk_mass*means["mass"]
     if not bool(torch.isfinite(total)):
         raise ValueError("DIL total loss must be finite")
     metrics = {

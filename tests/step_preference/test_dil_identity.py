@@ -18,7 +18,7 @@ def bce_config(**changes):
     values = dict(enabled=True, mode="stage2b", objective="context_preference",
                   preference_loss_type="dil_bce_rf_topk", preference_topk=4,
                   lambda_topk_mass=0.2, preference_entropy_top_percent=50.0,
-                  beta=0.5, lambda_entropy=0.0, shared_prefix_enabled=True,
+                  beta=0.5, lambda_ce=1., preference_margin=0., lambda_entropy=0.0, shared_prefix_enabled=True,
                   visual_off_suppress_latent_boundaries=False,
                   direct_from_stage1=True)
     values.update(changes)
@@ -88,7 +88,7 @@ def test_bce_resume_missing_or_unknown_identity(tmp_path):
                  {**identity, "schema_version": 2}, {**identity, "beta": True},
                  {**identity, "beta": 1},
                  {**identity, "beta": -0.5},
-                 {**identity, "lambda_ce": 0.5},
+                 {**identity, "lambda_ce": -0.5},
                  {**identity, "lambda_entropy": 0.1},
                  {**identity, "preference_margin": 0.1},
                  {**identity, "lambda_preference": -1.0},

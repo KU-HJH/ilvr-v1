@@ -71,8 +71,8 @@ def validate_dil_config(config: StepPreferenceConfig) -> None:
         raise ValueError("DIL-BCE requires latent boundaries kept")
     if config.block_original_image:
         raise ValueError("DIL-BCE requires original image access")
-    if config.lambda_ce != 1.0 or config.lambda_entropy != 0.0 or config.preference_margin != 0.0:
-        raise ValueError("DIL-BCE requires CE=1, entropy=0, and preference margin=0")
+    if config.lambda_entropy != 0.0 or config.preference_margin != 0.0:
+        raise ValueError("DIL-BCE requires entropy=0 and preference margin=0")
 
 
 def validate_dil_runtime(

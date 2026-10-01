@@ -775,6 +775,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--micro-batch",
     "--epochs",
     "--learning-rate",
+    "--ce-weight",
     "--gradient-accumulation",
     "--ema-tau",
     "--seed",

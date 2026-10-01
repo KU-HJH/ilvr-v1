@@ -15,8 +15,10 @@ from utils_deepseed import parse_args
 
 
 def context_config(**kwargs):
+    historical = dict(beta=.1, lambda_ce=1., preference_margin=0.)
+    historical.update(kwargs)
     return StepPreferenceConfig(enabled=True, mode="stage2b",
-        stage2a_checkpoint_path="tiny-stage2a", sidecar_attention_backend="dense", **kwargs)
+        stage2a_checkpoint_path="tiny-stage2a", sidecar_attention_backend="dense", **historical)
 
 
 def forbidden(*args, **kwargs):
@@ -130,7 +132,7 @@ def test_disabled_preference_matches_direct_stage2_loss_and_gradients():
         for key in ("input_ids", "attention_mask", "labels")
     }
 
-    loss = _trainer(StepPreferenceConfig()).compute_loss(model, inputs)
+    loss = _trainer(StepPreferenceConfig(lambda_ce=1.)).compute_loss(model, inputs)
     baseline = reference(
         **inputs,
         stage2_loss_only=True,

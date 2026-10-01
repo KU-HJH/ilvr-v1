@@ -29,11 +29,11 @@ def test_step_preference_config_is_immutable_and_exposes_normative_defaults():
     assert config.enabled is False
     assert config.mode == "stage2a"
     assert config.objective == "context_preference"
-    assert config.beta == 0.1
-    assert config.lambda_ce == 1.0
+    assert config.beta == 10.0
+    assert config.lambda_ce == 0.1
     assert config.lambda_dpo == 1.0
     assert config.lambda_preference == 1.0
-    assert config.preference_margin == 0.0
+    assert config.preference_margin == 0.5
     assert config.visual_only_context_preference is False
     assert config.visual_off_suppress_latent_boundaries is False
     assert config.lambda_entropy == 0.1
@@ -63,12 +63,12 @@ def test_training_cli_exposes_only_disabled_stage2a_defaults():
     assert args.step_preference_objective == "context_preference"
     assert args.step_negative_path is None
     assert args.step_negative_manifest is None
-    assert args.step_dpo_beta == 0.1
+    assert args.step_dpo_beta == 10.0
     assert args.step_preference_weight == 1.0
-    assert args.step_preference_margin == 0.0
+    assert args.step_preference_margin == 0.5
     assert args.step_visual_only_context_preference is False
     assert args.step_visual_off_suppress_latent_boundaries is False
-    assert args.ce_weight == 1.0
+    assert args.ce_weight == 0.1
     assert args.step_dpo_weight == 1.0
     assert args.step_entropy_weight == 0.1
     assert args.step_entropy_margin == 0.1

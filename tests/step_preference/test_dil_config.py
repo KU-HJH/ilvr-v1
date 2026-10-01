@@ -91,7 +91,7 @@ def test_basic_bce_accepts_no_topk_options():
     {"objective": "legacy_dpo", "negative_path": "n", "negative_manifest": "m"},
     {"visual_only_context_preference": False},
     {"prefix_mode": "v_off_prefix"}, {"visual_off_suppress_latent_boundaries": True},
-    {"lambda_ce": 0.5}, {"lambda_entropy": 0.1}, {"preference_margin": 0.1},
+    {"lambda_ce": -0.5}, {"lambda_entropy": 0.1}, {"preference_margin": 0.1},
     {"shared_prefix_enabled": False},
 ])
 def test_bce_rejects_unsupported_training_contract(updates):

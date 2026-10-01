@@ -15,6 +15,9 @@ def _config(**updates):
         stage2a_checkpoint_path="tiny-stage2a",
         prefix_mode="evidence_replacement",
         lambda_preference=10.0,
+        lambda_ce=1.0,
+        beta=0.1,
+        preference_margin=0.0,
         lambda_entropy=0.0,
         sidecar_attention_backend="dense",
         visual_only_context_preference=True,
@@ -91,7 +94,7 @@ def test_trainer_uses_original_minus_replacement_step_mean_and_clean_ce(target_s
         [value["visual_original"] - value["visual_replacement"] for value in by_step.values()]
     )
     expected = output.loss - trainer.step_preference_config.lambda_preference * torch.nn.functional.logsigmoid(
-        trainer.step_preference_config.beta * (margins - trainer.step_preference_config.preference_margin)
+        trainer.step_preference_config.beta * margins - trainer.step_preference_config.preference_margin
     ).mean()
     torch.testing.assert_close(loss, expected, atol=1e-5, rtol=1e-4)
     assert {result["kind"] for result in output.stage2_sidecar_results} == {

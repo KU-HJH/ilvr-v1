@@ -744,7 +744,7 @@ class Stage2Trainer(Trainer):
             [ent[modality] for modality in active_modalities]
         ).mean()
         total = (
-            clean_ce
+            config.lambda_ce * clean_ce
             + config.lambda_preference * preference
             + config.lambda_entropy * entropy
         )
@@ -813,7 +813,7 @@ class Stage2Trainer(Trainer):
         if originals:
             margins = torch.stack([original - replacement for original, replacement in zip(originals, replacements)])
             preference = -F.logsigmoid(
-                config.beta * (margins - config.preference_margin)
+                config.beta * margins - config.preference_margin
             ).mean()
             original_mean = torch.stack(originals).mean()
             replacement_mean = torch.stack(replacements).mean()
@@ -830,7 +830,7 @@ class Stage2Trainer(Trainer):
                 f"stats/replacement_{name}_margin_count": count,
             }
 
-        total = clean_ce + config.lambda_preference * preference
+        total = config.lambda_ce * clean_ce + config.lambda_preference * preference
         metrics = {
             "loss/total": total,
             "loss/ce": clean_ce,
@@ -1058,6 +1058,7 @@ class Stage2Trainer(Trainer):
                     valid_textual, dtype=torch.bool, device=clean_ce.device
                 ),
                 beta=config.beta,
+                margin=config.preference_margin,
             )
             visual_entropy_tokens = torch.cat(visual_entropy_losses)
             textual_entropy_tokens = torch.cat(textual_entropy_losses)
@@ -1763,7 +1764,12 @@ class Stage2Trainer(Trainer):
             if diagnostics is None
             else {name: value.detach() for name, value in diagnostics.items()}
         )
-        return (outputs.loss, outputs) if return_outputs else outputs.loss
+        ce_weight = config.lambda_ce if isinstance(config, StepPreferenceConfig) else 1.0
+        loss = ce_weight * outputs.loss
+        if return_outputs:
+            outputs.loss = loss
+            return loss, outputs
+        return loss
 
     def log(self, logs, start_time=None):
         diagnostics = getattr(self, "_latest_stage2_diagnostics", None)

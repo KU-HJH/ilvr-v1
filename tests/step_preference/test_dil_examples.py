@@ -34,7 +34,7 @@ def test_fresh_profile_overrides_stale_source():
     })
     assert result.returncode == 0, result.stderr
     expected = {
-        "GRADIENT_ACCUMULATION_STEPS": "4", "STEP_PREFERENCE_BETA": "0.5",
+        "GRADIENT_ACCUMULATION_STEPS": "4", "STEP_PREFERENCE_BETA": "1.0",
         "STEP_PREFERENCE_WEIGHT": "1.0", "STEP_PREFERENCE_TOPK": "",
         "STEP_PREFERENCE_ENTROPY_TOP_PERCENT": "",
         "STEP_PREFERENCE_LAMBDA_TOPK_MASS": "0",
@@ -166,7 +166,7 @@ def test_documented_variant_runs_coordinator_and_both_worker_dry_runs(name, tmp_
             "--num_machines": "2", "--num_processes": "4", "--machine_rank": str(rank),
             "--gradient_accumulation_steps": "4", "--per_device_train_batch_size": "1",
             "--learning_rate": "5e-5", "--seed": "42", "--warm_up_steps": "10",
-            "--step_preference_beta": "0.5", "--step_preference_weight": "1.0",
+            "--step_preference_beta": "1.0", "--step_preference_weight": "1.0",
             "--step_preference_loss_type": selector,
             "--step_preference_lambda_topk_mass": mass,
             "--step_preference_entropy_source": source,

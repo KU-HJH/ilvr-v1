@@ -53,6 +53,7 @@ def worker_commands(settings, stage_arguments=()):
             spec.command[spec.command.index("--") + 1:], cwd=REPO,
             capture_output=True, text=True,
             env={**worker_env, "STAGE2_DRY_RUN": "true", "STAGE2_DRY_RUN_FORMAT": "json",
+                 "PYTHONDONTWRITEBYTECODE": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
                  "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
         )
         yield rank, worker_env, result

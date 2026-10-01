@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import json
+from pathlib import Path
 from numbers import Real
 import re
 from typing import Literal
@@ -15,6 +17,14 @@ from step_preference.dil_config import validate_dil_config
 
 StepPreferenceMode = Literal["stage2a", "stage2b"]
 StepPreferenceObjective = Literal["context_preference", "legacy_dpo"]
+
+
+def resolve_preference_defaults(loss_type, beta=None, margin=None):
+    """Resolve fresh coefficients after the loss selector, retaining explicit values."""
+    dil = loss_type in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
+    return (1.0 if dil else 10.0) if beta is None else beta, (
+        (0.0 if dil else 0.5) if margin is None else margin
+    )
 
 
 def split_stage2_budget(total_steps: int, stage2a_ratio: float) -> tuple[int, int]:
@@ -71,11 +81,11 @@ class StepPreferenceConfig:
     mode: StepPreferenceMode = "stage2a"
     objective: StepPreferenceObjective = "context_preference"
     target_scope: str = "immediate_text"
-    beta: float = 0.1
-    lambda_ce: float = 1.0
+    beta: float | None = None
+    lambda_ce: float | None = None
     lambda_dpo: float = 1.0
     lambda_preference: float = 1.0
-    preference_margin: float = 0.0
+    preference_margin: float | None = None
     preference_loss_type: str = "dpo"
     preference_topk: int | None = None
     lambda_topk_mass: float = 0.0
@@ -110,6 +120,21 @@ class StepPreferenceConfig:
     packed_admission_verification_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        beta, ce, margin = self.beta, self.lambda_ce, self.preference_margin
+        _optional_path("resume_from_checkpoint_path", self.resume_from_checkpoint_path)
+        if self.resume_from_checkpoint_path and self.preference_loss_type != "dpo":
+            saved_path = Path(self.resume_from_checkpoint_path) / "config.json"
+            if saved_path.is_file():
+                from step_preference.dil_identity import read_dil_identity
+                saved = read_dil_identity(json.loads(saved_path.read_text(encoding="utf-8")))
+                if saved is not None:
+                    beta = saved["beta"] if beta is None else beta
+                    ce = saved["lambda_ce"] if ce is None else ce
+                    margin = saved["preference_margin"] if margin is None else margin
+        beta, margin = resolve_preference_defaults(self.preference_loss_type, beta, margin)
+        object.__setattr__(self, "beta", beta)
+        object.__setattr__(self, "lambda_ce", 0.1 if ce is None else ce)
+        object.__setattr__(self, "preference_margin", margin)
         normalize_preference_target_scope(self.target_scope)
         if self.visual_only_context_preference is None:
             object.__setattr__(
@@ -251,8 +276,6 @@ class StepPreferenceConfig:
             else:
                 split_stage2_budget(self.total_steps, self.stage2a_ratio)
         if self.is_context_preference:
-            if self.lambda_ce != 1.0:
-                raise ValueError("context preference requires ce_weight=1")
             if self.negative_path is not None or self.negative_manifest is not None:
                 raise ValueError(
                     "context preference does not consume negative artifacts; "
@@ -367,16 +390,19 @@ class StepPreferenceConfig:
     @classmethod
     def from_args(cls, args) -> "StepPreferenceConfig":
         """Build from the public training namespace without mutating it."""
+        beta = getattr(args, "step_dpo_beta", None)
+        if beta is None:
+            beta = getattr(args, "step_preference_beta", None)
         return cls(
             enabled=getattr(args, "step_preference_enabled", False),
             mode=getattr(args, "step_preference_mode", "stage2a"),
             objective=getattr(args, "step_preference_objective", "context_preference"),
             target_scope=getattr(args, "step_preference_target_scope", "immediate_text"),
-            beta=getattr(args, "step_dpo_beta", 0.1),
-            lambda_ce=getattr(args, "ce_weight", 1.0),
+            beta=beta,
+            lambda_ce=getattr(args, "ce_weight", None),
             lambda_dpo=getattr(args, "step_dpo_weight", 1.0),
             lambda_preference=getattr(args, "step_preference_weight", 1.0),
-            preference_margin=getattr(args, "step_preference_margin", 0.0),
+            preference_margin=getattr(args, "step_preference_margin", None),
             preference_loss_type=getattr(args, "step_preference_loss_type", "dpo"),
             preference_topk=getattr(args, "step_preference_topk", None),
             lambda_topk_mass=getattr(args, "step_preference_lambda_topk_mass", 0.0),

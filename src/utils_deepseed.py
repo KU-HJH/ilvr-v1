@@ -60,7 +60,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--step_dpo_beta",
         dest="step_dpo_beta",
         type=float,
-        default=0.1,
+        default=None,
     )
     parser.add_argument("--step_preference_weight", type=float, default=1.0)
     parser.add_argument("--step_preference_loss_type",
@@ -75,7 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("immediate_text", "until_next_latent"), default="immediate_text",
         help="Preference target: next text entry (default), or all text until the next latent block.",
     )
-    parser.add_argument("--step_preference_margin", type=float, default=0.0)
+    parser.add_argument("--step_preference_margin", type=float, default=None)
     parser.add_argument("--step_preference_prefix_mode",
         choices=("clean_prefix", "v_off_prefix", "v_off_insertion", "evidence_replacement"), default="clean_prefix")
     parser.add_argument("--step_preference_branch_mode",
@@ -118,7 +118,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save_model_path", type=str, default='./checkpoints/model_stage1')
     parser.add_argument("--load_model_path", type=str, default='./checkpoints/model_stage1')
     parser.add_argument("--cache_dir", type=str, default='./cache')
-    parser.add_argument("--ce_weight", type=float, default=1.0)
+    parser.add_argument("--ce_weight", type=float, default=None)
     parser.add_argument("--warm_up_steps", type=int, default=10)
     parser.add_argument("--sim_weight", type=float, default=1.0)
     parser.add_argument("--ema_tau", type=float, default=0.999)
@@ -246,7 +246,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("gradient_accumulation_steps must be at least 1")
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
+    if args.stage == "stage1" and args.resume_from_checkpoint_path and args.ce_weight is None:
+        metadata_path = Path(args.resume_from_checkpoint_path) / "stage1_peft_metadata.json"
+        if metadata_path.is_file():
+            args.ce_weight = json.loads(metadata_path.read_text(encoding="utf-8"))["ce_weight"]
     args.step_preference_config = StepPreferenceConfig.from_args(args)
+    args.step_dpo_beta = args.step_preference_config.beta
+    args.step_preference_beta = args.step_preference_config.beta
+    args.step_preference_margin = args.step_preference_config.preference_margin
+    args.ce_weight = args.step_preference_config.lambda_ce
     from stage2.planned_stop import validate_planned_checkpoint_stop
     validate_planned_checkpoint_stop(
         args.stage2_stop_after_checkpoint, config=args.step_preference_config,

@@ -51,6 +51,7 @@ output_dir=${STAGE1_OUTPUT_DIR:-}
 micro_batch=${STAGE1_MICRO_BATCH:-1}
 epochs=${STAGE1_EPOCHS:-1}
 learning_rate=${STAGE1_LEARNING_RATE:-5e-5}
+ce_weight=${STAGE1_CE_WEIGHT:-${CE_WEIGHT:-}}
 gradient_accumulation=${STAGE1_GRADIENT_ACCUMULATION:-2}
 ema_tau=${STAGE1_EMA_TAU:-1.0}
 seed=${STAGE1_SEED:-42}
@@ -165,6 +166,7 @@ while (( $# )); do
         --micro-batch) require_value "$@"; micro_batch=$2; shift 2 ;;
         --epochs) require_value "$@"; epochs=$2; shift 2 ;;
         --learning-rate) require_value "$@"; learning_rate=$2; shift 2 ;;
+        --ce-weight) require_value "$@"; ce_weight=$2; shift 2 ;;
         --gradient-accumulation) require_value "$@"; gradient_accumulation=$2; shift 2 ;;
         --ema-tau) require_value "$@"; ema_tau=$2; shift 2 ;;
         --seed) require_value "$@"; seed=$2; shift 2 ;;
@@ -375,6 +377,9 @@ command=(
 )
 
 command+=(--tuning_method "$method")
+if [[ -n $ce_weight ]]; then
+    command+=(--ce_weight "$ce_weight")
+fi
 
 if [[ $method == lora || $method == dora ]]; then
     command+=(

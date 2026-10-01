@@ -155,6 +155,7 @@ def _config(**changes):
         mode="stage2b",
         objective="legacy_dpo",
         beta=0.5,
+        preference_margin=0.0,
         lambda_ce=1.0,
         lambda_dpo=2.0,
         lambda_entropy=0.3,

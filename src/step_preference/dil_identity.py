@@ -77,7 +77,7 @@ def read_dil_identity(config_payload: Mapping[str, object]) -> dict[str, object]
            for key in _FLOATS):
         raise ValueError("invalid DIL objective identity numeric type")
     if (identity["beta"] <= 0 or identity["lambda_preference"] < 0
-        or identity["lambda_topk_mass"] < 0 or identity["lambda_ce"] != 1.0
+        or identity["lambda_topk_mass"] < 0 or identity["lambda_ce"] < 0.0
         or identity["lambda_entropy"] != 0.0
         or identity["preference_margin"] != 0.0):
         raise ValueError("invalid DIL objective identity objective weights")

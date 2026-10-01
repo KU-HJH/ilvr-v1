@@ -156,9 +156,10 @@ Stage 2A checkpoints and dataset paths, launch it in this form:
 STEP_PREFERENCE_ENABLED=true \
 STEP_PREFERENCE_MODE=stage2b \
 STEP_PREFERENCE_OBJECTIVE=context_preference \
-STEP_PREFERENCE_BETA=0.1 \
+CE_WEIGHT=0.1 \
+STEP_PREFERENCE_BETA=10.0 \
 STEP_PREFERENCE_WEIGHT=1.0 \
-STEP_PREFERENCE_MARGIN=0.0 \
+STEP_PREFERENCE_MARGIN=0.5 \
 STEP_ENTROPY_WEIGHT=0.1 \
 STEP_ENTROPY_MARGIN=0.1 \
 STAGE1_CHECKPOINT="$STAGE1_CHECKPOINT" \
@@ -201,7 +202,12 @@ preserves the original mRoPE positions and latent-block geometry; it is not
 equivalent to deleting the latent block from the sequence.
 
 Each target block score is its mean target-token log probability. Preference
-and entropy losses are reduced within each step first, then all V/T steps have
+uses `-logsigmoid(beta * delta - margin)`, subtracting the tunable margin
+outside beta. Fresh training defaults to CE weight 0.1, ordinary preference
+beta 10 / margin 0.5, and preference weight 1. All [DIL-BCE variants](docs/dil-bce.md)
+instead use beta 1 / margin 0. Keep existing runs and saved resume coefficients
+and loss semantics; the historical 54% result used CE1 / beta0.5 / margin0.
+Preference and entropy losses are reduced within each step first, then all V/T steps have
 equal weight, so longer text steps do not receive more weight. Every valid
 step is scored. If the input does not fit memory, report the input size as a
 blocker; do not split sidecar groups into chunks or silently drop steps to fit.

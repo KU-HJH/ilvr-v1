@@ -63,7 +63,25 @@ STAGE2_SAMPLER_POLICY=${STAGE2_SAMPLER_POLICY:-auto}
 STAGE2_REFERENCE_SAMPLER_PROBE_DIR=${STAGE2_REFERENCE_SAMPLER_PROBE_DIR:-}
 SUPERVISE_LATENT_BOUNDARIES=${SUPERVISE_LATENT_BOUNDARIES:-true}
 LEARNING_RATE=${LEARNING_RATE:-5e-5}
-CE_WEIGHT=${CE_WEIGHT:-1.0}
+# An omitted resume coefficient comes from saved objective identity, never fresh defaults.
+if [[ -n "${RESUME_CHECKPOINT:-}" && "${STEP_PREFERENCE_LOSS_TYPE:-dpo}" == dil_bce_rf* &&
+      ( -z "${CE_WEIGHT:-}" || ( -z "${STEP_PREFERENCE_BETA:-}" && -z "${STEP_DPO_BETA:-}" ) ) ]]; then
+  saved_loss_coefficients=$("$REPO_ROOT/venv/ilvr-venv/bin/python" - "$RESUME_CHECKPOINT" <<'PY'
+import json
+import sys
+from pathlib import Path
+from step_preference.dil_identity import read_dil_identity
+saved = read_dil_identity(json.loads((Path(sys.argv[1]) / "config.json").read_text()))
+if saved is None:
+    raise ValueError("DIL resume requires saved objective identity or explicit saved loss coefficients")
+print(saved["lambda_ce"], saved["beta"])
+PY
+  ) || exit 2
+  read -r saved_ce_weight saved_preference_beta <<< "$saved_loss_coefficients"
+  CE_WEIGHT=${CE_WEIGHT:-$saved_ce_weight}
+  STEP_DPO_BETA=${STEP_DPO_BETA:-$saved_preference_beta}
+fi
+CE_WEIGHT=${CE_WEIGHT:-0.1}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-2}
 ATTENTION_IMPLEMENTATION=${ATTENTION_IMPLEMENTATION:-sdpa}
 if [[ -n "${VISION_ATTENTION_IMPLEMENTATION:-}" ]]; then
@@ -217,11 +235,17 @@ fi
 case "$STEP_PREFERENCE_ENABLED" in
   true)
     STEP_PREFERENCE_MODE=${STEP_PREFERENCE_MODE:-stage2a}
-    STEP_DPO_BETA=${STEP_DPO_BETA:-0.1}
+    STEP_PREFERENCE_LOSS_TYPE=${STEP_PREFERENCE_LOSS_TYPE:-dpo}
+    case "$STEP_PREFERENCE_LOSS_TYPE" in
+      dil_bce_rf|dil_bce_rf_topk|dil_bce_rf_topk_reverse)
+        default_preference_beta=1.0; default_preference_margin=0.0 ;;
+      *) default_preference_beta=10.0; default_preference_margin=0.5 ;;
+    esac
+    STEP_DPO_BETA=${STEP_DPO_BETA:-$default_preference_beta}
     STEP_DPO_WEIGHT=${STEP_DPO_WEIGHT:-1.0}
     STEP_PREFERENCE_BETA=${STEP_PREFERENCE_BETA:-$STEP_DPO_BETA}
     STEP_PREFERENCE_WEIGHT=${STEP_PREFERENCE_WEIGHT:-1.0}
-    STEP_PREFERENCE_MARGIN=${STEP_PREFERENCE_MARGIN:-0.0}
+    STEP_PREFERENCE_MARGIN=${STEP_PREFERENCE_MARGIN:-$default_preference_margin}
     STEP_ENTROPY_WEIGHT=${STEP_ENTROPY_WEIGHT:-0.1}
     STEP_ENTROPY_MARGIN=${STEP_ENTROPY_MARGIN:-0.1}
     STAGE2A_RATIO=${STAGE2A_RATIO:-0.5}
@@ -314,6 +338,7 @@ case "$STEP_PREFERENCE_ENABLED" in
       STEP_PREFERENCE_ARGS+=(
         --step_dpo_beta "$STEP_DPO_BETA"
         --step_dpo_weight "$STEP_DPO_WEIGHT"
+        --step_preference_margin "$STEP_PREFERENCE_MARGIN"
       )
       if [[ "$step_shared_prefix_enabled" == true ]]; then
         STEP_PREFERENCE_ARGS+=(
@@ -748,9 +773,6 @@ if [[ "$STEP_PREFERENCE_ENABLED" == true ]]; then
     require_finite_positive_number STEP_PREFERENCE_BETA "$STEP_PREFERENCE_BETA"
     require_finite_non_negative_number STEP_PREFERENCE_WEIGHT "$STEP_PREFERENCE_WEIGHT"
     require_finite_number STEP_PREFERENCE_MARGIN "$STEP_PREFERENCE_MARGIN"
-    if [[ "$STEP_PREFERENCE_MODE" == stage2b ]]; then
-      require_number_equal_one CE_WEIGHT "$CE_WEIGHT"
-    fi
   else
     require_finite_positive_number STEP_DPO_BETA "$STEP_DPO_BETA"
     require_finite_non_negative_number STEP_DPO_WEIGHT "$STEP_DPO_WEIGHT"
