@@ -110,6 +110,12 @@ The earlier approved experiment used top-k 1516 (1%), sample-level clean full-vo
 
 Select `STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk_both_upper` (CLI: `--step_preference_loss_type dil_bce_rf_topk_both_upper`) for chosen `mean_t softplus(-beta * clean_GT_logp_t)` and rejected `mean_t sum_k q_tk * softplus(beta * log(q_tk))` over entropy-selected positions. The OFF top-k distribution and its weighting remain differentiable. This reuses the original top-k rejected token term and the reverse variant's chosen token reduction; mass KL, entropy selection, and the original-step denominator stay unchanged. Fresh coefficients are beta1 / CE0.1 / margin0. Checkpoints use formula version `dil_bce_rf_topk_both_upper_v1` and reject resumes across the original, reverse, and both-upper variants.
 
+### Both means before softplus
+
+Select `STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk_both_lower` (CLI: `--step_preference_loss_type dil_bce_rf_topk_both_lower`) for chosen `softplus(-beta * mean_t clean_GT_logp_t)` and rejected `softplus(beta * mean_t sum_k q_tk * log(q_tk))` within each original step over entropy-selected positions. OFF top-k `q` is normalized within the selected support and remains differentiable, including its weighting. The rejected expectation reuses the live entropy statistic as `-H(q)`. Each step receives its own chosen and rejected softplus before averaging across original steps; a discarded step contributes zero and retains its denominator slot.
+
+Use a fresh run with beta1 / CE0.1 / margin0 / preference weight1, top-k1516 / mass weight1 / clean entropy top20, `until_next_latent`, and the explicitly approved `historical_balanced_2rank` sampler through the existing two-node/four-rank coordinator. Preserve the Stage1 initializer and evaluation profile. Group-mass KL keeps its clean target detached, and actual top-k selection remains `sorted=False`. This objective saves `dil_bce_rf_topk_both_lower_v1`; all cross-variant resumes are rejected. Existing selectors and saved objectives retain their formulas.
+
 ### Planned checkpoint stop for a bounded resume probe
 
 For an independently authorized three-update DIL smoke, one fresh run can stop after a complete checkpoint 2 and resume to the original budget 3. Keep the approved dataset and profile. This optional diagnostic requires enabled DIL `context_preference` Stage 2B and a positive integer strictly below the resolved total budget. Both coordinator and workers receive the option; the coordinator also requires explicit `--max_steps`.

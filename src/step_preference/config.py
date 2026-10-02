@@ -21,7 +21,7 @@ StepPreferenceObjective = Literal["context_preference", "legacy_dpo"]
 
 def resolve_preference_defaults(loss_type, beta=None, margin=None):
     """Resolve fresh coefficients after the loss selector, retaining explicit values."""
-    dil = loss_type in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper")
+    dil = loss_type in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper", "dil_bce_rf_topk_both_lower")
     return (1.0 if dil else 10.0) if beta is None else beta, (
         (0.0 if dil else 0.5) if margin is None else margin
     )
@@ -374,7 +374,7 @@ class StepPreferenceConfig:
     def is_dil_resume(self) -> bool:
         return (
             self.is_context_preference
-            and self.preference_loss_type in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper")
+            and self.preference_loss_type in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper", "dil_bce_rf_topk_both_lower")
             and self.resume_from_checkpoint_path is not None
         )
 

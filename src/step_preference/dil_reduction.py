@@ -21,12 +21,13 @@ def reduce_dil_context_loss(
     selection_entropies: Sequence[Tensor] | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Average selected tokens within each step, then all original sample steps."""
-    if config.preference_loss_type not in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper"):
+    if config.preference_loss_type not in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper", "dil_bce_rf_topk_both_lower"):
         raise ValueError("DIL reduction requires a DIL loss selector")
     count = len(clean_token_logps)
-    topk = config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper")
+    topk = config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper", "dil_bce_rf_topk_both_lower")
     reverse = config.preference_loss_type == "dil_bce_rf_topk_reverse"
     tokenwise_positive = reverse or config.preference_loss_type == "dil_bce_rf_topk_both_upper"
+    mean_before_negative = reverse or config.preference_loss_type == "dil_bce_rf_topk_both_lower"
     if len(off_token_logps) != count or (topk and (topk_terms is None or len(topk_terms) != count)):
         raise ValueError("DIL step cardinality mismatch")
     for clean, off in zip(clean_token_logps, off_token_logps):
@@ -69,10 +70,10 @@ def reduce_dil_context_loss(
         sums["off"] = sums["off"] + off_score
         if topk:
             terms = topk_terms[index]
-            # Both-upper reuses the kernel's live q-weighted tokenwise softplus;
-            # only reverse moves rejected softplus outside the averaging axes.
+            # Reverse and both-lower average the live q expectation before
+            # rejected softplus; other variants retain the kernel token terms.
             for name, value in zip(("negative", "mass", "q_entropy", "clean_mass", "off_mass", "mass_gap", "gt_coverage"), terms):
-                if reverse and name == "negative":
+                if mean_before_negative and name == "negative":
                     # E_q[log q] = -H(q); q and its expectation stay live.
                     # Average candidates and selected tokens before one softplus.
                     sums[name] = sums[name] + F.softplus(-config.beta*terms.entropy[mask].mean())

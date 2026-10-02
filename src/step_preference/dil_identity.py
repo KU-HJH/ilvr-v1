@@ -14,7 +14,8 @@ from step_preference.config import StepPreferenceConfig
 NAMESPACE = "ilvr_context_preference"
 _FORMULAS = {"dil_bce_rf": "dil_bce_rf_v1", "dil_bce_rf_topk": "dil_bce_rf_topk_v1",
              "dil_bce_rf_topk_reverse": "dil_bce_rf_topk_reverse_v1",
-             "dil_bce_rf_topk_both_upper": "dil_bce_rf_topk_both_upper_v1"}
+             "dil_bce_rf_topk_both_upper": "dil_bce_rf_topk_both_upper_v1",
+             "dil_bce_rf_topk_both_lower": "dil_bce_rf_topk_both_lower_v1"}
 _FIXED = {
     "schema_version": 1,
     "mask": "latent_body_attention",
@@ -97,7 +98,7 @@ def read_dil_identity(config_payload: Mapping[str, object]) -> dict[str, object]
     if loss_type not in _FORMULAS or identity["formula_version"] != _FORMULAS[loss_type]:
         raise ValueError("invalid DIL objective identity formula")
     topk = identity["topk"]
-    if loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper"):
+    if loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper", "dil_bce_rf_topk_both_lower"):
         if type(topk) is not int or topk < 2:
             raise ValueError("invalid DIL objective identity topk")
     elif topk is not None:

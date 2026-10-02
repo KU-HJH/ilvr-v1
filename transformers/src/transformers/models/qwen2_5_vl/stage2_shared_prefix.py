@@ -34,7 +34,7 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
     if dil is not None:
         import math
         if (not isinstance(dil, Mapping) or set(dil) != {"loss_type", "beta", "k"}
-                or dil["loss_type"] not in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper")
+                or dil["loss_type"] not in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper", "dil_bce_rf_topk_both_lower")
                 or type(dil["beta"]) not in (int, float)
                 or not math.isfinite(dil["beta"]) or dil["beta"] <= 0
                 or type(dil["k"]) is not int
