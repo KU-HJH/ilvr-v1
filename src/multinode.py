@@ -1814,7 +1814,7 @@ def _vision_gain_runtime_probe_main(argv: list[str]) -> int:
                                                  log_root=_REPOSITORY_ROOT / "logs/multinode")
             if phase == "resume":
                 identity = _checkpoint_artifact_identity(plan, commit=commit, global_step=1)
-                redistribute_resume_checkpoint(runner, checkpoint_path=checkpoint,
+                redistribute_resume_checkpoint(initial_runner, checkpoint_path=checkpoint,
                     checkpoint_identity=identity, requested_identity=identity, destination=checkpoint)
             start_rank0_then_rank1(plan, runner, commands=commands[phase], ready_timeout_seconds=600)
             exits = monitor_owned_jobs(plan, runner, expected_commit=commit,
@@ -1833,6 +1833,7 @@ def _vision_gain_runtime_probe_main(argv: list[str]) -> int:
                 identity = _checkpoint_artifact_identity(plan, commit=commit, global_step=1)
                 collect_checkpoint_artifacts(runner, checkpoint_path=checkpoint, runtime_identity=identity,
                                              exit_codes=exits, world_size=4)
+                initial_runner = runner
             else:
                 witness = validate_rank_records(observed["ranks"], commit=commit, zero_stage=args.zero_stage)
         witness_path = _REPOSITORY_ROOT / "results" / args.run_id / "vision-gain-probe-witness.json"
