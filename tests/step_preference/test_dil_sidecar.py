@@ -41,7 +41,7 @@ def test_sidecar_rejects_permuted_step_identity(corruption):
 
 
 @pytest.mark.parametrize("mass_only", [False, True])
-@pytest.mark.parametrize("kind", ["dil_bce_rf_topk", "dil_bce_rf_topk_reverse"])
+@pytest.mark.parametrize("kind", ["dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper"])
 def test_dil_checkpoint_replay_preserves_gradients(mass_only, kind):
     model, batch = dil_case()
     baseline = copy.deepcopy(model)

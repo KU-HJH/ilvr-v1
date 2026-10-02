@@ -23,15 +23,15 @@ def bce_config(kind="dil_bce_rf"):
     return StepPreferenceConfig(
         enabled=True, mode="stage2b", objective="context_preference",
         preference_loss_type=kind, beta=0.5,
-        preference_topk=8 if kind == "dil_bce_rf_topk_reverse" else None,
-        lambda_topk_mass=1. if kind == "dil_bce_rf_topk_reverse" else 0.,
+        preference_topk=8 if kind in ("dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper") else None,
+        lambda_topk_mass=1. if kind in ("dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper") else 0.,
         lambda_entropy=0.0, direct_from_stage1=True,
         shared_prefix_enabled=True,
         visual_off_suppress_latent_boundaries=False,
     )
 
 
-@pytest.fixture(params=["dil_bce_rf", "dil_bce_rf_topk_reverse"])
+@pytest.fixture(params=["dil_bce_rf", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper"])
 def bce_kind(request):
     return request.param
 

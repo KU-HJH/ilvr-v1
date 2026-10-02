@@ -15,7 +15,7 @@ from tests.step_preference.test_context_preference import context_config
 def dil_config(kind="dil_bce_rf_topk", **kwargs):
     values = dict(preference_loss_type=kind, beta=.5, lambda_entropy=0.,
                   visual_only_context_preference=True, shared_prefix_enabled=True, visual_off_suppress_latent_boundaries=False)
-    if kind in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse"):
+    if kind in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper"):
         values.update(preference_topk=7, lambda_topk_mass=.7)
     values.update(kwargs)
     return context_config(**values)
@@ -55,7 +55,7 @@ def full_logit_oracle(output, off, batch, config):
     if config.preference_entropy_top_percent is not None and config.preference_entropy_top_percent < 100:
         chosen = set(sorted(chosen, key=lambda i: (-float(entropy[i].detach()), i))[
             :math.ceil(len(chosen)*config.preference_entropy_top_percent/100)])
-    total = output.loss
+    total = config.lambda_ce*output.loss
     cursor = 0
     for span in spans:
         size = span.target_text_end-span.target_text_start
@@ -64,7 +64,7 @@ def full_logit_oracle(output, off, batch, config):
             ids = batch["input_ids"][0, span.target_text_start:span.target_text_end]
             local = [i-cursor for i in indices]
             positive = F.softplus(-config.beta*clean_lp[indices].gather(1, ids[local, None]).mean())
-            if config.preference_loss_type == "dil_bce_rf_topk_reverse":
+            if config.preference_loss_type in ("dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper"):
                 positive = F.softplus(-config.beta*clean_lp[indices].gather(1, ids[local, None])).mean()
             if config.preference_loss_type == "dil_bce_rf":
                 negative = F.softplus(config.beta*off_lp[indices].gather(1, ids[local, None]).mean())
@@ -111,7 +111,19 @@ def test_actual_unequal_step_loss_and_parameter_gradients_match_full_logits(conf
     compare_grads(actual, oracle, model)
 
 
-@pytest.mark.parametrize("kind", ["dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse"])
+@pytest.mark.parametrize("percent", [None, 20.])
+def test_both_upper_actual_trainer_sidecar_matches_full_logit_loss_and_gradients(percent):
+    # Catches missing trainer/sidecar dispatch and either historical reduction.
+    config = dil_config("dil_bce_rf_topk_both_upper", beta=1., lambda_ce=.1,
+        preference_entropy_top_percent=percent)
+    model, batch = dil_case()
+    actual, output, off = observed_forward(model, batch, config)
+    oracle = full_logit_oracle(output, off, batch, config)
+    torch.testing.assert_close(actual, oracle, atol=1e-6, rtol=1e-5)
+    compare_grads(actual, oracle, model)
+
+
+@pytest.mark.parametrize("kind", ["dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper"])
 @pytest.mark.parametrize("padding", [False, True])
 def test_direct_trainer_validates_resolved_boundaries_before_forward(kind, padding):
     model, batch = dil_case()

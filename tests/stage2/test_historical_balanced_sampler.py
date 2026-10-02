@@ -140,7 +140,7 @@ def actual_trainer(storage,monkeypatch,**changes):
     return Stage2Trainer(**values)
 
 
-@pytest.mark.parametrize('kind', ['dil_bce_rf_topk', 'dil_bce_rf_topk_reverse'])
+@pytest.mark.parametrize('kind', ['dil_bce_rf_topk', 'dil_bce_rf_topk_reverse', 'dil_bce_rf_topk_both_upper'])
 def test_real_trainer_constructs_unwrapped_sampler_with_fixed_denominator(storage,monkeypatch,kind):
     t = actual_trainer(storage,monkeypatch,step_preference_config=dil_config(kind))
     assert t.model_accepts_loss_kwargs is False and t.accelerator.even_batches is False

@@ -21,11 +21,11 @@ def fresh_argv():
     return argv + ['--stage2b_direct_from_stage1', '--stage1_adapter_path', 'stage1']
 
 
-@pytest.mark.parametrize('kind', ['dil_bce_rf', 'dil_bce_rf_topk_reverse'])
+@pytest.mark.parametrize('kind', ['dil_bce_rf', 'dil_bce_rf_topk_reverse', 'dil_bce_rf_topk_both_upper'])
 def test_parser_accepts_stop_only_before_resolved_budget(kind):
     argv = fresh_argv()
     argv[argv.index('--step_preference_loss_type') + 1] = kind
-    if kind == 'dil_bce_rf_topk_reverse':
+    if kind in ('dil_bce_rf_topk_reverse', 'dil_bce_rf_topk_both_upper'):
         argv += ['--step_preference_topk', '8']
     args = parse_args(argv + ['--stage2_stop_after_checkpoint', '2'])
     assert args.stage2_stop_after_checkpoint == 2

@@ -310,7 +310,7 @@ class Stage2Trainer(Trainer):
             if not (profile.enabled and profile.zero_stage == 2 and profile.world_size == 4
                     and config.enabled and config.is_context_preference
                     and config.visual_only_context_preference and config.prefix_mode == "clean_prefix"
-                    and config.preference_loss_type in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
+                    and config.preference_loss_type in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper")
                     and training_args.gradient_accumulation_steps == 4
                     and training_args.per_device_train_batch_size == 1
                     and not training_args.dataloader_drop_last):
@@ -672,7 +672,7 @@ class Stage2Trainer(Trainer):
             from step_preference.dil_reduction import reduce_dil_context_loss
 
             ordered = [results[(span.step_id, "visual")] for span in spans]
-            topk = config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
+            topk = config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper")
             selection = None
             if uses_entropy_selection(config):
                 selection = (clean_entropies if config.preference_entropy_source == "clean"
@@ -906,7 +906,7 @@ class Stage2Trainer(Trainer):
                 ),
             ),
         )
-        if config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse"):
+        if config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper"):
             call["stage2_shared_prefix_inputs"]["dil_objective"] = {
                 "loss_type": config.preference_loss_type, "beta": config.beta, "k": config.preference_topk,
             }
@@ -987,7 +987,7 @@ class Stage2Trainer(Trainer):
             ]
             if config.preference_loss_type != "dpo":
                 clean_token_logps.append(logits[0].float().log_softmax(-1).gather(-1, targets[0, :, None]).squeeze(-1))
-                if config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse"):
+                if config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper"):
                     result = results[(span.step_id, "visual")]
                     if (result.get("name") != f"step-{span.step_id}-visual-off"
                             or result.get("predictor_positions") != tuple(range(span.target_text_start-1, span.target_text_end-1))

@@ -63,6 +63,7 @@ def worker_commands(settings, stage_arguments=()):
     ("dil_bce_rf", None, "0", None, "clean"),
     ("dil_bce_rf_topk", "8", "1", "20", "voff"),
     ("dil_bce_rf_topk_reverse", "1516", "1", "20", "clean"),
+    ("dil_bce_rf_topk_both_upper", "1516", "1", "20", "clean"),
 ])
 def test_dil_settings_reach_both_real_worker_commands(selector, topk, mass, percent, source):
     settings = {
@@ -115,7 +116,7 @@ def test_invalid_dil_combination_fails_in_worker_dry_run(settings):
 
 
 @pytest.mark.parametrize("selector,topk", [("dil_bce_rf", ""), ("dil_bce_rf_topk", "8"),
-    ("dil_bce_rf_topk_reverse", "1516")])
+    ("dil_bce_rf_topk_reverse", "1516"), ("dil_bce_rf_topk_both_upper", "1516")])
 def test_dil_resume_reaches_both_worker_argv_without_fresh_initialization(selector, topk):
     checkpoint = str(REPO / "checkpoints" / "dil-forwarding-test" / "checkpoint-1")
     settings = {"STEP_PREFERENCE_LOSS_TYPE": selector, "STEP_PREFERENCE_TOPK": topk,

@@ -16,7 +16,7 @@ from step_preference.equivalence import _trainer
 from utils_deepseed import parse_args
 
 REPO = Path(__file__).resolve().parents[2]
-SELECTORS = ("dpo", "dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
+SELECTORS = ("dpo", "dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper")
 
 
 def config(selector="dpo", **changes):
