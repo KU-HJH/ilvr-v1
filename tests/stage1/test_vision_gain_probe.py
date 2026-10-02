@@ -346,3 +346,52 @@ def test_manual_reference_is_independent_and_handles_unused_gradient_and_block_s
         assert all(not torch.count_nonzero(gradient) for gradient in actual)
     else:
         assert api._flatten(actual).abs().max() > 0
+
+
+
+def test_probe_fixture_ignores_worker_cwd_and_matches_resume_preflight(tmp_path, monkeypatch, capsys):
+    from argparse import Namespace
+    from pathlib import Path
+    from types import SimpleNamespace
+    import src.multinode as coordinator
+    api = probe_api()
+    unrelated = tmp_path / "worker-cwd"; unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+    run_id = "vg-cwd-regression"
+    commit = "a" * 40
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("ILVR_REPOSITORY_COMMIT", commit)
+    monkeypatch.setattr(api, "_initialize_distributed", lambda: None)
+    monkeypatch.setattr(api.dist, "get_world_size", lambda: 4)
+    monkeypatch.setattr(api.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(api.dist, "barrier", lambda: None)
+    monkeypatch.setattr(api, "load_deepspeed_runtime_profile", lambda *args, **kwargs: SimpleNamespace(zero_stage=1))
+    monkeypatch.setattr(api, "unset_hf_deepspeed_config", lambda: None)
+    monkeypatch.setattr(api, "probe_dependencies", lambda: None)
+    consumed = []
+    class CapturedBeforeTraining(Exception):
+        pass
+    def capture_components(args, **kwargs):
+        consumed.append(args)
+        raise CapturedBeforeTraining
+    monkeypatch.setattr(api, "build_stage1_training_components", capture_components)
+    with pytest.raises(CapturedBeforeTraining):
+        api.run_probe(Namespace(run_id=run_id, commit=commit, phase="initial", zero_stage=1,
+                                deepspeed=tmp_path / "ds.json"))
+    repository = Path(api.__file__).resolve().parents[2]
+    expected = repository / "data" / run_id
+    assert Path(consumed[0].data_path) == expected / "TRAIN.jsonl"
+    assert Path(consumed[0].image_root) == expected / "images"
+    assert not (unrelated / "data").exists()
+    # Capture the actual coordinator's preflight input paths without executing it.
+    original_preflight = coordinator.build_preflight_commands
+    preflight_inputs = []
+    def capture_preflight(plan, **kwargs):
+        preflight_inputs.append(kwargs["input_paths"])
+        return original_preflight(plan, **kwargs)
+    monkeypatch.setattr(coordinator, "build_preflight_commands", capture_preflight)
+    assert coordinator._training_main("stage1", ["--vision-gain-runtime-probe", "--run-id", run_id,
+                         "--zero-stage", "1", "--main-process-port", "29590", "--dry-run"]) == 0
+    capsys.readouterr()
+    assert Path(consumed[0].data_path) in preflight_inputs[1]

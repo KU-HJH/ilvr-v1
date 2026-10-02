@@ -561,7 +561,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     assert dist.get_world_size() == 4
     assert int(os.environ["LOCAL_RANK"]) == dist.get_rank() % 2
     paths = resolve_run_artifact_paths(args.run_id)
-    fixture = Path.cwd() / "data" / args.run_id
+    fixture = Path(__file__).resolve().parents[2] / "data" / args.run_id
     if int(os.environ["LOCAL_RANK"]) == 0:
         if args.phase == "initial":
             fixture.mkdir(parents=True, exist_ok=False)
