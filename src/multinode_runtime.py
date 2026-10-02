@@ -1520,6 +1520,7 @@ def _node_shell_command(
 def build_dil_full_model_probe_commands(
     plan: "LaunchPlan", *, commit: str, manifest: str | Path,
     manifest_sha256: str, log_root: str | Path = _LOG_ROOT,
+    diagnostic: str = "full-model", smoke: bool = False,
 ) -> OwnedTmuxCommands:
     """The one approved diagnostic entrypoint, under the normal owned supervisor."""
     if (plan.stage != "stage2" or plan.tuning_method != "dora" or plan.zero_stage != 2
@@ -1529,6 +1530,9 @@ def build_dil_full_model_probe_commands(
             or plan.cluster.master_addr != "10.1.102.41"
             or plan.cluster.socket_ifname != "bond1.102" or plan.attempt_id != "initial"):
         raise ValueError("DIL probe requires fresh two-node/four-rank DoRA ZeRO2 profile")
+    if diagnostic not in ("full-model", "entropy-distribution") or (smoke and diagnostic != "entropy-distribution"):
+        raise ValueError("unsupported DIL diagnostic mode")
+    script = "collect_entropy_distribution.py" if diagnostic == "entropy-distribution" else "probe_dil_full_model.py"
     _require_digest("manifest_sha256", manifest_sha256)
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("invalid probe commit")
@@ -1548,8 +1552,9 @@ def build_dil_full_model_probe_commands(
             "--main_process_ip", "10.1.102.41", "--main_process_port", str(plan.main_process_port),
             "--mixed_precision", "bf16", "--use_deepspeed", "--deepspeed_multinode_launcher", "standard",
             "--deepspeed_config_file", str(plan.deepspeed_config),
-            str(repository / "scripts/probe_dil_full_model.py"), "run", "--repository", str(repository),
+            str(repository / "scripts" / script), "run", "--repository", str(repository),
             "--manifest", str(manifest), "--manifest-sha256", manifest_sha256, "--run-id", plan.run_id,
+            *(("--smoke",) if smoke else ()),
         )
         supervisor, digest, spec = _node_shell_command(
             plan, machine_rank=machine_rank, commit=commit, stage_command=command,
