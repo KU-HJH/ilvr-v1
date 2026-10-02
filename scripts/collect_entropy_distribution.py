@@ -247,6 +247,10 @@ def worker(args):
                 raise ValueError('duplicate reducer observation')
             capture['tokens'] = paired_tokens(capture['input_ids'],spans,clean_entropies,results)
             return clean_ce, {}
+        def _accumulate_step_preference_metrics(self, values):
+            # This diagnostic does not reduce a training objective. Keep its
+            # paired entropy records without fabricating composed-loss metrics.
+            pass
     trainer = ObservedTrainer(model=components.model,args=build_stage2_training_arguments(native_args),
         train_dataset=components.train_dataset,data_collator=components.data_collator,processing_class=components.processor,
         stage2_peft_metadata=components.peft_metadata,step_preference_config=components.step_preference_config,

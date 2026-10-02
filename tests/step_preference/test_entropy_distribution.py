@@ -144,3 +144,79 @@ def test_cuda_duplicate_steps_fail_before_publishing_records():
     row = {'name':'step-0-visual-off','predictor_positions':(0,), 'target_ids':ids[0,1:], 'entropies':ent}
     with pytest.raises(ValueError,match='duplicate'):
         m.paired_tokens(ids,[span,span],[ent,ent],{(0,'visual'):row})
+
+
+def test_cuda_worker_observer_survives_parent_metric_path_without_training_stats(tmp_path, monkeypatch):
+    # Breaks on the actual worker's empty reducer metrics reaching strict parent accumulation.
+    # Replace large checkpoint loading/Trainer initialization only; retain the worker's
+    # real local subclass, native compute_loss/context dispatch, decoder and sidecar.
+    m = api()
+    from step_preference.shared_prefix_measurement import tiny_measurement_case
+    from step_preference.equivalence import _trainer
+    from tests.step_preference.test_dil_config import _bce_config
+    from stage2.trainer import Stage2Trainer
+    import main
+    import stage2.data
+    import deepspeed_runtime
+    from scripts import probe_dil_full_model
+    with torch.device('cuda:0'):
+        model, batch = tiny_measurement_case(steps=2,total_target_tokens=6,device='cuda:0')
+    batch['step_preference'] = {'steps':tuple({'span':span} for span in batch['reasoning_step_spans'])}
+    model.config.supervise_latent_boundaries = True
+    model.to(dtype=torch.bfloat16)
+    before = {name: p.detach().clone() for name,p in model.named_parameters()}
+    config = _bce_config(preference_loss_type='dil_bce_rf_topk_both_lower',preference_topk=7,
+                        beta=1.,lambda_ce=.1,target_scope='until_next_latent',
+                        preference_entropy_top_percent=20.,sidecar_attention_backend='dense')
+    created = []
+    class InitializedTinyTrainer(Stage2Trainer):
+        def __init__(self, **kwargs):
+            self.__dict__.update(_trainer(config).__dict__)
+            self.model = kwargs['model']
+            self.optimizer = self.deepspeed = None
+            self.accelerator = SimpleNamespace(device=torch.device('cuda:0'),process_index=2,num_processes=4)
+            created.append(self)
+        def _prepare_inputs(self, inputs):
+            return inputs
+    rows = [{'sample_id':f'case-{i}'} for i in range(3379)]
+    examples = [SimpleNamespace(sample_id=row['sample_id']) for row in rows]
+    def collate(selected):
+        return {**batch,'sample_ids':(selected[0].sample_id,)}
+    components = SimpleNamespace(model=model,trainer_class=InitializedTinyTrainer,train_dataset=examples,
+        data_collator=collate,processor=None,peft_metadata=None,step_preference_config=config)
+    length = tmp_path/'length.json'
+    length.write_text(json.dumps({'lengths':[1]*3379,'retained_indices':list(range(3379))}))
+    manifest = {'base':m.BASE,'initializer':str(tmp_path/'checkpoints'/m.INITIALIZER),
+        'data_path':str(tmp_path/'data/TRAIN.jsonl'),'image_root':str(tmp_path/'data'),
+        'length_manifest':str(length),'length_manifest_sha256':m.sha256(length),'retained_indices':list(range(3379))}
+    monkeypatch.setattr(m,'load_manifest',lambda _path,_root:manifest)
+    monkeypatch.setattr(probe_dil_full_model,'bootstrap',lambda *_args:None)
+    monkeypatch.setattr(main,'build_stage2_training_components',lambda _args:components)
+    monkeypatch.setattr(main,'build_stage2_training_arguments',lambda _args:None)
+    monkeypatch.setattr(deepspeed_runtime,'bind_deepspeed_runtime_profile',lambda *_args,**_kwargs:None)
+    monkeypatch.setattr(stage2.data,'load_jsonl_examples',lambda _path:rows)
+    monkeypatch.setenv('LOCAL_RANK','0'); monkeypatch.setenv('RANK','2'); monkeypatch.setenv('ILVR_MACHINE_RANK','1')
+    head_logits, outputs = [], []
+    head_hook = model.lm_head.register_forward_hook(lambda _m,_a,out:head_logits.append(out.detach()))
+    output_hook = model.register_forward_hook(lambda _m,_a,out:outputs.append(out))
+    try:
+        m.worker(SimpleNamespace(repository=str(tmp_path),manifest=length,manifest_sha256=m.sha256(length),
+                                 run_id='diagnostic-causal-test',smoke=True))
+    finally:
+        head_hook.remove(); output_hook.remove()
+    output = tmp_path/'results/diagnostic-causal-test'
+    records = [json.loads(line) for line in (output/'entropy-rank-2.jsonl').read_text().splitlines()]
+    assert len(records) == 1 and records[0]['retained_index'] == 2
+    assert len(records[0]['tokens']) == 6
+    clean_lp = outputs[0].stage2_selected_logits[0].float().log_softmax(-1)
+    off_lp = head_logits[-1][0].float().log_softmax(-1)
+    clean_entropy,off_entropy = -(clean_lp.exp()*clean_lp).sum(-1),-(off_lp.exp()*off_lp).sum(-1)
+    torch.testing.assert_close(torch.tensor([t['Hc'] for t in records[0]['tokens']],device='cuda'),clean_entropy)
+    torch.testing.assert_close(torch.tensor([t['Hv'] for t in records[0]['tokens']],device='cuda'),off_entropy)
+    assert created[0]._step_preference_metric_totals == {}  # no fabricated composed-loss metrics
+    witness = json.loads((output/'entropy-witness-rank-2.json').read_text())
+    assert witness['eval_no_grad_frozen'] and witness['weights_version_unchanged']
+    assert all(not module.training for module in model.modules())
+    for name,p in model.named_parameters():
+        assert not p.requires_grad and p.grad is None
+        torch.testing.assert_close(p,before[name],atol=0,rtol=0)
