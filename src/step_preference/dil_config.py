@@ -47,8 +47,8 @@ def validate_dil_config(config: StepPreferenceConfig) -> None:
     percent = config.preference_entropy_top_percent
     if percent is not None and not 0 < _finite("step_preference_entropy_top_percent", percent) <= 100:
         raise ValueError("step_preference_entropy_top_percent must be in (0, 100]")
-    if config.preference_entropy_source not in ("clean", "voff"):
-        raise ValueError("step_preference_entropy_source must be clean or voff")
+    if config.preference_entropy_source not in ("clean", "voff", "entropy_gap"):
+        raise ValueError("step_preference_entropy_source must be clean, voff or entropy_gap")
     if percent is None and config.preference_entropy_source != "clean":
         raise ValueError("step_preference_entropy_source requires entropy selection")
 

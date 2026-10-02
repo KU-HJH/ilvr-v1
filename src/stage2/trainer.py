@@ -675,8 +675,14 @@ class Stage2Trainer(Trainer):
             topk = config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_both_upper", "dil_bce_rf_topk_both_lower")
             selection = None
             if uses_entropy_selection(config):
-                selection = (clean_entropies if config.preference_entropy_source == "clean"
-                             else [row["entropies"] for row in ordered])
+                if config.preference_entropy_source == "entropy_gap":
+                    # Both are aligned full-vocabulary FP32 entropies from the
+                    # current model's existing clean and visual-off branches.
+                    selection = [(row["entropies"].detach() - clean.detach()).abs()
+                                 for clean, row in zip(clean_entropies, ordered)]
+                else:
+                    selection = (clean_entropies if config.preference_entropy_source == "clean"
+                                 else [row["entropies"] for row in ordered])
             total, metrics = reduce_dil_context_loss(
                 clean_ce, clean_token_logps,
                 [row["target_logps"] if topk else row["mean_logp"].reshape(1) for row in ordered],

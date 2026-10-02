@@ -69,7 +69,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step_preference_lambda_topk_mass", type=float, default=0.0)
     parser.add_argument("--step_preference_entropy_top_percent", type=float)
     parser.add_argument("--step_preference_entropy_source",
-                        choices=("clean", "voff"), default="clean")
+                        choices=("clean", "voff", "entropy_gap"), default="clean")
     parser.add_argument(
         "--step_preference_target_scope",
         choices=("immediate_text", "until_next_latent"), default="immediate_text",

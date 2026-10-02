@@ -111,7 +111,7 @@ def read_dil_identity(config_payload: Mapping[str, object]) -> dict[str, object]
         raise ValueError("invalid DIL objective identity entropy percentage")
     if loss_type == "dil_bce_rf" and percent is not None:
         raise ValueError("invalid DIL objective identity entropy percentage")
-    if identity["entropy_source"] not in ("clean", "voff") or (
+    if identity["entropy_source"] not in ("clean", "voff", "entropy_gap") or (
         percent is None and identity["entropy_source"] != "clean"
     ):
         raise ValueError("invalid DIL objective identity entropy source")

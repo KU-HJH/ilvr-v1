@@ -116,6 +116,23 @@ Select `STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk_both_lower` (CLI: `--step_pref
 
 Use a fresh run with beta1 / CE0.1 / margin0 / preference weight1, top-k1516 / mass weight1 / clean entropy top20, `until_next_latent`, and the explicitly approved `historical_balanced_2rank` sampler through the existing two-node/four-rank coordinator. Preserve the Stage1 initializer and evaluation profile. Group-mass KL keeps its clean target detached, and actual top-k selection remains `sorted=False`. This objective saves `dil_bce_rf_topk_both_lower_v1`; all cross-variant resumes are rejected. Existing selectors and saved objectives retain their formulas.
 
+For live entropy-gap selection, set `STEP_PREFERENCE_ENTROPY_SOURCE=entropy_gap`
+(CLI: `--step_preference_entropy_source entropy_gap`) together with
+`STEP_PREFERENCE_ENTROPY_TOP_PERCENT=20` on an existing top-k DIL selector.
+Each training forward ranks `abs(H_visual_off - H_clean)` using FP32,
+full-vocabulary entropies from the current model's two existing aligned,
+teacher-forced branches. It adds no model or forward and preserves training
+mode and dropout. Selection is detached and sample-local: stable descending
+ranking across all eligible tokens in all original steps retains
+`ceil(N * 20 / 100)`, with original token order breaking ties. Chosen, rejected
+and mass losses share that mask; clean CE still covers all existing supervised
+tokens, and discarded steps keep their denominator slots and zero gradients.
+The OFF top-k entropy used inside the rejected loss is a different quantity
+and is not the selection score. `clean` remains the default and `voff` remains
+available. Checkpoints save `entropy_source=entropy_gap` distinctly; same-source
+resume is accepted and all cross-source resumes are rejected. Changing the
+source requires a fresh run.
+
 ### Planned checkpoint stop for a bounded resume probe
 
 For an independently authorized three-update DIL smoke, one fresh run can stop after a complete checkpoint 2 and resume to the original budget 3. Keep the approved dataset and profile. This optional diagnostic requires enabled DIL `context_preference` Stage 2B and a positive integer strictly below the resolved total budget. Both coordinator and workers receive the option; the coordinator also requires explicit `--max_steps`.
