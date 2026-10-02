@@ -18,7 +18,8 @@ def records():
                  global_rank=rank, world_size=4, zero_stage=1, steps=2, alpha=0.001,
                  aux_grad_isolated=True, moments_base_only=True, master_delta_matches=True,
                  second_step_retains_aux=True, reload_retains_aux=True,
-                 aux_movement_max=0.002, master_delta_residual=0.0,
+                 aux_movement_max=0.002, initial_aux_movement_max=0.002, successful_mutations=2,
+                 master_delta_residual=0.0,
                  moment_residual=0.0, reload_residual=0.0, sync_residual=0.0,
                  peak_memory_bytes=1024, valid_blocks_per_microbatch=rank,
                  microbatches_per_step=[4, 2]) for rank in range(4)]
@@ -108,3 +109,158 @@ def test_probe_training_arguments_pin_frozen_teacher_and_common_profile(tmp_path
                        SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"), tmp_path / "data")
     assert resumed.max_steps == parsed.max_steps == 2
     assert resumed.resume_from_checkpoint_path == str(tmp_path / "checkpoints/checkpoint-1")
+
+
+@pytest.fixture
+def resumed_probe(tmp_path, monkeypatch):
+    """Real CPU AdamW; only distributed/master access and Trainer setup are replaced."""
+    from types import SimpleNamespace
+    import deepspeed.utils
+    api = probe_api()
+    parameter = torch.nn.Parameter(torch.tensor([0.201, -0.302]))
+    optimizer = torch.optim.AdamW([parameter], lr=5e-5)
+    trainer = api.ProbeTrainer.__new__(api.ProbeTrainer)
+    trainer.model = torch.nn.ParameterList([parameter])
+    zero = SimpleNamespace(optimizer=optimizer, update_lp_params=lambda: None)
+    trainer.model_wrapped = SimpleNamespace(optimizer=zero)
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path))
+    trainer.state = SimpleNamespace(global_step=1)
+    trainer.lr_scheduler = SimpleNamespace(state_dict=lambda: {"last_epoch": 1})
+    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
+    trainer.probe_phase = "resume"
+    trainer.probe_base_witness = []
+    trainer._probe_expected_base_partitions = []
+    trainer._probe_base_entry_checked = False
+    trainer._probe_verified_masters = None
+    trainer.probe_stats = {key: value for key, value in records()[0].items()
+                           if key in (*api.BOOLEANS, *api.RESIDUALS, "aux_movement_max",
+                                      "initial_aux_movement_max", "successful_mutations")}
+    trainer.probe_stats.update(second_step_retains_aux=False, reload_retains_aux=False,
+                               successful_mutations=1)
+    monkeypatch.setattr(api.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(api.dist, "all_reduce", lambda tensor, op: tensor.mul_(4))
+    monkeypatch.setattr(deepspeed.utils, "safe_get_full_fp32_param", lambda p: p.detach().clone())
+    def set_master(p, value):
+        with torch.no_grad():
+            p.copy_(value)
+    monkeypatch.setattr(deepspeed.utils, "safe_set_full_fp32_param", set_master)
+    monkeypatch.setattr(api.CustomTrainerStage1, "_install_deepspeed_step_adapter", lambda self: None)
+    monkeypatch.setattr(api.CustomTrainerStage1, "_finish_optimizer_step", lambda self, model, successful: None)
+    path = trainer._reference_path(); path.parent.mkdir(parents=True)
+    torch.save(dict(masters=[parameter.detach().clone()], optimizer=api._snapshot(optimizer.state_dict()),
+                    stats=trainer.probe_stats), path)
+    trainer._install_deepspeed_step_adapter()
+    trainer.probe_clean, trainer.probe_masked = torch.tensor([6., -12.]), torch.zeros(2)
+    trainer.probe_count, trainer.probe_micros = 6, 2
+    return api, trainer, parameter, optimizer
+
+
+def test_reload_does_not_claim_unperformed_second_update(resumed_probe):
+    _, trainer, _, _ = resumed_probe
+    assert trainer.probe_stats["reload_retains_aux"] is True
+    assert trainer.probe_stats["second_step_retains_aux"] is False
+
+
+def test_second_optimizer_entry_rejects_lost_initial_displacement(resumed_probe):
+    _, _, parameter, optimizer = resumed_probe
+    with torch.no_grad():
+        parameter.sub_(torch.tensor([0.001, -0.002]))
+    parameter.grad = torch.tensor([0.4, -0.2])
+    with pytest.raises(AssertionError):
+        optimizer.step()
+
+
+def test_successful_second_base_plus_auxiliary_result_sets_retention(resumed_probe):
+    api, trainer, parameter, optimizer = resumed_probe
+    old = parameter.detach().clone()
+    gradient = torch.tensor([0.4, -0.2])
+    expected, _, _ = api.adamw_reference(old, gradient, torch.zeros(2), torch.zeros(2),
+                                        0, optimizer.param_groups[0])
+    parameter.grad = gradient; optimizer.step()
+    trainer._finish_optimizer_step(trainer.model_wrapped, successful=True)
+    torch.testing.assert_close(parameter, expected + torch.tensor([0.001, -0.002]), rtol=1e-6, atol=1e-7)
+    assert trainer.probe_stats["second_step_retains_aux"] is True
+    assert trainer.probe_stats["successful_mutations"] == 2
+
+
+@pytest.mark.parametrize("phase,global_step,micros", [("initial", 0, 4), ("resume", 1, 2)])
+def test_skipped_base_update_cannot_complete_probe(resumed_probe, phase, global_step, micros):
+    _, trainer, _, _ = resumed_probe
+    trainer.probe_phase = phase
+    trainer.state.global_step = global_step
+    trainer.probe_micros = micros
+    with pytest.raises(AssertionError, match="successful optimizer update"):
+        trainer._finish_optimizer_step(trainer.model_wrapped, successful=False)
+
+
+@pytest.mark.parametrize("bad", [{"successful_mutations": 1}, {"initial_aux_movement_max": 0.0}])
+def test_rank_witness_requires_initial_and_resume_mutations(bad):
+    api = probe_api()
+    changed = records(); changed[0].update(bad)
+    with pytest.raises(ValueError):
+        api.validate_rank_records(changed, commit="a" * 40, zero_stage=1)
+
+
+@pytest.mark.parametrize("mutation", ["hook", "reentry", "callback", "registered_callback"])
+def test_reducer_snapshot_detects_installed_hook_state_mutation(mutation):
+    from types import SimpleNamespace
+    from deepspeed.runtime.base_optimizer import BackwardHookStateManager
+    api = probe_api()
+    snapshot = getattr(api, "reducer_snapshot", None)
+    assert callable(snapshot), "missing complete reducer-state snapshot"
+    state = BackwardHookStateManager()
+    state.enter_backward(); state.exit_backward()
+    zero = SimpleNamespace(_backward_hook_state=state)
+    before = snapshot(zero)
+    if mutation == "hook":
+        state.update_hook_state_and_maybe_run_epilogue(3)
+    elif mutation == "reentry":
+        state.reenter_backward_if_needed()
+    elif mutation == "callback":
+        # Queue a real installed-manager callback during a CPU autograd graph task.
+        state.enter_backward()
+        before = snapshot(zero)
+        p = torch.tensor(2., requires_grad=True)
+        p.register_hook(lambda grad: (state.update_hook_state_and_maybe_run_epilogue(1), grad)[1])
+        p.square().backward()
+        assert state.post_backward_callback_queued
+        assert state.post_backward_callback_graph_task_id is not None
+    else:
+        state.register_grad_acc_post_hook(lambda: None)
+    with pytest.raises(AssertionError):
+        api._assert_same(before, snapshot(zero))
+
+
+def test_finish_rejects_mutation_after_verified_base_result(resumed_probe):
+    _, trainer, parameter, optimizer = resumed_probe
+    parameter.grad = torch.tensor([0.4, -0.2]); optimizer.step()
+    with torch.no_grad():
+        parameter.sub_(torch.tensor([0.001, -0.002]))
+    with pytest.raises(AssertionError):
+        trainer._finish_optimizer_step(trainer.model_wrapped, successful=True)
+
+
+def test_initial_result_is_nonzero_and_persisted_before_reload(resumed_probe):
+    api, trainer, parameter, optimizer = resumed_probe
+    trainer.probe_phase = "initial"; trainer.state.global_step = 0
+    trainer.probe_stats.update(successful_mutations=0, initial_aux_movement_max=0.0,
+                               reload_retains_aux=False)
+    trainer.probe_micros = 4
+    parameter.grad = torch.tensor([0.4, -0.2]); optimizer.step()
+    trainer._finish_optimizer_step(trainer.model_wrapped, successful=True)
+    trainer.save_probe_reference()
+    saved = torch.load(trainer._reference_path(), weights_only=True)
+    torch.testing.assert_close(saved["masters"][0], parameter, rtol=0, atol=0)
+    assert saved["stats"]["successful_mutations"] == 1
+    assert saved["stats"]["initial_aux_movement_max"] > 100 * torch.finfo(torch.float32).eps
+    assert saved["stats"]["second_step_retains_aux"] is False
+
+
+def test_initial_zero_movement_cannot_use_prior_cumulative_movement(resumed_probe):
+    _, trainer, parameter, optimizer = resumed_probe
+    trainer.probe_phase = "initial"; trainer.state.global_step = 0
+    trainer.probe_stats.update(successful_mutations=0, initial_aux_movement_max=0.0)
+    trainer.probe_clean.zero_(); trainer.probe_micros = 4
+    parameter.grad = torch.tensor([0.4, -0.2]); optimizer.step()
+    with pytest.raises(AssertionError):
+        trainer._finish_optimizer_step(trainer.model_wrapped, successful=True)

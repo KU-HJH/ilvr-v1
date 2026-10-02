@@ -63,16 +63,17 @@ def validate_rank_records(records, *, commit, zero_stage):
                 or record.get("commit") != commit or record.get("packages") != packages
                 or record.get("world_size") != 4 or record.get("zero_stage") != zero_stage
                 or record.get("steps") != 2 or record.get("alpha") != ALPHA
+                or record.get("successful_mutations") != 2
                 or record.get("valid_blocks_per_microbatch") != record["global_rank"]
                 or record.get("microbatches_per_step") != [4, 2]):
             raise ValueError("probe runtime identity mismatch")
         if any(record.get(k) is not True for k in BOOLEANS):
             raise ValueError("probe runtime evidence missing or false")
-        for key in (*RESIDUALS, "aux_movement_max", "peak_memory_bytes"):
+        for key in (*RESIDUALS, "aux_movement_max", "initial_aux_movement_max", "peak_memory_bytes"):
             value = record.get(key)
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"probe numeric evidence invalid: {key}")
-        if record["aux_movement_max"] <= 100 * torch.finfo(torch.float32).eps:
+        if min(record["aux_movement_max"], record["initial_aux_movement_max"]) <= 100 * torch.finfo(torch.float32).eps:
             raise ValueError("probe has no resolvable auxiliary displacement")
         # Per-tensor allclose is checked in the runtime; enforce its global absolute witness too.
         if any(record[key] > 1e-7 for key in RESIDUALS):
@@ -255,6 +256,20 @@ def _assert_same(left, right):
         assert left == right
 
 
+def reducer_snapshot(zero):
+    fields = ("averaged_gradients", "ipg_buckets", "params_already_reduced", "is_partition_reduced",
+              "remaining_grads_in_partition", "all_grad_tensors", "_epilogue_ran_this_backward",
+              "is_gradient_accumulation_boundary", "micro_step_id")
+    state = {name: getattr(zero, name, None) for name in fields}
+    manager = zero._backward_hook_state
+    # Snapshot every installed manager counter/flag, including queued graph-task state.
+    # Callback identities matter: two different callables must not collapse to "function".
+    state["_backward_hook_state"] = {
+        name: [id(hook) for hook in value] if name == "_grad_acc_post_hooks" else value
+        for name, value in vars(manager).items()}
+    return _snapshot(state)
+
+
 class StopAfterFirstSave(TrainerCallback):
     def __init__(self, trainer):
         self.trainer = trainer
@@ -277,11 +292,15 @@ class ProbeTrainer(CustomTrainerStage1):
         self.probe_count = 0
         self.probe_micros = 0
         self.probe_base_witness = []
+        self._probe_expected_base_partitions = []
         self.probe_stats = dict(aux_grad_isolated=True, moments_base_only=True,
                                master_delta_matches=True, second_step_retains_aux=False,
                                reload_retains_aux=False, master_delta_residual=0.0,
                                moment_residual=0.0, reload_residual=0.0, sync_residual=0.0,
-                               aux_movement_max=0.0, score_residual=0.0, gradient_relative_l2=0.0)
+                               aux_movement_max=0.0, initial_aux_movement_max=0.0, successful_mutations=0,
+                               score_residual=0.0, gradient_relative_l2=0.0)
+        self._probe_verified_masters = None
+        self._probe_base_entry_checked = False
 
     def _install_deepspeed_step_adapter(self):
         super()._install_deepspeed_step_adapter()
@@ -289,6 +308,11 @@ class ProbeTrainer(CustomTrainerStage1):
         optimizer = engine.optimizer.optimizer
         original = optimizer.step
         def base_step(*args, **kwargs):
+            if not self._probe_base_entry_checked:
+                if self.state.global_step == 1:
+                    assert self.probe_stats["reload_retains_aux"]
+                    self._assert_verified_masters()
+                self._probe_base_entry_checked = True
             references = []
             for group in optimizer.param_groups:
                 for parameter in group["params"]:
@@ -304,6 +328,7 @@ class ProbeTrainer(CustomTrainerStage1):
             result = original(*args, **kwargs)
             for parameter, (expected, first, second) in references:
                 torch.testing.assert_close(parameter, expected, rtol=1e-6, atol=1e-7)
+                self._probe_expected_base_partitions.append((parameter, expected.clone()))
                 for key, want in (("exp_avg", first), ("exp_avg_sq", second)):
                     got = optimizer.state[parameter][key]
                     torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-7)
@@ -329,17 +354,27 @@ class ProbeTrainer(CustomTrainerStage1):
         assert self.state.global_step == 1
         assert self.lr_scheduler.state_dict()["last_epoch"] == 1
         self.probe_stats.update(saved["stats"])
-        self.probe_stats["second_step_retains_aux"] = True
+        assert self.probe_stats["successful_mutations"] == 1
+        assert self.probe_stats["initial_aux_movement_max"] > 100 * torch.finfo(torch.float32).eps
+        self._probe_verified_masters = [p.clone() for p in saved["masters"]]
+        self._probe_base_entry_checked = False
+        self.probe_stats["second_step_retains_aux"] = False
         self.probe_stats["reload_retains_aux"] = True
+
+    def _assert_verified_masters(self):
+        from deepspeed.utils import safe_get_full_fp32_param
+        assert self._probe_verified_masters is not None
+        parameters = self._parameters()
+        assert len(parameters) == len(self._probe_verified_masters)
+        for parameter, expected in zip(parameters, self._probe_verified_masters):
+            got = safe_get_full_fp32_param(parameter)
+            torch.testing.assert_close(got, expected.to(got.device), rtol=0, atol=0)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         inputs = self._prepare_inputs(inputs)
         parameters = self._parameters()
         zero = model.optimizer
-        fields = ("averaged_gradients", "ipg_buckets", "params_already_reduced", "is_partition_reduced",
-                  "remaining_grads_in_partition", "all_grad_tensors", "_epilogue_ran_this_backward",
-                  "is_gradient_accumulation_boundary", "micro_step_id")
-        before = _snapshot({name: getattr(zero, name, None) for name in fields})
+        before = reducer_snapshot(zero)
         before_grads = _snapshot([(p.grad, getattr(p, "grad_accum", None)) for p in parameters])
         with torch.random.fork_rng(devices=[self.accelerator.device.index]):
             targets = self.target_builder.build(self.ema_teacher.model, dict(inputs), inputs["stage1_batch_metadata"])
@@ -366,7 +401,7 @@ class ProbeTrainer(CustomTrainerStage1):
                     assert relative <= 0.01
                     self.probe_stats["gradient_relative_l2"] = max(self.probe_stats["gradient_relative_l2"], relative)
                     self.probe_stats["score_residual"] = max(self.probe_stats["score_residual"], max(abs(a-b) for a,b in zip(actual_scores, reference_scores)))
-        _assert_same(before, _snapshot({name: getattr(zero, name, None) for name in fields}))
+        _assert_same(before, reducer_snapshot(zero))
         _assert_same(before_grads, _snapshot([(p.grad, getattr(p, "grad_accum", None)) for p in parameters]))
         c, h = _flatten(clean), _flatten(masked)
         if self.probe_clean is None:
@@ -387,21 +422,29 @@ class ProbeTrainer(CustomTrainerStage1):
 
     def _finish_optimizer_step(self, model=None, *, successful):
         from deepspeed.utils import safe_get_full_fp32_param, safe_set_full_fp32_param
+        assert successful, "probe requires successful optimizer update"
+        assert self._probe_base_entry_checked and self.probe_base_witness
+        assert self.probe_stats["successful_mutations"] == self.state.global_step
+        assert self._probe_expected_base_partitions
+        for parameter, expected in self._probe_expected_base_partitions:
+            torch.testing.assert_close(parameter, expected, rtol=1e-6, atol=1e-7)
         count = torch.tensor(self.probe_count, dtype=torch.int64, device=self.accelerator.device)
         for tensor in (self.probe_clean, self.probe_masked, count):
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         direction = displacement_for_step(project_direction(self.probe_clean, self.probe_masked, int(count)), applied=successful)
         expected_micros = 4 if self.state.global_step == 0 else 2
         assert self.probe_micros == expected_micros
+        assert direction is not None, "probe requires an auxiliary mutation"
         if direction is not None:
             offset = 0
+            movement = 0.0
             moments = _snapshot(model.optimizer.optimizer.state_dict())
             expected = []
             for parameter in self._parameters():
                 master = safe_get_full_fp32_param(parameter)
                 delta = ALPHA * direction[offset:offset + parameter.numel()].view_as(master)
                 updated = master + delta
-                self.probe_stats["aux_movement_max"] = max(self.probe_stats["aux_movement_max"], float((updated - master).abs().max()))
+                movement = max(movement, float((updated - master).abs().max()))
                 safe_set_full_fp32_param(parameter, updated)
                 expected.append(updated)
                 offset += parameter.numel()
@@ -412,7 +455,16 @@ class ProbeTrainer(CustomTrainerStage1):
                 self.probe_stats["master_delta_residual"] = max(self.probe_stats["master_delta_residual"], float((got-want).abs().max()))
                 torch.testing.assert_close(parameter, got.to(parameter.dtype), rtol=0, atol=0)
             _assert_same(moments, _snapshot(model.optimizer.optimizer.state_dict()))
-            assert self.probe_stats["aux_movement_max"] > 100 * torch.finfo(torch.float32).eps
+            assert movement > 100 * torch.finfo(torch.float32).eps
+            self.probe_stats["aux_movement_max"] = max(self.probe_stats["aux_movement_max"], movement)
+            self.probe_stats["successful_mutations"] += 1
+            self._probe_verified_masters = [p.detach().cpu().clone() for p in expected]
+            if self.state.global_step == 0:
+                self.probe_stats["initial_aux_movement_max"] = movement
+            else:
+                # Entry retained the first displacement; independent AdamW and the
+                # master/low-precision checks above verified the actual second result.
+                self.probe_stats["second_step_retains_aux"] = True
         if successful:
             diagnostic = Path(self.args.output_dir) / "probe-reference" / f"rank-{dist.get_rank()}-step-{self.state.global_step + 1}.pt"
             diagnostic.parent.mkdir(parents=True, exist_ok=True)
@@ -421,15 +473,19 @@ class ProbeTrainer(CustomTrainerStage1):
                             base_partitions=self.probe_base_witness,
                             fp32_masters=[safe_get_full_fp32_param(p).cpu() for p in self._parameters()]), diagnostic)
         self.probe_base_witness = []
+        self._probe_expected_base_partitions = []
+        self._probe_base_entry_checked = False
         self.probe_clean = self.probe_masked = None
         self.probe_count = self.probe_micros = 0
         super()._finish_optimizer_step(model, successful=successful)
 
     def save_probe_reference(self):
-        from deepspeed.utils import safe_get_full_fp32_param
+        assert self.probe_stats["successful_mutations"] == 1
+        assert self.probe_stats["initial_aux_movement_max"] > 100 * torch.finfo(torch.float32).eps
+        self._assert_verified_masters()
         path = self._reference_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(dict(masters=[safe_get_full_fp32_param(p).cpu() for p in self._parameters()],
+        torch.save(dict(masters=self._probe_verified_masters,
                         optimizer=_snapshot(self.model_wrapped.optimizer.optimizer.state_dict()),
                         stats=self.probe_stats), path)
 
@@ -494,6 +550,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
     torch.cuda.reset_peak_memory_stats()
     trainer.train(resume_from_checkpoint=str(paths.checkpoint_dir / "checkpoint-1") if args.phase == "resume" else None)
     assert trainer.state.global_step == (1 if args.phase == "initial" else 2)
+    assert trainer._successful_optimizer_steps == 1
+    assert trainer.probe_stats["successful_mutations"] == trainer.state.global_step
+    assert trainer.probe_stats["initial_aux_movement_max"] > 100 * torch.finfo(torch.float32).eps
     record = dict(schema=1, kind=KIND, commit=args.commit,
                   packages={name: version(name) for name in ("torch", "deepspeed", "accelerate", "trl")},
                   global_rank=dist.get_rank(), local_rank=int(os.environ["LOCAL_RANK"]),
