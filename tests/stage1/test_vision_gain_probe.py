@@ -264,3 +264,85 @@ def test_initial_zero_movement_cannot_use_prior_cumulative_movement(resumed_prob
     parameter.grad = torch.tensor([0.4, -0.2]); optimizer.step()
     with pytest.raises(AssertionError):
         trainer._finish_optimizer_step(trainer.model_wrapped, successful=True)
+
+
+
+def test_runtime_comparator_uses_independent_same_bf16_manual_reference(monkeypatch):
+    from types import SimpleNamespace
+    from dataclasses import replace
+    from deepspeed.runtime.base_optimizer import BackwardHookStateManager
+    from stage1.equivalence import stage1_checkpoint_context_fn
+    api = probe_api()
+    torch.manual_seed(42)
+    model, batch, targets = api.cpu_score_fixture()
+    model.bfloat16()
+    targets = replace(targets, latent_values=targets.latent_values.bfloat16())
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={
+        "use_reentrant": False, "context_fn": stage1_checkpoint_context_fn})
+    trainer = api.ProbeTrainer.__new__(api.ProbeTrainer)
+    trainer.model = model
+    # This mirrors __init__ at FIX_BASE; corrected reference is cast to the runtime dtype.
+    trainer.reference_model = deepcopy(model).float()
+    trainer.state = SimpleNamespace(global_step=0)
+    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
+    trainer.target_builder = SimpleNamespace(build=lambda teacher, inputs, metadata: targets)
+    trainer.ema_teacher = SimpleNamespace(model=model)
+    trainer._prepare_inputs = lambda inputs: inputs
+    trainer.probe_clean = trainer.probe_masked = None
+    trainer.probe_count = trainer.probe_micros = 0
+    trainer.probe_stats = dict(score_residual=0.0, gradient_relative_l2=0.0)
+    zero = SimpleNamespace(_backward_hook_state=BackwardHookStateManager())
+    monkeypatch.setattr(api.dist, "get_rank", lambda: 2)
+    original_fork = torch.random.fork_rng
+    monkeypatch.setattr(torch.random, "fork_rng", lambda devices, **kwargs: original_fork(devices=[], **kwargs))
+    monkeypatch.setattr(api.CustomTrainerStage1, "training_step",
+                        lambda self, model, inputs, num_items_in_batch: torch.tensor(0.0))
+    # Prior real base backward must also survive runtime comparison and manual reference.
+    with api.activate_stage1_stochastic_context(api._context(model, batch, 0)):
+        model(**api.score_inputs(model, batch, targets, masked=False)).logits.float().square().mean().backward()
+    old_grads = [None if p.grad is None else p.grad.clone() for p in trainer._parameters()]
+    result = trainer.training_step(SimpleNamespace(optimizer=zero), batch)
+    assert result == 0
+    assert trainer.probe_count == 2 and trainer.probe_micros == 1
+    assert trainer.probe_stats["gradient_relative_l2"] <= .01
+    assert trainer.probe_clean.dtype == trainer.probe_masked.dtype == torch.float32
+    assert trainer.probe_clean.abs().max() > 0
+    assert trainer.probe_masked.abs().max() > 0
+    for p, before in zip(trainer._parameters(), old_grads):
+        if before is None:
+            assert p.grad is None
+        else:
+            torch.testing.assert_close(p.grad, before, rtol=0, atol=0)
+
+
+
+@pytest.mark.parametrize("block_count,masked", [(0, False), (0, True), (1, False), (3, False), (1, True), (3, True)])
+def test_manual_reference_is_independent_and_handles_unused_gradient_and_block_sums(monkeypatch, block_count, masked):
+    from dataclasses import replace
+    from stage1.equivalence import stage1_checkpoint_context_fn
+    api = probe_api()
+    torch.manual_seed(42)
+    model, batch, targets = api.cpu_score_fixture()
+    model.bfloat16()
+    model.register_parameter("probe_unused", torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16)))
+    targets = replace(targets, latent_values=targets.latent_values.bfloat16())
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={
+        "use_reentrant": False, "context_fn": stage1_checkpoint_context_fn})
+    expected_scores = []
+    expected = api.score_gradients(model, batch, targets, block_count=block_count, masked=masked,
+                                   optimizer_step=0, scores=expected_scores)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("manual reference called runtime score_gradients")
+    monkeypatch.setattr(api, "score_gradients", forbidden)
+    reference_scores = []
+    actual = api.reference_score_gradients(deepcopy(model), batch, targets, block_count=block_count,
+                                           masked=masked, optimizer_step=0, scores=reference_scores)
+    torch.testing.assert_close(torch.tensor(reference_scores), torch.tensor(expected_scores), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(api._flatten(actual), api._flatten(expected), rtol=1e-2, atol=1e-5)
+    unused_index = [name for name,p in model.named_parameters() if p.requires_grad].index("probe_unused")
+    assert torch.equal(actual[unused_index], torch.zeros(2))
+    assert all(gradient.dtype == torch.float32 for gradient in actual)
+    if block_count == 0:
+        assert all(not torch.count_nonzero(gradient) for gradient in actual)
+    else:
+        assert api._flatten(actual).abs().max() > 0

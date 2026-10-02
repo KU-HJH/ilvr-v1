@@ -200,6 +200,40 @@ def score_gradients(model, batch, targets, *, block_count, masked, optimizer_ste
     return gradients
 
 
+def reference_score_gradients(model, batch, targets, *, block_count, masked, optimizer_step, scores=None):
+    """Independent FP32 score/backward reference through the same BF16 network.
+
+    This model is a separate clone without the runtime's ZeRO hooks. Scoring and
+    gradient collection deliberately do not call score_gradients/autograd.grad.
+    """
+    parameters = tuple(p for p in model.parameters() if p.requires_grad)
+    gradients = [torch.zeros_like(p, dtype=torch.float32) for p in parameters]
+    blocks = ([block] for block in range(block_count)) if masked else ([list(range(block_count))] if block_count else [])
+    model.zero_grad(set_to_none=True)
+    for selected in blocks:
+        model.zero_grad(set_to_none=True)
+        with activate_stage1_stochastic_context(_context(model, batch, optimizer_step)):
+            logits = model(**score_inputs(model, batch, targets, masked=masked, block=selected[0])).logits
+            terms = []
+            for block in selected:
+                span = batch["stage1_batch_metadata"].samples[0].latent_spans[block]
+                positions = torch.arange(span.end + 1, span.end + 3, device=logits.device)
+                rows = logits[0, positions - 1, :].float()
+                log_probs = rows - torch.logsumexp(rows, dim=-1, keepdim=True)
+                target_ids = batch["input_ids"][0, positions]
+                terms.append(log_probs[torch.arange(positions.numel(), device=logits.device), target_ids].sum()
+                             / positions.numel())
+            score = torch.stack(terms).sum()
+            if scores is not None:
+                scores.append(float(score.detach()))
+            score.backward()
+        for accumulator, parameter in zip(gradients, parameters):
+            if parameter.grad is not None:
+                accumulator.add_(parameter.grad.detach().float())
+    model.zero_grad(set_to_none=True)
+    return gradients
+
+
 def cpu_score_fixture():
     """Real tiny Qwen + DoRA with prior-backward support, no distributed engine."""
     from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
@@ -285,7 +319,7 @@ class ProbeTrainer(CustomTrainerStage1):
     """Test-only auxiliary path attached to the observed engine mutation boundary."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.reference_model = deepcopy(self.model).float()
+        self.reference_model = deepcopy(self.model)
         self.reference_model.train()
         self.probe_clean = None
         self.probe_masked = None
@@ -384,14 +418,13 @@ class ProbeTrainer(CustomTrainerStage1):
                                     optimizer_step=self.state.global_step, scores=clean_scores)
             masked = score_gradients(self.model, inputs, targets, block_count=count, masked=True,
                                      optimizer_step=self.state.global_step, scores=masked_scores)
-            # Independent current-state FP32 forwards with the identical dropout site keys.
-            self.reference_model.to(self.accelerator.device)
+            # Independent current-state BF16 recomputation; only scoring/buffers
+            # use FP32. A FP32 network has different forward/backward rounding.
+            self.reference_model.to(device=self.accelerator.device, dtype=next(self.model.parameters()).dtype)
             self.reference_model.load_state_dict(self.model.state_dict())
-            reference_batch = {k: v.float() if isinstance(v, torch.Tensor) and v.is_floating_point() else v for k, v in inputs.items()}
-            reference_targets = replace(targets, latent_values=targets.latent_values.float())
             for actual, is_masked, actual_scores in ((clean, False, clean_scores), (masked, True, masked_scores)):
                 reference_scores = []
-                expected = score_gradients(self.reference_model, reference_batch, reference_targets,
+                expected = reference_score_gradients(self.reference_model, inputs, targets,
                             block_count=count, masked=is_masked, optimizer_step=self.state.global_step, scores=reference_scores)
                 if count:
                     torch.testing.assert_close(torch.tensor(actual_scores), torch.tensor(reference_scores), rtol=1e-3, atol=1e-3)
