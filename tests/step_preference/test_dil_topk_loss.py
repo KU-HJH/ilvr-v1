@@ -2,8 +2,61 @@ import math
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from step_preference.dil_topk_loss import topk_negative_and_mass, topk_token_terms
+
+
+class _ObserveTopk(TorchDispatchMode):
+    """Observe the real ATen request without replacing its CUDA kernel."""
+    def __init__(self):
+        super().__init__()
+        self.requests = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        result = func(*args, **kwargs)
+        if func == torch.ops.aten.topk.default:
+            options = dict(zip(("input", "k", "dim", "largest", "sorted"), args)) | kwargs
+            self.requests.append((args[0].device, options.get("sorted", True), result[1]))
+        return result
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("beta", [.5, 1.])
+def test_cuda_topk_requests_unsorted_support_and_preserves_live_loss_gradients(dtype, beta):
+    # Catches a sorted/default request at the production selection, changed
+    # support, frozen q weights, or a changed mass/gradient reduction.
+    clean = torch.tensor([[.25, -.75, 1., -.125, .5, -1.5],
+                          [.5, .75, -.5, .125, -1.25, 1.5]],
+                         device="cuda:0", dtype=dtype, requires_grad=True)
+    off = torch.tensor([[1.5, -.25, .5, -.75, .875, -1.25],
+                        [-.5, .25, 1., .625, -1.5, 1.25]],
+                       device="cuda:0", dtype=dtype, requires_grad=True)
+    targets = torch.tensor([0, 1], device="cuda:0")
+    with _ObserveTopk() as observation:
+        actual = topk_token_terms(clean, off, targets, beta=beta, k=3, chunk_size=1)
+    assert len(observation.requests) == 2
+    for device, sorted_request, support in observation.requests:
+        assert device.type == "cuda" and support.is_cuda
+        assert sorted_request is False, "DIL OFF support selection must request sorted=False"
+    # Tie-free fixtures: sorted reference support is order-independent in the
+    # q-weighted objective. FP64 arithmetic uses the actual quantized inputs.
+    expected = _oracle(clean.double(), off.double(), targets, beta, 3)
+    for got, want in zip(actual, expected, strict=True):
+        assert got.is_cuda
+        torch.testing.assert_close(got.double(), want, atol=2e-5, rtol=2e-4)
+    got_grad = torch.autograd.grad((actual.negative_loss+actual.mass_loss).sum(),
+                                   (clean, off), allow_unused=True)
+    want_grad = torch.autograd.grad((expected[0]+expected[1]).sum(), (clean, off), allow_unused=True)
+    assert got_grad[0] is None and want_grad[0] is None
+    assert got_grad[1].is_cuda and torch.count_nonzero(got_grad[1]) > 0
+    torch.testing.assert_close(got_grad[1], want_grad[1], atol=2e-3 if dtype == torch.bfloat16 else 1e-5,
+                               rtol=2e-2 if dtype == torch.bfloat16 else 1e-4)
+    print({"kernel_device": str(observation.requests[0][0]), "sorted": False,
+           "dtype": str(dtype), "beta": beta, "nonzero_off_grad": int(torch.count_nonzero(got_grad[1]))})
 
 
 def _oracle(clean, off, target_ids, beta, k):

@@ -128,7 +128,7 @@ def topk_token_terms(
             clean_chunk = clean_logits[start:stop].float()
         if not bool(torch.isfinite(clean_chunk).all()) or not bool(torch.isfinite(off_chunk).all()):
             raise ValueError("clean and OFF logits must be finite after float32 conversion")
-        ids = off_chunk.detach().topk(k, dim=-1).indices
+        ids = off_chunk.detach().topk(k, dim=-1, sorted=False).indices
         # These checks touch k IDs per token and never sort the vocabulary.
         if stage2_debugging:
             if bool((ids < 0).any()) or bool((ids >= vocab).any()):
