@@ -1756,7 +1756,97 @@ def _dil_full_model_probe_main(argv: list[str]) -> int:
     return 2
 
 
+def _vision_gain_runtime_probe_main(argv: list[str]) -> int:
+    """Two fixed owned attempts with checkpoint redistribution between them."""
+    from tests.stage1.vision_gain_zero_probe import KIND, PROFILE, validate_rank_records
+    from src.multinode_runtime import build_owned_vision_gain_probe_commands, publish_small_file
+
+    parser = argparse.ArgumentParser(prog="train-stage1 --vision-gain-runtime-probe", allow_abbrev=False)
+    parser.add_argument("--vision-gain-runtime-probe", action="store_true", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--zero-stage", type=int, choices=(1, 2), required=True)
+    parser.add_argument("--main-process-port", type=int, required=True)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        commit = _repository_git_stdout(("rev-parse", "HEAD"))
+        plans = {phase: build_launch_plan(stage="stage1", tuning_method="dora", zero_stage=args.zero_stage,
+                    run_id=args.run_id, main_process_port=args.main_process_port, attempt_id=phase)
+                 for phase in ("initial", "resume")}
+        commands = {phase: build_owned_vision_gain_probe_commands(plan, commit=commit)
+                    for phase, plan in plans.items()}
+        roots = tuple(_REPOSITORY_ROOT / name for name in ("checkpoints", "results", "logs"))
+        inputs = (_REPOSITORY_ROOT / "tests/stage1/vision_gain_zero_probe.py", plans["initial"].deepspeed_config)
+        checkpoint_path = _REPOSITORY_ROOT / "checkpoints" / args.run_id / "checkpoint-1"
+        preflights = {}
+        for phase, plan in plans.items():
+            run_paths = (_REPOSITORY_ROOT / "logs/multinode" / plan.run_id / phase,
+                         _REPOSITORY_ROOT / "results" / plan.run_id / f"{phase}-witness.json")
+            if phase == "initial":
+                run_paths += (_REPOSITORY_ROOT / "checkpoints" / plan.run_id,
+                              _REPOSITORY_ROOT / "data" / plan.run_id)
+            phase_inputs = inputs if phase == "initial" else (*inputs, checkpoint_path,
+                             _REPOSITORY_ROOT / "checkpoints" / args.run_id / "probe-reference",
+                             _REPOSITORY_ROOT / "data" / args.run_id / "TRAIN.jsonl")
+            sessions = tuple(f"ilvr-{plan.run_id}-{phase}-rank{rank}" for rank in (0, 1))
+            preflights[phase] = (build_preflight_commands(plan, input_paths=phase_inputs, artifact_roots=roots,
+                                    remote_run_paths=run_paths, local_run_paths=run_paths,
+                                    remote_tmux_sessions=(sessions[0],), local_tmux_sessions=(sessions[1],)),
+                                run_paths, sessions, phase_inputs)
+        if args.dry_run:
+            print(json.dumps(dict(kind=KIND, resolved_profile=PROFILE,
+                                  attempts={phase: dict(plan=_json_ready(plans[phase]), local=command.local,
+                                              remote=command.remote, resource_preflight=_json_ready(preflights[phase][0]))
+                                            for phase, command in commands.items()}), sort_keys=True))
+            return 0
+        def run(command):
+            return subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
+        checkpoint = _REPOSITORY_ROOT / "checkpoints" / args.run_id / "checkpoint-1"
+        for phase, plan in plans.items():
+            preflight, run_paths, sessions, phase_inputs = preflights[phase]
+            snapshots = [collect_node_snapshot(plan, node=node, runner=run, commands=preflight,
+                          input_paths=phase_inputs, artifact_roots=roots, run_paths=run_paths,
+                          tmux_sessions=(sessions[rank],), repository=plan.cluster.remote_repo_root)
+                         for rank, node in enumerate(("remote", "local"))]
+            if validate_preflight(*snapshots).commit != commit:
+                raise ValueError("probe preflight commit changed")
+            runner = SubprocessCoordinatorRunner(plan, commands=commands[phase], commit=commit,
+                                                 log_root=_REPOSITORY_ROOT / "logs/multinode")
+            if phase == "resume":
+                identity = _checkpoint_artifact_identity(plan, commit=commit, global_step=1)
+                redistribute_resume_checkpoint(runner, checkpoint_path=checkpoint,
+                    checkpoint_identity=identity, requested_identity=identity, destination=checkpoint)
+            start_rank0_then_rank1(plan, runner, commands=commands[phase], ready_timeout_seconds=600)
+            exits = monitor_owned_jobs(plan, runner, expected_commit=commit,
+                      expected_command_digests={rank: commands[phase].command_digests[rank] for rank in (0, 1)})
+            if exits != {0: 0, 1: 0}:
+                raise RuntimeError(f"vision-gain {phase} probe failed: {exits}")
+            raw = [runner.read_lifecycle_phase_evidence(rank, phase) for rank in (0, 1)]
+            if raw[0] != raw[1]:
+                raise ValueError("probe witness differs between nodes")
+            observed = json.loads(raw[0])
+            if phase == "initial":
+                if (observed.get("kind") != KIND or observed.get("commit") != commit
+                        or {record.get("global_rank") for record in observed.get("ranks", [])} != {0, 1, 2, 3}
+                        or any(record.get("steps") != 1 for record in observed["ranks"])):
+                    raise ValueError("initial probe witness identity mismatch")
+                identity = _checkpoint_artifact_identity(plan, commit=commit, global_step=1)
+                collect_checkpoint_artifacts(runner, checkpoint_path=checkpoint, runtime_identity=identity,
+                                             exit_codes=exits, world_size=4)
+            else:
+                witness = validate_rank_records(observed["ranks"], commit=commit, zero_stage=args.zero_stage)
+        witness_path = _REPOSITORY_ROOT / "results" / args.run_id / "vision-gain-probe-witness.json"
+        publish_small_file(witness_path, json.dumps(witness, sort_keys=True).encode())
+        print(json.dumps({"probe_witness": str(witness_path)}, sort_keys=True))
+        return 0
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    return 2
+
+
 def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
+    if stage == "stage1" and "--vision-gain-runtime-probe" in argv:
+        return _vision_gain_runtime_probe_main(argv)
     if stage == "stage2" and any(value == "--dil-full-model-probe" or value.startswith("--dil-full-model-probe=") for value in argv):
         return _dil_full_model_probe_main(argv)
     parser = argparse.ArgumentParser(

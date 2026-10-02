@@ -44,6 +44,89 @@ from stage1.trainer import (
 import stage1.trainer as stage1_trainer_module
 
 
+@pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_training_step_keeps_context_through_checkpoint_backward(
+    tmp_path, checkpointed, scheduled
+):
+    """Catches absent context, wrong row keys, or closing before recomputation."""
+    from dataclasses import replace
+
+    from transformers import Trainer, TrainingArguments
+
+    from stage1.equivalence import (
+        Stage1StochasticContext,
+        activate_stage1_stochastic_context,
+        stage1_checkpoint_context_fn,
+    )
+
+    trainer, batch = make_qwen_trainer("dora", dropout=0.05)
+    if scheduled:
+        batch["stage1_batch_metadata"] = replace(
+            batch["stage1_batch_metadata"],
+            samples=tuple(
+                replace(row, canonical_slot_id=100 + index)
+                for index, row in enumerate(
+                    batch["stage1_batch_metadata"].samples
+                )
+            ),
+        )
+    if checkpointed:
+        trainer.model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": False,
+                "context_fn": stage1_checkpoint_context_fn,
+            }
+        )
+    Trainer.__init__(
+        trainer,
+        model=trainer.model,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            use_cpu=True,
+            report_to=[],
+            gradient_accumulation_steps=4,
+            remove_unused_columns=False,
+            seed=73,
+        ),
+    )
+    trainer.state.global_step = 17
+    context = Stage1StochasticContext(
+        base_seed=73,
+        optimizer_global_step=17,
+        rows=((100, 8), (101, 8)) if scheduled else ((0, 8), (1, 8)),
+        expected_sites=trainer.model.stage1_stochastic_sites,
+    )
+    torch.manual_seed(98)
+    with activate_stage1_stochastic_context(context):
+        expected = Trainer.training_step(
+            trainer, trainer.model, clone_batch(batch)
+        )
+    expected_grads = {
+        name: parameter.grad.clone()
+        for name, parameter in trainer.model.named_parameters()
+        if parameter.grad is not None
+    }
+    trainer.model.zero_grad(set_to_none=True)
+
+    torch.manual_seed(98)
+    actual = trainer.training_step(trainer.model, clone_batch(batch))
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert expected_grads
+    assert all(torch.isfinite(gradient).all() for gradient in expected_grads.values())
+    assert any(gradient.abs().sum() > 0 for gradient in expected_grads.values())
+    for name, parameter in trainer.model.named_parameters():
+        if name in expected_grads:
+            torch.testing.assert_close(
+                parameter.grad, expected_grads[name], rtol=0, atol=0
+            )
+        else:
+            assert parameter.grad is None
+    with pytest.raises(RuntimeError, match="missing Stage 1 stochastic context"):
+        stage1_checkpoint_context_fn()
+
+
 class CountingTargetBuilder:
     def __init__(self, latent_values, latent_mask, selected_counts):
         self.latent_values = latent_values
@@ -596,9 +679,9 @@ def test_b1_ce_alignment_and_total_loss_match_legacy_golden():
     assert teacher_values.grad is None
 
 
-def make_qwen_trainer(method):
+def make_qwen_trainer(method, *, dropout=0.0):
     model = build_stage1_tuned_model(
-        tiny_qwen_fixture.__wrapped__(), tuning(method), LATENT_TOKEN_IDS
+        tiny_qwen_fixture.__wrapped__(), tuning(method, dropout=dropout), LATENT_TOKEN_IDS
     )
     if method == "dora":
         qwen = resolve_qwen2_5_vl_model(model)
@@ -1616,7 +1699,7 @@ def test_deepspeed_prepare_accepts_optimizer_for_bound_zero_stage(
         "version",
         lambda package: {
             "accelerate": "1.10.1",
-            "deepspeed": "0.18.0",
+            "deepspeed": "0.18.7",
         }[package],
     )
     trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
@@ -1660,7 +1743,7 @@ def test_deepspeed_prepare_rejects_optimizer_mismatched_to_bound_stage(monkeypat
         "version",
         lambda package: {
             "accelerate": "1.10.1",
-            "deepspeed": "0.18.0",
+            "deepspeed": "0.18.7",
         }[package],
     )
     trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
@@ -1688,3 +1771,48 @@ def test_nonfinite_loss_raises_before_backward_or_step():
 
     with pytest.raises(FloatingPointError, match="loss is nonfinite"):
         trainer.compute_loss(trainer.model, make_batch(mask))
+
+
+@pytest.mark.parametrize("version, accepted", [("0.18.7", True), ("9.9.9", False)])
+def test_stage1_accepts_installed_ds0187_and_rejects_unknown_version(monkeypatch, version, accepted):
+    """Catches the trainer rejecting the runtime accepted by preflight."""
+    import deepspeed.runtime.engine as engine_module
+    import deepspeed.runtime.zero.stage_1_and_2 as zero12_module
+
+    mask = torch.tensor([[False, True, False]])
+    trainer = make_trainer(
+        CountingStudent(),
+        CountingTargetBuilder(torch.tensor([[1.0]]), mask, ((1,),)),
+    )
+    optimizer = FakeZero12Optimizer(partition_gradients=False)
+    engine = SimpleNamespace(
+        optimizer=optimizer,
+        step=lambda: None,
+        is_gradient_accumulation_boundary=lambda: True,
+        was_step_applied=lambda: True,
+    )
+    monkeypatch.setattr(engine_module, "DeepSpeedEngine", type(engine))
+    monkeypatch.setattr(
+        zero12_module, "DeepSpeedZeroOptimizer", FakeZero12Optimizer
+    )
+    monkeypatch.setattr(
+        stage1_trainer_module.importlib_metadata,
+        "version",
+        lambda package: {
+            "accelerate": "1.10.1",
+            "deepspeed": version,
+        }[package],
+    )
+    trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(
+        True, 1, None, None, 2
+    )
+    trainer.model_wrapped = engine
+    trainer.accelerator.distributed_type = DistributedType.DEEPSPEED
+    trainer.accelerator.deepspeed_engine_wrapped = DeepSpeedEngineWrapper(engine)
+
+    if accepted:
+        trainer._install_deepspeed_step_adapter()
+        assert trainer._deepspeed_step_adapter.engine is engine
+    else:
+        with pytest.raises(RuntimeError, match="unsupported DeepSpeed Stage 1 lifecycle"):
+            trainer._install_deepspeed_step_adapter()
