@@ -217,3 +217,28 @@ unresolved environment finding without dependency edits or suppression — the
 dependency temporarily clears the explicit setting and all tests passed — cost
 if wrong is a separate extension-compilation compatibility fix. Do not claim
 warning-free output. All three task gates are complete; final broad review next.
+
+## Final independent review and completion-gate setup
+
+Reviewer `/root/gt_final_review` (gpt-6-astra/high) reviewed2f48c51..958c677
+against spec/plan, actual CLI->trainer->sidecar->primitive->typed-reducer paths,
+checkpoint replay and pre-parent identity validation. Verdict: Ready to merge Yes
+for this change; no Critical/Important defects. Existing DeepSpeed warning remains
+an unresolved Minor, not a clean-output assertion. Reviewer read full4060/11/1
+and focused79/73 logs without rerunning suites. Final verification is still pending.
+
+Ruling: accept the final review's four explicit scope exclusions — real two-node
+GT training/GPU GT replay/distributed optimizer restore; convergence or performance;
+pre-baseline equivalence with other branches; dependency remediation — each is
+outside the approved implementation scope. Cost if those capabilities are later
+needed: their own training/compatibility/environment validation is still required;
+none is inferred from these tests.
+
+Active gates: verification-before-completion and finishing-a-development-branch.
+Claim witnesses selected before execution: one fresh project full suite for the
+shared test-pass claim; bash syntax for the launcher; diff check for patch hygiene;
+independent spec/call-path review plus the suite's causal tests for requirements.
+No identical second final suite will be run. Product revision6b222a6 and reviewed
+head958c677 have identical product content; subsequent controller records only
+append workflow evidence. Branch fork recorded atf575cd9, current tip of
+feat/dil-bce-port; no merge/push/cleanup decision inferred from this observation.
