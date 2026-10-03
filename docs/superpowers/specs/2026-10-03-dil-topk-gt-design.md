@@ -1,8 +1,9 @@
 # GT-conditioned DIL-BCE: shared OFF Top-k union GT
 
-Status: written design for user review; implementation is not authorized by
-this artifact alone. The mathematical intent was approved in chat. Approval of
-this written version is required before writing the implementation plan.
+Status: user authorized writing-plans after presentation of this written spec
+at `1c3eae3` by explicitly invoking `$superpowers:writing-plans`. This approves
+the transition to planning, not implementation. Written-plan review and
+execution-method selection remain required.
 
 ## 1. 목적과 승인된 의도
 
@@ -168,9 +169,9 @@ reviewed revision에 대해 repository venv의 project full-suite command를 한
 
 ## 9. Workflow와 다음 gate
 
-현재: 대화에서 승인된 설계 → written spec self-review → 사용자 written-spec
-검토 대기. 이 파일의 검토 승인을 받은 다음에만 `superpowers:writing-plans`로
-구체적 구현 plan을 작성한다. 그 plan의 검토 및 사용자 구현 방식 선택 후에
+현재: 대화에서 승인된 설계 → written spec self-review → 사용자 writing-plans
+호출로 계획 단계 진행 승인. `superpowers:writing-plans`로 구체적 구현 plan을
+작성한다. 그 plan의 검토 및 사용자 구현 방식 선택 후에
 TDD/구현/독립 review/verification/branch finishing을 진행한다.
 
 직접 구현 또는 subagent 구현 방식은 아직 선택되지 않았다. Spec 작성은

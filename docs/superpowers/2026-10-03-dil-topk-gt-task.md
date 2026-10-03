@@ -9,7 +9,8 @@ mass; preserve both existing top-k variants and historical resume semantics.
 Initial path: bounded change to the existing DIL execution flow. After the user
 challenged the missing spec/plan (`spec/plan은 어디에 팔았지?`), the controller
 upgraded to the full architectural spec/plan path. The mathematical intent is
-approved in chat; the written spec still requires its own approval. Do not use
+approved in chat; the written-spec approval was subsequently supplied by the
+explicit writing-plans invocation recorded below. Do not use
 the earlier bounded classification to omit the plan or written-artifact gates.
 
 User approval evidence in this conversation:
@@ -77,8 +78,7 @@ smallest critical existing sidecar/trainer integration check.
   run for this new objective yet.
 - Execution method: awaiting user selection. The earlier method-choice question
   was not answered; do not infer native or subagent implementation.
-- Pending: user review of `specs/2026-10-03-dil-topk-gt-design.md`, writing-plans,
-  written-plan review and execution-method selection, implementation/TDD,
+- Pending: written-plan review and execution-method selection, implementation/TDD,
   independent specification and quality review, fixes, fresh verification and
   applicable branch finishing.
 - No agents dispatched. No training, checkpoint modification, merge or push.
@@ -108,4 +108,29 @@ legacy compatibility and verification scope against the inspected production
 paths. Made the conditional-score diagnostic name/reduction explicit. Ran
 `rg -n 'TBD|TODO|FIXME|placeholder'` on the spec; no matches. No product tests
 were run for these two controller documents, and implementation remains
-unstarted. The next gate is user review of the written spec, not implementation.
+unstarted. At that point the next gate was user review of the written spec.
+
+## Writing-plans authorization and outcome
+
+After the written spec was linked and committed at `1c3eae3`, the user explicitly
+invoked `$superpowers:writing-plans`. This is the instruction to proceed from
+that spec into planning; no repeated spec approval was requested. The invocation
+does not select an implementation method or approve a plan that did not yet exist.
+
+Skill executed: writing-plans (scope/file mapping, three TDD task boundaries,
+exact interfaces, runtime witnesses, self-review, execution handoff). Artifact:
+`plans/2026-10-03-dil-topk-gt.md`. Active phase is written-plan review and method
+selection. No product code, tests or training were executed in this planning turn.
+
+Self-review compared all nine spec sections to tasks, checked seven-field GT
+statistics and the ten-value sidecar layout, mapped the five additional review
+risks to tests, and checked command/file references against the worktree. Found
+that the existing full-logit test oracle initializes unweighted CE; the plan now
+explicitly makes that oracle use lambda_CE for the fresh-default GT cases.
+
+Document verification: repository venv Python checked mandatory plan headings,
+exactly three tasks, no TODO/TBD/FIXME markers, and all 20 referenced existing
+source/test/document paths (two new test files are explicitly planned). Result:
+exit 0. `git diff --check` also returned exit 0. These checks verify the planning
+artifact, not the unimplemented feature. The plan covers one objective pipeline,
+not independent sub-projects; no plan-review subagent was dispatched.
