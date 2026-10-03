@@ -138,3 +138,82 @@ not independent sub-projects; no plan-review subagent was dispatched.
 ## Execution authorization (current)
 
 User `서브에이전트로해` approved the presented plan at 35e169d and selected SDD. Earlier awaiting-selection entries are historical. Active phase: Task 1 implementation after baseline. Using-git-worktrees confirmed the existing named linked worktree; SDD ledger is `.superpowers/sdd/2026-10-03-dil-topk-gt/progress.md`. Preflight producer/consumer and within-task scan is recorded there; no conflicts. Baseline command and log are recorded there: 17 passed in 2.90s, exit 0. No training launch.
+
+## Task 1 implementation and independent gate
+
+Implementer `/root/gt_task1` (gpt-6.1-sol/high), commit `9c5d0f9`, added GT token
+statistics and shared stable mass handling. RED: six expected missing-feature
+assertion failures. GREEN: new/old primitive suite 20 passed. Independent reviewer
+`/root/gt_review1` (same model tier) approved spec compliance and quality with no
+Critical/Important/Minor findings; report at the task workspace `task-1-review.md`.
+
+The first full run was NOT green: 16 failed, 3947 passed, 38 skipped, 33 errors
+(task1-full.log under logs/dil-topk-gt-impl-20261003T074736Z). Root diagnosed its
+own plan's uppercase timestamp and hidden CUDA as causes; controller correction
+`6cb832e` fixes the control document, not product code. Existing timestamp test
+then passed, and the exact 49 failed/error nodes passed with GPU0 visible in
+12.26s. This causal subset is not reported as a full-suite pass. Both GPUs had
+0 MiB/0% utilization before that unit-test run. No training job was launched.
+
+Ruling: correct plan timestamp to lowercase and expose an idle local GPU for
+existing CUDA unit tests — those failures came from controller-supplied execution
+settings — cost if wrong is resource contention, mitigated by rechecking idle
+resources before any unit-test use. New GT tests remain CPU. Final fresh suite
+against the reviewed completed revision remains pending.
+
+Task 1 gate complete; Task 2 delegated to `/root/gt_task2` at base `9c5d0f9`.
+
+## Task 2 implementation and independent gate
+
+Implementer `/root/gt_task2` (gpt-6.1-sol/high), commit `8a35ffa`, connected
+selector/defaults, typed reduction and identity. RED: eight expected missing
+selector failures. GREEN: 81 passed after correcting a fixture's unused
+full-vocabulary diagnostic gradient assumption (the first green attempt was
+1 failed/80 passed). Full suite: 4031 passed, 11 skipped, one existing CPU Adam
+compilation warning in 1216.05s, exit 0. Logs: task2-red.log,
+task2-green.log, task2-green-fixture-corrected.log, task2-full.log under the
+same execution run. Root read the final suite output and committed file stat.
+
+Independent reviewer `/root/gt_review2` (gpt-6.1-sol/high) approved spec and
+quality for 9c5d0f9..8a35ffa, with no Critical/Important findings. Minor finding:
+TORCH_CUDA_ARCH_LIST was unset, so compilation targets were implicit. Resolve
+future suite settings using the observed local architecture without repeating
+the completed suite. Actual runtime/replay/distributed/parent-resume verification
+is explicitly assigned to Task 3. Active phase: Task 3 implementation.
+
+## Task 3 implementation evidence
+
+Implementer `/root/gt_task3` (gpt-6.1-sol/high), commit
+`6b222a64ad04633068d8b83b378e78a010500309`, connected runtime, worker, resume,
+planned-stop and documentation paths. Twelve assigned files changed; generic
+coordinator forwarding already passed both-worker witnesses and stayed unchanged.
+Runtime RED: 14 failed/65 passed. Intermediate runtime: 1 failed/78 passed
+(the remaining shell selector). Routing RED: 5 failed/68 passed, including one
+invalid old-topk test fixture corrected without a product change; selector-switch
+causal check then 2 passed. Final focused tests: runtime79 passed, lifecycle73
+passed, both warning-free. Shell syntax and diff checks returned exit0.
+Full suite: 4060 passed, 11 skipped, 1 warning in1220.97s, exit0. Root read complete
+full-suite output and committed file list. Logs and numeric exit files use
+`task3-runtime-red`, `task3-runtime-green-1`, `task3-runtime-green-2`,
+`task3-runtime-final`, `task3-routing-red`, `task3-routing-red-fixed-test`,
+`task3-routing-green`, `task3-shell-syntax`, `task3-diff-check`, `task3-full`
+under the same execution run's logs directory.
+
+Setting TORCH_CUDA_ARCH_LIST=9.0 did not eliminate the CPUAdam JIT warning:
+installed DeepSpeed op_builder/builder.py:570-572 saves and blanks that variable
+inside jit_load, restoring it at606-607. No dependency edit or warning suppression
+was applied. The warning remains visible and is not a pristine-output claim.
+Task3 review is assigned to `/root/gt_review3`; final whole-change review and fresh
+verification remain pending. No training/remote-participation/performance claim.
+
+Task3 independent reviewer `/root/gt_review3` approved specification compliance
+and quality for8a35ffa..6b222a6. No Critical/Important issues. Review traced actual
+trainer->sidecar->typed-reducer paths and pre-parent resume validation; independent
+oracle, replay and artifact witnesses match the spec. The reviewer independently
+confirmed DeepSpeed's environment clearing, retaining this Minor as unresolved.
+
+Ruling: retain the existing DeepSpeed JIT architecture warning as a reviewed,
+unresolved environment finding without dependency edits or suppression — the
+dependency temporarily clears the explicit setting and all tests passed — cost
+if wrong is a separate extension-compilation compatibility fix. Do not claim
+warning-free output. All three task gates are complete; final broad review next.
