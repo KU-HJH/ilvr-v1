@@ -64,7 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--step_preference_weight", type=float, default=1.0)
     parser.add_argument("--step_preference_loss_type",
-                        choices=("dpo", "dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse"), default="dpo")
+                        choices=("dpo", "dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt"), default="dpo")
     parser.add_argument("--step_preference_topk", type=int)
     parser.add_argument("--step_preference_lambda_topk_mass", type=float, default=0.0)
     parser.add_argument("--step_preference_entropy_top_percent", type=float)

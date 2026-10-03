@@ -10,8 +10,8 @@ if TYPE_CHECKING:
     from step_preference.config import StepPreferenceConfig
 
 
-_DIL_LOSS_TYPES = ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
-_TOPK_LOSS_TYPES = ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
+_DIL_LOSS_TYPES = ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt")
+_TOPK_LOSS_TYPES = ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt")
 
 
 def _finite(name: str, value: Real) -> float:

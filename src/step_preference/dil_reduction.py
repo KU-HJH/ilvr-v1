@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from step_preference.config import StepPreferenceConfig
 from step_preference.dil_config import uses_entropy_selection
-from step_preference.dil_topk_loss import TopkTokenResult
+from step_preference.dil_topk_loss import TopkTokenResult, TopkGtTokenResult
 from step_preference import entropy_selection
 
 
@@ -17,15 +17,16 @@ def reduce_dil_context_loss(
     off_token_logps: Sequence[Tensor],
     *,
     config: StepPreferenceConfig,
-    topk_terms: Sequence[TopkTokenResult] | None = None,
+    topk_terms: Sequence[TopkTokenResult | TopkGtTokenResult] | None = None,
     selection_entropies: Sequence[Tensor] | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Average selected tokens within each step, then all original sample steps."""
-    if config.preference_loss_type not in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse"):
+    if config.preference_loss_type not in ("dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt"):
         raise ValueError("DIL reduction requires a DIL loss selector")
     count = len(clean_token_logps)
-    topk = config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
+    topk = config.preference_loss_type in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt")
     reverse = config.preference_loss_type == "dil_bce_rf_topk_reverse"
+    gt = config.preference_loss_type == "dil_bce_rf_topk_gt"
     if len(off_token_logps) != count or (topk and (topk_terms is None or len(topk_terms) != count)):
         raise ValueError("DIL step cardinality mismatch")
     for clean, off in zip(clean_token_logps, off_token_logps):
@@ -34,8 +35,9 @@ def reduce_dil_context_loss(
         if topk and clean.shape != off.shape:
             raise ValueError("DIL top-k token alignment mismatch")
     if topk:
+        result_type = TopkGtTokenResult if gt else TopkTokenResult
         for clean, terms in zip(clean_token_logps, topk_terms):
-            if not isinstance(terms, TopkTokenResult) or any(t.shape != clean.shape for t in terms):
+            if not isinstance(terms, result_type) or any(t.shape != clean.shape for t in terms):
                 raise ValueError("DIL top-k statistics alignment mismatch")
     if uses_entropy_selection(config):
         if selection_entropies is None or len(selection_entropies) != count or any(
@@ -47,6 +49,8 @@ def reduce_dil_context_loss(
         masks = tuple(torch.ones_like(c, dtype=torch.bool) for c in clean_token_logps)
     zero = clean_ce * 0.
     names = ("positive", "negative", "mass", "clean", "off", "q_entropy", "gt_coverage", "clean_mass", "off_mass", "mass_gap")
+    if gt:
+        names += ("gt_logq",)
     sums = dict.fromkeys(names, zero)
     selected_tokens = selected_steps = 0
     for index, (clean, off, mask) in enumerate(zip(clean_token_logps, off_token_logps, masks)):
@@ -57,6 +61,8 @@ def reduce_dil_context_loss(
             sums["negative"] = sums["negative"] + off.sum()*0.
             if topk:
                 sums["mass"] = sums["mass"] + sum(t.sum()*0. for t in topk_terms[index])
+                if gt:
+                    sums["gt_logq"] = sums["gt_logq"] + topk_terms[index].gt_logq.sum()*0.
             continue
         selected_steps += 1
         clean_score = clean[mask].float().mean()
@@ -68,7 +74,15 @@ def reduce_dil_context_loss(
         sums["off"] = sums["off"] + off_score
         if topk:
             terms = topk_terms[index]
-            for name, value in zip(("negative", "mass", "q_entropy", "clean_mass", "off_mass", "mass_gap", "gt_coverage"), terms):
+            if gt:
+                gt_score = terms.gt_logq[mask].float().mean()
+                sums["gt_logq"] = sums["gt_logq"] + gt_score
+                sums["negative"] = sums["negative"] + F.softplus(config.beta*gt_score)
+            term_names = ("mass", "q_entropy", "clean_mass", "off_mass", "mass_gap", "gt_coverage")
+            values = terms[1:] if gt else terms
+            if not gt:
+                term_names = ("negative", *term_names)
+            for name, value in zip(term_names, values):
                 if reverse and name == "negative":
                     # E_q[log q] = -H(q); q and its expectation stay live.
                     # Average candidates and selected tokens before one softplus.
@@ -98,6 +112,8 @@ def reduce_dil_context_loss(
         "stats/selected_tokens": clean_ce.new_tensor(selected_tokens),
         "stats/entropy_top_percent": clean_ce.new_tensor(config.preference_entropy_top_percent or 100.),
     }
+    if gt:
+        metrics["stats/topk_gt_logq"] = means["gt_logq"]
     for name in ("loss/entropy", "loss/entropy_visual", "loss/entropy_text", "loss/context_preference_text",
                  "stats/context_margin_text", "stats/logp_text_off", "stats/entropy_text_off"):
         metrics[name] = zero
