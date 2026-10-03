@@ -16,7 +16,7 @@ from step_preference.equivalence import _trainer
 from utils_deepseed import parse_args
 
 REPO = Path(__file__).resolve().parents[2]
-SELECTORS = ("dpo", "dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
+SELECTORS = ("dpo", "dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt")
 
 
 def config(selector="dpo", **changes):
@@ -108,7 +108,9 @@ def test_real_sidecar_loss_scales_ce_once_without_scaling_preference(selector):
     from dataclasses import replace
     from tests.step_preference.test_dil_trainer import dil_case
     model, batch = dil_case()
-    cfg = config(selector, lambda_ce=.1, beta=2., preference_margin=.5 if selector == "dpo" else 0.)
+    cfg = config(selector, lambda_ce=.1, beta=1. if selector == "dil_bce_rf_topk_gt" else 2.,
+                 lambda_topk_mass=1. if selector == "dil_bce_rf_topk_gt" else 0.,
+                 preference_margin=.5 if selector == "dpo" else 0.)
     trainer = _trainer(cfg)
     actual, output = trainer.compute_loss(model, batch, return_outputs=True)
     raw_ce = output.loss

@@ -63,6 +63,7 @@ def worker_commands(settings, stage_arguments=()):
     ("dil_bce_rf", None, "0", None, "clean"),
     ("dil_bce_rf_topk", "8", "1", "20", "voff"),
     ("dil_bce_rf_topk_reverse", "1516", "1", "20", "clean"),
+    ("dil_bce_rf_topk_gt", "1516", "1", "20", "clean"),
 ])
 def test_dil_settings_reach_both_real_worker_commands(selector, topk, mass, percent, source):
     settings = {
@@ -115,12 +116,15 @@ def test_invalid_dil_combination_fails_in_worker_dry_run(settings):
 
 
 @pytest.mark.parametrize("selector,topk", [("dil_bce_rf", ""), ("dil_bce_rf_topk", "8"),
-    ("dil_bce_rf_topk_reverse", "1516")])
+    ("dil_bce_rf_topk_reverse", "1516"), ("dil_bce_rf_topk_gt", "1516")])
 def test_dil_resume_reaches_both_worker_argv_without_fresh_initialization(selector, topk):
     checkpoint = str(REPO / "checkpoints" / "dil-forwarding-test" / "checkpoint-1")
     settings = {"STEP_PREFERENCE_LOSS_TYPE": selector, "STEP_PREFERENCE_TOPK": topk,
                 "STAGE2B_DIRECT_FROM_STAGE1": "false", "STAGE1_ADAPTER_PATH": "",
                 "RESUME_CHECKPOINT": checkpoint}
+    if selector == "dil_bce_rf_topk_gt":
+        settings.update(STEP_PREFERENCE_LAMBDA_TOPK_MASS="1",
+                        STEP_PREFERENCE_ENTROPY_TOP_PERCENT="20", STEP_PREFERENCE_ENTROPY_SOURCE="clean")
     for rank, worker_env, result in worker_commands(settings, ("--max_steps", "212")):
         assert result.returncode == 0, result.stderr
         argv = json.loads(result.stdout)
@@ -130,6 +134,12 @@ def test_dil_resume_reaches_both_worker_argv_without_fresh_initialization(select
         assert argv[argv.index("--step_preference_loss_type") + 1] == selector
         assert argv[argv.index("--step_preference_beta") + 1] == "0.5"
         assert argv[argv.index("--step_preference_weight") + 1] == "1.0"
+        if selector == "dil_bce_rf_topk_gt":
+            for option, value in (("--step_preference_topk", "1516"),
+                                  ("--step_preference_lambda_topk_mass", "1"),
+                                  ("--step_preference_entropy_top_percent", "20"),
+                                  ("--step_preference_entropy_source", "clean")):
+                assert argv[argv.index(option) + 1] == value
         assert "--stage2b_direct_from_stage1" not in argv
         assert "--stage1_adapter_path" not in argv
         assert "--stage2a_checkpoint_path" not in argv
@@ -158,3 +168,17 @@ def test_planned_stop_reaches_both_workers_with_unchanged_total_budget():
         assert argv[argv.index('--stage2_stop_after_checkpoint') + 1] == '2'
         assert argv[argv.index('--max_steps') + 1] == '3'
         assert argv[argv.index('--machine_rank') + 1] == str(rank)
+
+
+def test_gt_omitted_beta_fresh_resolves_dil_defaults_in_both_workers():
+    # Break: shell defaults ordinary beta/margin for GT or loses independent mass.
+    settings = {"STEP_PREFERENCE_LOSS_TYPE": "dil_bce_rf_topk_gt",
+                "STEP_PREFERENCE_TOPK": "1516", "STEP_PREFERENCE_LAMBDA_TOPK_MASS": "1",
+                "STEP_PREFERENCE_BETA": "", "CE_WEIGHT": ""}
+    for rank, _, result in worker_commands(settings):
+        assert result.returncode == 0, result.stderr
+        argv = json.loads(result.stdout)
+        for option, value in (("--step_preference_beta", "1.0"), ("--step_preference_margin", "0.0"),
+                              ("--ce_weight", "0.1"), ("--step_preference_lambda_topk_mass", "1")):
+            assert argv[argv.index(option)+1] == value
+        assert argv[argv.index("--machine_rank")+1] == str(rank)

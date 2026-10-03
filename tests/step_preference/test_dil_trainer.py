@@ -15,8 +15,10 @@ from tests.step_preference.test_context_preference import context_config
 def dil_config(kind="dil_bce_rf_topk", **kwargs):
     values = dict(preference_loss_type=kind, beta=.5, lambda_entropy=0.,
                   visual_only_context_preference=True, shared_prefix_enabled=True, visual_off_suppress_latent_boundaries=False)
-    if kind in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse"):
+    if kind in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt"):
         values.update(preference_topk=7, lambda_topk_mass=.7)
+    if kind == "dil_bce_rf_topk_gt":
+        values.update(beta=1., lambda_ce=.1, lambda_topk_mass=1.)
     values.update(kwargs)
     return context_config(**values)
 
@@ -46,7 +48,7 @@ def observed_forward(model, batch, config):
 def full_logit_oracle(output, off, batch, config):
     spans = batch["reasoning_step_spans"]
     if not spans:
-        return output.loss
+        return config.lambda_ce * output.loss
     clean = output.stage2_selected_logits[0].float()
     clean_lp, off_lp = clean.log_softmax(-1), off.float().log_softmax(-1)
     ent_source = clean_lp if config.preference_entropy_source == "clean" else off_lp
@@ -55,7 +57,7 @@ def full_logit_oracle(output, off, batch, config):
     if config.preference_entropy_top_percent is not None and config.preference_entropy_top_percent < 100:
         chosen = set(sorted(chosen, key=lambda i: (-float(entropy[i].detach()), i))[
             :math.ceil(len(chosen)*config.preference_entropy_top_percent/100)])
-    total = output.loss
+    total = config.lambda_ce * output.loss
     cursor = 0
     for span in spans:
         size = span.target_text_end-span.target_text_start
@@ -69,6 +71,19 @@ def full_logit_oracle(output, off, batch, config):
             if config.preference_loss_type == "dil_bce_rf":
                 negative = F.softplus(config.beta*off_lp[indices].gather(1, ids[local, None]).mean())
                 mass = total*0
+            elif config.preference_loss_type == "dil_bce_rf_topk_gt":
+                gt_logq, masses = [], []
+                for index, target in zip(indices, ids[local]):
+                    # Independent Python union; no production support or loss helper.
+                    support_ids = set(off[index].detach().argsort(descending=True)[:config.preference_topk].tolist())
+                    support_ids.add(int(target))
+                    support = sorted(support_ids)
+                    mc = clean_lp[index].detach().exp()[support].sum()
+                    mo = off_lp[index].exp()[support].sum()
+                    gt_logq.append((off_lp[index, target].exp() / mo).log())
+                    masses.append(mc * (mc / mo).log() + (1-mc) * ((1-mc)/(1-mo)).log())
+                negative = F.softplus(config.beta * torch.stack(gt_logq).mean())
+                mass = torch.stack(masses).mean()
             else:
                 support = off[indices].detach().topk(config.preference_topk, -1).indices
                 q = off[indices].float().gather(-1, support).softmax(-1)
@@ -100,7 +115,11 @@ def compare_grads(actual, expected, model, *, exact=False):
     dil_config("dil_bce_rf_topk_reverse", preference_entropy_top_percent=20, preference_entropy_source="voff"),
     dil_config(preference_entropy_top_percent=20),
     dil_config(preference_entropy_top_percent=20, preference_entropy_source="voff"),
-    dil_config(lambda_preference=0., lambda_topk_mass=2.)])
+    dil_config(lambda_preference=0., lambda_topk_mass=2.),
+    dil_config("dil_bce_rf_topk_gt"),
+    dil_config("dil_bce_rf_topk_gt", lambda_preference=0.),
+    dil_config("dil_bce_rf_topk_gt", preference_entropy_top_percent=20),
+    dil_config("dil_bce_rf_topk_gt", preference_entropy_top_percent=20, preference_entropy_source="voff")])
 def test_actual_unequal_step_loss_and_parameter_gradients_match_full_logits(config):
     # Catches DPO dispatch, token-weighted steps, detached q, and coupling mass to lambdaP.
     model, batch = dil_case()
@@ -111,7 +130,7 @@ def test_actual_unequal_step_loss_and_parameter_gradients_match_full_logits(conf
     compare_grads(actual, oracle, model)
 
 
-@pytest.mark.parametrize("kind", ["dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse"])
+@pytest.mark.parametrize("kind", ["dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt"])
 @pytest.mark.parametrize("padding", [False, True])
 def test_direct_trainer_validates_resolved_boundaries_before_forward(kind, padding):
     model, batch = dil_case()
@@ -130,21 +149,28 @@ def test_direct_trainer_validates_resolved_boundaries_before_forward(kind, paddi
     assert not calls
 
 
-def test_direct_trainer_uses_output_head_vocabulary_before_empty_forward():
+@pytest.mark.parametrize("kind", ["dil_bce_rf_topk", "dil_bce_rf_topk_gt"])
+def test_direct_trainer_uses_output_head_vocabulary_before_empty_forward(kind):
     model, batch = dil_case()
     model.lm_head = torch.nn.Linear(model.config.hidden_size, 5, bias=False)
     batch["reasoning_step_spans"] = ()
     batch["step_preference"] = {"steps": ()}
-    with pytest.raises(ValueError, match="smaller than output vocab"):
-        _trainer(dil_config()).compute_loss(model, batch)
+    calls = []
+    hook = model.register_forward_pre_hook(lambda *_: calls.append(True))
+    try:
+        with pytest.raises(ValueError, match="smaller than output vocab"):
+            _trainer(dil_config(kind)).compute_loss(model, batch)
+    finally:
+        hook.remove()
+    assert not calls
 
 
 @pytest.mark.parametrize("config", [dil_config("dil_bce_rf"), dil_config(), dil_config(preference_entropy_top_percent=20),
-    dil_config("dil_bce_rf_topk_reverse")])
+    dil_config("dil_bce_rf_topk_reverse"), dil_config("dil_bce_rf_topk_gt")])
 def test_empty_sample_keeps_clean_ce(config):
     model, batch = dil_case()
     batch["reasoning_step_spans"] = ()
     batch["step_preference"] = {"steps": ()}
     actual, out, _ = observed_forward(model, batch, config)
-    torch.testing.assert_close(actual, out.loss, atol=0, rtol=0)
-    compare_grads(actual, out.loss, model, exact=True)
+    torch.testing.assert_close(actual, config.lambda_ce*out.loss, atol=0, rtol=0)
+    compare_grads(actual, config.lambda_ce*out.loss, model, exact=True)

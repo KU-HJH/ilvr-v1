@@ -23,15 +23,15 @@ def bce_config(kind="dil_bce_rf"):
     return StepPreferenceConfig(
         enabled=True, mode="stage2b", objective="context_preference",
         preference_loss_type=kind, beta=0.5,
-        preference_topk=8 if kind == "dil_bce_rf_topk_reverse" else None,
-        lambda_topk_mass=1. if kind == "dil_bce_rf_topk_reverse" else 0.,
+        preference_topk=8 if kind in ("dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt") else None,
+        lambda_topk_mass=1. if kind in ("dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt") else 0.,
         lambda_entropy=0.0, direct_from_stage1=True,
         shared_prefix_enabled=True,
         visual_off_suppress_latent_boundaries=False,
     )
 
 
-@pytest.fixture(params=["dil_bce_rf", "dil_bce_rf_topk_reverse"])
+@pytest.fixture(params=["dil_bce_rf", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt"])
 def bce_kind(request):
     return request.param
 
@@ -168,3 +168,23 @@ def test_bce_full_model_save_reload_preserves_identity(tmp_path):
     assert restored.config.ilvr_context_preference == build_dil_identity(bce_config())
     torch.testing.assert_close(restored.lm_head.weight, model.lm_head.weight)
     assert (tmp_path / "model.safetensors").is_file()
+
+
+@pytest.mark.parametrize("saved,current", [("dil_bce_rf_topk", "dil_bce_rf_topk_gt"),
+                                          ("dil_bce_rf_topk_gt", "dil_bce_rf_topk")])
+def test_gt_selector_switch_rejected_before_parent_restore(tmp_path, monkeypatch, saved, current):
+    from dataclasses import replace
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    checkpoint = tmp_path / "checkpoint-1"
+    cfg = replace(bce_config("dil_bce_rf_topk_gt"), preference_loss_type=saved)
+    trainer = Stage2Trainer(model=model, args=TrainingArguments(output_dir=str(tmp_path), use_cpu=True,
+                           report_to=[]), step_preference_config=cfg)
+    trainer.save_model(checkpoint)
+    write_deepspeed_runtime_sidecar(checkpoint, trainer.deepspeed_runtime_profile)
+    trainer.step_preference_config = replace(cfg, preference_loss_type=current)
+    calls = []
+    monkeypatch.setattr(Trainer, "train", lambda *args, **kwargs: calls.append(kwargs))
+    with pytest.raises(ValueError, match="identity"):
+        trainer.train(resume_from_checkpoint=str(checkpoint))
+    assert not calls

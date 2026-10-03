@@ -166,3 +166,56 @@ saved_cli=(--warm_up_steps 10)
 ```
 
 Inspect both node commands and worker dry-run JSON before an independently authorized launch. The actual entry path verifies the saved DIL identity and budget, original-base/PEFT provenance, sparse token rows and vocabulary/boundary contract. The trainer repeats the identity check before delegating state restoration to the existing Trainer/DeepSpeed path. Missing or changed DIL identity is rejected; DPO Stage 2B resume acceptance remains unchanged.
+
+### GT-inclusive top-k support
+
+Select `dil_bce_rf_topk_gt` for formula identity `dil_bce_rf_topk_gt_v1`. For each target position `t`, form one shared support
+`S_t = unique(TopK(stopgrad(z_OFF,t), k).indices union {GT_t})`, with `2 <= k < |V|`.
+OFF chooses the support; clean top-k is never used. The same deduplicated support
+normalizes the rejected score and defines both full-vocabulary masses:
+
+```text
+q_GT,t = p_OFF(GT_t) / sum_{v in S_t} p_OFF(v)
+M_clean,t = sum_{v in S_t} p_clean(v)
+M_OFF,t = sum_{v in S_t} p_OFF(v)
+positive_j = softplus(-beta * mean_selected_t(clean full-vocabulary GT logp_t))
+negative_j = softplus(beta * mean_selected_t(log q_GT,t))
+mass_t = KL(Bernoulli(stopgrad(M_clean,t)) || Bernoulli(M_OFF,t))
+```
+
+Average each step's selected mass terms, then average positive, negative and
+mass contributions over the original step count. Entropy selection still uses
+full-vocabulary clean entropy by default, or full-vocabulary OFF entropy with
+`STEP_PREFERENCE_ENTROPY_SOURCE=voff`. A step without selected tokens contributes
+zero and keeps its place in the denominator. Clean group-mass targets are detached;
+OFF conditional probabilities and group masses keep gradients. If the GT union
+covers the full vocabulary, both masses are exactly one and mass KL and its
+gradient are zero.
+
+`stats/topk_gt_coverage` reports GT membership in the OFF top-k **before** adding
+GT. `stats/topk_gt_logq` reports the conditional GT log-probability averaged with
+the same selected-token/original-step reduction. `stats/topk_q_entropy` uses the
+shared union distribution; selection entropy remains full-vocabulary. All token
+statistics are FP32, including with BF16 logits.
+
+The old `dil_bce_rf`, `dil_bce_rf_topk` and `dil_bce_rf_topk_reverse` options retain
+their formulas and saved identities; the default selector remains `dpo`. Fresh
+GT runs use beta 1, margin 0, preference weight 1 and CE weight 0.1. The independent
+mass coefficient defaults to 0 unless explicitly enabled. Omitted resume
+coefficients restore saved values. Old top-k and GT identities cannot resume one
+another; changing selector or objective requires a fresh run.
+
+After the common fresh profile above, inspect this existing-coordinator dry run
+on compatible reviewed code on both nodes. It explicitly enables mass weight 1:
+
+```bash
+env STEP_PREFERENCE_LOSS_TYPE=dil_bce_rf_topk_gt STEP_PREFERENCE_TOPK="$k_pct1" \
+  STEP_PREFERENCE_BETA=1 STEP_DPO_BETA=1 STEP_PREFERENCE_MARGIN=0 \
+  CE_WEIGHT=0.1 STEP_PREFERENCE_WEIGHT=1 STEP_PREFERENCE_LAMBDA_TOPK_MASS=1 \
+  ./run_multinode_stage2_training.sh --dry-run --run-id "dil-topk-gt-mass-$run_stamp" \
+  --zero-stage 2 --main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" --warm_up_steps 10
+```
+
+This command documents routing and resolved settings; it does not establish
+four-rank participation or a training result. The existing planned checkpoint
+stop option also accepts GT and preserves the original total budget.

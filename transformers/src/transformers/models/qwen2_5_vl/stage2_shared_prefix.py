@@ -34,7 +34,7 @@ def validate_shared_inputs(model, options, input_ids, attention_mask, *, packed,
     if dil is not None:
         import math
         if (not isinstance(dil, Mapping) or set(dil) != {"loss_type", "beta", "k"}
-                or dil["loss_type"] not in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse")
+                or dil["loss_type"] not in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt")
                 or type(dil["beta"]) not in (int, float)
                 or not math.isfinite(dil["beta"]) or dil["beta"] <= 0
                 or type(dil["k"]) is not int
@@ -243,14 +243,17 @@ def _score_chunk(model, branches, embeds, positions, mask, flat_prefix, *, dil_o
         ).last_hidden_state
         if dil_objective is None:
             return score_selected_hidden(model, hidden, selected, targets, lengths)
-        from step_preference.dil_topk_loss import topk_token_terms
+        from step_preference.dil_topk_loss import topk_gt_token_terms, topk_token_terms
 
         logits = model.lm_head(hidden.index_select(1, selected))[0].float()
         log_probs = logits.log_softmax(-1)
         target_logps = log_probs.gather(-1, targets[:, None]).squeeze(-1)
         entropies = -(log_probs.exp() * log_probs).sum(-1)
-        terms = topk_token_terms(clean_logits, logits, targets,
-                                beta=dil_objective["beta"], k=dil_objective["k"])
+        if dil_objective["loss_type"] == "dil_bce_rf_topk_gt":
+            terms = topk_gt_token_terms(clean_logits, logits, targets, k=dil_objective["k"])
+        else:
+            terms = topk_token_terms(clean_logits, logits, targets,
+                                    beta=dil_objective["beta"], k=dil_objective["k"])
         reduced, start = [], 0
         for length in lengths:
             stop = start + length
@@ -428,9 +431,10 @@ def score_sidecars(model, options, input_ids, clean_embeds, clean_positions, pre
                 result = dict(name=branch.name, kind=branch.kind, step_id=branch.step_id,
                               mean_logp=values[index*stride], entropies=values[index*stride+1])
                 if dil is not None:
-                    from step_preference.dil_topk_loss import TopkTokenResult
+                    from step_preference.dil_topk_loss import TopkGtTokenResult, TopkTokenResult
+                    token_result = TopkGtTokenResult if dil["loss_type"] == "dil_bce_rf_topk_gt" else TopkTokenResult
                     result.update(target_logps=values[index*stride+2],
-                                  dil_tokens=TopkTokenResult(*values[index*stride+3:index*stride+10]),
+                                  dil_tokens=token_result(*values[index*stride+3:index*stride+10]),
                                   target_ids=torch.tensor(branch.target_token_ids, device=embeds.device),
                                   predictor_positions=tuple(branch.logical_positions[i] for i in branch.selected_positions))
                 results.append(result)

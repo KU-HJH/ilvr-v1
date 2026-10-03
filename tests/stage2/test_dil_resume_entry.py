@@ -35,7 +35,7 @@ def resume_argv(checkpoint, base, data, selector="dil_bce_rf"):
         "--vision_attention_implementation", "flash_attention_2",
         "--latent_size", "2", "--no-gradient_checkpointing", "--max_steps", "212",
     ]
-    if selector in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse"):
+    if selector in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt"):
         argv += ["--step_preference_topk", "8", "--step_preference_lambda_topk_mass", "1"]
     return argv
 
@@ -61,7 +61,7 @@ def save_identity(artifact, selector):
                   direct_from_stage1=True, preference_loss_type=selector, beta=0.5,
                   shared_prefix_enabled=True, visual_off_suppress_latent_boundaries=False,
                   lambda_entropy=0.)
-    if selector in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse"):
+    if selector in ("dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt"):
         values.update(preference_topk=8, lambda_topk_mass=1.)
     payload = json.loads((artifact / "config.json").read_text())
     payload["ilvr_context_preference"] = build_dil_identity(StepPreferenceConfig(**values))
@@ -82,7 +82,7 @@ def cpu_loading_boundaries(monkeypatch):
     monkeypatch.setattr(main, "Stage2DataCollator", lambda *a, **k: lambda batch: batch)
 
 
-@pytest.mark.parametrize("selector", ["dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse"])
+@pytest.mark.parametrize("selector", ["dil_bce_rf", "dil_bce_rf_topk", "dil_bce_rf_topk_reverse", "dil_bce_rf_topk_gt"])
 def test_real_resume_entry_reloads_sparse_weights_and_reaches_parent_train(
     resume_artifact, monkeypatch, selector,
 ):
