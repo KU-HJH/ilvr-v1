@@ -50,12 +50,14 @@ Set up execution-only environment:
 ```bash
 export PYTHONPATH="$PWD/transformers/src:$PWD/src"
 export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=""
-DIL_GT_EXEC_ID="dil-topk-gt-$(date -u +%Y%m%dT%H%M%SZ)"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+DIL_GT_EXEC_ID="dil-topk-gt-$(date -u +%Y%m%dt%H%M%Sz)"
 mkdir -p "logs/$DIL_GT_EXEC_ID" "checkpoints/$DIL_GT_EXEC_ID" "results/$DIL_GT_EXEC_ID"
 ```
 
 Validate resolved checkpoint paths first. Before **each** pytest invocation, set `PYTEST_ADDOPTS="--basetemp=$PWD/checkpoints/$DIL_GT_EXEC_ID/<unique-phase>"` using a fresh phase directory. Never use an existing run as basetemp. Capture full stdout/stderr and exit status under `logs/$DIL_GT_EXEC_ID/` (enable pipefail if using tee). Baseline: `./venv/ilvr-venv/bin/python -m pytest tests/step_preference/test_dil_topk_loss.py tests/step_preference/test_dil_reverse.py -q`. Report baseline failures before implementation.
+
+Full-suite environment correction: existing tests include unconditional CUDA/FlashAttention2 tensor unit tests. Do not hide CUDA for that suite. Confirm an idle local GPU and use it for those unit tests; this does not authorize a training job or multi-node launch. Keep new GT numerical and tiny-model tests on CPU as specified. Preserve the first failed full-suite log caused by hidden CUDA; do not describe a focused rerun as a full-suite pass.
 
 ### Task 1: Shared-union token statistics
 
