@@ -347,3 +347,45 @@ checkpoints and venv links remain intact. Human file-disposition choice is neede
 before source cleanup. The local merge and its verification are complete. Only
 this control evidence is appended after the tested revision; no product changes
 or push occurred.
+
+## Authorized source cleanup (latest state)
+
+User `정리하는 방향으로 가다` selected cleanup after being offered preservation
+or moving existing files before removal. Applied the non-destructive move-and-clean
+path under finishing-a-development-branch Step6; no repeated integration approval
+or code/test changes were needed. Before mutation, confirmed the source was still
+4a575ac, fully merged into feat/dil-bce-port, with no tracked edits and no other
+process using its working directory or naming the source path.
+
+Moved existing source logs and results into the canonical repository, preserving
+their relative layout:
+- Logs: `/root/workspace/ILVR/logs/dil-loss-defaults-cleanup-20261003t110854z`
+- Results: `/root/workspace/ILVR/results/dil-loss-defaults-cleanup-20261003t110854z`
+- Cache/other untracked metadata: `/root/workspace/ILVR/.cache/dil-loss-defaults-cleanup-20261003t110854z`
+
+Before worktree removal, checked SHA256 and size for all3910 untracked/ignored
+regular files. The three data/checkpoint/venv symlinks were not followed or moved.
+The whole logs-directory move also included the tracked historical
+logs/step-preference-phase-a/baseline.log. A non-force removal correctly refused
+that tracked deletion; its retained copy was verified against Git HEAD, then its
+source copy was restored from HEAD to allow normal cleanup. No force or data
+discard was used.
+
+Normal `git worktree remove` succeeded, followed by `git branch -d` from the
+destination worktree and an empty dry-run/normal worktree prune. Fresh post-removal
+verification confirmed: source path and branch ref absent, no source worktree
+registration, source commit retained in destination history, all3910 relocated
+file hashes plus the tracked baseline log match, and shared target device/inode
+identities remain unchanged.
+
+Manifest: `/root/workspace/ILVR/results/dil-loss-defaults-cleanup-20261003t110854z/cleanup-manifest.json`
+Manifest SHA256:
+`5747a68fd671e8e83ba27d8b4db2dea66b542e54c22db077fbe32fe2a9139385`
+Execution record: relocated logs directory's cleanup.log.
+
+Active worktree remains /root/workspace/ILVR/.worktrees/dil-bce-port.
+Implementation, review, approved local integration, merged-result verification
+and requested cleanup are complete. Earlier source-worktree log/result references
+in this historical record are now resolved through the relocation paths above.
+This control record is the only subsequent Git change; no product behavior
+changed and no repeated full test suite was needed for file relocation.
