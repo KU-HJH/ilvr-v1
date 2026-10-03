@@ -34,6 +34,18 @@ class TopkTokenResult(NamedTuple):
     gt_coverage: Tensor
 
 
+class TopkGtTokenResult(NamedTuple):
+    """FP32 GT log-probability and statistics on shared OFF top-k union GT."""
+
+    gt_logq: Tensor
+    mass_loss: Tensor
+    entropy: Tensor
+    clean_mass: Tensor
+    off_mass: Tensor
+    mass_abs_gap: Tensor
+    gt_coverage: Tensor
+
+
 def _group_gap(logits: Tensor, support: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Keep group maxima and log-sum corrections separate in FP32."""
     selected = logits.masked_fill(~support, -torch.inf)
@@ -73,6 +85,47 @@ def _weighted_off_cross_entropy(
     # Pick one smooth branch at h=0; abs(h) has zero autograd derivative there.
     correction = torch.where(positive_gap, F.softplus(-h), F.softplus(h))
     return linear + (target_m + target_c) * correction
+
+
+def _group_mass_terms(
+    clean_chunk: Tensor, off_chunk: Tensor, support: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Detached clean-to-live-OFF binary KL, including full-vocabulary rows."""
+    partial = ~support.all(-1)
+    # One finite logit suffices to connect a zero; a vocabulary sum can overflow.
+    zero = off_chunk[:, 0] * 0.0
+    if not bool(partial.any()):
+        return zero, torch.ones_like(zero), torch.ones_like(zero) + zero, zero
+
+    partial_off = off_chunk[partial]
+    partial_support = support[partial]
+    with torch.no_grad():
+        _, _, _, _, clean_h = _group_gap(clean_chunk[partial], partial_support)
+        target_logm = -F.softplus(-clean_h)
+        target_logc = -F.softplus(clean_h)
+        target_m = target_logm.exp()
+        target_c = target_logc.exp()
+    off_a_max, off_b_max, off_a_corr, off_b_corr, off_h = _group_gap(partial_off, partial_support)
+    cross_entropy = _weighted_off_cross_entropy(
+        off_a_max, off_b_max, off_a_corr, off_b_corr, off_h, target_m, target_c,
+    )
+    target_entropy = -(
+        target_m * torch.where(target_m > 0, target_logm, 0.0)
+        + target_c * torch.where(target_c > 0, target_logc, 0.0)
+    )
+    mass_loss = cross_entropy - target_entropy
+    off_m = (-F.softplus(-off_h)).exp()
+    gap = (target_m - off_m).abs()
+    if bool(partial.all()):
+        return mass_loss, target_m, off_m, gap
+
+    rows = partial.nonzero(as_tuple=True)[0]
+    return (
+        zero.index_copy(0, rows, mass_loss),
+        torch.ones_like(zero).index_copy(0, rows, target_m),
+        (torch.ones_like(zero) + zero).index_copy(0, rows, off_m),
+        zero.index_copy(0, rows, gap),
+    )
 
 
 def topk_token_terms(
@@ -145,28 +198,11 @@ def topk_token_terms(
 
         if compute_mass:
             support = torch.zeros_like(off_chunk, dtype=torch.bool).scatter_(-1, ids, True)
-            # The clean branch only supplies a fixed target for this call.
-            with torch.no_grad():
-                _, _, _, _, clean_h = _group_gap(clean_chunk, support)
-                target_logm = -F.softplus(-clean_h)
-                target_logc = -F.softplus(clean_h)
-                target_m = target_logm.exp()
-                target_c = target_logc.exp()
-            off_a_max, off_b_max, off_a_corr, off_b_corr, off_h = _group_gap(off_chunk, support)
-            cross_entropy = _weighted_off_cross_entropy(
-                off_a_max, off_b_max, off_a_corr, off_b_corr, off_h,
-                target_m, target_c,
-            )
-            # Zero-weight clean groups contribute exactly zero to entropy.
-            target_entropy = -(
-                target_m * torch.where(target_m > 0, target_logm, 0.0)
-                + target_c * torch.where(target_c > 0, target_logc, 0.0)
-            )
-            mass_parts.append(cross_entropy - target_entropy)
-            off_m = (-F.softplus(-off_h)).exp()
+            mass_loss, target_m, off_m, gap = _group_mass_terms(clean_chunk, off_chunk, support)
+            mass_parts.append(mass_loss)
             clean_mass_parts.append(target_m)
             off_mass_parts.append(off_m)
-            gap_parts.append((target_m - off_m).abs())
+            gap_parts.append(gap)
         else:
             zeros = off_chunk.new_zeros(stop - start)
             mass_parts.append(zeros)
@@ -183,6 +219,79 @@ def topk_token_terms(
         mass_abs_gap=torch.cat(gap_parts),
         gt_coverage=torch.cat(coverage_parts),
     )
+
+
+def topk_gt_token_terms(
+    clean_logits: Tensor,
+    off_logits: Tensor,
+    target_ids: Tensor,
+    *,
+    k: int,
+    compute_mass: bool = True,
+    chunk_size: int = 128,
+    stage2_debugging: bool = True,
+) -> TopkGtTokenResult:
+    """Normalize live OFF GT logits on one shared OFF top-k union GT support.
+
+    Entropy and both full-vocabulary group masses use that union; coverage
+    records membership in the original top-k. Clean supplies detached targets.
+    """
+    if clean_logits.ndim != 2 or off_logits.shape != clean_logits.shape:
+        raise ValueError("clean and OFF logits must have matching [T,V] shape")
+    tokens, vocab = clean_logits.shape
+    if tokens == 0:
+        raise ValueError("step must be nonempty")
+    if type(k) is not int or not 2 <= k < vocab:
+        raise ValueError("k must be an integer with 2 <= k < vocabulary size")
+    if type(chunk_size) is not int or chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    if target_ids.shape != (tokens,):
+        raise ValueError("target IDs must have shape [T]")
+    if clean_logits.device != off_logits.device or clean_logits.device != target_ids.device:
+        raise ValueError("clean, OFF, and target devices must match")
+    if not clean_logits.is_floating_point() or not off_logits.is_floating_point():
+        raise ValueError("clean and OFF logits must be floating-point")
+    if target_ids.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        raise ValueError("target IDs must have integer dtype")
+    if bool((target_ids < 0).any()) or bool((target_ids >= vocab).any()):
+        raise ValueError("target IDs must be in vocabulary range")
+
+    parts = [[] for _ in TopkGtTokenResult._fields]
+    for start in range(0, tokens, chunk_size):
+        stop = min(start + chunk_size, tokens)
+        off_chunk = off_logits[start:stop].float()
+        with torch.no_grad():
+            clean_chunk = clean_logits[start:stop].float()
+        if not bool(torch.isfinite(clean_chunk).all()) or not bool(torch.isfinite(off_chunk).all()):
+            raise ValueError("clean and OFF logits must be finite after float32 conversion")
+        ids = off_chunk.detach().topk(k, dim=-1).indices
+        if stage2_debugging:
+            if bool((ids < 0).any()) or bool((ids >= vocab).any()):
+                raise ValueError("selected top-k IDs are out of range")
+            sorted_ids = ids.sort(dim=-1).values
+            if bool((sorted_ids[:, 1:] == sorted_ids[:, :-1]).any()):
+                raise ValueError("selected top-k IDs are not unique")
+        targets = target_ids[start:stop].long()
+        matches = ids == targets[:, None]
+        covered = matches.any(-1)
+        union_ids = torch.cat((ids, targets[:, None]), dim=-1)
+        valid = torch.cat((torch.ones_like(ids, dtype=torch.bool), ~covered[:, None]), dim=-1)
+        selected = off_chunk.gather(-1, union_ids).masked_fill(~valid, -torch.inf)
+        logq = selected.log_softmax(-1)
+        gt_index = torch.where(covered, matches.long().argmax(-1), k)
+        gt_logq = logq.gather(-1, gt_index[:, None]).squeeze(-1)
+        q = logq.exp()
+        entropy = -(q * torch.where(q > 0, logq, 0.0)).sum(-1)
+        if compute_mass:
+            # Boolean scatter deduplicates the same IDs used by the denominator.
+            support = torch.zeros_like(off_chunk, dtype=torch.bool).scatter_(-1, union_ids, True)
+            mass_loss, clean_mass, off_mass, gap = _group_mass_terms(clean_chunk, off_chunk, support)
+        else:
+            mass_loss = clean_mass = off_mass = gap = off_chunk.new_zeros(stop - start)
+        values = (gt_logq, mass_loss, entropy, clean_mass, off_mass, gap, covered.float())
+        for field_parts, value in zip(parts, values, strict=True):
+            field_parts.append(value)
+    return TopkGtTokenResult(*(torch.cat(field_parts) for field_parts in parts))
 
 
 def topk_negative_and_mass(
