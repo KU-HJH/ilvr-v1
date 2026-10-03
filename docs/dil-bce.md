@@ -191,3 +191,57 @@ saved_cli=(--warm_up_steps 10)
 ```
 
 Inspect both node commands and worker dry-run JSON before an independently authorized launch. The actual entry path verifies the saved DIL identity and budget, original-base/PEFT provenance, sparse token rows and vocabulary/boundary contract. The trainer repeats the identity check before delegating state restoration to the existing Trainer/DeepSpeed path. Missing or changed DIL identity is rejected; DPO Stage 2B resume acceptance remains unchanged.
+
+## Fixed-latent causal analysis
+
+The existing seven-condition evaluator is available as
+`scripts/analyze_latent_causal_intervention.py`. It collects one frozen native
+GT-interleaved trajectory per sample, then replays independent cacheless prefixes
+with clean, zero-body, masked-body-key, cross-sample, previous-step, next-step,
+and whole-block shuffle inputs. It scores **all** eligible GT text, without a
+learned 20% mask. Next-step and shuffle use future-GT-conditioned latents and are
+offline interventions. Each model supplies its own latent bank.
+
+Run the same dataset, seed and selection on both models. The approved smoke file
+contains eight samples, including the longest TEST400 sample (16,704 tokens),
+and supplies the same smoke donor population for both models. From this worktree:
+
+```bash
+export PYTHONPATH="$PWD/transformers/src:$PWD/src"
+train_id=dil-gap20-both-lower-ce01-b1-m0-20261002-01
+venv/ilvr-venv/bin/python -u scripts/analyze_latent_causal_intervention.py \
+  --checkpoint "checkpoints/evaluation-staging/$train_id/prepared-checkpoint-212" \
+  --base-model-dir /raid/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct \
+  --data data/dil-latent-causal-20261003/smoke-longest-eight.jsonl \
+  --image-root data --output-dir results/dil-latent-causal-entropy-gap-smoke-20261003-01 \
+  --data-split test --max-samples 8 --max-input-tokens 32768 --seed 42 \
+  --analysis-suite full --dtype float32 --vision-dtype bfloat16 \
+  --device cuda:0 --devices cuda:0 cuda:1 \
+  --identity-logp-atol 0.001 --identity-nll-atol 0.0001
+```
+
+Use `dil-both-lower-ce01-b1-m0-20261002-01` and a distinct high-entropy output
+on the other node. After both checkpoint smokes pass, use `--data data/TEST.jsonl
+--max-samples 400` with fresh full-run output directories and the same remaining
+arguments. Run one model per node, using both visible GPUs for each model. Logs
+belong under this worktree's `logs/`; result directories must be empty before a
+run. The evaluator authenticates FP32 SDPA decoding and BF16 FlashAttention2
+vision, and refuses publication after identity failure. `run_status.json`
+retains failure information. Prepared artifacts remain under `checkpoints/`.
+
+After collecting both completed directories into this worktree's results tree:
+
+```bash
+venv/ilvr-venv/bin/python -m stage2.latent_causal_comparison \
+  --high-entropy results/dil-latent-causal-high-entropy-full-20261003-01 \
+  --entropy-gap results/dil-latent-causal-entropy-gap-full-20261003-01 \
+  --output-dir results/dil-latent-causal-paired-20261003-01
+```
+
+Comparison rejects changed selection, image identities, donors, permutations or
+targets. It subtracts aligned block deltas before computing sample means and
+2,000 sample bootstrap replicates; it also reports the common block support
+across conditions. Report effects in nat/token alongside identity errors and
+exclusions. Positive intervention ΔNLL means worse GT prediction; it does not
+measure final-answer accuracy or prove visual reasoning. The paired difference
+is entropy-gap minus high-entropy.
