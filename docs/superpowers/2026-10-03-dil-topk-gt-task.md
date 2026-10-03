@@ -298,3 +298,52 @@ existing linked worktree. Fork commitf575cd9 matches `feat/dil-bce-port`; any me
 still requires the human's integration choice. Active phase: implementation,
 review and verification complete; human choice of merge, PR or keep-as-is pending.
 No training, remote execution, merge, push or worktree removal has occurred.
+
+## Authorized local integration (latest state)
+
+After source/destination and inclusion of the earlier coefficient changes were
+explicitly explained, the user said `그럼 병합하자`. This authorizes local
+`feat/dil-loss-defaults-20261001` -> `feat/dil-bce-port` integration.
+Finishing-a-development-branch Option1 and verification-before-completion were
+resumed from the already-evidenced implementation/review gates. No repeat design
+approval or independent product review was needed: integration is a fast-forward,
+with no product edits or conflict resolution.
+
+Target worktree: `/root/workspace/ILVR/.worktrees/dil-bce-port`. Its tracked files
+were clean; existing untracked caches were preserved. No upstream was configured,
+so no pull was attempted. Target moved fromf575cd9 to
+`4a575ac8add4d2b9fe6db1d98b321b082fca18ed` using
+`git merge --ff-only feat/dil-loss-defaults-20261001`, exit0. This includes the
+approved source branch's earlier coefficient changes and new GT objective.
+Merge log and pre-merge statuses:
+`logs/dil-topk-gt-merge-20261003t100142z/` in the target worktree.
+
+First merged-result full-suite attempt was interrupted after repeated fixture
+setup errors. A fail-fast diagnostic recorded25 passed/1 error: pytest could not
+create basetemp because the controller omitted its parent run directory. Root
+cause was this execution setup, not a demonstrated product failure. Preserved
+`full.log` and `first-error.log` under the initial run. Systematic-debugging traced
+the FileNotFoundError; no product/environment dependency was modified.
+
+Fresh retry run `dil-topk-gt-merge-20261003t100538z` explicitly created the parent
+under canonical checkpoints. The causal existing test
+`tests/evaluation/test_continuous_latent.py::test_external_evidence_loader_does_not_write_copied_source`
+then passed1/1 in2.54s. Reused the exact final-verification environment above,
+with target-worktree PYTHONPATH, its repository venv, CUDA0/architecture9.0 and
+fresh basetemp `$PWD/checkpoints/dil-topk-gt-merge-20261003t100538z/full`.
+Command `./venv/ilvr-venv/bin/python -m pytest -q` completed:
+**4060 passed, 11 skipped, 1 existing DeepSpeed warning in1237.24s, exit0**.
+Root read the complete log and numeric exit file. Witnesses: retry run's
+`causal.log`, `causal.exit`, `full.log`, `full.exit`. Both GPUs were idle before
+unit-test use. No training or remote execution occurred.
+
+After that green run, source/target trees were identical. Safe cleanup from the
+canonical root with `git worktree remove <source-worktree>` refused with exit128:
+`contains modified or untracked files`. No force was used; source worktree and
+branch remain. Exact untracked files are recorded in retry run's
+`cleanup-blockers.txt`; ignored inventory in `source-ignored-inventory.txt`.
+They include source caches plus existing logs4.4MiB/results32MiB (ignored); data,
+checkpoints and venv links remain intact. Human file-disposition choice is needed
+before source cleanup. The local merge and its verification are complete. Only
+this control evidence is appended after the tested revision; no product changes
+or push occurred.
