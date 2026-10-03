@@ -242,3 +242,59 @@ No identical second final suite will be run. Product revision6b222a6 and reviewe
 head958c677 have identical product content; subsequent controller records only
 append workflow evidence. Branch fork recorded atf575cd9, current tip of
 feat/dil-bce-port; no merge/push/cleanup decision inferred from this observation.
+
+## Final verification and handoff (latest state)
+
+Implementation and independent task/final reviews are complete. Final fresh
+verification ran at `e0d44f0ba771d4184fa987166fcd16a75e69e3f9`; compared with the
+reviewed958c677 only this controller record changed. Product code remains exactly
+that reviewed at6b222a6/958c677. No product edits occurred during verification.
+
+Final command, from the existing worktree:
+
+```bash
+export PYTHONPATH="$PWD/transformers/src:$PWD/src"
+export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=0 TORCH_CUDA_ARCH_LIST=9.0
+export PYTEST_ADDOPTS="--basetemp=$PWD/checkpoints/dil-topk-gt-impl-20261003T074736Z/final-full"
+./venv/ilvr-venv/bin/python -m pytest -q
+```
+
+Before launch, canonical checkpoint resolution matched and final basetemp did not
+exist; both local H100 NVL GPUs reported compute9.0, 0MiB and0% utilization.
+Result: **4060 passed, 11 skipped, 1 warning in1221.36s**, pytest exit0. Root read
+complete stdout/stderr, warning summary and the captured numeric exit status.
+Witnesses: `logs/dil-topk-gt-impl-20261003T074736Z/final-full.log` and
+`final-full.exit`. This one fresh full-suite execution satisfies the overlapping
+verification-before-completion and finishing Step1 test-pass claims. The known
+DeepSpeed warning remains unresolved; skipped tests are not claimed as passing.
+Separate `bash -n run_stage2_training.sh` and
+`git diff --check 2f48c51 HEAD` checks completed without error. No second identical
+final suite was run.
+
+Requirements evidence reconciled against all spec sections:
+
+| Contract | Independent review and executable witness |
+| --- | --- |
+| OFF union, dedup, tie reuse, live denominator, clean detach, BF16/extreme/full-support mass | Task1 primitive oracle/gradient tests; final review dil_topk_loss.py:90,275 |
+| Mean then softplus, empty step/original denominator, independent mass and CE-once | Task2 hand-derived contract tests; final review dil_reduction.py:56 |
+| Actual typed sidecar/trainer dispatch, alignment and no extra forwards | Task3 runtime79; review trainer.py:675,909,990 and shared-prefix.py:255,433 |
+| Mass-only checkpoint replay/prefix and latent gradients | Task3 sidecar actual replay cases; review test_dil_sidecar.py:66,71 |
+| Defaults, generated worker argv, saved coefficients and old/GT resume rejection before parent restoration | Task2 identity/config and Task3 lifecycle73; review trainer.py:596,612 |
+| Existing selectors and formula identities preserved | Primitive/reduction regressions plus final full suite; distinct GT v1 identity |
+| Documentation and usage | docs/dil-bce.md:172,212; Task3 reviewed explicit enabled-mass dry-run example |
+
+All independent agents, commit ranges, actual failures/corrections and rulings
+are recorded above; source changes are recoverable from Git and execution logs
+remain under the recorded run. This is the durable resume/audit record replacing
+the plan-specific scratch reports. No reviewed-but-unresolved issue was relabeled
+as resolved: the dependency warning and excluded execution claims remain explicit.
+The disposable SDD workspace may now be removed; sibling plan records, existing
+worktree, caches, symlinks and model/test artifacts remain untouched.
+
+Finishing Step2 confirms named branch `feat/dil-loss-defaults-20261001` in the
+existing linked worktree. Fork commitf575cd9 matches `feat/dil-bce-port`; any merge
+still requires the human's integration choice. Active phase: implementation,
+review and verification complete; human choice of merge, PR or keep-as-is pending.
+No training, remote execution, merge, push or worktree removal has occurred.
