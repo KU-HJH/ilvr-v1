@@ -99,3 +99,42 @@ def replay_qwen(dtype, p):
         layer.self_attn.q_proj = nn.Sequential(SampleStableStage1Dropout(site,p),layer.self_attn.q_proj)
         sites.append(site)
     return decoder, base.lm_head.to(dtype), tuple(sites)
+
+
+def product_v3_trainer(tmp_path,*,checkpointed=False,empty=False,image=False):
+    from dataclasses import replace
+    import torch
+    from transformers import Trainer,TrainingArguments
+    from tests.stage1.test_peft import tiny_qwen,tuning
+    from tests.stage1.test_trainer import make_trainer,make_batch,CountingTargetBuilder
+    from stage1.peft import build_stage1_tuned_model
+    from stage1.ema import Stage1EmaTeacher
+    from stage1.v3_config import Stage1V3Config
+    from stage1.v3_metadata import V3Block,V3BatchMetadata
+    from stage1.v3_update import V3GainController
+    from stage1.equivalence import stage1_checkpoint_context_fn
+    from peft_common import resolve_qwen2_5_vl_model
+    model=build_stage1_tuned_model(tiny_qwen.__wrapped__(),tuning('dora',dropout=.05),(125,126,127))
+    ids=torch.tensor([[1]*12+[125,126,126,127,2,3,4]])
+    if image: ids[0,0]=80
+    mask=ids.eq(126)
+    batch=make_batch(mask)
+    batch.update(input_ids=ids,labels=ids.clone(),attention_mask=torch.ones_like(ids),
+                 position_ids=torch.arange(19).view(1,1,-1).expand(3,1,-1),
+                 pixel_values=torch.arange(12,dtype=torch.float32).view(1,-1)/12 if image else None,
+                 image_grid_thw=torch.tensor([[1,1,1]]) if image else None)
+    blocks=() if empty else (V3Block(0,1,12,15,(16,18),(2,4),tuple(range(1,12))),)
+    batch['stage1_batch_metadata']=replace(batch['stage1_batch_metadata'],v3=V3BatchMetadata(blocks))
+    builder=CountingTargetBuilder(torch.full((2,8),.25),mask,((2,),))
+    trainer=make_trainer(model,builder,sim_weight=1.,ce_weight=.1)
+    Trainer.__init__(trainer,model=model,args=TrainingArguments(output_dir=str(tmp_path),use_cpu=True,
+        report_to=[],gradient_accumulation_steps=4,remove_unused_columns=False,seed=42))
+    trainer.ema_teacher=Stage1EmaTeacher(model,decay=1.,method='dora')
+    trainer.state.global_step=1
+    trainer.v3_config=Stage1V3Config()
+    trainer.v3_planned_steps=21
+    trainer.v3_gain_controller=V3GainController(tuple(p for p in model.parameters() if p.requires_grad),trainer.v3_config)
+    if checkpointed:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={
+            'use_reentrant':False,'context_fn':stage1_checkpoint_context_fn})
+    return trainer,batch

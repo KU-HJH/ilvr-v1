@@ -85,7 +85,9 @@ def compute_v3_gradients(model: nn.Module,reference: nn.Module,model_inputs: Map
     candidates=tuple(b.candidate_positions for b in blocks for _ in b.query_positions)
     decoder=resolve_qwen2_5_vl_model(model).model
     with lifecycle.graph('gain_clean'),capture_v3_trace(decoder,keys,candidates) as trace:
-        with bind_v3_execution(decoder,lambda i:lifecycle.checkpoint_contexts('gain_clean',('decoder',i))):
+        with bind_v3_execution(decoder,lambda i:lifecycle.checkpoint_contexts('gain_clean',('decoder',i)),
+                visual=resolve_qwen2_5_vl_model(model).visual,
+                vision_contexts=lambda i:lifecycle.checkpoint_contexts('gain_clean',('vision',i))):
             gain_clean=torch.func.functional_call(model,(aliases,buffers),(),inputs).logits
     training_flags=tuple((module,module.training) for module in reference.modules())
     try:

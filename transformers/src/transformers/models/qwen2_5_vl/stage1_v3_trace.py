@@ -33,14 +33,35 @@ def validate_v3_decoder(decoder):
 
 
 @contextmanager
-def bind_v3_execution(decoder: nn.Module, checkpoint_contexts: Callable):
+def bind_v3_execution(decoder: nn.Module, checkpoint_contexts: Callable, *, visual=None, vision_contexts=None):
     validate_v3_decoder(decoder)
     if _EXECUTION.get() is not None:
         raise RuntimeError('nested v3 decoder execution')
+    if (visual is None) != (vision_contexts is None):
+        raise ValueError('v3 vision binding requires both module and contexts')
     token = _EXECUTION.set((decoder,checkpoint_contexts))
+    old_checkpoint = getattr(visual,'_gradient_checkpointing_func',None)
     try:
+        if visual is not None and visual.gradient_checkpointing:
+            if old_checkpoint is None:
+                raise ValueError('v3 vision checkpoint callable is unavailable')
+            units = {id(block):i for i,block in enumerate(visual.blocks)}
+            def vision_checkpoint(function,*args,**kwargs):
+                block = getattr(function,'__self__',None)
+                if id(block) not in units:
+                    raise RuntimeError('unknown v3 vision checkpoint unit')
+                runner = _LayerCall(block,block.forward)
+                bindings = {'layer.'+n:p for n,p in block.named_parameters()}
+                buffers = {'layer.'+n:b.detach().clone() for n,b in block.named_buffers()}
+                managers = vision_contexts(units[id(block)])
+                def call(*a,**kw):
+                    return torch.func.functional_call(runner,(bindings,buffers),a,kw)
+                return checkpoint(call,*args,use_reentrant=False,context_fn=lambda:managers,**kwargs)
+            visual._gradient_checkpointing_func = vision_checkpoint
         yield
     finally:
+        if old_checkpoint is not None:
+            visual._gradient_checkpointing_func = old_checkpoint
         _EXECUTION.reset(token)
 
 
@@ -62,6 +83,8 @@ def v3_decoder_forward(forward):
         if execution is None or execution[0] is not self:
             return forward(self,*args,**kwargs)
         validate_v3_decoder(self)
+        if kwargs.get('use_cache',self.config.use_cache) or kwargs.get('past_key_values') is not None:
+            raise ValueError('v3 checkpoint execution requires use_cache=False and no mutable cache')
         enabled = self.gradient_checkpointing and self.training
         old_flag = self.gradient_checkpointing
         restorations = []

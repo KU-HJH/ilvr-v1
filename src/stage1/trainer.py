@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import ExitStack
 import os
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -165,16 +166,25 @@ class _DeepSpeedStepAdapter:
         if not boundary:
             return self.original_step(*args, **kwargs)
 
-        trainer._validate_deepspeed_gradient_norm(self.engine)
-        result = self.original_step(*args, **kwargs)
-        applied = self.engine.was_step_applied()
-        if type(applied) is not bool:
-            raise RuntimeError(
-                "unsupported DeepSpeed Stage 1 lifecycle: applied-step "
-                "witness is not boolean"
-            )
-        trainer._finish_optimizer_step(self.engine, successful=applied)
-        return result
+        gain = getattr(trainer, "v3_gain_controller", None)
+        try:
+            if gain is not None:
+                gain.validate_engine(self.engine)
+                gain.prepare()
+            trainer._validate_deepspeed_gradient_norm(self.engine)
+            result = self.original_step(*args, **kwargs)
+            applied = self.engine.was_step_applied()
+            if type(applied) is not bool:
+                raise RuntimeError(
+                    "unsupported DeepSpeed Stage 1 lifecycle: applied-step "
+                    "witness is not boolean"
+                )
+            trainer._finish_optimizer_step(self.engine, successful=applied)
+            return result
+        except BaseException:
+            if gain is not None:
+                gain.state = "FAILED"
+            raise
 
 
 class _Stage1OptimizerCallback(TrainerCallback):
@@ -236,6 +246,7 @@ class CustomTrainerStage1(SFTTrainer):
         ema_teacher: Stage1EmaTeacher | None = None,
         stage1_peft_metadata=None,
         collect_stage1_diagnostics: bool = False,
+        v3_config=None,
         **kwargs,
     ) -> None:
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
@@ -294,6 +305,17 @@ class CustomTrainerStage1(SFTTrainer):
         self.ema_teacher = ema_teacher or Stage1EmaTeacher(
             self.model, decay=float(ema_tau), method=method
         )
+        self.v3_config = v3_config
+        self.v3_gain_controller = None
+        self.v3_planned_steps = None
+        if v3_config is not None:
+            from .v3_config import Stage1V3Config
+            from .v3_update import V3GainController
+            if not isinstance(v3_config, Stage1V3Config) or self.ema_teacher.decay != 1.0:
+                raise ValueError("Stage1-v3 requires a validated config and frozen EMA")
+            self.v3_gain_controller = V3GainController(
+                tuple(p for p in self.model.parameters() if p.requires_grad), v3_config
+            )
         self.add_callback(_Stage1OptimizerCallback(self))
 
     def _publish_deepspeed_runtime_identity(
@@ -348,6 +370,8 @@ class CustomTrainerStage1(SFTTrainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Keep sample-keyed dropout active through Trainer's backward replay."""
+        if getattr(self, "v3_config", None) is not None:
+            return self._v3_training_step(model, inputs, num_items_in_batch)
         sites = tuple(
             module.site_name
             for module in model.modules()
@@ -377,6 +401,39 @@ class CustomTrainerStage1(SFTTrainer):
         )
         with activate_stage1_stochastic_context(context):
             return super().training_step(model, inputs, num_items_in_batch)
+
+    def _v3_training_step(self, model, inputs, num_items_in_batch=None):
+        from peft_common import resolve_qwen2_5_vl_model
+        from .v3_lifecycle import V3Lifecycle
+        metadata = inputs.get("stage1_batch_metadata")
+        if not isinstance(metadata, Stage1BatchMetadata) or metadata.v3 is None:
+            raise ValueError("Stage1-v3 requires source-aligned batch metadata")
+        qwen = resolve_qwen2_5_vl_model(model)
+        sites = tuple(module.site_name for module in model.modules()
+                      if isinstance(module, SampleStableStage1Dropout))
+        spec = Stage1StochasticContext(self.args.seed, self.state.global_step,
+            tuple((sample.source_index if sample.canonical_slot_id is None else sample.canonical_slot_id,
+                   sample.unpadded_length) for sample in metadata.samples), sites)
+        has_auxiliary = bool(metadata.v3.blocks)
+        graphs = ("F", "gain_clean", "packed_replay") if has_auxiliary else ("F",)
+        inventory = {(graph, ("decoder", i)): tuple(module.site_name for module in layer.modules()
+                     if isinstance(module, SampleStableStage1Dropout))
+                     for graph in graphs for i, layer in enumerate(qwen.model.layers)}
+        for graph in graphs:
+            if graph != "packed_replay":
+                inventory.update({(graph, ("vision", i)): () for i in range(len(qwen.visual.blocks))})
+        lifecycle = V3Lifecycle(spec, inventory, has_auxiliary=has_auxiliary)
+        try:
+            with lifecycle.activate(), ExitStack() as stack:
+                self._v3_step_stack = stack
+                self._v3_lifecycle = lifecycle
+                return super().training_step(model, inputs, num_items_in_batch)
+        except BaseException:
+            self.v3_gain_controller.state = "FAILED"
+            raise
+        finally:
+            self._v3_step_stack = None
+            self._v3_lifecycle = None
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -412,7 +469,21 @@ class CustomTrainerStage1(SFTTrainer):
             forward_inputs = dict(model_inputs)
             forward_inputs.pop("labels")
 
-        outputs = model(**forward_inputs)
+        if getattr(self, "v3_config", None) is not None:
+            from peft_common import resolve_qwen2_5_vl_model
+            from transformers.models.qwen2_5_vl.stage1_v3_trace import bind_v3_execution
+            lifecycle = getattr(self, "_v3_lifecycle", None)
+            if lifecycle is None:
+                raise RuntimeError("v3 compute_loss must run inside training_step lifecycle")
+            qwen = resolve_qwen2_5_vl_model(model)
+            with lifecycle.graph("F"), bind_v3_execution(
+                qwen.model, lambda i: lifecycle.checkpoint_contexts("F", ("decoder", i)),
+                visual=qwen.visual,
+                vision_contexts=lambda i: lifecycle.checkpoint_contexts("F", ("vision", i)),
+            ):
+                outputs = model(**dict(forward_inputs, use_cache=False))
+        else:
+            outputs = model(**forward_inputs)
         model_ce_loss = getattr(outputs, "loss", None)
         if labels.shape[0] == 1 and (
             not isinstance(model_ce_loss, torch.Tensor)
@@ -423,6 +494,16 @@ class CustomTrainerStage1(SFTTrainer):
         outputs.loss = ce_loss
         alignment_loss = self._alignment_loss(outputs, targets)
         loss = self.ce_weight * ce_loss + self.sim_weight * alignment_loss
+        if getattr(self, "v3_config", None) is not None:
+            from .v3_gradients import compute_v3_gradients
+            from .v3_objective import text_kl_weight
+            result = compute_v3_gradients(model, self.ema_teacher.model, model_inputs,
+                metadata.v3, outputs.logits, self.v3_gain_controller.parameters,
+                self.v3_config, lifecycle)
+            self.v3_gain_controller.accumulate(result)
+            beta = text_kl_weight(self.state.global_step, self.v3_planned_steps, self.v3_config)
+            loss = loss + beta * result.kl_proxy
+            self._v3_step_stack.enter_context(lifecycle.backward("ordinary"))
         if not bool(torch.isfinite(loss.detach()).all().item()):
             raise FloatingPointError("Stage 1 loss is nonfinite")
 
@@ -770,6 +851,9 @@ class CustomTrainerStage1(SFTTrainer):
                 "unsupported DeepSpeed Stage 1 lifecycle: required engine "
                 "step witnesses are unavailable"
             )
+        gain = getattr(self, "v3_gain_controller", None)
+        if gain is not None:
+            gain.validate_engine(engine)
         adapter = _DeepSpeedStepAdapter(self, engine, engine.step)
         engine.step = adapter
         self._deepspeed_step_adapter = adapter
@@ -840,6 +924,9 @@ class CustomTrainerStage1(SFTTrainer):
     def _finish_optimizer_step(
         self, model: nn.Module | None = None, *, successful: bool
     ) -> None:
+        gain = getattr(self, "v3_gain_controller", None)
+        if gain is not None:
+            gain.finish(model, successful=successful)
         if not successful:
             return
         student = model if isinstance(model, nn.Module) else self.model
@@ -995,6 +1082,9 @@ class CustomTrainerStage1(SFTTrainer):
         self.ema_teacher.load_state_dict(state)
 
     def _save_checkpoint(self, model, trial):
+        gain = getattr(self, "v3_gain_controller", None)
+        if gain is not None:
+            gain.assert_checkpointable()
         """Append replicated EMA state after Trainer/DeepSpeed checkpointing."""
 
         self._defer_stage1_checkpoint_rotation = True
@@ -1130,6 +1220,9 @@ class CustomTrainerStage1(SFTTrainer):
 
     def save_model(self, output_dir=None, _internal_call=False):
         """Extend ordinary Trainer saves with strict Stage 1 PEFT sidecars."""
+        gain = getattr(self, "v3_gain_controller", None)
+        if gain is not None:
+            gain.assert_checkpointable()
 
         metadata = self.stage1_peft_metadata
         if metadata is None:
