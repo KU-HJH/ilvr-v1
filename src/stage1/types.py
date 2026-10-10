@@ -4,11 +4,14 @@ import argparse
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Mapping
+from typing import TYPE_CHECKING, Literal, Mapping
 
 import torch
 
 from peft_common import normalize_decoder_target_suffixes
+
+if TYPE_CHECKING:
+    from .v3_metadata import V3BatchMetadata
 
 
 Stage1TuningMethod = Literal["full", "lora", "dora"]
@@ -134,6 +137,7 @@ class Stage1BatchMetadata:
     samples: tuple[Stage1SampleMetadata, ...]
     batch_size: int
     sequence_length: int
+    v3: "V3BatchMetadata | None" = None
 
 
 @dataclass(frozen=True)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from typing import Sequence
@@ -174,7 +174,7 @@ def _collate_processed_rows(rows: Sequence[dict[str, object]]) -> dict[str, obje
 class Stage1DataCollator:
     """Collate Stage 1 samples without inferring ownership across batch rows."""
 
-    def __init__(self, processor, token_ids, latent_size):
+    def __init__(self, processor, token_ids, latent_size, *, v3_enabled: bool = False):
         if (
             not isinstance(latent_size, int)
             or isinstance(latent_size, bool)
@@ -184,6 +184,7 @@ class Stage1DataCollator:
         self.processor = processor
         self.token_ids = token_ids
         self.latent_size = latent_size
+        self.v3_enabled = v3_enabled
         self.assistant_pattern = processor.tokenizer(
             "<|im_start|>assistant",
             add_special_tokens=False,
@@ -271,6 +272,10 @@ class Stage1DataCollator:
             examples, metadata, input_ids, attention_mask, labels, latent_mask
         )
         self._validate_samplewise_ownership(examples, metadata, attention_mask)
+        if self.v3_enabled:
+            from .v3_metadata import build_v3_metadata
+
+            metadata = replace(metadata, v3=build_v3_metadata(self.processor, examples, batch, metadata))
         return {
             **batch,
             "stage1_batch_metadata": metadata,
