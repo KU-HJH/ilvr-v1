@@ -961,6 +961,7 @@ def test_stage1_stochastic_inventory_identifies_only_registered_and_deferred_sou
             "SampleStableStage1Dropout.forward",
             "torch.rand",
         ),
+        ("stage1/v3_lifecycle.py", "_raw_mask", "torch.rand"),
         # Task 7 must replace this exact interim legacy source with
         # alignment_noise_bank before the final three-source inventory gate.
         (

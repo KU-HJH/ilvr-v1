@@ -859,6 +859,11 @@ class SampleStableStage1Dropout(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.training:
             return x
+        from .v3_lifecycle import current_v3_lifecycle
+
+        v3 = current_v3_lifecycle()
+        if v3 is not None:
+            return v3.native_dropout(self.site_name, self.p, x)
         if self.p == 0.0 and _STAGE1_STOCHASTIC_CONTEXT.get() is None:
             return x
         active_context = _require_stage1_stochastic_context()
