@@ -1747,6 +1747,7 @@ def build_owned_v3_acceptance_commands(
             "--remote-host-repo-root", str(plan.cluster.remote_host_repo_root))
         environment = {
             **_MINIMAL_EXEC_ENVIRONMENT,
+            "PATH": str(repository / "venv/ilvr-venv/bin") + ":" + _MINIMAL_EXEC_ENVIRONMENT["PATH"].split(":", 1)[1],
             **_distributed_environment(plan, machine_rank),
             "MASTER_ADDR": plan.cluster.master_addr,
             "GLOO_SOCKET_IFNAME": plan.cluster.socket_ifname,

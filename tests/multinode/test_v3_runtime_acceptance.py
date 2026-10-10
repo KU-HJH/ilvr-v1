@@ -1,4 +1,5 @@
 import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 import pytest
@@ -21,6 +22,42 @@ def test_fixed_acceptance_route_uses_each_node_root_and_four_ranks():
             assert cmd[cmd.index('--deepspeed')+1]==str(root/'configs/deepspeed_zero1.json')
     with pytest.raises(ValueError):builder(replace(p,zero_stage=2),commit='a'*40)
     with pytest.raises(TypeError):builder(p,commit='a'*40,harness_path='other.py')
+
+
+@pytest.mark.parametrize('phase', ['initial', 'resume'])
+@pytest.mark.parametrize('same_root', [False, True])
+def test_acceptance_path_uses_node_venv_without_mutating_shared_environment(phase, same_root):
+    plan = native_plan()
+    if same_root:
+        plan = replace(plan, cluster=replace(plan.cluster, remote_repo_root=LOCAL))
+    shared_environment = dict(rt._MINIMAL_EXEC_ENVIRONMENT)
+    commands = rt.build_owned_v3_acceptance_commands(replace(plan, attempt_id=phase), commit='a'*40)
+    system_path = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    for rank, root in ((0, plan.cluster.remote_repo_root), (1, LOCAL)):
+        spec = commands.node_specs[rank]
+        expected = f'{root}/venv/ilvr-venv/bin:{system_path}'
+        assert dict(spec.environment)['PATH'] == expected
+        assert f'PATH={expected}' in spec.command
+    assert rt._MINIMAL_EXEC_ENVIRONMENT == shared_environment
+
+
+@pytest.mark.parametrize('phase', ['initial', 'resume'])
+def test_acceptance_child_python_resolves_from_remote_venv(tmp_path, phase):
+    remote_root = tmp_path / 'remote checkout'
+    remote_bin = remote_root / 'venv/ilvr-venv/bin'
+    remote_bin.mkdir(parents=True)
+    child = remote_bin / 'python'
+    child.write_text("#!/bin/sh\nprintf 'remote-venv-child\\n'\n")
+    child.chmod(0o755)
+    plan = native_plan()
+    plan = replace(plan, attempt_id=phase,
+                   cluster=replace(plan.cluster, remote_repo_root=remote_root))
+    commands = rt.build_owned_v3_acceptance_commands(plan, commit='a'*40)
+    environment = dict(commands.node_specs[0].environment)
+    # Exercise the worker's real isolated PATH lookup without running the harness.
+    completed = subprocess.run(['/usr/bin/env', '-i', f"PATH={environment['PATH']}", 'python'],
+                               input='', capture_output=True, text=True, check=True, timeout=10)
+    assert completed.stdout == 'remote-venv-child\n'
 
 
 def test_acceptance_coordinator_dry_run_is_bounded_and_preserves_native_roots(capsys):

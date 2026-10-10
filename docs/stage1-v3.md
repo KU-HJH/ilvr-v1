@@ -129,6 +129,8 @@ Tensor snapshots remain under checkpoints; JSON witnesses go under results.
 missing or inconsistent evidence. A successful dry run is only command
 construction; full training and TEST400 remain separate follow-up work.
 
-One Minor review finding remains open: the acceptance builder's remote PATH
-starts with the local venv path. Its explicit remote Accelerate executable is
-correct, but PATH-based child executable lookup has not been corrected.
+The acceptance builder prefixes each node's PATH with that node's
+`venv/ilvr-venv/bin`, followed by the fixed system search paths. This applies
+to initial and resumed attempts, including PATH-based child executable lookup.
+The earlier remote PATH review finding is addressed; follow-up evidence is
+recorded in `logs/stage1-v3-path-fix/workflow.md`.
