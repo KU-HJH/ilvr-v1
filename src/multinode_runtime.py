@@ -3904,6 +3904,10 @@ def _finite_loss_reference(
                 checkpoint_root / f"checkpoint-{expected_global_step}"
             ),
             expected_global_step=expected_global_step,
+            expected_producer_checkpoint=(
+                node_path(plan, checkpoint_root / f"checkpoint-{expected_global_step}", machine_rank=0)
+                if plan.cluster.local_repo_root != plan.cluster.remote_repo_root else None
+            ),
         )
         return {
             "status": "validated",

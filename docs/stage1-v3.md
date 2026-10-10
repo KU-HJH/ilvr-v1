@@ -5,7 +5,8 @@
 `--stage1-variant v3` on the coordinator/launcher, or `--stage1_variant v3`
 on the training CLI. An omitted variant on a fresh run retains `standard`.
 
-The implementation is undergoing CPU verification and independent review.
+The implementation has focused CPU contract tests and an independent review;
+final suite evidence is recorded in `logs/stage1-v3-implementation/workflow.md`.
 **Distributed acceptance has not been run.** Tiny CPU checks do not establish
 four-rank execution, full 3B memory use, throughput, or TEST400 accuracy.
 
@@ -127,3 +128,7 @@ Tensor snapshots remain under checkpoints; JSON witnesses go under results.
 `tests/stage1/v3_runtime_acceptance.py::validate_v3_rank_records` rejects
 missing or inconsistent evidence. A successful dry run is only command
 construction; full training and TEST400 remain separate follow-up work.
+
+One Minor review finding remains open: the acceptance builder's remote PATH
+starts with the local venv path. Its explicit remote Accelerate executable is
+correct, but PATH-based child executable lookup has not been corrected.

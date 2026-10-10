@@ -231,7 +231,9 @@ def resolve_coordinator_arguments(arguments,output):
     """Use the same effective profile for worker argv, plan and result validation."""
     import os
     from utils_deepseed import parse_args
-    values={a:arguments[i+1] for i,a in enumerate(arguments[:-1]) if a.startswith('--')}
+    from src.multinode import _argument_value
+    values={option:value for option in (*LAUNCHER_ALIASES,'--stage1-variant','--resume')
+            if (value:=_argument_value(tuple(arguments),option)) is not None}
     variant=values.get('--stage1-variant') or os.environ.get('STAGE1_VARIANT')
     checkpoint=values.get('--resume')
     has_saved=checkpoint is not None and (Path(checkpoint)/FILENAME).is_file()
@@ -244,11 +246,17 @@ def resolve_coordinator_arguments(arguments,output):
     args=parse_args(argv)
     if args.stage1_variant!='v3':return arguments
     from src.multinode import _replace_argument_value
-    result=tuple(arguments)
-    result=_replace_argument_value(result,'--stage1-variant','v3')
+    # Coordinator validation accepts --flag=value; workers accept separate
+    # tokens. Normalize only this opt-in route, preserving literal value text.
+    result=tuple(part for token in arguments for part in
+                 (token.split('=',1) if token.startswith('--') and '=' in token else (token,)))
+    def upsert(items,option,value):
+        return (_replace_argument_value(items,option,value) if option in items
+                else (*items,option,value))
+    result=upsert(result,'--stage1-variant','v3')
     for option,key in LAUNCHER_ALIASES.items():
-        if option in ('--max-steps','--deepspeed-config'):continue
-        result=_replace_argument_value(result,option,str(getattr(args,key)))
+        if option in ('--max-steps','--deepspeed-config','--textual_states'):continue
+        result=upsert(result,option,str(getattr(args,key)))
     if '--max-steps' in result:
         i=result.index('--max-steps');result=result[:i]+result[i+2:]
     return result
