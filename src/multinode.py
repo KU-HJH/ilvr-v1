@@ -87,6 +87,7 @@ class ClusterSpec:
     remote_host_repo_root: Path
     master_addr: str
     socket_ifname: str
+    local_repo_root: Path
     remote_rank: int = 0
     local_rank: int = 1
     num_machines: int = 2
@@ -94,15 +95,48 @@ class ClusterSpec:
     num_processes: int = 4
 
     @classmethod
-    def default(cls) -> "ClusterSpec":
+    def default(
+        cls, *, local_repo_root: Path | None = None,
+        remote_repo_root: Path | None = None,
+        remote_host_repo_root: Path | None = None,
+    ) -> "ClusterSpec":
+        local = _repository_root(local_repo_root or _REPOSITORY_ROOT)
+        if (remote_repo_root is None) != (remote_host_repo_root is None):
+            raise ValueError("both remote repository roots must be explicit")
+        if remote_repo_root is None:
+            try:
+                remote_host_repo_root = _remote_host_repository_root(local)
+            except ValueError as error:
+                raise ValueError("native checkout requires explicit remote repository roots") from error
+            remote_repo_root = local
         return cls(
-            remote_host="korea@10.1.102.41",
-            remote_container="llm_kd",
-            remote_repo_root=_REPOSITORY_ROOT,
-            remote_host_repo_root=_remote_host_repository_root(_REPOSITORY_ROOT),
-            master_addr="10.1.102.41",
-            socket_ifname="bond1.102",
+            remote_host="korea@10.1.102.41", remote_container="llm_kd",
+            local_repo_root=local,
+            remote_repo_root=_repository_root(remote_repo_root),
+            remote_host_repo_root=_repository_root(remote_host_repo_root),
+            master_addr="10.1.102.41", socket_ifname="bond1.102",
         )
+
+
+def _repository_root(value: str | Path) -> Path:
+    # Do not resolve a remote path against this machine's filesystem.
+    path = Path(value)
+    if (not path.is_absolute() or ".." in path.parts
+            or any(character in str(path) for character in ("\0", "\n", "\r"))):
+        raise ValueError("repository root must be absolute without traversal or control characters")
+    return path
+
+
+def validate_cluster_topology(cluster: ClusterSpec) -> None:
+    expected = dict(remote_host="korea@10.1.102.41", remote_container="llm_kd",
+        master_addr="10.1.102.41", socket_ifname="bond1.102", remote_rank=0,
+        local_rank=1, num_machines=2, gpus_per_node=2, num_processes=4)
+    for name, value in expected.items():
+        actual = getattr(cluster, name)
+        if type(actual) is not type(value) or actual != value:
+            raise ValueError(f"cluster must match the fixed ILVR topology: {name}")
+    for name in ("local_repo_root", "remote_repo_root", "remote_host_repo_root"):
+        _repository_root(getattr(cluster, name))
 
 
 @dataclass(frozen=True)
@@ -136,8 +170,7 @@ class LaunchPlan:
             or not 1024 <= self.main_process_port <= 65535
         ):
             raise ValueError("main_process_port must be between 1024 and 65535")
-        if self.cluster != ClusterSpec.default():
-            raise ValueError("cluster must match the fixed ILVR topology")
+        validate_cluster_topology(self.cluster)
         if self.world_size != self.cluster.num_processes:
             raise ValueError("world_size must equal the fixed four-process topology")
         if self.required_free_bytes != _TRAINING_REQUIRED_FREE_BYTES:
@@ -147,6 +180,7 @@ class LaunchPlan:
         expected_config = selected_deepspeed_config(
             self.stage, self.tuning_method, self.zero_stage
         )
+        expected_config = self.cluster.local_repo_root / "configs" / expected_config.name
         if self.deepspeed_config != expected_config:
             raise ValueError("deepspeed_config must match the selected ZeRO policy")
         if (
@@ -355,9 +389,15 @@ def build_launch_plan(
     run_id: str,
     main_process_port: int,
     attempt_id: str = "initial",
+    local_repo_root: Path | None = None,
+    remote_repo_root: Path | None = None,
+    remote_host_repo_root: Path | None = None,
 ) -> LaunchPlan:
     """Validate and build the fixed four-process training launch plan."""
-    cluster = ClusterSpec.default()
+    cluster = ClusterSpec.default(local_repo_root=local_repo_root,
+        remote_repo_root=remote_repo_root, remote_host_repo_root=remote_host_repo_root)
+    if cluster.local_repo_root.resolve() != _REPOSITORY_ROOT.resolve():
+        raise ValueError("local repository root must identify this checkout")
     config_path = selected_deepspeed_config(stage, tuning_method, zero_stage)
     source_config_path = (
         canonical_deepspeed_config_path(zero_stage)
@@ -384,6 +424,35 @@ def build_launch_plan(
         attempt_id=attempt_id,
     )
     return plan
+
+
+def decode_launch_plan(raw: bytes) -> LaunchPlan:
+    """Read the saved identity without reinterpreting it for this checkout."""
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f"duplicate launch plan field: {key}")
+            result[key] = value
+        return result
+    payload = json.loads(raw, object_pairs_hook=pairs)
+    if not isinstance(payload, dict) or not isinstance(payload.get("cluster"), dict):
+        raise ValueError("launch plan requires a cluster identity")
+    cluster = dict(payload["cluster"])
+    if "local_repo_root" not in cluster:
+        remote = _repository_root(cluster["remote_repo_root"])
+        try:
+            host = _remote_host_repository_root(remote)
+        except ValueError as error:
+            raise ValueError("unsupported legacy repository roots") from error
+        if str(host) != cluster.get("remote_host_repo_root"):
+            raise ValueError("legacy repository roots do not have same-root semantics")
+        cluster["local_repo_root"] = remote
+    for key in ("local_repo_root", "remote_repo_root", "remote_host_repo_root"):
+        cluster[key] = _repository_root(cluster[key])
+    payload["cluster"] = ClusterSpec(**cluster)
+    payload["deepspeed_config"] = Path(payload["deepspeed_config"])
+    return LaunchPlan(**payload)
 
 
 def validate_node_local_deepspeed_config(
@@ -861,6 +930,9 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", default="initial")
     parser.add_argument("--main-process-port", type=int, required=True)
+    parser.add_argument("--local-repo-root", type=Path)
+    parser.add_argument("--remote-repo-root", type=Path)
+    parser.add_argument("--remote-host-repo-root", type=Path)
 
 
 def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
@@ -871,6 +943,9 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
         run_id=args.run_id,
         main_process_port=args.main_process_port,
         attempt_id=args.attempt_id,
+        local_repo_root=args.local_repo_root,
+        remote_repo_root=args.remote_repo_root,
+        remote_host_repo_root=args.remote_host_repo_root,
     )
 
 

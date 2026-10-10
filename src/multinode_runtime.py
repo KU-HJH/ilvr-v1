@@ -759,6 +759,15 @@ def receive_launch_plan(
     _require_digest("launch plan transfer digest", expected_sha256)
     if len(raw) != expected_size or hashlib.sha256(raw).hexdigest() != expected_sha256:
         raise ValueError("launch plan transfer mismatch")
+    from src.multinode import decode_launch_plan
+
+    plan = decode_launch_plan(raw)
+    if plan.cluster.remote_repo_root != _REPOSITORY_ROOT:
+        raise ValueError("receiver repository root differs from saved remote root")
+    expected_path = (_REPOSITORY_ROOT / "logs/multinode" / plan.run_id
+                     / plan.attempt_id / "launch-plan.json")
+    if Path(path) != expected_path:
+        raise ValueError("receiver launch plan path differs from saved attempt identity")
     destination = _publish_bytes_no_replace(path, raw)
     stored = _read_regular_file(destination)
     if len(stored) != expected_size or hashlib.sha256(stored).hexdigest() != expected_sha256:
