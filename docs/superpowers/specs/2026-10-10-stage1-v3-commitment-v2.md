@@ -1,7 +1,8 @@
 # Stage1-v3 — design commitment v2
 
-상태: **서면 설계 최종 승인 전; 수정 lifecycle의 CPU 전제 실험 별도 승인 대기**.
-이번 `진행해`는 v2 설계 작성에 대한 승인이다. 새 실험·제품 구현·전체 구현 계획 승인은 아니다.
+상태: **CPU 전제 실험의 제한된 feasibility 결과를 반영했으며, 최종 서면 설계 승인 대기**.
+처음 `진행해`는 v2 작성, 이후 `진행해`는 아래 CPU 실험과 root native 실행·독립 검토의 승인이다.
+제품 구현·전체 구현 계획 승인으로 확대하지 않는다. [실험 결과와 한계](2026-10-10-stage1-v3-probe-v2-outcome.md)를 함께 검토한다.
 
 승인 대상 설계는 [proposal v2](2026-10-10-stage1-v3-design-v2.md)와 그 문서가 상속하는
 [proposal v1](2026-10-10-stage1-v3-design.md), 아래 검증 조건의 합성 계약이다.
@@ -89,7 +90,8 @@ A/B/C는 고정 실행 계약을 유지한다면 v3 전용 lifecycle과 독립 C
 }
 ```
 
-**v2 first-nail은 미실행이다.** [이전 실험](2026-10-10-stage1-v3-probe-outcome.md)은 checkpoint
+**제안 작성 당시 v2 first-nail은 미실행이었다.** 이후 별도 승인으로 실행한 결과는 문서 끝에 반영했다.
+[이전 v1 실험](2026-10-10-stage1-v3-probe-outcome.md)은 checkpoint
 OFF 4조건의 수치 일치와 ON 4조건의 RV VJP 실패를 관측했다. 8조건의 첫 joint gradient 일치는
 새 lifecycle이나 완료된 checkpoint RV gradient/projection을 입증하지 않는다. 기존 독립
 검토의 Minor2개도 과거 probe에서 해결됐다고 소급 표시하지 않는다.
@@ -105,7 +107,7 @@ v2의 기존 요구를 판별하는 조건만 구체화했다: topology 음성 �
 실제 autograd 경계, 두 호환성 결과의 별도 보고, 필요한 unequal-root 작업과 미지원 거부의 경계다.
 동결 proposal은 그대로 보존한다. 이 commitment를 포함한 정확한 합성 계약이 이후 승인 대상이다.
 
-## 지금 별도 승인할 CPU 전제 실험
+## 별도 승인받아 수행한 CPU 전제 실험의 제안 기록
 
 질문: 제안한 v3 lifecycle이 checkpoint 재계산 중 원래 alias와 shared-prefix derivative를
 보존하면서, joint R+KL 후 RV VJP와 projection까지 독립 계산과 일치시키는가?
@@ -127,10 +129,28 @@ coordinator/path 수정, optimizer step, 모델 저장, GPU·원격 실행은 �
 실패하면 원인을 보고하고 설계로 돌아온다. 무제한 수정 반복이나 다른 목적함수로 전환하지 않는다.
 산출물은 관측된 일치/불일치, 명령·결과·원인과 독립 검토 기록이다.
 
-추천 방식은 **root native 실행 + 별도 독립 reviewer**다. 이 후속 probe의 범위와 방법을 한 번에
-승인받으며, 이전 probe의 방법 승인을 제품 구현 선택으로 확대하지 않는다. 현재 승인되지 않았다.
+제안한 방식은 **root native 실행 + 별도 독립 reviewer**다. 이 후속 probe의 범위와 방법을 한 번에
+승인받아 수행했다. 이전/이번 probe의 방법 승인을 제품 구현 선택으로 확대하지 않는다.
 
-실험을 생략하려면 위 checkpoint/alias-gradient 전제의 불확실성을 감수한다는 명시적 waiver와
-정확한 written-spec 승인 의사가 필요하다. 실험 결과 또는 waiver를 반영한 commitment를 최종
-서면 승인받은 뒤에만 `superpowers:writing-plans`로 진행한다. 전체 구현 계획 검토와 구현 방법
-선택, TDD·독립 review·fresh verification 및 해당 finish gate는 이후에도 유지한다.
+제안 당시 실험 생략에는 명시적 uncertainty waiver와 정확한 written-spec 승인 의사가 필요했다.
+이번에는 실험을 수행했으며 waiver를 추정하지 않는다. 아래 결과를 반영한 이 commitment를 최종
+서면 승인받은 뒤에만 `superpowers:writing-plans`로 진행한다. 전체 구현 계획 검토와 구현 방법 선택,
+TDD·독립 review·fresh verification 및 해당 finish gate는 이후에도 유지한다.
+
+## 실행 증거를 반영한 최종 commitment
+
+제품 설계는 동결 v2와 상속 v1 및 이 문서의 검증 조건 그대로다. [v2 CPU 실험 결과](2026-10-10-stage1-v3-probe-v2-outcome.md)는
+12개 dtype/dropout/checkpoint 조건과1개 alias/live-parameter 대조의 수치·호출 일치를 보였다.
+잘못된 alias binding의 음성 대조는 호출 검사와 mask가 맞아도 gradient 불일치로 거부됐다.
+독립 검토는 이 작은 fixture의 feasibility 주장에 Critical/Important 없이 Minor1개를 남겼다.
+최종 집중 테스트26개와 matrix13조건이 통과했다. 재계산 중 예외·binding 복원까지 직접 관측한
+주장은 하지 않는다. 전체 CPU suite는 기존 경로 문제로6개 수집 오류가 있어 별도로 미통과다.
+
+이 증거는 unchanged lifecycle의 v1 실패와 구분된다. 제안한 v3-only lifecycle로 같은 수치 계약을
+작은 CPU fixture에서 실행할 수 있음을 뒷받침한다. 실제 Qwen/DoRA/Trainer/ZeRO·네 rank·tail/resume,
+mutable buffer/tied weight, native/remote 경로, 성능과 일반적인 실패 복원은 후속 구현 검증 대상이다.
+남아 있는 구현 검증 의무를 면제하거나 실험 코드를 제품 구현으로 승인하지 않는다.
+
+최종 승인 대상은 **동결 proposal v2가 상속한 v1 계약 + 이 commitment의 검증 조건 + 연결된 실험
+증거와 명시한 한계**다. hate/macrothink 이후 수식·프로필·호출 예산·수정 범위의 material 변경은 없다.
+인간의 최종 서면 설계 승인은 아직 받지 않았다.
