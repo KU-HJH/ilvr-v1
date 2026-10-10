@@ -22,10 +22,14 @@ Python installation.
 
 Provisioning is a one-time administrator action, not a launcher-time sync.
 Before the first run, the `llm_kd` container must be running; the same clean,
-committed checkout and repository venv must exist at the canonical repository
-path on both nodes; `tmux`, OpenSSH, Docker, and `rsync` must be installed; and
-the required model, data, and image inputs must exist at identical absolute
-paths. The canonical `checkpoints` symlink and the `results` and `logs`
+committed checkout and repository venv must exist on both nodes; `tmux`,
+OpenSSH, Docker, and `rsync` must be installed. Canonical/in-tree checkouts
+retain their existing root defaults. Native Stage 1 worktrees declare
+`--local-repo-root`, `--remote-repo-root` (container), and
+`--remote-host-repo-root` explicitly. Repository-owned input and checkpoint
+paths are mapped to each node's declared root; external absolute inputs must
+remain readable at their explicit paths. See [Stage1-v3](stage1-v3.md).
+The `checkpoints` symlink and the `results` and `logs`
 directories must already be writable on both nodes with at least 100 GiB free.
 
 The commands below use existing inputs:

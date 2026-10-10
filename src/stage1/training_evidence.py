@@ -160,6 +160,7 @@ def decode_stage1_training_evidence(
     expected_world_size: int,
     expected_checkpoint: str | Path,
     expected_global_step: int,
+    expected_producer_checkpoint: str | Path | None = None,
     expected_micro_batch: int | None = None,
     expected_gradient_accumulation_steps: int | None = None,
     expected_ema_tau: float | None = None,
@@ -201,6 +202,12 @@ def decode_stage1_training_evidence(
         "checkpoint_path": payload["checkpoint_path"],
         "loss": payload["loss"],
     }
+    if expected_producer_checkpoint is not None:
+        # Validate the node's declared absolute path without pretending it is a
+        # local filesystem path. Local checkpoint existence is checked below.
+        if payload["checkpoint_path"] != str(Path(expected_producer_checkpoint)):
+            raise ValueError("Stage 1 training evidence producer identity is inconsistent")
+        common["checkpoint_path"] = expected_checkpoint
     if schema_version == 1:
         run_id, method, zero_stage, world_size, global_step, checkpoint = (
             _validate_identity(
@@ -242,6 +249,8 @@ def decode_stage1_training_evidence(
             ema_tau=payload["ema_tau"],
             seed=payload["seed"],
         )
+    if expected_producer_checkpoint is not None:
+        rebuilt["checkpoint_path"] = str(Path(expected_producer_checkpoint))
     if payload != rebuilt:
         raise ValueError("Stage 1 training evidence contains unobserved claims")
     expected_config = (
@@ -283,7 +292,7 @@ def decode_stage1_training_evidence(
         or payload["zero_stage"] != expected_zero_stage
         or payload["world_size"] != expected_world_size
         or payload["global_step"] != expected_global_step
-        or payload["checkpoint_path"] != str(Path(expected_checkpoint))
+        or payload["checkpoint_path"] != str(Path(expected_producer_checkpoint or expected_checkpoint))
     ):
         raise ValueError("Stage 1 training evidence identity is inconsistent")
     return payload

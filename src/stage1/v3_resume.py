@@ -220,6 +220,40 @@ def attach_v3_identity(trainer,args,dataset,checkpoint=None):
     trainer.stage1_variant='v3'
 
 
+
+LAUNCHER_ALIASES={'--method':'tuning_method','--model':'model','--epochs':'epochs','--learning-rate':'learning_rate',
+    '--ce-weight':'ce_weight','--gradient-accumulation':'gradient_accumulation_steps','--micro-batch':'per_device_train_batch_size',
+    '--ema-tau':'ema_tau','--seed':'seed','--deepspeed-config':'deepspeed_config','--attention-implementation':'attention_implementation',
+    '--textual_states':'textual_states','--max-steps':'max_steps'}
+
+
+def resolve_coordinator_arguments(arguments,output):
+    """Use the same effective profile for worker argv, plan and result validation."""
+    import os
+    from utils_deepseed import parse_args
+    values={a:arguments[i+1] for i,a in enumerate(arguments[:-1]) if a.startswith('--')}
+    variant=values.get('--stage1-variant') or os.environ.get('STAGE1_VARIANT')
+    checkpoint=values.get('--resume')
+    has_saved=checkpoint is not None and (Path(checkpoint)/FILENAME).is_file()
+    if variant!='v3' and not has_saved:return arguments
+    argv=['--stage','stage1','--save_model_path',str(output)]
+    if variant:argv+=['--stage1_variant',variant]
+    if checkpoint:argv+=['--resume_from_checkpoint_path',checkpoint]
+    for option,key in LAUNCHER_ALIASES.items():
+        if option in values:argv+=['--'+key,values[option]]
+    args=parse_args(argv)
+    if args.stage1_variant!='v3':return arguments
+    from src.multinode import _replace_argument_value
+    result=tuple(arguments)
+    result=_replace_argument_value(result,'--stage1-variant','v3')
+    for option,key in LAUNCHER_ALIASES.items():
+        if option in ('--max-steps','--deepspeed-config'):continue
+        result=_replace_argument_value(result,option,str(getattr(args,key)))
+    if '--max-steps' in result:
+        i=result.index('--max-steps');result=result[:i]+result[i+2:]
+    return result
+
+
 def _launcher_main():
     import argparse
     from utils_deepseed import parse_args
@@ -229,16 +263,12 @@ def _launcher_main():
     parser.add_argument('--output',required=True)
     parser.add_argument('original',nargs=argparse.REMAINDER)
     options=parser.parse_args()
-    aliases={'--method':'tuning_method','--model':'model','--epochs':'epochs','--learning-rate':'learning_rate',
-        '--ce-weight':'ce_weight','--gradient-accumulation':'gradient_accumulation_steps','--micro-batch':'per_device_train_batch_size',
-        '--ema-tau':'ema_tau','--seed':'seed','--deepspeed-config':'deepspeed_config','--attention-implementation':'attention_implementation',
-        '--textual_states':'textual_states','--max-steps':'max_steps'}
     argv=['--stage','stage1','--save_model_path',options.output]
     if options.variant:argv+=['--stage1_variant',options.variant]
     if options.resume:argv+=['--resume_from_checkpoint_path',options.resume]
     for i,item in enumerate(options.original):
-        if item in aliases:
-            argv+=['--'+aliases[item],options.original[i+1]]
+        if item in LAUNCHER_ALIASES:
+            argv+=['--'+LAUNCHER_ALIASES[item],options.original[i+1]]
     args=parse_args(argv)
     values={'stage1_variant':args.stage1_variant}
     if args.stage1_variant=='v3':values.update({name:getattr(args,name) for name in V3_FRESH_PROFILE})

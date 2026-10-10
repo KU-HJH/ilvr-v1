@@ -196,3 +196,17 @@ def test_stage1_training_evidence_publish_is_exclusive(tmp_path):
     assert json.loads(output.read_text()) == build_stage1_training_evidence(**kwargs)
     with pytest.raises(FileExistsError):
         publish_stage1_training_evidence(output, **kwargs)
+
+
+@pytest.mark.parametrize('wrong_root',[False,True])
+def test_remote_producer_path_is_bound_to_declared_root_without_rewriting_evidence(tmp_path,wrong_root):
+    kwargs=evidence_kwargs(tmp_path)
+    payload=build_stage1_training_evidence(**kwargs)
+    remote=Path('/remote/native/ILVR/checkpoints')/RUN_ID/'checkpoint-1'
+    payload['checkpoint_path']=str(remote if not wrong_root else Path('/foreign/checkpoints')/RUN_ID/'checkpoint-1')
+    arguments=dict(expected_run_id=RUN_ID,expected_method='full',expected_zero_stage=1,expected_world_size=4,
+        expected_checkpoint=kwargs['checkpoint_path'],expected_producer_checkpoint=remote,expected_global_step=1)
+    if wrong_root:
+        with pytest.raises(ValueError,match='identity'):decode_stage1_training_evidence(json.dumps(payload).encode(),**arguments)
+    else:
+        assert decode_stage1_training_evidence(json.dumps(payload).encode(),**arguments)==payload

@@ -1718,6 +1718,101 @@ def build_owned_vision_gain_probe_commands(
 
 
 
+
+def build_owned_v3_acceptance_commands(
+    plan: "LaunchPlan", *, commit: str,
+) -> OwnedTmuxCommands:
+    """The fixed Stage1-v3 acceptance harness; explicit per-node roots."""
+    from src.multinode import LaunchPlan, ClusterSpec
+
+    if not isinstance(plan, LaunchPlan):
+        raise TypeError("plan must be a LaunchPlan")
+    if (plan.stage != "stage1" or plan.tuning_method != "dora" or plan.zero_stage != 1
+            or plan.world_size != 4
+            or plan.attempt_id not in ("initial", "resume")):
+        raise ValueError("v3 acceptance requires fixed two-node/four-rank DoRA ZeRO1")
+    if not re.fullmatch(r"[a-f0-9]{40}", commit):
+        raise ValueError("invalid probe commit")
+    node_commands: list[tuple[str, ...]] = []
+    digests: list[str] = []
+    node_specs: list[OwnedNodeCommand] = []
+    for machine_rank in (plan.cluster.remote_rank, plan.cluster.local_rank):
+        repository = node_repository(plan, machine_rank=machine_rank)
+        config = node_path(plan, plan.deepspeed_config, machine_rank=machine_rank)
+        selected_harness = repository / "tests/stage1/v3_runtime_acceptance.py"
+        selected_arguments = ("--phase", plan.attempt_id, "--zero-stage", "1", "--deepspeed", str(config),
+            "--run-id", plan.run_id, "--commit", commit,
+            "--local-repo-root", str(plan.cluster.local_repo_root),
+            "--remote-repo-root", str(plan.cluster.remote_repo_root),
+            "--remote-host-repo-root", str(plan.cluster.remote_host_repo_root))
+        environment = {
+            **_MINIMAL_EXEC_ENVIRONMENT,
+            **_distributed_environment(plan, machine_rank),
+            "MASTER_ADDR": plan.cluster.master_addr,
+            "GLOO_SOCKET_IFNAME": plan.cluster.socket_ifname,
+            "NCCL_SOCKET_IFNAME": plan.cluster.socket_ifname,
+            "PYTHONPATH": (
+                f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}"
+            ),
+            "ILVR_REPOSITORY_COMMIT": commit,
+        }
+        harness_command = (
+            str(repository / "venv/ilvr-venv/bin/accelerate"),
+            "launch",
+            "--num_machines",
+            str(plan.cluster.num_machines),
+            "--num_processes",
+            str(plan.cluster.num_processes),
+            "--machine_rank",
+            str(machine_rank),
+            "--main_process_ip",
+            plan.cluster.master_addr,
+            "--main_process_port",
+            str(plan.main_process_port),
+            "--mixed_precision",
+            "bf16",
+            "--use_deepspeed",
+            "--deepspeed_multinode_launcher",
+            "standard",
+            "--deepspeed_config_file",
+            str(config),
+            str(selected_harness),
+            *selected_arguments,
+        )
+        supervisor, digest, node_spec = _node_shell_command(
+            plan,
+            machine_rank=machine_rank,
+            commit=commit,
+            stage_command=harness_command,
+            environment=environment,
+            log_root=_LOG_ROOT,
+            require_bash_launcher=False,
+        )
+        session = f"ilvr-{plan.run_id}-{plan.attempt_id}-rank{machine_rank}"
+        tmux = (
+            "/usr/bin/tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "--",
+            *supervisor,
+        )
+        node_commands.append(
+            tuple(build_remote_exec(tmux, cluster=plan.cluster, working_directory=repository)) if machine_rank == 0 else tmux
+        )
+        digests.append(digest)
+        node_specs.append(node_spec)
+    return OwnedTmuxCommands(
+        remote=node_commands[0],
+        local=node_commands[1],
+        command_digests=(digests[0], digests[1]),
+        node_specs=(node_specs[0], node_specs[1]),
+        finite_loss_evidence_path=None,
+    )
+
+
+
 def build_owned_lifecycle_harness_commands(
     plan: "LaunchPlan",
     *,
