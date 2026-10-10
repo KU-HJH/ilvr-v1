@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 import json
 import os
 import shlex
@@ -80,11 +81,11 @@ def test_stage2_coordinator_waits_for_length_preprocessing(monkeypatch):
         multinode_module._training_main("stage2", [
             "--run-id", "stage2-preprocessing-test", "--zero-stage", "2",
             "--main-process-port", "29631", "--max_steps", "1", "--save_steps", "1",
-        ])
+         *ROOT_ARGUMENTS])
 
 
 def plan(stage="stage1", method="lora"):
-    return build_launch_plan(
+    return build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage=stage,
         tuning_method=method,
         zero_stage=3,
@@ -1267,12 +1268,14 @@ def test_stage2_witness_decoder_imports_under_production_module_path(tmp_path):
 from pathlib import Path
 import sys
 from src.multinode import build_launch_plan
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS
 from src.multinode_runtime import _finite_loss_reference
 from stage2.checkpointing import classify_stage2_artifact
 
 assert callable(classify_stage2_artifact)
 
 plan = build_launch_plan(
+    **REMOTE_ROOT_KWARGS,
     stage="stage2",
     tuning_method="full",
     zero_stage=1,
@@ -1387,6 +1390,7 @@ def test_stage1_wrapper_dry_run_builds_both_nodes_without_remote_calls(tmp_path)
     completed = subprocess.run(
         (
             REPO_ROOT / "run_multinode_stage1_training.sh",
+            *ROOT_ARGUMENTS,
             "--run-id",
             "stage1-lora-zero3-four-gpu",
             "--zero-stage",
@@ -1435,6 +1439,7 @@ def test_resume_requires_a_fresh_noninitial_attempt_id():
     completed = subprocess.run(
         (
             REPO_ROOT / "run_multinode_stage1_training.sh",
+            *ROOT_ARGUMENTS,
             "--run-id",
             "stage1-lora-zero3-four-gpu",
             "--zero-stage",
@@ -1483,6 +1488,7 @@ def test_wrapper_rejects_different_run_resume_before_any_remote_call():
     completed = subprocess.run(
         (
             REPO_ROOT / "run_multinode_stage1_training.sh",
+            *ROOT_ARGUMENTS,
             "--run-id",
             "stage1-lora-zero3-four-gpu",
             "--attempt-id",

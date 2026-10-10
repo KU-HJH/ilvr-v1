@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 import json
 import os
 import subprocess
@@ -28,10 +29,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def test_default_topology_preserves_the_worktree_suffix_on_remote_host():
     """Catches the fixed remote mapping dropping the active worktree suffix."""
-    spec = ClusterSpec.default()
+    repository = Path("/root/workspace/ILVR/.worktrees/example")
+    spec = ClusterSpec.default(local_repo_root=repository)
 
-    assert spec.remote_repo_root == REPO_ROOT
-    relative = REPO_ROOT.relative_to(Path("/root/workspace/ILVR"))
+    assert spec.remote_repo_root == repository
+    relative = repository.relative_to(Path("/root/workspace/ILVR"))
     assert spec.remote_host_repo_root == (
         Path("/home/korea/Workspace/hjh/workspace/ILVR") / relative
     )
@@ -39,12 +41,13 @@ def test_default_topology_preserves_the_worktree_suffix_on_remote_host():
 
 def test_default_cluster_is_fixed_two_node_four_process_topology():
     """Catches a launch silently drifting from the approved four-GPU topology."""
-    spec = ClusterSpec.default()
+    repository = Path("/root/workspace/ILVR/.worktrees/example")
+    spec = ClusterSpec.default(local_repo_root=repository)
 
     assert spec.remote_host == "korea@10.1.102.41"
     assert spec.remote_container == "llm_kd"
-    assert spec.remote_repo_root == REPO_ROOT
-    relative = REPO_ROOT.relative_to(Path("/root/workspace/ILVR"))
+    assert spec.remote_repo_root == repository
+    relative = repository.relative_to(Path("/root/workspace/ILVR"))
     assert spec.remote_host_repo_root == (
         Path("/home/korea/Workspace/hjh/workspace/ILVR") / relative
     )
@@ -57,7 +60,7 @@ def test_default_cluster_is_fixed_two_node_four_process_topology():
 @pytest.mark.parametrize("zero_stage", (1, 2, 3))
 def test_launch_plan_selects_exact_zero_config(zero_stage):
     """Catches a supported ZeRO choice selecting a noncanonical config path."""
-    plan = build_launch_plan(
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage1",
         tuning_method="lora",
         zero_stage=zero_stage,
@@ -75,7 +78,7 @@ def test_launch_plan_selects_exact_zero_config(zero_stage):
 @pytest.mark.parametrize("zero_stage", (1, 2, 3))
 def test_canonical_config_is_validated_for_the_four_process_world(zero_stage):
     """Catches topology planning bypassing canonical DeepSpeed policy validation."""
-    plan = build_launch_plan(
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage2",
         tuning_method="full",
         zero_stage=zero_stage,
@@ -91,7 +94,7 @@ def test_canonical_config_is_validated_for_the_four_process_world(zero_stage):
 @pytest.mark.parametrize("tuning_method", ("lora", "dora"))
 def test_stage2_peft_zero3_selects_dedicated_gpu_only_config(tuning_method):
     """Catches Stage 2 PEFT inheriting the canonical ZeRO-3 prefetch bucket."""
-    plan = build_launch_plan(
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage2",
         tuning_method=tuning_method,
         zero_stage=3,
@@ -124,14 +127,14 @@ def test_stage2_peft_zero3_selects_dedicated_gpu_only_config(tuning_method):
     assert dedicated["zero_optimization"]["offload_optimizer"] == {
         "device": "none"
     }
-    assert build_launch_plan(
+    assert build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage2",
         tuning_method="full",
         zero_stage=3,
         run_id="stage2-full-zero3-four-gpu",
         main_process_port=29631,
     ).deepspeed_config == canonical_deepspeed_config(3)
-    assert build_launch_plan(
+    assert build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage1",
         tuning_method=tuning_method,
         zero_stage=3,
@@ -202,7 +205,7 @@ def test_stage2_peft_zero3_rejects_gradient_checkpointing():
 
 def test_node_local_config_must_match_the_launch_plan_digest(tmp_path):
     """Catches a node launching a policy-valid config with different bytes."""
-    plan = build_launch_plan(
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage1",
         tuning_method="lora",
         zero_stage=2,
@@ -222,7 +225,7 @@ def test_node_local_config_must_match_the_launch_plan_digest(tmp_path):
 
 def test_node_local_config_accepts_the_exact_validated_bytes():
     """Catches node-local validation rejecting the config that built the plan."""
-    plan = build_launch_plan(
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage1",
         tuning_method="lora",
         zero_stage=2,
@@ -246,7 +249,7 @@ def test_node_local_config_rejects_stage_or_policy_mismatch(
     tmp_path, changes, message
 ):
     """Catches a node bypassing the launch plan's ZeRO or policy contract."""
-    plan = build_launch_plan(
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage1",
         tuning_method="lora",
         zero_stage=2,
@@ -290,12 +293,12 @@ def test_launch_plan_rejects_invalid_identity_or_contract(kwargs, message):
     values.update(kwargs)
 
     with pytest.raises(ValueError, match=message):
-        build_launch_plan(**values)
+        build_launch_plan(**REMOTE_ROOT_KWARGS, **values)
 
 
 def test_launch_plan_is_immutable_and_resume_only_changes_attempt_identity():
     """Catches resume attempts overwriting the checkpoint run identity or plan."""
-    initial = build_launch_plan(
+    initial = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage1",
         tuning_method="dora",
         zero_stage=3,
@@ -329,7 +332,8 @@ def test_plan_cli_prints_sorted_json_without_creating_files(tmp_path):
         "stage2-lora-zero2-four-gpu",
         "--main-process-port",
         "29615",
-    ]
+     *ROOT_ARGUMENTS]
+    command.extend(ROOT_ARGUMENTS)
     before = set(tmp_path.iterdir())
     environment = os.environ | {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}
 
@@ -372,7 +376,7 @@ def test_launch_plan_rejects_runtime_profile_with_wrong_zero_stage(monkeypatch, 
     )
 
     with pytest.raises(ValueError, match="zero_optimization.stage"):
-        build_launch_plan(
+        build_launch_plan(**REMOTE_ROOT_KWARGS,
             stage="stage1",
             tuning_method="full",
             zero_stage=2,
@@ -400,7 +404,7 @@ def test_launch_plan_rejects_runtime_profile_with_fixed_global_batch(monkeypatch
     )
 
     with pytest.raises(ValueError, match="train_batch_size"):
-        build_launch_plan(
+        build_launch_plan(**REMOTE_ROOT_KWARGS,
             stage="stage1",
             tuning_method="full",
             zero_stage=2,

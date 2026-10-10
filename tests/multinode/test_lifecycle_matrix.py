@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 
 import json
 import os
@@ -52,7 +53,7 @@ def test_matrix_contains_exactly_eighteen_cases_in_binding_order():
 
 def test_matrix_plans_exact_initial_and_resume_harness_jobs_per_cell(tmp_path):
     """Catches a phase running before Task 6 makes the checkpoint node-local."""
-    plans = build_lifecycle_plans(
+    plans = build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
         parent_run_id="four-gpu-matrix",
         first_port=29700,
         result_root=tmp_path / "results",
@@ -117,7 +118,7 @@ def test_matrix_plans_exact_initial_and_resume_harness_jobs_per_cell(tmp_path):
 
 def test_owned_harness_builder_rejects_arbitrary_path_or_arguments():
     """Catches the lifecycle coordinator becoming an arbitrary command escape."""
-    launch_plan = build_lifecycle_plans(
+    launch_plan = build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
         parent_run_id="four-gpu-matrix",
         first_port=29700,
         result_root=Path("/root/workspace/ILVR/results"),
@@ -149,7 +150,7 @@ def test_owned_harness_builder_rejects_arbitrary_path_or_arguments():
 
 def test_lifecycle_worker_environment_resolves_canonical_venv_deepspeed():
     """Catches Accelerate failing because its sealed PATH cannot find DeepSpeed."""
-    plan = build_lifecycle_plans(
+    plan = build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
         parent_run_id="four-gpu-matrix",
         first_port=29700,
         result_root=Path("/root/workspace/ILVR/results"),
@@ -167,7 +168,7 @@ def test_lifecycle_worker_environment_resolves_canonical_venv_deepspeed():
 
 def test_lifecycle_worker_environment_imports_worktree_transformers():
     """Catches the shared venv editable path selecting another checkout."""
-    plan = build_lifecycle_plans(
+    plan = build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
         parent_run_id="four-gpu-matrix",
         first_port=29700,
         result_root=REPO_ROOT / "results",
@@ -324,7 +325,7 @@ def test_stage2_tiny_processor_assets_pass_loader_and_manifest_selection(
 def test_lifecycle_plans_bind_safe_child_ids_ports_and_two_ordered_phase_jobs(tmp_path):
     """Catches either phase changing the shared child identity or port."""
     result_root = tmp_path / "results"
-    plans = build_lifecycle_plans(
+    plans = build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
         parent_run_id="four-gpu-matrix",
         first_port=29700,
         result_root=result_root,
@@ -389,7 +390,7 @@ def _phase_bytes(plan, phase, *, gradient):
 def test_lifecycle_phase_decoder_rejects_top_level_bool_float_aliases(
     tmp_path, field, replacement
 ):
-    plan = build_lifecycle_plans(
+    plan = build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
         parent_run_id="matrix-parent", first_port=29700,
         result_root=tmp_path / "results", python_executable="/repo/python",
         commit="a" * 40,
@@ -409,7 +410,7 @@ def test_lifecycle_phase_decoder_rejects_top_level_bool_float_aliases(
 
 def test_resume_never_starts_when_checkpoint_redistribution_fails(tmp_path, monkeypatch):
     """Catches local ranks 2/3 loading before their loader artifacts arrive."""
-    plan = build_lifecycle_plans(
+    plan = build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
         parent_run_id="matrix-parent", first_port=29700,
         result_root=tmp_path / "results", python_executable="/repo/python",
         commit="a" * 40, config_digests={1: "a" * 64, 2: "a" * 64, 3: "a" * 64},
@@ -448,7 +449,7 @@ def test_phase_evidence_keeps_distinct_initial_and_resume_gradients(
     tmp_path, monkeypatch
 ):
     """Catches a case summary copying the initial gradient into resume evidence."""
-    plan = build_lifecycle_plans(
+    plan = build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
         parent_run_id="matrix-parent", first_port=29700,
         result_root=tmp_path / "results", python_executable="/repo/python",
         commit="a" * 40, config_digests={1: "a" * 64, 2: "a" * 64, 3: "a" * 64},
@@ -473,7 +474,7 @@ def test_phase_evidence_keeps_distinct_initial_and_resume_gradients(
 
 
 def test_remote_phase_evidence_uses_only_the_fixed_bounded_node_cli(tmp_path):
-    plan = build_lifecycle_plans(
+    plan = build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
         parent_run_id="matrix-parent", first_port=29700,
         result_root=tmp_path / "results", python_executable="/repo/python",
         commit="a" * 40,
@@ -522,7 +523,7 @@ def test_lifecycle_plans_validate_the_complete_port_range_before_use(
 ):
     """Catches the eighteenth port failing only after earlier cases ran."""
     with pytest.raises(ValueError, match="18 ports"):
-        build_lifecycle_plans(
+        build_lifecycle_plans(**REMOTE_ROOT_KWARGS,
             parent_run_id="four-gpu-matrix",
             first_port=first_port,
             result_root=tmp_path / "results",
@@ -534,7 +535,7 @@ def test_lifecycle_dry_run_has_no_filesystem_or_runner_side_effect(tmp_path):
     """Catches dry-run reserving the parent namespace or starting a command."""
     result_root = tmp_path / "missing-results"
 
-    plans = run_lifecycle_matrix(
+    plans = run_lifecycle_matrix(**REMOTE_ROOT_KWARGS,
         parent_run_id="four-gpu-matrix-dry",
         first_port=29700,
         result_root=result_root,
@@ -553,7 +554,7 @@ def test_matrix_prechecks_parent_namespace_before_any_attempt(tmp_path):
     parent.mkdir(parents=True)
     (parent / "stale.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(FileExistsError, match="parent result namespace"):
-        run_lifecycle_matrix(
+        run_lifecycle_matrix(**REMOTE_ROOT_KWARGS,
             parent_run_id="four-gpu-matrix",
             first_port=29700,
             result_root=result_root,
@@ -575,7 +576,7 @@ def test_wrapper_dry_run_prints_exactly_eighteen_lifecycle_plan_objects(tmp_path
             "--result-root",
             str(result_root),
             "--dry-run",
-        ],
+        *ROOT_ARGUMENTS,],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,

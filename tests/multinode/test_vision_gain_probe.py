@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -20,7 +21,7 @@ def builder():
 def test_probe_is_fixed_dora_zero12_four_ranks():
     api = builder()
     for stage in (1, 2):
-        plan = build_launch_plan(stage="stage1", tuning_method="dora", zero_stage=stage,
+        plan = build_launch_plan(**REMOTE_ROOT_KWARGS, stage="stage1", tuning_method="dora", zero_stage=stage,
                                  run_id=f"vg-probe-z{stage}", main_process_port=29590)
         commands = api(plan, commit="a" * 40)
         assert [s.machine_rank for s in commands.node_specs] == [0, 1]
@@ -39,7 +40,7 @@ def test_probe_is_fixed_dora_zero12_four_ranks():
                         dict(cluster=replace(plan.cluster, local_rank=0))):
             with pytest.raises(ValueError):
                 api(replace(plan, **changed), commit="a" * 40)
-    zero3 = build_launch_plan(stage="stage1", tuning_method="dora", zero_stage=3,
+    zero3 = build_launch_plan(**REMOTE_ROOT_KWARGS, stage="stage1", tuning_method="dora", zero_stage=3,
                               run_id="vg-probe-z3", main_process_port=29590)
     with pytest.raises(ValueError):
         api(zero3, commit="a" * 40)
@@ -47,7 +48,7 @@ def test_probe_is_fixed_dora_zero12_four_ranks():
 
 def test_fixed_probe_coordinator_dry_run_has_both_attempts(capsys):
     assert _training_main("stage1", ["--vision-gain-runtime-probe", "--run-id", "vg-route",
-                                    "--zero-stage", "1", "--main-process-port", "29590", "--dry-run"]) == 0
+                                    "--zero-stage", "1", "--main-process-port", "29590", "--dry-run", *ROOT_ARGUMENTS]) == 0
     record = json.loads(capsys.readouterr().out)
     assert record["kind"] == "stage1-vision-gain-runtime-probe"
     assert set(record["attempts"]) == {"initial", "resume"}
@@ -127,7 +128,7 @@ def test_probe_resume_transfer_preserves_exclusive_launch_directory(tmp_path, mo
     saved = json.loads((attempt_root / "resume/launch-plan.json").read_text())
     assert saved["attempt_id"] == "resume"
     # The correction must retain exclusive ownership, including duplicate refusal.
-    plan = build_launch_plan(stage="stage1", tuning_method="dora", zero_stage=1,
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS, stage="stage1", tuning_method="dora", zero_stage=1,
                              run_id=run_id, main_process_port=29590, attempt_id="resume")
     with pytest.raises(FileExistsError):
         runtime.serialize_launch_plan(plan, log_root=tmp_path / "logs/multinode")

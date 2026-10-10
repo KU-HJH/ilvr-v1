@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 """Coordinator terminal separation for the fixed no-optimizer diagnostic."""
 import json
 from pathlib import Path
@@ -28,7 +29,7 @@ def manifest_fixture(tmp_path, variant="portTorch"):
 def test_fixed_probe_command_uses_owned_four_rank_harness_without_training():
     builder = getattr(runtime, "build_dil_full_model_probe_commands", None)
     assert builder is not None, "fixed coordinator diagnostic command is missing"
-    plan = build_launch_plan(stage="stage2", tuning_method="dora", zero_stage=2,
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS, stage="stage2", tuning_method="dora", zero_stage=2,
                              run_id="probe-contract", main_process_port=29631)
     manifest = plan.cluster.remote_repo_root / "results/probe-manifest.json"
     commands = builder(plan, commit="a"*40, manifest=manifest, manifest_sha256="b"*64)
@@ -65,8 +66,8 @@ def test_probe_dry_run_exposes_actual_identity_checks_and_topology(tmp_path, mon
     monkeypatch.setattr(coordinator, "_REPOSITORY_ROOT", repository)
     monkeypatch.setattr(coordinator, "_remote_host_repository_root", lambda path: path)
     monkeypatch.setattr(coordinator, "_repository_git_stdout", lambda args: "a"*40)
-    # The canonical config belongs to the actual checkout; no fixture weights.
-    monkeypatch.setattr(coordinator, "selected_deepspeed_config", lambda *args: Path(__file__).resolve().parents[2]/"configs/deepspeed_zero2.json")
+    # Keep the plan config under the declared fixture checkout.
+    monkeypatch.setattr(coordinator, "selected_deepspeed_config", lambda *args: repository/"configs/deepspeed_zero2.json")
     assert coordinator._training_main("stage2", ["--dil-full-model-probe", str(manifest),
         "--run-id", "probe-contract", "--zero-stage", "2", "--main-process-port", "29631", "--dry-run"]) == 0
     result = json.loads(capsys.readouterr().out)
@@ -87,7 +88,7 @@ def test_probe_completion_collects_four_records_without_training_witness(tmp_pat
     monkeypatch.setattr(coordinator, "_REPOSITORY_ROOT", repository)
     monkeypatch.setattr(coordinator, "_remote_host_repository_root", lambda path: path)
     monkeypatch.setattr(coordinator, "_repository_git_stdout", lambda args: "a"*40)
-    monkeypatch.setattr(coordinator, "selected_deepspeed_config", lambda *args: Path(__file__).resolve().parents[2]/"configs/deepspeed_zero2.json")
+    monkeypatch.setattr(coordinator, "selected_deepspeed_config", lambda *args: repository/"configs/deepspeed_zero2.json")
     monkeypatch.setattr(coordinator, "collect_node_snapshot", lambda *args, **kwargs: None)
     monkeypatch.setattr(coordinator, "validate_preflight", lambda *args: SimpleNamespace(commit="a"*40))
     def identity_preflight(command, **kwargs):

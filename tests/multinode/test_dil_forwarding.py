@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 """DIL settings must survive the coordinator and the actual worker shell."""
 
 import json
@@ -13,7 +14,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 def worker_commands(settings, stage_arguments=()):
-    plan = multinode.build_launch_plan(
+    plan = multinode.build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage2", tuning_method="dora", zero_stage=2,
         run_id="dil-forwarding-test", main_process_port=29631,
     )

@@ -385,6 +385,7 @@ def test_probe_fixture_ignores_worker_cwd_and_matches_resume_preflight(tmp_path,
     assert Path(consumed[0].image_root) == expected / "images"
     assert not (unrelated / "data").exists()
     # Capture the actual coordinator's preflight input paths without executing it.
+    from tests.multinode.root_fixtures import ROOT_ARGUMENTS
     original_preflight = coordinator.build_preflight_commands
     preflight_inputs = []
     def capture_preflight(plan, **kwargs):
@@ -392,6 +393,6 @@ def test_probe_fixture_ignores_worker_cwd_and_matches_resume_preflight(tmp_path,
         return original_preflight(plan, **kwargs)
     monkeypatch.setattr(coordinator, "build_preflight_commands", capture_preflight)
     assert coordinator._training_main("stage1", ["--vision-gain-runtime-probe", "--run-id", run_id,
-                         "--zero-stage", "1", "--main-process-port", "29590", "--dry-run"]) == 0
+                         "--zero-stage", "1", "--main-process-port", "29590", "--dry-run", *ROOT_ARGUMENTS]) == 0
     capsys.readouterr()
     assert Path(consumed[0].data_path) in preflight_inputs[1]

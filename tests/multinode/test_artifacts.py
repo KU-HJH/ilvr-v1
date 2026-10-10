@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 import dataclasses
 import json
 import os
@@ -457,7 +458,7 @@ def complete_manifests(**changes):
 
 
 def launch_plan():
-    return build_launch_plan(
+    return build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage1",
         tuning_method="lora",
         zero_stage=3,
@@ -2033,7 +2034,7 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
 def test_checkpoint_layout_is_derived_from_zero_stage(zero_stage, layout):
     assert derive_model_state_layout(zero_stage) == layout
 
-    plan = build_launch_plan(
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage1",
         tuning_method="full",
         zero_stage=zero_stage,

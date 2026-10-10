@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.multinode.root_fixtures import ROOT_ARGUMENTS
 
 REPO = Path(__file__).resolve().parents[2]
 PROFILE = REPO / "scripts/stage2/dil_bce_profile.sh"
@@ -57,8 +58,8 @@ def test_empty_exported_resume_keeps_fresh_coordinator_mode():
     result = subprocess.run(
         ["bash", "-c", 'set -euo pipefail; source "$1"; "$2" --dry-run '
          '--run-id dil-empty-resume-profile-test --zero-stage 2 '
-         '--main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS"',
-         "bash", str(PROFILE), str(REPO / "run_multinode_stage2_training.sh")],
+         '--main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" "${@:3}"',
+         "bash", str(PROFILE), str(REPO / "run_multinode_stage2_training.sh"), *ROOT_ARGUMENTS],
         cwd=REPO,
         env={**os.environ, "RESUME_CHECKPOINT": "", "CUDA_VISIBLE_DEVICES": "",
              "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
@@ -127,6 +128,9 @@ def test_documented_variant_runs_coordinator_and_both_worker_dry_runs(name, tmp_
         "source ./scripts/stage2/dil_bce_profile.sh",
         'source ./scripts/stage2/dil_bce_profile.sh\nexport STAGE1_ADAPTER_PATH="$1"',
     )
+    # The documented same-root protocol needs an explicit pair in a native test checkout.
+    examples = {name: block.replace("./run_multinode_stage2_training.sh",
+        "./run_multinode_stage2_training.sh " + shlex.join(ROOT_ARGUMENTS)) for name, block in examples.items()}
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     result = subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + common + "\nPS4='+ '\nset -x\n" + examples[name], "bash", str(fixture)],

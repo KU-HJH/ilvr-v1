@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 import dataclasses
 import json
 import re
@@ -69,7 +70,7 @@ def test_preflight_rejects_deepspeed_0180_on_either_node(stale_node):
 
 def test_stage2_peft_zero3_preflight_uses_dedicated_config_on_both_nodes():
     """Catches node-info validating a different config than the GPU workers."""
-    launch_plan = build_launch_plan(
+    launch_plan = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage2",
         tuning_method="lora",
         zero_stage=3,
@@ -96,7 +97,7 @@ def test_stage2_peft_zero3_preflight_uses_dedicated_config_on_both_nodes():
 
 def test_stage2_peft_zero3_node_info_decodes_selected_policy(monkeypatch):
     """Catches selected-policy fields disappearing at the node-info parser boundary."""
-    launch_plan = build_launch_plan(
+    launch_plan = build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage2",
         tuning_method="lora",
         zero_stage=3,
@@ -181,7 +182,7 @@ def test_preflight_accepts_python_311_build_marker():
 
 
 def plan():
-    return build_launch_plan(
+    return build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage1",
         tuning_method="lora",
         zero_stage=2,
@@ -300,7 +301,7 @@ def test_preflight_dry_run_prints_commands_without_probing(monkeypatch, capsys):
             "--main-process-port",
             "29613",
             "--dry-run",
-        ]
+        *ROOT_ARGUMENTS,]
     ) == 0
 
     payload = json.loads(capsys.readouterr().out)
@@ -340,7 +341,7 @@ def test_preflight_uses_each_node_repository_artifact_roots(monkeypatch, capsys)
             "stage1-lora-zero2-four-gpu",
             "--main-process-port",
             "29613",
-        ]
+        *ROOT_ARGUMENTS,]
     ) == 0
 
     capsys.readouterr()
@@ -442,7 +443,7 @@ def test_dry_run_prints_the_same_three_executable_commands(monkeypatch, capsys):
             "preflight", "--stage", "stage1", "--tuning-method", "lora",
             "--zero-stage", "2", "--run-id", "stage1-lora-zero2-four-gpu",
             "--main-process-port", "29613", "--dry-run",
-        ]
+        *ROOT_ARGUMENTS,]
     ) == 0
 
     payload = json.loads(capsys.readouterr().out)

@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 """New preference options must survive coordinator, shell and CLI validation."""
 import json
 import subprocess
@@ -20,7 +21,7 @@ def test_evidence_gain_options_reach_both_workers(mode, blocked):
         STEP_VISUAL_ONLY_CONTEXT_PREFERENCE='true',
         STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES='false',
         STEP_PREFERENCE_PREFIX_MODE=mode, STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE=blocked)
-    plan = build_launch_plan(stage='stage2', tuning_method='dora', zero_stage=2,
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS, stage='stage2', tuning_method='dora', zero_stage=2,
         run_id='evidence-gain-forward-test', main_process_port=29873)
     environment = validated_stage2_environment(source,
         output_dir=str(REPO/'checkpoints'/plan.run_id),
@@ -52,7 +53,7 @@ def test_evidence_replacement_forwards_fixed_entropy_seed_and_boundaries_to_both
         STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES='false',
         SEED='917',
     )
-    plan = build_launch_plan(stage='stage2', tuning_method='dora', zero_stage=2,
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS, stage='stage2', tuning_method='dora', zero_stage=2,
         run_id='replacement-forward-test', main_process_port=29874)
     environment = validated_stage2_environment(source,
         output_dir=str(REPO/'checkpoints'/plan.run_id),

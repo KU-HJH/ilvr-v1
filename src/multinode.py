@@ -240,6 +240,8 @@ def build_lifecycle_plans(
     python_executable: str,
     commit: str = "0" * 40,
     config_digests: dict[int, str] | None = None,
+    remote_repo_root: Path | None = None,
+    remote_host_repo_root: Path | None = None,
 ) -> tuple[LifecyclePlan, ...]:
     """Validate all 18 identities and ports before constructing any side effect."""
     _validate_identifier("parent_run_id", parent_run_id)
@@ -298,7 +300,7 @@ def build_lifecycle_plans(
                     and case.zero_stage == 3
                     else digests[case.zero_stage]
                 ),
-                cluster=ClusterSpec.default(),
+                cluster=ClusterSpec.default(remote_repo_root=remote_repo_root, remote_host_repo_root=remote_host_repo_root),
                 attempt_id=phase,
             )
             for phase in ("initial", "resume")
@@ -591,6 +593,8 @@ def run_lifecycle_matrix(
     result_root: str | Path,
     python_executable: str,
     dry_run: bool = False,
+    remote_repo_root: Path | None = None,
+    remote_host_repo_root: Path | None = None,
 ) -> tuple[LifecyclePlan, ...]:
     """Run each fixed tiny harness serially and complete only after all 18."""
     plans = build_lifecycle_plans(
@@ -598,6 +602,8 @@ def run_lifecycle_matrix(
         first_port=first_port,
         result_root=result_root,
         python_executable=python_executable,
+        remote_repo_root=remote_repo_root,
+        remote_host_repo_root=remote_host_repo_root,
     )
     if dry_run:
         return plans
@@ -622,6 +628,8 @@ def run_lifecycle_matrix(
         first_port=first_port,
         result_root=result_root,
         python_executable=python_executable,
+        remote_repo_root=remote_repo_root,
+        remote_host_repo_root=remote_host_repo_root,
         commit=commit,
         config_digests=digests,
     )
@@ -837,6 +845,8 @@ def _lifecycle_matrix_main(argv: list[str]) -> int:
     parser.add_argument("--first-port", required=True, type=int)
     parser.add_argument("--result-root", default=str(_REPOSITORY_ROOT / "results"))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--remote-repo-root", type=Path)
+    parser.add_argument("--remote-host-repo-root", type=Path)
     args = parser.parse_args(argv)
     try:
         plans = run_lifecycle_matrix(
@@ -845,6 +855,8 @@ def _lifecycle_matrix_main(argv: list[str]) -> int:
             result_root=args.result_root,
             python_executable=sys.executable,
             dry_run=args.dry_run,
+            remote_repo_root=args.remote_repo_root,
+            remote_host_repo_root=args.remote_host_repo_root,
         )
     except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
@@ -1079,7 +1091,7 @@ def _tmux_session_is_fresh(name: str) -> bool:
 def _remote_master_port_is_free(port: int) -> bool:
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        probe.bind((ClusterSpec.default().master_addr, port))
+        probe.bind(("10.1.102.41", port))
     except OSError:
         return False
     finally:
@@ -1397,7 +1409,7 @@ def _ownership_ready(argv: list[str]) -> int:
     ownership = read_ownership(args.ownership_path)
     if ownership.command_digest != args.command_digest:
         raise ValueError("ownership command digest mismatch")
-    if args.master_addr != ClusterSpec.default().master_addr:
+    if args.master_addr != "10.1.102.41":
         raise ValueError("readiness master address must match the fixed topology")
     if not 1024 <= args.main_process_port <= 65535:
         raise ValueError("readiness port must be between 1024 and 65535")
@@ -1842,10 +1854,12 @@ def _vision_gain_runtime_probe_main(argv: list[str]) -> int:
     parser.add_argument("--zero-stage", type=int, choices=(1, 2), required=True)
     parser.add_argument("--main-process-port", type=int, required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--remote-repo-root", type=Path)
+    parser.add_argument("--remote-host-repo-root", type=Path)
     args = parser.parse_args(argv)
     try:
         commit = _repository_git_stdout(("rev-parse", "HEAD"))
-        plans = {phase: build_launch_plan(stage="stage1", tuning_method="dora", zero_stage=args.zero_stage,
+        plans = {phase: build_launch_plan(remote_repo_root=args.remote_repo_root, remote_host_repo_root=args.remote_host_repo_root, stage="stage1", tuning_method="dora", zero_stage=args.zero_stage,
                     run_id=args.run_id, main_process_port=args.main_process_port, attempt_id=phase)
                  for phase in ("initial", "resume")}
         commands = {phase: build_owned_vision_gain_probe_commands(plan, commit=commit)
@@ -1934,6 +1948,9 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
     parser.add_argument("--main-process-port", type=int, required=True)
     parser.add_argument("--result-root", default=str(_REPOSITORY_ROOT / "results"))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--local-repo-root", type=Path)
+    parser.add_argument("--remote-repo-root", type=Path)
+    parser.add_argument("--remote-host-repo-root", type=Path)
     args, stage_arguments = parser.parse_known_args(argv)
     try:
         result_root = Path(args.result_root)
@@ -2023,6 +2040,9 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             run_id=args.run_id,
             main_process_port=args.main_process_port,
             attempt_id=args.attempt_id,
+            local_repo_root=args.local_repo_root,
+            remote_repo_root=args.remote_repo_root,
+            remote_host_repo_root=args.remote_host_repo_root,
         )
         commit = _repository_git_stdout(("rev-parse", "HEAD"))
         commands = build_owned_tmux_commands(
@@ -2133,7 +2153,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             artifact_roots=artifact_roots,
             run_paths=run_paths,
             tmux_sessions=(sessions[1],),
-            repository=plan.cluster.remote_repo_root,
+            repository=plan.cluster.local_repo_root,
         )
         report = validate_preflight(remote_snapshot, local_snapshot)
         if report.commit != commit:
@@ -2676,9 +2696,9 @@ def _main(argv: list[str] | None = None) -> int:
                 artifact_roots = tuple(Path(path) for path in args.artifact_root)
             else:
                 artifact_roots = (
-                    plan.cluster.remote_repo_root / "checkpoints",
-                    plan.cluster.remote_repo_root / "results",
-                    plan.cluster.remote_repo_root / "logs",
+                    plan.cluster.local_repo_root / "checkpoints",
+                    plan.cluster.local_repo_root / "results",
+                    plan.cluster.local_repo_root / "logs",
                 )
             remote_run_paths = tuple(
                 root / plan.run_id / plan.attempt_id for root in artifact_roots
@@ -2742,7 +2762,7 @@ def _main(argv: list[str] | None = None) -> int:
                 tmux_sessions=(sessions[1],),
                 runner=runner,
                 commands=commands,
-                repository=plan.cluster.remote_repo_root,
+                repository=plan.cluster.local_repo_root,
             )
             report = validate_preflight(remote, local)
             print(json.dumps(_json_ready(report), sort_keys=True))

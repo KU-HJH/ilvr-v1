@@ -11,7 +11,10 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from src.multinode import ClusterSpec
 
 
 _MANIFEST_SCHEMA_VERSION = 1
@@ -1427,18 +1430,24 @@ def _rsync_prefix(files_from: Path) -> tuple[str, ...]:
 
 
 def build_push_command(
-    manifest: NodeArtifactManifest, *, files_from: str | Path | None = None
+    manifest: NodeArtifactManifest, *, files_from: str | Path | None = None,
+    cluster: "ClusterSpec | None" = None
 ) -> tuple[str, ...]:
     """Build a fixed local-ranks-to-canonical-owner rsync argv."""
     _validate_run_id(manifest.run_id)
+    if cluster is not None:
+        from src.multinode import validate_cluster_topology
+        validate_cluster_topology(cluster)
+    local = cluster.local_repo_root if cluster is not None else _LOCAL_REPOSITORY
+    remote = cluster.remote_repo_root if cluster is not None else _LOCAL_REPOSITORY
     source = (
-        _LOCAL_REPOSITORY
+        local
         / "checkpoints"
         / manifest.run_id
         / manifest.checkpoint_relative
     )
     destination = (
-        _LOCAL_REPOSITORY
+        remote
         / "checkpoints"
         / manifest.run_id
         / manifest.checkpoint_relative
@@ -1652,17 +1661,23 @@ def build_pull_command(
     destination: str | Path | None = None,
     *,
     files_from: str | Path | None = None,
+    cluster: "ClusterSpec | None" = None,
 ) -> tuple[str, ...]:
     """Build a canonical-owner-to-local rsync argv for resume artifacts."""
     _validate_run_id(manifest.run_id)
+    if cluster is not None:
+        from src.multinode import validate_cluster_topology
+        validate_cluster_topology(cluster)
+    local = cluster.local_repo_root if cluster is not None else _LOCAL_REPOSITORY
+    remote = cluster.remote_repo_root if cluster is not None else _LOCAL_REPOSITORY
     source = (
-        _LOCAL_REPOSITORY
+        remote
         / "checkpoints"
         / manifest.run_id
         / manifest.checkpoint_relative
     )
     local_destination = (
-        _LOCAL_REPOSITORY / "checkpoints" / manifest.run_id
+        local / "checkpoints" / manifest.run_id
         if destination is None
         else Path(destination)
     )

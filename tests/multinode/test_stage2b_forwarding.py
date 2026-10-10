@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 """Regression for Stage 2B settings lost between coordinator and workers."""
 
 import json
@@ -46,7 +47,7 @@ def stage2b_environment(dpo="1", entropy="0.1"):
 @pytest.mark.parametrize("dpo,entropy", [("0", "0"), ("1", "0"), ("0", "0.1"), ("1", "0.1")])
 def test_stage2b_variants_reach_both_worker_training_commands(dpo, entropy):
     """Dropping a variant setting must fail at the real shell/CLI boundary."""
-    plan = multinode.build_launch_plan(
+    plan = multinode.build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage2", tuning_method="dora", zero_stage=2,
         run_id="stage2b-forwarding-test", main_process_port=29631,
     )
@@ -92,7 +93,7 @@ def test_stage2b_variants_reach_both_worker_training_commands(dpo, entropy):
 @pytest.mark.parametrize("target_scope", ["immediate_text", "until_next_latent"])
 def test_context_preference_settings_reach_both_owned_worker_commands(target_scope):
     """Dropping context objective settings must fail at the real worker boundary."""
-    plan = multinode.build_launch_plan(
+    plan = multinode.build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage2", tuning_method="dora", zero_stage=2,
         run_id="context-forwarding-test", main_process_port=29631,
     )
@@ -162,7 +163,7 @@ def test_context_preference_settings_reach_both_owned_worker_commands(target_sco
 
 def test_direct_stage1_setting_reaches_both_owned_worker_commands():
     """Catches the coordinator dropping direct Stage 1 admission on either worker."""
-    plan = multinode.build_launch_plan(
+    plan = multinode.build_launch_plan(**REMOTE_ROOT_KWARGS,
         stage="stage2", tuning_method="dora", zero_stage=2,
         run_id="direct-stage1-forwarding-test", main_process_port=29631,
     )
@@ -224,4 +225,4 @@ def test_stage2b_preflight_includes_checkpoint_and_negative_inputs(monkeypatch):
         multinode._training_main("stage2", [
             "--run-id", "stage2b-forwarding-test", "--zero-stage", "2",
             "--main-process-port", "29631", "--max_steps", "6", "--save_steps", "6",
-        ])
+         *ROOT_ARGUMENTS])

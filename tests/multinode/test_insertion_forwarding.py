@@ -1,3 +1,4 @@
+from tests.multinode.root_fixtures import REMOTE_ROOT_KWARGS, ROOT_ARGUMENTS
 """Exercise coordinator -> both worker shells -> actual argument validation."""
 import json
 import subprocess
@@ -19,7 +20,7 @@ def test_insertion_mode_reaches_both_workers_and_config(mode):
         STEP_VISUAL_ONLY_CONTEXT_PREFERENCE='true',
         STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES='false',
         STEP_PREFERENCE_PREFIX_MODE='v_off_insertion', STEP_PREFERENCE_BRANCH_MODE=mode)
-    plan = build_launch_plan(stage='stage2', tuning_method='dora', zero_stage=2,
+    plan = build_launch_plan(**REMOTE_ROOT_KWARGS, stage='stage2', tuning_method='dora', zero_stage=2,
         run_id='insertion-forward-test', main_process_port=29873)
     environment = validated_stage2_environment(source,
         output_dir=str(REPO/'checkpoints'/plan.run_id),

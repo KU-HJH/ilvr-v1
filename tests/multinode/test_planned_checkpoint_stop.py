@@ -1,4 +1,5 @@
 """Real coordinator parsing, collection validation and witness publication."""
+from tests.multinode.root_fixtures import ROOT_ARGUMENTS
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -98,7 +99,7 @@ def test_coordinator_collects_observed_target_only_after_success(coordinator_pat
             return replace(self.manifests[0], process_ranks=(0, 1, 2, 3),
                            entries=tuple(replace(e, node_rank=0) for e in entries))
     monkeypatch.setattr(coordinator, 'SubprocessCoordinatorRunner', Runner)
-    argv = ['--run-id', run_id, '--zero-stage', '2', '--main-process-port', '29631',
+    argv = [*ROOT_ARGUMENTS, '--run-id', run_id, '--zero-stage', '2', '--main-process-port', '29631',
             '--max_steps', '3', '--save_steps', '3', '--result-root', str(result_root)]
     if stop:
         argv += ['--stage2_stop_after_checkpoint', str(stop)]

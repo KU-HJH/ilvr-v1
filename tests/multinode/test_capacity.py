@@ -786,7 +786,7 @@ def test_stage1_coordinator_uses_training_evidence_step_without_max_steps(
         tuning_method="lora",
         zero_stage=3,
         world_size=4,
-        cluster=SimpleNamespace(remote_repo_root=repository),
+        cluster=SimpleNamespace(remote_repo_root=repository, local_repo_root=repository),
     )
     commands = SimpleNamespace(
         command_digests=("a" * 64, "b" * 64),
