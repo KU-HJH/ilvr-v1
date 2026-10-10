@@ -191,3 +191,57 @@ def test_legacy_missing_selector_remains_kl_without_rewriting_contract(tmp_path)
     malformed['config'].pop('text_cap')
     with pytest.raises(ValueError,match='resume'):
         api().validate_v3_resume(malformed,malformed)
+
+
+@pytest.mark.parametrize('indented',[False,True])
+def test_actual_final_save_preserves_equivalent_legacy_contract(tmp_path,indented):
+    from tests.stage1.v3_helpers import product_v3_trainer
+    trainer,_=product_v3_trainer(tmp_path)
+    current=api().build_v3_checkpoint_contract(trainer.v3_config,schedule(),{'frozen_teacher_sha256':'a'*64})
+    legacy=deepcopy(current)
+    legacy['config'].pop('text_selector')
+    original=(json.dumps(legacy,indent=2) if indented else json.dumps(legacy,sort_keys=True,separators=(',',':'))+'\n').encode()
+    path=tmp_path/'stage1_v3.json'
+    path.write_bytes(original)
+    trainer.v3_contract=current
+    trainer.stage1_peft_metadata=None
+    # Exercise real Trainer/model saving followed by the product metadata hook.
+    trainer.save_model(str(tmp_path))
+    assert path.read_bytes()==original and api().read_v3_contract(tmp_path)==legacy
+    trainer.save_model(str(tmp_path/'new-checkpoint'))
+    assert api().read_v3_contract(tmp_path/'new-checkpoint')==current
+
+
+@pytest.mark.parametrize('change',['selector','config','profile'])
+def test_legacy_writer_rejects_actual_identity_changes_without_overwrite(tmp_path,change):
+    current=api().build_v3_checkpoint_contract(Stage1V3Config(),schedule(),{'frozen_teacher_sha256':'a'*64})
+    legacy=deepcopy(current)
+    legacy['config'].pop('text_selector')
+    path=tmp_path/'stage1_v3.json'
+    original=json.dumps(legacy).encode()
+    path.write_bytes(original)
+    if change=='selector':
+        current=api().build_v3_checkpoint_contract(Stage1V3Config(text_selector='entropy'),schedule(),
+            {'frozen_teacher_sha256':'a'*64})
+    elif change=='config':current['config']['text_kl_beta']=.02
+    else:current['profile']['seed']=123
+    with pytest.raises(ValueError,match='replace|mismatch'):
+        api().write_v3_contract(tmp_path,current)
+    assert path.read_bytes()==original
+
+
+def test_modern_writer_retains_exact_bytes_and_symlink_rejection(tmp_path):
+    current=api().build_v3_checkpoint_contract(Stage1V3Config(),schedule(),{'frozen_teacher_sha256':'a'*64})
+    path=tmp_path/'stage1_v3.json'
+    path.write_text(json.dumps(current,indent=2))
+    original=path.read_bytes()
+    with pytest.raises(ValueError,match='replace'):
+        api().write_v3_contract(tmp_path,current)
+    assert path.read_bytes()==original
+    path.unlink()
+    target=tmp_path/'foreign.json'
+    target.write_bytes(original)
+    path.symlink_to(target)
+    with pytest.raises(ValueError,match='replace|regular'):
+        api().write_v3_contract(tmp_path,current)
+    assert target.read_bytes()==original

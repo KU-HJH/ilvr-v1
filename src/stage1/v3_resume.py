@@ -213,7 +213,14 @@ def write_v3_contract(directory,contract):
     path=Path(directory).resolve()/FILENAME
     raw=_canonical(contract)+b'\n'
     if path.exists():
-        if path.is_symlink() or path.read_bytes()!=raw:raise ValueError('refusing to replace different v3 checkpoint contract')
+        if path.is_symlink():raise ValueError('refusing to replace different v3 checkpoint contract')
+        if path.read_bytes()!=raw:
+            existing=read_v3_contract(path.parent)
+            if 'text_selector' in existing['config']:
+                raise ValueError('refusing to replace different v3 checkpoint contract')
+            validate_v3_resume(existing,contract)
+            # Equivalent legacy KL metadata is already authoritative. Leave
+            # its original bytes intact when saving to the same final output.
         return
     _publish_bytes_no_replace(path,raw)
 
