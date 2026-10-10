@@ -1966,6 +1966,13 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         forwarded = tuple(stage_arguments)
         if stage == "stage1":
             forwarded = validate_stage1_arguments(forwarded)
+            variant = _argument_value(forwarded, "--stage1-variant") or os.environ.get("STAGE1_VARIANT")
+            if variant is not None:
+                if variant not in ("standard", "v3"):
+                    raise ValueError("Stage 1 variant must be standard or v3")
+                forwarded = _replace_argument_value(forwarded, "--stage1-variant", variant)
+                if variant == "v3" and args.zero_stage != 1:
+                    raise ValueError("Stage1-v3 requires --zero-stage 1")
             tuning_method = _argument_value(forwarded, "--method")
             if tuning_method not in ("full", "lora", "dora"):
                 raise ValueError("Stage 1 requires --method full, lora, or dora")

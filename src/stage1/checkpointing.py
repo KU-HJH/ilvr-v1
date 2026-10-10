@@ -290,6 +290,9 @@ def _classify_stage1_artifact_with_metadata(
         raise ValueError(f"Stage 1 artifact is not a directory: {directory}")
 
     names = {entry.name for entry in directory.iterdir() if entry.is_file()}
+    if "stage1_v3.json" in names:
+        from .v3_resume import read_v3_contract
+        read_v3_contract(directory)
     present_peft = names & (_REQUIRED_PEFT_MARKERS | _OTHER_PEFT_MARKERS)
     present_full = {name for name in names if _is_full_weight_filename(name)}
     if present_peft and present_full:

@@ -24,6 +24,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--evaluation_output_path", type=str, default="evaluation_results.json", help="Path to save evaluation results JSON file.")
     parser.add_argument("--model", type=str, default='Qwen/Qwen2.5-VL-7B-Instruct')
     parser.add_argument("--stage", type=str, default="stage1")
+    parser.add_argument("--stage1_variant", choices=("standard", "v3"), default=None)
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)
@@ -216,6 +217,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
+    from stage1.v3_resume import resolve_v3_arguments
+    resolve_v3_arguments(args, raw_argv)
     if args.vision_attention_implementation is None:
         args.vision_attention_implementation = args.attention_implementation
     if args.log_file is None:
@@ -225,7 +228,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             pass
         else:
             args.log_file = str(paths.log_dir / "train.log")
-    args.tuning_method_explicit = any(
+    args.tuning_method_explicit = getattr(args, "stage1_variant", None) == "v3" or any(
         item == "--tuning_method" or item.startswith("--tuning_method=")
         for item in raw_argv
     )

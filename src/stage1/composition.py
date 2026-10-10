@@ -448,6 +448,9 @@ def build_stage1_training_components(
     if args.stage != "stage1":
         raise ValueError("Stage 1 composition requires --stage stage1")
     data_path, image_root, output_dir = _require_stage1_inputs(args)
+    v3_enabled = getattr(args, "stage1_variant", None) == "v3"
+    if v3_enabled and (not profile.enabled or profile.zero_stage != 1 or profile.world_size != 4):
+        raise ValueError("Stage1-v3 requires the two-node/four-rank ZeRO-1 profile")
     tuning = resolve_stage1_tuning_config(args)
 
     # This is deliberately first: Task 9 classifies the complete local artifact
@@ -469,6 +472,23 @@ def build_stage1_training_components(
     if metadata is not None:
         _validate_resume_semantics(args, metadata)
 
+    v3_dataset = None
+    if v3_enabled:
+        from .v3_resume import retained_source_ids, build_v3_schedule_identity, read_v3_contract
+        v3_dataset = dependencies.prepare_dataset(data_path, image_root)
+        if args.max_train_samples is not None:
+            v3_dataset = v3_dataset[:args.max_train_samples]
+        if checkpoint is not None:
+            saved = read_v3_contract(checkpoint)
+            args.stage1_v3_saved_contract = saved
+            identity = build_v3_schedule_identity(retained_ids=retained_source_ids(v3_dataset),
+                sampler_identity={}, microsteps_per_rank=1, accumulation_steps=1)
+            if identity.retained_ids_sha256 != saved["schedule"]["retained_ids_sha256"]:
+                raise ValueError("v3 resume retained data identity mismatch before model load")
+            from .v3_resume import teacher_digest
+            teacher = torch.load(checkpoint / "stage1_ema_teacher.pt", map_location="cpu", weights_only=True)
+            if teacher_digest(teacher["state"]) != saved["frozen_teacher_sha256"]:
+                raise ValueError("v3 resume frozen teacher mismatch before model load")
     processor_source = checkpoint if checkpoint is not None else args.model
     processor = dependencies.load_processor(
         processor_source,
@@ -607,12 +627,19 @@ def build_stage1_training_components(
     parameter_report = dependencies.validate_boundary(
         model, tuning, latent_ids, zero_stage=profile.zero_stage
     )
-    dataset = dependencies.prepare_dataset(data_path, image_root)
-    if args.max_train_samples is not None:
+    dataset = v3_dataset if v3_enabled else dependencies.prepare_dataset(data_path, image_root)
+    if not v3_enabled and args.max_train_samples is not None:
         dataset = dataset[: args.max_train_samples]
     token_ids = LatentTokenIds(*latent_ids)
-    collator = dependencies.collator_factory(processor, token_ids, args.latent_size)
+    v3_kwargs = {}
+    if v3_enabled:
+        from .v3_config import Stage1V3Config
+        saved = getattr(args, "stage1_v3_saved_contract", None)
+        v3_kwargs["v3_config"] = Stage1V3Config(**saved["config"]) if saved else Stage1V3Config()
+    collator = dependencies.collator_factory(processor, token_ids, args.latent_size,
+        **({"v3_enabled": True} if v3_enabled else {}))
     trainer = dependencies.trainer_factory(
+        **v3_kwargs,
         model=model,
         args=build_stage1_training_arguments(args),
         train_dataset=dataset,
@@ -632,6 +659,9 @@ def build_stage1_training_components(
             getattr(args, "benchmark_evidence_path", None)
         ),
     )
+    if v3_enabled:
+        from .v3_resume import attach_v3_identity
+        attach_v3_identity(trainer, args, dataset, checkpoint)
     if tuning.method != "full" and args.gradient_checkpointing:
         validate_stage1_checkpoint_context(getattr(trainer, "model", model))
     return Stage1TrainingComponents(

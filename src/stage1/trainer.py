@@ -368,6 +368,44 @@ class CustomTrainerStage1(SFTTrainer):
             else "lora"
         )
 
+    def set_initial_training_values(self, args, dataloader, total_train_batch_size):
+        if getattr(self, "v3_config", None) is None:
+            return super().set_initial_training_values(args, dataloader, total_train_batch_size)
+        from .v3_resume import (build_v3_schedule_identity, prepared_sampler_identity,
+                               retained_source_ids, build_v3_checkpoint_contract, validate_v3_resume)
+        length = len(dataloader)
+        lengths = [length]
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            lengths = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(lengths, length)
+        if any(value != length for value in lengths):
+            raise ValueError("v3 prepared loader lengths differ across ranks")
+        schedule = build_v3_schedule_identity(
+            retained_ids=getattr(self, "v3_retained_ids", retained_source_ids(self.train_dataset)),
+            sampler_identity=prepared_sampler_identity(dataloader, args.world_size),
+            microsteps_per_rank=length, accumulation_steps=args.gradient_accumulation_steps)
+        if args.num_train_epochs != 1 or args.max_steps not in (-1, schedule.planned_steps):
+            raise ValueError("v3 requires one actual prepared-loader epoch with its derived update budget")
+        self.stage1_variant = "v3"
+        self.v3_schedule = schedule
+        self.v3_planned_steps = schedule.planned_steps
+        profile = getattr(self, "v3_resolved_profile", None)
+        if profile is not None:
+            contract = build_v3_checkpoint_contract(self.v3_config, schedule, profile)
+            saved = getattr(self, "v3_saved_contract", None)
+            if saved is not None:
+                validate_v3_resume(saved, contract)
+            self.v3_contract = contract
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                import hashlib, json
+                digest = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
+                identities = [None] * torch.distributed.get_world_size()
+                torch.distributed.all_gather_object(identities, digest)
+                if any(value != digest for value in identities):
+                    raise ValueError("v3 resolved profile/teacher/sampler differs across ranks")
+        count = self.num_examples(dataloader)
+        return (1, schedule.updates_per_epoch, count, count, True, length, schedule.planned_steps)
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Keep sample-keyed dropout active through Trainer's backward replay."""
         if getattr(self, "v3_config", None) is not None:
@@ -1105,6 +1143,9 @@ class CustomTrainerStage1(SFTTrainer):
             if self.args.should_save:
                 try:
                     self._save_stage1_ema_checkpoint(checkpoint_dir)
+                    if getattr(self, "v3_config", None) is not None:
+                        from .v3_resume import write_v3_contract
+                        write_v3_contract(checkpoint_dir, self.v3_contract)
                     write_deepspeed_runtime_sidecar(
                         checkpoint_dir, self.deepspeed_runtime_profile
                     )
@@ -1181,6 +1222,12 @@ class CustomTrainerStage1(SFTTrainer):
             )
 
         if pending_checkpoint is not None:
+            if getattr(self, "v3_config", None) is not None:
+                from .v3_resume import read_v3_contract, validate_v3_resume
+                saved = read_v3_contract(pending_checkpoint)
+                if getattr(self, "v3_saved_contract", None) is not None:
+                    validate_v3_resume(saved, self.v3_saved_contract)
+                self.v3_saved_contract = saved
             validate_deepspeed_resume_identity(
                 pending_checkpoint, self.deepspeed_runtime_profile
             )
@@ -1226,7 +1273,11 @@ class CustomTrainerStage1(SFTTrainer):
 
         metadata = self.stage1_peft_metadata
         if metadata is None:
-            return super().save_model(output_dir, _internal_call=_internal_call)
+            result = super().save_model(output_dir, _internal_call=_internal_call)
+            if self.args.should_save and getattr(self, "v3_config", None) is not None:
+                from .v3_resume import write_v3_contract
+                write_v3_contract(Path(output_dir or self.args.output_dir), self.v3_contract)
+            return result
 
         from stage1.checkpointing import (
             _save_stage1_peft_supplements,
@@ -1258,7 +1309,7 @@ class CustomTrainerStage1(SFTTrainer):
                 _save_stage1_peft_supplements(self.model, target, metadata)
             else:
                 with tempfile.TemporaryDirectory(
-                    prefix="stage1-token-rows-"
+                    prefix="stage1-token-rows-", dir=self.args.output_dir
                 ) as temporary:
                     _save_stage1_peft_supplements(
                         self.model, Path(temporary), metadata
@@ -1266,6 +1317,9 @@ class CustomTrainerStage1(SFTTrainer):
         elif self.args.should_save:
             _save_stage1_peft_supplements(self.model, target, metadata)
         if self.args.should_save:
+            if getattr(self, "v3_config", None) is not None:
+                from .v3_resume import write_v3_contract
+                write_v3_contract(target, self.v3_contract)
             classify_stage1_artifact(target)
 
 

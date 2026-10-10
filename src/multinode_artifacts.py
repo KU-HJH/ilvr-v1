@@ -1154,6 +1154,8 @@ def select_common_metadata_entries(
 ) -> tuple[ArtifactEntry, ...]:
     """Select only explicitly approved metadata for this stage/method contract."""
     allowed = _required_common_paths(_validate_identity(manifest.runtime_identity))
+    if manifest.runtime_identity["stage"] == "stage1":
+        allowed = allowed | {Path("stage1_v3.json")}
     return tuple(entry for entry in manifest.entries if entry.relative_path in allowed)
 
 
@@ -1224,6 +1226,10 @@ def validate_collection(
     combined: dict[Path, ArtifactEntry] = {}
     identity = identities[0]
     allowed_common = _required_common_paths(identity)
+    if identity["stage"] == "stage1" and any(
+        entry.relative_path == Path("stage1_v3.json") for manifest in values for entry in manifest.entries
+    ):
+        allowed_common = allowed_common | {Path("stage1_v3.json")}
     step_directory = f"global_step{identity['global_step']}"
     for manifest in sorted(values, key=lambda item: item.node_rank):
         for entry in manifest.entries:
@@ -1394,6 +1400,7 @@ def validate_transfer_destination(
                 "scheduler.pt",
                 "deepspeed-runtime.json",
                 "stage1_peft_metadata.json",
+                "stage1_v3.json",
                 "stage2_peft_metadata.json",
                 "stage2-sampler.json",
             }

@@ -827,6 +827,7 @@ def receive_launch_plan(
 
 
 _STAGE1_VALUE_OPTIONS = {
+    "--stage1-variant",
     "--method",
     "--model",
     "--data-path",

@@ -42,6 +42,8 @@ if (( $# )) && [[ $1 == --manifest ]]; then
     fi
 fi
 
+stage1_variant=${STAGE1_VARIANT:-}
+original_launch_arguments=("$@")
 method=${STAGE1_METHOD:-}
 model=${STAGE1_MODEL:-}
 data_path=${STAGE1_DATA_PATH:-}
@@ -157,6 +159,7 @@ require_value() {
 
 while (( $# )); do
     case $1 in
+        --stage1-variant) require_value "$@"; stage1_variant=$2; shift 2 ;;
         --method) require_value "$@"; method=$2; shift 2 ;;
         --model) require_value "$@"; model=$2; shift 2 ;;
         --data-path) require_value "$@"; data_path=$2; shift 2 ;;
@@ -190,6 +193,44 @@ while (( $# )); do
         *) printf 'error: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+v3_profile_arguments=()
+if [[ -n $stage1_variant || -f $resume_path/stage1_v3.json ]]; then
+    profile_values=()
+    mapfile -d '' -t profile_values < <(
+        PYTHONPATH="$script_dir/transformers/src:$script_dir/src:$script_dir" "$repository_python" -m src.stage1.v3_resume \
+            --variant "$stage1_variant" --resume "$resume_path" --output "$output_dir" -- "${original_launch_arguments[@]}"
+    )
+    (( ${#profile_values[@]} >= 2 && ${#profile_values[@]} % 2 == 0 )) || {
+        printf 'error: Stage1 variant/profile resolution failed\n' >&2; exit 2;
+    }
+    for (( profile_i=0; profile_i<${#profile_values[@]}; profile_i+=2 )); do
+        profile_key=${profile_values[profile_i]}
+        profile_value=${profile_values[profile_i+1]}
+        case $profile_key in
+            stage1_variant) stage1_variant=$profile_value ;;
+            tuning_method) method=$profile_value ;;
+            model) model=$profile_value ;;
+            per_device_train_batch_size) micro_batch=$profile_value ;;
+            gradient_accumulation_steps) gradient_accumulation=$profile_value ;;
+            epochs) epochs=${profile_value%.0} ;;
+            learning_rate) learning_rate=$profile_value ;;
+            seed) seed=$profile_value ;;
+            ce_weight) ce_weight=$profile_value ;;
+            ema_tau) ema_tau=$profile_value ;;
+            deepspeed_config) deepspeed_config=$profile_value ;;
+            attention_implementation) attention_implementation=$profile_value ;;
+            textual_states) textual_states=$profile_value ;;
+            max_steps) max_steps= ;;
+        esac
+        if [[ $profile_key == gradient_checkpointing ]]; then
+            [[ $profile_value == true ]] || { printf 'error: v3 requires checkpointing\n' >&2; exit 2; }
+            v3_profile_arguments+=(--gradient_checkpointing)
+        else
+            v3_profile_arguments+=("--$profile_key" "$profile_value")
+        fi
+    done
+fi
 
 for required in method model data_path image_root output_dir; do
     value=${!required}
@@ -427,6 +468,7 @@ else
     command+=(--no_final_save)
 fi
 
+command+=("${v3_profile_arguments[@]}")
 if [[ $dry_run == true ]]; then
     printf '%q ' "${command[@]}"
     printf '\n'
