@@ -89,14 +89,16 @@ def compute_v3_gradients(model: nn.Module,reference: nn.Module,model_inputs: Map
                 visual=resolve_qwen2_5_vl_model(model).visual,
                 vision_contexts=lambda i:lifecycle.checkpoint_contexts('gain_clean',('vision',i))):
             gain_clean=torch.func.functional_call(model,(aliases,buffers),(),inputs).logits
-    training_flags=tuple((module,module.training) for module in reference.modules())
-    try:
-        reference.eval()
-        with torch.no_grad():
-            reference_logits=torch.func.functional_call(reference,
-                {n:b.detach().clone() for n,b in reference.named_buffers()},(),inputs).logits
-    finally:
-        for module,training in training_flags: module.training=training
+    reference_logits=None
+    if config.text_selector == 'kl':
+        training_flags=tuple((module,module.training) for module in reference.modules())
+        try:
+            reference.eval()
+            with torch.no_grad():
+                reference_logits=torch.func.functional_call(reference,
+                    {n:b.detach().clone() for n,b in reference.named_buffers()},(),inputs).logits
+        finally:
+            for module,training in training_flags: module.training=training
     selected=select_text_keys(blocks,trace.attention_rows,gain_clean,reference_logits,config)
     replay_blocks=tuple(V3ReplayBlock(b.batch_index,b.start,b.end,b.target_positions,b.target_ids,
                        tuple(selected[b.batch_index,q] for q in b.query_positions)) for b in blocks)

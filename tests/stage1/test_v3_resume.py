@@ -151,3 +151,43 @@ def test_contract_rejects_unknown_nested_fields_as_validation_error():
     contract['config']['unknown']=True
     with pytest.raises(ValueError,match='v3 resume'):
         api().validate_v3_resume(contract,contract)
+
+
+@pytest.mark.parametrize('selector,formula', [
+    ('kl','T2_KL_student_reference_sample_centered_full_causal_v1'),
+    ('entropy','T2_entropy_student_sample_centered_full_causal_v1'),
+])
+def test_contract_records_selector_and_checks_its_formula(tmp_path,selector,formula):
+    contract=api().build_v3_checkpoint_contract(Stage1V3Config(text_selector=selector),schedule(),
+        {'frozen_teacher_sha256':'a'*64})
+    assert contract['config']['text_selector']==selector
+    assert contract['formula_ids']['selector']==formula
+    api().write_v3_contract(tmp_path,contract)
+    assert api().read_v3_contract(tmp_path)==contract
+    bad=deepcopy(contract)
+    bad['formula_ids']['selector']=('T2_entropy_student_sample_centered_full_causal_v1' if selector=='kl'
+                                  else 'T2_KL_student_reference_sample_centered_full_causal_v1')
+    with pytest.raises(ValueError,match='resume|selector'):
+        api().validate_v3_resume(bad,bad)
+
+
+def test_legacy_missing_selector_remains_kl_without_rewriting_contract(tmp_path):
+    current=api().build_v3_checkpoint_contract(Stage1V3Config(),schedule(),{'frozen_teacher_sha256':'a'*64})
+    legacy=deepcopy(current)
+    legacy['config'].pop('text_selector')
+    path=tmp_path/'stage1_v3.json'
+    original=json.dumps(legacy,indent=2).encode()
+    path.write_bytes(original)
+    read=api().read_v3_contract(tmp_path)
+    assert read==legacy and path.read_bytes()==original
+    api().validate_v3_resume(read,current)
+    api().validate_v3_resume(current,read)
+    assert read==legacy and path.read_bytes()==original
+    entropy=api().build_v3_checkpoint_contract(Stage1V3Config(text_selector='entropy'),schedule(),
+        {'frozen_teacher_sha256':'a'*64})
+    with pytest.raises(ValueError,match='mismatch'):
+        api().validate_v3_resume(read,entropy)
+    malformed=deepcopy(legacy)
+    malformed['config'].pop('text_cap')
+    with pytest.raises(ValueError,match='resume'):
+        api().validate_v3_resume(malformed,malformed)

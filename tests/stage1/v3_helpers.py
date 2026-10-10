@@ -101,7 +101,7 @@ def replay_qwen(dtype, p):
     return decoder, base.lm_head.to(dtype), tuple(sites)
 
 
-def product_v3_trainer(tmp_path,*,checkpointed=False,empty=False,image=False):
+def product_v3_trainer(tmp_path,*,checkpointed=False,empty=False,image=False,config=None):
     from dataclasses import replace
     import torch
     from transformers import Trainer,TrainingArguments
@@ -131,7 +131,7 @@ def product_v3_trainer(tmp_path,*,checkpointed=False,empty=False,image=False):
         report_to=[],gradient_accumulation_steps=4,remove_unused_columns=False,seed=42))
     trainer.ema_teacher=Stage1EmaTeacher(model,decay=1.,method='dora')
     trainer.state.global_step=1
-    trainer.v3_config=Stage1V3Config()
+    trainer.v3_config=config if config is not None else Stage1V3Config()
     trainer.v3_planned_steps=21
     trainer.v3_gain_controller=V3GainController(tuple(p for p in model.parameters() if p.requires_grad),trainer.v3_config)
     if checkpointed:

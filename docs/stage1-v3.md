@@ -27,9 +27,21 @@ the current latent body for the suffix. START/END and the original image stay
 available. Source-item crossing tokens are excluded only from auxiliary spans.
 The collator's input tensors and CE labels retain their existing meaning.
 
-Text selection uses FP32 full-vocabulary student-to-reference KL at temperature
-2, centered within each sample, rho 0.3–0.5, text cap 0.3, fallback 0.1 and
-image cap 0. The ordinary loss adds temperature-2 KL(detached F || R), averaged
+Text selection defaults to FP32 full-vocabulary student-to-reference KL at
+temperature 2, centered within each sample, rho 0.3–0.5, text cap 0.3,
+fallback 0.1 and image cap 0. To select by student entropy instead, pass
+`--stage1-v3-selector entropy` to the coordinator/launcher, or
+`--stage1_v3_selector entropy` to the training CLI; `kl` selects the default.
+The option is valid only for Stage1-v3. Entropy uses existing gain-clean query
+logits: `p = softmax(logits / 2)`, `H = -sum(p * log(p))`, then
+`u = -log(max(H, 0) + 1e-6)` and the same sample-centered sigmoid/rho mapping.
+Lower entropy within a sample means more prior text is blocked; singleton or
+equal-entropy queries use the rho midpoint. Attention ranking, deterministic
+ties, caps and low-mass fallback are shared by both modes. Entropy measures
+student uncertainty rather than reference disagreement; no accuracy
+equivalence or improvement has been established.
+
+In both modes the ordinary loss adds temperature-2 KL(detached F || R), averaged
 by query within each valid sample then across samples. Its weight rises to
 0.01 over ceil(0.05 × planned updates).
 
@@ -41,9 +53,14 @@ step, alpha=0.001 times the direction is added to FP32 master parameters and
 synchronized to BF16; Adam moments remain unchanged by this addition.
 An engine-skipped step clears the auxiliary window without applying Gain.
 
-Core execution is F once, gain-clean once, frozen reference once and one packed
-R/RV decoder call. Helper work and checkpoint recomputation are counted
-separately. Joint two-lane R/KL VJP and a separate RV VJP preserve attached
+With valid auxiliary blocks, KL selection executes F once, gain-clean once,
+frozen reference once and one packed R/RV decoder call. Entropy selection
+omits only that reference call: three core calls, or four including the
+one helper-teacher decoder forward at the default microbatch 1 (KL: five).
+Checkpoint layer recomputation and separate helper-image vision encoder calls
+are additional. The packed call contains two branches per valid block, so
+the call count is not a measured compute or speed ratio.
+Joint two-lane R/KL VJP and a separate RV VJP preserve attached
 prefix gradients and original sample/token dropout identity. No valid blocks
 means ordinary F/helper execution with zero auxiliary work.
 
@@ -85,12 +102,16 @@ ordinary loss denominator. Gain instead divides by its actual global B.
 The implementation does not import Stage 2 padding semantics or historical
 431/212 update budgets.
 
-`stage1_v3.json` records configuration/formula IDs, resolved profile and package
+`stage1_v3.json` records configuration/formula IDs (including the text selector), resolved profile and package
 versions, frozen teacher content identity, retained source identity, sampler
 settings, planned updates and remainder. Existing optimizer, scheduler, RNG
 and EMA files remain authoritative. Only a complete nonfailed boundary may
 be saved. Resume inherits the saved variant/profile when omitted; explicit
-conflicts and historical standard→v3 reinterpretation are rejected. Both
+conflicts and historical standard→v3 reinterpretation are rejected. An omitted
+selector inherits the saved mode. Older v3 contracts without a selector field
+retain KL semantics; their files are not rewritten. Explicit KL↔entropy
+switches or inconsistent selector/formula metadata fail before training;
+changing modes requires a fresh run. Both
 nodes receive identical contract bytes through the existing checkpoint
 collection/redistribution route. Use a fresh coordinator `--attempt-id` when
 resuming and preserve the run ID.

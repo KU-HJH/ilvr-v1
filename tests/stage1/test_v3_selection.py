@@ -50,3 +50,57 @@ def test_selector_uses_full_vocabulary_student_to_reference_kl_and_sample_center
 def test_selector_rejects_invalid_attention(bad):
     with pytest.raises(ValueError, match='attention'):
         select((block(),), {(0,21):torch.tensor([bad]+[.01]*9)})
+
+
+@pytest.mark.parametrize('first_two,expected_low', [(.41, (2,3,4)), (.43, (2,3))])
+def test_entropy_selector_uses_temperature_and_full_vocabulary_without_reference(first_two, expected_low):
+    # At T=2, H(.8,.1,.1)=.6390 and H(uniform)=1.0986, giving
+    # rho_low=.4134 and rho_high=.3866. T=1 instead gives rho_low>.43.
+    student = torch.zeros(2,40,3, requires_grad=True)
+    with torch.no_grad():
+        student[0,21] = 2*torch.tensor([.8,.1,.1]).log()
+    weights = torch.tensor([first_two/2]*2+[.2]+[(1-first_two-.2)/7]*7, requires_grad=True)
+    rows = {key:weights for key in ((0,21),(0,22),(1,21))}
+    chosen = importlib.import_module('stage1.v3_selection').select_text_keys(
+        (block(targets=(22,23)),block(row=1)), rows, student, None,
+        Stage1V3Config(text_selector='entropy'))
+    assert chosen == {(0,21):expected_low, (0,22):(2,3), (1,21):(2,3)}
+    assert student.grad is None and weights.grad is None
+
+
+def test_entropy_selector_does_not_replace_full_vocabulary_with_gt_probability():
+    student = torch.zeros(2,40,3)
+    student[0,21] = 2*torch.tensor([.8,.1,.1]).log()
+    student[0,22] = 2*torch.tensor([.45,.1,.45]).log()
+    # Same probability for GT id1, different entropy. rho straddles .4.
+    b = V3Block(0,1,18,21,(22,23),(1,1),tuple(range(2,12)))
+    rows = {key:torch.tensor([.2,.2,.2]+[.4/7]*7) for key in ((0,21),(0,22))}
+    assert importlib.import_module('stage1.v3_selection').select_text_keys(
+        (b,), rows, student, None, Stage1V3Config(text_selector='entropy')) == {
+            (0,21):(2,3,4), (0,22):(2,3)}
+
+
+@pytest.mark.parametrize('weights,expected', [([.03]*10,(2,3,4)),([.009]*10,(2,)),([0.]*10,(2,))])
+def test_entropy_selector_preserves_equal_entropy_caps_and_low_mass_fallback(weights, expected):
+    student = torch.zeros(2,40,3)
+    # Extreme finite logits yield zero entropy; inverse-log epsilon stays finite.
+    student[...,0] = 10000
+    assert importlib.import_module('stage1.v3_selection').select_text_keys(
+        (block(),), {(0,21):torch.tensor(weights)}, student, None,
+        Stage1V3Config(text_selector='entropy')) == {(0,21):expected}
+
+
+@pytest.mark.parametrize('bad', [float('nan'),float('inf'),-float('inf')])
+def test_entropy_selector_rejects_nonfinite_student_scores(bad):
+    student = torch.zeros(2,40,3)
+    student[0,21,0] = bad
+    with pytest.raises(ValueError, match='entropy|finite'):
+        importlib.import_module('stage1.v3_selection').select_text_keys(
+            (block(),), {(0,21):torch.tensor([.03]*10)}, student, None,
+            Stage1V3Config(text_selector='entropy'))
+
+
+@pytest.mark.parametrize('bad', ['unknown',None,True])
+def test_selector_config_rejects_unknown_modes(bad):
+    with pytest.raises(ValueError, match='selector'):
+        Stage1V3Config(text_selector=bad)

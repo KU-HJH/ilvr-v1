@@ -635,7 +635,8 @@ def build_stage1_training_components(
     if v3_enabled:
         from .v3_config import Stage1V3Config
         saved = getattr(args, "stage1_v3_saved_contract", None)
-        v3_kwargs["v3_config"] = Stage1V3Config(**saved["config"]) if saved else Stage1V3Config()
+        v3_kwargs["v3_config"] = (Stage1V3Config(**saved["config"]) if saved
+                                 else Stage1V3Config(text_selector=args.stage1_v3_selector))
     collator = dependencies.collator_factory(processor, token_ids, args.latent_size,
         **({"v3_enabled": True} if v3_enabled else {}))
     trainer = dependencies.trainer_factory(

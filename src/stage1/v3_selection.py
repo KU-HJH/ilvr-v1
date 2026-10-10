@@ -11,10 +11,12 @@ from .v3_objective import QueryKey
 
 @torch.no_grad()
 def select_text_keys(blocks: tuple[V3Block, ...], attention: Mapping[QueryKey, Tensor],
-                     student_logits: Tensor, reference_logits: Tensor,
+                     student_logits: Tensor, reference_logits: Tensor | None,
                      config: Stage1V3Config) -> dict[QueryKey, tuple[int, ...]]:
-    if student_logits.ndim != 3 or student_logits.shape != reference_logits.shape:
-        raise ValueError('selector logits must have matching [B,T,V] shape')
+    if student_logits.ndim != 3:
+        raise ValueError('selector student logits must have [B,T,V] shape')
+    if config.text_selector == 'kl' and (reference_logits is None or student_logits.shape != reference_logits.shape):
+        raise ValueError('KL selector logits must have matching [B,T,V] shape')
     keys = tuple((b.batch_index,q) for b in blocks for q in b.query_positions)
     if len(set(keys)) != len(keys):
         raise ValueError('duplicate selector query ownership')
@@ -22,10 +24,13 @@ def select_text_keys(blocks: tuple[V3Block, ...], attention: Mapping[QueryKey, T
         return {}
     rows, queries = zip(*keys)
     p = (student_logits[rows,queries].float()/config.temperature).log_softmax(-1)
-    r = (reference_logits[rows,queries].float()/config.temperature).log_softmax(-1)
-    d = config.temperature**2 * (p.exp()*(p-r)).sum(-1)
+    if config.text_selector == 'entropy':
+        d = -(p.exp()*p).sum(-1)
+    else:
+        r = (reference_logits[rows,queries].float()/config.temperature).log_softmax(-1)
+        d = config.temperature**2 * (p.exp()*(p-r)).sum(-1)
     if not torch.isfinite(d).all():
-        raise ValueError('nonfinite selector KL')
+        raise ValueError('nonfinite selector '+config.text_selector)
     u = -(d.clamp_min(0)+1e-6).log()
     rhos = {}
     for sample in sorted(set(rows)):

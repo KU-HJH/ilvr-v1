@@ -7,6 +7,7 @@ import math
 class Stage1V3Config:
     schema_version: int = 1
     objective: str = "text_only_gain_v1"
+    text_selector: str = "kl"
     gain_alpha: float = .001
     min_h_norm_sq: float = 1e-30
     text_kl_beta: float = .01
@@ -27,8 +28,10 @@ class Stage1V3Config:
             raise ValueError("unsupported Stage1-v3 schema")
         if self.objective != "text_only_gain_v1":
             raise ValueError("unsupported Stage1-v3 objective")
+        if type(self.text_selector) is not str or self.text_selector not in ("kl", "entropy"):
+            raise ValueError("Stage1-v3 text selector must be kl or entropy")
         for name, value in asdict(self).items():
-            if name in ("schema_version", "objective"):
+            if name in ("schema_version", "objective", "text_selector"):
                 continue
             if type(value) not in (int, float) or not math.isfinite(value):
                 raise ValueError(f"Stage1-v3 {name} must be finite numeric")

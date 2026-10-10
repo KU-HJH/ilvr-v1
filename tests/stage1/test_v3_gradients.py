@@ -20,7 +20,8 @@ def api(): return importlib.import_module('stage1.v3_gradients')
 @pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
 @pytest.mark.parametrize('p',[0.,.05])
 @pytest.mark.parametrize('mode',['off','early','full'])
-def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkeypatch,tied=False,fault=False):
+@pytest.mark.parametrize('selector',['kl','entropy'])
+def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkeypatch,selector,tied=False,fault=False):
     module = api()
     model = build_stage1_tuned_model(tiny_qwen.__wrapped__(),tuning('dora',dropout=.05),(125,126,127)).to(dtype)
     qwen = resolve_qwen2_5_vl_model(model)
@@ -84,9 +85,10 @@ def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkey
             with monkeypatch.context() as patch:
                 patch.setattr(torch.autograd,'grad',counted)
                 result = module.compute_v3_gradients(model,reference,inputs,V3BatchMetadata(blocks),f,
-                                                    parameters,Stage1V3Config(),life)
+                                                    parameters,Stage1V3Config(text_selector=selector),life)
             assert arities == [2,1]
-            assert calls == ['F','gain_clean','reference','packed_replay']
+            assert calls == (['F','gain_clean','reference','packed_replay'] if selector=='kl'
+                             else ['F','gain_clean','packed_replay'])
             assert result.block_count == 2
             assert all(p.grad is old and torch.equal(old,value) for p,old,value in zip(parameters,old_grads,old_values))
             assert f.grad is None and helper.grad is None
@@ -157,6 +159,6 @@ def test_no_valid_blocks_has_no_auxiliary_forward_or_vjp(monkeypatch):
 
 @pytest.mark.parametrize('mode',['early','full'])
 def test_tied_unused_parameter_and_peft_exception_cleanup(monkeypatch,mode):
-    test_joint_vjp_preserves_optimizer_grads_and_call_budget(torch.float32,.05,mode,monkeypatch,tied=True)
+    test_joint_vjp_preserves_optimizer_grads_and_call_budget(torch.float32,.05,mode,monkeypatch,'kl',tied=True)
     with pytest.raises(RuntimeError,match='injected PEFT RV failure'):
-        test_joint_vjp_preserves_optimizer_grads_and_call_budget(torch.float32,.05,mode,monkeypatch,tied=True,fault=True)
+        test_joint_vjp_preserves_optimizer_grads_and_call_budget(torch.float32,.05,mode,monkeypatch,'kl',tied=True,fault=True)

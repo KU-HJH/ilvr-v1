@@ -24,14 +24,15 @@ def test_fresh_profile_overrides_stale_coefficients_and_execution_values():
     assert args.model.endswith('Qwen2.5-VL-3B-Instruct')
 
 
-def saved(tmp_path):
+def saved(tmp_path,selector='kl',legacy=False):
     module=importlib.import_module('stage1.v3_resume')
     profile=dict(module.V3_FRESH_PROFILE,frozen_teacher_sha256='a'*64)
     # A supported saved coefficient is authoritative on resume.
     profile['ce_weight']=.2
     schedule=module.build_v3_schedule_identity(retained_ids=('a','b'),sampler_identity={'world_size':4},
         microsteps_per_rank=6,accumulation_steps=4)
-    contract=module.build_v3_checkpoint_contract(Stage1V3Config(),schedule,profile)
+    contract=module.build_v3_checkpoint_contract(Stage1V3Config(text_selector=selector),schedule,profile)
+    if legacy:contract['config'].pop('text_selector')
     path=tmp_path/'checkpoint-1';path.mkdir()
     (path/'stage1_v3.json').write_text(json.dumps(contract))
     return path,contract
@@ -75,13 +76,14 @@ def test_coordinator_allowlist_and_launcher_enforce_fresh_profile_without_writes
     assert Path(words[words.index('--deepspeed_config')+1]).name=='deepspeed_zero1.json'
 
 
-def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monkeypatch):
+@pytest.mark.parametrize('selector',['kl','entropy'])
+def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monkeypatch,selector):
     from dataclasses import replace
     from types import SimpleNamespace
     from tests.stage1.test_composition import stage1_args,fake_dependencies
     import stage1.composition as composition
     import stage1.v3_resume as resume
-    args=stage1_args(tmp_path,'--stage1_variant','v3')
+    args=stage1_args(tmp_path,'--stage1_variant','v3','--stage1_v3_selector',selector)
     events=[];deps,_,_,_=fake_dependencies(events)
     seen={}
     def collator(*a,**kw):seen['collator']=kw;return object()
@@ -94,5 +96,80 @@ def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monk
         deepspeed_runtime_profile=__import__('deepspeed_runtime').load_deepspeed_runtime_profile(args.deepspeed_config,world_size=4))
     assert seen['collator']=={'v3_enabled':True}
     assert isinstance(seen['trainer']['v3_config'],Stage1V3Config)
+    assert seen['trainer']['v3_config'].text_selector==selector
     assert seen['trainer']['ce_weight']==.1 and seen['trainer']['ema_tau']==1.
     assert seen['identity'][1] is args
+
+
+def test_cli_default_and_explicit_entropy_preserve_training_profile():
+    default=parse_args(['--stage1_variant','v3'])
+    entropy=parse_args(['--stage1_variant','v3','--stage1_v3_selector','entropy'])
+    assert default.stage1_v3_selector=='kl' and entropy.stage1_v3_selector=='entropy'
+    for name in importlib.import_module('stage1.v3_resume').V3_FRESH_PROFILE:
+        assert getattr(default,name)==getattr(entropy,name)
+
+
+@pytest.mark.parametrize('extra', [[],['--stage1_variant','standard'],['--stage','stage2']])
+def test_selector_is_rejected_outside_v3(extra):
+    with pytest.raises(ValueError,match='selector|Stage1-v3'):
+        parse_args([*extra,'--stage1_v3_selector','entropy'])
+
+
+@pytest.mark.parametrize('selector,legacy', [('kl',False),('entropy',False),('kl',True)])
+def test_resume_inherits_selector_and_rejects_explicit_mode_switch(tmp_path,selector,legacy):
+    checkpoint,contract=saved(tmp_path,selector,legacy)
+    common=['--resume_from_checkpoint_path',str(checkpoint)]
+    args=parse_args(common)
+    assert args.stage1_v3_selector==selector and args.stage1_v3_saved_contract==contract
+    assert parse_args([*common,'--stage1_v3_selector',selector]).stage1_v3_selector==selector
+    opposite='kl' if selector=='entropy' else 'entropy'
+    with pytest.raises(ValueError,match='selector|mismatch'):
+        parse_args([*common,'--stage1_v3_selector',opposite])
+
+
+@pytest.mark.parametrize('selector,resumed', [('kl',False),('entropy',False),('entropy',True)])
+def test_launcher_passes_selector_to_worker_argv(tmp_path,selector,resumed):
+    extra=['--stage1-variant','v3','--stage1-v3-selector',selector]
+    if resumed:
+        checkpoint,_=saved(tmp_path,selector)
+        extra=['--resume',str(checkpoint)]
+    env=dict(os.environ,ILVR_NUM_MACHINES='2',ILVR_NUM_PROCESSES='4',ILVR_MACHINE_RANK='1',
+        ILVR_MAIN_PROCESS_IP='10.1.102.41',ILVR_MAIN_PROCESS_PORT='29579',ILVR_SOCKET_IFNAME='bond1.102')
+    env.pop('STAGE1_VARIANT',None)
+    result=subprocess.run([str(ROOT/'run_stage1_training.sh'),'--dry-run','--method','dora',
+        '--model','models/Qwen2.5-VL-3B-Instruct','--data-path',str(ROOT/'data/TRAIN.jsonl'),
+        '--image-root',str(ROOT/'data/images'),'--output-dir',str(ROOT/'checkpoints/v3-entropy-dry'),*extra],
+        env=env,cwd=ROOT,text=True,capture_output=True)
+    assert result.returncode==0,result.stderr
+    argv=shlex.split(result.stdout)
+    assert argv[argv.index('--stage1_v3_selector')+1]==selector
+    assert argv[argv.index('--stage1_variant')+1]=='v3'
+
+
+@pytest.mark.parametrize('selector',['entropy','unknown'])
+def test_launcher_rejects_selector_without_v3_before_launch(selector):
+    result=subprocess.run([str(ROOT/'run_stage1_training.sh'),'--dry-run',
+        '--stage1-v3-selector',selector],env={**os.environ,'STAGE1_VARIANT':'standard'},
+        cwd=ROOT,text=True,capture_output=True)
+    assert result.returncode!=0 and ('selector' in result.stderr or 'unrecognized' in result.stderr)
+
+
+@pytest.mark.parametrize('inline',[False,True])
+def test_coordinator_normalizes_selector_and_preserves_resume_mode(tmp_path,inline):
+    from src.multinode_runtime import validate_stage1_arguments
+    from stage1.v3_resume import resolve_coordinator_arguments
+    flags=('--stage1-variant=v3','--stage1-v3-selector=entropy') if inline else (
+        '--stage1-variant','v3','--stage1-v3-selector','entropy')
+    resolved=resolve_coordinator_arguments(validate_stage1_arguments(flags),tmp_path/'out')
+    assert resolved[resolved.index('--stage1-v3-selector')+1]=='entropy'
+    checkpoint,_=saved(tmp_path,'entropy')
+    resumed=resolve_coordinator_arguments(('--resume',str(checkpoint)),tmp_path/'out')
+    assert resumed[resumed.index('--stage1-v3-selector')+1]=='entropy'
+    with pytest.raises(ValueError,match='selector|mismatch'):
+        resolve_coordinator_arguments(('--resume',str(checkpoint),'--stage1-v3-selector','kl'),tmp_path/'out')
+
+
+def test_coordinator_rejects_selector_without_v3(tmp_path):
+    from stage1.v3_resume import resolve_coordinator_arguments
+    with pytest.raises(ValueError,match='selector|Stage1-v3'):
+        resolve_coordinator_arguments(('--stage1-v3-selector','entropy'),tmp_path)

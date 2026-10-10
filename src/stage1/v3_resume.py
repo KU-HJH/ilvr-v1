@@ -32,6 +32,21 @@ def _canonical(value):
     return json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
 
 
+def _formula_ids(config):
+    formulas=dict(FORMULAS)
+    if config.text_selector=='entropy':
+        formulas['selector']='T2_entropy_student_sample_centered_full_causal_v1'
+    return formulas
+
+
+def _contract_identity(value):
+    # Only the additive selector field has a legacy default; never fill other
+    # missing fields or mutate/rewrite the original saved contract.
+    normalized=dict(value,config=dict(value['config']))
+    normalized['config'].setdefault('text_selector','kl')
+    return _canonical(normalized)
+
+
 @dataclass(frozen=True)
 class V3ScheduleIdentity:
     retained_ids_sha256: str
@@ -61,7 +76,7 @@ def build_v3_checkpoint_contract(config: Stage1V3Config,schedule: V3ScheduleIden
     teacher=profile.get('frozen_teacher_sha256')
     if not isinstance(teacher,str) or len(teacher)!=64 or any(c not in '0123456789abcdef' for c in teacher):
         raise ValueError('v3 checkpoint requires frozen teacher content identity')
-    return dict(schema_version=1,variant='v3',config=config.to_dict(),formula_ids=dict(FORMULAS),
+    return dict(schema_version=1,variant='v3',config=config.to_dict(),formula_ids=_formula_ids(config),
                 schedule=asdict(schedule),planned_steps=schedule.planned_steps,profile=profile,
                 frozen_teacher_sha256=teacher,boundary='complete')
 
@@ -69,14 +84,15 @@ def build_v3_checkpoint_contract(config: Stage1V3Config,schedule: V3ScheduleIden
 def _validate_contract(value):
     fields={'schema_version','variant','config','formula_ids','schedule','planned_steps','profile','frozen_teacher_sha256','boundary'}
     if (not isinstance(value,Mapping) or set(value)!=fields or type(value['schema_version']) is not int
-            or value['schema_version']!=1 or value['variant']!='v3' or value['boundary']!='complete'
-            or value['formula_ids']!=FORMULAS):
+            or value['schema_version']!=1 or value['variant']!='v3' or value['boundary']!='complete'):
         raise ValueError('unsupported or incomplete v3 resume identity')
     try:
         config=Stage1V3Config(**value['config'])
         schedule=V3ScheduleIdentity(**value['schedule'])
     except (TypeError, ValueError) as error:
         raise ValueError('invalid v3 resume config/schedule') from error
+    if value['formula_ids']!=_formula_ids(config):
+        raise ValueError('v3 resume selector/formula mismatch')
     if (not isinstance(schedule.retained_ids_sha256,str) or len(schedule.retained_ids_sha256)!=64
             or any(c not in '0123456789abcdef' for c in schedule.retained_ids_sha256)
             or type(schedule.sampler_identity) is not dict
@@ -88,13 +104,13 @@ def _validate_contract(value):
             or schedule.planned_steps!=schedule.updates_per_epoch
             or schedule.remainder_microsteps!=schedule.microsteps_per_rank%schedule.accumulation_steps):
         raise ValueError('inconsistent v3 resume remainder/budget')
-    if _canonical(value)!=_canonical(build_v3_checkpoint_contract(config,schedule,value['profile'])):
+    if _contract_identity(value)!=_canonical(build_v3_checkpoint_contract(config,schedule,value['profile'])):
         raise ValueError('inconsistent v3 resume contract')
 
 
 def validate_v3_resume(saved: Mapping[str,object],requested: Mapping[str,object]) -> None:
     _validate_contract(saved);_validate_contract(requested)
-    if _canonical(saved)!=_canonical(requested):raise ValueError('v3 resume objective/profile/schedule mismatch')
+    if _contract_identity(saved)!=_contract_identity(requested):raise ValueError('v3 resume objective/profile/schedule mismatch')
 
 
 def read_v3_contract(checkpoint: str|Path):
@@ -116,8 +132,10 @@ def resolve_v3_arguments(args,raw_argv):
     explicit={item.split('=',1)[0][2:] for item in raw_argv if item.startswith('--')}
     args.stage1_v3_explicit=explicit
     variant=getattr(args,'stage1_variant',None)
+    selector=getattr(args,'stage1_v3_selector',None)
     if args.stage!='stage1':
         if variant is not None:raise ValueError('stage1_variant is only valid for Stage 1')
+        if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
         return
     checkpoint=getattr(args,'resume_from_checkpoint_path',None)
     if checkpoint is None:
@@ -130,7 +148,13 @@ def resolve_v3_arguments(args,raw_argv):
         raise ValueError('stage1 variant resume mismatch; historical checkpoints cannot become v3')
     args.stage1_variant=variant or inherited
     args.stage1_v3_saved_contract=saved
-    if args.stage1_variant!='v3':return
+    if args.stage1_variant!='v3':
+        if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
+        return
+    saved_selector=Stage1V3Config(**saved['config']).text_selector if saved else 'kl'
+    if saved and selector is not None and selector!=saved_selector:
+        raise ValueError('v3 resume text selector mismatch; changing modes requires a fresh run')
+    args.stage1_v3_selector=selector or saved_selector
     profile=dict(V3_FRESH_PROFILE) if saved is None else saved['profile']
     for key in V3_FRESH_PROFILE:
         if key not in profile:raise ValueError('v3 resume profile missing '+key)
@@ -224,7 +248,7 @@ def attach_v3_identity(trainer,args,dataset,checkpoint=None):
 LAUNCHER_ALIASES={'--method':'tuning_method','--model':'model','--epochs':'epochs','--learning-rate':'learning_rate',
     '--ce-weight':'ce_weight','--gradient-accumulation':'gradient_accumulation_steps','--micro-batch':'per_device_train_batch_size',
     '--ema-tau':'ema_tau','--seed':'seed','--deepspeed-config':'deepspeed_config','--attention-implementation':'attention_implementation',
-    '--textual_states':'textual_states','--max-steps':'max_steps'}
+    '--textual_states':'textual_states','--max-steps':'max_steps','--stage1-v3-selector':'stage1_v3_selector'}
 
 
 def resolve_coordinator_arguments(arguments,output):
@@ -237,7 +261,9 @@ def resolve_coordinator_arguments(arguments,output):
     variant=values.get('--stage1-variant') or os.environ.get('STAGE1_VARIANT')
     checkpoint=values.get('--resume')
     has_saved=checkpoint is not None and (Path(checkpoint)/FILENAME).is_file()
-    if variant!='v3' and not has_saved:return arguments
+    if variant!='v3' and not has_saved:
+        if '--stage1-v3-selector' in values:raise ValueError('stage1-v3-selector is only valid for Stage1-v3')
+        return arguments
     argv=['--stage','stage1','--save_model_path',str(output)]
     if variant:argv+=['--stage1_variant',variant]
     if checkpoint:argv+=['--resume_from_checkpoint_path',checkpoint]
@@ -279,7 +305,9 @@ def _launcher_main():
             argv+=['--'+LAUNCHER_ALIASES[item],options.original[i+1]]
     args=parse_args(argv)
     values={'stage1_variant':args.stage1_variant}
-    if args.stage1_variant=='v3':values.update({name:getattr(args,name) for name in V3_FRESH_PROFILE})
+    if args.stage1_variant=='v3':
+        values.update({name:getattr(args,name) for name in V3_FRESH_PROFILE})
+        values['stage1_v3_selector']=args.stage1_v3_selector
     import sys
     for name,value in values.items():
         sys.stdout.write(name+'\0'+(str(value).lower() if isinstance(value,bool) else str(value))+'\0')

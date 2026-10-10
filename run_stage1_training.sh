@@ -43,6 +43,7 @@ if (( $# )) && [[ $1 == --manifest ]]; then
 fi
 
 stage1_variant=${STAGE1_VARIANT:-}
+stage1_v3_selector=
 original_launch_arguments=("$@")
 method=${STAGE1_METHOD:-}
 model=${STAGE1_MODEL:-}
@@ -160,6 +161,7 @@ require_value() {
 while (( $# )); do
     case $1 in
         --stage1-variant) require_value "$@"; stage1_variant=$2; shift 2 ;;
+        --stage1-v3-selector) require_value "$@"; stage1_v3_selector=$2; shift 2 ;;
         --method) require_value "$@"; method=$2; shift 2 ;;
         --model) require_value "$@"; model=$2; shift 2 ;;
         --data-path) require_value "$@"; data_path=$2; shift 2 ;;
@@ -195,7 +197,7 @@ while (( $# )); do
 done
 
 v3_profile_arguments=()
-if [[ -n $stage1_variant || -f $resume_path/stage1_v3.json ]]; then
+if [[ -n $stage1_variant || -n $stage1_v3_selector || -f $resume_path/stage1_v3.json ]]; then
     profile_values=()
     mapfile -d '' -t profile_values < <(
         PYTHONPATH="$script_dir/transformers/src:$script_dir/src:$script_dir" "$repository_python" -m src.stage1.v3_resume \

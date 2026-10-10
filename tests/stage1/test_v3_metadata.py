@@ -109,7 +109,7 @@ def test_v3_config_rejects_invalid_or_unimplemented_semantics(change):
 def test_v3_config_has_approved_coefficients_and_immutable_identity():
     config = importlib.import_module('stage1.v3_config').Stage1V3Config()
     config.validate()
-    assert config.to_dict() == dict(schema_version=1, objective='text_only_gain_v1',
+    assert config.to_dict() == dict(schema_version=1, objective='text_only_gain_v1', text_selector='kl',
         gain_alpha=.001, min_h_norm_sq=1e-30, text_kl_beta=.01, text_kl_warmup_ratio=.05,
         temperature=2., rho_min=.3, rho_max=.5, text_cap=.3, low_mass_threshold=.1,
         low_mass_ratio=.1, image_cap=0.)
