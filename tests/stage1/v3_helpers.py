@@ -78,3 +78,24 @@ def source_example(items, *, source_index=17):
 def source_collator(*, enabled=False, processor=None):
     kwargs = {'v3_enabled': True} if enabled else {}
     return Stage1DataCollator(processor or SourceProcessor(), TOKENS, latent_size=3, **kwargs)
+
+
+def replay_qwen(dtype, p):
+    """Two-layer real Qwen decoder, with a stable dropout at each Q projection."""
+    from copy import deepcopy
+    import torch
+    from torch import nn
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLModel
+    from tests.stage1.test_peft import tiny_qwen
+    from stage1.equivalence import SampleStableStage1Dropout
+    base = tiny_qwen.__wrapped__()
+    config = deepcopy(base.config)
+    config.num_hidden_layers = 2
+    config._attn_implementation = 'sdpa'
+    decoder = Qwen2_5_VLModel(config).to(dtype)
+    sites = []
+    for i,layer in enumerate(decoder.layers):
+        site = f'model.layers.{i}.self_attn.q_proj.lora_dropout.default'
+        layer.self_attn.q_proj = nn.Sequential(SampleStableStage1Dropout(site,p),layer.self_attn.q_proj)
+        sites.append(site)
+    return decoder, base.lm_head.to(dtype), tuple(sites)

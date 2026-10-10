@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
+from .stage1_v3_trace import v3_decoder_forward
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1480,6 +1482,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    @v3_decoder_forward
     def forward(
         self,
         input_ids: torch.LongTensor = None,

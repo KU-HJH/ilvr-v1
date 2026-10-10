@@ -863,6 +863,10 @@ class SampleStableStage1Dropout(torch.nn.Module):
 
         v3 = current_v3_lifecycle()
         if v3 is not None:
+            from transformers.models.qwen2_5_vl.stage1_v3_trace import packed_dropout_output
+            packed = packed_dropout_output(self.site_name, self.p, x)
+            if packed is not None:
+                return packed
             return v3.native_dropout(self.site_name, self.p, x)
         if self.p == 0.0 and _STAGE1_STOCHASTIC_CONTEXT.get() is None:
             return x

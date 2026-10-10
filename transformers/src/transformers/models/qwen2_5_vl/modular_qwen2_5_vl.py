@@ -22,6 +22,8 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
+from .stage1_v3_trace import v3_decoder_forward
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -381,7 +383,9 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
 
 
 class Qwen2_5_VLModel(Qwen2VLModel):
-    pass
+    @v3_decoder_forward
+    def forward(self, *args, **kwargs):
+        return super().forward(*args, **kwargs)
 
 
 @dataclass
