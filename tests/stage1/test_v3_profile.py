@@ -19,6 +19,7 @@ def test_fresh_profile_overrides_stale_coefficients_and_execution_values():
     assert (args.ce_weight,args.ema_tau,args.epochs,args.gradient_accumulation_steps)==(.1,1.,1.,4)
     assert args.learning_rate==5e-5 and args.warm_up_steps==10 and args.seed==42
     assert args.attention_implementation=='sdpa' and args.gradient_checkpointing
+    assert args.vision_attention_implementation=='flash_attention_2'
     assert Path(args.deepspeed_config).name=='deepspeed_zero1.json'
     assert (args.tuning_method,args.lora_r,args.lora_alpha,args.lora_dropout,args.latent_size)==('dora',32,64,.05,8)
     assert args.model.endswith('Qwen2.5-VL-3B-Instruct')
@@ -71,7 +72,8 @@ def test_coordinator_allowlist_and_launcher_enforce_fresh_profile_without_writes
     assert result.returncode==0,result.stderr
     words=shlex.split(result.stdout)
     for key,value in {'stage1_variant':'v3','epochs':'1','ce_weight':'0.1','ema_tau':'1.0',
-                      'gradient_accumulation_steps':'4','attention_implementation':'sdpa'}.items():
+                      'gradient_accumulation_steps':'4','attention_implementation':'sdpa',
+                      'vision_attention_implementation':'flash_attention_2'}.items():
         assert words[words.index('--'+key)+1]==value
     assert Path(words[words.index('--deepspeed_config')+1]).name=='deepspeed_zero1.json'
 
@@ -85,6 +87,15 @@ def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monk
     import stage1.v3_resume as resume
     args=stage1_args(tmp_path,'--stage1_variant','v3','--stage1_v3_selector',selector)
     events=[];deps,_,_,_=fake_dependencies(events)
+    # This fixture isolates composition metadata, not CUDA availability. The
+    # separate real-Qwen regression authenticates the concrete backend pair.
+    original_config=deps.load_config
+    def load_config(*a,**kw):
+        config=original_config(*a,**kw);config.vision_config=SimpleNamespace()
+        return config
+    monkeypatch.setattr(composition.Qwen2_5_VLForConditionalGeneration,
+        '_check_and_enable_flash_attn_2',lambda config,**kw:config)
+    deps=replace(deps,load_config=load_config)
     seen={}
     def collator(*a,**kw):seen['collator']=kw;return object()
     original=deps.trainer_factory
@@ -173,3 +184,48 @@ def test_coordinator_rejects_selector_without_v3(tmp_path):
     from stage1.v3_resume import resolve_coordinator_arguments
     with pytest.raises(ValueError,match='selector|Stage1-v3'):
         resolve_coordinator_arguments(('--stage1-v3-selector','entropy'),tmp_path)
+
+
+@pytest.mark.parametrize('legacy',[False,True])
+def test_resume_preserves_saved_vision_and_rejects_backend_changes(tmp_path,legacy):
+    checkpoint,contract=saved(tmp_path)
+    if legacy:
+        contract['profile'].pop('vision_attention_implementation',None)
+        contract['profile']['vision_backend']='Qwen2_5_VLVisionSdpaAttention'
+        (checkpoint/'stage1_v3.json').write_text(json.dumps(contract))
+    common=['--resume_from_checkpoint_path',str(checkpoint)]
+    expected='sdpa' if legacy else 'flash_attention_2'
+    assert parse_args(common).vision_attention_implementation==expected
+    opposite='flash_attention_2' if legacy else 'sdpa'
+    with pytest.raises(ValueError,match='vision_attention_implementation.*mismatch'):
+        parse_args([*common,'--vision_attention_implementation',opposite])
+
+
+def test_legacy_vision_profile_identity_is_unchanged_when_reattached_and_saved(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    import torch
+    import peft_common
+    module=importlib.import_module('stage1.v3_resume')
+    teacher_state={'parameters':{'weight':torch.ones(1)}}
+    trainer=SimpleNamespace(model=object(),ema_teacher=SimpleNamespace(state_dict=lambda:teacher_state))
+    vision=type('Qwen2_5_VLVisionSdpaAttention',(),{})()
+    monkeypatch.setattr(peft_common,'resolve_qwen2_5_vl_model',lambda model:
+        SimpleNamespace(visual=SimpleNamespace(blocks=[SimpleNamespace(attn=vision)])))
+    args=parse_args(['--stage1_variant','v3'])
+    module.attach_v3_identity(trainer,args,['row'])
+    profile=dict(trainer.v3_resolved_profile)
+    profile.pop('vision_attention_implementation',None)
+    schedule=module.build_v3_schedule_identity(retained_ids=('0:0',),sampler_identity={'world_size':4},
+        microsteps_per_rank=1,accumulation_steps=4)
+    contract=module.build_v3_checkpoint_contract(Stage1V3Config(),schedule,profile)
+    checkpoint=tmp_path/'checkpoint-1';checkpoint.mkdir()
+    module.write_v3_contract(checkpoint,contract)
+    before=(checkpoint/module.FILENAME).read_bytes()
+    torch.save({'state':teacher_state},checkpoint/'stage1_ema_teacher.pt')
+    resumed=parse_args(['--resume_from_checkpoint_path',str(checkpoint)])
+    module.attach_v3_identity(trainer,resumed,['row'],checkpoint)
+    assert trainer.v3_resolved_profile==profile
+    requested=module.build_v3_checkpoint_contract(Stage1V3Config(),schedule,trainer.v3_resolved_profile)
+    module.validate_v3_resume(contract,requested)
+    module.write_v3_contract(checkpoint,requested)
+    assert (checkpoint/module.FILENAME).read_bytes()==before

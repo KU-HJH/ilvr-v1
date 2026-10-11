@@ -422,6 +422,22 @@ def validate_stage1_checkpoint_context(model: torch.nn.Module) -> None:
         )
 
 
+def _load_stage1_model(source, config, args, dependencies):
+    model_kwargs = dict(torch_dtype=torch.bfloat16, cache_dir=args.cache_dir,
+                        trust_remote_code=True)
+    if (getattr(args, "stage1_variant", None) == "v3"
+            and args.vision_attention_implementation != args.attention_implementation):
+        from stage2.attention_backend import load_qwen2_5_vl_with_attention
+        return load_qwen2_5_vl_with_attention(
+            source, attention_implementation=args.attention_implementation,
+            vision_attention_implementation=args.vision_attention_implementation,
+            load_config=lambda source, **kwargs: config,
+            load_model=dependencies.load_model, model_load_kwargs=model_kwargs,
+        )
+    return dependencies.load_model(source, config=config,
+        attn_implementation=args.attention_implementation, **model_kwargs)
+
+
 def build_stage1_training_components(
     args,
     *,
@@ -517,14 +533,7 @@ def build_stage1_training_components(
         _configure_latent_model(config, latent_ids, latent_size=args.latent_size)
         config.compress_strategy = args.compress_strategy
         config.use_cache = False
-        base_model = dependencies.load_model(
-            args.model,
-            config=config,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=args.attention_implementation,
-            cache_dir=args.cache_dir,
-            trust_remote_code=True,
-        )
+        base_model = _load_stage1_model(args.model, config, args, dependencies)
         base_model.resize_token_embeddings(resized_vocab_size)
         dependencies.validate_vocab_alignment(base_model, resized_vocab_size)
         if tuning.method != "full":
@@ -558,14 +567,7 @@ def build_stage1_training_components(
                 f"checkpoint={getattr(config, 'latent_size', None)}, "
                 f"requested={args.latent_size}"
             )
-        model = dependencies.load_model(
-            checkpoint,
-            config=config,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=args.attention_implementation,
-            cache_dir=args.cache_dir,
-            trust_remote_code=True,
-        )
+        model = _load_stage1_model(checkpoint, config, args, dependencies)
         model = dependencies.build_tuned_model(
             model, tuning, latent_ids, zero_stage=profile.zero_stage
         )
@@ -592,14 +594,7 @@ def build_stage1_training_components(
             requested_base_model_reference=args.model,
             metadata_snapshot=metadata_snapshot,
         )
-        base_model = dependencies.load_model(
-            args.model,
-            config=config,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=args.attention_implementation,
-            cache_dir=args.cache_dir,
-            trust_remote_code=True,
-        )
+        base_model = _load_stage1_model(args.model, config, args, dependencies)
         model = dependencies.load_peft_model(
             base_model,
             processor,

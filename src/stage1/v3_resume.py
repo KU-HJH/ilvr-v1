@@ -16,7 +16,7 @@ V3_FRESH_PROFILE=dict(model='Qwen/Qwen2.5-VL-3B-Instruct',tuning_method='dora',
     seed=42,warm_up_steps=10,ce_weight=.1,sim_weight=1.,ema_tau=1.,latent_size=8,
     lora_r=32,lora_alpha=64,lora_dropout=.05,
     lora_target_modules='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',
-    attention_implementation='sdpa',gradient_checkpointing=True,
+    attention_implementation='sdpa',vision_attention_implementation='flash_attention_2',gradient_checkpointing=True,
     deepspeed_config='configs/deepspeed_zero1.json',max_steps=-1,
     max_seq_length_train=32768,textual_states='previous')
 FORMULAS=dict(selector='T2_KL_student_reference_sample_centered_full_causal_v1',
@@ -155,7 +155,11 @@ def resolve_v3_arguments(args,raw_argv):
     if saved and selector is not None and selector!=saved_selector:
         raise ValueError('v3 resume text selector mismatch; changing modes requires a fresh run')
     args.stage1_v3_selector=selector or saved_selector
-    profile=dict(V3_FRESH_PROFILE) if saved is None else saved['profile']
+    profile=dict(V3_FRESH_PROFILE) if saved is None else dict(saved['profile'])
+    # Older v3 checkpoints used one backend for both towers. Preserve their
+    # execution and serialized identity rather than applying the fresh default.
+    if saved and 'vision_attention_implementation' not in profile:
+        profile['vision_attention_implementation']=profile.get('attention_implementation')
     for key in V3_FRESH_PROFILE:
         if key not in profile:raise ValueError('v3 resume profile missing '+key)
         value=profile[key]
@@ -172,8 +176,6 @@ def resolve_v3_arguments(args,raw_argv):
         setattr(args,key,value)
     args.tuning_method_explicit=True
     args.use_lora=False
-    # Stage1 currently selects its existing vision path from the decoder setting.
-    args.vision_attention_implementation=args.attention_implementation
 
 
 def retained_source_ids(dataset):
@@ -231,6 +233,8 @@ def attach_v3_identity(trainer,args,dataset,checkpoint=None):
     qwen=resolve_qwen2_5_vl_model(trainer.model)
     saved=getattr(args,'stage1_v3_saved_contract',None)
     profile={name:getattr(args,name) for name in V3_FRESH_PROFILE}
+    if saved and 'vision_attention_implementation' not in saved['profile']:
+        profile.pop('vision_attention_implementation')
     profile['model']=V3_FRESH_PROFILE['model']
     profile['deepspeed_config']='configs/'+Path(args.deepspeed_config).name
     profile.update(world_size=4,effective_global_batch=16,bf16=True,weight_decay=.01,

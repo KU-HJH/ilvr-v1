@@ -17,7 +17,7 @@ Fresh v3 uses the original Qwen2.5-VL-3B-Instruct base, DoRA r32/alpha64/dropout
 0.1, alignment weight 1, frozen EMA 1.0 and helper noise 0.01. Execution uses
 two nodes/four ranks, microbatch 1, accumulation 4, global batch 16, LR 5e-5,
 seed 42, warmup 10, BF16, AdamW/linear, weight decay 0.01, clipping 1.0,
-ZeRO-1 without offload, SDPA and the existing Stage 1 vision path,
+ZeRO-1 without offload, decoder SDPA and vision FlashAttention2,
 non-reentrant checkpointing, max sequence 32768 and zero data workers.
 The full profile is explicitly resolved after sourced environment settings.
 
