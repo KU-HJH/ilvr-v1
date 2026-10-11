@@ -27,6 +27,11 @@ class V3GainController:
     def accumulate(self,result: V3Gradients) -> None:
         if self.state not in ('IDLE','ACCUMULATING'):
             raise RuntimeError('Gain accumulation outside a valid update window')
+        # DeepSpeed places parameters after trainer construction. Align only
+        # before a new window; moving an open window must not erase its sums.
+        if self.state=='IDLE' and any(buffer.device!=parameter.device for buffer,parameter in
+                                     zip(self._r+self._rv,self.parameters+self.parameters)):
+            self._clear()
         self.state='ACCUMULATING'
         if (type(result.block_count) is not int or result.block_count<0
                 or len(result.r_sum_grads)!=len(self.parameters) or len(result.rv_sum_grads)!=len(self.parameters)):
