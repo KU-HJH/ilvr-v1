@@ -133,6 +133,54 @@ def test_v3_lifecycle_reuses_checkpoint_managers_for_two_vjps(dtype, p, mode):
                if phase == 'recompute' and graph != 'F')
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA autograd')
+@pytest.mark.parametrize('mode', ['early', 'full'])
+@pytest.mark.parametrize('fail_rv', [False, True])
+def test_cuda_checkpoint_vjps_keep_lifecycle_context_and_restore_dispatch(mode, fail_rv):
+    # Without scoped dispatch, CUDA recompute loses the activating ContextVars.
+    with torch.autograd.set_multithreading_enabled(True):
+        try:
+            with torch.device('cuda'):
+                if fail_rv:
+                    with pytest.raises(RuntimeError, match='injected RV recompute failure'):
+                        cycle(torch.float32, .05, mode, fail_rv=True)
+                else:
+                    life, observations, arities = cycle(torch.float32, .05, mode)
+                    assert life.state == 'CLOSED'
+                    assert arities == [2, 1]
+                    assert {(g, phase, role) for g, phase, role, _ in observations
+                            if phase == 'recompute'} == {
+                        ('F', 'recompute', 'ordinary'),
+                        ('gain_clean', 'recompute', 'joint_r_kl'),
+                        ('packed_replay', 'recompute', 'joint_r_kl'),
+                        ('gain_clean', 'recompute', 'rv'),
+                        ('packed_replay', 'recompute', 'rv'),
+                    }
+        finally:
+            assert torch.autograd.is_multithreading_enabled()
+
+
+@pytest.mark.parametrize('previous', [False, True])
+@pytest.mark.parametrize('failure', [False, True])
+def test_activation_serializes_backward_and_restores_previous_dispatch(previous, failure):
+    # Catches an unscoped global disable and restoration that always enables.
+    life = context(auxiliary=False)
+    with torch.autograd.set_multithreading_enabled(previous):
+        try:
+            with pytest.raises(RuntimeError, match='injected activation failure') if failure else nullcontext():
+                with life.activate():
+                    assert not torch.autograd.is_multithreading_enabled()
+                    if failure:
+                        raise RuntimeError('injected activation failure')
+                    originals(life)
+                    finish_roles(life)
+        finally:
+            assert torch.autograd.is_multithreading_enabled() is previous
+    assert life.state == ('FAILED' if failure else 'CLOSED')
+    assert api().current_v3_lifecycle() is None
+
+
 def test_zero_kl_still_has_both_auxiliary_traversals():
     assert cycle(torch.float32, .05, 'early', zero_kl=True)[2] == [2, 1]
 

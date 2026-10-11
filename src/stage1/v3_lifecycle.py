@@ -114,14 +114,18 @@ class V3Lifecycle:
         token = _ACTIVE.set(self)
         frame_token = _FRAME.set((None, None, None, None))
         try:
-            yield self
-            if self.state == "FAILED" or tuple(self._completed_backwards) != self._backwards:
-                self._error("incomplete v3 backward lifecycle")
-            expected = {(g, u, s, "original", None)
-                        for (g, u), sites in self.inventory.items() for s in sites}
-            if expected - self._site_visits:
-                self._error("missing v3 original stochastic site observations")
-            self.state = "CLOSED"
+            # CUDA engine worker threads do not inherit the ContextVars used
+            # by checkpoint recompute. Keep backward on the activating thread;
+            # the manager restores the caller's setting on every exit path.
+            with torch.autograd.set_multithreading_enabled(False):
+                yield self
+                if self.state == "FAILED" or tuple(self._completed_backwards) != self._backwards:
+                    self._error("incomplete v3 backward lifecycle")
+                expected = {(g, u, s, "original", None)
+                            for (g, u), sites in self.inventory.items() for s in sites}
+                if expected - self._site_visits:
+                    self._error("missing v3 original stochastic site observations")
+                self.state = "CLOSED"
         except BaseException:
             self.state = "FAILED"
             raise
