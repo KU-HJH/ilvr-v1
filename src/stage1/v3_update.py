@@ -20,6 +20,7 @@ class V3GainController:
         self._clear()
 
     def _clear(self):
+        # Primary lane: raw R for none, already-differenced Gain for weighted.
         self._r=tuple(torch.zeros_like(p,dtype=torch.float32) for p in self.parameters)
         self._rv=tuple(torch.zeros_like(p,dtype=torch.float32) for p in self.parameters)
         self._count=0;self._invalid=False;self.direction=()
@@ -33,11 +34,15 @@ class V3GainController:
                                      zip(self._r+self._rv,self.parameters+self.parameters)):
             self._clear()
         self.state='ACCUMULATING'
+        weighted=self.config.gain_weighting=='token_entropy'
+        primary=result.gain_sum_grads if weighted else result.r_sum_grads
         if (type(result.block_count) is not int or result.block_count<0
-                or len(result.r_sum_grads)!=len(self.parameters) or len(result.rv_sum_grads)!=len(self.parameters)):
+                or primary is None or len(primary)!=len(self.parameters)
+                or (result.r_sum_grads if weighted else result.gain_sum_grads) is not None
+                or len(result.rv_sum_grads)!=len(self.parameters)):
             self._invalid=True;return
         self._count+=result.block_count
-        for destination,source in zip(self._r+self._rv,result.r_sum_grads+result.rv_sum_grads):
+        for destination,source in zip(self._r+self._rv,primary+result.rv_sum_grads):
             if source.shape!=destination.shape or source.device!=destination.device or source.dtype!=torch.float32:
                 self._invalid=True;continue
             destination.add_(source.detach())
@@ -62,7 +67,9 @@ class V3GainController:
             try:
                 if self.global_block_count:
                     b=self.global_block_count
-                    self.direction=project_gain(tuple((a-h)/b for a,h in zip(r,rv)),tuple(h/b for h in rv),
+                    gain=(tuple(a/b for a in r) if self.config.gain_weighting=='token_entropy'
+                          else tuple((a-h)/b for a,h in zip(r,rv)))
+                    self.direction=project_gain(gain,tuple(h/b for h in rv),
                                                 min_h_norm_sq=self.config.min_h_norm_sq)
                 else:self.direction=tuple(torch.zeros_like(g) for g in r)
             except (ValueError,RuntimeError) as failure:error=failure

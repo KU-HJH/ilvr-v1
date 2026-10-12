@@ -36,14 +36,17 @@ def _formula_ids(config):
     formulas=dict(FORMULAS)
     if config.text_selector=='entropy':
         formulas['selector']='T2_entropy_student_sample_centered_full_causal_v1'
+    if config.gain_weighting=='token_entropy':
+        formulas['gain']='F_T1_detached_H_logV_token_gap_block_mean_raw_RV_project_fp64_post_adam_fp32_v1'
     return formulas
 
 
 def _contract_identity(value):
-    # Only the additive selector field has a legacy default; never fill other
+    # Only additive selector/weighting fields have legacy defaults; never fill other
     # missing fields or mutate/rewrite the original saved contract.
     normalized=dict(value,config=dict(value['config']))
     normalized['config'].setdefault('text_selector','kl')
+    normalized['config'].setdefault('gain_weighting','none')
     return _canonical(normalized)
 
 
@@ -133,9 +136,11 @@ def resolve_v3_arguments(args,raw_argv):
     args.stage1_v3_explicit=explicit
     variant=getattr(args,'stage1_variant',None)
     selector=getattr(args,'stage1_v3_selector',None)
+    weighting=getattr(args,'stage1_v3_gain_weighting',None)
     if args.stage!='stage1':
         if variant is not None:raise ValueError('stage1_variant is only valid for Stage 1')
         if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
+        if weighting is not None:raise ValueError('stage1_v3_gain_weighting is only valid for Stage1-v3')
         return
     checkpoint=getattr(args,'resume_from_checkpoint_path',None)
     if checkpoint is None:
@@ -150,11 +155,16 @@ def resolve_v3_arguments(args,raw_argv):
     args.stage1_v3_saved_contract=saved
     if args.stage1_variant!='v3':
         if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
+        if weighting is not None:raise ValueError('stage1_v3_gain_weighting is only valid for Stage1-v3')
         return
-    saved_selector=Stage1V3Config(**saved['config']).text_selector if saved else 'kl'
+    config=Stage1V3Config(**saved['config']) if saved else Stage1V3Config()
+    saved_selector=config.text_selector
     if saved and selector is not None and selector!=saved_selector:
         raise ValueError('v3 resume text selector mismatch; changing modes requires a fresh run')
     args.stage1_v3_selector=selector or saved_selector
+    if saved and weighting is not None and weighting!=config.gain_weighting:
+        raise ValueError('v3 resume Gain weighting mismatch; changing modes requires a fresh run')
+    args.stage1_v3_gain_weighting=weighting or config.gain_weighting
     profile=dict(V3_FRESH_PROFILE) if saved is None else dict(saved['profile'])
     # Older v3 checkpoints used one backend for both towers. Preserve their
     # execution and serialized identity rather than applying the fresh default.
@@ -218,10 +228,10 @@ def write_v3_contract(directory,contract):
         if path.is_symlink():raise ValueError('refusing to replace different v3 checkpoint contract')
         if path.read_bytes()!=raw:
             existing=read_v3_contract(path.parent)
-            if 'text_selector' in existing['config']:
+            if 'text_selector' in existing['config'] and 'gain_weighting' in existing['config']:
                 raise ValueError('refusing to replace different v3 checkpoint contract')
             validate_v3_resume(existing,contract)
-            # Equivalent legacy KL metadata is already authoritative. Leave
+            # Equivalent additive legacy metadata is already authoritative. Leave
             # its original bytes intact when saving to the same final output.
         return
     _publish_bytes_no_replace(path,raw)
@@ -259,7 +269,8 @@ def attach_v3_identity(trainer,args,dataset,checkpoint=None):
 LAUNCHER_ALIASES={'--method':'tuning_method','--model':'model','--epochs':'epochs','--learning-rate':'learning_rate',
     '--ce-weight':'ce_weight','--gradient-accumulation':'gradient_accumulation_steps','--micro-batch':'per_device_train_batch_size',
     '--ema-tau':'ema_tau','--seed':'seed','--deepspeed-config':'deepspeed_config','--attention-implementation':'attention_implementation',
-    '--textual_states':'textual_states','--max-steps':'max_steps','--stage1-v3-selector':'stage1_v3_selector'}
+    '--textual_states':'textual_states','--max-steps':'max_steps','--stage1-v3-selector':'stage1_v3_selector',
+    '--stage1-v3-gain-weighting':'stage1_v3_gain_weighting'}
 
 
 def resolve_coordinator_arguments(arguments,output):
@@ -274,6 +285,7 @@ def resolve_coordinator_arguments(arguments,output):
     has_saved=checkpoint is not None and (Path(checkpoint)/FILENAME).is_file()
     if variant!='v3' and not has_saved:
         if '--stage1-v3-selector' in values:raise ValueError('stage1-v3-selector is only valid for Stage1-v3')
+        if '--stage1-v3-gain-weighting' in values:raise ValueError('stage1-v3-gain-weighting is only valid for Stage1-v3')
         return arguments
     argv=['--stage','stage1','--save_model_path',str(output)]
     if variant:argv+=['--stage1_variant',variant]
@@ -319,6 +331,7 @@ def _launcher_main():
     if args.stage1_variant=='v3':
         values.update({name:getattr(args,name) for name in V3_FRESH_PROFILE})
         values['stage1_v3_selector']=args.stage1_v3_selector
+        values['stage1_v3_gain_weighting']=args.stage1_v3_gain_weighting
     import sys
     for name,value in values.items():
         sys.stdout.write(name+'\0'+(str(value).lower() if isinstance(value,bool) else str(value))+'\0')

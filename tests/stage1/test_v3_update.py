@@ -71,8 +71,14 @@ def test_all_four_ranks_reduce_sums_and_count_in_same_order_including_zero(monke
 
 
 @pytest.mark.parametrize('skip',[False,True])
-def test_adapter_applies_gain_after_adam_only_on_success_and_preserves_moments(monkeypatch,skip):
-    c,p=controller();c.accumulate(result([2.,-1.],[1.,1.],1))
+@pytest.mark.parametrize('weighting',['none','token_entropy'])
+def test_adapter_applies_gain_after_adam_only_on_success_and_preserves_moments(monkeypatch,skip,weighting):
+    c,p=controller()
+    if weighting=='token_entropy':
+        c=api().V3GainController((p,),Stage1V3Config(gain_weighting=weighting))
+        zero=torch.tensor(0.)
+        c.accumulate(V3Gradients(None,(torch.tensor([1.,1.]),),1,zero,zero,gain_sum_grads=(torch.tensor([1.,-2.]),)))
+    else:c.accumulate(result([2.,-1.],[1.,1.],1))
     engine,master,adam,events=fake_engine(monkeypatch,c,p,skip=skip)
     baseline=torch.nn.Parameter(master.detach().clone());base_adam=torch.optim.AdamW([baseline],lr=.03,weight_decay=.01)
     before=master.detach().clone()
@@ -138,13 +144,15 @@ def test_runtime_mapping_rejected_before_base(monkeypatch,field,value):
 @pytest.mark.parametrize('checkpointed',[False,True])
 @pytest.mark.parametrize('empty',[False,True])
 @pytest.mark.parametrize('image',[False,True])
-def test_real_parent_training_step_helper_once_and_configured_accumulation(tmp_path,monkeypatch,checkpointed,empty,image):
+@pytest.mark.parametrize('weighting',['none','token_entropy'])
+def test_real_parent_training_step_helper_once_and_configured_accumulation(tmp_path,monkeypatch,checkpointed,empty,image,weighting):
     from tests.stage1.v3_helpers import product_v3_trainer
     from stage1.v3_lifecycle import current_v3_lifecycle
     from peft_common import resolve_qwen2_5_vl_model
     from transformers import Trainer
     from trl import SFTTrainer
-    trainer,batch=product_v3_trainer(tmp_path,checkpointed=checkpointed,empty=empty,image=image)
+    trainer,batch=product_v3_trainer(tmp_path,checkpointed=checkpointed,empty=empty,image=image,
+                                  config=Stage1V3Config(gain_weighting=weighting))
     assert 'training_step' not in SFTTrainer.__dict__
     calls=[];losses={};seen=[]
     qwen=resolve_qwen2_5_vl_model(trainer.model)

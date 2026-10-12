@@ -7,10 +7,11 @@ from stage1.v3_config import Stage1V3Config
 
 @pytest.mark.parametrize('empty',[False,True])
 @pytest.mark.parametrize('selector',['kl','entropy'])
-def test_product_integration_call_budget(tmp_path,empty,selector):
+@pytest.mark.parametrize('weighting',['none','token_entropy'])
+def test_product_integration_call_budget(tmp_path,empty,selector,weighting):
     api=importlib.import_module('tests.stage1.v3_runtime_acceptance')
     trainer,batch=product_v3_trainer(tmp_path,checkpointed=True,image=True,empty=empty,
-        config=Stage1V3Config(text_selector=selector))
+        config=Stage1V3Config(text_selector=selector,gain_weighting=weighting))
     with api.observe_microstep(trainer) as event:
         trainer.training_step(trainer.model,batch)
     expected=['F'] if empty else (['F','gain_clean','reference','packed_replay']

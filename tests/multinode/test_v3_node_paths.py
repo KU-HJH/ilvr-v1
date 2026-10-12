@@ -127,12 +127,14 @@ def test_same_root_supervisor_preserves_legacy_environment_argv():
     assert command[start:start + 3] == ('/usr/bin/env', '-i', 'HOME=/root')
 
 
-def test_entropy_coordinator_dry_run_passes_mode_to_both_nodes(capsys):
+@pytest.mark.parametrize('weighting',['none','token_entropy'])
+def test_entropy_coordinator_dry_run_passes_mode_to_both_nodes(capsys,weighting):
     assert mn._main(['train-stage1','--run-id','stage1-v3-entropy-dry','--zero-stage','1',
         '--main-process-port','29681','--dry-run','--stage1-variant','v3',
-        '--stage1-v3-selector','entropy','--local-repo-root',str(LOCAL),
+        '--stage1-v3-selector','entropy','--stage1-v3-gain-weighting',weighting,'--local-repo-root',str(LOCAL),
         '--remote-repo-root',str(REMOTE),'--remote-host-repo-root',str(HOST)])==0
     payload=json.loads(capsys.readouterr().out)
     for worker in (payload['local'],remote_inner(payload['remote'])):
         assert value(worker,'--stage1-v3-selector')=='entropy'
         assert value(worker,'--stage1-variant')=='v3'
+        assert value(worker,'--stage1-v3-gain-weighting')==weighting

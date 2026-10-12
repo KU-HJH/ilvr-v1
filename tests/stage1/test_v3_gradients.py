@@ -1,4 +1,5 @@
 import importlib
+import math
 from copy import deepcopy
 import pytest
 import torch
@@ -21,7 +22,7 @@ def api(): return importlib.import_module('stage1.v3_gradients')
 @pytest.mark.parametrize('p',[0.,.05])
 @pytest.mark.parametrize('mode',['off','early','full'])
 @pytest.mark.parametrize('selector',['kl','entropy'])
-def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkeypatch,selector,tied=False,fault=False):
+def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkeypatch,selector,tied=False,fault=False,gain_weighting='none'):
     module = api()
     model = build_stage1_tuned_model(tiny_qwen.__wrapped__(),tuning('dora',dropout=.05),(125,126,127)).to(dtype)
     qwen = resolve_qwen2_5_vl_model(model)
@@ -81,11 +82,19 @@ def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkey
         with set_checkpoint_early_stop(mode!='full'),life.activate():
             with life.graph('F'),bind_v3_execution(qwen.model,lambda i:life.checkpoint_contexts('F',('decoder',i))):
                 f = model(**inputs).logits
+            if gain_weighting=='token_entropy':
+                # Keep real replay logits, but make the supplied F uncertainty
+                # differ sharply from gain-clean/R/RV to authenticate the source.
+                f=f.clone()
+                with torch.no_grad():
+                    f[0,15].fill_(-1000);f[0,15,0]=1000
+                    f[0,17].zero_()
+                    f[1,15].fill_(-1000);f[1,15,0]=math.log(3);f[1,15,1]=0
             f.retain_grad()
             with monkeypatch.context() as patch:
                 patch.setattr(torch.autograd,'grad',counted)
                 result = module.compute_v3_gradients(model,reference,inputs,V3BatchMetadata(blocks),f,
-                                                    parameters,Stage1V3Config(text_selector=selector),life)
+                                                    parameters,Stage1V3Config(text_selector=selector,gain_weighting=gain_weighting),life)
             assert arities == [2,1]
             assert calls == (['F','gain_clean','reference','packed_replay'] if selector=='kl'
                              else ['F','gain_clean','packed_replay'])
@@ -118,21 +127,41 @@ def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkey
             with activate_stage1_stochastic_context(Stage1StochasticContext(42,3,(spec.rows[row],),sites)):
                 logits=model(**single).logits[0,list(block.query_positions)].float()
             ids_tensor=torch.tensor(block.target_ids)
-            score=logits.log_softmax(-1).gather(1,ids_tensor[:,None]).mean()
-            (oracle_rv if rv else oracle_r).append(score)
+            token_scores=logits.log_softmax(-1).gather(1,ids_tensor[:,None]).flatten()
+            (oracle_rv if rv else oracle_r).append(token_scores)
             if not rv:
                 clean=(f[row,list(block.query_positions)].detach().float()/2).log_softmax(-1)
                 restricted=(logits/2).log_softmax(-1)
                 per_sample_kl.append((4*clean.exp()*(clean-restricted)).sum(-1).mean())
     expected_kl=torch.stack(per_sample_kl).mean()
     expected_kl_grads=original_grad(expected_kl,parameters,allow_unused=True,retain_graph=True)
-    expected_r=original_grad(sum(oracle_r),parameters,allow_unused=True,retain_graph=True)
-    expected_rv=original_grad(sum(oracle_rv),parameters,allow_unused=True)
+    if gain_weighting=='token_entropy':
+        weighted=[]
+        for block,r,rv in zip(blocks,oracle_r,oracle_rv):
+            # Oracle uses literal T1 full-vocabulary formula, independent of helper.
+            logits=f[block.batch_index,list(block.query_positions)].detach().double()
+            logp=logits.log_softmax(-1)
+            w=(-(logp.exp()*logp).sum(-1)/math.log(logp.shape[-1])).float()
+            weighted.append((w*(r-rv)).mean())
+        expected_r=original_grad(sum(weighted),parameters,allow_unused=True,retain_graph=True)
+        assert result.r_sum_grads is None
+        actual_gain=result.gain_sum_grads
+    else:
+        expected_r=original_grad(sum(r.mean() for r in oracle_r),parameters,allow_unused=True,retain_graph=True)
+        assert result.gain_sum_grads is None
+        actual_gain=result.r_sum_grads
+    expected_rv=original_grad(sum(rv.mean() for rv in oracle_rv),parameters,allow_unused=True)
     torch.testing.assert_close(result.kl_value,expected_kl)
-    for actuals,expecteds in ((proxy_grads,expected_kl_grads),(result.r_sum_grads,expected_r),(result.rv_sum_grads,expected_rv)):
+    for actuals,expecteds in ((proxy_grads,expected_kl_grads),(actual_gain,expected_r),(result.rv_sum_grads,expected_rv)):
         for actual,expected in zip(actuals,expecteds):
             expected=torch.zeros_like(actual) if expected is None else expected.to(actual)
             torch.testing.assert_close(actual,expected,atol=1e-6,rtol=1e-4)
+
+
+@pytest.mark.parametrize('selector',['kl','entropy'])
+@pytest.mark.parametrize('mode',['off','full'])
+def test_token_entropy_actual_masked_qwen_gradient_and_no_extra_calls(monkeypatch,selector,mode):
+    test_joint_vjp_preserves_optimizer_grads_and_call_budget(torch.float32,.05,mode,monkeypatch,selector,gain_weighting='token_entropy')
 
 
 def test_proxy_has_no_unused_edge_and_beta_applies_once():
@@ -147,14 +176,16 @@ def test_proxy_has_no_unused_edge_and_beta_applies_once():
     assert torch.count_nonzero(a.grad)==0 and unused.grad is None
 
 
-def test_no_valid_blocks_has_no_auxiliary_forward_or_vjp(monkeypatch):
+@pytest.mark.parametrize('weighting',['none','token_entropy'])
+def test_no_valid_blocks_has_no_auxiliary_forward_or_vjp(monkeypatch,weighting):
     module=api();param=torch.nn.Parameter(torch.ones(2))
     def unexpected(*args,**kwargs):pytest.fail('empty auxiliary must not execute')
     monkeypatch.setattr(torch.autograd,'grad',unexpected)
     result=module.compute_v3_gradients(None,None,{},V3BatchMetadata(()),torch.zeros(1,2,3),
-                                      (param,),Stage1V3Config(),None)
+                                      (param,),Stage1V3Config(gain_weighting=weighting),None)
     assert result.block_count==0 and result.kl_value.item()==0 and result.kl_proxy.item()==0
-    assert all(torch.count_nonzero(g)==0 for g in result.r_sum_grads+result.rv_sum_grads)
+    primary=result.r_sum_grads if weighting=='none' else result.gain_sum_grads
+    assert all(torch.count_nonzero(g)==0 for g in primary+result.rv_sum_grads)
 
 
 @pytest.mark.parametrize('mode',['early','full'])

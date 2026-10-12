@@ -11,16 +11,18 @@ from .v3_config import Stage1V3Config
 from .v3_metadata import V3BatchMetadata
 from .v3_lifecycle import V3Lifecycle,packed_dropout_mask
 from .v3_selection import select_text_keys
-from .v3_objective import block_score_sum,text_kl_loss
+from .v3_objective import block_score_sum,text_kl_loss,normalized_token_entropy,entropy_weighted_gain_and_rv_sums
 
 
 @dataclass(frozen=True)
 class V3Gradients:
-    r_sum_grads: tuple[Tensor,...]
+    r_sum_grads: tuple[Tensor,...] | None
     rv_sum_grads: tuple[Tensor,...]
     block_count: int
     kl_proxy: Tensor
     kl_value: Tensor
+    # A weighted Gain already includes the RV subtraction; never label it R.
+    gain_sum_grads: tuple[Tensor,...] | None = None
 
 
 class _GradientProxy(torch.autograd.Function):
@@ -67,7 +69,9 @@ def compute_v3_gradients(model: nn.Module,reference: nn.Module,model_inputs: Map
     if not metadata.blocks:
         zeros=tuple(torch.zeros_like(p,dtype=torch.float32) for p in parameters)
         value=clean_logits.new_zeros((),dtype=torch.float32)
-        return V3Gradients(zeros,tuple(g.clone() for g in zeros),0,value,value)
+        return V3Gradients(zeros if config.gain_weighting=='none' else None,
+            tuple(g.clone() for g in zeros),0,value,value,
+            gain_sum_grads=zeros if config.gain_weighting=='token_entropy' else None)
     model=getattr(model,'module',model)
     named=tuple((name,p) for name,p in model.named_parameters() if p.requires_grad)
     if tuple(id(p) for _,p in named)!=tuple(id(p) for p in parameters):
@@ -108,21 +112,27 @@ def compute_v3_gradients(model: nn.Module,reference: nn.Module,model_inputs: Map
             ({'model.'+n:p for n,p in aliases.items()},{'model.'+n:b for n,b in buffers.items()}),
             (trace,replay_blocks,lifecycle))
     row,query=zip(*keys)
-    r=block_score_sum(output.r_logits,blocks)
-    rv=block_score_sum(output.rv_logits,blocks)
+    if config.gain_weighting=='token_entropy':
+        weights=normalized_token_entropy(clean_logits,keys)
+        primary,rv=entropy_weighted_gain_and_rv_sums(output.r_logits,output.rv_logits,blocks,weights)
+    else:
+        primary=block_score_sum(output.r_logits,blocks)
+        rv=block_score_sum(output.rv_logits,blocks)
     kl=text_kl_loss(clean_logits[row,query],output.r_logits,keys,temperature=config.temperature)
     def joint(seed):
-        gradients=torch.autograd.grad((r,kl),alias_parameters,grad_outputs=tuple(seed.unbind()),
+        gradients=torch.autograd.grad((primary,kl),alias_parameters,grad_outputs=tuple(seed.unbind()),
                                       allow_unused=True,retain_graph=True)
         return {i:g for i,g in enumerate(gradients) if g is not None}
     with lifecycle.backward('joint_r_kl'):
-        joint_grads=torch.vmap(joint,randomness='same')(torch.eye(2,device=r.device,dtype=r.dtype))
+        joint_grads=torch.vmap(joint,randomness='same')(torch.eye(2,device=primary.device,dtype=primary.dtype))
     with lifecycle.backward('rv'):
         rv_grads=torch.autograd.grad(rv,alias_parameters,allow_unused=True)
-    r_grads=tuple(joint_grads[i][0].detach().float() if i in joint_grads else torch.zeros_like(p,dtype=torch.float32)
+    primary_grads=tuple(joint_grads[i][0].detach().float() if i in joint_grads else torch.zeros_like(p,dtype=torch.float32)
                   for i,p in enumerate(parameters))
     rv_grads=tuple(g.detach().float() if g is not None else torch.zeros_like(p,dtype=torch.float32)
                    for g,p in zip(rv_grads,parameters))
     kl_grads=tuple(joint_grads[i][1].detach().clone() if i in joint_grads else None for i in range(len(parameters)))
     value=kl.detach()
-    return V3Gradients(r_grads,rv_grads,len(blocks),optimizer_gradient_proxy(value,kl_grads,parameters),value)
+    return V3Gradients(primary_grads if config.gain_weighting=='none' else None,
+        rv_grads,len(blocks),optimizer_gradient_proxy(value,kl_grads,parameters),value,
+        gain_sum_grads=primary_grads if config.gain_weighting=='token_entropy' else None)

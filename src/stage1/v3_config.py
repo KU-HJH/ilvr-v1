@@ -19,6 +19,7 @@ class Stage1V3Config:
     low_mass_threshold: float = .1
     low_mass_ratio: float = .1
     image_cap: float = 0.
+    gain_weighting: str = "none"
 
     def __post_init__(self) -> None:
         self.validate()
@@ -30,8 +31,10 @@ class Stage1V3Config:
             raise ValueError("unsupported Stage1-v3 objective")
         if type(self.text_selector) is not str or self.text_selector not in ("kl", "entropy"):
             raise ValueError("Stage1-v3 text selector must be kl or entropy")
+        if type(self.gain_weighting) is not str or self.gain_weighting not in ("none", "token_entropy"):
+            raise ValueError("Stage1-v3 Gain weighting must be none or token_entropy")
         for name, value in asdict(self).items():
-            if name in ("schema_version", "objective", "text_selector"):
+            if name in ("schema_version", "objective", "text_selector", "gain_weighting"):
                 continue
             if type(value) not in (int, float) or not math.isfinite(value):
                 raise ValueError(f"Stage1-v3 {name} must be finite numeric")

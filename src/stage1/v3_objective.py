@@ -23,6 +23,62 @@ def block_score_sum(logits: Tensor, blocks: tuple[V3Block, ...]) -> Tensor:
     return result
 
 
+@torch.no_grad()
+def normalized_token_entropy(clean_logits: Tensor, query_keys: tuple[QueryKey, ...],
+                             *, query_chunk_size: int = 128) -> Tensor:
+    """Detached T1 H/log(V) from ordinary F, in block/query order.
+
+    Cast only selected query chunks to FP32, rather than the full sequence.
+    """
+    if (clean_logits.ndim != 3 or clean_logits.shape[-1] <= 1
+            or type(query_chunk_size) is not int or query_chunk_size <= 0):
+        raise ValueError('invalid entropy logits/vocabulary/query chunk size')
+    if any(type(row) is not int or type(query) is not int
+           or not 0 <= row < clean_logits.shape[0] or not 0 <= query < clean_logits.shape[1]
+           for row,query in query_keys):
+        raise ValueError('invalid entropy query position')
+    weights = torch.empty(len(query_keys),device=clean_logits.device,dtype=torch.float32)
+    for start in range(0,len(query_keys),query_chunk_size):
+        keys = query_keys[start:start+query_chunk_size]
+        rows,queries = zip(*keys)
+        logp = clean_logits.detach()[rows,queries].float().log_softmax(-1)
+        entropy = -(logp.exp()*logp).sum(-1)/math.log(logp.shape[-1])
+        if not torch.isfinite(entropy).all():
+            raise ValueError('nonfinite normalized token entropy')
+        weights[start:start+len(keys)] = entropy.clamp(0.,1.)
+    return weights
+
+
+def entropy_weighted_gain_and_rv_sums(r_logits: Tensor, rv_logits: Tensor,
+                                    blocks: tuple[V3Block, ...], weights: Tensor) -> tuple[Tensor,Tensor]:
+    """Already-differenced token-weighted Gain sum and unweighted RV sum.
+
+    Share RV log-softmax between the Gain and protection VJPs. Original
+    token counts remain the denominators; never divide by sum of weights.
+    """
+    queries = sum(len(b.target_ids) for b in blocks)
+    if (r_logits.ndim != 2 or r_logits.shape != rv_logits.shape or r_logits.shape[0] != queries
+            or r_logits.device != rv_logits.device or weights.shape != (queries,)
+            or weights.device != r_logits.device or weights.dtype != torch.float32
+            or weights.requires_grad or not torch.isfinite(weights).all()
+            or (weights < 0).any() or (weights > 1).any()):
+        raise ValueError('invalid detached token entropy Gain inputs')
+    r = r_logits.float().log_softmax(-1)
+    rv = rv_logits.float().log_softmax(-1)
+    gain = r.sum()*0
+    protection = rv.sum()*0
+    offset = 0
+    for block in blocks:
+        n = len(block.target_ids)
+        ids = torch.tensor(block.target_ids,device=r_logits.device)
+        r_scores = r[offset:offset+n].gather(1,ids[:,None]).flatten()
+        rv_scores = rv[offset:offset+n].gather(1,ids[:,None]).flatten()
+        gain = gain+(weights[offset:offset+n]*(r_scores-rv_scores)).mean()
+        protection = protection+rv_scores.mean()
+        offset += n
+    return gain,protection
+
+
 def text_kl_loss(clean_logits: Tensor, restricted_logits: Tensor, query_keys: tuple[QueryKey, ...],
                  *, temperature: float = 2.) -> Tensor:
     if (clean_logits.shape != restricted_logits.shape or restricted_logits.ndim != 2

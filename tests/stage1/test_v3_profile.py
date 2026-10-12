@@ -79,13 +79,14 @@ def test_coordinator_allowlist_and_launcher_enforce_fresh_profile_without_writes
 
 
 @pytest.mark.parametrize('selector',['kl','entropy'])
-def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monkeypatch,selector):
+@pytest.mark.parametrize('weighting',['none','token_entropy'])
+def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monkeypatch,selector,weighting):
     from dataclasses import replace
     from types import SimpleNamespace
     from tests.stage1.test_composition import stage1_args,fake_dependencies
     import stage1.composition as composition
     import stage1.v3_resume as resume
-    args=stage1_args(tmp_path,'--stage1_variant','v3','--stage1_v3_selector',selector)
+    args=stage1_args(tmp_path,'--stage1_variant','v3','--stage1_v3_selector',selector,'--stage1_v3_gain_weighting',weighting)
     events=[];deps,_,_,_=fake_dependencies(events)
     # This fixture isolates composition metadata, not CUDA availability. The
     # separate real-Qwen regression authenticates the concrete backend pair.
@@ -108,6 +109,7 @@ def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monk
     assert seen['collator']=={'v3_enabled':True}
     assert isinstance(seen['trainer']['v3_config'],Stage1V3Config)
     assert seen['trainer']['v3_config'].text_selector==selector
+    assert seen['trainer']['v3_config'].gain_weighting==weighting
     assert seen['trainer']['ce_weight']==.1 and seen['trainer']['ema_tau']==1.
     assert seen['identity'][1] is args
 

@@ -53,6 +53,30 @@ step, alpha=0.001 times the direction is added to FP32 master parameters and
 synchronized to BF16; Adam moments remain unchanged by this addition.
 An engine-skipped step clears the auxiliary window without applying Gain.
 
+Optionally pass `--stage1-v3-gain-weighting token_entropy` on the
+coordinator/launcher, or `--stage1_v3_gain_weighting token_entropy` on the
+training CLI. The fresh default is `none`, preserving the original Gain.
+For each valid target token, use the ordinary full-context student F logits
+at its preceding query position to compute temperature-1 normalized Shannon
+entropy `w = detach(-sum(p * log(p)) / log(V))`, where `p = softmax(F)` and
+`V` is the actual output vocabulary size. Detached FP32 query chunks bound
+entropy temporaries; entropy is not computed over the whole sequence.
+Multiply each token's `log p_R(GT) - log p_RV(GT)` by this coefficient before
+the original token mean within each block and actual-global-B mean. Do not
+divide by the sum of coefficients or rescale alpha. Higher full-context
+uncertainty gives greater relative contribution; this heuristic has no
+established accuracy or vision-use improvement.
+
+The protection gradient h remains the original **unweighted** RV score
+gradient, with the same projection and post-Adam displacement. The joint VJP
+carries the already-differenced weighted Gain, so RV is not subtracted again.
+Existing F and packed R/RV logits and the same two explicit VJP calls are
+reused; no forward is added. This option is independent of the KL/entropy
+text selector, which still uses temperature 2, and does not change ordinary
+CE, alignment or Text-KL. Call counts do not imply equal checkpoint
+recomputation, memory or throughput. CPU tests do not establish this weighted
+mode's real GPU or distributed training behavior.
+
 With valid auxiliary blocks, KL selection executes F once, gain-clean once,
 frozen reference once and one packed R/RV decoder call. Entropy selection
 omits only that reference call: three core calls, or four including the
@@ -60,7 +84,7 @@ one helper-teacher decoder forward at the default microbatch 1 (KL: five).
 Checkpoint layer recomputation and separate helper-image vision encoder calls
 are additional. The packed call contains two branches per valid block, so
 the call count is not a measured compute or speed ratio.
-Joint two-lane R/KL VJP and a separate RV VJP preserve attached
+Joint two-lane R/KL (weighted Gain/KL when enabled) VJP and a separate RV VJP preserve attached
 prefix gradients and original sample/token dropout identity. No valid blocks
 means ordinary F/helper execution with zero auxiliary work.
 
@@ -115,6 +139,11 @@ changing modes requires a fresh run. Both
 nodes receive identical contract bytes through the existing checkpoint
 collection/redistribution route. Use a fresh coordinator `--attempt-id` when
 resuming and preserve the run ID.
+
+The contract also records `gain_weighting` and its formula identity. Omitted
+resume weighting inherits the saved mode. Older contracts without this field
+retain `none` and their original bytes; explicit `none`↔`token_entropy`
+switches or mismatched formula IDs are rejected before model execution.
 
 ## Bounded runtime acceptance
 
