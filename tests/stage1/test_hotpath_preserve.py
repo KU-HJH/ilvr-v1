@@ -12,6 +12,21 @@ from stage1.types import Stage1LatentSpan
 from .test_targets import LiteralTokenizer
 
 
+@pytest.fixture(scope='module', autouse=True)
+def restore_accelerate_state_after_hotpath_tests():
+    from accelerate.state import AcceleratorState, PartialState, GradientState
+    states = (AcceleratorState._shared_state, PartialState._shared_state, GradientState._shared_state)
+    snapshots = [dict(state) for state in states]
+    try:
+        yield
+    finally:
+        # Restore only state owned by these trainer fixtures; preserve any
+        # earlier pollution so subsequent integration guards can detect it.
+        for state, snapshot in zip(states, snapshots):
+            state.clear()
+            state.update(snapshot)
+
+
 @pytest.fixture(scope='module')
 def local_processor():
     from transformers import AutoProcessor

@@ -271,6 +271,8 @@ class Trainer:
 for param in model.parameters():
  if param.requires_grad:
   param.register_hook(lambda grad: grad if seen['patched']==1 else (_ for _ in ()).throw(AssertionError('ended scope')))
+# Keep the two-feature dropout draw nonempty for the nonzero-gradient witness.
+torch.manual_seed(0)
 loss,grads=p.differentiate(Trainer(),model,torch.ones(1,2),p.native_dora_scope(model,'sourceFlash',seen))
 assert seen['eligible']==seen['patched']==1 and seen['restored']
 assert all(param.grad is None for param in model.parameters())
