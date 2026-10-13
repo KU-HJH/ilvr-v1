@@ -128,3 +128,34 @@ defaults plus the explicit loss overrides above, followed by final-artifact
 preparation and TEST400 automatic evaluation. Derive the actual Stage1 update
 budget and verify compatible code/environment and available resources on both
 nodes before launch. No training, evaluation or new premise probe has run.
+
+## Section approval and proposal preparation
+
+The user replied `진행해` to the final section question about writing the revised
+design with Stage1-v3 Text-off reuse and Gain omitted. This completes the
+conversational section-review prerequisite and authorizes written-spec creation,
+not approval of a previously nonexistent spec or implementation plan. Earlier
+pending-section statements above are historical.
+
+Root authored `specs/2026-10-13-stage1-v5-design-proposal-v1.md`, incorporating the
+confirmed formula/call structure/k=50 and existing execution authorization.
+The next phase is inline spec self-review, proposal freeze, root hate and
+macrothink fresh reads under the standing AGENTS invocation. These advisory
+checks are warranted because a wrong graph/reduction premise would invalidate
+costly distributed training and its evaluation. No integration implementation
+has started.
+
+Root self-reviewed all ten proposal sections for placeholders, inconsistent
+coefficients/roles, scope drift and ambiguity. Clarified optional OFF call
+pruning and the difference between the selected run profile and standalone orig
+defaults. The document fixes the Stage1 reference source, source-item alignment,
+independent masks, Text-KL direction, distinct reduction denominators, resume and
+execution boundary; these remain specified behavior, not observed integration.
+
+Proposal v1 is now frozen at SHA-256
+`71d78c7280d7ca14f5bd28b2c77863958d447b28779936de45b2bbe52d7b893e`.
+The commit containing this append freezes that exact proposal. All critique
+passes must use these same bytes. Fresh document checks passed (exit 0), with
+full output read from `logs/stage1-v5-design/proposal-document-check.log`.
+Original DIL source and inherited product code remain unchanged. No full suite
+is appropriate for this documentation-only claim; branch finishing is not next.
