@@ -334,3 +334,17 @@ existing worktree, and completed the required task/interface preflight table.
 See `2026-10-13-dil-bce-orig-implementation.md` for the durable ledger,
 including the one test-order ruling. Task1 implementation dispatch is next;
 no implementation is yet claimed. Training authorization remains separate.
+
+## Stage1 scope correction during execution
+
+Task1 numerical kernels were implemented at `5debf2a`, fixed at `c52fc56`,
+and independently approved after one scoped fix round; details and exact
+validation limits are in `2026-10-13-dil-bce-orig-implementation.md`.
+The user then authorized training plus automatic post-training evaluation and
+explicitly clarified `Stage 1 학습에 DIL-BCE-ORIG 적용`. This supersedes the
+previous Stage2 integration scope. No old Task2-6 implementation began.
+Resume architectural brainstorming for the Stage1 integration revision while
+preserving reviewed kernels and the user's Subagent-driven method selection.
+Do not initialize this fresh Stage1 run from the proposed Stage1 checkpoint.
+No training/evaluation has launched; execution authorization persists, while
+revised design/protocol/reference choices remain unresolved.
