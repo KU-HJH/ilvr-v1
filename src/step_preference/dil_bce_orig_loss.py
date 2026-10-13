@@ -39,7 +39,9 @@ def _validate_pair(clean: Tensor, other: Tensor, targets: Tensor) -> None:
         raise ValueError("target IDs must be integral")
     _validate_logits(clean, "clean logits")
     _validate_logits(other, "reference/OFF logits")
-    if bool(((targets < 0) | (targets >= clean.shape[1])).any()):
+    # Python vocabulary-size scalars can wrap when compared in a narrow dtype.
+    wide_targets = targets.long()
+    if bool(((wide_targets < 0) | (wide_targets >= clean.shape[1])).any()):
         raise ValueError("target IDs must be in vocabulary range")
 
 

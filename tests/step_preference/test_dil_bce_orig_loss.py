@@ -107,6 +107,21 @@ def test_invalid_inputs(kind):
         mod.dil_bce_orig_components(z, ref, y)
 
 
+@pytest.mark.parametrize("dtype,vocab", [(torch.uint8, 256), (torch.int8, 128), (torch.int16, 65536), (torch.int32, 65536), (torch.int64, 65536)])
+@pytest.mark.parametrize("api", ["dil_bce_orig_components", "orig_components_chunked"])
+def test_integral_target_bounds_do_not_wrap_at_dtype_boundary(dtype, vocab, api):
+    # Rejecting label zero when V exceeds a narrow integer's range is a bug.
+    y = torch.tensor([0, min(vocab - 1, torch.iinfo(dtype).max)], dtype=dtype)
+    z = torch.zeros(2, vocab, requires_grad=True)
+    result = getattr(kernels(), api)(z, z.detach(), y)
+    close(result.chosen, [math.log(2), math.log(2)])
+    close(result.reference, [math.log(2), math.log(2)])
+    close(result.policy_gt_logp, [-math.log(vocab), -math.log(vocab)])
+    grad, = torch.autograd.grad((result.chosen + result.reference).sum(), z)
+    assert torch.isfinite(grad).all()
+    assert (grad.gather(1, y.long()[:, None]) < 0).all()
+
+
 def test_empty_positions_stay_student_connected():
     z = torch.empty(0, 3, requires_grad=True)
     ref = torch.empty(0, 3, requires_grad=True)

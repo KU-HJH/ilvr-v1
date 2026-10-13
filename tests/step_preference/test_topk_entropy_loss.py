@@ -99,6 +99,19 @@ def test_candidate_modes_and_ragged_gt_union():
     assert torch.isfinite(result.kl).all()
 
 
+@pytest.mark.parametrize("dtype,vocab", [(torch.uint8, 256), (torch.int8, 128), (torch.int16, 65536), (torch.int32, 65536), (torch.int64, 65536)])
+@pytest.mark.parametrize("mode", ["independent", "sync_topk"])
+def test_support_integral_target_bounds_do_not_wrap_at_dtype_boundary(dtype, vocab, mode):
+    y = torch.tensor([0, min(vocab - 1, torch.iinfo(dtype).max)], dtype=dtype)
+    z = torch.zeros(2, vocab)
+    z[:, 0], z[:, 1] = 3., 2.
+    candidates = kernels().build_entropy_support(z, z, y, k=2, mode=mode, include_gt=True)
+    assert candidates.ids[0, candidates.valid[0]].tolist() == [0, 1]
+    assert candidates.ids[1, candidates.valid[1]].tolist() == [0, 1, int(y[1])]
+    assert candidates.gt_coverage.tolist() == [True, False]
+    assert candidates.ids.dtype == torch.long
+
+
 def test_entropy_only_support_gradient():
     z = torch.tensor([[1., 2., 3., 4.]], requires_grad=True)
     result = kernels().topk_entropy_components(z, support([[0, 2]]))
