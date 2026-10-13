@@ -57,3 +57,16 @@ return to architectural brainstorming; do not mask it with a later GPU run.
 If it passes, synthesize the exact final written commitment with these explicit
 selector and memory boundaries and the probe's precise limitations, then request
 final written-spec approval. Product planning and integration remain unstarted.
+
+## Reviewed result and synthesis
+
+The authorized probe is complete at `8b675e2`: six matrix cases and three
+causal controls, 9/9 on fresh root verification after independent task/fix/final
+reviews. The first review found a Text-KL sensitivity gap; isolated gradients
+and a detach control closed it without changing the proposed objective.
+The first nail did not falsify the shared graph within this tiny CPU scope.
+Fixed-realized reference inputs, helper fixtures and CPU arithmetic leave
+production preparation, Trainer/distributed reduction and memory unverified.
+Exact evidence and limitations are now synthesized in
+`2026-10-13-stage1-v5-design.md`, design commitment v1. Frozen proposal bytes
+remain unchanged; final written human approval has not yet been received.
