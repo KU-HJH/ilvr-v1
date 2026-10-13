@@ -44,6 +44,9 @@ def observe_microstep(trainer):
     original_grad=torch.autograd.grad
     in_helper=False
     lives=[]
+    had_event_flag = hasattr(trainer, '_v3_record_events')
+    event_flag = getattr(trainer, '_v3_record_events', False)
+    trainer._v3_record_events = True
     def build(*a,**kw):
         nonlocal in_helper
         event['helper_builds']+=1;in_helper=True
@@ -63,6 +66,8 @@ def observe_microstep(trainer):
     trainer.target_builder.build=build;trainer.accelerator.backward=backward;torch.autograd.grad=grad
     try:yield event
     finally:
+        if had_event_flag: trainer._v3_record_events = event_flag
+        else: del trainer._v3_record_events
         trainer.target_builder.build=original_build;trainer.accelerator.backward=original_backward;torch.autograd.grad=original_grad
         for hook in hooks:hook.remove()
         if lives:

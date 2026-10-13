@@ -313,6 +313,7 @@ class CustomTrainerStage1(SFTTrainer):
                 image_pool_k=self.image_pool_k,
                 helper_group_L=self.helper_group_L,
                 textual_states=self.textual_states,
+                collect_diagnostics=v3_config is None or self.collect_stage1_diagnostics,
             )
         self.target_builder = target_builder
 
@@ -476,13 +477,18 @@ class CustomTrainerStage1(SFTTrainer):
                    sample.unpadded_length) for sample in metadata.samples), sites)
         has_auxiliary = bool(metadata.v3.blocks)
         graphs = ("F", "gain_clean", "packed_replay") if has_auxiliary else ("F",)
-        inventory = {(graph, ("decoder", i)): tuple(module.site_name for module in layer.modules()
-                     if isinstance(module, SampleStableStage1Dropout))
-                     for graph in graphs for i, layer in enumerate(qwen.model.layers)}
+        # Share the fixed layer inventory across this microstep's three graphs.
+        # Rebuild next microstep, so module replacement/rebinding cannot go stale.
+        decoder_sites = tuple(tuple(module.site_name for module in layer.modules()
+                              if isinstance(module, SampleStableStage1Dropout))
+                              for layer in qwen.model.layers)
+        inventory = {(graph, ("decoder", i)): layer_sites
+                     for graph in graphs for i, layer_sites in enumerate(decoder_sites)}
         for graph in graphs:
             if graph != "packed_replay":
                 inventory.update({(graph, ("vision", i)): () for i in range(len(qwen.visual.blocks))})
-        lifecycle = V3Lifecycle(spec, inventory, has_auxiliary=has_auxiliary)
+        lifecycle = V3Lifecycle(spec, inventory, has_auxiliary=has_auxiliary,
+            record_events=self.collect_stage1_diagnostics or getattr(self, '_v3_record_events', False))
         try:
             with lifecycle.activate(), ExitStack() as stack:
                 self._v3_step_stack = stack
@@ -1230,6 +1236,10 @@ class CustomTrainerStage1(SFTTrainer):
         **kwargs,
     ):
         """Require and defer compatible EMA state for Stage 1 resume."""
+
+        gain = getattr(self, 'v3_gain_controller', None)
+        if gain is not None:
+            gain._optimizer_static_cache.clear()
 
         from .planned_stop import validate_planned_checkpoint_stop
         validate_planned_checkpoint_stop(

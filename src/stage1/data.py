@@ -209,8 +209,11 @@ class Stage1DataCollator:
         for example in examples:
             singleton = (example,)
             full = self._process_full_conversations(singleton)
-            original = self._process_original_images(singleton)
-            helper = self._process_helper_images(singleton)
+            if self._can_reuse_full_vision():
+                original, helper = self._split_full_vision(example, full)
+            else:
+                original = self._process_original_images(singleton)
+                helper = self._process_helper_images(singleton)
             self._validate_grid_rows(
                 singleton,
                 original["image_grid_thw"],
@@ -376,6 +379,28 @@ class Stage1DataCollator:
         )
         self._validate_grid_rows(examples, batch["image_grid_thw"], counts, "full")
         return batch
+
+    def _can_reuse_full_vision(self):
+        # Only the pinned per-image Qwen implementation has this equivalence.
+        # Custom processors retain their existing three-call contract.
+        if not self.v3_enabled:
+            return False
+        from transformers import Qwen2_5_VLProcessor, Qwen2VLImageProcessor, Qwen2TokenizerFast
+
+        return (type(self.processor) is Qwen2_5_VLProcessor
+                and type(self.processor.image_processor) is Qwen2VLImageProcessor
+                and type(self.processor.tokenizer) is Qwen2TokenizerFast)
+
+    @staticmethod
+    def _split_full_vision(example, full):
+        grids, pixels = full['image_grid_thw'], full['pixel_values']
+        boundary = len(example.original_image_paths)
+        pixel_boundary = int(grids[:boundary].prod(dim=-1).sum())
+        original = dict(pixel_values=pixels[:pixel_boundary], image_grid_thw=grids[:boundary])
+        helper = (dict(pixel_values=pixels[pixel_boundary:], image_grid_thw=grids[boundary:])
+                  if example.helper_image_paths else
+                  dict(pixel_values=torch.empty((0, 0)), image_grid_thw=torch.empty((0, 3), dtype=torch.long)))
+        return original, helper
 
     def _process_original_images(
         self, examples: Sequence[PreparedStage1Example]

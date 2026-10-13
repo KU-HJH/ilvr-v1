@@ -68,7 +68,8 @@ def run_v3_packed_replay(decoder: nn.Module,lm_head: nn.Module,trace: V3Trace,
     prefixes = tuple(tuple(torch.cat([
         torch.nn.functional.pad(value[b.batch_index:b.batch_index+1,:,:b.end],(0,0,0,prefix_length-b.end))
         for b in rows],dim=0) for value in pair) for pair in trace.key_values)
-    token = _PACKED.set((dropout_mask,samples,positions,valid))
+    # The binding (including its cache) is captured by every checkpoint closure.
+    token = _PACKED.set((dropout_mask,samples,positions,valid,{}))
     try:
         with bind_v3_execution(decoder,checkpoint_contexts):
             output = torch.func.functional_call(decoder,(dict(parameter_bindings),dict(buffer_bindings)),(),dict(

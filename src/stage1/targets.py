@@ -31,6 +31,7 @@ class Stage1TeacherTargetBuilder:
         image_pool_k: int = 8,
         helper_group_L: int | None = 256,
         textual_states: str = "previous",
+        collect_diagnostics: bool = True,
     ) -> None:
         if not math.isfinite(coverage_p) or not 0.0 < coverage_p <= 1.0:
             raise ValueError("coverage_p must be finite and in (0, 1]")
@@ -45,6 +46,7 @@ class Stage1TeacherTargetBuilder:
             self.image_pool_k if helper_group_L is None else int(helper_group_L)
         )
         self.textual_states = textual_states
+        self.collect_diagnostics = bool(collect_diagnostics)
         self._assistant_patterns = self._token_patterns(
             ("<|im_start|>assistant", "<|im_start|>assistant\n")
         )
@@ -189,7 +191,7 @@ class Stage1TeacherTargetBuilder:
             latent_values=latent_values,
             latent_mask=latent_mask,
             selected_counts=tuple(selected_counts),
-            diagnostics=self._diagnostics(latent_values),
+            diagnostics=self._diagnostics(latent_values) if self.collect_diagnostics else {},
             selected_candidate_indices=tuple(selected_candidate_indices),
             selection_margins=tuple(selection_margins),
         )
@@ -230,14 +232,16 @@ class Stage1TeacherTargetBuilder:
             helper_images = ()
 
         row_ids = sample_ids[0]
+        # Structural token scans share one host snapshot; model inputs stay on device.
+        token_ids = self._token_ids(row_ids)
         row_hidden_pre = hidden_pre[0]
         row_hidden_last = hidden_last[0]
         if self.textual_states == "all":
             assistant_start, assistant_end = self._assistant_bounds(
-                row_ids, sample
+                token_ids, sample
             )
         else:
-            assistant_start = self._assistant_start(row_ids, sample)
+            assistant_start = self._assistant_start(token_ids, sample)
             assistant_end = assistant_start
         user_query = self._user_query(
             teacher=teacher,
@@ -250,9 +254,10 @@ class Stage1TeacherTargetBuilder:
             image_token_id=image_token_id,
             original_grid=original_grid,
             original_counts=self._visual_token_counts(original_grid, teacher),
+            token_ids=token_ids,
         )
         text_spans = self._assistant_text_spans(
-            row_ids,
+            token_ids,
             sample,
             assistant_end if self.textual_states == "all" else assistant_start,
         )
@@ -446,16 +451,21 @@ class Stage1TeacherTargetBuilder:
             offset += count
         return tuple(images)
 
+    @staticmethod
+    def _token_ids(sample_ids):
+        return sample_ids.detach().cpu().tolist() if isinstance(sample_ids, torch.Tensor) else sample_ids
+
     def _assistant_bounds(
         self, sample_ids: torch.Tensor, sample: Stage1SampleMetadata
     ) -> tuple[int, int]:
+        sample_ids = self._token_ids(sample_ids)
         best_match = None
         for cpu_pattern in self._assistant_patterns:
-            pattern = cpu_pattern.to(sample_ids.device)
-            for start in range(sample_ids.numel() - pattern.numel() + 1):
-                if torch.equal(sample_ids[start : start + pattern.numel()], pattern):
+            pattern = cpu_pattern.tolist()
+            for start in range(len(sample_ids) - len(pattern) + 1):
+                if sample_ids[start : start + len(pattern)] == pattern:
                     if start > 0:
-                        candidate = (start, start + int(pattern.numel()))
+                        candidate = (start, start + len(pattern))
                         if (
                             best_match is None
                             or candidate[0] < best_match[0]
@@ -475,10 +485,11 @@ class Stage1TeacherTargetBuilder:
     def _assistant_start(
         self, sample_ids: torch.Tensor, sample: Stage1SampleMetadata
     ) -> int:
+        sample_ids = self._token_ids(sample_ids)
         for cpu_pattern in self._assistant_patterns:
-            pattern = cpu_pattern.to(sample_ids.device)
-            for start in range(sample_ids.numel() - pattern.numel() + 1):
-                if torch.equal(sample_ids[start : start + pattern.numel()], pattern):
+            pattern = cpu_pattern.tolist()
+            for start in range(len(sample_ids) - len(pattern) + 1):
+                if sample_ids[start : start + len(pattern)] == pattern:
                     if start > 0:
                         return start
                     break
@@ -499,16 +510,15 @@ class Stage1TeacherTargetBuilder:
         image_token_id,
         original_grid,
         original_counts,
+        token_ids=None,
     ):
-        prefix_ids = sample_ids[:assistant_start]
+        prefix_ids = (self._token_ids(sample_ids) if token_ids is None else token_ids)[:assistant_start]
         prompt_indices = [
             index
-            for index, token in enumerate(prefix_ids.tolist())
+            for index, token in enumerate(prefix_ids)
             if token not in self._special_ids and token != image_token_id
         ]
-        image_indices = (
-            (prefix_ids == image_token_id).nonzero(as_tuple=False).view(-1).tolist()
-        )
+        image_indices = [index for index, token in enumerate(prefix_ids) if token == image_token_id]
         if prompt_indices and image_indices:
             try:
                 return self._attention_user_query(
@@ -656,13 +666,14 @@ class Stage1TeacherTargetBuilder:
         return torch.cat(grouped, dim=0).mean(dim=0, keepdim=True)
 
     def _assistant_text_spans(self, sample_ids, sample, assistant_start):
+        sample_ids = self._token_ids(sample_ids)
         spans = []
         previous = assistant_start
         for span in sample.latent_spans:
             indices = [
                 index
                 for index in range(previous, span.start)
-                if int(sample_ids[index].item()) not in self._special_ids
+                if sample_ids[index] not in self._special_ids
             ]
             spans.append(indices)
             previous = span.end + 1

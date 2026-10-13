@@ -55,7 +55,8 @@ def _finite_master_and_state(master, state, *, require_state=False):
 
 
 class Zero1AdamWGainAdapter:
-    def __init__(self, engine: object, parameters: tuple[nn.Parameter, ...], config: Stage1V3Config):
+    def __init__(self, engine: object, parameters: tuple[nn.Parameter, ...], config: Stage1V3Config,
+                 *, static_cache=None):
         self.engine, self.parameters, self.config = engine, parameters, config
         self.zero = engine.optimizer
         self.process_group = getattr(self.zero, 'dp_process_group', None)
@@ -66,6 +67,7 @@ class Zero1AdamWGainAdapter:
         self._protection = ()
         self._snapshot = None
         self._original_groups = None
+        self._static_cache = {} if static_cache is None else static_cache
 
     def _sum(self, tensor):
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.process_group)
@@ -84,7 +86,16 @@ class Zero1AdamWGainAdapter:
 
     def _validate(self):
         z = self.zero
-        if (version('deepspeed') != '0.18.7' or version('torch').split('+')[0] != '2.7.1'
+        cache = self._static_cache
+        context = (id(self.engine), id(z), id(z.optimizer), id(self.process_group),
+                   tuple(id(p) for p in self.parameters), id(version))
+        if cache.get('context') != context:
+            cache.clear()
+            cache['context'] = context
+            cache['owners'] = (self.engine, z, z.optimizer, self.process_group, self.parameters, version)
+        if 'versions' not in cache:
+            cache['versions'] = (version('deepspeed'), version('torch').split('+')[0])
+        if (cache['versions'] != ('0.18.7', '2.7.1')
                 or self.engine.zero_optimization_stage() != 1 or z.partition_gradients is not False
                 or z.cpu_offload is not False or z.loss_scale != 1.
                 or getattr(z, 'has_moe_layers', False) or getattr(z, 'round_robin_gradients', False)
@@ -130,7 +141,12 @@ class Zero1AdamWGainAdapter:
                 raise ValueError('partition size mismatch')
             total = sum(p.numel() for p in lp_params)
             valid = max(0, min(size, total-rank*size))
-            mask = torch.arange(size, device=master.device) < valid
+            geometry = (id(master), master.data_ptr(), tuple(master.shape), master.device, master.dtype,
+                        rank, world, valid)
+            cached = cache.get(('group', gi))
+            mask = (cached[1].valid_mask if cached is not None and cached[0] == geometry
+                    and cached[2] == cached[1].valid_mask._version else
+                    torch.arange(size, device=master.device) < valid)
             fragments, offset = [], 0
             grads = z.averaged_gradients[gi]
             if not isinstance(grads, list):
@@ -161,7 +177,14 @@ class Zero1AdamWGainAdapter:
                     raise ValueError('invalid owned gradient')
             if valid < size and grads[-1].count_nonzero():
                 raise ValueError('nonzero gradient padding')
-            owned.append(OwnedGroup(master, mask, tuple(fragments)))
+            # Mapping/layout/value checks above still execute on every update.
+            # Only derived, validated geometry is retained; mutable LR/state is not.
+            descriptors = tuple(fragments)
+            group_view = (cached[1] if cached is not None and cached[0] == geometry
+                          and cached[1].valid_mask is mask and cached[1].fragments == descriptors
+                          else OwnedGroup(master, mask, descriptors))
+            cache[('group', gi)] = (geometry, group_view, mask._version)
+            owned.append(group_view)
             lrs.append(float(group['lr']))
             signature.append((tuple(p.numel() for p in lp_params), size,
                               tuple(group[k] for k in ('lr', 'betas', 'eps', 'weight_decay'))))

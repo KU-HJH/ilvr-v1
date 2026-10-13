@@ -18,6 +18,7 @@ class V3GainController:
         self.state='IDLE';self.successful_steps=0;self.global_block_count=0
         self.direction=();self._engine=None
         self._optimizer_adapter=None;self.last_metrics={}
+        self._optimizer_static_cache={}
         self._clear()
 
     def _clear(self):
@@ -116,7 +117,8 @@ class V3GainController:
         if self.config.gain_update_mode=='post_adam':return
         if self.state!='PREPARED':raise RuntimeError('optimizer Gain requires prepared raw gradients')
         from .v3_zero1_update import Zero1AdamWGainAdapter
-        self._optimizer_adapter=Zero1AdamWGainAdapter(engine,self.parameters,self.config)
+        self._optimizer_adapter=Zero1AdamWGainAdapter(engine,self.parameters,self.config,
+                                                     static_cache=self._optimizer_static_cache)
         self._optimizer_adapter.prepare(self.raw_gain,self.raw_rv,block_count=self.global_block_count)
 
     def abort_optimizer_step(self) -> None:

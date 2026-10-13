@@ -59,7 +59,8 @@ class _CheckpointPhase:
 
 class V3Lifecycle:
     def __init__(self, spec: Stage1StochasticContext,
-                 inventory: Mapping[tuple[GraphRole, Unit], tuple[str, ...]], *, has_auxiliary: bool):
+                 inventory: Mapping[tuple[GraphRole, Unit], tuple[str, ...]], *, has_auxiliary: bool,
+                 record_events: bool = True):
         if not isinstance(spec, Stage1StochasticContext) or type(has_auxiliary) is not bool:
             raise ValueError("v3 lifecycle requires immutable stochastic identity and boolean auxiliary state")
         self.spec, self.has_auxiliary = spec, has_auxiliary
@@ -85,11 +86,13 @@ class V3Lifecycle:
         self.inventory = MappingProxyType(frozen)
         self.state = "NEW"
         self.events = []
+        self.record_events = bool(record_events)
         self._completed_graphs = []
         self._started_backwards = set()
         self._completed_backwards = []
         self._unit_visits = set()
         self._site_visits = set()
+        self._packed_coordinates = None
 
     @property
     def frame(self):
@@ -194,8 +197,9 @@ class V3Lifecycle:
         if key in self._site_visits:
             self._error(f"duplicate {phase} invocation in {backward}: {site}")
         self._site_visits.add(key)
-        self.events.append(dict(graph=graph, unit=unit, site=site,
-                                phase=phase, backward=backward, origin=origin))
+        if self.record_events:
+            self.events.append(dict(graph=graph, unit=unit, site=site,
+                                    phase=phase, backward=backward, origin=origin))
 
     def native_dropout(self, site: str, p: float, x: Tensor) -> Tensor:
         if not isinstance(x, Tensor) or x.ndim != 3 or not x.is_floating_point() or x.layout != torch.strided:
@@ -235,10 +239,18 @@ def packed_dropout_mask(site: str, p: float, *, sample_indices: Tensor,
             or sample_indices.ndim != 1 or token_positions.shape != sample_indices.shape
             or sample_indices.dtype != torch.long or token_positions.dtype != torch.long):
         raise ValueError("packed dropout requires aligned int64 source coordinates")
-    samples, positions = sample_indices.tolist(), token_positions.tolist()
-    for row, position in zip(samples, positions):
-        if not 0 <= row < len(owner.spec.rows) or not 0 <= position < owner.spec.rows[row][1]:
-            raise ValueError("packed dropout coordinate outside source valid length")
+    signature = tuple((id(t), t._version, tuple(t.shape), t.device, t.data_ptr())
+                      for t in (sample_indices, token_positions))
+    cached = owner._packed_coordinates
+    if cached is None or cached[0] != signature:
+        samples, positions = sample_indices.tolist(), token_positions.tolist()
+        for row, position in zip(samples, positions):
+            if not 0 <= row < len(owner.spec.rows) or not 0 <= position < owner.spec.rows[row][1]:
+                raise ValueError("packed dropout coordinate outside source valid length")
+        # Retain the source tensors to prevent object-ID reuse within a lifecycle.
+        owner._packed_coordinates = (signature, samples, positions, sample_indices, token_positions)
+    else:
+        _, samples, positions, _, _ = cached
     owner.record(site, origin="packed")
     masks = {row: _raw_mask(owner.spec, site, p, *owner.spec.rows[row], hidden_size, device)
              for row in set(samples)}
