@@ -22,7 +22,7 @@ def api(): return importlib.import_module('stage1.v3_gradients')
 @pytest.mark.parametrize('p',[0.,.05])
 @pytest.mark.parametrize('mode',['off','early','full'])
 @pytest.mark.parametrize('selector',['kl','entropy'])
-def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkeypatch,selector,tied=False,fault=False,gain_weighting='none'):
+def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkeypatch,selector,tied=False,fault=False,gain_weighting='none',gain_entropy_mode='normalized'):
     module = api()
     model = build_stage1_tuned_model(tiny_qwen.__wrapped__(),tuning('dora',dropout=.05),(125,126,127)).to(dtype)
     qwen = resolve_qwen2_5_vl_model(model)
@@ -94,7 +94,8 @@ def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkey
             with monkeypatch.context() as patch:
                 patch.setattr(torch.autograd,'grad',counted)
                 result = module.compute_v3_gradients(model,reference,inputs,V3BatchMetadata(blocks),f,
-                                                    parameters,Stage1V3Config(text_selector=selector,gain_weighting=gain_weighting),life)
+                                                    parameters,Stage1V3Config(text_selector=selector,gain_weighting=gain_weighting,
+                                                        gain_entropy_mode=gain_entropy_mode),life)
             assert arities == [2,1]
             assert calls == (['F','gain_clean','reference','packed_replay'] if selector=='kl'
                              else ['F','gain_clean','packed_replay'])
@@ -141,7 +142,9 @@ def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkey
             # Oracle uses literal T1 full-vocabulary formula, independent of helper.
             logits=f[block.batch_index,list(block.query_positions)].detach().double()
             logp=logits.log_softmax(-1)
-            w=(-(logp.exp()*logp).sum(-1)/math.log(logp.shape[-1])).float()
+            w=-(logp.exp()*logp).sum(-1)
+            if gain_entropy_mode=='normalized':w=w/math.log(logp.shape[-1])
+            w=w.float()
             weighted.append((w*(r-rv)).mean())
         expected_r=original_grad(sum(weighted),parameters,allow_unused=True,retain_graph=True)
         assert result.r_sum_grads is None
@@ -160,8 +163,10 @@ def test_joint_vjp_preserves_optimizer_grads_and_call_budget(dtype,p,mode,monkey
 
 @pytest.mark.parametrize('selector',['kl','entropy'])
 @pytest.mark.parametrize('mode',['off','full'])
-def test_token_entropy_actual_masked_qwen_gradient_and_no_extra_calls(monkeypatch,selector,mode):
-    test_joint_vjp_preserves_optimizer_grads_and_call_budget(torch.float32,.05,mode,monkeypatch,selector,gain_weighting='token_entropy')
+@pytest.mark.parametrize('gain_entropy_mode',['normalized','raw'])
+def test_token_entropy_actual_masked_qwen_gradient_and_no_extra_calls(monkeypatch,selector,mode,gain_entropy_mode):
+    test_joint_vjp_preserves_optimizer_grads_and_call_budget(torch.float32,.05,mode,monkeypatch,selector,
+        gain_weighting='token_entropy',gain_entropy_mode=gain_entropy_mode)
 
 
 def test_proxy_has_no_unused_edge_and_beta_applies_once():

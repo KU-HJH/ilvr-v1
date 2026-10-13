@@ -1,19 +1,19 @@
 """Versioned v3 objective, effective profile and actual-loader schedule identity."""
 from __future__ import annotations
-from dataclasses import asdict,dataclass
+from dataclasses import asdict,dataclass,replace
 from collections.abc import Mapping
 import hashlib
 import json
 import math
 from pathlib import Path
 import torch
-from .v3_config import Stage1V3Config
+from .v3_config import Stage1V3Config,fresh_v3_config
 
 FILENAME='stage1_v3.json'
 ROOT=Path(__file__).resolve().parents[2]
 V3_FRESH_PROFILE=dict(model='Qwen/Qwen2.5-VL-3B-Instruct',tuning_method='dora',
     per_device_train_batch_size=1,gradient_accumulation_steps=4,epochs=1.,learning_rate=5e-5,
-    seed=42,warm_up_steps=10,ce_weight=.1,sim_weight=1.,ema_tau=1.,latent_size=8,
+    seed=42,warm_up_steps=10,ce_weight=.1,sim_weight=.1,ema_tau=1.,latent_size=8,
     lora_r=32,lora_alpha=64,lora_dropout=.05,
     lora_target_modules='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',
     attention_implementation='sdpa',vision_attention_implementation='flash_attention_2',gradient_checkpointing=True,
@@ -34,14 +34,15 @@ def _canonical(value):
 
 def _formula_ids(config):
     formulas=dict(FORMULAS)
+    entropy_id='H_raw' if config.gain_entropy_mode=='raw' else 'H_logV'
     if config.text_selector=='entropy':
         formulas['selector']='T2_entropy_student_sample_centered_full_causal_v1'
     if config.gain_weighting=='token_entropy':
-        formulas['gain']='F_T1_detached_H_logV_token_gap_block_mean_raw_RV_project_fp64_post_adam_fp32_v1'
+        formulas['gain']=f'F_T1_detached_{entropy_id}_token_gap_block_mean_raw_RV_project_fp64_post_adam_fp32_v1'
     if config.gain_update_mode=='adamw_projected':
         formulas['gain']='global_block_mean_same_state_adamw_joint_moments_active_lr_project_fp64_fp32_master_v1'
         if config.gain_weighting=='token_entropy':
-            formulas['gain']='F_T1_detached_H_logV_token_gap_'+formulas['gain']
+            formulas['gain']=f'F_T1_detached_{entropy_id}_token_gap_'+formulas['gain']
         formulas['gain_alpha_role']='inactive_legacy_displacement_v1'
     return formulas
 
@@ -54,6 +55,7 @@ def _contract_identity(value):
     normalized['config'].setdefault('gain_weighting','none')
     normalized['config'].setdefault('gain_update_mode','post_adam')
     normalized['config'].setdefault('gain_optimizer_weight',None)
+    normalized['config'].setdefault('gain_entropy_mode','normalized')
     return _canonical(normalized)
 
 
@@ -65,7 +67,12 @@ def _resolve_gain_update(saved_config: Stage1V3Config | None, mode: str | None,
             raise ValueError('v3 resume Gain optimizer mismatch; changing modes/weights requires a fresh run')
         mode = saved_config.gain_update_mode if mode is None else mode
         weight = saved_config.gain_optimizer_weight if weight is None else weight
-    config = Stage1V3Config(gain_update_mode='post_adam' if mode is None else mode,
+    else:
+        fresh = fresh_v3_config()
+        mode = fresh.gain_update_mode if mode is None else mode
+        if mode == 'adamw_projected' and weight is None:
+            weight = fresh.gain_optimizer_weight
+    config = Stage1V3Config(gain_update_mode=mode,
                            gain_optimizer_weight=weight)
     return config.gain_update_mode, config.gain_optimizer_weight
 
@@ -158,6 +165,7 @@ def resolve_v3_arguments(args,raw_argv):
     variant=getattr(args,'stage1_variant',None)
     selector=getattr(args,'stage1_v3_selector',None)
     weighting=getattr(args,'stage1_v3_gain_weighting',None)
+    entropy_mode=getattr(args,'stage1_v3_gain_entropy_mode',None)
     gain_mode=getattr(args,'stage1_v3_gain_update_mode',None)
     gain_weight=getattr(args,'stage1_v3_gain_optimizer_weight',None)
     from .planned_stop import validate_planned_checkpoint_stop
@@ -167,6 +175,7 @@ def resolve_v3_arguments(args,raw_argv):
         if variant is not None:raise ValueError('stage1_variant is only valid for Stage 1')
         if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
         if weighting is not None:raise ValueError('stage1_v3_gain_weighting is only valid for Stage1-v3')
+        if entropy_mode is not None:raise ValueError('stage1_v3_gain_entropy_mode is only valid for Stage1-v3')
         if gain_mode is not None or gain_weight is not None:raise ValueError('Gain optimizer options are only valid for Stage1-v3')
         return
     checkpoint=getattr(args,'resume_from_checkpoint_path',None)
@@ -187,9 +196,10 @@ def resolve_v3_arguments(args,raw_argv):
     if args.stage1_variant!='v3':
         if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
         if weighting is not None:raise ValueError('stage1_v3_gain_weighting is only valid for Stage1-v3')
+        if entropy_mode is not None:raise ValueError('stage1_v3_gain_entropy_mode is only valid for Stage1-v3')
         if gain_mode is not None or gain_weight is not None:raise ValueError('Gain optimizer options are only valid for Stage1-v3')
         return
-    config=Stage1V3Config(**saved['config']) if saved else Stage1V3Config()
+    config=Stage1V3Config(**saved['config']) if saved else fresh_v3_config()
     saved_selector=config.text_selector
     if saved and selector is not None and selector!=saved_selector:
         raise ValueError('v3 resume text selector mismatch; changing modes requires a fresh run')
@@ -197,6 +207,9 @@ def resolve_v3_arguments(args,raw_argv):
     if saved and weighting is not None and weighting!=config.gain_weighting:
         raise ValueError('v3 resume Gain weighting mismatch; changing modes requires a fresh run')
     args.stage1_v3_gain_weighting=weighting or config.gain_weighting
+    if saved and entropy_mode is not None and entropy_mode!=config.gain_entropy_mode:
+        raise ValueError('v3 resume Gain entropy mismatch; changing modes requires a fresh run')
+    args.stage1_v3_gain_entropy_mode=entropy_mode or config.gain_entropy_mode
     # Fresh-run environment defaults never override saved objective identity.
     if saved is None:
         if gain_mode is None:gain_mode=os.environ.get('STAGE1_V3_GAIN_UPDATE_MODE') or None
@@ -205,6 +218,10 @@ def resolve_v3_arguments(args,raw_argv):
             if supplied:gain_weight=float(supplied)
     args.stage1_v3_gain_update_mode,args.stage1_v3_gain_optimizer_weight=_resolve_gain_update(
         config if saved else None,gain_mode,gain_weight)
+    args.stage1_v3_resolved_config=replace(config,text_selector=args.stage1_v3_selector,
+        gain_weighting=args.stage1_v3_gain_weighting,gain_entropy_mode=args.stage1_v3_gain_entropy_mode,
+        gain_update_mode=args.stage1_v3_gain_update_mode,
+        gain_optimizer_weight=args.stage1_v3_gain_optimizer_weight).to_dict()
     profile=dict(V3_FRESH_PROFILE) if saved is None else dict(saved['profile'])
     # Older v3 checkpoints used one backend for both towers. Preserve their
     # execution and serialized identity rather than applying the fresh default.
@@ -268,7 +285,8 @@ def write_v3_contract(directory,contract):
         if path.is_symlink():raise ValueError('refusing to replace different v3 checkpoint contract')
         if path.read_bytes()!=raw:
             existing=read_v3_contract(path.parent)
-            if 'text_selector' in existing['config'] and 'gain_weighting' in existing['config']:
+            if all(key in existing['config'] for key in ('text_selector','gain_weighting',
+                    'gain_update_mode','gain_optimizer_weight','gain_entropy_mode')):
                 raise ValueError('refusing to replace different v3 checkpoint contract')
             validate_v3_resume(existing,contract)
             # Equivalent additive legacy metadata is already authoritative. Leave
@@ -311,6 +329,7 @@ LAUNCHER_ALIASES={'--method':'tuning_method','--model':'model','--epochs':'epoch
     '--ema-tau':'ema_tau','--seed':'seed','--deepspeed-config':'deepspeed_config','--attention-implementation':'attention_implementation',
     '--textual_states':'textual_states','--max-steps':'max_steps','--stage1-v3-selector':'stage1_v3_selector',
     '--stage1-v3-gain-weighting':'stage1_v3_gain_weighting',
+    '--stage1-v3-gain-entropy-mode':'stage1_v3_gain_entropy_mode',
     '--stage1-v3-gain-update-mode':'stage1_v3_gain_update_mode',
     '--stage1-v3-gain-optimizer-weight':'stage1_v3_gain_optimizer_weight',
     '--stage1-v3-stop-after-checkpoint':'stage1_v3_stop_after_checkpoint'}
@@ -333,6 +352,7 @@ def resolve_coordinator_arguments(arguments,output):
         if '--stage1-v3-stop-after-checkpoint' in values:raise ValueError('stop_after_checkpoint is only valid for Stage1-v3')
         if '--stage1-v3-selector' in values:raise ValueError('stage1-v3-selector is only valid for Stage1-v3')
         if '--stage1-v3-gain-weighting' in values:raise ValueError('stage1-v3-gain-weighting is only valid for Stage1-v3')
+        if '--stage1-v3-gain-entropy-mode' in values:raise ValueError('stage1-v3-gain-entropy-mode is only valid for Stage1-v3')
         if any(k in values for k in ('--stage1-v3-gain-update-mode','--stage1-v3-gain-optimizer-weight')):
             raise ValueError('Gain optimizer options are only valid for Stage1-v3')
         return arguments
@@ -386,6 +406,7 @@ def _launcher_main():
         values.update({name:getattr(args,name) for name in V3_FRESH_PROFILE})
         values['stage1_v3_selector']=args.stage1_v3_selector
         values['stage1_v3_gain_weighting']=args.stage1_v3_gain_weighting
+        values['stage1_v3_gain_entropy_mode']=args.stage1_v3_gain_entropy_mode
         values['stage1_v3_gain_update_mode']=args.stage1_v3_gain_update_mode
         if args.stage1_v3_gain_optimizer_weight is not None:
             values['stage1_v3_gain_optimizer_weight']=args.stage1_v3_gain_optimizer_weight

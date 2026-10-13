@@ -14,7 +14,7 @@ four-rank execution, full 3B memory use, throughput, or TEST400 accuracy.
 
 Fresh v3 uses the original Qwen2.5-VL-3B-Instruct base, DoRA r32/alpha64/dropout
 0.05 with q/k/v/o/gate/up/down decoder projections, latent size 8, CE weight
-0.1, alignment weight 1, frozen EMA 1.0 and helper noise 0.01. Execution uses
+0.1, alignment weight 0.1, frozen EMA 1.0 and helper noise 0.01. Execution uses
 two nodes/four ranks, microbatch 1, accumulation 4, global batch 16, LR 5e-5,
 seed 42, warmup 10, BF16, AdamW/linear, weight decay 0.01, clipping 1.0,
 ZeRO-1 without offload, decoder SDPA and vision FlashAttention2,
@@ -42,10 +42,13 @@ student uncertainty rather than reference disagreement; no accuracy
 equivalence or improvement has been established.
 
 In both modes the ordinary loss adds temperature-2 KL(detached F || R), averaged
-by query within each valid sample then across samples. Its weight rises to
-0.01 over ceil(0.05 × planned updates).
+by query within each valid sample then across samples. Fresh runs use weight
+0.01 from the first step (`text_kl_warmup_ratio=0`). The separate LR warmup
+remains 10 updates. Resume restores the saved KL coefficient and warmup ratio.
 
-In the default `post_adam` mode, R and RV GT scores are block means. Their gradient sums and block count B are
+The fresh Gain default is `adamw_projected`, coefficient 10, with raw token
+entropy weighting as described below. In the legacy `post_adam` mode,
+R and RV GT scores are block means. Their gradient sums and block count B are
 reduced across all four ranks. With g=(R−RV)/B and h=RV/B, a negative global
 h·g component is projected away using FP64 dot/norm reductions. Tiny nonzero
 h norm squared below 1e-30 produces no displacement. After a successful AdamW
@@ -53,13 +56,16 @@ step, alpha=0.001 times the direction is added to FP32 master parameters and
 synchronized to BF16; Adam moments remain unchanged by this addition.
 An engine-skipped step clears the auxiliary window without applying Gain.
 
-Optionally pass `--stage1-v3-gain-weighting token_entropy` on the
+`--stage1-v3-gain-weighting token_entropy` on the
 coordinator/launcher, or `--stage1_v3_gain_weighting token_entropy` on the
-training CLI. The fresh default is `none`, preserving the original Gain.
+training CLI, is enabled by default for fresh v3 runs. `none` disables weighting.
 For each valid target token, use the ordinary full-context student F logits
-at its preceding query position to compute temperature-1 normalized Shannon
-entropy `w = detach(-sum(p * log(p)) / log(V))`, where `p = softmax(F)` and
-`V` is the actual output vocabulary size. Detached FP32 query chunks bound
+at its preceding query position to compute temperature-1 Shannon entropy
+`w = detach(-sum(p * log(p)))`, where `p = softmax(F)`. This raw entropy uses
+natural logarithms, has no `log(V)` normalization and is not capped at 1.
+`--stage1-v3-gain-entropy-mode normalized` selects the historical
+`H/log(V)` formula with its [0,1] bound; `raw` is the fresh default. Python
+CLI spellings use underscores. Detached FP32 query chunks bound
 entropy temporaries; entropy is not computed over the whole sequence.
 Multiply each token's `log p_R(GT) - log p_RV(GT)` by this coefficient before
 the original token mean within each block and actual-global-B mean. Do not
@@ -68,8 +74,8 @@ uncertainty gives greater relative contribution; this heuristic has no
 established accuracy or vision-use improvement.
 
 The protection gradient h remains the original **unweighted** RV score
-gradient. The default update uses the same projection and post-Adam displacement;
-the optional optimizer mode below protects its incremental AdamW displacement. The joint VJP
+gradient. The default optimizer mode below protects its incremental AdamW
+displacement; legacy `post_adam` retains its original projection. The joint VJP
 carries the already-differenced weighted Gain, so RV is not subtracted again.
 Existing F and packed R/RV logits and the same two explicit VJP calls are
 reused; no forward is added. This option is independent of the KL/entropy
@@ -89,17 +95,18 @@ Joint two-lane R/KL (weighted Gain/KL when enabled) VJP and a separate RV VJP pr
 prefix gradients and original sample/token dropout identity. No valid blocks
 means ordinary F/helper execution with zero auxiliary work.
 
-## Optional optimizer-integrated Gain
+## Optimizer-integrated Gain
 
-Select `--stage1-v3-gain-update-mode adamw_projected` with an explicit
-`--stage1-v3-gain-optimizer-weight VALUE` on the coordinator/launcher. Python
+Fresh runs default to `--stage1-v3-gain-update-mode adamw_projected` and
+`--stage1-v3-gain-optimizer-weight 10`. An explicit coefficient can be supplied
+on the coordinator/launcher. Python
 CLI spellings use underscores. Fresh environment aliases are
 `STAGE1_V3_GAIN_UPDATE_MODE` and `STAGE1_V3_GAIN_OPTIMIZER_WEIGHT`; explicit CLI
 values take precedence. This gradient coefficient must be finite and
-nonnegative, including zero. It has no implicit default and is not inferred
+nonnegative, including zero. It is not inferred
 from the legacy displacement `gain_alpha=0.001`. In this mode alpha is
-recorded as inactive. Omission preserves `post_adam`; supplying an optimizer
-weight in that legacy mode is an error.
+recorded as inactive. Explicit `post_adam` selects the legacy update without
+an optimizer weight; supplying an optimizer weight in that mode is an error.
 
 For ordinary gradient b, global-block-mean Gain g and **raw unweighted** RV
 h, the native optimizer receives `clip(b - weight*g)`. No raw-gradient
@@ -204,10 +211,17 @@ nodes receive identical contract bytes through the existing checkpoint
 collection/redistribution route. Use a fresh coordinator `--attempt-id` when
 resuming and preserve the run ID.
 
-The contract also records `gain_weighting` and its formula identity. Omitted
+The contract also records `gain_weighting`, `gain_entropy_mode` and the Gain
+formula identity. Omitted
 resume weighting inherits the saved mode. Older contracts without this field
 retain `none` and their original bytes; explicit `none`↔`token_entropy`
 switches or mismatched formula IDs are rejected before model execution.
+Contracts without `gain_entropy_mode` retain historical normalized entropy.
+Saved alignment, Gain mode/coefficient (including zero), KL beta and warmup
+remain authoritative. Fresh defaults never rewrite an existing checkpoint.
+`Stage1V3Config` constructor omissions intentionally keep legacy decoding
+semantics; fresh runtime entrypoints use `fresh_v3_config` and pass the fully
+resolved configuration to the trainer.
 
 ## Bounded runtime acceptance
 

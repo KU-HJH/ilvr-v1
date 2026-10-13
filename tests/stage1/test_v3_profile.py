@@ -117,6 +117,9 @@ def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monk
     assert seen['trainer']['v3_config'].gain_weighting==weighting
     assert seen['trainer']['v3_config'].gain_update_mode==update_mode
     assert seen['trainer']['v3_config'].gain_optimizer_weight==(.25 if update_mode=='adamw_projected' else None)
+    assert seen['trainer']['v3_config'].gain_entropy_mode=='raw'
+    assert seen['trainer']['v3_config'].text_kl_warmup_ratio==0.
+    assert seen['trainer']['sim_weight']==.1
     assert seen['trainer']['ce_weight']==.1 and seen['trainer']['ema_tau']==1.
     assert seen['identity'][1] is args
     assert seen['trainer'].get('stage1_v3_stop_after_checkpoint')==stop

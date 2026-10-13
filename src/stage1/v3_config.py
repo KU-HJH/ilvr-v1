@@ -5,6 +5,10 @@ import math
 
 @dataclass(frozen=True)
 class Stage1V3Config:
+    """Saved objective value; constructor omissions retain historical semantics.
+
+    Runtime entrypoints use fresh_v3_config for a new run.
+    """
     schema_version: int = 1
     objective: str = "text_only_gain_v1"
     text_selector: str = "kl"
@@ -20,6 +24,7 @@ class Stage1V3Config:
     low_mass_ratio: float = .1
     image_cap: float = 0.
     gain_weighting: str = "none"
+    gain_entropy_mode: str = "normalized"
     gain_update_mode: str = "post_adam"
     gain_optimizer_weight: float | None = None
 
@@ -35,6 +40,8 @@ class Stage1V3Config:
             raise ValueError("Stage1-v3 text selector must be kl or entropy")
         if type(self.gain_weighting) is not str or self.gain_weighting not in ("none", "token_entropy"):
             raise ValueError("Stage1-v3 Gain weighting must be none or token_entropy")
+        if self.gain_entropy_mode not in ("normalized", "raw"):
+            raise ValueError("Stage1-v3 Gain entropy mode must be normalized or raw")
         if self.gain_update_mode not in ("post_adam", "adamw_projected"):
             raise ValueError("Stage1-v3 Gain update mode must be post_adam or adamw_projected")
         weight = self.gain_optimizer_weight
@@ -44,7 +51,7 @@ class Stage1V3Config:
         elif type(weight) not in (int, float) or not math.isfinite(weight) or weight < 0:
             raise ValueError("Stage1-v3 gain_optimizer_weight must be explicitly finite and nonnegative")
         for name, value in asdict(self).items():
-            if name in ("schema_version", "objective", "text_selector", "gain_weighting",
+            if name in ("schema_version", "objective", "text_selector", "gain_weighting", "gain_entropy_mode",
                         "gain_update_mode", "gain_optimizer_weight"):
                 continue
             if type(value) not in (int, float) or not math.isfinite(value):
@@ -64,3 +71,10 @@ class Stage1V3Config:
     def to_dict(self) -> dict[str, object]:
         self.validate()
         return asdict(self)
+
+
+def fresh_v3_config() -> Stage1V3Config:
+    """Current defaults, applied only when no saved contract exists."""
+    return Stage1V3Config(gain_weighting="token_entropy", gain_entropy_mode="raw",
+                          gain_update_mode="adamw_projected", gain_optimizer_weight=10.,
+                          text_kl_warmup_ratio=0.)

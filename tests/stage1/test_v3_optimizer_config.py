@@ -66,9 +66,10 @@ def test_resolver_inherits_saved_mode_and_zero_but_rejects_changes():
     saved = Stage1V3Config(gain_update_mode='adamw_projected', gain_optimizer_weight=0.)
     assert resolve(saved, None, None) == ('adamw_projected', 0.)
     assert resolve(saved, 'adamw_projected', 0.) == ('adamw_projected', 0.)
-    assert resolve(None, None, None) == ('post_adam', None)
+    assert resolve(None, None, None) == ('adamw_projected', 10.)
     for mode, weight in [('post_adam', None), (None, .1)]:
         with pytest.raises(ValueError, match='resume'):
             resolve(saved, mode, weight)
-    with pytest.raises(ValueError):
-        resolve(None, 'adamw_projected', None)
+    assert resolve(None, 'adamw_projected', None) == ('adamw_projected', 10.)
+    assert resolve(None, 'post_adam', None) == ('post_adam', None)
+    assert resolve(None, None, 0.) == ('adamw_projected', 0.)

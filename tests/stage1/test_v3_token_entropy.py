@@ -102,7 +102,7 @@ def test_token_entropy_checkpoint_mode_and_legacy_bytes_are_authoritative(tmp_pa
 def test_token_entropy_cli_coordinator_and_worker_mode(tmp_path,selector,resumed):
     from src.multinode_runtime import validate_stage1_arguments
     default=parse_args(['--stage1_variant','v3'])
-    assert default.stage1_v3_gain_weighting=='none'
+    assert default.stage1_v3_gain_weighting=='token_entropy'
     checkpoint,contract=saved(tmp_path,selector)
     # Real pre-feature checkpoint must inherit none.
     contract['config'].pop('gain_weighting')

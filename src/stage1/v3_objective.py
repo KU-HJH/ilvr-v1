@@ -24,13 +24,13 @@ def block_score_sum(logits: Tensor, blocks: tuple[V3Block, ...]) -> Tensor:
 
 
 @torch.no_grad()
-def normalized_token_entropy(clean_logits: Tensor, query_keys: tuple[QueryKey, ...],
-                             *, query_chunk_size: int = 128) -> Tensor:
-    """Detached T1 H/log(V) from ordinary F, in block/query order.
+def token_entropy(clean_logits: Tensor, query_keys: tuple[QueryKey, ...],
+                  *, mode: str, query_chunk_size: int = 128) -> Tensor:
+    """Detached T1 entropy from ordinary F, in block/query order.
 
     Cast only selected query chunks to FP32, rather than the full sequence.
     """
-    if (clean_logits.ndim != 3 or clean_logits.shape[-1] <= 1
+    if (mode not in ('normalized','raw') or clean_logits.ndim != 3 or clean_logits.shape[-1] <= 1
             or type(query_chunk_size) is not int or query_chunk_size <= 0):
         raise ValueError('invalid entropy logits/vocabulary/query chunk size')
     if any(type(row) is not int or type(query) is not int
@@ -42,26 +42,35 @@ def normalized_token_entropy(clean_logits: Tensor, query_keys: tuple[QueryKey, .
         keys = query_keys[start:start+query_chunk_size]
         rows,queries = zip(*keys)
         logp = clean_logits.detach()[rows,queries].float().log_softmax(-1)
-        entropy = -(logp.exp()*logp).sum(-1)/math.log(logp.shape[-1])
+        entropy = -(logp.exp()*logp).sum(-1)
+        if mode == 'normalized':
+            entropy = entropy/math.log(logp.shape[-1])
         if not torch.isfinite(entropy).all():
-            raise ValueError('nonfinite normalized token entropy')
-        weights[start:start+len(keys)] = entropy.clamp(0.,1.)
+            raise ValueError('nonfinite token entropy')
+        weights[start:start+len(keys)] = entropy.clamp(0.,1.) if mode == 'normalized' else entropy.clamp_min(0.)
     return weights
 
 
+def normalized_token_entropy(clean_logits: Tensor, query_keys: tuple[QueryKey, ...],
+                             *, query_chunk_size: int = 128) -> Tensor:
+    """Historical H/log(V), retaining the original arithmetic and [0,1] bound."""
+    return token_entropy(clean_logits,query_keys,mode='normalized',query_chunk_size=query_chunk_size)
+
+
 def entropy_weighted_gain_and_rv_sums(r_logits: Tensor, rv_logits: Tensor,
-                                    blocks: tuple[V3Block, ...], weights: Tensor) -> tuple[Tensor,Tensor]:
+                                    blocks: tuple[V3Block, ...], weights: Tensor,
+                                    *, entropy_mode: str = 'normalized') -> tuple[Tensor,Tensor]:
     """Already-differenced token-weighted Gain sum and unweighted RV sum.
 
     Share RV log-softmax between the Gain and protection VJPs. Original
     token counts remain the denominators; never divide by sum of weights.
     """
     queries = sum(len(b.target_ids) for b in blocks)
-    if (r_logits.ndim != 2 or r_logits.shape != rv_logits.shape or r_logits.shape[0] != queries
+    if (entropy_mode not in ('normalized','raw') or r_logits.ndim != 2 or r_logits.shape != rv_logits.shape or r_logits.shape[0] != queries
             or r_logits.device != rv_logits.device or weights.shape != (queries,)
             or weights.device != r_logits.device or weights.dtype != torch.float32
             or weights.requires_grad or not torch.isfinite(weights).all()
-            or (weights < 0).any() or (weights > 1).any()):
+            or (weights < 0).any() or (entropy_mode == 'normalized' and (weights > 1).any())):
         raise ValueError('invalid detached token entropy Gain inputs')
     r = r_logits.float().log_softmax(-1)
     rv = rv_logits.float().log_softmax(-1)

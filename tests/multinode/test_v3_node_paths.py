@@ -141,6 +141,20 @@ def test_entropy_coordinator_dry_run_passes_mode_to_both_nodes(capsys,weighting,
         assert value(worker,'--stage1-v3-selector')=='entropy'
         assert value(worker,'--stage1-variant')=='v3'
         assert value(worker,'--stage1-v3-gain-weighting')==weighting
+        assert value(worker,'--stage1-v3-gain-entropy-mode')=='raw'
         assert value(worker,'--stage1-v3-gain-update-mode')==update_mode
         if update_mode=='adamw_projected':assert value(worker,'--stage1-v3-gain-optimizer-weight')=='0.25'
         else:assert '--stage1-v3-gain-optimizer-weight' not in worker
+
+
+def test_fresh_coordinator_defaults_on_both_workers(capsys):
+    assert mn._main(['train-stage1','--run-id','stage1-v3-defaults-dry','--zero-stage','1',
+        '--main-process-port','29681','--dry-run','--stage1-variant','v3',
+        '--local-repo-root',str(LOCAL),'--remote-repo-root',str(REMOTE),
+        '--remote-host-repo-root',str(HOST)])==0
+    payload=json.loads(capsys.readouterr().out)
+    for worker in (payload['local'],remote_inner(payload['remote'])):
+        assert value(worker,'--stage1-v3-gain-weighting')=='token_entropy'
+        assert value(worker,'--stage1-v3-gain-entropy-mode')=='raw'
+        assert value(worker,'--stage1-v3-gain-update-mode')=='adamw_projected'
+        assert value(worker,'--stage1-v3-gain-optimizer-weight')=='10.0'

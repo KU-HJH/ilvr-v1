@@ -11,7 +11,7 @@ from .v3_config import Stage1V3Config
 from .v3_metadata import V3BatchMetadata
 from .v3_lifecycle import V3Lifecycle,packed_dropout_mask
 from .v3_selection import select_text_keys
-from .v3_objective import block_score_sum,text_kl_loss,normalized_token_entropy,entropy_weighted_gain_and_rv_sums
+from .v3_objective import block_score_sum,text_kl_loss,token_entropy,entropy_weighted_gain_and_rv_sums
 
 
 @dataclass(frozen=True)
@@ -113,8 +113,9 @@ def compute_v3_gradients(model: nn.Module,reference: nn.Module,model_inputs: Map
             (trace,replay_blocks,lifecycle))
     row,query=zip(*keys)
     if config.gain_weighting=='token_entropy':
-        weights=normalized_token_entropy(clean_logits,keys)
-        primary,rv=entropy_weighted_gain_and_rv_sums(output.r_logits,output.rv_logits,blocks,weights)
+        weights=token_entropy(clean_logits,keys,mode=config.gain_entropy_mode)
+        primary,rv=entropy_weighted_gain_and_rv_sums(output.r_logits,output.rv_logits,blocks,weights,
+                                                   entropy_mode=config.gain_entropy_mode)
     else:
         primary=block_score_sum(output.r_logits,blocks)
         rv=block_score_sum(output.rv_logits,blocks)
