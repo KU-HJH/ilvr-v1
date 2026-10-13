@@ -323,3 +323,14 @@ Plan SHA-256:
 `e699acb7432bb4d116ab1b9f64c7e911ddbe45026ed4593d3f27ea92b5310722`.
 The commit containing this plan and approval/evidence append is the plan handoff
 revision. Plan approval and implementation-method selection are still pending.
+
+## Plan approval and Subagent-driven execution
+
+The user replied `Subagent` to the presented plan and execution-method choice.
+This approves plan commit `e597354f09b9d4f2db4925cb48ff55e9157f8da4`
+and selects `superpowers:subagent-driven-development`. The approved plan hash
+is unchanged. Root created this plan's scoped SDD workspace, checked the
+existing worktree, and completed the required task/interface preflight table.
+See `2026-10-13-dil-bce-orig-implementation.md` for the durable ledger,
+including the one test-order ruling. Task1 implementation dispatch is next;
+no implementation is yet claimed. Training authorization remains separate.
