@@ -266,3 +266,60 @@ Final commitment SHA-256:
 `065e24b0d953eceddfa173ff842d3e8259f57861d233e2cf3fa72297ed936f52`.
 The commit containing this record and that exact specification is the written
 design handoff identity; approval is still pending and no plan was written.
+
+## Written-spec approval and implementation planning
+
+After the controller presented design commitment v1 and requested final written
+specification approval, the user replied `계속`. This is the actual approval
+event for the complete written spec at commit
+`112b09c230250e3e3adcaec77ea6171701b2032d`, SHA-256
+`065e24b0d953eceddfa173ff842d3e8259f57861d233e2cf3fa72297ed936f52`.
+It approves sections 1-11, including the recorded compatibility decisions,
+conditional replay, reduction/padding convention and runtime evidence boundary.
+The earlier pending-status statements remain historical records. The approved
+spec bytes have not been edited. This approval does not choose an implementation
+method, approve a plan not yet presented, or authorize training.
+
+Root completed brainstorming's approved architectural handoff and read/applied
+`superpowers:writing-plans`. Plan:
+`plans/2026-10-13-dil-bce-orig.md`. The six task boundaries are numerical kernels,
+configuration/identity, history replay, effective reference lifecycle,
+Trainer/distributed reduction, and entrypoint/artifact/runtime-witness integration.
+Each specifies files, consumed/produced interfaces, failing assertions, RED/GREEN
+commands and selected-method review/commit gates. CPU/Gloo/actual-parent evidence
+is separated from the unexecuted two-node/four-rank production witness.
+
+Root's inline writing-plans self-review checked all eleven spec sections and
+source D1-D8/E1-E7/N1-N4/I1-I12, cross-task types, exact CLI field names, actual
+existing file locations, five concrete review-focus tests, and proportionality.
+It made explicit the CLI provenance field and Task 5's modifications to the
+shared statistics/output modules, and expanded abbreviated test invocations.
+No planning subagents were used. The pre-rank snapshot preparation is a concrete
+implementation of the already approved one-writer-per-node rule; no rank-side
+wait/retry system or new training launcher is planned.
+
+The controller read TDD, requesting-code-review and finishing-a-development-branch
+to account for their future gates; their implementation/review/finish phases
+have not executed. verification-before-completion is applied now only to the
+control-document handoff: plan structure/coverage, unchanged approved spec and
+source hashes, authored whitespace, and absence of product-code changes. Branch
+finishing is not the next gate, so no project full suite is appropriate for
+this planning-only claim. Existing baseline/probe results are not new tests.
+
+Active path: architectural; current phase: plan review and implementation-method
+selection, pending the user's response to the plan handoff. The recommendation
+is Subagent-driven because math/replay/artifact/DDP interfaces can silently
+change the objective; only the user can select it or Native. Product changes,
+TDD execution, implementation/reviewer agents, final independent review,
+production execution and branch finishing remain unstarted.
+
+Fresh plan-document verification returned exit0. The controller read the full
+output: six tasks and their interfaces/TDD/review gates, all five named
+review-focus tests, preserved approved spec/source hashes, canonical source byte
+comparison, existing integration paths, authored whitespace and no product-code
+changes all passed. This is documentation validation only, not feature testing.
+Log: `logs/dil-bce-orig-plan-20261013/document-check.log`.
+Plan SHA-256:
+`e699acb7432bb4d116ab1b9f64c7e911ddbe45026ed4593d3f27ea92b5310722`.
+The commit containing this plan and approval/evidence append is the plan handoff
+revision. Plan approval and implementation-method selection are still pending.
