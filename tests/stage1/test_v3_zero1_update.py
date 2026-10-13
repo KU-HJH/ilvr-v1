@@ -129,3 +129,26 @@ def test_skip_cleans_hooks_without_parameter_or_state_change(monkeypatch):
     assert not zero.optimizer.state
     assert not zero.optimizer._optimizer_step_pre_hooks
     assert not zero.optimizer._optimizer_step_post_hooks
+
+
+@pytest.mark.parametrize('path', ['base', 'joint', 'zero_weight', 'zero_blocks'])
+def test_native_group_norm_overflow_is_rejected_before_optimizer_mutation(monkeypatch, path):
+    # DeepSpeed masks overflowing per-group squared norm to -1; aggregation
+    # alone then returns +1. Finite input tensors do not make that norm valid.
+    _, zero, adapter = make(monkeypatch, weight=0. if path == 'zero_weight' else 1.)
+    before = zero.single_partition_of_fp32_groups[0].clone()
+    blocks = 0 if path == 'zero_blocks' else 1
+    if path == 'joint':
+        gain = torch.tensor([-2e19, 0.])
+    else:
+        zero.averaged_gradients[0] = [torch.tensor([2e19, 0.], dtype=torch.bfloat16)]
+        assert torch.isfinite(zero.averaged_gradients[0][0]).all()
+        assert zero.get_grad_norm_direct(zero.averaged_gradients[0], zero.params_in_partition[0]).item() == -1.
+        assert zero.scaled_global_norm().item() == 1.
+        gain = zero.averaged_gradients[0][0].float().clone()  # Base bad even if joint cancels it.
+    with pytest.raises(RuntimeError, match='norm'):
+        adapter.prepare((gain,), (torch.zeros(2),), block_count=blocks)
+    assert torch.equal(before, zero.single_partition_of_fp32_groups[0])
+    assert not zero.optimizer.state
+    assert not zero.events
+    assert not zero.optimizer._optimizer_step_pre_hooks and not zero.optimizer._optimizer_step_post_hooks

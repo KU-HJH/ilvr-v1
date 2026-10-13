@@ -10,6 +10,7 @@ import math
 import torch
 from deepspeed.utils.mixed_precision_linkage import link_hp_params
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+from deepspeed.runtime.zero import stage_1_and_2 as zero_module
 
 
 class Collective:
@@ -36,10 +37,14 @@ class Collective:
 def install_cpu_collectives(monkeypatch, api):
     def all_reduce(tensor, op=None, group=None):
         tensor.copy_(group.collective.reduce(group.rank, tensor))
-    monkeypatch.setattr(api, 'dist', SimpleNamespace(is_available=lambda: True,
+    shim = SimpleNamespace(is_available=lambda: True,
         is_initialized=lambda: True, get_rank=lambda group: group.rank,
         get_world_size=lambda group: group.size, all_reduce=all_reduce,
-        ReduceOp=SimpleNamespace(SUM='sum')))
+        ReduceOp=SimpleNamespace(SUM='sum'))
+    monkeypatch.setattr(api, 'dist', shim)
+    monkeypatch.setattr(zero_module, 'dist', shim)
+    monkeypatch.setattr(zero_module, 'get_accelerator',
+                        lambda: SimpleNamespace(current_device_name=lambda: 'cpu'))
     # This is the only supported-profile relaxation: CPU/non-fused instead of CUDA/fused.
     monkeypatch.setattr(api, '_require_supported_gpu_optimizer', lambda optimizer: None)
 
@@ -47,12 +52,18 @@ def install_cpu_collectives(monkeypatch, api):
 class ControlledZero:
     _optimizer_step = DeepSpeedZeroOptimizer._optimizer_step
     unscale_and_clip_grads = DeepSpeedZeroOptimizer.unscale_and_clip_grads
+    get_grad_norm_direct = DeepSpeedZeroOptimizer.get_grad_norm_direct
+    scaled_global_norm = DeepSpeedZeroOptimizer.scaled_global_norm
+    _model_parallel_all_reduce = DeepSpeedZeroOptimizer._model_parallel_all_reduce
 
     def __init__(self, group_values, *, collective, rank=0, lrs=None, clip=1.):
         self.dp_process_group = SimpleNamespace(rank=rank, size=collective.size, collective=collective)
         self.real_dp_process_group = [self.dp_process_group] * len(group_values)
         self.partition_gradients = self.cpu_offload = self.has_moe_layers = self.round_robin_gradients = False
         self.model_parallel_world_size = 1
+        self.model_parallel_rank = 0
+        self.model_parallel_group = None
+        self.device = torch.device('cpu')
         self.torch_autocast_gradscaler = self.zenflow = None
         self.loss_scale = 1.
         self.clip_grad = clip
@@ -99,15 +110,6 @@ class ControlledZero:
     @property
     def all_parameters(self):
         return tuple(p for group in self.bit16_groups for p in group)
-
-    def scaled_global_norm(self):
-        norms = []
-        group = self.dp_process_group
-        for i in range(len(self.bit16_groups)):
-            grads = self.averaged_gradients[i][:len(self.params_in_partition[i])]
-            local = sum((g.double().norm().square() for g in grads), torch.tensor(0., dtype=torch.float64)).float()
-            norms.append(group.collective.reduce(group.rank, local).sqrt())
-        return torch.stack(norms).norm()
 
     def step(self):
         norm = self.scaled_global_norm()

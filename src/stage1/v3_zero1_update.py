@@ -89,7 +89,8 @@ class Zero1AdamWGainAdapter:
                 or z.cpu_offload is not False or z.loss_scale != 1.
                 or getattr(z, 'has_moe_layers', False) or getattr(z, 'round_robin_gradients', False)
                 or getattr(z, 'model_parallel_world_size', 1) != 1
-                or getattr(z, 'torch_autocast_gradscaler', None) is not None or getattr(z, 'zenflow', False)):
+                or getattr(z, 'torch_autocast_gradscaler', None) is not None or getattr(z, 'zenflow', False)
+                or not callable(getattr(z, 'get_grad_norm_direct', None))):
             raise ValueError('unsupported torch/ZeRO-1 profile')
         self.native = z.optimizer
         if type(self.native) is not torch.optim.AdamW:
@@ -217,11 +218,11 @@ class Zero1AdamWGainAdapter:
             self._joint_delta_sq = torch.zeros((), dtype=torch.float64, device=self.device)
             bypass = 'zero_weight' if self.config.gain_optimizer_weight == 0 else ('zero_blocks' if block_count == 0 else None)
             self.metrics['bypass_reason'] = bypass
+            norm = self._checked_global_norm('base')
+            self.metrics['base_gradient_norm'] = float(norm)
+            self.metrics['joint_gradient_norm'] = float(norm)
             if not bypass:
                 joint, self._protection = self._agree('owned gradients', lambda: self._owned_inputs(gain, protection))
-                norm = self.zero.scaled_global_norm()
-                self._agree('base norm', lambda: self._check_norm(norm))
-                self.metrics['base_gradient_norm'] = float(norm)
                 base, delta_sq = [], torch.zeros((), dtype=torch.float64, device=self.device)
                 def calculate_base():
                     nonlocal delta_sq
@@ -238,8 +239,7 @@ class Zero1AdamWGainAdapter:
                 self.metrics['base_displacement_norm'] = float(self._sum(delta_sq).sqrt())
                 for gi, gradients in enumerate(joint):
                     self.zero.averaged_gradients[gi] = gradients
-                norm = self.zero.scaled_global_norm()
-                self._agree('joint norm', lambda: self._check_norm(norm))
+                norm = self._checked_global_norm('joint')
                 self.metrics['joint_gradient_norm'] = float(norm)
             self._hooks = [self.native.register_step_pre_hook(self._before_native),
                            self.native.register_step_post_hook(self._after_native)]
@@ -260,6 +260,19 @@ class Zero1AdamWGainAdapter:
     def _check_norm(norm):
         if norm.numel() != 1 or not torch.isfinite(norm).all() or norm < 0:
             raise ValueError('invalid native gradient norm')
+
+    def _checked_global_norm(self, label):
+        # DS masks invalid per-group norms to -1. Its subsequent vector norm
+        # loses that sign, so validate each native value before aggregation.
+        norms = []
+        for i in range(len(self.groups)):
+            norm = self.zero.get_grad_norm_direct(self.zero.averaged_gradients[i],
+                                                 self.zero.params_in_partition[i])
+            self._agree(f'{label} group norm', lambda: self._check_norm(norm))
+            norms.append(norm)
+        result = torch.linalg.vector_norm(torch.stack(norms), ord=2)
+        self._agree(f'{label} norm', lambda: self._check_norm(result))
+        return result
 
     def _before_native(self, optimizer, args, kwargs):
         def check():
