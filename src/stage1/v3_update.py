@@ -17,6 +17,7 @@ class V3GainController:
         self.parameters,self.config=parameters,config
         self.state='IDLE';self.successful_steps=0;self.global_block_count=0
         self.direction=();self._engine=None
+        self._optimizer_adapter=None;self.last_metrics={}
         self._clear()
 
     def _clear(self):
@@ -24,6 +25,7 @@ class V3GainController:
         self._r=tuple(torch.zeros_like(p,dtype=torch.float32) for p in self.parameters)
         self._rv=tuple(torch.zeros_like(p,dtype=torch.float32) for p in self.parameters)
         self._count=0;self._invalid=False;self.direction=()
+        self.raw_gain=();self.raw_rv=()
 
     def accumulate(self,result: V3Gradients) -> None:
         if self.state not in ('IDLE','ACCUMULATING'):
@@ -69,9 +71,16 @@ class V3GainController:
                     b=self.global_block_count
                     gain=(tuple(a/b for a in r) if self.config.gain_weighting=='token_entropy'
                           else tuple((a-h)/b for a,h in zip(r,rv)))
-                    self.direction=project_gain(gain,tuple(h/b for h in rv),
-                                                min_h_norm_sq=self.config.min_h_norm_sq)
-                else:self.direction=tuple(torch.zeros_like(g) for g in r)
+                    self.raw_gain=gain;self.raw_rv=tuple(h/b for h in rv)
+                    if self.config.gain_update_mode=='post_adam':
+                        self.direction=project_gain(gain,self.raw_rv,
+                                                    min_h_norm_sq=self.config.min_h_norm_sq)
+                else:
+                    self.raw_gain=tuple(torch.zeros_like(g) for g in r)
+                    self.raw_rv=tuple(torch.zeros_like(g) for g in rv)
+                    self.direction=self.raw_gain
+                if any(not torch.isfinite(g).all() for g in self.raw_gain+self.raw_rv):
+                    raise ValueError('nonfinite global Gain/RV gradient')
             except (ValueError,RuntimeError) as failure:error=failure
             invalid=self._sum(torch.tensor(int(error is not None),device=device,dtype=torch.int32),process_group)
             if invalid.item():raise RuntimeError('invalid or nonfinite global Gain projection') from error
@@ -80,6 +89,10 @@ class V3GainController:
             self.state='FAILED';raise
 
     def validate_engine(self,engine: object) -> None:
+        if self.config.gain_update_mode=='adamw_projected':
+            # The new adapter performs collective profile/mapping validation after
+            # raw-gradient reduction; do not run a rank-local legacy guard first.
+            return
         if self._engine is engine:return
         optimizer=getattr(engine,'optimizer',None)
         if (version('deepspeed')!='0.18.7' or not callable(getattr(engine,'zero_optimization_stage',None))
@@ -99,11 +112,30 @@ class V3GainController:
                 raise RuntimeError('v3 ZeRO-1 full master mapping unavailable')
         self._engine=engine
 
+    def prepare_optimizer_step(self,engine: object) -> None:
+        if self.config.gain_update_mode=='post_adam':return
+        if self.state!='PREPARED':raise RuntimeError('optimizer Gain requires prepared raw gradients')
+        from .v3_zero1_update import Zero1AdamWGainAdapter
+        self._optimizer_adapter=Zero1AdamWGainAdapter(engine,self.parameters,self.config)
+        self._optimizer_adapter.prepare(self.raw_gain,self.raw_rv,block_count=self.global_block_count)
+
+    def abort_optimizer_step(self) -> None:
+        if self._optimizer_adapter is not None:
+            self._optimizer_adapter.abort()
+            self._optimizer_adapter=None
+
     @torch.no_grad()
     def finish(self,engine: object,*,successful: bool) -> None:
         if self.state!='PREPARED' or type(successful) is not bool:
             raise RuntimeError('duplicate or unprepared Gain finish')
         try:
+            if self.config.gain_update_mode=='adamw_projected':
+                if self._optimizer_adapter is None:raise RuntimeError('optimizer Gain adapter was not prepared')
+                self.last_metrics=self._optimizer_adapter.finish(successful=successful)
+                self._optimizer_adapter=None
+                if successful:self.successful_steps+=1
+                self._clear();self.state='IDLE'
+                return
             self.validate_engine(engine)
             if successful:
                 if self.global_block_count and self.config.gain_alpha:
@@ -120,6 +152,7 @@ class V3GainController:
                 self.successful_steps+=1
             self._clear();self.state='IDLE'
         except BaseException:
+            self.abort_optimizer_step()
             self.state='FAILED';raise
 
     def assert_checkpointable(self) -> None:

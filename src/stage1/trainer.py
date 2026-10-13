@@ -171,6 +171,7 @@ class _DeepSpeedStepAdapter:
             if gain is not None:
                 gain.validate_engine(self.engine)
                 gain.prepare()
+                gain.prepare_optimizer_step(self.engine)
             trainer._validate_deepspeed_gradient_norm(self.engine)
             result = self.original_step(*args, **kwargs)
             applied = self.engine.was_step_applied()
@@ -183,6 +184,7 @@ class _DeepSpeedStepAdapter:
             return result
         except BaseException:
             if gain is not None:
+                gain.abort_optimizer_step()
                 gain.state = "FAILED"
             raise
 
@@ -966,11 +968,28 @@ class CustomTrainerStage1(SFTTrainer):
         if gain is not None:
             gain.finish(model, successful=successful)
         if not successful:
+            if gain is not None and gain.last_metrics:
+                self._log_v3_optimizer_metrics(gain.last_metrics)
             return
         student = model if isinstance(model, nn.Module) else self.model
         if self.ema_teacher.decay != 1.0:
             self.ema_teacher.update(student)
         self._successful_optimizer_steps += 1
+        if gain is not None and gain.last_metrics:
+            self._log_v3_optimizer_metrics(gain.last_metrics)
+
+    def _log_v3_optimizer_metrics(self, metrics: dict) -> None:
+        logs = {}
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            if isinstance(value, str):
+                logs[f"stage1_v3/{key}_{value}"] = 1
+            else:
+                logs[f"stage1_v3/{key}"] = value
+        logs["stage1_v3/successful_steps"] = self._successful_optimizer_steps
+        # Do not consume the ordinary-loss diagnostics in our log override.
+        super().log(logs)
 
     def optimizer_step(self, *args, optimizer=None, **kwargs):
         """Compatibility entry point mirroring the callback-managed boundary."""

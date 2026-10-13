@@ -48,10 +48,13 @@ def fake_engine(monkeypatch,c,p,*,skip=False,fail=False):
     return engine,master,adam,events
 
 
-def test_all_four_ranks_reduce_sums_and_count_in_same_order_including_zero(monkeypatch):
+@pytest.mark.parametrize('update_mode',['post_adam','adamw_projected'])
+def test_all_four_ranks_reduce_sums_and_count_in_same_order_including_zero(monkeypatch,update_mode):
     module=api();traces=[]
     for rank in range(4):
         c,p=controller()
+        if update_mode=='adamw_projected':
+            c=api().V3GainController((p,),Stage1V3Config(gain_update_mode=update_mode,gain_optimizer_weight=.25))
         for count in (rank//2,rank-rank//2):c.accumulate(result([2*count,-count],[count,count],count))
         expected=[torch.tensor(0,dtype=torch.int32),torch.tensor(rank,dtype=torch.int64),
                   torch.tensor([2*rank,-rank],dtype=torch.float32),torch.tensor([rank,rank],dtype=torch.float32),
@@ -65,7 +68,10 @@ def test_all_four_ranks_reduce_sums_and_count_in_same_order_including_zero(monke
         monkeypatch.setattr(module.dist,'all_reduce',reduce)
         c.prepare()
         assert c.global_block_count==6
-        torch.testing.assert_close(c.direction[0],torch.tensor([1.5,-1.5]))
+        if update_mode=='post_adam':torch.testing.assert_close(c.direction[0],torch.tensor([1.5,-1.5]))
+        else:
+            assert torch.equal(c.raw_gain[0],torch.tensor([1.,-2.]))
+            assert torch.equal(c.raw_rv[0],torch.tensor([1.,1.]))
         traces.append(trace)
     assert traces==[traces[0]]*4
 
@@ -145,14 +151,16 @@ def test_runtime_mapping_rejected_before_base(monkeypatch,field,value):
 @pytest.mark.parametrize('empty',[False,True])
 @pytest.mark.parametrize('image',[False,True])
 @pytest.mark.parametrize('weighting',['none','token_entropy'])
-def test_real_parent_training_step_helper_once_and_configured_accumulation(tmp_path,monkeypatch,checkpointed,empty,image,weighting):
+@pytest.mark.parametrize('update_mode',['post_adam','adamw_projected'])
+def test_real_parent_training_step_helper_once_and_configured_accumulation(tmp_path,monkeypatch,checkpointed,empty,image,weighting,update_mode):
     from tests.stage1.v3_helpers import product_v3_trainer
     from stage1.v3_lifecycle import current_v3_lifecycle
     from peft_common import resolve_qwen2_5_vl_model
     from transformers import Trainer
     from trl import SFTTrainer
     trainer,batch=product_v3_trainer(tmp_path,checkpointed=checkpointed,empty=empty,image=image,
-                                  config=Stage1V3Config(gain_weighting=weighting))
+                                  config=Stage1V3Config(gain_weighting=weighting,gain_update_mode=update_mode,
+                                      gain_optimizer_weight=.25 if update_mode=='adamw_projected' else None))
     assert 'training_step' not in SFTTrainer.__dict__
     calls=[];losses={};seen=[]
     qwen=resolve_qwen2_5_vl_model(trainer.model)
