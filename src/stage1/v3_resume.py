@@ -38,16 +38,36 @@ def _formula_ids(config):
         formulas['selector']='T2_entropy_student_sample_centered_full_causal_v1'
     if config.gain_weighting=='token_entropy':
         formulas['gain']='F_T1_detached_H_logV_token_gap_block_mean_raw_RV_project_fp64_post_adam_fp32_v1'
+    if config.gain_update_mode=='adamw_projected':
+        formulas['gain']='global_block_mean_same_state_adamw_joint_moments_active_lr_project_fp64_fp32_master_v1'
+        if config.gain_weighting=='token_entropy':
+            formulas['gain']='F_T1_detached_H_logV_token_gap_'+formulas['gain']
+        formulas['gain_alpha_role']='inactive_legacy_displacement_v1'
     return formulas
 
 
 def _contract_identity(value):
-    # Only additive selector/weighting fields have legacy defaults; never fill other
+    # Only additive mode fields have legacy defaults; never fill other
     # missing fields or mutate/rewrite the original saved contract.
     normalized=dict(value,config=dict(value['config']))
     normalized['config'].setdefault('text_selector','kl')
     normalized['config'].setdefault('gain_weighting','none')
+    normalized['config'].setdefault('gain_update_mode','post_adam')
+    normalized['config'].setdefault('gain_optimizer_weight',None)
     return _canonical(normalized)
+
+
+def _resolve_gain_update(saved_config: Stage1V3Config | None, mode: str | None,
+                         weight: float | None) -> tuple[str, float | None]:
+    if saved_config is not None:
+        if ((mode is not None and mode != saved_config.gain_update_mode)
+                or (weight is not None and weight != saved_config.gain_optimizer_weight)):
+            raise ValueError('v3 resume Gain optimizer mismatch; changing modes/weights requires a fresh run')
+        mode = saved_config.gain_update_mode if mode is None else mode
+        weight = saved_config.gain_optimizer_weight if weight is None else weight
+    config = Stage1V3Config(gain_update_mode='post_adam' if mode is None else mode,
+                           gain_optimizer_weight=weight)
+    return config.gain_update_mode, config.gain_optimizer_weight
 
 
 @dataclass(frozen=True)

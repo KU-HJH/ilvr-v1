@@ -20,6 +20,8 @@ class Stage1V3Config:
     low_mass_ratio: float = .1
     image_cap: float = 0.
     gain_weighting: str = "none"
+    gain_update_mode: str = "post_adam"
+    gain_optimizer_weight: float | None = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -33,8 +35,17 @@ class Stage1V3Config:
             raise ValueError("Stage1-v3 text selector must be kl or entropy")
         if type(self.gain_weighting) is not str or self.gain_weighting not in ("none", "token_entropy"):
             raise ValueError("Stage1-v3 Gain weighting must be none or token_entropy")
+        if self.gain_update_mode not in ("post_adam", "adamw_projected"):
+            raise ValueError("Stage1-v3 Gain update mode must be post_adam or adamw_projected")
+        weight = self.gain_optimizer_weight
+        if self.gain_update_mode == "post_adam":
+            if weight is not None:
+                raise ValueError("Stage1-v3 optimizer weight requires adamw_projected mode")
+        elif type(weight) not in (int, float) or not math.isfinite(weight) or weight < 0:
+            raise ValueError("Stage1-v3 gain_optimizer_weight must be explicitly finite and nonnegative")
         for name, value in asdict(self).items():
-            if name in ("schema_version", "objective", "text_selector", "gain_weighting"):
+            if name in ("schema_version", "objective", "text_selector", "gain_weighting",
+                        "gain_update_mode", "gain_optimizer_weight"):
                 continue
             if type(value) not in (int, float) or not math.isfinite(value):
                 raise ValueError(f"Stage1-v3 {name} must be finite numeric")
