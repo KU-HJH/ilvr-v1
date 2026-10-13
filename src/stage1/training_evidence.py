@@ -31,6 +31,36 @@ _FIELDS_V2 = _FIELDS_V1 | {
     "teacher_update_mode",
     "seed",
 }
+_FIELDS_V3 = _FIELDS_V2 | {"planned_stop"}
+
+
+def _validate_planned_stop(value, global_step):
+    if (type(value) is not dict
+            or set(value) != {"global_step", "max_steps", "budget_complete"}
+            or type(value["global_step"]) is not int
+            or type(value["max_steps"]) is not int
+            or value["global_step"] != global_step
+            or not 0 < global_step < value["max_steps"]
+            or value["budget_complete"] is not False):
+        raise ValueError("Stage 1 planned stop evidence is invalid")
+
+
+def validate_planned_stop_checkpoint(checkpoint, planned_stop):
+    """Bind the invocation budget to shared metadata after all-rank collection."""
+    from src.multinode_runtime import _read_regular_file
+    from .v3_resume import read_v3_contract
+
+    contract = read_v3_contract(checkpoint)
+    # checkpoints/ is intentionally a symlink; resolve that directory while
+    # retaining the regular-file check on the metadata itself.
+    state = json.loads(_read_regular_file(Path(checkpoint).resolve() / "trainer_state.json"),
+                       object_pairs_hook=_reject_duplicates)
+    if (type(state) is not dict or type(state.get("global_step")) is not int
+            or type(state.get("max_steps")) is not int
+            or state["global_step"] != planned_stop["global_step"]
+            or state["max_steps"] != planned_stop["max_steps"]
+            or contract["planned_steps"] != planned_stop["max_steps"]):
+        raise ValueError("Stage 1 planned stop checkpoint budget/step mismatch")
 
 
 def _finite_number(value: object) -> bool:
@@ -88,6 +118,7 @@ def build_stage1_training_evidence(
     global_step: int,
     checkpoint_path: str | Path,
     loss: float,
+    planned_stop: dict | None = None,
 ) -> dict[str, object]:
     """Bind one observed finite Trainer loss to its exact numbered checkpoint."""
     run_id, method, zero_stage, world_size, global_step, checkpoint = (
@@ -116,7 +147,7 @@ def build_stage1_training_evidence(
     if not _finite_number(ema_tau) or not 0.0 <= float(ema_tau) <= 1.0:
         raise ValueError("Stage 1 training evidence EMA decay is invalid")
     normalized_ema_tau = float(ema_tau)
-    return {
+    payload = {
         "schema_version": 2,
         "kind": "stage1-training-evidence",
         "run_id": run_id,
@@ -140,6 +171,10 @@ def build_stage1_training_evidence(
         "loss": float(loss),
         "finite_loss": True,
     }
+    if planned_stop is not None:
+        _validate_planned_stop(planned_stop, global_step)
+        payload.update(schema_version=3, planned_stop=dict(planned_stop))
+    return payload
 
 
 def _reject_duplicates(pairs):
@@ -165,6 +200,7 @@ def decode_stage1_training_evidence(
     expected_gradient_accumulation_steps: int | None = None,
     expected_ema_tau: float | None = None,
     expected_seed: int | None = None,
+    expected_planned_stop: int | None = None,
 ) -> dict[str, object]:
     """Decode and revalidate one exact ordinary Stage 1 producer object."""
     if type(raw) is not bytes or not raw or len(raw) > 1024 * 1024:
@@ -180,10 +216,19 @@ def decode_stage1_training_evidence(
         expected_fields = _FIELDS_V1
     elif schema_version == 2:
         expected_fields = _FIELDS_V2
+    elif schema_version == 3:
+        expected_fields = _FIELDS_V3
     else:
         raise ValueError("Stage 1 training evidence schema is invalid")
     if set(payload) != expected_fields:
         raise ValueError("Stage 1 training evidence fields are invalid")
+    if schema_version == 3:
+        _validate_planned_stop(payload["planned_stop"], payload["global_step"])
+        if (type(expected_planned_stop) is not int
+                or payload["global_step"] != expected_planned_stop):
+            raise ValueError("Stage 1 planned stop differs from invocation")
+    elif expected_planned_stop is not None:
+        raise ValueError("Stage 1 planned stop evidence is missing")
     if (
         type(payload["schema_version"]) is not int
         or type(payload["kind"]) is not str
@@ -248,6 +293,7 @@ def decode_stage1_training_evidence(
             ],
             ema_tau=payload["ema_tau"],
             seed=payload["seed"],
+            **({"planned_stop": payload["planned_stop"]} if schema_version == 3 else {}),
         )
     if expected_producer_checkpoint is not None:
         rebuilt["checkpoint_path"] = str(Path(expected_producer_checkpoint))

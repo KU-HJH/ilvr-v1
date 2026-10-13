@@ -832,6 +832,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--stage1-v3-gain-weighting",
     "--stage1-v3-gain-update-mode",
     "--stage1-v3-gain-optimizer-weight",
+    "--stage1-v3-stop-after-checkpoint",
     "--method",
     "--model",
     "--data-path",
@@ -3837,6 +3838,7 @@ def _finite_loss_reference(
     plan: "LaunchPlan" | None = None,
     checkpoint_root: Path | None = None,
     expected_global_step: int | None = None,
+    planned_stop_max_steps: int | None = None,
 ) -> dict[str, object]:
     if path is None:
         raise ValueError("finite loss evidence is required for a successful attempt")
@@ -3913,7 +3915,14 @@ def _finite_loss_reference(
                 node_path(plan, checkpoint_root / f"checkpoint-{expected_global_step}", machine_rank=0)
                 if plan.cluster.local_repo_root != plan.cluster.remote_repo_root else None
             ),
+            expected_planned_stop=expected_global_step if planned_stop_max_steps is not None else None,
         )
+        if planned_stop_max_steps is not None:
+            from stage1.training_evidence import validate_planned_stop_checkpoint
+            if decoded["planned_stop"]["max_steps"] != planned_stop_max_steps:
+                raise ValueError("Stage 1 planned stop budget differs from witness")
+            validate_planned_stop_checkpoint(
+                checkpoint_root / f"checkpoint-{expected_global_step}", decoded["planned_stop"])
         return {
             "status": "validated",
             "path": str(path),
@@ -4015,6 +4024,7 @@ def write_training_witness(
         plan=plan,
         checkpoint_root=checkpoint,
         expected_global_step=expected_global_step,
+        planned_stop_max_steps=planned_stop_max_steps,
     )
     run_directory = _trusted_absolute_path(result_root) / plan.run_id
     path = run_directory / f"{plan.attempt_id}-train-witness.json"

@@ -2113,9 +2113,10 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 benchmark_evidence_path=str(producer_evidence),
             )
             resume_requested = "RESUME_CHECKPOINT" in stage_environment
-        planned_stop = _argument_value(forwarded, "--stage2_stop_after_checkpoint") if stage == "stage2" else None
+        planned_stop = _argument_value(forwarded, "--stage2_stop_after_checkpoint" if stage == "stage2"
+                                       else "--stage1-v3-stop-after-checkpoint")
         planned_stop_max_steps = None
-        if planned_stop is not None:
+        if planned_stop is not None and stage == "stage2":
             budget = _argument_value(forwarded, "--max_steps")
             if not (planned_stop.isdecimal() and budget is not None and budget.isdecimal()
                     and 0 < int(planned_stop) < int(budget)):
@@ -2321,7 +2322,9 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
 
             raw_evidence = runner.read_stage1_training_evidence(evidence_path)
             step_value = _argument_value(forwarded, "--max-steps")
-            if step_value is None:
+            if planned_stop is not None:
+                final_step = int(planned_stop)
+            elif step_value is None:
                 evidence_payload = json.loads(raw_evidence)
                 evidence_step = (
                     evidence_payload.get("global_step")
@@ -2339,7 +2342,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 )
             else:
                 final_step = int(step_value)
-            decode_stage1_training_evidence(
+            decoded_evidence = decode_stage1_training_evidence(
                 raw_evidence,
                 expected_run_id=plan.run_id,
                 expected_method=plan.tuning_method,
@@ -2362,7 +2365,10 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                     _argument_value(forwarded, "--ema-tau") or "1.0"
                 ),
                 expected_seed=int(_argument_value(forwarded, "--seed") or "42"),
+                expected_planned_stop=int(planned_stop) if planned_stop is not None else None,
             )
+            if planned_stop is not None:
+                planned_stop_max_steps = decoded_evidence["planned_stop"]["max_steps"]
             publish_small_file(
                 evidence_path,
                 raw_evidence,

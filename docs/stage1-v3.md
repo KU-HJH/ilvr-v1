@@ -248,3 +248,41 @@ The acceptance builder prefixes each node's PATH with that node's
 to initial and resumed attempts, including PATH-based child executable lookup.
 The earlier remote PATH review finding is addressed; follow-up evidence is
 recorded in `logs/stage1-v3-path-fix/workflow.md`.
+
+## Stop after a complete checkpoint
+
+For a fresh Stage1-v3 run, add `--stage1-v3-stop-after-checkpoint N` and
+`--no-final-save` to the existing multi-node coordinator command. This optional
+invocation setting defaults to off. It forces a full numbered checkpoint at
+update N, then stops normally after Stage1 checkpoint saving, EMA/v3 sidecars
+and rank synchronization finish. A save error remains a failed attempt.
+
+The original one-epoch budget and LR schedule stay intact. N must be a positive
+integer strictly below the budget derived from the actual prepared dataloader;
+that comparison happens before the first update. Resume and model-only saves
+cannot use this option. The Python spelling is
+`--stage1_v3_stop_after_checkpoint N --no_final_save`.
+
+Successful intentional stops emit schema-3 Stage1 producer evidence containing
+`planned_stop: {global_step: N, max_steps: <full budget>, budget_complete: false}`.
+The coordinator binds N to its invocation, collects all-rank checkpoint state,
+and checks the full budget against both `trainer_state.json` and
+`stage1_v3.json` before publishing the incomplete-budget training witness.
+Ordinary producer evidence retains schema 2; historical schemas 1 and 2 remain
+readable. The stop option is absent from the saved v3 objective/profile identity.
+
+Resume with the same run ID, a new `--attempt-id`, and
+`--resume <run-output>/checkpoint-N`; omit the stop option. The remaining updates
+use the original saved budget. Checkpoint N remains available until resumption,
+but a later checkpoint may rotate it away under the existing last-one policy.
+
+CPU tests cover the actual save/callback/resume path and failure handling. They
+do not establish four-rank ZeRO or Gain numerical equivalence. The subsequent
+short runtime comparison should use 48 uniquely indexed presentations of the
+longest sample (global batch 16, three updates): continuous 0→3 versus 0→2,
+save/stop, resume 2→3. The first LR is zero, so the split must follow the second
+update. Record nonzero applied FP32 displacement, Gain/projection execution,
+optimizer/scheduler/RNG/teacher restoration and occurrence order. The older
+acceptance harness above tests its original post-Adam/KL configuration and does
+not replace that check for the optional optimizer Gain mode. Full training is
+still a separate, unlaunched step.

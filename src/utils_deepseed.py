@@ -191,6 +191,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max_train_samples", type=int)
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--stage2_stop_after_checkpoint", type=int)
+    parser.add_argument("--stage1_v3_stop_after_checkpoint", type=int)
     parser.add_argument("--benchmark_run_config")
     parser.add_argument("--benchmark_evidence_path")
     parser.add_argument("--benchmark_source_data_path")

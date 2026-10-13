@@ -160,7 +160,10 @@ def resolve_v3_arguments(args,raw_argv):
     weighting=getattr(args,'stage1_v3_gain_weighting',None)
     gain_mode=getattr(args,'stage1_v3_gain_update_mode',None)
     gain_weight=getattr(args,'stage1_v3_gain_optimizer_weight',None)
+    from .planned_stop import validate_planned_checkpoint_stop
+    stop=getattr(args,'stage1_v3_stop_after_checkpoint',None)
     if args.stage!='stage1':
+        validate_planned_checkpoint_stop(stop,is_v3=False)
         if variant is not None:raise ValueError('stage1_variant is only valid for Stage 1')
         if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
         if weighting is not None:raise ValueError('stage1_v3_gain_weighting is only valid for Stage1-v3')
@@ -177,6 +180,10 @@ def resolve_v3_arguments(args,raw_argv):
         raise ValueError('stage1 variant resume mismatch; historical checkpoints cannot become v3')
     args.stage1_variant=variant or inherited
     args.stage1_v3_saved_contract=saved
+    validate_planned_checkpoint_stop(stop,is_v3=args.stage1_variant=='v3',
+        resume=checkpoint,final_save=args.final_save)
+    if stop is not None and (args.benchmark_run_config or args.benchmark_evidence_path):
+        raise ValueError('planned stop cannot use the separate benchmark evidence protocol')
     if args.stage1_variant!='v3':
         if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
         if weighting is not None:raise ValueError('stage1_v3_gain_weighting is only valid for Stage1-v3')
@@ -305,7 +312,8 @@ LAUNCHER_ALIASES={'--method':'tuning_method','--model':'model','--epochs':'epoch
     '--textual_states':'textual_states','--max-steps':'max_steps','--stage1-v3-selector':'stage1_v3_selector',
     '--stage1-v3-gain-weighting':'stage1_v3_gain_weighting',
     '--stage1-v3-gain-update-mode':'stage1_v3_gain_update_mode',
-    '--stage1-v3-gain-optimizer-weight':'stage1_v3_gain_optimizer_weight'}
+    '--stage1-v3-gain-optimizer-weight':'stage1_v3_gain_optimizer_weight',
+    '--stage1-v3-stop-after-checkpoint':'stage1_v3_stop_after_checkpoint'}
 
 
 def resolve_coordinator_arguments(arguments,output):
@@ -317,8 +325,12 @@ def resolve_coordinator_arguments(arguments,output):
             if (value:=_argument_value(tuple(arguments),option)) is not None}
     variant=values.get('--stage1-variant') or os.environ.get('STAGE1_VARIANT')
     checkpoint=values.get('--resume')
+    if ('--stage1-v3-stop-after-checkpoint' in values
+            and _argument_value(tuple(arguments),'--benchmark-run-config') is not None):
+        raise ValueError('planned stop cannot use the separate benchmark evidence protocol')
     has_saved=checkpoint is not None and (Path(checkpoint)/FILENAME).is_file()
     if variant!='v3' and not has_saved:
+        if '--stage1-v3-stop-after-checkpoint' in values:raise ValueError('stop_after_checkpoint is only valid for Stage1-v3')
         if '--stage1-v3-selector' in values:raise ValueError('stage1-v3-selector is only valid for Stage1-v3')
         if '--stage1-v3-gain-weighting' in values:raise ValueError('stage1-v3-gain-weighting is only valid for Stage1-v3')
         if any(k in values for k in ('--stage1-v3-gain-update-mode','--stage1-v3-gain-optimizer-weight')):
@@ -327,6 +339,8 @@ def resolve_coordinator_arguments(arguments,output):
     argv=['--stage','stage1','--save_model_path',str(output)]
     if variant:argv+=['--stage1_variant',variant]
     if checkpoint:argv+=['--resume_from_checkpoint_path',checkpoint]
+    for item in arguments:
+        if item in ('--no-final-save','--final-save'):argv.append('--'+item[2:].replace('-','_'))
     for option,key in LAUNCHER_ALIASES.items():
         if option in values:argv+=['--'+key,values[option]]
     args=parse_args(argv)
@@ -364,6 +378,8 @@ def _launcher_main():
     for i,item in enumerate(options.original):
         if item in LAUNCHER_ALIASES:
             argv+=['--'+LAUNCHER_ALIASES[item],options.original[i+1]]
+        elif item in ('--no-final-save','--final-save'):
+            argv.append('--'+item[2:].replace('-','_'))
     args=parse_args(argv)
     values={'stage1_variant':args.stage1_variant}
     if args.stage1_variant=='v3':
@@ -373,6 +389,8 @@ def _launcher_main():
         values['stage1_v3_gain_update_mode']=args.stage1_v3_gain_update_mode
         if args.stage1_v3_gain_optimizer_weight is not None:
             values['stage1_v3_gain_optimizer_weight']=args.stage1_v3_gain_optimizer_weight
+        if args.stage1_v3_stop_after_checkpoint is not None:
+            values['stage1_v3_stop_after_checkpoint']=args.stage1_v3_stop_after_checkpoint
     import sys
     for name,value in values.items():
         sys.stdout.write(name+'\0'+(str(value).lower() if isinstance(value,bool) else str(value))+'\0')

@@ -475,6 +475,11 @@ def build_stage1_training_components(
         output_dir, args.resume_from_checkpoint_path
     )
     checkpoint = decision.checkpoint_path
+    from .planned_stop import validate_planned_checkpoint_stop
+    validate_planned_checkpoint_stop(
+        getattr(args, "stage1_v3_stop_after_checkpoint", None), is_v3=v3_enabled,
+        resume=checkpoint, final_save=args.final_save,
+    )
     metadata = None
     metadata_snapshot = decision.peft_metadata_snapshot
     if decision.artifact_kind is Stage1ArtifactKind.PEFT:
@@ -629,6 +634,7 @@ def build_stage1_training_components(
     v3_kwargs = {}
     if v3_enabled:
         from .v3_config import Stage1V3Config
+        v3_kwargs["stage1_v3_stop_after_checkpoint"] = getattr(args, "stage1_v3_stop_after_checkpoint", None)
         saved = getattr(args, "stage1_v3_saved_contract", None)
         v3_kwargs["v3_config"] = (Stage1V3Config(**saved["config"]) if saved
                                  else Stage1V3Config(text_selector=args.stage1_v3_selector,
@@ -684,6 +690,13 @@ def run_stage1(
     rank_config_digest_provider: Callable | None = None,
 ) -> None:
     """Train once and, when requested, perform one separately timed final save."""
+
+    from .planned_stop import validate_planned_checkpoint_stop
+    stop_step = getattr(args, "stage1_v3_stop_after_checkpoint", None)
+    validate_planned_checkpoint_stop(
+        stop_step, is_v3=getattr(args, "stage1_variant", None) == "v3",
+        resume=getattr(args, "resume_from_checkpoint_path", None), final_save=args.final_save,
+    )
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if deepspeed_runtime_profile is None:
@@ -797,6 +810,19 @@ def run_stage1(
     logging.info("Stage 1 Trainer time: %.3fs", trainer_seconds)
 
     save_seconds = 0.0
+    planned_stop = None
+    if stop_step is not None:
+        callback = getattr(components.trainer, "stage1_v3_planned_stop_callback", None)
+        state = components.trainer.state
+        budget = components.trainer.v3_planned_steps
+        if (getattr(callback, "completed_step", None) != stop_step
+                or state.global_step != stop_step or state.max_steps != budget):
+            raise ValueError("Stage1-v3 planned stop did not complete its checkpoint save")
+        validate_planned_checkpoint_stop(stop_step, is_v3=True, planned_steps=budget)
+        planned_stop = {"global_step": stop_step, "max_steps": budget, "budget_complete": False}
+        logging.info("Stage1-v3 planned stop: checkpoint-%s saved; %s/%s updates, budget incomplete",
+                     stop_step, stop_step, budget)
+
     if args.final_save:
         save_start = monotonic()
         components.trainer.save_model(args.save_model_path)
@@ -829,6 +855,8 @@ def run_stage1(
             "checkpoint_path": Path(args.save_model_path) / f"checkpoint-{global_step}",
             "loss": loss,
         }
+        if planned_stop is not None:
+            evidence["planned_stop"] = planned_stop
         from stage1.training_evidence import (
             build_stage1_training_evidence,
             publish_stage1_training_evidence,

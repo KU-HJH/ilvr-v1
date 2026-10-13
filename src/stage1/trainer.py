@@ -249,8 +249,13 @@ class CustomTrainerStage1(SFTTrainer):
         stage1_peft_metadata=None,
         collect_stage1_diagnostics: bool = False,
         v3_config=None,
+        stage1_v3_stop_after_checkpoint=None,
         **kwargs,
     ) -> None:
+        from .planned_stop import validate_planned_checkpoint_stop
+        validate_planned_checkpoint_stop(
+            stage1_v3_stop_after_checkpoint, is_v3=v3_config is not None,
+        )
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
             raise TypeError("Stage 1 trainer requires a DeepSpeed runtime profile")
         self.deepspeed_runtime_profile = deepspeed_runtime_profile
@@ -260,6 +265,16 @@ class CustomTrainerStage1(SFTTrainer):
         if "tokenizer" in kwargs and "processing_class" not in kwargs:
             kwargs["processing_class"] = kwargs.pop("tokenizer")
         super().__init__(*args, **kwargs)
+        validate_planned_checkpoint_stop(
+            stage1_v3_stop_after_checkpoint, is_v3=v3_config is not None,
+            save_only_model=self.args.save_only_model,
+        )
+        self.stage1_v3_stop_after_checkpoint = stage1_v3_stop_after_checkpoint
+        self.stage1_v3_planned_stop_callback = None
+        if stage1_v3_stop_after_checkpoint is not None:
+            from .planned_stop import PlannedCheckpointStop
+            self.stage1_v3_planned_stop_callback = PlannedCheckpointStop(stage1_v3_stop_after_checkpoint)
+            self.add_callback(self.stage1_v3_planned_stop_callback)
 
         self.sim_weight = self._finite_weight(sim_weight, "sim_weight")
         self.ce_weight = self._finite_weight(ce_weight, "ce_weight")
@@ -388,6 +403,11 @@ class CustomTrainerStage1(SFTTrainer):
             microsteps_per_rank=length, accumulation_steps=args.gradient_accumulation_steps)
         if args.num_train_epochs != 1 or args.max_steps not in (-1, schedule.planned_steps):
             raise ValueError("v3 requires one actual prepared-loader epoch with its derived update budget")
+        from .planned_stop import validate_planned_checkpoint_stop
+        validate_planned_checkpoint_stop(
+            getattr(self, "stage1_v3_stop_after_checkpoint", None), is_v3=True,
+            planned_steps=schedule.planned_steps, save_only_model=args.save_only_model,
+        )
         self.stage1_variant = "v3"
         self.v3_schedule = schedule
         self.v3_planned_steps = schedule.planned_steps
@@ -1210,6 +1230,14 @@ class CustomTrainerStage1(SFTTrainer):
         **kwargs,
     ):
         """Require and defer compatible EMA state for Stage 1 resume."""
+
+        from .planned_stop import validate_planned_checkpoint_stop
+        validate_planned_checkpoint_stop(
+            getattr(self, "stage1_v3_stop_after_checkpoint", None),
+            is_v3=getattr(self, "v3_config", None) is not None,
+            resume=kwargs.get("model_path", resume_from_checkpoint),
+            save_only_model=getattr(self.args, "save_only_model", False),
+        )
 
         self._publish_deepspeed_runtime_identity(
             Path(self.args.output_dir), label="Stage 1 runtime identity publication"

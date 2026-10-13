@@ -81,13 +81,15 @@ def test_coordinator_allowlist_and_launcher_enforce_fresh_profile_without_writes
 @pytest.mark.parametrize('selector',['kl','entropy'])
 @pytest.mark.parametrize('weighting',['none','token_entropy'])
 @pytest.mark.parametrize('update_mode',['post_adam','adamw_projected'])
-def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monkeypatch,selector,weighting,update_mode):
+@pytest.mark.parametrize('stop',[None,2])
+def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monkeypatch,selector,weighting,update_mode,stop):
     from dataclasses import replace
     from types import SimpleNamespace
     from tests.stage1.test_composition import stage1_args,fake_dependencies
     import stage1.composition as composition
     import stage1.v3_resume as resume
     extra=['--stage1_v3_gain_update_mode',update_mode]
+    if stop is not None:extra+=['--stage1_v3_stop_after_checkpoint',str(stop),'--no_final_save']
     if update_mode=='adamw_projected':extra+=['--stage1_v3_gain_optimizer_weight','0.25']
     args=stage1_args(tmp_path,'--stage1_variant','v3','--stage1_v3_selector',selector,'--stage1_v3_gain_weighting',weighting,*extra)
     events=[];deps,_,_,_=fake_dependencies(events)
@@ -117,6 +119,7 @@ def test_composition_passes_opt_in_metadata_objective_and_identity(tmp_path,monk
     assert seen['trainer']['v3_config'].gain_optimizer_weight==(.25 if update_mode=='adamw_projected' else None)
     assert seen['trainer']['ce_weight']==.1 and seen['trainer']['ema_tau']==1.
     assert seen['identity'][1] is args
+    assert seen['trainer'].get('stage1_v3_stop_after_checkpoint')==stop
 
 
 def test_cli_default_and_explicit_entropy_preserve_training_profile():
