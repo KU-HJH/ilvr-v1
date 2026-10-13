@@ -58,12 +58,17 @@ def test_explicit_optimizer_options_rejected_outside_v3(extra):
         parse_args([*extra,'--stage1_v3_gain_update_mode','adamw_projected','--stage1_v3_gain_optimizer_weight','0'])
 
 
-def test_fresh_default_and_missing_new_weight():
+def test_fresh_default_and_explicit_legacy_mode():
     args = parse_args(['--stage1_variant','v3'])
-    assert args.stage1_v3_gain_update_mode == 'post_adam'
-    assert args.stage1_v3_gain_optimizer_weight is None
+    assert args.stage1_v3_gain_update_mode == 'adamw_projected'
+    assert args.stage1_v3_gain_optimizer_weight == 10.
+    explicit = parse_args(['--stage1_variant','v3','--stage1_v3_gain_update_mode','adamw_projected'])
+    assert explicit.stage1_v3_gain_optimizer_weight == 10.
+    legacy = parse_args(['--stage1_variant','v3','--stage1_v3_gain_update_mode','post_adam'])
+    assert legacy.stage1_v3_gain_optimizer_weight is None
     with pytest.raises(ValueError,match='weight'):
-        parse_args(['--stage1_variant','v3','--stage1_v3_gain_update_mode','adamw_projected'])
+        parse_args(['--stage1_variant','v3','--stage1_v3_gain_update_mode','post_adam',
+                    '--stage1_v3_gain_optimizer_weight','10'])
 
 
 @pytest.mark.parametrize('inline',[False,True])
@@ -74,7 +79,9 @@ def test_coordinator_resolves_mode_and_never_serializes_none(tmp_path,inline):
     resolved = resolve_coordinator_arguments(validate_stage1_arguments(argv),tmp_path/'out')
     assert resolved[resolved.index('--stage1-v3-gain-update-mode')+1] == 'adamw_projected'
     assert resolved[resolved.index('--stage1-v3-gain-optimizer-weight')+1] == '0.0'
-    legacy = resolve_coordinator_arguments(('--stage1-variant','v3'),tmp_path/'out')
+    fresh = resolve_coordinator_arguments(('--stage1-variant','v3'),tmp_path/'out')
+    assert fresh[fresh.index('--stage1-v3-gain-optimizer-weight')+1] == '10.0'
+    legacy = resolve_coordinator_arguments(('--stage1-variant','v3','--stage1-v3-gain-update-mode','post_adam'),tmp_path/'out')
     assert '--stage1-v3-gain-optimizer-weight' not in legacy
 
 
