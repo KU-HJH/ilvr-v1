@@ -82,3 +82,46 @@ The latest instruction supersedes the previous Stage2 integration scope. The sou
 Active phase is now architectural brainstorming for a Stage1 revision, not execution of old Tasks2-6. The selected Subagent-driven implementation method persists. Read-only investigation and controller control artifacts may continue; Stage1 product integration awaits the revised applicable design/plan gates. No further training permission is needed merely to repeat authorization already given; unresolved protocol/design/reference choices still need resolution before execution. No training/evaluation has launched.
 
 Canonical training-defaults.md was freshly read after execution scope expanded. Stage1 starts fresh from original Qwen2.5-VL-3B under its own teacher/EMA/ZeRO semantics, subject to the revised approved integration. Stage2 initializer checkpoint431 and Stage2 212-step budget must not be carried over as Stage1 defaults. Stage1 update budget must be measured under its actual retained data/sampler/Trainer behavior. Automatic evaluation retains canonical TEST400 defaults unless explicitly changed.
+
+## Stage1 revision: context investigation and open objective choice
+
+Understood as: implement the document's DIL mathematics in fresh standard
+Stage1 training from original Qwen, using the requested worktree and selected
+Subagent-driven method, then train and automatically evaluate the final artifact.
+No instruction selects the separate Stage1-v3 implementation. Its newly recorded
+defaults explicitly do not change standard Stage1.
+
+Root resumed `superpowers:brainstorming` on the architectural path, reconciled
+the existing approval/review records, and applied `readchk` to the scope change.
+Canonical AGENTS and training-defaults were reread. No product change or premise
+experiment was made during this investigation.
+
+Static findings at revision `9876dbe`:
+
+- `src/stage1/trainer.py:344` builds teacher targets, supplies detached latent
+  values to the student, and combines CE with cosine latent alignment. It does
+  not use Stage2's student latent rollout. Removing alignment changes this
+  training objective and is not implied unambiguously by the stage correction.
+- `src/stage1/ema.py:426` deep-copies the effective student after PEFT setup;
+  `update` returns immediately at decay 1. The existing frozen teacher is a
+  candidate DIL reference owner, subject to revised design approval and runtime
+  evidence for immutable state, identical conditioning and resume restoration.
+  Method names alone do not establish these runtime properties.
+- `src/stage1/data.py` preserves Stage1 chat rendering and assistant CE labels,
+  with latent block metadata but no existing immediate-text preference spans.
+  New span mapping must preserve the existing rendered tokens and CE labels.
+- The existing multi-node Stage1 coordinator and four-worker evaluation path
+  exist. Reuse them after development gates; actual retained-data update budget,
+  compatible execution on both nodes and final-artifact preparation remain to
+  be verified. No launch or resource claim is made here.
+
+Pending asynchronous clarification: preserve existing Stage1 alignment and add
+DIL (recommended to retain explicit latent prediction supervision), or replace
+alignment with the document's CE+DIL(+optional entropy/mass) objective. This is
+an unresolved objective choice, not a repeat request for training authorization.
+
+Architectural checklist: context investigation completed for this clarification;
+objective choice pending; approaches/section confirmations, revised written spec,
+spec self-review, frozen-proposal hate/macrothink commitment, final written-spec
+approval and revised plan approval remain pending. Prior Task1 evidence remains
+valid for its unchanged numerical kernels only. No implementation task is active.
