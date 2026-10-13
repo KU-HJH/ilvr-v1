@@ -159,3 +159,22 @@ passes must use these same bytes. Fresh document checks passed (exit 0), with
 full output read from `logs/stage1-v5-design/proposal-document-check.log`.
 Original DIL source and inherited product code remain unchanged. No full suite
 is appropriate for this documentation-only claim; branch finishing is not next.
+
+## Design commitment critiques in progress
+
+Root executed hate against frozen proposal v1 and captured exactly `{root,
+first_nail}` in `specs/2026-10-13-stage1-v5-hate-v1.json`. Its objection is the
+unwitnessed shared-F checkpoint/dropout gradient equivalence; the first nail is
+a bounded tiny CPU DoRA comparison against independent masked calls. The
+separate experiment authorization question is pending. No probe has run and
+the earlier Stage2 probe is not reused as evidence for this different graph.
+
+Root invoked macrothink under the standing design-gate authorization. The
+stripped prompt retained the user's objective/coefficient/call-count constraints
+and observed Stage1-v3 facts but omitted the root's objection and implementation
+recommendation. It requested an independent framing before reading the frozen
+proposal, then evidence-bounded divergence assessment. Three fresh same-model
+read-only agents are active: `/root/v5_fresh_read_1`, `/root/v5_fresh_read_2`,
+`/root/v5_fresh_read_3`. They were told not to invoke Paperthin, spawn agents,
+edit files or run experiments. No divergence classification or completion is
+claimed until their actual results are received and synthesized by root.
