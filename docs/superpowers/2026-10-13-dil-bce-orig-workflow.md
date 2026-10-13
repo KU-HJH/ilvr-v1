@@ -148,3 +148,121 @@ docs/superpowers`; the source copy is checked by byte comparison and SHA-256.
 This is an input-format exception, not a product/runtime defect or a test pass.
 The CPU first-nail experiment was requested separately through asynchronous
 user input; it remains pending until an explicit answer arrives.
+
+## Macrothink execution and synthesis
+
+Frozen proposal v1 was committed at `de7999256728d0ef832ded690e36a60371cbfe42`.
+Root dispatched three fresh-context, same-model, read-only agents under the
+standing design-commitment policy: `/root/orig_fresh_read_1`,
+`/root/orig_fresh_read_2`, `/root/orig_fresh_read_3`. Each was instructed to record
+an independent framing from the stripped problem before opening the frozen
+proposal, verify its SHA-256, avoid other critiques and perform no experiments,
+edits, hook invocations or further delegation. All three reported those initial
+framings before reviewing v1 and verified the supplied proposal hash.
+
+The stripped problem retained token imitation, full-vocabulary frozen-policy
+negatives, online student latents, optional ablation uncertainty, legacy/CE/resume
+preservation and fixed global16/tail policies. It omitted the chosen class/API
+names, separate-model recommendation, loss name and the controller's first-nail
+objection. The reads independently emphasized score/link, positive/reference
+overlap, conditioning/differentiation, weighting and recoverable effective policy.
+
+Classification against the current direction:
+
+- Incompatible divergence: none identified in these static reads. This is not
+  evidence of runtime correctness or a majority-vote approval.
+- Read 1: divergent-compatible. Require actual parent Trainer/DeepSpeed tail
+  scaling and collective-order witnesses; use a literal reference decoder as
+  the replay comparator, rather than general student/reference equality.
+- Read 2: divergent-compatible. State the conditional semi-gradient and changing
+  reference outputs; document grouping-dependent weighting, test the actual
+  padding wrapper, and distinguish eval identity from training-mode dropout.
+- Read 3: divergent-compatible. Scope support-only OFF gradients to entropy,
+  preserve complement gradients for mass, add actual GAS4/tail evidence, and
+  hold reference logits/discrete selectors fixed during finite differences.
+- Convergent portions of all reads: density-ratio formula, independent
+  reference-owned embeddings and immutable reference identity were consistent
+  with their initial framing. Convergence is reassurance only, never proof.
+
+Root clustered the compatible findings into (1) exact conditioning/gradient
+boundaries and (2) actual distributed execution versus reduction algebra. The
+final design retains the architecture and addresses these in sections 3/4/6/9.
+No material disagreement is relabeled as resolved by votes. Known production
+and PEFT uncertainties remain explicit acceptance gates. Root alone performed
+synthesis; these agents did not provide implementation reviews or authorize a
+phase transition.
+
+## Explicit probe authorization and observed first-nail evidence
+
+The user answered the separate experiment question with
+`CPU 재생 검사 실행 승인`. Root then created one throwaway experiment in
+`logs/dil-bce-orig-premise-20261013/probe.py` and ran it once using:
+
+```bash
+export PYTHONPATH="$PWD/transformers/src:$PWD/src:$PWD"
+export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=''
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+./venv/ilvr-venv/bin/python logs/dil-bce-orig-premise-20261013/probe.py
+```
+
+No model artifacts were loaded or saved, no optimizer step or training run was
+executed, and no product implementation was added. The fixture is a randomly
+initialized native tiny Qwen, length17, two latent blocks, latent positions
+6/7/12/13, predictors8/9/14/15. A copied model supplies equal initial effective
+weights for this experiment only; it is not the production reference loader.
+
+Observed exit0/pass; the controller read complete stdout/JSON and numeric exit:
+equal-weight eval logits and literal-reference replay logits each had max error0;
+changed reference token/image representations differed0.15/0.20 while captured
+latent slots remained exact. Negative controls differed0.7284281849861145
+(all-student-embedding logits) and3.5637803077697754 (reference-rerolled latents).
+Two observed reference replays made one decoder call each with no student KV.
+Reference outputs were detached from a requires-grad latent leaf, student
+backward retained nonzero gradients, and reference parameters/buffers stayed
+unchanged after the intentional reference perturbation and subsequent replay.
+
+This establishes a narrow CPU feasibility witness, not the production replay
+API, PEFT behavior, new objective, optimizer exclusion, distributed training,
+snapshot/resume or GPU capacity. The first nail did not disprove the premise;
+there was no reason to stop the remaining advisory reads or redesign the
+architecture on that basis. No unexecuted experiment is claimed as evidence.
+
+Preserved evidence:
+
+- Probe source SHA-256: `391fda6285789cdb57d8aabc2fb4c8a94fa3f076597f5eab0bcbaf6d20308c07`.
+- Results: `results/dil-bce-orig-premise-20261013/result.json`.
+- Log and exit: `logs/dil-bce-orig-premise-20261013/probe.log`, `probe.exit`.
+- Result and log SHA-256 (identical serialized output):
+  `cfcb4d8153fc4e9b252e18e4bf8660efa318a0114a01cc9724ce940eb4195899`.
+
+## Current phase: final written-spec approval
+
+`specs/2026-10-13-dil-bce-orig-design.md` is now design commitment v1, with
+agreed intent/scope, final design, exact changes from frozen proposal v1,
+first-nail evidence, advisory divergences and remaining uncertainties. All
+preliminary design sections, self-review and the mandatory root advisory hooks
+have actually executed; this is not implementation completion.
+
+The source document and feature code remain unchanged. The controller has
+authored only control documents and the explicitly authorized throwaway probe.
+No written-spec approval, plan approval or implementation-method choice has
+arrived yet. Writing-plans is the next phase only after written-spec approval;
+implementation skills, TDD/product edits, independent code reviews and branch
+finishing have not started. Branch finishing is not the next gate here.
+
+The final control-document check initially used a raw substring assertion for
+a sentence split by a Markdown line break; that assertion failed. Its correction
+normalizes whitespace before checking the same semantic text. This is a
+verification-script formatting correction, not a changed design or product fix.
+The final successful check and commit are recorded by the subsequent command
+output/Git identity; no failed assertion is treated as a pass.
+
+Final document verification returned exit0: eleven complete design sections and
+the review clarifications are present; the canonical input is byte-identical;
+probe source/result hashes and numeric exit match the observed witness; no
+product-code diff exists from the approved base. `git diff --check` returned0.
+Log: `logs/dil-bce-orig-design-20261013/final-doc-check.log`.
+Final commitment SHA-256:
+`065e24b0d953eceddfa173ff842d3e8259f57861d233e2cf3fa72297ed936f52`.
+The commit containing this record and that exact specification is the written
+design handoff identity; approval is still pending and no plan was written.

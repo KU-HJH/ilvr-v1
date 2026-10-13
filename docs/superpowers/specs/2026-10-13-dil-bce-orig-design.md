@@ -1,8 +1,12 @@
 # DIL-BCE-ORIG implementation design
 
-Date: 2026-10-13. Status: **design proposal v1; not finally approved**.
+Date: 2026-10-13. Status: **design commitment v1; awaiting final written-spec approval**.
 Workspace: `/root/workspace/ILVR/.worktrees/dil-bce-orig`.
 Base: `00c212cb598d88e5cfe22a40d11d320f04c609d5` (`feat/dil-bce-port`).
+Frozen proposal v1: commit `de7999256728d0ef832ded690e36a60371cbfe42`,
+SHA-256 `add66ad6e3e9c517426def6a5a24108e5b70a2bbcd8e6579b8dbcb4fa9f7e972`.
+Sections 1-10 below are the complete commitment; section 11 records the critique
+synthesis and evidence. Approval binds to this complete version and scope.
 
 ## 1. Intent, authority and completion boundary
 
@@ -75,7 +79,7 @@ When entropy is active, select k detached candidate IDs from OFF logits
 (`independent`) or clean logits (`sync_topk`). Reuse the base's `topk` tie behavior
 without modifying legacy execution. Require `2 <= k < V`. Optional GT union
 adds GT once; ragged support uses a valid mask and actual support size n.
-Only selected OFF values remain live:
+For entropy U alone, only selected OFF values have a direct logit gradient:
 
 ```text
 logq = selected_off_logits - logsumexp(selected_off_logits over valid support)
@@ -85,6 +89,9 @@ M = KL(Bern(stopgrad(clean support mass)) || Bern(OFF support mass))
 ```
 
 Mass uses full-vocabulary probabilities over exactly the entropy support.
+Unlike U, M keeps both support and complement OFF logits live through its full
+normalizer. A partial-support mass fixture must observe nonzero complement
+gradients; the support-only gradient assertion applies exclusively to U.
 Use the existing stable group-gap computation where applicable; full support
 has exactly zero mass loss and gradient. `lambda_topk_mass > 0` requires entropy
 active; chosen-mass weight must be zero. No old rejected BCE is added.
@@ -148,6 +155,18 @@ materialized, is computed internally from this reference call and is never
 shared with the student. Select the packet's predictors and return detached
 full-vocabulary logits. No permanent reference-logit cache is allowed.
 
+This is a conditional semi-gradient update: frozen reference weights do not
+imply fixed reference predictions as student latent inputs change between
+updates. The update preserves the student latent gradient and omits the
+reference response's derivative with respect to those inputs. Finite-difference
+loss oracles hold realized reference logits and discrete candidate/position
+selectors fixed; replay regeneration is tested separately. Do not claim the
+full derivative of an end-to-end objective that differentiates through reference
+conditioning. Equal student/reference logits are required only for equal
+effective weights, inputs and deterministic/eval conditions. The general replay
+oracle is an independently assembled reference-decoder evaluation, not equality
+with a student that has different weights or active dropout.
+
 The corresponding model helper belongs beside the patched Qwen Stage2 code,
 for example `stage2_reference_replay.py`; `modeling_qwen2_5_vl.py` exposes the
 packet and replay entry point. PEFT resolution follows the existing wrapper
@@ -209,6 +228,22 @@ Persist that identity. Test equal/unequal step counts, real empty-step samples,
 zero-loss slots, all-empty counts, complete accumulation and partial tails.
 Each rank executes the same count collectives; logging reduces detached sums
 with the same denominators, rather than averaging already unequal rank means.
+
+Read padding state through the actual `Stage2Trainer.compute_loss` wrapper:
+it removes the input sample-weight field before objective dispatch and exposes
+`_stage2_padding_active`. Inside the orig reducer, zero both the padded local
+step sum and its count while preserving a live zero graph; the outer wrapper's
+final loss zeroing alone is insufficient for count/metric correctness.
+Orig collective metrics must execute before or outside the existing early
+return for padded metrics. The CPU distributed tests traverse this wrapper.
+
+The microbatch grouping is mathematically consequential: with step counts
+(1,1,1,5) and constant per-sample step losses (0,0,0,1), raw preference is 5/8,
+not the example mean 1/4. Add a regrouping fixture with unequal step counts
+across accumulation microbatches to demonstrate that this is deliberately not
+an optimizer-window global-step mean. The separately authorized production
+witness must compare actual Trainer/DeepSpeed gradients with an independent
+oracle for both unequal steps and a three-real/one-padding tail at GAS4.
 
 ## 7. Configuration, CLI and errors
 
@@ -294,14 +329,14 @@ Acceptance matrix:
 | Requirement | Required evidence |
 | --- | --- |
 | Source D1-D8 | Independent FP64 formulas, population and single-GT gradients, detached reference, token-before-step reduction, wrong-approximation fixtures |
-| Source E1-E7 | Uniform/nonuniform/saturated entropy, live-q derivative, candidate modes/GT union, support-only gradients, full-support mass zero |
+| Source E1-E7 | Uniform/nonuniform/saturated entropy, live-q derivative, candidate modes/GT union, entropy-only support gradients, live mass complement gradients and full-support mass zero |
 | Source N1-N4 | Chunk 1/128/all loss+gradient comparison, dtype/extremes, ragged padding and bad-input/config failures |
 | Source I1/I7/I10/I11/I12 | Real alias/CLI resolution, empty masks/steps, CE range and coefficient, all legacy regressions, no duplicate objective, diagnostic values |
-| Source I2-I4 | Tiny patched-model and PEFT runtime: same-history logits, differing embeddings, frozen weights/buffers after update, no reference-to-student input gradient, Trainer mode transitions |
+| Source I2-I4 | Tiny patched-model and PEFT runtime: independent reference replay oracle, equal-weight eval agreement, differing embeddings, changed latent inputs with unchanged reference weights, frozen weights/buffers after update, no reference-to-student input gradient, Trainer mode transitions |
 | Source I5-I6 | Actual decoder/sidecar call witnesses for entropy off/on and each selection source; no unnecessary OFF forward |
-| Source I8 | CPU Gloo multi-process gradient comparison against a literal global oracle, including padding/accumulation conventions above |
+| Source I8 | CPU Gloo multi-process gradient comparison through actual compute_loss against a literal global oracle, including padding, accumulation and sample-regrouping conventions above |
 | Source I9 | Fresh snapshot, content mismatch/missing file, same-content relocated source, omitted/explicit resume options and parent-dispatch rejection tests |
-| Production path | Coordinator dry-run and both-worker argv; independently reviewed four-rank GPU smoke for finite gradients, reference invariance, peak memory and added cost |
+| Production path | Coordinator dry-run and both-worker argv; independently reviewed four-rank GPU smoke for finite gradients, reference invariance, peak memory and added cost, plus actual Trainer/DeepSpeed gradient-oracle agreement for unequal steps and the GAS4 padded partial tail |
 
 For helper comparisons begin with FP32 atol=1e-5/rtol=1e-4; FP64 oracle internal
 checks use atol=1e-10/rtol=1e-8. Justify distinct model/BF16 tolerances.
@@ -322,7 +357,69 @@ shared-prefix scorer, CLI/worker/coordinator artifact forwarding and tests.
 Reuse existing helpers where contracts match; no unrelated trainer rewrite.
 
 Fresh baseline evidence is 116 existing DIL tests passing at the base revision.
-No new implementation, same-history reference replay, new gradient formula,
-distributed orig path, reference snapshot round trip or production-memory claim
-has yet been tested. The final design commitment will record critique findings,
-first-nail status, any revisions and the remaining uncertainty before approval.
+The separately authorized throwaway native-model CPU replay experiment in
+section 11 passed. It is not the new production API or a checkpoint loader.
+No new objective implementation, PEFT replay, distributed orig path, reference
+snapshot round trip or production-memory claim has yet been tested.
+
+## 11. Design commitment v1: critique synthesis and evidence
+
+Agreed problem and scope remain sections 1-2: implement the requested conditional
+token objective in the approved worktree/base, with separate frozen reference,
+optional entropy/mass, compatible lifecycle and explicit legacy preservation.
+The final design is sections 3-10, including the reconciliation decisions in
+sections 2 and 6. This commitment does not authorize training or pick the
+implementation method.
+
+The root ran hate on frozen proposal v1 and captured one root objection: replay
+can have the correct shape and no gradients yet compute a different objective
+if it regenerates latent history or reuses all student embeddings. The first
+nail was a tiny CPU comparison with literal reference input assembly and two
+negative controls. The user explicitly answered `CPU 재생 검사 실행 승인`;
+this authorizes that one premise experiment, not implementation or this spec.
+
+Observed experiment result: exit 0, two latent blocks, four latent positions,
+four predictors. Equal-weight eval max-logit error and independent literal
+reference max-logit error were both 0. Changing reference token/image embedding
+parameters changed their representations by 0.15/0.20 while replayed latents
+remained exact. Reusing the student's entire embeddings differed by 0.7284 in
+logits; independently regenerating reference latents differed by 3.5638 in
+latent values. Reference paths had no gradient to a requires-grad latent leaf;
+student gradients remained present; reference state was unchanged by replay
+and student backward. These are native tiny-model results, not PEFT/production
+equivalence, a learned-objective result or an optimizer-step witness.
+
+Artifacts: `results/dil-bce-orig-premise-20261013/result.json` and
+`logs/dil-bce-orig-premise-20261013/{probe.py,probe.log,probe.exit}`.
+Probe SHA-256: `391fda6285789cdb57d8aabc2fb4c8a94fa3f076597f5eab0bcbaf6d20308c07`.
+The first nail did not falsify feasibility within this narrow scope; runtime
+verification of the actual implementation remains mandatory.
+
+Three same-model fresh reads were authorized by the standing macrothink policy.
+Each recorded its stripped-problem interpretation before opening the same
+frozen proposal, verified the hash, and performed only static reads:
+
+| Agent | Classification | Contribution |
+| --- | --- | --- |
+| `/root/orig_fresh_read_1` | divergent-compatible | Actual Trainer/DeepSpeed partial-tail witness; reference-specific literal replay oracle |
+| `/root/orig_fresh_read_2` | divergent-compatible | Explicit semi-gradient interpretation; grouping-dependent reduction; actual padding-wrapper tests; eval/dropout assumptions |
+| `/root/orig_fresh_read_3` | divergent-compatible | Entropy versus mass gradient boundary; actual GAS4/tail witness; fixed-reference/selectors during finite differences |
+
+No incompatible divergence was identified within these static reads. Compatible
+divergences cluster into two roots: (1) conditioning/gradient boundaries must be
+specified precisely enough to reject a plausible wrong implementation, and
+(2) distributed algebra must be witnessed through the real wrapper/backward
+path. Changes from proposal v1 explicitly address these roots in sections 3,
+4, 6 and 9. No reviewed incompatible finding is being waived or hidden.
+
+The reads also converged on the density-ratio formula and independent-reference
+architecture. This is reassurance only, not a vote, verification or proof.
+At fixed conditioning the population optimum imitates the positive token
+distribution; it is not a claim that training distills the reference distribution
+or that the evolving latent model has a proven global optimum.
+
+Remaining uncertainties are listed in section 10 and are acceptance gates for
+implementation/runtime evidence. The unavailable source-document features and
+the explicit averaging/tail conventions remain visible final-approval choices.
+After written-spec approval, invoke writing-plans; then request plan review and
+the user's implementation-method selection before product changes.
