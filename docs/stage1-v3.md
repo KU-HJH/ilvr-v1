@@ -45,7 +45,7 @@ In both modes the ordinary loss adds temperature-2 KL(detached F || R), averaged
 by query within each valid sample then across samples. Its weight rises to
 0.01 over ceil(0.05 × planned updates).
 
-R and RV GT scores are block means. Their gradient sums and block count B are
+In the default `post_adam` mode, R and RV GT scores are block means. Their gradient sums and block count B are
 reduced across all four ranks. With g=(R−RV)/B and h=RV/B, a negative global
 h·g component is projected away using FP64 dot/norm reductions. Tiny nonzero
 h norm squared below 1e-30 produces no displacement. After a successful AdamW
@@ -68,7 +68,8 @@ uncertainty gives greater relative contribution; this heuristic has no
 established accuracy or vision-use improvement.
 
 The protection gradient h remains the original **unweighted** RV score
-gradient, with the same projection and post-Adam displacement. The joint VJP
+gradient. The default update uses the same projection and post-Adam displacement;
+the optional optimizer mode below protects its incremental AdamW displacement. The joint VJP
 carries the already-differenced weighted Gain, so RV is not subtracted again.
 Existing F and packed R/RV logits and the same two explicit VJP calls are
 reused; no forward is added. This option is independent of the KL/entropy
@@ -87,6 +88,69 @@ the call count is not a measured compute or speed ratio.
 Joint two-lane R/KL (weighted Gain/KL when enabled) VJP and a separate RV VJP preserve attached
 prefix gradients and original sample/token dropout identity. No valid blocks
 means ordinary F/helper execution with zero auxiliary work.
+
+## Optional optimizer-integrated Gain
+
+Select `--stage1-v3-gain-update-mode adamw_projected` with an explicit
+`--stage1-v3-gain-optimizer-weight VALUE` on the coordinator/launcher. Python
+CLI spellings use underscores. Fresh environment aliases are
+`STAGE1_V3_GAIN_UPDATE_MODE` and `STAGE1_V3_GAIN_OPTIMIZER_WEIGHT`; explicit CLI
+values take precedence. This gradient coefficient must be finite and
+nonnegative, including zero. It has no implicit default and is not inferred
+from the legacy displacement `gain_alpha=0.001`. In this mode alpha is
+recorded as inactive. Omission preserves `post_adam`; supplying an optimizer
+weight in that legacy mode is an error.
+
+For ordinary gradient b, global-block-mean Gain g and **raw unweighted** RV
+h, the native optimizer receives `clip(b - weight*g)`. No raw-gradient
+projection is applied to g first. A temporary calculation on owned FP32
+shards computes the base AdamW candidate from `clip(b)`, using the same
+pre-step parameters, moments, counters, group settings and LR. Each branch
+uses its own clipping norm. There is one real native update; its joint
+moments/counters are retained exactly.
+
+Only the incremental displacement `joint - base` is projected against h,
+using global FP64 dot/norm statistics. Projection excludes groups whose
+captured LR is zero and ignores partition padding. A negative RV dot after
+FP32 rounding suppresses the whole increment for that boundary. Zero weight
+or zero global blocks use the native path without a base calculation or
+projection. Successful LR=0 steps still advance native moments; skipped
+steps advance neither parameters, moments nor EMA.
+
+The guarantee concerns this step's additional **FP32-master** displacement.
+Rejected Gain remains in Adam moments and can affect future steps. Finite
+BF16 rounding can reverse directional alignment, and no nonlinear score or
+learning-quality improvement is guaranteed. Guards check native masters,
+moments and BF16 casts before each group copy, and corrected candidates
+before final synchronization. A detected failure forbids checkpointing;
+there is no rollback promise after native mutation.
+
+The supported runtime is torch 2.7.1 native fused AdamW, DeepSpeed 0.18.7
+ZeRO-1, BF16/FP32 masters, no offload and loss scale 1. Model forward/VJP
+execution is reused. CPU tests cover AdamW state/candidate comparisons and
+controlled partition/collective traces; actual fused GPU/ZeRO behavior,
+additional memory and OOM behavior require separately authorized checks.
+Neither GPU checks nor training are part of this implementation task.
+
+Boundary logs under `stage1_v3/` include gradient/displacement norms, RV dots,
+per-group captured LR, coefficient and projection/rounding-fallback events.
+Counts are per-boundary 0/1 indicators; their observed means give rates.
+Unavailable measurements are omitted on bypass/skip and the reason is
+recorded explicitly. These diagnostics are separate from ordinary loss.
+
+For an argument-only preview, append the following to the **dry-run command
+below**, keeping its `--dry-run` flag. The coefficient 0.25 is illustrative,
+not a validated training recommendation:
+
+```bash
+--stage1-v3-gain-update-mode adamw_projected --stage1-v3-gain-optimizer-weight 0.25
+```
+
+Saved contracts identify mode, coefficient and formula. Resume inherits
+omitted values, ignores stale fresh-run environment defaults, and rejects
+explicit mode/coefficient changes. Old contracts missing these fields keep
+their legacy formula and original JSON bytes. Changing the formula requires
+a fresh run; this does not authorize launching one.
 
 ## Worktree and launch
 

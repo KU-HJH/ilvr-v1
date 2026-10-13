@@ -830,6 +830,8 @@ _STAGE1_VALUE_OPTIONS = {
     "--stage1-variant",
     "--stage1-v3-selector",
     "--stage1-v3-gain-weighting",
+    "--stage1-v3-gain-update-mode",
+    "--stage1-v3-gain-optimizer-weight",
     "--method",
     "--model",
     "--data-path",

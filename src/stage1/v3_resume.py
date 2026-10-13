@@ -152,15 +152,19 @@ def read_v3_contract(checkpoint: str|Path):
 
 
 def resolve_v3_arguments(args,raw_argv):
+    import os
     explicit={item.split('=',1)[0][2:] for item in raw_argv if item.startswith('--')}
     args.stage1_v3_explicit=explicit
     variant=getattr(args,'stage1_variant',None)
     selector=getattr(args,'stage1_v3_selector',None)
     weighting=getattr(args,'stage1_v3_gain_weighting',None)
+    gain_mode=getattr(args,'stage1_v3_gain_update_mode',None)
+    gain_weight=getattr(args,'stage1_v3_gain_optimizer_weight',None)
     if args.stage!='stage1':
         if variant is not None:raise ValueError('stage1_variant is only valid for Stage 1')
         if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
         if weighting is not None:raise ValueError('stage1_v3_gain_weighting is only valid for Stage1-v3')
+        if gain_mode is not None or gain_weight is not None:raise ValueError('Gain optimizer options are only valid for Stage1-v3')
         return
     checkpoint=getattr(args,'resume_from_checkpoint_path',None)
     if checkpoint is None:
@@ -176,6 +180,7 @@ def resolve_v3_arguments(args,raw_argv):
     if args.stage1_variant!='v3':
         if selector is not None:raise ValueError('stage1_v3_selector is only valid for Stage1-v3')
         if weighting is not None:raise ValueError('stage1_v3_gain_weighting is only valid for Stage1-v3')
+        if gain_mode is not None or gain_weight is not None:raise ValueError('Gain optimizer options are only valid for Stage1-v3')
         return
     config=Stage1V3Config(**saved['config']) if saved else Stage1V3Config()
     saved_selector=config.text_selector
@@ -185,6 +190,14 @@ def resolve_v3_arguments(args,raw_argv):
     if saved and weighting is not None and weighting!=config.gain_weighting:
         raise ValueError('v3 resume Gain weighting mismatch; changing modes requires a fresh run')
     args.stage1_v3_gain_weighting=weighting or config.gain_weighting
+    # Fresh-run environment defaults never override saved objective identity.
+    if saved is None:
+        if gain_mode is None:gain_mode=os.environ.get('STAGE1_V3_GAIN_UPDATE_MODE') or None
+        if gain_weight is None:
+            supplied=os.environ.get('STAGE1_V3_GAIN_OPTIMIZER_WEIGHT')
+            if supplied:gain_weight=float(supplied)
+    args.stage1_v3_gain_update_mode,args.stage1_v3_gain_optimizer_weight=_resolve_gain_update(
+        config if saved else None,gain_mode,gain_weight)
     profile=dict(V3_FRESH_PROFILE) if saved is None else dict(saved['profile'])
     # Older v3 checkpoints used one backend for both towers. Preserve their
     # execution and serialized identity rather than applying the fresh default.
@@ -290,7 +303,9 @@ LAUNCHER_ALIASES={'--method':'tuning_method','--model':'model','--epochs':'epoch
     '--ce-weight':'ce_weight','--gradient-accumulation':'gradient_accumulation_steps','--micro-batch':'per_device_train_batch_size',
     '--ema-tau':'ema_tau','--seed':'seed','--deepspeed-config':'deepspeed_config','--attention-implementation':'attention_implementation',
     '--textual_states':'textual_states','--max-steps':'max_steps','--stage1-v3-selector':'stage1_v3_selector',
-    '--stage1-v3-gain-weighting':'stage1_v3_gain_weighting'}
+    '--stage1-v3-gain-weighting':'stage1_v3_gain_weighting',
+    '--stage1-v3-gain-update-mode':'stage1_v3_gain_update_mode',
+    '--stage1-v3-gain-optimizer-weight':'stage1_v3_gain_optimizer_weight'}
 
 
 def resolve_coordinator_arguments(arguments,output):
@@ -306,6 +321,8 @@ def resolve_coordinator_arguments(arguments,output):
     if variant!='v3' and not has_saved:
         if '--stage1-v3-selector' in values:raise ValueError('stage1-v3-selector is only valid for Stage1-v3')
         if '--stage1-v3-gain-weighting' in values:raise ValueError('stage1-v3-gain-weighting is only valid for Stage1-v3')
+        if any(k in values for k in ('--stage1-v3-gain-update-mode','--stage1-v3-gain-optimizer-weight')):
+            raise ValueError('Gain optimizer options are only valid for Stage1-v3')
         return arguments
     argv=['--stage','stage1','--save_model_path',str(output)]
     if variant:argv+=['--stage1_variant',variant]
@@ -325,7 +342,8 @@ def resolve_coordinator_arguments(arguments,output):
     result=upsert(result,'--stage1-variant','v3')
     for option,key in LAUNCHER_ALIASES.items():
         if option in ('--max-steps','--deepspeed-config','--textual_states'):continue
-        result=upsert(result,option,str(getattr(args,key)))
+        value=getattr(args,key)
+        if value is not None:result=upsert(result,option,str(value))
     if '--max-steps' in result:
         i=result.index('--max-steps');result=result[:i]+result[i+2:]
     return result
@@ -352,6 +370,9 @@ def _launcher_main():
         values.update({name:getattr(args,name) for name in V3_FRESH_PROFILE})
         values['stage1_v3_selector']=args.stage1_v3_selector
         values['stage1_v3_gain_weighting']=args.stage1_v3_gain_weighting
+        values['stage1_v3_gain_update_mode']=args.stage1_v3_gain_update_mode
+        if args.stage1_v3_gain_optimizer_weight is not None:
+            values['stage1_v3_gain_optimizer_weight']=args.stage1_v3_gain_optimizer_weight
     import sys
     for name,value in values.items():
         sys.stdout.write(name+'\0'+(str(value).lower() if isinstance(value,bool) else str(value))+'\0')

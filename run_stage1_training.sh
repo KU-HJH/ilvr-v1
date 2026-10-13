@@ -45,6 +45,17 @@ fi
 stage1_variant=${STAGE1_VARIANT:-}
 stage1_v3_selector=
 stage1_v3_gain_weighting=
+stage1_v3_gain_update_mode=
+stage1_v3_gain_optimizer_weight=
+normalized_gain_arguments=()
+for argument in "$@"; do
+    case $argument in
+        --stage1-v3-gain-update-mode=*|--stage1-v3-gain-optimizer-weight=*)
+            normalized_gain_arguments+=("${argument%%=*}" "${argument#*=}") ;;
+        *) normalized_gain_arguments+=("$argument") ;;
+    esac
+done
+set -- "${normalized_gain_arguments[@]}"
 original_launch_arguments=("$@")
 method=${STAGE1_METHOD:-}
 model=${STAGE1_MODEL:-}
@@ -165,6 +176,8 @@ while (( $# )); do
         --stage1-variant) require_value "$@"; stage1_variant=$2; shift 2 ;;
         --stage1-v3-selector) require_value "$@"; stage1_v3_selector=$2; shift 2 ;;
         --stage1-v3-gain-weighting) require_value "$@"; stage1_v3_gain_weighting=$2; shift 2 ;;
+        --stage1-v3-gain-update-mode) require_value "$@"; stage1_v3_gain_update_mode=$2; shift 2 ;;
+        --stage1-v3-gain-optimizer-weight) require_value "$@"; stage1_v3_gain_optimizer_weight=$2; shift 2 ;;
         --method) require_value "$@"; method=$2; shift 2 ;;
         --model) require_value "$@"; model=$2; shift 2 ;;
         --data-path) require_value "$@"; data_path=$2; shift 2 ;;
@@ -200,7 +213,7 @@ while (( $# )); do
 done
 
 v3_profile_arguments=()
-if [[ -n $stage1_variant || -n $stage1_v3_selector || -n $stage1_v3_gain_weighting || -f $resume_path/stage1_v3.json ]]; then
+if [[ -n $stage1_variant || -n $stage1_v3_selector || -n $stage1_v3_gain_weighting || -n $stage1_v3_gain_update_mode || -n $stage1_v3_gain_optimizer_weight || -f $resume_path/stage1_v3.json ]]; then
     profile_values=()
     mapfile -d '' -t profile_values < <(
         PYTHONPATH="$script_dir/transformers/src:$script_dir/src:$script_dir" "$repository_python" -m src.stage1.v3_resume \

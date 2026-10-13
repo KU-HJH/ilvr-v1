@@ -29,6 +29,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Stage1-v3 text-key selection (fresh default: kl; resume: saved mode).")
     parser.add_argument("--stage1_v3_gain_weighting", choices=("none", "token_entropy"), default=None,
                         help="Stage1-v3 Gain weighting (fresh default: none; resume: saved mode).")
+    parser.add_argument("--stage1_v3_gain_update_mode", choices=("post_adam", "adamw_projected"), default=None,
+                        help="Gain update formula (fresh default: post_adam; resume: saved mode).")
+    parser.add_argument("--stage1_v3_gain_optimizer_weight", type=float, default=None,
+                        help="Explicit gradient coefficient for adamw_projected Gain; distinct from legacy alpha.")
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)

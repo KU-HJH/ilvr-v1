@@ -128,13 +128,19 @@ def test_same_root_supervisor_preserves_legacy_environment_argv():
 
 
 @pytest.mark.parametrize('weighting',['none','token_entropy'])
-def test_entropy_coordinator_dry_run_passes_mode_to_both_nodes(capsys,weighting):
+@pytest.mark.parametrize('update_mode',['post_adam','adamw_projected'])
+def test_entropy_coordinator_dry_run_passes_mode_to_both_nodes(capsys,weighting,update_mode):
+    extra=['--stage1-v3-gain-update-mode',update_mode]
+    if update_mode=='adamw_projected':extra+=['--stage1-v3-gain-optimizer-weight','0.25']
     assert mn._main(['train-stage1','--run-id','stage1-v3-entropy-dry','--zero-stage','1',
         '--main-process-port','29681','--dry-run','--stage1-variant','v3',
         '--stage1-v3-selector','entropy','--stage1-v3-gain-weighting',weighting,'--local-repo-root',str(LOCAL),
-        '--remote-repo-root',str(REMOTE),'--remote-host-repo-root',str(HOST)])==0
+        '--remote-repo-root',str(REMOTE),'--remote-host-repo-root',str(HOST),*extra])==0
     payload=json.loads(capsys.readouterr().out)
     for worker in (payload['local'],remote_inner(payload['remote'])):
         assert value(worker,'--stage1-v3-selector')=='entropy'
         assert value(worker,'--stage1-variant')=='v3'
         assert value(worker,'--stage1-v3-gain-weighting')==weighting
+        assert value(worker,'--stage1-v3-gain-update-mode')==update_mode
+        if update_mode=='adamw_projected':assert value(worker,'--stage1-v3-gain-optimizer-weight')=='0.25'
+        else:assert '--stage1-v3-gain-optimizer-weight' not in worker

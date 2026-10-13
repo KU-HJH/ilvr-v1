@@ -632,7 +632,9 @@ def build_stage1_training_components(
         saved = getattr(args, "stage1_v3_saved_contract", None)
         v3_kwargs["v3_config"] = (Stage1V3Config(**saved["config"]) if saved
                                  else Stage1V3Config(text_selector=args.stage1_v3_selector,
-                                                     gain_weighting=args.stage1_v3_gain_weighting))
+                                                     gain_weighting=args.stage1_v3_gain_weighting,
+                                                     gain_update_mode=args.stage1_v3_gain_update_mode,
+                                                     gain_optimizer_weight=args.stage1_v3_gain_optimizer_weight))
     collator = dependencies.collator_factory(processor, token_ids, args.latent_size,
         **({"v3_enabled": True} if v3_enabled else {}))
     trainer = dependencies.trainer_factory(
