@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 
 def execute(qwen,reference,x,positions,blocks,runner,control=None):
-    if control not in (None,'detach_prefix','contaminate_v'):
+    if control not in (None,'detach_prefix','contaminate_v','detach_text'):
         raise ValueError('unknown probe control')
     clean = runner(qwen.model,x,positions,role='F',capture=True)
     clean_logits = qwen.lm_head(clean.last_hidden_state)
@@ -52,8 +52,9 @@ def execute(qwen,reference,x,positions,blocks,runner,control=None):
                               for i,(_,b) in enumerate(rows) for target in b[2]])
     logits = qwen.lm_head(replay.last_hidden_state[row_indices,offsets])
     n = logits.shape[0]//2
+    text = logits[n:].detach() if control == 'detach_text' else logits[n:]
     return dict(clean=clean_logits,reference=reference_logits,
-                hidden=clean.last_hidden_state,v=logits[:n],text=logits[n:])
+                hidden=clean.last_hidden_state,v=logits[:n],text=text)
 
 
 def losses(output,x,noise,labels,support,ids,body,predictors,blocks):

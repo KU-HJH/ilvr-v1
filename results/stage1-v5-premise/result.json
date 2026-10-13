@@ -11,6 +11,8 @@
         "reference_immutable": true
       },
       "checkpoint_mode": "off",
+      "diagnostic_recomputation_attention_calls": 0,
+      "diagnostic_recomputation_completed_layers": 0,
       "dropout": 0.0,
       "fixed_candidates_sha256": "ca90bce8ae3b0f99d065e84c61572bc89abe7aae613cb4b47b56f678b95f5224",
       "gradient_max_error": 2.9802322387695312e-08,
@@ -52,6 +54,10 @@
         "text": 1.1920928955078125e-07,
         "v": 1.1920928955078125e-07
       },
+      "raw_text_kl_candidate_unused": [],
+      "raw_text_kl_gradient_max_error": 7.741618901491165e-09,
+      "raw_text_kl_gradient_max_magnitude": 0.00027363430126570165,
+      "raw_text_kl_oracle_unused": [],
       "recomputation_attention_calls": 0,
       "recomputation_completed_layers": 0,
       "reference_state_sha256": "767c99679fc3685b6bc5d1da5783d4533a79ecd5116d73fa9012124f4ea31545",
@@ -68,6 +74,8 @@
         "reference_immutable": true
       },
       "checkpoint_mode": "off",
+      "diagnostic_recomputation_attention_calls": 0,
+      "diagnostic_recomputation_completed_layers": 0,
       "dropout": 0.05,
       "fixed_candidates_sha256": "6178b6c1ea2c08c89bdce87b41b3ee04bc04d02bc18d2074371273b47568482e",
       "gradient_max_error": 2.9802322387695312e-08,
@@ -109,6 +117,10 @@
         "text": 1.1920928955078125e-07,
         "v": 1.1920928955078125e-07
       },
+      "raw_text_kl_candidate_unused": [],
+      "raw_text_kl_gradient_max_error": 5.8626028476282954e-09,
+      "raw_text_kl_gradient_max_magnitude": 0.00026148284086957574,
+      "raw_text_kl_oracle_unused": [],
       "recomputation_attention_calls": 0,
       "recomputation_completed_layers": 0,
       "reference_state_sha256": "767c99679fc3685b6bc5d1da5783d4533a79ecd5116d73fa9012124f4ea31545",
@@ -125,6 +137,8 @@
         "reference_immutable": true
       },
       "checkpoint_mode": "early",
+      "diagnostic_recomputation_attention_calls": 4,
+      "diagnostic_recomputation_completed_layers": 0,
       "dropout": 0.0,
       "fixed_candidates_sha256": "ca90bce8ae3b0f99d065e84c61572bc89abe7aae613cb4b47b56f678b95f5224",
       "gradient_max_error": 2.9802322387695312e-08,
@@ -166,6 +180,10 @@
         "text": 1.1920928955078125e-07,
         "v": 1.1920928955078125e-07
       },
+      "raw_text_kl_candidate_unused": [],
+      "raw_text_kl_gradient_max_error": 7.741618901491165e-09,
+      "raw_text_kl_gradient_max_magnitude": 0.00027363430126570165,
+      "raw_text_kl_oracle_unused": [],
       "recomputation_attention_calls": 4,
       "recomputation_completed_layers": 0,
       "reference_state_sha256": "767c99679fc3685b6bc5d1da5783d4533a79ecd5116d73fa9012124f4ea31545",
@@ -182,6 +200,8 @@
         "reference_immutable": true
       },
       "checkpoint_mode": "early",
+      "diagnostic_recomputation_attention_calls": 4,
+      "diagnostic_recomputation_completed_layers": 0,
       "dropout": 0.05,
       "fixed_candidates_sha256": "6178b6c1ea2c08c89bdce87b41b3ee04bc04d02bc18d2074371273b47568482e",
       "gradient_max_error": 2.9802322387695312e-08,
@@ -223,6 +243,10 @@
         "text": 1.1920928955078125e-07,
         "v": 1.1920928955078125e-07
       },
+      "raw_text_kl_candidate_unused": [],
+      "raw_text_kl_gradient_max_error": 5.8626028476282954e-09,
+      "raw_text_kl_gradient_max_magnitude": 0.00026148284086957574,
+      "raw_text_kl_oracle_unused": [],
       "recomputation_attention_calls": 4,
       "recomputation_completed_layers": 0,
       "reference_state_sha256": "767c99679fc3685b6bc5d1da5783d4533a79ecd5116d73fa9012124f4ea31545",
@@ -239,6 +263,8 @@
         "reference_immutable": true
       },
       "checkpoint_mode": "full",
+      "diagnostic_recomputation_attention_calls": 4,
+      "diagnostic_recomputation_completed_layers": 4,
       "dropout": 0.0,
       "fixed_candidates_sha256": "ca90bce8ae3b0f99d065e84c61572bc89abe7aae613cb4b47b56f678b95f5224",
       "gradient_max_error": 2.9802322387695312e-08,
@@ -280,6 +306,10 @@
         "text": 1.1920928955078125e-07,
         "v": 1.1920928955078125e-07
       },
+      "raw_text_kl_candidate_unused": [],
+      "raw_text_kl_gradient_max_error": 7.741618901491165e-09,
+      "raw_text_kl_gradient_max_magnitude": 0.00027363430126570165,
+      "raw_text_kl_oracle_unused": [],
       "recomputation_attention_calls": 4,
       "recomputation_completed_layers": 4,
       "reference_state_sha256": "767c99679fc3685b6bc5d1da5783d4533a79ecd5116d73fa9012124f4ea31545",
@@ -296,6 +326,8 @@
         "reference_immutable": true
       },
       "checkpoint_mode": "full",
+      "diagnostic_recomputation_attention_calls": 4,
+      "diagnostic_recomputation_completed_layers": 4,
       "dropout": 0.05,
       "fixed_candidates_sha256": "6178b6c1ea2c08c89bdce87b41b3ee04bc04d02bc18d2074371273b47568482e",
       "gradient_max_error": 2.9802322387695312e-08,
@@ -337,6 +369,10 @@
         "text": 1.1920928955078125e-07,
         "v": 1.1920928955078125e-07
       },
+      "raw_text_kl_candidate_unused": [],
+      "raw_text_kl_gradient_max_error": 5.8626028476282954e-09,
+      "raw_text_kl_gradient_max_magnitude": 0.00026148284086957574,
+      "raw_text_kl_oracle_unused": [],
       "recomputation_attention_calls": 4,
       "recomputation_completed_layers": 4,
       "reference_state_sha256": "767c99679fc3685b6bc5d1da5783d4533a79ecd5116d73fa9012124f4ea31545",
@@ -355,6 +391,60 @@
       "fixed_candidates_sha256": "6178b6c1ea2c08c89bdce87b41b3ee04bc04d02bc18d2074371273b47568482e",
       "max_error": 0.00849217176437378,
       "status": "EXPECTED_EQUIVALENCE_REJECTION"
+    },
+    {
+      "candidate_unused": [
+        "base_model.model.model.embed_tokens.token_adapter.trainable_tokens_delta.default",
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight",
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight",
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.0.self_attn.k_proj.lora_A.default.weight",
+        "base_model.model.model.layers.0.self_attn.k_proj.lora_B.default.weight",
+        "base_model.model.model.layers.0.self_attn.k_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.0.self_attn.v_proj.lora_A.default.weight",
+        "base_model.model.model.layers.0.self_attn.v_proj.lora_B.default.weight",
+        "base_model.model.model.layers.0.self_attn.v_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.0.self_attn.o_proj.lora_A.default.weight",
+        "base_model.model.model.layers.0.self_attn.o_proj.lora_B.default.weight",
+        "base_model.model.model.layers.0.self_attn.o_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.0.mlp.gate_proj.lora_A.default.weight",
+        "base_model.model.model.layers.0.mlp.gate_proj.lora_B.default.weight",
+        "base_model.model.model.layers.0.mlp.gate_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.0.mlp.up_proj.lora_A.default.weight",
+        "base_model.model.model.layers.0.mlp.up_proj.lora_B.default.weight",
+        "base_model.model.model.layers.0.mlp.up_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.0.mlp.down_proj.lora_A.default.weight",
+        "base_model.model.model.layers.0.mlp.down_proj.lora_B.default.weight",
+        "base_model.model.model.layers.0.mlp.down_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.1.self_attn.q_proj.lora_A.default.weight",
+        "base_model.model.model.layers.1.self_attn.q_proj.lora_B.default.weight",
+        "base_model.model.model.layers.1.self_attn.q_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.1.self_attn.k_proj.lora_A.default.weight",
+        "base_model.model.model.layers.1.self_attn.k_proj.lora_B.default.weight",
+        "base_model.model.model.layers.1.self_attn.k_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.1.self_attn.v_proj.lora_A.default.weight",
+        "base_model.model.model.layers.1.self_attn.v_proj.lora_B.default.weight",
+        "base_model.model.model.layers.1.self_attn.v_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.1.self_attn.o_proj.lora_A.default.weight",
+        "base_model.model.model.layers.1.self_attn.o_proj.lora_B.default.weight",
+        "base_model.model.model.layers.1.self_attn.o_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.1.mlp.gate_proj.lora_A.default.weight",
+        "base_model.model.model.layers.1.mlp.gate_proj.lora_B.default.weight",
+        "base_model.model.model.layers.1.mlp.gate_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.1.mlp.up_proj.lora_A.default.weight",
+        "base_model.model.model.layers.1.mlp.up_proj.lora_B.default.weight",
+        "base_model.model.model.layers.1.mlp.up_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.model.layers.1.mlp.down_proj.lora_A.default.weight",
+        "base_model.model.model.layers.1.mlp.down_proj.lora_B.default.weight",
+        "base_model.model.model.layers.1.mlp.down_proj.lora_magnitude_vector.default.weight",
+        "base_model.model.lm_head.output_delta",
+        "LIVE_INPUT"
+      ],
+      "control": "detach_text",
+      "fixed_candidates_sha256": "6178b6c1ea2c08c89bdce87b41b3ee04bc04d02bc18d2074371273b47568482e",
+      "oracle_unused": [],
+      "raw_text_kl_gradient_max_error": 0.00026148284086957574,
+      "status": "EXPECTED_EQUIVALENCE_REJECTION"
     }
   ],
   "command": "PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q -s logs/stage1-v5-premise/test_probe.py",
@@ -365,7 +455,7 @@
     "torch": "2.7.1+cu128",
     "transformers": "4.50.0.dev0"
   },
-  "expected_cases": 8,
+  "expected_cases": 9,
   "fixture": {
     "alpha": 8,
     "blocks": [
@@ -451,7 +541,7 @@
     "Fixed text-key selections/candidate IDs/noise; does not test selectors or data mapping",
     "Source-coordinate adapter dropout harness; no replacement of native RMSNorm arithmetic"
   ],
-  "observed_case_records": 8,
+  "observed_case_records": 9,
   "origin": {
     "checkpoint_contexts": "pinned e555a2b6ddf43d689cceca7342fa3fb6a17b90c3 stage1_v3_trace.py per-layer closure/context idea",
     "dropout": "current stage1.equivalence.stage1_sample_seed and native full source draw shape"
@@ -467,8 +557,8 @@
     "transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py": "42a8e13260c6bf0641d9cbf1baeb56008cf5d51b024f0754ae33bbed97607243"
   },
   "source_sha256": {
-    "probe_adapter.py": "ed356b7f1c077351eff8d64ee5e58bc9a92271bdef75f4cf87f91a2ceedbcd61",
-    "test_probe.py": "806ed713dfb4f1fdf568acc45a2393eb71f3c4a8fe100d88228b7fb684c1e8e3"
+    "probe_adapter.py": "13014ec5b11858b69c3c69ed200b30a73fc82a0c7da81b19c83ef57b17005093",
+    "test_probe.py": "d1bf354a0b6f282e7f61efe7a9b6a3bd0ee21fec1a1afa00672b95ac1149e698"
   },
   "tolerances": {
     "atol": 1e-05,

@@ -4,7 +4,6 @@ Mutations caught: detached F K/V, V-off inheriting Text-off, omitted trainable
 row paths, different dropout coordinates, reference mutation, wrong reductions.
 Oracle uses full-sequence calls and literal masks; never candidate K/V/planning.
 """
-from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 import hashlib
@@ -50,13 +49,18 @@ def digest_state(model):
     return digest.hexdigest()
 
 
-@contextmanager
-def execution_coordinates(value):
-    token = COORD.set(value)
-    try:
-        yield
-    finally:
-        COORD.reset(token)
+class SourceCoordinates:
+    """Checkpoint retains these managers across diagnostic and ordinary VJPs."""
+    def __init__(self,value):
+        self.value = value
+        self.tokens = []
+
+    def __enter__(self):
+        self.tokens.append(COORD.set(self.value))
+        return self
+
+    def __exit__(self,*exc):
+        COORD.reset(self.tokens.pop())
 
 
 class NativeRunner:
@@ -110,10 +114,10 @@ class NativeRunner:
                         return output
                     if self.checkpointed and decoder.training:
                         return checkpoint(call,*args,use_reentrant=False,
-                            context_fn=lambda:(execution_coordinates(value),execution_coordinates((coordinates,role,'recompute'))),**kwargs)
+                            context_fn=lambda:(SourceCoordinates(value),SourceCoordinates((coordinates,role,'recompute'))),**kwargs)
                     return call(*args,**kwargs)
                 layer.forward = wrapped
-            with execution_coordinates(value):
+            with SourceCoordinates(value):
                 return decoder(inputs_embeds=embeds,position_ids=positions,attention_mask=mask,
                                stage2_capture_kv=capture,stage2_prefix_key_values=prefix,
                                use_cache=False,return_dict=True)
@@ -256,6 +260,22 @@ def gradients(model,live):
     return answer
 
 
+def isolated_gradients(loss,model,live):
+    """Inspect raw K without changing the fused objective or accumulating .grad.
+
+    A completely detached scalar is represented by genuinely unused gradients,
+    so its causal control reaches the same gradient assertion as the live term.
+    Zero-fill unused paths on either side; never discard a live oracle path.
+    """
+    named = [(name,p) for name,p in model.named_parameters() if p.requires_grad]
+    named.append(('LIVE_INPUT',live))
+    values = (torch.autograd.grad(loss,[p for _,p in named],retain_graph=True,allow_unused=True)
+              if loss.requires_grad else (None,)*len(named))
+    unused = [name for (name,_),value in zip(named,values) if value is None]
+    return ({name:torch.zeros_like(p) if value is None else value.detach()
+             for (name,p),value in zip(named,values)},unused)
+
+
 @pytest.mark.parametrize('dropout',[0.,.05])
 @pytest.mark.parametrize('checkpoint_mode',['off','early','full'])
 def test_fused_shared_F_matches_literal_masked_calls_all_gradients(dropout,checkpoint_mode):
@@ -281,10 +301,22 @@ def test_fused_shared_F_matches_literal_masked_calls_all_gradients(dropout,check
             terms = adapter.losses(got,x,noise,labels,support,IDS,BODY,PREDICTORS,BLOCKS)
             expected = oracle_losses(want,ox,noise,labels,support)
             loss_error = assert_equivalent(terms,expected)
+            isolated_start = len(runner.attention_calls)
+            isolated_completed_start = len(runner.layer_completions)
+            k_got,k_unused = isolated_gradients(terms['text_kl'],student,live)
+            k_want,oracle_k_unused = isolated_gradients(expected['text_kl'],os,ol)
+            assert COORD.get() is None, 'diagnostic checkpoint contexts must restore after early-stop exceptions'
+            text_gradient_error = assert_equivalent(k_got,k_want)
+            isolated_replays = [v for v in runner.attention_calls[isolated_start:] if v[2]=='recompute']
+            isolated_completed = [v for v in runner.layer_completions[isolated_completed_start:] if v[1]=='recompute']
+            combined_start = len(runner.attention_calls)
+            combined_completed_start = len(runner.layer_completions)
+            assert live.grad is None and all(p.grad is None for p in student.parameters())
             calls_before = list(runner.original_calls)
             assert calls_before == [('student','F'),('reference','reference'),('student','packed')]
             terms['total'].backward()
             expected['total'].backward()
+            assert COORD.get() is None, 'ordinary backward must restore checkpoint coordinates'
         assert runner.original_calls == calls_before, 'layer replay must not introduce new decoder calls'
         gradient_error = assert_equivalent(gradients(student,live),gradients(os,ol))
         nonzero = [name for name,p in student.named_parameters() if p.requires_grad and p.grad.abs().sum()>0]
@@ -309,14 +341,19 @@ def test_fused_shared_F_matches_literal_masked_calls_all_gradients(dropout,check
         with torch.no_grad():
             repeat = rq.lm_head(runner(rq.model,x.detach(),POSITIONS,role='reference_post_update').last_hidden_state)
         torch.testing.assert_close(repeat,got['reference'],atol=0,rtol=0)
-        recomputations = [v for v in runner.attention_calls if v[2]=='recompute']
+        recomputations = [v for v in runner.attention_calls[combined_start:] if v[2]=='recompute']
         assert bool(recomputations) == (checkpoint_mode!='off')
-        completed_replays = [v for v in runner.layer_completions if v[1]=='recompute']
+        completed_replays = [v for v in runner.layer_completions[combined_completed_start:] if v[1]=='recompute']
         assert len(completed_replays) == (4 if checkpoint_mode=='full' else 0)
         record = dict(dropout=dropout,checkpoint_mode=checkpoint_mode,status='PASS',
             output_max_errors=outputs_error,loss_max_errors=loss_error,
             loss_values={name:float(value.detach()) for name,value in terms.items()},
             gradient_max_error=max(gradient_error.values()),
+            raw_text_kl_gradient_max_error=max(text_gradient_error.values()),
+            raw_text_kl_gradient_max_magnitude=max(float(v.abs().max()) for v in k_want.values()),
+            raw_text_kl_candidate_unused=k_unused,raw_text_kl_oracle_unused=oracle_k_unused,
+            diagnostic_recomputation_attention_calls=len(isolated_replays),
+            diagnostic_recomputation_completed_layers=len(isolated_completed),
             update_max_error=max(updates_error.values()),trainable_parameters=len(owned),
             nonzero_trainable_gradients=len(nonzero),original_calls=calls_before,
             recomputation_attention_calls=len(recomputations),
@@ -374,6 +411,38 @@ def test_causal_negative_controls_fail_the_intended_equivalence(control):
         orr.close()
 
 
+def test_detached_text_off_fails_isolated_raw_K_gradient_equivalence():
+    adapter = candidate_adapter()
+    student,reference,os,oref,live,helper,noise,labels = fixture(.05)
+    qwen,x = realize(student,live,helper)
+    ol = live.detach().clone().requires_grad_()
+    oq,ox = realize(os,ol,helper)
+    rq,orq = resolve_qwen2_5_vl_model(reference),resolve_qwen2_5_vl_model(oref)
+    runner,orr = NativeRunner(qwen,rq,False),NativeRunner(oq,orq,False)
+    try:
+        ordinary = adapter.execute(qwen,rq,x,POSITIONS,BLOCKS,runner)
+        support = ordinary['v'].detach().float().topk(50,dim=-1).indices
+        broken = adapter.execute(qwen,rq,x,POSITIONS,BLOCKS,runner,control='detach_text')
+        want = oracle(oq,orq,ox,orr)
+        assert_equivalent(broken,want)
+        terms = adapter.losses(broken,x,noise,labels,support,IDS,BODY,PREDICTORS,BLOCKS)
+        expected = oracle_losses(want,ox,noise,labels,support)
+        assert_equivalent(terms,expected)
+        bad,unused = isolated_gradients(terms['text_kl'],student,live)
+        good,oracle_unused = isolated_gradients(expected['text_kl'],os,ol)
+        with pytest.raises(AssertionError) as caught:
+            assert_equivalent(bad,good)
+        error = max(float((bad[name]-good[name]).abs().max()) for name in bad)
+        assert error>ATOL
+        print(f'NEGATIVE_CONTROL detach_text: expected raw Text-KL gradient equivalence rejection\n{caught.value}\nmax_error={error}')
+        RECORDS.append(dict(control='detach_text',status='EXPECTED_EQUIVALENCE_REJECTION',
+            raw_text_kl_gradient_max_error=error,candidate_unused=unused,oracle_unused=oracle_unused,
+            fixed_candidates_sha256=hashlib.sha256(support.numpy().tobytes()).hexdigest()))
+    finally:
+        runner.close()
+        orr.close()
+
+
 @pytest.fixture(scope='session',autouse=True)
 def save_results():
     yield
@@ -384,8 +453,8 @@ def save_results():
                     'src/step_preference/topk_entropy_loss.py',
                     'transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py')
     payload = dict(artifact_kind='throwaway_CPU_premise_probe',base_commit='3441a1ce9d205b175681ef229aedb8643f23718e',
-        overall_outcome='supported_within_probe_scope' if len(RECORDS)==8 else 'incomplete_or_failed',
-        expected_cases=8,observed_case_records=len(RECORDS),
+        overall_outcome='supported_within_probe_scope' if len(RECORDS)==9 else 'incomplete_or_failed',
+        expected_cases=9,observed_case_records=len(RECORDS),
         command="PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q -s logs/stage1-v5-premise/test_probe.py",
         tolerances=dict(atol=ATOL,rtol=RTOL),cases=RECORDS,source_sha256=source_hashes,
         limits=['Fixed helper fixtures; no helper pass or full four-call Trainer witness',
