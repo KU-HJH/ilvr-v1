@@ -131,16 +131,16 @@ def packed_dropout_output(site: str, p: float, x: Tensor) -> Tensor | None:
         raise ValueError('v3 packed dropout shape differs from original token coordinates')
     signature = tuple((id(t), t._version, tuple(t.shape), t.device, t.dtype, t.data_ptr())
                       for t in (samples, positions, valid))
-    if cache.get('signature') != signature:
+    # A callback may retain its indexed tensors and mutate them between sites.
+    # Preserve the former fresh-indexing behavior for those callbacks too.
+    cached_versions = tuple(t._version for t in cache.get('coordinates', ()))
+    if cache.get('signature') != signature or cache.get('versions') != cached_versions:
         cache['coordinates'] = (samples[valid], positions[valid])
         cache['signature'] = signature
+        cache['versions'] = tuple(t._version for t in cache['coordinates'])
     sample_indices, token_positions = cache['coordinates']
-    versions = (sample_indices._version, token_positions._version)
     raw = callback(site,p,sample_indices=sample_indices,token_positions=token_positions,
                    hidden_size=x.shape[-1],device=x.device)
-    if versions != (sample_indices._version, token_positions._version):
-        # A custom callback used to receive fresh indexed tensors at every site.
-        cache.pop('signature', None)
     mask = torch.ones_like(x)
     mask[valid] = raw.to(x.dtype)*(1/(1-p))
     return x*mask

@@ -387,9 +387,18 @@ class Stage1DataCollator:
             return False
         from transformers import Qwen2_5_VLProcessor, Qwen2VLImageProcessor, Qwen2TokenizerFast
 
-        return (type(self.processor) is Qwen2_5_VLProcessor
-                and type(self.processor.image_processor) is Qwen2VLImageProcessor
-                and type(self.processor.tokenizer) is Qwen2TokenizerFast)
+        if type(self.processor) is not Qwen2_5_VLProcessor:
+            return False
+        components = ((self.processor, Qwen2_5_VLProcessor),
+                      (self.processor.image_processor, Qwen2VLImageProcessor),
+                      (self.processor.tokenizer, Qwen2TokenizerFast))
+        for component, expected_type in components:
+            if type(component) is not expected_type:
+                return False
+            # Exact types can still customize inherited methods per instance.
+            if any(callable(getattr(expected_type, name, None)) for name in vars(component)):
+                return False
+        return True
 
     @staticmethod
     def _split_full_vision(example, full):

@@ -87,6 +87,25 @@ def test_v3_reuses_processor_pixels_with_exact_legacy_batch(local_processor, hel
     assert len(calls) == 2 + helpers
 
 
+def test_custom_qwen_preprocess_keeps_role_specific_pixels(local_processor):
+    # Exact Qwen types can still customize instance methods; splitting a full
+    # batch must not replace their role-specific results.
+    processor = local_processor.image_processor
+    original = processor.preprocess
+    def customized(*args, **kwargs):
+        result = original(*args, **kwargs)
+        result['pixel_values'] = result['pixel_values'] + len(result['image_grid_thw'])
+        return result
+    with patch.object(processor, 'preprocess', customized):
+        reference = image_collator(local_processor, v3=False)([image_example(2)])
+        actual = image_collator(local_processor)([image_example(2)])
+    for key in reference:
+        if key == 'stage1_batch_metadata':
+            assert replace(actual[key], v3=None) == reference[key]
+        else:
+            torch.testing.assert_close(actual[key], reference[key], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize('mode', ['previous', 'all'])
 def test_token_search_keeps_marker_rules_without_tensor_scalar_loops(mode):
     # Pattern priority differs from earliest/longest match; do not merge the rules.
@@ -267,6 +286,27 @@ def test_packed_callback_mutation_cannot_poison_next_site_coordinates():
     finally:
         _PACKED.reset(token)
     assert seen == [[0, 1, 2], [0, 1, 2], [1, 2, 3]]
+
+
+@pytest.mark.parametrize('changed_coordinate', [0, 1])
+def test_retained_callback_coordinates_mutated_between_sites_are_refreshed(changed_coordinate):
+    from transformers.models.qwen2_5_vl.stage1_v3_trace import _PACKED, packed_dropout_output
+    samples, positions = torch.zeros((1, 3), dtype=torch.long), torch.arange(3).view(1, -1)
+    valid = torch.ones_like(samples, dtype=torch.bool)
+    retained, seen = [], []
+    def callback(site, p, *, sample_indices, token_positions, hidden_size, device):
+        retained.append((sample_indices, token_positions))
+        seen.append((sample_indices.tolist(), token_positions.tolist()))
+        return ((sample_indices + token_positions) % 2).unsqueeze(-1).expand(-1, hidden_size)
+    token = _PACKED.set((callback, samples, positions, valid, {}))
+    try:
+        first = packed_dropout_output('a', .05, torch.ones((1, 3, 2)))
+        retained[0][changed_coordinate].add_(1)
+        second = packed_dropout_output('b', .05, torch.ones((1, 3, 2)))
+    finally:
+        _PACKED.reset(token)
+    assert seen == [([0, 0, 0], [0, 1, 2]), ([0, 0, 0], [0, 1, 2])]
+    assert torch.equal(first, second)
 
 
 def test_disabled_target_diagnostics_keep_exact_targets_and_selection():
