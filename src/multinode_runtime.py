@@ -847,6 +847,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--latent-size",
     "--max-seq-length-train",
     "--dataloader-num-workers",
+    "--textual_states",
     "--step-preference-beta",
     "--step-preference-margin",
 

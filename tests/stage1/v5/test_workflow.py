@@ -38,6 +38,63 @@ def test_recipe_dry_run_overrides_sourced_stale_profile(tmp_path):
         assert evaluate[evaluate.index(flag)+1]==value
     assert evaluate[evaluate.index('--run-id')+1]=='v5-flow-test-test400'
 
+def test_actual_recipe_reaches_coordinator_and_both_worker_dry_runs():
+    import json
+    from utils_deepseed import parse_args
+    from src.multinode_runtime import validate_stage1_arguments
+    environment={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','CUDA_VISIBLE_DEVICES':'',
+        'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1'}
+    recipe=run('--dry-run',env=environment)
+    assert recipe.returncode==0,recipe.stderr
+    train=shlex.split(recipe.stdout.splitlines()[0])
+    coordinator=subprocess.run([*train,'--dry-run'],cwd=ROOT,env=environment,text=True,capture_output=True)
+    assert coordinator.returncode==0,coordinator.stderr
+    commands=json.loads(coordinator.stdout)
+    cluster=commands['plan']['cluster']
+    assert commands['plan']['world_size']==4
+    assert cluster['local_repo_root']==str(ROOT)
+    assert cluster['num_machines']==2 and cluster['gpus_per_node']==2
+    # Decode the emitted remote shell command; never execute SSH or node-run.
+    remote=shlex.split(shlex.split(commands['remote'][-1])[-1])
+    for rank,owned,root in ((0,remote,Path(cluster['remote_repo_root'])),(1,commands['local'],ROOT)):
+        cursor=owned.index('-i')+1
+        assert owned[cursor]==f'--chdir={root}'
+        cursor+=1
+        worker_environment={}
+        while '=' in owned[cursor] and not owned[cursor].startswith('--'):
+            key,value=owned[cursor].split('=',1)
+            worker_environment[key]=value
+            cursor+=1
+        assert worker_environment['ILVR_NUM_MACHINES']=='2'
+        assert worker_environment['ILVR_NUM_PROCESSES']=='4'
+        stage=owned[max(i for i,value in enumerate(owned) if value=='--')+1:]
+        assert stage[:2]==['/usr/bin/bash',str(root/'run_stage1_training.sh')]
+        assert stage[stage.index('--textual_states')+1]=='previous'
+        # Run the unchanged local worker implementation with each node's mapped
+        # arguments and environment; the remote filesystem is not exercised.
+        worker=subprocess.run(['/usr/bin/bash',str(ROOT/'run_stage1_training.sh'),*stage[2:],'--dry-run'],
+            cwd=ROOT,env={**environment,**worker_environment,'CUDA_VISIBLE_DEVICES':''},text=True,capture_output=True)
+        assert worker.returncode==0,worker.stderr
+        argv=shlex.split(worker.stdout)
+        for flag,value in (('--num_machines','2'),('--num_processes','4'),('--machine_rank',str(rank))):
+            assert argv[argv.index(flag)+1]==value
+        args=parse_args(argv[argv.index('src/main.py')+1:])
+        for name,value in dict(stage1_variant='v5',stage1_v5_debug=False,textual_states='previous',
+            tuning_method='dora',ce_weight=.1,sim_weight=.1,per_device_train_batch_size=1,
+            gradient_accumulation_steps=4,learning_rate=5e-5,seed=42,warm_up_steps=10,ema_tau=1.,
+            latent_size=8,lora_r=32,lora_alpha=64,lora_dropout=.05,attention_implementation='sdpa',
+            vision_attention_implementation='flash_attention_2',max_seq_length_train=32768,
+            dataloader_num_workers=0,gradient_checkpointing=True).items():
+            assert getattr(args,name)==value
+        assert args.stage1_v5_config.lambda_topk_entropy==.1
+        assert args.stage1_v5_config.preference_topk_k==50
+        assert args.stage1_v5_config.text_kl_weight==.01
+        assert args.stage1_v5_config.beta==1. and args.stage1_v5_config.margin==0.
+    with pytest.raises(ValueError,match='not an approved Stage 1'):
+        validate_stage1_arguments(('--textual-states','previous'))
+    assert not (ROOT/'checkpoints/v5-flow-test').exists()
+    assert not (ROOT/'results/v5-flow-test').exists()
+
 @pytest.mark.parametrize('fail,events',[('', ['train_success','prepare_success','evaluate_TEST400']),
     ('train',['train_failure']),('prepare',['train_success','prepare_failure'])])
 def test_recipe_only_evaluates_selected_successful_final_artifact(tmp_path,fail,events):
