@@ -449,3 +449,70 @@ existing `tests/step_preference/` paths, retaining identical test semantics.
 Cost if wrong: regression evidence would be missing; exact executed paths and
 passing output above resolve that risk. All objective inputs are selected
 [N,V] in metadata.query_keys order; Task5 gathers ordinary F at those keys.
+
+## Task3 procedure deviation and recovery
+
+Before its commit, implementer `/root/v5_task3_impl` reported a timing violation:
+systematic-debugging must be read/invoked before a bug fix. Its scripted import
+insertion failed to match `import torch.nn as nn`, producing NameError for
+`v5_decoder_forward` during initial test collection. It inspected the stack and
+source and inserted `from .stage1_v5_trace import v5_decoder_forward` at Qwen
+modeling line53 before reading that skill. Affected change is the missing import
+in `transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`.
+The omitted step is skill invocation timing, not claimed absence of debugging;
+later mask-fixture debugging used the skill. Original failed evidence remains
+`logs/stage1-v5-task3/green-initial.log` (NameError at lines27/78).
+
+Implementation progression paused before commit; root recorded and reported
+the deviation. At this point focused/native tests are reported green, but
+independent specification/quality review and full feature/runtime gates remain
+unverified. Root recovery is to preserve this non-retroactive record and failed
+log, finish the report with exact affected scope, then continue the already
+authorized task commit and independent review of the complete change (including
+that import). No repeated broad test or self-review substitute is prescribed.
+Later review cannot retroactively establish compliance with the missed timing.
+
+## Product Task3 completed
+
+Implementer `/root/v5_task3_impl` (gpt-6.1-sol/high) committed native trace/replay
+at`8cb30bf` and selected-reference chunk fix at`b2c8291`, task base`dc2aabc`.
+Independent `/root/v5_task3_review` (gpt-6-astra/high, fresh/distinct) found one
+Important missing chunk128 projection, directly witnessed with129queries.
+Scoped fix review approved both spec/quality with no remaining findings/parked
+items. The previously recorded timing deviation remains non-retroactive.
+
+CPU native six-case dropout/checkpoint oracle covers all trainable/input
+combined gradients and isolated raw-K gradients (max errors2.980232e-8 and
+2.478373e-9), actual F/reference/packed entries, and three causal controls.
+Separate selected-reference image/token/latent preparation and native vision
+checkpoint tests are bounded CPU evidence. They do not prove integrated helper,
+Trainer/DDP/BF16/FA2 or capacity. Later tasks/live gates own those claims.
+
+TDD:20missing-feature failures; retained subsequent import and fixture failures
+under `logs/stage1-v5-task3/`. Named regression command used repository Python,
+PYTHONDONTWRITEBYTECODE=1, PYTHONPATH=src:transformers/src, pytest -q on
+`tests/stage1/test_qwen_latent_injection.py tests/stage1/test_equivalence.py
+tests/stage1/test_peft.py`:442passed/1inventory-failure. Final affected run with
+CUDA_VISIBLE_DEVICES='', pytest -q -s on v5/test_execution.py, v5/test_replay.py
+and the exact inventory test:23passed/5.99s. Fix RED8failed; same environment,
+pytest -q -s on v5/test_execution.py plus
+v5/test_replay.py::test_native_combined_and_raw_K_match_literal_full_masks:
+24passed/5.58s, exit0/no warnings, intentional runtime witnesses retained.
+Default129queries project128+1, configured32 projects32+32+32+32+1; one reference
+decoder, reversed query ordering matches its own full projection.
+
+Root rulings: preserve standard nonempty dropout-site schema; p0 fixture
+constructs declared sites then disables their probability. Cost if wrong: no
+fresh zero-site profile support (not claimed). Extend strict RNG inventory only
+with V5Execution.dropout_mask/torch.rand; cost if wrong: unintended random path
+admission. Omit artificial peft.py edit because actual existing installer and
+native fixture suffice; cost if wrong: adapter binding gap. Reviewer checked
+that path independently. Add selected-only stage1_selected_chunk_positions
+keyword (default128) so Task5 passes configured chunk size; cost if wrong:
+inconsistent reference/OFF bounds. Runtime projection tests cover this contract.
+
+Task5 integration uses `bind_v5_execution(decoder, execution, role='F',
+visual=...)` inside graph(F) with capture around ordinary F; packed helper binds
+internally inside graph(packed). Keep owner active through parent backward,
+exit observation hooks beforehand. Full task/fix reports and reviews remain
+in plan-specific SDD workspace for final handoff.
