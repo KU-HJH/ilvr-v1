@@ -816,3 +816,122 @@ full report. Task6 is complete, O1 resolved for CPU composition/content checks.
 Historical TDD deviation remains noncompliant; recovery and later approval do not
 rewrite it. Task7 owns live-engine continuation and production-profile admission;
 root final review, full-suite, provisioning/preflight and actual training remain.
+
+## Task7 active: diagnostic implementation
+
+Fresh implementer `/root/v5_task7_impl` (gpt-6.1-sol/high) began at
+`22aed7c7709d1ef63dfa204fe59c3e4d964a4f4b`, with task brief, binding constraints
+and reviewed producer interfaces. CPU protocol/dryrun implementation only; no
+worker authorization for actual training, remote execution or final root suite.
+
+Ruling: permit narrow src/multinode_runtime.py builder/read adaptation beyond
+Task7's explicit optional-file list. Root inspected existing exact-path/args
+lifecycle builder and Stage2/ZeRO2-only full-model builder; neither supports the
+approved Stage1-v5 witness. Reuse existing owned supervisor/preflight/start/monitor
+and managed paths, preserve old exact allowlists, no arbitrary-entrypoint API or
+alternate launcher. Cost if wrong: wrong-node/path launch or ownership weakening;
+causal allowed/rejected profile+argv/managed-root tests and independent review
+required. Scope remains the approved diagnostic, not new orchestration.
+
+Ruling: preserve Task5's exact reviewed FOUR_RANK_WINDOWS literal, whose full
+window sums9 (3+2+0+4) and tail5. Root's Task7 handoff incorrectly labeled fullN10;
+worker's actual parent-loop witness exposed9/9/5. Root inspected producer and
+binding spec/plan: tests already derive actualsum, noN10 requirement exists.
+Correct description only; global oracle uses observed per-rank totals. Cost if
+wrong: misleading denominator claim or altered coverage; diagnostic records real
+counts and checks aggregate. This is an evidence-description correction, not a
+numerical objective or approved design revision.
+
+Task7 implementation `3426946516378a735b2b0bd251c8691400798ea4` touches only
+scripts/verify_stage1_v5.py, tests/stage1/v5/test_protocol.py, src/multinode.py and
+multinode_runtime.py. Root read full report. Actual CPU parent loop/save/restore
+observes9/9/5 full/full/tail, resumed sources4..9 and8..9 and finalstep3; independent
+gradient/AdamW oracle matches at CPU denominator4, explicitly not GPU global16.
+Actual tiny Qwen/DoRA real-helper observer sees original helper/F/reference/packed
+and one parent backward. Read-only audit uses real parent loader and Accelerate
+sharder; source37 fixture observes40 occurrences/10 local microbatches/3updates/
+tail2. Actual production TRAIN audit remains unexecuted.
+
+TDD records: missing diagnostic/builder RED12; missing actual-loop driver RED1;
+missing observer/interface-test defect RED2; corrupted counts/missing norms RED2;
+missing audit reference binding RED1; extra original F-call incorrectly admitted
+RED1. Exact commands/output in task-7-report and logs/stage1-v5-task7. Single
+integration command prefix `PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q` plus
+`tests/stage1/v5` =>247passed/16.66s; it precedes only narrow extra-call verifier
+amendment. Final same prefix plus `tests/stage1/v5/test_protocol.py` =>19passed/
+10.05s, pristine. Root read complete final/integration logs. Syntax AST/diff and
+actual coordinator dryrun recorded green. No model download, GPU, SSH or actual
+training/audit executed by worker. Full production and ZeRO claims remain pending.
+
+Independent fresh `/root/v5_task7_review` (gpt-6-astra/high) is reviewing exact
+22aed7c..3426946 package, specification and quality. Runtime extension andN9 root
+rulings supplied; actual call/gradient/update/data/ownership paths and evidence
+limits must be assessed. No task/final approval inferred from worker self-review.
+
+Task7 independent review at3426946 reports specification issues/quality needs
+fixes: I1 coordinate winners omit joint worst non-dominated row; I2 aggregate
+source-set counts accept2sources with1update; I3 actual approved profile/full-data
+loader schedule are not expected-bound and tiny update oracle mirrors liveLR,
+which can hide a final-tail schedule error. One focused CPU counterexample probe
+substantiates I1/I2; full report has actual call/shape/engine traces and limits.
+No suite rerun/live execution, final19/all-v5247 logs independently read pristine.
+Root read full report; fix1 goes to original implementer with all3findings.
+
+Ruling: cover actual audited non-dominated source geometries, removing arbitrary
+three-coordinate-winner cap; finite audit frontier is the bounded scope, no
+capacity-search algorithm or fabricated input. Cost if wrong: extra smoke time or
+missed true packed memory geometry. Require causal omitted-joint-row test plus
+observed exact source/window/norm coverage. Runtime frontier size remains unknown
+before audit. Profile/original-schedule/LR-oracle bindings implement approved
+admission evidence; production loss/settings and actual training remain unchanged.
+
+## Resume reconciliation and debug-only delta (2026-10-14)
+
+Reconciled actual HEAD c8e31acae1855f377f1ed664d17e265129c25672 and read the
+complete task-7-rereview-1.md. Independent /root/v5_task7_review approves repair
+specification and quality: I1/I2/I3 addressed, no new scoped findings. Final
+focused witness is 47 passed/10.76s; no live audit or training is claimed.
+Task7 implementation is complete, with final whole-change review and live gates
+still pending. Earlier evidenced approvals remain bound to the unchanged main
+spec and plan; the user already approved training and automatic evaluation.
+
+Understood as: the latest request removes repeated diagnostic checking from
+normal Stage1-v5 training by grouping it behind debugging, while retaining the
+approved objective and verifying actual two-node training before handoff.
+Readchk cross-check resolves the scope; no question about training authorization
+or implementation method is needed. Brainstorming bounded path is active only
+for this new runtime check-gating delta; existing task approvals are retained.
+
+Frozen design proposal debug v1: add runtime --stage1-v5-debug / Python
+--stage1_v5_debug, default false. Gate repetitive numeric/invariant checks and
+diagnostic-only computations in the v5 training hot path; preserve mathematical
+operations, selection/masking, RNG and checkpoint recomputation, ownership/state
+transitions, and one-time input/profile/resume/checkpoint checks. Shared loss
+helpers retain strict validation by default for existing callers; the v5 path
+passes its explicit mode. Debug mode is runtime instrumentation, not an objective
+coefficient or a reason to reject a mathematically identical saved resume.
+Dedicated diagnostics retain their admission checks. Carry the option through
+the actual coordinator/shell/parser/trainer path and explicitly resolve it in
+the launch recipe. Test same-batch debug-on/off loss, all trainable gradients and
+RNG, including checkpoint recomputation, and a checker tripwire proving that
+normal mode skips the diagnostic while debug mode detects the bad value.
+
+Standing root-only hate invocation on that frozen proposal:
+{root: "A guard may hide an algorithmic or state-transition operation, so normal
+training could silently change gradients or checkpoint/RNG behavior even while
+debug tests pass.", first_nail: "Run the same tiny Qwen/DoRA batch with identical
+weights and RNG in both modes, compare loss and every trainable gradient plus
+post-backward RNG, and trip a diagnostic-only check under checkpoint replay."}
+First nail is proposed, not executed or claimed as evidence. It is a focused
+TDD/verification requirement before expensive training; this reversible guard
+change does not rely on a material untested architectural premise at commitment.
+Macrothink is nonapplicable: the user's concrete instrumentation request and
+existing call paths resolve the problem, so extra fresh problem-framing reads
+would exceed the risk of solving a different problem for this bounded delta.
+
+Design commitment debug v1 equals proposal v1, with the hate-derived equivalence
+and tripwire tests explicit. No material divergence or remaining scope conflict.
+Short in-chat final design approval is pending under the bounded brainstorming
+gate. No product change for debug v1 has been made. After approval use the user's
+existing SDD method, one concrete task brief, TDD and independent spec/quality
+review; no new architectural plan document.
