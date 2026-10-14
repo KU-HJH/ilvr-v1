@@ -395,7 +395,11 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
             if name in explicit and explicit[name] != value:
                 raise ValueError(f'conflicting explicit values for {name}')
             explicit[name] = value
-        if is_v5 and name in ('step_preference_loss_type', 'step_entropy_margin'):
+        if (is_v5 and action.dest.startswith(('step_', 'stage2'))
+                and name not in V5_OPTION_ALIASES):
+            # Only approved one-to-one aliases participate in the v5 objective.
+            # Reject explicit legacy controls, including negative boolean forms,
+            # rather than leaving requested semantics unused on the namespace.
             raise ValueError(f'{option} is unsupported for Stage1-v5')
     if is_v5 and args.stage != 'stage1':
         raise ValueError('stage1_variant=v5 requires --stage stage1')

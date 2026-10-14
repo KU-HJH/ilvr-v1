@@ -125,3 +125,36 @@ def test_argparse_abbreviations_cannot_bypass_v5_presence_or_fixed_coefficients(
     args = parse_args(['--stage1_variant=v5', '--lambda_topk_ent=.1', '--preference_topk_k=50'])
     assert args.stage1_v5_config.lambda_topk_entropy == .1
     assert args.stage1_v5_explicit_values['lambda_topk_entropy'] == .1
+
+
+@pytest.mark.parametrize('legacy_argv', [
+    ['--stage1_v5_selection', 'voff', '--preference_entropy_top_percent', '50',
+     '--step_preference_entropy_source', 'clean'],
+    ['--step_preference_prefix_mode', 'evidence_replacement'],
+    ['--step_preference_prefix_mode', 'clean_prefix'],
+    ['--step_preference_target_scope', 'until_next_latent'],
+    ['--step_preference_branch_mode', 'cumulative'],
+    ['--step_preference_block_original_image'],
+    ['--step_preference_objective', 'legacy_dpo'],
+    ['--step_preference_mode', 'stage2b'],
+    ['--step_preference_packing'],
+    ['--step_shared_prefix_enabled'],
+    ['--step_sidecar_query_budget', '128'],
+    ['--step_dpo_weight', '0'],
+    ['--no-step_visual_only_context_preference'],
+    ['--no-step_visual_off_suppress_latent_boundaries'],
+    ['--stage2a_ratio', '.9'],
+    ['--stage2b_direct_from_stage1'],
+])
+def test_v5_rejects_explicit_unsupported_legacy_controls(legacy_argv):
+    with pytest.raises(ValueError, match='unsupported for Stage1-v5'):
+        parse_args(['--stage1_variant', 'v5', *legacy_argv])
+
+
+@pytest.mark.parametrize('stage', ['stage1', 'stage2'])
+def test_legacy_selector_and_prefix_remain_valid_on_existing_paths(stage):
+    args = parse_args(['--stage', stage, '--step_preference_entropy_source', 'clean',
+                       '--step_preference_prefix_mode', 'clean_prefix'])
+    assert args.step_preference_config.preference_entropy_source == 'clean'
+    assert args.step_preference_config.prefix_mode == 'clean_prefix'
+    assert args.stage1_v5_config is None
