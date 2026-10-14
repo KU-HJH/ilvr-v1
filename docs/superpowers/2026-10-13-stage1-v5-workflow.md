@@ -354,3 +354,29 @@ Trainer GAS scaling, current EMA filename and producer/consumer consistency.
 The plan is a new artifact; no human plan review has been invented or inferred
 from an approval preceding its creation. Actual handoff outcome will be recorded
 below. Product implementation has not yet started.
+
+## 2026-10-14: written plan approved; product implementation begins
+
+The user answered the linked written-plan review: “계획 확인, 학습·자동 평가까지
+진행”. This binds plan commit `be9d631dde645f0128ab8500f2c8d061fbef1a5a`,
+SHA256 `b3b4f75d674af2fea671b9ce7e3aabb80c0cf3b2b1b67b6d219c676d4067696d`.
+Design commitment v1 approval above remains unchanged. Writing-plans is complete;
+the active phase is subagent-driven implementation of seven tasks, followed by
+independent final review, fresh verification, two-node training and automatic
+TEST400 evaluation. No further method/training approval is needed within scope.
+
+Root read the plan/spec and SDD instructions, verified this existing linked
+Stage1-v5 worktree (not a submodule), and created the plan-specific ledger at
+`.superpowers/sdd/2026-10-14-stage1-v5/progress.md`. Existing baseline and CPU
+premise evidence are reused; no dependency installation or repeated probe.
+Prior hidden-CUDA full-suite failures are not represented as a passing suite.
+
+Read-only checks found both nodes reachable, two idle H100 NVL GPUs each,
+bond1.102 present and sufficient checkpoint storage (local37TiB/remote39TiB).
+Both report torch2.7.1+cu128, transformers4.50.0.dev0, accelerate1.10.1,
+deepspeed0.18.7 and peft0.17.1. TRAIN3450 and TEST400 match on both nodes:
+`5bc1313a594f5713975b67388c745c6632275c37fd260055b27230c9cfedbed8` and
+`6a1dccf32bb5196d09941adfd8ea79e29b58c34316f286673b557ed29dc69618`.
+Original base and image-root paths exist. This does not establish future resource
+availability, full input validity, reviewed-code compatibility or update budget;
+authoritative preflight/audit remains after implementation.
