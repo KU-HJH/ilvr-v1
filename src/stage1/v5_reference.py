@@ -109,7 +109,7 @@ def _validate_processor_layout(teacher: Stage1EmaTeacher, processor) -> None:
     tokens = ('<|latent_pad|>', '<|latent_start|>', '<|latent_end|>')
     config_ids = tuple(getattr(qwen.config, name, None) for name in
                        ('latent_token_id', 'latent_start_id', 'latent_end_id'))
-    if config_ids != ids or tuple(tokenizer.convert_tokens_to_ids(t) for t in tokens) != ids or tuple(
+    if ids != tuple(range(len(tokenizer)-3,len(tokenizer))) or config_ids != ids or tuple(tokenizer.convert_tokens_to_ids(t) for t in tokens) != ids or tuple(
             tokenizer.convert_ids_to_tokens(i) for i in ids) != tokens:
         raise ValueError('processor/reference latent token layout mismatch')
 
@@ -210,15 +210,18 @@ def _validate_base_coverage(teacher: Stage1EmaTeacher, keys: dict[str, tuple[Pat
             original = stream.get_tensor(source_name).to(dtype=parameter.dtype)
         current = parameter.detach().cpu()
         if base_name in ('model.embed_tokens.weight', 'lm_head.weight'):
-            n = original.shape[0]
-            if current.shape != (n + 3, original.shape[1]) or not torch.equal(current[:n], original):
+            # Stage1 resizes to tokenizer+3, which may shrink source padding.
+            # Layout authentication above requires the final three latent rows.
+            n = current.shape[0]-3
+            if (n<=0 or original.shape[0]<n or current.shape[1:]!=original.shape[1:]
+                    or not torch.equal(current[:n], original[:n])):
                 raise ValueError(f'reference does not match original base: {name}')
             if base_name == 'lm_head.weight':
-                expected = original.float().mean(0, keepdim=True).to(current.dtype).expand(3, -1)
+                expected = original[:n].float().mean(0, keepdim=True).to(current.dtype).expand(3, -1)
                 if not torch.equal(current[n:], expected):
                     raise ValueError('uncovered appended frozen output rows')
-            # PEFT replaces appended input rows with saved trainable_tokens_delta;
-            # the underlying random appended input rows never enter active policy.
+            # PEFT replaces latent input rows with saved trainable_tokens_delta;
+            # their underlying base rows never enter active policy.
         elif current.shape != original.shape or not torch.equal(current, original):
             raise ValueError(f'reference does not match original base: {name}')
         covered.add(base_name)

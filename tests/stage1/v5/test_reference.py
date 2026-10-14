@@ -21,14 +21,22 @@ def api():
 
 
 @pytest.fixture
-def bundle(tmp_path, monkeypatch):
+def bundle(tmp_path, monkeypatch, request):
     import artifact_paths
     monkeypatch.setattr(artifact_paths, 'CANONICAL_CHECKPOINT_ROOT', tmp_path / 'checkpoints')
     base_path = tmp_path / 'base'
-    base = tiny_original_qwen()
+    pretrained_rows,tied,dtype=getattr(request,'param',(125,False,torch.float32))
+    base = tiny_original_qwen(pretrained_vocab_size=pretrained_rows)
+    if tied:
+        base.config.tie_word_embeddings=True
+        base.tie_weights()
+    with torch.no_grad():
+        base.get_input_embeddings().weight[125:].fill_(4.)
+        if not tied: base.get_output_embeddings().weight[125:].fill_(8.)
     base.save_pretrained(base_path)
     def fresh():
-        model = copy.deepcopy(base)
+        # Actual Stage1 loads the original in its training dtype before resizing.
+        model = copy.deepcopy(base).to(dtype=dtype)
         model.resize_token_embeddings(RESIZED_VOCAB_SIZE)
         model.config.latent_token_id, model.config.latent_start_id, model.config.latent_end_id = LATENT_TOKEN_IDS
         return build_stage1_tuned_model(model, stage1_tuning(), LATENT_TOKEN_IDS)
@@ -36,6 +44,111 @@ def bundle(tmp_path, monkeypatch):
     processor = TinyStage1Processor()
     directory = tmp_path / 'checkpoints' / 'initial'
     return student, processor, base_path, directory, fresh
+
+
+@pytest.mark.parametrize('bundle',[
+    (126,False,torch.float32),(128,False,torch.float32),(132,False,torch.float32),
+    (126,True,torch.bfloat16),(128,True,torch.bfloat16),(132,True,torch.bfloat16)],
+    indirect=True,ids=['partial-grow','same-size','shrink','tied-bf16-partial-grow','tied-bf16-same-size','tied-bf16-shrink'])
+def test_padded_source_authenticates_retained_rows_and_restores_initial_state(bundle):
+    from safetensors import safe_open
+    from peft_common import resolve_qwen2_5_vl_model
+    ref=api()
+    student,processor,base,directory,fresh=bundle
+    teacher=Stage1EmaTeacher(student,1.,'dora')
+    qwen=resolve_qwen2_5_vl_model(teacher.model)
+    with safe_open(base/'model.safetensors',framework='pt',device='cpu') as stream:
+        tied='lm_head.weight' not in stream.keys()
+        original_input=stream.get_tensor('model.embed_tokens.weight')
+        original_output=original_input if tied else stream.get_tensor('lm_head.weight')
+    assert original_input.shape[0] in (126,128,132)
+    assert qwen.model.embed_tokens.token_adapter.base_layer.weight.shape==(128,8)
+    assert qwen.lm_head.base_head.weight.shape==(128,8)
+    torch.testing.assert_close(qwen.model.embed_tokens.token_adapter.base_layer.weight[:125],
+        original_input[:125].to(qwen.model.embed_tokens.token_adapter.base_layer.weight.dtype),rtol=0,atol=0)
+    output=qwen.lm_head.base_head.weight
+    ordinary=original_output[:125].to(output.dtype)
+    expected=ordinary.float().mean(0,keepdim=True).to(output.dtype).expand(3,-1)
+    torch.testing.assert_close(output[:125],ordinary,rtol=0,atol=0)
+    torch.testing.assert_close(output[125:],expected,rtol=0,atol=0)
+    assert not torch.equal(expected,original_output.to(output.dtype).float().mean(0,keepdim=True).to(output.dtype).expand(3,-1))
+    calls=[]
+    teacher.model.register_forward_pre_hook(lambda *_:calls.append(1))
+    identity=ref.inspect_v5_reference(teacher,student,processor,base_path=base)
+    assert not directory.exists()
+    assert ref.capture_v5_reference(teacher,student,processor,base_path=base,directory=directory)==identity
+    initial={name:value.clone() for name,value in teacher.state_dict()['parameters'].items()}
+    with torch.no_grad():
+        for parameter in student.parameters():
+            if parameter.requires_grad: parameter.add_(3.)
+    resumed=Stage1EmaTeacher(student,1.,'dora',initial_reference_model=fresh())
+    resumed.model.register_forward_pre_hook(lambda *_:calls.append(1))
+    ref.restore_v5_reference(resumed,student,processor,base_path=base,directory=directory,expected=identity)
+    assert all(torch.equal(resumed.state_dict()['parameters'][name],value) for name,value in initial.items())
+    assert calls==[]
+
+
+@pytest.mark.parametrize('bundle',[(132,True,torch.bfloat16)],indirect=True)
+@pytest.mark.parametrize('tamper',['ordinary_input','ordinary_output','latent_output','other_frozen'])
+def test_padded_tied_source_still_rejects_frozen_row_or_tensor_tampering(bundle,tamper):
+    from peft_common import resolve_qwen2_5_vl_model
+    ref=api()
+    student,processor,base,directory,_=bundle
+    teacher=Stage1EmaTeacher(student,1.,'dora')
+    ref.capture_v5_reference(teacher,student,processor,base_path=base,directory=directory)
+    qwen=resolve_qwen2_5_vl_model(teacher.model)
+    with torch.no_grad():
+        if tamper=='ordinary_input': qwen.model.embed_tokens.token_adapter.base_layer.weight[124,0].add_(1.)
+        elif tamper=='ordinary_output': qwen.lm_head.base_head.weight[124,0].add_(1.)
+        elif tamper=='latent_output': qwen.lm_head.base_head.weight[125,0].add_(1.)
+        else: qwen.model.norm.weight[0].add_(1.)
+    calls=[]
+    teacher.model.register_forward_pre_hook(lambda *_:calls.append(1))
+    with pytest.raises(ValueError,match='original base|frozen output rows'):
+        ref.inspect_v5_reference(teacher,student,processor,base_path=base)
+    assert calls==[]
+
+
+def test_consistent_but_nonfinal_latent_layout_is_rejected(bundle):
+    from peft_common import resolve_qwen2_5_vl_model
+    from test_checkpointing import TinyStage1Tokenizer
+    ref=api()
+    student,processor,base,directory,_=bundle
+    teacher=Stage1EmaTeacher(student,1.,'dora')
+    ids=(124,126,127)
+    for model in (student,teacher.model):
+        qwen=resolve_qwen2_5_vl_model(model)
+        model.peft_config['default'].trainable_token_indices={'model.embed_tokens':list(ids)}
+        qwen.model.embed_tokens.token_adapter.token_indices['default']=list(ids)
+        qwen.lm_head.token_ids.copy_(torch.tensor(ids))
+        qwen.config.latent_token_id,qwen.config.latent_start_id,qwen.config.latent_end_id=ids
+    processor.tokenizer=TinyStage1Tokenizer(ids)
+    calls=[]
+    teacher.model.register_forward_pre_hook(lambda *_:calls.append(1))
+    with pytest.raises(ValueError,match='layout'):
+        ref.capture_v5_reference(teacher,student,processor,base_path=base,directory=directory)
+    assert calls==[] and not directory.exists()
+
+
+@pytest.mark.parametrize('bundle',[(132,True,torch.bfloat16)],indirect=True)
+def test_discarded_source_padding_remains_in_full_file_identity(bundle):
+    from safetensors.torch import load_file,save_file
+    ref=api()
+    student,processor,base,directory,_=bundle
+    teacher=Stage1EmaTeacher(student,1.,'dora')
+    identity=ref.capture_v5_reference(teacher,student,processor,base_path=base,directory=directory)
+    tensors=load_file(base/'model.safetensors')
+    assert 'lm_head.weight' not in tensors
+    tensors['model.embed_tokens.weight'][131,0].add_(1.)
+    save_file(tensors,base/'model.safetensors',metadata={'format':'pt'})
+    changed=ref.inspect_v5_reference(teacher,student,processor,base_path=base)
+    assert changed.base_content_sha256!=identity.base_content_sha256
+    assert changed.effective_state_sha256==identity.effective_state_sha256
+    calls=[]
+    teacher.model.register_forward_pre_hook(lambda *_:calls.append(1))
+    with pytest.raises(ValueError,match='original base content identity'):
+        ref.restore_v5_reference(teacher,student,processor,base_path=base,directory=directory,expected=identity)
+    assert calls==[]
 
 
 def test_restores_initial_state_from_original_base_not_resumed_student(bundle):
