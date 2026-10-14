@@ -2702,6 +2702,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         stage2_logit_positions: Optional[torch.LongTensor] = None,
         stage2_selective_logits_only: bool = False,
         stage1_selected_positions: Optional[Tuple[Tuple[int, int], ...]] = None,
+        stage1_selected_chunk_positions: int = 128,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2721,6 +2722,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         resolved_use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         if stage1_selected_positions is not None:
+            if type(stage1_selected_chunk_positions) is not int or stage1_selected_chunk_positions <= 0:
+                raise ValueError("stage1_selected_chunk_positions must be a positive integer")
             if getattr(self.config, "stage", None) != "stage1":
                 raise ValueError("selected Stage 1 logits require Stage 1")
             if labels is not None:
@@ -2957,7 +2960,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 selected_hidden = hidden_states[rows, positions]
             else:
                 selected_hidden = hidden_states.new_empty((0, hidden_states.shape[-1]))
-            stage1_selected_logits = self.lm_head(selected_hidden)
+            stage1_selected_logits = torch.cat([
+                self.lm_head(chunk)
+                for chunk in selected_hidden.split(stage1_selected_chunk_positions)
+            ], dim=0)
             logits = None
 
         loss = None

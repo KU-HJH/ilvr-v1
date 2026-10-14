@@ -148,3 +148,60 @@ def test_trace_observations_match_native_full_causal_attention():
         assert trace.inputs_embeds is output.inputs_embeds
         assert all(value.requires_grad for pair in trace.key_values for value in pair)
         with execution.backward(): output.logits.sum().backward()
+
+
+@pytest.mark.parametrize('chunk_positions',[None,32])
+def test_selected_reference_projection_is_chunked_and_matches_full_order(chunk_positions):
+    """Catch unbounded selected projection and concatenation in wrong query order."""
+    student,*_ = fixture(.05)
+    reference = resolve_qwen2_5_vl_model(student).eval().requires_grad_(False)
+    ids = IDS.repeat(1,8)
+    positions = torch.arange(ids.shape[1])[None,None].expand(3,1,-1)
+    kwargs = dict(input_ids=ids,position_ids=positions,use_cache=False,return_dict=True)
+    keys = tuple((0,p) for p in reversed(range(129)))
+    with torch.no_grad(): full = reference(**kwargs)
+    head_calls,decoder_calls = [],[]
+    head_hook = reference.lm_head.register_forward_pre_hook(lambda _m,a:head_calls.append(tuple(a[0].shape)))
+    decoder_hook = reference.model.register_forward_pre_hook(lambda *_:decoder_calls.append('reference'))
+    selected_kwargs = {} if chunk_positions is None else {'stage1_selected_chunk_positions':chunk_positions}
+    try:
+        with torch.no_grad():
+            selected = reference(**kwargs,stage1_selected_positions=keys,**selected_kwargs)
+        assert decoder_calls == ['reference']
+        assert head_calls == ([(128,8),(1,8)] if chunk_positions is None else [(32,8)]*4+[(1,8)])
+        assert selected.logits is None and selected.stage1_selected_logits.shape == (129,128)
+        torch.testing.assert_close(selected.stage1_selected_logits,full.logits[0,list(reversed(range(129)))])
+        print(f'SELECTED_REFERENCE_CHUNKS chunk={chunk_positions or 128} calls={head_calls} decoder_calls={decoder_calls}')
+    finally:
+        head_hook.remove(); decoder_hook.remove()
+
+
+@pytest.mark.parametrize('chunk_positions',[0,-1,True,1.5,None])
+def test_selected_reference_chunk_positions_rejects_invalid_bound_before_decoder(chunk_positions):
+    student,*_ = fixture(.05)
+    reference = resolve_qwen2_5_vl_model(student).eval()
+    calls = []
+    hook = reference.model.register_forward_pre_hook(lambda *_:calls.append('decoder'))
+    try:
+        with pytest.raises(ValueError,match='chunk_positions'):
+            reference(input_ids=IDS,position_ids=POSITIONS,use_cache=False,
+                stage1_selected_positions=((0,9),),stage1_selected_chunk_positions=chunk_positions)
+        assert calls == []
+    finally: hook.remove()
+
+
+def test_selected_reference_chunking_preserves_empty_and_legacy_projection():
+    student,*_ = fixture(.05)
+    reference = resolve_qwen2_5_vl_model(student).eval()
+    calls = []
+    hook = reference.lm_head.register_forward_pre_hook(lambda _m,a:calls.append(tuple(a[0].shape)))
+    try:
+        with torch.no_grad():
+            empty = reference(input_ids=IDS,position_ids=POSITIONS,use_cache=False,
+                stage1_selected_positions=(),stage1_selected_chunk_positions=2)
+            full = reference(input_ids=IDS,position_ids=POSITIONS,use_cache=False,
+                stage1_selected_chunk_positions=0)
+        assert calls == [(0,8),(1,26,8)]
+        assert empty.logits is None and empty.stage1_selected_logits.shape == (0,128)
+        assert full.stage1_selected_logits is None and full.logits.shape == (1,26,128)
+    finally: hook.remove()
