@@ -50,6 +50,7 @@ from ...utils import (
     logging,
     replace_return_docstrings,
 )
+from .stage1_v5_trace import v5_decoder_forward
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 from .stage2_latent_rollout import LatentRolloutEngine, parse_latent_spans, validate_stage2_config
 
@@ -1480,6 +1481,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    @v5_decoder_forward
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1829,6 +1831,7 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     inputs_embeds: Optional[torch.FloatTensor] = None
     stage2_latent_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     stage2_diagnostics: Optional[Dict[str, torch.Tensor]] = None
+    stage1_selected_logits: Optional[torch.FloatTensor] = None
     stage2_selected_logits: Optional[torch.FloatTensor] = None
     stage2_sidecar_results: Optional[Tuple[Mapping[str, object], ...]] = None
     stage2_sidecar_stats: Optional[Mapping[str, object]] = None
@@ -2698,6 +2701,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         stage2_shared_prefix_inputs: Optional[Mapping[str, object]] = None,
         stage2_logit_positions: Optional[torch.LongTensor] = None,
         stage2_selective_logits_only: bool = False,
+        stage1_selected_positions: Optional[Tuple[Tuple[int, int], ...]] = None,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2715,6 +2719,23 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         resolved_use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        if stage1_selected_positions is not None:
+            if getattr(self.config, "stage", None) != "stage1":
+                raise ValueError("selected Stage 1 logits require Stage 1")
+            if labels is not None:
+                raise ValueError("selected Stage 1 logits do not accept labels")
+            if not return_dict:
+                raise ValueError("selected Stage 1 logits require return_dict=True")
+            source = input_ids if inputs_embeds is None else inputs_embeds
+            keys = stage1_selected_positions
+            if (not isinstance(keys,tuple) or len(set(keys))!=len(keys)
+                    or source is None or any(not isinstance(key,tuple) or len(key)!=2
+                    or any(type(v) is not int for v in key)
+                    or not 0<=key[0]<source.shape[0] or not 0<=key[1]<source.shape[1]
+                    or (attention_mask is not None and (attention_mask.ndim!=2
+                        or not bool(attention_mask[key[0],key[1]]))) for key in keys)):
+                raise ValueError("invalid Stage 1 selected positions")
 
         if stage2_shared_prefix_inputs is not None and getattr(self.config, "stage", None) != "stage2":
             raise ValueError("shared-prefix inputs are supported only in Stage 2")
@@ -2927,7 +2948,17 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         hidden_states = outputs[0]
             
 
-        logits = self.lm_head(hidden_states)
+        stage1_selected_logits = None
+        if stage1_selected_positions is None:
+            logits = self.lm_head(hidden_states)
+        else:
+            if stage1_selected_positions:
+                rows, positions = zip(*stage1_selected_positions)
+                selected_hidden = hidden_states[rows, positions]
+            else:
+                selected_hidden = hidden_states.new_empty((0, hidden_states.shape[-1]))
+            stage1_selected_logits = self.lm_head(selected_hidden)
+            logits = None
 
         loss = None
         if labels is not None:
@@ -2952,6 +2983,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             attentions=outputs.attentions if 'outputs' in locals() and hasattr(outputs, 'attentions') else None,
             rope_deltas=self.rope_deltas,
             inputs_embeds=inputs_embeds,
+            stage1_selected_logits=stage1_selected_logits,
         )
 
     def prepare_inputs_for_generation(
