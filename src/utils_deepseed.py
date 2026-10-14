@@ -24,6 +24,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--evaluation_output_path", type=str, default="evaluation_results.json", help="Path to save evaluation results JSON file.")
     parser.add_argument("--model", type=str, default='Qwen/Qwen2.5-VL-7B-Instruct')
     parser.add_argument("--stage", type=str, default="stage1")
+    parser.add_argument("--stage1_variant", choices=("standard", "v5"), default="standard")
+    parser.add_argument("--stage1_loss_type", choices=("dil-bce-orig", "dil_bce_orig"))
+    parser.add_argument("--lambda_preference", type=float)
+    parser.add_argument("--lambda_topk_entropy", type=float)
+    parser.add_argument("--lambda_entropy", type=float)
+    parser.add_argument("--preference_topk_k", type=int)
+    parser.add_argument("--preference_topk_mode", choices=("independent", "sync_topk"))
+    parser.add_argument("--topk_include_gt", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--lambda_topk_mass", type=float)
+    parser.add_argument("--lambda_topk_chosen_mass", type=float)
+    parser.add_argument("--preference_entropy_top_percent", type=float)
+    parser.add_argument("--loss_chunk_positions", type=int)
+    parser.add_argument("--stage1_v5_selection", choices=("all", "clean", "voff", "gap", "intersection"))
+    parser.add_argument("--stage1_v5_text_kl_weight", type=float)
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)
@@ -216,6 +230,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
+    _resolve_stage1_v5_args(parser, args, raw_argv)
     if args.vision_attention_implementation is None:
         args.vision_attention_implementation = args.attention_implementation
     if args.log_file is None:
@@ -250,10 +265,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metadata_path = Path(args.resume_from_checkpoint_path) / "stage1_peft_metadata.json"
         if metadata_path.is_file():
             args.ce_weight = json.loads(metadata_path.read_text(encoding="utf-8"))["ce_weight"]
-    args.step_preference_config = StepPreferenceConfig.from_args(args)
-    args.step_dpo_beta = args.step_preference_config.beta
-    args.step_preference_beta = args.step_preference_config.beta
-    args.step_preference_margin = args.step_preference_config.preference_margin
+    if args.stage1_v5_config is None:
+        args.step_preference_config = StepPreferenceConfig.from_args(args)
+        args.step_dpo_beta = args.step_preference_config.beta
+        args.step_preference_beta = args.step_preference_config.beta
+        args.step_preference_margin = args.step_preference_config.preference_margin
+    else:
+        # Compatibility for existing Stage2 checks below; v5 never enters its
+        # phase/default resolver and all v5 consumers use stage1_v5_config.
+        args.step_preference_config = StepPreferenceConfig(lambda_ce=args.ce_weight)
     args.ce_weight = args.step_preference_config.lambda_ce
     from stage2.planned_stop import validate_planned_checkpoint_stop
     validate_planned_checkpoint_stop(
@@ -338,6 +358,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     elif args.tuning_method_explicit:
         raise ValueError("--tuning_method is only valid for Stage 1 or Stage 2")
     return args
+
+
+def _resolve_stage1_v5_args(parser, args, raw_argv):
+    """Keep explicit alias presence for later saved-objective resolution."""
+    from stage1.v5_config import V5_OPTION_ALIASES, resolve_v5_config
+    public = {
+        'stage1_loss_type', 'lambda_preference', 'lambda_topk_entropy',
+        'lambda_entropy', 'preference_topk_k', 'preference_topk_mode',
+        'topk_include_gt', 'lambda_topk_mass', 'lambda_topk_chosen_mass',
+        'preference_entropy_top_percent', 'loss_chunk_positions',
+        'stage1_v5_selection', 'stage1_v5_text_kl_weight',
+    }
+    explicit = {}
+    is_v5 = args.stage1_variant == 'v5'
+    for index, item in enumerate(raw_argv):
+        option, equal, inline = item.partition('=')
+        action = parser._option_string_actions.get(option)
+        if action is None:
+            # argparse accepts unique abbreviations. Track the registered name
+            # so an abbreviation cannot evade path/alias validation.
+            matches = parser._get_option_tuples(option) if option.startswith('--') else ()
+            if len(matches) != 1:
+                continue
+            action, option = matches[0][:2]
+        spelling = option.removeprefix('--')
+        name = action.dest if spelling == 'no-topk_include_gt' else spelling
+        if name in public and not (is_v5 and args.stage == 'stage1'):
+            raise ValueError(f'{option} is only valid for --stage stage1 --stage1_variant v5')
+        if is_v5 and name in public | set(V5_OPTION_ALIASES):
+            if isinstance(action, argparse.BooleanOptionalAction):
+                value = not option.startswith('--no-')
+            else:
+                value = action.type(inline if equal else raw_argv[index + 1]) if action.type else (
+                    inline if equal else raw_argv[index + 1])
+            if name in explicit and explicit[name] != value:
+                raise ValueError(f'conflicting explicit values for {name}')
+            explicit[name] = value
+        if is_v5 and name in ('step_preference_loss_type', 'step_entropy_margin'):
+            raise ValueError(f'{option} is unsupported for Stage1-v5')
+    if is_v5 and args.stage != 'stage1':
+        raise ValueError('stage1_variant=v5 requires --stage stage1')
+    args.stage1_v5_explicit_values = explicit
+    args.stage1_v5_config = resolve_v5_config(explicit) if is_v5 else None
+    if is_v5:
+        config = args.stage1_v5_config
+        args.stage1_loss_type = config.loss_type
+        for name in public - {'stage1_loss_type', 'stage1_v5_selection', 'stage1_v5_text_kl_weight'}:
+            setattr(args, name, getattr(config, name))
+        args.stage1_v5_selection = config.selection
+        args.stage1_v5_text_kl_weight = config.text_kl_weight
+        args.step_dpo_beta = args.step_preference_beta = config.beta
+        args.step_preference_margin = config.margin
+        args.step_preference_weight = config.lambda_preference
+        args.step_preference_topk = config.preference_topk_k
+        args.step_preference_lambda_topk_mass = config.lambda_topk_mass
+        args.step_preference_entropy_top_percent = config.preference_entropy_top_percent
+        args.step_entropy_weight = config.lambda_entropy
 
 
 def get_args():

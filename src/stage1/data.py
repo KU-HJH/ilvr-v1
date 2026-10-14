@@ -174,13 +174,16 @@ def _collate_processed_rows(rows: Sequence[dict[str, object]]) -> dict[str, obje
 class Stage1DataCollator:
     """Collate Stage 1 samples without inferring ownership across batch rows."""
 
-    def __init__(self, processor, token_ids, latent_size):
+    def __init__(self, processor, token_ids, latent_size, stage1_variant: str = 'standard'):
         if (
             not isinstance(latent_size, int)
             or isinstance(latent_size, bool)
             or latent_size <= 0
         ):
             raise ValueError("latent_size must be a positive integer")
+        if stage1_variant not in ('standard', 'v5'):
+            raise ValueError('unsupported Stage 1 variant')
+        self.stage1_variant = stage1_variant
         self.processor = processor
         self.token_ids = token_ids
         self.latent_size = latent_size
@@ -271,10 +274,13 @@ class Stage1DataCollator:
             examples, metadata, input_ids, attention_mask, labels, latent_mask
         )
         self._validate_samplewise_ownership(examples, metadata, attention_mask)
-        return {
-            **batch,
-            "stage1_batch_metadata": metadata,
-        }
+        result = {**batch, "stage1_batch_metadata": metadata}
+        if self.stage1_variant == 'v5':
+            from stage1.v5_metadata import build_v5_metadata
+            result['stage1_v5_metadata'] = build_v5_metadata(
+                self.processor, examples, batch, metadata
+            )
+        return result
 
     @staticmethod
     def _validate_sample_identity(examples: Sequence[PreparedStage1Example]) -> None:
