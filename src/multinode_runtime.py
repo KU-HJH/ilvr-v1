@@ -1682,6 +1682,45 @@ def build_dil_full_model_probe_commands(
                              node_specs=tuple(specs), finite_loss_evidence_path=None)
 
 
+def build_stage1_v5_witness_commands(
+    plan: "LaunchPlan", *, commit: str, data_path: Path, image_root: Path,
+    model: Path, audit_path: Path, log_root: str | Path = _LOG_ROOT,
+) -> OwnedTmuxCommands:
+    """Fixed Stage1-v5 diagnostic under the existing owned node supervisor."""
+    from src.multinode import validate_cluster_topology
+    validate_cluster_topology(plan.cluster)
+    if (plan.stage, plan.tuning_method, plan.zero_stage, plan.world_size, plan.attempt_id) != (
+            'stage1', 'dora', 1, 4, 'initial'):
+        raise ValueError('v5 witness requires fresh four-rank Stage1 DoRA ZeRO1')
+    if not re.fullmatch(r'[a-f0-9]{40}', commit): raise ValueError('invalid witness commit')
+    for value in (data_path,image_root,model,audit_path): _trusted_absolute_path(value)
+    commands=[]; digests=[]; specs=[]
+    for machine_rank in (0,1):
+        repository=node_repository(plan,machine_rank=machine_rank)
+        mapped=lambda path:str(node_path(plan,path,machine_rank=machine_rank))
+        environment={**_MINIMAL_EXEC_ENVIRONMENT,**_distributed_environment(plan,machine_rank),
+            'PATH':str(repository/'venv/ilvr-venv/bin')+':'+_MINIMAL_EXEC_ENVIRONMENT['PATH'].split(':',1)[1],
+            'MASTER_ADDR':plan.cluster.master_addr,'GLOO_SOCKET_IFNAME':plan.cluster.socket_ifname,
+            'NCCL_SOCKET_IFNAME':plan.cluster.socket_ifname,'PYTHONDONTWRITEBYTECODE':'1',
+            'PYTHONPATH':f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}",
+            'ILVR_REPOSITORY_COMMIT':commit}
+        command=(str(repository/'venv/ilvr-venv/bin/accelerate'),'launch',
+            '--num_machines','2','--num_processes','4','--machine_rank',str(machine_rank),
+            '--main_process_ip',plan.cluster.master_addr,'--main_process_port',str(plan.main_process_port),
+            '--mixed_precision','bf16','--use_deepspeed','--deepspeed_multinode_launcher','standard',
+            '--deepspeed_config_file',mapped(plan.deepspeed_config),
+            str(repository/'scripts/verify_stage1_v5.py'),'--mode','distributed-witness',
+            '--run-id',plan.run_id,'--data-path',mapped(data_path),'--image-root',mapped(image_root),
+            '--model',mapped(model),'--audit-json',mapped(audit_path),'--deepspeed',mapped(plan.deepspeed_config),
+            '--output-json',str(repository/'results'/plan.run_id/'stage1-v5-witness.json'))
+        supervisor,digest,spec=_node_shell_command(plan,machine_rank=machine_rank,commit=commit,
+            stage_command=command,environment=environment,log_root=Path(log_root),require_bash_launcher=False)
+        tmux=('/usr/bin/tmux','new-session','-d','-s',f'ilvr-{plan.run_id}-initial-rank{machine_rank}','--',*supervisor)
+        commands.append(tuple(build_remote_exec(tmux,working_directory=repository,cluster=plan.cluster)) if machine_rank==0 else tmux)
+        digests.append(digest); specs.append(spec)
+    return OwnedTmuxCommands(remote=commands[0],local=commands[1],command_digests=tuple(digests),node_specs=tuple(specs),finite_loss_evidence_path=None)
+
+
 def build_owned_lifecycle_harness_commands(
     plan: "LaunchPlan",
     *,
@@ -2363,6 +2402,19 @@ class SubprocessCoordinatorRunner:
         raw = completed.stdout.encode("utf-8")
         if not raw or len(raw) > 1024 * 1024:
             raise ValueError("remote lifecycle evidence size is invalid")
+        return raw
+
+    def read_stage1_v5_witness_record(self, rank: int) -> bytes:
+        if self.plan.stage != 'stage1' or rank not in (0,1,2,3):
+            raise ValueError('invalid v5 witness record rank/stage')
+        repository=node_repository(self.plan,machine_rank=0 if rank<2 else 1)
+        path=repository/'results'/self.plan.run_id/f'v5-rank-{rank}.json'
+        if rank>=2: return _read_regular_file(path,maximum_size=16*1024*1024)
+        completed=self._run(build_remote_exec((str(repository/'venv/ilvr-venv/bin/python'),
+            str(repository/'scripts/verify_stage1_v5.py'),'--mode','record-show','--run-id',self.plan.run_id,
+            '--rank',str(rank)),working_directory=repository,cluster=self.plan.cluster))
+        raw=completed.stdout.encode()
+        if not raw or len(raw)>16*1024*1024: raise ValueError('invalid v5 rank record size')
         return raw
 
     def read_dil_full_model_probe_record(self, rank: int) -> bytes:

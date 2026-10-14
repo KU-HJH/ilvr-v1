@@ -1831,7 +1831,68 @@ def _dil_full_model_probe_main(argv: list[str]) -> int:
     return 2
 
 
+def _stage1_v5_witness_main(argv: list[str]) -> int:
+    """The fixed Stage1-v5 diagnostic uses ordinary coordinator ownership."""
+    from scripts.verify_stage1_v5 import selected_admission_geometry, validate_rank_records
+    from src.multinode_runtime import build_stage1_v5_witness_commands, publish_small_file
+    parser=argparse.ArgumentParser(prog='train-stage1 --stage1-v5-witness',allow_abbrev=False)
+    parser.add_argument('--stage1-v5-witness',action='store_true',required=True)
+    parser.add_argument('--run-id',required=True)
+    parser.add_argument('--zero-stage',type=int,choices=(1,),required=True)
+    parser.add_argument('--main-process-port',type=int,required=True)
+    for name in ('data-path','image-root','model','audit-json'):
+        parser.add_argument('--'+name,type=Path,required=True)
+    for name in ('local-repo-root','remote-repo-root','remote-host-repo-root'):
+        parser.add_argument('--'+name,type=Path)
+    parser.add_argument('--dry-run',action='store_true')
+    args=parser.parse_args(argv)
+    try:
+        plan=build_launch_plan(stage='stage1',tuning_method='dora',zero_stage=1,run_id=args.run_id,
+            main_process_port=args.main_process_port,local_repo_root=args.local_repo_root,
+            remote_repo_root=args.remote_repo_root,remote_host_repo_root=args.remote_host_repo_root)
+        commit=_repository_git_stdout(('rev-parse','HEAD'))
+        commands=build_stage1_v5_witness_commands(plan,commit=commit,data_path=args.data_path,
+            image_root=args.image_root,model=args.model,audit_path=args.audit_json)
+        inputs=(args.data_path,args.image_root,args.model,args.audit_json,
+                _REPOSITORY_ROOT/'scripts/verify_stage1_v5.py',plan.deepspeed_config)
+        roots=tuple(_REPOSITORY_ROOT/k for k in ('checkpoints','results','logs'))
+        paths=(_REPOSITORY_ROOT/'checkpoints'/plan.run_id,_REPOSITORY_ROOT/'results'/plan.run_id,
+               _REPOSITORY_ROOT/'logs/multinode'/plan.run_id/plan.attempt_id)
+        sessions=tuple(f'ilvr-{plan.run_id}-initial-rank{r}' for r in (0,1))
+        preflight=build_preflight_commands(plan,input_paths=inputs,artifact_roots=roots,
+            remote_run_paths=paths,local_run_paths=paths,remote_tmux_sessions=(sessions[0],),local_tmux_sessions=(sessions[1],))
+        if args.dry_run:
+            print(json.dumps(dict(kind='stage1-v5-witness',plan=_json_ready(plan),
+                local=commands.local,remote=commands.remote,node_specs=_json_ready(commands.node_specs),
+                resource_preflight=_json_ready(preflight)),sort_keys=True))
+            return 0
+        def run(command):
+            return subprocess.run(command,capture_output=True,text=True,check=False,timeout=_CONTROL_TIMEOUT_SECONDS)
+        remote=collect_node_snapshot(plan,node='remote',runner=run,commands=preflight,input_paths=inputs,
+            artifact_roots=roots,run_paths=paths,tmux_sessions=(sessions[0],))
+        local=collect_node_snapshot(plan,node='local',runner=run,commands=preflight,input_paths=inputs,
+            artifact_roots=roots,run_paths=paths,tmux_sessions=(sessions[1],))
+        if validate_preflight(remote,local).commit!=commit: raise ValueError('v5 witness preflight commit changed')
+        audited=json.loads(args.audit_json.read_text())
+        runner=SubprocessCoordinatorRunner(plan,commands=commands,commit=commit,log_root=_REPOSITORY_ROOT/'logs/multinode')
+        start_rank0_then_rank1(plan,runner,commands=commands,ready_timeout_seconds=600)
+        exits=monitor_owned_jobs(plan,runner,expected_commit=commit,
+            expected_command_digests={0:commands.command_digests[0],1:commands.command_digests[1]})
+        if exits!={0:0,1:0}: raise RuntimeError(f'Stage1-v5 witness failed: {exits}')
+        records=[json.loads(runner.read_stage1_v5_witness_record(rank)) for rank in range(4)]
+        result=validate_rank_records(records,run_id=plan.run_id,expected_geometry=selected_admission_geometry(audited))
+        path=_REPOSITORY_ROOT/'results'/plan.run_id/'coordinator-admission.json'
+        publish_small_file(path,json.dumps(result,sort_keys=True).encode())
+        print(json.dumps(dict(witness=str(path)),sort_keys=True))
+        return 0
+    except (OSError,RuntimeError,ValueError,json.JSONDecodeError) as error:
+        parser.error(str(error))
+    return 2
+
+
 def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
+    if stage == 'stage1' and '--stage1-v5-witness' in argv:
+        return _stage1_v5_witness_main(argv)
     if stage == "stage2" and any(value == "--dil-full-model-probe" or value.startswith("--dil-full-model-probe=") for value in argv):
         return _dil_full_model_probe_main(argv)
     parser = argparse.ArgumentParser(
