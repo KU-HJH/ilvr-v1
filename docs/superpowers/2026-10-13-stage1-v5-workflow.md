@@ -552,3 +552,137 @@ Task4 complete; initial implementation review remains historically needs-fixes.
 The full report, exact witness and scoped re-review are in the existing
 plan-specific SDD workspace. Task5 carries sequencing/rank publication and
 complete runtime metadata responsibilities; these are not verified by Task4.
+
+## Task5 TDD procedure deviation and bounded recovery
+
+Required procedure: failing behavior-specific test must precede production
+implementation (superpowers:test-driven-development Iron Law). Implementer
+`/root/v5_task5_impl` disclosed before final progression that it wrote
+`CustomTrainerStage1V5._build_v5_runtime_contract` and `train` in
+`src/stage1/v5_trainer.py` before their direct sequencing RED. Earlier module
+RED did not exercise those methods and cannot establish their TDD compliance.
+First later sequencing test also had fixture microbatch8 (TrainingArguments
+default), not approved microbatch1; it is not evidence of a production loss bug.
+No Task5 commit, independent review, full suite or production launch has occurred.
+Root paused the affected progression and reports this omission explicitly.
+
+Recovery within existing approved scope: discard only the two premature
+methods, establish corrected behavior-specific failure with microbatch1, then
+implement afresh from that test and verify affected paths. Preserve original
+failed logs and this non-retroactive record; do not retain discarded methods
+as a reference. Other already evidenced Task5 changes need not be rewritten.
+All task independent review and later full-suite/distributed gates still apply.
+The uncertainty is train-time contract/sequencing correctness until new evidence
+and independent review; later success does not erase the original violation.
+
+Timing clarification from worker: before root's pause message arrived, it had
+already recorded its discrepancy in task-5-report.md, deleted exactly those two
+methods, corrected microbatch1 fixture and started the specific RED command
+(log`logs/stage1-v5-task5/red-train-sequencing-recovery.log`). No reimplementation
+had occurred. Root records this actual order and now authorizes resuming the
+bounded recovery above; no new design or user approval is required for the same
+already approved behavior.
+
+Task5 incidental test side effect disclosure: the initial unsupported-composition
+RED reached pretrained loading before the worker interrupted its owned pytest.
+Self-review found task-created `cache/models--Qwen--Qwen2.5-VL-3B-Instruct`,
+about1.1GB physical, tokenizer/config plus two incomplete blobs with logical
+sizes3.36GB/2.15GB. Worker reports absence at intake, matching task timestamps
+and no remaining process. This was unintended partial pretrained downloading,
+not merely processor lookup; no training ran. Root reports that distinction and
+authorizes deletion only of positively owned task-created cache subtree after
+preserving path/size/timestamp/no-live-owner evidence. No unrelated cache or
+parent removal. Corrected test has an external-loader tripwire; later tests
+remain offline/tiny. Cleanup evidence will be retained in task report/log.
+
+## Product Task5 implementation awaiting independent review
+
+Implementer `/root/v5_task5_impl` (gpt-6.1-sol/high), base`f14cd19`, committed
+seven owned product paths at`d9e79546ceca7af267ae389d5db1116b33ba2c75`.
+Opt-in Trainer uses actual parent get_batch_samples/training_step/backward;
+V5Execution persists through one parent backward with helper/F/reference/packed
+original calls and live graph. Native CE/alignment hooks were extracted with
+standard behavior retained. D/U/mass scale configuredGAS*world/N, including
+original empty blocks and partial accumulation; K/native use configuredGAS.
+Parser saved-sidecar inheritance precedes eager validation. Composition restores
+original-base initial reference before helper/Trainer use, reuses authenticated
+SDPA-decoder/FA2-vision loader, and saved checkpoints include objective/reference.
+Parent EMA resume cannot silently replace the immutable initial reference.
+
+Fresh final command at reviewed product content: repository Python with
+PYTHONDONTWRITEBYTECODE=1, CUDA_VISIBLE_DEVICES='', PYTHONPATH=src:transformers/src,
+pytest -q on `tests/stage1/v5/test_trainer.py test_reduction.py test_config.py
+ test_resume.py` (each under same v5 directory), plus
+`tests/stage1/test_trainer.py tests/stage1/test_composition.py
+ tests/stage1/test_original_stage1_compat.py`;197passed/10.53s, exit0/no warnings.
+Exact command and full output: task-5-report.md and
+logs/stage1-v5-task5/verification-final.log. Diff check passed. Runtime CPU
+witnesses include real native teacher targets, call order, one backward/update,
+reference immutability, and independent scalar global-gradient oracle for full
+N10 and tailN5 with empty rank. DS kwargs are a recorded boundary, not real ZeRO.
+Actual four-rank/BF16/capacity/retained-occurrence evidence remains Task7/root.
+
+Specific train/contract-method TDD recovery above produced behavioral RED
+(_v5_contract_ready false before parent dispatch), fresh implementation and GREEN;
+no retroactive compliance claim. Later suffix/horizon/EMA failures were causal
+regressions. Incidental download cleanup evidence is
+logs/stage1-v5-task5/interrupted-cache-evidence.json; only positively owned model
+cache subtree removed, unrelated parent/lock directories preserved.
+
+Independent `/root/v5_task5_review` (gpt-6-astra/high, fresh/distinct) now reviews
+package`review-f14cd19..d9e7954.diff`. Both specification/quality verdicts pending;
+no product-completion or training-readiness claim yet.
+
+Task5 independent review at`d9e7954` found Important I1 (fresh all-rank contract,
+base and processor content agreement incomplete) and I2 (parent floor epoch
+budget/post-skip tail sync breaks partial-window resume). Root inspected actual
+parent statements and publication paths. Reviewer's bounded CPU AST+real batch
+prefetch witness uses loader10/GAS4, step1: final source8/9 syncfalse; step2:
+epoch1 skips original tail. No real-engine claim. Probe log is
+logs/stage1-v5-task5/reviewer-resume-boundary-probe.log. No Minor findings.
+
+Root Ruling: authorize narrowly opt-in parent Trainer schedule/boundary hooks and
+minimal read-only reference-identity helper extraction if required for these
+approved behavior fixes. Keep ordinary paths, sampler and parent backward/update
+unchanged; no copied loop/general provenance. Cost if wrong is parent schedule
+or reference lifecycle regression, requiring causal tests and scoped review.
+Fresh contract agreement must compare effective content/profile while mapping
+approved node-local paths. Actual distributed proof remains Task7.
+
+Additional Task5 I2 root ruling: allow same v5-opt-in scheduling hook to derive
+final prefetch remainder from actual prepared per-rank steps_in_epoch rather
+than global num_examples. Concrete parent expression global37/local10/GAS4
+requests1 remaining batch although2 remain, dropping source9 and its sync.
+This supports approved one-exposure/window behavior without changing sampler or
+GAS denominator. Cost if wrong: missing/repeated sources or legacy schedule
+regression; exact-parent fresh/resume tests and live Task7 occurrence witness
+required. Example counts are not an actual production audit.
+
+Task5 fix1 at`4a47435` adds full local nonpublisher reference inspection and
+canonical live/saved contract digest agreement before readiness. Only original
+model/DeepSpeed config path locations map to validated content identities.
+V5-only parent hooks use actual ceil windows, absolute resumed boundary and
+prepared-loader tail. Native backward/optimizer/sampler unchanged. Fresh fix
+verification: repository Python/PYTHONDONTWRITEBYTECODE=1/CUDA_VISIBLE_DEVICES=''/
+PYTHONPATH=src:transformers/src, pytest -q on v5 test_trainer/test_reduction/
+test_reference/test_resume plus existing Stage2 reference_random tests
+`test_real_trainer_epoch_budget_and_linear_schedule_include_tail` and
+`test_inherited_resume_control_flow_preserves_pre_tail_microstep`:
+85passed/11.34s, exit0/no warnings. Exact full command/output and causal RED11,
+node-path RED1, corrected prefetch RED10 are in task-5-report/logs. CPU parent
+expression+actual prefetch witnesses do not replace live-engine continuation.
+
+Scoped independent `/root/v5_task5_review` approves I1/I2 repairs and quality,
+no new Critical/Important breakage. Deferred O1 remains: unchanged PEFT exact
+base-source-string guards in composition.py:327 and checkpointing.py:1238/1327/
+1425 block equal-content relocated resume after parser acceptance. Task5 core
+complete with this explicitly unresolved cross-task observation; portable resume
+is NOT claimed. Full review and all prior procedure deviations remain recorded.
+
+Root Ruling: Task6 managed-root integration owns O1, with minimal additional
+composition/checkpointing edits if needed. Only v5 content-authenticated original
+base relocation may bypass path equality; strict legacy paths remain. Cost if
+wrong is wrong-base resume/legacy artifact regression. Require causal real tiny
+load/composition equal-content success and changed-content rejection, independent
+review and affected existing regressions. Task7 actual continuation and final
+whole-change review must see O1 resolution evidence.
