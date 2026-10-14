@@ -1880,7 +1880,7 @@ def _stage1_v5_witness_main(argv: list[str]) -> int:
             expected_command_digests={0:commands.command_digests[0],1:commands.command_digests[1]})
         if exits!={0:0,1:0}: raise RuntimeError(f'Stage1-v5 witness failed: {exits}')
         records=[json.loads(runner.read_stage1_v5_witness_record(rank)) for rank in range(4)]
-        result=validate_rank_records(records,run_id=plan.run_id,expected_geometry=selected_admission_geometry(audited))
+        result=validate_rank_records(records,run_id=plan.run_id,expected_geometry=selected_admission_geometry(audited),audited=audited)
         path=_REPOSITORY_ROOT/'results'/plan.run_id/'coordinator-admission.json'
         publish_small_file(path,json.dumps(result,sort_keys=True).encode())
         print(json.dumps(dict(witness=str(path)),sort_keys=True))

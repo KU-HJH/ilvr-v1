@@ -111,9 +111,9 @@ def audit(args):
         source_identity=dict(data_sha256=_sha(args.data_path),data_path=str(args.data_path),image_root=str(args.image_root)),
         code_identity=dict(commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPOSITORY,text=True).strip(),
             files={name:_sha(REPOSITORY/name) for name in ('scripts/verify_stage1_v5.py','src/stage1/data.py',
-                'src/stage1/v5_trainer.py','transformers/src/transformers/trainer.py')}),
+                'src/stage1/v5_trainer.py','src/stage1/trainer.py','transformers/src/transformers/trainer.py')}),
         profile_identity=dict(model=str(args.model),base_content_sha256=base_digest,processor_sha256=_processor_identity(processor),config_sha256=_sha(Path(args.model)/'config.json'),
-            model_type=config.model_type,latent_ids=ids,packages={p:version(p) for p in ('torch','transformers','accelerate','deepspeed','peft','trl')}))
+            model_type=config.model_type,latent_ids=ids,deepspeed_config_sha256=_sha(REPOSITORY/'configs/deepspeed_zero1.json'),packages={p:version(p) for p in ('torch','transformers','accelerate','deepspeed','peft','trl')}))
     return report
 
 
@@ -125,16 +125,125 @@ def require_distributed_entry():
     if not torch.cuda.is_available(): raise ValueError('witness requires actual GPU ZeRO1 execution')
 
 
-def validate_rank_records(records, *, run_id, expected_geometry):
+def _contract_digest(contract):
+    return hashlib.sha256(json.dumps(contract,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+
+
+def validate_contract_profile(contract, audited):
+    """Bind actual resolved execution/objective to the approved selected profile."""
+    from stage1.v5_config import Stage1V5Config
+    from stage1.v5_resume import validate_v5_resume
+    validate_v5_resume(contract,{})
+    if contract['config']!=asdict(Stage1V5Config(lambda_topk_entropy=.1,preference_topk_k=50)):
+        raise ValueError('different resolved v5 objective')
+    if contract['coefficients']!=dict(ce_weight=.1,sim_weight=.1):
+        raise ValueError('different resolved CE/alignment coefficients')
+    execution=contract['execution']
+    fixed=dict(per_device_train_batch_size=1,gradient_accumulation_steps=4,bf16=True,seed=42,
+        learning_rate=5e-5,warmup_steps=10,weight_decay=.01,max_grad_norm=1.,
+        gradient_checkpointing=True,dataloader_num_workers=0,optim='adamw_torch_fused',
+        lr_scheduler_type='linear',tuning_method='dora',ema_tau=1.,zero_stage=1,
+        attention_implementation='sdpa',vision_attention_implementation='flash_attention_2',
+        latent_size=8,max_sequence_length=32768,lora_r=32,lora_alpha=64,lora_dropout=.05,
+        lora_target_modules='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',loss_chunk_positions=128,
+        compress_strategy='average',coverage_p=.9,image_pool_k=8,helper_group_L=256,textual_states='previous',
+        model=audited['profile_identity']['base_content_sha256'])
+    for key,value in fixed.items():
+        if execution.get(key)!=value: raise ValueError(f'different resolved execution {key}')
+    source_paths={'v5_trainer':'src/stage1/v5_trainer.py','stage1_trainer':'src/stage1/trainer.py',
+                  'transformers_trainer':'transformers/src/transformers/trainer.py'}
+    if execution['source_sha256']!={key:audited['code_identity']['files'][path] for key,path in source_paths.items()}:
+        raise ValueError('actual imported source profile differs from audit')
+    if execution['packages']!=audited['profile_identity']['packages']:
+        raise ValueError('audit/runtime package profile mismatch')
+    digest=audited['profile_identity']['deepspeed_config_sha256']
+    if execution['deepspeed_profile']!=dict(enabled=True,zero_stage=1,world_size=4,
+                                           config_path=digest,config_digest=digest):
+        raise ValueError('different resolved DeepSpeed profile')
+    for key in ('base_content_sha256','processor_sha256'):
+        if contract['reference'][key]!=audited['profile_identity'][key]:
+            raise ValueError(f'audit/runtime reference mismatch: {key}')
+
+
+def validate_runtime_binding(audited, binding):
+    validate_contract_profile(binding['contract'],audited)
+    observed=binding['original_loader']
+    for key in ('retained_samples','prepared_loader_microbatches_per_rank','sampler_occurrences',
+                'source_occurrences','configured_gas','optimizer_updates_for_one_exposure',
+                'final_window_microbatches','native_tail_denominator','sampler_profile'):
+        if observed[key]!=audited[key]: raise ValueError(f'original prepared loader/audit mismatch: {key}')
+    schedule=binding['contract']['schedule']
+    fixed=dict(dataset_samples=audited['retained_samples'],
+        prepared_microbatches_per_rank=audited['prepared_loader_microbatches_per_rank'][0],
+        gradient_accumulation_steps=4,effective_global_batch=16,world_size=4,
+        configured_max_steps=audited['optimizer_updates_for_one_exposure'],num_train_epochs=1.,
+        one_exposure_window_updates=audited['optimizer_updates_for_one_exposure'],
+        parent_epoch_update_budget=audited['optimizer_updates_for_one_exposure'],
+        final_window_microbatches=audited['final_window_microbatches'],dataloader_drop_last=False,
+        tail_native_denominator='configured_gas_world_size',
+        auxiliary_denominator='actual_window_original_blocks_including_empty')
+    for key,value in fixed.items():
+        if schedule.get(key)!=value: raise ValueError(f'original contract/audit schedule mismatch: {key}')
+    expected_input=dict(data_sha256=audited['source_identity']['data_sha256'],
+        base_content_sha256=audited['profile_identity']['base_content_sha256'],
+        processor_sha256=audited['profile_identity']['processor_sha256'],
+        source_sha256=audited['code_identity']['files'])
+    if binding['input_identity']!=expected_input: raise ValueError('runtime input content identity mismatch')
+
+
+def observe_original_loader_rank(trainer, loader, rank):
+    """Iterate actual prepared batches, including native collation/device placement."""
+    occurrences=[]
+    for microbatch,batch in enumerate(loader):
+        for sample in batch['stage1_batch_metadata'].samples:
+            occurrences.append(dict(rank=rank,microbatch=microbatch,
+                source_index=sample.source_index,source_id=sample.source_id))
+    return dict(rank=rank,occurrences=occurrences,length=len(loader),
+        sampler_profile=asdict(trainer.accelerator.dataloader_config))
+
+
+def observe_original_loader(trainer, loader, contract):
+    import torch.distributed as dist
+    local=observe_original_loader_rank(trainer,loader,dist.get_rank())
+    gathered=[None]*4;dist.all_gather_object(gathered,local)
+    if [r['rank'] for r in gathered]!=[0,1,2,3] or any(
+            r['sampler_profile']!=local['sampler_profile'] for r in gathered):
+        raise ValueError('original loader rank/sampler profile disagreement')
+    occurrences=[o for r in gathered for o in r['occurrences']]
+    counts=Counter(o['source_index'] for o in occurrences)
+    schedule=contract['schedule']
+    return dict(retained_samples=len(trainer.train_dataset),
+        prepared_loader_microbatches_per_rank=[r['length'] for r in gathered],sampler_occurrences=occurrences,
+        source_occurrences=[dict(source_index=k,repeat_count=v) for k,v in sorted(counts.items())],
+        configured_gas=trainer.args.gradient_accumulation_steps,
+        optimizer_updates_for_one_exposure=schedule['parent_epoch_update_budget'],
+        final_window_microbatches=schedule['final_window_microbatches'],native_tail_denominator=16,
+        sampler_profile=local['sampler_profile'])
+
+
+def validate_rank_records(records, *, run_id, expected_geometry, audited):
     if len(records)!=4 or {r['rank'] for r in records}!={0,1,2,3}: raise ValueError('missing/corrupt global ranks')
     contracts=set()
     for r in records:
         if r['world_size']!=4 or r['run_id']!=run_id or r['entry'] is not True or r['exit'] is not True:
             raise ValueError('incorrect real rank entry/exit')
         if r['reference_before']!=r['reference_after']: raise ValueError('reference mutated')
+        validate_runtime_binding(audited,r['runtime_binding'])
+        validate_contract_profile(r['fixture_contract'],audited)
+        if r['contract_digest']!=_contract_digest(r['fixture_contract']):
+            raise ValueError('unbound common contract digest')
+        if r['runtime_binding']['contract']['reference']['effective_state_sha256']!=r['reference_before']:
+            raise ValueError('reference state is not bound to actual original contract')
+        fixture_schedule=r['fixture_contract']['schedule']
+        for key,value in dict(dataset_samples=16*len(expected_geometry),prepared_microbatches_per_rank=4*len(expected_geometry),
+                              configured_max_steps=len(expected_geometry),parent_epoch_update_budget=len(expected_geometry),
+                              final_window_microbatches=4).items():
+            if fixture_schedule.get(key)!=value: raise ValueError(f'fixture schedule mismatch: {key}')
         contracts.add(r['contract_digest'])
         if len(r['tiny_windows'])!=3: raise ValueError('missing full/tail windows')
-        for w,(n,m) in zip(r['tiny_windows'],((9,4),(9,4),(5,2)),strict=True):
+        for i,(w,(n,m)) in enumerate(zip(r['tiny_windows'],((9,4),(9,4),(5,2)),strict=True)):
+            if w['optimizer_step']!=i or not math.isclose(w['learning_rate'],tiny_learning_rate(i),rel_tol=0.,abs_tol=1e-12):
+                raise ValueError('tiny learning rate/optimizer-step mismatch')
             if (w['global_original_steps'],w['actual_microbatches'],w['configured_gas'],w['native_denominator'])!=(n,m,4,16):
                 raise ValueError('wrong actual global denominator/window')
             counts=w['all_rank_original_counts']
@@ -149,9 +258,18 @@ def validate_rank_records(records, *, run_id, expected_geometry):
         for c,s in zip(r['continuations'],(1,2),strict=True):
             if (c['saved_step'],c['sources'],c['updates'],c['final_step'])!=(s,list(range(s*4,10)),3-s,3):
                 raise ValueError('engine continuation lost sources/tail update')
+            if c['learning_rates']!=[tiny_learning_rate(i) for i in range(s,3)]:
+                raise ValueError('continuation learning rate mismatch')
         if any(r['hooks'].get(k,0)<=0 for k in ('helper','F','reference','packed','backward')):
             raise ValueError('missing real model/backward entries')
         p=r['production']
+        expected_windows=[dict(step=i,source_index=g['source_index'],microbatches=[g['source_index']]*4)
+                          for i,g in enumerate(expected_geometry)]
+        if (p['global_step']!=len(expected_geometry) or p['source_windows']!=expected_windows
+                or len(p['gradient_norms'])!=len(expected_windows)
+                or p['gradient_norm_steps']!=list(range(len(expected_geometry)))
+                or p['optimizer_steps']!=[dict(step=i,successful=True) for i in range(len(expected_geometry))]):
+            raise ValueError('incomplete or uneven source/window/norm coverage')
         if p['microbatches']!=4*p['global_step'] or any(
                 r['hooks'][key]!=p['microbatches'] for key in ('helper','F','reference','packed','backward')):
             raise ValueError('incorrect original four-call/one-backward counts')
@@ -161,8 +279,18 @@ def validate_rank_records(records, *, run_id, expected_geometry):
             raise ValueError('missing/nonfinite production gradient norms')
         if p['geometry']!=expected_geometry or set(p['source_indices'])!={g['source_index'] for g in expected_geometry}:
             raise ValueError('missing maximum joint geometry')
+    if len({_contract_digest(r['runtime_binding']) for r in records})!=1:
+        raise ValueError('original runtime binding differs across ranks')
     if len(contracts)!=1 or len({r['reference_before'] for r in records})!=1: raise ValueError('rank contract/reference disagreement')
     return dict(kind='stage1-v5-admission',ranks=[0,1,2,3],run_id=run_id,status='pass')
+
+
+def tiny_learning_rate(optimizer_step):
+    # Probe config: total3, warmup10, base5e-5 and linear schedule. All three
+    # mutation boundaries remain in warmup; values are independently derived.
+    if type(optimizer_step) is not int or not 0<=optimizer_step<3:
+        raise ValueError('invalid tiny optimizer step')
+    return 5e-5*optimizer_step/10
 
 
 def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
@@ -240,9 +368,14 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
             observed=safe_get_full_grad(trainer.model.p).detach().float().cpu()
             before=safe_get_full_fp32_param(trainer.model.p).detach().float().cpu()
             lr=engine.optimizer.param_groups[0]['lr']
+        expected_lr=tiny_learning_rate(trainer.state.global_step)
+        if not math.isclose(lr,expected_lr,rel_tol=0.,abs_tol=1e-12):
+            raise ValueError(f'tiny optimizer learning rate mismatch at step {trainer.state.global_step}: {lr} != {expected_lr}')
+        pending['learning_rate']=lr
+        pending['optimizer_step']=trainer.state.global_step
         if not torch.isfinite(observed): raise ValueError('tiny nonfinite gradient')
         pending.update(error=float((observed-oracle.grad).abs()),norm=float(observed.abs()),before=before)
-        oracle_optimizer.param_groups[0]['lr']=lr
+        oracle_optimizer.param_groups[0]['lr']=expected_lr
         oracle_optimizer.step()
     def after_step(trainer,engine=None):
         if engine is None: actual=trainer.model.p.detach().float().cpu()
@@ -252,7 +385,7 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
         w=trainer.latest_window
         windows.append(dict(global_original_steps=w.global_original_steps,configured_gas=4,
             actual_microbatches=w.actual_microbatches,native_denominator=4*world,
-            all_rank_original_counts=pending['all_rank_original_counts'],gradient_error=pending['error'],gradient_norm=pending['norm'],update_error=float((actual-oracle.detach()).abs())))
+            optimizer_step=pending['optimizer_step'],learning_rate=pending['learning_rate'],all_rank_original_counts=pending['all_rank_original_counts'],gradient_error=pending['error'],gradient_norm=pending['norm'],update_error=float((actual-oracle.detach()).abs())))
     def collate(rows):
         slot=rows[0]; micro=slot if use_cpu else slot//4; rank=0 if use_cpu else slot%4
         local=(sum(c[micro%4] for c in counts) if micro<8 else sum(c[micro-8] for c in tails)) if use_cpu else (
@@ -287,9 +420,9 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
         oracle.data.copy_(initial_value); oracle_optimizer=torch.optim.AdamW([oracle],lr=0.,weight_decay=.01)
         for i in range(saved):
             oracle_optimizer.zero_grad(); (.1*oracle.square()+oracle.pow(3)).backward()
-            oracle_optimizer.param_groups[0]['lr']=5e-5*i/10; oracle_optimizer.step()
+            oracle_optimizer.param_groups[0]['lr']=tiny_learning_rate(i); oracle_optimizer.step()
         trainer.train(resume_from_checkpoint=str(directory/'initial'/f'checkpoint-{saved}'))
-        continuations.append(dict(saved_step=saved,sources=list(sources),updates=len(windows),final_step=trainer.state.global_step))
+        continuations.append(dict(saved_step=saved,sources=list(sources),updates=len(windows),final_step=trainer.state.global_step,learning_rates=[w['learning_rate'] for w in windows]))
         if any(w['gradient_error']>.005 or w['update_error']>2e-6 for w in windows):
             raise ValueError(f'restored engine oracle mismatch: {windows}')
         del trainer
@@ -299,9 +432,15 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
 
 def observe_production_trainer(trainer):
     from peft_common import resolve_qwen2_5_vl_model
-    hooks=Counter(); observed=set(); observed_geometry={}; gradient_norms=[]
+    hooks=Counter(); observed=set(); observed_geometry={}; gradient_norms=[]; gradient_norm_steps=[]; source_windows=[]; optimizer_steps=[]
+    original_finish=trainer._finish_optimizer_step
+    def finish(*args,successful,**kwargs):
+        optimizer_steps.append(dict(step=trainer.state.global_step,successful=successful))
+        return original_finish(*args,successful=successful,**kwargs)
+    trainer._finish_optimizer_step=finish
     original_norm=trainer._record_gradient_diagnostic
     def record_norm(norm):
+        gradient_norm_steps.append(trainer.state.global_step)
         gradient_norms.append(float(norm.detach().cpu())); return original_norm(norm)
     trainer._record_gradient_diagnostic=record_norm
     student=resolve_qwen2_5_vl_model(trainer.model)
@@ -319,6 +458,10 @@ def observe_production_trainer(trainer):
     def step(model,inputs,*a,**kw):
         sample=inputs['stage1_batch_metadata'].samples[0]
         observed.add(sample.source_index)
+        step_index=trainer.state.global_step
+        if not source_windows or source_windows[-1]['step']!=step_index:
+            source_windows.append(dict(step=step_index,source_index=sample.source_index,microbatches=[]))
+        source_windows[-1]['microbatches'].append(sample.source_index)
         observed_geometry[sample.source_index]=dict(packed_geometry(inputs['stage1_v5_metadata'],
             source_index=sample.source_index,source_id=sample.source_id),clean_length=sample.unpadded_length)
         return original_step(model,inputs,*a,**kw)
@@ -327,7 +470,7 @@ def observe_production_trainer(trainer):
     def backward(*a,**kw):
         hooks.update(['backward']); return original_backward(*a,**kw)
     trainer.accelerator.backward=backward
-    return dict(hooks=hooks,source_indices=observed,geometry=observed_geometry,handles=handles,gradient_norms=gradient_norms)
+    return dict(hooks=hooks,source_indices=observed,geometry=observed_geometry,handles=handles,gradient_norms=gradient_norms,gradient_norm_steps=gradient_norm_steps,source_windows=source_windows,optimizer_steps=optimizer_steps)
 
 
 def validate_audit_reference(audited, identity):
@@ -339,18 +482,13 @@ def validate_audit_reference(audited, identity):
 def production_witness(args, audited):
     """Bounded original-base/r32/BF16/ZeRO1 training on every admission source."""
     import torch
-    from peft_common import resolve_qwen2_5_vl_model
     from stage1.composition import build_stage1_training_components
     from stage1.v5_reference import _state_identity
     from utils_deepseed import parse_args
     from transformers.integrations.deepspeed import unset_hf_deepspeed_config
     unset_hf_deepspeed_config()
-    geometry=audited['max_packed_geometry']
-    if not geometry or not any(g['selected_queries'] for g in geometry): raise ValueError('no eligible capacity source')
-    # At most the three actual dimension maxima; retain complete true joint geometry.
-    chosen={max(geometry,key=lambda g:g[key])['source_index'] for key in
-            ('dense_bias_elements','replicated_prefix_tokens','selected_queries')}
-    geometry=[g for g in geometry if g['source_index'] in chosen]
+    geometry=selected_admission_geometry(audited)
+    if any(not g['selected_queries'] for g in geometry): raise ValueError('no eligible capacity source')
     path=REPOSITORY/'checkpoints'/args.run_id/'production'
     cli=['--stage','stage1','--model',str(args.model),'--data_path',str(args.data_path),
         '--image_root',str(args.image_root),'--save_model_path',str(path),
@@ -363,7 +501,7 @@ def production_witness(args, audited):
         '--stage1_v5_selection','all','--stage1_v5_text_kl_weight','0.01',
         '--step_preference_beta','1','--step_preference_margin','0','--loss_chunk_positions','128',
         '--per_device_train_batch_size','1','--gradient_accumulation_steps','4','--epochs','1',
-        '--max_steps',str(len(geometry)),'--learning_rate','5e-5','--warm_up_steps','10','--seed','42',
+        '--max_steps',str(audited['optimizer_updates_for_one_exposure']),'--learning_rate','5e-5','--warm_up_steps','10','--seed','42',
         '--attention_implementation','sdpa','--vision_attention_implementation','flash_attention_2',
         '--gradient_checkpointing','--textual_states','previous','--save_strategy','no',
         '--deepspeed_config',str(args.deepspeed)]
@@ -371,12 +509,24 @@ def production_witness(args, audited):
     components=build_stage1_training_components(parsed)
     trainer=components.trainer
     validate_audit_reference(audited,trainer.v5_reference_identity)
+    # Observe original retained loader/profile before any diagnostic substitution.
+    full_loader=trainer.get_train_dataloader()
+    full_contract=trainer._effective_v5_contract(trainer._build_v5_runtime_contract(full_loader))
+    validate_contract_profile(full_contract,audited)
+    binding=dict(contract=full_contract,original_loader=observe_original_loader(trainer,full_loader,full_contract),
+        input_identity=dict(data_sha256=_sha(args.data_path),
+            base_content_sha256=trainer.v5_reference_identity.base_content_sha256,
+            processor_sha256=trainer.v5_reference_identity.processor_sha256,
+            source_sha256={path:_sha(REPOSITORY/path) for path in audited['code_identity']['files']}))
+    validate_runtime_binding(audited,binding)
+    del full_loader
     # Fixture sampler: each source repeated sixteen times, four microsteps on
     # every rank. Every actual retained maximum is executed unchanged.
     by_index={e.source_index:e for e in components.dataset}
     trainer.train_dataset=[by_index[g['source_index']] for g in geometry for _ in range(16)]
     from torch.utils.data import SequentialSampler
     trainer._get_train_sampler=lambda:SequentialSampler(trainer.train_dataset)
+    trainer.args.max_steps=len(geometry)
     observation=observe_production_trainer(trainer)
     hooks=observation['hooks']; observed=observation['source_indices']; observed_geometry=observation['geometry']; handles=observation['handles']
     before=_state_identity(trainer.ema_teacher,trainer.ema_teacher.state_dict())
@@ -386,9 +536,9 @@ def production_witness(args, audited):
     for h in handles: h.remove()
     contract=trainer._effective_v5_contract(trainer._v5_contract)
     result=dict(hooks=dict(hooks),reference_before=before,reference_after=after,
-        contract_digest=hashlib.sha256(json.dumps(contract,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+        runtime_binding=binding,fixture_contract=contract,contract_digest=_contract_digest(contract),
         production=dict(global_step=trainer.state.global_step,microbatches=hooks['backward'],finite_loss=math.isfinite(output.training_loss),
-            gradient_norms=observation['gradient_norms'],
+            gradient_norms=observation['gradient_norms'],gradient_norm_steps=observation['gradient_norm_steps'],source_windows=observation['source_windows'],optimizer_steps=observation['optimizer_steps'],
             peak_allocated=torch.cuda.max_memory_allocated(),peak_reserved=torch.cuda.max_memory_reserved(),
             source_indices=sorted(observed),geometry=[observed_geometry[g['source_index']] for g in geometry]))
     del components,trainer
@@ -396,10 +546,11 @@ def production_witness(args, audited):
 
 
 def selected_admission_geometry(audited):
+    # Every actual non-dominated geometry is required; no coordinate-winner cap.
     rows=audited['max_packed_geometry']
-    chosen={max(rows,key=lambda g:g[key])['source_index'] for key in
-            ('dense_bias_elements','replicated_prefix_tokens','selected_queries')}
-    return [g for g in rows if g['source_index'] in chosen]
+    if not rows or len({r['source_index'] for r in rows})!=len(rows):
+        raise ValueError('empty or duplicate admission geometry')
+    return rows
 
 
 def _output_path(path):
@@ -452,7 +603,7 @@ def main(argv=None):
             gc.collect();torch.cuda.empty_cache()
             record.update(production_witness(args,audited)); record['exit']=True
             records=[None]*4;dist.all_gather_object(records,record)
-            result=validate_rank_records(records,run_id=args.run_id,expected_geometry=selected_admission_geometry(audited))
+            result=validate_rank_records(records,run_id=args.run_id,expected_geometry=selected_admission_geometry(audited),audited=audited)
             result['records']=records
             output.parent.mkdir(parents=True,exist_ok=True)
             from src.multinode_runtime import _publish_bytes_no_replace
