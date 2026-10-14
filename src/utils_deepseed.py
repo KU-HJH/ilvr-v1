@@ -401,7 +401,12 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
                 name = {'warmup_steps': 'warm_up_steps'}.get(name, name)
                 if hasattr(args, name):
                     if name in present and getattr(args, name) != value:
-                        raise ValueError(f'explicit {name} conflicts with saved v5 contract')
+                        # Node-local locations are authenticated by mandatory
+                        # reference restore and runtime config-content agreement.
+                        if name not in ('model', 'deepspeed_config'):
+                            raise ValueError(f'explicit {name} conflicts with saved v5 contract')
+                        if name == 'model' and not Path(args.model).is_dir():
+                            raise ValueError('v5 requires a local original full base; no HF-name fallback')
                     if name not in present:
                         setattr(args, name, value)
         elif args.stage1_variant == 'v5':

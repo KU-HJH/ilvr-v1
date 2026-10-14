@@ -25,6 +25,9 @@ from .v5_selection import select_v5_text_keys
 
 
 class CustomTrainerStage1V5(CustomTrainerStage1):
+    # Opt in only this class to actual epoch windows and absolute resume tails.
+    stage1_v5_actual_window_schedule = True
+
     def __init__(self, *args, v5_config: Stage1V5Config,
                  v5_reference_identity: V5ReferenceIdentity,
                  v5_saved_contract=None, **kwargs):
@@ -221,7 +224,8 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
             effective_global_batch=gas*self.accelerator.num_processes*self.args.per_device_train_batch_size,
             configured_max_steps=self.args.max_steps, num_train_epochs=self.args.num_train_epochs,
             one_exposure_window_updates=(microbatches+gas-1)//gas,
-            parent_epoch_update_budget=max(microbatches//gas,1),
+            parent_epoch_update_budget=self.set_initial_training_values(self.args,loader,
+                gas*self.accelerator.num_processes*self.args.per_device_train_batch_size)[1],
             final_window_microbatches=(microbatches-1)%gas+1 if microbatches else 0,
             tail_native_denominator='configured_gas_world_size',
             auxiliary_denominator='actual_window_original_blocks_including_empty')
@@ -254,6 +258,36 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         return build_v5_contract(self.v5_config,self.v5_reference_identity,
             ce_weight=self.ce_weight,sim_weight=self.sim_weight,schedule=schedule,execution=execution)
 
+    @staticmethod
+    def _effective_v5_contract(contract):
+        # Only approved location fields are replaced by their authenticated
+        # content identity. Coefficients, packages, source and all other values
+        # remain in the compared/saved semantics.
+        effective = json.loads(json.dumps(contract, allow_nan=False))
+        execution = effective['execution']
+        if 'model' in execution:
+            execution['model'] = effective['reference']['base_content_sha256']
+        if 'deepspeed_profile' in execution:
+            profile = execution['deepspeed_profile']
+            profile['config_path'] = profile['config_digest']
+        return effective
+
+    def _agree_v5_contract(self, contract):
+        import hashlib
+        def digest(value):
+            canonical = json.dumps(self._effective_v5_contract(value),
+                                   sort_keys=True, separators=(',', ':'), allow_nan=False)
+            return hashlib.sha256(canonical.encode()).digest()
+        # Bind the saved contract too: no rank may independently proceed from a
+        # different resume identity while the other ranks enter publication.
+        local_bytes = digest(contract) + (digest(self.v5_saved_contract)
+                                          if self.v5_saved_contract is not None else bytes(32))
+        local = torch.tensor(list(local_bytes),dtype=torch.uint8,device=self.accelerator.device)
+        gathered = self.accelerator.gather(local).reshape(-1,local.numel())
+        if (gathered.shape[0] != self.accelerator.num_processes
+                or not bool(gathered.eq(local.unsqueeze(0)).all())):
+            raise ValueError('Stage1-v5 effective contract agreement failed across ranks')
+
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
         self._v5_contract_ready = False
         requested = kwargs.get('model_path',resume_from_checkpoint)
@@ -266,7 +300,9 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
             if self.v5_saved_contract != saved:
                 raise ValueError('v5 resume requires composition-restored initial reference')
         contract = self._build_v5_runtime_contract(self.get_train_dataloader())
-        if self.v5_saved_contract is not None and self.v5_saved_contract != contract:
+        self._agree_v5_contract(contract)
+        if (self.v5_saved_contract is not None and self._effective_v5_contract(self.v5_saved_contract)
+                != self._effective_v5_contract(contract)):
             raise ValueError('saved v5 schedule/execution/reference conflicts with runtime')
         self._v5_contract = contract
         self._publish_v5_files(Path(self.args.output_dir))

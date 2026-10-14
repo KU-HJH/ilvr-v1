@@ -256,3 +256,31 @@ def test_runtime_adapter_drift_rejects_before_forward(bundle, operation, drift):
     finally:
         for handle in handles:
             handle.remove()
+
+
+def test_nonpublisher_inspection_authenticates_content_without_snapshot(bundle):
+    ref = api()
+    assert hasattr(ref,'inspect_v5_reference'), 'nonpublisher full reference content validation missing'
+    student,processor,base,directory,_ = bundle
+    teacher = Stage1EmaTeacher(student,1.,'dora')
+    observed=[]
+    hooks=[m.register_forward_pre_hook(lambda *a:observed.append(1)) for m in teacher.model.modules()]
+    try:
+        identity = ref.inspect_v5_reference(teacher,student,processor,base_path=base)
+        assert not directory.exists() and observed == []
+        published = ref.capture_v5_reference(teacher,student,processor,base_path=base,directory=directory)
+        assert identity == published
+        processor.tokenizer._ids['different_processor_token'] = 4
+        changed = ref.inspect_v5_reference(teacher,student,processor,base_path=base)
+        assert changed.processor_sha256 != published.processor_sha256
+        assert changed.effective_state_sha256 == published.effective_state_sha256
+        import json
+        config=json.loads((base/'config.json').read_text())
+        config['unused_base_content_annotation']='different'
+        (base/'config.json').write_text(json.dumps(config))
+        different_base=ref.inspect_v5_reference(teacher,student,processor,base_path=base)
+        assert different_base.base_content_sha256 != published.base_content_sha256
+        assert different_base.effective_state_sha256 == published.effective_state_sha256
+        assert observed == []
+    finally:
+        for hook in hooks: hook.remove()

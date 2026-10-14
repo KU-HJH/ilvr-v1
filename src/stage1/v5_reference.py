@@ -245,10 +245,7 @@ def _state_identity(teacher: Stage1EmaTeacher, state: dict) -> str:
     return digest.hexdigest()
 
 
-def capture_v5_reference(teacher: Stage1EmaTeacher, student: nn.Module, processor, *,
-                         base_path: Path, directory: Path) -> V5ReferenceIdentity:
-    """Validate and persist initial selected state; caller coordinates rank publication."""
-    directory = require_canonical_artifact_path(directory, kind='checkpoint')
+def _inspect_v5_reference(teacher, student, processor, base_path):
     _topology(teacher, student)
     _validate_processor_layout(teacher, processor)
     base_digest, keys = _base_identity(Path(base_path))
@@ -256,6 +253,21 @@ def capture_v5_reference(teacher: Stage1EmaTeacher, student: nn.Module, processo
     state = teacher.state_dict()
     identity = V5ReferenceIdentity(1, base_digest, _state_identity(teacher, state),
                                    _processor_identity(processor), teacher.parameter_names)
+    return identity, state
+
+
+def inspect_v5_reference(teacher: Stage1EmaTeacher, student: nn.Module, processor, *,
+                         base_path: Path) -> V5ReferenceIdentity:
+    """Authenticate every rank's base/processor/effective reference without saving."""
+    identity, _ = _inspect_v5_reference(teacher, student, processor, base_path)
+    return identity
+
+
+def capture_v5_reference(teacher: Stage1EmaTeacher, student: nn.Module, processor, *,
+                         base_path: Path, directory: Path) -> V5ReferenceIdentity:
+    """Validate and persist initial selected state; caller coordinates rank publication."""
+    directory = require_canonical_artifact_path(directory, kind='checkpoint')
+    identity, state = _inspect_v5_reference(teacher, student, processor, base_path)
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / V5_REFERENCE_FILENAME
     if destination.is_symlink():

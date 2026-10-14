@@ -309,7 +309,7 @@ def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejec
         saved=load_v5_contract(tmp_path)
         assert saved['schedule']['prepared_microbatches_per_rank']==10
         assert saved['schedule']['one_exposure_window_updates']==3
-        assert saved['schedule']['parent_epoch_update_budget']==2
+        assert saved['schedule']['parent_epoch_update_budget']==3
         assert saved['schedule']['final_window_microbatches']==2
         assert saved['schedule']['configured_max_steps']==3
         assert saved['execution']['packages']['accelerate']=='1.10.1'
@@ -325,3 +325,99 @@ def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejec
     with pytest.raises(ValueError,match='conflicts'):
         trainer.train(resume_from_checkpoint=str(tmp_path))
     assert len(parent_calls)==1 and calls==[]
+
+
+@pytest.mark.parametrize('changed', ['objective','lr','packages','source','base','processor','deepspeed'])
+def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,monkeypatch,changed):
+    from tests.stage1.v5.test_resume import contract
+    from stage1.trainer import CustomTrainerStage1
+    import hashlib,json
+    contracts=[deepcopy(contract()) for _ in range(4)]
+    for rank,value in enumerate(contracts):
+        value['execution'].update(model=f'/node{rank//2}/models/base',learning_rate=5e-5,
+            packages={'torch':'pinned'},source_sha256={'trainer':'a'*64},
+            deepspeed_profile={'config_path':f'/node{rank//2}/repo/configs/zero1.json','config_digest':'d'*64})
+    bad=contracts[2]
+    if changed == 'objective': bad['config']['lambda_topk_entropy']=.2
+    elif changed == 'lr': bad['execution']['learning_rate']=1e-4
+    elif changed == 'packages': bad['execution']['packages']['torch']='other'
+    elif changed == 'source': bad['execution']['source_sha256']['trainer']='e'*64
+    elif changed == 'base': bad['reference']['base_content_sha256']='e'*64
+    elif changed == 'deepspeed': bad['execution']['deepspeed_profile']['config_digest']='e'*64
+    else: bad['reference']['processor_sha256']='e'*64
+    def independent_digest(value):
+        mapped=deepcopy(value)
+        mapped['execution']['model']=mapped['reference']['base_content_sha256']
+        mapped['execution']['deepspeed_profile']['config_path']=mapped['execution']['deepspeed_profile']['config_digest']
+        return torch.tensor(list(hashlib.sha256(json.dumps(mapped,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).digest()),dtype=torch.uint8)
+    ranks=torch.cat([torch.cat((independent_digest(c),torch.zeros(32,dtype=torch.uint8))) for c in contracts])
+    calls=[]
+    monkeypatch.setattr(CustomTrainerStage1,'train',lambda *a,**kw:calls.append('parent/helper'))
+    for rank,local in enumerate(contracts):
+        trainer=api().__new__(api())
+        trainer.args=SimpleNamespace(output_dir=str(tmp_path))
+        trainer.v5_saved_contract=None
+        trainer.get_train_dataloader=lambda:None
+        trainer._build_v5_runtime_contract=lambda _loader,value=local:value
+        trainer._publish_v5_files=lambda directory:calls.append('publish')
+        def gather(value):
+            torch.testing.assert_close(value[:32],independent_digest(local),rtol=0,atol=0)
+            return ranks
+        trainer.accelerator=SimpleNamespace(device=torch.device('cpu'),num_processes=4,gather=gather)
+        with pytest.raises(ValueError,match='agreement'):
+            trainer.train()
+        assert trainer._v5_contract_ready is False
+    assert calls == []
+
+
+def test_effective_contract_allows_only_content_equal_node_local_paths(tmp_path,monkeypatch):
+    from tests.stage1.v5.test_resume import contract
+    from stage1.trainer import CustomTrainerStage1
+    import hashlib,json
+    mapped=contract()
+    mapped['execution'].update(model=mapped['reference']['base_content_sha256'],
+        deepspeed_profile={'config_path':'d'*64,'config_digest':'d'*64})
+    expected=torch.tensor(list(hashlib.sha256(json.dumps(mapped,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).digest())+[0]*32,dtype=torch.uint8)
+    calls=[]
+    monkeypatch.setattr(CustomTrainerStage1,'train',lambda *a,**kw:calls.append('parent'))
+    for rank in range(4):
+        trainer=api().__new__(api())
+        local=contract()
+        local['execution'].update(model=f'/node{rank//2}/models/base',
+            deepspeed_profile={'config_path':f'/node{rank//2}/repo/zero1.json','config_digest':'d'*64})
+        trainer.args=SimpleNamespace(output_dir=str(tmp_path))
+        trainer.v5_saved_contract=None
+        trainer.get_train_dataloader=lambda:None
+        trainer._build_v5_runtime_contract=lambda loader:local
+        trainer._publish_v5_files=lambda directory:calls.append('publish')
+        trainer.accelerator=SimpleNamespace(device=torch.device('cpu'),num_processes=4,
+            gather=lambda value:expected.repeat(4))
+        trainer.train()
+        assert trainer._v5_contract_ready
+    assert calls == ['publish','parent']*4
+
+
+def test_resume_parser_keeps_explicit_local_paths_for_later_content_validation(tmp_path,monkeypatch):
+    from tests.stage1.v5.test_resume import contract
+    from utils_deepseed import parse_args
+    from pathlib import Path
+    import hashlib,json
+    local_base=tmp_path/'original-base'; local_base.mkdir()
+    local_config=tmp_path/'zero1.json'
+    raw=(Path(__file__).resolve().parents[3]/'configs/deepspeed_zero1.json').read_bytes()
+    local_config.write_bytes(raw)
+    saved=contract()
+    saved['execution'].update(model='/other-node/original-base',
+        deepspeed_profile={'config_path':'/other-node/zero1.json','config_digest':hashlib.sha256(raw).hexdigest()})
+    (tmp_path/'stage1_v5.json').write_text(json.dumps(saved))
+    monkeypatch.setenv('WORLD_SIZE','4')
+    args=parse_args(['--resume_from_checkpoint_path',str(tmp_path),'--model',str(local_base),
+                     '--deepspeed_config',str(local_config)])
+    assert args.model==str(local_base) and args.deepspeed_config==str(local_config.resolve())
+    from deepspeed_runtime import bind_deepspeed_runtime_profile
+    profile=bind_deepspeed_runtime_profile(args,world_size=4)
+    assert profile.config_digest==saved['execution']['deepspeed_profile']['config_digest']
+    # A different local base still has to pass composition's mandatory content
+    # restore (covered by actual inspector/restore tests); no HF-name fallback.
+    with pytest.raises(ValueError):
+        parse_args(['--resume_from_checkpoint_path',str(tmp_path),'--model','Qwen/not-local'])

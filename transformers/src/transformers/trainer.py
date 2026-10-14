@@ -2501,7 +2501,8 @@ class Trainer:
             step = -1
             epoch_iterator = iter(epoch_dataloader)
             # We chunkify the epoch iterator into gradient accumulation steps `n` batches
-            remainder = num_examples % args.gradient_accumulation_steps
+            remainder = (steps_in_epoch if getattr(self, "stage1_v5_actual_window_schedule", False)
+                         else num_examples) % args.gradient_accumulation_steps
             if remainder == 0:
                 remainder = args.gradient_accumulation_steps
             update_step = -1
@@ -2515,7 +2516,8 @@ class Trainer:
                 for i, inputs in enumerate(batch_samples):
                     step += 1
                     boundary_step = step + 1
-                    if getattr(self, "stage2_sampler_policy", None) in ("reference_random", "historical_balanced_2rank"):
+                    if (getattr(self, "stage2_sampler_policy", None) in ("reference_random", "historical_balanced_2rank")
+                            or getattr(self, "stage1_v5_actual_window_schedule", False)):
                         # Resume restarts `step` after skipped batches. Keep the
                         # final partial update at its absolute epoch boundary.
                         boundary_step += steps_skipped
@@ -5267,6 +5269,8 @@ class Trainer:
         # Case 2: We have a dataloader length and can extrapolate
         if len_dataloader is not None:
             num_update_steps_per_epoch = max(len_dataloader // args.gradient_accumulation_steps, 1)
+            if getattr(self, "stage1_v5_actual_window_schedule", False):
+                num_update_steps_per_epoch = max(math.ceil(len_dataloader / args.gradient_accumulation_steps), 1)
             # Case 3: We have a length but are using epochs, we can extrapolate the number of steps
             if epoch_based:
                 max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)

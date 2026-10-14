@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from importlib import metadata as importlib_metadata
 import json
 import logging
@@ -655,7 +655,7 @@ def build_stage1_training_components(
         from copy import deepcopy
         from stage1.ema import Stage1EmaTeacher
         from stage1.v5_reference import (V5ReferenceIdentity, capture_v5_reference,
-                                        restore_v5_reference, _state_identity)
+                                        restore_v5_reference, inspect_v5_reference)
         from stage1.v5_trainer import CustomTrainerStage1V5
         # SFTConfig initializes the existing distributed device context; use its
         # normal process group for identity/error agreement, not manual ranks.
@@ -678,6 +678,8 @@ def build_stage1_training_components(
             elif training_args.should_save:
                 identity = capture_v5_reference(teacher,model,processor,
                     base_path=Path(args.model),directory=output_dir)
+            else:
+                identity = inspect_v5_reference(teacher,model,processor,base_path=Path(args.model))
         except Exception as exc:
             error = exc
         if not torch.distributed.is_initialized():
@@ -687,15 +689,10 @@ def build_stage1_training_components(
         if any(failure is not None for failure in failures):
             if error is not None: raise error
             raise RuntimeError(f'v5 initial reference failed on another rank: {failures}')
-        if checkpoint is None:
-            identities = [identity]
-            torch.distributed.broadcast_object_list(identities,src=0)
-            identity = identities[0]
-        local_digest = _state_identity(teacher,teacher.state_dict())
-        digests = [None]*profile.world_size
-        torch.distributed.all_gather_object(digests,local_digest)
-        if any(digest != identity.effective_state_sha256 for digest in digests):
-            raise ValueError('v5 initial reference differs across ranks')
+        identities = [None]*profile.world_size
+        torch.distributed.all_gather_object(identities,asdict(identity))
+        if any(value != identities[0] for value in identities):
+            raise ValueError('v5 full base/processor/reference identity agreement failed')
         error = None
         try:
             if checkpoint is not None and training_args.should_save:
