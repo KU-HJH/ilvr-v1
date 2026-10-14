@@ -14,31 +14,33 @@ class CandidateSupport:
     ids: Tensor
     valid: Tensor
     # Membership in the initial top-k, before the optional GT union.
-    gt_coverage: Tensor
+    gt_coverage: Tensor | None
 
 
 @dataclass(frozen=True)
 class TopkEntropyComponents:
     kl: Tensor
     entropy: Tensor
-    normalized_entropy: Tensor
+    normalized_entropy: Tensor | None
     support_size: Tensor
 
 
 @dataclass(frozen=True)
 class MassTokenComponents:
     loss: Tensor
-    clean_mass: Tensor
-    off_mass: Tensor
-    mass_abs_gap: Tensor
+    clean_mass: Tensor | None
+    off_mass: Tensor | None
+    mass_abs_gap: Tensor | None
 
 
 def build_entropy_support(
     clean_logits: Tensor, off_logits: Tensor, target_ids: Tensor,
-    *, k: int, mode: str, include_gt: bool,
+    *, k: int, mode: str, include_gt: bool, validate: bool = True,
+    collect_diagnostics: bool = True,
 ) -> CandidateSupport:
     """Choose top-k with the existing torch tie behavior; append missing GT."""
-    _validate_pair(clean_logits, off_logits, target_ids)
+    if validate:
+        _validate_pair(clean_logits, off_logits, target_ids)
     if type(k) is not int or not 2 <= k < clean_logits.shape[1]:
         raise ValueError("k must be an integer with 2 <= k < vocabulary size")
     if mode not in ("independent", "sync_topk"):
@@ -48,7 +50,8 @@ def build_entropy_support(
     with torch.no_grad():
         source = off_logits if mode == "independent" else clean_logits
         ids = source.detach().float().topk(k, dim=-1).indices
-        coverage = (ids == target_ids[:, None]).any(-1)
+        coverage = ((ids == target_ids[:, None]).any(-1)
+                    if include_gt or collect_diagnostics or validate else None)
         valid = torch.ones_like(ids, dtype=torch.bool)
         if include_gt:
             ids = torch.cat((ids, target_ids.long()[:, None]), -1)
@@ -77,9 +80,11 @@ def _validate_support(logits: Tensor, support: CandidateSupport) -> None:
         raise ValueError("valid candidate IDs must be unique")
 
 
-def topk_entropy_components(off_logits: Tensor, support: CandidateSupport) -> TopkEntropyComponents:
+def topk_entropy_components(off_logits: Tensor, support: CandidateSupport, *,
+                            validate: bool = True, collect_diagnostics: bool = True) -> TopkEntropyComponents:
     """KL to uniform in nats on exactly the valid support, with q live."""
-    _validate_support(off_logits, support)
+    if validate:
+        _validate_support(off_logits, support)
     selected = off_logits.float().gather(-1, support.ids.masked_fill(~support.valid, 0))
     selected = selected.masked_fill(~support.valid, -torch.inf)
     logq = selected.log_softmax(-1)
@@ -90,20 +95,23 @@ def topk_entropy_components(off_logits: Tensor, support: CandidateSupport) -> To
     entropy = -(q * safe_logq).sum(-1)
     size = support.valid.sum(-1)
     logn = size.float().log()
-    return TopkEntropyComponents(logn - entropy, entropy, entropy / logn, size)
+    return TopkEntropyComponents(logn - entropy, entropy, entropy / logn if collect_diagnostics else None, size)
 
 
 def entropy_support_mass_components(
-    clean_logits: Tensor, off_logits: Tensor, support: CandidateSupport,
+    clean_logits: Tensor, off_logits: Tensor, support: CandidateSupport, *,
+    validate: bool = True, collect_diagnostics: bool = True,
 ) -> MassTokenComponents:
     """Binary KL with detached clean mass and live support/complement OFF."""
     if clean_logits.shape != off_logits.shape or clean_logits.device != off_logits.device:
         raise ValueError("clean and OFF logits must have matching shapes/devices")
-    _validate_logits(clean_logits, "clean logits")
-    _validate_support(off_logits, support)
+    if validate:
+        _validate_logits(clean_logits, "clean logits")
+        _validate_support(off_logits, support)
     # scatter_add avoids an invalid padded zero overwriting a valid ID zero.
     counts = torch.zeros_like(off_logits, dtype=torch.long).scatter_add(
         -1, support.ids.masked_fill(~support.valid, 0), support.valid.long(),
     )
     mask = counts > 0
-    return MassTokenComponents(*_group_mass_terms(clean_logits.detach().float(), off_logits.float(), mask))
+    return MassTokenComponents(*_group_mass_terms(clean_logits.detach().float(), off_logits.float(), mask,
+                                                 collect_diagnostics=collect_diagnostics))

@@ -23,9 +23,9 @@ def _validate_selected_logits(logits: Tensor, metadata: V5BatchMetadata, name: s
         raise ValueError(f'{name} logits must match clean shape and device')
 
 
-def _chunk_logp(logits: Tensor, temperature: float = 1.) -> Tensor:
+def _chunk_logp(logits: Tensor, temperature: float = 1., *, validate: bool = True) -> Tensor:
     logp = (logits.detach().float() / temperature).log_softmax(-1)
-    if not bool(torch.isfinite(logp).all()):
+    if validate and not bool(torch.isfinite(logp).all()):
         raise ValueError('nonfinite normalized selection logits')
     return logp
 
@@ -33,22 +33,25 @@ def _chunk_logp(logits: Tensor, temperature: float = 1.) -> Tensor:
 @torch.no_grad()
 def select_v5_text_keys(
     metadata: V5BatchMetadata, attention: Mapping[QueryKey, Tensor],
-    clean_logits: Tensor, reference_logits: Tensor, config: Stage1V5Config,
+    clean_logits: Tensor, reference_logits: Tensor, config: Stage1V5Config, *,
+    validate: bool = True,
 ) -> dict[QueryKey, tuple[int, ...]]:
     """Port the pinned v3 KL selector, indexing full original attention rows."""
-    _validate_selected_logits(clean_logits, metadata, 'clean')
-    _validate_selected_logits(reference_logits, metadata, 'reference', like=clean_logits)
+    if validate:
+        _validate_selected_logits(clean_logits, metadata, 'clean')
+    if validate:
+        _validate_selected_logits(reference_logits, metadata, 'reference', like=clean_logits)
     keys = metadata.query_keys
     if not keys:
         return {}
     parts = []
     for start in range(0, len(keys), config.loss_chunk_positions):
         stop = start + config.loss_chunk_positions
-        p = _chunk_logp(clean_logits[start:stop], config.temperature)
-        r = _chunk_logp(reference_logits[start:stop], config.temperature)
+        p = _chunk_logp(clean_logits[start:stop], config.temperature, validate=validate)
+        r = _chunk_logp(reference_logits[start:stop], config.temperature, validate=validate)
         parts.append(config.temperature ** 2 * (p.exp() * (p-r)).sum(-1))
     d = torch.cat(parts)
-    if not bool(torch.isfinite(d).all()):
+    if validate and not bool(torch.isfinite(d).all()):
         raise ValueError('nonfinite selector KL')
     u = -(d.clamp_min(0) + 1e-6).log()
     rhos = {}
@@ -64,12 +67,12 @@ def select_v5_text_keys(
         for query in block.query_positions:
             key = (block.batch_index, query)
             row = attention[key].detach().float()
-            if (row.ndim != 1 or row.numel() <= query
+            if validate and (row.ndim != 1 or row.numel() <= query
                     or not bool(torch.isfinite(row).all()) or bool((row < 0).any())):
                 raise ValueError('invalid original-sequence attention row')
             weights = row[list(candidates)]
             mass = weights.sum().item()
-            if mass > 1. + 1e-5:
+            if validate and mass > 1. + 1e-5:
                 raise ValueError('candidate attention mass exceeds causal total')
             ranked = sorted(zip(candidates, weights.tolist()), key=lambda pair: (-pair[1], pair[0]))
             if mass < config.low_attention_mass:
@@ -88,10 +91,11 @@ def select_v5_text_keys(
 @torch.no_grad()
 def select_v5_orig_positions(
     metadata: V5BatchMetadata, clean_logits: Tensor, voff_logits: Tensor | None,
-    config: Stage1V5Config,
+    config: Stage1V5Config, *, validate: bool = True,
 ) -> Tensor:
     """Sample-local full-vocabulary entropy ranks, with no intersection refill."""
-    _validate_selected_logits(clean_logits, metadata, 'clean')
+    if validate:
+        _validate_selected_logits(clean_logits, metadata, 'clean')
     count = len(metadata.query_keys)
     if config.selection == 'all':
         return torch.ones(count, dtype=torch.bool, device=clean_logits.device)
@@ -101,14 +105,15 @@ def select_v5_orig_positions(
     if needs_off:
         if voff_logits is None:
             raise ValueError('V-off logits required by orig position selection')
-        _validate_selected_logits(voff_logits, metadata, 'V-off', like=clean_logits)
+        if validate:
+            _validate_selected_logits(voff_logits, metadata, 'V-off', like=clean_logits)
     clean_parts, off_parts = [], []
     for start in range(0, count, config.loss_chunk_positions):
         stop = start + config.loss_chunk_positions
-        lp = _chunk_logp(clean_logits[start:stop])
+        lp = _chunk_logp(clean_logits[start:stop], validate=validate)
         clean_parts.append(-(lp.exp() * lp).sum(-1))
         if needs_off:
-            lo = _chunk_logp(voff_logits[start:stop])
+            lo = _chunk_logp(voff_logits[start:stop], validate=validate)
             off_parts.append(-(lo.exp() * lo).sum(-1))
     clean = torch.cat(clean_parts)
     off = torch.cat(off_parts) if needs_off else None

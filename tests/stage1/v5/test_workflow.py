@@ -78,7 +78,8 @@ def test_decoder_binds_managed_remote_producer_to_local_checkpoint(tmp_path,monk
         evidence.decode_stage1_training_evidence(json.dumps(payload).encode(),**{**kwargs,'expected_producer_checkpoint':'/wrong/checkpoint-3'})
 
 @pytest.mark.parametrize('changed',[False,True])
-def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper(tmp_path,monkeypatch,changed):
+@pytest.mark.parametrize('debug',[False,True])
+def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper(tmp_path,monkeypatch,changed,debug):
     import copy
     from dataclasses import replace
     import json
@@ -128,7 +129,8 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
         '--per_device_train_batch_size','1','--gradient_accumulation_steps','4','--gradient_checkpointing',
         '--attention_implementation','sdpa','--vision_attention_implementation','flash_attention_2',
         '--latent_size','2','--lora_r','4','--lora_alpha','8','--lora_dropout','0',
-        '--deepspeed_config',str(ROOT/'configs/deepspeed_zero1.json')])
+        '--deepspeed_config',str(ROOT/'configs/deepspeed_zero1.json'),
+        '--stage1_v5_debug' if debug else '--no-stage1_v5_debug'])
     profile=load_deepspeed_runtime_profile(args.deepspeed_config,world_size=4)
     snapshot=checkpointing.read_stage1_peft_metadata_snapshot(artifact)
     decision=checkpointing.Stage1ResumeDecision(artifact,checkpointing.Stage1ArtifactKind.PEFT,False,snapshot)
@@ -136,7 +138,11 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
     monkeypatch.setattr(Qwen2_5_VLForConditionalGeneration, '_check_and_enable_flash_attn_2',
                         classmethod(lambda cls,config,**kw:config))
     class Trainer:
-        def __init__(self,**kwargs): self.model=kwargs['model']; self.ema_teacher=kwargs['ema_teacher']; calls.append('constructed')
+        def __init__(self,**kwargs):
+            self.model=kwargs['model']; self.ema_teacher=kwargs['ema_teacher']
+            self.stage1_v5_debug=kwargs['stage1_v5_debug']
+            self.collect_stage1_diagnostics=kwargs['collect_stage1_diagnostics']
+            calls.append('constructed')
     monkeypatch.setattr(v5_trainer,'CustomTrainerStage1V5',Trainer)
     monkeypatch.setattr(composition,'build_stage1_training_arguments',lambda args:SimpleNamespace(device='cpu',should_save=False))
     monkeypatch.setattr(composition,'validate_stage1_checkpoint_context',lambda model:None)
@@ -158,6 +164,8 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
         with pytest.warns(UserWarning,match="base_model_name_or_path.*renamed"):
             bundle=composition.build_stage1_training_components(args,dependencies=deps,deepspeed_runtime_profile=profile)
         assert calls==['load','load','constructed']
+        assert bundle.trainer.stage1_v5_debug is debug
+        assert bundle.trainer.collect_stage1_diagnostics is debug
         for name,value in teacher.state_dict()['parameters'].items():
             torch.testing.assert_close(bundle.trainer.ema_teacher.state_dict()['parameters'][name],value,rtol=0,atol=0)
 

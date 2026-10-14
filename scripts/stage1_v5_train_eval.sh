@@ -28,6 +28,7 @@ if [[ -n $settings ]]; then source "$settings"; fi
 base=/root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct
 python="$repo_root/venv/ilvr-venv/bin/python"
 export PYTHONPATH="$repo_root/transformers/src:$repo_root:$repo_root/src"
+export STAGE1_V5_DEBUG=false
 export STAGE1_NUM_PROCESSES=4 STAGE1_CE_WEIGHT=0.1 CE_WEIGHT=0.1 STAGE1_GRADIENT_ACCUMULATION=4 STAGE1_SEED=42
 export STAGE1_MODEL="$base" STAGE1_MICRO_BATCH=1 STAGE1_LEARNING_RATE=5e-5 STAGE1_EMA_TAU=1.0
 # Clear optional sourced invocation state so fresh runs cannot accidentally resume.
@@ -37,7 +38,7 @@ eval_id="$run_id-test400"
 prepared="$repo_root/checkpoints/evaluation-staging/$run_id/prepared-model"
 train=("$repo_root/run_multinode_stage1_training.sh" --run-id "$run_id" --zero-stage 1 --main-process-port "$port" "${roots[@]}"
     --method dora --model "$base" --data-path "$repo_root/data/TRAIN.jsonl" --image-root "$repo_root/data/images_comt"
-    --stage1-variant v5 --stage1-loss-type dil-bce-orig --ce-weight 0.1 --sim-weight 0.1
+    --stage1-variant v5 --no-stage1-v5-debug --stage1-loss-type dil-bce-orig --ce-weight 0.1 --sim-weight 0.1
     --lambda-preference 1 --lambda-topk-entropy 0.1 --preference-topk-k 50 --preference-topk-mode independent
     --no-topk-include-gt --lambda-topk-mass 0 --stage1-v5-selection all --stage1-v5-text-kl-weight 0.01
     --loss-chunk-positions 128 --step-preference-beta 1 --step-preference-margin 0

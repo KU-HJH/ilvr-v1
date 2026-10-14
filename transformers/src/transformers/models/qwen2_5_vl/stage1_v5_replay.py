@@ -26,7 +26,8 @@ class V5ReplayOutput:
 def run_v5_packed_replay(decoder: nn.Module,lm_head: nn.Module,trace: V5Trace,
                          blocks: tuple[V5ReplayBlock,...],*,execution,need_voff: bool,
                          need_textoff: bool,chunk_positions: int=128) -> V5ReplayOutput:
-    validate_v5_decoder(decoder)
+    if execution.debug:
+        validate_v5_decoder(decoder)
     if type(need_voff) is not bool or type(need_textoff) is not bool or type(chunk_positions) is not int or chunk_positions<=0:
         raise ValueError('v5 replay requires boolean branches and positive chunk_positions')
     keys = tuple((b.batch_index,t-1) for b in blocks for t in b.target_positions)
@@ -38,7 +39,7 @@ def run_v5_packed_replay(decoder: nn.Module,lm_head: nn.Module,trace: V5Trace,
     if (x is None or trace.padding is None or trace.position_ids is None
             or len(trace.key_values)!=len(decoder.layers)):
         raise ValueError('v5 replay requires a complete attached clean trace')
-    for b in active:
+    for b in active if execution.debug else ():
         if (not 0<=b.batch_index<x.shape[0] or not 0<=b.start<b.end<x.shape[1]
                 or len(b.target_ids)!=len(b.target_positions)
                 or len(b.blocked_text_keys)!=len(b.target_positions)

@@ -711,7 +711,8 @@ def build_stage1_training_components(
             raise RuntimeError(f'v5 resume reference publication failed: {failures}')
         factory = CustomTrainerStage1V5
         v5_kwargs = dict(v5_config=args.stage1_v5_config, v5_reference_identity=identity,
-                         v5_saved_contract=v5_saved, ema_teacher=teacher)
+                         v5_saved_contract=v5_saved, ema_teacher=teacher,
+                         stage1_v5_debug=bool(getattr(args, "stage1_v5_debug", False)))
     trainer = factory(
         model=model,
         args=training_args,
@@ -728,9 +729,8 @@ def build_stage1_training_components(
         deepspeed_runtime_profile=profile,
         ema_method=tuning.method,
         stage1_peft_metadata=metadata,
-        collect_stage1_diagnostics=is_v5 or bool(
-            getattr(args, "benchmark_evidence_path", None)
-        ),
+        collect_stage1_diagnostics=(bool(getattr(args, "stage1_v5_debug", False)) if is_v5
+                                   else bool(getattr(args, "benchmark_evidence_path", None))),
         **v5_kwargs,
     )
     if tuning.method != "full" and args.gradient_checkpointing:

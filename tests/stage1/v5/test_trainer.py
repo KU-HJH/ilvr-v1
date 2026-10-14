@@ -21,7 +21,7 @@ def api():
     return CustomTrainerStage1V5
 
 
-def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False):
+def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, debug=True):
     Trainer = api()
     student, reference, *_ = fixture(.05)
     q = resolve_qwen2_5_vl_model(student)
@@ -56,6 +56,7 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False):
             inputs.pop('pixel_values_latent'); inputs.pop('image_grid_thw_latent')
             return Stage1TeacherTargets(values,mask,((2,3),),{})
     trainer = Trainer.__new__(Trainer)
+    trainer.stage1_v5_debug=debug
     trainer.model = student; trainer.model_wrapped = student
     trainer.ema_teacher = Stage1EmaTeacher(student,decay=1.,method='dora',initial_reference_model=reference)
     trainer.target_builder=Helper(); trainer._ema_execution_device=None
@@ -69,6 +70,7 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False):
                      '<|vision_start|>':81,'<|vision_end|>':83}
                 return {'input_ids':torch.tensor([[ids[text]]])}
         native=Stage1TeacherTargetBuilder(Tokenizer(),image_pool_k=2,helper_group_L=2)
+        native.validate=debug; native.collect_diagnostics=debug
         class RealHelper:
             def build(self,teacher,inputs,meta):
                 helper_active[0]=True
@@ -83,7 +85,7 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False):
         batch.update(input_ids=ids,pixel_values=torch.randn(4,12),image_grid_thw=torch.tensor([[1,2,2]]),
             pixel_values_latent=torch.randn(8,12),image_grid_thw_latent=torch.tensor([[1,2,2],[1,2,2]]),
             stage1_batch_metadata=Stage1BatchMetadata((sample,),1,26))
-    trainer.ce_weight=trainer.sim_weight=.1; trainer.collect_stage1_diagnostics=True
+    trainer.ce_weight=trainer.sim_weight=.1; trainer.collect_stage1_diagnostics=debug
     trainer.v5_config=Stage1V5Config(lambda_topk_entropy=.1,preference_topk_k=50)
     trainer._v5_contract_ready=True; trainer._v5_step_stack=None
     trainer.args=TrainingArguments(str(tmp_path),use_cpu=True,per_device_train_batch_size=1,gradient_accumulation_steps=4,seed=42,report_to=[])

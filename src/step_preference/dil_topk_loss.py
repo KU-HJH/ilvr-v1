@@ -88,13 +88,16 @@ def _weighted_off_cross_entropy(
 
 
 def _group_mass_terms(
-    clean_chunk: Tensor, off_chunk: Tensor, support: Tensor,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    clean_chunk: Tensor, off_chunk: Tensor, support: Tensor, *,
+    collect_diagnostics: bool = True,
+) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
     """Detached clean-to-live-OFF binary KL, including full-vocabulary rows."""
     partial = ~support.all(-1)
     # One finite logit suffices to connect a zero; a vocabulary sum can overflow.
     zero = off_chunk[:, 0] * 0.0
     if not bool(partial.any()):
+        if not collect_diagnostics:
+            return zero, None, None, None
         return zero, torch.ones_like(zero), torch.ones_like(zero) + zero, zero
 
     partial_off = off_chunk[partial]
@@ -114,6 +117,11 @@ def _group_mass_terms(
         + target_c * torch.where(target_c > 0, target_logc, 0.0)
     )
     mass_loss = cross_entropy - target_entropy
+    if not collect_diagnostics:
+        if bool(partial.all()):
+            return mass_loss, None, None, None
+        rows = partial.nonzero(as_tuple=True)[0]
+        return zero.index_copy(0, rows, mass_loss), None, None, None
     off_m = (-F.softplus(-off_h)).exp()
     gap = (target_m - off_m).abs()
     if bool(partial.all()):

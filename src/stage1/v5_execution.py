@@ -33,7 +33,8 @@ class _CheckpointPhase:
         if self.phase == 'recompute' and frame != (None,None,'backward'):
             raise RuntimeError('v5 recompute requires its ordinary backward')
         self.token = _FRAME.set((self.role,self.unit,self.phase))
-        owner.events.append(dict(role=self.role,unit=self.unit,phase=self.phase,site=None))
+        if owner.debug:
+            owner.events.append(dict(role=self.role,unit=self.unit,phase=self.phase,site=None))
         return self
 
     def __exit__(self,*exc):
@@ -49,9 +50,10 @@ class V5Execution:
     Diagnostic autograd traversals may run inside that same scope with
     retain_graph=True; they never create another original decoder invocation.
     """
-    def __init__(self, spec: Stage1StochasticContext):
+    def __init__(self, spec: Stage1StochasticContext, *, debug: bool = True):
         if not isinstance(spec,Stage1StochasticContext):
             raise TypeError('v5 execution requires Stage1StochasticContext')
+        self.debug = bool(debug)
         self.spec = spec
         self.state = 'NEW'
         self.events = []
@@ -80,7 +82,7 @@ class V5Execution:
             if exc_type is None:
                 if not self._backward_done or not self._graphs or self._graphs[0]!='F':
                     raise RuntimeError('incomplete v5 ordinary backward')
-                if self._original_sites != set(self.spec.expected_sites):
+                if self.debug and self._original_sites != set(self.spec.expected_sites):
                     raise RuntimeError('missing v5 original F stochastic sites')
                 self.state = 'CLOSED'
             else:
@@ -135,7 +137,7 @@ class V5Execution:
         frame = _FRAME.get()
         if frame is None or frame[0] not in ('F','packed') or frame[1] is None:
             raise RuntimeError('v5 dropout requires native checkpoint unit ownership')
-        if site not in self.spec.expected_sites:
+        if self.debug and site not in self.spec.expected_sites:
             raise RuntimeError(f'unregistered v5 stochastic site: {site}')
         if type(p) not in (int,float) or not math.isfinite(p) or not 0<=p<1:
             raise ValueError('v5 dropout probability must be finite in [0,1)')
@@ -145,13 +147,14 @@ class V5Execution:
                 or type(hidden_size) is not int or hidden_size<=0):
             raise ValueError('v5 dropout requires aligned int64 source coordinates')
         samples,positions = sample_indices.tolist(),token_positions.tolist()
-        if any(not 0<=r<len(self.spec.rows) or not 0<=t<self.spec.rows[r][1] for r,t in zip(samples,positions)):
+        if self.debug and any(not 0<=r<len(self.spec.rows) or not 0<=t<self.spec.rows[r][1] for r,t in zip(samples,positions)):
             raise ValueError('v5 dropout coordinates outside source valid length')
         role,unit,phase = frame
-        if role=='F' and phase=='original':
+        if self.debug and role=='F' and phase=='original':
             if site in self._original_sites: raise RuntimeError('duplicate v5 original F stochastic site')
             self._original_sites.add(site)
-        self.events.append(dict(role=role,unit=unit,phase=phase,site=site))
+        if self.debug:
+            self.events.append(dict(role=role,unit=unit,phase=phase,site=site))
         masks = {}
         for row in set(samples):
             slot,length = self.spec.rows[row]

@@ -171,6 +171,8 @@ while (( $# )); do
     requested_options[$1]=1
     case $1 in
         --sim-weight) require_value "$@"; extra_worker_arguments+=(--sim_weight "$2"); shift 2 ;;
+        --stage1-v5-debug) extra_worker_arguments+=(--stage1_v5_debug); shift ;;
+        --no-stage1-v5-debug) extra_worker_arguments+=(--no-stage1_v5_debug); shift ;;
         --stage1-variant) require_value "$@"; extra_worker_arguments+=(--stage1_variant "$2"); shift 2 ;;
         --stage1-loss-type) require_value "$@"; extra_worker_arguments+=(--stage1_loss_type "$2"); shift 2 ;;
         --lambda-preference) require_value "$@"; extra_worker_arguments+=(--lambda_preference "$2"); shift 2 ;;

@@ -31,6 +31,8 @@ class Stage1TeacherTargetBuilder:
         image_pool_k: int = 8,
         helper_group_L: int | None = 256,
         textual_states: str = "previous",
+        validate: bool = True,
+        collect_diagnostics: bool = True,
     ) -> None:
         if not math.isfinite(coverage_p) or not 0.0 < coverage_p <= 1.0:
             raise ValueError("coverage_p must be finite and in (0, 1]")
@@ -38,6 +40,8 @@ class Stage1TeacherTargetBuilder:
             raise ValueError("image_pool_k must be positive")
         if textual_states not in ("all", "previous"):
             raise ValueError("textual_states must be 'all' or 'previous'")
+        self.validate = bool(validate)
+        self.collect_diagnostics = bool(collect_diagnostics)
         self.tokenizer = tokenizer
         self.coverage_p = float(coverage_p)
         self.image_pool_k = int(image_pool_k)
@@ -103,7 +107,8 @@ class Stage1TeacherTargetBuilder:
         helper_grid = self._require_tensor_value(
             helper_grid, "image_grid_thw_latent"
         )
-        self._validate_batch_shape(input_ids, attention_mask, metadata)
+        if self.validate:
+            self._validate_batch_shape(input_ids, attention_mask, metadata)
 
         teacher.eval()
         device = self._teacher_device(teacher, input_ids.device)
@@ -180,8 +185,7 @@ class Stage1TeacherTargetBuilder:
                     ] = True
 
         latent_values = torch.cat(packed, dim=0)
-        expected_count = int(latent_mask.sum().item())
-        if latent_values.shape[0] != expected_count:
+        if self.validate and latent_values.shape[0] != int(latent_mask.sum().item()):
             raise RuntimeError(
                 "row-major latent target count does not match latent mask"
             )
@@ -189,7 +193,7 @@ class Stage1TeacherTargetBuilder:
             latent_values=latent_values,
             latent_mask=latent_mask,
             selected_counts=tuple(selected_counts),
-            diagnostics=self._diagnostics(latent_values),
+            diagnostics=self._diagnostics(latent_values) if self.collect_diagnostics else {},
             selected_candidate_indices=tuple(selected_candidate_indices),
             selection_margins=tuple(selection_margins),
         )
@@ -216,7 +220,7 @@ class Stage1TeacherTargetBuilder:
             return_dict=True,
         )
         hidden_pre, hidden_last = self._hidden_states(
-            text_outputs, (1, sample.unpadded_length)
+            text_outputs, (1, sample.unpadded_length), validate=self.validate
         )
         input_embeddings = self._language_input_embeddings(
             teacher, text_outputs, sample_ids
@@ -389,7 +393,7 @@ class Stage1TeacherTargetBuilder:
             raise ValueError("Stage 1 metadata sample count must match batch_size")
 
     @staticmethod
-    def _hidden_states(text_outputs, expected_prefix):
+    def _hidden_states(text_outputs, expected_prefix, *, validate: bool = True):
         hidden_states = getattr(text_outputs, "hidden_states", None)
         if isinstance(hidden_states, (tuple, list)):
             if not hidden_states:
@@ -405,9 +409,9 @@ class Stage1TeacherTargetBuilder:
             raise ValueError("teacher hidden states must have shape [B, T, H]")
         if hidden_pre.shape != hidden_last.shape:
             raise ValueError("teacher pre-final and final hidden states must share shape")
-        if not bool(torch.isfinite(hidden_pre).all().item()) or not bool(
+        if validate and (not bool(torch.isfinite(hidden_pre).all().item()) or not bool(
             torch.isfinite(hidden_last).all().item()
-        ):
+        )):
             raise FloatingPointError("teacher hidden states must be finite")
         return hidden_pre, hidden_last
 
@@ -432,7 +436,7 @@ class Stage1TeacherTargetBuilder:
     def _split_visual_features(self, features, grid_thw, teacher):
         if not isinstance(features, torch.Tensor) or features.ndim != 2:
             raise ValueError("teacher helper visual features must have shape [N, H]")
-        if not bool(torch.isfinite(features).all().item()):
+        if self.validate and not bool(torch.isfinite(features).all().item()):
             raise FloatingPointError("teacher helper visual features must be finite")
         counts = self._visual_token_counts(grid_thw, teacher)
         if sum(counts) != features.shape[0]:
@@ -738,12 +742,12 @@ class Stage1TeacherTargetBuilder:
         similarities = F.cosine_similarity(
             candidates, query.expand_as(candidates), dim=-1
         )
-        if not bool(torch.isfinite(similarities).all().item()):
+        if self.validate and not bool(torch.isfinite(similarities).all().item()):
             raise FloatingPointError(
                 "teacher candidate similarities must be finite"
             )
         probabilities = torch.softmax(similarities, dim=0)
-        if not bool(torch.isfinite(probabilities).all().item()):
+        if self.validate and not bool(torch.isfinite(probabilities).all().item()):
             raise FloatingPointError(
                 "teacher selection probabilities must be finite"
             )
@@ -762,7 +766,7 @@ class Stage1TeacherTargetBuilder:
         )
         selected_count = min(coverage_count, int(max_count))
         selected_indices = sorted_indices[:selected_count]
-        if selected_count < int(probabilities.numel()):
+        if self.collect_diagnostics and selected_count < int(probabilities.numel()):
             margin = float(
                 (
                     sorted_probabilities[selected_count - 1].to(torch.float64)
@@ -775,7 +779,7 @@ class Stage1TeacherTargetBuilder:
             margin = "all_selected"
         return (
             candidates.index_select(0, selected_indices),
-            tuple(int(index) for index in selected_indices.tolist()),
+            tuple(int(index) for index in selected_indices.tolist()) if self.collect_diagnostics else (),
             margin,
         )
 

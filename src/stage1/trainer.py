@@ -160,7 +160,8 @@ class _DeepSpeedStepAdapter:
         if not boundary:
             return self.original_step(*args, **kwargs)
 
-        trainer._validate_deepspeed_gradient_norm(self.engine)
+        if trainer._stage1_checks_enabled():
+            trainer._validate_deepspeed_gradient_norm(self.engine)
         result = self.original_step(*args, **kwargs)
         applied = self.engine.was_step_applied()
         if type(applied) is not bool:
@@ -194,7 +195,8 @@ class _Stage1OptimizerCallback(TrainerCallback):
         if trainer is not None and getattr(
             trainer, "_deepspeed_step_adapter", None
         ) is None:
-            trainer._validate_gradient_norm(kwargs.get("model"))
+            if trainer._stage1_checks_enabled():
+                trainer._validate_gradient_norm(kwargs.get("model"))
         return control
 
     def on_optimizer_step(self, args, state, control, **kwargs):
@@ -280,6 +282,8 @@ class CustomTrainerStage1(SFTTrainer):
                 image_pool_k=self.image_pool_k,
                 helper_group_L=self.helper_group_L,
                 textual_states=self.textual_states,
+                validate=self._stage1_checks_enabled(),
+                collect_diagnostics=self._stage1_checks_enabled(),
             )
         self.target_builder = target_builder
 
@@ -379,6 +383,10 @@ class CustomTrainerStage1(SFTTrainer):
             self._latest_stage1_diagnostics = None
         return (loss, outputs) if return_outputs else loss
 
+    def _stage1_checks_enabled(self) -> bool:
+        # Ordinary Stage1 retains strict diagnostics; v5 opts into its runtime flag.
+        return getattr(self, "stage1_v5_debug", True)
+
     def _prepare_stage1_loss_inputs(self, inputs) -> tuple[dict, Stage1BatchMetadata, Stage1TeacherTargets]:
         """Build helper targets once, preserving the original model tensors."""
         working_inputs = dict(inputs)
@@ -388,11 +396,13 @@ class CustomTrainerStage1(SFTTrainer):
                 "stage1_batch_metadata must be a Stage1BatchMetadata instance"
             )
 
-        self._validate_ema_teacher_device(working_inputs)
+        if self._stage1_checks_enabled():
+            self._validate_ema_teacher_device(working_inputs)
         targets = self.target_builder.build(
             self.ema_teacher.model, working_inputs, metadata
         )
-        self._validate_targets(targets, metadata, working_inputs)
+        if self._stage1_checks_enabled():
+            self._validate_targets(targets, metadata, working_inputs)
         model_inputs = {
             key: value
             for key, value in working_inputs.items()
@@ -830,7 +840,8 @@ class CustomTrainerStage1(SFTTrainer):
         if optimizer is None:
             raise RuntimeError("Stage 1 optimizer_step requires an optimizer")
 
-        self._validate_gradient_norm(self.model)
+        if self._stage1_checks_enabled():
+            self._validate_gradient_norm(self.model)
         result = optimizer.step(*remaining, **kwargs)
         skipped = bool(
             getattr(self.accelerator, "optimizer_step_was_skipped", False)

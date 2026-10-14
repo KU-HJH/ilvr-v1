@@ -30,17 +30,22 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
 
     def __init__(self, *args, v5_config: Stage1V5Config,
                  v5_reference_identity: V5ReferenceIdentity,
-                 v5_saved_contract=None, **kwargs):
+                 v5_saved_contract=None, stage1_v5_debug=False, **kwargs):
         if not isinstance(v5_config, Stage1V5Config):
             raise TypeError('v5 requires Stage1V5Config')
         if not isinstance(v5_reference_identity, V5ReferenceIdentity):
             raise TypeError('v5 requires immutable reference identity')
+        self.stage1_v5_debug = bool(stage1_v5_debug)
+        kwargs["collect_stage1_diagnostics"] = self.stage1_v5_debug
         self.v5_config = v5_config
         self.v5_reference_identity = v5_reference_identity
         self.v5_saved_contract = v5_saved_contract
         self._v5_contract_ready = False
         self._v5_step_stack = None
         super().__init__(*args, **kwargs)
+        from transformers.models.qwen2_5_vl.stage1_v5_trace import validate_v5_decoder
+        validate_v5_decoder(resolve_qwen2_5_vl_model(self.model).model)
+        validate_v5_decoder(resolve_qwen2_5_vl_model(self.ema_teacher.model).model)
         profile = self.deepspeed_runtime_profile
         if (self.ema_teacher.decay != 1. or self.ema_teacher.method != 'dora'
                 or not profile.enabled or profile.zero_stage != 1
@@ -86,7 +91,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         try:
             with ExitStack() as stack:
                 self._v5_step_stack = stack
-                self._v5_execution = stack.enter_context(V5Execution(spec))
+                self._v5_execution = stack.enter_context(V5Execution(spec, debug=self.stage1_v5_debug))
                 # Preserve exact parent dispatch, loss/GAS scaling, DeepSpeed and
                 # ordinary optimizer lifecycle. compute_loss opens backward only
                 # after all original graph/observation scopes have exited.
@@ -136,7 +141,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 row = clean.new_zeros(labels.shape[1], dtype=torch.float32)
                 row[list(positions)] = trace.attention_rows[key]
                 attention[key] = row
-            selected = select_v5_text_keys(metadata, attention, clean, reference, self.v5_config)
+            selected = select_v5_text_keys(metadata, attention, clean, reference, self.v5_config, validate=self.stage1_v5_debug)
             blocks = tuple(V5ReplayBlock(b.batch_index,b.start,b.end,b.target_positions,b.target_ids,
                            tuple(selected[(b.batch_index,q)] for q in b.query_positions))
                            for b in metadata.blocks)
@@ -151,13 +156,14 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                         execution=execution,need_voff=need_voff,need_textoff=need_textoff,
                         chunk_positions=self.v5_config.loss_chunk_positions)
                 voff, textoff = off.voff_logits, off.textoff_logits
-        sums = compute_v5_loss_sums(clean, reference, voff, textoff, metadata, self.v5_config)
+        sums = compute_v5_loss_sums(clean, reference, voff, textoff, metadata, self.v5_config,
+            validate=self.stage1_v5_debug, collect_diagnostics=self.stage1_v5_debug)
         scale = v5_auxiliary_scale(window)
         config = self.v5_config
         loss = (self.ce_weight*ce + self.sim_weight*alignment + config.text_kl_weight*sums.text_kl +
                 scale*(config.lambda_preference*sums.dil_sum + config.lambda_topk_entropy*sums.entropy_sum +
                        config.lambda_topk_mass*sums.mass_sum))
-        if not bool(torch.isfinite(loss.detach()).all()):
+        if self.stage1_v5_debug and not bool(torch.isfinite(loss.detach()).all()):
             raise FloatingPointError('Stage1-v5 loss is nonfinite')
         self._latest_stage1_diagnostics = {
             **sums.diagnostics, 'ce_loss':ce.detach(), 'alignment_loss':alignment.detach(),
@@ -235,7 +241,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
             'gradient_checkpointing','dataloader_num_workers','optim','lr_scheduler_type')}
         qwen = resolve_qwen2_5_vl_model(self.model)
         adapter = self.model.peft_config['default']
-        execution.update(tuning_method=self.ema_teacher.method,ema_tau=self.ema_teacher.decay,
+        execution.update(stage1_v5_debug=self.stage1_v5_debug, tuning_method=self.ema_teacher.method,ema_tau=self.ema_teacher.decay,
             zero_stage=self.deepspeed_runtime_profile.zero_stage,
             deepspeed_profile=self.deepspeed_runtime_profile.to_dict(),
             attention_implementation=qwen.model.config._attn_implementation,
@@ -265,6 +271,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         # remain in the compared/saved semantics.
         effective = json.loads(json.dumps(contract, allow_nan=False))
         execution = effective['execution']
+        execution.pop('stage1_v5_debug', None)  # Instrumentation is not resume semantics.
         if 'model' in execution:
             execution['model'] = effective['reference']['base_content_sha256']
         if 'deepspeed_profile' in execution:

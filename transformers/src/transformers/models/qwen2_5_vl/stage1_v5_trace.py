@@ -33,12 +33,13 @@ def validate_v5_decoder(decoder):
 
 @contextmanager
 def bind_v5_execution(decoder: nn.Module, execution, *, role="F", visual=None):
-    validate_v5_decoder(decoder)
+    if execution.debug:
+        validate_v5_decoder(decoder)
     if _EXECUTION.get() is not None:
         raise RuntimeError('nested v5 decoder execution')
     if role not in ("F", "packed") or (role=="packed" and visual is not None):
         raise ValueError("invalid v5 execution binding role")
-    token = _EXECUTION.set((decoder,lambda i: execution.checkpoint_contexts(role,("decoder",i))))
+    token = _EXECUTION.set((decoder,lambda i: execution.checkpoint_contexts(role,("decoder",i)),execution.debug))
     old_checkpoint = getattr(visual,'_gradient_checkpointing_func',None)
     try:
         if visual is not None and visual.gradient_checkpointing:
@@ -81,7 +82,8 @@ def v5_decoder_forward(forward):
         execution = _EXECUTION.get()
         if execution is None or execution[0] is not self:
             return forward(self,*args,**kwargs)
-        validate_v5_decoder(self)
+        if execution[2]:
+            validate_v5_decoder(self)
         if kwargs.get('use_cache',self.config.use_cache) or kwargs.get('past_key_values') is not None:
             raise ValueError('v5 checkpoint execution requires use_cache=False and no mutable cache')
         enabled = self.gradient_checkpointing and self.training
@@ -149,7 +151,10 @@ def packed_dropout_output(site: str, p: float, x: Tensor) -> Tensor | None:
 def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
                      candidate_positions: tuple[tuple[int,...],...]):
     decoder = model if hasattr(model,'layers') else model.model
-    validate_v5_decoder(decoder)
+    execution = _EXECUTION.get()
+    debug = execution is None or execution[2]
+    if debug:
+        validate_v5_decoder(decoder)
     if len(query_keys)!=len(candidate_positions) or len(set(query_keys))!=len(query_keys):
         raise ValueError('trace query/candidate identity mismatch')
     trace = V5Trace()
@@ -180,7 +185,7 @@ def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
     def observe(attn,args,kwargs,output):
         from .modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb,repeat_kv
         index = attn.layer_idx
-        if index in seen: raise RuntimeError('duplicate v5 attention observation')
+        if debug and index in seen: raise RuntimeError('duplicate v5 attention observation')
         seen.add(index)
         q,k = projection_outputs.pop((index,'q')),projection_outputs.pop((index,'k'))
         b,t,_ = q.shape
@@ -211,7 +216,7 @@ def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
                 handles.append(getattr(attn,name+'_proj').register_forward_hook(save))
             handles.append(attn.register_forward_hook(observe,with_kwargs=True))
         yield trace
-        if len(seen)!=len(decoder.layers) or len(trace.key_values)!=len(decoder.layers):
+        if debug and (len(seen)!=len(decoder.layers) or len(trace.key_values)!=len(decoder.layers)):
             raise RuntimeError('incomplete v5 trace')
     finally:
         for handle in reversed(handles): handle.remove()

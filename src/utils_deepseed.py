@@ -38,6 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--loss_chunk_positions", type=int)
     parser.add_argument("--stage1_v5_selection", choices=("all", "clean", "voff", "gap", "intersection"))
     parser.add_argument("--stage1_v5_text_kl_weight", type=float)
+    parser.add_argument("--stage1_v5_debug", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)
@@ -398,6 +399,8 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
             if 'deepspeed_profile' in saved['execution']:
                 inherited['deepspeed_config'] = saved['execution']['deepspeed_profile']['config_path']
             for name, value in inherited.items():
+                if name == "stage1_v5_debug":
+                    continue  # Runtime instrumentation never inherits objective semantics.
                 name = {'warmup_steps': 'warm_up_steps'}.get(name, name)
                 if hasattr(args, name):
                     if name in present and getattr(args, name) != value:

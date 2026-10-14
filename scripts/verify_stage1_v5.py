@@ -492,7 +492,7 @@ def production_witness(args, audited):
     path=REPOSITORY/'checkpoints'/args.run_id/'production'
     cli=['--stage','stage1','--model',str(args.model),'--data_path',str(args.data_path),
         '--image_root',str(args.image_root),'--save_model_path',str(path),
-        '--stage1_variant','v5','--stage1_loss_type','dil-bce-orig',
+        '--stage1_variant','v5','--stage1_v5_debug','--stage1_loss_type','dil-bce-orig',
         '--tuning_method','dora','--lora_r','32','--lora_alpha','64','--lora_dropout','0.05',
         '--lora_target_modules','q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',
         '--latent_size','8','--ema_tau','1','--ce_weight','0.1','--sim_weight','0.1',

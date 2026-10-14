@@ -869,7 +869,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--max-steps",
     "--benchmark-run-config",
 }
-_STAGE1_BOOLEAN_OPTIONS = {"--topk-include-gt", "--no-topk-include-gt","--final-save", "--no-final-save", "--use_lora"}
+_STAGE1_BOOLEAN_OPTIONS = {"--stage1-v5-debug", "--no-stage1-v5-debug","--topk-include-gt", "--no-topk-include-gt","--final-save", "--no-final-save", "--use_lora"}
 _STAGE1_COORDINATOR_OPTIONS = {
     "--output-dir",
     "--log-file",
