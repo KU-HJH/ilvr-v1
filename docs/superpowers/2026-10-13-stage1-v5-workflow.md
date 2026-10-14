@@ -380,3 +380,45 @@ deepspeed0.18.7 and peft0.17.1. TRAIN3450 and TEST400 match on both nodes:
 Original base and image-root paths exist. This does not establish future resource
 availability, full input validity, reviewed-code compatibility or update budget;
 authoritative preflight/audit remains after implementation.
+
+### Latest execution stopping point
+
+The user then instructed: “학습이 되는것까지 확인하고 멈춰봐.” Root stated it
+will observe actual participation by all four ranks, finite loss and optimizer
+step progress, then report and stop monitoring while leaving training running
+in the background. This narrows the current response's completion witness;
+implementation/review/launch gates remain, and no training process is to be
+killed by interpreting this as a termination request. Existing automatic
+post-training evaluation authorization is retained; results need not be awaited
+before the requested handoff. No objective or design change is involved.
+
+## Product Task1 completed
+
+Implementer `/root/v5_task1_impl` (gpt-6.1-sol/high) implemented approved contracts,
+original-source metadata and opt-in CLI in `1e2a4bb`, then fixed review finding I1
+in `f5f8ff3`. Task base `37dedfc`. Independent reviewer `/root/v5_task1_review`
+(same model/effort, distinct fresh context) assessed both spec and quality:
+initial Important finding was unsupported explicit legacy controls silently
+accepted on v5. Scoped re-review accepted the fix, no remaining findings or
+parked items. Broader runtime/resume questions remain assigned to Tasks3-7.
+
+Actual task skills: implementer TDD, targeted systematic debugging and fresh
+claim verification; root SDD/requesting-review/receiving-review routing. No
+product training/full-suite claim. RED was48failures for missing behavior;
+final initial-task command used repository Python, PYTHONDONTWRITEBYTECODE=1,
+CUDA_VISIBLE_DEVICES='', PYTHONPATH=src:transformers/src and pytest -q with
+`tests/stage1/v5/test_config.py tests/stage1/v5/test_metadata.py
+tests/stage1/test_cli.py tests/stage1/test_data.py`:99passed/3.15s, no warnings.
+Fix RED16failed/2passed; same environment and pytest with v5/test_config.py plus
+stage1/test_cli.py:70passed/3.10s, no warnings, exit0. Complete logs under
+`logs/stage1-v5-task1/`, including retained failed abbreviation adaptation.
+Report/reviews remain in the plan-specific SDD workspace until final evidence
+handoff; these exact Git revisions identify the reviewed changes.
+
+Root Ruling: fresh explicit percentage with omitted selector infers clean,
+matching original DIL Section7/existing source default; explicit all+percentage
+rejects and saved config remains authoritative. Default all/None and requested
+run unchanged. Cost if wrong: optional percentage-only CLI requires correction.
+Independent reviewer accepted this interpretation against binding source/spec.
+Task5 must load saved sidecar before eager parser validation; producer names are
+`args.stage1_v5_config` and `args.stage1_v5_explicit_values`.
