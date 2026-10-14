@@ -935,3 +935,150 @@ Short in-chat final design approval is pending under the bounded brainstorming
 gate. No product change for debug v1 has been made. After approval use the user's
 existing SDD method, one concrete task brief, TDD and independent spec/quality
 review; no new architectural plan document.
+
+User approved the exact bounded commitment: "승인, 검사 분리 후 학습 진행".
+Brainstorming debug v1 is complete; selected SDD method proceeds with concrete
+task-debug-brief.md and independent review. No renewed training authorization
+is needed. Actual additional read-only trace found native Stage1 teacher-device,
+target and pre-step norm checks reached by v5 plus composition's unconditional
+diagnostic collection; they fall within the presented repeated-check scope.
+Their algorithm/engine/state transitions and legacy strict defaults are retained.
+Debug runtime mode is not added as a saved objective coefficient. Main whole-
+branch review /root/v5_final_review (gpt-6-astra/high) is reading the immutable
+9119b55..c20b721 package; this approved delta will be supplied as a supplement
+before that same review's final-head verdict, avoiding repeated broad reviews.
+
+Debug implementer is /root/v5_debug_impl (gpt-6.1-sol/high), BASE c20b721.
+Ruling: allow only collect_diagnostics plumbing in shared
+src/step_preference/dil_topk_loss.py::_group_mass_terms, default True, to suppress
+diagnostic-only work on the existing optional v5 mass path. Selected mass0 stays
+off and formulas/active branches stay unchanged. Cost if wrong: shared Stage2 or
+direct-helper regression; causal diagnostic skip plus loss/gradient equivalence
+tests and independent review are required. No unrelated helper expansion.
+
+Final whole-branch review core draft at c20b721 has one Important I1, no
+Critical/Minor core findings; final assessment awaits debug supplement. Root
+read the complete report and applied receiving-code-review. Existing admission
+frontier prunes on dense bias, prefix tokens and queries but omits independently
+allocated padded suffix tokens (branch_count * suffix_length), clean length and
+original/helper visual input shapes. Reviewer directly called actual geometry
+functions on two feasible synthetic layouts: A (B2/P2000/S1500/Q3000) removes B
+(B20/P150/S600/Q1218) under current metrics, although B has 12000 suffix tokens
+vs A's3000. This is evidence of incomplete proxy dominance, not an actual TRAIN
+capacity/OOM result. Root confirmed the packed allocation and collated pixel/grid
+producer fields. Repair belongs to the one consolidated final fix wave after
+debug review; no repeated broad review or new capacity-search infrastructure.
+Actual audited frontier/signature counts and measured GPU feasibility are still
+unknown. All declined live/score/other-profile claims in the draft remain
+unverified; no stronger image-byte or universal allocator bound is claimed.
+
+Debug delta implemented at8e803cd790d2fb1949c06f74f4b7ad3c40130074 (20owned
+product/test paths). Root read full task-debug-report and complete test logs:
+517focused regressions passed/19.69s before final native compatibility refinements;
+67amended checks passed/10.47s and final107passed/10.91s cover those refinements,
+all pristine. Exact command prefix: PYTHONDONTWRITEBYTECODE=1
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=transformers/src:src:. ./venv/ilvr-venv/bin/python
+-m pytest. Final amended arguments: tests/stage1/v5/test_debug.py
+tests/stage1/test_targets.py tests/stage1/test_trainer.py -q. Focused broader
+arguments and causal REDs retained in report/logs/stage1-v5-debug.
+Actual tiny Qwen/DoRA real-helper OFF/ON loss, all trainable gradients (including
+None states), and post-backward CPU RNG compare exactly; instrumented native
+attention observes both F/packed originals and both checkpoint recomputations.
+Runtime flag is default OFF, recipe explicitly disables it, dedicated admission
+witness enables it. Runtime contract records mode but objective/resume comparison
+excludes it; source/package/reference authentication remains strict.
+Independent /root/v5_debug_review (gpt-6-astra/high) now reviews spec and quality;
+main /root/v5_final_review receives the immutable supplement and will reconcile
+the task verdict before final assessment. No live training/performance claim.
+
+Debug independent review8e803cd: spec issues/quality needs fixes, one Important
+I1. Current-rank agreement reused resume-neutral normalization, removing debug
+mode; debug-only DeepSpeed norm collection reaches DP all_reduce, so mixed current
+modes can change collective ordering. Actual CPU agreement probe accepted mixed
+digests; the distributed hazard is source-traced, not a live observed hang. Root
+read full report and confirmed current/saved digest use. Fix round1 to original
+/root/v5_debug_impl requires current mode agreement while uniform current mode
+may differ from saved mode. Final whole-branch reviewer independently identified
+the same issue; repair and scoped task review remain gates before final verdict.
+
+Debug fix1 commit654fff98852bde20dc5e46678522ac62e080d04d adds the resolved
+current mode byte to the actual startup rank-agreement packet. Saved-versus-
+current resume comparison stays mode-neutral. Three mixed-mode causal tests
+failed before repair; uniform current-mode switches from saved pass both ways.
+Fresh covering command uses prior CPU prefix plus tests/stage1/v5/test_debug.py
+tests/stage1/v5/test_trainer.py tests/stage1/v5/test_resume.py -q =>62passed/10.55s,
+pristine, complete log logs/stage1-v5-debug/fix1-green.log. Root read report/log;
+independent scoped task re-review and final incremental review are pending.
+
+Debug fix1 independent scoped review approves spec repair and quality at654fff9;
+I1 addressed, no new findings. Root read full task-debug-rereview-1.md and freshly
+confirmed unchanged product HEAD with only this control document dirty. Debug
+task is complete. Final reviewer independently confirms its I2 resolved and has
+received exact final-head reconciliation plus task verdict; final core capacity
+I1 remains open until the single consolidated fix wave and scoped re-review.
+
+Final whole-branch report finalized654fff9: specification changes required,
+quality ready with fixes; one Important I1 incomplete allocation geometry, no
+Critical/Minor, debug-rank I2 resolved. Root read full report. Single final fix
+wave will address I1 through final-fix-brief.md, retaining all reviewed runtime
+profile/window/optimizer/ownership constraints.
+Ruling: use raw packed B/P/S/Q and clean-length comparisons only within equal
+actual original/helper grid and pixel shape signatures, with suffix B*S and
+existing derived metrics recorded and bound to runtime collated inputs. This
+avoids an invented visual/backend memory bound. Cost if wrong: extra actual
+witness sources/time or misleading coverage; audit count is inspected before
+launch, no silent cap/sampling/deduplication or new capacity-search system.
+Reviewer declined actual-data/hardware/transport claims remain root execution
+gates. Completed training/TEST400 score is outside the latest stopping point;
+background recipe continues after verified start. Unsupported profiles, every-
+image bytewise authentication, post-update full-base rehash and full-size debug
+performance/GPU-RNG equivalence are not claimed. Earlier premise/kernel evidence
+is reused only within recorded bounds. These dispositions do not waive I1.
+
+Latest user reiteration: "검증/테스트는 지금만 포함하고 args.debugging과 같은
+argument로 묶어서 학습할 때는 쓸데없이 안하도록 해라". Understood as reinforcing
+the already approved debug-v1 scope: normal training explicitly uses
+args.stage1_v5_debug=False; repeated diagnostic checks/computation are skipped,
+regular loss/progress logs remain. Standalone audit/admission tests run only in
+this verification phase and are not inserted into the normal train/eval recipe.
+The example args.debugging does not require an unrelated rename. Initial input,
+profile/resume/publication checks remain as previously approved. No new design
+or approval cycle; final fixer was reminded to keep geometry validation in the
+standalone diagnostic. Implementation/training-start objective continues.
+
+Final fixer /root/v5_final_fix (gpt-6.1-sol/high), BASE654fff9, identified and
+root verified the fix interaction: added clean/visual dimensions can retain a
+valid row with zero auxiliary queries. Ruling: remove diagnostic-only blanket
+rejection and derive exact reference/packed counts from eligible audited sources;
+helper/F/backward and full window/norm/update coverage remain mandatory. Actual
+target builder always performs helper text forward; v5 reference/OFF are guarded
+by keys. Cost if wrong: rejecting valid geometry or weakening count evidence;
+causal mixed/all-empty records plus actual real-helper empty observer are required.
+No normal training/Trainer change or separate implementation lifecycle is added.
+
+Final consolidated repair1448de5d58d597036027742bb42716857aff55c5 changes only
+the standalone diagnostic and protocol tests. The common collated geometry
+producer binds raw/derived extents, clean length, both ordered vision grids and
+pixel shapes to each observed input before target consumption. Optional ref/OFF
+call counts derive from audited query eligibility; every retained source still
+requires a full accumulation/update window. Final focused protocol evidence:
+PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=.:src:transformers/src
+./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/v5/test_protocol.py,
+72passed/10.96s, logs/stage1-v5-final-fix/green-reviewed.log; root read complete
+output. One scoped final rereview pending with original /root/v5_final_review.
+Actual TRAIN frontier size, GPU capacity and training progress remain untested.
+
+Final scoped rereview at1448de5: original independent /root/v5_final_review
+closes I1 and its empty-target interaction, approves specification repair and
+quality, no new findings. Root read the complete final-rereview.md. Actual-data
+frontier/budget and live four-rank/ZeRO/continuation/capacity remain separate gates;
+no full-training/evaluation result is inferred. SDD implementation/review complete.
+Fresh project full-suite command selected jointly for verification-before-
+completion and finishing Step1: PYTHONDONTWRITEBYTECODE=1
+PYTHONPATH=src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q, CUDA
+visible, full output logs/stage1-v5-final/full-suite.log (result pending).
+The user's explicit Stage1-v5 worktree execution and latest training-start handoff
+retain the branch/worktree as-is; no integration action is requested or inferred.
+Minimal SDD control evidence is copied to results/stage1-v5-development-20261014
+before removing this plan's scratch directory. Git diffs remain reproducible from
+recorded base/head identities; all historical deviation records are preserved.
