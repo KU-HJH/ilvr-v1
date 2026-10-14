@@ -422,3 +422,30 @@ run unchanged. Cost if wrong: optional percentage-only CLI requires correction.
 Independent reviewer accepted this interpretation against binding source/spec.
 Task5 must load saved sidecar before eager parser validation; producer names are
 `args.stage1_v5_config` and `args.stage1_v5_explicit_values`.
+
+## Product Task2 completed
+
+Implementer `/root/v5_task2_impl` (gpt-6.1-sol/high) implemented loss/selection
+helpers at `28fbebd5c70d178fba2826de32ddbaca1b7982ce`, base`1d9fd2a`.
+Independent `/root/v5_task2_review` (same model/effort, fresh/distinct) approved
+both specification and quality with no findings. Reviewed numerical kernels
+remain unchanged. Real-logit gathering/trace, Trainer reduction, reference
+lifecycle and production evidence remain Tasks3-7 responsibilities. Reviewer
+approval-provenance note is resolved by actual user replies/hash bindings above;
+the approved spec bytes retain their pre-approval header intentionally.
+
+Implemented TDD and claim verification: initial24missing-feature failures;
+new empty-OFF-selector test3failures corrected. Repository Python with
+PYTHONDONTWRITEBYTECODE=1 and PYTHONPATH=src:transformers/src ran pytest -q on
+`tests/stage1/v5/test_selection.py tests/stage1/v5/test_objective.py
+tests/step_preference/test_dil_bce_orig_loss.py
+tests/step_preference/test_topk_entropy_loss.py`:97passed/2.24s, exit0.
+After final connected-zero refactor, the first two files alone:27passed/2.06s,
+exit0, no warnings. Logs under `logs/stage1-v5-task2/`; report and review in
+plan-specific SDD workspace. No GPU/distributed/full-suite claim.
+
+Root Ruling: corrected brief's nonexistent top-level kernel test paths to the
+existing `tests/step_preference/` paths, retaining identical test semantics.
+Cost if wrong: regression evidence would be missing; exact executed paths and
+passing output above resolve that risk. All objective inputs are selected
+[N,V] in metadata.query_keys order; Task5 gathers ordinary F at those keys.
