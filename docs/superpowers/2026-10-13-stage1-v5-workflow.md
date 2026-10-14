@@ -1082,3 +1082,71 @@ retain the branch/worktree as-is; no integration action is requested or inferred
 Minimal SDD control evidence is copied to results/stage1-v5-development-20261014
 before removing this plan's scratch directory. Git diffs remain reproducible from
 recorded base/head identities; all historical deviation records are preserved.
+
+First fresh whole-project verification completed at reviewed product1448de5 plus
+control-only1962686:31failed,4427passed,11skipped,1warning in1102.21s. Full log
+logs/stage1-v5-final/full-suite.log,160864bytes. Warning is installed CPU Adam
+extension's unspecified TORCH_CUDA_ARCH_LIST; this is not a green full-suite gate.
+All31 tracebacks are in historical coordinator/root-fixture paths: incomplete
+cluster double, inconsistent lexical config mock, unsupported unqualified native
+lifecycle subprocess, imported worker helper without sibling fixture, and direct
+example/CE plan calls without explicit roots. Root invoked systematic-debugging;
+/root/v5_final_fix reproduced distinct boundaries before fixes and records exact
+causal paths in verification-failure-diagnosis.md. Root read those paths/consumer
+assertions and all failure identities; fixer must reconcile the full log.
+
+Ruling: test-only repairs restore the approved managed-root interface, preserving
+production native-root rejection and canonical lifecycle behavior. Native wrapper
+checks exact refusal/no publication, with actual in-process CLI18-object output
+under scoped explicit fixture; imported worker helper supplies its own test roots.
+Existing examples/CE tests pass existing explicit-root options while retaining
+actual workers/coefficient/budget/assertions. Cost if wrong: false-green or weaker
+wrapper coverage; no skipped tests, fabricated output, product guard relaxation,
+new lifecycle feature or objective change is allowed. Six existing test files
+are scoped in verification-fix-brief.md. This independently discovered
+verification regression is handled through selected SDD implementer, independent
+spec/quality review and fresh verification, not another final-review fix wave.
+No actual training has launched. The read-only real-data audit is running with
+unchanged reviewed source hashes, separate from these test-only repairs.
+
+Remote managed copy provisioned at /root/workspace/ILVR/.worktrees/Stage1-v5
+(host /home/korea/Workspace/hjh/workspace/ILVR/.worktrees/Stage1-v5), detached
+1962686 via local Git bundle, no canonical branch mutation. Original canonical
+HEAD0e6d673 remains. Data/checkpoints/venv link to remote canonical paths;
+worktree results/logs are separate. Witness dry-run at port29871 records both
+owned node commands, matching code, explicit roots, two nodes/four ranks and
+ZeRO1 in logs/stage1-v5-final/witness-dry-run.json; dry-run is not live preflight
+or training evidence. It must be refreshed for the eventual final HEAD.
+
+Verification test-only repair af8fb2662869b794af3118b6ab553d143488ce5b changes
+six test files,30insertions11deletions. Complete31-failure reconciliation in
+verification-fix-report.md: capacity1,probe2,lifecycle1,imported helper16,
+examples10,direct Stage1constructor1. Root read final report and complete covering
+log logs/stage1-v5-verification-fix/covering.log:169passed389.98s, no warnings,
+skips or failures. This covers all31 original failures, not the full project.
+Independent /root/v5_verification_review (gpt-6.1-sol/high) is assessing spec and
+quality with immutable review-1962686..af8fb26.diff. Normal production/audit
+sources are unchanged. Whole-project green gate and live admission still pending.
+
+Independent verification repair review /root/v5_verification_review approves
+specification and quality ataf8fb26, no findings. Root read complete report;
+six test hashes and covering log independently match, all31original failed
+identities are selected by the recorded169-pass command. Canonical lifecycle
+shell success is retained but not directly observed on native checkout; actual
+native refusal and actual in-process18-plan CLI evidence are distinct. No claim
+of live hardware/training admission follows. Verification-regression task complete.
+
+Fresh root full suite after that review: OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:transformers/src
+./venv/ilvr-venv/bin/python -m pytest -q >
+logs/stage1-v5-final/full-suite-reviewed.log 2>&1. CUDA visible; these CPU thread
+settings bound tests only and do not change the training profile. Result pending.
+This is required fresh verification of the repaired tree, not a duplicate broad
+review. The actual-data audit remains running under
+stage1-v5-audit-20261014-084400; source hashes unchanged through test-only repair.
+
+All subsequent verification/runtime records are retained under
+results/stage1-v5-development-20261014 and the distinct run result/log directories.
+After freezing the launch commit, do not mutate HEAD or production sources while
+owned training/automatic evaluation run. Keep this requested worktree and branch;
+no merge/push/deletion is authorized or needed for the training-start handoff.
