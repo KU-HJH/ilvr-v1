@@ -2388,6 +2388,53 @@ def test_peft_loader_rejects_unsupported_legacy_adapter_marker(tmp_path, stage):
         validate_loader_artifact(artifact, loader_identity(stage, "lora"))
 
 
+def test_v5_completed_checkpoint_manifest_cli_retains_reference_for_resume(tmp_path, capsys):
+    """Catches the public manifest rejecting the approved v5 reference marker."""
+    from src.multinode import _main
+    from src.multinode_artifacts import select_common_metadata_entries
+    from stage1.checkpointing import classify_stage1_artifact, Stage1ArtifactKind
+
+    values = identity(tuning_method="dora", zero_stage=1, model_state_layout="replicated")
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint = checkpoint_root / values["run_id"] / "checkpoint-2"
+    write_observed_full_checkpoint(checkpoint, values=values)
+    (checkpoint / "model.safetensors").unlink()
+    write_loader_artifact(checkpoint, stage="stage1", method="dora")
+    for name, payload in {"stage1_v5.json": b'{}\n',
+                          "stage1_v5_reference.pt": b"initial selected reference"}.items():
+        (checkpoint / name).write_bytes(payload)
+    assert _main(["artifact-manifest", "--run-directory", str(checkpoint),
+        "--run-id", values["run_id"], "--checkpoint-root", str(checkpoint_root),
+        "--node-rank", "0", "--process-rank", "0", "--process-rank", "1",
+        "--runtime-identity-json", json.dumps(values), "--completion-marker"]) == 0
+    manifest = NodeArtifactManifest.from_json(json.loads(capsys.readouterr().out))
+    assert manifest.runtime_identity == values
+    validate_loader_artifact(checkpoint, values)
+    assert classify_stage1_artifact(checkpoint) is Stage1ArtifactKind.PEFT
+    pair = {Path("stage1_v5.json"), Path("stage1_v5_reference.pt")}
+    assert pair <= {entry.relative_path for entry in manifest.entries}
+    assert pair <= {entry.relative_path for entry in select_common_metadata_entries(manifest)}
+    assert pair <= {entry.relative_path for entry in select_resume_entries(manifest)}
+    assert pair.isdisjoint(entry.relative_path for entry in select_inference_entries(manifest))
+    assert (checkpoint / "stage1_v5_reference.pt").read_bytes() == b"initial selected reference"
+
+
+@pytest.mark.parametrize("stage,extra,expected", [
+    ("stage1", "unrecognized_reference.pt", "unknown"),
+    ("stage1", "model.safetensors", "mixed"),
+    ("stage2", "stage1_v5_reference.pt", "unknown"),
+])
+def test_v5_marker_acceptance_keeps_peft_weight_allowlist_strict(tmp_path, stage, extra, expected):
+    artifact = tmp_path / stage
+    write_loader_artifact(artifact, stage=stage, method="dora")
+    if stage == "stage1":
+        (artifact / "stage1_v5.json").write_text("{}\n")
+        (artifact / "stage1_v5_reference.pt").write_bytes(b"initial reference")
+    (artifact / extra).write_bytes(b"forbidden weight marker")
+    with pytest.raises(ValueError, match=expected):
+        validate_loader_artifact(artifact, loader_identity(stage, "dora"))
+
+
 def test_stage2_sparse_rows_are_required_only_by_strict_metadata(tmp_path):
     sparse = tmp_path / "stage2-sparse"
     write_loader_artifact(

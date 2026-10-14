@@ -630,7 +630,7 @@ def _require_peft_payload_names(names: set[str], *, stage: str) -> None:
         "training_args.bin",
     }
     if stage == "stage1":
-        allowed_weight_names.add("stage1_ema_teacher.pt")
+        allowed_weight_names.update({"stage1_ema_teacher.pt", "stage1_v5_reference.pt"})
     unsupported = {
         name
         for name in names
