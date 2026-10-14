@@ -11,6 +11,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 PROFILE = REPO / "scripts/stage2/dil_bce_profile.sh"
+ROOT_ARGUMENTS = ('--local-repo-root',str(REPO),'--remote-repo-root',str(REPO),
+    '--remote-host-repo-root','/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/native-test')
 
 
 def source_profile(extra=None):
@@ -57,8 +59,8 @@ def test_empty_exported_resume_keeps_fresh_coordinator_mode():
     result = subprocess.run(
         ["bash", "-c", 'set -euo pipefail; source "$1"; "$2" --dry-run '
          '--run-id dil-empty-resume-profile-test --zero-stage 2 '
-         '--main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS"',
-         "bash", str(PROFILE), str(REPO / "run_multinode_stage2_training.sh")],
+         '--main-process-port 29631 --max_steps "$STAGE2_TOTAL_STEPS" "${@:3}"',
+         "bash", str(PROFILE), str(REPO / "run_multinode_stage2_training.sh"),*ROOT_ARGUMENTS],
         cwd=REPO,
         env={**os.environ, "RESUME_CHECKPOINT": "", "CUDA_VISIBLE_DEVICES": "",
              "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
@@ -129,7 +131,8 @@ def test_documented_variant_runs_coordinator_and_both_worker_dry_runs(name, tmp_
     )
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     result = subprocess.run(
-        ["bash", "-c", "set -euo pipefail\n" + common + "\nPS4='+ '\nset -x\n" + examples[name], "bash", str(fixture)],
+        ["bash", "-c", "set -euo pipefail\n" + common + "\nPS4='+ '\nset -x\n" + examples[name] + ' "${@:2}"',
+         "bash", str(fixture),*ROOT_ARGUMENTS],
         cwd=REPO, env={**environment, "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
         text=True, capture_output=True,
     )

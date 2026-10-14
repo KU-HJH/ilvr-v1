@@ -562,7 +562,7 @@ def test_matrix_prechecks_parent_namespace_before_any_attempt(tmp_path):
 
 
 
-def test_wrapper_dry_run_prints_exactly_eighteen_lifecycle_plan_objects(tmp_path):
+def test_wrapper_dry_run_prints_exactly_eighteen_lifecycle_plan_objects(tmp_path,capsys):
     """Catches the operator wrapper mutating files or emitting attempt fragments."""
     result_root = tmp_path / "missing-results"
     completed = subprocess.run(
@@ -582,8 +582,22 @@ def test_wrapper_dry_run_prints_exactly_eighteen_lifecycle_plan_objects(tmp_path
         check=False,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    plans = [json.loads(line) for line in completed.stdout.splitlines()]
+    if not REPO_ROOT.is_relative_to('/root/workspace/ILVR'):
+        # The actual subprocess cannot inherit the scoped explicit-root fixture.
+        assert completed.returncode == 2
+        assert completed.stdout == ''
+        assert completed.stderr.splitlines()[-1] == (
+            'python -m src.multinode lifecycle-matrix: error: '
+            'native checkout requires explicit remote repository roots')
+        assert not result_root.exists()
+        from src.multinode import _main
+        assert _main(['lifecycle-matrix','--run-id','four-gpu-matrix-dry',
+            '--first-port','29700','--result-root',str(result_root),'--dry-run']) == 0
+        output=capsys.readouterr().out
+    else:
+        assert completed.returncode == 0, completed.stderr
+        output=completed.stdout
+    plans = [json.loads(line) for line in output.splitlines()]
     assert len(plans) == 18
     assert all(set(plan) == {
         "stage",

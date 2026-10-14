@@ -65,8 +65,7 @@ def test_probe_dry_run_exposes_actual_identity_checks_and_topology(tmp_path, mon
     monkeypatch.setattr(coordinator, "_REPOSITORY_ROOT", repository)
     monkeypatch.setattr(coordinator, "_remote_host_repository_root", lambda path: path)
     monkeypatch.setattr(coordinator, "_repository_git_stdout", lambda args: "a"*40)
-    # The canonical config belongs to the actual checkout; no fixture weights.
-    monkeypatch.setattr(coordinator, "selected_deepspeed_config", lambda *args: Path(__file__).resolve().parents[2]/"configs/deepspeed_zero2.json")
+    # The real planner reads approved config bytes and binds the fixture root.
     assert coordinator._training_main("stage2", ["--dil-full-model-probe", str(manifest),
         "--run-id", "probe-contract", "--zero-stage", "2", "--main-process-port", "29631", "--dry-run"]) == 0
     result = json.loads(capsys.readouterr().out)
@@ -87,7 +86,6 @@ def test_probe_completion_collects_four_records_without_training_witness(tmp_pat
     monkeypatch.setattr(coordinator, "_REPOSITORY_ROOT", repository)
     monkeypatch.setattr(coordinator, "_remote_host_repository_root", lambda path: path)
     monkeypatch.setattr(coordinator, "_repository_git_stdout", lambda args: "a"*40)
-    monkeypatch.setattr(coordinator, "selected_deepspeed_config", lambda *args: Path(__file__).resolve().parents[2]/"configs/deepspeed_zero2.json")
     monkeypatch.setattr(coordinator, "collect_node_snapshot", lambda *args, **kwargs: None)
     monkeypatch.setattr(coordinator, "validate_preflight", lambda *args: SimpleNamespace(commit="a"*40))
     def identity_preflight(command, **kwargs):

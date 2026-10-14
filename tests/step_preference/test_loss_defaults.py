@@ -252,7 +252,9 @@ def test_stage1_coordinator_forwards_ce_to_both_workers():
     from src.multinode import build_launch_plan
     from src.multinode_runtime import build_owned_tmux_commands
     plan = build_launch_plan(stage="stage1", tuning_method="dora", zero_stage=1,
-                             run_id="loss-defaults-stage1", main_process_port=29631)
+        run_id="loss-defaults-stage1", main_process_port=29631,
+        local_repo_root=REPO,remote_repo_root=REPO,
+        remote_host_repo_root=Path('/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/native-test'))
     commands = build_owned_tmux_commands(plan, commit="a"*40,
         stage_arguments=("--method", "dora", "--model", "model", "--data-path", "data.jsonl", "--image-root", "data", "--ce-weight", ".1"))
     for spec in commands.node_specs:

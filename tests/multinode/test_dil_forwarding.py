@@ -16,6 +16,8 @@ def worker_commands(settings, stage_arguments=()):
     plan = multinode.build_launch_plan(
         stage="stage2", tuning_method="dora", zero_stage=2,
         run_id="dil-forwarding-test", main_process_port=29631,
+        local_repo_root=REPO,remote_repo_root=REPO,
+        remote_host_repo_root=Path('/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/native-test'),
     )
     source = {
         "STAGE1_CHECKPOINT": "/models/base with spaces",
