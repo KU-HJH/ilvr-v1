@@ -103,6 +103,7 @@ _NON_MODEL_BINARY_FILES = frozenset(
         "scaler.pt",
         "rng_state.pth",
         STAGE1_EMA_TEACHER_STATE_FILENAME,
+        "stage1_v5_reference.pt",
         "training_args.bin",
     }
 )

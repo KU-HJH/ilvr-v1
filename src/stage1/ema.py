@@ -428,11 +428,30 @@ class Stage1EmaTeacher:
         student: nn.Module,
         decay: float,
         method: Stage1EmaMethod,
+        initial_reference_model: nn.Module | None = None,
     ) -> None:
         self.decay = _validate_decay(decay)
         self.method = _validate_method(method)
         unwrapped_student = _unwrap_model(student)
-        self.model = copy.deepcopy(unwrapped_student).eval()
+        if initial_reference_model is not None:
+            initial_reference_model = _unwrap_model(initial_reference_model)
+            student_storage = {
+                (p.device, p.untyped_storage().data_ptr())
+                for p in unwrapped_student.parameters()
+            }
+            if any(
+                (p.device, p.untyped_storage().data_ptr()) in student_storage
+                for p in initial_reference_model.parameters()
+            ):
+                raise ValueError("initial reference/student storage alias")
+        # A resumed frozen reference must start from original-base topology,
+        # never from the resumed student's policy. The provided model is owned
+        # by this teacher; default construction retains its deep-copy behavior.
+        self.model = (
+            copy.deepcopy(unwrapped_student)
+            if initial_reference_model is None
+            else _unwrap_model(initial_reference_model)
+        ).eval()
         self.model.requires_grad_(False)
         self._pairs = build_ema_parameter_map(
             unwrapped_student, self.model, self.method
