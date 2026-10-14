@@ -26,8 +26,13 @@ from src.multinode import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.native_roots
 def test_default_topology_preserves_the_worktree_suffix_on_remote_host():
     """Catches the fixed remote mapping dropping the active worktree suffix."""
+    if not REPO_ROOT.is_relative_to("/root/workspace/ILVR"):
+        with pytest.raises(ValueError,match="explicit remote repository roots"):
+            ClusterSpec.default()
+        return
     spec = ClusterSpec.default()
 
     assert spec.remote_repo_root == REPO_ROOT
@@ -44,10 +49,9 @@ def test_default_cluster_is_fixed_two_node_four_process_topology():
     assert spec.remote_host == "korea@10.1.102.41"
     assert spec.remote_container == "llm_kd"
     assert spec.remote_repo_root == REPO_ROOT
-    relative = REPO_ROOT.relative_to(Path("/root/workspace/ILVR"))
-    assert spec.remote_host_repo_root == (
-        Path("/home/korea/Workspace/hjh/workspace/ILVR") / relative
-    )
+    if REPO_ROOT.is_relative_to("/root/workspace/ILVR"):
+        relative = REPO_ROOT.relative_to(Path("/root/workspace/ILVR"))
+        assert spec.remote_host_repo_root == Path("/home/korea/Workspace/hjh/workspace/ILVR") / relative
     assert (spec.num_machines, spec.gpus_per_node, spec.num_processes) == (2, 2, 4)
     assert (spec.remote_rank, spec.local_rank) == (0, 1)
     assert spec.master_addr == "10.1.102.41"
@@ -330,6 +334,8 @@ def test_plan_cli_prints_sorted_json_without_creating_files(tmp_path):
         "--main-process-port",
         "29615",
     ]
+    command.extend(("--remote-repo-root",str(REPO_ROOT),
+        "--remote-host-repo-root","/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/native-test"))
     before = set(tmp_path.iterdir())
     environment = os.environ | {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}
 

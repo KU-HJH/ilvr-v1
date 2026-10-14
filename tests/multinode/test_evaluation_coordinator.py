@@ -222,7 +222,7 @@ def test_evaluation_worker_environment_imports_worktree_transformers():
             ),
         ],
         cwd="/",
-        env=environment,
+        env={**environment,"PYTHONDONTWRITEBYTECODE":"1"},
         capture_output=True,
         text=True,
         check=False,
@@ -537,7 +537,7 @@ def test_production_runner_transfer_publishes_exact_list_before_fake_rsync(
 
     runner.pull_remote_results(commands)
 
-    assert files_path.read_bytes() == evaluation_result_files_bytes()
+    assert files_path.read_bytes() == evaluation_result_files_bytes(include_runtime_identity=True)
     assert calls == [commands.remote_pull]
     assert "--secluded-args" in calls[0]
     assert calls[0][calls[0].index("--rsync-path") + 1] == (
@@ -989,6 +989,8 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
         "shard-0.jsonl.manifest.json",
         "shard-1.jsonl",
         "shard-1.jsonl.manifest.json",
+        "shard-0.runtime-identity.json",
+        "shard-1.runtime-identity.json",
     ]
     for commands in payload["worker_commands_by_observed_stage"].values():
         for command in commands:

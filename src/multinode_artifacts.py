@@ -11,7 +11,10 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from src.multinode import ClusterSpec
 
 
 _MANIFEST_SCHEMA_VERSION = 1
@@ -43,10 +46,6 @@ _MANIFEST_IDENTITY_FIELDS = (
 )
 _RESUME_IDENTITY_FIELDS = _MANIFEST_IDENTITY_FIELDS
 _LOCAL_REPOSITORY = Path(__file__).resolve().parents[1]
-_REMOTE_HOST_REPOSITORY = (
-    Path("/home/korea/Workspace/hjh/workspace/ILVR")
-    / _LOCAL_REPOSITORY.relative_to(Path("/root/workspace/ILVR"))
-)
 _REMOTE_HOST = "korea@10.1.102.41"
 _RSYNC_SSH = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8"
 _MAX_COMMON_METADATA_BYTES = 4 * 1024 * 1024
@@ -87,6 +86,8 @@ def _prepared_inference_relative_path(
         raise ValueError(f"{label} must belong to a run")
     _validate_run_id(relative.parts[0])
     return relative
+_V5_TRAINING_FILES = frozenset({Path("stage1_v5.json"), Path("stage1_v5_reference.pt")})
+
 _INFERENCE_STATIC_NAMES = frozenset(
     {
         "adapter_config.json",
@@ -1155,6 +1156,8 @@ def select_common_metadata_entries(
 ) -> tuple[ArtifactEntry, ...]:
     """Select only explicitly approved metadata for this stage/method contract."""
     allowed = _required_common_paths(_validate_identity(manifest.runtime_identity))
+    if manifest.runtime_identity["stage"] == "stage1":
+        allowed = allowed | _V5_TRAINING_FILES
     return tuple(entry for entry in manifest.entries if entry.relative_path in allowed)
 
 
@@ -1225,6 +1228,9 @@ def validate_collection(
     combined: dict[Path, ArtifactEntry] = {}
     identity = identities[0]
     allowed_common = _required_common_paths(identity)
+    if identity["stage"] == "stage1" and any(
+            entry.relative_path in _V5_TRAINING_FILES for manifest in values for entry in manifest.entries):
+        allowed_common = allowed_common | _V5_TRAINING_FILES
     step_directory = f"global_step{identity['global_step']}"
     for manifest in sorted(values, key=lambda item: item.node_rank):
         for entry in manifest.entries:
@@ -1395,6 +1401,8 @@ def validate_transfer_destination(
                 "scheduler.pt",
                 "deepspeed-runtime.json",
                 "stage1_peft_metadata.json",
+                "stage1_v5.json",
+                "stage1_v5_reference.pt",
                 "stage2_peft_metadata.json",
                 "stage2-sampler.json",
             }
@@ -1431,18 +1439,24 @@ def _rsync_prefix(files_from: Path) -> tuple[str, ...]:
 
 
 def build_push_command(
-    manifest: NodeArtifactManifest, *, files_from: str | Path | None = None
+    manifest: NodeArtifactManifest, *, files_from: str | Path | None = None,
+    cluster: "ClusterSpec | None" = None
 ) -> tuple[str, ...]:
     """Build a fixed local-ranks-to-canonical-owner rsync argv."""
     _validate_run_id(manifest.run_id)
+    if cluster is not None:
+        from src.multinode import validate_cluster_topology
+        validate_cluster_topology(cluster)
+    local = cluster.local_repo_root if cluster is not None else _LOCAL_REPOSITORY
+    remote = cluster.remote_repo_root if cluster is not None else _LOCAL_REPOSITORY
     source = (
-        _LOCAL_REPOSITORY
+        local
         / "checkpoints"
         / manifest.run_id
         / manifest.checkpoint_relative
     )
     destination = (
-        _LOCAL_REPOSITORY
+        remote
         / "checkpoints"
         / manifest.run_id
         / manifest.checkpoint_relative
@@ -1656,17 +1670,23 @@ def build_pull_command(
     destination: str | Path | None = None,
     *,
     files_from: str | Path | None = None,
+    cluster: "ClusterSpec | None" = None,
 ) -> tuple[str, ...]:
     """Build a canonical-owner-to-local rsync argv for resume artifacts."""
     _validate_run_id(manifest.run_id)
+    if cluster is not None:
+        from src.multinode import validate_cluster_topology
+        validate_cluster_topology(cluster)
+    local = cluster.local_repo_root if cluster is not None else _LOCAL_REPOSITORY
+    remote = cluster.remote_repo_root if cluster is not None else _LOCAL_REPOSITORY
     source = (
-        _LOCAL_REPOSITORY
+        remote
         / "checkpoints"
         / manifest.run_id
         / manifest.checkpoint_relative
     )
     local_destination = (
-        _LOCAL_REPOSITORY / "checkpoints" / manifest.run_id
+        local / "checkpoints" / manifest.run_id
         if destination is None
         else Path(destination)
     )
@@ -1925,13 +1945,16 @@ def inference_model_identity(manifest: NodeArtifactManifest) -> str:
     return f"task6:{hashlib.sha256(payload).hexdigest()}"
 
 
-def evaluation_result_files_bytes() -> bytes:
+def evaluation_result_files_bytes(*, include_runtime_identity: bool = False) -> bytes:
     """Encode only remote shard 0/1 JSONL and Task 7 sidecars."""
-    return b"".join(name.encode("utf-8") + b"\0" for name in _EVALUATION_REMOTE_FILES)
+    names = _EVALUATION_REMOTE_FILES
+    if include_runtime_identity:
+        names += ('shard-0.runtime-identity.json', 'shard-1.runtime-identity.json')
+    return b"".join(name.encode("utf-8") + b"\0" for name in names)
 
 
 def build_evaluation_pull_command(
-    output_directory: str | Path, *, files_from: str | Path
+    output_directory: str | Path, *, files_from: str | Path, cluster: "ClusterSpec | None" = None
 ) -> tuple[str, ...]:
     """Build the one fixed, non-recursive remote evaluation result pull."""
     output = Path(output_directory)
@@ -1941,7 +1964,10 @@ def build_evaluation_pull_command(
         raise ValueError("evaluation output must be under the canonical result root") from error
     validate_coordinator_relative_path(relative, label="evaluation output")
     _validate_run_id(relative.parts[0])
-    remote = _LOCAL_REPOSITORY / "results" / relative
+    if cluster is not None:
+        from src.multinode import validate_cluster_topology
+        validate_cluster_topology(cluster)
+    remote = (cluster.remote_repo_root if cluster is not None else _LOCAL_REPOSITORY) / "results" / relative
     prefix = _rsync_prefix(Path(files_from))
     return (
         *prefix[:-1],
@@ -1959,11 +1985,15 @@ def build_prepared_inference_pull_command(
     destination: str | Path,
     *,
     files_from: str | Path,
+    cluster: "ClusterSpec | None" = None,
 ) -> tuple[str, ...]:
     """Pull only Task 6 allowlisted files from one prepared remote artifact."""
     validate_inference_manifest_identity(
         manifest, expected_identity=manifest.runtime_identity
     )
+    if cluster is not None:
+        from src.multinode import validate_cluster_topology
+        validate_cluster_topology(cluster)
     source = Path(source_directory)
     relative = _prepared_inference_relative_path(
         source, label="prepared inference source"
@@ -1974,7 +2004,7 @@ def build_prepared_inference_pull_command(
         allow_resolved=True,
     )
     remote = (
-        _LOCAL_REPOSITORY / "checkpoints" / "evaluation-staging" / relative
+        (cluster.remote_repo_root if cluster is not None else _LOCAL_REPOSITORY) / "checkpoints" / "evaluation-staging" / relative
     )
     prefix = _rsync_prefix(Path(files_from))
     return (
@@ -2011,15 +2041,19 @@ def build_prepared_inference_push_command(
     source_directory: str | Path,
     *,
     files_from: str | Path,
+    cluster: "ClusterSpec | None" = None,
 ) -> tuple[str, ...]:
     """Push one exact prepared artifact to the identical remote checkpoint path."""
+    if cluster is not None:
+        from src.multinode import validate_cluster_topology
+        validate_cluster_topology(cluster)
     source = Path(source_directory)
     prepared_inference_mirror_files_bytes(manifest, source)
     relative = _prepared_inference_relative_path(
         source, label="prepared inference source"
     )
     remote_parent = (
-        _LOCAL_REPOSITORY
+        (cluster.remote_repo_root if cluster is not None else _LOCAL_REPOSITORY)
         / "checkpoints"
         / "evaluation-staging"
         / relative.parent

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -47,6 +48,43 @@ def dataset_identity(dataset_path: str | os.PathLike[str]) -> dict[str, Any]:
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+
+
+def dataset_content_sha256(dataset_path: str | os.PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with Path(dataset_path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def authenticated_dataset_identity(dataset_path: str | os.PathLike[str], *,
+                                   canonical_identity_json: str | None = None,
+                                   expected_sha256: str | None = None,
+                                   num_shards: int = 1) -> dict[str, Any]:
+    """Authenticate mapped worker bytes before emitting the canonical identity.
+
+    No pair means the existing physical identity. Managed callers validate this
+    before model loading and again immediately before publishing a sidecar.
+    """
+    if (canonical_identity_json is None) != (expected_sha256 is None):
+        raise ValueError('managed dataset identity inputs must be paired')
+    actual = dataset_identity(dataset_path)
+    if canonical_identity_json is None:
+        return actual
+    if num_shards != NUM_EVALUATION_SHARDS:
+        raise ValueError('managed dataset identity requires four-shard evaluation')
+    if (not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+            or any(character not in '0123456789abcdef' for character in expected_sha256)):
+        raise ValueError('invalid expected dataset content SHA256')
+    try:
+        canonical = _validate_dataset_identity(json.loads(canonical_identity_json))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError('invalid canonical dataset identity') from error
+    if (actual['size'] != canonical['size']
+            or dataset_content_sha256(dataset_path) != expected_sha256):
+        raise ValueError('evaluation dataset content mismatch')
+    return canonical
 
 
 def resolve_evaluation_image_paths(

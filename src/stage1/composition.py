@@ -321,10 +321,14 @@ def _validate_resume_tuning(
         )
 
 
-def _validate_resume_semantics(args, metadata: Stage1PeftMetadata) -> None:
+def _validate_resume_semantics(args, metadata: Stage1PeftMetadata, *, v5_resume_artifact: Path | None = None) -> None:
     if metadata.schema_version == 3:
         raise ValueError("schema 3 Stage 1 training resume is unsupported")
-    if args.model != metadata.base_model_reference:
+    if v5_resume_artifact is not None:
+        from stage1.checkpointing import _validate_base_source
+        _validate_base_source(args.model, metadata.base_model_reference,
+                              v5_resume_artifact=v5_resume_artifact)
+    elif args.model != metadata.base_model_reference:
         raise ValueError(
             "Stage 1 PEFT base source mismatch: "
             f"metadata={metadata.base_model_reference!r}, "
@@ -508,7 +512,7 @@ def build_stage1_training_components(
         metadata = dependencies.decode_peft_metadata(metadata_snapshot)
     _validate_resume_tuning(decision, tuning, metadata) if checkpoint else None
     if metadata is not None:
-        _validate_resume_semantics(args, metadata)
+        _validate_resume_semantics(args, metadata, v5_resume_artifact=checkpoint if is_v5 else None)
 
     v5_saved = None
     if is_v5 and checkpoint is not None:
@@ -613,6 +617,7 @@ def build_stage1_training_components(
             checkpoint,
             requested_base_model_reference=args.model,
             metadata_snapshot=metadata_snapshot,
+            **({"v5_resume": True} if is_v5 else {}),
         )
         base_model = _load_stage1_model(args.model, config, args, dependencies)
         model = dependencies.load_peft_model(
@@ -622,6 +627,7 @@ def build_stage1_training_components(
             requested_base_model_reference=args.model,
             is_trainable=True,
             preflight=preflight,
+            **({"v5_resume": True} if is_v5 else {}),
         )
 
     stochastic_sites: tuple[str, ...] = ()

@@ -44,6 +44,7 @@ from stage2.peft import (
 )
 from multinode_evaluation import (
     dataset_identity,
+    authenticated_dataset_identity,
     iter_owned_samples,
     resolve_evaluation_image_paths,
     resolve_model_identity,
@@ -140,6 +141,8 @@ def get_eval_args():
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--model-identity", type=str)
+    parser.add_argument("--canonical-dataset-identity", type=str)
+    parser.add_argument("--expected-dataset-sha256", type=str)
     return parser.parse_args()
 
 
@@ -511,6 +514,12 @@ def main():
     if not dataset_path.is_file():
         raise ValueError("evaluation test data must be a file")
     dataset_root = dataset_path.parent
+    dataset_auth = dict(
+        canonical_identity_json=getattr(args, 'canonical_dataset_identity', None),
+        expected_sha256=getattr(args, 'expected_dataset_sha256', None),
+        num_shards=args.num_shards,
+    )
+    authenticated_dataset_identity(args.test_data_path, **dataset_auth)
     runtime_identity_path = getattr(args, "runtime_identity_path", None)
     if runtime_identity_path is not None:
         from step_preference.capacity_evidence import git_identity, require
@@ -728,7 +737,7 @@ def main():
         write_shard_manifest(
             shard_manifest_path(args.output_json_path),
             shard_jsonl=args.output_json_path,
-            dataset_identity=dataset_identity(args.test_data_path),
+            dataset_identity=authenticated_dataset_identity(args.test_data_path, **dataset_auth),
             model_identity=resolve_model_identity(
                 args.model_dir, args.model_identity
             ),

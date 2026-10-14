@@ -1874,7 +1874,7 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
     )
     assert build_push is not None
     assert calls[1] == build_push(
-        manifest, destination, files_from=files_path
+        manifest, destination, files_from=files_path, cluster=plan.cluster
     )
     assert calls[2] == tuple(runtime_module.build_remote_exec(
         (

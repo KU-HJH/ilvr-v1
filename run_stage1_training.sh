@@ -24,6 +24,7 @@ if (( $# )) && [[ $1 == --manifest ]]; then
     manifest_mode=true
     manifest_path=$2
     manifest_dry_run=false
+extra_worker_arguments=()
     if (( $# == 3 )); then
         manifest_dry_run=true
     fi
@@ -157,6 +158,29 @@ require_value() {
 
 while (( $# )); do
     case $1 in
+        --sim-weight) require_value "$@"; extra_worker_arguments+=(--sim_weight "$2"); shift 2 ;;
+        --stage1-variant) require_value "$@"; extra_worker_arguments+=(--stage1_variant "$2"); shift 2 ;;
+        --stage1-loss-type) require_value "$@"; extra_worker_arguments+=(--stage1_loss_type "$2"); shift 2 ;;
+        --lambda-preference) require_value "$@"; extra_worker_arguments+=(--lambda_preference "$2"); shift 2 ;;
+        --lambda-topk-entropy) require_value "$@"; extra_worker_arguments+=(--lambda_topk_entropy "$2"); shift 2 ;;
+        --lambda-entropy) require_value "$@"; extra_worker_arguments+=(--lambda_entropy "$2"); shift 2 ;;
+        --preference-topk-k) require_value "$@"; extra_worker_arguments+=(--preference_topk_k "$2"); shift 2 ;;
+        --preference-topk-mode) require_value "$@"; extra_worker_arguments+=(--preference_topk_mode "$2"); shift 2 ;;
+        --lambda-topk-mass) require_value "$@"; extra_worker_arguments+=(--lambda_topk_mass "$2"); shift 2 ;;
+        --lambda-topk-chosen-mass) require_value "$@"; extra_worker_arguments+=(--lambda_topk_chosen_mass "$2"); shift 2 ;;
+        --preference-entropy-top-percent) require_value "$@"; extra_worker_arguments+=(--preference_entropy_top_percent "$2"); shift 2 ;;
+        --stage1-v5-selection) require_value "$@"; extra_worker_arguments+=(--stage1_v5_selection "$2"); shift 2 ;;
+        --stage1-v5-text-kl-weight) require_value "$@"; extra_worker_arguments+=(--stage1_v5_text_kl_weight "$2"); shift 2 ;;
+        --loss-chunk-positions) require_value "$@"; extra_worker_arguments+=(--loss_chunk_positions "$2"); shift 2 ;;
+        --vision-attention-implementation) require_value "$@"; extra_worker_arguments+=(--vision_attention_implementation "$2"); shift 2 ;;
+        --warm-up-steps) require_value "$@"; extra_worker_arguments+=(--warm_up_steps "$2"); shift 2 ;;
+        --latent-size) require_value "$@"; extra_worker_arguments+=(--latent_size "$2"); shift 2 ;;
+        --max-seq-length-train) require_value "$@"; extra_worker_arguments+=(--max_seq_length_train "$2"); shift 2 ;;
+        --dataloader-num-workers) require_value "$@"; extra_worker_arguments+=(--dataloader_num_workers "$2"); shift 2 ;;
+        --step-preference-beta) require_value "$@"; extra_worker_arguments+=(--step_preference_beta "$2"); shift 2 ;;
+        --step-preference-margin) require_value "$@"; extra_worker_arguments+=(--step_preference_margin "$2"); shift 2 ;;
+        --topk-include-gt) extra_worker_arguments+=(--topk_include_gt); shift ;;
+        --no-topk-include-gt) extra_worker_arguments+=(--no-topk_include_gt); shift ;;
         --method) require_value "$@"; method=$2; shift 2 ;;
         --model) require_value "$@"; model=$2; shift 2 ;;
         --data-path) require_value "$@"; data_path=$2; shift 2 ;;
@@ -376,7 +400,7 @@ command=(
     --gradient_checkpointing
 )
 
-command+=(--tuning_method "$method")
+command+=(--tuning_method "$method" "${extra_worker_arguments[@]}")
 if [[ -n $ce_weight ]]; then
     command+=(--ce_weight "$ce_weight")
 fi

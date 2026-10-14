@@ -1278,6 +1278,8 @@ plan = build_launch_plan(
     zero_stage=1,
     run_id="stage2-full-zero1-production-import",
     main_process_port=29631,
+    remote_repo_root=Path.cwd(),
+    remote_host_repo_root=Path("/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/native-test"),
 )
 _finite_loss_reference(
     Path(sys.argv[1]),
@@ -1302,6 +1304,7 @@ _finite_loss_reference(
             "PATH": str(REPO_ROOT / "venv/ilvr-venv/bin"),
             "PYTHONPATH": f"{REPO_ROOT}:{REPO_ROOT / 'src'}",
             "PYTHONUNBUFFERED": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
         },
         capture_output=True,
         text=True,
@@ -1393,6 +1396,8 @@ def test_stage1_wrapper_dry_run_builds_both_nodes_without_remote_calls(tmp_path)
             "3",
             "--main-process-port",
             "29631",
+            "--remote-repo-root", str(REPO_ROOT),
+            "--remote-host-repo-root", "/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/native-test",
             "--dry-run",
             "--method",
             "lora",
