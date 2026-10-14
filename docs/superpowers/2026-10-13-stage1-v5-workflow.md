@@ -330,3 +330,27 @@ writing-plans, obtain the plan review, and execute using the already-selected
 Subagent method. Existing authorization for fresh Stage1 training and automatic
 TEST400 evaluation persists; do not ask for it again. No real training/evaluation
 or new product integration has been launched or claimed complete.
+
+## 2026-10-14: user authorizes the presented commitment and reiterates training
+
+Understood as: the user wants the already specified Stage1-v5 work carried
+through implementation, two-node training and automatic evaluation, without
+re-asking for training scope or execution method. The reply “학습까지
+진행하라니까” directly follows the linked final commitment v1 approval question;
+it approves that presented design. Bound artifact is commit `a4519cd`, spec
+SHA256 `e3d2515ccc7b1a0de0e82de2e4b957abebbcf220b022c1baff06521fd5c45762`.
+No coefficient/reference/mask/scope change was requested. Subagent-driven method
+and prior training/automatic-evaluation authorization persist.
+
+Root reconciled the clean worktree, prior experimental reviews and hashes;
+no completed probe/task was re-dispatched. Brainstorming's written-spec gate is
+now satisfied and its sole architectural transition, writing-plans, is active.
+Root wrote `plans/2026-10-14-stage1-v5.md`: seven independently testable
+implementation tasks, final review/verification, then root-operated preflight,
+four-rank runtime witness, fresh training and automatic TEST400 evaluation.
+Pinned Stage1-v3 HEAD/source hashes were rechecked and still match the design.
+The plan self-review checked spec coverage, exact public interfaces, existing
+Trainer GAS scaling, current EMA filename and producer/consumer consistency.
+The plan is a new artifact; no human plan review has been invented or inferred
+from an approval preceding its creation. Actual handoff outcome will be recorded
+below. Product implementation has not yet started.
