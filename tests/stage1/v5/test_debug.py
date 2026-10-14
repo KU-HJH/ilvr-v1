@@ -256,3 +256,72 @@ def test_native_compatibility_optimizer_step_gates_diagnostics_and_retains_updat
     else:
         trainer.optimizer_step()
         assert trainer._successful_optimizer_steps==1 and not torch.equal(parameter,before)
+
+
+def _agreement_trainers(tmp_path, modes, *, saved=None):
+    """Use real startup agreement packets; only the gather/parent boundary is simulated."""
+    from copy import deepcopy
+    from types import SimpleNamespace
+    from tests.stage1.v5.test_resume import contract
+    from stage1.v5_config import Stage1V5Config
+    trainers=[]
+    packets=[]
+    for mode in modes:
+        trainer=api().__new__(api())
+        trainer.stage1_v5_debug=mode
+        trainer.v5_saved_contract=deepcopy(saved)
+        current=contract()
+        current['execution']['stage1_v5_debug']=mode
+        trainer.v5_config=Stage1V5Config(**current['config'])
+        trainer.ce_weight=trainer.sim_weight=.1
+        trainer.args=SimpleNamespace(output_dir=str(tmp_path))
+        trainer.get_train_dataloader=lambda:None
+        trainer._build_v5_runtime_contract=lambda _loader,current=current:deepcopy(current)
+        def capture(value):
+            packets.append(value.clone())
+            return value.repeat(4)
+        trainer.accelerator=SimpleNamespace(device=torch.device('cpu'),num_processes=4,gather=capture)
+        trainer._agree_v5_contract(current)
+        trainers.append(trainer)
+    gathered=torch.cat(packets)
+    for trainer in trainers:
+        trainer.accelerator.gather=lambda _value:gathered
+    return trainers
+
+
+@pytest.mark.parametrize('saved_mode',[None,False,True])
+def test_current_mixed_debug_modes_reject_before_publication_or_parent_training(tmp_path,monkeypatch,saved_mode):
+    from tests.stage1.v5.test_resume import contract
+    from stage1.trainer import CustomTrainerStage1
+    saved=contract() if saved_mode is not None else None
+    if saved is not None: saved['execution']['stage1_v5_debug']=saved_mode
+    trainers=_agreement_trainers(tmp_path,(False,False,True,True),saved=saved)
+    side_effects=[]
+    monkeypatch.setattr(CustomTrainerStage1,'train',lambda *a,**kw:side_effects.append('parent/helper'))
+    for trainer in trainers:
+        trainer._publish_v5_files=lambda _path:side_effects.append('publication')
+        with pytest.raises(ValueError,match='agreement'):
+            trainer.train()
+        assert trainer._v5_contract_ready is False
+    assert side_effects==[]
+
+
+@pytest.mark.parametrize('current_mode',[False,True])
+def test_uniform_current_debug_switch_from_saved_mode_passes_actual_resume_startup(tmp_path,monkeypatch,current_mode):
+    from tests.stage1.v5.test_resume import contract
+    from stage1.trainer import CustomTrainerStage1
+    saved=contract(); saved['execution']['stage1_v5_debug']=not current_mode
+    (tmp_path/'stage1_v5.json').write_text(json.dumps(saved))
+    trainers=_agreement_trainers(tmp_path,(current_mode,)*4,saved=saved)
+    side_effects=[]
+    def parent(self,**kwargs):
+        assert self._v5_contract_ready is True
+        assert self._v5_contract['execution']['stage1_v5_debug'] is current_mode
+        assert kwargs['resume_from_checkpoint']==str(tmp_path)
+        side_effects.append('parent')
+        return 'accepted-uniform-new-mode'
+    monkeypatch.setattr(CustomTrainerStage1,'train',parent)
+    for trainer in trainers:
+        trainer._publish_v5_files=lambda _path:side_effects.append('publication')
+        assert trainer.train(resume_from_checkpoint=str(tmp_path))=='accepted-uniform-new-mode'
+    assert side_effects==['publication','parent']*4

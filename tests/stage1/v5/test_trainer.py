@@ -352,7 +352,7 @@ def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,m
         mapped['execution']['model']=mapped['reference']['base_content_sha256']
         mapped['execution']['deepspeed_profile']['config_path']=mapped['execution']['deepspeed_profile']['config_digest']
         return torch.tensor(list(hashlib.sha256(json.dumps(mapped,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).digest()),dtype=torch.uint8)
-    ranks=torch.cat([torch.cat((independent_digest(c),torch.zeros(32,dtype=torch.uint8))) for c in contracts])
+    ranks=torch.cat([torch.cat((independent_digest(c),torch.zeros(33,dtype=torch.uint8))) for c in contracts])
     calls=[]
     monkeypatch.setattr(CustomTrainerStage1,'train',lambda *a,**kw:calls.append('parent/helper'))
     for rank,local in enumerate(contracts):
@@ -379,7 +379,7 @@ def test_effective_contract_allows_only_content_equal_node_local_paths(tmp_path,
     mapped=contract()
     mapped['execution'].update(model=mapped['reference']['base_content_sha256'],
         deepspeed_profile={'config_path':'d'*64,'config_digest':'d'*64})
-    expected=torch.tensor(list(hashlib.sha256(json.dumps(mapped,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).digest())+[0]*32,dtype=torch.uint8)
+    expected=torch.tensor(list(hashlib.sha256(json.dumps(mapped,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).digest())+[0]*33,dtype=torch.uint8)
     calls=[]
     monkeypatch.setattr(CustomTrainerStage1,'train',lambda *a,**kw:calls.append('parent'))
     for rank in range(4):

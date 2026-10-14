@@ -289,6 +289,9 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         # different resume identity while the other ranks enter publication.
         local_bytes = digest(contract) + (digest(self.v5_saved_contract)
                                           if self.v5_saved_contract is not None else bytes(32))
+        # Debug norm collection issues collectives: CURRENT ranks must agree,
+        # while saved instrumentation stays neutral for resume compatibility.
+        local_bytes += bytes((int(getattr(self, 'stage1_v5_debug', False)),))
         local = torch.tensor(list(local_bytes),dtype=torch.uint8,device=self.accelerator.device)
         gathered = self.accelerator.gather(local).reshape(-1,local.numel())
         if (gathered.shape[0] != self.accelerator.num_processes
