@@ -24,7 +24,6 @@ if (( $# )) && [[ $1 == --manifest ]]; then
     manifest_mode=true
     manifest_path=$2
     manifest_dry_run=false
-extra_worker_arguments=()
     if (( $# == 3 )); then
         manifest_dry_run=true
     fi
@@ -69,6 +68,8 @@ benchmark_run_config=${STAGE1_BENCHMARK_RUN_CONFIG:-}
 benchmark_evidence_path=${STAGE1_BENCHMARK_EVIDENCE_PATH:-}
 benchmark_smoke_resume_witness=${STAGE1_BENCHMARK_SMOKE_RESUME_WITNESS:-}
 training_evidence_path=
+extra_worker_arguments=()
+declare -A requested_options=()
 dry_run=false
 final_save=true
 legacy_use_lora=false
@@ -156,7 +157,18 @@ require_value() {
     fi
 }
 
+# Keep environment knobs as explicit requests; unset/empty values are fallbacks.
+for binding in STAGE1_MICRO_BATCH:--micro-batch STAGE1_EPOCHS:--epochs STAGE1_LEARNING_RATE:--learning-rate \
+    STAGE1_CE_WEIGHT:--ce-weight CE_WEIGHT:--ce-weight STAGE1_GRADIENT_ACCUMULATION:--gradient-accumulation \
+    STAGE1_EMA_TAU:--ema-tau STAGE1_SEED:--seed STAGE1_ATTENTION_IMPLEMENTATION:--attention-implementation \
+    STAGE1_SAVE_STRATEGY:--save-strategy STAGE1_SAVE_STEPS:--save-steps STAGE1_TEXTUAL_STATES:--textual_states \
+    STAGE1_MAX_STEPS:--max-steps; do
+    env_name=${binding%%:*}
+    if [[ -v $env_name && -n ${!env_name} ]]; then requested_options[${binding#*:}]=1; fi
+done
+
 while (( $# )); do
+    requested_options[$1]=1
     case $1 in
         --sim-weight) require_value "$@"; extra_worker_arguments+=(--sim_weight "$2"); shift 2 ;;
         --stage1-variant) require_value "$@"; extra_worker_arguments+=(--stage1_variant "$2"); shift 2 ;;
@@ -214,6 +226,9 @@ while (( $# )); do
         *) printf 'error: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+v5_resume=false
+if [[ -n $resume_path && -f $resume_path/stage1_v5.json ]]; then v5_resume=true; fi
 
 for required in method model data_path image_root output_dir; do
     value=${!required}
@@ -386,26 +401,33 @@ command=(
     --image_root "$image_root"
     --save_model_path "$output_dir"
     --log_file "$log_file"
-    --per_device_train_batch_size "$micro_batch"
-    --epochs "$epochs"
-    --learning_rate "$learning_rate"
-    --gradient_accumulation_steps "$gradient_accumulation"
-    --ema_tau "$ema_tau"
-    --seed "$seed"
     --deepspeed_config "$deepspeed_config"
-    --attention_implementation "$attention_implementation"
-    --save_strategy "$save_strategy"
-    --save_steps "$save_steps"
-    --textual_states "$textual_states"
-    --gradient_checkpointing
 )
+
+append_execution_option() {
+    local shell_option=$1 worker_option=$2 value=$3
+    if [[ $v5_resume != true || -v requested_options[$shell_option] ]]; then
+        command+=("$worker_option" "$value")
+    fi
+}
+append_execution_option --micro-batch --per_device_train_batch_size "$micro_batch"
+append_execution_option --epochs --epochs "$epochs"
+append_execution_option --learning-rate --learning_rate "$learning_rate"
+append_execution_option --gradient-accumulation --gradient_accumulation_steps "$gradient_accumulation"
+append_execution_option --ema-tau --ema_tau "$ema_tau"
+append_execution_option --seed --seed "$seed"
+append_execution_option --attention-implementation --attention_implementation "$attention_implementation"
+append_execution_option --save-strategy --save_strategy "$save_strategy"
+append_execution_option --save-steps --save_steps "$save_steps"
+append_execution_option --textual_states --textual_states "$textual_states"
+if [[ $v5_resume != true ]]; then command+=(--gradient_checkpointing); fi
 
 command+=(--tuning_method "$method" "${extra_worker_arguments[@]}")
 if [[ -n $ce_weight ]]; then
-    command+=(--ce_weight "$ce_weight")
+    append_execution_option --ce-weight --ce_weight "$ce_weight"
 fi
 
-if [[ $method == lora || $method == dora ]]; then
+if [[ $v5_resume != true && ( $method == lora || $method == dora ) ]]; then
     command+=(
         --lora_r 32
         --lora_alpha 64
@@ -418,7 +440,7 @@ if [[ -n $resume_path ]]; then
     command+=(--resume_from_checkpoint_path "$resume_path")
 fi
 if [[ -n $max_steps ]]; then
-    command+=(--max_steps "$max_steps")
+    append_execution_option --max-steps --max_steps "$max_steps"
 fi
 if [[ -n $benchmark_run_config || -n $benchmark_evidence_path ]]; then
     if [[ -z $benchmark_run_config || -z $benchmark_evidence_path || -z $source_data_path ]]; then

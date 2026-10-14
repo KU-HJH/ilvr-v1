@@ -2059,6 +2059,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             commit=commit,
             log_root=log_root,
         )
+        saved_stage1_resume = None
         if resume_requested:
             resume_source = (
                 Path(_argument_value(forwarded, "--resume"))
@@ -2082,6 +2083,11 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 requested_identity=resume_identity,
                 destination=redistributed,
             )
+            if stage == 'stage1' and (redistributed / 'stage1_v5.json').exists():
+                # Capture the strict contract after authenticated redistribution,
+                # before Trainer can rotate away its source checkpoint.
+                from stage1.v5_resume import load_v5_contract
+                saved_stage1_resume = load_v5_contract(redistributed)
         # Stage 2 measures the full dataset before opening the rendezvous port.
         start_rank0_then_rank1(
             plan, runner, commands=commands,
@@ -2110,7 +2116,21 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             from src.stage1.training_evidence import decode_stage1_training_evidence
 
             raw_evidence = runner.read_stage1_training_evidence(evidence_path)
+            saved_execution, saved_schedule = {}, {}
+            if saved_stage1_resume is not None:
+                saved_execution = saved_stage1_resume['execution']
+                saved_schedule = saved_stage1_resume['schedule']
+            producer_values = {}
+            for flag, key, fallback in (
+                ('--micro-batch', 'per_device_train_batch_size', '1'),
+                ('--gradient-accumulation', 'gradient_accumulation_steps', '2'),
+                ('--ema-tau', 'ema_tau', '1.0'), ('--seed', 'seed', '42'),
+            ):
+                supplied = _argument_value(forwarded, flag)
+                producer_values[key] = supplied if supplied is not None else saved_execution.get(key, fallback)
             step_value = _argument_value(forwarded, "--max-steps")
+            if step_value is None and 'configured_max_steps' in saved_schedule:
+                step_value = str(saved_schedule['configured_max_steps'])
             if step_value is None:
                 evidence_payload = json.loads(raw_evidence)
                 evidence_step = (
@@ -2142,16 +2162,10 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 expected_producer_checkpoint=(
                     plan.cluster.remote_repo_root / "checkpoints" / plan.run_id / f"checkpoint-{final_step}"
                 ),
-                expected_micro_batch=int(
-                    _argument_value(forwarded, "--micro-batch") or "1"
-                ),
-                expected_gradient_accumulation_steps=int(
-                    _argument_value(forwarded, "--gradient-accumulation") or "2"
-                ),
-                expected_ema_tau=float(
-                    _argument_value(forwarded, "--ema-tau") or "1.0"
-                ),
-                expected_seed=int(_argument_value(forwarded, "--seed") or "42"),
+                expected_micro_batch=int(producer_values['per_device_train_batch_size']),
+                expected_gradient_accumulation_steps=int(producer_values['gradient_accumulation_steps']),
+                expected_ema_tau=float(producer_values['ema_tau']),
+                expected_seed=int(producer_values['seed']),
             )
             publish_small_file(
                 evidence_path,
@@ -2197,7 +2211,8 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             if not required_v5 <= {entry.relative_path for entry in retained}:
                 raise ValueError('Stage1-v5 local final checkpoint lacks saved reference state')
         if stage == "stage1":
-            batch_value = _argument_value(forwarded, "--micro-batch") or "1"
+            batch_value = (producer_values['per_device_train_batch_size'] if ordinary_stage1
+                           else _argument_value(forwarded, "--micro-batch") or "1")
             batch_per_gpu = int(batch_value)
         else:
             batch_per_gpu = 1

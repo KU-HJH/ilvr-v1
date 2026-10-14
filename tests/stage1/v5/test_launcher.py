@@ -169,3 +169,58 @@ def test_actual_first_worker_start_records_bound_dataset_digest_before_launch(tm
     assert value=={'canonical_identity':{'path':str(data),'size':stat.st_size,'mtime_ns':stat.st_mtime_ns},
         'content_sha256':hashlib.sha256(data.read_bytes()).hexdigest()}
     assert record.read_bytes()==before
+
+
+def test_public_resume_shell_preserves_omissions_on_both_mapped_nodes(tmp_path,monkeypatch):
+    import pytest
+    import shutil
+    from src import multinode
+    from src.multinode_runtime import build_owned_tmux_commands
+    from stage1.v5_config import Stage1V5Config
+    from stage1.v5_reference import V5ReferenceIdentity
+    from stage1.v5_resume import build_v5_contract
+    from utils_deepseed import parse_args
+    local,remote=tmp_path/'local',tmp_path/'remote'
+    (local/'configs').mkdir(parents=True)
+    shutil.copy2(ROOT/'configs/deepspeed_zero1.json',local/'configs/deepspeed_zero1.json')
+    monkeypatch.setattr(multinode,'_REPOSITORY_ROOT',local)
+    saved=build_v5_contract(Stage1V5Config(lambda_topk_entropy=.1,preference_topk_k=50),
+        V5ReferenceIdentity(1,'a'*64,'b'*64,'c'*64,('weight',)),ce_weight=.1,sim_weight=.1,
+        schedule={'configured_max_steps':3,'num_train_epochs':2.},execution={
+            'per_device_train_batch_size':1,'gradient_accumulation_steps':4,'learning_rate':3e-5,
+            'ema_tau':1.,'seed':77,'attention_implementation':'sdpa','vision_attention_implementation':'flash_attention_2',
+            'gradient_checkpointing':True,'textual_states':'all','lora_r':32,'lora_alpha':64,
+            'lora_dropout':.05,'lora_target_modules':'q_proj','latent_size':8,'warmup_steps':10})
+    for root in (local,remote):
+        cp=root/'checkpoints/v5-resume-command/checkpoint-1'; cp.mkdir(parents=True)
+        (cp/'stage1_v5.json').write_text(json.dumps(saved))
+    plan=multinode.build_launch_plan(stage='stage1',tuning_method='dora',zero_stage=1,
+        run_id='v5-resume-command',main_process_port=29683,attempt_id='resume',
+        remote_repo_root=remote,remote_host_repo_root=Path('/host/v5'))
+    base=['--method','dora','--model','/original/base','--data-path',str(local/'data/TRAIN.jsonl'),
+        '--image-root',str(local/'data/images'),'--resume',str(local/'checkpoints/v5-resume-command/checkpoint-1')]
+    for extra,overrides in (([],{}),(['--gradient-accumulation','2'],{}),(['--attention-implementation','eager'],{}),
+        ([],{'STAGE1_SEED':'123'}),([],{ 'STAGE1_GRADIENT_ACCUMULATION':'2'})):
+        commands=build_owned_tmux_commands(plan,commit='a'*40,stage_arguments=base+extra,
+            checkpoint_root=local/'checkpoints',log_root=local/'logs/multinode',
+            stage_log_root=local/'logs/zero-stage-compatibility',result_root=local/'results')
+        for node,root in zip(commands.node_specs,(remote,local)):
+            stage=node.command[node.command.index('--')+1:]
+            completed=subprocess.run(['bash',str(ROOT/'run_stage1_training.sh'),*stage[2:],'--dry-run'],
+                env={**{k:v for k,v in os.environ.items() if not k.startswith('STAGE1_') and k!='CE_WEIGHT'},
+                     **dict(node.environment),'PYTHONDONTWRITEBYTECODE':'1',**overrides},text=True,capture_output=True)
+            assert completed.returncode==0,completed.stderr
+            worker=shlex.split(completed.stdout); argv=worker[worker.index('src/main.py')+1:]
+            assert argv[argv.index('--resume_from_checkpoint_path')+1]==str(root/'checkpoints/v5-resume-command/checkpoint-1')
+            if extra or overrides:
+                with pytest.raises(ValueError,match='conflicts with saved v5 contract'): parse_args(argv)
+                continue
+            args=parse_args(argv)
+            assert args.stage1_variant=='v5' and args.ce_weight==args.sim_weight==.1
+            expected={'per_device_train_batch_size':1,'gradient_accumulation_steps':4,'learning_rate':3e-5,
+                'ema_tau':1.,'seed':77,'attention_implementation':'sdpa','vision_attention_implementation':'flash_attention_2',
+                'gradient_checkpointing':True,'textual_states':'all','lora_r':32,'lora_alpha':64,
+                'lora_dropout':.05,'latent_size':8,'warm_up_steps':10,'max_steps':3,'epochs':2.}
+            for name,value in expected.items(): assert getattr(args,name)==value
+            from stage1.types import resolve_stage1_tuning_config
+            assert resolve_stage1_tuning_config(args).target_suffixes==('q_proj',)

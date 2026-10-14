@@ -272,7 +272,7 @@ def test_actual_stage1_worker_checks_content_before_inference_and_before_publica
         assert events==['load','infer']
         assert json.loads(manifest.read_text())['dataset_identity']==canonical
 
-@pytest.mark.parametrize('variant',['v5','standard','v5-missing'])
+@pytest.mark.parametrize('variant',['v5','standard','v5-missing','v5-resume','v5-resume-rotated'])
 def test_actual_coordinator_collects_then_retains_v5_on_both_nodes_before_success(tmp_path,monkeypatch,variant):
     import json
     import shutil
@@ -300,7 +300,7 @@ def test_actual_coordinator_collects_then_retains_v5_on_both_nodes_before_succes
         'stage1_peft_metadata.json','adapter_config.json','adapter_model.safetensors','ilvr_token_rows.safetensors',
         'config.json','preprocessor_config.json','tokenizer_config.json','tokenizer.json']:
         (right/name).write_bytes(b'fixture')
-    if variant=='v5':
+    if variant=='v5' or variant.startswith('v5-resume'):
         (right/'stage1_v5.json').write_bytes(b'saved contract')
         (right/'stage1_v5_reference.pt').write_bytes(b'immutable initial reference')
     class BoundaryRunner:
@@ -326,14 +326,32 @@ def test_actual_coordinator_collects_then_retains_v5_on_both_nodes_before_succes
             events.append('redistribute')
         def read_stage1_training_evidence(self,path):
             return json.dumps(build_stage1_training_evidence(run_id=run,method='dora',zero_stage=1,world_size=4,
-                micro_batch=1,gradient_accumulation_steps=4,ema_tau=1.,seed=42,global_step=2,checkpoint_path=right,loss=.2)).encode()
+                micro_batch=1,gradient_accumulation_steps=4,ema_tau=1.,seed=77 if variant.startswith('v5-resume') else 42,global_step=2,checkpoint_path=right,loss=.2)).encode()
     runner=BoundaryRunner()
+    if variant.startswith('v5-resume'):
+        from stage1.v5_resume import build_v5_contract
+        from stage1.v5_config import Stage1V5Config
+        from stage1.v5_reference import V5ReferenceIdentity
+        resume=left.parent/'checkpoint-1'; resume.mkdir()
+        contract=build_v5_contract(Stage1V5Config(lambda_topk_entropy=.1,preference_topk_k=50),
+            V5ReferenceIdentity(1,'a'*64,'b'*64,'c'*64,('weight',)),ce_weight=.1,sim_weight=.1,
+            schedule={'configured_max_steps':2,'num_train_epochs':1},execution={
+                'per_device_train_batch_size':1,'gradient_accumulation_steps':4,'ema_tau':1.,'seed':77,
+                'attention_implementation':'sdpa'})
+        (resume/'stage1_v5.json').write_text(json.dumps(contract))
+        # Existing redistribution is independently exercised above. This case
+        # isolates post-training validation of the already-available contract.
+        monkeypatch.setattr(coordinator,'validate_resume_path',lambda _run,path:Path(path))
+        monkeypatch.setattr(coordinator,'redistribute_resume_checkpoint',lambda *_a,**_k:())
     monkeypatch.setattr(coordinator,'SubprocessCoordinatorRunner',lambda *_a,**_k:runner)
     builder=runtime.build_owned_tmux_commands
     monkeypatch.setattr(coordinator,'build_owned_tmux_commands',lambda plan,**kwargs:builder(plan,
         checkpoint_root=local/'checkpoints',log_root=local/'logs/multinode',stage_log_root=local/'logs/zero-stage-compatibility',**kwargs))
     monkeypatch.setattr(coordinator,'start_rank0_then_rank1',lambda *_a,**_k:events.append('train'))
-    monkeypatch.setattr(coordinator,'monitor_owned_jobs',lambda *_a,**_k:{0:0,1:0})
+    def completed(*_a,**_k):
+        if variant=='v5-resume-rotated': shutil.rmtree(resume)
+        return {0:0,1:0}
+    monkeypatch.setattr(coordinator,'monitor_owned_jobs',completed)
     def success(*_a,**_k):
         if variant=='v5':
             for filename in ['stage1_v5.json','stage1_v5_reference.pt']:
@@ -349,5 +367,10 @@ def test_actual_coordinator_collects_then_retains_v5_on_both_nodes_before_succes
         with pytest.raises(SystemExit): coordinator._training_main('stage1',argv)
         assert events==['train','collect']
         return
+    if variant.startswith('v5-resume'):
+        argv[argv.index('--stage1-variant')+1]='v5'
+        i=argv.index('--gradient-accumulation'); del argv[i:i+2]
+        i=argv.index('--max-steps'); del argv[i:i+2]
+        argv += ['--attempt-id','resume','--resume',str(resume)]
     assert coordinator._training_main('stage1',argv)==0
     assert events==(['train','collect','redistribute','success'] if variant=='v5' else ['train','collect','success'])
