@@ -516,3 +516,39 @@ visual=...)` inside graph(F) with capture around ordinary F; packed helper binds
 internally inside graph(packed). Keep owner active through parent backward,
 exit observation hooks beforehand. Full task/fix reports and reviews remain
 in plan-specific SDD workspace for final handoff.
+
+## Product Task4 implementation and review fix
+
+Implementer `/root/v5_task4_impl` (gpt-6.1-sol/high) implemented reference/resume
+helpers at`69659f4`, task base`f2720ce`. Fresh original-base DoRA topology,
+processor/base/selected-state identity, immutable small reference artifact and
+saved objective contract are covered by256focused tests including existing
+EMA/checkpoint lifecycle. Command: repository Python with PYTHONDONTWRITEBYTECODE=1,
+CUDA_VISIBLE_DEVICES='', PYTHONPATH=src:transformers/src, pytest -q on
+`tests/stage1/v5/test_reference.py tests/stage1/v5/test_resume.py
+ tests/stage1/test_ema.py tests/stage1/test_checkpointing.py`; exit0,
+256passed/15.13s. RED/malformed-base/tied-base/actual-forward evidence is preserved
+in `logs/stage1-v5-task4/` and plan-specific task-4-report.md. CPU/tiny scope
+only; Trainer sequencing/publication, both-node artifacts and production remain
+later gates. No original-base weights copied into each reference artifact.
+
+Independent `/root/v5_task4_review` (gpt-6.1-sol/high, fresh/distinct) found
+Important R1: live DoRA scaling changes actual output while the declared
+config/tensor identity stays equal. Its focused CPU set_scale2->4 witness
+observed max output difference0.006716012954711914 and equal recapture identity.
+Root inspected helper path, accepted this actual counterexample, and sent fix
+round1 to original implementer. At`4e523d7` supported native PEFT execution state
+is validated on student/reference before capture/restore: active default adapter,
+DoRA dispatch and alpha/r scaling. No new runtime-scaling feature or format.
+RED8expected rejection failures; final same environment pytest -q on the two
+v5reference/resume files:44passed/10.92s, exit0/no warnings. An initial guard
+name collision with native Transformers active_adapters() was diagnosed and
+restricted to actual PEFT dispatch owners; failed log retained.
+Scoped independent review is pending; no Task4 approval is claimed yet.
+
+Task4 scoped independent re-review at`4e523d7` now approves specification and
+quality: R1 addressed, no new Critical/Important findings or deferred items.
+Task4 complete; initial implementation review remains historically needs-fixes.
+The full report, exact witness and scoped re-review are in the existing
+plan-specific SDD workspace. Task5 carries sequencing/rank publication and
+complete runtime metadata responsibilities; these are not verified by Task4.
