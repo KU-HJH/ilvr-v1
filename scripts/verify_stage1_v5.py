@@ -13,6 +13,10 @@ from pathlib import Path
 import subprocess
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+GEOMETRY_DIMENSIONS = ('branch_count','prefix_length','suffix_length','selected_queries','clean_length',
+    'padded_suffix_tokens','dense_bias_elements','replicated_prefix_tokens')
+VISUAL_SHAPE_FIELDS = ('original_image_grid_thw','helper_image_grid_thw',
+    'original_pixel_shape','helper_pixel_shape')
 
 
 def packed_geometry(metadata, *, source_index, source_id):
@@ -27,15 +31,44 @@ def packed_geometry(metadata, *, source_index, source_id):
         prefix_source_item=prefix.source_item_index if prefix else None,
         suffix_source_item=suffix.source_item_index if suffix else None,
         selected_queries=2*len(metadata.query_keys), projection_chunk_positions=128,
-        dense_bias_elements=branches*s*(p+s),replicated_prefix_tokens=branches*p)
+        dense_bias_elements=branches*s*(p+s),replicated_prefix_tokens=branches*p,
+        padded_suffix_tokens=branches*s)
+
+
+def collated_geometry(batch):
+    """Read the actual microbatch1 inputs before the helper consumes its tensors."""
+    try:
+        sample,=batch['stage1_batch_metadata'].samples
+        ids=batch['input_ids']
+        if len(ids.shape)!=2 or ids.shape[0]!=1:
+            raise ValueError('admission geometry requires collated microbatch1')
+        return dict(packed_geometry(batch['stage1_v5_metadata'],
+            source_index=sample.source_index,source_id=sample.source_id),clean_length=ids.shape[1],
+            original_image_grid_thw=batch['image_grid_thw'].detach().cpu().tolist(),
+            helper_image_grid_thw=batch['image_grid_thw_latent'].detach().cpu().tolist(),
+            original_pixel_shape=list(batch['pixel_values'].shape),
+            helper_pixel_shape=list(batch['pixel_values_latent'].shape))
+    except KeyError as error:
+        raise ValueError(f'missing collated admission geometry: {error.args[0]}') from error
+
+
+def _geometry_comparison(row):
+    try:
+        return tuple(row[k] for k in GEOMETRY_DIMENSIONS),tuple(row[k] for k in VISUAL_SHAPE_FIELDS)
+    except KeyError as error:
+        raise ValueError(f'missing whole-step admission geometry: {error.args[0]}') from error
 
 
 def maximum_geometries(rows):
-    """Keep actual non-dominated memory geometries, never construct a fictitious row."""
-    dimensions=('dense_bias_elements','replicated_prefix_tokens','selected_queries')
-    return [row for row in rows if not any(
-        all(other[k]>=row[k] for k in dimensions) and any(other[k]>row[k] for k in dimensions)
-        for other in rows)]
+    """Keep all non-dominated actual rows in source order, including equal rows.
+
+    Compare raw B/P/S/Q/L and derived allocations only for identical original
+    and helper visual shapes. This is no allocator or FA2 workspace bound.
+    """
+    comparisons=[_geometry_comparison(row) for row in rows]
+    return [row for row,(extents,visual) in zip(rows,comparisons) if not any(
+        other_visual==visual and all(a>=b for a,b in zip(other,extents))
+        and any(a>b for a,b in zip(other,extents)) for other,other_visual in comparisons)]
 
 
 def audit_prepared_loader(dataset, *, output_dir):
@@ -101,8 +134,7 @@ def audit(args):
         batch=collator([example])
         if batch['input_ids'].shape[1]>32768:
             raise ValueError(f'source {example.source_index} exceeds approved 32768 sequence capacity')
-        rows.append(dict(packed_geometry(batch['stage1_v5_metadata'],source_index=example.source_index,
-            source_id=example.source_id),clean_length=batch['input_ids'].shape[1]))
+        rows.append(collated_geometry(batch))
     report=audit_prepared_loader(examples,output_dir=REPOSITORY/'checkpoints'/args.run_id/'audit-metadata')
     from importlib.metadata import version
     from stage1.v5_reference import _base_identity, _processor_identity
@@ -222,6 +254,7 @@ def observe_original_loader(trainer, loader, contract):
 
 
 def validate_rank_records(records, *, run_id, expected_geometry, audited):
+    for row in expected_geometry: _geometry_comparison(row)
     if len(records)!=4 or {r['rank'] for r in records}!={0,1,2,3}: raise ValueError('missing/corrupt global ranks')
     contracts=set()
     for r in records:
@@ -260,7 +293,7 @@ def validate_rank_records(records, *, run_id, expected_geometry, audited):
                 raise ValueError('engine continuation lost sources/tail update')
             if c['learning_rates']!=[tiny_learning_rate(i) for i in range(s,3)]:
                 raise ValueError('continuation learning rate mismatch')
-        if any(r['hooks'].get(k,0)<=0 for k in ('helper','F','reference','packed','backward')):
+        if any(r['hooks'].get(k,0)<=0 for k in ('helper','F','backward')):
             raise ValueError('missing real model/backward entries')
         p=r['production']
         expected_windows=[dict(step=i,source_index=g['source_index'],microbatches=[g['source_index']]*4)
@@ -270,9 +303,12 @@ def validate_rank_records(records, *, run_id, expected_geometry, audited):
                 or p['gradient_norm_steps']!=list(range(len(expected_geometry)))
                 or p['optimizer_steps']!=[dict(step=i,successful=True) for i in range(len(expected_geometry))]):
             raise ValueError('incomplete or uneven source/window/norm coverage')
+        eligible_microbatches=4*sum(g['selected_queries']>0 for g in expected_geometry)
+        expected_hooks=dict(helper=p['microbatches'],F=p['microbatches'],backward=p['microbatches'],
+            reference=eligible_microbatches,packed=eligible_microbatches)
         if p['microbatches']!=4*p['global_step'] or any(
-                r['hooks'][key]!=p['microbatches'] for key in ('helper','F','reference','packed','backward')):
-            raise ValueError('incorrect original four-call/one-backward counts')
+                r['hooks'].get(key,0)!=count for key,count in expected_hooks.items()):
+            raise ValueError('incorrect conditional model/one-backward counts')
         if p['global_step']<1 or p['finite_loss'] is not True or not 0<p['peak_allocated']<=p['peak_reserved']:
             raise ValueError('production profile failed')
         if not p['gradient_norms'] or any(not math.isfinite(g) or g<=0 for g in p['gradient_norms']):
@@ -430,7 +466,7 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
                 scope='CPU actual parent loop' if use_cpu else 'four-rank actual Trainer/ZeRO1')
 
 
-def observe_production_trainer(trainer):
+def observe_production_trainer(trainer, *, expected_geometry=None):
     from peft_common import resolve_qwen2_5_vl_model
     hooks=Counter(); observed=set(); observed_geometry={}; gradient_norms=[]; gradient_norm_steps=[]; source_windows=[]; optimizer_steps=[]
     original_finish=trainer._finish_optimizer_step
@@ -455,15 +491,19 @@ def observe_production_trainer(trainer):
     handles=[student.model.register_forward_pre_hook(lambda m,a,kw:hooks.update(['packed' if 'stage2_prefix_key_values' in kw else 'F']),with_kwargs=True),
         reference.model.register_forward_pre_hook(lambda *_:hooks.update(['helper' if helper[0] else 'reference']))]
     original_step=trainer.training_step
+    expected_by_source=({g['source_index']:g for g in selected_admission_geometry(
+        dict(max_packed_geometry=expected_geometry))} if expected_geometry is not None else None)
     def step(model,inputs,*a,**kw):
         sample=inputs['stage1_batch_metadata'].samples[0]
+        geometry=collated_geometry(inputs)
+        if expected_by_source is not None and geometry!=expected_by_source.get(sample.source_index):
+            raise ValueError('live collated admission geometry differs from audit')
         observed.add(sample.source_index)
         step_index=trainer.state.global_step
         if not source_windows or source_windows[-1]['step']!=step_index:
             source_windows.append(dict(step=step_index,source_index=sample.source_index,microbatches=[]))
         source_windows[-1]['microbatches'].append(sample.source_index)
-        observed_geometry[sample.source_index]=dict(packed_geometry(inputs['stage1_v5_metadata'],
-            source_index=sample.source_index,source_id=sample.source_id),clean_length=sample.unpadded_length)
+        observed_geometry[sample.source_index]=geometry
         return original_step(model,inputs,*a,**kw)
     trainer.training_step=step
     original_backward=trainer.accelerator.backward
@@ -488,7 +528,6 @@ def production_witness(args, audited):
     from transformers.integrations.deepspeed import unset_hf_deepspeed_config
     unset_hf_deepspeed_config()
     geometry=selected_admission_geometry(audited)
-    if any(not g['selected_queries'] for g in geometry): raise ValueError('no eligible capacity source')
     path=REPOSITORY/'checkpoints'/args.run_id/'production'
     cli=['--stage','stage1','--model',str(args.model),'--data_path',str(args.data_path),
         '--image_root',str(args.image_root),'--save_model_path',str(path),
@@ -527,7 +566,7 @@ def production_witness(args, audited):
     from torch.utils.data import SequentialSampler
     trainer._get_train_sampler=lambda:SequentialSampler(trainer.train_dataset)
     trainer.args.max_steps=len(geometry)
-    observation=observe_production_trainer(trainer)
+    observation=observe_production_trainer(trainer,expected_geometry=geometry)
     hooks=observation['hooks']; observed=observation['source_indices']; observed_geometry=observation['geometry']; handles=observation['handles']
     before=_state_identity(trainer.ema_teacher,trainer.ema_teacher.state_dict())
     torch.cuda.reset_peak_memory_stats()
@@ -550,6 +589,7 @@ def selected_admission_geometry(audited):
     rows=audited['max_packed_geometry']
     if not rows or len({r['source_index'] for r in rows})!=len(rows):
         raise ValueError('empty or duplicate admission geometry')
+    for row in rows: _geometry_comparison(row)
     return rows
 
 

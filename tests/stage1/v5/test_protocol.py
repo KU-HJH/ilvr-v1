@@ -13,6 +13,17 @@ def api():
     return verify_stage1_v5
 
 
+def geometry_row(source_index=17, **changes):
+    row=dict(source_index=source_index,source_id=str(source_index),original_blocks=2,
+        branch_count=4,prefix_length=40,suffix_length=20,selected_queries=8,
+        prefix_source_item=3,suffix_source_item=1,projection_chunk_positions=128,
+        dense_bias_elements=4800,replicated_prefix_tokens=160,padded_suffix_tokens=80,
+        clean_length=64,original_image_grid_thw=[[1,2,2]],helper_image_grid_thw=[[1,2,2],[1,2,2]],
+        original_pixel_shape=[4,12],helper_pixel_shape=[8,12])
+    row.update(changes)
+    return row
+
+
 def test_geometry_combines_prefix_and_suffix_from_different_blocks():
     metadata=V5BatchMetadata((V5Block(0,1,5,10,(11,30),(2,3),()),
                               V5Block(0,3,35,40,(41,42),(2,3),())))
@@ -23,13 +34,94 @@ def test_geometry_combines_prefix_and_suffix_from_different_blocks():
     assert geometry['dense_bias_elements']==4800
     assert geometry['replicated_prefix_tokens']==160
     assert geometry['selected_queries']==8
+    assert geometry.get('padded_suffix_tokens')==80
 
 
 def test_worst_geometry_keeps_non_dominated_actual_rows():
-    rows=[dict(source_index=1,dense_bias_elements=100,replicated_prefix_tokens=900,selected_queries=5),
-          dict(source_index=2,dense_bias_elements=1000,replicated_prefix_tokens=100,selected_queries=50),
-          dict(source_index=3,dense_bias_elements=10,replicated_prefix_tokens=10,selected_queries=1)]
+    rows=[geometry_row(1,dense_bias_elements=100,replicated_prefix_tokens=900,selected_queries=5),
+          geometry_row(2,dense_bias_elements=1000,replicated_prefix_tokens=100,selected_queries=50),
+          geometry_row(3,branch_count=2,prefix_length=10,suffix_length=1,clean_length=32,
+              padded_suffix_tokens=2,dense_bias_elements=10,replicated_prefix_tokens=10,selected_queries=1)]
     assert [r['source_index'] for r in api().maximum_geometries(rows)]==[1,2]
+
+
+def test_frontier_retains_reviewed_padded_suffix_counterexample():
+    a=V5BatchMetadata((V5Block(0,0,1991,2000,tuple(range(2001,3501)),(1,)*1500,()),))
+    b=V5BatchMetadata(tuple(V5Block(0,i,15*(i+1)-9,15*(i+1),
+        tuple(range(151,751)) if i==9 else (15*(i+1)+1,),
+        (1,)*600 if i==9 else (1,),()) for i in range(10)))
+    # Equal visual signatures isolate the previously discarded packed shape.
+    rows=[dict(geometry_row(),**api().packed_geometry(a,source_index=0,source_id='A'),clean_length=3501),
+          dict(geometry_row(),**api().packed_geometry(b,source_index=1,source_id='B'),clean_length=751)]
+    assert [r['source_index'] for r in api().maximum_geometries(rows)]==[0,1]
+    assert [(r['dense_bias_elements'],r['replicated_prefix_tokens'],r['selected_queries'],
+             r['padded_suffix_tokens']) for r in rows]==[(10500000,4000,3000,3000),(9000000,3000,1218,12000)]
+
+
+def test_frontier_retains_independent_clean_extent_and_prunes_equal_visual_dominance():
+    smaller=geometry_row(2,branch_count=2,prefix_length=20,suffix_length=10,selected_queries=4,
+        dense_bias_elements=600,replicated_prefix_tokens=40,padded_suffix_tokens=20,clean_length=32)
+    rows=[geometry_row(1),smaller,dict(smaller,source_index=3,clean_length=80),geometry_row(4)]
+    assert [r['source_index'] for r in api().maximum_geometries(rows)]==[1,3,4]
+    assert [r['source_index'] for r in api().maximum_geometries(
+        [geometry_row(1),geometry_row(2,clean_length=80)])]==[2]
+
+
+@pytest.mark.parametrize('field,value',[
+    ('original_image_grid_thw',[[1,1,4]]),('helper_image_grid_thw',[[1,2,2],[1,1,4]]),
+    ('original_pixel_shape',[4,24]),('helper_pixel_shape',[8,24])])
+def test_frontier_does_not_compare_distinct_actual_visual_signatures(field,value):
+    smaller=geometry_row(2,branch_count=2,prefix_length=20,suffix_length=10,selected_queries=4,
+        dense_bias_elements=600,replicated_prefix_tokens=40,padded_suffix_tokens=20,clean_length=32)
+    smaller[field]=value
+    assert [r['source_index'] for r in api().maximum_geometries([geometry_row(1),smaller])]==[1,2]
+
+
+def test_collated_geometry_reads_actual_tensor_shapes_without_consuming_helpers():
+    from tests.stage1.v5.test_metadata import source_collator,source_example
+    batch=source_collator(enabled=True)([source_example(['pre',None,'xy',None,'z'])])
+    assert hasattr(api(),'collated_geometry'), 'whole-step collated shape producer missing'
+    geometry=api().collated_geometry(batch)
+    assert geometry['source_index']==17 and geometry['source_id']=='source-17'
+    assert geometry['original_image_grid_thw']==[[1,2,2]]
+    assert geometry['helper_image_grid_thw']==[[1,2,2],[1,2,2]]
+    assert geometry['original_pixel_shape']==[4,1] and geometry['helper_pixel_shape']==[8,1]
+    assert geometry['clean_length']==batch['input_ids'].shape[1]
+    assert 'pixel_values_latent' in batch and 'image_grid_thw_latent' in batch
+    # The admission extent is the live collated tensor, not a cached sample length.
+    batch['input_ids']=torch.cat([batch['input_ids'],torch.ones(1,7,dtype=torch.long)],dim=1)
+    assert api().collated_geometry(batch)['clean_length']==geometry['clean_length']+7
+    del batch['pixel_values_latent']
+    with pytest.raises(ValueError,match='geometry'):
+        api().collated_geometry(batch)
+
+
+def empty_geometry_row(source_index=29, **changes):
+    row=geometry_row(source_index,branch_count=0,prefix_length=0,suffix_length=0,selected_queries=0,
+        prefix_source_item=None,suffix_source_item=None,dense_bias_elements=0,
+        replicated_prefix_tokens=0,padded_suffix_tokens=0,clean_length=80)
+    row.update(changes)
+    return row
+
+
+def test_frontier_preserves_empty_target_source_with_independent_clean_or_visual_extent():
+    empty=empty_geometry_row()
+    assert [g['source_index'] for g in api().maximum_geometries([geometry_row(),empty])]==[17,29]
+    empty['clean_length']=32; empty['helper_image_grid_thw']=[[1,4,4]]
+    empty['helper_pixel_shape']=[16,12]
+    assert [g['source_index'] for g in api().maximum_geometries([geometry_row(),empty])]==[17,29]
+
+
+def test_production_witness_does_not_reject_empty_target_frontier_before_composition(monkeypatch):
+    from types import SimpleNamespace
+    import stage1.composition
+    def stop_before_model_construction(_args):
+        raise RuntimeError('empty frontier reached normal composition')
+    monkeypatch.setattr(stage1.composition,'build_stage1_training_components',stop_before_model_construction)
+    args=SimpleNamespace(run_id='v5-empty-entry',model=Path('/unused/base'),data_path=Path('/unused/data'),
+        image_root=Path('/unused/images'),deepspeed=Path('configs/deepspeed_zero1.json'))
+    with pytest.raises(RuntimeError,match='empty frontier reached normal composition'):
+        api().production_witness(args,dict(max_packed_geometry=[empty_geometry_row()],optimizer_updates_for_one_exposure=1))
 
 
 def test_audit_uses_actual_parent_loader_sampler_and_tail(tmp_path):
@@ -46,7 +138,7 @@ def test_audit_uses_actual_parent_loader_sampler_and_tail(tmp_path):
 def valid_records(geometry=None):
     from copy import deepcopy
     import hashlib,json
-    if geometry is None: geometry=[dict(source_index=17,dense_bias_elements=4800)]
+    if geometry is None: geometry=[geometry_row()]
     audited,binding=binding_fixture()
     fixture=deepcopy(binding['contract'])
     fixture['schedule'].update(dataset_samples=16*len(geometry),prepared_microbatches_per_rank=4*len(geometry),
@@ -62,7 +154,8 @@ def valid_records(geometry=None):
             gradient_error=0.,update_error=0.,gradient_norm=1.) for i,(n,m,lr) in enumerate(((9,4,0.),(9,4,5e-6),(5,2,1e-5)))],
         continuations=[dict(saved_step=s,sources=list(range(4*s,10)),updates=3-s,final_step=3,
             learning_rates=([5e-6,1e-5] if s==1 else [1e-5])) for s in (1,2)],
-        hooks={k:4*len(geometry) for k in ('helper','F','reference','packed','backward')},
+        hooks={k:4*(sum(g['selected_queries']>0 for g in geometry) if k in ('reference','packed')
+                    else len(geometry)) for k in ('helper','F','reference','packed','backward')},
         production=dict(global_step=len(geometry),microbatches=4*len(geometry),finite_loss=True,
             gradient_norms=[1.]*len(geometry),gradient_norm_steps=list(range(len(geometry))),peak_allocated=123,peak_reserved=456,
             source_windows=[dict(step=i,source_index=g['source_index'],microbatches=[g['source_index']]*4) for i,g in enumerate(geometry)],
@@ -73,7 +166,7 @@ def valid_records(geometry=None):
 @pytest.mark.parametrize('mutation', ['rank','denominator','counts','gradient','reference','continuation','hook','extra_call','geometry','norm'])
 def test_rank_verification_rejects_corrupt_runtime_evidence(mutation):
     records=valid_records()
-    kwargs=dict(run_id='v5-protocol',audited=binding_fixture()[0],expected_geometry=[dict(source_index=17,dense_bias_elements=4800)])
+    kwargs=dict(run_id='v5-protocol',audited=binding_fixture()[0],expected_geometry=[geometry_row()])
     assert api().validate_rank_records(records,**kwargs)['ranks']==[0,1,2,3]
     if mutation=='rank': records.pop()
     elif mutation=='denominator': records[2]['tiny_windows'][-1]['native_denominator']=8
@@ -142,6 +235,15 @@ def test_runtime_observer_records_real_helper_f_reference_packed_backward(tmp_pa
     assert dict(observed['hooks'])==dict(helper=1,F=1,reference=1,packed=1,backward=1)
     assert observed['source_indices']=={7}
     assert observed['geometry'][7]['prefix_length']==19
+    assert observed['geometry'][7].get('clean_length')==26
+    assert observed['geometry'][7].get('padded_suffix_tokens')==20
+    assert observed['geometry'][7].get('original_image_grid_thw')==[[1,2,2]]
+    assert observed['geometry'][7].get('helper_image_grid_thw')==[[1,2,2],[1,2,2]]
+    assert observed['geometry'][7].get('original_pixel_shape')==[4,12]
+    assert observed['geometry'][7].get('helper_pixel_shape')==[8,12]
+    # Native target preparation consumes a working copy; the observer retains
+    # both helper shapes while the original collated batch stays reusable.
+    assert 'pixel_values_latent' in batch and 'image_grid_thw_latent' in batch
     trainer._successful_optimizer_steps=0
     trainer._validate_gradient_norm(trainer.model)
     trainer.optimizer.step()
@@ -151,6 +253,57 @@ def test_runtime_observer_records_real_helper_f_reference_packed_backward(tmp_pa
     assert observed['gradient_norm_steps']==[0]
     assert len(observed['gradient_norms'])==1 and observed['gradient_norms'][0]>0
     for handle in observed['handles']: handle.remove()
+
+
+@pytest.mark.parametrize('field',['input_ids','image_grid_thw','image_grid_thw_latent',
+                                'pixel_values','pixel_values_latent'])
+def test_runtime_observer_rejects_changed_collated_shape_before_helper(tmp_path,field):
+    from tests.stage1.v5.test_trainer import integrated_fixture
+    trainer,batch,*_=integrated_fixture(tmp_path,real_helper=True)
+    expected=geometry_row(7,source_id='cpu',prefix_length=19,suffix_length=5,selected_queries=16,
+        prefix_source_item=1,suffix_source_item=1,dense_bias_elements=480,
+        replicated_prefix_tokens=76,padded_suffix_tokens=20,clean_length=26)
+    observed=api().observe_production_trainer(trainer,expected_geometry=[expected])
+    if field=='input_ids':
+        batch[field]=torch.cat([batch[field],torch.ones(1,1,dtype=torch.long)],dim=1)
+    elif 'grid' in field:
+        batch[field][0]=torch.tensor([1,1,4])
+    else:
+        batch[field]=torch.cat([batch[field],batch[field][:,:1]],dim=1)
+    batches,_=trainer.get_batch_samples(iter([batch]),4)
+    try:
+        with pytest.raises(ValueError,match='geometry'):
+            trainer.training_step(trainer.model,batches[0])
+        assert dict(observed['hooks'])=={}
+        assert 'pixel_values_latent' in batch and 'image_grid_thw_latent' in batch
+    finally:
+        for handle in observed['handles']: handle.remove()
+
+
+def test_runtime_observer_covers_real_helper_empty_target_shape(tmp_path):
+    from tests.stage1.v5.test_trainer import integrated_fixture
+    trainer,batch,*_=integrated_fixture(tmp_path,real_helper=True,empty=True)
+    expected=empty_geometry_row(7,source_id='cpu',clean_length=26)
+    observed=api().observe_production_trainer(trainer,expected_geometry=[expected])
+    batches,_=trainer.get_batch_samples(iter([batch]),4)
+    try:
+        assert torch.isfinite(trainer.training_step(trainer.model,batches[0]))
+        assert dict(observed['hooks'])==dict(helper=1,F=1,backward=1)
+        assert observed['geometry'][7]==expected
+    finally:
+        for handle in observed['handles']: handle.remove()
+
+
+@pytest.mark.parametrize('all_empty',[False,True])
+def test_admission_accepts_conditional_calls_for_every_empty_target_source(all_empty):
+    geometry=[empty_geometry_row()] if all_empty else [geometry_row(),empty_geometry_row()]
+    records=valid_records(geometry)
+    kwargs=dict(run_id='v5-protocol',expected_geometry=geometry,audited=binding_fixture()[0])
+    assert api().validate_rank_records(records,**kwargs)['status']=='pass'
+    records[0]['hooks']['packed']+=1
+    with pytest.raises(ValueError): api().validate_rank_records(records,**kwargs)
+    records=valid_records(geometry); records[0]['hooks']['helper']-=1
+    with pytest.raises(ValueError): api().validate_rank_records(records,**kwargs)
 
 
 def test_coordinator_dry_run_routes_exact_diagnostic_without_launch(capsys):
@@ -178,8 +331,8 @@ def test_audit_reference_profile_is_bound_to_actual_composed_reference():
 
 
 def test_admission_covers_joint_frontier_row_without_coordinate_maximum():
-    rows=[dict(source_index=i,prefix_length=p,suffix_length=s,selected_queries=q,
-               dense_bias_elements=2*s*(p+s),replicated_prefix_tokens=2*p)
+    rows=[geometry_row(i,branch_count=2,prefix_length=p,suffix_length=s,selected_queries=q,
+               dense_bias_elements=2*s*(p+s),replicated_prefix_tokens=2*p,padded_suffix_tokens=2*s)
           for i,p,s,q in ((1,1000,1,2),(2,100,1300,2),(3,10,200,400),(4,990,900,390))]
     frontier=api().maximum_geometries(rows)
     assert [g['source_index'] for g in frontier]==[1,2,3,4]
@@ -189,7 +342,7 @@ def test_admission_covers_joint_frontier_row_without_coordinate_maximum():
 @pytest.mark.parametrize('mutation',['insufficient_window','uneven_sources','missing_norm','order','rank_order','applied_step','norm_step'])
 def test_admission_rejects_incomplete_or_uneven_source_windows(mutation):
     from copy import deepcopy
-    geometry=[dict(source_index=17,dense_bias_elements=4800),dict(source_index=29,dense_bias_elements=9000)]
+    geometry=[geometry_row(17),geometry_row(29,dense_bias_elements=9000)]
     records=valid_records(geometry)
     for r in records:
         r['production'].update(geometry=deepcopy(geometry),source_indices=[17,29],
@@ -209,6 +362,33 @@ def test_admission_rejects_incomplete_or_uneven_source_windows(mutation):
         for r in records: r['production']['source_windows'].reverse()
     else: p['source_windows'].reverse()
     with pytest.raises(ValueError): api().validate_rank_records(records,run_id='v5-protocol',expected_geometry=geometry,audited=binding_fixture()[0])
+
+
+@pytest.mark.parametrize('field',[
+    'branch_count','prefix_length','suffix_length','selected_queries','padded_suffix_tokens','clean_length',
+    'original_image_grid_thw','helper_image_grid_thw','original_pixel_shape','helper_pixel_shape'])
+def test_admission_rejects_changed_or_missing_whole_step_shape(field):
+    from copy import deepcopy
+    geometry=[geometry_row()]
+    records=valid_records(geometry)
+    del records[0]['production']['geometry'][0][field]
+    with pytest.raises(ValueError):
+        api().validate_rank_records(records,run_id='v5-protocol',expected_geometry=geometry,audited=binding_fixture()[0])
+    # A legacy/incomplete audit must fail even when every rank agrees with it.
+    incomplete=deepcopy(geometry); del incomplete[0][field]
+    incomplete_records=valid_records(geometry)
+    for record in incomplete_records:
+        del record['production']['geometry'][0][field]
+    with pytest.raises(ValueError,match='geometry'):
+        api().validate_rank_records(incomplete_records,run_id='v5-protocol',
+            expected_geometry=incomplete,audited=binding_fixture()[0])
+    with pytest.raises(ValueError,match='geometry'):
+        api().selected_admission_geometry(dict(max_packed_geometry=incomplete))
+    records=valid_records(geometry)
+    old=records[0]['production']['geometry'][0][field]
+    records[0]['production']['geometry'][0][field]=old+1 if isinstance(old,int) else []
+    with pytest.raises(ValueError):
+        api().validate_rank_records(records,run_id='v5-protocol',expected_geometry=geometry,audited=binding_fixture()[0])
 
 
 def test_tiny_parent_oracle_rejects_wrong_final_tail_learning_rate(tmp_path,monkeypatch):
@@ -309,4 +489,4 @@ def test_admission_rejects_unbound_common_profile_and_learning_rate(mutation):
     elif mutation=='lr': records[0]['tiny_windows'][2]['learning_rate']=2e-5
     else: records[0]['continuations'][1]['learning_rates']=[2e-5]
     with pytest.raises(ValueError):
-        api().validate_rank_records(records,run_id='v5-protocol',expected_geometry=[dict(source_index=17,dense_bias_elements=4800)],audited=audited)
+        api().validate_rank_records(records,run_id='v5-protocol',expected_geometry=[geometry_row()],audited=audited)
