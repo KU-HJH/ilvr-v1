@@ -764,14 +764,23 @@ class CustomTrainerStage1(SFTTrainer):
             return
         accelerate_version = importlib_metadata.version("accelerate")
         deepspeed_version = importlib_metadata.version("deepspeed")
+        supported_deepspeed = deepspeed_version == _SUPPORTED_DEEPSPEED_VERSION
+        if deepspeed_version == "0.18.7":
+            from .v5_trainer import CustomTrainerStage1V5
+
+            supported_deepspeed = (
+                isinstance(self, CustomTrainerStage1V5)
+                and self.deepspeed_runtime_profile.enabled
+                and self.deepspeed_runtime_profile.zero_stage == 1
+            )
         if (
             accelerate_version != _SUPPORTED_ACCELERATE_VERSION
-            or deepspeed_version != _SUPPORTED_DEEPSPEED_VERSION
+            or not supported_deepspeed
         ):
             raise RuntimeError(
                 "unsupported DeepSpeed Stage 1 lifecycle: expected "
                 f"accelerate {_SUPPORTED_ACCELERATE_VERSION} and deepspeed "
-                f"{_SUPPORTED_DEEPSPEED_VERSION}, found accelerate "
+                f"{_SUPPORTED_DEEPSPEED_VERSION} (or 0.18.7 for v5 ZeRO-1), found accelerate "
                 f"{accelerate_version} and deepspeed {deepspeed_version}"
             )
 

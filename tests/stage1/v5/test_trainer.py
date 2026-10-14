@@ -21,6 +21,124 @@ def api():
     return CustomTrainerStage1V5
 
 
+@pytest.fixture
+def native_deepspeed_lifecycle():
+    """Native engine lifecycle; distributed optimizer leaves use local SGD."""
+    from accelerate.utils import DeepSpeedEngineWrapper, DistributedType
+    from deepspeed.runtime.config import DeepSpeedConfig
+    from deepspeed.runtime.engine import DeepSpeedEngine
+    from deepspeed.runtime.base_optimizer import BackwardHookStateManager
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+    from deepspeed_runtime import DeepSpeedRuntimeProfile
+    from torch import nn
+    engine=DeepSpeedEngine.__new__(DeepSpeedEngine)
+    nn.Module.__init__(engine)
+    engine._set_client_model(nn.Linear(1,1,bias=False))
+    engine.module.weight.data.fill_(1.)
+    engine._config=DeepSpeedConfig({'train_batch_size':4,'train_micro_batch_size_per_gpu':1,
+        'gradient_accumulation_steps':4,'bf16':{'enabled':True},'zero_optimization':{'stage':1}})
+    optimizer=DeepSpeedZeroOptimizer.__new__(DeepSpeedZeroOptimizer)
+    optimizer.partition_gradients=False
+    optimizer.custom_loss_scaler=False; optimizer.torch_autocast_gradscaler=None
+    optimizer.use_grad_accum_attribute=False
+    optimizer._backward_hook_state=BackwardHookStateManager()
+    optimizer.optimizer=torch.optim.SGD(engine.module.parameters(),lr=.1)
+    optimizer.overflow=False
+    # No distributed initialization/partitions: retain native engine step and
+    # applied-step publication, replace only optimizer mutation/reduction leaves.
+    optimizer.step=lambda: None if optimizer.overflow else optimizer.optimizer.step()
+    optimizer.zero_grad=optimizer.optimizer.zero_grad
+    engine.optimizer=optimizer
+    engine._is_gradient_accumulation_boundary=None
+    engine._is_compiled_autograd_enabled=False; engine._compile_kwargs={}
+    engine.torch_autocast_z0_gradscaler=None
+    engine.inside_no_sync_ctxt=False; engine.enable_backward_allreduce=False
+    engine.zenflow=False; engine.quantizer=None; engine.progressive_layer_drop=False
+    engine._support_torch_style_backward=False
+    engine.micro_steps=0; engine.global_steps=0; engine.global_samples=0
+    engine.gas_boundary_ctr=0; engine.skipped_steps=0; engine.global_rank=0
+    engine.engine_timers=SimpleNamespace(step_timers=(),backward_inner_timers=(),
+        backward_reduce_timers=(),backward_timers=())
+    engine.tput_timer=SimpleNamespace(stop=lambda **kw:None)
+    engine.monitor=SimpleNamespace(enabled=False)
+    engine.checkpoint_engine=SimpleNamespace(is_decoupled=lambda:False)
+    engine.compression_scheduler=SimpleNamespace(step=lambda:None)
+    engine.lr_scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer.optimizer,lambda _:1.)
+    trainer=api().__new__(api())
+    trainer.stage1_v5_debug=False
+    trainer._deepspeed_step_adapter=None; trainer._successful_optimizer_steps=0
+    trainer.model=engine.module; trainer.model_wrapped=engine
+    trainer.ema_teacher=Stage1EmaTeacher(engine.module,decay=1.,method='full')
+    trainer.deepspeed_runtime_profile=DeepSpeedRuntimeProfile(True,1,None,None,4)
+    wrapper=DeepSpeedEngineWrapper(engine)
+    trainer.accelerator=SimpleNamespace(distributed_type=DistributedType.DEEPSPEED,
+        deepspeed_engine_wrapped=wrapper)
+    return trainer,engine,wrapper
+
+
+def test_installed_deepspeed_v5_zero1_prepare_installs_adapter(native_deepspeed_lifecycle):
+    """Catches rejecting the installed, witnessed v5 ZeRO-1 lifecycle."""
+    from importlib.metadata import version
+    assert (version('accelerate'),version('deepspeed'))==('1.10.1','0.18.7')
+    trainer,engine,_=native_deepspeed_lifecycle
+    trainer._install_deepspeed_step_adapter()
+    assert trainer._deepspeed_step_adapter.engine is engine
+
+
+def test_native_deepspeed_v5_boundary_applied_step_and_reference(native_deepspeed_lifecycle):
+    """Catches counting skipped/nonboundary native steps or mutating reference."""
+    trainer,engine,wrapper=native_deepspeed_lifecycle
+    initial=trainer.ema_teacher.model.weight.detach().clone()
+    trainer._attach_deepspeed_step_adapter(engine)
+    gradients=[]
+    engine.module.weight.register_hook(lambda grad:gradients.append(grad.clone()))
+    for _ in range(3):
+        wrapper.backward(engine.module(torch.ones(1,1)).sum()/4,sync_gradients=False,scale_wrt_gas=False)
+        assert engine.is_gradient_accumulation_boundary() is False
+        assert engine.optimizer.is_gradient_accumulation_boundary is False
+        assert trainer._successful_optimizer_steps==engine.global_steps==0
+        torch.testing.assert_close(engine.module.weight,initial,rtol=0,atol=0)
+    wrapper.backward(engine.module(torch.ones(1,1)).sum()/4,sync_gradients=True,scale_wrt_gas=False)
+    assert all(torch.equal(grad,torch.tensor([[.25]])) for grad in gradients)
+    assert engine.is_gradient_accumulation_boundary() is True
+    assert engine.optimizer.is_gradient_accumulation_boundary is True
+    assert engine.was_step_applied() is True
+    assert trainer._successful_optimizer_steps==engine.global_steps==1
+    assert engine.lr_scheduler.last_epoch==1
+    torch.testing.assert_close(engine.module.weight,torch.tensor([[.9]]))
+    engine.optimizer.overflow=True
+    wrapper.backward(engine.module(torch.ones(1,1)).sum(),sync_gradients=True,scale_wrt_gas=False)
+    assert engine.was_step_applied() is False and engine.skipped_steps==1
+    assert trainer._successful_optimizer_steps==1 and engine.global_steps==2
+    assert engine.lr_scheduler.last_epoch==1
+    torch.testing.assert_close(engine.module.weight,torch.tensor([[.9]]))
+    engine.optimizer.overflow=False
+    wrapper.backward(engine.module(torch.ones(1,1)).sum(),sync_gradients=True,scale_wrt_gas=False)
+    assert engine.was_step_applied() is True and trainer._successful_optimizer_steps==2
+    assert engine.lr_scheduler.last_epoch==2
+    torch.testing.assert_close(engine.module.weight,torch.tensor([[.8]]))
+    torch.testing.assert_close(trainer.ema_teacher.model.weight,initial,rtol=0,atol=0)
+
+
+@pytest.mark.parametrize('accelerate_version,deepspeed_version,legacy,stage',[
+    ('1.10.1','0.18.8',False,1),('1.10.1','0.18.9',False,1),
+    ('1.11.0','0.18.7',False,1),('1.10.1','0.18.7',True,1),
+    ('1.10.1','0.18.7',False,2),('1.10.1','0.18.7',False,3)])
+def test_new_deepspeed_support_rejects_unverified_version_or_scope(
+        native_deepspeed_lifecycle,monkeypatch,accelerate_version,deepspeed_version,legacy,stage):
+    from stage1 import trainer as module
+    from deepspeed_runtime import DeepSpeedRuntimeProfile
+    trainer,engine,_=native_deepspeed_lifecycle
+    if legacy: trainer.__class__=module.CustomTrainerStage1
+    trainer.deepspeed_runtime_profile=DeepSpeedRuntimeProfile(True,stage,None,None,4)
+    monkeypatch.setattr(module.importlib_metadata,'version',lambda name:
+        {'accelerate':accelerate_version,'deepspeed':deepspeed_version}[name])
+    with pytest.raises(RuntimeError,match='unsupported DeepSpeed'):
+        trainer._install_deepspeed_step_adapter()
+    assert trainer._deepspeed_step_adapter is None
+    assert engine.global_steps==trainer._successful_optimizer_steps==0
+
+
 def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, debug=True):
     Trainer = api()
     student, reference, *_ = fixture(.05)
