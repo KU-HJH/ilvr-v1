@@ -686,3 +686,133 @@ wrong is wrong-base resume/legacy artifact regression. Require causal real tiny
 load/composition equal-content success and changed-content rejection, independent
 review and affected existing regressions. Task7 actual continuation and final
 whole-change review must see O1 resolution evidence.
+
+## Task6 procedure discrepancy and bounded recovery
+
+Implementer `/root/v5_task6_impl` disclosed during self-review that the new
+start_worker dataset-digest record conditional was written after helper/worker
+ordering RED but before its own direct start_worker-record behavioral RED.
+Required TDD procedure is a failing behavior witness BEFORE production code;
+helper tests do not establish that record branch's test-first compliance.
+Affected scope is only the new metadata-record branch in existing multinode
+runtime start_worker, not already evidenced authentication/argv/merger behavior.
+Worker stopped affected progression and reported it was deleting that branch
+without retained implementation reference before asking root acknowledgment.
+No launch, network/model loading, or later green evidence is claimed for it.
+
+Root records/reports actual sequence and approves bounded recovery within the
+existing scope: direct real start_worker-record failing test, then fresh minimal
+branch implementation, focused verification and independent Task6 review.
+Do not reimplement already evidenced work or describe later recovery as earlier
+compliance. Remaining uncertainty is record publication behavior until evidence
+and review; actual multi-node evaluation remains unobserved. Exact file/method
+and commands are to be retained in task report; no new design approval needed.
+
+Worker clarification: exact method is
+`src/multinode_runtime.py::EvaluationSubprocessRunner.start_worker`, first-worker
+`dataset-identity.json` publication before `self._run(worker.launch)`. Branch
+already deleted; direct RED at real command_runner boundary is
+logs/stage1-v5-task6/red-record-recovery.log,1failed with “dataset digest was not
+durably recorded before launch”. No fresh reimplementation yet at clarification.
+Root acknowledges recovery now; preserve this actual ordering.
+
+## Task6 additional managed-root rulings and pre-review evidence
+
+Task6 implementer `/root/v5_task6_impl` (gpt-6.1-sol/high), base`9c598ce`, is
+completing direct existing-coordinator train/prepare/evaluate wiring. Root owns
+provisioning the full reviewed remote source revision after development gates;
+no new sync/manifest system is required. Recipe's known original model default
+is canonical checkpoint/pretrained Qwen2.5-VL-3B, while current worktree data,
+checkpoint run outputs, logs and results retain their required roots. TEST400
+means existing data/TEST.jsonl with400 records, not a new TEST400.jsonl file.
+
+Ruling: minimally extend training_evidence.py with coordinator-bound exact
+expected remote producer-checkpoint location. This resolves remote producer vs
+local collected path without changing evidence schema/ownership checks or
+porting v3 planned-stop behavior. Cost if wrong: wrong-producer acceptance or
+valid-run rejection; causal correct/wrong location tests and review required.
+
+Ruling: scoped historical same-root test fixtures may explicitly supply roots
+(pinned-v3 pattern), with opt-out/dedicated unmodified guard tests. Production
+native-root remote-argument requirement stays strict. Cost if wrong: false green
+root-guard coverage. Initial affected regression279passed/65failed is preserved,
+not counted green; actual later verification follows below.
+
+Ruling: managed-root evaluation workers may receive paired coordinator canonical
+dataset identity and full-file SHA256. Each worker authenticates actual mapped
+local bytes/size before inference and before sidecar publication, then emits the
+same existing-schema identity. Coordinator records digest. Legacy mode and strict
+merger equality remain; incomplete pairs or changed content reject, including
+same size/mtime. No sidecar rewriting/scoring/protocol change or generic provenance.
+Cost if wrong: different TEST data falsely merged; direct offline worker/merger
+and content counterexample tests plus independent review required. Minimal eval.py
+entrypoint plumbing is included. Required Stage1 runtime_identity_path is also
+passed as unique per-shard results artifact and included in exact collection.
+
+Ruling: final fresh-v5 completion must physically retain both small reference and
+contract on both nodes. Reuse existing redistribute_resume_checkpoint after
+canonical collection with same identity/path/delta/no-overwrite validation,
+transferring only missing approved shared resume entries, never original full
+base. Ordinary paths stay unchanged, no bespoke transport. Cost if wrong:
+unneeded transfer or incorrect completion/overwrite; causal ordering/retention
+regression and review required. This is the brief's stated both-node requirement.
+
+Before final retention change, affected suite652passed/24.14s, pristine final
+output; shell syntax and three-command recipe dryrun green. After narrow final
+retention integration, affected suite234passed/15.11s, pristine output. Root read
+logs/stage1-v5-task6/verification-final-green.log and verification-final-retention.log.
+Exact commands, intermediate failures and actual runtime scope are to be linked
+from final task report. These are CPU/command-flow witnesses, not live distributed
+training/evaluation evidence. Task6 independent review is still pending.
+
+## Task6 independent review and fix1
+
+Reviewer `/root/v5_task6_review`, distinct from implementer, reviewed
+9c598ce..c26051b and supplied specification issues/quality needs fixes.
+Important I1: actual coordinator->shell->parser resume omissions become explicit
+GAS2/FA2, rejecting savedGAS4/SDPA. One bounded CPU actual-command probe reproduced
+`explicit attention_implementation conflicts with saved v5 contract`; no ranks
+or model were launched. Root read report and confirmed unconditional shell
+emission. Fix1 goes to original implementer and covers complete always-emitted
+saved execution set plus coordinator producer-evidence expectations, preserving
+explicit conflict rejection and ordinary legacy fallbacks. Full report/probe:
+`.superpowers/sdd/2026-10-14-stage1-v5/task-6-review.md`.
+
+O1 actual composition/PEFT content authentication is now independently assessed
+as addressed for CPU equal-base relocation and changed-byte rejection. Complete
+public managed resume remains unapproved pending I1 and live Task7 evidence.
+Review read pristine652/234 test logs without reruns. Historical method deviation
+and remaining final/live gates are unchanged. No actual training has launched.
+
+Controller reconciliation during Task6 fix1: re-read canonical AGENTS.md,
+training-defaults.md and current multi-node operator guide. Bound design/plan
+SHA256 remain exactly e3d2515ccc7b1a0de0e82de2e4b957abebbcf220b022c1baff06521fd5c45762
+and b3b4f75d674af2fea671b9ce7e3aabb80c0cf3b2b1b67b6d219c676d4067696d;
+approval paragraphs above inspected directly. Reviewed default revision
+2f48c51985c395c16bea80a89847d7586728f9cd remains an ancestor. Read-only node
+check observed two idle H100 NVL GPUs on each node; SSH/container reachable.
+Remote distinct Stage1-v5 path is absent, so no remote source or training was
+changed. This check is preliminary, not launch preflight or actual rank evidence.
+
+Task6 fix1 commit `718470d9178d23c7bf3e074b3407f40ba37c6a4c` changes only
+run_stage1_training.sh, src/multinode.py, v5 test_launcher/test_workflow. Existing
+strict Python resolver receives true omissions on v5-sidecar resume; actual
+CLI/nonempty execution environment requests retain conflict rejection. Ordinary
+fallbacks unchanged. Coordinator captures strict saved contract immediately after
+authenticated redistribution before launch, retaining evidence expectations even
+when Trainer rotates the original resume checkpoint away. No saved sidecar rewrite.
+
+Causal corrected absent-provenance RED1 reproduces attention conflict, rotation
+RED1 reproduces producer-GAS disagreement. Final after-amendment verification:
+`PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest tests/stage1/v5/test_launcher.py tests/stage1/v5/test_workflow.py tests/multinode/test_coordinator.py tests/stage1/test_launcher.py -q`
+=> **172passed/17.56s**, pristine output at
+logs/stage1-v5-task6/verification-fix1-final.log; bash syntax and git diff--check
+also green. Actual both-mapped-node owned command->shell->parser and actual
+producer decoder are exercised; remote/process boundaries remain test doubles.
+
+Independent `/root/v5_task6_review` scoped c26051b..718470d review approves I1
+specification repair and quality, no new breakage/out-of-scope findings; root read
+full report. Task6 is complete, O1 resolved for CPU composition/content checks.
+Historical TDD deviation remains noncompliant; recovery and later approval do not
+rewrite it. Task7 owns live-engine continuation and production-profile admission;
+root final review, full-suite, provisioning/preflight and actual training remain.
