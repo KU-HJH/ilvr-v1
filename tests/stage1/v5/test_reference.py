@@ -214,3 +214,45 @@ def test_original_tied_safetensors_alias_is_complete_effective_base_coverage(bun
     teacher = Stage1EmaTeacher(student, 1., 'dora')
     identity = ref.capture_v5_reference(teacher, student, processor, base_path=base_path, directory=directory)
     ref.restore_v5_reference(teacher, student, processor, base_path=base_path, directory=directory, expected=identity)
+
+
+@pytest.mark.parametrize('operation', ['capture', 'restore'])
+@pytest.mark.parametrize('drift', ['scaling', 'active_adapter', 'variant', 'use_dora'])
+def test_runtime_adapter_drift_rejects_before_forward(bundle, operation, drift):
+    ref = api()
+    student, processor, base, directory, _ = bundle
+    teacher = Stage1EmaTeacher(student, 1., 'dora')
+    module = next(m for m in teacher.model.modules() if hasattr(m, 'lora_B') and 'default' in m.lora_B)
+    # Nonzero B makes the scale change alter the actual effective module policy.
+    with torch.no_grad():
+        module.lora_B['default'].weight.fill_(0.1)
+    identity = ref.capture_v5_reference(teacher, student, processor, base_path=base, directory=directory)
+    parameters = {name: p.detach().clone() for name, p in teacher.model.named_parameters()}
+    declared_config = copy.deepcopy(teacher.model.peft_config['default'].to_dict())
+    if drift == 'scaling':
+        x = torch.arange(module.in_features, dtype=module.weight.dtype)[None, None] / module.in_features
+        with torch.no_grad():
+            before = module(x)
+            module.set_scale('default', 2.)
+            after = module(x)
+        assert not torch.equal(before, after)
+    elif drift == 'active_adapter':
+        module._active_adapter = []
+    elif drift == 'variant':
+        module.lora_variant.clear()
+    else:
+        module.use_dora['default'] = False
+    assert teacher.model.peft_config['default'].to_dict() == declared_config
+    assert all(torch.equal(dict(teacher.model.named_parameters())[name], value) for name, value in parameters.items())
+    calls = []
+    handles = [m.register_forward_pre_hook(lambda *args: calls.append(1)) for m in teacher.model.modules()]
+    try:
+        with pytest.raises(ValueError, match='runtime adapter'):
+            if operation == 'capture':
+                ref.capture_v5_reference(teacher, student, processor, base_path=base, directory=directory)
+            else:
+                ref.restore_v5_reference(teacher, student, processor, base_path=base, directory=directory, expected=identity)
+        assert calls == []
+    finally:
+        for handle in handles:
+            handle.remove()

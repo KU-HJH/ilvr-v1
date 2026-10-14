@@ -114,6 +114,37 @@ def _validate_processor_layout(teacher: Stage1EmaTeacher, processor) -> None:
         raise ValueError('processor/reference latent token layout mismatch')
 
 
+def _validate_adapter_runtime(model: nn.Module, config) -> None:
+    from peft.tuners.lora.layer import Linear as LoraLinear
+    from peft.tuners.lora.variants import DoraLinearVariant
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    # The supported Stage1 composer uses ordinary alpha/r scaling and one
+    # default DoRA adapter. Runtime dispatch state is not an immutable cache.
+    if config.use_rslora or config.rank_pattern or config.alpha_pattern:
+        raise ValueError('unsupported runtime adapter scaling configuration')
+    if model.active_adapters != ['default']:
+        raise ValueError('unsupported runtime adapter activation')
+    expected_scale = config.lora_alpha / config.r
+    for module in model.modules():
+        # Transformers also defines an unrelated active_adapters() method;
+        # inspect the PEFT dispatch owners, not that native model method.
+        if isinstance(module, BaseTunerLayer) and module.active_adapters != ['default']:
+            raise ValueError('unsupported runtime adapter activation')
+        if getattr(module, 'disable_adapters', False) is True or getattr(module, 'merged', False) is True:
+            raise ValueError('disabled or merged runtime adapters are unsupported')
+        if not hasattr(module, 'lora_A'):
+            continue
+        if (not isinstance(module, LoraLinear) or
+                module.r != {'default': config.r} or
+                module.lora_alpha != {'default': config.lora_alpha} or
+                module.scaling != {'default': expected_scale} or
+                module.use_dora != {'default': True} or
+                set(module.lora_variant) != {'default'} or
+                type(module.lora_variant['default']) is not DoraLinearVariant):
+            raise ValueError('runtime adapter state differs from supported DoRA composition')
+
+
 def _topology(teacher: Stage1EmaTeacher, student: nn.Module) -> None:
     student = _unwrap_model(student)
     if teacher.decay != 1. or teacher.method != 'dora':
@@ -150,9 +181,8 @@ def _topology(teacher: Stage1EmaTeacher, student: nn.Module) -> None:
             raise ValueError('student/reference storage alias')
         if parameter.shape != student_named[name].shape:
             raise ValueError('reference/student shape mismatch')
-    for module in teacher.model.modules():
-        if getattr(module, 'disable_adapters', False) is True or getattr(module, 'merged', False) is True:
-            raise ValueError('disabled or merged reference adapters are unsupported')
+    _validate_adapter_runtime(student, config)
+    _validate_adapter_runtime(teacher.model, config)
     teacher_qwen = resolve_qwen2_5_vl_model(teacher.model)
     if tuple(teacher_qwen.model.embed_tokens.token_adapter.token_indices['default']) != ids or tuple(
             teacher_qwen.lm_head.token_ids.cpu().tolist()) != ids:
