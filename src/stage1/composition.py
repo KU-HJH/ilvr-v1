@@ -422,6 +422,36 @@ def validate_stage1_checkpoint_context(model: torch.nn.Module) -> None:
         )
 
 
+def _copy_v5_resume_reference(checkpoint, output_dir):
+    import shutil
+    from artifact_paths import require_canonical_artifact_path
+    from stage1.v5_reference import V5_REFERENCE_FILENAME
+    output_dir = require_canonical_artifact_path(output_dir, kind='checkpoint')
+    source, destination = checkpoint / V5_REFERENCE_FILENAME, output_dir / V5_REFERENCE_FILENAME
+    if source.is_symlink() or destination.is_symlink():
+        raise ValueError('immutable v5 reference must be a regular file')
+    if source.resolve() != destination.resolve():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if destination.exists() and destination.read_bytes() != source.read_bytes():
+            raise ValueError('cannot overwrite immutable v5 run reference')
+        shutil.copyfile(source, destination)
+
+
+def _load_stage1_model(source, config, args, dependencies):
+    """Reuse the authenticated mixed-backend construction for opt-in v5."""
+    model_kwargs = dict(torch_dtype=torch.bfloat16, cache_dir=args.cache_dir,
+                        trust_remote_code=True)
+    if getattr(args, 'stage1_variant', 'standard') == 'v5':
+        from stage2.attention_backend import load_qwen2_5_vl_with_attention
+        return load_qwen2_5_vl_with_attention(source,
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=args.vision_attention_implementation,
+            load_config=lambda source, **kwargs: config,
+            load_model=dependencies.load_model, model_load_kwargs=model_kwargs)
+    return dependencies.load_model(source, config=config,
+        attn_implementation=args.attention_implementation, **model_kwargs)
+
+
 def build_stage1_training_components(
     args,
     *,
@@ -449,6 +479,17 @@ def build_stage1_training_components(
         raise ValueError("Stage 1 composition requires --stage stage1")
     data_path, image_root, output_dir = _require_stage1_inputs(args)
     tuning = resolve_stage1_tuning_config(args)
+    is_v5 = getattr(args, 'stage1_variant', 'standard') == 'v5'
+    if is_v5:
+        if (tuning.method != 'dora' or args.ema_tau != 1.
+                or not profile.enabled or profile.zero_stage != 1 or profile.world_size != 4
+                or args.per_device_train_batch_size != 1 or args.gradient_accumulation_steps != 4
+                or getattr(args, 'use_cpu', False) or args.attention_implementation != 'sdpa'
+                or args.vision_attention_implementation != 'flash_attention_2'
+                or not args.gradient_checkpointing):
+            raise ValueError('unsupported Stage1-v5 execution profile')
+        from transformers import set_seed
+        set_seed(args.seed)
 
     # This is deliberately first: Task 9 classifies the complete local artifact
     # and Trainer state without loading model weights.
@@ -468,6 +509,13 @@ def build_stage1_training_components(
     _validate_resume_tuning(decision, tuning, metadata) if checkpoint else None
     if metadata is not None:
         _validate_resume_semantics(args, metadata)
+
+    v5_saved = None
+    if is_v5 and checkpoint is not None:
+        from stage1.v5_resume import load_v5_contract, validate_v5_resume
+        v5_saved = load_v5_contract(checkpoint)
+        validate_v5_resume(v5_saved, {**getattr(args, 'stage1_v5_explicit_values', {}),
+                                     'ce_weight':args.ce_weight,'sim_weight':args.sim_weight})
 
     processor_source = checkpoint if checkpoint is not None else args.model
     processor = dependencies.load_processor(
@@ -497,14 +545,7 @@ def build_stage1_training_components(
         _configure_latent_model(config, latent_ids, latent_size=args.latent_size)
         config.compress_strategy = args.compress_strategy
         config.use_cache = False
-        base_model = dependencies.load_model(
-            args.model,
-            config=config,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=args.attention_implementation,
-            cache_dir=args.cache_dir,
-            trust_remote_code=True,
-        )
+        base_model = _load_stage1_model(args.model, config, args, dependencies)
         base_model.resize_token_embeddings(resized_vocab_size)
         dependencies.validate_vocab_alignment(base_model, resized_vocab_size)
         if tuning.method != "full":
@@ -542,7 +583,8 @@ def build_stage1_training_components(
             checkpoint,
             config=config,
             torch_dtype=torch.bfloat16,
-            attn_implementation=args.attention_implementation,
+            attn_implementation=({"": args.attention_implementation, "vision_config": args.vision_attention_implementation}
+                                 if is_v5 else args.attention_implementation),
             cache_dir=args.cache_dir,
             trust_remote_code=True,
         )
@@ -572,14 +614,7 @@ def build_stage1_training_components(
             requested_base_model_reference=args.model,
             metadata_snapshot=metadata_snapshot,
         )
-        base_model = dependencies.load_model(
-            args.model,
-            config=config,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=args.attention_implementation,
-            cache_dir=args.cache_dir,
-            trust_remote_code=True,
-        )
+        base_model = _load_stage1_model(args.model, config, args, dependencies)
         model = dependencies.load_peft_model(
             base_model,
             processor,
@@ -611,10 +646,72 @@ def build_stage1_training_components(
     if args.max_train_samples is not None:
         dataset = dataset[: args.max_train_samples]
     token_ids = LatentTokenIds(*latent_ids)
-    collator = dependencies.collator_factory(processor, token_ids, args.latent_size)
-    trainer = dependencies.trainer_factory(
+    collator = dependencies.collator_factory(processor, token_ids, args.latent_size,
+        **({'stage1_variant': 'v5'} if is_v5 else {}))
+    training_args = build_stage1_training_arguments(args)
+    factory = dependencies.trainer_factory
+    v5_kwargs = {}
+    if is_v5:
+        from copy import deepcopy
+        from stage1.ema import Stage1EmaTeacher
+        from stage1.v5_reference import (V5ReferenceIdentity, capture_v5_reference,
+                                        restore_v5_reference, _state_identity)
+        from stage1.v5_trainer import CustomTrainerStage1V5
+        # SFTConfig initializes the existing distributed device context; use its
+        # normal process group for identity/error agreement, not manual ranks.
+        training_args.device
+        reference_model = None
+        if checkpoint is not None:
+            reference_config = deepcopy(config)
+            original = _load_stage1_model(args.model, reference_config, args, dependencies)
+            original.resize_token_embeddings(len(processor.tokenizer))
+            reference_model = dependencies.build_tuned_model(original,tuning,latent_ids,
+                                                               zero_stage=profile.zero_stage)
+        teacher = Stage1EmaTeacher(model,decay=1.,method='dora',
+                                  initial_reference_model=reference_model)
+        error, identity = None, None
+        try:
+            if checkpoint is not None:
+                identity = V5ReferenceIdentity(**v5_saved['reference'])
+                restore_v5_reference(teacher,model,processor,base_path=Path(args.model),
+                                     directory=checkpoint,expected=identity)
+            elif training_args.should_save:
+                identity = capture_v5_reference(teacher,model,processor,
+                    base_path=Path(args.model),directory=output_dir)
+        except Exception as exc:
+            error = exc
+        if not torch.distributed.is_initialized():
+            raise RuntimeError('v5 requires the initialized four-rank process group')
+        failures = [None]*profile.world_size
+        torch.distributed.all_gather_object(failures, None if error is None else str(error))
+        if any(failure is not None for failure in failures):
+            if error is not None: raise error
+            raise RuntimeError(f'v5 initial reference failed on another rank: {failures}')
+        if checkpoint is None:
+            identities = [identity]
+            torch.distributed.broadcast_object_list(identities,src=0)
+            identity = identities[0]
+        local_digest = _state_identity(teacher,teacher.state_dict())
+        digests = [None]*profile.world_size
+        torch.distributed.all_gather_object(digests,local_digest)
+        if any(digest != identity.effective_state_sha256 for digest in digests):
+            raise ValueError('v5 initial reference differs across ranks')
+        error = None
+        try:
+            if checkpoint is not None and training_args.should_save:
+                _copy_v5_resume_reference(checkpoint, output_dir)
+        except Exception as exc:
+            error = exc
+        torch.distributed.all_gather_object(failures, None if error is None else str(error))
+        if any(failure is not None for failure in failures):
+            if error is not None: raise error
+            raise RuntimeError(f'v5 resume reference publication failed: {failures}')
+        factory = CustomTrainerStage1V5
+        v5_kwargs = dict(v5_config=args.stage1_v5_config, v5_reference_identity=identity,
+                         v5_saved_contract=v5_saved, ema_teacher=teacher)
+    trainer = factory(
         model=model,
-        args=build_stage1_training_arguments(args),
+        args=training_args,
         train_dataset=dataset,
         data_collator=collator,
         processing_class=processor,
@@ -628,9 +725,10 @@ def build_stage1_training_components(
         deepspeed_runtime_profile=profile,
         ema_method=tuning.method,
         stage1_peft_metadata=metadata,
-        collect_stage1_diagnostics=bool(
+        collect_stage1_diagnostics=is_v5 or bool(
             getattr(args, "benchmark_evidence_path", None)
         ),
+        **v5_kwargs,
     )
     if tuning.method != "full" and args.gradient_checkpointing:
         validate_stage1_checkpoint_context(getattr(trainer, "model", model))

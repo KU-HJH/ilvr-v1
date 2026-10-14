@@ -248,7 +248,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         item == "--lora_target_modules"
         or item.startswith("--lora_target_modules=")
         for item in raw_argv
-    )
+    ) or bool(args.stage1_v5_saved_contract is not None
+              and 'lora_target_modules' in args.stage1_v5_saved_contract['execution'])
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         raise ValueError("Learning rate must be finite and positive")
     if args.lora_r <= 0 or args.lora_alpha <= 0:
@@ -370,6 +371,42 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
         'preference_entropy_top_percent', 'loss_chunk_positions',
         'stage1_v5_selection', 'stage1_v5_text_kl_weight',
     }
+    # Resolve saved variant/objective BEFORE any eager fresh-option validation.
+    # Omitted entropy support and execution options inherit their exact identity.
+    from stage1.v5_resume import load_v5_contract, validate_v5_resume, V5_CONTRACT_FILENAME
+    saved = None
+    resume = getattr(args, 'resume_from_checkpoint_path', None)
+    present = set()
+    for item in raw_argv:
+        option = item.partition('=')[0]
+        action = parser._option_string_actions.get(option)
+        if action is None and option.startswith('--'):
+            matches = parser._get_option_tuples(option)
+            if len(matches) == 1:
+                action = matches[0][0]
+        if action is not None:
+            present.add(action.dest)
+    if args.stage == 'stage1' and resume:
+        if (Path(resume) / V5_CONTRACT_FILENAME).exists():
+            saved = load_v5_contract(Path(resume))
+            if 'stage1_variant' in present and args.stage1_variant != 'v5':
+                raise ValueError('explicit stage1_variant conflicts with saved v5 contract')
+            args.stage1_variant = 'v5'
+            inherited = {**saved['coefficients'], **saved['execution']}
+            inherited.update(max_steps=saved['schedule'].get('configured_max_steps', args.max_steps),
+                             epochs=saved['schedule'].get('num_train_epochs', args.epochs))
+            if 'deepspeed_profile' in saved['execution']:
+                inherited['deepspeed_config'] = saved['execution']['deepspeed_profile']['config_path']
+            for name, value in inherited.items():
+                name = {'warmup_steps': 'warm_up_steps'}.get(name, name)
+                if hasattr(args, name):
+                    if name in present and getattr(args, name) != value:
+                        raise ValueError(f'explicit {name} conflicts with saved v5 contract')
+                    if name not in present:
+                        setattr(args, name, value)
+        elif args.stage1_variant == 'v5':
+            load_v5_contract(Path(resume))  # Explicitly reject legacy relabeling.
+    args.stage1_v5_saved_contract = saved
     explicit = {}
     is_v5 = args.stage1_variant == 'v5'
     for index, item in enumerate(raw_argv):
@@ -404,7 +441,8 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
     if is_v5 and args.stage != 'stage1':
         raise ValueError('stage1_variant=v5 requires --stage stage1')
     args.stage1_v5_explicit_values = explicit
-    args.stage1_v5_config = resolve_v5_config(explicit) if is_v5 else None
+    args.stage1_v5_config = (validate_v5_resume(saved, explicit) if saved is not None
+                            else resolve_v5_config(explicit)) if is_v5 else None
     if is_v5:
         config = args.stage1_v5_config
         args.stage1_loss_type = config.loss_type

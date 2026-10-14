@@ -347,26 +347,7 @@ class CustomTrainerStage1(SFTTrainer):
         # ``num_items_in_batch`` remains in the public Trainer signature.  The
         # local Qwen loss has no compatible forward argument for this hint.
         del num_items_in_batch
-        working_inputs = dict(inputs)
-        metadata = working_inputs.pop("stage1_batch_metadata", None)
-        if not isinstance(metadata, Stage1BatchMetadata):
-            raise TypeError(
-                "stage1_batch_metadata must be a Stage1BatchMetadata instance"
-            )
-
-        self._validate_ema_teacher_device(working_inputs)
-        targets = self.target_builder.build(
-            self.ema_teacher.model, working_inputs, metadata
-        )
-        self._validate_targets(targets, metadata, working_inputs)
-        model_inputs = {
-            key: value
-            for key, value in working_inputs.items()
-            if key not in _HELPER_INPUTS
-        }
-        model_inputs["latent_hidden_states"] = targets.latent_values.detach()
-        model_inputs["image_out_mask"] = targets.latent_mask
-
+        model_inputs, metadata, targets = self._prepare_stage1_loss_inputs(inputs)
         labels = model_inputs.get("labels")
         if not isinstance(labels, torch.Tensor) or labels.ndim != 2:
             raise TypeError("Stage 1 labels must be a rank-2 tensor")
@@ -376,15 +357,7 @@ class CustomTrainerStage1(SFTTrainer):
             forward_inputs.pop("labels")
 
         outputs = model(**forward_inputs)
-        model_ce_loss = getattr(outputs, "loss", None)
-        if labels.shape[0] == 1 and (
-            not isinstance(model_ce_loss, torch.Tensor)
-            or model_ce_loss.numel() != 1
-        ):
-            raise RuntimeError("Stage 1 student forward must return a scalar loss")
-        ce_loss = self._equal_sample_ce_loss(outputs, labels, model_ce_loss)
-        outputs.loss = ce_loss
-        alignment_loss = self._alignment_loss(outputs, targets)
+        ce_loss, alignment_loss = self._stage1_native_losses(outputs, labels, targets)
         loss = self.ce_weight * ce_loss + self.sim_weight * alignment_loss
         if not bool(torch.isfinite(loss.detach()).all().item()):
             raise FloatingPointError("Stage 1 loss is nonfinite")
@@ -405,6 +378,43 @@ class CustomTrainerStage1(SFTTrainer):
         else:
             self._latest_stage1_diagnostics = None
         return (loss, outputs) if return_outputs else loss
+
+    def _prepare_stage1_loss_inputs(self, inputs) -> tuple[dict, Stage1BatchMetadata, Stage1TeacherTargets]:
+        """Build helper targets once, preserving the original model tensors."""
+        working_inputs = dict(inputs)
+        metadata = working_inputs.pop("stage1_batch_metadata", None)
+        if not isinstance(metadata, Stage1BatchMetadata):
+            raise TypeError(
+                "stage1_batch_metadata must be a Stage1BatchMetadata instance"
+            )
+
+        self._validate_ema_teacher_device(working_inputs)
+        targets = self.target_builder.build(
+            self.ema_teacher.model, working_inputs, metadata
+        )
+        self._validate_targets(targets, metadata, working_inputs)
+        model_inputs = {
+            key: value
+            for key, value in working_inputs.items()
+            if key not in _HELPER_INPUTS
+        }
+        model_inputs["latent_hidden_states"] = targets.latent_values.detach()
+        model_inputs["image_out_mask"] = targets.latent_mask
+
+        return model_inputs, metadata, targets
+
+    def _stage1_native_losses(self, outputs, labels: torch.Tensor, targets: Stage1TeacherTargets) -> tuple[torch.Tensor, torch.Tensor]:
+        """Unchanged native per-sample CE and latent alignment reductions."""
+        model_ce_loss = getattr(outputs, "loss", None)
+        if labels.shape[0] == 1 and (
+            not isinstance(model_ce_loss, torch.Tensor)
+            or model_ce_loss.numel() != 1
+        ):
+            raise RuntimeError("Stage 1 student forward must return a scalar loss")
+        ce_loss = self._equal_sample_ce_loss(outputs, labels, model_ce_loss)
+        outputs.loss = ce_loss
+        alignment_loss = self._alignment_loss(outputs, targets)
+        return ce_loss, alignment_loss
 
     @staticmethod
     def _equal_sample_ce_loss(outputs, labels, model_ce_loss) -> torch.Tensor:
