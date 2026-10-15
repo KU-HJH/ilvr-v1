@@ -278,3 +278,29 @@ def test_model_weights_identity_tracks_adapter_and_sparse_rows(tmp_path):
     (generation/'ilvr_token_rows.safetensors').write_bytes(b'rows-A')
     (generation/'adapter_model.safetensors').write_bytes(b'adapter-B')
     assert cli.model_weights_identity(checkpoint) != cli.model_weights_identity(generation)
+
+
+def test_analysis_processor_reproduces_initial_added_token_serialization(tmp_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import BPE
+    from transformers import AutoProcessor, Qwen2TokenizerFast, Qwen2VLImageProcessor, Qwen2_5_VLProcessor
+    from stage1.composition import _add_fresh_latent_tokens
+    from stage1.v5_reference import _processor_identity
+    from scripts import analyze_stage1_v5_causal as cli
+    base, checkpoint = tmp_path/'base', tmp_path/'checkpoint'
+    tokenizer = Qwen2TokenizerFast(tokenizer_object=Tokenizer(BPE(
+        vocab={'a': 0, '<|endoftext|>': 1, '<|im_end|>': 2}, merges=[])))
+    Qwen2_5_VLProcessor(image_processor=Qwen2VLImageProcessor(), tokenizer=tokenizer).save_pretrained(base)
+    initial = AutoProcessor.from_pretrained(base)
+    assert _add_fresh_latent_tokens(initial.tokenizer) == (3, (3, 4, 5))
+    initial.save_pretrained(checkpoint)
+    reloaded = AutoProcessor.from_pretrained(checkpoint)
+    # Real pinned-tokenizer roundtrip preserves vocabulary but loses AddedToken
+    # objects in additional_special_tokens, changing the exact serialized hash.
+    assert reloaded.tokenizer.get_vocab() == initial.tokenizer.get_vocab()
+    expected = _processor_identity(initial)
+    assert _processor_identity(reloaded) != expected
+    restored = cli.load_analysis_processor(base)
+    assert _processor_identity(restored) == expected
+    assert [restored.tokenizer.convert_tokens_to_ids(t) for t in
+            ('<|latent_pad|>', '<|latent_start|>', '<|latent_end|>')] == [3, 4, 5]

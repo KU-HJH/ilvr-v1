@@ -67,10 +67,19 @@ def select(args):
     write_json(args.manifest, manifest)
 
 
+def load_analysis_processor(base):
+    """Reproduce initial training serialization; saved-tokenizer reload loses AddedToken types."""
+    from transformers import AutoProcessor
+    from stage1.composition import _add_fresh_latent_tokens
+    processor = AutoProcessor.from_pretrained(base, cache_dir=str(ROOT/'data/cache'), trust_remote_code=True)
+    _add_fresh_latent_tokens(processor.tokenizer)
+    return processor
+
+
 def load_analysis_models(checkpoint, base, device):
     """CPU BF16 training-shaped base/resize/DoRA ordering, then authenticate helper."""
     import torch
-    from transformers import AutoConfig, AutoProcessor, Qwen2_5_VLForConditionalGeneration, set_seed
+    from transformers import AutoConfig, Qwen2_5_VLForConditionalGeneration, set_seed
     from stage2.attention_backend import load_qwen2_5_vl_with_attention
     from stage1.composition import _configure_latent_model
     from stage1.checkpointing import load_stage1_peft_artifact, load_stage1_peft_metadata
@@ -85,7 +94,7 @@ def load_analysis_models(checkpoint, base, device):
     saved = contract['execution']
     set_seed(saved['seed'])
     metadata = load_stage1_peft_metadata(checkpoint)
-    processor = AutoProcessor.from_pretrained(checkpoint, cache_dir=str(ROOT/'data/cache'), trust_remote_code=True)
+    processor = load_analysis_processor(base)
     def original():
         config = AutoConfig.from_pretrained(base, trust_remote_code=True)
         _configure_latent_model(config, metadata.latent_token_ids, latent_size=saved['latent_size'])
