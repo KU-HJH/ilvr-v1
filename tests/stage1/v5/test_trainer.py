@@ -434,7 +434,8 @@ def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejec
         assert saved['schedule']['configured_max_steps']==3
         assert saved['execution']['packages']['accelerate']=='1.10.1'
         assert saved['execution']['lora_target_modules']==','.join(DEFAULT_STAGE1_TARGET_SUFFIXES)
-        assert set(saved['execution']['source_sha256'])=={'v5_trainer','stage1_trainer','transformers_trainer'}
+        assert set(saved['execution']['source_sha256'])=={'v5_trainer','stage1_trainer','transformers_trainer',
+            'query','targets','history_attention','history_teacher'}
         parent_calls.append(kw)
         return 'parent-result'
     monkeypatch.setattr(CustomTrainerStage1,'train',parent)

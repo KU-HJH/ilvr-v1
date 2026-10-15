@@ -898,3 +898,18 @@ def test_launcher_rejects_invalid_save_steps(tmp_path, value):
 
     assert completed.returncode == 2
     assert "save_steps" in completed.stderr
+
+
+@pytest.mark.parametrize('explicit_text', [False, True])
+def test_adaptive_worker_omits_only_generated_textual_fallback(tmp_path, explicit_text):
+    extra = ['--textual_states', 'all'] if explicit_text else []
+    completed = run_launcher(LAUNCHER, *base_args(tmp_path/'out'),
+                             '--query_mode', 'adaptive', '--history_text_gamma', '.55',
+                             '--history_attention_layers', 'last4', *extra)
+    assert completed.returncode == 0, completed.stderr
+    argv = shlex.split(completed.stdout)
+    assert argv[argv.index('--query_mode')+1] == 'adaptive'
+    assert argv[argv.index('--history_text_gamma')+1] == '.55'
+    assert argv[argv.index('--history_attention_layers')+1] == 'last4'
+    assert ('--textual_states' in argv) == explicit_text
+    if explicit_text: assert argv[argv.index('--textual_states')+1] == 'all'

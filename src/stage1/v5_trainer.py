@@ -22,6 +22,10 @@ from .v5_reference import V5ReferenceIdentity, V5_REFERENCE_FILENAME
 from .v5_resume import (V5_CONTRACT_FILENAME, build_v5_contract, load_v5_contract,
                         validate_v5_resume)
 from .v5_selection import select_v5_text_keys
+from .query import Stage1QueryConfig, query_execution_config, resolve_query_layers
+from .targets import Stage1TeacherTargetBuilder
+from .history_attention import ReducedHistoryAttentionObserver
+from .history_teacher import HistoryPrefixAdapter
 
 
 class CustomTrainerStage1V5(CustomTrainerStage1):
@@ -257,10 +261,17 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
             loss_chunk_positions=self.v5_config.loss_chunk_positions,
             backend=read_stage1_backend_settings(),
             packages={key:packages.version(key) for key in ('torch','transformers','accelerate','deepspeed','peft','trl')})
+        query_config = getattr(self, 'query_config', Stage1QueryConfig())
+        layers = (resolve_query_layers(query_config.attention_layers, len(qwen.model.layers))
+                  if query_config.mode == 'adaptive' else ())
+        execution['query_config'] = query_execution_config(query_config, layers)
         execution['source_sha256'] = {
             key:hashlib.sha256(Path(inspect.getsourcefile(cls)).read_bytes()).hexdigest()
             for key,cls in (('v5_trainer',CustomTrainerStage1V5),
-                            ('stage1_trainer',CustomTrainerStage1),('transformers_trainer',Trainer))}
+                            ('stage1_trainer',CustomTrainerStage1),('transformers_trainer',Trainer),
+                            ('query',Stage1QueryConfig),('targets',Stage1TeacherTargetBuilder),
+                            ('history_attention',ReducedHistoryAttentionObserver),
+                            ('history_teacher',HistoryPrefixAdapter))}
         return build_v5_contract(self.v5_config,self.v5_reference_identity,
             ce_weight=self.ce_weight,sim_weight=self.sim_weight,schedule=schedule,execution=execution)
 
@@ -271,6 +282,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         # remain in the compared/saved semantics.
         effective = json.loads(json.dumps(contract, allow_nan=False))
         execution = effective['execution']
+        execution.setdefault('query_config', query_execution_config(Stage1QueryConfig(), ()))
         execution.pop('stage1_v5_debug', None)  # Instrumentation is not resume semantics.
         if 'model' in execution:
             execution['model'] = effective['reference']['base_content_sha256']

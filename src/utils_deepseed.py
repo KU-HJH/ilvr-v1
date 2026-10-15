@@ -24,6 +24,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--evaluation_output_path", type=str, default="evaluation_results.json", help="Path to save evaluation results JSON file.")
     parser.add_argument("--model", type=str, default='Qwen/Qwen2.5-VL-7B-Instruct')
     parser.add_argument("--stage", type=str, default="stage1")
+    parser.add_argument("--query_mode", choices=("legacy", "adaptive"), default="legacy")
+    parser.add_argument("--history_text_gamma", type=float, default=.9)
+    parser.add_argument("--history_attention_layers", choices=("last", "last4", "all"), default="last")
     parser.add_argument("--stage1_variant", choices=("standard", "v5"), default="standard")
     parser.add_argument("--stage1_loss_type", choices=("dil-bce-orig", "dil_bce_orig"))
     parser.add_argument("--lambda_preference", type=float)
@@ -416,6 +419,8 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
             load_v5_contract(Path(resume))  # Explicitly reject legacy relabeling.
     args.stage1_v5_saved_contract = saved
     explicit = {}
+    query_explicit = {}
+    query_fields = {'query_mode', 'history_text_gamma', 'history_attention_layers'}
     is_v5 = args.stage1_variant == 'v5'
     for index, item in enumerate(raw_argv):
         option, equal, inline = item.partition('=')
@@ -427,6 +432,12 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
             if len(matches) != 1:
                 continue
             action, option = matches[0][:2]
+        if action.dest in query_fields:
+            value = inline if equal else raw_argv[index + 1]
+            value = action.type(value) if action.type else value
+            if action.dest in query_explicit and query_explicit[action.dest] != value:
+                raise ValueError(f'conflicting explicit values for {action.dest}')
+            query_explicit[action.dest] = value
         spelling = option.removeprefix('--')
         name = action.dest if spelling == 'no-topk_include_gt' else spelling
         if name in public and not (is_v5 and args.stage == 'stage1'):
@@ -465,6 +476,23 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
         args.step_preference_lambda_topk_mass = config.lambda_topk_mass
         args.step_preference_entropy_top_percent = config.preference_entropy_top_percent
         args.step_entropy_weight = config.lambda_entropy
+
+    from stage1.query import resolve_query_config
+    from stage1.v5_resume import resolve_v5_query_resume
+    query = (resolve_v5_query_resume(saved, query_explicit) if saved is not None
+             else resolve_query_config(query_explicit))
+    if query.mode == 'adaptive':
+        if (args.stage != 'stage1' or not is_v5 or args.tuning_method != 'dora'
+                or args.per_device_train_batch_size != 1):
+            raise ValueError('adaptive query requires Stage1-v5 DoRA with batch size 1')
+        if 'textual_states' in present:
+            raise ValueError('adaptive query does not accept explicit textual_states')
+    elif query_fields.intersection(query_explicit) - {'query_mode'}:
+        raise ValueError('legacy query does not accept history controls')
+    args.stage1_query_explicit_values = query_explicit
+    args.stage1_query_config = query
+    args.query_mode, args.history_text_gamma, args.history_attention_layers = (
+        query.mode, query.text_gamma, query.attention_layers)
 
 
 def get_args():

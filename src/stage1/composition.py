@@ -484,6 +484,10 @@ def build_stage1_training_components(
     data_path, image_root, output_dir = _require_stage1_inputs(args)
     tuning = resolve_stage1_tuning_config(args)
     is_v5 = getattr(args, 'stage1_variant', 'standard') == 'v5'
+    from stage1.query import Stage1QueryConfig
+    query_config = getattr(args, 'stage1_query_config', Stage1QueryConfig())
+    if query_config.mode == 'adaptive' and not is_v5:
+        raise ValueError('adaptive query requires Stage1-v5')
     if is_v5:
         if (tuning.method != 'dora' or args.ema_tau != 1.
                 or not profile.enabled or profile.zero_stage != 1 or profile.world_size != 4
@@ -516,8 +520,11 @@ def build_stage1_training_components(
 
     v5_saved = None
     if is_v5 and checkpoint is not None:
-        from stage1.v5_resume import load_v5_contract, validate_v5_resume
+        from stage1.v5_resume import load_v5_contract, validate_v5_resume, resolve_v5_query_resume
         v5_saved = load_v5_contract(checkpoint)
+        restored_query = resolve_v5_query_resume(v5_saved, getattr(args, 'stage1_query_explicit_values', {}))
+        if restored_query != query_config:
+            raise ValueError('resolved query conflicts with saved v5 contract')
         validate_v5_resume(v5_saved, {**getattr(args, 'stage1_v5_explicit_values', {}),
                                      'ce_weight':args.ce_weight,'sim_weight':args.sim_weight})
 
@@ -725,6 +732,7 @@ def build_stage1_training_components(
         image_pool_k=args.image_pool_k,
         helper_group_L=args.helper_group_L,
         textual_states=args.textual_states,
+        query_config=query_config,
         ce_weight=args.ce_weight,
         deepspeed_runtime_profile=profile,
         ema_method=tuning.method,

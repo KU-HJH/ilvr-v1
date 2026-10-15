@@ -69,6 +69,7 @@ benchmark_evidence_path=${STAGE1_BENCHMARK_EVIDENCE_PATH:-}
 benchmark_smoke_resume_witness=${STAGE1_BENCHMARK_SMOKE_RESUME_WITNESS:-}
 training_evidence_path=
 extra_worker_arguments=()
+query_mode=legacy
 declare -A requested_options=()
 dry_run=false
 final_save=true
@@ -170,6 +171,8 @@ done
 while (( $# )); do
     requested_options[$1]=1
     case $1 in
+        --query_mode) require_value "$@"; query_mode=$2; extra_worker_arguments+=(--query_mode "$2"); shift 2 ;;
+        --history_text_gamma|--history_attention_layers) require_value "$@"; extra_worker_arguments+=("$1" "$2"); shift 2 ;;
         --sim-weight) require_value "$@"; extra_worker_arguments+=(--sim_weight "$2"); shift 2 ;;
         --stage1-v5-debug) extra_worker_arguments+=(--stage1_v5_debug); shift ;;
         --no-stage1-v5-debug) extra_worker_arguments+=(--no-stage1_v5_debug); shift ;;
@@ -421,7 +424,9 @@ append_execution_option --seed --seed "$seed"
 append_execution_option --attention-implementation --attention_implementation "$attention_implementation"
 append_execution_option --save-strategy --save_strategy "$save_strategy"
 append_execution_option --save-steps --save_steps "$save_steps"
-append_execution_option --textual_states --textual_states "$textual_states"
+if [[ $query_mode != adaptive || -v requested_options[--textual_states] ]]; then
+    append_execution_option --textual_states --textual_states "$textual_states"
+fi
 if [[ $v5_resume != true ]]; then command+=(--gradient_checkpointing); fi
 
 command+=(--tuning_method "$method" "${extra_worker_arguments[@]}")
