@@ -203,3 +203,60 @@ actual parent backward. These are complementary witnesses, not a fully
 authenticated production training/resume execution. Production initialization,
 GPU/BF16/FA2/four-rank/full restore/long-input/performance remain unverified.
 Task6 complete; whole-change review and final suite remain required.
+
+## Whole-change independent review
+
+Reviewer /root/history_query_final_review (gpt-6-astra, xhigh), complete
+148b0e8ead14456d02cc595f0cc32a0752ee22e8..
+53dc51aa7d81f20fe99062aa2d365e4946a544af package/spec/plan and recorded
+focused evidence read. No mutations or suite reruns; one focused venv probe.
+Returned **With fixes, conditional on scoped re-review and final full suite**.
+No Critical/Important quality finding; one required spec correction and one
+retained coverage Minor. Source/reference/loss/resume integration otherwise
+aligned in evidenced CPU scope. This was not a clean approval.
+
+1. Required spec correction, Minor runtime severity: query.py:62 clips last4
+   below4, contrary to approved spec:93. Test:45 expects clipping; resume:150
+   and workflow:197 use impossible2layer last4 metadata. Focused probe accepted
+   counts1/2/3 and serialized/restored indices[0,1]. Root found no override.
+   Fix must reject insufficient topology and reconcile causal fixtures; actual
+   valid last4 witnesses must have at least4 layers.
+2. Retained Task3 Minor is valid: fixture:52/attentiontest:43 has only oneKV
+   head. Native repeat_kv mapping agrees statically, but distinct-group mapping
+   is not witnessed. Add multipleKV/moreQheads/distinct outputs and headchunk
+   crossing a group boundary; otherwise retain explicitly, never claim proven
+   general GQA equivalence.
+
+Root dispatched one consolidated /root/history_query_final_fix
+(gpt-6.1-sol, high) for both findings, followed by one scoped re-review.
+Final suite remains pending; no production behavior claim is inferred.
+
+Reviewer declined-to-judge dispositions (each explicitly resolved by root):
+
+| Set-aside behavior | Controller disposition |
+|---|---|
+| BF16/GPU/visionFA2/four-rank participation | No authorized runtime witness; preserve unverified status. |
+| Real long-input latency/VRAM/throughput/accuracy | Unmeasured; no improvement or long-input support claim. |
+| Authenticated production init/full model-optimizer resume | Complementary substituted-composition/actual-parent fixtures only; no end-to-end production claim. |
+| Stage2/movingEMA/generation/windowed attention | Explicit approved exclusions; no implementation or claim. |
+| Final whole-project regression | Mandatory root full suite after scoped re-review, still pending. |
+| Uncommitted controller records/bytecode caches | Control-only updates retained by root; owned generated caches will be removed; no product review inference. |
+
+Consolidated correction195e1bc1e66edc7fdabcb3a81fd04a585a31c543 was
+independently scoped-reviewed by /root/history_query_final_fix_review
+(gpt-6.1-sol, high): both findings ADDRESSED, no new breakage/out-of-scope
+observations. last4 actual topology guard query.py:68 and serialization:84,
+restore:122; tests:51 and runtime resume:158; valid small fixture all/[0] at
+workflow:198. Existing both-node gamma.55/last4 fixture remains valid with
+indices[2,3,4,5]. GQA attention test:86 now has4Q/2distinctKV/headchunk3 with
+nonzeroDoRA/imageMRoPE, fixture defaults unchanged. Native maxabs0, scoped
+test-only wrong-KV swap fails2/2 scores, maxabs.000106006860733; restored.
+
+Root/reviewer read complete logs/implementation/final-fix/
+focused-worktree-green.log:244 passed in15.31s. Earlier fixer's PYTHONPATH
+omission loaded canonical Transformers without replay (238passed/6import
+failures); actual __file__/__path__/find_spec diagnosis proved setup cause,
+no import code changed. Correct environment is .:src:transformers/src.
+Earlier incomplete-path runs are TDD history, not final worktree runtime
+verification. All actual final findings resolved; no deferred/parked finding.
+Final root project suite remains pending; production runtime limits persist.

@@ -457,3 +457,124 @@ has occurred. Preparation read finishing/verification skills; final verification
 command will be chosen for their shared overlapping full-suite claim after
 whole-change review. Original source branch is Stage1-v5 at148b0e8; requested
 stage1_v5 linked worktree remains distinct and preserved.
+
+## Retained SDD preflight evidence
+
+The following is the actual initial controller scan, retained before scratch
+cleanup. It did not detect the last4/spec mismatch later caught by whole-change
+review; its initial consistency assessment is not a runtime correctness proof.
+
+## Preflight: shared files/interfaces
+
+| Tasks | Producer → consumer / shared file | Finding |
+|---|---|---|
+| 1–2 | Query config/layout → native prefix | Consistent; sample-row versus batch shape is explicit. |
+| 1–3 | Config/chunks/layer indices → observer | Consistent; probabilities and FP32 mass contract match. |
+| 1–4 | Text/latent math → adaptive builder | Consistent; absent text omitted and variable Kstar retained. |
+| 1–5 | Config/serialization → CLI/save/resume | Consistent; strict nested execution config and independent formula ID. |
+| 1–6 | Query settings/math → assembled fixture | Consistent; CPU fixture is distinct from production profile admission. |
+| 2–3 | Shared history_fixtures and injected prefix → observer reference | Consistent; sequential implementers avoid fixture conflicts. |
+| 2–4 | Adapter/selection records → target ledger | Consistent; raw inputs versus contextual summaries distinguished. |
+| 2–5 | Adapter module content hash → existing source evidence | Consistent; no plain-backbone replacement. |
+| 2–6 | Real prefix/fixtures → parent-Trainer integration | Consistent; no teacher state crosses a build. |
+| 3–4 | Reduced scores → mass-preserving query | Consistent; current/future keys excluded by causal rules. |
+| 3–5 | Observer module content hash → existing source evidence | Consistent; loss formula is not repurposed as query identity. |
+| 3–6 | Observer lifetime/fixture → repeated builds | Consistent; capture/cleanup and RNG witnessed. |
+| 4–5 | Builder constructor → composition/trainer plumbing | Consistent; default absent config stays legacy. |
+| 4–6 | Packed targets/shared snapshot → F/reference/OFF | Consistent; original row-major result shape retained. |
+| 5–6 | Real parser/resume/launcher → complete flow and README | Consistent; dry-run mapping is not remote runtime evidence. |
+
+## Preflight: task internal consistency
+
+| Task | Tests versus implementation/files | Finding |
+|---|---|---|
+| 1 | Two files; literal math/layout/config expectations and pure functions | Consistent; no source-text tests. |
+| 2 | Three files; native embedding/position/hidden comparisons | Consistent; fixtures retain nonzero effective DoRA. |
+| 3 | Observer/tests plus existing fixture; eager probability comparison | Consistent; full denominator, GQA/MRoPE and exception cleanup pinned. |
+| 4 | Dispatch plus tests/fixture; pinned Git baseline and causal input capture | Consistent; baseline is test-only, not external production dependency. |
+| 5 | CLI/contract/shell allowlist plus named existing tests | Consistent; generated textual fallback versus explicit request distinguished. |
+| 6 | Integration tests/docs; only causal production fixes in owning method | Consistent; sensitivity can use test-only perturbation if assembled behavior is already green, without inventing production code. |
+
+No preflight conflicts requiring a scope or architecture ruling were found.
+
+
+## Retained controller rulings, chronological
+
+Ruling: Task1 saved config is the strict execution.query_config schema, with
+resolved_layer_indices as its index key; text layout emits only pre-START
+segments and no post-final tail — the spec requires exact saved semantics
+and selection-only reasoning spans, while the plan left the JSON index name
+implicit — if wrong, the saved-query contract/consumers would need migration
+and layout expectations would require correction. Exact fields/boundaries
+are appended to task-1-brief.md and were supplied to the implementer.
+
+Ruling: Use the approved plan's focused TDD gates for intermediate component
+tasks and run the mandatory project full suite once against the final reviewed
+feature revision — TDD's project-wide feature-completion gate is preserved,
+while applying the generic implementer template's full-suite-per-commit line
+to all six intermediate components would duplicate broad regression work —
+if wrong, an interaction defect could be detected later and require rework.
+
+Ruling: Keep Task2's fixed adapter signature; tokenizer/metadata-dependent
+single-assistant and image-before-assistant checks belong to Task4 before
+adapter construction, while Task2 checks model-known image/latent structure,
+mask and selected-pad ownership — the plan's Task2 trajectory-validation text
+was broader than the information its approved interface receives — if wrong,
+a malformed trajectory could reach the adapter until the caller checks are
+corrected. Clarification appended to both task briefs; overall validation
+requirement is retained and must be witnessed in Task4.
+
+Ruling: A shape-validated empty selection for an actual completed past block
+is a no-op, with identity/width/duplicate checks preserved; Task4 still rejects
+missing helper candidates — the spec defines zero active history and variable
+Kstar, so injection must not depend on whether a caller records or omits that
+empty history — if wrong, overly permissive adapter input could require tighter
+validation; malformed-candidate rejection remains a separate builder gate.
+
+Ruling: Fail closed when actual native execution ceases to be full causal,
+including a dormant sliding_window value that becomes active across a prefix
+boundary; do not alter teacher configuration, native attention or query math —
+the approved spec excludes sliding-window attention and requires mask/profile
+mismatch errors, while use_sliding_window alone is insufficient evidence —
+if wrong, compatible long-prefix inputs may be rejected and need a later
+reviewed compatibility change. No long-prefix support claim will be made.
+
+Ruling: Builder validates full-causal prefix length before every required
+adaptive teacher path, including empty-history/query observations, by checking
+required stops against actual effective sliding_window — observer empty cases
+deliberately skip capture, but the approved profile also binds prompt/first
+prefix states — if wrong, an otherwise compatible prefix may be rejected;
+without this gate an empty observer could bypass native-mask validation.
+
+Ruling: Task5 also updates the existing exact source_sha256 key assertion in
+v5/test_trainer.py to include the required new query modules, retaining an
+exact set — its source-hash implementation changes that contract now, so the
+adjacent regression belongs with the producer rather than waiting for Task6 —
+if wrong, an expected-key list could hide a missing authentication input;
+independent review must compare the exact actual/new set. No other scope
+expansion or relaxation of source/reference verification is authorized.
+
+Ruling: Treat explicit-null acceptance as the confirmed strict-schema spec
+gap and correct it in the original implementer's focused fix loop despite
+its Minor quality severity — the spec requires strict present saved metadata,
+and SDD requires correction of confirmed spec gaps before advancing — if
+wrong, malformed historical null metadata is rejected earlier than before;
+runtime already rejected it, so supported saved semantics do not change.
+
+Ruling: Add the missing Stage1-v5 README subsection inside existing Training,
+beside Stage1/ZeRO guides — the plan's assumed existing v5 subsection does not
+exist, but its operator-documentation scope and placement intent remain clear —
+if wrong, operators may need the section moved for discoverability; no code
+or documentation subject scope is expanded. Task6 brief updated.
+
+## Final review and verification handoff
+
+All six task reviews and the one consolidated final correction/re-review are
+complete. Final product/test revision is195e1bc1e66edc7fdabcb3a81fd04a585a31c543.
+Both final findings are ADDRESSED; no deferred/parked findings remain.
+Root now applies verification-before-completion and finishing-a-development-branch
+together; one fresh project full suite will witness their overlapping test-pass
+claim. All real training/distributed opt-ins stay disabled. Both local H100NVL
+GPUs were idle with no compute processes; GPU0 remains visible for unit tests.
+Pytest basetemp is under the canonical checkpoints symlink for model fixtures,
+with no test selection/filtering change. Full suite is pending, not yet a pass.
