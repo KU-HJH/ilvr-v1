@@ -13,7 +13,7 @@ No complete written design, implementation plan/method, premise experiment,
 training launch, or implementation has been approved. Existing retrieval
 brainstorming in the separate `Stage1-v5` worktree does not authorize this change.
 
-Active phase: writing-plans; plan review and execution-method selection pending.
+Active phase: approved plan execution via Subagent-driven development.
 Latest explicit naming decision: `--query_mode` replaces the initially
 recommended `--history_query_mode`; proposed values remain legacy/adaptive.
 An implementation would follow the architectural path: sequential teacher
@@ -343,3 +343,117 @@ required header/constraints/review sections, balanced fences and no placeholder
 markers. No planned pytest command, native comparison, training or other
 feature experiment has run. Git/content evidence and the plan commit identity
 are recorded in `results/stage1-v5-history-query-design/plan-verification.json`.
+
+## User selected Subagent-driven execution
+
+Latest instruction: `Subagent로 진행해`, after the presented plan and execution
+choice. This selects Subagent-driven execution and supersedes any inference
+from the interrupted `진행해봐`. The approved plan/spec hashes are unchanged;
+intake HEAD is 8e6f81751c66d410c3e882a594fa14b49a3869d6, with no product diff.
+Root applied the SDD skill, role templates, TDD/writing-good-tests and required
+independent review workflow. Existing isolated worktree was verified.
+
+This plan's skill-created scratch workspace is
+`.superpowers/sdd/2026-10-15-stage1-v5-history-query/`; progress.md identifies
+the exact plan and records the required preflight task/interface table,
+sequential agent dispatches, review/fix outcomes and completion state.
+Minimal evidence will be retained here/in existing results before scratch
+cleanup. The root does not implement product fixes. No training is authorized.
+
+Task1 complete: implementer `/root/history_task1_impl` created
+`e38e21c881b3d9a28d01899d48f90a56229a1e14`; independent reviewer
+`/root/history_task1_review` returned Spec compliant / Task quality Approved,
+with no findings. Root resolved future-runtime cannot-verify items to their
+owning tasks. Focused tests:83 missing-API RED failures, then83 passing;
+fresh final focused83 passed in2.79s. The intermediate broad run was stopped
+on its owned PID after628 passes/exit2 and is explicitly not a full-suite pass.
+Exact logs are under logs/stage1-v5-history-query-implementation/.
+
+Controller rulings so far: strict saved execution-query schema/index naming
+and selection-span boundaries were fixed in the task brief; intermediate
+component tasks use focused gates and the project-wide feature gate remains
+the final reviewed full suite. If wrong, schema consumers could need migration
+or interaction defects could be found later and require rework. These rulings
+and their full rationale remain in this plan's progress ledger.
+
+Task2 complete: `/root/history_task2_impl` produced
+2034445b0657f40d4cf59c0204426e7bb0ffc6fe; independent
+`/root/history_task2_review` returned Spec compliant / Task quality Approved,
+no findings. Focused28 passed; four CPU FP32 nonzero-DoRA native-wrapper
+comparisons showed zero embedding/position/mask/hidden error. Detailed evidence
+and remaining runtime scope are in reviews/2026-10-15-stage1-v5-history-query.md
+and logs/results/stage1-v5-history-query-implementation/.
+
+Additional controller rulings: Task4 owns tokenizer/metadata-dependent
+trajectory/image-before-assistant validation; Task2 retains its fixed API and
+model-known structural validation. Empty selections for real completed blocks
+are validated no-ops, while Task4 still rejects missing helper candidates.
+If wrong, malformed input validation could need tightening or caller fixes.
+
+Task3 complete: /root/history_task3_impl produced7d291f5 thenac2a8bf.
+Initial independent /root/history_task3_review found native-window masking
+disagreed with full-causal reconstruction despite44 passing short-prefix CPU
+tests (maxabs7.45e-09). Root ruled to reject actual window-crossing prefixes,
+without modifying teacher/native semantics; if wrong, compatible long inputs
+could be rejected and require a later reviewed compatibility change.
+Original implementer added causal RED/GREEN regressions:30 passing; independent
+/root/history_task3_fix_review found the Important defect ADDRESSED with no
+new breakage. Minor multiple-KV-head fixture coverage is deferred to final
+review. Exact evidence/ranges reside in the review record and logs/results.
+
+Task4 environment-procedure violation: implementer reported one system-python3
+invocation used solely to rewrite targets.py, despite the venv-only rule.
+No test/model/training execution used it. Required environment-selection step
+was omitted for that edit; final changed content remained unverified at report.
+Root recorded/reported the deviation before affected progression resumed.
+Recovery is venv/apply_patch-only work followed by the planned focused venv
+tests and independent review; later evidence does not make the earlier action
+compliant. No additional implementation scope or training was authorized.
+
+Task4 complete at8d729c992254f626c26c33cc5720230e3c2e4b68, independent
+/root/history_task4_review Spec compliant / quality Approved, no findings.
+Focused65 passed; exact legacy parity and adaptive raw-injection/contextual-
+query/causality/call-count witnesses are recorded in the review roll-up.
+Root additionally ruled the builder must validate all adaptive prefix stops
+before teacher execution, including empty observations that install no
+observer hooks. If wrong, compatible inputs may be rejected; this prevents
+bypassing the approved full-causal profile. Task5 CLI/resume wiring follows.
+
+Task5 complete at8fe8717cba98eac6af5d23a5fd6799900b9f185f following initial
+c073b8d and strict-null fix. Independent /root/history_task5_review found a
+Minor schema discrepancy (runtime still rejected malformed null); root treated
+it as a confirmed spec gap, corrected by original implementer, independently
+re-reviewed ADDRESSED by /root/history_task5_fix_review. Focused215 plus
+fixture8/source-key witness passed, then null RED4/GREEN36; exact both-node
+dry-run argv saved. No SSH/training/remote participation claim.
+
+Controller rulings added: update only the stale exact source-key regression
+with its Task5 producer, keeping exact authentication coverage (cost if wrong:
+missing hash could be concealed); correct present-null schema early despite
+Minor quality severity (cost if wrong: earlier malformed-contract rejection).
+Task5 flat logs were moved byte-preserving to the required run subdirectory;
+the storage deviation/correction is recorded, not presented as earlier
+compliance. Task6 integration/docs now owns remaining assembled witnesses.
+
+Task6 complete atf93e9eebc7584eb2dfa84ed575910331134451f3; independent
+/root/history_task6_review Spec compliant within CPU scope / quality Approved,
+no findings. Eight actual-parent CPU integration cases pass, with three
+expected causal failures under test-only adaptive removal and restored GREEN.
+Full model/optimizer checkpoint restoration and production initialization are
+not proved by these fixtures; Task5 composition substitutes Trainer/distributed
+interfaces and Task6 bypasses __init__ for actual parent backward. Review
+roll-up and task6 logs/results retain the concrete evidence and limits.
+
+README placement ruling: its supposed existing v5 operator section was absent,
+so Task6 adds a bounded subsection inside Training beside Stage1/ZeRO guides.
+If wrong, discoverability may require moving it; documentation subject scope
+and behavior remain unchanged. Root authored only lifecycle control artifacts.
+
+Active phase: all six implementation tasks and their independent task reviews
+complete; independent whole-change review, any required final fix/re-review,
+fresh project full-suite verification and branch finishing remain pending.
+No merge, push, PR, worktree deletion, production training or GPU premise probe
+has occurred. Preparation read finishing/verification skills; final verification
+command will be chosen for their shared overlapping full-suite claim after
+whole-change review. Original source branch is Stage1-v5 at148b0e8; requested
+stage1_v5 linked worktree remains distinct and preserved.
