@@ -287,3 +287,17 @@ v5_trainer.py:294 and pre-publication train dispatch:279,313 traced. Read
 mutations. Simulated ranks remain CPU contract-gate evidence only. This is
 a new runtime-verification finding, not residual final-review rework. Fresh
 full suite is still required; no completed-feature/merge approval claim.
+
+## Fresh final verification
+
+Root r3 full suite exit0:4849passed,11skipped,1existing Torch extension
+architecture warning in1238.82s. Complete output read; log
+logs/stage1-v5-history-query-implementation/final-full-suite.log. Exact command,
+SHA256, failed attempts, approved artifact hashes, reviewed cff4cd1 identity
+and bounds are in results/stage1-v5-history-query-implementation/
+final-verification.json. New product/test contents are identical to the reviewed
+revision; only lifecycle evidence is updated afterward. Full-suite pass now
+satisfies the previous conditional regression gate; no additional broad review
+cycle was run. All code-review findings are addressed, with no parked finding.
+Production runtime/performance evidence remains unverified;11skips are not
+passes. Human integration choice and requested-worktree preservation remain.

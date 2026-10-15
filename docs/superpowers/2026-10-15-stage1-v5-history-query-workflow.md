@@ -1,4 +1,9 @@
-# Stage1-v5 history-query intake
+# Stage1-v5 history-query workflow
+
+Current state: implementation and independent reviews complete; fresh full
+suite passed4849/skipped11/one existing Torch warning. Integration choice
+belongs to the human; requested worktree is preserved. Entries below are
+chronological: earlier pending states describe their time, not current status.
 
 ## Authority and current phase
 
@@ -619,3 +624,26 @@ No second broad review was run. Required fresh full suite re-enters finishing
 Step1 with a fresh owned r3 fixture parent; GPU0 idle, training opt-ins off.
 Post-verification scratch evidence retained in existing review/results; only
 that owned scratch is removed again. Original9 rulings remain retained.
+
+## Final verified implementation and branch handoff
+
+Fresh full-suite r3 exited0:4849passed,11skipped,1warning in1238.82s. Root
+read its complete output. One existing Torch extension warning concerns unset
+TORCH_CUDA_ARCH_LIST; skipped witnesses are not passes. This single successful
+full-suite witness serves verification-before-completion and finishing Step1.
+Earlier failed attempts remain explicitly failed with logs/hashes and causes.
+The exact command, reviewed cff4cd1 code/test identity, start HEAD0734b4f,
+full log hash and all9 controller rulings are retained in final-verification.json.
+Final source/approved-artifact checks pass; only lifecycle docs changed after
+reviewed cff4cd1. Three launcher syntax checks passed against unchanged scripts.
+
+Finishing Step2: named linked worktree stage1_v5 at
+/root/.codex/worktrees/1061/ILVR; gitdir/common differ. Step3 source branch is
+Stage1-v5, original fork148b0e8; its current pointera1c3d855 is separate ongoing
+work, not merged or rebased here. Step4 integration menu remains for the human.
+No merge/push/PR/worktree deletion or production training occurred. Known owned
+bytecode and only this plan scratch removed after retaining minimal evidence.
+No unresolved code-review findings remain; production BF16/GPU/visionFA2/
+actual4ranks/full restore/real-length resource or accuracy effects remain
+unverified, as documented. Root progress-reporting and earlier environment/
+storage deviations remain recorded and are not retroactively compliant.
