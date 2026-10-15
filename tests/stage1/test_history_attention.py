@@ -172,3 +172,65 @@ def test_forward_exception_removes_observer_hooks_and_projection_cache():
     assert torch.isfinite(adapter.forward(prefix).last_hidden_state).all()
     with pytest.raises(RuntimeError, match='missing|capture|failed'):
         observer.scores()
+
+
+@pytest.mark.parametrize('backend', ['eager', 'sdpa'])
+def test_native_window_crossing_rejects_full_causal_observer_even_when_flag_off(backend):
+    """Native sliding_window=4 excludes key14 at query18 despite use_sliding_window=False."""
+    obs_type = observer_type()
+    adapter, prefix = prepared(make_history_case(attention_backend=backend))
+    config = adapter.backbone.config
+    config.sliding_window = 4
+    assert config.use_sliding_window is False
+    with torch.no_grad():
+        for projection in (adapter.backbone.layers[0].self_attn.q_proj,
+                           adapter.backbone.layers[0].self_attn.k_proj):
+            projection.lora_magnitude_vector['default'].weight.zero_()
+            projection.base_layer.bias.zero_()
+    # Read native eager probabilities, and also the actual mask entering each backend.
+    masks = []
+    capture = adapter.backbone.layers[0].register_forward_pre_hook(
+        lambda m, a, kw: masks.append(kw['attention_mask'].detach().clone()),
+        with_kwargs=True)
+    try:
+        result = native(adapter.backbone, prefix, attentions=backend == 'eager')
+    finally:
+        capture.remove()
+    assert len(masks) == 1
+    assert masks[0][0, 0, 18, 14] < -1e20
+    assert torch.equal(masks[0][0, 0, 18, 15:19], torch.zeros(4))
+    if backend == 'eager':
+        torch.testing.assert_close(result.attentions[0][0, :, 18, [14, 15]],
+                                   torch.tensor([[0., .25], [0., .25]]), atol=0, rtol=0)
+    before = hook_counts(adapter.backbone)
+    try:
+        with pytest.raises(ValueError, match='sliding.window|full.causal'):
+            with obs_type(adapter.backbone, layer_indices=(0,), query_positions=(18,),
+                          latent_positions=(14, 15), attention_mask=prefix.attention_mask,
+                          config=Stage1QueryConfig(mode='adaptive')):
+                pass
+        assert hook_counts(adapter.backbone) == before
+    finally:
+        assert config.sliding_window == 4 and config.use_sliding_window is False
+
+
+@pytest.mark.parametrize('backend', ['eager', 'sdpa'])
+@pytest.mark.parametrize('window', [19, 20, None])
+@pytest.mark.parametrize('flag', [False, True])
+def test_short_prefix_retains_native_full_causal_support_at_window_boundary(backend, window, flag):
+    """At S==window the last query is window-1, so no key is excluded yet."""
+    obs_type = observer_type()
+    adapter, prefix = prepared(make_history_case(attention_backend=backend))
+    adapter.backbone.config.sliding_window = window
+    adapter.backbone.config.use_sliding_window = flag
+    expected = native(adapter.backbone, prefix).last_hidden_state
+    before = hook_counts(adapter.backbone)
+    with obs_type(adapter.backbone, layer_indices=(0,), query_positions=(17, 18),
+                  latent_positions=(14, 15), attention_mask=prefix.attention_mask,
+                  config=Stage1QueryConfig(mode='adaptive')) as observer:
+        actual = native(adapter.backbone, prefix).last_hidden_state
+        assert torch.isfinite(observer.scores()).all()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert hook_counts(adapter.backbone) == before
+    assert adapter.backbone.config.sliding_window == window
+    assert adapter.backbone.config.use_sliding_window is flag

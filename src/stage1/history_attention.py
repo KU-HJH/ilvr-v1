@@ -17,6 +17,10 @@ class ReducedHistoryAttentionObserver:
     Hooks read the effective q/k outputs and the decoder's actual rotary inputs.
     Only the active layer owns projection tensors; key/query/head chunks bound
     score workspace. No attention backend or model state is changed.
+
+    The patched native mask uses config.sliding_window independently of its
+    enable flag. Full-causal observation requires sliding_window=None or a
+    prefix length no greater than that window (last query index < window).
     """
 
     def __init__(self, backbone, *, layer_indices: tuple[int, ...],
@@ -58,13 +62,21 @@ class ReducedHistoryAttentionObserver:
         self._entered = True
         if not self.query_positions or not self.latent_positions:
             return self
+        # Native eager/SDPA mask construction uses sliding_window even when
+        # use_sliding_window=False. Once S > window it excludes causal keys;
+        # changing that native execution or observing a windowed objective is
+        # outside this observer's full-causal contract.
+        window = self.backbone.config.sliding_window
+        if window is not None and self._mask.shape[1] > window:
+            raise ValueError(
+                'observer requires full-causal attention: prefix length '
+                f'{self._mask.shape[1]} exceeds native sliding_window={window}')
         try:
             for i in self.layer_indices:
                 layer = self.backbone.layers[i]
                 if (any(m.training for m in layer.modules())
                         or any(p.requires_grad or p.grad is not None for p in layer.parameters())
-                        or layer.attn_type not in ('sdpa', 'eager')
-                        or layer.self_attn.config.use_sliding_window):
+                        or layer.attn_type not in ('sdpa', 'eager')):
                     raise ValueError('observer requires frozen eval full-causal eager/SDPA layers')
                 self._handles.append(layer.register_forward_pre_hook(
                     partial(self._before_layer, i), with_kwargs=True))
