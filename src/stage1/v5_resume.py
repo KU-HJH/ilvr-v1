@@ -34,6 +34,8 @@ def _execution(execution: Mapping[str, object]) -> None:
     if not isinstance(execution, Mapping):
         raise ValueError('invalid v5 execution profile')
     if 'query_config' in execution:
+        if not isinstance(execution['query_config'], Mapping):
+            raise ValueError('saved query config must be an execution mapping')
         resolve_query_config({}, saved=execution['query_config'])
     supported = {'tuning_method': 'dora', 'method': 'dora', 'ema_tau': 1.,
                  'zero_stage': 1, 'per_device_train_batch_size': 1,
@@ -117,12 +119,13 @@ def resolve_v5_query_resume(saved_contract: Mapping[str, object],
     """Authenticate the v5 sidecar, then inherit its independent query semantics."""
     _validate(saved_contract)
     execution = saved_contract['execution']
-    saved = execution.get('query_config')
-    if saved is None:
+    if 'query_config' not in execution:
         # Only historical contracts predate query metadata. Current source
         # bindings cannot silently lose their query execution contract.
         if {'query', 'targets', 'history_attention', 'history_teacher'} & set(
                 execution.get('source_sha256', {})):
             raise ValueError('current v5 contract is missing query_config')
         saved = query_execution_config(Stage1QueryConfig(), ())
+    else:
+        saved = execution['query_config']
     return resolve_query_config(explicit_query, saved=saved)

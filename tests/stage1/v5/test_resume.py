@@ -183,3 +183,26 @@ def test_historical_query_normalization_preserves_source_and_reference_guards():
     current = copy.deepcopy(historical)
     current['reference']['base_content_sha256'] = 'd'*64
     assert normalize(historical) != normalize(current)
+
+
+
+@pytest.mark.parametrize('entrypoint', ['build', 'load', 'loss_resume', 'query_resume'])
+def test_explicit_null_query_metadata_rejects_before_resume_inheritance(tmp_path, entrypoint):
+    saved = contract()
+    saved['execution']['query_config'] = None
+    resume = api()
+    with pytest.raises(ValueError, match='query.*mapping'):
+        if entrypoint == 'build':
+            from stage1.v5_reference import V5ReferenceIdentity
+            resume.build_v5_contract(Stage1V5Config(**saved['config']),
+                V5ReferenceIdentity(**saved['reference']), **saved['coefficients'],
+                schedule=saved['schedule'], execution=saved['execution'])
+        elif entrypoint == 'load':
+            checkpoint = tmp_path/'checkpoints/null-query/checkpoint-1'
+            checkpoint.mkdir(parents=True)
+            (checkpoint/'stage1_v5.json').write_text(json.dumps(saved))
+            resume.load_v5_contract(checkpoint)
+        elif entrypoint == 'loss_resume':
+            resume.validate_v5_resume(saved, {})
+        else:
+            resume.resolve_v5_query_resume(saved, {})
