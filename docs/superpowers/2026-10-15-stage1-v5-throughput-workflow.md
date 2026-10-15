@@ -344,3 +344,49 @@ collation tracemalloc32382669→26419152B, VmHWM1001428→1001820KiB. Only expec
 saved-slow-image advisory appears in collation preamble. No test/benchmark
 concurrency or training launch. These fresh measurements substantiate local
 path claims, not utilization/end-to-end claims.
+
+## Fresh final verification result and handoff
+
+Full project command above ran once at `91bc90f96b01172e0b357deffe0e41421aed2837`:
+**4642 passed, 11 skipped, 1 warning in1207.69s**, exit0. Root read the complete
+`logs/stage1-v5-throughput-20261015/root-full-suite.log`. Warning is
+`TORCH_CUDA_ARCH_LIST is not set` from existing
+`tests/stage2/test_full_optimizer_offload.py::test_installed_cpu_adam_mapping_preserves_no_decay_group`;
+no failures. Skips are reported as skips, not passes. This single result supplies
+both verification-before-completion and finishing Step1's overlapping test-pass
+claim. No duplicate full-suite run. Distinct local performance commands are recorded
+above and passed on the same product source content.
+
+Post-suite diff checks passed: whitespace for148b0e8..HEAD; exact empty diff
+61c07a6..HEAD for src/transformers/scripts/tests confirms final reviewed content
+is the tested content. Only evidence docs changed after final review. All source
+and test edits are committed; unrelated pre-existing caches and cancelled retrieval
+workflow remain untouched. No model artifacts, training, remote synchronization,
+merge, push, environment changes or profile changes occurred.
+
+All approved implementation requirements are complete with independent task and
+final review and fresh verification. Remaining known minor: interleaved trace map
+insertion order changes, without an observed ordering-dependent consumer. Bulk
+packing can increase temporary memory. Neither is silently represented as universal
+compatibility/memory savings. Full training speed/utilization/BF16 four-rank behavior
+was not measured and is not claimed.
+
+Finishing Step2 verified named Stage1-v5 branch in host-managed linked worktree.
+Branch origin9119b55 matches existing dil-bce-orig; any integration remains the
+human's choice. Worktree is preserved. The final response presents the three
+finishing options after this verified result; no integration decision is inferred.
+
+Durable detailed evidence under `results/stage1-v5-throughput-20261015/`:
+`task-1-report.md`, `task-2-report.md`, `task-1-review.md`, `task-2-review.md`,
+`final-review.md`, `workflow-ledger.md`. These preserve agent identities, commands,
+outputs, failures/fixes, review verdicts and the root fixture ruling. Frozen oracles,
+tests, measurement scripts and diffs live in Git. Only this task's owned SDD scratch
+is removed after preserving those records; other scratch/worktrees remain.
+
+Actual lifecycle: readchk scope resolved; systematic-debugging investigation;
+bounded brainstorming with frozen v1 hate/macrothink and user `진행해` approval;
+writing-plans nonapplicable (bounded task brief); using-git-worktrees verified
+existing isolation; SDD sequential implementers with TDD and independent per-task
+spec/quality review; requesting-code-review final broad review; fresh verification
+and finishing Step1–3 executed. No workflow gate was substituted by self-review.
+Integration menu is the remaining human-owned handoff, not unfinished implementation.
