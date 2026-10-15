@@ -93,6 +93,17 @@ def analysis_execution(model):
     yield _AnalysisExecution()
 
 
+def student_sdpa_policy(device):
+    return 'efficient_only' if torch.device(device).type == 'cuda' else 'automatic'
+
+
+def student_sdpa_context(device):
+    if student_sdpa_policy(device) == 'efficient_only':
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        return sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
+    return nullcontext()
+
+
 def replay_selected(model, model_inputs, metadata, *, check_unmasked=False,
                     atol=.02, rtol=.02, chunk_size=128):
     from peft_common import resolve_qwen2_5_vl_model
@@ -103,7 +114,8 @@ def replay_selected(model, model_inputs, metadata, *, check_unmasked=False,
     inputs = {k: v for k, v in model_inputs.items() if k != 'labels'}
     inputs.update(use_cache=False, return_dict=True, stage1_selected_positions=keys,
                   stage1_selected_chunk_positions=chunk_size)
-    with analysis_execution(model) as execution:
+    student_device = next(qwen.parameters()).device
+    with analysis_execution(model) as execution, student_sdpa_context(student_device):
         with bind_v5_execution(qwen.model, execution, visual=qwen.visual), capture_v5_trace(qwen, (), ()) as trace:
             output = model(**inputs)
         clean = output.stage1_selected_logits
@@ -118,6 +130,7 @@ def replay_selected(model, model_inputs, metadata, *, check_unmasked=False,
             oracle = replay.textoff_logits
             # Fixed before real BF16 probes; report absolute and normalized drift.
             drift = dict(passed=bool(torch.allclose(clean, oracle, atol=atol, rtol=rtol)),
+                student_sdpa_policy=student_sdpa_policy(student_device),
                 atol=atol, rtol=rtol, max_abs=float((clean.float()-oracle.float()).abs().max()),
                 mean_abs=float((clean.float()-oracle.float()).abs().mean()),
                 query_keys=[list(k) for k in keys], dtype=str(clean.dtype))

@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'src'))
 sys.path.insert(0, str(ROOT/'transformers/src'))
 from evaluation.stage1_v5_causal import (
-    select_rows, replay_selected, block_metrics, summarize_voff, prepare_analysis_inputs,
+    select_rows, replay_selected, block_metrics, summarize_voff, prepare_analysis_inputs, student_sdpa_policy,
     pair_generation, verify_baseline, bootstrap_mean)
 
 
@@ -148,6 +148,10 @@ def voff(args):
     examples = [replace(e, source_index=i) for e, i in zip(examples, indices)]
     model, teacher, processor, metadata, contract = load_analysis_models(args.checkpoint, args.base, args.device)
     saved = contract['execution']
+    student_attention = dict(implementation=saved['attention_implementation'],
+        device_type=next(model.parameters()).device.type,
+        backend_policy=student_sdpa_policy(next(model.parameters()).device),
+        scope='student_native_clean_and_packed', helper_policy='unchanged')
     collator = Stage1DataCollator(processor, LatentTokenIds(*metadata.latent_token_ids),
                                  saved['latent_size'], stage1_variant='v5')
     output = Path(args.output)
@@ -162,6 +166,7 @@ def voff(args):
                 atol=args.atol, rtol=args.rtol, chunk_size=128)
             result = block_metrics(clean, off, v5.target_ids, [len(b.target_ids) for b in v5.blocks])
             result.update(source_index=example.source_index, unmasked_oracle=drift,
+                student_attention=student_attention,
                 block_coordinates=[dict(start=b.start, end=b.end, target_positions=b.target_positions) for b in v5.blocks])
             results.append(result)
             stream.write(json.dumps(result, allow_nan=False)+'\n')
@@ -169,6 +174,7 @@ def voff(args):
             print(f'V-off source={example.source_index} targets={result["target_count"]}', flush=True)
     summary = summarize_voff(results, indices)
     summary.update(model_checkpoint=str(Path(args.checkpoint).resolve()),
+        student_attention=student_attention,
         model_weights_sha256=model_weights_identity(args.checkpoint),
         initial_reference=contract['reference'], saved_execution=saved,
         source_sha256=manifest['source_sha256'], source_indices=indices,

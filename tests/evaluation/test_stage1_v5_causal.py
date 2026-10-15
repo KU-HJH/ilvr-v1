@@ -182,7 +182,7 @@ def test_unmasked_drift_includes_gold_ce_and_kl_at_temperature_one():
     assert abs(drift['no_op_sample']['kl_clean_off']) < 1e-6
 
 
-def test_native_collator_helper_preparation_and_replay_are_eval_only():
+def test_native_collator_helper_preparation_and_replay_are_eval_only(monkeypatch):
     from tests.stage1.v5.test_metadata import SourceProcessor, source_example, source_collator
     from tests.stage1.v5.test_replay import fixture, digest_state
     from stage1.ema import Stage1EmaTeacher
@@ -201,13 +201,26 @@ def test_native_collator_helper_preparation_and_replay_are_eval_only():
         batch[key] = batch[key].expand(-1, 12).contiguous()
     teacher = Stage1EmaTeacher(student, decay=1., method='dora')
     initial = digest_state(teacher.model)
+    original_flags = _sdpa_flags()
+    kernel_entries = []
+    real_kernel_context = causal.student_sdpa_context
+    def observed_kernel_context(device):
+        kernel_entries.append(device)
+        return real_kernel_context(device)
+    monkeypatch.setattr(causal, 'student_sdpa_context', observed_kernel_context)
+    helper_flags = []
+    helper_handle = teacher.model.register_forward_pre_hook(lambda *_: helper_flags.append(_sdpa_flags()))
     saved = dict(coverage_p=.9, image_pool_k=2, helper_group_L=2, textual_states='previous')
     with torch.no_grad():
         prepared, metadata = causal.prepare_analysis_inputs(teacher, processor, batch, saved, 'cpu')
         assert prepared['latent_hidden_states'].shape == (2, 8)
+        helper_handle.remove()
+        assert helper_flags and all(flags == original_flags for flags in helper_flags)
+        assert kernel_entries == []  # Actual helper preparation never enters the student context.
         clean, off, _ = causal.replay_selected(student, prepared, metadata,
             check_unmasked=True, atol=1e-5, rtol=1e-4)
     assert clean.shape == off.shape == (5, 128)
+    assert len(kernel_entries) == 1
     assert digest_state(teacher.model) == initial
     assert all(p.grad is None for p in student.parameters())
 
@@ -304,3 +317,53 @@ def test_analysis_processor_reproduces_initial_added_token_serialization(tmp_pat
     assert _processor_identity(restored) == expected
     assert [restored.tokenizer.convert_tokens_to_ids(t) for t in
             ('<|latent_pad|>', '<|latent_start|>', '<|latent_end|>')] == [3, 4, 5]
+
+
+def _sdpa_flags():
+    return {name: getattr(torch.backends.cuda, name+'_sdp_enabled')() for name in
+            ('flash', 'mem_efficient', 'math', 'cudnn')}
+
+
+def test_student_only_efficient_boundary_restores_flags_and_keeps_cpu_replay(monkeypatch):
+    from contextlib import contextmanager
+    from tests.stage1.v5.test_replay import fixture, realize, POSITIONS
+    from stage1.v5_metadata import V5BatchMetadata, V5Block
+    original = _sdpa_flags()
+    # Context flag operations are real and CPU-only: no CUDA tensors/device initialization.
+    with causal.student_sdpa_context(torch.device('cpu')):
+        assert _sdpa_flags() == original
+        assert causal.student_sdpa_policy('cpu') == 'automatic'
+    with causal.student_sdpa_context(torch.device('cuda')):
+        assert _sdpa_flags() == dict(flash=False, mem_efficient=True, math=False, cudnn=False)
+        assert causal.student_sdpa_policy('cuda') == 'efficient_only'
+    assert _sdpa_flags() == original
+    with pytest.raises(RuntimeError, match='injected failure'):
+        with causal.student_sdpa_context(torch.device('cuda')):
+            raise RuntimeError('injected failure')
+    assert _sdpa_flags() == original
+
+    real_context = causal.student_sdpa_context
+    active, student_calls = [], []
+    @contextmanager
+    def observed_context(device):
+        with real_context(device):
+            active.append(True)
+            try:
+                yield
+            finally:
+                active.pop()
+    monkeypatch.setattr(causal, 'student_sdpa_context', observed_context)
+    student, _, _, _, live, helper, _, _ = fixture(0.)
+    student.eval()
+    qwen, embeds = realize(student, live, helper)
+    handle = qwen.model.register_forward_pre_hook(lambda *_: student_calls.append(bool(active)))
+    metadata = V5BatchMetadata((V5Block(0, 7, 6, 9, (10, 11), (31, 32), (3,)),))
+    try:
+        with torch.no_grad():
+            _, _, drift = causal.replay_selected(student, dict(inputs_embeds=embeds, position_ids=POSITIONS),
+                                               metadata, check_unmasked=True, atol=1e-5, rtol=1e-4)
+    finally:
+        handle.remove()
+    assert student_calls == [True, True]  # Actual native clean and packed decoder calls.
+    assert drift['student_sdpa_policy'] == 'automatic'
+    assert not active and _sdpa_flags() == original
