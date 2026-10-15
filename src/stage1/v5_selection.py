@@ -34,9 +34,9 @@ def _chunk_logp(logits: Tensor, temperature: float = 1., *, validate: bool = Tru
 def select_v5_text_keys(
     metadata: V5BatchMetadata, attention: Mapping[QueryKey, Tensor],
     clean_logits: Tensor, reference_logits: Tensor, config: Stage1V5Config, *,
-    validate: bool = True,
+    validate: bool = True, compact_attention: bool = False,
 ) -> dict[QueryKey, tuple[int, ...]]:
-    """Port the pinned v3 KL selector, indexing full original attention rows."""
+    """Select original keys from full rows or explicitly candidate-aligned rows."""
     if validate:
         _validate_selected_logits(clean_logits, metadata, 'clean')
     if validate:
@@ -54,37 +54,57 @@ def select_v5_text_keys(
     if validate and not bool(torch.isfinite(d).all()):
         raise ValueError('nonfinite selector KL')
     u = -(d.clamp_min(0) + 1e-6).log()
-    rhos = {}
+    rhos = torch.empty_like(u)
     for sample in sorted({k[0] for k in keys}):
         indices = [i for i, key in enumerate(keys) if key[0] == sample]
         rho = config.rho_min + (config.rho_max-config.rho_min) * (
             u[indices] - u[indices].mean()).sigmoid()
-        rhos.update((keys[i], value) for i, value in zip(indices, rho.tolist()))
-    result = {}
+        rhos[indices] = rho
+    entries, all_weights, masses = [], [], []
     for block in metadata.blocks:
         candidates = block.candidate_positions
         cap = math.floor(config.text_cap * len(candidates))
         for query in block.query_positions:
             key = (block.batch_index, query)
             row = attention[key].detach().float()
-            if validate and (row.ndim != 1 or row.numel() <= query
+            valid_length = (row.numel() == len(candidates) if compact_attention else row.numel() > query)
+            if validate and (row.ndim != 1 or not valid_length
                     or not bool(torch.isfinite(row).all()) or bool((row < 0).any())):
                 raise ValueError('invalid original-sequence attention row')
-            weights = row[list(candidates)]
-            mass = weights.sum().item()
-            if validate and mass > 1. + 1e-5:
-                raise ValueError('candidate attention mass exceeds causal total')
-            ranked = sorted(zip(candidates, weights.tolist()), key=lambda pair: (-pair[1], pair[0]))
-            if mass < config.low_attention_mass:
-                chosen = ranked[:min(cap, math.floor(config.low_attention_fraction * len(candidates)))]
-            else:
-                chosen, total = [], 0.
-                for pair in ranked[:cap]:
-                    chosen.append(pair)
-                    total += pair[1]
-                    if total >= rhos[key] * mass:
-                        break
-            result[key] = tuple(position for position, _ in chosen)
+            weights = row if compact_attention else row[list(candidates)]
+            all_weights.append(weights)
+            # Preserve the per-row FP32 reduction (including empty candidates).
+            masses.append(weights.sum())
+            entries.append((key,candidates,cap))
+    weight_count = sum(weights.numel() for weights in all_weights)
+    if any(weights.device != rhos.device for weights in all_weights):
+        # Direct callers historically could keep attention on another device.
+        # Preserve each original-device reduction before copying its FP32 value.
+        all_weights = [weights.to(rhos.device) for weights in all_weights]
+        masses = [mass.to(rhos.device) for mass in masses]
+    # One host transfer, with unchanged FP32 masses/rho and Python cumulative
+    # arithmetic. Do not replace the GPU sums by sums over the host weights.
+    packed = torch.cat([*all_weights,torch.stack(masses),rhos]).tolist()
+    host_masses = packed[weight_count:weight_count+len(keys)]
+    host_rhos = dict(zip(keys,packed[weight_count+len(keys):]))
+    result = {}
+    offset = 0
+    for (key,candidates,cap),mass in zip(entries,host_masses):
+        weights = packed[offset:offset+len(candidates)]
+        offset += len(candidates)
+        if validate and mass > 1. + 1e-5:
+            raise ValueError('candidate attention mass exceeds causal total')
+        ranked = sorted(zip(candidates, weights), key=lambda pair: (-pair[1], pair[0]))
+        if mass < config.low_attention_mass:
+            chosen = ranked[:min(cap, math.floor(config.low_attention_fraction * len(candidates)))]
+        else:
+            chosen, total = [], 0.
+            for pair in ranked[:cap]:
+                chosen.append(pair)
+                total += pair[1]
+                if total >= host_rhos[key] * mass:
+                    break
+        result[key] = tuple(position for position, _ in chosen)
     return result
 
 

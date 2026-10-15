@@ -136,12 +136,8 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
             reference_inputs.pop('labels', None)
             with torch.no_grad():
                 reference = self.ema_teacher.model(**reference_inputs).stage1_selected_logits
-            attention = {}
-            for key, positions in zip(keys, candidates):
-                row = clean.new_zeros(labels.shape[1], dtype=torch.float32)
-                row[list(positions)] = trace.attention_rows[key]
-                attention[key] = row
-            selected = select_v5_text_keys(metadata, attention, clean, reference, self.v5_config, validate=self.stage1_v5_debug)
+            selected = select_v5_text_keys(metadata, trace.attention_rows, clean, reference,
+                self.v5_config, validate=self.stage1_v5_debug, compact_attention=True)
             blocks = tuple(V5ReplayBlock(b.batch_index,b.start,b.end,b.target_positions,b.target_ids,
                            tuple(selected[(b.batch_index,q)] for q in b.query_positions))
                            for b in metadata.blocks)

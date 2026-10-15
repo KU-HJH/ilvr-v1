@@ -159,8 +159,15 @@ def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
         raise ValueError('trace query/candidate identity mismatch')
     trace = V5Trace()
     handles,seen,projection_outputs = [],set(),{}
+    queries_by_sample = {}
+    for key,candidates in zip(query_keys,candidate_positions):
+        queries_by_sample.setdefault(key[0],[]).append((key,candidates))
+    coordinates = None
+    sample_padding = {}
+    candidate_indices = {}
 
     def before(module,args,kwargs):
+        nonlocal coordinates
         if trace.inputs_embeds is not None:
             raise RuntimeError('duplicate v5 clean decoder forward')
         embeds = kwargs.get('inputs_embeds')
@@ -172,6 +179,11 @@ def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
         trace.padding = torch.ones((b,t),device=embeds.device,dtype=torch.long) if padding is None else padding
         if trace.padding.shape != (b,t):
             raise ValueError('v5 clean trace requires source [B,T] padding')
+        if query_keys:
+            coordinates = torch.arange(t,device=embeds.device)
+            sample_padding.update((row,trace.padding[row].bool()) for row in queries_by_sample)
+            candidate_indices.update((positions,torch.tensor(positions,device=embeds.device,dtype=torch.long))
+                                     for positions in dict.fromkeys(candidate_positions))
         ids = kwargs.get('position_ids')
         if ids is None: ids = torch.arange(t,device=embeds.device).view(1,1,-1).expand(3,b,-1)
         if ids.ndim==2: ids = ids[None].expand(3,-1,-1)
@@ -196,14 +208,19 @@ def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
             cos,sin = kwargs['position_embeddings']
             q,k = apply_multimodal_rotary_pos_emb(q,k,cos,sin,attn.rope_scaling['mrope_section'])
             k = repeat_kv(k,attn.num_key_value_groups)
-            for key,candidates in zip(query_keys,candidate_positions):
-                row,position = key
-                scores = q[row,:,position:position+1].float() @ k[row].float().transpose(-2,-1)
-                scores = scores.squeeze(1)*attn.scaling
-                visible = (torch.arange(t,device=q.device)<=position) & trace.padding[row].bool()
-                weights = scores.masked_fill(~visible,float('-inf')).softmax(-1).mean(0)
-                values = weights[list(candidates)]/len(decoder.layers)
-                trace.attention_rows[key] = trace.attention_rows.get(key,0)+values
+            for row,queries in queries_by_sample.items():
+                # Bound the FP32 copy to this sample/layer; keep every query's
+                # original GEMM shape and reduction order unchanged.
+                sample_k = k[row].float().transpose(-2,-1)
+                for key,candidates in queries:
+                    position = key[1]
+                    scores = q[row,:,position:position+1].float() @ sample_k
+                    scores = scores.squeeze(1)*attn.scaling
+                    visible = (coordinates<=position) & sample_padding[row]
+                    weights = scores.masked_fill(~visible,float('-inf')).softmax(-1).mean(0)
+                    values = weights[candidate_indices[candidates]]/len(decoder.layers)
+                    trace.attention_rows[key] = trace.attention_rows.get(key,0)+values
+                del sample_k
 
     try:
         handles.append(decoder.register_forward_pre_hook(before,with_kwargs=True))
