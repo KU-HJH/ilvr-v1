@@ -260,3 +260,30 @@ no import code changed. Correct environment is .:src:transformers/src.
 Earlier incomplete-path runs are TDD history, not final worktree runtime
 verification. All actual final findings resolved; no deferred/parked finding.
 Final root project suite remains pending; production runtime limits persist.
+
+## Post-full-suite causal test correction
+
+First complete suite failed8 agreement tests/4839passed/11skipped/1existing
+Torch architecture warning. Finishing stopped. Actual dictionary/digest
+diagnostics proved old independent oracles omitted only approved historical
+legacy execution.query_config. Adding its literal schema1/modelegacy/formula
+makes entire dictionaries and digests equal. Production normalization is the
+approved behavior and was not changed.
+
+/root/history_query_postverify_fix (gpt-6.1-sol, high) created
+cff4cd13664bb7d5984244a6287559b5f03ce236, only v5/test_trainer.py. Original
+RED8 and causal RED2; trainer/resume GREEN68 passed in11.55s, pristine. All
+seven original divergence dimensions retained, query divergence added; mixed
+missing/explicit legacy identities admitted. Expected standard-library
+JSON/SHA256 remains independent, no product normalizer/digest helper calls.
+Proof/logs under results/logs/stage1-v5-history-query-implementation/
+post-verification/. Root read report and actual failure output in full.
+
+Independent /root/history_query_postverify_review (gpt-6.1-sol, high), range
+2390123..cff4cd1: Spec Approved / Quality Approved, no findings. Oracle at
+test_trainer.py:476, mixed admission:550; actual agreement/local row comparison
+v5_trainer.py:294 and pre-publication train dispatch:279,313 traced. Read
+68GREEN/original8RED/causal2RED and full canonical proof; no test reruns or
+mutations. Simulated ranks remain CPU contract-gate evidence only. This is
+a new runtime-verification finding, not residual final-review rework. Fresh
+full suite is still required; no completed-feature/merge approval claim.
