@@ -13,7 +13,7 @@ No complete written design, implementation plan/method, premise experiment,
 training launch, or implementation has been approved. Existing retrieval
 brainstorming in the separate `Stage1-v5` worktree does not authorize this change.
 
-Active phase: architectural brainstorming, final written-spec approval pending.
+Active phase: writing-plans; plan review and execution-method selection pending.
 Latest explicit naming decision: `--query_mode` replaces the initially
 recommended `--history_query_mode`; proposed values remain legacy/adaptive.
 An implementation would follow the architectural path: sequential teacher
@@ -290,3 +290,56 @@ The full proposal-to-commitment diff was read; only the identified clarification
 status and critique synthesis changed. Exact Git/content verification commands,
 their outputs, artifact hashes and design commit identity are persisted under
 `results/stage1-v5-history-query-design/verification.json` at this gate.
+
+## Final spec approval and planning authorization
+
+The asynchronous reply explicitly selected `불확실성 수용·명세 승인` for the
+commitment-v1 written-spec question. The question named the unrun CPU first
+nail and unverified native numerical equivalence, real-length cost/VRAM and
+performance. This is the human's explicit uncertainty acceptance and final
+written-spec approval for planning, not evidence those premises passed.
+
+Approval binds to `specs/2026-10-15-stage1-v5-history-query-design.md` at
+design commit `9c402ff2daa49c1e293b4eb0829f3402389f2839`, SHA256
+`9ad3acbf64a4fc17ea25332591dddbb351a47c3dc02f6bf2ecdac0f7e69aae40`.
+The approved bytes, including their creation-time pending-approval heading,
+are retained; this ledger records the later approval state.
+
+Brainstorming completed its architectural path and root invoked/read
+`superpowers:writing-plans` as the sole next skill. Root authors and self-reviews
+the implementation plan; no planning agent is needed or dispatched. This
+task still has no chosen execution method. No implementation skill, feature
+code, new tests/probes, training or evaluation is authorized/executed yet.
+
+Planning source discovery located the actual shell launcher and
+`src/multinode_runtime.py::validate_stage1_arguments`; hypothetical Python
+launcher-module names do not exist and are not plan targets. The shell worker
+always appends `--textual_states previous` for fresh runs, and the current v5
+recipe hardcodes it. The plan must distinguish that generated fallback from
+an explicit caller request so adaptive can launch and resumes retain omissions.
+Current tiny Qwen/DoRA fixtures can support native-reference CPU tests without
+downloaded models. These remain observations and planned tests, not results.
+
+## Implementation plan written and self-reviewed
+
+Plan: `plans/2026-10-15-stage1-v5-history-query.md`, SHA256
+`d8d9bae862cccaa98f2ee9d383a4a1f3ec1fa6c2704cd6072fb7992084d0cc3c`.
+Root completed writing-plans' self-review against the approved spec: six
+reviewable tasks, exact interfaces/file paths, 30 future steps with scoped
+RED/GREEN commands, all five review-focus classes assigned to tests, and
+explicit independent-review/final-verification/runtime-authorization gates.
+Self-review clarified tensor shapes, original builder signature/return,
+CLI action-destination tracking, generated fallback and saved query omission.
+
+Native is recommended because the six tasks share tightly coupled interfaces;
+SDD remains an offered choice. Neither is selected and neither implementation
+skill has been invoked. Human plan review and method selection are pending.
+No additional agent was used to write/review the plan; the root self-review
+is the writing-plans-required check, not independent code review.
+
+Fresh artifact-only verification via repository venv Python: exit0, approved
+spec SHA unchanged, six task headings/30 unchecked steps, six interface blocks,
+required header/constraints/review sections, balanced fences and no placeholder
+markers. No planned pytest command, native comparison, training or other
+feature experiment has run. Git/content evidence and the plan commit identity
+are recorded in `results/stage1-v5-history-query-design/plan-verification.json`.
