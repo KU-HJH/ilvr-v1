@@ -182,3 +182,131 @@ and finishing-a-development-branch were read. Implementation/review/final gates
 remain pending until evidence is recorded below. Root owns control artifacts only.
 
 Focused pre-implementation baseline: selection, execution, data and v5 metadata tests: **80 passed in 4.80s**, exit 0. Exact command and log are in the SDD ledger (`.superpowers/sdd/2026-10-15-stage1-v5-throughput/progress.md`); durable log `logs/stage1-v5-throughput-20261015/baseline.log`. Preflight table covers both tasks and shared batch-metadata interface; no conflict found.
+
+## Verification claims and required witnesses
+
+- Discrete selection is unchanged: frozen-original selector oracle across threshold,
+  tie, empty, low-mass and multi-sample cases; exact selected key comparison.
+- Observation arithmetic is unchanged: actual Qwen trace/native attention and
+  original operator comparisons, identical matrix shapes/reduction order; attached
+  replay KV and detached observation behavior.
+- Training graph remains supported on tested fixtures: existing actual tiny Qwen
+  loss/gradient/dropout/checkpoint tests. This does not prove full-size BF16 or
+  four-rank equivalence.
+- Collation semantics are unchanged: full prepared tensor/metadata comparison with
+  old three-call implementation and the local original Qwen processor, including
+  no-helper and multiple images with variable grids; malformed cardinality rejection.
+- Redundancy is removed: causal operation/transfer counts and image/processor-call
+  counts; same-fixture before/after local measurements including memory.
+- Project regression suite: final command after independent reviews is
+  `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q`.
+  `pytest.ini` collects `tests/`. CUDA remains visible. This full-suite run is shared
+  evidence for verification-before-completion and finishing Step 1, run once on the
+  final reviewed product revision. Additional timing is a distinct performance
+  witness; no full training or GPU-utilization claim is made.
+
+Task 1 implementer: `/root/throughput_attention_impl`, gpt-6.1-sol/high,
+BASE `bb942b7323495cda716b7c5b889d6a8dc699aa23`. Work is task-scoped and sequential;
+root owns coordination, not product implementation. Task 2's real processor source
+is existing `checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct`; no download.
+
+## Task 1 result and independent gate
+
+Implementer `/root/throughput_attention_impl` committed
+`73dca0f531187ad28ed6fe7fcd0ea52bf908e39d` (BASE bb942b7). Changes: per-sample/layer
+FP32 K reuse; invariant coordinate/index reuse; compact candidate handoff; bulk
+weights/mass/rho read retaining original-device FP32 reductions and Python selection.
+Frozen-original source hashes: trace
+`1a7d4bfb8b1d968e0a40541642b78e8fa5dbf61d4570af4c8effe3fe42441724`; selector
+`3530678a6f9f7673d91d8305c2895e5904ca648f2dbbb8d34019e446e3f99827`.
+Causal RED logs record K copies 24 vs required 4, scalar reads 16 vs 0, candidate
+index constructions 24 vs 2; mixed-device direct-call regression also passed
+after RED. Final focused command used the standard environment above and
+`-m pytest -q tests/stage1/v5/test_throughput_attention.py tests/stage1/v5/test_selection.py tests/stage1/v5/test_execution.py tests/stage1/v5/test_replay.py tests/stage1/v5/test_debug.py tests/stage1/v5/test_trainer.py`:
+**119 passed in 16.38s**, no warnings, log `task1-final-verification.log` under
+`logs/stage1-v5-throughput-20261015/` (root read full output).
+
+Independent reviewer `/root/throughput_attention_review` (gpt-6.1-sol/high)
+reviewed bb942b7..73dca0f: spec compliant, quality Approved, zero Critical/Important.
+Verified frozen blob IDs against base, actual call consumers, named native Qwen
+assertions and raw RED/GREEN/measurement evidence without rerunning the suite.
+Minor deferred for final review: grouping interleaved samples changes trace
+mapping insertion order; consumers found use keyed lookup and no documented
+ordering contract. No observed output/gradient impact; this remains an unresolved
+minor observation, not erased by approval. Full-size/distributed claims remain
+unverified and out of scope; final full-project suite remains pending.
+
+Final local benchmark reproducible with `scripts/benchmark_stage1_v5_attention_selection.py --device cuda:0 --output <results path>` (or cpu), standard environment.
+JSON/log stems `task1-cuda-candidates-final` and `task1-cpu-candidates-final` under
+this task's results/logs directories. H100 NVL, 3 warmups, 20 repetitions,
+BF16-projection/FP32 observation fixture, batch2/length512/64queries/2layers;
+selector 32queries/128candidates/row4096/vocab17, validation=False. Exact original
+attention and selected keys on CPU/CUDA. CUDA medians ms: attention16.134232→10.771047,
+selection2.412995→1.042174; K copies128→4, index constructions128→2, scalar reads32→0,
+list reads34→1. CUDA extra peak bytes: attention5804032→5811200;
+selection12800→41472. Python packing peak59606→193428B. These buffers are bounded;
+no memory reduction or training speedup claimed. Initial CUDA benchmark had an
+incorrect full-vs-compact argument; failed evidence and causal regression are
+preserved. This measurement bug is separate from the design hate pass's first
+nail, which remains unrun (no end-to-end phase profile).
+
+Task 2 implementer `/root/throughput_collator_impl` (gpt-6.1-sol/high), BASE
+73dca0f. Causal RED: 9 processor calls vs required3 across three samples.
+Initial focused result82passed/1failed: existing SourceProcessor fake generates
+whole-call arange pixels, so the same helper changes values depending on preceding
+originals; actual Qwen per-image equivalence passes. Root ruling: allow the smallest
+image-content-dependent fixture correction, retain metadata assertions and failed
+log, require independent review of it. Cost if wrong: could hide a real ownership
+regression; frozen-original and actual processor comparisons are required evidence.
+
+## Task 2 implementation evidence
+
+Commit `e5a1c1c44c458cdaef35063ff877a59d80c4057f` (BASE73dca0f), six scoped files.
+V5 full-conversation processor output is split by original-image grid count and
+sum of raw grid products; role validations and all downstream token/metadata
+paths remain. Standard retains three calls; no-helper retains `(0,0)` default-dtype
+pixels. Frozen original complete data.py SHA256
+`d132b34f4a2a79403b7f850b9d667a4e947bf368a807da31856591fb81e2a183` matches BASE.
+Causal RED exact command: standard environment, `-m pytest -q tests/stage1/v5/test_throughput_collation.py::test_v5_materializes_each_image_once_and_processes_each_sample_once`,
+exit1 (`assert 9 == 3`), `task2-red.log`. Final focused command:
+`-m pytest -q tests/stage1/test_data.py tests/stage1/v5/test_metadata.py tests/stage1/v5/test_throughput_collation.py tests/stage1/v5/test_execution.py` with standard environment,
+**83passed/4.90s**, no warnings; `task2-green-final.log`.
+
+Final offline witness command uses standard environment plus
+`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` and
+`-m tests.stage1.v5.benchmark_collation --processor-path checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct --output results/stage1-v5-throughput-20261015/task2-collation-default.json`.
+Exit0; log `task2-qwen-benchmark-default.log`. Production-default loader yields
+Qwen2_5_VLProcessor/Qwen2TokenizerFast/saved Qwen2VLImageProcessor; expected slow
+image processor advisory occurs3times, no errors. Eight complete exact-output
+comparisons cover ordinary/occurrence singleton and batch; input IDs, masks,
+labels, pixels, grids and both metadata objects agree with frozen original.
+Fixture3samples/4originals/3helpers includes variable sizes and no-helper;
+raw original/helper rows1792/2176, patchwidth1176. Generated images remain under
+data/stage1-v5-throughput-20261015/collation-witness. Separate fresh processes per
+mode,2warmups/15repetitions, full collation median64.632654→34.681149ms. Calls9→3,
+opens14→7. Tracemalloc peak32383269→26419544B; whole-process VmHWM1001552→1007540KiB.
+RSS includes imports/native allocator and does not demonstrate memory reduction.
+Small synthetic inputs and warm file cache support local savings only.
+
+Preserved attempts: explicit use_fast=False chose an unsuitable non-offset
+Python tokenizer and failed in the old oracle; explicit use_fast=True selected
+an alternate image backend and passed, but final witness above uses production
+defaults. Preliminary mutable-count-list and RSS-reporting issues were corrected
+in measurement code, with earlier logs retained. No product fallback or tolerance
+relaxation was introduced. Independent reviewer `/root/throughput_collator_review`
+(gpt-6.1-sol/high) now has brief, report, exact diff and fixture-correction evidence.
+
+Task 2 independent verdict: spec compliant; quality Approved; zero Critical/Important.
+Reviewer verified frozen blob `a2c7a1e9166e8df5faabe1f49652e4bba84bcf8c` against base,
+actual Qwen per-image/raw-patch implementation, unchanged existing metadata
+assertions, causal RED and83-pass GREEN, eight exact comparisons and measurement
+outputs. No tests rerun. Minor deferred: expected slow-image-processor advisory
+appears3times; report already classifies it explicitly, final reviewer will triage.
+Model-level behavior and end-to-end speed are not inferred universally from the
+collator comparison. Task 1 tiny-model checks and final full-suite gate are separate.
+
+Both task gates passed. Final broad review covers all new changes since intake
+148b0e8 on the existing branch, including interactions between the two changes,
+with the earlier reviewed Stage1-v5 revision as baseline. Deferred minors: trace
+mapping insertion order and expected processor advisory. No parked finding or
+process violation. Final verification and finishing have not yet executed.
