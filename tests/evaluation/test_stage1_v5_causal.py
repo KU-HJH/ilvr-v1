@@ -233,3 +233,48 @@ def test_generation_summary_authenticates_saved_source_before_reuse(tmp_path):
     args = SimpleNamespace(**paths, output=str(tmp_path/'out.json'), seed=42)
     with pytest.raises(ValueError, match='source.*identity'):
         generation_summary(args)
+
+
+def test_report_rejects_swapped_model_summaries_before_writing(tmp_path):
+    from types import SimpleNamespace
+    from scripts.analyze_stage1_v5_causal import report
+    generations, voffs = [], []
+    for label, digest in [('A', 'a'*64), ('B', 'b'*64)]:
+        generation = dict(model_weights_sha256=digest, source_sha256='test-source',
+            legacy_on_accuracy=.5, legacy_off_accuracy=.5, source_count=100, valid_gold_count=99,
+            effect_off_minus_on=0., paired_bootstrap_ci=[0., 0.], on_correct_off_wrong=0,
+            on_wrong_off_correct=0, answer_changes=0, excluded_invalid_gold=[57],
+            excluded_errors=[], paired_effects={'3': 0})
+        voff = dict(model_weights_sha256=digest, model_checkpoint=f'/checkpoints/{label}/checkpoint-648',
+            complete_selected_subset=True, source_sha256='train-source', sample_mean={'delta_ce': .1},
+            sample_bootstrap_ci={'delta_ce': [.1, .1]}, token_weighted={'delta_ce': .1},
+            unmasked_checks=[], eligible_samples=64, source_count=64, target_count=500,
+            empty_blocks=0, exclusions=[], paired_sample_metrics={'3': {'delta_ce': .1}})
+        generation_path, voff_path = tmp_path/f'{label}-generation.json', tmp_path/f'{label}-voff.json'
+        generation_path.write_text(json.dumps(generation))
+        voff_path.write_text(json.dumps(voff))
+        generations.append(str(generation_path))
+        voffs.append(str(voff_path))
+    output = tmp_path/'report.md'
+    args = SimpleNamespace(generation=generations, voff=list(reversed(voffs)), names=['A', 'B'], output=str(output))
+    with pytest.raises(ValueError, match='model.*identity'):
+        report(args)
+    assert not output.exists()
+    args.voff = voffs
+    report(args)
+    assert '## A' in output.read_text() and '## B' in output.read_text()
+
+
+def test_model_weights_identity_tracks_adapter_and_sparse_rows(tmp_path):
+    from scripts import analyze_stage1_v5_causal as cli
+    checkpoint, generation = tmp_path/'checkpoint', tmp_path/'generation'
+    for directory in (checkpoint, generation):
+        directory.mkdir()
+        (directory/'adapter_model.safetensors').write_bytes(b'adapter-A')
+        (directory/'ilvr_token_rows.safetensors').write_bytes(b'rows-A')
+    assert cli.model_weights_identity(checkpoint) == cli.model_weights_identity(generation)
+    (generation/'ilvr_token_rows.safetensors').write_bytes(b'rows-B')
+    assert cli.model_weights_identity(checkpoint) != cli.model_weights_identity(generation)
+    (generation/'ilvr_token_rows.safetensors').write_bytes(b'rows-A')
+    (generation/'adapter_model.safetensors').write_bytes(b'adapter-B')
+    assert cli.model_weights_identity(checkpoint) != cli.model_weights_identity(generation)

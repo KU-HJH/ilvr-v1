@@ -28,6 +28,19 @@ def write_json(path, value):
         stream.write('\n')
 
 
+def model_weights_identity(artifact):
+    """Bind the two final Stage1 policy-weight files shared by both artifacts."""
+    digest = hashlib.sha256()
+    for name in ('adapter_model.safetensors', 'ilvr_token_rows.safetensors'):
+        path = Path(artifact)/name
+        digest.update(name.encode())
+        digest.update(path.stat().st_size.to_bytes(8, 'big'))
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024*1024), b''):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
 def select(args):
     rows, manifest = select_rows(args.source, count=args.count, seed=args.seed,
         indices_path=args.indices, expected_sha256=args.expected_sha256)
@@ -147,6 +160,7 @@ def voff(args):
             print(f'V-off source={example.source_index} targets={result["target_count"]}', flush=True)
     summary = summarize_voff(results, indices)
     summary.update(model_checkpoint=str(Path(args.checkpoint).resolve()),
+        model_weights_sha256=model_weights_identity(args.checkpoint),
         initial_reference=contract['reference'], saved_execution=saved,
         source_sha256=manifest['source_sha256'], source_indices=indices,
         condition='eval_no_grad_conditional_helper_latent_body_attention_T1',
@@ -179,6 +193,12 @@ def generation_summary(args):
     for row in spot+off:
         if (row.get('model_identity') != model_id or row.get('generation_profile') != profile):
             raise ValueError('saved baseline model/profile identity mismatch')
+    artifacts = {r.get('model_artifact') for r in spot+off}
+    if not artifacts or None in artifacts:
+        raise ValueError('generation model artifact identity missing')
+    weight_identities = {model_weights_identity(path) for path in artifacts}
+    if len(weight_identities) != 1:
+        raise ValueError('generation model weight identity mismatch')
     # Actual local subset data hash is explicit; then map local indices to source.
     if any(r.get('source_sha256') != manifest['subset_sha256'] for r in off):
         raise ValueError('OFF subset identity mismatch')
@@ -190,6 +210,7 @@ def generation_summary(args):
     off = [dict(r, index=indices[r['index']], source_sha256=manifest['source_sha256']) for r in off]
     result = pair_generation(on, off, indices, seed=args.seed)
     result.update(model_identity=model_id, generation_profile=profile,
+        model_weights_sha256=next(iter(weight_identities)), model_artifacts=sorted(artifacts),
         source_sha256=manifest['source_sha256'], baseline_spot_sources=indices[:2],
         baseline_reuse='exact_prompt_suffix_and_scoring_first_two')
     write_json(args.output, result)
@@ -198,6 +219,10 @@ def generation_summary(args):
 def report(args):
     generations = [json.loads(Path(p).read_text()) for p in args.generation]
     voffs = [json.loads(Path(p).read_text()) for p in args.voff]
+    for generation, voff_summary in zip(generations, voffs):
+        identity = generation.get('model_weights_sha256')
+        if not identity or identity != voff_summary.get('model_weights_sha256'):
+            raise ValueError('generation/TRAIN model weight identity mismatch')
     if any(not v.get('complete_selected_subset') for v in voffs):
         raise ValueError('cannot report incomplete selected TRAIN coverage')
     lines = ['# Stage1-v5 latent causal analysis', '',
