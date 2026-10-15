@@ -472,7 +472,7 @@ def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejec
     assert len(parent_calls)==1 and calls==[]
 
 
-@pytest.mark.parametrize('changed', ['objective','lr','packages','source','base','processor','deepspeed'])
+@pytest.mark.parametrize('changed', ['objective','lr','packages','source','base','processor','deepspeed','query'])
 def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,monkeypatch,changed):
     from tests.stage1.v5.test_resume import contract
     from stage1.trainer import CustomTrainerStage1
@@ -489,9 +489,23 @@ def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,m
     elif changed == 'source': bad['execution']['source_sha256']['trainer']='e'*64
     elif changed == 'base': bad['reference']['base_content_sha256']='e'*64
     elif changed == 'deepspeed': bad['execution']['deepspeed_profile']['config_digest']='e'*64
+    elif changed == 'query':
+        bad['execution']['query_config'] = {
+            'schema_version': 1, 'mode': 'adaptive',
+            'formula_id': 'stage1_injected_prefix_discounted_segments_attention_mass_v1',
+            'text_mode': 'discounted_segments', 'latent_mode': 'attention_mass',
+            'text_gamma': .9, 'attention_layers': 'last', 'resolved_layer_indices': [3],
+            'query_chunk_size': 64, 'key_chunk_size': 2048, 'head_chunk_size': 4,
+            'mask_mode': 'full_causal_2d_v1',
+        }
     else: bad['reference']['processor_sha256']='e'*64
     def independent_digest(value):
         mapped=deepcopy(value)
+        # Historical sidecars predate query metadata and represent this exact
+        # legacy schema; keep the oracle independent of product normalization.
+        mapped['execution'].setdefault('query_config', {
+            'schema_version': 1, 'mode': 'legacy', 'formula_id': 'stage1_legacy_query_v1',
+        })
         mapped['execution']['model']=mapped['reference']['base_content_sha256']
         mapped['execution']['deepspeed_profile']['config_path']=mapped['execution']['deepspeed_profile']['config_digest']
         return torch.tensor(list(hashlib.sha256(json.dumps(mapped,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).digest()),dtype=torch.uint8)
@@ -515,11 +529,16 @@ def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,m
     assert calls == []
 
 
-def test_effective_contract_allows_only_content_equal_node_local_paths(tmp_path,monkeypatch):
+@pytest.mark.parametrize('explicit_legacy_ranks', [(), (1, 3)],
+                         ids=['historical', 'mixed_historical_explicit_legacy'])
+def test_effective_contract_allows_only_content_equal_node_local_paths(tmp_path,monkeypatch,explicit_legacy_ranks):
     from tests.stage1.v5.test_resume import contract
     from stage1.trainer import CustomTrainerStage1
     import hashlib,json
     mapped=contract()
+    mapped['execution']['query_config'] = {
+        'schema_version': 1, 'mode': 'legacy', 'formula_id': 'stage1_legacy_query_v1',
+    }
     mapped['execution'].update(model=mapped['reference']['base_content_sha256'],
         deepspeed_profile={'config_path':'d'*64,'config_digest':'d'*64})
     expected=torch.tensor(list(hashlib.sha256(json.dumps(mapped,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).digest())+[0]*33,dtype=torch.uint8)
@@ -528,6 +547,10 @@ def test_effective_contract_allows_only_content_equal_node_local_paths(tmp_path,
     for rank in range(4):
         trainer=api().__new__(api())
         local=contract()
+        if rank in explicit_legacy_ranks:
+            local['execution']['query_config'] = {
+                'schema_version': 1, 'mode': 'legacy', 'formula_id': 'stage1_legacy_query_v1',
+            }
         local['execution'].update(model=f'/node{rank//2}/models/base',
             deepspeed_profile={'config_path':f'/node{rank//2}/repo/zero1.json','config_digest':'d'*64})
         trainer.args=SimpleNamespace(output_dir=str(tmp_path))
