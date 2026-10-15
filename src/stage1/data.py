@@ -211,8 +211,11 @@ class Stage1DataCollator:
         for example in examples:
             singleton = (example,)
             full = self._process_full_conversations(singleton)
-            original = self._process_original_images(singleton)
-            helper = self._process_helper_images(singleton)
+            if self.stage1_variant == 'v5':
+                original, helper = self._split_full_vision(singleton, full)
+            else:
+                original = self._process_original_images(singleton)
+                helper = self._process_helper_images(singleton)
             self._validate_grid_rows(
                 singleton,
                 original["image_grid_thw"],
@@ -377,6 +380,27 @@ class Stage1DataCollator:
         )
         self._validate_grid_rows(examples, batch["image_grid_thw"], counts, "full")
         return batch
+
+    def _split_full_vision(self, examples, full):
+        """Reuse singleton Qwen raw patches in original-then-helper image order."""
+        self._validate_pixel_grid_cardinality(examples, full, "full")
+        [example] = examples
+        original_count = len(example.original_image_paths)
+        grids = full["image_grid_thw"]
+        pixels = full["pixel_values"]
+        original_grids = grids[:original_count]
+        # Pixel rows precede spatial merging: each image owns grid_thw.prod rows.
+        original_rows = int(original_grids.prod(dim=1).sum().item())
+        original = {
+            "image_grid_thw": original_grids,
+            "pixel_values": pixels[:original_rows],
+        }
+        helper = {
+            "image_grid_thw": grids[original_count:],
+            "pixel_values": pixels[original_rows:]
+            if example.helper_image_paths else torch.empty((0, 0)),
+        }
+        return original, helper
 
     def _process_original_images(
         self, examples: Sequence[PreparedStage1Example]

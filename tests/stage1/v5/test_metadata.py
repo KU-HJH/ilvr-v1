@@ -58,7 +58,12 @@ class SourceProcessor:
         count = sum(len(group) for group in images) if images else 0
         assert sum(t.count('<|image_pad|>') for t in text) == count
         return dict(input_ids=ids, attention_mask=ids.ne(0).long(),
-            pixel_values=torch.arange(count * 4, dtype=torch.float32).reshape(-1, 1),
+            # Image preprocessing is per-image: preceding images must not alter
+            # the same image's patches when full-call vision outputs are reused.
+            pixel_values=torch.tensor([
+                float(image.getpixel((0, 0))[0])
+                for group in (images or []) for image in group for _ in range(4)
+            ], dtype=torch.float32).reshape(-1, 1),
             image_grid_thw=torch.tensor([[1, 2, 2]] * count, dtype=torch.long).reshape(-1, 3))
 
 
