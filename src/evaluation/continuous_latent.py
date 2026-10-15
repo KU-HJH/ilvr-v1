@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Protocol, runtime_checkable
 
 import torch
 from transformers import RepetitionPenaltyLogitsProcessor
+
+from evaluation.static_inference import (
+    IncrementalMRoPE,
+    static_inference_cache as static_cache_scope,
+)
 
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentSpan,
@@ -173,6 +179,7 @@ class ContinuousLatentController:
         return_post_end_logits: bool = False,
         disable_latent_generation: bool = False,
         use_kv_cache: bool = False,
+        static_inference_cache: bool = False,
     ) -> ContinuousLatentGenerationResult:
         self._validate_inputs(
             model=model,
@@ -189,6 +196,26 @@ class ContinuousLatentController:
             or not disable_latent_generation
         ):
             raise ValueError("KV cache requires Stage 1 with latent generation disabled")
+        if type(static_inference_cache) is not bool:
+            raise TypeError("static_inference_cache must be a boolean")
+        if static_inference_cache and not use_kv_cache:
+            raise ValueError("static inference cache requires Stage 1 OFF with KV cache")
+        with static_cache_scope(model) if static_inference_cache else nullcontext():
+            return self._generate(
+                model=model, input_ids=input_ids, attention_mask=attention_mask,
+                token_ids=token_ids, generation_config=generation_config,
+                pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+                return_latent_states=return_latent_states,
+                return_post_end_logits=return_post_end_logits,
+                disable_latent_generation=disable_latent_generation,
+                use_kv_cache=use_kv_cache, static_inference_cache=static_inference_cache,
+            )
+
+    def _generate(
+        self, *, model, input_ids, attention_mask, token_ids, generation_config,
+        pixel_values, image_grid_thw, return_latent_states, return_post_end_logits,
+        disable_latent_generation, use_kv_cache, static_inference_cache,
+    ):
         sequences = input_ids
         mask = attention_mask
         inputs_embeds = model.prepare_stage2_base_inputs_embeds(
@@ -196,6 +223,7 @@ class ContinuousLatentController:
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
+        rope = None
         latent_blocks: list[tuple[torch.Tensor, ...]] = []
         post_end_logits: list[torch.Tensor] = []
         latent_start_count = 0
@@ -224,14 +252,20 @@ class ContinuousLatentController:
             if remaining_capacity <= 0:
                 stop_reason = boundary_stop_reason
                 break
-            position_ids, _ = model.get_rope_index(
-                sequences, image_grid_thw=image_grid_thw, attention_mask=mask
-            )
+            if static_inference_cache:
+                if rope is None:
+                    rope = IncrementalMRoPE(model, input_ids, attention_mask, image_grid_thw)
+                position_ids = rope.get(sequences, mask, cached_length)
+            else:
+                position_ids, _ = model.get_rope_index(
+                    sequences, image_grid_thw=image_grid_thw, attention_mask=mask
+                )
             cache_kwargs = {}
             if use_kv_cache:
                 # Physical cache offsets include prompt padding; MRoPE positions
                 # retain the original image/text layout instead of using offsets.
-                position_ids = position_ids[..., cached_length:]
+                if rope is None:
+                    position_ids = position_ids[..., cached_length:]
                 cache_kwargs = {
                     "past_key_values": past_key_values,
                     "cache_position": torch.arange(
@@ -260,6 +294,8 @@ class ContinuousLatentController:
             logits[..., token_ids.end_token_id] = -torch.inf
             next_id = _select_text_token(logits, generation_config)
             next_token_id = int(next_id.item())
+            if rope is not None:
+                rope.appended(next_token_id)
             if disable_latent_generation and next_token_id in {
                 token_ids.start_token_id,
                 token_ids.pad_token_id,

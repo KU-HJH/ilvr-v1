@@ -206,6 +206,8 @@ def generation_summary(args):
         raise ValueError('baseline uses vision ablation')
     if profile.pop('use_kv_cache', False) is not False:
         raise ValueError('generation ON baseline cache execution is unsupported')
+    if profile.pop('static_inference_cache', False) is not False:
+        raise ValueError('generation ON baseline static cache is unsupported')
     model_id = baseline_metadata['model_identity']
     for row in spot+off:
         if (row.get('model_identity') != model_id or row.get('generation_profile') != profile):

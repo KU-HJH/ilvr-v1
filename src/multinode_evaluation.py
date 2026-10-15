@@ -199,12 +199,21 @@ def _validate_generation_config(
     accepted_field_sets += tuple(
         fields | {"use_kv_cache"} for fields in accepted_field_sets
     )
+    accepted_field_sets += tuple(
+        fields | {"static_inference_cache"} for fields in accepted_field_sets
+    )
     if not isinstance(value, dict) or set(value) not in accepted_field_sets:
         raise ValueError("invalid generation config")
     if "disable_latent_generation" in value and type(value["disable_latent_generation"]) is not bool:
         raise ValueError("invalid generation config disable_latent_generation")
     if "use_kv_cache" in value and type(value["use_kv_cache"]) is not bool:
         raise ValueError("invalid generation config use_kv_cache")
+    if "static_inference_cache" in value and type(value["static_inference_cache"]) is not bool:
+        raise ValueError("invalid generation config static_inference_cache")
+    if value.get("static_inference_cache", False) and not (
+        value.get("use_kv_cache", False) and value.get("disable_latent_generation", False)
+    ):
+        raise ValueError("static_inference_cache requires OFF with KV cache")
     max_new_tokens = value["max_new_tokens"]
     max_sequence_length = value.get("max_sequence_length")
     repetition_penalty = value.get("repetition_penalty")
@@ -257,6 +266,8 @@ def _validate_generation_config(
         normalized["disable_latent_generation"] = value["disable_latent_generation"]
     if "use_kv_cache" in value:
         normalized["use_kv_cache"] = value["use_kv_cache"]
+    if "static_inference_cache" in value:
+        normalized["static_inference_cache"] = value["static_inference_cache"]
     return normalized
 
 
@@ -548,7 +559,13 @@ def merge_shards(
             common_generation_config = generation_config
             generation_config_initialized = True
         elif generation_config != common_generation_config:
-            raise ValueError("generation config mismatch across shards")
+            # Historical absence and explicit false select the same execution.
+            current_config = dict(generation_config or {})
+            first_config = dict(common_generation_config or {})
+            current_config.setdefault("static_inference_cache", False)
+            first_config.setdefault("static_inference_cache", False)
+            if current_config != first_config:
+                raise ValueError("generation config mismatch across shards")
         manifests[shard_index] = (manifest, jsonl_path)
     if set(manifests) != set(range(NUM_EVALUATION_SHARDS)):
         raise ValueError("merge requires shard indices 0-3 exactly once")
@@ -564,6 +581,10 @@ def merge_shards(
             manifest_cache = (manifest.get("generation_config") or {}).get("use_kv_cache", False)
             if type(row_cache) is not bool or row_cache != manifest_cache:
                 raise ValueError("cache execution mode mismatch between row and manifest")
+            row_static = row.get("static_inference_cache", False)
+            manifest_static = (manifest.get("generation_config") or {}).get("static_inference_cache", False)
+            if type(row_static) is not bool or row_static != manifest_static:
+                raise ValueError("static inference cache mode mismatch between row and manifest")
             source_index = row["index"]
             if source_index in rows_by_index:
                 raise ValueError(f"duplicate source index {source_index}")

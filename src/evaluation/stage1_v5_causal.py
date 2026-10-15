@@ -176,6 +176,15 @@ def pair_generation(on_rows, off_rows, source_indices, *, seed=42):
     if any(type(r.get('use_kv_cache', False)) is not bool or r.get('use_kv_cache', False)
            for r in on.values()):
         raise ValueError('ON cache execution is unsupported')
+    static_modes = [r.get('static_inference_cache', False) for r in off.values()]
+    if (any(type(mode) is not bool for mode in static_modes)
+            or len(set(static_modes)) != 1):
+        raise ValueError('OFF static inference cache mode must be a uniform boolean')
+    if static_modes[0] and not off_cache_modes[0]:
+        raise ValueError('static inference cache requires KV cache')
+    if any(type(r.get('static_inference_cache', False)) is not bool
+           or r.get('static_inference_cache', False) for r in on.values()):
+        raise ValueError('ON static inference cache is unsupported')
     invalid, errors, effects, pairs = [], [], [], []
     for i in source_indices:
         a, b = on[i], off[i]
@@ -205,6 +214,7 @@ def pair_generation(on_rows, off_rows, source_indices, *, seed=42):
                                    and rows[i].get('gold_parse_status') == 'parsed' for i in ids)
     return dict(source_indices=source_indices, source_count=count, valid_gold_count=len(valid),
         off_use_kv_cache=off_cache_modes[0],
+        off_static_inference_cache=static_modes[0],
         legacy_on_accuracy=correct(on, source_indices)/count,
         legacy_off_accuracy=correct(off, source_indices)/count,
         valid_gold_on_accuracy=correct(on, valid)/len(valid) if valid else None,

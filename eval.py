@@ -142,6 +142,8 @@ def get_eval_args():
                         help="Stage 1 diagnostic: suppress latent START generation.")
     parser.add_argument("--use-kv-cache", action="store_true",
                         help="Cache Stage 1 OFF decoding (requires --disable-latent-generation).")
+    parser.add_argument("--static-inference-cache", action="store_true",
+                        help="Reuse fixed Stage 1 OFF inference state (requires --use-kv-cache).")
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--model-identity", type=str)
@@ -358,6 +360,7 @@ def run_one_example(
     sample: Dict[str, Any],
     gen_kwargs: Dict[str, Any],
     *, disable_latent_generation: bool = False, use_kv_cache: bool = False,
+    static_inference_cache: bool = False,
 ) -> Dict[str, Any]:
     """
     Run inference on a single example and return raw output,
@@ -401,6 +404,10 @@ def run_one_example(
         raise TypeError("use_kv_cache must be a boolean")
     if use_kv_cache and (stage != "stage1" or not disable_latent_generation):
         raise ValueError("KV cache requires Stage 1 with latent generation disabled")
+    if type(static_inference_cache) is not bool:
+        raise TypeError("static_inference_cache must be a boolean")
+    if static_inference_cache and not use_kv_cache:
+        raise ValueError("static inference cache requires Stage 1 OFF with KV cache")
     if disable_latent_generation and stage != "stage1":
         raise ValueError("disable_latent_generation is a Stage 1 diagnostic only")
     if stage == "stage1":
@@ -445,6 +452,7 @@ def run_one_example(
                 return_latent_states=False,
                 disable_latent_generation=disable_latent_generation,
                 use_kv_cache=use_kv_cache,
+                static_inference_cache=static_inference_cache,
             )
             out_ids = generation_result.sequences
         else:
@@ -601,6 +609,8 @@ def main():
                    if getattr(args, "disable_latent_generation", False) else {}),
                 **({"use_kv_cache": True}
                    if getattr(args, "use_kv_cache", False) else {}),
+                **({"static_inference_cache": True}
+                   if getattr(args, "static_inference_cache", False) else {}),
             )
             sample_infer_time = pred.get("inference_time", None)
             if sample_infer_time is not None:
@@ -715,6 +725,8 @@ def main():
     diagnostic_identity = {
         "disable_latent_generation": getattr(args, "disable_latent_generation", False),
         "use_kv_cache": getattr(args, "use_kv_cache", False),
+        **({"static_inference_cache": True}
+           if getattr(args, "static_inference_cache", False) else {}),
         "model_identity": resolve_model_identity(args.model_dir, getattr(args, "model_identity", None)),
         "model_artifact": str(Path(args.model_dir).resolve()),
         "source_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
@@ -786,6 +798,8 @@ def main():
                 **({"use_kv_cache": getattr(args, "use_kv_cache", False)}
                    if (getattr(args, "disable_latent_generation", False)
                        or getattr(args, "use_kv_cache", False)) else {}),
+                **({"static_inference_cache": True}
+                   if getattr(args, "static_inference_cache", False) else {}),
             },
             shard_index=args.shard_index,
             num_shards=args.num_shards,
