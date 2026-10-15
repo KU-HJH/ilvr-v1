@@ -310,3 +310,37 @@ Both task gates passed. Final broad review covers all new changes since intake
 with the earlier reviewed Stage1-v5 revision as baseline. Deferred minors: trace
 mapping insertion order and expected processor advisory. No parked finding or
 process violation. Final verification and finishing have not yet executed.
+
+## Final independent review and completion gate
+
+`/root/throughput_final_review` (gpt-6-astra/high) reviewed148b0e8..61c07a6:
+Ready to merge conditional on fresh full-project tests; zero Critical/Important.
+Verified byte-identical originals, actual runtime boundaries, causal logs,
+119/83 focused results and recomputed final medians from raw repetitions.
+Fixture ruling accepted based on actual per-image Qwen implementation and
+independent real-pixel/full-processor evidence. Advisory is expected/no defect.
+Trace insertion-order observation remains a disclosed nonblocking minor;
+known consumers are keyed, with no ordering guarantee. No fix wave needed.
+
+Controller dispositions for every declined item: production-size BF16/four-rank
+and B200 claims remain out of scope; end-to-end speed/utilization/quality requires
+separate authorized execution; arbitrary batch-dependent/stochastic processors
+are outside the existing Qwen contract; unchanged baseline review is reused with
+integration checked here; fresh full-suite success is a pending required gate.
+No uncertainty is silently promoted to equivalence or waived by review.
+
+Verification and finishing are now active. Root will run fresh distinct local
+performance witnesses first (no contention), then the recorded full project
+command once for both verification and finishing Step1. This review does not
+establish final test success. Host worktree and branch integration are human-owned.
+
+Fresh root performance witnesses on the reviewed product content both exited0:
+`root-attention-cuda.json/.log` and `root-collation-default.json/.log`, with the
+same commands/fixtures above and new output names. Complete logged JSON parsed,
+exact-equality flags checked and medians recomputed. Attention15.984324→10.700707ms;
+selection2.4148565→1.0417705ms; collation67.494156→37.245753ms (1.81213x).
+Counts and exact comparisons unchanged. CUDA extra peaks as in Task1 report;
+collation tracemalloc32382669→26419152B, VmHWM1001428→1001820KiB. Only expected
+saved-slow-image advisory appears in collation preamble. No test/benchmark
+concurrency or training launch. These fresh measurements substantiate local
+path claims, not utilization/end-to-end claims.
