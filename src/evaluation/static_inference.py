@@ -41,14 +41,15 @@ def static_inference_cache(model):
                 lora_weight = lora_B(lora_A(x_eye)).T
                 weight = dequantize_module_weight(base_layer).to(x.dtype)
                 weight_norm = module.get_weight_norm(weight, lora_weight.detach(), scaling).detach()
-                cache[x.dtype] = ((module.weight / weight_norm).view(1, -1), weight)
-            mag_norm_scale, weight = cache[x.dtype]
+                cache[x.dtype] = (module.weight / weight_norm).view(1, -1)
+            mag_norm_scale = cache[x.dtype]
             lora_result = lora_B(lora_A(x))
             if base_result is not None:
                 bias = base_layer.bias
                 if bias is not None:
                     base_result = base_result - bias
             else:
+                weight = dequantize_module_weight(base_layer).to(x.dtype)
                 base_result = F.linear(x, transpose(weight, module.fan_in_fan_out))
             return (mag_norm_scale - 1) * base_result + mag_norm_scale * lora_result * scaling
         return forward

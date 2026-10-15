@@ -382,3 +382,42 @@ def test_custom_dora_forward_is_preserved_as_an_unsupported_configuration():
         with static_inference_cache(model): actual = layer(x)
         assert torch.equal(actual, expected)
         assert dora.forward is custom
+
+
+def test_mixed_dtype_dora_releases_converted_weight_inside_active_cache_scope():
+    """Catches retaining a full converted base matrix alongside the small factor."""
+    import weakref
+    from evaluation.static_inference import static_inference_cache
+
+    model = adapted_model()
+    layer = next(m for m in model.modules() if hasattr(m, 'lora_magnitude_vector') and len(m.lora_magnitude_vector))
+    dora = layer.lora_magnitude_vector['default']
+    a, b = layer.lora_A['default'].double(), layer.lora_B['default'].double()
+    dora.double()
+    base = layer.get_base_layer()
+    x = torch.arange(8, dtype=torch.float64).reshape(1, 8)/8
+    kwargs = dict(lora_A=a, lora_B=b, scaling=layer.scaling['default'], base_layer=base)
+    converted = []
+    original_norm = dora.get_weight_norm
+    def observe_norm(weight, lora_weight, scaling):
+        assert weight.dtype == torch.float64 and base.weight.dtype == torch.float32
+        assert weight.data_ptr() != base.weight.data_ptr()
+        converted.append(weakref.ref(weight))
+        return original_norm(weight, lora_weight, scaling)
+
+    with torch.no_grad():
+        base_result = base(x.float())
+        expected = dora(x, base_result=base_result, **kwargs)
+        expected_fallback = dora(x, base_result=None, **kwargs)
+        dora.get_weight_norm = observe_norm
+        try:
+            with static_inference_cache(model):
+                actual = dora(x, base_result=base_result, **kwargs)
+                assert torch.equal(actual, expected)
+                assert len(converted) == 1
+                assert converted[0]() is None, 'converted base matrix remains resident during generation'
+                assert torch.equal(dora(x, base_result=base_result, **kwargs), expected)
+                assert torch.equal(dora(x, base_result=None, **kwargs), expected_fallback)
+                assert len(converted) == 1, 'factor was recomputed instead of reused'
+        finally:
+            del dora.get_weight_norm
