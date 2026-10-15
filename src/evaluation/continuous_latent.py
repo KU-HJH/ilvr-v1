@@ -1,4 +1,4 @@
-"""Stage-neutral no-cache generation over continuous latent blocks."""
+"""Stage-neutral continuous latent generation with opt-in Stage 1 OFF caching."""
 
 from __future__ import annotations
 
@@ -156,7 +156,7 @@ class ContinuousLatentGenerationResult:
 
 
 class ContinuousLatentController:
-    """Generate text and continuous latent blocks without a KV cache."""
+    """Generate continuous latent blocks, or optionally cache Stage 1 text only."""
 
     @torch.no_grad()
     def generate(
@@ -172,6 +172,7 @@ class ContinuousLatentController:
         return_latent_states: bool = False,
         return_post_end_logits: bool = False,
         disable_latent_generation: bool = False,
+        use_kv_cache: bool = False,
     ) -> ContinuousLatentGenerationResult:
         self._validate_inputs(
             model=model,
@@ -181,6 +182,13 @@ class ContinuousLatentController:
         )
         if type(disable_latent_generation) is not bool:
             raise TypeError("disable_latent_generation must be a boolean")
+        if type(use_kv_cache) is not bool:
+            raise TypeError("use_kv_cache must be a boolean")
+        if use_kv_cache and (
+            getattr(model.config, "stage", None) != "stage1"
+            or not disable_latent_generation
+        ):
+            raise ValueError("KV cache requires Stage 1 with latent generation disabled")
         sequences = input_ids
         mask = attention_mask
         inputs_embeds = model.prepare_stage2_base_inputs_embeds(
@@ -193,6 +201,8 @@ class ContinuousLatentController:
         latent_start_count = 0
         generated = 0
         stop_reason = "max_new_tokens"
+        past_key_values = None
+        cached_length = 0
         repetition_processor = RepetitionPenaltyLogitsProcessor(
             generation_config.repetition_penalty
         )
@@ -217,14 +227,31 @@ class ContinuousLatentController:
             position_ids, _ = model.get_rope_index(
                 sequences, image_grid_thw=image_grid_thw, attention_mask=mask
             )
+            cache_kwargs = {}
+            if use_kv_cache:
+                # Physical cache offsets include prompt padding; MRoPE positions
+                # retain the original image/text layout instead of using offsets.
+                position_ids = position_ids[..., cached_length:]
+                cache_kwargs = {
+                    "past_key_values": past_key_values,
+                    "cache_position": torch.arange(
+                        cached_length, sequences.shape[1], device=sequences.device
+                    ),
+                }
             outputs = model.model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=mask,
                 position_ids=position_ids,
-                use_cache=False,
+                use_cache=use_kv_cache,
                 return_dict=True,
                 generate_mode=True,
+                **cache_kwargs,
             )
+            if use_kv_cache:
+                past_key_values = getattr(outputs, "past_key_values", None)
+                if past_key_values is None:
+                    raise RuntimeError("requested KV cache was not returned by the decoder")
+                cached_length = sequences.shape[1]
             logits = model.lm_head(outputs.last_hidden_state[:, -1, :]).clone()
             logits = repetition_processor(sequences, logits)
             if disable_latent_generation:
@@ -260,9 +287,10 @@ class ContinuousLatentController:
             next_ids = next_id[:, None]
             sequences = torch.cat((sequences, next_ids), dim=1)
             mask = torch.cat((mask, torch.ones_like(next_ids)), dim=1)
-            inputs_embeds = torch.cat(
-                (inputs_embeds, model.get_input_embeddings()(next_id).unsqueeze(1)),
-                dim=1,
+            next_embeds = model.get_input_embeddings()(next_id).unsqueeze(1)
+            inputs_embeds = (
+                next_embeds if use_kv_cache
+                else torch.cat((inputs_embeds, next_embeds), dim=1)
             )
             generated += 1
 

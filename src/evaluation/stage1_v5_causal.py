@@ -169,6 +169,13 @@ def pair_generation(on_rows, off_rows, source_indices, *, seed=42):
     on, off = _indexed(on_rows), _indexed(off_rows)
     if set(on) != set(source_indices) or set(off) != set(source_indices):
         raise ValueError('generation coverage mismatch')
+    off_cache_modes = [r.get('use_kv_cache', False) for r in off.values()]
+    if (any(type(mode) is not bool for mode in off_cache_modes)
+            or len(set(off_cache_modes)) != 1):
+        raise ValueError('OFF cache execution mode must be a uniform boolean')
+    if any(type(r.get('use_kv_cache', False)) is not bool or r.get('use_kv_cache', False)
+           for r in on.values()):
+        raise ValueError('ON cache execution is unsupported')
     invalid, errors, effects, pairs = [], [], [], []
     for i in source_indices:
         a, b = on[i], off[i]
@@ -197,6 +204,7 @@ def pair_generation(on_rows, off_rows, source_indices, *, seed=42):
     correct = lambda rows, ids: sum(bool(rows[i].get('match')) and not rows[i].get('error')
                                    and rows[i].get('gold_parse_status') == 'parsed' for i in ids)
     return dict(source_indices=source_indices, source_count=count, valid_gold_count=len(valid),
+        off_use_kv_cache=off_cache_modes[0],
         legacy_on_accuracy=correct(on, source_indices)/count,
         legacy_off_accuracy=correct(off, source_indices)/count,
         valid_gold_on_accuracy=correct(on, valid)/len(valid) if valid else None,

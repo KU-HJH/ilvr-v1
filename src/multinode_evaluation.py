@@ -196,10 +196,15 @@ def _validate_generation_config(
     accepted_field_sets += tuple(
         fields | {"disable_latent_generation"} for fields in accepted_field_sets
     )
+    accepted_field_sets += tuple(
+        fields | {"use_kv_cache"} for fields in accepted_field_sets
+    )
     if not isinstance(value, dict) or set(value) not in accepted_field_sets:
         raise ValueError("invalid generation config")
     if "disable_latent_generation" in value and type(value["disable_latent_generation"]) is not bool:
         raise ValueError("invalid generation config disable_latent_generation")
+    if "use_kv_cache" in value and type(value["use_kv_cache"]) is not bool:
+        raise ValueError("invalid generation config use_kv_cache")
     max_new_tokens = value["max_new_tokens"]
     max_sequence_length = value.get("max_sequence_length")
     repetition_penalty = value.get("repetition_penalty")
@@ -250,6 +255,8 @@ def _validate_generation_config(
         normalized["generation_limit_policy"] = generation_limit_policy
     if "disable_latent_generation" in value:
         normalized["disable_latent_generation"] = value["disable_latent_generation"]
+    if "use_kv_cache" in value:
+        normalized["use_kv_cache"] = value["use_kv_cache"]
     return normalized
 
 
@@ -553,6 +560,10 @@ def merge_shards(
         rows = _read_shard_rows(jsonl_path)
         actual_indices = []
         for row in rows:
+            row_cache = row.get("use_kv_cache", False)
+            manifest_cache = (manifest.get("generation_config") or {}).get("use_kv_cache", False)
+            if type(row_cache) is not bool or row_cache != manifest_cache:
+                raise ValueError("cache execution mode mismatch between row and manifest")
             source_index = row["index"]
             if source_index in rows_by_index:
                 raise ValueError(f"duplicate source index {source_index}")

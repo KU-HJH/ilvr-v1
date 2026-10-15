@@ -140,6 +140,8 @@ def get_eval_args():
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--disable-latent-generation", action="store_true",
                         help="Stage 1 diagnostic: suppress latent START generation.")
+    parser.add_argument("--use-kv-cache", action="store_true",
+                        help="Cache Stage 1 OFF decoding (requires --disable-latent-generation).")
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--model-identity", type=str)
@@ -355,7 +357,7 @@ def run_one_example(
     processor,
     sample: Dict[str, Any],
     gen_kwargs: Dict[str, Any],
-    *, disable_latent_generation: bool = False,
+    *, disable_latent_generation: bool = False, use_kv_cache: bool = False,
 ) -> Dict[str, Any]:
     """
     Run inference on a single example and return raw output,
@@ -395,6 +397,10 @@ def run_one_example(
         raise ValueError("checkpoint config must contain a positive latent_size")
     token_ids = resolve_latent_token_ids(processor.tokenizer, qwen_model.config)
     stage = getattr(qwen_model.config, "stage", None)
+    if type(use_kv_cache) is not bool:
+        raise TypeError("use_kv_cache must be a boolean")
+    if use_kv_cache and (stage != "stage1" or not disable_latent_generation):
+        raise ValueError("KV cache requires Stage 1 with latent generation disabled")
     if disable_latent_generation and stage != "stage1":
         raise ValueError("disable_latent_generation is a Stage 1 diagnostic only")
     if stage == "stage1":
@@ -438,6 +444,7 @@ def run_one_example(
                 image_grid_thw=inputs.get("image_grid_thw"),
                 return_latent_states=False,
                 disable_latent_generation=disable_latent_generation,
+                use_kv_cache=use_kv_cache,
             )
             out_ids = generation_result.sequences
         else:
@@ -592,6 +599,8 @@ def main():
                 model, processor, evaluation_sample, gen_kwargs,
                 **({"disable_latent_generation": True}
                    if getattr(args, "disable_latent_generation", False) else {}),
+                **({"use_kv_cache": True}
+                   if getattr(args, "use_kv_cache", False) else {}),
             )
             sample_infer_time = pred.get("inference_time", None)
             if sample_infer_time is not None:
@@ -705,6 +714,7 @@ def main():
     import hashlib
     diagnostic_identity = {
         "disable_latent_generation": getattr(args, "disable_latent_generation", False),
+        "use_kv_cache": getattr(args, "use_kv_cache", False),
         "model_identity": resolve_model_identity(args.model_dir, getattr(args, "model_identity", None)),
         "model_artifact": str(Path(args.model_dir).resolve()),
         "source_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
@@ -773,6 +783,9 @@ def main():
                 "top_p": args.top_p,
                 **({"disable_latent_generation": True}
                    if getattr(args, "disable_latent_generation", False) else {}),
+                **({"use_kv_cache": getattr(args, "use_kv_cache", False)}
+                   if (getattr(args, "disable_latent_generation", False)
+                       or getattr(args, "use_kv_cache", False)) else {}),
             },
             shard_index=args.shard_index,
             num_shards=args.num_shards,

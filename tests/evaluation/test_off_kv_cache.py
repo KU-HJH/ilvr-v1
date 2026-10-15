@@ -1,0 +1,311 @@
+"""Runtime witnesses for the opt-in Stage 1 OFF cache execution path."""
+import json
+import sys
+
+import pytest
+import torch
+from torch import nn
+
+from evaluation.continuous_latent import (
+    ContinuousLatentController, ContinuousLatentGenerationConfig,
+)
+from evaluation.stage1_v5_causal import pair_generation
+from tests.evaluation.test_continuous_latent import TOKENS, scripted_model
+from tests.evaluation.test_stage1_v5_causal import row
+from tests.multinode.test_evaluation import _write_fake_shards, _merge
+from tests.stage2.helpers import tiny_stage2_qwen
+from tests.stage2.test_eval_integration import (
+    _import_entry_point, RecordingStage1Model, RecordingController,
+    FakeProcessor, ModelWhoseGenerateRaises,
+)
+
+
+class ObservedHead(nn.Module):
+    """Keep the real logits, force START to test suppression, avoid vision controls."""
+    def __init__(self, head):
+        super().__init__()
+        self.head = head
+        self.logits = []
+
+    def forward(self, hidden):
+        logits = self.head(hidden)
+        self.logits.append(logits.detach().clone())
+        logits = logits.clone()
+        logits[..., 80:83] = -100
+        logits[..., TOKENS.start_token_id] = 100
+        return logits
+
+
+def image_prompt():
+    # The leading masked slot separates physical cache offsets from MRoPE offsets.
+    return dict(input_ids=torch.tensor([[0, 7, 81, 80, 80, 80, 80, 8]]),
+                attention_mask=torch.tensor([[0, 1, 1, 1, 1, 1, 1, 1]]),
+                pixel_values=torch.arange(48, dtype=torch.float32).reshape(4, 12)/48,
+                image_grid_thw=torch.tensor([[1, 2, 2]]))
+
+
+@pytest.mark.parametrize('backend', ['eager', 'sdpa'])
+def test_native_cached_decoder_matches_full_image_prompt_logits_and_resets(backend):
+    """Catches replaying full prefixes, losing image MRoPE/masks, or stale caches."""
+    torch.manual_seed(12)
+    model = tiny_stage2_qwen(attn_implementation=backend).eval()
+    model.config.stage = 'stage1'
+    model.lm_head = ObservedHead(model.lm_head)
+    controller = ContinuousLatentController()
+    prompt = image_prompt()
+    config = ContinuousLatentGenerationConfig(max_new_tokens=4, repetition_penalty=1.05)
+    plain = controller.generate(model=model, token_ids=TOKENS,
+        generation_config=config, disable_latent_generation=True, **prompt)
+    reference_logits = model.lm_head.logits[:]
+    model.lm_head.logits.clear()
+    calls, lengths, caches = [], [], []
+
+    def before(_module, _args, kwargs):
+        calls.append(dict(length=kwargs['inputs_embeds'].shape[1],
+            mask=kwargs['attention_mask'].clone(), positions=kwargs['position_ids'].clone(),
+            cache_position=kwargs['cache_position'].clone(),
+            past_length=(kwargs['past_key_values'].get_seq_length()
+                         if kwargs['past_key_values'] is not None else 0),
+            use_cache=kwargs['use_cache'], generate_mode=kwargs['generate_mode']))
+
+    def after(_module, _args, output):
+        lengths.append(output.past_key_values.get_seq_length())
+        caches.append(output.past_key_values)
+
+    pre = model.model.register_forward_pre_hook(before, with_kwargs=True)
+    post = model.model.register_forward_hook(after)
+    try:
+        cached = controller.generate(model=model, token_ids=TOKENS,
+            generation_config=config, disable_latent_generation=True, use_kv_cache=True, **prompt)
+        again = controller.generate(model=model, token_ids=TOKENS,
+            generation_config=config, disable_latent_generation=True, use_kv_cache=True, **prompt)
+    finally:
+        pre.remove()
+        post.remove()
+    assert cached.generated_suffix_ids == again.generated_suffix_ids == plain.generated_suffix_ids
+    assert cached.stop_reason == plain.stop_reason == 'max_new_tokens'
+    assert cached.latent_block_count == cached.latent_start_count == 0
+    assert not set(cached.generated_suffix_ids) & {90, 91, 92}
+    assert [c['length'] for c in calls] == [8, 1, 1, 1]*2
+    assert [c['past_length'] for c in calls] == [0, 8, 9, 10]*2
+    assert lengths == [8, 9, 10, 11]*2
+    assert caches[0] is not caches[4]
+    assert all(c['use_cache'] and c['generate_mode'] for c in calls)
+    # Hand-derived Qwen image positions, including the ignored pad's position=1.
+    assert calls[0]['positions'][:, 0].tolist() == [
+        [1, 0, 1, 2, 2, 2, 2, 4],
+        [1, 0, 1, 2, 2, 3, 3, 4],
+        [1, 0, 1, 2, 3, 2, 3, 4]]
+    assert calls[0]['cache_position'].tolist() == list(range(8))
+    for i in range(1, 4):
+        assert calls[i]['positions'][:, 0].tolist() == [[4+i]]*3
+        assert calls[i]['cache_position'].tolist() == [7+i]
+        assert calls[i]['mask'].tolist() == [[0]+[1]*(7+i)]
+    for actual, expected in zip(model.lm_head.logits, reference_logits*2, strict=True):
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize('limit,eos,reason,length', [
+    (None, None, 'max_new_tokens', 4), (10, None, 'max_sequence_length', 2),
+    (None, 'first', 'eos', 1),
+])
+def test_cached_off_preserves_eos_and_bounded_termination(limit, eos, reason, length):
+    """Catches cache mode bypassing EOS or the original strict length policy."""
+    torch.manual_seed(12)
+    model = tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage = 'stage1'
+    model.lm_head = ObservedHead(model.lm_head)
+    prompt = image_prompt()
+    controller = ContinuousLatentController()
+    if eos:
+        first = controller.generate(model=model, token_ids=TOKENS,
+            generation_config=ContinuousLatentGenerationConfig(max_new_tokens=1),
+            disable_latent_generation=True, **prompt)
+        eos = first.generated_suffix_ids[0]
+    config = ContinuousLatentGenerationConfig(max_new_tokens=4,
+        max_sequence_length=limit, eos_token_id=eos)
+    plain = controller.generate(model=model, token_ids=TOKENS,
+        generation_config=config, disable_latent_generation=True, **prompt)
+    cached = controller.generate(model=model, token_ids=TOKENS,
+        generation_config=config, disable_latent_generation=True, use_kv_cache=True, **prompt)
+    assert cached.generated_suffix_ids == plain.generated_suffix_ids
+    assert len(cached.generated_suffix_ids) == length
+    assert cached.stop_reason == plain.stop_reason == reason
+
+
+@pytest.mark.parametrize('value', [1, 'true', None])
+def test_controller_cache_option_rejects_non_boolean(value):
+    """Catches truthy coercion at the public cache boundary."""
+    with pytest.raises(TypeError, match='use_kv_cache.*boolean'):
+        ContinuousLatentController().generate(
+            model=scripted_model(latent_size=2, emitted_ids=[3], stage='stage1'),
+            input_ids=torch.tensor([[1]]), attention_mask=torch.ones(1, 1),
+            token_ids=TOKENS, generation_config=ContinuousLatentGenerationConfig(),
+            disable_latent_generation=True, use_kv_cache=value)
+
+
+@pytest.mark.parametrize('stage,disable', [('stage1', False), ('stage2', True)])
+def test_controller_rejects_unsupported_cache_before_forward(stage, disable):
+    """Catches accidentally caching an enabled latent or Stage 2 execution."""
+    with pytest.raises(ValueError, match='Stage 1.*disabled'):
+        ContinuousLatentController().generate(
+            model=scripted_model(latent_size=2, emitted_ids=[3], stage=stage),
+            input_ids=torch.tensor([[1]]), attention_mask=torch.ones(1, 1),
+            token_ids=TOKENS, generation_config=ContinuousLatentGenerationConfig(),
+            disable_latent_generation=disable, use_kv_cache=True)
+
+
+def test_requested_cache_without_returned_state_fails_explicitly():
+    """A backend that drops the cache must not silently replay the prefix."""
+    model = tiny_stage2_qwen().eval()
+    model.config.stage = 'stage1'
+    def drop_cache(_module, _args, output):
+        output.past_key_values = None
+        return output
+    handle = model.model.register_forward_hook(drop_cache)
+    try:
+        with pytest.raises(RuntimeError, match='cache.*returned'):
+            ContinuousLatentController().generate(model=model, token_ids=TOKENS,
+                generation_config=ContinuousLatentGenerationConfig(max_new_tokens=2),
+                disable_latent_generation=True, use_kv_cache=True, **image_prompt())
+    finally:
+        handle.remove()
+
+
+@pytest.mark.parametrize('cache', [False, True])
+def test_cli_parses_cache_and_forwards_it_to_stage1(cache, monkeypatch):
+    """Catches an ignored CLI switch or dropped controller argument."""
+    module = _import_entry_point('eval', monkeypatch)
+    argv = ['eval', '--model_dir', 'model', '--test_data_path', 'data',
+            '--task_name', 'zebra-cot', '--runtime_identity_path', 'runtime']
+    monkeypatch.setattr(sys, 'argv', argv+(['--use-kv-cache'] if cache else []))
+    assert module.get_eval_args().use_kv_cache is cache
+    controller = RecordingController()
+    monkeypatch.setattr(module, 'ContinuousLatentController', lambda: controller)
+    module.run_one_example(RecordingStage1Model(), FakeProcessor(),
+        {'text_input': 'question'}, {}, disable_latent_generation=True, use_kv_cache=cache)
+    assert controller.calls[0]['use_kv_cache'] is cache
+
+
+@pytest.mark.parametrize('model,disable', [(RecordingStage1Model, False),
+                                         (ModelWhoseGenerateRaises, True)])
+def test_eval_rejects_unsupported_cache_before_inference(model, disable, monkeypatch):
+    module = _import_entry_point('eval', monkeypatch)
+    with pytest.raises(ValueError, match='Stage 1.*disabled'):
+        module.run_one_example(model(), FakeProcessor(), {'text_input': 'question'}, {},
+            disable_latent_generation=disable, use_kv_cache=True)
+
+
+def generation_config(cache):
+    return dict(max_new_tokens=4, max_sequence_length=32, repetition_penalty=1.,
+                temperature=0., top_p=1., use_kv_cache=cache,
+                disable_latent_generation=True)
+
+
+@pytest.mark.parametrize('cache', [False, True])
+def test_manifest_roundtrips_cache_choice_and_merge_summary(cache, tmp_path):
+    """Catches dropping cache provenance from normalized configs or final summary."""
+    shards = _write_fake_shards(tmp_path, generation_configs=[generation_config(cache)]*4,
+        row_overrides={i: dict(index=i, task_name='task', match=True, use_kv_cache=cache) for i in range(4)})
+    assert json.loads(shards[0].read_text())['generation_config']['use_kv_cache'] is cache
+    assert _merge(tmp_path, shards, 4)['generation_config']['use_kv_cache'] is cache
+
+
+def test_merge_rejects_mixed_cache_modes(tmp_path):
+    shards = _write_fake_shards(tmp_path,
+        generation_configs=[generation_config(c) for c in [True, False, True, True]])
+    with pytest.raises(ValueError, match='generation config mismatch'):
+        _merge(tmp_path, shards, 4)
+
+
+@pytest.mark.parametrize('value', [1, 'true', None])
+def test_manifest_rejects_non_boolean_cache(value, tmp_path):
+    with pytest.raises(ValueError, match='use_kv_cache'):
+        _write_fake_shards(tmp_path, generation_configs=[generation_config(value)]*4)
+
+
+def test_merge_rejects_row_cache_disagreeing_with_manifest(tmp_path):
+    shards = _write_fake_shards(tmp_path, generation_configs=[generation_config(True)]*4,
+        row_overrides={i: dict(index=i, task_name='task', match=True, use_kv_cache=(i != 2)) for i in range(4)})
+    with pytest.raises(ValueError, match='cache.*mismatch'):
+        _merge(tmp_path, shards, 4)
+
+
+@pytest.mark.parametrize('cache', [False, True])
+def test_paired_summary_preserves_off_cache_mode_without_altering_semantic_profile(cache):
+    on = [row(0, True), row(1, True)]
+    off = [dict(row(i, True, off=True), use_kv_cache=cache) for i in range(2)]
+    result = pair_generation(on, off, [0, 1])
+    assert result['off_use_kv_cache'] is cache
+    assert result['effect_off_minus_on'] == 0
+
+
+@pytest.mark.parametrize('modes', [[True, False], [True, 1], [True, None]])
+def test_paired_summary_rejects_mixed_or_non_boolean_cache_rows(modes):
+    on = [row(0, True), row(1, True)]
+    off = [dict(row(i, True, off=True), use_kv_cache=modes[i]) for i in range(2)]
+    with pytest.raises(ValueError, match='cache'):
+        pair_generation(on, off, [0, 1])
+
+
+@pytest.mark.parametrize('shards,cache', [(1, False), (1, True), (4, False), (4, True)])
+def test_main_records_cache_execution_without_changing_semantic_profile(shards, cache, tmp_path, monkeypatch):
+    """Catches dropping the main-loop switch or result/manifest provenance."""
+    from types import SimpleNamespace
+    module = _import_entry_point('eval', monkeypatch)
+    dataset, output = tmp_path/'data.jsonl', tmp_path/'worker.jsonl'
+    dataset.write_text(json.dumps(dict(text_input='question', image_input=[],
+                                       original_final_answer='42'))+'\n')
+    args = SimpleNamespace(model_dir='model', base_model_dir=None, cache_dir='cache',
+        test_data_path=str(dataset), output_json_path=str(output), task_name='zebra-cot',
+        max_new_tokens=2, max_sequence_length=32, repetition_penalty=1., temperature=0.,
+        top_p=1., num_shards=shards, shard_index=0, model_identity='model-A',
+        disable_latent_generation=True, use_kv_cache=cache)
+    monkeypatch.setattr(module, 'get_eval_args', lambda: args)
+    model = tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage = 'stage1'
+    monkeypatch.setattr(module, 'load_evaluation_artifacts',
+        lambda **_kwargs: (model, FakeProcessor(include_visual_inputs=False)))
+    assert module.main() == (0 if shards == 4 else None)
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert all(r['use_kv_cache'] is cache for r in rows)
+    assert all('use_kv_cache' not in r['generation_profile'] for r in rows)
+    assert rows[0]['latent_start_count'] == rows[0]['latent_block_count'] == 0
+    if shards == 4:
+        manifest = json.loads((tmp_path/'worker.jsonl.manifest.json').read_text())
+        assert manifest['generation_config']['use_kv_cache'] is cache
+
+
+@pytest.mark.parametrize('explicit_baseline_cache', [False, True])
+def test_summary_cli_keeps_execution_metadata_out_of_semantic_profile(explicit_baseline_cache, tmp_path, monkeypatch):
+    """Catches treating new uncached baseline provenance as a decoding mismatch."""
+    import hashlib
+    from types import SimpleNamespace
+    from scripts import analyze_stage1_v5_causal as cli
+    source = tmp_path/'source.jsonl'
+    source.write_text('{}\n')
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    baseline = [row(3, True), row(12, True)]
+    spot = [dict(r, index=i, model_artifact='artifact', use_kv_cache=False)
+            for i, r in enumerate(baseline)]
+    off = [dict(r, index=i, model_artifact='artifact', disable_latent_generation=True,
+                source_sha256='subset', use_kv_cache=True) for i, r in enumerate(baseline)]
+    config = dict(max_new_tokens=4096)
+    if explicit_baseline_cache:
+        config['use_kv_cache'] = False
+    values = dict(on=baseline, spot=spot, off=off,
+        manifest=dict(source_indices=[3, 12], source_sha256=digest, subset_sha256='subset'),
+        baseline_manifest=dict(successful=True, model_identity='model-A',
+            generation_config=config, dataset_identity={'path': str(source)}))
+    paths = {}
+    for key, value in values.items():
+        path = tmp_path/(key+'.json')
+        path.write_text(''.join(json.dumps(r)+'\n' for r in value) if isinstance(value, list)
+                        else json.dumps(value))
+        paths[key] = str(path)
+    monkeypatch.setattr(cli, 'model_weights_identity', lambda _path: 'fixed-weight-identity')
+    output = tmp_path/'out.json'
+    cli.generation_summary(SimpleNamespace(**paths, seed=42, output=str(output)))
+    summary = json.loads(output.read_text())
+    assert summary['off_use_kv_cache'] is True
+    assert summary['generation_profile'] == {'max_new_tokens': 4096}
