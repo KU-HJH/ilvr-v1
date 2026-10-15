@@ -22,7 +22,9 @@ def prepared(case, stop=19):
     adapter = HistoryPrefixAdapter(
         case.teacher, input_ids=x['input_ids'], attention_mask=x['attention_mask'],
         original_pixels=x['pixel_values'], original_grid=x['image_grid_thw'])
-    selection = HistorySelection(0, (14, 15), torch.arange(16).reshape(2, 8).float()/9, (0, 1))
+    hidden_size = adapter.backbone.config.hidden_size
+    selection = HistorySelection(0, (14, 15),
+        torch.arange(2 * hidden_size).reshape(2, hidden_size).float()/9, (0, 1))
     return adapter, adapter.prepare(stop, (selection,))
 
 
@@ -79,6 +81,49 @@ def test_scores_match_native_nonzero_dora_image_mrope_gqa(selector, chunks):
     assert all(layer.attn_type == 'sdpa' for layer in adapter.backbone.layers)
     # Result remains available after caches/hooks are cleared on exit.
     torch.testing.assert_close(observer.scores(), actual, atol=0, rtol=0)
+
+
+def test_distinct_kv_groups_match_native_across_head_chunk_boundary():
+    """Mapping every query head to KV0 or alternating KV groups breaks this witness."""
+    eager = make_history_case(attention_backend='eager', num_attention_heads=4,
+                              num_key_value_heads=2)
+    sdpa = make_history_case(num_attention_heads=4, num_key_value_heads=2)
+    for case in (eager, sdpa):
+        case.inputs['attention_mask'][0, 0] = 0
+    eager_adapter, expected_prefix = prepared(eager)
+    adapter, prefix = prepared(sdpa)
+    attention = adapter.backbone.layers[0].self_attn
+    assert (attention.num_heads, attention.num_key_value_heads,
+            attention.num_key_value_groups) == (4, 2, 2)
+    # Read actual effective DoRA K outputs, rather than assuming random groups differ.
+    keys = []
+    handle = eager_adapter.backbone.layers[0].self_attn.k_proj.register_forward_hook(
+        lambda _m, _a, output: keys.append(output.detach().clone()))
+    try:
+        result = native(eager_adapter.backbone, expected_prefix, attentions=True)
+    finally:
+        handle.remove()
+    grouped_keys = keys[0].reshape(1, 19, 2, 4)
+    assert not torch.allclose(grouped_keys[:, :, 0], grouped_keys[:, :, 1])
+    assert any('lora_B' in name and bool(parameter.ne(0).any())
+               for name, parameter in sdpa.teacher.named_parameters())
+    queries, latents = (12, 17, 18), (14, 15)
+    probabilities = result.attentions[0][0, :, list(queries)][:, :, list(latents)].float()
+    assert not torch.allclose(probabilities[:2], probabilities[2:])
+    assert torch.equal(probabilities[:, 0], torch.zeros(4, 2))
+    expected = probabilities.mean((0, 1))
+    assert expected.sum() < 1  # Full causal keys remain in the denominator.
+    config = Stage1QueryConfig(mode='adaptive', query_chunk_size=2,
+                              key_chunk_size=3, head_chunk_size=3)
+    # Chunk [0,1,2] spans the native [0,0,1,1] KV mapping's boundary.
+    with observer_type()(adapter.backbone, layer_indices=(0,), query_positions=queries,
+                         latent_positions=latents, attention_mask=prefix.attention_mask,
+                         config=config) as observer:
+        adapter.forward(prefix)
+        actual = observer.scores()
+    error = (actual - expected).abs().max().item()
+    print(f'native_multigroup_gqa_max_abs_error heads=4 kv=2 head_chunk=3: {error:.12g}')
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
 
 def test_uniform_logits_keep_full_causal_denominator_and_padding():

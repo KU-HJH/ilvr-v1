@@ -85,12 +85,13 @@ def test_query_resume_inherits_saved_settings_without_changing_loss_formula():
         api().resolve_v5_query_resume(contract(), {'query_mode': 'adaptive'})
 
 
-@pytest.mark.parametrize('mutation', ['gamma', 'layers', 'formula', 'missing', 'reference', 'loss'])
+@pytest.mark.parametrize('mutation', ['gamma', 'layers', 'short_last4', 'formula', 'missing', 'reference', 'loss'])
 def test_query_resume_rejects_tampered_semantics_and_identity(mutation):
     saved = adaptive_contract()
     query = saved['execution']['query_config']
     if mutation == 'gamma': query['text_gamma'] = float('nan')
     elif mutation == 'layers': query['resolved_layer_indices'] = []
+    elif mutation == 'short_last4': query['resolved_layer_indices'] = [0, 1]
     elif mutation == 'formula': query['formula_id'] = 'other'
     elif mutation == 'missing': query.pop('text_gamma')
     elif mutation == 'reference': saved['reference']['schema_version'] = 77
@@ -131,8 +132,9 @@ def test_current_source_binding_cannot_lose_its_query_contract():
         api().resolve_v5_query_resume(saved, {})
 
 
-@pytest.mark.parametrize('mode', ['legacy', 'adaptive'])
-def test_runtime_contract_records_effective_topology_and_independent_query_semantics(tmp_path, mode):
+@pytest.mark.parametrize(('mode', 'selector'), [
+    ('legacy', 'last4'), ('adaptive', 'all'), ('adaptive', 'last4')])
+def test_runtime_contract_records_effective_topology_and_independent_query_semantics(tmp_path, mode, selector):
     from types import SimpleNamespace
     from torch.utils.data import DataLoader
     from peft_common import resolve_qwen2_5_vl_model
@@ -147,12 +149,18 @@ def test_runtime_contract_records_effective_topology_and_independent_query_seman
         requested_target_suffixes=DEFAULT_STAGE1_TARGET_SUFFIXES)
     trainer.coverage_p = .9; trainer.image_pool_k = 2; trainer.helper_group_L = 2
     trainer.textual_states = 'previous'
-    trainer.query_config = Stage1QueryConfig(mode, .55, 'last4')
+    trainer.query_config = Stage1QueryConfig(mode, .55, selector)
     resolve_qwen2_5_vl_model(trainer.model).config.compress_strategy = 'average'
     trainer.args.bf16 = True; trainer.args.max_seq_length = 32768; trainer.args.max_steps = 3
     trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(True, 1, None, 'a'*64, 4)
     trainer.train_dataset = list(range(10))
-    saved = trainer._build_v5_runtime_contract(DataLoader(trainer.train_dataset, batch_size=1))
+    loader = DataLoader(trainer.train_dataset, batch_size=1)
+    if mode == 'adaptive' and selector == 'last4':
+        assert len(resolve_qwen2_5_vl_model(trainer.model).model.layers) == 2
+        with pytest.raises(ValueError, match='last4|four|4'):
+            trainer._build_v5_runtime_contract(loader)
+        return
+    saved = trainer._build_v5_runtime_contract(loader)
     query = saved['execution']['query_config']
     assert query['mode'] == mode
     assert query['formula_id'] != saved['formula_id']
@@ -160,7 +168,7 @@ def test_runtime_contract_records_effective_topology_and_independent_query_seman
         'v5_trainer', 'stage1_trainer', 'transformers_trainer',
         'query', 'targets', 'history_attention', 'history_teacher'}
     if mode == 'adaptive':
-        assert query['text_gamma'] == .55 and query['attention_layers'] == 'last4'
+        assert query['text_gamma'] == .55 and query['attention_layers'] == 'all'
         assert query['resolved_layer_indices'] == [0, 1]
         assert (query['query_chunk_size'], query['key_chunk_size'], query['head_chunk_size']) == (64, 2048, 4)
         assert query['mask_mode'] == 'full_causal_2d_v1'

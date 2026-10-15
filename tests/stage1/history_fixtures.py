@@ -42,20 +42,22 @@ class HistoryCase:
 
 
 def make_history_case(*, layers: int = 1, dtype=torch.float32,
-                      attention_backend: str = 'sdpa', nonzero_dora: bool = True
+                      attention_backend: str = 'sdpa', nonzero_dora: bool = True,
+                      num_attention_heads: int = 2, num_key_value_heads: int = 1
                       ) -> HistoryCase:
     """Match checkpointing's tiny-original/Stage1 tuning conventions with GQA."""
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(29)
+        hidden_size = 4 * num_attention_heads  # Preserve head_dim=4 and the MRoPE sections.
         config = Qwen2_5_VLConfig(
-            vocab_size=125, hidden_size=8, intermediate_size=16,
-            num_hidden_layers=layers, num_attention_heads=2,
-            num_key_value_heads=1,
+            vocab_size=125, hidden_size=hidden_size, intermediate_size=2 * hidden_size,
+            num_hidden_layers=layers, num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
             vision_config={
                 'depth': 1, 'hidden_size': 8, 'intermediate_size': 16,
                 'num_heads': 2, 'patch_size': 2, 'spatial_merge_size': 1,
                 'temporal_patch_size': 1, 'window_size': 2,
-                'out_hidden_size': 8, 'fullatt_block_indexes': [0],
+                'out_hidden_size': hidden_size, 'fullatt_block_indexes': [0],
             },
             image_token_id=80, vision_start_token_id=81, video_token_id=82,
             stage='stage1', latent_size=2,

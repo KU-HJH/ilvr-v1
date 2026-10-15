@@ -60,12 +60,14 @@ def _validate_layers(indices: object) -> None:
 
 
 def resolve_query_layers(selector: str, layer_count: int) -> tuple[int, ...]:
-    """Return zero-based decoder layers, clipping last4 to available layers."""
+    """Return zero-based decoder layers; last4 requires at least four layers."""
     _positive_int('layer_count', layer_count)
     if selector == 'last':
         return (layer_count - 1,)
     if selector == 'last4':
-        return tuple(range(max(0, layer_count - 4), layer_count))
+        if layer_count < 4:
+            raise ValueError('last4 requires at least four actual decoder layers')
+        return tuple(range(layer_count - 4, layer_count))
     if selector == 'all':
         return tuple(range(layer_count))
     raise ValueError('attention layers must be last, last4 or all')
@@ -79,6 +81,8 @@ def query_execution_config(
               'formula_id': _LEGACY_FORMULA if config.mode == 'legacy' else _ADAPTIVE_FORMULA}
     if config.mode == 'adaptive':
         _validate_layers(resolved_layers)
+        if config.attention_layers == 'last4' and len(resolved_layers) != 4:
+            raise ValueError('last4 requires exactly four resolved decoder layers')
         result.update({
             'text_mode': 'discounted_segments', 'latent_mode': 'attention_mass',
             'text_gamma': config.text_gamma, 'attention_layers': config.attention_layers,

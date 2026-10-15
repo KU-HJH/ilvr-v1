@@ -195,7 +195,7 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
     from stage1.query import Stage1QueryConfig, query_execution_config
     if query_mode == 'adaptive':
         contract['execution']['query_config'] = query_execution_config(
-            Stage1QueryConfig('adaptive', .55, 'last4'), (0, 1))
+            Stage1QueryConfig('adaptive', .55, 'all'), (0,))
     (artifact/'stage1_v5.json').write_text(json.dumps(contract))
     if changed:
         with (new/'model.safetensors').open('ab') as stream: stream.write(b'changed-content')
@@ -245,7 +245,7 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
         assert bundle.trainer.query_config.mode == query_mode
         if query_mode == 'adaptive':
             assert bundle.trainer.query_config.text_gamma == .55
-            assert bundle.trainer.query_config.attention_layers == 'last4'
+            assert bundle.trainer.query_config.attention_layers == 'all'
         assert bundle.trainer.stage1_v5_debug is debug
         assert bundle.trainer.collect_stage1_diagnostics is debug
         for name,value in teacher.state_dict()['parameters'].items():

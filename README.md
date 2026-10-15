@@ -130,7 +130,8 @@ checkpoint, result, and log roots rather than editing generic output paths.
 Stage1-v5 defaults to `--query_mode legacy`; existing `textual_states` behavior
 is preserved. Adaptive queries are opt-in with `--query_mode adaptive`,
 `--history_text_gamma 0.9` and `--history_attention_layers last` (`last4` and
-`all` are also supported). Adaptive mode rejects an explicitly supplied
+`all` are also supported; `last4` requires at least four actual decoder layers).
+Adaptive mode rejects an explicitly supplied
 `--textual_states`, including the same value as the legacy default.
 
 Use the existing v5 recipe to preview the coordinator command, inference

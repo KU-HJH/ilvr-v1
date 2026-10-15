@@ -42,18 +42,34 @@ def test_invalid_public_config_is_rejected(values):
 
 @pytest.mark.parametrize(('selector', 'count', 'expected'), [
     ('last', 6, (5,)), ('last4', 6, (2, 3, 4, 5)),
-    ('last4', 2, (0, 1)), ('all', 3, (0, 1, 2)),
+    ('last4', 4, (0, 1, 2, 3)), ('all', 3, (0, 1, 2)),
 ])
 def test_layer_selection_resolves_actual_decoder_indices(selector, count, expected):
     assert api().resolve_query_layers(selector, count) == expected
 
 
 @pytest.mark.parametrize(('selector', 'count'), [
+    ('last4', 1), ('last4', 2), ('last4', 3),
     ('middle', 4), ('last', 0), ('last', -1), ('last', True), ('all', 2.5),
 ])
 def test_invalid_layer_selection_fails(selector, count):
     with pytest.raises(ValueError):
         api().resolve_query_layers(selector, count)
+
+
+@pytest.mark.parametrize('indices', [(0,), (0, 1), (0, 1, 2), (3, 4, 5)])
+def test_last4_cannot_serialize_fewer_than_four_resolved_layers(indices):
+    q = api()
+    with pytest.raises(ValueError, match='last4|four|4'):
+        q.query_execution_config(q.Stage1QueryConfig('adaptive', .55, 'last4'), indices)
+
+
+@pytest.mark.parametrize('indices', [[0], [0, 1], [0, 1, 2], [3, 4, 5]])
+def test_saved_last4_cannot_restore_fewer_than_four_resolved_layers(indices):
+    saved = adaptive_saved()
+    saved.update(attention_layers='last4', resolved_layer_indices=indices)
+    with pytest.raises(ValueError, match='last4|four|4'):
+        api().resolve_query_config({}, saved=saved)
 
 
 def adaptive_saved():
