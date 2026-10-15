@@ -98,3 +98,22 @@ def make_history_case(*, layers: int = 1, dtype=torch.float32,
     )
     return HistoryCase(teacher, HistoryTokenizer(), inputs,
                        Stage1BatchMetadata((sample,), 1, 25))
+
+
+def load_baseline_target_builder(base_commit: str) -> type:
+    """Execute an inspected, pinned Git blob in a test-only isolated namespace."""
+    import re
+    import subprocess
+    from pathlib import Path
+    from types import ModuleType
+
+    if re.fullmatch(r'[0-9a-f]{40}', base_commit) is None:
+        raise ValueError('baseline must be a full lowercase Git commit identity')
+    root = Path(__file__).resolve().parents[2]
+    source = subprocess.run(
+        ['git', 'show', f'{base_commit}:src/stage1/targets.py'], cwd=root,
+        check=True, capture_output=True, text=True).stdout
+    namespace = ModuleType(f'_stage1_targets_baseline_{base_commit}')
+    exec(compile(source, f'git:{base_commit}:src/stage1/targets.py', 'exec'),
+         namespace.__dict__)
+    return namespace.Stage1TeacherTargetBuilder
