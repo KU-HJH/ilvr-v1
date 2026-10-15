@@ -425,7 +425,8 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
 
 
 def _run_main_with_fake_sample(
-    module, monkeypatch, tmp_path, *, num_shards, shard_index=0, fail_index=None
+    module, monkeypatch, tmp_path, *, num_shards, shard_index=0, fail_index=None,
+    disable_latent_generation=False,
 ):
     (tmp_path / "image.png").write_bytes(b"image")
     dataset = tmp_path / "test.jsonl"
@@ -462,11 +463,12 @@ def _run_main_with_fake_sample(
             num_shards=num_shards,
             shard_index=shard_index,
             model_identity=None,
+            disable_latent_generation=disable_latent_generation,
         ),
     )
     monkeypatch.setattr(module, "load_evaluation_artifacts", lambda **_kwargs: (object(), object()))
 
-    def run_one(_model, _processor, sample, _gen_kwargs):
+    def run_one(_model, _processor, sample, _gen_kwargs, *, disable_latent_generation=False):
         assert _gen_kwargs["max_sequence_length"] == 32768
         assert _gen_kwargs["repetition_penalty"] == 1.05
         index = int(sample["text_input"].rsplit("-", 1)[1])
@@ -479,8 +481,8 @@ def _run_main_with_fake_sample(
             "prompt_identity": "p" * 64,
             "prompt_token_length": 2,
             "generated_suffix_token_ids": [21, 22],
-            "latent_start_count": 1,
-            "latent_block_count": 1,
+            "latent_start_count": 0 if disable_latent_generation else 1,
+            "latent_block_count": 0 if disable_latent_generation else 1,
             "stop_reason": "eos",
         }
         if module.__name__ == "eval":
@@ -831,6 +833,27 @@ def test_four_shard_worker_uses_global_indices_and_writes_success_sidecar(
     assert manifest["expected_source_indices"] == [1, 5]
     assert manifest["processed_source_indices"] == [1, 5]
     assert manifest["worker_exit_status"] == 0
+
+
+def test_four_shard_latent_off_eval_publishes_condition_in_real_manifest(
+    monkeypatch, tmp_path
+):
+    """Rejecting or dropping the OFF condition at publication must fail this test."""
+    module = _import_entry_point("eval", monkeypatch)
+    _dataset, output, result = _run_main_with_fake_sample(
+        module, monkeypatch, tmp_path, num_shards=4, shard_index=1,
+        disable_latent_generation=True,
+    )
+
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    manifest = json.loads(Path(f"{output}.manifest.json").read_text())
+    assert result == 0
+    assert [row["index"] for row in rows] == [1, 5]
+    assert all(row["disable_latent_generation"] is True for row in rows)
+    assert all(row["latent_block_count"] == 0 for row in rows)
+    assert manifest["generation_config"]["disable_latent_generation"] is True
+    assert manifest["worker_exit_status"] == 0
+    assert manifest["processed_source_indices"] == [1, 5]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)

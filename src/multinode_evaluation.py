@@ -193,8 +193,13 @@ def _validate_generation_config(
         if require_vision_ablation
         else (required, required | {"vision_ablation"})
     )
+    accepted_field_sets += tuple(
+        fields | {"disable_latent_generation"} for fields in accepted_field_sets
+    )
     if not isinstance(value, dict) or set(value) not in accepted_field_sets:
         raise ValueError("invalid generation config")
+    if "disable_latent_generation" in value and type(value["disable_latent_generation"]) is not bool:
+        raise ValueError("invalid generation config disable_latent_generation")
     max_new_tokens = value["max_new_tokens"]
     max_sequence_length = value.get("max_sequence_length")
     repetition_penalty = value.get("repetition_penalty")
@@ -243,6 +248,8 @@ def _validate_generation_config(
         normalized["vision_ablation"] = vision_ablation
     if require_generation_limit_policy or "generation_limit_policy" in value:
         normalized["generation_limit_policy"] = generation_limit_policy
+    if "disable_latent_generation" in value:
+        normalized["disable_latent_generation"] = value["disable_latent_generation"]
     return normalized
 
 
