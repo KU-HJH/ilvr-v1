@@ -138,6 +138,8 @@ def get_eval_args():
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--disable-latent-generation", action="store_true",
+                        help="Stage 1 diagnostic: suppress latent START generation.")
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--model-identity", type=str)
@@ -353,6 +355,7 @@ def run_one_example(
     processor,
     sample: Dict[str, Any],
     gen_kwargs: Dict[str, Any],
+    *, disable_latent_generation: bool = False,
 ) -> Dict[str, Any]:
     """
     Run inference on a single example and return raw output,
@@ -392,6 +395,8 @@ def run_one_example(
         raise ValueError("checkpoint config must contain a positive latent_size")
     token_ids = resolve_latent_token_ids(processor.tokenizer, qwen_model.config)
     stage = getattr(qwen_model.config, "stage", None)
+    if disable_latent_generation and stage != "stage1":
+        raise ValueError("disable_latent_generation is a Stage 1 diagnostic only")
     if stage == "stage1":
         if not isinstance(qwen_model, ContinuousLatentModelProtocol):
             raise TypeError(
@@ -432,6 +437,7 @@ def run_one_example(
                 pixel_values=inputs.get("pixel_values"),
                 image_grid_thw=inputs.get("image_grid_thw"),
                 return_latent_states=False,
+                disable_latent_generation=disable_latent_generation,
             )
             out_ids = generation_result.sequences
         else:
@@ -583,7 +589,9 @@ def main():
                 sample.get("image_input", []), dataset_root
             )
             pred = run_one_example(
-                model, processor, evaluation_sample, gen_kwargs
+                model, processor, evaluation_sample, gen_kwargs,
+                **({"disable_latent_generation": True}
+                   if getattr(args, "disable_latent_generation", False) else {}),
             )
             sample_infer_time = pred.get("inference_time", None)
             if sample_infer_time is not None:
@@ -694,6 +702,18 @@ def main():
                 })
             results.append(error_result)
 
+    import hashlib
+    diagnostic_identity = {
+        "disable_latent_generation": getattr(args, "disable_latent_generation", False),
+        "model_identity": resolve_model_identity(args.model_dir, getattr(args, "model_identity", None)),
+        "model_artifact": str(Path(args.model_dir).resolve()),
+        "source_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+        "generation_profile": {key: value for key, value in gen_kwargs.items() if key != "do_sample"},
+    } if (getattr(args, "disable_latent_generation", False)
+          or getattr(args, "model_identity", None) is not None) else {}
+    for row in results:
+        row.update(diagnostic_identity)
+
     metric_total = worker_total if sharded else total
     score_summary = (
         EvaluationScoreSummary.from_rows(results, metric_total)
@@ -715,6 +735,7 @@ def main():
             # Write a summary line as the last entry
             summary = {
                 "summary": True,
+                **diagnostic_identity,
                 "num_samples": total,
                 "average_inference_time_sec": avg_inference_time,
                 "total_inference_time_sec": total_inference_time,
@@ -750,6 +771,8 @@ def main():
                 ),
                 "temperature": args.temperature,
                 "top_p": args.top_p,
+                **({"disable_latent_generation": True}
+                   if getattr(args, "disable_latent_generation", False) else {}),
             },
             shard_index=args.shard_index,
             num_shards=args.num_shards,
