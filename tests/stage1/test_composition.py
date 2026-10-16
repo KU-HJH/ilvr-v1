@@ -5,17 +5,20 @@ import json
 import logging
 import math
 import os
+import random
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import peft
+import numpy as np
 import pytest
 import torch
 from accelerate.state import AcceleratorState, GradientState, PartialState
+from accelerate.data_loader import DataLoaderShard
 from torch import nn
 from torch.utils.checkpoint import checkpoint
-from transformers import Qwen2_5_VLConfig
+from transformers import Qwen2_5_VLConfig, Trainer
 from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
 from peft_common import capture_qwen2_5_vl_architecture
@@ -218,11 +221,129 @@ def test_stage1_peft_uses_sample_stable_nonreentrant_gradient_checkpointing(
     assert training_args.gradient_checkpointing_kwargs == expected_kwargs
 
 
-def test_stage1_training_arguments_pin_single_process_data_loading(tmp_path):
-    """Catches worker scheduling adding an untracked stochastic process boundary."""
+def test_stage1_training_arguments_default_to_single_process_data_loading(tmp_path):
+    """Catches an omitted worker option silently enabling multiprocessing."""
     training_args = build_stage1_training_arguments(stage1_args(tmp_path))
 
     assert training_args.dataloader_num_workers == 0
+
+
+@pytest.mark.parametrize("workers", [0, 2, 4, 8, 16, 32, 64])
+def test_stage1_training_arguments_honor_requested_workers(tmp_path, workers):
+    """Catches explicit worker counts being discarded before Trainer setup."""
+    training_args = build_stage1_training_arguments(
+        stage1_args(tmp_path, "--dataloader_num_workers", str(workers))
+    )
+
+    assert training_args.dataloader_num_workers == workers
+    assert training_args.dataloader_prefetch_factor is None
+    assert training_args.dataloader_persistent_workers is False
+    assert training_args.dataloader_pin_memory is True
+
+
+def test_stage1_training_arguments_keep_legacy_missing_worker_default(tmp_path):
+    """Catches old programmatic callers losing their default-zero behavior."""
+    args = stage1_args(tmp_path)
+    del args.dataloader_num_workers
+
+    assert build_stage1_training_arguments(args).dataloader_num_workers == 0
+
+
+@pytest.mark.parametrize("variant", ["standard", "v5"])
+def test_stage1_rejects_negative_workers_during_argument_parsing(variant):
+    """Catches invalid worker counts surviving pre-model argument validation."""
+    with pytest.raises(ValueError, match="Stage 1 dataloader_num_workers.*non-negative"):
+        parse_args(["--stage1_variant", variant, "--dataloader_num_workers", "-1"])
+
+
+def test_stage2_retains_negative_worker_validation():
+    with pytest.raises(ValueError, match="Stage 2 dataloader_num_workers.*non-negative"):
+        parse_args(["--stage", "stage2", "--dataloader_num_workers", "-1"])
+
+
+class WorkerWitnessCollator:
+    """Test-only observation of the process that actually performed collation."""
+
+    def __init__(self, collator):
+        self.collator = collator
+
+    def __call__(self, examples):
+        batch = self.collator(examples)
+        worker = torch.utils.data.get_worker_info()
+        batch["worker_witness"] = torch.tensor(
+            [os.getpid(), -1 if worker is None else worker.id]
+        )
+        return batch
+
+
+def test_stage1_native_prepared_loader_workers_preserve_batches_and_main_rng(tmp_path):
+    """Catches ignored workers, reordered samples, changed tensors or RNG draws.
+
+    This uses v5's inherited Trainer loader path and the real v5 collator with
+    Qwen image preprocessing. It does not execute a model or distributed ranks.
+    """
+    from stage1.v5_trainer import CustomTrainerStage1V5
+    from tests.stage1.v5.collation_fixtures import (
+        PixelProcessor, assert_batches_equal, examples_at, make_collator,
+    )
+
+    assert CustomTrainerStage1V5.get_train_dataloader is Trainer.get_train_dataloader
+    examples = examples_at(tmp_path / "images")
+    observations = {}
+    for workers in (0, 2):
+        _clear_training_process_state()
+        args = stage1_args(tmp_path, "--use_cpu", "--dataloader_num_workers", str(workers))
+        args.deepspeed_config = None
+        args.per_device_train_batch_size = 1
+        training_args = build_stage1_training_arguments(args)
+        collator = make_collator(PixelProcessor())
+        # The portable fixture grows its character vocabulary; fill it before
+        # forking so it behaves like the fixed production tokenizer vocabulary.
+        collator(examples)
+        trainer = Trainer(model=nn.Linear(1, 1), args=training_args,
+                          train_dataset=examples,
+                          data_collator=WorkerWitnessCollator(collator))
+        loader = trainer.get_train_dataloader()
+        assert isinstance(loader, DataLoaderShard)
+        assert loader.num_workers == workers
+        assert loader.prefetch_factor == (None if workers == 0 else 2)
+        assert loader.persistent_workers is False
+        # TrainingArguments CPU device setup disables pinning; the non-CPU
+        # SFTConfig's unchanged default is checked separately above.
+        assert loader.pin_memory is False
+        batches, worker_records, draws = [], [], []
+        initial_rng = torch.random.get_rng_state().clone()
+        for batch in loader:
+            worker_records.append(batch.pop("worker_witness").tolist())
+            batches.append(batch)
+            # CPU torch/Python/NumPy represent training-process randomness;
+            # compare interleaved draws, including iterator lookahead effects.
+            draws.append((torch.rand(4), random.random(), np.random.random()))
+        observations[workers] = (batches, worker_records, draws, initial_rng,
+                                 torch.random.get_rng_state().clone())
+        trainer.accelerator.free_memory()
+
+    baseline, baseline_workers, baseline_draws, initial0, final0 = observations[0]
+    actual, actual_workers, actual_draws, initial2, final2 = observations[2]
+    assert baseline_workers == [[os.getpid(), -1]] * 3
+    assert {record[1] for record in actual_workers} == {0, 1}
+    assert len({record[0] for record in actual_workers}) == 2
+    assert all(record[0] != os.getpid() for record in actual_workers)
+    source_order = lambda batches: [
+        batch["stage1_batch_metadata"].samples[0].source_index for batch in batches
+    ]
+    assert sorted(source_order(baseline)) == [0, 1, 2]
+    assert source_order(actual) == source_order(baseline)
+    for observed, expected in zip(actual, baseline, strict=True):
+        assert_batches_equal(observed, expected)
+    assert torch.equal(initial0, initial2)
+    assert torch.equal(final0, final2)
+    for observed, expected in zip(actual_draws, baseline_draws, strict=True):
+        assert torch.equal(observed[0], expected[0])
+        assert observed[1:] == expected[1:]
+    print({"worker_counts": [0, 2], "source_order": source_order(actual),
+           "baseline_processes": baseline_workers, "worker_processes": actual_workers,
+           "all_batch_fields_equal": True, "main_rng_draws_equal": True})
 
 
 @pytest.mark.parametrize("method", ["full", "lora", "dora"])

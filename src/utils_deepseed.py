@@ -347,6 +347,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.per_device_train_batch_size != 1:
             raise ValueError("Stage 2 requires per_device_train_batch_size=1")
     elif args.stage == "stage1":
+        if args.dataloader_num_workers < 0:
+            raise ValueError("Stage 1 dataloader_num_workers must be non-negative")
         if args.step_preference_enabled:
             raise ValueError("step preference training is only valid for Stage 2")
         if args.use_lora and args.tuning_method_explicit:
