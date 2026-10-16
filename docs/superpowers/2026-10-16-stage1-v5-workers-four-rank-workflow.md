@@ -162,3 +162,49 @@ provisioned; no dependency installation. Existing full-suite baseline on identic
 product content:4642 passed/11 skipped/1 warning, recorded in the prior throughput
 workflow and root-full-suite.log. No repeated broad baseline run; root owns one
 fresh full-suite completion verification after review, per standing user policy.
+
+## Reviewed implementation and fresh verification
+
+Task implementer `/root/workers4r_impl` (gpt-6.1-sol/high), BASE64a6f15, committed
+`2a17a3ae68bbe3833c570af994a72fbee5ad41a4`: forward the existing worker argument
+with missing-field default0, reject negative Stage1 values, and add behavioral
+coverage. No other production policy changed. Causal RED had8 expected failures
+(six ignored positive counts and two negative-input variants); corrected native
+loader RED also observed0 instead of2. Focused GREEN:130 passed/11.87s, exit0.
+Real CPU DataLoaderShard worker2 PID/worker-ID observations, exact sample order,
+all batch fields and interleaved main-process RNG matched worker0. This does not
+establish CUDA or four-rank equivalence.
+
+Task reviewer `/root/workers4r_review` (gpt-6.1-sol/high): spec and quality Approved,
+zero findings. Final reviewer `/root/workers4r_final_review` (gpt-6-astra/high):
+spec/quality/integration Approved, zero findings. Root read both complete reports
+and the implementation/RED/GREEN evidence. Previous reviewed product content is
+reused for the identical baseline; the final review covers integration of this
+delta. No fix wave, deferred finding, parked finding or discretionary ruling.
+
+Fresh root verification at2a17a3a, once for verification-before-completion and
+finishing Step1:
+
+```text
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
+PYTHONPATH=src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q
+4654 passed, 11 skipped, 1 warning in1209.59s; exit0
+```
+
+Complete log read: `logs/stage1-v5-workers4r-20261016/root-full-suite.log`.
+Warning: existing CPUAdam test reports TORCH_CUDA_ARCH_LIST unset, same as baseline;
+no test failures. Whitespace check and tracked-clean status passed. No code/test
+edits followed the focused or full verification. Detailed reports and ledger are
+retained in `results/stage1-v5-workers4r-20261016/`.
+
+Disposition of final-review evidence limits: full-suite claim now verified;
+actual CUDA/four-rank process, worker and initial-reference/loss checks remain
+campaign requirements; no numerical resume or full-quality claim is made; the
+approved short-window/prefetch-backlog limitation remains. Prior source review is
+reused rather than re-performed. Package versions and five critical installed
+implementation hashes match between hosts; exact hashes are in the ledger.
+
+Finishing gate Step1 passed; existing host-managed named Stage1-v5 worktree is
+preserved. No merge/push/deletion is requested. The authorized experiment continues
+from this reviewed source; any integration choice belongs to the human after the
+requested results are delivered. Active phase: verified experiment execution.
