@@ -391,7 +391,7 @@ def build_stage1_training_arguments(args) -> SFTConfig:
         max_steps=args.max_steps,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
-        dataloader_num_workers=0,
+        dataloader_num_workers=getattr(args, "dataloader_num_workers", 0),
         deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False,
         seed=args.seed,
