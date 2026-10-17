@@ -50,7 +50,7 @@ one final full suite after independent reviews, not another baseline full suite.
 | Modify `src/stage1/v5_trainer.py`, `scripts/verify_stage1_v5.py` | Actual metric source binding and exact compatible verifier source map |
 | Modify `tests/stage1/test_history_query.py`, `tests/stage1/test_history_targets.py` | Identity migration and real Teacher/selection/ownership witnesses |
 | Modify `tests/stage1/test_cli.py`, `tests/stage1/test_composition.py` | Pre-model parser/direct composition guard witnesses |
-| Modify `tests/stage1/v5/test_resume.py`, `tests/stage1/v5/test_protocol.py`, `tests/stage1/v5/test_workflow.py`, `tests/stage1/v5/test_history_integration.py`, `tests/stage1/v5/test_trainer.py` | Historical inspection, current contracts, actual parent/shared target/reference/gradient and verifier consumers |
+| Modify `tests/stage1/v5/test_resume.py`, `tests/stage1/v5/test_protocol.py`, `tests/stage1/v5/test_workflow.py`, `tests/stage1/v5/test_history_integration.py`, `tests/stage1/v5/test_trainer.py`, `tests/stage1/v5/test_launcher.py` | Historical inspection, current contracts, actual parent/shared target/reference/gradient and verifier consumers |
 | Modify `README.md` | Current adaptive formula, role/input distinction, final-layer restriction and fresh-run requirement |
 | Inspect `run_stage1_training.sh`, `scripts/stage1_v5_train_eval.sh`, `src/multinode_runtime.py` | Existing flags/default last must stay compatible; change only affected wording or assumptions |
 | Preserve `src/stage1/history_teacher.py`, `src/stage1/history_attention.py` and their utility tests | Historical code remains callable in isolation; never used by new adaptive execution |
@@ -775,10 +775,10 @@ with `Final hidden-state selector for adaptive training (last only)`; retain
 historical read support in the model-independent validator. Add no temperature,
 head or third-mode public option.
 
-- [x] **Step 10: Run one focused set and smallest actual-parent integration, then commit.**
+- [ ] **Step 10: Run one focused set and smallest actual-parent integration, then commit.**
 
 ```bash
-./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_history_metric.py tests/stage1/test_history_query.py tests/stage1/test_history_targets.py tests/stage1/test_cli.py tests/stage1/test_composition.py tests/stage1/v5/test_resume.py tests/stage1/v5/test_history_integration.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_workflow.py tests/stage1/v5/test_trainer.py
+./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_history_metric.py tests/stage1/test_history_query.py tests/stage1/test_history_targets.py tests/stage1/test_cli.py tests/stage1/test_composition.py tests/stage1/v5/test_resume.py tests/stage1/v5/test_history_integration.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_workflow.py tests/stage1/v5/test_trainer.py tests/stage1/v5/test_launcher.py
 git diff --check
 ```
 
@@ -818,7 +818,7 @@ off the completed feature. Its project full suite is selected as the shared
 fresh test-pass witness, run once at the independently reviewed final revision:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-v5-content-metric-20261017/final-pytest-r2 > logs/stage1-v5-content-metric-20261017/final-full-suite-r2.log 2>&1
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-v5-content-metric-20261017/final-pytest-r3 > logs/stage1-v5-content-metric-20261017/final-full-suite-r3.log 2>&1
 ```
 
 Before this command create its task-owned parent directory, then verify that
@@ -878,3 +878,7 @@ as a file-inventory correction within the bound scope. Bind the actual metric
 file via its module/class, not `inspect.getsourcefile` on the no-grad-decorated
 function, which can identify PyTorch's decorator wrapper instead. Retain the
 causal actual-source hash test that exposed this mismatch.
+
+Final-suite consumer finding: `tests/stage1/v5/test_launcher.py` imports the now-current adaptive contract but retained a `last4` assertion. Full-suite RED (5077 passed, one failed) exposed this omitted consumer. Reopen Task 2 only for its current-schema assertions, preserve both-node coordinator/parser and resume/default-omission checks, and fix through the original SDD implementer with spec/quality/final delta re-review. Existing identical product reviews are reused; a fresh full suite is required after the failed witness.
+
+Launcher delta review closure: original implementer commit `2b12b43` received independent SPEC, QUALITY and final whole-change extension PASS. Focused evidence is the identical 548-test set plus the changed launcher file’s nine-test GREEN; do not repeat the former set just to update a checkbox. The required fresh full-project suite covers their combined current revision and remains the completion witness.

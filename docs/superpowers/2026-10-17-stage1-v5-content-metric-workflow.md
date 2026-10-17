@@ -322,3 +322,62 @@ preflight confirms parent exists, canonical path, and unused log/base directory.
 Plan preflight corrected. Identical reviewed product/source remains unchanged;
 all task/final review verdicts still apply. Retry is required by this concrete
 failed verification, not an optional duplicate broad cycle. Result pending.
+
+## Full-suite attempt 2: one stale launcher test consumer
+
+At exact control `c2ca892`, session92703 completed exit1:
+`1 failed,5077 passed,11 skipped,1 warning in1218.88s (20m18s)`.
+Root read the complete log `final-full-suite-r2.log`. Sole failure:
+`tests/stage1/v5/test_launcher.py::test_actual_coordinator_adaptive_resume_omits_query_defaults_on_both_nodes`.
+Its imported `adaptive_contract()` fixture now correctly represents schema2/last,
+actual coordinator and worker parser succeed, but line276 still expects last4.
+The consumer was outside the initial focused file inventory. This is a real
+failed completion witness, not a completed suite; final integration gate stays
+closed. Warning is the existing CPUAdam TORCH_CUDA_ARCH_LIST message.
+
+Root's live status checks read only the tail, so earlier progress updates missed
+the F marker printed at45%. Root corrected that overbroad no-failure status on
+reading the complete result. Subsequent progress checks must inspect all existing
+progress output for F/E rather than infer whole-run status from the tail.
+
+Reopened Task2 narrowly: root explicitly authorized original implementer
+`/root/content_metric_activation_impl` to migrate only affected assertions in
+`tests/stage1/v5/test_launcher.py`, preserving both-node coordinator/default
+omission/gamma/parser/resume witnesses. This is another current-contract
+consumer inventory correction, not a changed design. Full-suite failure is its
+causal RED. No production file change is requested. Original independent task
+and final reviewers will review this delta; their identical-product assessments
+are reused. Plan map/focused set corrected; fresh whole-suite retry required
+after the fix/review gates, with a new log/basetemp identity. No training.
+
+## Launcher delta fixed and independently re-reviewed
+
+Original implementer committed only the authorized consumer file at
+`2b12b43cc3ef6d34d78e158df4455fd9b4f821d8`:four insertions/one deletion.
+Fixture explicitly binds queryschema2/exactformula; last4 assertion becomes last.
+All actual both-node/four-rank dryrun, omitted defaults, saved gamma and paths
+remain intact. Root inspected the full diff and complete RED/GREEN logs:
+`task2-launcher-consumer-red.log` reproduces1failed in3.22s at the stale assertion;
+`task2-launcher-consumer-green.log` runs the entire launcher file,9passed in3.50s,
+exit0. No production file changed.
+
+Original independent reviewers assessed only this new delta while reusing
+identical reviewed code: `/root/content_metric_activation_spec` SPEC PASS,
+then `/root/content_metric_activation_quality` QUALITY PASS, then
+`/root/content_metric_final_review` extended whole-change PASS at exact2b12b43.
+Each inspected actual changes/evidence; no outstanding finding or reviewer edit.
+Historical migration and original production approvals remain applicable. This
+is required fix/review, not a replacement or waiver of any earlier gate.
+
+Active phase returns to verification-before-completion and finishing Step1.
+Fresh command at the reviewed code/test revision (control-only record follows):
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-v5-content-metric-20261017/final-pytest-r3 > logs/stage1-v5-content-metric-20261017/final-full-suite-r3.log 2>&1
+```
+
+Fresh preflight PASS: parent exists; checkpoint link preserved and canonical;
+basetemp/log unused; product and tests match reviewed2b12b43; diff check clean.
+All previous failure logs preserved. No completion or merge claim before the
+complete result. The required retry is justified by the failed completion
+witness and actual reviewed test fix. No training/real-data probe authorized.
