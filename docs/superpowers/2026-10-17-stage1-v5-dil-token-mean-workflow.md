@@ -14,11 +14,10 @@ Inspected revision: `c9d6afe1293b404243e7a48d0e31aeaf33cab4e2`.
 Tracked implementation was clean at intake. Canonical `AGENTS.md`, the user
 supplied global workflow policy, and relevant skills were read.
 
-Active lifecycle: `superpowers:brainstorming`, context exploration and
-preliminary scope/architecture confirmation. No implementation approval for
-this reduction change exists. The earlier history-query approval does not
-authorize a new loss reduction. The user's earlier choice of Subagent-driven
-development is retained for the eventual approved implementation.
+Active lifecycle: final commitment v1 approved; architectural brainstorming
+complete, writing-plans completed, retained user-selected Subagent-driven
+implementation next. Earlier pending entries below describe their time; the
+approval section at the end is authoritative for current authorization.
 
 The preliminary question distinguished a token denominator across all ranks
 and all microbatches from averaging sample-local token means. The user answered
@@ -116,3 +115,30 @@ no new loss-mode CLI or generalized legacy engine is proposed. User final
 commitment approval is still pending. No source implementation/test/training work
 has been performed. Next gate: user written-spec review, then writing-plans
 and the retained Subagent-driven route.
+
+## Final approval and implementation plan
+
+The user answered `진행해` after the exact final written commitment v1 was
+presented with implementation approval requested. Approval binds SHA256
+`64d8a8474575e540f222514d9109836a2f2353ad5671fb4e672f0cea4075406e`.
+The frozen spec is not rewritten to erase its creation-time pending status.
+This authorizes the described code/tests via the retained SDD method, not
+training, evaluation campaigns, checkpoint mutation or integration actions.
+
+Brainstorming completed its architectural path and root executed writing-plans
+as the terminal next skill. The implementation plan is
+`plans/2026-10-17-stage1-v5-dil-token-mean.md`. Root self-reviewed requirements
+coverage, concrete steps, file ownership, types and placeholder absence.
+There is one atomic implementation task because token sum, denominator,
+contract and consumers must change together. SDD/task prompts, TDD, requesting
+review and final verification/finish skills were read for their required gates.
+No further method-selection question is needed; user already selected SDD.
+
+Using-git-worktrees verified existing isolated branch `stage1_v5`: Git dir
+`/root/workspace/ILVR/.git/worktrees/ILVR2`, common dir
+`/root/workspace/ILVR/.git`, no superproject. Existing canonical venv is reused.
+Fresh focused baseline command used the repository venv and
+`PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src`
+with `python -m pytest tests/stage1/v5 -q`: **389 passed in 22.08s**, exit0.
+Complete output: `logs/stage1-v5-dil-token-mean-20261017/baseline.log`.
+No dependencies were installed or training launched.
