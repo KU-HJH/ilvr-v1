@@ -113,3 +113,57 @@ Applicable mandatory skill gate: brainstorming/SKILL.md says to ask the user
 to review the written spec, then "Wait for the user's response" and "Only
 proceed once the user approves." The earlier implementation request accepts
 the direction but does not substitute for this later exact written commitment.
+
+## Written commitment response and planning transition
+
+After the exact written commitment and its implementation-only uncertainty
+were presented, the user asked the next phase and then explicitly invoked
+`$superpowers:writing-plans`. Root treats that instruction to advance the
+presented design as approval to plan the unchanged commitment v1 above. This
+records the actual response, not a claim that the user selected a suggested
+approval-button phrase. The frozen spec retains its creation-time pending
+status; this later entry is the authoritative phase transition. No evidence
+about metric usefulness, production cost, or accuracy has been added, and no
+training, evaluation or real-data premise probe is authorized.
+
+Active phase: writing-plans; implementation method remains the previously
+selected Subagent-driven method. Skills writing-plans and using-git-worktrees
+were read and applied. Existing isolation verified: named `Stage1-v5`, Git dir
+`/root/workspace/ILVR/.git/worktrees/ILVR1`, common dir
+`/root/workspace/ILVR/.git`, no superproject. No new worktree/dependency install.
+Planning starts from control commit `b39e0f2`, product merge `1c86472`.
+
+Fresh focused baseline command (repository venv, vendored Transformers first):
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_history_query.py tests/stage1/test_history_targets.py tests/stage1/v5/test_resume.py tests/stage1/v5/test_history_integration.py
+```
+
+Observed exit 0, `176 passed in 11.87s`; complete output read from
+`logs/stage1-v5-content-metric-20261017/baseline.log`. This is the pre-change
+baseline, not evidence for the proposed behavior. No product file changed.
+
+Read-only consumer tracing found the verification script's source-hash map
+already lags the runtime map (three trainer keys versus seven runtime keys).
+The implementation plan must align the actual map, including the new metric,
+and retain exact hash checking; synthetic three-key fixtures are insufficient.
+
+## Implementation plan and root self-review
+
+Plan saved at `plans/2026-10-17-stage1-v5-content-metric.md`. Two sequential
+tasks: pure unused metric with independent math/selector tests, then atomic
+adaptive activation plus strict identity/resume/consumer updates. The latter
+cannot be separated into a misleading new-formula/old-runtime intermediate.
+The plan includes exact paths, APIs/code snippets, RED/GREEN commands, reference
+and DIL invariants, independent task/final review and final suite/handoff gates.
+
+Root self-review matched every commitment section to task/verification evidence,
+checked API/type consistency and corrected fixed-temperature JSON type checking
+and actual hidden-state hook capture. Fresh mechanical plan check: two tasks,
+balanced fences, no placeholder patterns, complete metric module AST parses;
+exit0. `git diff --check` exit0. This validates the plan artifact only, not the
+proposed implementation. No product files have changed at this point.
+
+The previously selected Subagent-driven method is retained without another
+method-selection question. Next phase is SDD/TDD with fresh implementer agents,
+spec-before-quality task reviews and an independent final whole-change review.
