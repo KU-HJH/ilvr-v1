@@ -198,3 +198,16 @@ index0 versus uniform index1 with positive margins; no semantic usefulness claim
 Fresh independent specification reviewer `/root/content_metric_math_spec`
 dispatched read-only against base `9263b33` and exact product `9d1b03a`.
 Review verdict pending; quality review and Task 2 cannot advance before PASS.
+
+Task 1 review gates completed on exact product `9d1b03a`:
+`/root/content_metric_math_spec` returned SPEC PASS after independent source/
+scope/log review and fresh `167 passed in 3.31s`, exit0. Then distinct
+`/root/content_metric_math_quality` returned QUALITY PASS with no findings;
+its targeted CPU BF16 dispatch probe observed FP32 score/mean/norm operations,
+exact no-autocast output equality and no gradient path. Neither reviewer edited
+files or ran training. No unresolved findings. Task 1 checked steps refer to
+these actual witnesses, not implementer assertion alone.
+
+Active phase advances to SDD Task 2: atomic adaptive activation, saved identity,
+historical read/current training split and affected consumer/integration/docs.
+Task 1 arithmetic review is reused; Task 2 and final review remain required.

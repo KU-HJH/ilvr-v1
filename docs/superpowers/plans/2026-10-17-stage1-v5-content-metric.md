@@ -79,7 +79,7 @@ real model artifacts in logs/results or arbitrary temporary directories.
 **Files:** Create `src/stage1/history_metric.py` and
 `tests/stage1/test_history_metric.py`. No runtime activation in this task.
 
-- [ ] **Step 1: Write the independent cosine/aggregation RED test.**
+- [x] **Step 1: Write the independent cosine/aggregation RED test.**
 
 ```python
 import pytest
@@ -101,7 +101,7 @@ def test_content_history_uses_global_softmax_and_raw_values_without_grad():
     assert text.grad is None and values.grad is None
 ```
 
-- [ ] **Step 2: Run RED and read the complete failure.**
+- [x] **Step 2: Run RED and read the complete failure.**
 
 ```bash
 ./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_history_metric.py
@@ -111,7 +111,7 @@ Expected: collection fails because `stage1.history_metric` does not exist.
 Save the output as `task1-red.log`; a dependency/import environment failure
 unrelated to that module is not the expected RED.
 
-- [ ] **Step 3: Implement the validated metric interface.**
+- [x] **Step 3: Implement the validated metric interface.**
 
 Use this complete module. The two key passes are a global softmax at fixed
 tau1: cosine logits lie in [-1,1], so exponentiation is bounded; no per-chunk
@@ -200,7 +200,7 @@ def compose_content_query(global_intent: Tensor, text_summary: Tensor | None,
     return query
 ```
 
-- [ ] **Step 4: Add chunk/empty/invalid-input tests before changing any failing behavior.**
+- [x] **Step 4: Add chunk/empty/invalid-input tests before changing any failing behavior.**
 
 ```python
 @pytest.mark.parametrize('q,k', [(1, 1), (2, 2), (64, 2048)])
@@ -261,7 +261,7 @@ replace that function. Add a finite-large norm case if FP32 conversion/norm
 overflow is not covered by the above invalid rows. Device mismatch is guarded
 without requiring a CUDA test.
 
-- [ ] **Step 5: Add the actual selector-boundary witness.**
+- [x] **Step 5: Add the actual selector-boundary witness.**
 
 ```python
 from stage1.history_metric import ContentHistory
@@ -293,7 +293,7 @@ This is a known directional, tie-free selector test, not an expectation that
 every real sample changes or improves. Final Teacher isolation has a separate
 real-model witness in Task 2.
 
-- [ ] **Step 6: Run the focused GREEN set, self-review and commit only Task 1.**
+- [x] **Step 6: Run the focused GREEN set, self-review and commit only Task 1.**
 
 ```bash
 ./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_history_metric.py tests/stage1/test_history_query.py
