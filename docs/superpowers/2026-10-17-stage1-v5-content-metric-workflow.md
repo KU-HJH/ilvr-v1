@@ -211,3 +211,56 @@ these actual witnesses, not implementer assertion alone.
 Active phase advances to SDD Task 2: atomic adaptive activation, saved identity,
 historical read/current training split and affected consumer/integration/docs.
 Task 1 arithmetic review is reused; Task 2 and final review remain required.
+
+Fresh Task 2 implementer `/root/content_metric_activation_impl` started from
+`eea7a3c043d963a766847806cc6f5654248de9c4` with complete fresh-context task text.
+Observed causal RED logs: legacy literal witness catches three decoder prefix
+calls and zero Teacher wrapper calls; current schema/layer RED catches schema1
+and last4/all acceptance. Initial query/literal observation/frozen legacy GREEN:
+113 passed. Later target semantics GREEN:39 passed (task still in progress).
+
+Actual source-file regression caught `inspect.getsourcefile` of the no-grad
+decorated metric resolving to the PyTorch wrapper. Implementer is binding the
+actual metric source through its class/module; retain this causal witness.
+Implementer also found affected hardcoded source/schema assertions in
+`tests/stage1/v5/test_trainer.py`, absent from the initial inventory, and asked
+before editing. Root authorized only the affected consumer assertions/fixtures,
+updated plan file map and focused command. This is within existing identity/
+consumer scope, not a changed design or self-authorized scope expansion.
+
+Task 2 implementer returned DONE_WITH_CONCERNS at
+`cc4336f7a5752152f83a0083e2d9c4468649561e`. Concerns are the already-disclosed
+absence of real-data relevance/calibration, cost and accuracy measurements;
+no additional unresolved correctness finding was reported. Root inspected the
+actual 17-file diff (736 insertions/361 deletions), including Teacher observation,
+query reconstruction/training dispatch, source maps, README and parent/reference
+tests. No loss computation or data/sampler/worker code changed.
+
+Root read complete `task2-focused.log`:548 passed in18.85s, exit0, including
+the authorized trainer consumer. Causal observation/schema RED logs previously
+read; remaining causal/source/integration logs retained alongside. Real sidecar
+post-change strict read PASS with unchanged SHA256
+`8e064ae861790494e9f3142e49f39a95756eae3e579bb9792d2941beccfcf4f9`;
+root read complete inspection output and earlier baseline metadata is under
+`results/stage1-v5-content-metric-20261017/historical-before.json`.
+
+Fresh independent `/root/content_metric_activation_spec` dispatched against
+exact `eea7a3c..cc4336f` with bound requirements and entrypoint/evidence discipline.
+Specification verdict pending; quality and final review not yet authorized to
+advance. No whole-project suite or training has run in Task 2.
+
+Task 2 review gates completed on exact product `cc4336f`:
+`/root/content_metric_activation_spec` returned SPEC PASS after inspecting all
+17 files, tracing Teacher/helper/history and parent/reference/loss paths, and
+independently checking the real historical sidecar. It reports28 targeted
+witnesses passed in10.84s, exit0; final full-suite verification remains required.
+Then distinct `/root/content_metric_activation_quality` returned QUALITY PASS,
+no critical/important/minor findings, after reading every changed-file diff and
+tracing actual calls/state/guards/source-map consumers. Fresh diff check PASS;
+it reused the complete548-test focused log without another broad run. No edits
+by either reviewer. Task 2 completed with no unresolved review finding.
+
+Active phase: required final independent whole-change review, covering both
+metric `9d1b03a` and activation `cc4336f`, before final full-suite verification.
+Unmeasured real-data relevance, GPU behavior/cost and accuracy remain unknown.
+No training/evaluation/real-data premise probe has been launched or authorized.

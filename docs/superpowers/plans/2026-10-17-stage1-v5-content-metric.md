@@ -50,7 +50,7 @@ one final full suite after independent reviews, not another baseline full suite.
 | Modify `src/stage1/v5_trainer.py`, `scripts/verify_stage1_v5.py` | Actual metric source binding and exact compatible verifier source map |
 | Modify `tests/stage1/test_history_query.py`, `tests/stage1/test_history_targets.py` | Identity migration and real Teacher/selection/ownership witnesses |
 | Modify `tests/stage1/test_cli.py`, `tests/stage1/test_composition.py` | Pre-model parser/direct composition guard witnesses |
-| Modify `tests/stage1/v5/test_resume.py`, `tests/stage1/v5/test_protocol.py`, `tests/stage1/v5/test_workflow.py`, `tests/stage1/v5/test_history_integration.py` | Historical inspection, current contracts, actual parent/shared target/reference/gradient and verifier consumers |
+| Modify `tests/stage1/v5/test_resume.py`, `tests/stage1/v5/test_protocol.py`, `tests/stage1/v5/test_workflow.py`, `tests/stage1/v5/test_history_integration.py`, `tests/stage1/v5/test_trainer.py` | Historical inspection, current contracts, actual parent/shared target/reference/gradient and verifier consumers |
 | Modify `README.md` | Current adaptive formula, role/input distinction, final-layer restriction and fresh-run requirement |
 | Inspect `run_stage1_training.sh`, `scripts/stage1_v5_train_eval.sh`, `src/multinode_runtime.py` | Existing flags/default last must stay compatible; change only affected wording or assumptions |
 | Preserve `src/stage1/history_teacher.py`, `src/stage1/history_attention.py` and their utility tests | Historical code remains callable in isolation; never used by new adaptive execution |
@@ -162,17 +162,18 @@ def content_history(text: Tensor, values: Tensor, *,
         if not bool(torch.isfinite(norm).all()) or bool((norm <= 1e-8).any()):
             raise FloatingPointError('scoring vector norms must be finite and greater than 1e-8')
     queries, keys = text / text_norm, values / value_norm
-    for q0 in range(0, queries.shape[0], query_chunk_size):
-        query = queries[q0:q0 + query_chunk_size]
-        denominator = query.new_zeros((query.shape[0], 1))
-        for k0 in range(0, keys.shape[0], key_chunk_size):
-            logits = query @ keys[k0:k0 + key_chunk_size].T
-            denominator += logits.exp().sum(1, keepdim=True)
-        for k0 in range(0, keys.shape[0], key_chunk_size):
-            logits = query @ keys[k0:k0 + key_chunk_size].T
-            weights[k0:k0 + key_chunk_size] += (logits.exp() / denominator).sum(0)
-    weights /= text.shape[0]
-    summary = (weights[:, None] * values).sum(0, keepdim=True)
+    with torch.autocast(device_type=text.device.type, enabled=False):
+        for q0 in range(0, queries.shape[0], query_chunk_size):
+            query = queries[q0:q0 + query_chunk_size]
+            denominator = query.new_zeros((query.shape[0], 1))
+            for k0 in range(0, keys.shape[0], key_chunk_size):
+                logits = query @ keys[k0:k0 + key_chunk_size].T
+                denominator += logits.exp().sum(1, keepdim=True)
+            for k0 in range(0, keys.shape[0], key_chunk_size):
+                logits = query @ keys[k0:k0 + key_chunk_size].T
+                weights[k0:k0 + key_chunk_size] += (logits.exp() / denominator).sum(0)
+        weights /= text.shape[0]
+        summary = (weights[:, None] * values).sum(0, keepdim=True)
     if not bool(torch.isfinite(summary).all()):
         raise FloatingPointError('history summary must be finite in FP32')
     return ContentHistory(weights, summary, True)
@@ -185,10 +186,12 @@ def compose_content_query(global_intent: Tensor, text_summary: Tensor | None,
     if intent.shape[0] != 1:
         raise ValueError('global intent must have shape [1,H]')
     parts = [intent]
-    for name, value in (('text summary', text_summary),
-                        ('history summary', history.summary if history.present else None)):
-        if value is None:
-            continue
+    components = []
+    if text_summary is not None:
+        components.append(('text summary', text_summary))
+    if history.present:
+        components.append(('history summary', history.summary))
+    for name, value in components:
         row = _matrix(name, value)
         if row.shape != intent.shape or row.device != intent.device:
             raise ValueError(f'{name} must share query shape and device')
@@ -311,7 +314,7 @@ through this implementer before advancing to Task 2.
 **Files:** All Modify/Test rows in the responsibility map. Task 1 is required.
 Keep this task atomic across runtime, contract and current verification consumers.
 
-- [ ] **Step 1: Write a real-model RED witness for literal legacy observation.**
+- [x] **Step 1: Write a real-model RED witness for literal legacy observation.**
 
 Replace adaptive injection expectations, keeping the legacy frozen-blob oracle.
 Add this test beside `observe_build` in `tests/stage1/test_history_targets.py`:
@@ -365,7 +368,7 @@ The output hook above captures the actual wrapper hidden states. The independent
 literal call must remain independent of the new shared helper. Compare hidden
 states at fixed weights/inputs, not changed targets.
 
-- [ ] **Step 2: Run the new witness RED.**
+- [x] **Step 2: Run the new witness RED.**
 
 ```bash
 ./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_history_targets.py::test_adaptive_observes_literal_legacy_full_input_once_without_target_injection
@@ -374,7 +377,7 @@ states at fixed weights/inputs, not changed targets.
 Expected: old adaptive makes multiple prefix calls and fails the one-call/full
 input witness. Record `task2-observation-red.log`; do not weaken the assertion.
 
-- [ ] **Step 3: Write schema/current-layer RED tests before activation.**
+- [x] **Step 3: Write schema/current-layer RED tests before activation.**
 
 The new serialized mapping is exactly this (no unused head chunk or layer list):
 
@@ -411,7 +414,7 @@ def test_new_training_rejects_nonfinal_layers(selector):
 Run these tests and save `task2-contract-red.log`. They must fail on missing
 validator/new schema or acceptance of unsupported current layers.
 
-- [ ] **Step 4: Implement strict historical read/current training separation.**
+- [x] **Step 4: Implement strict historical read/current training separation.**
 
 In `query.py`, preserve the old serializer body as private
 `_historical_query_execution_config(config, resolved_layers)` and its old formula
@@ -531,7 +534,7 @@ Add `'history_metric'` to the missing-query source-binding guard in
 and before model/processor loaders. Parser already calls the resolver before
 loaders: preserve that dispatch and add runtime witnesses for both entrypoints.
 
-- [ ] **Step 5: Share the literal observation and replace adaptive history loop.**
+- [x] **Step 5: Share the literal observation and replace adaptive history loop.**
 
 Factor only the unchanged wrapper call and extraction out of legacy:
 
@@ -606,7 +609,7 @@ unused old observer/adapter imports from targets only. Old utility files stay.
 Do not pass helper pixels, target tensors, latent_hidden_states or image_out_mask
 to the Teacher observation. Existing builder eval/no-grad scope stays unchanged.
 
-- [ ] **Step 6: Add historical inspection/early rejection RED-to-GREEN witnesses.**
+- [x] **Step 6: Add historical inspection/early rejection RED-to-GREEN witnesses.**
 
 Use a literal historical native query, not the new serializer, in resume tests:
 
@@ -651,7 +654,7 @@ composition tests, install model-loader spies that fail if called, request
 last4/all or old native resume, assert the intended ValueError and zero calls.
 Do not change a historical artifact to make a new resume test pass.
 
-- [ ] **Step 7: Bind actual current source files and repair the exact verifier map.**
+- [x] **Step 7: Bind actual current source files and repair the exact verifier map.**
 
 In `_build_v5_runtime_contract`, replace native attention layer resolution with
 `query_execution_config(query_config, ())` and add the metric module to the
@@ -689,7 +692,7 @@ represent every actual source key and add a witness that removes or changes
 all checkpoint/model/data/package equality checks. This is a local explicit-map
 correction, not a new provenance framework or a real audit run.
 
-- [ ] **Step 8: Replace old adaptive integration expectations with current witnesses.**
+- [x] **Step 8: Replace old adaptive integration expectations with current witnesses.**
 
 Keep actual tiny DoRA and parent trainer fixtures; use the following concrete
 assertions when replacing native-prefix expectations:
@@ -744,7 +747,7 @@ with different selected targets are not an invariance claim. Current saved
 adaptive config `.55,last` replaces old `.55,all`; the latter belongs only to
 historical inspection/rejection tests. No loss/gradient normalization changes.
 
-- [ ] **Step 9: Record current semantics in existing README and CLI wording.**
+- [x] **Step 9: Record current semantics in existing README and CLI wording.**
 
 Replace the current adaptive paragraph with this content, preserving unrelated
 training examples and historical design/results documents:
@@ -772,10 +775,10 @@ with `Final hidden-state selector for adaptive training (last only)`; retain
 historical read support in the model-independent validator. Add no temperature,
 head or third-mode public option.
 
-- [ ] **Step 10: Run one focused set and smallest actual-parent integration, then commit.**
+- [x] **Step 10: Run one focused set and smallest actual-parent integration, then commit.**
 
 ```bash
-./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_history_metric.py tests/stage1/test_history_query.py tests/stage1/test_history_targets.py tests/stage1/test_cli.py tests/stage1/test_composition.py tests/stage1/v5/test_resume.py tests/stage1/v5/test_history_integration.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_workflow.py
+./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_history_metric.py tests/stage1/test_history_query.py tests/stage1/test_history_targets.py tests/stage1/test_cli.py tests/stage1/test_composition.py tests/stage1/v5/test_resume.py tests/stage1/v5/test_history_integration.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_workflow.py tests/stage1/v5/test_trainer.py
 git diff --check
 ```
 
@@ -861,3 +864,13 @@ the validated input device type, and retain an enclosing CPU BF16 autocast
 regression against independent FP32 math. The Task 1 implementer observed this
 causal RED before the targeted fix. This is implementation detail, not a formula
 or design-scope change; no accuracy claim follows.
+
+Execution consumer correction: Task 2 inspection found hardcoded source-map and
+schema assertions also in `tests/stage1/v5/test_trainer.py`. This affected test
+consumer is included in the file map/focused set above; update only those
+assertions/fixtures under the same current/historical identity requirements.
+The implementer requested this addition before editing it; root authorized it
+as a file-inventory correction within the bound scope. Bind the actual metric
+file via its module/class, not `inspect.getsourcefile` on the no-grad-decorated
+function, which can identify PyTorch's decorator wrapper instead. Retain the
+causal actual-source hash test that exposed this mismatch.
