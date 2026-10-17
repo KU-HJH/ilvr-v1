@@ -157,3 +157,33 @@ merged test-pass claim at both completion gates. No cleanup/completion claim
 until exit0. No training/push. Host-managed worktrees and lowercase stage1_v5
 remain preserved. Only merged uppercase Stage1-v5 branch is eligible for safe
 -d deletion after full verification and ownership/ancestry checks.
+
+## Fresh merged completion verification and authorized finishing result
+
+Selected full-suite command ran once at
+`8eb09f9c83a3f8cae6c9cdc8b8dda4b86a6537fe`, unchanged reviewed product
+`c2a817d062870ff317dbf26a0c436ef36848898a`. Actual exit0 from session48160;
+root read the entire final-full-suite.log: **5084 passed,11 skipped,1 warning
+in1226.14s (20m26s)**. The warning is the existing Torch CPUAdam extension
+TORCH_CUDA_ARCH_LIST warning, not a failed test. Log SHA256:
+`6868d3034c8f4a69bf818bb37633a7468f501ca7e1ad1bc2bed4f63fc6ca380b`.
+This fresh merged witness satisfies verification-before-completion and the
+finishing Option1 post-merge test-pass gate. No second broad suite is needed
+for controller-only evidence; no additional code changed during/after testing.
+Root rechecked reviewed product/test equality, git diff --check (both exit0),
+frozen spec hash113658fdd4c8ddf8357d3cace7dff21753e8148969a4c566961357a05aaa1d3d,
+and historical sidecar hash8e064ae861790494e9f3142e49f39a95756eae3e579bb9792d2941beccfcf4f9.
+
+After green verification, runtime git checks confirmed source5f445c2 ancestral
+to main and no worktree owns refs/heads/Stage1-v5. git branch -d Stage1-v5
+succeeded; exact uppercase source ref is absent, all source commits remain
+reachable through merge2f6b5b7. Host-managed6b9d retained on main; lowercase
+stage1_v5/1061 is intact, canonical checkout remains detached0e6d673, existing
+untracked files/checkpoint/data/venv links preserved. No worktree removal,
+pruning, force deletion, push, training or evaluation was performed.
+
+Finishing Option1 local integration is complete. Independent final SPEC and
+QUALITY PASS plus actual full-suite witness establish inspected CPU scope;
+no GPU/multi-node/relevance/accuracy/cost claim is made. Initial integration
+failure and causal RED evidence remain preserved. This final append records
+actual completion evidence only; it changes no delivered code/tests/spec.
