@@ -358,6 +358,11 @@ class CustomTrainerStage1(SFTTrainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Keep sample-keyed dropout active through Trainer's backward replay."""
+        from .v5_execution import current_v5_execution
+        if current_v5_execution() is not None:
+            # V5 already owns dropout for the original graphs and backward replay.
+            return super().training_step(model, inputs, num_items_in_batch)
+
         sites = tuple(
             module.site_name
             for module in model.modules()

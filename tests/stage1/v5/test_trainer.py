@@ -282,6 +282,57 @@ def test_actual_four_calls_one_parent_backward_native_update_and_reference_owned
     assert trainer._v5_step_stack is None
 
 
+def test_v5_exclusively_owns_dropout_through_parent_backward_and_checkpoint_replay(tmp_path, monkeypatch):
+    """A real V5 backward must not acquire the ordinary Stage 1 dropout owner."""
+    from stage1.equivalence import SampleStableStage1Dropout, _STAGE1_STOCHASTIC_CONTEXT
+    from stage1.v5_execution import current_v5_execution
+
+    trainer, batch, calls, _, backwards, _ = integrated_fixture(tmp_path)
+    dropout = [module for module in trainer.model.modules()
+               if isinstance(module, SampleStableStage1Dropout)]
+    assert dropout and all(module.p == .05 for module in dropout)
+    assert resolve_qwen2_5_vl_model(trainer.model).model.gradient_checkpointing
+    sites = {module.site_name for module in dropout}
+    observations = []
+    real_backward = trainer.accelerator.backward
+
+    def observed_backward(loss, **kwargs):
+        owner = current_v5_execution()
+        legacy_owner = _STAGE1_STOCHASTIC_CONTEXT.get()
+        assert owner is not None and owner.state == 'BACKWARD'
+        result = real_backward(loss, **kwargs)
+        observations.append(owner)
+        assert current_v5_execution() is owner and owner.state == 'BACKWARD'
+        assert legacy_owner is None, 'V5 backward acquired the legacy Stage 1 dropout owner'
+        assert _STAGE1_STOCHASTIC_CONTEXT.get() is None
+        return result
+
+    monkeypatch.setattr(trainer.accelerator, 'backward', observed_backward)
+    batches, _ = trainer.get_batch_samples(iter([batch]), 4)
+    try:
+        loss = trainer.training_step(trainer.model, batches[0])
+    finally:
+        assert current_v5_execution() is None
+        assert _STAGE1_STOCHASTIC_CONTEXT.get() is None
+        assert trainer._v5_step_stack is None and trainer._v5_execution is None
+
+    assert torch.isfinite(loss)
+    assert calls == ['helper', 'F', 'reference', 'packed']
+    assert len(observations) == len(backwards) == 1
+    assert observations[0] is backwards[0] and backwards[0].state == 'CLOSED'
+    for role in ('F', 'packed'):
+        for phase in ('original', 'recompute'):
+            observed_sites = [event['site'] for event in backwards[0].events
+                              if event['role'] == role and event['phase'] == phase
+                              and event['site'] is not None]
+            assert len(observed_sites) == len(sites) and set(observed_sites) == sites
+    gradients = [parameter.grad for parameter in trainer.model.parameters()
+                 if parameter.requires_grad]
+    assert gradients and all(gradient is not None and bool(torch.isfinite(gradient).all())
+                             for gradient in gradients)
+    assert any(bool(gradient.abs().sum() > 0) for gradient in gradients)
+
+
 def test_empty_original_blocks_count_but_skip_reference_and_packed(tmp_path):
     trainer,batch,calls,_,backs,_=integrated_fixture(tmp_path,empty=True)
     batches,_=trainer.get_batch_samples(iter([batch]),4)
