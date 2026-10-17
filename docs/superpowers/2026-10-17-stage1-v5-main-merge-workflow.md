@@ -58,3 +58,37 @@ cleanup and must remain.
    Preserve host worktrees, canonical checkout, untracked files and artifacts.
 5. Write required ntfy completion summary and report actual result. No push or
    training. All steps below remain pending until actual evidence is recorded.
+
+## Actual merge and blocked integration review
+
+Control-only source authorization commit5f445c2; existing6b9d switched to main.
+git pull --ff-only reported already up to date. Automatic merge succeeded:
+`2f6b5b7ae00c607b59797009c0956505e3ff6ece`, parents
+`703d28b20f49e93d39988790c4bc5ec7ba08d0c5` and
+`5f445c2faded623ad294aee1dfb93ebf9e5f9246`, tree
+`5c3d1a2621545f5f5dfe5c443674adebf04c9a09`. No manual conflict edits.
+
+Root requested independent integration review from fresh
+`/root/stage1_v5_main_merge_review`. Actual source-tree comparison preserves
+5287/5289 source entries exactly; only parent trainer and its tests differ;
+four other main-only design docs exactly preserved. But runtime integration
+SPEC FAIL/QUALITY FAIL, Critical C1: parent legacy context opens inside V5,
+V5 dropout bypasses legacy counters, successful backward is rejected on exit.
+Focused12 tests:7failed/5passed in11.30s; ordinary main5 pass. Real p=.05,
+14-site/checkpoint probe completes one backward/44 nonzero finite gradients
+but zero legacy invocations, then expected validation error. Both contexts
+cleaned after failure. No full suite or cleanup performed on this broken merge.
+
+Root read the complete review report (SHA256
+54fb617015750aa5d58e6fb4a4461285411be2e6343db3dfeb7dfd05e7cfe05c), actual
+V5/parent/context code and evidence paths. Review remains a failed verdict,
+not retroactively a clean integration. Failure logs/probe are preserved.
+
+Root applied systematic-debugging within the ongoing implementation/review
+phase: actual backward trace and comparison identify the owner mismatch before
+any fix. Bound task F1 in briefs/2026-10-17-stage1-v5-main-context-fix.md restores
+both parents' existing behavior with one active-owner guard and one causal
+regression. This is within the already-approved lifecycle-preservation scope,
+not a new formula/design; no new costly premise experiment. Selected SDD/TDD
+and independent spec/quality/final review are mandatory. Root makes no product
+edits. Final merged test-pass/cleanup remains gated on actual correction.
