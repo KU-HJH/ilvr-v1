@@ -1805,3 +1805,16 @@ def test_legacy_query_config_reaches_the_trainer_without_changing_textual_mode(t
     bundle = build_stage1_training_components(args, dependencies=deps)
     assert bundle.trainer.kwargs['query_config'].mode == 'legacy'
     assert bundle.trainer.kwargs['textual_states'] == 'all'
+
+
+@pytest.mark.parametrize('selector', ['last4', 'all'])
+def test_direct_composition_rejects_nonfinal_adaptive_before_loaders(tmp_path, selector):
+    from stage1.query import Stage1QueryConfig
+    args = stage1_args(tmp_path)
+    # Bypass the parser intentionally: composition must protect programmatic callers.
+    args.stage1_query_config = Stage1QueryConfig('adaptive', .9, selector)
+    calls = []
+    deps, _, _, _ = fake_dependencies(calls, metadata=object())
+    with pytest.raises(ValueError, match='final|last.only'):
+        build_stage1_training_components(args, dependencies=deps)
+    assert calls == []

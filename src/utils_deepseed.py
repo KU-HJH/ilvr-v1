@@ -26,7 +26,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage", type=str, default="stage1")
     parser.add_argument("--query_mode", choices=("legacy", "adaptive"), default="legacy")
     parser.add_argument("--history_text_gamma", type=float, default=.9)
-    parser.add_argument("--history_attention_layers", choices=("last", "last4", "all"), default="last")
+    parser.add_argument("--history_attention_layers", choices=("last", "last4", "all"), default="last",
+                        help="Final hidden-state selector for adaptive training (last only)")
     parser.add_argument("--stage1_variant", choices=("standard", "v5"), default="standard")
     parser.add_argument("--stage1_loss_type", choices=("dil-bce-orig", "dil_bce_orig"))
     parser.add_argument("--lambda_preference", type=float)

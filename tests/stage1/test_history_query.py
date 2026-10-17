@@ -12,6 +12,26 @@ def api():
     return importlib.import_module('stage1.query')
 
 
+NEW_QUERY = {
+    'schema_version': 2, 'mode': 'adaptive',
+    'formula_id': 'stage1_placeholder_discounted_segments_cosine_relative_v2',
+    'teacher_context': 'ilvr_placeholder_full_sequence_v1',
+    'mask_mode': 'native_legacy_v1', 'text_mode': 'discounted_segments',
+    'text_gamma': .9, 'latent_mode': 'external_cosine_relative',
+    'hidden_state': 'final_normalized', 'temperature': 1.0,
+    'query_chunk_size': 64, 'key_chunk_size': 2048,
+}
+OLD_NATIVE_QUERY = {
+    'schema_version': 1, 'mode': 'adaptive',
+    'formula_id': 'stage1_injected_prefix_discounted_segments_attention_mass_v1',
+    'text_mode': 'discounted_segments', 'latent_mode': 'attention_mass',
+    'text_gamma': .55, 'attention_layers': 'last4',
+    'resolved_layer_indices': [0, 1, 2, 3],
+    'query_chunk_size': 64, 'key_chunk_size': 2048, 'head_chunk_size': 4,
+    'mask_mode': 'full_causal_2d_v1',
+}
+
+
 def test_public_cli_fields_resolve_and_defaults_stay_legacy():
     q = api()
     config = q.resolve_query_config({})
@@ -21,10 +41,9 @@ def test_public_cli_fields_resolve_and_defaults_stay_legacy():
     }
     adaptive = q.resolve_query_config({
         'query_mode': 'adaptive', 'history_text_gamma': .4,
-        'history_attention_layers': 'last4',
+        'history_attention_layers': 'last',
     })
-    assert (adaptive.mode, adaptive.text_gamma, adaptive.attention_layers) == (
-        'adaptive', .4, 'last4')
+    assert (adaptive.mode, adaptive.text_gamma, adaptive.attention_layers) == ('adaptive', .4, 'last')
     with pytest.raises(FrozenInstanceError):
         adaptive.mode = 'legacy'
 
@@ -57,69 +76,92 @@ def test_invalid_layer_selection_fails(selector, count):
         api().resolve_query_layers(selector, count)
 
 
-@pytest.mark.parametrize('indices', [(0,), (0, 1), (0, 1, 2), (3, 4, 5)])
-def test_last4_cannot_serialize_fewer_than_four_resolved_layers(indices):
+@pytest.mark.parametrize('selector', ['last4', 'all'])
+def test_new_adaptive_training_rejects_nonfinal_layers(selector):
     q = api()
-    with pytest.raises(ValueError, match='last4|four|4'):
-        q.query_execution_config(q.Stage1QueryConfig('adaptive', .55, 'last4'), indices)
+    config = q.Stage1QueryConfig('adaptive', .55, selector)
+    with pytest.raises(ValueError, match='final|last.only'):
+        q.query_execution_config(config, (0, 1, 2, 3))
+    with pytest.raises(ValueError, match='final|last.only'):
+        q.resolve_query_config({'query_mode': 'adaptive', 'history_attention_layers': selector})
+    with pytest.raises(ValueError, match='final|last.only'):
+        q.validate_query_training_config(config)
 
 
-@pytest.mark.parametrize('indices', [[0], [0, 1], [0, 1, 2], [3, 4, 5]])
-def test_saved_last4_cannot_restore_fewer_than_four_resolved_layers(indices):
-    saved = adaptive_saved()
-    saved.update(attention_layers='last4', resolved_layer_indices=indices)
-    with pytest.raises(ValueError, match='last4|four|4'):
-        api().resolve_query_config({}, saved=saved)
+def test_new_adaptive_training_rejects_unused_head_chunk_control():
+    q = api()
+    with pytest.raises(ValueError, match='head_chunk'):
+        q.validate_query_training_config(q.Stage1QueryConfig(mode='adaptive', head_chunk_size=2))
 
 
 def adaptive_saved():
-    return {
-        'schema_version': 1, 'mode': 'adaptive',
-        'formula_id': 'stage1_injected_prefix_discounted_segments_attention_mass_v1',
-        'text_mode': 'discounted_segments', 'latent_mode': 'attention_mass',
-        'text_gamma': .9, 'attention_layers': 'last', 'resolved_layer_indices': [5],
-        'query_chunk_size': 64, 'key_chunk_size': 2048, 'head_chunk_size': 4,
-        'mask_mode': 'full_causal_2d_v1',
-    }
+    return dict(NEW_QUERY)
 
 
 def test_execution_schema_and_resume_preserve_formula_and_explicit_values():
     q = api()
     legacy = {'schema_version': 1, 'mode': 'legacy', 'formula_id': 'stage1_legacy_query_v1'}
     assert q.query_execution_config(q.Stage1QueryConfig(), (5,)) == legacy
+    assert q.query_execution_config(q.Stage1QueryConfig(mode='adaptive'), (5,)) == NEW_QUERY
+    assert q.validate_query_execution_config(legacy) == q.Stage1QueryConfig()
     assert q.resolve_query_config({}, saved=legacy).mode == 'legacy'
-    saved = adaptive_saved()
-    config = q.resolve_query_config({}, saved=saved)
-    assert q.query_execution_config(config, (5,)) == saved
-    assert q.resolve_query_config({'query_mode': 'adaptive', 'history_text_gamma': .9}, saved=saved) == config
+    assert q.query_execution_config(q.Stage1QueryConfig(mode='adaptive'), ()) == NEW_QUERY
+    config = q.validate_query_execution_config(NEW_QUERY)
+    assert q.resolve_query_config({}, saved=NEW_QUERY) == config
+    assert q.query_execution_config(config, ()) == NEW_QUERY
+    assert q.resolve_query_config({'query_mode': 'adaptive', 'history_text_gamma': .9}, saved=NEW_QUERY) == config
     with pytest.raises(ValueError, match='saved|resume|conflict'):
-        q.resolve_query_config({'history_text_gamma': .5}, saved=saved)
+        q.resolve_query_config({'history_text_gamma': .5}, saved=NEW_QUERY)
     with pytest.raises(ValueError, match='saved|resume|conflict'):
         q.resolve_query_config({'query_mode': 'adaptive'}, saved=legacy)
 
 
-@pytest.mark.parametrize(('key', 'value'), [
-    ('schema_version', 2), ('schema_version', True), ('formula_id', 'other'),
-    ('text_mode', 'token_mean'), ('latent_mode', 'normalized'),
-    ('mask_mode', 'other'), ('resolved_layer_indices', []),
-    ('resolved_layer_indices', [1, 1]), ('resolved_layer_indices', [-1]),
-    ('resolved_layer_indices', [1.5]), ('resolved_layer_indices', [True]),
-    ('resolved_layer_indices', (5,)), ('query_chunk_size', 0),
-    ('key_chunk_size', True), ('head_chunk_size', 1.5), ('extra', 1),
-])
-def test_invalid_saved_execution_schema_fails(key, value):
-    saved = adaptive_saved()
-    saved[key] = value
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize('selector,indices', [('last4', [0, 1, 2, 3]), ('all', [0, 1]), ('last', [35])])
+def test_historical_query_is_readable_but_never_reinterpreted_for_training(selector, indices):
+    saved = {**OLD_NATIVE_QUERY, 'attention_layers': selector, 'resolved_layer_indices': indices}
+    config = api().validate_query_execution_config(saved)
+    assert config.attention_layers == selector and config.text_gamma == .55
+    with pytest.raises(ValueError, match='original reviewed code.*fresh run'):
         api().resolve_query_config({}, saved=saved)
 
 
-@pytest.mark.parametrize('key', list(adaptive_saved()))
+@pytest.mark.parametrize('indices', [[], [0], [0, 1, 2], [1, 1, 2, 3], [-1, 1, 2, 3],
+                                     [True, 1, 2, 3], [0., 1, 2, 3], (0, 1, 2, 3)])
+def test_historical_layers_require_strict_json_list_and_last4_width(indices):
+    saved = {**OLD_NATIVE_QUERY, 'resolved_layer_indices': indices}
+    with pytest.raises(ValueError):
+        api().validate_query_execution_config(saved)
+
+
+@pytest.mark.parametrize(('key', 'value'), [
+    ('schema_version', 1), ('schema_version', True), ('schema_version', 2.),
+    ('mode', 'legacy'), ('formula_id', 'other'), ('teacher_context', 'injected'),
+    ('text_mode', 'token_mean'), ('latent_mode', 'attention_mass'),
+    ('hidden_state', 'pre_norm'), ('mask_mode', 'other'), ('temperature', 2.0),
+    ('temperature', 1), ('temperature', True), ('temperature', float('nan')),
+    ('text_gamma', True), ('text_gamma', float('inf')), ('query_chunk_size', 0),
+    ('key_chunk_size', True), ('query_chunk_size', 64.), ('extra', 1),
+])
+def test_invalid_saved_execution_schema_fails(key, value):
+    saved = {**NEW_QUERY, key: value}
+    for resolve in (api().validate_query_execution_config,
+                    lambda saved: api().resolve_query_config({}, saved=saved)):
+        with pytest.raises(ValueError):
+            resolve(saved)
+
+
+@pytest.mark.parametrize('key', list(NEW_QUERY))
 def test_incomplete_saved_execution_schema_fails(key):
     saved = adaptive_saved()
     del saved[key]
     with pytest.raises(ValueError):
-        api().resolve_query_config({}, saved=saved)
+        api().validate_query_execution_config(saved)
+
+
+@pytest.mark.parametrize('saved', [None, [], {}, {'schema_version': 3, 'mode': 'adaptive'}])
+def test_read_validator_requires_supported_execution_mapping(saved):
+    with pytest.raises(ValueError):
+        api().validate_query_execution_config(saved)
 
 
 @pytest.mark.parametrize('values', [
@@ -247,3 +289,38 @@ def test_nonfinite_or_degenerate_query_fails(global_intent):
 def test_invalid_latent_aggregates_fail_explicitly(hidden, scores):
     with pytest.raises((ValueError, FloatingPointError)):
         api().aggregate_history_latents(hidden, scores)
+
+
+def test_current_schema_roundtrips_nondefault_gamma_and_execution_chunks():
+    q = api()
+    config = q.Stage1QueryConfig(mode='adaptive', text_gamma=.55,
+                                 query_chunk_size=3, key_chunk_size=7)
+    saved = q.query_execution_config(config, ())
+    assert saved == {**NEW_QUERY, 'text_gamma': .55, 'query_chunk_size': 3, 'key_chunk_size': 7}
+    assert q.validate_query_execution_config(saved) == config
+    assert q.resolve_query_config({}, saved=saved) == config
+
+
+@pytest.mark.parametrize('key', list(OLD_NATIVE_QUERY))
+def test_historical_read_schema_rejects_every_missing_field(key):
+    saved = dict(OLD_NATIVE_QUERY)
+    del saved[key]
+    with pytest.raises(ValueError):
+        api().validate_query_execution_config(saved)
+
+
+@pytest.mark.parametrize('key,value', [
+    ('schema_version', True), ('formula_id', 'other'), ('text_mode', 'token_mean'),
+    ('latent_mode', 'external_cosine_relative'), ('mask_mode', 'native_legacy_v1'),
+    ('text_gamma', True), ('text_gamma', float('nan')), ('attention_layers', 'middle'),
+    ('query_chunk_size', 64.), ('key_chunk_size', False), ('head_chunk_size', 4.), ('extra', 1),
+])
+def test_historical_read_schema_rejects_tampered_semantics_and_scalar_types(key, value):
+    with pytest.raises(ValueError):
+        api().validate_query_execution_config({**OLD_NATIVE_QUERY, key:value})
+
+
+@pytest.mark.parametrize('value', [None, {}, 'adaptive'])
+def test_training_validator_requires_a_query_config(value):
+    with pytest.raises(ValueError, match='Stage1QueryConfig'):
+        api().validate_query_training_config(value)

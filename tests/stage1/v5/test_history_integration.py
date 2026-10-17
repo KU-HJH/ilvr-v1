@@ -87,15 +87,15 @@ def test_real_parent_step_shared_snapshot_gradients_and_literal_window_denominat
             ce = F.cross_entropy(logits[:, :-1].float().reshape(-1, 128),
                                  batch['labels'][:, 1:].reshape(-1))
             torch.testing.assert_close(diagnostic['ce_loss'], ce.detach())
-            expected_calls = ['helper'] * (3 if mode == 'adaptive' else 1) + ['F']
+            expected_calls = ['helper', 'F']
             if not empty_slots[index]:
                 expected_calls += ['reference', 'packed']
             assert calls[first_call:] == expected_calls
             if mode == 'adaptive' and not empty_slots[index]:
-                assert len(calls[first_call:]) == 2 + 4  # M=2, all three downstream contexts
-            f = forwards[first_forward + (0 if mode == 'adaptive' else 1)]
-            # Adaptive prefixes call the decoder directly; legacy helper calls
-            # the wrapper once. Both then pass their detached snapshot to F.
+                assert len(calls[first_call:]) == 4  # helper observation, F, reference, packed OFF
+            f = forwards[first_forward + 1]
+            # Both helpers now call the wrapper once; the following F consumes
+            # the same detached snapshot passed into immutable reference scoring.
             assert f['latent_hidden_states'].data_ptr() == targets.latent_values.data_ptr()
             assert not targets.latent_values.requires_grad
             if not empty_slots[index]:
@@ -133,7 +133,7 @@ def test_real_parent_step_shared_snapshot_gradients_and_literal_window_denominat
 def test_repeated_actual_builds_reset_sample_history_preserve_rng_and_remove_hooks(tmp_path):
     """Retained per-sample ledger/text state or attention hooks breaks A/B/A."""
     trainer, batch, *_ = integrated_fixture(tmp_path,
-        history_config=Stage1QueryConfig('adaptive', .55, 'all'))
+        history_config=Stage1QueryConfig('adaptive', .55, 'last'))
     teacher, builder = trainer.ema_teacher.model, trainer.target_builder
     hooks, frozen = hook_inventory(teacher), digest_state(teacher)
     metadata = batch['stage1_batch_metadata']
@@ -160,10 +160,10 @@ def test_saved_parser_query_builds_same_next_targets_with_unchanged_reference(tm
     from tests.stage1.v5.test_resume import contract
     from tests.stage1.history_fixtures import HistoryTokenizer
     from utils_deepseed import parse_args
-    config = Stage1QueryConfig('adaptive', .55, 'all')
+    config = Stage1QueryConfig('adaptive', .55, 'last')
     trainer, batch, *_ = integrated_fixture(tmp_path, history_config=config)
     saved = contract()
-    saved['execution']['query_config'] = query_execution_config(config, (0, 1))
+    saved['execution']['query_config'] = query_execution_config(config, ())
     saved['execution'].update(tuning_method='dora', per_device_train_batch_size=1,
                               attention_implementation='sdpa')
     checkpoint = tmp_path / 'stage1_v5.json'
@@ -186,3 +186,30 @@ def test_saved_parser_query_builds_same_next_targets_with_unchanged_reference(tm
     assert digest_state(trainer.ema_teacher.model) == before
     with pytest.raises(ValueError, match='conflict'):
         parse_args(['--resume_from_checkpoint_path', str(tmp_path), '--query_mode', 'legacy'])
+
+
+def test_fixed_identical_targets_preserve_immutable_reference_scoring_across_query_modes(tmp_path):
+    """Query preparation changes targets, not reference weights or scoring rules."""
+    legacy, batch, *_ = integrated_fixture(tmp_path/'legacy', history_config=Stage1QueryConfig())
+    adaptive, adaptive_batch, *_ = integrated_fixture(tmp_path/'adaptive',
+        history_config=Stage1QueryConfig(mode='adaptive'))
+    assert digest_state(legacy.ema_teacher.model) == digest_state(adaptive.ema_teacher.model)
+    for key in ('input_ids', 'pixel_values', 'image_grid_thw', 'attention_mask', 'position_ids'):
+        torch.testing.assert_close(batch[key], adaptive_batch[key], rtol=0, atol=0)
+    fixed = legacy.target_builder.build(legacy.ema_teacher.model, dict(batch), batch['stage1_batch_metadata'])
+    keys = batch['stage1_v5_metadata'].query_keys
+    inputs = {key: batch[key] for key in ('input_ids', 'attention_mask', 'pixel_values',
+                                           'image_grid_thw', 'position_ids')}
+    inputs.update(latent_hidden_states=fixed.latent_values, image_out_mask=fixed.latent_mask,
+                  use_cache=False, return_dict=True, stage1_selected_positions=keys,
+                  stage1_selected_chunk_positions=legacy.v5_config.loss_chunk_positions)
+    before = [digest_state(trainer.ema_teacher.model) for trainer in (legacy, adaptive)]
+    adaptive_inputs = {**inputs, **{key: adaptive_batch[key] for key in
+        ('input_ids', 'attention_mask', 'pixel_values', 'image_grid_thw', 'position_ids')}}
+    assert adaptive_inputs['latent_hidden_states'] is inputs['latent_hidden_states']
+    assert adaptive_inputs['image_out_mask'] is inputs['image_out_mask']
+    with torch.no_grad():
+        old = legacy.ema_teacher.model(**inputs).stage1_selected_logits
+        new = adaptive.ema_teacher.model(**adaptive_inputs).stage1_selected_logits
+    torch.testing.assert_close(old, new, rtol=0, atol=0)
+    assert before == [digest_state(trainer.ema_teacher.model) for trainer in (legacy, adaptive)]

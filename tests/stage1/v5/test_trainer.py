@@ -179,7 +179,11 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, 
     reference_q.model.register_forward_pre_hook(lambda *_: calls.append('helper' if helper_active[0] else 'reference'))
     def inspect(_m,_a,kw):
         assert not any(k.startswith('stage1_v5') or k=='stage1_batch_metadata' for k in kw)
-        if not helper_active[0]: assert kw['input_ids'] is batch['input_ids']
+        # Direct target-builder probes also enter the Teacher wrapper now.
+        # F and DIL reference scoring still require the original input object.
+        observation = kw.get('output_hidden_states') is True
+        if not helper_active[0] and not observation:
+            assert kw['input_ids'] is batch['input_ids']
         forwards.append(kw)
     student.register_forward_pre_hook(inspect, with_kwargs=True)
     reference.register_forward_pre_hook(inspect, with_kwargs=True)
@@ -460,7 +464,7 @@ def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejec
         assert saved['execution']['packages']['accelerate']=='1.10.1'
         assert saved['execution']['lora_target_modules']==','.join(DEFAULT_STAGE1_TARGET_SUFFIXES)
         assert set(saved['execution']['source_sha256'])=={'v5_trainer','stage1_trainer','transformers_trainer',
-            'query','targets','history_attention','history_teacher'}
+            'query','targets','history_attention','history_teacher','history_metric'}
         parent_calls.append(kw)
         return 'parent-result'
     monkeypatch.setattr(CustomTrainerStage1,'train',parent)
@@ -491,14 +495,8 @@ def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,m
     elif changed == 'base': bad['reference']['base_content_sha256']='e'*64
     elif changed == 'deepspeed': bad['execution']['deepspeed_profile']['config_digest']='e'*64
     elif changed == 'query':
-        bad['execution']['query_config'] = {
-            'schema_version': 1, 'mode': 'adaptive',
-            'formula_id': 'stage1_injected_prefix_discounted_segments_attention_mass_v1',
-            'text_mode': 'discounted_segments', 'latent_mode': 'attention_mass',
-            'text_gamma': .9, 'attention_layers': 'last', 'resolved_layer_indices': [3],
-            'query_chunk_size': 64, 'key_chunk_size': 2048, 'head_chunk_size': 4,
-            'mask_mode': 'full_causal_2d_v1',
-        }
+        from tests.stage1.test_history_query import NEW_QUERY
+        bad['execution']['query_config'] = dict(NEW_QUERY)
     else: bad['reference']['processor_sha256']='e'*64
     def independent_digest(value):
         mapped=deepcopy(value)

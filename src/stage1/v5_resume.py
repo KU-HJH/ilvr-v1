@@ -10,7 +10,8 @@ from typing import Mapping
 from stage1.v5_config import (Stage1V5Config, resolve_v5_config, v5_formula_id,
                               validate_v5_training_config)
 from stage1.v5_reference import V5ReferenceIdentity
-from stage1.query import Stage1QueryConfig, query_execution_config, resolve_query_config
+from stage1.query import (Stage1QueryConfig, query_execution_config, resolve_query_config,
+                          validate_query_execution_config)
 
 V5_CONTRACT_FILENAME = 'stage1_v5.json'
 _SEMANTICS_V1 = {
@@ -44,7 +45,7 @@ def _execution(execution: Mapping[str, object]) -> None:
     if 'query_config' in execution:
         if not isinstance(execution['query_config'], Mapping):
             raise ValueError('saved query config must be an execution mapping')
-        resolve_query_config({}, saved=execution['query_config'])
+        validate_query_execution_config(execution['query_config'])
     supported = {'tuning_method': 'dora', 'method': 'dora', 'ema_tau': 1.,
                  'zero_stage': 1, 'per_device_train_batch_size': 1,
                  'microbatch': 1, 'bf16': True}
@@ -120,6 +121,8 @@ def validate_v5_resume(saved: Mapping[str, object], explicit: Mapping[str, objec
     if saved['schema_version'] == 1:
         raise ValueError('historical Stage1-v5 block-mean training requires its original reviewed code; '
                          'token-mean training requires a fresh run')
+    if 'query_config' in saved['execution']:
+        resolve_query_config({}, saved=saved['execution']['query_config'])
     objective = {}
     other = {'stage1_variant': saved['variant'], **saved['coefficients'], **saved['execution']}
     # CLI option spellings normalize once; loss values use the explicit alias map.
@@ -146,7 +149,7 @@ def resolve_v5_query_resume(saved_contract: Mapping[str, object],
     if 'query_config' not in execution:
         # Only historical contracts predate query metadata. Current source
         # bindings cannot silently lose their query execution contract.
-        if {'query', 'targets', 'history_attention', 'history_teacher'} & set(
+        if {'query', 'targets', 'history_attention', 'history_teacher', 'history_metric'} & set(
                 execution.get('source_sha256', {})):
             raise ValueError('current v5 contract is missing query_config')
         saved = query_execution_config(Stage1QueryConfig(), ())

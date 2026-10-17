@@ -18,7 +18,8 @@ _CLI_FIELDS = {
 }
 _CHUNKS = ('query_chunk_size', 'key_chunk_size', 'head_chunk_size')
 _LEGACY_FORMULA = 'stage1_legacy_query_v1'
-_ADAPTIVE_FORMULA = 'stage1_injected_prefix_discounted_segments_attention_mass_v1'
+_HISTORICAL_ADAPTIVE_FORMULA = 'stage1_injected_prefix_discounted_segments_attention_mass_v1'
+_ADAPTIVE_FORMULA = 'stage1_placeholder_discounted_segments_cosine_relative_v2'
 
 
 def _gamma(value: object) -> float:
@@ -73,12 +74,12 @@ def resolve_query_layers(selector: str, layer_count: int) -> tuple[int, ...]:
     raise ValueError('attention layers must be last, last4 or all')
 
 
-def query_execution_config(
+def _historical_query_execution_config(
     config: Stage1QueryConfig, resolved_layers: tuple[int, ...],
 ) -> dict[str, object]:
     """Serialize the formula and execution semantics used by this query."""
     result = {'schema_version': 1, 'mode': config.mode,
-              'formula_id': _LEGACY_FORMULA if config.mode == 'legacy' else _ADAPTIVE_FORMULA}
+              'formula_id': _LEGACY_FORMULA if config.mode == 'legacy' else _HISTORICAL_ADAPTIVE_FORMULA}
     if config.mode == 'adaptive':
         _validate_layers(resolved_layers)
         if config.attention_layers == 'last4' and len(resolved_layers) != 4:
@@ -93,24 +94,45 @@ def query_execution_config(
     return result
 
 
-def resolve_query_config(
-    explicit: Mapping[str, object], *, saved: Mapping[str, object] | None = None,
-) -> Stage1QueryConfig:
-    """Resolve public CLI fields, inheriting saved execution semantics on resume."""
-    unknown = set(explicit) - _CLI_FIELDS.keys()
-    if unknown:
-        raise ValueError(f'unknown query option: {sorted(unknown)}')
-    values = {_CLI_FIELDS[name]: value for name, value in explicit.items()}
-    explicit_config = Stage1QueryConfig(**values)
-    if saved is None:
-        return explicit_config
+def validate_query_training_config(config: Stage1QueryConfig) -> None:
+    """Reject utility-only historical selectors before any training model work."""
+    if not isinstance(config, Stage1QueryConfig):
+        raise ValueError('query training config must be a Stage1QueryConfig')
+    if config.mode == 'adaptive':
+        if config.attention_layers != 'last':
+            raise ValueError('adaptive training uses final-normalized hidden states (last only)')
+        if config.head_chunk_size != 4:
+            raise ValueError('adaptive training does not support a head_chunk_size control')
+
+
+def query_execution_config(
+    config: Stage1QueryConfig, resolved_layers: tuple[int, ...],
+) -> dict[str, object]:
+    """Serialize current training semantics; layers remain a compatibility argument."""
+    validate_query_training_config(config)
+    if config.mode == 'legacy':
+        return _historical_query_execution_config(config, ())
+    return {
+        'schema_version': 2, 'mode': 'adaptive', 'formula_id': _ADAPTIVE_FORMULA,
+        'teacher_context': 'ilvr_placeholder_full_sequence_v1',
+        'mask_mode': 'native_legacy_v1', 'text_mode': 'discounted_segments',
+        'text_gamma': config.text_gamma, 'latent_mode': 'external_cosine_relative',
+        'hidden_state': 'final_normalized', 'temperature': 1.0,
+        'query_chunk_size': config.query_chunk_size, 'key_chunk_size': config.key_chunk_size,
+    }
+
+
+def validate_query_execution_config(saved: Mapping[str, object]) -> Stage1QueryConfig:
+    """Strictly read current and historical artifacts without authorizing training."""
     if not isinstance(saved, Mapping):
         raise ValueError('saved query config must be an execution mapping')
-    mode = saved.get('mode')
-    if mode == 'legacy':
+    version, mode = saved.get('schema_version'), saved.get('mode')
+    if type(version) is not int:
+        raise ValueError('saved query config has invalid schema')
+    if version == 1 and mode == 'legacy':
         inherited = Stage1QueryConfig()
-        expected = query_execution_config(inherited, ())
-    elif mode == 'adaptive':
+        expected = _historical_query_execution_config(inherited, ())
+    elif version == 1 and mode == 'adaptive':
         names = ('text_gamma', 'attention_layers', *_CHUNKS)
         if any(name not in saved for name in (*names, 'resolved_layer_indices')):
             raise ValueError('saved adaptive query config has missing required fields')
@@ -119,14 +141,42 @@ def resolve_query_config(
             raise ValueError('saved resolved layer indices must be a JSON list')
         _validate_layers(indices)
         inherited = Stage1QueryConfig(mode='adaptive', **{name: saved[name] for name in names})
-        expected = query_execution_config(inherited, tuple(indices))
+        expected = _historical_query_execution_config(inherited, tuple(indices))
+    elif version == 2 and mode == 'adaptive':
+        names = ('text_gamma', 'query_chunk_size', 'key_chunk_size')
+        if any(name not in saved for name in names):
+            raise ValueError('saved adaptive query config has missing required fields')
+        if type(saved.get('temperature')) is not float:
+            raise ValueError('saved adaptive temperature must be the float 1.0')
+        inherited = Stage1QueryConfig(mode='adaptive', **{name: saved[name] for name in names})
+        expected = query_execution_config(inherited, ())
     else:
-        raise ValueError('saved query config has invalid or missing mode')
-    if type(saved.get('schema_version')) is not int or dict(saved) != expected:
+        raise ValueError('saved query config has invalid or unsupported mode/schema')
+    if dict(saved) != expected:
         raise ValueError('saved query config has invalid schema or semantic fields')
+    return inherited
+
+
+def resolve_query_config(
+    explicit: Mapping[str, object], *, saved: Mapping[str, object] | None = None,
+) -> Stage1QueryConfig:
+    """Resolve training fields without reinterpreting historical native adaptive."""
+    unknown = set(explicit) - _CLI_FIELDS.keys()
+    if unknown:
+        raise ValueError(f'unknown query option: {sorted(unknown)}')
+    values = {_CLI_FIELDS[name]: value for name, value in explicit.items()}
+    explicit_config = Stage1QueryConfig(**values)
+    if saved is None:
+        validate_query_training_config(explicit_config)
+        return explicit_config
+    inherited = validate_query_execution_config(saved)
+    if inherited.mode == 'adaptive' and saved['schema_version'] == 1:
+        raise ValueError('historical native-adaptive training requires its original reviewed code; '
+                         'external content adaptive requires a fresh run')
     for name, value in values.items():
         if value != getattr(inherited, name):
             raise ValueError(f'explicit {name} conflicts with saved query resume config')
+    validate_query_training_config(inherited)
     return inherited
 
 

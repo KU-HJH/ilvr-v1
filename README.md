@@ -129,8 +129,9 @@ checkpoint, result, and log roots rather than editing generic output paths.
 
 Stage1-v5 defaults to `--query_mode legacy`; existing `textual_states` behavior
 is preserved. Adaptive queries are opt-in with `--query_mode adaptive`,
-`--history_text_gamma 0.9` and `--history_attention_layers last` (`last4` and
-`all` are also supported; `last4` requires at least four actual decoder layers).
+`--history_text_gamma 0.9` and `--history_attention_layers last`. New adaptive
+training uses the final-normalized Teacher hidden states and accepts `last` only;
+`last4` and `all` remain readable for historical artifact inspection.
 Adaptive mode rejects an explicitly supplied
 `--textual_states`, including the same value as the legacy default.
 
@@ -171,36 +172,42 @@ query modes. Historical block-mean sidecars remain readable for inspection;
 resuming those runs requires their original reviewed code. Changing to token
 mean requires a fresh run, which saves a distinct schema-2 reduction contract.
 
-Adaptive selection uses a prompt-only intent followed by one injected-prefix
-pass per latent block. Each prefix stops immediately before the current START;
-only previously selected raw targets replace active past pads. Discounted
-nonempty text segments contribute one vote each, and latent attention mass
-uses the full valid causal-key denominator without renormalizing that mass.
-Helper images remain candidate-extractor inputs. With M blocks, preparation
-costs one prompt plus M decoder forwards instead of the legacy helper forward.
-When F, immutable-reference scoring and packed OFF all run, the total is M+4
-original decoder calls; backward checkpoint recomputation is additional. Empty
-auxiliary targets skip reference/packed OFF, so M+4 is not an unconditional
-per-sample count. Query/key/head chunks 64/2048/4 bound observer workspace.
+Adaptive target selection observes the Teacher with the literal ILVR/legacy
+wrapper call: full sample token IDs, original images, and actual latent-pad token
+embeddings. It makes one full-sequence language observation; selected targets
+are never injected into that observation. The native causal mask, sliding-window
+configuration and MRoPE preparation stay with the existing wrapper. Helper images
+are encoded separately and supply candidates only.
 
-The current full-causal guard checks every adaptive prefix length S, including
-the prompt and prefixes with no latent attention to observe: the native
-`sliding_window` must be `None` or S must be **at most** that configured window
-(last query index < window). A longer prefix fails before language execution,
-even when `use_sliding_window=False`, because this patched native mask still
-uses the configured window. The guard preserves native configuration; an input
-length setting of 32768 does not establish support beyond this boundary.
+History relevance is external FP32 cosine softmax at fixed temperature 1. For
+each current assistant-text row before the current START, it scores all earlier
+selected **raw visual target rows**; it then averages the text-row probabilities
+and sums the raw values with those weights. This is relative content relevance,
+not native attention mass. Query/key chunks 64/2048 bound metric workspace.
+Nonempty segment means receive one discounted vote per segment (gamma 0.9 by
+default). Intent, available discounted text and available history have equal
+coefficients. Empty current text or empty prior history omits the history term;
+previous discounted text may still contribute. No current/future helper or
+selected target changes the Teacher observation.
 
-`stage1_v5.json` records query formula identity separately from the loss:
-`stage1_legacy_query_v1` or
-`stage1_injected_prefix_discounted_segments_attention_mass_v1`. Adaptive
-records gamma, layer selector/resolved indices, chunk sizes and
-`full_causal_2d_v1`. Resume inherits saved settings and rejects semantic
-conflicts; a historical query-less checkpoint means legacy only. Switching a
-legacy run to adaptive requires a fresh run, and the recipe above is fresh-run
-only. Resume through the existing coordinator with the saved identity and a
-fresh attempt ID; omit query options to inherit them. Base/reference/source
-checks continue to apply.
+`stage1_v5.json` records query identity separately from the loss. Legacy remains
+schema 1 with `stage1_legacy_query_v1`; current adaptive uses query schema 2 and
+`stage1_placeholder_discounted_segments_cosine_relative_v2`, including its
+placeholder Teacher context, native mask, final-normalized hidden states,
+gamma, query/key chunks and fixed temperature. Historical native-adaptive query
+schema 1 (`stage1_injected_prefix_discounted_segments_attention_mass_v1`) remains
+readable, but training requires its original reviewed code; switching to external
+content adaptive requires a fresh run. Resume inherits supported saved settings
+and rejects semantic conflicts. Historical query-less checkpoints mean legacy
+only. The recipe above is for fresh runs; resume through the existing coordinator
+with saved identity and a fresh attempt ID. Base/reference/source checks continue
+to apply.
+
+The target-selection Teacher remains the frozen initial effective DoRA model
+(EMA tau 1). DIL reference scoring retains its existing rules and weights and
+consumes the shared detached selected targets. Losses, global-token DIL reduction,
+auxiliary scaling, workers, sampler and optimizer lifecycle are unchanged. The
+new metric's usefulness, runtime cost and accuracy are **unmeasured**.
 
 The CPU integration witnesses use tiny FP32 Qwen/DoRA models and the actual
 v5 parent-Trainer backward path. They check shared selected targets across

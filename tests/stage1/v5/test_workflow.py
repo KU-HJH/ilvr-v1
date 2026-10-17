@@ -48,7 +48,7 @@ def test_actual_recipe_reaches_coordinator_and_both_worker_dry_runs(query_mode, 
     settings=tmp_path/'query-stale.sh'
     settings.write_text('export STAGE1_TEXTUAL_STATES=all\nquery_mode=legacy\nhistory_text_gamma=.2\nhistory_attention_layers=all\n')
     recipe=run('--dry-run', '--settings', str(settings), '--query_mode', query_mode,
-               '--history_text_gamma', '.55', '--history_attention_layers', 'last4',
+               '--history_text_gamma', '.55', '--history_attention_layers', 'last',
                env=environment) if query_mode == 'adaptive' else run('--dry-run', env=environment)
     assert recipe.returncode==0,recipe.stderr
     train=shlex.split(recipe.stdout.splitlines()[0])
@@ -95,7 +95,7 @@ def test_actual_recipe_reaches_coordinator_and_both_worker_dry_runs(query_mode, 
         assert args.stage1_query_config.mode == query_mode
         if query_mode == 'adaptive':
             assert args.stage1_query_config.text_gamma == .55
-            assert args.stage1_query_config.attention_layers == 'last4'
+            assert args.stage1_query_config.attention_layers == 'last'
         assert args.stage1_v5_config.lambda_topk_entropy==.1
         assert args.stage1_v5_config.preference_topk_k==50
         assert args.stage1_v5_config.text_kl_weight==.01
@@ -151,7 +151,7 @@ def test_decoder_binds_managed_remote_producer_to_local_checkpoint(tmp_path,monk
 
 @pytest.mark.parametrize('changed',[False,True])
 @pytest.mark.parametrize('debug',[False,True])
-@pytest.mark.parametrize('query_mode', ['legacy', 'adaptive'])
+@pytest.mark.parametrize('query_mode', ['legacy', 'adaptive', 'historical_native'])
 def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper(tmp_path,monkeypatch,changed,debug,query_mode):
     import copy
     from dataclasses import replace
@@ -193,9 +193,9 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
     contract=build_v5_contract(Stage1V5Config(lambda_topk_entropy=.1,preference_topk_k=50),identity,
         ce_weight=.1,sim_weight=.1,schedule={},execution={'tuning_method':'dora','ema_tau':1.,'zero_stage':1})
     from stage1.query import Stage1QueryConfig, query_execution_config
-    if query_mode == 'adaptive':
+    if query_mode != 'legacy':
         contract['execution']['query_config'] = query_execution_config(
-            Stage1QueryConfig('adaptive', .55, 'all'), (0,))
+            Stage1QueryConfig('adaptive', .55, 'last'), ())
     (artifact/'stage1_v5.json').write_text(json.dumps(contract))
     if changed:
         with (new/'model.safetensors').open('ab') as stream: stream.write(b'changed-content')
@@ -208,6 +208,10 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
         '--latent_size','2','--lora_r','4','--lora_alpha','8','--lora_dropout','0',
         '--deepspeed_config',str(ROOT/'configs/deepspeed_zero1.json'),
         '--stage1_v5_debug' if debug else '--no-stage1_v5_debug'])
+    if query_mode == 'historical_native':
+        from tests.stage1.test_history_query import OLD_NATIVE_QUERY
+        contract['execution']['query_config'] = dict(OLD_NATIVE_QUERY)
+        (artifact/'stage1_v5.json').write_text(json.dumps(contract))
     profile=load_deepspeed_runtime_profile(args.deepspeed_config,world_size=4)
     snapshot=checkpointing.read_stage1_peft_metadata_snapshot(artifact)
     decision=checkpointing.Stage1ResumeDecision(artifact,checkpointing.Stage1ArtifactKind.PEFT,False,snapshot)
@@ -227,13 +231,28 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
     monkeypatch.setattr(torch.distributed,'is_initialized',lambda:True)
     def gather(out,value): out[:]=[value]*4
     monkeypatch.setattr(torch.distributed,'all_gather_object',gather)
+    loader_calls=[]
+    def processor_load(*args, **kwargs):
+        loader_calls.append('processor')
+        return processor
+    def config_load(source, **kwargs):
+        loader_calls.append('config')
+        return Qwen2_5_VLConfig.from_pretrained(source, local_files_only=True)
     def load(source,*,config,**kw):
+        loader_calls.append('model')
         calls.append('load')
         return Qwen2_5_VLForConditionalGeneration.from_pretrained(source,config=config,local_files_only=True)
     deps=replace(composition.DEFAULT_STAGE1_DEPENDENCIES,
-        resolve_resume=lambda *_:decision,load_processor=lambda *_a,**_k:processor,
-        load_config=lambda source,**_k:Qwen2_5_VLConfig.from_pretrained(source,local_files_only=True),
+        resolve_resume=lambda *_:decision,load_processor=processor_load,
+        load_config=config_load,
         load_model=load,prepare_dataset=lambda *_:[],collator_factory=lambda *_a,**_k:None)
+    if query_mode == 'historical_native':
+        # Existing base authentication retains priority when both inputs are invalid.
+        message = 'base.*content|original-base content' if changed else 'original reviewed code.*fresh run'
+        with pytest.raises(ValueError, match=message):
+            composition.build_stage1_training_components(args, dependencies=deps, deepspeed_runtime_profile=profile)
+        assert loader_calls == [] and calls == []
+        return
     if changed:
         with pytest.raises(ValueError,match='base.*content|original-base content'):
             composition.build_stage1_training_components(args,dependencies=deps,deepspeed_runtime_profile=profile)
@@ -245,7 +264,7 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
         assert bundle.trainer.query_config.mode == query_mode
         if query_mode == 'adaptive':
             assert bundle.trainer.query_config.text_gamma == .55
-            assert bundle.trainer.query_config.attention_layers == 'all'
+            assert bundle.trainer.query_config.attention_layers == 'last'
         assert bundle.trainer.stage1_v5_debug is debug
         assert bundle.trainer.collect_stage1_diagnostics is debug
         for name,value in teacher.state_dict()['parameters'].items():

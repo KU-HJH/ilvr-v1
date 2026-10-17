@@ -484,8 +484,9 @@ def build_stage1_training_components(
     data_path, image_root, output_dir = _require_stage1_inputs(args)
     tuning = resolve_stage1_tuning_config(args)
     is_v5 = getattr(args, 'stage1_variant', 'standard') == 'v5'
-    from stage1.query import Stage1QueryConfig
+    from stage1.query import Stage1QueryConfig, validate_query_training_config
     query_config = getattr(args, 'stage1_query_config', Stage1QueryConfig())
+    validate_query_training_config(query_config)
     if query_config.mode == 'adaptive' and not is_v5:
         raise ValueError('adaptive query requires Stage1-v5')
     if is_v5:

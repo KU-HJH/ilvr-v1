@@ -1,4 +1,4 @@
-"""Runtime target parity, injected-prefix causality and fail-closed ownership."""
+"""Runtime target parity, placeholder observation and external-history causality and fail-closed ownership."""
 from copy import deepcopy
 from dataclasses import replace
 
@@ -58,6 +58,58 @@ def observe_build(case, target_builder):
     return result, prefixes, visuals
 
 
+def test_adaptive_observation_equals_literal_ilvr_teacher_call():
+    """Observe the actual wrapper and decoder, independently of builder helpers."""
+    case = make_history_case()
+    qwen = resolve_qwen2_5_vl_model(case.teacher)
+    inputs_before = {key: value.clone() for key, value in case.inputs.items()}
+    rng = torch.random.get_rng_state().clone()
+    decoder_calls, wrapper_hidden = [], []
+
+    def decoder_input(module, args, kwargs):
+        decoder_calls.append({key: kwargs[key].detach().clone()
+                              for key in ('inputs_embeds', 'attention_mask', 'position_ids')})
+
+    def wrapper_output(module, args, output):
+        hidden = output.hidden_states
+        wrapper_hidden.append((hidden[-1] if isinstance(hidden, (tuple, list))
+                               else hidden).detach().clone())
+
+    handles = [qwen.model.register_forward_pre_hook(decoder_input, with_kwargs=True),
+               case.teacher.register_forward_hook(wrapper_output)]
+    try:
+        # Literal pre-change ILVR call: no builder or prefix utility participates.
+        with torch.no_grad():
+            case.teacher(input_ids=case.inputs['input_ids'],
+                         attention_mask=case.inputs['attention_mask'],
+                         pixel_values=case.inputs['pixel_values'],
+                         image_grid_thw=case.inputs['image_grid_thw'],
+                         output_hidden_states=True, return_dict=True)
+        assert len(decoder_calls) == len(wrapper_hidden) == 1
+        literal_input, literal_hidden = decoder_calls.pop(), wrapper_hidden.pop()
+        result, prefixes, visuals = observe_build(case, builder(case))
+        assert len(decoder_calls) == len(wrapper_hidden) == len(prefixes) == 1
+        assert decoder_calls[0]['inputs_embeds'].shape[1] == case.inputs['input_ids'].shape[1]
+        for key in literal_input:
+            torch.testing.assert_close(decoder_calls[0][key], literal_input[key], rtol=0, atol=0)
+        torch.testing.assert_close(wrapper_hidden[0], literal_hidden, rtol=0, atol=0)
+        with torch.no_grad():
+            token_rows = qwen.model.embed_tokens(case.inputs['input_ids'])
+        for span in case.metadata.samples[0].latent_spans:
+            positions = list(span.latent_positions)
+            torch.testing.assert_close(decoder_calls[0]['inputs_embeds'][0, positions],
+                                       token_rows[0, positions], rtol=0, atol=0)
+        assert len(visuals) == 2
+        assert not result.latent_values.requires_grad and result.latent_values.grad_fn is None
+        assert all(not p.requires_grad and p.grad is None for p in case.teacher.parameters())
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert torch.equal(rng, torch.random.get_rng_state())
+    for key, value in inputs_before.items():
+        torch.testing.assert_close(case.inputs[key], value, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize('textual_states', ['previous', 'all'])
 @pytest.mark.parametrize('explicit_legacy', [False, True])
 def test_legacy_runtime_matches_pinned_product_blob(textual_states, explicit_legacy):
@@ -87,12 +139,12 @@ def test_legacy_runtime_matches_pinned_product_blob(textual_states, explicit_leg
 
 
 @pytest.mark.parametrize('diagnostics', [False, True])
-def test_adaptive_actual_prefixes_inject_only_past_first_kstar_raw_targets(diagnostics):
-    """Injecting means, diagnostic indices, inactive pads or future blocks fails."""
+def test_adaptive_full_sequence_keeps_all_latent_pad_embeddings(diagnostics):
+    """Raw selected rows occupy first-K target slots, never Teacher input slots."""
     case = make_history_case()
     target_builder = builder(case, collect_diagnostics=diagnostics, validate=False)
     result, prefixes, visuals = observe_build(case, target_builder)
-    assert [call['inputs_embeds'].shape[1] for call in prefixes] == [11, 13, 19]
+    assert [call['inputs_embeds'].shape[1] for call in prefixes] == [25]
     assert len(visuals) == 2  # one original encode, one helper encode
     assert result.selected_counts == ((1, 1),)
     assert result.latent_mask.nonzero().tolist() == [[0, 14], [0, 20]]
@@ -100,14 +152,11 @@ def test_adaptive_actual_prefixes_inject_only_past_first_kstar_raw_targets(diagn
     qwen = resolve_qwen2_5_vl_model(case.teacher)
     with torch.no_grad():
         token_values = qwen.model.embed_tokens(case.inputs['input_ids'])
-    for prefix in prefixes:
-        assert not prefix['inputs_embeds'].requires_grad
-        torch.testing.assert_close(prefix['inputs_embeds'][0, :11],
-                                   prefixes[0]['inputs_embeds'][0], rtol=0, atol=0)
-    torch.testing.assert_close(prefixes[2]['inputs_embeds'][0, 14],
-                               result.latent_values[0], rtol=0, atol=0)
-    torch.testing.assert_close(prefixes[2]['inputs_embeds'][0, 15:17],
-                               token_values[0, 15:17], rtol=0, atol=0)
+    assert not prefixes[0]['inputs_embeds'].requires_grad
+    for span in case.metadata.samples[0].latent_spans:
+        positions = list(span.latent_positions)
+        torch.testing.assert_close(prefixes[0]['inputs_embeds'][0, positions],
+                                   token_values[0, positions], rtol=0, atol=0)
     if not diagnostics:
         assert result.selected_candidate_indices == (((), ()),)
         assert result.diagnostics == {}
@@ -135,15 +184,19 @@ def test_multiple_helpers_preserve_source_order_and_existing_pooling():
                                torch.cat((pooled[0], pooled[2])), rtol=0, atol=0)
     torch.testing.assert_close(target_builder.candidates[1], pooled[1], rtol=0, atol=0)
     assert result.selected_counts == ((2, 2),)
-    torch.testing.assert_close(prefixes[2]['inputs_embeds'][0, 14:16],
-                               result.latent_values[:2], rtol=0, atol=0)
+    assert result.latent_mask.nonzero().tolist() == [[0, 14], [0, 15], [0, 20], [0, 21]]
+    for selected, packed in zip(target_builder.selections, result.latent_values.split(2)):
+        torch.testing.assert_close(selected, packed, rtol=0, atol=0)
+    with torch.no_grad():
+        pads = qwen.model.embed_tokens(case.inputs['input_ids'])[0, [14, 15, 20, 21]]
+    torch.testing.assert_close(prefixes[0]['inputs_embeds'][0, [14, 15, 20, 21]], pads, rtol=0, atol=0)
     assert len(visuals) == 2
 
 
 @pytest.mark.parametrize('mutation', ['future_text', 'future_latent', 'future_helper',
                                      'current_helper'])
 def test_current_query_cannot_observe_current_helpers_or_future_trajectory(mutation):
-    """A full-trajectory teacher pass or helper-conditioned intent leaks here."""
+    """Native causal Teacher rows before START exclude future text and all helpers."""
     case = make_history_case()
     changed = deepcopy(case)
     if mutation == 'future_text':
@@ -164,46 +217,83 @@ def test_current_query_cannot_observe_current_helpers_or_future_trajectory(mutat
         start = 4 if mutation == 'future_helper' else 0
         changed.inputs['pixel_values_latent'][start:start+4].add_(100)
     before, after = builder(case), builder(changed)
-    result, prefixes, unused = observe_build(case, before)
-    perturbed, changed_prefixes, unused = observe_build(changed, after)
+    hidden = []
+    def capture(module, args, out):
+        value = out.hidden_states
+        hidden.append((value[-1] if isinstance(value, (tuple, list)) else value).clone())
+    handles = [case.teacher.register_forward_hook(capture), changed.teacher.register_forward_hook(capture)]
+    try:
+        result, prefixes, unused = observe_build(case, before)
+        perturbed, changed_prefixes, unused = observe_build(changed, after)
+    finally:
+        for handle in handles:
+            handle.remove()
     torch.testing.assert_close(before.queries[0], after.queries[0], rtol=0, atol=0)
-    for a, b in zip(prefixes[:2], changed_prefixes[:2]):
-        torch.testing.assert_close(a['inputs_embeds'], b['inputs_embeds'], rtol=0, atol=0)
+    # Full observations may differ at future positions; only earlier causal rows
+    # support the first decision, and must remain bit-identical.
+    torch.testing.assert_close(prefixes[0]['inputs_embeds'][:, :13],
+                               changed_prefixes[0]['inputs_embeds'][:, :13], rtol=0, atol=0)
+    torch.testing.assert_close(hidden[0][:, :13], hidden[1][:, :13], rtol=0, atol=0)
+    if mutation in ('current_helper', 'future_helper'):
+        torch.testing.assert_close(hidden[0], hidden[1], rtol=0, atol=0)
     if mutation != 'current_helper':
         torch.testing.assert_close(result.latent_values[0], perturbed.latent_values[0],
                                    rtol=0, atol=0)
         assert result.selected_candidate_indices[0][0] == perturbed.selected_candidate_indices[0][0]
 
 
-def test_previous_raw_target_intervention_changes_native_context_and_downstream_query():
-    """Using stored means without injecting the native teacher prefix fails."""
+def test_previous_raw_target_intervention_changes_only_external_history_and_query(monkeypatch):
+    """Hold every Teacher input/weight/state fixed and intervene only on past raw values."""
+    import stage1.targets as module
     case = make_history_case()
-    changed = deepcopy(case)
+    e0, e1 = torch.eye(8)[:2]
+    histories, hidden = [], []
+    actual_metric = module.content_history
+    def capture_metric(text, values, **kwargs):
+        result = actual_metric(text, values, **kwargs)
+        histories.append((text.clone(), values.clone(), result))
+        return result
+    monkeypatch.setattr(module, 'content_history', capture_metric)
+    def capture_hidden(module, args, output):
+        value = output.hidden_states
+        hidden.append((value[-1] if isinstance(value, (tuple, list)) else value).clone())
 
     class IntervenedBuilder(RecordingBuilder):
+        def __init__(self, value):
+            super().__init__(case.tokenizer, query_config=Stage1QueryConfig(mode='adaptive'),
+                             coverage_p=.1, helper_group_L=0)
+            self.value = value
         def _select(self, candidates, query, max_count):
             selected, indices, margin = super()._select(candidates, query, max_count)
             if len(self.queries) == 1:
-                # Fixed synthetic intervention; everything except past target held fixed.
-                selected = torch.arange(1, 9, device=selected.device).float()[None]
+                selected = self.value[None]
             return selected, indices, margin
 
-    before = builder(case)
-    after = IntervenedBuilder(changed.tokenizer,
-        query_config=Stage1QueryConfig(mode='adaptive'), coverage_p=.1, helper_group_L=0)
-    _, original_prefixes, _ = observe_build(case, before)
-    _, changed_prefixes, _ = observe_build(changed, after)
-    torch.testing.assert_close(before.queries[0], after.queries[0], rtol=0, atol=0)
-    assert not torch.equal(before.queries[1], after.queries[1])
-    torch.testing.assert_close(after.candidates[1], before.candidates[1], rtol=0, atol=0)
-    torch.testing.assert_close(changed_prefixes[2]['inputs_embeds'][0, 14],
-                               torch.arange(1, 9).float(), rtol=0, atol=0)
-    assert not torch.equal(original_prefixes[2]['inputs_embeds'][0, 14],
-                           changed_prefixes[2]['inputs_embeds'][0, 14])
+    first, second = IntervenedBuilder(4 * e0), IntervenedBuilder(4 * e1)
+    handle = case.teacher.register_forward_hook(capture_hidden)
+    try:
+        a, original, _ = observe_build(case, first)
+        b, changed, _ = observe_build(case, second)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(a.latent_values[0], 4 * e0, rtol=0, atol=0)
+    torch.testing.assert_close(b.latent_values[0], 4 * e1, rtol=0, atol=0)
+    assert len(original) == len(changed) == len(hidden) // 2 == 1
+    for key in ('inputs_embeds', 'attention_mask', 'position_ids'):
+        torch.testing.assert_close(original[0][key], changed[0][key], rtol=0, atol=0)
+    torch.testing.assert_close(hidden[0], hidden[1], rtol=0, atol=0)
+    torch.testing.assert_close(first.queries[0], second.queries[0], rtol=0, atol=0)
+    torch.testing.assert_close(histories[1][0], histories[3][0], rtol=0, atol=0)
+    torch.testing.assert_close(histories[1][1], (4 * e0)[None], rtol=0, atol=0)
+    torch.testing.assert_close(histories[3][1], (4 * e1)[None], rtol=0, atol=0)
+    assert histories[1][2].present and histories[3][2].present
+    assert not torch.equal(histories[1][2].summary, histories[3][2].summary)
+    assert not torch.equal(first.queries[1], second.queries[1])
+    torch.testing.assert_close(first.candidates[1], second.candidates[1], rtol=0, atol=0)
 
 
-def test_empty_text_first_block_and_empty_later_segment_have_no_attention_mass():
-    """Empty current text must not reuse older query positions for latent attention."""
+def test_empty_text_first_block_and_empty_later_segment_omit_external_history():
+    """Empty current text must not reuse older query positions for external history."""
     case = make_history_case()
     # Mark all text as special without changing valid token/latent ownership.
     case.inputs['input_ids'][0, [11, 12, 17, 18]] = 7
@@ -270,31 +360,25 @@ def test_malformed_adaptive_inputs_fail_even_when_validation_disabled(mutation):
         observe_build(case, builder(case, validate=False, collect_diagnostics=False))
 
 
-@pytest.mark.parametrize('window', [10, 12, 18])
-def test_every_adaptive_prefix_is_full_causal_before_any_language_call(window):
-    """Prompt/first-block empty observer sets cannot bypass native window checks."""
+@pytest.mark.parametrize('window', [10, 12, 18, 19])
+def test_adaptive_preserves_literal_native_sliding_window_masks(window):
     case = make_history_case()
     qwen = resolve_qwen2_5_vl_model(case.teacher)
     qwen.model.config.sliding_window = window
-    calls = []
-    handle = qwen.model.register_forward_pre_hook(lambda m, a: calls.append(a))
+    literal = []
+    handle = qwen.model.register_forward_pre_hook(
+        lambda m, a, kw: literal.append(kw['attention_mask'].clone()), with_kwargs=True)
     try:
-        with pytest.raises(ValueError, match='full.causal|sliding_window'):
-            observe_build(case, builder(case))
+        with torch.no_grad():
+            case.teacher(input_ids=case.inputs['input_ids'], attention_mask=case.inputs['attention_mask'],
+                pixel_values=case.inputs['pixel_values'], image_grid_thw=case.inputs['image_grid_thw'],
+                output_hidden_states=True, return_dict=True)
     finally:
         handle.remove()
-    assert not calls
+    result, calls, _ = observe_build(case, builder(case))
+    assert result.selected_counts == ((1, 1),) and len(calls) == 1
+    torch.testing.assert_close(calls[0]['attention_mask'], literal[0], rtol=0, atol=0)
     assert qwen.model.config.sliding_window == window
-
-
-def test_exact_window_boundary_preserves_native_config():
-    case = make_history_case()
-    qwen = resolve_qwen2_5_vl_model(case.teacher)
-    qwen.model.config.sliding_window = 19
-    result, prefixes, unused = observe_build(case, builder(case))
-    assert result.selected_counts == ((1, 1),)
-    assert len(prefixes) == 3
-    assert qwen.model.config.sliding_window == 19
 
 
 @pytest.mark.parametrize('mutation', ['orphan_image', 'video', 'missing_vision_start'])
@@ -319,109 +403,52 @@ def test_no_latent_empty_return_still_rejects_malformed_original_layout(mutation
         observe_build(case, builder(case, validate=False))
 
 
-def test_builder_query_matches_independent_native_hidden_and_mass_reduction(monkeypatch):
-    """Wrong text discount, latent raw values, query positions or mass fusion fails."""
-    import stage1.targets as module
+def test_builder_query_matches_independent_placeholder_hidden_and_raw_cosine_reduction():
+    """Literal normalized current text, segment votes and raw past rows define queries."""
     case = make_history_case(layers=2)
-    case.inputs['input_ids'][0, 18] = 7  # second segment contains one valid text token
-    qwen = resolve_qwen2_5_vl_model(case.teacher)
-    hidden, reduced = [], []
-    handle = qwen.model.register_forward_hook(lambda m, a, out: hidden.append(
-        out.last_hidden_state.detach().clone()))
-    real_observer = module.ReducedHistoryAttentionObserver
-
-    class CaptureObserver(real_observer):
-        def scores(self):
-            scores = super().scores()
-            reduced.append((self.query_positions, self.latent_positions, scores.clone()))
-            return scores
+    case.inputs['input_ids'][0, 18] = 7  # second segment has one valid text token
+    hidden = []
+    def capture(module, args, out):
+        value = out.hidden_states
+        hidden.append((value[-1] if isinstance(value, (tuple, list)) else value).clone())
 
     class CaptureIntent(RecordingBuilder):
         def _user_query(self, **kwargs):
             self.intent = super()._user_query(**kwargs).clone()
             return self.intent
 
-    monkeypatch.setattr(module, 'ReducedHistoryAttentionObserver', CaptureObserver)
     target_builder = CaptureIntent(case.tokenizer,
-        query_config=Stage1QueryConfig(mode='adaptive', attention_layers='all'),
-        coverage_p=.1, helper_group_L=0)
+        query_config=Stage1QueryConfig(mode='adaptive'), coverage_p=1, helper_group_L=0)
+    handle = case.teacher.register_forward_hook(capture)
     try:
-        observe_build(case, target_builder)
+        result, _, _ = observe_build(case, target_builder)
     finally:
         handle.remove()
-    assert len(hidden) == 3
-    assert reduced[0][:2] == ((11, 12), ())
-    assert reduced[1][:2] == ((17,), (14,))
-    ell0 = hidden[1][0, [11, 12]].float().mean(0, keepdim=True)
-    ell1 = hidden[2][0, [17]].float().mean(0, keepdim=True)
-    scores = reduced[1][2]
-    assert 0 < float(scores.sum()) < 1
+    assert len(hidden) == 1
+    ell0 = hidden[0][0, [11, 12]].float().mean(0, keepdim=True)
+    text1 = hidden[0][0, [17]].float()
+    ell1 = text1.mean(0, keepdim=True)
+    previous = result.latent_values[:result.selected_counts[0][0]].float()
+    assert previous.shape[0] > 1  # distinguishes relevance-weighting from a raw mean
+    weights = torch.softmax(torch.nn.functional.normalize(text1, dim=1) @
+                            torch.nn.functional.normalize(previous, dim=1).T, dim=1).mean(0)
+    body = (weights[:, None] * previous).sum(0, keepdim=True)
     expected0 = (target_builder.intent.float() + ell0) / 2
-    body = (hidden[2][0, [14]].float() * scores[:, None]).sum(0, keepdim=True)
-    expected1 = (target_builder.intent.float() + (.9 * ell0 + ell1) / 1.9 + body) / (2 + scores.sum())
+    expected1 = (target_builder.intent.float() + (.9 * ell0 + ell1) / 1.9 + body) / 3
     torch.testing.assert_close(target_builder.queries[0], expected0, rtol=1e-6, atol=1e-7)
     torch.testing.assert_close(target_builder.queries[1], expected1, rtol=1e-6, atol=1e-7)
 
 
-def test_known_cumulative_prefix_dependency_changes_downstream_selection(monkeypatch):
-    """A deterministic causal teacher separates injected state from stored query math."""
-    import stage1.targets as module
-    from stage1.history_teacher import HistoryPrefixObservation
+def test_adaptive_never_invokes_historical_prefix_or_attention_utilities(monkeypatch):
+    from stage1.history_teacher import HistoryPrefixAdapter
+    from stage1.history_attention import ReducedHistoryAttentionObserver
+    def forbidden(*args, **kwargs):
+        pytest.fail('historical native attention utility reached from current adaptive')
+    monkeypatch.setattr(HistoryPrefixAdapter, '__init__', forbidden)
+    monkeypatch.setattr(ReducedHistoryAttentionObserver, '__init__', forbidden)
     case = make_history_case()
-    qwen = resolve_qwen2_5_vl_model(case.teacher)
-    # A causal cumulative-sum native-boundary fixture: first target is the only
-    # nonzero context input. Current segment and active-pad hidden both equal it.
-    with torch.no_grad():
-        for parameter in qwen.model.embed_tokens.parameters():
-            parameter.zero_()
-    e0, e1 = torch.eye(8)[:2]
-
-    def visual(pixels, *, grid_thw):
-        if pixels.shape[0] == 4:
-            return torch.zeros((4, 8))
-        return torch.stack((e0, e1, e0, e1, e0, e1, e0, e1))
-
-    monkeypatch.setattr(qwen.visual, 'forward', visual)
-    monkeypatch.setattr(module.HistoryPrefixAdapter, 'forward',
-        lambda adapter, prefix: HistoryPrefixObservation(prefix.inputs_embeds.cumsum(1)))
-
-    class KnownMass:
-        def __init__(self, backbone, *, latent_positions, **kwargs):
-            self.n = len(latent_positions)
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            return False
-        def scores(self):
-            return torch.full((self.n,), .25)
-
-    monkeypatch.setattr(module, 'ReducedHistoryAttentionObserver', KnownMass)
-
-    class ControlledPreviousTarget(RecordingBuilder):
-        def __init__(self, value):
-            super().__init__(case.tokenizer, query_config=Stage1QueryConfig(mode='adaptive'),
-                             coverage_p=.1, helper_group_L=0)
-            self.value = value
-        def _user_query(self, **kwargs):
-            return e0[None]
-        def _select(self, candidates, query, max_count):
-            selected, indices, margin = super()._select(candidates, query, max_count)
-            return (self.value[None] if len(self.queries) == 1 else selected), indices, margin
-
-    first = ControlledPreviousTarget(4 * e0)
-    second = ControlledPreviousTarget(4 * e1)
-    a, _, _ = observe_build(case, first)
-    b, _, _ = observe_build(case, second)
-    torch.testing.assert_close(first.queries[0], e0[None] / 2, rtol=0, atol=0)
-    torch.testing.assert_close(second.queries[0], first.queries[0], rtol=0, atol=0)
-    torch.testing.assert_close(first.queries[1],
-        (e0 + 4 * e0 / 1.9 + e0)[None] / 2.25)
-    torch.testing.assert_close(second.queries[1],
-        (e0 + 4 * e1 / 1.9 + e1)[None] / 2.25)
-    assert a.selected_candidate_indices[0][1] == (0,)
-    assert b.selected_candidate_indices[0][1] == (1,)
-    torch.testing.assert_close(a.latent_values[1], e0, rtol=0, atol=0)
-    torch.testing.assert_close(b.latent_values[1], e1, rtol=0, atol=0)
+    result, calls, visuals = observe_build(case, builder(case))
+    assert result.selected_counts == ((1, 1),) and len(calls) == 1 and len(visuals) == 2
 
 
 def test_builder_does_not_reuse_text_or_selection_state_across_builds():
@@ -437,3 +464,36 @@ def test_builder_does_not_reuse_text_or_selection_state_across_builds():
         torch.testing.assert_close(before['inputs_embeds'], after['inputs_embeds'], rtol=0, atol=0)
     for before, after in zip(target_builder.queries[:2], target_builder.queries[2:]):
         torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('selector', ['last4', 'all'])
+def test_direct_builder_rejects_nonfinal_adaptive_before_teacher_work(selector):
+    case = make_history_case()
+    calls = []
+    handle = case.teacher.register_forward_pre_hook(lambda *args: calls.append(args))
+    try:
+        with pytest.raises(ValueError, match='final|last.only'):
+            Stage1TeacherTargetBuilder(case.tokenizer,
+                query_config=Stage1QueryConfig('adaptive', .9, selector))
+    finally:
+        handle.remove()
+    assert calls == []
+
+
+def test_empty_current_text_omits_history_but_keeps_discounted_prior_text(monkeypatch):
+    import stage1.targets as module
+    case = make_history_case()
+    case.inputs['input_ids'][0, [17, 18]] = 7
+    calls = []
+    actual = module.content_history
+    def capture(text, values, **kwargs):
+        result = actual(text, values, **kwargs)
+        calls.append((text.clone(), values.clone(), result))
+        return result
+    monkeypatch.setattr(module, 'content_history', capture)
+    target_builder = builder(case)
+    observe_build(case, target_builder)
+    assert calls[0][0].shape == (2, 8) and calls[0][1].shape == (0, 8)
+    assert calls[1][0].shape == (0, 8) and calls[1][1].shape == (1, 8)
+    assert not calls[0][2].present and not calls[1][2].present
+    torch.testing.assert_close(target_builder.queries[0], target_builder.queries[1])

@@ -192,6 +192,8 @@ def test_history_query_cli_defaults_and_explicit_values_are_separate_from_loss()
 
 
 @pytest.mark.parametrize('extra', [
+    ['--query_mode', 'adaptive', '--history_attention_layers', 'all'],
+    ['--query_mode', 'adaptive', '--history_attention_layers', 'last4'],
     ['--query_mode', 'other'], ['--history_text_gamma', 'nan'],
     ['--history_text_gamma', '1.01'], ['--history_attention_layers', 'first'],
     ['--query_mode', 'legacy', '--history_text_gamma', '.9'],
@@ -210,6 +212,6 @@ def test_history_query_cli_rejects_unsupported_or_conflicting_requests(extra):
 
 def test_history_query_unique_abbreviations_and_equals_track_registered_dest():
     args = parse_args([*QUERY_V5, '--query_m=adaptive', '--history_text_g=.55',
-                       '--history_attention_l=last4'])
+                       '--history_attention_l=last'])
     assert args.stage1_query_explicit_values == {
-        'query_mode': 'adaptive', 'history_text_gamma': .55, 'history_attention_layers': 'last4'}
+        'query_mode': 'adaptive', 'history_text_gamma': .55, 'history_attention_layers': 'last'}

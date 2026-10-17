@@ -13,6 +13,16 @@ from pathlib import Path
 import subprocess
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+RUNTIME_SOURCE_PATHS = {
+    'v5_trainer': 'src/stage1/v5_trainer.py',
+    'stage1_trainer': 'src/stage1/trainer.py',
+    'transformers_trainer': 'transformers/src/transformers/trainer.py',
+    'query': 'src/stage1/query.py', 'targets': 'src/stage1/targets.py',
+    'history_attention': 'src/stage1/history_attention.py',
+    'history_teacher': 'src/stage1/history_teacher.py',
+    'history_metric': 'src/stage1/history_metric.py',
+}
+
 GEOMETRY_DIMENSIONS = ('branch_count','prefix_length','suffix_length','selected_queries','clean_length',
     'padded_suffix_tokens','dense_bias_elements','replicated_prefix_tokens')
 VISUAL_SHAPE_FIELDS = ('original_image_grid_thw','helper_image_grid_thw',
@@ -143,7 +153,7 @@ def audit(args):
         source_identity=dict(data_sha256=_sha(args.data_path),data_path=str(args.data_path),image_root=str(args.image_root)),
         code_identity=dict(commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPOSITORY,text=True).strip(),
             files={name:_sha(REPOSITORY/name) for name in ('scripts/verify_stage1_v5.py','src/stage1/data.py',
-                'src/stage1/v5_trainer.py','src/stage1/trainer.py','transformers/src/transformers/trainer.py')}),
+                *RUNTIME_SOURCE_PATHS.values())}),
         profile_identity=dict(model=str(args.model),base_content_sha256=base_digest,processor_sha256=_processor_identity(processor),config_sha256=_sha(Path(args.model)/'config.json'),
             model_type=config.model_type,latent_ids=ids,deepspeed_config_sha256=_sha(REPOSITORY/'configs/deepspeed_zero1.json'),packages={p:version(p) for p in ('torch','transformers','accelerate','deepspeed','peft','trl')}))
     return report
@@ -182,9 +192,9 @@ def validate_contract_profile(contract, audited):
         model=audited['profile_identity']['base_content_sha256'])
     for key,value in fixed.items():
         if execution.get(key)!=value: raise ValueError(f'different resolved execution {key}')
-    source_paths={'v5_trainer':'src/stage1/v5_trainer.py','stage1_trainer':'src/stage1/trainer.py',
-                  'transformers_trainer':'transformers/src/transformers/trainer.py'}
-    if execution['source_sha256']!={key:audited['code_identity']['files'][path] for key,path in source_paths.items()}:
+    files = audited['code_identity']['files']
+    if (not all(path in files for path in RUNTIME_SOURCE_PATHS.values())
+            or execution['source_sha256'] != {key:files[path] for key,path in RUNTIME_SOURCE_PATHS.items()}):
         raise ValueError('actual imported source profile differs from audit')
     if execution['packages']!=audited['profile_identity']['packages']:
         raise ValueError('audit/runtime package profile mismatch')

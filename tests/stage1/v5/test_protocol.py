@@ -477,6 +477,8 @@ def test_tiny_parent_oracle_rejects_wrong_final_tail_learning_rate(tmp_path,monk
 
 def binding_fixture():
     from tests.stage1.v5.test_resume import contract
+    from tests.stage1.v5.test_resume import RUNTIME_SOURCE_PATHS
+    from stage1.query import Stage1QueryConfig, query_execution_config
     payload=contract()
     execution=dict(per_device_train_batch_size=1,gradient_accumulation_steps=4,bf16=True,seed=42,
         learning_rate=5e-5,warmup_steps=10,weight_decay=.01,max_grad_norm=1.,gradient_checkpointing=True,
@@ -485,7 +487,7 @@ def binding_fixture():
         vision_attention_implementation='flash_attention_2',latent_size=8,max_sequence_length=32768,
         lora_r=32,lora_alpha=64,lora_dropout=.05,
         lora_target_modules='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',
-        loss_chunk_positions=128,compress_strategy='average',coverage_p=.9,image_pool_k=8,helper_group_L=256,textual_states='previous',model='a'*64,source_sha256=dict(v5_trainer='f'*64,stage1_trainer='f'*64,transformers_trainer='f'*64),packages=dict(torch='actual-torch',accelerate='actual-accelerate'),
+        loss_chunk_positions=128,compress_strategy='average',coverage_p=.9,image_pool_k=8,helper_group_L=256,textual_states='previous',model='a'*64,source_sha256={key:'f'*64 for key in RUNTIME_SOURCE_PATHS},query_config=query_execution_config(Stage1QueryConfig(),()),packages=dict(torch='actual-torch',accelerate='actual-accelerate'),
         deepspeed_profile=dict(enabled=True,zero_stage=1,world_size=4,config_path='d'*64,config_digest='d'*64))
     payload['execution']=execution
     payload['schedule']=dict(dataset_samples=37,prepared_microbatches_per_rank=10,
@@ -503,7 +505,7 @@ def binding_fixture():
         sampler_profile=dict(split_batches=False,even_batches=True,use_seedable_sampler=True,data_seed=None))
     audit={**original,'profile_identity':dict(base_content_sha256='a'*64,processor_sha256='c'*64,
         packages=execution['packages'],deepspeed_config_sha256='d'*64), 'source_identity':dict(data_sha256='e'*64),
-        'code_identity':dict(files={'src/stage1/v5_trainer.py':'f'*64,'src/stage1/trainer.py':'f'*64,'transformers/src/transformers/trainer.py':'f'*64})}
+        'code_identity':dict(files={path:'f'*64 for path in RUNTIME_SOURCE_PATHS.values()})}
     binding=dict(contract=payload,original_loader=original,
         input_identity=dict(data_sha256='e'*64,base_content_sha256='a'*64,processor_sha256='c'*64,
                             source_sha256=audit['code_identity']['files']))
@@ -563,3 +565,73 @@ def test_admission_rejects_unbound_common_profile_and_learning_rate(mutation):
     else: records[0]['continuations'][1]['learning_rates']=[2e-5]
     with pytest.raises(ValueError):
         api().validate_rank_records(records,run_id='v5-protocol',expected_geometry=[geometry_row()],audited=audited)
+
+
+@pytest.mark.parametrize('mutation', ['none', 'removed_metric', 'changed_metric', 'extra_source'])
+def test_profile_binds_actual_runtime_source_map_including_history_metric(tmp_path, mutation):
+    import hashlib
+    from types import SimpleNamespace
+    from torch.utils.data import DataLoader
+    from stage1.types import DEFAULT_STAGE1_TARGET_SUFFIXES
+    from stage1.v5_reference import V5ReferenceIdentity
+    from tests.stage1.v5.test_resume import RUNTIME_SOURCE_PATHS
+    from tests.stage1.v5.test_trainer import integrated_fixture
+    trainer, *_ = integrated_fixture(tmp_path)
+    trainer.v5_reference_identity = V5ReferenceIdentity(1, 'a'*64, 'b'*64, 'c'*64, ('weight',))
+    trainer.stage1_peft_metadata = SimpleNamespace(base_model_reference='original/tiny',
+        requested_target_suffixes=DEFAULT_STAGE1_TARGET_SUFFIXES)
+    from deepspeed_runtime import DeepSpeedRuntimeProfile
+    from peft_common import resolve_qwen2_5_vl_model
+    trainer.coverage_p = .9; trainer.image_pool_k = 2; trainer.helper_group_L = 2
+    trainer.textual_states = 'previous'
+    trainer.args.bf16 = True; trainer.args.max_seq_length = 32768
+    trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(True, 1, None, 'a'*64, 4)
+    resolve_qwen2_5_vl_model(trainer.model).config.compress_strategy = 'average'
+    trainer.train_dataset = list(range(10))
+    runtime = trainer._build_v5_runtime_contract(DataLoader(trainer.train_dataset, batch_size=1))
+    root = Path(__file__).resolve().parents[3]
+    literal = {key: hashlib.sha256((root/path).read_bytes()).hexdigest()
+               for key, path in RUNTIME_SOURCE_PATHS.items()}
+    assert runtime['execution']['source_sha256'] == literal
+    audited, binding = binding_fixture()
+    # The selected profile remains the production fixture; only the actual
+    # imported runtime source identity and corresponding audit bytes are used.
+    audited['code_identity']['files'] = {path: literal[key] for key, path in RUNTIME_SOURCE_PATHS.items()}
+    payload = binding['contract']
+    payload['execution']['source_sha256'] = dict(runtime['execution']['source_sha256'])
+    if mutation == 'removed_metric': payload['execution']['source_sha256'].pop('history_metric')
+    elif mutation == 'changed_metric': payload['execution']['source_sha256']['history_metric'] = '0'*64
+    elif mutation == 'extra_source': payload['execution']['source_sha256']['extra'] = 'a'*64
+    if mutation == 'none':
+        api().validate_contract_profile(payload, audited)
+    else:
+        with pytest.raises(ValueError, match='source profile'):
+            api().validate_contract_profile(payload, audited)
+
+
+
+def test_audit_inventory_includes_all_runtime_sources_and_existing_files(tmp_path, monkeypatch):
+    """Inventory is exercised through audit(), without loading weights or data."""
+    from types import SimpleNamespace
+    import transformers
+    import stage1.composition as composition
+    import stage1.data as data
+    import stage1.v5_reference as reference
+    from tests.stage1.v5.test_resume import RUNTIME_SOURCE_PATHS
+    witness = api()
+    monkeypatch.setattr(transformers.AutoProcessor, 'from_pretrained',
+                        lambda *a, **k: SimpleNamespace(tokenizer=object()))
+    monkeypatch.setattr(transformers.AutoConfig, 'from_pretrained',
+                        lambda *a, **k: SimpleNamespace(model_type='qwen2_5_vl'))
+    monkeypatch.setattr(composition, '_add_fresh_latent_tokens', lambda tokenizer: (125, (125, 126, 127)))
+    monkeypatch.setattr(data, 'prepare_stage1_comt_examples', lambda *a: [])
+    monkeypatch.setattr(data, 'Stage1DataCollator', lambda *a, **k: object())
+    monkeypatch.setattr(witness, 'audit_prepared_loader', lambda *a, **k: {})
+    monkeypatch.setattr(reference, '_base_identity', lambda *a: ('a'*64, ()))
+    monkeypatch.setattr(reference, '_processor_identity', lambda *a: 'b'*64)
+    monkeypatch.setattr(witness, '_sha', lambda path: str(Path(path).relative_to(witness.REPOSITORY)))
+    report = witness.audit(SimpleNamespace(model=witness.REPOSITORY/'unused-base',
+        data_path=witness.REPOSITORY/'data/unused.jsonl', image_root=witness.REPOSITORY/'data/images',
+        run_id='unit-inventory-only'))
+    expected = set(RUNTIME_SOURCE_PATHS.values()) | {'scripts/verify_stage1_v5.py', 'src/stage1/data.py'}
+    assert report['code_identity']['files'] == {path:path for path in expected}
