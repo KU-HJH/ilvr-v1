@@ -232,6 +232,69 @@ def test_actual_parent_loop_checkpoint_continuation_retains_partial_tail(tmp_pat
         dict(saved_step=2,sources=[8,9],updates=1,final_step=3,learning_rates=[1e-5])]
 
 
+def test_tiny_continuation_restores_exact_independent_token_objective_adamw_state(tmp_path, monkeypatch):
+    """Zero-LR step still changes moments; tiny parameter errors cannot hide it."""
+    from copy import deepcopy
+    import math
+    import torch.nn.functional as F
+    from transformers import Trainer
+    p = torch.nn.Parameter(torch.tensor(.2))
+    expected_optimizer = torch.optim.AdamW([p], lr=0., weight_decay=.01)
+    expected = {}
+    for saved_step in (1, 2):
+        expected_optimizer.zero_grad()
+        lp = (p * torch.tensor([.2, -.5, .8])).log_softmax(-1)
+        lm = torch.tensor([.3, .6, -.4]).log_softmax(-1)
+        r = lp - lm
+        # The literal first/full window has five GT-0 and six GT-1 tokens,
+        # across nine original blocks. All block entropy rows are identical.
+        dil = (5*F.softplus(-r[0]) + 6*F.softplus(-r[1]))/11
+        dil = dil + (lm.exp()*F.softplus(r)).sum()
+        logq = (p*torch.tensor([.6, -.2, .1]))[[0, 2]].log_softmax(-1)
+        entropy = math.log(2) + (logq.exp()*logq).sum()
+        (.1*p.square() + dil + .1*entropy).backward()
+        expected_optimizer.param_groups[0]['lr'] = 5e-6*(saved_step-1)
+        expected_optimizer.step()
+        expected[saved_step] = (p.detach().clone(), deepcopy(expected_optimizer.state[p]))
+
+    constructed, observed = [], []
+    real_init, real_train = torch.optim.AdamW.__init__, Trainer.train
+    def record_optimizer(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        constructed.append(self)
+    def inspect_before_continuation(self, *args, **kwargs):
+        checkpoint = kwargs.get('resume_from_checkpoint')
+        if checkpoint:
+            saved_step = int(Path(checkpoint).name.split('-')[-1])
+            # The fixture creates its independent restored oracle after building
+            # the resumed Trainer, immediately before entering native train().
+            oracle_optimizer = constructed[-1]
+            oracle = oracle_optimizer.param_groups[0]['params'][0]
+            wanted_parameter, wanted_state = expected[saved_step]
+            torch.testing.assert_close(oracle.detach(), wanted_parameter, rtol=0, atol=1e-7)
+            saved_optimizer = torch.load(Path(checkpoint)/'optimizer.pt',
+                                        weights_only=True, map_location='cpu')
+            saved_state, = saved_optimizer['state'].values()
+            print(dict(saved_step=saved_step, oracle_exp_avg=float(oracle_optimizer.state[oracle]['exp_avg']),
+                checkpoint_exp_avg=float(saved_state['exp_avg']), expected_exp_avg=float(wanted_state['exp_avg']),
+                oracle_exp_avg_sq=float(oracle_optimizer.state[oracle]['exp_avg_sq']),
+                checkpoint_exp_avg_sq=float(saved_state['exp_avg_sq']),
+                expected_exp_avg_sq=float(wanted_state['exp_avg_sq'])))
+            for key in ('step', 'exp_avg', 'exp_avg_sq'):
+                torch.testing.assert_close(oracle_optimizer.state[oracle][key], wanted_state[key],
+                                           rtol=1e-6, atol=1e-9, msg=f'oracle {key} at step {saved_step}')
+                torch.testing.assert_close(saved_state[key], wanted_state[key],
+                                           rtol=1e-6, atol=1e-9, msg=f'checkpoint {key} at step {saved_step}')
+            observed.append(saved_step)
+        return real_train(self, *args, **kwargs)
+    monkeypatch.setattr(torch.optim.AdamW, '__init__', record_optimizer)
+    monkeypatch.setattr(Trainer, 'train', inspect_before_continuation)
+    directory = Path(__file__).resolve().parents[3]/'checkpoints/stage1-v5-task7'/tmp_path.parent.name/tmp_path.name
+    report = api().tiny_engine_witness(directory, use_cpu=True)
+    assert observed == [1, 2]
+    assert [row['saved_step'] for row in report['continuations']] == observed
+
+
 def test_runtime_observer_records_real_helper_f_reference_packed_backward(tmp_path):
     from tests.stage1.v5.test_trainer import integrated_fixture
     trainer,batch,*_=integrated_fixture(tmp_path,real_helper=True)

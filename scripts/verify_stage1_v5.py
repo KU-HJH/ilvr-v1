@@ -344,6 +344,7 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
     Scalar logits feed the actual objective to isolate parent/engine reduction. Full Qwen calls are witnessed
     separately by production_witness; this fixture never claims model equivalence.
     """
+    from copy import deepcopy
     import torch
     from torch.utils.data import SequentialSampler
     from transformers import Trainer, TrainingArguments
@@ -356,7 +357,7 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
     world=1 if use_cpu else 4
     counts=FOUR_RANK_WINDOWS[0]
     tails=FOUR_RANK_WINDOWS[1]
-    sources=[]; windows=[]; local_counts=[]; local_token_rows=[]
+    sources=[]; windows=[]; local_counts=[]; local_token_rows=[]; oracle_states=[]
     config=Stage1V5Config(text_kl_weight=0.,lambda_topk_entropy=.1,preference_topk_k=2)
     class Scalar(torch.nn.Module):
         def __init__(self):
@@ -460,6 +461,9 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
         else:
             from deepspeed.utils import safe_get_full_fp32_param
             actual=safe_get_full_fp32_param(trainer.model.p).detach().float().cpu()
+        # Save only the independent scalar oracle's parameter and AdamW state,
+        # after its literal token/block update, without retaining an autograd graph.
+        oracle_states.append((oracle.detach().clone(),deepcopy(oracle_optimizer.state_dict())))
         w=trainer.latest_window
         windows.append(dict(global_original_steps=w.global_original_steps,configured_gas=4,
             global_dil_tokens=w.global_dil_tokens,dil_scale=v5_dil_scale(w),
@@ -496,17 +500,18 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
     original=build(directory/'initial')
     original.train()
     full_windows=list(windows)
+    saved_oracles=tuple(oracle_states)
     del original
     continuations=[]
     # Each independently restored parent+ZeRO continuation retains absolute source positions.
     for saved in (1,2):
         sources.clear(); windows.clear(); local_counts.clear()
         trainer=build(directory/f'continuation-{saved}')
-        # Oracle restores exact independent AdamW state for the prior updates.
-        oracle.data.copy_(initial_value); oracle_optimizer=torch.optim.AdamW([oracle],lr=0.,weight_decay=.01)
-        for i in range(saved):
-            oracle_optimizer.zero_grad(); (.1*oracle.square()+oracle.pow(3)).backward()
-            oracle_optimizer.param_groups[0]['lr']=tiny_learning_rate(i); oracle_optimizer.step()
+        # Restore the exact independent new-objective state, including moments
+        # from the zero-LR first update. Deep copies keep continuations isolated.
+        parameter,state=saved_oracles[saved-1]
+        oracle.data.copy_(parameter); oracle_optimizer=torch.optim.AdamW([oracle],lr=0.,weight_decay=.01)
+        oracle_optimizer.load_state_dict(deepcopy(state))
         trainer.train(resume_from_checkpoint=str(directory/'initial'/f'checkpoint-{saved}'))
         continuations.append(dict(saved_step=saved,sources=list(sources),updates=len(windows),final_step=trainer.state.global_step,learning_rates=[w['learning_rate'] for w in windows]))
         if any(w['gradient_error']>.005 or w['update_error']>2e-6 for w in windows):
