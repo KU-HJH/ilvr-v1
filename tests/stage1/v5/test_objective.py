@@ -52,7 +52,7 @@ def literal_support_terms(clean, off, supports):
     return torch.stack(entropy), torch.stack(mass)
 
 
-def test_dil_original_block_sum_matches_full_vocab_literal_and_gradient():
+def test_dil_token_sum_matches_full_vocab_literal_and_gradient():
     clean, ref, _, _ = fixture()
     config = Stage1V5Config(text_kl_weight=0.)
     sums = compute(clean, ref, None, None, metadata(), config)
@@ -60,9 +60,9 @@ def test_dil_original_block_sum_matches_full_vocab_literal_and_gradient():
     block0, block2 = literal[:2], literal[2:]
     zero = clean.sum() * 0
     assert sums.original_steps == 3
-    assert_close(sums.dil_sum, block0.mean() + zero + block2.mean())
+    assert_close(sums.dil_sum, block0.sum() + zero + block2.sum())
     actual_grad = torch.autograd.grad(sums.dil_sum, clean, retain_graph=True)[0]
-    literal_grad = torch.autograd.grad(literal[:2].mean() + literal[2:].mean(), clean)[0]
+    literal_grad = torch.autograd.grad(literal.sum(), clean)[0]
     assert_close(actual_grad, literal_grad)
     assert ref.grad is None
     assert_close(sums.diagnostics['dil_raw_sum'], sums.dil_sum.detach())
@@ -161,7 +161,7 @@ def test_chunk_remainder_keeps_token_weight_with_more_than_128_queries():
     ref = torch.randn(129, 4)
     meta = V5BatchMetadata((V5Block(0, 1, 0, 1, tuple(range(2, 131)), (0,) * 129, ()),))
     sums = compute(clean, ref, None, None, meta, Stage1V5Config(text_kl_weight=0.))
-    literal = literal_dil(clean, ref, torch.zeros(129, dtype=torch.long)).mean()
+    literal = literal_dil(clean, ref, torch.zeros(129, dtype=torch.long)).sum()
     assert_close(sums.dil_sum, literal)
     assert_close(torch.autograd.grad(sums.dil_sum, clean, retain_graph=True)[0],
                  torch.autograd.grad(literal, clean)[0])

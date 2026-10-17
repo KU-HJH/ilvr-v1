@@ -7,12 +7,13 @@ import math
 from pathlib import Path
 from typing import Mapping
 
-from stage1.v5_config import Stage1V5Config, resolve_v5_config, v5_formula_id
+from stage1.v5_config import (Stage1V5Config, resolve_v5_config, v5_formula_id,
+                              validate_v5_training_config)
 from stage1.v5_reference import V5ReferenceIdentity
 from stage1.query import Stage1QueryConfig, query_execution_config, resolve_query_config
 
 V5_CONTRACT_FILENAME = 'stage1_v5.json'
-_SEMANTICS = {
+_SEMANTICS_V1 = {
     'reference': 'immutable_initial_effective_teacher_v1',
     'auxiliary_targets': 'immediate_original_text_exclude_crossing_special_padding_v1',
     'interventions': 'independent_clean_prefix_voff_body_textoff_previous_text_v1',
@@ -21,6 +22,13 @@ _SEMANTICS = {
     'text_target': 'detached_clean_full_vocab_temperature_squared_kl_v1',
     'text_schedule': 'from_first_update_no_kl_warmup_v1',
 }
+_SEMANTICS_V2 = {
+    **_SEMANTICS_V1,
+    'reduction': 'global_actual_window_dil_tokens_aux_original_blocks_v2',
+    'dil_sum_units': 'eligible_token_loss_sum',
+    'auxiliary_sum_units': 'original_block_token_mean_sum',
+}
+_SCHEMA_SEMANTICS = {1: _SEMANTICS_V1, 2: _SEMANTICS_V2}
 
 
 def _json_copy(value):
@@ -48,6 +56,14 @@ def _execution(execution: Mapping[str, object]) -> None:
 def build_v5_contract(config, reference: V5ReferenceIdentity, *, ce_weight: float,
                       sim_weight: float, schedule: Mapping[str, object],
                       execution: Mapping[str, object]) -> dict:
+    validate_v5_training_config(config)
+    return _build_contract(config, reference, ce_weight=ce_weight, sim_weight=sim_weight,
+                           schedule=schedule, execution=execution, schema_version=2)
+
+
+def _build_contract(config, reference, *, ce_weight, sim_weight, schedule, execution,
+                    schema_version):
+    """Canonical payload reconstruction only; no historical execution engine."""
     if not isinstance(config, Stage1V5Config):
         raise ValueError('v5 contract requires Stage1V5Config')
     reference = V5ReferenceIdentity(**asdict(reference))
@@ -57,27 +73,32 @@ def build_v5_contract(config, reference: V5ReferenceIdentity, *, ce_weight: floa
     if not isinstance(schedule, Mapping):
         raise ValueError('invalid v5 sampler schedule')
     _execution(execution)
-    return _json_copy({'schema_version': 1, 'variant': 'v5', 'formula_id': v5_formula_id(config),
+    return _json_copy({'schema_version': schema_version, 'variant': 'v5', 'formula_id': v5_formula_id(config),
                        'config': asdict(config), 'coefficients': {'ce_weight': ce_weight, 'sim_weight': sim_weight},
-                       'semantics': _SEMANTICS, 'reference': asdict(reference),
+                       'semantics': _SCHEMA_SEMANTICS[schema_version], 'reference': asdict(reference),
                        'schedule': dict(schedule), 'execution': dict(execution)})
 
 
 def _validate(saved: Mapping[str, object]) -> Stage1V5Config:
     required = {'schema_version', 'variant', 'formula_id', 'config', 'coefficients',
                 'semantics', 'reference', 'schedule', 'execution'}
-    if not isinstance(saved, Mapping) or set(saved) != required or type(saved['schema_version']) is not int or saved['schema_version'] != 1:
+    if (not isinstance(saved, Mapping) or set(saved) != required
+            or type(saved['schema_version']) is not int
+            or saved['schema_version'] not in _SCHEMA_SEMANTICS):
         raise ValueError('invalid or unsupported v5 contract schema')
-    if saved['variant'] != 'v5' or saved['semantics'] != _SEMANTICS:
+    version = saved['schema_version']
+    if saved['variant'] != 'v5' or saved['semantics'] != _SCHEMA_SEMANTICS[version]:
         raise ValueError('saved v5 variant or formula semantics mismatch')
     config = saved['config']
     if not isinstance(config, Mapping) or set(config) != {f.name for f in fields(Stage1V5Config)}:
         raise ValueError('incomplete saved v5 objective')
     try:
         result = Stage1V5Config(**config)
+        if version == 2:
+            validate_v5_training_config(result)
         reference = V5ReferenceIdentity(**saved['reference'])
-        rebuilt = build_v5_contract(result, reference, **saved['coefficients'],
-                                    schedule=saved['schedule'], execution=saved['execution'])
+        rebuilt = _build_contract(result, reference, **saved['coefficients'],
+            schedule=saved['schedule'], execution=saved['execution'], schema_version=version)
     except (TypeError, AttributeError) as error:
         raise ValueError('malformed saved v5 objective or identity') from error
     if _json_copy(saved) != rebuilt:
@@ -96,6 +117,9 @@ def load_v5_contract(checkpoint: Path) -> dict:
 
 def validate_v5_resume(saved: Mapping[str, object], explicit: Mapping[str, object]) -> Stage1V5Config:
     _validate(saved)
+    if saved['schema_version'] == 1:
+        raise ValueError('historical Stage1-v5 block-mean training requires its original reviewed code; '
+                         'token-mean training requires a fresh run')
     objective = {}
     other = {'stage1_variant': saved['variant'], **saved['coefficients'], **saved['execution']}
     # CLI option spellings normalize once; loss values use the explicit alias map.

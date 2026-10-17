@@ -395,6 +395,7 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
     if args.stage == 'stage1' and resume:
         if (Path(resume) / V5_CONTRACT_FILENAME).exists():
             saved = load_v5_contract(Path(resume))
+            validate_v5_resume(saved, {})  # Reject historical training before inheritance/model work.
             if 'stage1_variant' in present and args.stage1_variant != 'v5':
                 raise ValueError('explicit stage1_variant conflicts with saved v5 contract')
             args.stage1_variant = 'v5'

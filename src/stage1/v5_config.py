@@ -116,13 +116,23 @@ def resolve_v5_config(values: Mapping[str, object], *, saved: Mapping[str, objec
     if saved is None:
         if explicit.get('preference_entropy_top_percent') is not None and 'selection' not in explicit:
             explicit['selection'] = 'clean'
-        return Stage1V5Config(**explicit)
+        config = Stage1V5Config(**explicit)
+        validate_v5_training_config(config)
+        return config
     inherited = _canonical_values(saved)
     saved_config = Stage1V5Config(**inherited)
     for name, value in explicit.items():
         if value != getattr(saved_config, name):
             raise ValueError(f'explicit {name} conflicts with saved Stage1-v5 resume objective')
     return saved_config
+
+
+def validate_v5_training_config(config: Stage1V5Config) -> None:
+    """Keep historical selector contracts readable without enabling new training."""
+    if not isinstance(config, Stage1V5Config):
+        raise ValueError('v5 training requires Stage1V5Config')
+    if config.selection != 'all':
+        raise ValueError('Stage1-v5 token-mean training requires selection=all')
 
 
 def v5_formula_id(config: Stage1V5Config) -> str:

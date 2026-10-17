@@ -161,6 +161,10 @@ def test_runtime_contract_records_effective_topology_and_independent_query_seman
             trainer._build_v5_runtime_contract(loader)
         return
     saved = trainer._build_v5_runtime_contract(loader)
+    assert saved['schedule']['dil_denominator'] == 'actual_window_eligible_dil_tokens'
+    assert saved['schedule']['auxiliary_denominator'] == 'actual_window_original_blocks_including_empty'
+    assert saved['semantics']['dil_sum_units'] == 'eligible_token_loss_sum'
+    assert saved['semantics']['auxiliary_sum_units'] == 'original_block_token_mean_sum'
     query = saved['execution']['query_config']
     assert query['mode'] == mode
     assert query['formula_id'] != saved['formula_id']

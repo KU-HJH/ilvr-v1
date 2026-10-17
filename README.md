@@ -163,6 +163,14 @@ ZeRO-1. It uses CE 0.1/alignment 0.1, v5 DIL beta 1/margin 0/preference weight 1
 top-k entropy 0.1 with K 50, Text-off KL 0.01, LR 5e-5, seed 42 and warmup 10.
 The original base is the initializer; previous Stage2 weights are not inputs.
 
+Stage1-v5 DIL averages eligible token losses across the actual optimizer window
+and all four ranks. Entropy/mass still average original-block token means,
+including empty blocks in their denominator; CE/alignment/Text-off KL retain
+configured-GAS scaling. New token-mean training requires `selection=all` in both
+query modes. Historical block-mean sidecars remain readable for inspection;
+resuming those runs requires their original reviewed code. Changing to token
+mean requires a fresh run, which saves a distinct schema-2 reduction contract.
+
 Adaptive selection uses a prompt-only intent followed by one injected-prefix
 pass per latent block. Each prefix stops immediately before the current START;
 only previously selected raw targets replace active past pads. Discounted

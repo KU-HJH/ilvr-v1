@@ -149,8 +149,10 @@ def valid_records(geometry=None):
         reference_before='b'*64,reference_after='b'*64,contract_digest=digest,
         runtime_binding=deepcopy(binding),fixture_contract=deepcopy(fixture),
         tiny_windows=[dict(global_original_steps=n,configured_gas=4,actual_microbatches=m,
+            global_dil_tokens=11 if m==4 else 6,dil_scale=16/(11 if m==4 else 6),auxiliary_scale=16/n,
             optimizer_step=i,learning_rate=lr,native_denominator=16,
             all_rank_original_counts=([[2,1,0,0],[1,0,1,0],[0,0,0,0],[1,2,0,1]] if m==4 else [[1,0],[1,1],[0,0],[0,2]]),
+            all_rank_dil_token_counts=([[3,1,0,0],[1,0,1,0],[0,0,0,0],[1,3,0,1]] if m==4 else [[1,0],[1,1],[0,0],[0,3]]),
             gradient_error=0.,update_error=0.,gradient_norm=1.) for i,(n,m,lr) in enumerate(((9,4,0.),(9,4,5e-6),(5,2,1e-5)))],
         continuations=[dict(saved_step=s,sources=list(range(4*s,10)),updates=3-s,final_step=3,
             learning_rates=([5e-6,1e-5] if s==1 else [1e-5])) for s in (1,2)],
@@ -163,7 +165,7 @@ def valid_records(geometry=None):
             source_indices=sorted(g['source_index'] for g in geometry),geometry=deepcopy(geometry))) for r in range(4)]
 
 
-@pytest.mark.parametrize('mutation', ['rank','denominator','counts','gradient','reference','continuation','hook','extra_call','geometry','norm'])
+@pytest.mark.parametrize('mutation', ['rank','denominator','counts','token_counts','token_total','dil_scale','auxiliary_scale','gradient','reference','continuation','hook','extra_call','geometry','norm'])
 def test_rank_verification_rejects_corrupt_runtime_evidence(mutation):
     records=valid_records()
     kwargs=dict(run_id='v5-protocol',audited=binding_fixture()[0],expected_geometry=[geometry_row()])
@@ -171,6 +173,9 @@ def test_rank_verification_rejects_corrupt_runtime_evidence(mutation):
     if mutation=='rank': records.pop()
     elif mutation=='denominator': records[2]['tiny_windows'][-1]['native_denominator']=8
     elif mutation=='counts': records[0]['tiny_windows'][0]['all_rank_original_counts'][0][0]=1
+    elif mutation=='token_counts': records[0]['tiny_windows'][0]['all_rank_dil_token_counts'][0][0]=2
+    elif mutation=='token_total': records[0]['tiny_windows'][0]['global_dil_tokens']=9
+    elif mutation in ('dil_scale','auxiliary_scale'): records[0]['tiny_windows'][0][mutation]=1.
     elif mutation=='norm': records[0]['production']['gradient_norms']=[]
     elif mutation=='gradient': records[0]['tiny_windows'][0]['gradient_error']=float('nan')
     elif mutation=='reference': records[1]['reference_after']='c'*64
@@ -216,6 +221,8 @@ def test_actual_parent_loop_checkpoint_continuation_retains_partial_tail(tmp_pat
     directory=Path(__file__).resolve().parents[3]/'checkpoints/stage1-v5-task7'/tmp_path.parent.name/tmp_path.name
     report=api().tiny_engine_witness(directory,use_cpu=True)
     assert [w['global_original_steps'] for w in report['tiny_windows']]==[9,9,5]
+    assert [w['global_dil_tokens'] for w in report['tiny_windows']]==[11,11,6]
+    assert all(w['dil_scale']==4/w['global_dil_tokens'] for w in report['tiny_windows'])
     assert report['scope']=='CPU actual parent loop'
     assert [w['native_denominator'] for w in report['tiny_windows']]==[4]*3
     assert [w['actual_microbatches'] for w in report['tiny_windows']]==[4,4,2]
@@ -423,6 +430,7 @@ def binding_fixture():
         num_train_epochs=1.,one_exposure_window_updates=3,parent_epoch_update_budget=3,
         final_window_microbatches=2,dataloader_drop_last=False,
         tail_native_denominator='configured_gas_world_size',
+        dil_denominator='actual_window_eligible_dil_tokens',
         auxiliary_denominator='actual_window_original_blocks_including_empty')
     occurrences=[dict(rank=r,microbatch=i,source_index=(4*i+r)%37,source_id=str((4*i+r)%37))
                  for r in range(4) for i in range(10)]
@@ -439,7 +447,7 @@ def binding_fixture():
     return audit,binding
 
 
-@pytest.mark.parametrize('mutation',['coefficient','r','warmup','package','sampler','budget','occurrences','tail','input','helper_group','code_profile'])
+@pytest.mark.parametrize('mutation',['coefficient','r','warmup','package','sampler','budget','occurrences','tail','input','helper_group','code_profile','dil_denominator','auxiliary_denominator'])
 def test_runtime_binding_rejects_stale_audit_or_different_effective_profile(mutation):
     audited,binding=binding_fixture()
     assert hasattr(api(),'validate_runtime_binding'), 'expected-bound original loader/profile missing'
@@ -454,6 +462,8 @@ def test_runtime_binding_rejects_stale_audit_or_different_effective_profile(muta
     elif mutation=='tail': audited['final_window_microbatches']=1
     elif mutation=='code_profile': binding['contract']['execution']['source_sha256']['v5_trainer']='0'*64
     elif mutation=='helper_group': binding['contract']['execution']['helper_group_L']=128
+    elif mutation in ('dil_denominator','auxiliary_denominator'):
+        binding['contract']['schedule'][mutation]='wrong_denominator'
     else: binding['input_identity']['data_sha256']='0'*64
     with pytest.raises(ValueError): api().validate_runtime_binding(audited,binding)
 

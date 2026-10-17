@@ -264,7 +264,8 @@ def test_actual_four_calls_one_parent_backward_native_update_and_reference_owned
         resolve_qwen2_5_vl_model(trainer.ema_teacher.model).model.embed_tokens(IDS))
     diagnostics=trainer._latest_stage1_diagnostics
     expected=(.1*diagnostics['ce_loss']+.1*diagnostics['alignment_loss']+
-        diagnostics['auxiliary_scale']*(diagnostics['dil_raw_sum']+.1*diagnostics['topk_entropy_raw_sum'])+
+        diagnostics['dil_scale']*diagnostics['dil_raw_sum']+
+        diagnostics['auxiliary_scale']*.1*diagnostics['topk_entropy_raw_sum']+
         .01*diagnostics['text_kl_raw'])/4
     torch.testing.assert_close(loss,expected)
     assert any(e['phase']=='recompute' for e in backs[0].events)
@@ -398,13 +399,13 @@ def test_get_batch_samples_reduces_original_blocks_once_even_empty_rank(tmp_path
             trainer=Trainer.__new__(Trainer)
             trainer.args=SimpleNamespace(average_tokens_across_devices=False,gradient_accumulation_steps=4)
             def reduce(value,**kw):
-                reductions.append(int(value))
-                return torch.tensor(total)
+                reductions.append(value.tolist())
+                return torch.tensor([total, 0])
             trainer.accelerator=SimpleNamespace(device=torch.device('cpu'),num_processes=4,reduce=reduce)
             original=[{'stage1_v5_metadata':V5BatchMetadata(tuple(
                 V5Block(0,i,2*i,2*i+1,(),(),()) for i in range(n)))} for n in slots]
             batches,_=trainer.get_batch_samples(iter(original),4)
-            assert reductions==[sum(slots)]
+            assert reductions==[[sum(slots), 0]]
             assert all(b['stage1_v5_window'].global_original_steps==total for b in batches)
             assert all(b['stage1_v5_window'].actual_microbatches==len(slots) for b in batches)
             assert all('stage1_v5_window' not in b for b in original)

@@ -77,8 +77,8 @@ def test_real_parent_step_shared_snapshot_gradients_and_literal_window_denominat
             auxiliary_scale = 4 / (2 * len(steps))
             assert float(diagnostic['auxiliary_scale']) == auxiliary_scale
             expected = (.1 * diagnostic['ce_loss'] + .1 * diagnostic['alignment_loss']
-                + auxiliary_scale * (diagnostic['dil_raw_sum']
-                    + .1 * diagnostic['topk_entropy_raw_sum'])
+                + diagnostic['dil_scale'] * diagnostic['dil_raw_sum']
+                + auxiliary_scale * .1 * diagnostic['topk_entropy_raw_sum']
                 + .01 * diagnostic['text_kl_raw']) / 4
             torch.testing.assert_close(loss, expected)
             # Native per-token CE is unchanged, independently evaluated from

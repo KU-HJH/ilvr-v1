@@ -13,11 +13,11 @@ from transformers.trainer_utils import get_last_checkpoint
 from peft_common import resolve_qwen2_5_vl_model
 from .equivalence import Stage1StochasticContext
 from .trainer import CustomTrainerStage1
-from .v5_config import Stage1V5Config
+from .v5_config import Stage1V5Config, validate_v5_training_config
 from .v5_execution import V5Execution
 from .v5_metadata import V5BatchMetadata
 from .v5_objective import compute_v5_loss_sums
-from .v5_reduction import V5Window, v5_auxiliary_scale
+from .v5_reduction import V5Window, v5_auxiliary_scale, v5_dil_scale
 from .v5_reference import V5ReferenceIdentity, V5_REFERENCE_FILENAME
 from .v5_resume import (V5_CONTRACT_FILENAME, build_v5_contract, load_v5_contract,
                         validate_v5_resume)
@@ -37,6 +37,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                  v5_saved_contract=None, stage1_v5_debug=False, **kwargs):
         if not isinstance(v5_config, Stage1V5Config):
             raise TypeError('v5 requires Stage1V5Config')
+        validate_v5_training_config(v5_config)
         if not isinstance(v5_reference_identity, V5ReferenceIdentity):
             raise TypeError('v5 requires immutable reference identity')
         self.stage1_v5_debug = bool(stage1_v5_debug)
@@ -72,11 +73,13 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         for batch in batches:
             if not isinstance(batch.get('stage1_v5_metadata'), V5BatchMetadata):
                 raise ValueError('missing v5 original-block metadata')
-        count = torch.tensor(sum(b['stage1_v5_metadata'].original_step_count for b in batches),
-                             device=self.accelerator.device, dtype=torch.long)
-        total = int(self.accelerator.reduce(count, reduction='sum').item())
-        window = V5Window(total, len(batches), self.args.gradient_accumulation_steps,
-                          self.accelerator.num_processes)
+        counts = torch.tensor([
+            sum(b['stage1_v5_metadata'].original_step_count for b in batches),
+            sum(len(b['stage1_v5_metadata'].query_keys) for b in batches),
+        ], device=self.accelerator.device, dtype=torch.int64)
+        totals = self.accelerator.reduce(counts, reduction='sum').tolist()
+        window = V5Window(totals[0], len(batches), self.args.gradient_accumulation_steps,
+                          self.accelerator.num_processes, totals[1])
         # Copy dictionaries only; original token/label/image tensors stay identical.
         return [dict(batch, stage1_v5_window=window) for batch in batches], hint
 
@@ -162,16 +165,20 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 voff, textoff = off.voff_logits, off.textoff_logits
         sums = compute_v5_loss_sums(clean, reference, voff, textoff, metadata, self.v5_config,
             validate=self.stage1_v5_debug, collect_diagnostics=self.stage1_v5_debug)
-        scale = v5_auxiliary_scale(window)
+        dil_scale = v5_dil_scale(window)
+        block_scale = v5_auxiliary_scale(window)
         config = self.v5_config
         loss = (self.ce_weight*ce + self.sim_weight*alignment + config.text_kl_weight*sums.text_kl +
-                scale*(config.lambda_preference*sums.dil_sum + config.lambda_topk_entropy*sums.entropy_sum +
+                dil_scale*config.lambda_preference*sums.dil_sum +
+                block_scale*(config.lambda_topk_entropy*sums.entropy_sum +
                        config.lambda_topk_mass*sums.mass_sum))
         if self.stage1_v5_debug and not bool(torch.isfinite(loss.detach()).all()):
             raise FloatingPointError('Stage1-v5 loss is nonfinite')
         self._latest_stage1_diagnostics = {
             **sums.diagnostics, 'ce_loss':ce.detach(), 'alignment_loss':alignment.detach(),
-            'total_loss':loss.detach(), 'auxiliary_scale':loss.new_tensor(scale),
+            'total_loss':loss.detach(), 'auxiliary_scale':loss.new_tensor(block_scale),
+            'dil_scale':loss.new_tensor(dil_scale),
+            'global_dil_tokens':loss.new_tensor(window.global_dil_tokens),
             'global_original_steps':loss.new_tensor(window.global_original_steps),
             'actual_microbatches':loss.new_tensor(window.actual_microbatches),
         } if self.collect_stage1_diagnostics else None
@@ -238,6 +245,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 gas*self.accelerator.num_processes*self.args.per_device_train_batch_size)[1],
             final_window_microbatches=(microbatches-1)%gas+1 if microbatches else 0,
             tail_native_denominator='configured_gas_world_size',
+            dil_denominator='actual_window_eligible_dil_tokens',
             auxiliary_denominator='actual_window_original_blocks_including_empty')
         execution = {key:getattr(self.args,key) for key in (
             'per_device_train_batch_size','gradient_accumulation_steps','bf16','seed',

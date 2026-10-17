@@ -489,6 +489,8 @@ def build_stage1_training_components(
     if query_config.mode == 'adaptive' and not is_v5:
         raise ValueError('adaptive query requires Stage1-v5')
     if is_v5:
+        from stage1.v5_config import validate_v5_training_config
+        validate_v5_training_config(args.stage1_v5_config)
         if (tuning.method != 'dora' or args.ema_tau != 1.
                 or not profile.enabled or profile.zero_stage != 1 or profile.world_size != 4
                 or args.per_device_train_batch_size != 1 or args.gradient_accumulation_steps != 4
