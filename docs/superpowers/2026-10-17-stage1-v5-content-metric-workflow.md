@@ -295,3 +295,30 @@ reviewed `38d3852` and `git diff --check` both exit0. Plan command updated only
 to keep any temporary scalar/model fixtures under the checkpoint namespace.
 This is not a product or formula change. Frozen proposal/commitment hashes
 rechecked unchanged. Full-suite result remains pending; no completion claim.
+
+## Verification attempt 1 environment failure and targeted recovery
+
+At control revision `9ab1c5d`, full-suite session8401 failed fixture setup because
+root added a nested explicit basetemp but did not create its parent. Root
+observed widespread E markers and stopped only its own verified pytest process
+(PID2537855, parent2537853, exact argv rechecked before SIGINT). Exit2 after
+228 passed/183 fixture errors in85.04s. No foreign process was signaled.
+Failed output remains `final-full-suite.log`; root read the entire141549-byte,
+2757-line log programmatically, extracted every exception, and confirmed all183
+are the identical missing-parent FileNotFoundError. This is not a product
+regression or a passed full suite; no implementation/review gate was replaced.
+
+Smallest fix: create only verified task-owned checkpoint parent. No code edits.
+Causal preflight uses the first failed fixture, same pytest basetemp mechanism:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q tests/evaluation/test_continuous_latent.py::test_external_evidence_loader_does_not_write_copied_source --basetemp=checkpoints/stage1-v5-content-metric-20261017/pytest-path-preflight-r2
+```
+
+Observed exit0,1passed in2.73s; complete output read at
+`pytest-path-preflight-r2.log`. Retry uses fresh basetemp `final-pytest-r2` and
+`final-full-suite-r2.log` with the same full-project command/profile. Fresh
+preflight confirms parent exists, canonical path, and unused log/base directory.
+Plan preflight corrected. Identical reviewed product/source remains unchanged;
+all task/final review verdicts still apply. Retry is required by this concrete
+failed verification, not an optional duplicate broad cycle. Result pending.
