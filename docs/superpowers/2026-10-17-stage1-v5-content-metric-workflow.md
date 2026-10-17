@@ -381,3 +381,41 @@ basetemp/log unused; product and tests match reviewed2b12b43; diff check clean.
 All previous failure logs preserved. No completion or merge claim before the
 complete result. The required retry is justified by the failed completion
 witness and actual reviewed test fix. No training/real-data probe authorized.
+
+## Fresh completion verification PASS and human handoff
+
+Full r3 command above ran at control revision
+`5d33b2dc9f701f5561ebb246f5edb94bd93e975c`, product/tests identical to final-reviewed
+`2b12b43cc3ef6d34d78e158df4455fd9b4f821d8`. Session64723 exited0. Root read the
+complete output: **5078 passed,11 skipped,1 warning in1220.29s (20m20s)**.
+The warning is the existing CPUAdam TORCH_CUDA_ARCH_LIST warning; skips are
+reported as skips, not executed passes. Log `final-full-suite-r3.log`, SHA256
+`e17f7a95a1eec5b18cce33e98bd6cf202433069da4dbbca492c4570ae0824377`.
+Earlier attempts remain recorded failures; they are not completion evidence.
+
+This one successful full-project witness after required fix/reviews supplies
+both verification-before-completion's test-pass claim and finishing Step1.
+It also runs all claim-specific metric/literal Teacher/selector/causality/
+parent/reference/DIL/resume/hash/legacy/throughput witnesses at the same revision.
+No duplicate suite is needed for overlapping claims. CPU contracts establish
+mechanics only; no production GPU equivalence, relevance, accuracy or cost claim.
+
+Fresh post-suite checks all PASS:
+
+```bash
+git diff --exit-code 2b12b43cc3ef6d34d78e158df4455fd9b4f821d8 -- src tests transformers/src scripts README.md run_stage1_training.sh run_multinode_stage1_training.sh
+git diff --check
+sha256sum logs/stage1-v5-content-metric-20261017/final-full-suite-r3.log docs/superpowers/specs/2026-10-17-stage1-v5-content-metric-design.md docs/superpowers/specs/2026-10-17-stage1-v5-content-metric-proposal-v1.md checkpoints/stage1-v5-adaptive-ce05-al05-g09-last-e3-w4-20261016-073334/checkpoint-648/stage1_v5.json
+```
+
+Frozen commitment/proposal and real historical sidecar hashes exactly match
+the recorded values. Tracked working tree was clean before this control-only
+completion record; original untracked caches/cancelled retrieval record remain.
+Workspace Gitdir/common-dir still identify the named host-owned worktree; keep
+it intact. `main` base candidate was detected, but human owns integration choice.
+
+Implementation complete with independent spec/quality/final reviews and fresh
+verification. Active phase: finishing Steps2-4, awaiting human branch disposition
+(local merge, push/PR, keep, discard). No merge, push, cleanup, training,
+evaluation or real-data premise probe has run. Planning approval binds to exact
+commitment v1; semantic usefulness uncertainty remains as disclosed.

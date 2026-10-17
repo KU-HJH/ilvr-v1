@@ -775,7 +775,7 @@ with `Final hidden-state selector for adaptive training (last only)`; retain
 historical read support in the model-independent validator. Add no temperature,
 head or third-mode public option.
 
-- [ ] **Step 10: Run one focused set and smallest actual-parent integration, then commit.**
+- [x] **Step 10: Run one focused set and smallest actual-parent integration, then commit.**
 
 ```bash
 ./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_history_metric.py tests/stage1/test_history_query.py tests/stage1/test_history_targets.py tests/stage1/test_cli.py tests/stage1/test_composition.py tests/stage1/v5/test_resume.py tests/stage1/v5/test_history_integration.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_workflow.py tests/stage1/v5/test_trainer.py tests/stage1/v5/test_launcher.py
@@ -805,14 +805,14 @@ the relevant reviewers re-review before task completion. Root does not fix code.
 
 ## Final review, fresh verification and branch handoff
 
-- [ ] Root dispatches a final independent whole-change reviewer after both task
+- [x] Root dispatches a final independent whole-change reviewer after both task
 reviews pass. Provide baseline `b39e0f2`, final product commit and the exact bound
 spec. Review actual entrypoints/parent hooks and strict old/new contracts, not
 comments/test names. No code edits or advisory hook spawning by reviewers.
-- [ ] Route any finding through the selected SDD implementer/fixer, then obtain
+- [x] Route any finding through the selected SDD implementer/fixer, then obtain
 the required re-review. Preserve unresolved issues honestly; tests alone are not
 approval. Record IDs, verdicts, commits and exact evidence in the workflow ledger.
-- [ ] Read/apply verification-before-completion and finishing-a-development-branch
+- [x] Read/apply verification-before-completion and finishing-a-development-branch
 before choosing the final command. The final branch gate applies when handing
 off the completed feature. Its project full suite is selected as the shared
 fresh test-pass witness, run once at the independently reviewed final revision:
@@ -829,7 +829,7 @@ Expected: exit0 with all applicable tests passing; established skips may remain.
 Read complete output and preserve counts/duration/warnings. A configured process
 or test filename does not prove a runtime claim. Capture separate claim-specific
 query/Teacher/resume witnesses once if the suite did not already run them.
-- [ ] Run `git diff --check`, verify reviewed product commit identity, audit
+- [x] Run `git diff --check`, verify reviewed product commit identity, audit
 changed-path scope and control hashes. Persist minimal approval/agent/review/
 verification evidence; leave pre-existing caches, worktrees and checkpoints.
 - [ ] Present the finishing skill's applicable human branch disposition choices.
@@ -882,3 +882,5 @@ causal actual-source hash test that exposed this mismatch.
 Final-suite consumer finding: `tests/stage1/v5/test_launcher.py` imports the now-current adaptive contract but retained a `last4` assertion. Full-suite RED (5077 passed, one failed) exposed this omitted consumer. Reopen Task 2 only for its current-schema assertions, preserve both-node coordinator/parser and resume/default-omission checks, and fix through the original SDD implementer with spec/quality/final delta re-review. Existing identical product reviews are reused; a fresh full suite is required after the failed witness.
 
 Launcher delta review closure: original implementer commit `2b12b43` received independent SPEC, QUALITY and final whole-change extension PASS. Focused evidence is the identical 548-test set plus the changed launcher file’s nine-test GREEN; do not repeat the former set just to update a checkbox. The required fresh full-project suite covers their combined current revision and remains the completion witness.
+
+Fresh final witness: at control revision `5d33b2d`, identical reviewed product/tests to `2b12b43`, full project r3 exited0: **5078 passed, 11 skipped, 1 existing warning in1220.29s**. Root read complete output. Log `logs/stage1-v5-content-metric-20261017/final-full-suite-r3.log`, SHA256 `e17f7a95a1eec5b18cce33e98bd6cf202433069da4dbbca492c4570ae0824377`. This covers the combined focused/launcher set and both completion gates. Earlier failed logs remain failures. Source equality, diff hygiene and frozen design/proposal/historical sidecar hashes freshly PASS. Human branch disposition remains pending; no merge/push/cleanup/training.
