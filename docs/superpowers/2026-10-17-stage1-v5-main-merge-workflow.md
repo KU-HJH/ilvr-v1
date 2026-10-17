@@ -92,3 +92,26 @@ regression. This is within the already-approved lifecycle-preservation scope,
 not a new formula/design; no new costly premise experiment. Selected SDD/TDD
 and independent spec/quality/final review are mandatory. Root makes no product
 edits. Final merged test-pass/cleanup remains gated on actual correction.
+
+## F1 delegated implementation and causal evidence
+
+Fresh `/root/stage1_v5_merge_context_fix` implemented the complete bounded brief
+from controlb6e4b7e. It committed only src/stage1/trainer.py and
+tests/stage1/v5/test_trainer.py at
+`c2a817d062870ff317dbf26a0c436ef36848898a`:five-line active-V5 getter guard and
+one51-line real-parent ownership regression. Same super.training_step dispatch;
+all ordinary main wrapper bytes after the guard retained. No other product edit.
+
+Root inspected actual diff and read complete causal logs: f1-red.log fails the
+new explicit legacy-owner assertion AFTER real backward in8.98s, before the
+production edit; f1-green-regression.log1passed in8.83s; f1-green-focused.log
+13passed in11.18s (ordinary main5, previously failing V5seven, new regression1).
+Test asserts real p=.05/checkpoint replay, all F/packed original/recompute
+site events, finite/nonzero gradients, one native backward and closed/cleared
+contexts. This is observed mechanics, not production/GPU equivalence.
+
+Fresh independent `/root/stage1_v5_main_fix_spec` is reviewing actual F1 scope
+and evidence. Spec pending; quality and final integration re-review must follow
+PASS in order. No merged full-suite pass or cleanup yet. Root only authors
+control records. Initial failed integration review and all failure evidence
+are preserved as failed findings pending actual re-review closure.
