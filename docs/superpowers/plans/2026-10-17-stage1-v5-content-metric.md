@@ -853,3 +853,11 @@ reuse existing `RecordingBuilder`, `builder`, `observe_build`, `contract`, `api`
 and tiny DoRA fixture definitions in their named files. Current and historical
 fixtures are deliberately separate. Every changed behavior has an identified
 RED and runtime/contract witness. No unassigned requirement remains.
+
+Execution clarification within the approved FP32 requirement: an enclosing
+CPU/CUDA autocast context can downcast matrix multiplication despite explicit
+float inputs. Disable autocast locally around metric scoring/aggregation using
+the validated input device type, and retain an enclosing CPU BF16 autocast
+regression against independent FP32 math. The Task 1 implementer observed this
+causal RED before the targeted fix. This is implementation detail, not a formula
+or design-scope change; no accuracy claim follows.

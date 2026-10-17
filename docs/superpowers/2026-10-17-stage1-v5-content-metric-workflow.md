@@ -167,3 +167,34 @@ proposed implementation. No product files have changed at this point.
 The previously selected Subagent-driven method is retained without another
 method-selection question. Next phase is SDD/TDD with fresh implementer agents,
 spec-before-quality task reviews and an independent final whole-change review.
+
+## SDD Task 1 in progress
+
+Root read/applied SDD, TDD, requesting-code-review and reviewer templates.
+Fresh implementer `/root/content_metric_math_impl` received the complete task
+requirements in a fresh-context dispatch; only two new pure metric/test files
+are owned. Base `9263b33b19913dd11dca6f39ffaaa9320937b25f`. No product activation.
+Implementer reported the literal missing-module RED and first arithmetic GREEN.
+It then added a CPU enclosing-autocast regression: FP32-cast inputs still ran
+BF16 matrix multiplication and failed expected arithmetic tolerance (~3.4e-4).
+Root authorized the local autocast-disable correction as necessary to meet the
+already-approved FP32 formula; no new scope or semantic calibration evidence.
+Plan clarification added. Full evidence/review verdicts remain pending.
+
+Root located the real historical adaptive sidecar read-only at
+`checkpoints/stage1-v5-adaptive-ce05-al05-g09-last-e3-w4-20261016-073334/checkpoint-648/stage1_v5.json`.
+It carries outer DIL schema1 and query schema1/native injected-prefix. Task 2
+will preserve and inspect it; a separate outer schema2 fixture is needed to
+isolate the native-query training rejection from the existing block-mean guard.
+
+Task 1 implementer completed at `9d1b03aa9394c18378fefe1c07b5745a0dbdfd5c`;
+root inspected actual two-file diff (97 module lines, 223 test lines) and read
+complete RED/GREEN logs: missing module, empty/validation/composition failures,
+caller-autocast arithmetic mismatch, malformed present-history summary failure,
+then final `167 passed in 3.30s` (exit0). Runtime remains unactivated. Scope
+contains only `history_metric.py` and its tests. Selector witness reports metric
+index0 versus uniform index1 with positive margins; no semantic usefulness claim.
+
+Fresh independent specification reviewer `/root/content_metric_math_spec`
+dispatched read-only against base `9263b33` and exact product `9d1b03a`.
+Review verdict pending; quality review and Task 2 cannot advance before PASS.
