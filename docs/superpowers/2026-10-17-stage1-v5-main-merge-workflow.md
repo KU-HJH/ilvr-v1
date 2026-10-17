@@ -115,3 +115,45 @@ and evidence. Spec pending; quality and final integration re-review must follow
 PASS in order. No merged full-suite pass or cleanup yet. Root only authors
 control records. Initial failed integration review and all failure evidence
 are preserved as failed findings pending actual re-review closure.
+
+F1 task review sequence completed at exact c2a817d: fresh distinct
+`/root/stage1_v5_main_fix_spec` SPEC PASS, then
+`/root/stage1_v5_main_fix_quality` QUALITY PASS. Both independently read actual
+two-file diff, real p=.05/checkpoint fixture, parent/MRO/dropout paths and full
+RED/GREEN/focused outputs. No Critical/Important/Minor findings. Removing the
+guard and the single new test restores entire base files; other main/V5 tests,
+V5Execution, equivalence and source feature paths remain unchanged. Neither
+reviewer edited code or repeated a broad suite. Original integration reviewer
+`/root/stage1_v5_main_merge_review` now re-reviews C1 and whole merge at the
+corrected revision; new report must preserve original failure artifacts.
+Final integration result and merged full suite remain pending.
+
+## Final independent integration review and selected completion witness
+
+Original reviewer `/root/stage1_v5_main_merge_review` completed final re-review
+at cfdb79b385ecd9efdd800c06079c9e09bc854f94/product c2a817d:
+SPEC PASS, QUALITY PASS; C1 CLOSED, no remaining inspected findings. Root read
+complete actual report and fresh focused output: 13 passed in11.15s, exit0.
+Report: results/stage1-v5-main-merge-20261017/integration-review-after-f1.md,
+SHA256 bad95abc4a22d6c823f2982f9780bd382fd9b12af66ea6232ea4bea6f096152d.
+Recorded scope independently traces installed MRO/native backward, proves exact
+whole-module preservation after removing F1, and checks initial failure hashes.
+Root checked all four new review evidence hashes OK. No product edits by root.
+
+Active gate: finishing-a-development-branch Option1 post-merge verification,
+with verification-before-completion. Prior source full-suite evidence satisfied
+pre-menu testing; one fresh merged full-suite below is required for the actual
+merged result. Product/test paths equal reviewed c2a817d; additional commits are
+controller evidence only. Fresh basetemp parent exists, chosen base and log are
+unused, checkpoint symlink/canonical resolved containment checked. Selected
+command, run from this worktree with repository venv:
+
+```bash
+env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-v5-main-merge-20261017/final-pytest-r1 > logs/stage1-v5-main-merge-20261017/final-full-suite.log 2>&1
+```
+
+This pending witness will be read completely and reused for the overlapping
+merged test-pass claim at both completion gates. No cleanup/completion claim
+until exit0. No training/push. Host-managed worktrees and lowercase stage1_v5
+remain preserved. Only merged uppercase Stage1-v5 branch is eligible for safe
+-d deletion after full verification and ownership/ancestry checks.
