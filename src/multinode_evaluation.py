@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -10,7 +11,9 @@ from evaluation.scoring import EvaluationScoreSummary
 
 
 NUM_EVALUATION_SHARDS = 4
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 6
+VISION_ABLATION_MANIFEST_SCHEMA_VERSION = 5
+REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION = 4
 SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION = 3
 GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION = 2
 LEGACY_MANIFEST_SCHEMA_VERSION = 1
@@ -45,6 +48,43 @@ def dataset_identity(dataset_path: str | os.PathLike[str]) -> dict[str, Any]:
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+
+
+def dataset_content_sha256(dataset_path: str | os.PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with Path(dataset_path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def authenticated_dataset_identity(dataset_path: str | os.PathLike[str], *,
+                                   canonical_identity_json: str | None = None,
+                                   expected_sha256: str | None = None,
+                                   num_shards: int = 1) -> dict[str, Any]:
+    """Authenticate mapped worker bytes before emitting the canonical identity.
+
+    No pair means the existing physical identity. Managed callers validate this
+    before model loading and again immediately before publishing a sidecar.
+    """
+    if (canonical_identity_json is None) != (expected_sha256 is None):
+        raise ValueError('managed dataset identity inputs must be paired')
+    actual = dataset_identity(dataset_path)
+    if canonical_identity_json is None:
+        return actual
+    if num_shards != NUM_EVALUATION_SHARDS:
+        raise ValueError('managed dataset identity requires four-shard evaluation')
+    if (not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+            or any(character not in '0123456789abcdef' for character in expected_sha256)):
+        raise ValueError('invalid expected dataset content SHA256')
+    try:
+        canonical = _validate_dataset_identity(json.loads(canonical_identity_json))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError('invalid canonical dataset identity') from error
+    if (actual['size'] != canonical['size']
+            or dataset_content_sha256(dataset_path) != expected_sha256):
+        raise ValueError('evaluation dataset content mismatch')
+    return canonical
 
 
 def resolve_evaluation_image_paths(
@@ -135,19 +175,52 @@ def _validate_generation_config(
     *,
     require_sequence_length: bool = True,
     require_repetition_penalty: bool = True,
+    require_vision_ablation: bool = False,
+    require_generation_limit_policy: bool = True,
+    include_default_vision_ablation: bool = False,
 ) -> dict[str, Any]:
     required = {"max_new_tokens", "temperature", "top_p"}
     if require_sequence_length:
         required.add("max_sequence_length")
     if require_repetition_penalty:
         required.add("repetition_penalty")
-    if not isinstance(value, dict) or set(value) != required:
+    if require_generation_limit_policy:
+        required.add("generation_limit_policy")
+    if require_vision_ablation:
+        required.add("vision_ablation")
+    accepted_field_sets = (
+        (required,)
+        if require_vision_ablation
+        else (required, required | {"vision_ablation"})
+    )
+    accepted_field_sets += tuple(
+        fields | {"disable_latent_generation"} for fields in accepted_field_sets
+    )
+    accepted_field_sets += tuple(
+        fields | {"use_kv_cache"} for fields in accepted_field_sets
+    )
+    accepted_field_sets += tuple(
+        fields | {"static_inference_cache"} for fields in accepted_field_sets
+    )
+    if not isinstance(value, dict) or set(value) not in accepted_field_sets:
         raise ValueError("invalid generation config")
+    if "disable_latent_generation" in value and type(value["disable_latent_generation"]) is not bool:
+        raise ValueError("invalid generation config disable_latent_generation")
+    if "use_kv_cache" in value and type(value["use_kv_cache"]) is not bool:
+        raise ValueError("invalid generation config use_kv_cache")
+    if "static_inference_cache" in value and type(value["static_inference_cache"]) is not bool:
+        raise ValueError("invalid generation config static_inference_cache")
+    if value.get("static_inference_cache", False) and not (
+        value.get("use_kv_cache", False) and value.get("disable_latent_generation", False)
+    ):
+        raise ValueError("static_inference_cache requires OFF with KV cache")
     max_new_tokens = value["max_new_tokens"]
     max_sequence_length = value.get("max_sequence_length")
     repetition_penalty = value.get("repetition_penalty")
     temperature = value["temperature"]
     top_p = value["top_p"]
+    vision_ablation = value.get("vision_ablation", "none")
+    generation_limit_policy = value.get("generation_limit_policy", "bounded")
     if not _is_int(max_new_tokens) or max_new_tokens <= 0:
         raise ValueError("invalid generation config max_new_tokens")
     if require_sequence_length and (
@@ -172,6 +245,10 @@ def _validate_generation_config(
         or not 0 < top_p <= 1
     ):
         raise ValueError("invalid generation config top_p")
+    if vision_ablation not in ("none", "all", "interleaved"):
+        raise ValueError("invalid generation config vision_ablation")
+    if generation_limit_policy not in ("bounded", "external_full_latent_block"):
+        raise ValueError("invalid generation config generation_limit_policy")
     normalized = {
         "max_new_tokens": max_new_tokens,
         "temperature": float(temperature),
@@ -181,6 +258,16 @@ def _validate_generation_config(
         normalized["max_sequence_length"] = max_sequence_length
     if require_repetition_penalty:
         normalized["repetition_penalty"] = float(repetition_penalty)
+    if require_vision_ablation or include_default_vision_ablation or "vision_ablation" in value:
+        normalized["vision_ablation"] = vision_ablation
+    if require_generation_limit_policy or "generation_limit_policy" in value:
+        normalized["generation_limit_policy"] = generation_limit_policy
+    if "disable_latent_generation" in value:
+        normalized["disable_latent_generation"] = value["disable_latent_generation"]
+    if "use_kv_cache" in value:
+        normalized["use_kv_cache"] = value["use_kv_cache"]
+    if "static_inference_cache" in value:
+        normalized["static_inference_cache"] = value["static_inference_cache"]
     return normalized
 
 
@@ -213,7 +300,11 @@ def write_shard_manifest(
         raise ValueError("worker exit status must be a non-negative integer")
 
     identity = _validate_dataset_identity(dict(dataset_identity))
-    generation = _validate_generation_config(dict(generation_config))
+    generation_input = dict(generation_config)
+    generation_input.setdefault("generation_limit_policy", "bounded")
+    generation = _validate_generation_config(
+        generation_input, include_default_vision_ablation=True
+    )
     expected = _validate_index_list(
         list(expected_source_indices), "expected source indices"
     )
@@ -269,6 +360,8 @@ def _validate_manifest(
         raise ValueError(f"unsupported shard manifest schema in {path}")
     if schema_version in (
         MANIFEST_SCHEMA_VERSION,
+        VISION_ABLATION_MANIFEST_SCHEMA_VERSION,
+        REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION,
         SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION,
         GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION,
     ):
@@ -298,6 +391,8 @@ def _validate_manifest(
         raise ValueError(f"invalid model identity in {path}")
     if schema_version in (
         MANIFEST_SCHEMA_VERSION,
+        VISION_ABLATION_MANIFEST_SCHEMA_VERSION,
+        REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION,
         SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION,
         GENERATION_CONFIG_MANIFEST_SCHEMA_VERSION,
     ):
@@ -305,9 +400,30 @@ def _validate_manifest(
             manifest["generation_config"],
             require_sequence_length=(
                 schema_version
-                in (MANIFEST_SCHEMA_VERSION, SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION)
+                in (
+                    MANIFEST_SCHEMA_VERSION,
+                    VISION_ABLATION_MANIFEST_SCHEMA_VERSION,
+                    REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION,
+                    SEQUENCE_LENGTH_MANIFEST_SCHEMA_VERSION,
+                )
             ),
-            require_repetition_penalty=(schema_version == MANIFEST_SCHEMA_VERSION),
+            require_repetition_penalty=(
+                schema_version in (
+                    MANIFEST_SCHEMA_VERSION,
+                    VISION_ABLATION_MANIFEST_SCHEMA_VERSION,
+                    REPETITION_PENALTY_MANIFEST_SCHEMA_VERSION,
+                )
+            ),
+            require_vision_ablation=(
+                schema_version
+                in (
+                    MANIFEST_SCHEMA_VERSION,
+                    VISION_ABLATION_MANIFEST_SCHEMA_VERSION,
+                )
+            ),
+            require_generation_limit_policy=(
+                schema_version == MANIFEST_SCHEMA_VERSION
+            ),
         )
     exit_status = manifest["worker_exit_status"]
     if not _is_int(exit_status) or exit_status < 0:
@@ -443,7 +559,13 @@ def merge_shards(
             common_generation_config = generation_config
             generation_config_initialized = True
         elif generation_config != common_generation_config:
-            raise ValueError("generation config mismatch across shards")
+            # Historical absence and explicit false select the same execution.
+            current_config = dict(generation_config or {})
+            first_config = dict(common_generation_config or {})
+            current_config.setdefault("static_inference_cache", False)
+            first_config.setdefault("static_inference_cache", False)
+            if current_config != first_config:
+                raise ValueError("generation config mismatch across shards")
         manifests[shard_index] = (manifest, jsonl_path)
     if set(manifests) != set(range(NUM_EVALUATION_SHARDS)):
         raise ValueError("merge requires shard indices 0-3 exactly once")
@@ -455,6 +577,14 @@ def merge_shards(
         rows = _read_shard_rows(jsonl_path)
         actual_indices = []
         for row in rows:
+            row_cache = row.get("use_kv_cache", False)
+            manifest_cache = (manifest.get("generation_config") or {}).get("use_kv_cache", False)
+            if type(row_cache) is not bool or row_cache != manifest_cache:
+                raise ValueError("cache execution mode mismatch between row and manifest")
+            row_static = row.get("static_inference_cache", False)
+            manifest_static = (manifest.get("generation_config") or {}).get("static_inference_cache", False)
+            if type(row_static) is not bool or row_static != manifest_static:
+                raise ValueError("static inference cache mode mismatch between row and manifest")
             source_index = row["index"]
             if source_index in rows_by_index:
                 raise ValueError(f"duplicate source index {source_index}")

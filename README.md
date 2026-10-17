@@ -1,5 +1,12 @@
 # [ACL'26 Oral] ILVR: Interleaved Latent Visual Reasoning with Selective Perceptual Modeling
 
+## Final Stage 1/2 training
+
+For the consolidated Stage 1 → Stage 2 training and evaluation workflow, start
+with [the final training runbook](docs/final-stage1-stage2/README.md). Its
+[provenance manifest](docs/final-stage1-stage2/PROVENANCE.md) records the exact
+source and evidence boundaries.
+
 [![arXiv](https://img.shields.io/badge/arXiv-2512.05665-b31b1b.svg)](https://arxiv.org/abs/2512.05665)
 [![ACL 2026](https://img.shields.io/badge/ACL%202026-Accepted-success)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -118,6 +125,100 @@ The supported new-run operator commands live in
 is a Stage 1 compatibility wrapper; use it only with the guide's canonical
 checkpoint, result, and log roots rather than editing generic output paths.
 
+### Stage 1-v5 history queries
+
+Stage1-v5 defaults to `--query_mode legacy`; existing `textual_states` behavior
+is preserved. Adaptive queries are opt-in with `--query_mode adaptive`,
+`--history_text_gamma 0.9` and `--history_attention_layers last`. New adaptive
+training uses the final-normalized Teacher hidden states and accepts `last` only;
+`last4` and `all` remain readable for historical artifact inspection.
+Adaptive mode rejects an explicitly supplied
+`--textual_states`, including the same value as the legacy default.
+
+Use the existing v5 recipe to preview the coordinator command, inference
+preparation and TEST400 evaluation commands. Set `STAGE1_MAX_STEPS` from the
+retained-data/prepared-loader audit, and set the two remote roots to the
+compatible reviewed checkout; the example only prints commands:
+
+```bash
+bash scripts/stage1_v5_train_eval.sh \
+  --run-id stage1-v5-adaptive-example \
+  --main-process-port 29683 \
+  --remote-repo-root /root/workspace/ILVR \
+  --remote-host-repo-root /home/korea/Workspace/hjh/workspace/ILVR \
+  --max-steps "${STAGE1_MAX_STEPS:?set from the prepared-loader audit}" \
+  --query_mode adaptive --history_text_gamma 0.9 \
+  --history_attention_layers last --dry-run
+```
+
+The first printed command invokes `run_multinode_stage1_training.sh`; append
+`--dry-run` to that command to inspect the coordinator's mapped node commands.
+A preview establishes arguments only. Actual execution requires the existing
+two-node/four-rank preflight and separately authorized launch, with compatible
+code/environments and the resolved profile recorded on both nodes. The recipe
+enforces its selected fresh-run profile after optional `--settings` sourcing:
+Qwen2.5-VL/DoRA r32/alpha64/dropout 0.05, latent size 8, per-device batch 1,
+GAS 4/global batch 16, frozen initial effective reference/tau 1, BF16,
+decoder SDPA, vision FlashAttention2, existing gradient checkpointing and
+ZeRO-1. It uses CE 0.1/alignment 0.1, v5 DIL beta 1/margin 0/preference weight 1,
+top-k entropy 0.1 with K 50, Text-off KL 0.01, LR 5e-5, seed 42 and warmup 10.
+The original base is the initializer; previous Stage2 weights are not inputs.
+
+Stage1-v5 DIL averages eligible token losses across the actual optimizer window
+and all four ranks. Entropy/mass still average original-block token means,
+including empty blocks in their denominator; CE/alignment/Text-off KL retain
+configured-GAS scaling. New token-mean training requires `selection=all` in both
+query modes. Historical block-mean sidecars remain readable for inspection;
+resuming those runs requires their original reviewed code. Changing to token
+mean requires a fresh run, which saves a distinct schema-2 reduction contract.
+
+Adaptive target selection observes the Teacher with the literal ILVR/legacy
+wrapper call: full sample token IDs, original images, and actual latent-pad token
+embeddings. It makes one full-sequence language observation; selected targets
+are never injected into that observation. The native causal mask, sliding-window
+configuration and MRoPE preparation stay with the existing wrapper. Helper images
+are encoded separately and supply candidates only.
+
+History relevance is external FP32 cosine softmax at fixed temperature 1. For
+each current assistant-text row before the current START, it scores all earlier
+selected **raw visual target rows**; it then averages the text-row probabilities
+and sums the raw values with those weights. This is relative content relevance,
+not native attention mass. Query/key chunks 64/2048 bound metric workspace.
+Nonempty segment means receive one discounted vote per segment (gamma 0.9 by
+default). Intent, available discounted text and available history have equal
+coefficients. Empty current text or empty prior history omits the history term;
+previous discounted text may still contribute. No current/future helper or
+selected target changes the Teacher observation.
+
+`stage1_v5.json` records query identity separately from the loss. Legacy remains
+schema 1 with `stage1_legacy_query_v1`; current adaptive uses query schema 2 and
+`stage1_placeholder_discounted_segments_cosine_relative_v2`, including its
+placeholder Teacher context, native mask, final-normalized hidden states,
+gamma, query/key chunks and fixed temperature. Historical native-adaptive query
+schema 1 (`stage1_injected_prefix_discounted_segments_attention_mass_v1`) remains
+readable, but training requires its original reviewed code; switching to external
+content adaptive requires a fresh run. Resume inherits supported saved settings
+and rejects semantic conflicts. Historical query-less checkpoints mean legacy
+only. The recipe above is for fresh runs; resume through the existing coordinator
+with saved identity and a fresh attempt ID. Base/reference/source checks continue
+to apply.
+
+The target-selection Teacher remains the frozen initial effective DoRA model
+(EMA tau 1). DIL reference scoring retains its existing rules and weights and
+consumes the shared detached selected targets. Losses, global-token DIL reduction,
+auxiliary scaling, workers, sampler and optimizer lifecycle are unchanged. The
+new metric's usefulness, runtime cost and accuracy are **unmeasured**.
+
+The CPU integration witnesses use tiny FP32 Qwen/DoRA models and the actual
+v5 parent-Trainer backward path. They check shared selected targets across
+F/reference/packed OFF, student gradients with a frozen reference, configured
+GAS denominators on partial windows and empty auxiliaries, decoder call counts,
+repeated-build RNG/hook cleanup, and saved-config next-target reproducibility.
+These tests do not run the production composition/ZeRO lifecycle, BF16/GPU or
+FlashAttention2 execution, four-rank training, long real inputs, performance or
+benchmark evaluation. Those runtime results remain unverified by this CPU
+integration check.
+
 <!-- BEGIN HISTORICAL NONCANONICAL PERFORMANCE WORKFLOW -->
 ### Historical Full and DoRA performance-workflow provenance — do not run
 
@@ -139,6 +240,79 @@ Stage 2 starts from a Stage 1 checkpoint and replaces CoMT helper-image steps
 with differentiable continuous-latent blocks. The original/user image remains
 a model input, but helper images are never loaded as Stage 2 visual inputs. The
 entire visual tower is frozen and is encoded once per rank-local batch.
+
+#### Stage 2B context preference
+
+Context preference is the default Stage 2B objective. With real Stage 1 and
+Stage 2A checkpoints and dataset paths, launch it in this form:
+
+```bash
+STEP_PREFERENCE_ENABLED=true \
+STEP_PREFERENCE_MODE=stage2b \
+STEP_PREFERENCE_OBJECTIVE=context_preference \
+CE_WEIGHT=0.1 \
+STEP_PREFERENCE_BETA=10.0 \
+STEP_PREFERENCE_WEIGHT=1.0 \
+STEP_PREFERENCE_MARGIN=0.5 \
+STEP_ENTROPY_WEIGHT=0.1 \
+STEP_ENTROPY_MARGIN=0.1 \
+STAGE1_CHECKPOINT="$STAGE1_CHECKPOINT" \
+STAGE2A_CHECKPOINT_PATH="$STAGE2A_CHECKPOINT_PATH" \
+DATA_PATH="$DATA_PATH" IMAGE_ROOT="$IMAGE_ROOT" \
+OUTPUT_DIR="$OUTPUT_DIR" \
+bash run_stage2_training.sh
+```
+
+Set `OUTPUT_DIR` to a distinct run directory below the current worktree's
+`checkpoints/` symlink. The context objective shares the clean prefix. Its
+default V-only route scores the clean and visual-off (V) contexts; the V+T
+opt-out additionally scores the textual-off (T) context, for at most three
+scoring decoder calls per local microbatch. Existing clean latent decoder
+calls and backward checkpoint recomputation are counted and reported
+separately. The default context route performs zero reference forwards,
+negative generations, rejected-branch scorings, or preference rollouts.
+
+Context-preference Stage 2B defaults to the selected V-only configuration: the
+preference target is `immediate_text`, and the visual-off comparison suppresses
+the current latent control boundaries. No extra settings are required.
+
+To restore the former V+T comparison, or to keep the latent boundaries visible
+in a V-only run, use the corresponding explicit opt-out:
+
+```bash
+STEP_VISUAL_ONLY_CONTEXT_PREFERENCE=false \
+bash run_stage2_training.sh
+
+STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES=false \
+bash run_stage2_training.sh
+```
+
+Boundary suppression is valid only with V-only context preference. Its V-off
+sidecar blocks root attention to `<|latent_start|>`, every current latent
+state, and `<|latent_end|>`, and replaces the replayed `<|latent_end|>` query
+embedding with a fixed zero vector. Clean scoring, including ordinary latent
+boundary supervision, remains unchanged. This is a content intervention that
+preserves the original mRoPE positions and latent-block geometry; it is not
+equivalent to deleting the latent block from the sequence.
+
+Each target block score is its mean target-token log probability. Preference
+uses `-logsigmoid(beta * delta - margin)`, subtracting the tunable margin
+outside beta. Fresh training defaults to CE weight 0.1, ordinary preference
+beta 10 / margin 0.5, and preference weight 1. All [DIL-BCE variants](docs/dil-bce.md)
+instead use beta 1 / margin 0. Keep existing runs and saved resume coefficients
+and loss semantics; the historical 54% result used CE1 / beta0.5 / margin0.
+Preference and entropy losses are reduced within each step first, then all V/T steps have
+equal weight, so longer text steps do not receive more weight. Every valid
+step is scored. If the input does not fit memory, report the input size as a
+blocker; do not split sidecar groups into chunks or silently drop steps to fit.
+These call-count and numerical checks establish implementation behavior, not
+training quality, long real-input memory suitability, or paper-level results.
+
+Ordinary Stage 2 remains available with `STEP_PREFERENCE_ENABLED=false`.
+Historical DPO experiments require the explicit
+`STEP_PREFERENCE_OBJECTIVE=legacy_dpo` selection and their separate legacy
+negative data and manifest files; those artifacts are not inputs to context
+preference.
 
 `run_stage2_training.sh` launches the Stage 2 path with this checkout's
 `./venv/ilvr-venv` Python and local `transformers/src` and `src` trees. It is

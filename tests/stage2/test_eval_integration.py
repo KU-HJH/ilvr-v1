@@ -44,7 +44,38 @@ from tests.stage2.test_stage1_checkpoint_handoff import (
 )
 
 
+@pytest.fixture(autouse=True)
+def restore_evaluator_backend_precision():
+    """Evaluator loading enables TF32; it must not leak into later numeric tests."""
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+
 MODULE_NAMES = ("eval", "evaluate_deepseed")
+
+
+@pytest.mark.gpu
+def test_evaluation_runtime_sidecar_counts_concrete_blocks_exclusively(monkeypatch, tmp_path):
+    module = importlib.import_module("eval")
+    from tests.stage2.test_attention_backend import _load_tiny_mixed_model
+    model, *_ = _load_tiny_mixed_model()
+    assert hasattr(module, "publish_evaluation_runtime_identity"), "evaluation runtime publisher missing"
+    from step_preference import capacity_evidence
+    monkeypatch.setattr(capacity_evidence, "git_identity", lambda: "a"*40)
+    output=tmp_path / "runtime.json"
+    module.publish_evaluation_runtime_identity(model, tmp_path, output)
+    payload=json.loads(output.read_bytes())
+    assert payload["language_attention_layer_count"] == payload["vision_attention_block_count"] == 2
+    with pytest.raises(ValueError): module.publish_evaluation_runtime_identity(model,tmp_path,output)
+    model.visual.blocks[0].attn=nn.Identity()
+    rejected=tmp_path / "rejected.json"
+    with pytest.raises(ValueError): module.publish_evaluation_runtime_identity(model,tmp_path,rejected)
+    assert not rejected.exists()
 LATENT_TOKEN_IDS = {
     "<|latent_pad|>": 90,
     "<|latent_start|>": 91,
@@ -230,6 +261,19 @@ class RealControllerCapModel(ModelWhoseGenerateRaises):
 def _import_entry_point(module_name, monkeypatch):
     module = importlib.import_module(module_name)
     monkeypatch.setattr(module.torch.cuda, "is_available", lambda: False)
+    if hasattr(module, "load_qwen2_5_vl_with_attention"):
+        monkeypatch.setattr(
+            module,
+            "load_qwen2_5_vl_with_attention",
+            lambda source, **kwargs: kwargs["load_model"](
+                source, **dict(kwargs["model_load_kwargs"])
+            ),
+        )
+        monkeypatch.setattr(
+            module,
+            "validate_qwen2_5_vl_attention_backends",
+            lambda *_args, **_kwargs: None,
+        )
     return module
 
 
@@ -272,7 +316,9 @@ def _saved_adapter_artifact(tmp_path, method="lora"):
     source = build_stage2_tuned_model(source_base, tuning).eval()
     activate_stage2_adapter_deltas(source)
     artifact_dir = tmp_path / "adapter"
-    source.save_pretrained(artifact_dir)
+    # Synthetic base has no on-disk config; PEFT deliberately assumes unchanged vocab.
+    with pytest.warns(UserWarning, match=r"Could not find a config file in  - will assume that the vocabulary was not modified\."):
+        source.save_pretrained(artifact_dir)
     save_stage2_peft_metadata(
         artifact_dir,
         build_stage2_peft_metadata(
@@ -342,6 +388,8 @@ def test_eval_cli_accepts_explicit_stage1_base(module_name, monkeypatch):
         ],
     )
 
+    if module_name == "eval":
+        monkeypatch.setattr(sys, "argv", [*sys.argv,"--runtime_identity_path","runtime.json"])
     assert module.get_eval_args().base_model_dir == "stage1"
 
 
@@ -363,6 +411,8 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
         ],
     )
 
+    if module_name == "eval":
+        monkeypatch.setattr(sys, "argv", [*sys.argv,"--runtime_identity_path","runtime.json"])
     args = module.get_eval_args()
 
     assert args.num_shards == 1
@@ -371,10 +421,12 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
     assert args.max_new_tokens == 4096
     assert args.max_sequence_length == 32768
     assert args.repetition_penalty == 1.05
+    assert args.generation_limit_policy == "bounded"
 
 
 def _run_main_with_fake_sample(
-    module, monkeypatch, tmp_path, *, num_shards, shard_index=0, fail_index=None
+    module, monkeypatch, tmp_path, *, num_shards, shard_index=0, fail_index=None,
+    disable_latent_generation=False,
 ):
     (tmp_path / "image.png").write_bytes(b"image")
     dataset = tmp_path / "test.jsonl"
@@ -411,11 +463,12 @@ def _run_main_with_fake_sample(
             num_shards=num_shards,
             shard_index=shard_index,
             model_identity=None,
+            disable_latent_generation=disable_latent_generation,
         ),
     )
     monkeypatch.setattr(module, "load_evaluation_artifacts", lambda **_kwargs: (object(), object()))
 
-    def run_one(_model, _processor, sample, _gen_kwargs):
+    def run_one(_model, _processor, sample, _gen_kwargs, *, disable_latent_generation=False):
         assert _gen_kwargs["max_sequence_length"] == 32768
         assert _gen_kwargs["repetition_penalty"] == 1.05
         index = int(sample["text_input"].rsplit("-", 1)[1])
@@ -428,8 +481,8 @@ def _run_main_with_fake_sample(
             "prompt_identity": "p" * 64,
             "prompt_token_length": 2,
             "generated_suffix_token_ids": [21, 22],
-            "latent_start_count": 1,
-            "latent_block_count": 1,
+            "latent_start_count": 0 if disable_latent_generation else 1,
+            "latent_block_count": 0 if disable_latent_generation else 1,
             "stop_reason": "eos",
         }
         if module.__name__ == "eval":
@@ -581,12 +634,14 @@ def test_default_single_worker_records_shared_answer_scoring(
             "latent_start_count": 1,
             "latent_block_count": 1,
             "stop_reason": "eos",
+            "vision_ablation": None,
+            "input_image_count": None,
             "match": True,
         }
         rows = [dict(row, index=index) for index in range(6)]
 
     expected = "".join(
-        json.dumps(row, ensure_ascii=False) + "\n" for row in rows
+        json.dumps(row, ensure_ascii=False, **({"sort_keys":True,"separators":(",",":")} if module_name == "eval" else {})) + "\n" for row in rows
     )
     assert result is None
     assert output.read_text(encoding="utf-8") == expected
@@ -721,7 +776,9 @@ def test_inference_error_rows_preserve_invalid_gold_for_summary(
         return result
 
     monkeypatch.setattr(module, "run_one_example", run_one)
-    module.main()
+    exit_status = module.main()
+    if module_name == "eval":
+        assert exit_status == 1, "caught inference errors must fail the evaluation process"
 
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     failed = next(row for row in rows if row.get("index") == 0)
@@ -770,10 +827,33 @@ def test_four_shard_worker_uses_global_indices_and_writes_success_sidecar(
         "repetition_penalty": 1.05,
         "temperature": 0.0,
         "top_p": 1.0,
+        "vision_ablation": "none",
+        "generation_limit_policy": "bounded",
     }
     assert manifest["expected_source_indices"] == [1, 5]
     assert manifest["processed_source_indices"] == [1, 5]
     assert manifest["worker_exit_status"] == 0
+
+
+def test_four_shard_latent_off_eval_publishes_condition_in_real_manifest(
+    monkeypatch, tmp_path
+):
+    """Rejecting or dropping the OFF condition at publication must fail this test."""
+    module = _import_entry_point("eval", monkeypatch)
+    _dataset, output, result = _run_main_with_fake_sample(
+        module, monkeypatch, tmp_path, num_shards=4, shard_index=1,
+        disable_latent_generation=True,
+    )
+
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    manifest = json.loads(Path(f"{output}.manifest.json").read_text())
+    assert result == 0
+    assert [row["index"] for row in rows] == [1, 5]
+    assert all(row["disable_latent_generation"] is True for row in rows)
+    assert all(row["latent_block_count"] == 0 for row in rows)
+    assert manifest["generation_config"]["disable_latent_generation"] is True
+    assert manifest["worker_exit_status"] == 0
+    assert manifest["processed_source_indices"] == [1, 5]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
@@ -858,6 +938,7 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
     processor = FakeProcessor()
     processor_sources = []
     model_sources = []
+    validations = []
 
     def load_processor(source, **_kwargs):
         processor_sources.append(source)
@@ -873,6 +954,12 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
         "from_pretrained",
         load_model,
     )
+    monkeypatch.setattr(
+        module,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda selected, **kwargs: validations.append((selected, kwargs)),
+        raising=False,
+    )
 
     model, loaded_processor = module.load_evaluation_artifacts(
         model_dir=str(artifact_dir),
@@ -885,6 +972,236 @@ def test_peft_eval_loads_processor_from_adapter_and_model_from_stage1_base(
     assert processor_sources == [str(artifact_dir)]
     assert model_sources == [str(base_dir)]
     assert resolve_stage2_qwen_model(model).config.stage == "stage2"
+    assert validations == [
+        (
+            resolve_stage2_qwen_model(model),
+            {
+                "attention_implementation": "sdpa",
+                "vision_attention_implementation": "flash_attention_2",
+            },
+        )
+    ] * 2
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_load_model_requires_fixed_mixed_backend_and_validates_runtime(
+    module_name, monkeypatch,
+):
+    """Catches evaluation flattening both towers onto one attention backend."""
+    module = _import_entry_point(module_name, monkeypatch)
+    model = tiny_stage2_qwen()
+    loads = []
+    direct_loads = []
+    validations = []
+
+    def load_mixed(source, **kwargs):
+        loads.append((source, kwargs))
+        return model
+
+    monkeypatch.setattr(
+        module, "load_qwen2_5_vl_with_attention", load_mixed, raising=False
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **kwargs: direct_loads.append((source, kwargs)) or model,
+    )
+    monkeypatch.setattr(
+        module,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda selected, **kwargs: validations.append((selected, kwargs)),
+        raising=False,
+    )
+
+    assert module.load_model("model", "cache") is model
+    assert model.training is False
+    assert torch.backends.cuda.matmul.allow_tf32 is True
+    assert direct_loads == [], "loader bypassed the authenticated mixed backend"
+    assert loads[0][0] == "model"
+    assert loads[0][1]["attention_implementation"] == "sdpa"
+    assert loads[0][1]["vision_attention_implementation"] == "flash_attention_2"
+    assert loads[0][1]["config_load_kwargs"] == {"cache_dir": "cache"}
+    assert loads[0][1]["model_load_kwargs"] == {
+        "cache_dir": "cache",
+        "device_map": "auto",
+        "torch_dtype": torch.bfloat16,
+    }
+    assert "attn_implementation" not in loads[0][1]["model_load_kwargs"]
+    assert validations == [
+        (
+            model,
+            {
+                "attention_implementation": "sdpa",
+                "vision_attention_implementation": "flash_attention_2",
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ImportError("cannot import flash_attn CUDA extension"),
+        ValueError("FlashAttention2 class resolution failed"),
+    ],
+    ids=("initialization", "class-resolution"),
+)
+def test_eval_mixed_backend_failure_propagates_without_eager_retry(
+    module_name, monkeypatch, failure
+):
+    """Catches evaluation retrying an unauthenticated eager model after mixed failure."""
+    module = _import_entry_point(module_name, monkeypatch)
+    calls = []
+
+    def fail_mixed(source, **kwargs):
+        calls.append(
+            (
+                source,
+                kwargs["attention_implementation"],
+                kwargs["vision_attention_implementation"],
+            )
+        )
+        raise failure
+
+    monkeypatch.setattr(
+        module, "load_qwen2_5_vl_with_attention", fail_mixed, raising=False
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(type(failure), match=str(failure)) as raised:
+        module.load_model("model", "cache")
+
+    assert raised.value is failure
+    assert calls == [("model", "sdpa", "flash_attention_2")]
+
+
+def _use_cpu_mixed_loader(module, monkeypatch):
+    """Keep construction/validation real; bypass only CUDA availability and disk weights."""
+    from stage2.attention_backend import (
+        load_qwen2_5_vl_with_attention,
+        validate_qwen2_5_vl_attention_backends,
+    )
+    from transformers import AutoConfig
+
+    def construct(source, **kwargs):
+        config = kwargs.get("config")
+        if config is None:
+            config = AutoConfig.from_pretrained(source)
+            config._attn_implementation = "sdpa"
+            config._attn_implementation_autoset = True
+            config.vision_config._attn_implementation = "flash_attention_2"
+            config.vision_config._attn_implementation_autoset = True
+        return module.Qwen2_5_VLForConditionalGeneration(config)
+
+    monkeypatch.setattr(
+        module, "load_qwen2_5_vl_with_attention", load_qwen2_5_vl_with_attention,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module, "validate_qwen2_5_vl_attention_backends",
+        validate_qwen2_5_vl_attention_backends, raising=False,
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "_check_and_enable_flash_attn_2",
+        lambda config, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        construct,
+    )
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize("tower", ["vision", "language"])
+def test_full_eval_rejects_runtime_backend_mismatch_with_correct_config(
+    module_name, tower, monkeypatch, tmp_path
+):
+    """Config strings cannot authenticate a wrong actual attention module."""
+    module = _import_entry_point(module_name, monkeypatch)
+    _use_cpu_mixed_loader(module, monkeypatch)
+    full_dir = tmp_path / "full"
+    _save_exact_base_source(tiny_stage2_qwen(), full_dir)
+    construct = module.Qwen2_5_VLForConditionalGeneration.from_pretrained
+
+    def load_wrong_runtime(source, **kwargs):
+        model = construct(source, **kwargs)
+        # Even the legacy loader receives correct strings in this negative control.
+        model.config._attn_implementation = "sdpa"
+        model.config.vision_config._attn_implementation = "flash_attention_2"
+        if tower == "vision":
+            model.visual.blocks[-1].attn = nn.Identity()
+        else:
+            model.model.layers[-1].self_attn = nn.Identity()
+        return model
+
+    monkeypatch.setattr(
+        module.Qwen2_5_VLForConditionalGeneration, "from_pretrained", load_wrong_runtime
+    )
+    monkeypatch.setattr(
+        module.AutoProcessor, "from_pretrained", lambda *_a, **_k: FakeProcessor()
+    )
+
+    with pytest.raises(ValueError, match=f"{tower} attention backend mismatch"):
+        module.load_evaluation_artifacts(
+            model_dir=str(full_dir), base_model_dir=None, cache_dir="cache"
+        )
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+@pytest.mark.parametrize(
+    "tower", [None, "vision", "language"],
+    ids=["valid", "wrong-vision", "wrong-language"],
+)
+def test_peft_eval_authenticates_resolved_backend_after_real_restore(
+    module_name, tower, monkeypatch, tmp_path
+):
+    """Omitting validation after real PEFT restoration must accept a wrong backend."""
+    module = _import_entry_point(module_name, monkeypatch)
+    _use_cpu_mixed_loader(module, monkeypatch)
+    artifact_dir, fresh_base = _saved_adapter_artifact(tmp_path)
+    base_dir = tmp_path / "stage1"
+    _save_exact_base_source(fresh_base, base_dir)
+    processor = FakeProcessor()
+    monkeypatch.setattr(
+        module.AutoProcessor, "from_pretrained", lambda *_a, **_k: processor
+    )
+    restore = module.load_stage2_model_for_inference
+    restored_models = []
+
+    def restore_then_mutate(*args, **kwargs):
+        model = restore(*args, **kwargs)
+        assert isinstance(model, PeftModel)
+        restored_models.append(model)
+        resolved = resolve_stage2_qwen_model(model)
+        assert resolved.config._attn_implementation == "sdpa"
+        assert resolved.config.vision_config._attn_implementation == "flash_attention_2"
+        if tower == "vision":
+            resolved.visual.blocks[-1].attn = nn.Identity()
+        elif tower == "language":
+            resolved.model.layers[-1].self_attn = nn.Identity()
+        return model
+
+    monkeypatch.setattr(module, "load_stage2_model_for_inference", restore_then_mutate)
+    if tower is None:
+        model, loaded_processor = module.load_evaluation_artifacts(
+            model_dir=str(artifact_dir), base_model_dir=str(base_dir), cache_dir="cache"
+        )
+        assert model is restored_models[0]
+        assert loaded_processor is processor
+        assert not model.training
+    else:
+        with pytest.raises(ValueError, match=f"{tower} attention backend mismatch"):
+            module.load_evaluation_artifacts(
+                model_dir=str(artifact_dir), base_model_dir=str(base_dir), cache_dir="cache"
+            )
+    assert len(restored_models) == 1
 
 
 def test_stage1_eval_loads_validated_stage1_dora_adapter(monkeypatch, tmp_path):
@@ -1361,7 +1678,7 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
     original_error = error_type(error_message)
 
     def fail_load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
+        calls.append(_source)
         raise original_error
 
     monkeypatch.setattr(
@@ -1373,7 +1690,7 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
     with pytest.raises(error_type, match=error_message) as raised:
         module.load_model("model", "cache")
     assert raised.value is original_error
-    assert calls == ["flash_attention_2"]
+    assert calls == ["model"]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
@@ -1389,7 +1706,7 @@ def test_non_backend_model_error_is_not_hidden_by_flash_fallback(
 def test_near_flash_attn_module_name_does_not_retry_eager(
     module_name, nested, error_message, monkeypatch
 ):
-    """Substring package-name matching must fail this actual-loader test."""
+    """Near-package errors remain visible without an evaluator retry."""
     module = _import_entry_point(module_name, monkeypatch)
     calls = []
     near_name_error = ImportError(error_message)
@@ -1400,7 +1717,7 @@ def test_near_flash_attn_module_name_does_not_retry_eager(
         original_error = near_name_error
 
     def fail_load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
+        calls.append(_source)
         raise original_error
 
     monkeypatch.setattr(
@@ -1412,21 +1729,21 @@ def test_near_flash_attn_module_name_does_not_retry_eager(
     with pytest.raises(type(original_error)) as raised:
         module.load_model("model", "cache")
     assert raised.value is original_error
-    assert calls == ["flash_attention_2"]
+    assert calls == ["model"]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
 def test_nested_non_backend_error_does_not_combine_classifier_signals(
     module_name, monkeypatch
 ):
-    """Combining classifier signals across exceptions must fail this test."""
+    """Nested configuration errors remain visible without an evaluator retry."""
     module = _import_entry_point(module_name, monkeypatch)
     calls = []
     original_error = RuntimeError("FlashAttention adapter load failed")
     original_error.__cause__ = ValueError("adapter dtype config mismatch")
 
     def fail_load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
+        calls.append(_source)
         raise original_error
 
     monkeypatch.setattr(
@@ -1438,7 +1755,7 @@ def test_nested_non_backend_error_does_not_combine_classifier_signals(
     with pytest.raises(RuntimeError, match="adapter load failed") as raised:
         module.load_model("model", "cache")
     assert raised.value is original_error
-    assert calls == ["flash_attention_2"]
+    assert calls == ["model"]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
@@ -1446,12 +1763,11 @@ def test_nested_non_backend_error_does_not_combine_classifier_signals(
 @pytest.mark.parametrize(
     "failure", ["unsupported-model", "missing-package"]
 )
-def test_real_transformers_flash_attention_error_retries_eager(
+def test_real_transformers_flash_attention_error_propagates_without_retry(
     module_name, nesting, failure, monkeypatch
 ):
-    """Ignoring the real Transformers traceback provenance must fail this test."""
+    """Even an authentic FA2 initialization failure must remain visible."""
     module = _import_entry_point(module_name, monkeypatch)
-    model = tiny_stage2_qwen()
     calls = []
     backend_error = _capture_transformers_flash_attention_error(
         module.Qwen2_5_VLForConditionalGeneration, monkeypatch, failure
@@ -1466,10 +1782,8 @@ def test_real_transformers_flash_attention_error_retries_eager(
         original_error = backend_error
 
     def load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
-        if kwargs["attn_implementation"] == "flash_attention_2":
-            raise original_error
-        return model
+        calls.append(_source)
+        raise original_error
 
     monkeypatch.setattr(
         module.Qwen2_5_VLForConditionalGeneration,
@@ -1477,8 +1791,10 @@ def test_real_transformers_flash_attention_error_retries_eager(
         load,
     )
 
-    assert module.load_model("model", "cache") is model
-    assert calls == ["flash_attention_2", "eager"]
+    with pytest.raises(type(original_error)) as raised:
+        module.load_model("model", "cache")
+    assert raised.value is original_error
+    assert calls == ["model"]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
@@ -1489,7 +1805,7 @@ def test_real_transformers_flash_attention_error_retries_eager(
 def test_identical_flash_attention_text_without_transformers_provenance_does_not_retry(
     module_name, nesting, failure, monkeypatch
 ):
-    """Restoring message-based classification must fail this test."""
+    """Fabricated backend errors remain visible without an evaluator retry."""
     module = _import_entry_point(module_name, monkeypatch)
     calls = []
     backend_error = _capture_transformers_flash_attention_error(
@@ -1506,7 +1822,7 @@ def test_identical_flash_attention_text_without_transformers_provenance_does_not
         original_error = fabricated_error
 
     def fail_load(_source, **kwargs):
-        calls.append(kwargs["attn_implementation"])
+        calls.append(_source)
         raise original_error
 
     monkeypatch.setattr(
@@ -1518,7 +1834,7 @@ def test_identical_flash_attention_text_without_transformers_provenance_does_not
     with pytest.raises(type(original_error)) as raised:
         module.load_model("model", "cache")
     assert raised.value is original_error
-    assert calls == ["flash_attention_2"]
+    assert calls == ["model"]
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
@@ -1635,7 +1951,60 @@ def test_eval_uses_controller_with_original_visual_inputs_and_preserves_decoding
     }
     if module_name == "eval":
         expected_result_fields.add("inference_time")
+    else:
+        expected_result_fields.update({"vision_ablation", "input_image_count"})
     assert set(result) == expected_result_fields
+
+
+@pytest.mark.parametrize(
+    ("vision_ablation", "expected_image_count"),
+    (("all", 0), ("interleaved", 1)),
+)
+def test_stage2_vision_ablation_controls_processor_images_and_disables_latents(
+    vision_ablation, expected_image_count, monkeypatch, tmp_path
+):
+    """Ablation must change only the approved image boundary and latent control."""
+    module = _import_entry_point("evaluate_deepseed", monkeypatch)
+    controller = RecordingController()
+    controller.generate = lambda **kwargs: (
+        controller.calls.append(kwargs)
+        or SimpleNamespace(
+            sequences=controller.sequences,
+            generated_suffix_ids=(21, 22),
+            latent_start_count=0,
+            latent_block_count=0,
+            stop_reason="eos",
+        )
+    )
+    monkeypatch.setattr(module, "Stage2InferenceController", lambda: controller)
+    original_image = tmp_path / "original.png"
+    Image.new("RGB", (2, 2), color="white").save(original_image)
+    processor = FakeProcessor()
+
+    result = module.run_one_example(
+        ModelWhoseGenerateRaises(),
+        processor,
+        {"text_input": "question", "image_input": str(original_image)},
+        {
+            "max_new_tokens": 1,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "vision_ablation": vision_ablation,
+        },
+    )
+
+    call = controller.calls[0]
+    assert call["disable_latent_generation"] is True
+    assert result["vision_ablation"] == vision_ablation
+    assert result["input_image_count"] == expected_image_count
+    if vision_ablation == "all":
+        assert processor.images is None
+        assert call["pixel_values"] is None
+        assert call["image_grid_thw"] is None
+    else:
+        assert len(processor.images) == 1
+        assert torch.equal(call["pixel_values"], processor.pixel_values)
+        assert torch.equal(call["image_grid_thw"], processor.image_grid_thw)
 
 
 @pytest.mark.parametrize("module_name", MODULE_NAMES)
@@ -1665,6 +2034,33 @@ def test_eval_maps_explicit_greedy_settings_to_controller(module_name, monkeypat
     assert config.top_p == 0.6
     assert config.eos_token_id == 3
     assert config.max_sequence_length == 128
+
+
+@pytest.mark.parametrize("module_name", MODULE_NAMES)
+def test_eval_forwards_external_generation_limit_policy(module_name, monkeypatch):
+    """Dropping the evaluator option must leave the controller on bounded semantics."""
+    module = _import_entry_point(module_name, monkeypatch)
+    controller = RecordingController()
+    monkeypatch.setattr(
+        module, "Stage2InferenceController", lambda: controller, raising=False
+    )
+
+    module.run_one_example(
+        ModelWhoseGenerateRaises(),
+        FakeProcessor(),
+        {"text_input": "question"},
+        {
+            "max_new_tokens": 1,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "generation_limit_policy": "external_full_latent_block",
+        },
+    )
+
+    assert (
+        controller.calls[0]["generation_config"].generation_limit_policy
+        == "external_full_latent_block"
+    )
 
 
 def test_deepspeed_eval_unwraps_model_for_controller_and_uses_wrapper_device(
@@ -1850,3 +2246,16 @@ def test_eval_rejects_processor_batches_larger_than_one(module_name, monkeypatch
         )
 
     assert controller.calls == []
+
+
+def test_evaluator_precision_fixture_restores_backend_flags():
+    """Removing fixture teardown must expose evaluator TF32 state to later tests."""
+    initial = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    isolation = restore_evaluator_backend_precision.__wrapped__()
+    next(isolation)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = not initial[0]
+        torch.backends.cudnn.allow_tf32 = not initial[1]
+    finally:
+        isolation.close()
+    assert (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32) == initial

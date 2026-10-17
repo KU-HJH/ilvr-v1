@@ -116,6 +116,11 @@ def test_stage2_controller_retains_its_original_generate_signature():
             inspect.Parameter.KEYWORD_ONLY,
             False,
         ),
+        (
+            "disable_latent_generation",
+            inspect.Parameter.KEYWORD_ONLY,
+            False,
+        ),
     )
 
 
@@ -463,7 +468,9 @@ def test_saved_stage2_adapter_reload_preserves_logits_and_latent_states(
     assert changed
     source_parameters = dict(source.named_parameters())
     assert all(torch.count_nonzero(source_parameters[name]) for name in changed)
-    source.save_pretrained(artifact_dir)
+    # Synthetic base has no on-disk config; PEFT deliberately assumes unchanged vocab.
+    with pytest.warns(UserWarning, match=r"Could not find a config file in  - will assume that the vocabulary was not modified\."):
+        source.save_pretrained(artifact_dir)
     metadata = build_stage2_peft_metadata(
         tuning=tuning,
         base_model_reference="tiny-stage1",

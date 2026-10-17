@@ -1,3 +1,6 @@
+import importlib.util
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +10,7 @@ from torch import nn
 from evaluation.continuous_latent import (
     ContinuousLatentController,
     ContinuousLatentGenerationConfig,
+    GenerationLimitError,
 )
 from stage2.peft import resolve_stage2_qwen_model
 from tests.stage2.helpers import ToyCausalLanguageModel, tiny_stage2_qwen
@@ -17,6 +21,9 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
 
 
 TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
+EXTERNAL_CONTROLLER_PATH = Path(
+    "/raid/workspace/ILVR/ILVR/.worktrees/ours1/source/src/stage2/inference.py"
+)
 
 
 class ScriptedHead(nn.Module):
@@ -91,6 +98,21 @@ def scripted_model(*, latent_size, emitted_ids, stage="stage2"):
     )
 
 
+def load_external_controller_module():
+    spec = importlib.util.spec_from_file_location(
+        "supplied_external_stage2_inference", EXTERNAL_CONTROLLER_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
 def test_neutral_controller_records_complete_latent_block_evidence():
     """Catches a controller that omits completed-block evidence or EOS state."""
     model = scripted_model(
@@ -119,6 +141,32 @@ def test_neutral_controller_records_complete_latent_block_evidence():
     )
     assert result.stop_reason == "eos"
     assert len(result.post_end_logits_by_block) == 1
+
+
+def test_disabling_latent_generation_masks_the_highest_logit_start_without_rollout():
+    """A vision ablation must not emit a latent control or invoke recurrence."""
+    model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
+    model.stage2_rollout_engine.rollout = lambda **_kwargs: pytest.fail(
+        "latent rollout ran while disabled"
+    )
+
+    result = ContinuousLatentController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=ContinuousLatentGenerationConfig(max_new_tokens=1),
+        disable_latent_generation=True,
+        return_latent_states=True,
+    )
+
+    assert result.latent_start_count == 0
+    assert result.latent_block_count == 0
+    assert not set(result.generated_suffix_ids) & {
+        TOKENS.start_token_id,
+        TOKENS.pad_token_id,
+        TOKENS.end_token_id,
+    }
 
 
 def test_post_end_logits_use_complete_post_recurrence_scaffold():
@@ -333,3 +381,141 @@ def test_sequence_length_is_a_strict_cap_at_every_latent_boundary(
     assert result.stop_reason == "max_sequence_length"
     if completed_blocks == 0:
         assert len(model.model.calls) == 1
+
+
+def test_external_policy_completes_latent_block_beyond_new_token_limit():
+    """Removing external block completion would leave only START at this boundary."""
+    model = scripted_model(latent_size=8, emitted_ids=[TOKENS.start_token_id])
+
+    result = ContinuousLatentController().generate(
+        model=model,
+        input_ids=torch.tensor([[1]]),
+        attention_mask=torch.ones(1, 1, dtype=torch.long),
+        token_ids=TOKENS,
+        generation_config=ContinuousLatentGenerationConfig(
+            max_new_tokens=1,
+            generation_limit_policy="external_full_latent_block",
+        ),
+        return_latent_states=True,
+    )
+
+    assert list(result.generated_suffix_ids) == [91] + [90] * 8 + [92]
+    assert len(result.generated_suffix_ids) == 10
+    assert result.latent_block_count == 1
+    assert result.stop_reason == "max_new_tokens"
+
+
+def test_generation_config_rejects_unknown_limit_policy():
+    """A misspelled policy must not silently select different limit semantics."""
+    with pytest.raises(ValueError, match="generation_limit_policy"):
+        ContinuousLatentGenerationConfig(generation_limit_policy="external")
+
+
+def test_external_policy_rejects_complete_block_over_sequence_limit():
+    """Admitting a partial external block at the sequence boundary must fail."""
+    model = scripted_model(latent_size=8, emitted_ids=[TOKENS.start_token_id])
+
+    with pytest.raises(
+        GenerationLimitError, match="latent block would exceed max_sequence_length"
+    ):
+        ContinuousLatentController().generate(
+            model=model,
+            input_ids=torch.tensor([[1]]),
+            attention_mask=torch.ones(1, 1, dtype=torch.long),
+            token_ids=TOKENS,
+            generation_config=ContinuousLatentGenerationConfig(
+                max_new_tokens=1,
+                max_sequence_length=10,
+                generation_limit_policy="external_full_latent_block",
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("emitted_ids", "max_new_tokens", "eos_token_id"),
+    [
+        ([4, 5], 2, None),
+        ([4, 3, 5], 4, 3),
+        ([91, 6, 91], 20, None),
+        ([91], 1, None),
+    ],
+    ids=("normal-text", "eos", "two-latent-blocks", "generation-boundary"),
+)
+def test_external_policy_matches_supplied_controller_token_traces(
+    emitted_ids, max_new_tokens, eos_token_id
+):
+    """A divergent admission or recurrence path must disagree with the supplied code."""
+    external = load_external_controller_module()
+    input_ids = torch.tensor([[1]])
+    ours_model = scripted_model(latent_size=2, emitted_ids=emitted_ids)
+    external_model = scripted_model(latent_size=2, emitted_ids=emitted_ids)
+
+    ours = ContinuousLatentController().generate(
+        model=ours_model,
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        token_ids=TOKENS,
+        generation_config=ContinuousLatentGenerationConfig(
+            max_new_tokens=max_new_tokens,
+            max_sequence_length=128000,
+            repetition_penalty=1.0,
+            eos_token_id=eos_token_id,
+            generation_limit_policy="external_full_latent_block",
+        ),
+    )
+    theirs = external.Stage2InferenceController().generate(
+        model=external_model,
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        token_ids=TOKENS,
+        generation_config=external.Stage2GenerationConfig(
+            max_new_tokens=max_new_tokens,
+            max_sequence_length=128000,
+            eos_token_id=eos_token_id,
+        ),
+    )
+
+    assert torch.equal(ours.sequences, theirs.sequences)
+
+
+def test_external_policy_matches_supplied_controller_sequence_boundary_error():
+    """Both controllers must reject a full latent block that exceeds total length."""
+    external = load_external_controller_module()
+    input_ids = torch.tensor([[1]])
+    ours_model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
+    external_model = scripted_model(latent_size=2, emitted_ids=[TOKENS.start_token_id])
+
+    with pytest.raises(GenerationLimitError):
+        ContinuousLatentController().generate(
+            model=ours_model,
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            token_ids=TOKENS,
+            generation_config=ContinuousLatentGenerationConfig(
+                max_new_tokens=1,
+                max_sequence_length=4,
+                repetition_penalty=1.0,
+                generation_limit_policy="external_full_latent_block",
+            ),
+        )
+    with pytest.raises(ValueError, match="latent block would exceed max_sequence_length"):
+        external.Stage2InferenceController().generate(
+            model=external_model,
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            token_ids=TOKENS,
+            generation_config=external.Stage2GenerationConfig(
+                max_new_tokens=1,
+                max_sequence_length=4,
+            ),
+        )
+
+
+def test_external_evidence_loader_does_not_write_copied_source(tmp_path, monkeypatch):
+    """The source-level controller loader must not generate evidence-tree bytecode."""
+    monkeypatch.setattr(sys, 'dont_write_bytecode', False)
+    copied = tmp_path / 'inference.py'
+    copied.write_text(EXTERNAL_CONTROLLER_PATH.read_text())
+    monkeypatch.setitem(load_external_controller_module.__globals__, 'EXTERNAL_CONTROLLER_PATH', copied)
+    load_external_controller_module()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ['inference.py']

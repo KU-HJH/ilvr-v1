@@ -23,7 +23,10 @@ REQUIRED_ENV = {
 
 
 def run_launcher(*args, env_overrides=None):
-    env = {"PATH": os.environ["PATH"], "STAGE2_DRY_RUN": "true", **REQUIRED_ENV}
+    env = {"PATH": os.environ["PATH"], "STAGE2_DRY_RUN": "true", **REQUIRED_ENV,
+           "PYTHONDONTWRITEBYTECODE": "1", "CUDA_VISIBLE_DEVICES": "",
+           "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+           "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
@@ -44,28 +47,43 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
     assert arguments == [
         "--stage",
         "stage2",
+        "--epochs",
+        "1",
         "--load_model_path",
         REQUIRED_ENV["STAGE1_CHECKPOINT"],
         "--data_path",
         REQUIRED_ENV["DATA_PATH"],
         "--image_root",
         REQUIRED_ENV["IMAGE_ROOT"],
+        "--dataloader_num_workers",
+        "0",
         "--save_model_path",
         REQUIRED_ENV["OUTPUT_DIR"],
         "--log_file",
         REQUIRED_ENV["LOG_FILE"],
         "--latent_size",
         "8",
+        "--stage2_diagnostics_interval",
+        "0",
+        "--stage2_reproduction_probe_dir",
+        "",
+        "--stage2_assistant_plan_rendering",
+        "concatenated-v1",
+        "--ce_weight",
+        "0.1",
         "--supervise_latent_boundaries",
         "--learning_rate",
-        "1e-5",
+        "5e-5",
         "--gradient_accumulation_steps",
-        "8",
+        "2",
         "--per_device_train_batch_size",
         "1",
         "--attention_implementation",
         "sdpa",
+        "--vision_attention_implementation",
+        "sdpa",
         "--no-gradient_checkpointing",
+        "--no-stage2_latent_activation_checkpointing",
         "--max_seq_length_train",
         "8192",
         "--tuning_method",
@@ -78,7 +96,25 @@ def test_stage2_launcher_dry_run_exposes_reproduction_defaults():
         "0.05",
         "--lora_target_modules",
         "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        "--seed",
+        "42",
+        "--stage2_length_manifest",
+        str(REPO_ROOT / "results/stage 2/stage2-length-manifest.json"),
+        "--stage2_length_manifest_sha256",
+        "0" * 64,
     ]
+
+
+def test_stage2_launcher_dry_run_owns_length_manifest_and_dataloader_num_workers():
+    """Catches a dry run omitting the rank-shared manifest or worker contract."""
+    arguments = resolved_launcher_arguments(
+        run_launcher(env_overrides={"DATALOADER_NUM_WORKERS": "2"})
+    )
+
+    manifest = str(REPO_ROOT / "results/stage 2/stage2-length-manifest.json")
+    assert arguments[arguments.index("--stage2_length_manifest") + 1] == manifest
+    assert arguments[arguments.index("--stage2_length_manifest_sha256") + 1] == "0" * 64
+    assert arguments[arguments.index("--dataloader_num_workers") + 1] == "2"
 
 
 def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
@@ -87,21 +123,32 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         run_launcher(
             env_overrides={
                 "LATENT_SIZE": "12",
+                "STAGE2_DIAGNOSTICS_INTERVAL": "4",
                 "SUPERVISE_LATENT_BOUNDARIES": "false",
                 "LEARNING_RATE": "2e-5",
                 "GRADIENT_ACCUMULATION_STEPS": "16",
                 "ATTENTION_IMPLEMENTATION": "flash_attention_2",
+                "VISION_ATTENTION_IMPLEMENTATION": "sdpa",
                 "GRADIENT_CHECKPOINTING": "true",
                 "MAX_SEQUENCE_LENGTH": "4096",
                 "DEEPSPEED_CONFIG": "/configs/zero 3.json",
                 "RESUME_CHECKPOINT": "/outputs/checkpoint 20",
+                "CE_WEIGHT": "1.0",
             }
         )
     )
 
-    assert arguments[-18:] == [
+    assert arguments[arguments.index("--latent_size") :] == [
         "--latent_size",
         "12",
+        "--stage2_diagnostics_interval",
+        "4",
+        "--stage2_reproduction_probe_dir",
+        "",
+        "--stage2_assistant_plan_rendering",
+        "concatenated-v1",
+        "--ce_weight",
+        "1.0",
         "--no-supervise_latent_boundaries",
         "--learning_rate",
         "2e-5",
@@ -111,13 +158,22 @@ def test_stage2_launcher_dry_run_resolves_explicit_reproduction_settings():
         "1",
         "--attention_implementation",
         "flash_attention_2",
+        "--vision_attention_implementation",
+        "sdpa",
         "--gradient_checkpointing",
+        "--no-stage2_latent_activation_checkpointing",
         "--max_seq_length_train",
         "4096",
+        "--seed",
+        "42",
         "--resume_from_checkpoint_path",
         "/outputs/checkpoint 20",
         "--deepspeed_config",
         "/configs/zero 3.json",
+        "--stage2_length_manifest",
+        str(REPO_ROOT / "results/stage 2/stage2-length-manifest.json"),
+        "--stage2_length_manifest_sha256",
+        "0" * 64,
     ]
 
 
@@ -145,6 +201,17 @@ def test_stage2_launcher_rejects_unknown_attention_backend():
     assert "ATTENTION_IMPLEMENTATION must be eager, sdpa, or flash_attention_2" in result.stderr
 
 
+def test_stage2_launcher_rejects_unknown_vision_attention_backend():
+    """Catches an unsupported vision backend reaching an expensive model startup."""
+    result = run_launcher(env_overrides={"VISION_ATTENTION_IMPLEMENTATION": "magic"})
+
+    assert result.returncode == 2
+    assert (
+        "VISION_ATTENTION_IMPLEMENTATION must be eager, sdpa, or flash_attention_2"
+        in result.stderr
+    )
+
+
 def test_stage2_launcher_rejects_non_positive_integer_settings():
     """Catches invalid rollout, accumulation, or sequence sizes before training starts."""
     for name in ("LATENT_SIZE", "GRADIENT_ACCUMULATION_STEPS", "MAX_SEQUENCE_LENGTH"):
@@ -152,6 +219,20 @@ def test_stage2_launcher_rejects_non_positive_integer_settings():
 
         assert result.returncode == 2
         assert f"{name} must be a positive integer" in result.stderr
+
+
+@pytest.mark.parametrize("value", ("-1", "1.5", "often"))
+def test_stage2_launcher_rejects_invalid_diagnostics_interval(value):
+    """Catches malformed diagnostic cadences reaching Python startup."""
+    result = run_launcher(
+        env_overrides={"STAGE2_DIAGNOSTICS_INTERVAL": value}
+    )
+
+    assert result.returncode == 2
+    assert (
+        "STAGE2_DIAGNOSTICS_INTERVAL must be a non-negative integer"
+        in result.stderr
+    )
 
 
 def test_stage2_launcher_rejects_invalid_learning_rate():
@@ -171,12 +252,15 @@ MANAGED_OPTIONS = (
     "--save_model_path",
     "--log_file",
     "--latent_size",
+    "--stage2_diagnostics_interval",
+    "--ce_weight",
     "--supervise_latent_boundaries",
     "--no-supervise_latent_boundaries",
     "--learning_rate",
     "--gradient_accumulation_steps",
     "--per_device_train_batch_size",
     "--attention_implementation",
+    "--vision_attention_implementation",
     "--gradient_checkpointing",
     "--no-gradient_checkpointing",
     "--max_seq_length_train",
@@ -233,7 +317,8 @@ def test_stage2_launcher_preserves_unmanaged_passthrough_and_quoting():
     )
 
     arguments = resolved_launcher_arguments(result)
-    assert arguments[-4:] == [
+    passthrough_start = arguments.index("--max_steps")
+    assert arguments[passthrough_start : passthrough_start + 4] == [
         "--max_steps",
         "7",
         "--evaluation_output_path",

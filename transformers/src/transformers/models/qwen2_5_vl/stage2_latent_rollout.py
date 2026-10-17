@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.utils.checkpoint
 
 
 class LatentStructureError(ValueError):
@@ -143,11 +144,22 @@ class LatentRolloutResult:
     diagnostics: LatentRolloutDiagnostics | None = None
 
 
-def _replace_embedding(embeds: torch.Tensor, position: int, value: torch.Tensor) -> torch.Tensor:
-    return torch.cat(
-        (embeds[:, :position], value.unsqueeze(1), embeds[:, position + 1 :]),
-        dim=1,
-    )
+def _assemble_latent_inputs(
+    base: torch.Tensor,
+    replacements: list[tuple[int, torch.Tensor]],
+    *,
+    stop: int,
+) -> torch.Tensor:
+    pieces = []
+    cursor = 0
+    for position, state in replacements:
+        if position >= stop:
+            break
+        pieces.append(base[:, cursor:position])
+        pieces.append(state.unsqueeze(1))
+        cursor = position + 1
+    pieces.append(base[:, cursor:stop])
+    return torch.cat(pieces, dim=1)
 
 
 def _build_diagnostics(
@@ -182,6 +194,7 @@ class LatentRolloutEngine:
         latent_spans: tuple[LatentSpan, ...],
         retain_latent_grads: bool = False,
         collect_diagnostics: bool = False,
+        latent_activation_checkpointing: bool = False,
     ) -> LatentRolloutResult:
         if base_inputs_embeds.ndim != 3:
             raise ValueError("base_inputs_embeds must have shape [batch, sequence, hidden]")
@@ -193,24 +206,51 @@ class LatentRolloutEngine:
         if full_position_ids.ndim != 3 or full_position_ids.shape[-2:] != sequence_shape:
             raise ValueError("full_position_ids must match the embedding batch and sequence dimensions")
 
-        current = base_inputs_embeds
         states = []
         prefix_lengths = []
+        replacements = []
         for span in latent_spans:
             for position in span.latent_positions:
-                outputs = language_model(
-                    inputs_embeds=current[:, :position],
-                    attention_mask=attention_mask[:, :position],
-                    position_ids=full_position_ids[..., :position],
-                    use_cache=False,
-                    return_dict=True,
+                prefix_inputs = _assemble_latent_inputs(
+                    base_inputs_embeds, replacements, stop=position
                 )
-                latent = outputs.last_hidden_state[:, -1, :]
+                prefix_mask = attention_mask[:, :position]
+                prefix_positions = full_position_ids[..., :position]
+
+                def predict_last_hidden(
+                    bound_inputs, bound_mask, bound_positions
+                ):
+                    outputs = language_model(
+                        inputs_embeds=bound_inputs,
+                        attention_mask=bound_mask,
+                        position_ids=bound_positions,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    return outputs.last_hidden_state[:, -1, :]
+
+                if latent_activation_checkpointing and torch.is_grad_enabled():
+                    with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+                        latent = torch.utils.checkpoint.checkpoint(
+                            predict_last_hidden,
+                            prefix_inputs,
+                            prefix_mask,
+                            prefix_positions,
+                            use_reentrant=False,
+                            preserve_rng_state=True,
+                        )
+                else:
+                    latent = predict_last_hidden(
+                        prefix_inputs, prefix_mask, prefix_positions
+                    )
                 if retain_latent_grads:
                     latent.retain_grad()
                 states.append(latent)
                 prefix_lengths.append(position)
-                current = _replace_embedding(current, position, latent)
+                replacements.append((position, latent))
+        final_inputs_embeds = _assemble_latent_inputs(
+            base_inputs_embeds, replacements, stop=base_inputs_embeds.shape[1]
+        )
         diagnostics = None
         if collect_diagnostics:
             diagnostics = _build_diagnostics(
@@ -219,4 +259,4 @@ class LatentRolloutEngine:
                 batch_size=base_inputs_embeds.shape[0],
                 device=base_inputs_embeds.device,
             )
-        return LatentRolloutResult(current, tuple(states), tuple(prefix_lengths), diagnostics)
+        return LatentRolloutResult(final_inputs_embeds, tuple(states), tuple(prefix_lengths), diagnostics)

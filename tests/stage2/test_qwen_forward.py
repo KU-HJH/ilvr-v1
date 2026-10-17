@@ -17,7 +17,11 @@ from stage2.peft import (
     build_stage2_tuned_model,
     resolve_stage2_qwen_model,
 )
-from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentRolloutEngine
+from transformers.models.qwen2_5_vl import stage2_latent_rollout
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
+    LatentRolloutEngine,
+    LatentSpan,
+)
 
 
 class OutputAwareToyCausalLanguageModel(ToyCausalLanguageModel):
@@ -130,6 +134,238 @@ class RecordingRolloutEngine:
     def rollout(self, **kwargs):
         self.calls += 1
         return self.delegate.rollout(**kwargs)
+
+
+def _reference_full_copy_rollout(
+    *,
+    language_model,
+    base_inputs_embeds,
+    attention_mask,
+    full_position_ids,
+    latent_spans,
+):
+    """Independent oracle for the original full-sequence-copy recurrence."""
+    current = base_inputs_embeds
+    states = []
+    prefix_lengths = []
+    for span in latent_spans:
+        for position in span.latent_positions:
+            outputs = language_model(
+                inputs_embeds=current[:, :position],
+                attention_mask=attention_mask[:, :position],
+                position_ids=full_position_ids[..., :position],
+                use_cache=False,
+                return_dict=True,
+            )
+            latent = outputs.last_hidden_state[:, -1, :]
+            states.append(latent)
+            prefix_lengths.append(position)
+            current = torch.cat(
+                (current[:, :position], latent.unsqueeze(1), current[:, position + 1 :]),
+                dim=1,
+            )
+    return current, tuple(states), tuple(prefix_lengths)
+
+
+def test_prefix_sized_rollout_matches_full_copy_oracle():
+    """Catches prefix assembly changing the no-cache recurrence or its gradients."""
+    torch.manual_seed(23)
+    input_ids = torch.arange(11).unsqueeze(0)
+    reference_embedding = nn.Embedding(32, 4)
+    candidate_embedding = deepcopy(reference_embedding)
+    reference_decoder = ToyCausalLanguageModel(4)
+    candidate_decoder = deepcopy(reference_decoder)
+    attention_mask = torch.ones_like(input_ids)
+    full_position_ids = torch.arange(11).view(1, 1, 11).expand(3, -1, -1)
+    latent_spans = (
+        LatentSpan(1, (2, 3), 4),
+        LatentSpan(6, (7, 8), 9),
+    )
+
+    reference_base = reference_embedding(input_ids)
+    candidate_base = candidate_embedding(input_ids)
+    reference_final, reference_states, reference_prefix_lengths = _reference_full_copy_rollout(
+        language_model=reference_decoder,
+        base_inputs_embeds=reference_base,
+        attention_mask=attention_mask,
+        full_position_ids=full_position_ids,
+        latent_spans=latent_spans,
+    )
+    candidate = LatentRolloutEngine().rollout(
+        language_model=candidate_decoder,
+        base_inputs_embeds=candidate_base,
+        attention_mask=attention_mask,
+        full_position_ids=full_position_ids,
+        latent_spans=latent_spans,
+    )
+
+    assembled = stage2_latent_rollout._assemble_latent_inputs(
+        candidate_base,
+        list(zip((2, 3, 7, 8), candidate.latent_states, strict=True)),
+        stop=candidate_base.shape[1],
+    )
+    torch.testing.assert_close(assembled, candidate.final_inputs_embeds, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(
+        candidate.final_inputs_embeds, reference_final, atol=1e-6, rtol=1e-5
+    )
+    assert candidate.prefix_lengths == reference_prefix_lengths == (2, 3, 7, 8)
+    for candidate_state, reference_state in zip(
+        candidate.latent_states, reference_states, strict=True
+    ):
+        torch.testing.assert_close(candidate_state, reference_state, atol=1e-6, rtol=1e-5)
+
+    reference_outputs = reference_decoder(
+        inputs_embeds=reference_final,
+        attention_mask=attention_mask,
+        position_ids=full_position_ids,
+        use_cache=False,
+        return_dict=True,
+    )
+    candidate_outputs = candidate_decoder(
+        inputs_embeds=candidate.final_inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=full_position_ids,
+        use_cache=False,
+        return_dict=True,
+    )
+    reference_loss = reference_outputs.last_hidden_state.square().mean()
+    candidate_loss = candidate_outputs.last_hidden_state.square().mean()
+    torch.testing.assert_close(candidate_loss, reference_loss, atol=1e-6, rtol=1e-5)
+    candidate_loss.backward()
+    reference_loss.backward()
+
+    assert [inputs.shape[1] for inputs, *_ in candidate_decoder.calls] == [2, 3, 7, 8, 11]
+    assert [inputs.shape[1] for inputs, *_ in reference_decoder.calls] == [2, 3, 7, 8, 11]
+    torch.testing.assert_close(
+        candidate_embedding.weight.grad, reference_embedding.weight.grad, atol=1e-6, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        candidate_decoder.scale.grad, reference_decoder.scale.grad, atol=1e-6, rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("method", ["full", "lora", "dora"])
+def test_stage2_loss_only_matches_full_loss_and_all_trainable_gradients(method):
+    """Catches selective LM-head projection changing any trainable gradient."""
+    torch.manual_seed(17)
+    full = build_stage2_tuned_model(tiny_stage2_qwen(), settings(method)).train()
+    selective = deepcopy(full).train()
+    selective_qwen = resolve_stage2_qwen_model(selective)
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
+    labels = input_ids.clone()
+    labels[:, :2] = -100
+    labels[input_ids == 90] = -100
+    seen = []
+    handle = selective_qwen.lm_head.register_forward_pre_hook(
+        lambda _module, args: seen.append(tuple(args[0].shape))
+    )
+
+    full_output = full(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+    )
+    selective_output = selective(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        stage2_loss_only=True,
+    )
+    handle.remove()
+    full_output.loss.backward()
+    selective_output.loss.backward()
+
+    active = int((labels[:, 1:] != -100).sum())
+    assert seen == [(active, selective_qwen.config.hidden_size)]
+    assert selective_output.logits is None
+    torch.testing.assert_close(
+        selective_output.loss, full_output.loss, atol=1e-6, rtol=1e-5
+    )
+    for (full_name, full_parameter), (fast_name, fast_parameter) in zip(
+        full.named_parameters(), selective.named_parameters(), strict=True
+    ):
+        assert full_name == fast_name
+        if full_parameter.requires_grad:
+            torch.testing.assert_close(
+                fast_parameter.grad,
+                full_parameter.grad,
+                atol=1e-6,
+                rtol=1e-5,
+            )
+
+
+@pytest.mark.parametrize(
+    ("labels", "return_dict", "message"),
+    [
+        (None, True, "Stage 2 loss-only forward requires labels"),
+        (
+            torch.full((1, 7), -100, dtype=torch.long),
+            True,
+            "Stage 2 loss-only forward requires at least one supervised label",
+        ),
+        (
+            torch.tensor([[-100, -100, -100, -100, 92, 2, 3]]),
+            False,
+            "Stage 2 loss-only forward requires return_dict=True",
+        ),
+    ],
+)
+def test_stage2_loss_only_rejects_invalid_contracts(labels, return_dict, message):
+    """Catches loss-only calls returning undefined or ambiguous output contracts."""
+    model = tiny_stage2_qwen()
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
+
+    with pytest.raises(ValueError, match=message):
+        model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            labels=labels,
+            return_dict=return_dict,
+            stage2_loss_only=True,
+        )
+
+
+def test_stage2_loss_only_default_call_retains_full_logits():
+    """Catches the optimized projection becoming the ordinary forward default."""
+    model = tiny_stage2_qwen()
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+    )
+
+    assert outputs.logits.shape == (1, input_ids.shape[1], model.config.vocab_size)
+
+
+def test_stage2_bfloat16_labels_preserve_full_fp32_logits_contract():
+    """Catches labels casting only shifted logits while returning BF16 full logits."""
+    model = tiny_stage2_qwen().to(dtype=torch.bfloat16)
+    input_ids = torch.tensor([[1, 91, 90, 90, 92, 2, 3]])
+    labels = input_ids.clone()
+    labels[:, :2] = -100
+    labels[input_ids == 90] = -100
+
+    ordinary = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        stage2_loss_only=False,
+    )
+    loss_only = model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        labels=labels,
+        stage2_loss_only=True,
+    )
+
+    assert ordinary.logits.shape == (
+        1,
+        input_ids.shape[1],
+        model.config.vocab_size,
+    )
+    assert ordinary.logits.dtype == torch.float32
+    assert loss_only.logits is None
 
 
 def test_stage2_freezes_full_visual_module_at_composition():

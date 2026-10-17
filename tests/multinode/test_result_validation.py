@@ -22,6 +22,7 @@ from stage2.evidence import build_stage2_producer_evidence
 
 METHODS = ("full", "lora", "dora")
 ZERO_STAGES = (1, 2, 3)
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _write_json(path: Path, payload: object) -> Path:
@@ -178,7 +179,7 @@ def _write_stage1_child_witness(stage1_root: Path, *, child: str, method: str,
         "stage": "stage1", "method": method, "zero_stage": zero_stage,
         "batch_per_gpu": batch, "world_size": 4, "machine_ranks": [0, 1],
         "exit_codes": {"0": 0, "1": 0},
-        "checkpoint_path": f"/root/workspace/ILVR/checkpoints/{child}",
+        "checkpoint_path": str(REPO_ROOT / "checkpoints" / child),
         "finite_loss_evidence": {"status": "validated", "path": str(producer),
                                  "sha256": hashlib.sha256(raw).hexdigest(),
                                  "size": len(raw), "finite_loss": True},

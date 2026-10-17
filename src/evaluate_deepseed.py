@@ -10,14 +10,17 @@ from typing import List, Dict, Any, Union
 
 import torch
 from PIL import Image
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoConfig, AutoProcessor
 
 from stage2.checkpointing import (
     Stage2ArtifactKind,
     inspect_stage2_artifact,
     resolve_latent_token_ids,
 )
-from stage2.backend_fallback import is_flash_attention_initialization_error
+from stage2.attention_backend import (
+    load_qwen2_5_vl_with_attention,
+    validate_qwen2_5_vl_attention_backends,
+)
 from stage2.inference import (
     Stage2InferenceController,
     build_stage2_generation_config,
@@ -55,6 +58,9 @@ ACTION_MAP = {
 
 
 BASE_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"  
+VISION_ABLATION_MODES = ("none", "all", "interleaved")
+
+
 def get_eval_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dir", type=str, required=True, help="Path to the trained model directory.")
@@ -66,11 +72,17 @@ def get_eval_args():
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--max_sequence_length", type=int, default=32768)
     parser.add_argument("--repetition_penalty", type=float, default=1.05)
+    parser.add_argument(
+        "--generation-limit-policy",
+        choices=("bounded", "external_full_latent_block"),
+        default="bounded",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--model-identity", type=str)
+    parser.add_argument("--vision-ablation", choices=VISION_ABLATION_MODES, default="none")
     return parser.parse_args()
 
 
@@ -83,26 +95,25 @@ def load_processor(model_dir: str, cache_dir: str):
         return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
 
 def load_model(model_dir: str, cache_dir: str):
-
-    try:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_dir,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
-            attn_implementation="flash_attention_2"
-        )
-    except Exception as e:
-        if not is_flash_attention_initialization_error(e):
-            raise
-        logging.warning(f"flash_attention_2 initialization failed ({e}), falling back to eager.")
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_dir,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
-            attn_implementation="eager"
-        )
+    """Load the fixed authenticated SDPA-language/FlashAttention2-vision pair."""
+    model = load_qwen2_5_vl_with_attention(
+        model_dir,
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
+        config_load_kwargs={"cache_dir": cache_dir},
+        model_load_kwargs={
+            "device_map": "auto",
+            "torch_dtype": torch.bfloat16,
+            "cache_dir": cache_dir,
+        },
+        load_config=AutoConfig.from_pretrained,
+        load_model=Qwen2_5_VLForConditionalGeneration.from_pretrained,
+    )
+    validate_qwen2_5_vl_attention_backends(
+        model,
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
+    )
     model.eval()
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -115,7 +126,7 @@ def load_evaluation_artifacts(
     *, model_dir: str, base_model_dir: str | None, cache_dir: str
 ):
     """Load either one full Stage 2 artifact or a Stage 1 base plus adapter."""
-    artifact_inspection = inspect_stage2_artifact(model_dir)
+    artifact_inspection = inspect_stage2_artifact(model_dir, for_inference=True)
     if artifact_inspection.artifact_kind is Stage2ArtifactKind.FULL:
         if base_model_dir is not None:
             raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
@@ -133,6 +144,11 @@ def load_evaluation_artifacts(
             source, selectors["cache_dir"]
         ),
         artifact_inspection=artifact_inspection,
+    )
+    validate_qwen2_5_vl_attention_backends(
+        resolve_stage2_qwen_model(model),
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
     )
     return model, processor
 
@@ -196,7 +212,14 @@ def extract_assistant_content(text: str) -> str:
 
 
 def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    img_list = _resolve_image_paths(sample.get("image_input", []))
+    vision_ablation = gen_kwargs.get("vision_ablation", "none")
+    if vision_ablation not in VISION_ABLATION_MODES:
+        raise ValueError("vision_ablation must be none, all, or interleaved")
+    img_list = (
+        []
+        if vision_ablation == "all"
+        else _resolve_image_paths(sample.get("image_input", []))
+    )
     images = open_images(img_list) if img_list else None
     prepared = prepare_evaluation_input(processor, sample, images)
 
@@ -210,6 +233,9 @@ def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[s
         k: v.to(effective_device)
         for k, v in prepared.tensors.items()
     }
+    if vision_ablation == "all":
+        inputs.pop("pixel_values", None)
+        inputs.pop("image_grid_thw", None)
 
     input_ids = inputs["input_ids"]
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -238,6 +264,7 @@ def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[s
             pixel_values=inputs.get("pixel_values"),
             image_grid_thw=inputs.get("image_grid_thw"),
             return_latent_states=False,
+            disable_latent_generation=vision_ablation != "none",
         )
     out_ids = generation_result.sequences
     out_text = processor.batch_decode(out_ids, skip_special_tokens=False)[0].strip()
@@ -251,22 +278,37 @@ def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[s
     # the user prompt and keeps trailing special tokens like <|im_end|>.
     assistant_only = extract_assistant_content(assistant_text)
     extracted = extract_final_answer(assistant_only).extracted
+    generated_suffix_ids = tuple(int(token_id) for token_id in suffix_ids[0].tolist())
+    if vision_ablation != "none" and (
+        generation_result.latent_start_count
+        or generation_result.latent_block_count
+        or set(generated_suffix_ids)
+        & {
+            token_ids.start_token_id,
+            token_ids.pad_token_id,
+            token_ids.end_token_id,
+        }
+    ):
+        raise RuntimeError("vision ablation generation produced a latent control")
     return {
         "prompt_identity": prepared.prompt_identity,
         "prompt_token_length": prepared.prompt_token_length,
-        "generated_suffix_token_ids": [
-            int(token_id) for token_id in suffix_ids[0].tolist()
-        ],
+        "generated_suffix_token_ids": list(generated_suffix_ids),
         "raw_output": out_text,
         "assistant_only": assistant_only,
         "extracted_final_answer": extracted,
         "latent_start_count": int(generation_result.latent_start_count),
         "latent_block_count": int(generation_result.latent_block_count),
         "stop_reason": generation_result.stop_reason,
+        "vision_ablation": vision_ablation,
+        "input_image_count": len(img_list),
     }
 
 def main():
     args = get_eval_args()
+    vision_ablation = getattr(args, "vision_ablation", "none")
+    if vision_ablation not in VISION_ABLATION_MODES:
+        raise ValueError("vision_ablation must be none, all, or interleaved")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
     sharded = args.num_shards == 4
@@ -308,9 +350,11 @@ def main():
         max_new_tokens=args.max_new_tokens,
         max_sequence_length=args.max_sequence_length,
         repetition_penalty=args.repetition_penalty,
+        generation_limit_policy=getattr(args, "generation_limit_policy", "bounded"),
         temperature=args.temperature,
         top_p=args.top_p,
-        do_sample=(args.temperature > 0)
+        do_sample=(args.temperature > 0),
+        vision_ablation=vision_ablation,
     )
 
     total = len(data)
@@ -330,8 +374,12 @@ def main():
         processed_indices.append(i)
         try:
             evaluation_sample = dict(sample)
-            evaluation_sample["image_input"] = resolve_evaluation_image_paths(
-                sample.get("image_input", []), dataset_root
+            evaluation_sample["image_input"] = (
+                []
+                if vision_ablation == "all"
+                else resolve_evaluation_image_paths(
+                    sample.get("image_input", []), dataset_root
+                )
             )
             pred = run_one_example(
                 model, processor, evaluation_sample, gen_kwargs
@@ -355,6 +403,8 @@ def main():
                     "predicted_full_output": out_text,
                     "extracted_path_string": path_str,
                     "vsp_simulation_result": sim,
+                    "vision_ablation": pred.get("vision_ablation"),
+                    "input_image_count": pred.get("input_image_count"),
                     "match": ok,
                 })
 
@@ -387,6 +437,8 @@ def main():
                     "latent_start_count": pred.get("latent_start_count"),
                     "latent_block_count": pred.get("latent_block_count"),
                     "stop_reason": pred.get("stop_reason"),
+                    "vision_ablation": pred.get("vision_ablation"),
+                    "input_image_count": pred.get("input_image_count"),
                     "match": bool(ok)
                 })
 
@@ -403,6 +455,12 @@ def main():
                 "index": i,
                 "task_name": args.task_name,
                 "error": str(e),
+                "vision_ablation": vision_ablation,
+                "input_image_count": (
+                    0
+                    if vision_ablation == "all"
+                    else len(_resolve_image_paths(sample.get("image_input", [])))
+                ),
             }
             if args.task_name != "vsp-spatial-planning-cot":
                 gold = sample.get("original_final_answer")
@@ -428,6 +486,12 @@ def main():
                     "latent_start_count": None,
                     "latent_block_count": None,
                     "stop_reason": None,
+                    "vision_ablation": vision_ablation,
+                    "input_image_count": (
+                        0
+                        if vision_ablation == "all"
+                        else len(_resolve_image_paths(sample.get("image_input", [])))
+                    ),
                     "match": False,
                 })
             results.append(error_result)
@@ -458,8 +522,12 @@ def main():
                 "max_new_tokens": args.max_new_tokens,
                 "max_sequence_length": args.max_sequence_length,
                 "repetition_penalty": args.repetition_penalty,
+                "generation_limit_policy": getattr(
+                    args, "generation_limit_policy", "bounded"
+                ),
                 "temperature": args.temperature,
                 "top_p": args.top_p,
+                "vision_ablation": vision_ablation,
             },
             shard_index=args.shard_index,
             num_shards=args.num_shards,

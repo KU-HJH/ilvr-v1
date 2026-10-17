@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import platform
+
+
+# Deterministic CUDA tests must configure cuBLAS before any test initializes CUDA.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
 _ORIGINAL_PYTHON_VERSION = platform.python_version

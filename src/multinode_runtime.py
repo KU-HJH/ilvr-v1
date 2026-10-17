@@ -22,13 +22,13 @@ from src.artifact_paths import CANONICAL_EVALUATION_STAGING_ROOT
 from src.deepspeed_runtime import load_deepspeed_runtime_profile
 
 if TYPE_CHECKING:
-    from src.multinode import LaunchPlan
+    from src.multinode import ClusterSpec, LaunchPlan
 
 
 _REMOTE_HOST = "korea@10.1.102.41"
 _REMOTE_CONTAINER = "llm_kd"
 _REQUIRED_FREE_BYTES = 100 * 1024**3
-_REPOSITORY_ROOT = Path("/root/workspace/ILVR")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _CHECKPOINT_ROOT = _REPOSITORY_ROOT / "checkpoints"
 _EVALUATION_STAGING_ROOT = CANONICAL_EVALUATION_STAGING_ROOT
 _RESULT_ROOT = _REPOSITORY_ROOT / "results"
@@ -47,7 +47,7 @@ _MINIMAL_EXEC_ENVIRONMENT = {
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
     "PATH": (
-        "/root/workspace/ILVR/venv/ilvr-venv/bin:"
+        f"{_REPOSITORY_ROOT / 'venv/ilvr-venv/bin'}:"
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     ),
     "PYTHONUNBUFFERED": "1",
@@ -55,6 +55,58 @@ _MINIMAL_EXEC_ENVIRONMENT = {
 _STAGE2_FIXED_EXEC_ENVIRONMENT = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
 }
+
+
+def node_repository(plan: "LaunchPlan", *, machine_rank: int) -> Path:
+    if type(machine_rank) is not int or machine_rank not in (0, 1):
+        raise ValueError("machine_rank must be 0 or 1")
+    return (plan.cluster.remote_repo_root if machine_rank == 0
+            else plan.cluster.local_repo_root)
+
+
+def node_path(plan: "LaunchPlan", path: str | Path, *, machine_rank: int) -> Path:
+    """Map a logical checkout-relative path, never a resolved storage target."""
+    candidate = Path(path)
+    if ".." in candidate.parts:
+        raise ValueError("node path must not contain parent traversal")
+    root = node_repository(plan, machine_rank=machine_rank)
+    try:
+        relative = candidate.relative_to(plan.cluster.local_repo_root)
+    except ValueError:
+        # External pretrained inputs keep their explicit node-local spelling.
+        # Existing artifact validators still decide permitted output locations.
+        return candidate
+    return root / relative
+
+
+_NODE_PATH_OPTIONS = {
+    "--model", "--data-path", "--source-data-path", "--image-root", "--resume",
+    "--benchmark-run-config", "--output-dir", "--log-file", "--deepspeed-config",
+    "--producer-evidence", "--smoke-resume-witness", "--training-evidence",
+    "--run-directory", "--checkpoint-root", "--ownership-path", "--exit-path",
+    "--destination", "--model-dir",
+    "--path", "--log-root", "--repository", "--manifest", "--deepspeed",
+    "--harness", "--input-path", "--artifact-root", "--run-path",
+}
+
+
+def _node_arguments(plan: "LaunchPlan", arguments: Sequence[str], rank: int) -> tuple[str, ...]:
+    result = []
+    previous = None
+    for argument in arguments:
+        name, equals, value = argument.partition("=")
+        if equals and name in _NODE_PATH_OPTIONS:
+            argument = name + "=" + str(node_path(plan, value, machine_rank=rank))
+        elif previous in _NODE_PATH_OPTIONS:
+            argument = str(node_path(plan, argument, machine_rank=rank))
+        result.append(argument)
+        previous = name if not equals else None
+    return tuple(result)
+
+
+def _require_same_repository_roots(plan: "LaunchPlan", operation: str) -> None:
+    if plan.cluster.local_repo_root != plan.cluster.remote_repo_root:
+        raise ValueError(f"{operation} does not support unequal repository roots")
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
@@ -759,6 +811,15 @@ def receive_launch_plan(
     _require_digest("launch plan transfer digest", expected_sha256)
     if len(raw) != expected_size or hashlib.sha256(raw).hexdigest() != expected_sha256:
         raise ValueError("launch plan transfer mismatch")
+    from src.multinode import decode_launch_plan
+
+    plan = decode_launch_plan(raw)
+    if plan.cluster.remote_repo_root != _REPOSITORY_ROOT:
+        raise ValueError("receiver repository root differs from saved remote root")
+    expected_path = (_REPOSITORY_ROOT / "logs/multinode" / plan.run_id
+                     / plan.attempt_id / "launch-plan.json")
+    if Path(path) != expected_path:
+        raise ValueError("receiver launch plan path differs from saved attempt identity")
     destination = _publish_bytes_no_replace(path, raw)
     stored = _read_regular_file(destination)
     if len(stored) != expected_size or hashlib.sha256(stored).hexdigest() != expected_sha256:
@@ -767,6 +828,32 @@ def receive_launch_plan(
 
 
 _STAGE1_VALUE_OPTIONS = {
+    "--query_mode",
+    "--history_text_gamma",
+    "--history_attention_layers",
+    "--sim-weight",
+    "--stage1-variant",
+    "--stage1-loss-type",
+    "--lambda-preference",
+    "--lambda-topk-entropy",
+    "--lambda-entropy",
+    "--preference-topk-k",
+    "--preference-topk-mode",
+    "--lambda-topk-mass",
+    "--lambda-topk-chosen-mass",
+    "--preference-entropy-top-percent",
+    "--stage1-v5-selection",
+    "--stage1-v5-text-kl-weight",
+    "--loss-chunk-positions",
+    "--vision-attention-implementation",
+    "--warm-up-steps",
+    "--latent-size",
+    "--max-seq-length-train",
+    "--dataloader-num-workers",
+    "--textual_states",
+    "--step-preference-beta",
+    "--step-preference-margin",
+
     "--method",
     "--model",
     "--data-path",
@@ -775,6 +862,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--micro-batch",
     "--epochs",
     "--learning-rate",
+    "--ce-weight",
     "--gradient-accumulation",
     "--ema-tau",
     "--seed",
@@ -785,7 +873,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--max-steps",
     "--benchmark-run-config",
 }
-_STAGE1_BOOLEAN_OPTIONS = {"--final-save", "--no-final-save", "--use_lora"}
+_STAGE1_BOOLEAN_OPTIONS = {"--stage1-v5-debug", "--no-stage1-v5-debug","--topk-include-gt", "--no-topk-include-gt","--final-save", "--no-final-save", "--use_lora"}
 _STAGE1_COORDINATOR_OPTIONS = {
     "--output-dir",
     "--log-file",
@@ -857,10 +945,50 @@ _STAGE2_ENVIRONMENT_ALLOWLIST = {
     "LATENT_SIZE",
     "SUPERVISE_LATENT_BOUNDARIES",
     "LEARNING_RATE",
+    "CE_WEIGHT",
     "GRADIENT_ACCUMULATION_STEPS",
     "ATTENTION_IMPLEMENTATION",
+    "VISION_ATTENTION_IMPLEMENTATION",
     "GRADIENT_CHECKPOINTING",
+    "STAGE2_LATENT_ACTIVATION_CHECKPOINTING",
     "MAX_SEQUENCE_LENGTH",
+    "DATALOADER_NUM_WORKERS",
+    "SEED",
+    "STEP_PREFERENCE_ENABLED",
+    "STEP_PREFERENCE_MODE",
+    "STEP_PREFERENCE_OBJECTIVE",
+    "STEP_PREFERENCE_TARGET_SCOPE",
+    "STAGE2_ASSISTANT_PLAN_RENDERING",
+    "STAGE2_REPRODUCTION_PROBE_DIR",
+    "STAGE2_SAMPLER_POLICY",
+    "STAGE2_REFERENCE_SAMPLER_PROBE_DIR",
+    "STEP_PREFERENCE_PREFIX_MODE",
+    "STEP_PREFERENCE_BRANCH_MODE",
+    "STEP_PREFERENCE_BLOCK_ORIGINAL_IMAGE",
+    "STEP_PREFERENCE_BETA",
+    "STEP_PREFERENCE_WEIGHT",
+    "STEP_PREFERENCE_MARGIN",
+    "STEP_PREFERENCE_LOSS_TYPE",
+    "STEP_PREFERENCE_TOPK",
+    "STEP_PREFERENCE_LAMBDA_TOPK_MASS",
+    "STEP_PREFERENCE_ENTROPY_TOP_PERCENT",
+    "STEP_PREFERENCE_ENTROPY_SOURCE",
+    "STEP_VISUAL_ONLY_CONTEXT_PREFERENCE",
+    "STEP_VISUAL_OFF_SUPPRESS_LATENT_BOUNDARIES",
+    "STAGE2B_DIRECT_FROM_STAGE1",
+    "STAGE1_ADAPTER_PATH",
+    "STAGE2A_CHECKPOINT_PATH",
+    "STEP_NEGATIVE_PATH",
+    "STEP_NEGATIVE_MANIFEST",
+    "STEP_DPO_BETA",
+    "STEP_DPO_WEIGHT",
+    "STEP_ENTROPY_WEIGHT",
+    "STEP_ENTROPY_MARGIN",
+    "STAGE2A_RATIO",
+    "STAGE2_TOTAL_STEPS",
+    "STEP_SHARED_PREFIX_ENABLED",
+    "STEP_SIDECAR_ATTENTION_BACKEND",
+    "STEP_SIDECAR_QUERY_BUDGET",
     "RESUME_CHECKPOINT",
     "BENCHMARK_EVIDENCE_PATH",
 }
@@ -922,6 +1050,7 @@ _STAGE2_VALUE_OPTIONS = {
     "--save_steps",
     "--max_train_samples",
     "--max_steps",
+    "--stage2_stop_after_checkpoint",
     "--seed",
 }
 _STAGE2_BOOLEAN_OPTIONS = {
@@ -947,6 +1076,8 @@ _STAGE2_COORDINATOR_OPTIONS = {
     "--attention_implementation",
     "--gradient_checkpointing",
     "--no-gradient_checkpointing",
+    "--stage2_latent_activation_checkpointing",
+    "--no-stage2_latent_activation_checkpointing",
     "--max_seq_length_train",
     "--deepspeed_config",
     "--resume_from_checkpoint_path",
@@ -1043,13 +1174,21 @@ class EvaluationPlan:
     max_new_tokens: int = 4096
     max_sequence_length: int = 32768
     repetition_penalty: float = 1.05
+    generation_limit_policy: str = "bounded"
     temperature: float = 0.0
     top_p: float = 1.0
+    vision_ablation: str = "none"
     attempt_timeout_seconds: int = 24 * 60 * 60
+    cluster: "ClusterSpec | None" = None
 
     def __post_init__(self) -> None:
         from src.multinode_artifacts import validate_coordinator_relative_path
 
+        if self.cluster is not None:
+            from src.multinode import validate_cluster_topology
+            validate_cluster_topology(self.cluster)
+            if self.cluster.local_repo_root.resolve() != _REPOSITORY_ROOT.resolve():
+                raise ValueError("evaluation local repository must identify this checkout")
         _require_identifier("run_id", self.run_id)
         _require_identifier("attempt_id", self.attempt_id)
         for label, path in (
@@ -1106,6 +1245,14 @@ class EvaluationPlan:
             or self.repetition_penalty <= 0
         ):
             raise ValueError("repetition_penalty must be finite and positive")
+        if self.generation_limit_policy not in (
+            "bounded",
+            "external_full_latent_block",
+        ):
+            raise ValueError(
+                "generation_limit_policy must be bounded or "
+                "external_full_latent_block"
+            )
         if (
             type(self.temperature) not in (int, float)
             or not math.isfinite(self.temperature)
@@ -1118,6 +1265,8 @@ class EvaluationPlan:
             or not 0 < self.top_p <= 1
         ):
             raise ValueError("top_p must be finite and in (0, 1]")
+        if self.vision_ablation not in ("none", "all", "interleaved"):
+            raise ValueError("vision_ablation must be none, all, or interleaved")
         if type(self.attempt_timeout_seconds) is not int or self.attempt_timeout_seconds <= 0:
             raise ValueError("attempt_timeout_seconds must be positive")
 
@@ -1173,6 +1322,17 @@ def build_evaluation_assignments(
     )
 
 
+def _evaluation_node_path(plan: EvaluationPlan, path: str | Path, *, remote: bool) -> Path:
+    candidate = Path(path)
+    if plan.cluster is None or not remote:
+        return candidate
+    try:
+        relative = candidate.relative_to(plan.cluster.local_repo_root)
+    except ValueError:
+        return candidate
+    return plan.cluster.remote_repo_root / relative
+
+
 def _build_evaluation_commands_for_stage(
     plan: EvaluationPlan,
     *,
@@ -1188,6 +1348,8 @@ def _build_evaluation_commands_for_stage(
 
     if stage not in ("stage1", "stage2"):
         raise ValueError("observed inference stage must be stage1 or stage2")
+    if stage == "stage1" and plan.vision_ablation != "none":
+        raise ValueError("vision ablation is only supported for Stage 2 evaluation")
     _require_digest("model_identity", model_identity.removeprefix("task6:"))
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise ValueError("commit must be a lowercase 40-character Git object ID")
@@ -1198,26 +1360,45 @@ def _build_evaluation_commands_for_stage(
     assignments = build_evaluation_assignments(
         run_id=plan.run_id, attempt_id=plan.attempt_id
     )
+    dataset_binding = None
+    if stage == 'stage1' and plan.cluster is not None and plan.cluster.local_repo_root != plan.cluster.remote_repo_root:
+        from src.multinode_evaluation import dataset_identity, dataset_content_sha256
+        dataset_binding = (json.dumps(dataset_identity(plan.test_data_path), sort_keys=True),
+                           dataset_content_sha256(plan.test_data_path))
     workers: list[EvaluationWorkerCommand] = []
     shard_jsonls = tuple(plan.output_dir / f"shard-{index}.jsonl" for index in range(4))
     for assignment in assignments:
+        remote = assignment.node == "remote"
+        repository = _evaluation_node_path(plan, _REPOSITORY_ROOT, remote=remote)
+        python = repository / "venv/ilvr-venv/bin/python"
+        evaluator = repository / ("eval.py" if stage == "stage1" else "src/evaluate_deepseed.py")
+        node_attempt = _evaluation_node_path(plan, attempt_directory, remote=remote)
         model_dir = plan.model_dir if assignment.node == "remote" else plan.local_model_dir
         evaluator_command = [
             str(python),
             str(evaluator),
-            "--model_dir", str(model_dir),
-            "--test_data_path", str(plan.test_data_path),
+            "--model_dir", str(_evaluation_node_path(plan, model_dir, remote=remote)),
+            "--test_data_path", str(_evaluation_node_path(plan, plan.test_data_path, remote=remote)),
             "--task_name", plan.task_name,
-            "--output_json_path", str(shard_jsonls[assignment.shard_index]),
-            "--cache_dir", str(plan.cache_dir),
+            "--output_json_path", str(_evaluation_node_path(plan, shard_jsonls[assignment.shard_index], remote=remote)),
+            "--cache_dir", str(_evaluation_node_path(plan, plan.cache_dir, remote=remote)),
             "--max_new_tokens", str(plan.max_new_tokens),
             "--max_sequence_length", str(plan.max_sequence_length),
             "--repetition_penalty", str(plan.repetition_penalty),
+            "--generation-limit-policy", plan.generation_limit_policy,
             "--temperature", str(plan.temperature),
             "--top_p", str(plan.top_p),
         ]
+        if stage == 'stage1':
+            evaluator_command.extend(('--runtime_identity_path', str(_evaluation_node_path(
+                plan, plan.output_dir / f'shard-{assignment.shard_index}.runtime-identity.json', remote=remote))))
+        if dataset_binding is not None:
+            evaluator_command.extend(('--canonical-dataset-identity', dataset_binding[0],
+                                      '--expected-dataset-sha256', dataset_binding[1]))
         if plan.base_model_dir is not None:
-            evaluator_command.extend(("--base_model_dir", str(plan.base_model_dir)))
+            evaluator_command.extend(("--base_model_dir", str(_evaluation_node_path(plan, plan.base_model_dir, remote=remote))))
+        if stage == "stage2":
+            evaluator_command.extend(("--vision-ablation", plan.vision_ablation))
         evaluator_command.extend(
             (
                 "--model-identity", model_identity,
@@ -1227,12 +1408,15 @@ def _build_evaluation_commands_for_stage(
         )
         environment = {
             **_MINIMAL_EXEC_ENVIRONMENT,
+            "PATH": str(repository / "venv/ilvr-venv/bin") + ":" + _MINIMAL_EXEC_ENVIRONMENT["PATH"].split(":", 1)[1],
             "CUDA_VISIBLE_DEVICES": str(assignment.gpu),
             "ILVR_REPOSITORY_COMMIT": commit,
-            "PYTHONPATH": f"{repository}:{repository / 'src'}",
+            "PYTHONPATH": (
+                f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}"
+            ),
         }
-        ownership_path = attempt_directory / assignment.ownership_name
-        exit_path = attempt_directory / assignment.exit_name
+        ownership_path = node_attempt / assignment.ownership_name
+        exit_path = node_attempt / assignment.exit_name
         supervisor = [
             str(python),
             "-m", "src.multinode", "node-run",
@@ -1251,6 +1435,7 @@ def _build_evaluation_commands_for_stage(
         digest = canonical_command_digest(owned_command, environment)
         isolated = (
             "/usr/bin/env", "-i",
+            *((f"--chdir={repository}",) if plan.cluster is not None and plan.cluster.local_repo_root != plan.cluster.remote_repo_root else ()),
             *(f"{name}={value}" for name, value in sorted(environment.items())),
             *owned_command,
         )
@@ -1258,7 +1443,7 @@ def _build_evaluation_commands_for_stage(
             "/usr/bin/tmux", "new-session", "-d", "-s",
             assignment.session_name, "--", *isolated,
         )
-        launch = tuple(build_remote_exec(tmux)) if assignment.node == "remote" else tmux
+        launch = tuple(build_remote_exec(tmux, working_directory=repository, cluster=plan.cluster)) if assignment.node == "remote" else tmux
         workers.append(
             EvaluationWorkerCommand(
                 assignment=assignment,
@@ -1281,9 +1466,9 @@ def _build_evaluation_commands_for_stage(
         shard_jsonls=shard_jsonls,
         shard_manifests=shard_manifests,
         remote_files_path=remote_files_path,
-        remote_files_payload=evaluation_result_files_bytes(),
+        remote_files_payload=evaluation_result_files_bytes(include_runtime_identity=stage == "stage1"),
         remote_pull=build_evaluation_pull_command(
-            plan.output_dir, files_from=remote_files_path
+            plan.output_dir, files_from=remote_files_path, cluster=plan.cluster
         ),
         merged_jsonl=plan.output_dir / "merged.jsonl",
         summary_json=plan.output_dir / "summary.json",
@@ -1402,8 +1587,8 @@ def _node_shell_command(
     log_root: Path,
     require_bash_launcher: bool = True,
 ) -> tuple[tuple[str, ...], str, OwnedNodeCommand]:
-    repository = plan.cluster.remote_repo_root
-    attempt_directory = log_root / plan.run_id / plan.attempt_id
+    repository = node_repository(plan, machine_rank=machine_rank)
+    attempt_directory = node_path(plan, log_root, machine_rank=machine_rank) / plan.run_id / plan.attempt_id
     ownership_path = attempt_directory / f"ownership-rank{machine_rank}.json"
     exit_path = attempt_directory / f"exit-rank{machine_rank}.json"
     if require_bash_launcher and (
@@ -1438,6 +1623,7 @@ def _node_shell_command(
     isolated_supervisor = (
         "/usr/bin/env",
         "-i",
+        *((f"--chdir={repository}",) if plan.cluster.local_repo_root != plan.cluster.remote_repo_root else ()),
         *(f"{name}={value}" for name, value in sorted(environment.items())),
         *owned_command,
     )
@@ -1452,6 +1638,91 @@ def _node_shell_command(
             exit_path=exit_path,
         ),
     )
+
+
+def build_dil_full_model_probe_commands(
+    plan: "LaunchPlan", *, commit: str, manifest: str | Path,
+    manifest_sha256: str, log_root: str | Path = _LOG_ROOT,
+) -> OwnedTmuxCommands:
+    """The one approved diagnostic entrypoint, under the normal owned supervisor."""
+    if (plan.stage != "stage2" or plan.tuning_method != "dora" or plan.zero_stage != 2
+            or plan.world_size != 4 or plan.cluster.num_machines != 2
+            or plan.cluster.num_processes != 4 or plan.cluster.gpus_per_node != 2
+            or plan.cluster.remote_rank != 0 or plan.cluster.local_rank != 1
+            or plan.cluster.master_addr != "10.1.102.41"
+            or plan.cluster.socket_ifname != "bond1.102" or plan.attempt_id != "initial"):
+        raise ValueError("DIL probe requires fresh two-node/four-rank DoRA ZeRO2 profile")
+    _require_digest("manifest_sha256", manifest_sha256)
+    if not re.fullmatch(r"[a-f0-9]{40}", commit):
+        raise ValueError("invalid probe commit")
+    manifest = _trusted_absolute_path(manifest)
+    repository = plan.cluster.remote_repo_root
+    commands, digests, specs = [], [], []
+    for machine_rank in (0, 1):
+        environment = {
+            **_MINIMAL_EXEC_ENVIRONMENT, **_distributed_environment(plan, machine_rank),
+            "MASTER_ADDR": "10.1.102.41", "GLOO_SOCKET_IFNAME": "bond1.102", "NCCL_SOCKET_IFNAME": "bond1.102",
+            "PYTHONDONTWRITEBYTECODE": "1", "ILVR_REPOSITORY_COMMIT": commit,
+            "PYTHONPATH": f"{repository}:{repository / 'src'}",
+        }
+        command = (
+            str(repository / "venv/ilvr-venv/bin/accelerate"), "launch",
+            "--num_machines", "2", "--num_processes", "4", "--machine_rank", str(machine_rank),
+            "--main_process_ip", "10.1.102.41", "--main_process_port", str(plan.main_process_port),
+            "--mixed_precision", "bf16", "--use_deepspeed", "--deepspeed_multinode_launcher", "standard",
+            "--deepspeed_config_file", str(plan.deepspeed_config),
+            str(repository / "scripts/probe_dil_full_model.py"), "run", "--repository", str(repository),
+            "--manifest", str(manifest), "--manifest-sha256", manifest_sha256, "--run-id", plan.run_id,
+        )
+        supervisor, digest, spec = _node_shell_command(
+            plan, machine_rank=machine_rank, commit=commit, stage_command=command,
+            environment=environment, log_root=Path(log_root), require_bash_launcher=False,
+        )
+        tmux = ("/usr/bin/tmux", "new-session", "-d", "-s", f"ilvr-{plan.run_id}-initial-rank{machine_rank}", "--", *supervisor)
+        commands.append(tuple(build_remote_exec(tmux)) if machine_rank == 0 else tmux)
+        digests.append(digest)
+        specs.append(spec)
+    return OwnedTmuxCommands(remote=commands[0], local=commands[1], command_digests=tuple(digests),
+                             node_specs=tuple(specs), finite_loss_evidence_path=None)
+
+
+def build_stage1_v5_witness_commands(
+    plan: "LaunchPlan", *, commit: str, data_path: Path, image_root: Path,
+    model: Path, audit_path: Path, log_root: str | Path = _LOG_ROOT,
+) -> OwnedTmuxCommands:
+    """Fixed Stage1-v5 diagnostic under the existing owned node supervisor."""
+    from src.multinode import validate_cluster_topology
+    validate_cluster_topology(plan.cluster)
+    if (plan.stage, plan.tuning_method, plan.zero_stage, plan.world_size, plan.attempt_id) != (
+            'stage1', 'dora', 1, 4, 'initial'):
+        raise ValueError('v5 witness requires fresh four-rank Stage1 DoRA ZeRO1')
+    if not re.fullmatch(r'[a-f0-9]{40}', commit): raise ValueError('invalid witness commit')
+    for value in (data_path,image_root,model,audit_path): _trusted_absolute_path(value)
+    commands=[]; digests=[]; specs=[]
+    for machine_rank in (0,1):
+        repository=node_repository(plan,machine_rank=machine_rank)
+        mapped=lambda path:str(node_path(plan,path,machine_rank=machine_rank))
+        environment={**_MINIMAL_EXEC_ENVIRONMENT,**_distributed_environment(plan,machine_rank),
+            'PATH':str(repository/'venv/ilvr-venv/bin')+':'+_MINIMAL_EXEC_ENVIRONMENT['PATH'].split(':',1)[1],
+            'MASTER_ADDR':plan.cluster.master_addr,'GLOO_SOCKET_IFNAME':plan.cluster.socket_ifname,
+            'NCCL_SOCKET_IFNAME':plan.cluster.socket_ifname,'PYTHONDONTWRITEBYTECODE':'1',
+            'PYTHONPATH':f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}",
+            'ILVR_REPOSITORY_COMMIT':commit}
+        command=(str(repository/'venv/ilvr-venv/bin/accelerate'),'launch',
+            '--num_machines','2','--num_processes','4','--machine_rank',str(machine_rank),
+            '--main_process_ip',plan.cluster.master_addr,'--main_process_port',str(plan.main_process_port),
+            '--mixed_precision','bf16','--use_deepspeed','--deepspeed_multinode_launcher','standard',
+            '--deepspeed_config_file',mapped(plan.deepspeed_config),
+            str(repository/'scripts/verify_stage1_v5.py'),'--mode','distributed-witness',
+            '--run-id',plan.run_id,'--data-path',mapped(data_path),'--image-root',mapped(image_root),
+            '--model',mapped(model),'--audit-json',mapped(audit_path),'--deepspeed',mapped(plan.deepspeed_config),
+            '--output-json',str(repository/'results'/plan.run_id/'stage1-v5-witness.json'))
+        supervisor,digest,spec=_node_shell_command(plan,machine_rank=machine_rank,commit=commit,
+            stage_command=command,environment=environment,log_root=Path(log_root),require_bash_launcher=False)
+        tmux=('/usr/bin/tmux','new-session','-d','-s',f'ilvr-{plan.run_id}-initial-rank{machine_rank}','--',*supervisor)
+        commands.append(tuple(build_remote_exec(tmux,working_directory=repository,cluster=plan.cluster)) if machine_rank==0 else tmux)
+        digests.append(digest); specs.append(spec)
+    return OwnedTmuxCommands(remote=commands[0],local=commands[1],command_digests=tuple(digests),node_specs=tuple(specs),finite_loss_evidence_path=None)
 
 
 def build_owned_lifecycle_harness_commands(
@@ -1519,7 +1790,9 @@ def build_owned_lifecycle_harness_commands(
             "MASTER_ADDR": plan.cluster.master_addr,
             "GLOO_SOCKET_IFNAME": plan.cluster.socket_ifname,
             "NCCL_SOCKET_IFNAME": plan.cluster.socket_ifname,
-            "PYTHONPATH": f"{repository}:{repository / 'src'}",
+            "PYTHONPATH": (
+                f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}"
+            ),
             "ILVR_REPOSITORY_COMMIT": commit,
         }
         harness_command = (
@@ -1594,9 +1867,11 @@ def build_owned_tmux_commands(
 
     if not isinstance(plan, LaunchPlan):
         raise TypeError("plan must be a LaunchPlan")
+    if plan.stage == "stage2":
+        _require_same_repository_roots(plan, "Stage 2 launcher")
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise ValueError("commit must be a lowercase 40-character Git object ID")
-    repository = plan.cluster.remote_repo_root
+    repository = plan.cluster.local_repo_root
     checkpoint = Path(checkpoint_root) / plan.run_id
     attempt_log = Path(stage_log_root) / plan.run_id / f"{plan.attempt_id}-train.log"
     supplied_environment = dict(stage_environment or {})
@@ -1680,8 +1955,12 @@ def build_owned_tmux_commands(
     digests: list[str] = []
     node_specs: list[OwnedNodeCommand] = []
     for machine_rank in (plan.cluster.remote_rank, plan.cluster.local_rank):
+        repository = node_repository(plan, machine_rank=machine_rank)
+        node_stage = _node_arguments(plan, stage_command, machine_rank)
+        node_stage = (node_stage[0], str(repository / Path(node_stage[1]).name), *node_stage[2:])
         environment = {
             **_MINIMAL_EXEC_ENVIRONMENT,
+            "PATH": str(repository / "venv/ilvr-venv/bin") + ":" + _MINIMAL_EXEC_ENVIRONMENT["PATH"].split(":", 1)[1],
             **(_STAGE2_FIXED_EXEC_ENVIRONMENT if plan.stage == "stage2" else {}),
             **base_environment,
             **_distributed_environment(plan, machine_rank),
@@ -1692,7 +1971,7 @@ def build_owned_tmux_commands(
             plan,
             machine_rank=machine_rank,
             commit=commit,
-            stage_command=stage_command,
+            stage_command=node_stage,
             environment=environment,
             log_root=Path(log_root),
         )
@@ -1713,7 +1992,7 @@ def build_owned_tmux_commands(
     return OwnedTmuxCommands(
         remote=tuple(
             build_remote_exec(
-                node_commands[0], working_directory=repository
+                node_commands[0], working_directory=plan.cluster.remote_repo_root, cluster=plan.cluster
             )
         ),
         local=node_commands[1],
@@ -1833,7 +2112,7 @@ class SubprocessCoordinatorRunner:
         self, machine_rank: int, arguments: Sequence[str]
     ) -> tuple[str, ...]:
         if machine_rank == self.plan.cluster.remote_rank:
-            return tuple(build_remote_exec(arguments))
+            return tuple(build_remote_exec(arguments, cluster=self.plan.cluster))
         if machine_rank == self.plan.cluster.local_rank:
             return tuple(arguments)
         raise ValueError("machine_rank must be 0 or 1")
@@ -1841,11 +2120,15 @@ class SubprocessCoordinatorRunner:
     def _internal_command(
         self, machine_rank: int, subcommand: str, arguments: Sequence[str]
     ) -> tuple[str, ...]:
+        arguments = _node_arguments(self.plan, arguments, machine_rank)
+        repository = node_repository(self.plan, machine_rank=machine_rank)
         if machine_rank == self.plan.cluster.remote_rank:
-            return _remote_repository_module_command(subcommand, arguments)
-        if machine_rank == self.plan.cluster.local_rank:
-            return _local_repository_module_command(subcommand, arguments)
-        raise ValueError("machine_rank must be 0 or 1")
+            return _remote_repository_module_command(subcommand, arguments, cluster=self.plan.cluster)
+        return _local_repository_module_command(subcommand, arguments, repository=repository)
+
+    def _internal_stdin_command(self, subcommand: str, arguments: Sequence[str]) -> tuple[str, ...]:
+        return _remote_repository_module_stdin_command(subcommand,
+            _node_arguments(self.plan, arguments, 0), cluster=self.plan.cluster)
 
     def _process_snapshot(self, ownership: OwnershipRecord) -> dict[str, object]:
         arguments = ["--pid", str(ownership.pid)]
@@ -1869,7 +2152,7 @@ class SubprocessCoordinatorRunner:
         if serialized.size > 1024 * 1024:
             raise ValueError("launch plan exceeds the one-MiB transfer limit")
         self._run(
-            _remote_repository_module_command(
+            self._internal_command(0,
                 "prepare-attempt",
                 (
                     "--log-root",
@@ -1883,7 +2166,7 @@ class SubprocessCoordinatorRunner:
         )
         remote_path = self.log_root / plan.run_id / plan.attempt_id / "launch-plan.json"
         self._run(
-            _remote_repository_module_stdin_command(
+            self._internal_stdin_command(
                 "receive-plan",
                 (
                     "--path",
@@ -1930,7 +2213,7 @@ class SubprocessCoordinatorRunner:
             arguments.extend(("--env", f"{name}={value}"))
         arguments.extend(("--", *spec.command))
         completed = self.command_runner(
-            _remote_repository_module_command("ownership-ready", arguments),
+            self._internal_command(0, "ownership-ready", arguments),
             input_bytes=None,
             timeout_seconds=_CONTROL_TIMEOUT_SECONDS,
         )
@@ -2125,12 +2408,43 @@ class SubprocessCoordinatorRunner:
             raise ValueError("remote lifecycle evidence size is invalid")
         return raw
 
+    def read_stage1_v5_witness_record(self, rank: int) -> bytes:
+        if self.plan.stage != 'stage1' or rank not in (0,1,2,3):
+            raise ValueError('invalid v5 witness record rank/stage')
+        repository=node_repository(self.plan,machine_rank=0 if rank<2 else 1)
+        path=repository/'results'/self.plan.run_id/f'v5-rank-{rank}.json'
+        if rank>=2: return _read_regular_file(path,maximum_size=16*1024*1024)
+        completed=self._run(build_remote_exec((str(repository/'venv/ilvr-venv/bin/python'),
+            str(repository/'scripts/verify_stage1_v5.py'),'--mode','record-show','--run-id',self.plan.run_id,
+            '--rank',str(rank)),working_directory=repository,cluster=self.plan.cluster))
+        raw=completed.stdout.encode()
+        if not raw or len(raw)>16*1024*1024: raise ValueError('invalid v5 rank record size')
+        return raw
+
+    def read_dil_full_model_probe_record(self, rank: int) -> bytes:
+        """Read only a fixed rank's metadata after exact-owned process completion."""
+        if rank not in (0, 1, 2, 3):
+            raise ValueError("invalid probe global rank")
+        repository = self.plan.cluster.remote_repo_root
+        if rank >= 2:
+            return _read_regular_file(repository / "results" / self.plan.run_id / f"probe-rank-{rank}.json",
+                                      maximum_size=16 * 1024 * 1024)
+        completed = self._run(build_remote_exec((
+            str(repository / "venv/ilvr-venv/bin/python"),
+            str(repository / "scripts/probe_dil_full_model.py"), "record-show",
+            "--repository", str(repository), "--run-id", self.plan.run_id, "--rank", str(rank),
+        ), working_directory=repository))
+        raw = completed.stdout.encode()
+        if not raw or len(raw) > 16 * 1024 * 1024:
+            raise ValueError("invalid probe rank record size")
+        return raw
+
     def read_stage1_training_evidence(self, path: Path) -> bytes:
         """Read the fixed remote ordinary Stage 1 producer after owned exit zero."""
         expected = self._launch_commands().finite_loss_evidence_path
         if self.plan.stage != "stage1" or expected is None or path != expected:
             raise ValueError("Stage 1 training evidence path differs from the launch")
-        repository = _REPOSITORY_ROOT
+        repository = self.plan.cluster.remote_repo_root
         completed = self._run(
             build_remote_exec(
                 (
@@ -2141,13 +2455,13 @@ class SubprocessCoordinatorRunner:
                     "src.multinode",
                     "stage1-training-evidence-show",
                     "--path",
-                    str(path),
+                    str(node_path(self.plan, path, machine_rank=0)),
                     "--run-id",
                     self.plan.run_id,
                     "--attempt-id",
                     self.plan.attempt_id,
                 ),
-                working_directory=repository,
+                working_directory=repository, cluster=self.plan.cluster,
             )
         )
         raw = completed.stdout.encode("utf-8")
@@ -2399,7 +2713,7 @@ class SubprocessCoordinatorRunner:
             str(self.checkpoint_root),
         )
         self._run(
-            _remote_repository_module_stdin_command(
+            self._internal_stdin_command(
                 "artifact-destination-check", arguments
             ),
             input_bytes=encoded,
@@ -2428,7 +2742,7 @@ class SubprocessCoordinatorRunner:
         )
         publish_files_list(files_path, entries)  # type: ignore[arg-type]
         self._run_artifact_transfer(
-            build_push_command(manifest, files_from=files_path)
+            build_push_command(manifest, files_from=files_path, cluster=self.plan.cluster)
         )
 
     def validate_resume_destination(
@@ -2492,7 +2806,7 @@ class SubprocessCoordinatorRunner:
         )
         publish_files_list(files_path, entries)  # type: ignore[arg-type]
         self._run_artifact_transfer(
-            build_pull_command(manifest, physical, files_from=files_path)
+            build_pull_command(manifest, physical, files_from=files_path, cluster=self.plan.cluster)
         )
         validate_transferred_entry_subset(physical, entries)  # type: ignore[arg-type]
 
@@ -2536,7 +2850,7 @@ class SubprocessCoordinatorRunner:
         )
         publish_files_list(files_path, entries)
         self._run_artifact_transfer(
-            build_pull_command(manifest, destination, files_from=files_path)
+            build_pull_command(manifest, destination, files_from=files_path, cluster=self.plan.cluster)
         )
         validate_transferred_entries(destination, entries)
 
@@ -2580,10 +2894,10 @@ class SubprocessCoordinatorRunner:
                     "-m",
                     "src.multinode",
                     subcommand,
-                    *arguments,
+                    *_node_arguments(self.plan, arguments, 0),
                 ),
                 working_directory=repository,
-            ))
+             cluster=self.plan.cluster))
 
         self._run(remote_repository_command(
             "prepare-inference-destination",
@@ -2591,7 +2905,7 @@ class SubprocessCoordinatorRunner:
         ))
         self._run_artifact_transfer(
             build_prepared_inference_push_command(
-                manifest, destination, files_from=files_path
+                manifest, destination, files_from=files_path, cluster=self.plan.cluster
             )
         )
         shown = self._run(remote_repository_command(
@@ -2669,7 +2983,7 @@ class EvaluationSubprocessRunner:
         self, worker: EvaluationWorkerCommand, arguments: Sequence[str]
     ) -> tuple[str, ...]:
         if worker.assignment.node == "remote":
-            return tuple(build_remote_exec(arguments))
+            return tuple(build_remote_exec(arguments, cluster=self.plan.cluster))
         if worker.assignment.node == "local":
             return tuple(arguments)
         raise ValueError("evaluation worker node is invalid")
@@ -2681,10 +2995,20 @@ class EvaluationSubprocessRunner:
         arguments: Sequence[str],
     ) -> tuple[str, ...]:
         if worker.assignment.node == "remote":
-            return _remote_repository_module_command(subcommand, arguments)
+            return self._remote_internal_command(subcommand, arguments)
         if worker.assignment.node == "local":
             return _local_repository_module_command(subcommand, arguments)
         raise ValueError("evaluation worker node is invalid")
+
+    def _remote_internal_command(self, subcommand: str, arguments: Sequence[str]) -> tuple[str, ...]:
+        mapped = []
+        previous = None
+        for argument in arguments:
+            if previous in _NODE_PATH_OPTIONS or previous in {"--model-dir", "--destination", "--output-dir"}:
+                argument = str(_evaluation_node_path(self.plan, argument, remote=True))
+            mapped.append(argument)
+            previous = argument
+        return _remote_repository_module_command(subcommand, mapped, cluster=self.plan.cluster)
 
     def repository_commit(self) -> str:
         return self.commit_value
@@ -2699,7 +3023,7 @@ class EvaluationSubprocessRunner:
             attempt_id=self.plan.attempt_id,
         )
         self._run(
-            _remote_repository_module_command(
+            self._remote_internal_command(
                 "prepare-attempt",
                 (
                     "--log-root",
@@ -2726,7 +3050,7 @@ class EvaluationSubprocessRunner:
         if plan != self.plan:
             raise ValueError("runner evaluation plan mismatch")
         shown = self._run(
-            _remote_repository_module_command(
+            self._remote_internal_command(
                 "prepared-inference-show",
                 (
                     "--model-dir",
@@ -2750,7 +3074,7 @@ class EvaluationSubprocessRunner:
         )
         prepare_inference_copy(manifest, physical_local_model, self)
         self._run(
-            _remote_repository_module_command(
+            self._remote_internal_command(
                 "prepare-evaluation-output",
                 (
                     "--output-dir",
@@ -2805,6 +3129,7 @@ class EvaluationSubprocessRunner:
                 self.plan.model_dir,
                 destination,
                 files_from=files_path,
+                cluster=self.plan.cluster,
             )
         )
         validate_transferred_entries(destination, entries)
@@ -2815,6 +3140,14 @@ class EvaluationSubprocessRunner:
         shard = worker.assignment.shard_index
         if shard in self._started:
             raise ValueError("evaluation worker was already started")
+        command = worker.node_spec.command
+        if not self._started and '--canonical-dataset-identity' in command:
+            binding = dict(
+                canonical_identity=json.loads(command[command.index('--canonical-dataset-identity') + 1]),
+                content_sha256=command[command.index('--expected-dataset-sha256') + 1],
+            )
+            record = self.log_root / self.plan.run_id / self.plan.attempt_id / 'dataset-identity.json'
+            publish_small_file(record, _canonical_json_bytes(binding))
         self._run(worker.launch)
         self._started[shard] = worker
 
@@ -2920,8 +3253,10 @@ class EvaluationSubprocessRunner:
                 "max_new_tokens": self.plan.max_new_tokens,
                 "max_sequence_length": self.plan.max_sequence_length,
                 "repetition_penalty": self.plan.repetition_penalty,
+                "generation_limit_policy": self.plan.generation_limit_policy,
                 "temperature": self.plan.temperature,
                 "top_p": self.plan.top_p,
+                "vision_ablation": self.plan.vision_ablation,
             },
         )
 
@@ -3463,6 +3798,8 @@ def _finite_loss_reference(
         producer_checkpoint = payload.get("checkpoint_path")
         if type(global_step) is not int or type(producer_checkpoint) is not str:
             raise ValueError("Stage 2 producer evidence identity is invalid")
+        if expected_global_step is not None and global_step != expected_global_step:
+            raise ValueError("Stage 2 producer global_step differs from expected checkpoint step")
         from stage2.evidence import decode_stage2_producer_evidence
 
         decoded = decode_stage2_producer_evidence(
@@ -3507,6 +3844,7 @@ def _finite_loss_reference(
                 checkpoint_root / f"checkpoint-{expected_global_step}"
             ),
             expected_global_step=expected_global_step,
+            expected_producer_checkpoint=node_path(plan, checkpoint_root / f'checkpoint-{expected_global_step}', machine_rank=0),
         )
         return {
             "status": "validated",
@@ -3578,6 +3916,7 @@ def write_training_witness(
     batch_per_gpu: int,
     finite_loss_evidence_path: str | Path | None = None,
     expected_global_step: int | None = None,
+    planned_stop_max_steps: int | None = None,
 ) -> Path:
     """Exclusively publish one attempt witness without inventing loss evidence."""
     if dict(exit_codes) != {0: 0, 1: 0}:
@@ -3625,6 +3964,12 @@ def write_training_witness(
         "checkpoint_path": str(checkpoint),
         "finite_loss_evidence": finite_loss,
     }
+    if planned_stop_max_steps is not None:
+        if not (type(expected_global_step) is int and type(planned_stop_max_steps) is int
+                and 0 < expected_global_step < planned_stop_max_steps):
+            raise ValueError("planned stop must precede the full training budget")
+        payload["planned_stop"] = {"global_step": expected_global_step,
+                                   "max_steps": planned_stop_max_steps, "budget_complete": False}
     return _publish_bytes_no_replace(path, _canonical_json_bytes(payload) + b"\n")
 
 
@@ -3683,13 +4028,18 @@ class PreflightCommands:
 
 
 def build_remote_exec(
-    argv: Sequence[str], *, working_directory: str | Path | None = None
+    argv: Sequence[str], *, working_directory: str | Path | None = None,
+    cluster: "ClusterSpec | None" = None
 ) -> list[str]:
     """Build the fixed, noninteractive remote container command safely."""
+    if cluster is not None:
+        from src.multinode import validate_cluster_topology
+        validate_cluster_topology(cluster)
+    approved_root = cluster.remote_repo_root if cluster is not None else _REPOSITORY_ROOT
     docker = ["/usr/bin/docker", "exec"]
     if working_directory is not None:
         directory = Path(working_directory)
-        if directory != _REPOSITORY_ROOT:
+        if directory != approved_root:
             raise ValueError("remote container working directory must be canonical")
         docker.extend(("--workdir", str(directory)))
     docker.extend((_REMOTE_CONTAINER, "/usr/bin/bash", "-lc", shlex.join(argv)))
@@ -3708,10 +4058,11 @@ def build_remote_exec(
 
 
 def _repository_module_command(
-    subcommand: str, arguments: Sequence[str] = ()
+    subcommand: str, arguments: Sequence[str] = (), *,
+    repository: Path | None = None, cluster: "ClusterSpec | None" = None,
 ) -> tuple[str, ...]:
     """Build an import-stable command for the fixed canonical repository."""
-    repository = _REPOSITORY_ROOT
+    repository = repository or _REPOSITORY_ROOT
     return (
         "/usr/bin/env",
         f"PYTHONPATH={repository}:{repository / 'src'}",
@@ -3724,36 +4075,45 @@ def _repository_module_command(
 
 
 def _local_repository_module_command(
-    subcommand: str, arguments: Sequence[str] = ()
+    subcommand: str, arguments: Sequence[str] = (), *,
+    repository: Path | None = None, cluster: "ClusterSpec | None" = None,
 ) -> tuple[str, ...]:
-    repository_command = _repository_module_command(subcommand, arguments)
+    repository = repository or _REPOSITORY_ROOT
+    repository_command = _repository_module_command(subcommand, arguments, repository=repository)
     return (
         repository_command[0],
         "-C",
-        str(_REPOSITORY_ROOT),
+        str(repository),
         *repository_command[1:],
     )
 
 
 def _remote_repository_module_command(
-    subcommand: str, arguments: Sequence[str] = ()
+    subcommand: str, arguments: Sequence[str] = (), *,
+    repository: Path | None = None, cluster: "ClusterSpec | None" = None,
 ) -> tuple[str, ...]:
+    repository = cluster.remote_repo_root if cluster is not None else (repository or _REPOSITORY_ROOT)
     return tuple(
         build_remote_exec(
-            _repository_module_command(subcommand, arguments),
-            working_directory=_REPOSITORY_ROOT,
+            _repository_module_command(subcommand, arguments, repository=repository),
+            working_directory=repository, cluster=cluster,
         )
     )
 
 
 def _build_remote_stdin_exec(
-    argv: Sequence[str], *, working_directory: str | Path | None = None
+    argv: Sequence[str], *, working_directory: str | Path | None = None,
+    cluster: "ClusterSpec | None" = None
 ) -> list[str]:
     """Build the fixed remote container boundary with stdin attached."""
+    if cluster is not None:
+        from src.multinode import validate_cluster_topology
+        validate_cluster_topology(cluster)
+    approved_root = cluster.remote_repo_root if cluster is not None else _REPOSITORY_ROOT
     docker = ["/usr/bin/docker", "exec", "-i"]
     if working_directory is not None:
         directory = Path(working_directory)
-        if directory != _REPOSITORY_ROOT:
+        if directory != approved_root:
             raise ValueError("remote container working directory must be canonical")
         docker.extend(("--workdir", str(directory)))
     docker.extend((_REMOTE_CONTAINER, "/usr/bin/bash", "-lc", shlex.join(argv)))
@@ -3770,12 +4130,14 @@ def _build_remote_stdin_exec(
 
 
 def _remote_repository_module_stdin_command(
-    subcommand: str, arguments: Sequence[str] = ()
+    subcommand: str, arguments: Sequence[str] = (), *,
+    repository: Path | None = None, cluster: "ClusterSpec | None" = None,
 ) -> tuple[str, ...]:
+    repository = cluster.remote_repo_root if cluster is not None else (repository or _REPOSITORY_ROOT)
     return tuple(
         _build_remote_stdin_exec(
-            _repository_module_command(subcommand, arguments),
-            working_directory=_REPOSITORY_ROOT,
+            _repository_module_command(subcommand, arguments, repository=repository),
+            working_directory=repository, cluster=cluster,
         )
     )
 
@@ -3803,7 +4165,7 @@ def _validate_snapshot(node: NodeSnapshot) -> None:
         not _is_python_311(node.python_version)
         or node.torch_version != "2.7.1+cu128"
         or node.accelerate_version != "1.10.1"
-        or node.deepspeed_version != "0.18.0"
+        or node.deepspeed_version != "0.18.7"
         or not node.torchrun_ok
     ):
         raise ValueError(f"{node.node}: environment versions or torchrun mismatch")
@@ -3873,7 +4235,7 @@ def build_preflight_commands(
         plan,
         node="local",
         machine_rank=plan.cluster.local_rank,
-        repository=repository,
+        repository=plan.cluster.local_repo_root,
         input_paths=input_paths,
         artifact_roots=artifact_roots,
         run_paths=local_run_paths,
@@ -3897,7 +4259,7 @@ def build_preflight_commands(
                 )
             ),
         ),
-        remote_node_info=tuple(build_remote_exec(remote_argv)),
+        remote_node_info=tuple(build_remote_exec(remote_argv, cluster=plan.cluster)),
         local_node_info=tuple(local_argv),
     )
 
@@ -3917,8 +4279,9 @@ def collect_node_snapshot(
     """Run exactly one node-info probe, using SSH only for the remote node."""
     if node not in {"remote", "local"}:
         raise ValueError("node must be 'remote' or 'local'")
-    repository = Path(repository) if repository is not None else plan.cluster.remote_repo_root
-    if repository != plan.cluster.remote_repo_root:
+    expected_repository = node_repository(plan, machine_rank=0 if node == "remote" else 1)
+    repository = Path(repository) if repository is not None else expected_repository
+    if repository != expected_repository:
         raise ValueError("node-info repository must be the canonical ILVR checkout")
     if commands is None:
         commands = build_preflight_commands(
@@ -3979,7 +4342,7 @@ def _node_info_command(
         "--tuning-method",
         plan.tuning_method,
         "--deepspeed-config",
-        str(plan.deepspeed_config),
+        str(node_path(plan, plan.deepspeed_config, machine_rank=machine_rank)),
         "--deepspeed-config-digest",
         plan.deepspeed_config_digest,
         "--zero-stage",
@@ -3991,7 +4354,7 @@ def _node_info_command(
         ("--run-path", run_paths),
     ):
         for path in paths:
-            command.extend((flag, str(path)))
+            command.extend((flag, str(node_path(plan, path, machine_rank=machine_rank))))
     for session in tmux_sessions:
         command.extend(("--tmux-session", session))
     return command

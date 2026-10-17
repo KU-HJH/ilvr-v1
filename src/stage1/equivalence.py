@@ -859,6 +859,14 @@ class SampleStableStage1Dropout(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.training:
             return x
+        from .v5_execution import current_v5_execution
+        execution = current_v5_execution()
+        if execution is not None:
+            from transformers.models.qwen2_5_vl.stage1_v5_trace import packed_dropout_output
+            packed = packed_dropout_output(self.site_name, self.p, x)
+            if packed is not None:
+                return packed
+            return execution.native_dropout(self.site_name, self.p, x)
         if self.p == 0.0 and _STAGE1_STOCHASTIC_CONTEXT.get() is None:
             return x
         active_context = _require_stage1_stochastic_context()

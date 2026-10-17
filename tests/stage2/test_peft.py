@@ -171,6 +171,16 @@ def test_stage2_peft_accepts_optimized_target_selectors_for_multilayer_decoder()
     assert len(report.resolved_target_names) == 21
 
 
+def test_stage2_peft_rejects_unmatched_compact_target_selector():
+    """Catches unknown compact selectors being ignored by union matching."""
+    wrapped = build_stage2_tuned_model(tiny_stage2_qwen(), settings("dora"))
+    config = wrapped.peft_config["default"]
+    config.target_modules = [*config.target_modules, "nonexistent_selector"]
+
+    with pytest.raises(ValueError, match="do not match Stage 2 tuning"):
+        validate_stage2_parameter_boundary(wrapped, settings("dora"))
+
+
 def test_wrapper_resolver_handles_deepspeed_then_peft():
     """Catches wrapper traversal that stops before the underlying Stage 2 Qwen."""
     wrapped = build_stage2_tuned_model(tiny_stage2_qwen(), lora_settings())

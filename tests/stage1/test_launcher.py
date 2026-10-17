@@ -364,13 +364,14 @@ def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_
         "--data_path": "/missing/CoMT train;literal/TRAIN.jsonl",
         "--image_root": "/missing/CoMT images & literal",
         "--save_model_path": str(output),
-        "--per_device_train_batch_size": "8",
-        "--epochs": "3",
-        "--learning_rate": "1e-5",
+        "--per_device_train_batch_size": "1",
+        "--epochs": "1",
+        "--learning_rate": "5e-5",
         "--gradient_accumulation_steps": "2",
         "--seed": "42",
         "--attention_implementation": "flash_attention_2",
         "--save_strategy": "no",
+        "--textual_states": "previous",
         "--lora_r": "32",
         "--lora_alpha": "64",
         "--lora_dropout": "0.05",
@@ -431,6 +432,20 @@ def test_stage1_launcher_rejects_invalid_teacher_decay(tmp_path, ema_tau):
 
     assert completed.returncode == 2
     assert "ema_tau must be a finite number in [0, 1]" in completed.stderr
+
+
+def test_launcher_forwards_explicit_textual_states(tmp_path):
+    """Catches the launcher ignoring an explicit textual history mode."""
+    completed = run_launcher(
+        LAUNCHER,
+        *base_args(tmp_path / "output"),
+        "--textual_states",
+        "all",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = shlex.split(completed.stdout)
+    assert command[command.index("--textual_states") + 1] == "all"
 
 
 def test_dry_run_derives_canonical_log_from_checkpoint_experiment_id():
@@ -883,3 +898,18 @@ def test_launcher_rejects_invalid_save_steps(tmp_path, value):
 
     assert completed.returncode == 2
     assert "save_steps" in completed.stderr
+
+
+@pytest.mark.parametrize('explicit_text', [False, True])
+def test_adaptive_worker_omits_only_generated_textual_fallback(tmp_path, explicit_text):
+    extra = ['--textual_states', 'all'] if explicit_text else []
+    completed = run_launcher(LAUNCHER, *base_args(tmp_path/'out'),
+                             '--query_mode', 'adaptive', '--history_text_gamma', '.55',
+                             '--history_attention_layers', 'last4', *extra)
+    assert completed.returncode == 0, completed.stderr
+    argv = shlex.split(completed.stdout)
+    assert argv[argv.index('--query_mode')+1] == 'adaptive'
+    assert argv[argv.index('--history_text_gamma')+1] == '.55'
+    assert argv[argv.index('--history_attention_layers')+1] == 'last4'
+    assert ('--textual_states' in argv) == explicit_text
+    if explicit_text: assert argv[argv.index('--textual_states')+1] == 'all'

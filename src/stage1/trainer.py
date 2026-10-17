@@ -35,6 +35,7 @@ from .equivalence import (
     activate_stage1_stochastic_context,
 )
 from .targets import Stage1TeacherTargetBuilder
+from .query import Stage1QueryConfig
 from .types import Stage1BatchMetadata, Stage1TeacherTargets
 
 
@@ -165,7 +166,8 @@ class _DeepSpeedStepAdapter:
         if not boundary:
             return self.original_step(*args, **kwargs)
 
-        trainer._validate_deepspeed_gradient_norm(self.engine)
+        if trainer._stage1_checks_enabled():
+            trainer._validate_deepspeed_gradient_norm(self.engine)
         result = self.original_step(*args, **kwargs)
         applied = self.engine.was_step_applied()
         if type(applied) is not bool:
@@ -199,7 +201,8 @@ class _Stage1OptimizerCallback(TrainerCallback):
         if trainer is not None and getattr(
             trainer, "_deepspeed_step_adapter", None
         ) is None:
-            trainer._validate_gradient_norm(kwargs.get("model"))
+            if trainer._stage1_checks_enabled():
+                trainer._validate_gradient_norm(kwargs.get("model"))
         return control
 
     def on_optimizer_step(self, args, state, control, **kwargs):
@@ -230,6 +233,8 @@ class CustomTrainerStage1(SFTTrainer):
         image_pool_k: int = 8,
         ce_weight: float = 1.0,
         helper_group_L: int | None = 256,
+        textual_states: str = "previous",
+        query_config: Stage1QueryConfig | None = None,
         ema_method: str | None = None,
         target_builder: Stage1TeacherTargetBuilder | None = None,
         ema_teacher: Stage1EmaTeacher | None = None,
@@ -252,6 +257,10 @@ class CustomTrainerStage1(SFTTrainer):
         self.coverage_p = float(coverage_p)
         self.image_pool_k = int(image_pool_k)
         self.helper_group_L = helper_group_L
+        self.textual_states = textual_states
+        if query_config is not None and not isinstance(query_config, Stage1QueryConfig):
+            raise TypeError('query_config must be a Stage1QueryConfig')
+        self.query_config = query_config or Stage1QueryConfig()
         self.collect_stage1_diagnostics = bool(collect_stage1_diagnostics)
         self._latest_stage1_diagnostics = None
         self._representative_gradient_norm: float | None = None
@@ -282,6 +291,10 @@ class CustomTrainerStage1(SFTTrainer):
                 coverage_p=self.coverage_p,
                 image_pool_k=self.image_pool_k,
                 helper_group_L=self.helper_group_L,
+                textual_states=self.textual_states,
+                query_config=self.query_config,
+                validate=self._stage1_checks_enabled(),
+                collect_diagnostics=self._stage1_checks_enabled(),
             )
         self.target_builder = target_builder
 
@@ -381,26 +394,7 @@ class CustomTrainerStage1(SFTTrainer):
         # ``num_items_in_batch`` remains in the public Trainer signature.  The
         # local Qwen loss has no compatible forward argument for this hint.
         del num_items_in_batch
-        working_inputs = dict(inputs)
-        metadata = working_inputs.pop("stage1_batch_metadata", None)
-        if not isinstance(metadata, Stage1BatchMetadata):
-            raise TypeError(
-                "stage1_batch_metadata must be a Stage1BatchMetadata instance"
-            )
-
-        self._validate_ema_teacher_device(working_inputs)
-        targets = self.target_builder.build(
-            self.ema_teacher.model, working_inputs, metadata
-        )
-        self._validate_targets(targets, metadata, working_inputs)
-        model_inputs = {
-            key: value
-            for key, value in working_inputs.items()
-            if key not in _HELPER_INPUTS
-        }
-        model_inputs["latent_hidden_states"] = targets.latent_values.detach()
-        model_inputs["image_out_mask"] = targets.latent_mask
-
+        model_inputs, metadata, targets = self._prepare_stage1_loss_inputs(inputs)
         labels = model_inputs.get("labels")
         if not isinstance(labels, torch.Tensor) or labels.ndim != 2:
             raise TypeError("Stage 1 labels must be a rank-2 tensor")
@@ -410,15 +404,7 @@ class CustomTrainerStage1(SFTTrainer):
             forward_inputs.pop("labels")
 
         outputs = model(**forward_inputs)
-        model_ce_loss = getattr(outputs, "loss", None)
-        if labels.shape[0] == 1 and (
-            not isinstance(model_ce_loss, torch.Tensor)
-            or model_ce_loss.numel() != 1
-        ):
-            raise RuntimeError("Stage 1 student forward must return a scalar loss")
-        ce_loss = self._equal_sample_ce_loss(outputs, labels, model_ce_loss)
-        outputs.loss = ce_loss
-        alignment_loss = self._alignment_loss(outputs, targets)
+        ce_loss, alignment_loss = self._stage1_native_losses(outputs, labels, targets)
         loss = self.ce_weight * ce_loss + self.sim_weight * alignment_loss
         if not bool(torch.isfinite(loss.detach()).all().item()):
             raise FloatingPointError("Stage 1 loss is nonfinite")
@@ -439,6 +425,49 @@ class CustomTrainerStage1(SFTTrainer):
         else:
             self._latest_stage1_diagnostics = None
         return (loss, outputs) if return_outputs else loss
+
+    def _stage1_checks_enabled(self) -> bool:
+        # Ordinary Stage1 retains strict diagnostics; v5 opts into its runtime flag.
+        return getattr(self, "stage1_v5_debug", True)
+
+    def _prepare_stage1_loss_inputs(self, inputs) -> tuple[dict, Stage1BatchMetadata, Stage1TeacherTargets]:
+        """Build helper targets once, preserving the original model tensors."""
+        working_inputs = dict(inputs)
+        metadata = working_inputs.pop("stage1_batch_metadata", None)
+        if not isinstance(metadata, Stage1BatchMetadata):
+            raise TypeError(
+                "stage1_batch_metadata must be a Stage1BatchMetadata instance"
+            )
+
+        if self._stage1_checks_enabled():
+            self._validate_ema_teacher_device(working_inputs)
+        targets = self.target_builder.build(
+            self.ema_teacher.model, working_inputs, metadata
+        )
+        if self._stage1_checks_enabled():
+            self._validate_targets(targets, metadata, working_inputs)
+        model_inputs = {
+            key: value
+            for key, value in working_inputs.items()
+            if key not in _HELPER_INPUTS
+        }
+        model_inputs["latent_hidden_states"] = targets.latent_values.detach()
+        model_inputs["image_out_mask"] = targets.latent_mask
+
+        return model_inputs, metadata, targets
+
+    def _stage1_native_losses(self, outputs, labels: torch.Tensor, targets: Stage1TeacherTargets) -> tuple[torch.Tensor, torch.Tensor]:
+        """Unchanged native per-sample CE and latent alignment reductions."""
+        model_ce_loss = getattr(outputs, "loss", None)
+        if labels.shape[0] == 1 and (
+            not isinstance(model_ce_loss, torch.Tensor)
+            or model_ce_loss.numel() != 1
+        ):
+            raise RuntimeError("Stage 1 student forward must return a scalar loss")
+        ce_loss = self._equal_sample_ce_loss(outputs, labels, model_ce_loss)
+        outputs.loss = ce_loss
+        alignment_loss = self._alignment_loss(outputs, targets)
+        return ce_loss, alignment_loss
 
     @staticmethod
     def _equal_sample_ce_loss(outputs, labels, model_ce_loss) -> torch.Tensor:
@@ -778,14 +807,23 @@ class CustomTrainerStage1(SFTTrainer):
             return
         accelerate_version = importlib_metadata.version("accelerate")
         deepspeed_version = importlib_metadata.version("deepspeed")
+        supported_deepspeed = deepspeed_version == _SUPPORTED_DEEPSPEED_VERSION
+        if deepspeed_version == "0.18.7":
+            from .v5_trainer import CustomTrainerStage1V5
+
+            supported_deepspeed = (
+                isinstance(self, CustomTrainerStage1V5)
+                and self.deepspeed_runtime_profile.enabled
+                and self.deepspeed_runtime_profile.zero_stage == 1
+            )
         if (
             accelerate_version != _SUPPORTED_ACCELERATE_VERSION
-            or deepspeed_version != _SUPPORTED_DEEPSPEED_VERSION
+            or not supported_deepspeed
         ):
             raise RuntimeError(
                 "unsupported DeepSpeed Stage 1 lifecycle: expected "
                 f"accelerate {_SUPPORTED_ACCELERATE_VERSION} and deepspeed "
-                f"{_SUPPORTED_DEEPSPEED_VERSION}, found accelerate "
+                f"{_SUPPORTED_DEEPSPEED_VERSION} (or 0.18.7 for v5 ZeRO-1), found accelerate "
                 f"{accelerate_version} and deepspeed {deepspeed_version}"
             )
 
@@ -854,7 +892,8 @@ class CustomTrainerStage1(SFTTrainer):
         if optimizer is None:
             raise RuntimeError("Stage 1 optimizer_step requires an optimizer")
 
-        self._validate_gradient_norm(self.model)
+        if self._stage1_checks_enabled():
+            self._validate_gradient_norm(self.model)
         result = optimizer.step(*remaining, **kwargs)
         skipped = bool(
             getattr(self.accelerator, "optimizer_step_was_skipped", False)

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -14,11 +15,72 @@ from stage2.data import (
     prepare_stage2_example,
     resolve_original_images,
 )
-from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds, LatentStructureError
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    PlanCharSpan,
+)
+from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
+    LatentSpan,
+    LatentStructureError,
+    LatentTokenIds,
+    parse_latent_spans,
+)
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
 
 TOKENS = LatentTokenIds(pad_token_id=90, start_token_id=91, end_token_id=92)
+
+
+@pytest.mark.parametrize("mutation", [None, "unpadded_length", "padded_length", "sample_id", "cap"])
+def test_packed_admission_collator_rechecks_natural_plan(tmp_path, monkeypatch, mutation):
+    from tests.step_preference.test_packed_admission_cli import AdmissionProcessor
+    from step_preference.negatives import StepNegative
+    from step_preference.packed_admission import PackedAdmissionRecord
+    from step_preference import packing
+
+    Image.new("RGB", (2, 2)).save(tmp_path / "input.png")
+    example = prepare_stage2_example(
+        dict(sample_id="sample-a", image_input="input.png", text_input="question",
+             sequence_plan=[dict(type="text", content="A"),
+                            dict(type="latent", helper_image="ignored.png"),
+                            dict(type="text", content="BC")]),
+        image_root=tmp_path, latent_size=8, require_reasoning_units=True,
+        assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    )
+    processor = AdmissionProcessor()
+    store = {("sample-a", 0): StepNegative("sample-a", 0, "BC", "DD", None, True, False, -1.0, -2.0, None)}
+    kwargs = dict(processor=processor, token_ids=TOKENS, latent_size=8,
+                  supervise_latent_boundaries=True, step_preference_enabled=True, negative_store=store)
+    original = Stage2DataCollator(**kwargs)([example])
+    natural = packing.build_packed_tree_plan(
+        clean_input_ids=original["input_ids"], attention_mask=original["attention_mask"],
+        reasoning_spans=original["reasoning_step_spans"], joined_steps=original["step_preference"]["steps"],
+    )
+    record = PackedAdmissionRecord(0, "sample-a", natural.root_length, natural.unpadded_length,
+                                   natural.padded_length, 4, 1, 1, 3, 8, "retained")
+    records = {"sample-a": record}
+    if mutation == "sample_id":
+        records = {}
+    if mutation in ("unpadded_length", "padded_length"):
+        planner = packing.build_packed_tree_plan
+        def changed(**kwargs):
+            plan = planner(**kwargs)
+            return replace(plan, **{mutation: getattr(plan, mutation) + 128})
+        monkeypatch.setattr(packing, "build_packed_tree_plan", changed)
+    collator_kwargs = dict(kwargs, packed_admission_records_by_sample_id=records,
+                           max_packed_sequence_length=128 if mutation == "cap" else 4608)
+    if mutation is not None:
+        with pytest.raises(ValueError, match="admission"):
+            Stage2DataCollator(**collator_kwargs)([example])
+        return
+    collator = Stage2DataCollator(**collator_kwargs)
+    records.clear()  # The caller cannot mutate the collator's authenticated snapshot.
+    actual = collator([example])
+    assert actual.keys() == original.keys()
+    for key in ("input_ids", "attention_mask", "labels", "pixel_values", "image_grid_thw"):
+        assert torch.equal(actual[key], original[key])
+    assert actual["sample_ids"] == ("sample-a",)
+    assert actual["reasoning_step_spans"] == original["reasoning_step_spans"]
 
 
 class RecordingTokenizer:
@@ -228,6 +290,92 @@ def test_prepare_example_preserves_original_image_paths_and_latent_count(tmp_pat
         str(tmp_path / "second.png"),
     )
     assert prepared.latent_block_count == 1
+
+
+def test_prepare_example_uses_one_adjacent_text_rendering_for_content_and_spans(
+    tmp_path,
+):
+    """Catches conversation text and recorded spans using different renderings."""
+    Image.new("RGB", (2, 2)).save(tmp_path / "input.png")
+    sample = {
+        "image_input": "input.png",
+        "text_input": "question",
+        "sequence_plan": [
+            {"type": "text", "content": "A."},
+            {"type": "text", "content": "The final answer"},
+        ],
+    }
+
+    prepared = prepare_stage2_example(
+        sample,
+        image_root=tmp_path,
+        latent_size=1,
+        assistant_plan_rendering=ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    )
+
+    assert prepared.conversation[1]["content"][0]["text"] == "A. \nThe final answer"
+    assert prepared.plan_char_spans == (
+        PlanCharSpan(0, "text", 0, 2),
+        PlanCharSpan(1, "text", 4, 20),
+    )
+
+
+def test_ordinary_stage2_prepare_and_collate_matches_the_legacy_golden(tmp_path):
+    """Catches opt-in rendering changing any ordinary Stage 2 model input."""
+    Image.new("RGB", (2, 2)).save(tmp_path / "input.png")
+    sample = {
+        "sample_id": "ordinary-golden",
+        "image_input": "input.png",
+        "text_input": "question",
+        "sequence_plan": [
+            {"type": "text", "content": "A"},
+            {"type": "latent", "helper_image": "ignored.png"},
+            {"type": "text", "content": "B"},
+            {"type": "text", "content": "C"},
+        ],
+    }
+
+    prepared = prepare_stage2_example(sample, image_root=tmp_path, latent_size=2)
+    collator = make_collator()
+    batch = collator([prepared])
+
+    assert prepared.conversation == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": str(tmp_path / "input.png")},
+                {"type": "text", "text": "question"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "A<|latent_start|><|latent_pad|><|latent_pad|><|latent_end|>BC",
+                }
+            ],
+        },
+    ]
+    assert prepared.plan_char_spans == (
+        PlanCharSpan(0, "text", 0, 1),
+        PlanCharSpan(1, "latent", 1, 59),
+        PlanCharSpan(2, "text", 59, 60),
+        PlanCharSpan(3, "text", 60, 61),
+    )
+    assert torch.equal(
+        batch["input_ids"], torch.tensor([[1, 31, 32, 91, 90, 90, 92, 7]])
+    )
+    assert torch.equal(batch["attention_mask"], torch.ones((1, 8), dtype=torch.long))
+    assert torch.equal(
+        batch["labels"],
+        torch.tensor([[-100, -100, -100, 91, -100, -100, 92, 7]]),
+    )
+    assert torch.equal(batch["pixel_values"], torch.ones((1, 3, 2, 2)))
+    assert torch.equal(batch["image_grid_thw"], torch.tensor([[1, 2, 2]]))
+    assert parse_latent_spans(
+        batch["input_ids"][0], token_ids=TOKENS, latent_size=2
+    ) == (LatentSpan(3, (4, 5), 6),)
 
 
 def test_load_jsonl_examples_ignores_blank_lines(tmp_path):

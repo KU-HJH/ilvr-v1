@@ -9,6 +9,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from peft_common import resolve_qwen2_5_vl_model
+from stage1.history_metric import content_history, compose_content_query
+from stage1.query import (
+    DiscountedTextState, Stage1QueryConfig, history_text_positions,
+    update_text_history, validate_query_training_config,
+)
 from stage1.types import (
     Stage1BatchMetadata,
     Stage1SampleMetadata,
@@ -30,17 +36,30 @@ class Stage1TeacherTargetBuilder:
         coverage_p: float = 0.9,
         image_pool_k: int = 8,
         helper_group_L: int | None = 256,
+        textual_states: str = "previous",
+        validate: bool = True,
+        collect_diagnostics: bool = True,
+        query_config: Stage1QueryConfig | None = None,
     ) -> None:
         if not math.isfinite(coverage_p) or not 0.0 < coverage_p <= 1.0:
             raise ValueError("coverage_p must be finite and in (0, 1]")
         if image_pool_k <= 0:
             raise ValueError("image_pool_k must be positive")
+        if textual_states not in ("all", "previous"):
+            raise ValueError("textual_states must be 'all' or 'previous'")
+        if query_config is not None and not isinstance(query_config, Stage1QueryConfig):
+            raise TypeError("query_config must be a Stage1QueryConfig or None")
+        self.query_config = query_config or Stage1QueryConfig()
+        validate_query_training_config(self.query_config)
+        self.validate = bool(validate)
+        self.collect_diagnostics = bool(collect_diagnostics)
         self.tokenizer = tokenizer
         self.coverage_p = float(coverage_p)
         self.image_pool_k = int(image_pool_k)
         self.helper_group_L = (
             self.image_pool_k if helper_group_L is None else int(helper_group_L)
         )
+        self.textual_states = textual_states
         self._assistant_patterns = self._token_patterns(
             ("<|im_start|>assistant", "<|im_start|>assistant\n")
         )
@@ -99,9 +118,24 @@ class Stage1TeacherTargetBuilder:
         helper_grid = self._require_tensor_value(
             helper_grid, "image_grid_thw_latent"
         )
-        self._validate_batch_shape(input_ids, attention_mask, metadata)
+        if self.validate or self.query_config.mode == "adaptive":
+            self._validate_batch_shape(input_ids, attention_mask, metadata)
 
-        teacher.eval()
+        if self.query_config.mode == "adaptive":
+            if metadata.batch_size != 1:
+                raise ValueError("adaptive history requires batch size 1")
+            if any(module.training for module in teacher.modules()) or any(
+                p.requires_grad or p.grad is not None for p in teacher.parameters()
+            ):
+                raise ValueError("adaptive history teacher must be frozen and in eval mode")
+            sample_length = metadata.samples[0].unpadded_length
+            if (type(sample_length) is not int
+                    or not 0 < sample_length <= metadata.sequence_length
+                    or not bool((attention_mask[:, :sample_length] == 1).all())
+                    or not bool((attention_mask[:, sample_length:] == 0).all())):
+                raise ValueError("adaptive attention mask must match unpadded metadata length")
+        else:
+            teacher.eval()
         device = self._teacher_device(teacher, input_ids.device)
         teacher_ids = input_ids.to(device)
         teacher_attention = attention_mask.to(device)
@@ -176,8 +210,8 @@ class Stage1TeacherTargetBuilder:
                     ] = True
 
         latent_values = torch.cat(packed, dim=0)
-        expected_count = int(latent_mask.sum().item())
-        if latent_values.shape[0] != expected_count:
+        if ((self.validate or self.query_config.mode == "adaptive")
+                and latent_values.shape[0] != int(latent_mask.sum().item())):
             raise RuntimeError(
                 "row-major latent target count does not match latent mask"
             )
@@ -185,7 +219,7 @@ class Stage1TeacherTargetBuilder:
             latent_values=latent_values,
             latent_mask=latent_mask,
             selected_counts=tuple(selected_counts),
-            diagnostics=self._diagnostics(latent_values),
+            diagnostics=self._diagnostics(latent_values) if self.collect_diagnostics else {},
             selected_candidate_indices=tuple(selected_candidate_indices),
             selection_margins=tuple(selection_margins),
         )
@@ -203,6 +237,19 @@ class Stage1TeacherTargetBuilder:
         helper_grid,
         image_token_id,
     ):
+        build_sample = (self._build_sample_adaptive
+                        if self.query_config.mode == "adaptive"
+                        else self._build_sample_legacy)
+        return build_sample(
+            teacher=teacher, sample=sample, sample_ids=sample_ids,
+            sample_attention=sample_attention, original_pixels=original_pixels,
+            original_grid=original_grid, helper_pixels=helper_pixels,
+            helper_grid=helper_grid, image_token_id=image_token_id,
+        )
+
+    def _observe_teacher(
+        self, teacher, sample, sample_ids, sample_attention, original_pixels, original_grid,
+    ):
         text_outputs = teacher(
             input_ids=sample_ids,
             attention_mask=sample_attention,
@@ -212,11 +259,28 @@ class Stage1TeacherTargetBuilder:
             return_dict=True,
         )
         hidden_pre, hidden_last = self._hidden_states(
-            text_outputs, (1, sample.unpadded_length)
+            text_outputs, (1, sample.unpadded_length), validate=self.validate
         )
         input_embeddings = self._language_input_embeddings(
             teacher, text_outputs, sample_ids
         )
+        return hidden_pre, hidden_last, input_embeddings
+
+    def _build_sample_legacy(
+        self,
+        *,
+        teacher,
+        sample,
+        sample_ids,
+        sample_attention,
+        original_pixels,
+        original_grid,
+        helper_pixels,
+        helper_grid,
+        image_token_id,
+    ):
+        hidden_pre, hidden_last, input_embeddings = self._observe_teacher(
+            teacher, sample, sample_ids, sample_attention, original_pixels, original_grid)
         if helper_grid.shape[0]:
             helper_features = teacher.visual(helper_pixels, grid_thw=helper_grid)
             helper_images = self._split_visual_features(
@@ -228,7 +292,13 @@ class Stage1TeacherTargetBuilder:
         row_ids = sample_ids[0]
         row_hidden_pre = hidden_pre[0]
         row_hidden_last = hidden_last[0]
-        assistant_start = self._assistant_start(row_ids, sample)
+        if self.textual_states == "all":
+            assistant_start, assistant_end = self._assistant_bounds(
+                row_ids, sample
+            )
+        else:
+            assistant_start = self._assistant_start(row_ids, sample)
+            assistant_end = assistant_start
         user_query = self._user_query(
             teacher=teacher,
             sample=sample,
@@ -241,32 +311,59 @@ class Stage1TeacherTargetBuilder:
             original_grid=original_grid,
             original_counts=self._visual_token_counts(original_grid, teacher),
         )
-        text_spans = self._assistant_text_spans(row_ids, sample, assistant_start)
+        text_spans = self._assistant_text_spans(
+            row_ids,
+            sample,
+            assistant_end if self.textual_states == "all" else assistant_start,
+        )
         candidates_by_block = self._sample_helper_candidates(helper_images, sample)
 
         packed = []
         block_counts = []
         block_indices = []
         block_margins = []
+        text_history_sum = None
+        text_history_count = 0
+        latent_history_sum = None
+        latent_history_count = 0
         previous_selected_mean = None
         for block_index, span in enumerate(sample.latent_spans):
-            query_parts = [user_query]
             if text_spans[block_index]:
                 text_indices = torch.tensor(
                     text_spans[block_index],
                     device=row_hidden_last.device,
                     dtype=torch.long,
                 )
-                query_parts.append(
-                    row_hidden_last.index_select(0, text_indices).mean(
-                        dim=0, keepdim=True
+                text_values = row_hidden_last.index_select(0, text_indices)
+                if self.textual_states == "all":
+                    current_text_sum = text_values.sum(dim=0, keepdim=True)
+                    text_history_sum = (
+                        current_text_sum
+                        if text_history_sum is None
+                        else text_history_sum + current_text_sum
                     )
+                    text_history_count += int(text_values.shape[0])
+            if self.textual_states == "all":
+                textual_history = (
+                    text_history_sum / text_history_count
+                    if text_history_count
+                    else None
                 )
-            if previous_selected_mean is not None:
-                query_parts.append(previous_selected_mean)
-            query = torch.stack(
-                [part.squeeze(0) for part in query_parts], dim=0
-            ).mean(dim=0, keepdim=True)
+                latent_history = (
+                    latent_history_sum / latent_history_count
+                    if latent_history_count
+                    else None
+                )
+            else:
+                textual_history = (
+                    text_values.mean(dim=0, keepdim=True)
+                    if text_spans[block_index]
+                    else None
+                )
+                latent_history = previous_selected_mean
+            query = self._reasoning_query(
+                user_query, textual_history, latent_history
+            )
 
             selected, indices, margin = self._select(
                 candidates_by_block[block_index],
@@ -279,6 +376,14 @@ class Stage1TeacherTargetBuilder:
             block_margins.append(margin)
             if selected.shape[0]:
                 previous_selected_mean = selected.mean(dim=0, keepdim=True)
+                if self.textual_states == "all":
+                    current_latent_sum = selected.sum(dim=0, keepdim=True)
+                    latent_history_sum = (
+                        current_latent_sum
+                        if latent_history_sum is None
+                        else latent_history_sum + current_latent_sum
+                    )
+                    latent_history_count += int(selected.shape[0])
         return (
             packed,
             tuple(block_counts),
@@ -286,6 +391,137 @@ class Stage1TeacherTargetBuilder:
             tuple(block_margins),
             row_hidden_last[:0],
         )
+
+    def _build_sample_adaptive(
+        self,
+        *,
+        teacher,
+        sample,
+        sample_ids,
+        sample_attention,
+        original_pixels,
+        original_grid,
+        helper_pixels,
+        helper_grid,
+        image_token_id,
+    ):
+        qwen = resolve_qwen2_5_vl_model(teacher)
+        owner = getattr(teacher, "module", teacher)
+        configs = getattr(owner, "peft_config", {})
+        if (getattr(qwen.config, "model_type", None) != "qwen2_5_vl"
+                or getattr(qwen.config, "stage", None) != "stage1"
+                or not configs or not all(getattr(c, "use_dora", False)
+                                           for c in configs.values())
+                or any(layer.attn_type != "sdpa" for layer in qwen.model.layers)):
+            raise ValueError("adaptive history requires Stage1 Qwen2.5-VL DoRA with SDPA")
+        row_ids = sample_ids[0]
+        assistant_start, assistant_end = self._assistant_bounds(row_ids, sample)
+        # Count unique starts, not overlapping short/long spellings of one header.
+        assistant_starts = set()
+        for pattern in self._assistant_patterns:
+            pattern = pattern.to(row_ids.device)
+            assistant_starts.update(
+                i for i in range(row_ids.numel() - pattern.numel() + 1)
+                if torch.equal(row_ids[i:i + pattern.numel()], pattern))
+        if assistant_starts != {assistant_start}:
+            raise ValueError("adaptive history requires a single assistant trajectory")
+        special_ids = frozenset(self._special_ids | set(
+            getattr(self.tokenizer, "all_special_ids", ())) | {image_token_id})
+        text_spans = history_text_positions(
+            row_ids, sample_attention[0], sample.latent_spans,
+            assistant_end, special_ids)
+        pad, start, end = (self._single_token_id(token) for token in
+                          ("<|latent_pad|>", "<|latent_start|>", "<|latent_end|>"))
+        if ((pad, start, end) != (qwen.config.latent_token_id,
+                                  qwen.config.latent_start_id, qwen.config.latent_end_id)
+                or len({pad, start, end}) != 3):
+            raise ValueError("adaptive tokenizer/model latent token IDs must agree")
+        expected_markers = {}
+        for span in sample.latent_spans:
+            expected_markers[span.start] = start
+            expected_markers[span.end] = end
+            expected_markers.update((p, pad) for p in span.latent_positions)
+        actual_markers = {i: token for i, token in enumerate(row_ids.tolist())
+                          if token in (pad, start, end)}
+        if actual_markers != expected_markers:
+            raise ValueError("adaptive latent markers must match complete metadata spans")
+        image_positions = (row_ids == image_token_id).nonzero().flatten().tolist()
+        if any(i >= assistant_start for i in image_positions):
+            raise ValueError("original images must precede the assistant trajectory")
+        counts = self._visual_token_counts(original_grid, teacher)
+        if (sum(counts) != len(image_positions)
+                or original_grid.dtype != torch.long
+                or bool((original_grid <= 0).any())
+                or bool((original_grid[:, 1:] % teacher.visual.spatial_merge_size != 0).any())
+                or original_pixels.ndim != 2
+                or original_pixels.shape[0] != int(original_grid.prod(dim=1).sum())):
+            raise ValueError("adaptive original image ownership must match pixels and tokens")
+        # Validate this even for a no-latent sample, without encoding its images.
+        tokens = row_ids.tolist()
+        if qwen.config.video_token_id in tokens:
+            raise ValueError("adaptive history video trajectories are unsupported")
+        vision_starts = [i for i, token in enumerate(tokens)
+                         if token == qwen.config.vision_start_token_id]
+        expected_images = tuple(p for i, count in zip(vision_starts, counts)
+                                for p in range(i + 1, i + 1 + count))
+        if (len(vision_starts) != len(counts)
+                or expected_images != tuple(image_positions)):
+            raise ValueError("adaptive original image markers must match owned grids")
+        if (len(sample.helper_to_block) != helper_grid.shape[0]
+                or helper_grid.ndim != 2 or helper_grid.shape[1] != 3
+                or bool((helper_grid <= 0).any())
+                or helper_pixels.ndim != 2
+                or helper_pixels.shape[0] != int(helper_grid.prod(dim=1).sum())
+                or any(type(i) is not int or not 0 <= i < len(sample.latent_spans)
+                       for i in sample.helper_to_block)
+                or set(sample.helper_to_block) != set(range(len(sample.latent_spans)))):
+            raise ValueError("adaptive history requires owned helper candidates for every block")
+        if not sample.latent_spans:
+            empty = qwen.model.embed_tokens.weight.new_empty(
+                (0, qwen.model.embed_tokens.weight.shape[1]))
+            return [], (), (), (), empty
+
+        hidden_pre, hidden_last, embeddings = self._observe_teacher(
+            teacher, sample, sample_ids, sample_attention, original_pixels, original_grid)
+        row_hidden_last = hidden_last[0]
+        user_query = self._user_query(
+            teacher=teacher, sample=sample, sample_ids=row_ids,
+            hidden_pre=hidden_pre[0], hidden_last=row_hidden_last,
+            input_embeddings=embeddings[0], assistant_start=assistant_start,
+            image_token_id=image_token_id, original_grid=original_grid,
+            original_counts=counts)
+        helper_features = teacher.visual(helper_pixels, grid_thw=helper_grid)
+        if not bool(torch.isfinite(helper_features).all()):
+            raise FloatingPointError("teacher helper visual features must be finite")
+        helper_images = self._split_visual_features(helper_features, helper_grid, teacher)
+        candidates = self._sample_helper_candidates(helper_images, sample)
+        if any(values.shape[0] == 0 for values in candidates):
+            raise ValueError("adaptive history requires nonempty candidates for every block")
+        packed, block_counts, block_indices, block_margins = [], [], [], []
+        state = DiscountedTextState()
+        for index, span in enumerate(sample.latent_spans):
+            text_values = row_hidden_last[list(text_spans[index])].float()
+            current_mean = text_values.mean(0, keepdim=True) if text_values.shape[0] else None
+            state, text_summary = update_text_history(
+                state, current_mean, gamma=self.query_config.text_gamma)
+            previous = torch.cat(packed, dim=0) if packed else row_hidden_last[:0]
+            history = content_history(
+                text_values, previous, query_chunk_size=self.query_config.query_chunk_size,
+                key_chunk_size=self.query_config.key_chunk_size)
+            query = compose_content_query(user_query, text_summary, history)
+            selected, indices, margin = self._select(
+                candidates[index], query, max_count=len(span.latent_positions))
+            if (selected.ndim != 2 or not 0 < selected.shape[0] <= len(span.latent_positions)
+                    or selected.shape[1] != row_hidden_last.shape[-1]
+                    or not bool(torch.isfinite(selected).all())):
+                raise ValueError("adaptive selection must contain finite raw first-Kstar targets")
+            count = int(selected.shape[0])
+            packed.append(selected)
+            block_counts.append(count)
+            block_indices.append(indices)
+            block_margins.append(margin)
+        return (packed, tuple(block_counts), tuple(block_indices), tuple(block_margins),
+                row_hidden_last[:0])
 
     @staticmethod
     def _owned_slice(tensor, owned_range, sample, role):
@@ -344,7 +580,7 @@ class Stage1TeacherTargetBuilder:
             raise ValueError("Stage 1 metadata sample count must match batch_size")
 
     @staticmethod
-    def _hidden_states(text_outputs, expected_prefix):
+    def _hidden_states(text_outputs, expected_prefix, *, validate: bool = True):
         hidden_states = getattr(text_outputs, "hidden_states", None)
         if isinstance(hidden_states, (tuple, list)):
             if not hidden_states:
@@ -360,9 +596,9 @@ class Stage1TeacherTargetBuilder:
             raise ValueError("teacher hidden states must have shape [B, T, H]")
         if hidden_pre.shape != hidden_last.shape:
             raise ValueError("teacher pre-final and final hidden states must share shape")
-        if not bool(torch.isfinite(hidden_pre).all().item()) or not bool(
+        if validate and (not bool(torch.isfinite(hidden_pre).all().item()) or not bool(
             torch.isfinite(hidden_last).all().item()
-        ):
+        )):
             raise FloatingPointError("teacher hidden states must be finite")
         return hidden_pre, hidden_last
 
@@ -387,7 +623,7 @@ class Stage1TeacherTargetBuilder:
     def _split_visual_features(self, features, grid_thw, teacher):
         if not isinstance(features, torch.Tensor) or features.ndim != 2:
             raise ValueError("teacher helper visual features must have shape [N, H]")
-        if not bool(torch.isfinite(features).all().item()):
+        if self.validate and not bool(torch.isfinite(features).all().item()):
             raise FloatingPointError("teacher helper visual features must be finite")
         counts = self._visual_token_counts(grid_thw, teacher)
         if sum(counts) != features.shape[0]:
@@ -400,6 +636,32 @@ class Stage1TeacherTargetBuilder:
             images.append(features[offset : offset + count])
             offset += count
         return tuple(images)
+
+    def _assistant_bounds(
+        self, sample_ids: torch.Tensor, sample: Stage1SampleMetadata
+    ) -> tuple[int, int]:
+        best_match = None
+        for cpu_pattern in self._assistant_patterns:
+            pattern = cpu_pattern.to(sample_ids.device)
+            for start in range(sample_ids.numel() - pattern.numel() + 1):
+                if torch.equal(sample_ids[start : start + pattern.numel()], pattern):
+                    if start > 0:
+                        candidate = (start, start + int(pattern.numel()))
+                        if (
+                            best_match is None
+                            or candidate[0] < best_match[0]
+                            or (
+                                candidate[0] == best_match[0]
+                                and candidate[1] > best_match[1]
+                            )
+                        ):
+                            best_match = candidate
+                    break
+        if best_match is not None:
+            return best_match
+        raise ValueError(
+            f"source_index={sample.source_index}: assistant marker must follow the user prefix"
+        )
 
     def _assistant_start(
         self, sample_ids: torch.Tensor, sample: Stage1SampleMetadata
@@ -597,6 +859,15 @@ class Stage1TeacherTargetBuilder:
             previous = span.end + 1
         return tuple(spans)
 
+    @staticmethod
+    def _reasoning_query(global_intent, textual_history=None, latent_history=None):
+        parts = [global_intent]
+        if textual_history is not None:
+            parts.append(textual_history)
+        if latent_history is not None:
+            parts.append(latent_history)
+        return torch.cat(parts, dim=0).mean(dim=0, keepdim=True)
+
     def _sample_helper_candidates(self, helper_images, sample):
         if len(helper_images) != len(sample.helper_to_block):
             raise ValueError(
@@ -658,12 +929,12 @@ class Stage1TeacherTargetBuilder:
         similarities = F.cosine_similarity(
             candidates, query.expand_as(candidates), dim=-1
         )
-        if not bool(torch.isfinite(similarities).all().item()):
+        if self.validate and not bool(torch.isfinite(similarities).all().item()):
             raise FloatingPointError(
                 "teacher candidate similarities must be finite"
             )
         probabilities = torch.softmax(similarities, dim=0)
-        if not bool(torch.isfinite(probabilities).all().item()):
+        if self.validate and not bool(torch.isfinite(probabilities).all().item()):
             raise FloatingPointError(
                 "teacher selection probabilities must be finite"
             )
@@ -682,7 +953,7 @@ class Stage1TeacherTargetBuilder:
         )
         selected_count = min(coverage_count, int(max_count))
         selected_indices = sorted_indices[:selected_count]
-        if selected_count < int(probabilities.numel()):
+        if self.collect_diagnostics and selected_count < int(probabilities.numel()):
             margin = float(
                 (
                     sorted_probabilities[selected_count - 1].to(torch.float64)
@@ -695,7 +966,7 @@ class Stage1TeacherTargetBuilder:
             margin = "all_selected"
         return (
             candidates.index_select(0, selected_indices),
-            tuple(int(index) for index in selected_indices.tolist()),
+            tuple(int(index) for index in selected_indices.tolist()) if self.collect_diagnostics else (),
             margin,
         )
 

@@ -1,0 +1,4 @@
+{
+  "root": "선택 query의 핵심 근거는 새 observer가 실제 frozen DoRA teacher의 causal attention을 측정한다는 전제다. 현재 global-intent helper는 final hidden에 Q/K를 다시 적용하는 근사이며 native attention 관측이 아니다. 그 경로를 재사용하거나 실제 projection의 adapter/MRoPE/GQA/mask 중 하나를 놓치면 코드가 정상 실행돼도 attention-mass history라는 방법 자체가 성립하지 않는다. 설계는 이 구별을 요구하지만 아직 신규 adapter/observer의 수치적 witness가 없다.",
+  "first_nail": "가장 싼 반증은 학습 없이 tiny 실제 Qwen2.5-VL에 nonzero DoRA와 original-image MRoPE를 붙여 두 latent 구간의 injected prefix를 비교하는 CPU reference probe다. Native wrapper와 prefix adapter의 실제 embeddings/positions/hidden을 대조하고, 동일 prefix의 native eager 확률과 observer의 past-active-latent 확률·mass를 GQA/causal mask 아래 비교한다. 정해진 FP32 허용치(atol1e-6, rtol1e-5) 밖이면 전제를 기각한다. 아직 구현되지 않은 observer/adapter가 필요하므로 implementation-like probe에 해당한다. 이 제안은 실행 승인이 아니며 현재 실행하지 않았다."
+}

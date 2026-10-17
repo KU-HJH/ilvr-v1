@@ -103,6 +103,7 @@ _NON_MODEL_BINARY_FILES = frozenset(
         "scaler.pt",
         "rng_state.pth",
         STAGE1_EMA_TEACHER_STATE_FILENAME,
+        "stage1_v5_reference.pt",
         "training_args.bin",
     }
 )
@@ -404,7 +405,7 @@ def _require_finite_number(value: object, *, name: str) -> float:
 
 @dataclass(frozen=True)
 class Stage1PeftMetadata:
-    """Complete schema-v2 provenance for one Stage 1 adapter artifact."""
+    """Complete schema-v2 or schema-v3 provenance for one Stage 1 adapter."""
 
     schema_version: int
     stage: Literal["stage1"]
@@ -431,9 +432,19 @@ class Stage1PeftMetadata:
     output_row_shape: tuple[int, int]
     peft_version: str
     repository_format_version: int
+    ema_setting: Literal["moving", "frozen"] | None = None
+    teacher_target_mode: Literal["legacy_unrecorded", "sample_isolated"] | None = None
+    training_implementation_version: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
+        if self.schema_version == STAGE1_PEFT_SCHEMA_VERSION:
+            for name in (
+                "ema_setting",
+                "teacher_target_mode",
+                "training_implementation_version",
+            ):
+                payload.pop(name)
         for name in (
             "latent_token_ids",
             "latent_token_strings",
@@ -450,16 +461,19 @@ class Stage1PeftMetadata:
         if not isinstance(payload, Mapping):
             raise ValueError("Stage 1 PEFT metadata must be a JSON object")
         schema_version = payload.get("schema_version")
-        if type(schema_version) is not int or schema_version not in (
-            1,
-            STAGE1_PEFT_SCHEMA_VERSION,
-        ):
+        if type(schema_version) is not int or schema_version not in (1, 2, 3):
             raise ValueError(
                 "unsupported Stage 1 PEFT metadata schema: "
-                f"expected=1 or {STAGE1_PEFT_SCHEMA_VERSION}, "
+                "expected=1, 2, or 3, "
                 f"actual={schema_version}"
             )
         expected_fields = {field.name for field in fields(cls)}
+        if schema_version in (1, 2):
+            expected_fields -= {
+                "ema_setting",
+                "teacher_target_mode",
+                "training_implementation_version",
+            }
         if schema_version == 1:
             expected_fields = expected_fields - {"pretrained_model_vocab_size"}
         actual_fields = set(payload)
@@ -473,6 +487,26 @@ class Stage1PeftMetadata:
         if schema_version == 1:
             payload["schema_version"] = STAGE1_PEFT_SCHEMA_VERSION
             payload["pretrained_model_vocab_size"] = payload["base_vocab_size"]
+        if schema_version == 3:
+            if payload["ema_setting"] not in ("moving", "frozen"):
+                raise ValueError("ema_setting must be moving or frozen")
+            if payload["teacher_target_mode"] not in (
+                "legacy_unrecorded", "sample_isolated"
+            ):
+                raise ValueError("unsupported teacher_target_mode")
+            version = payload["training_implementation_version"]
+            if type(version) is not int or version < 0:
+                raise ValueError(
+                    "training_implementation_version must be a non-negative integer"
+                )
+            expected_version = (
+                0 if payload["teacher_target_mode"] == "legacy_unrecorded" else 1
+            )
+            if version != expected_version:
+                raise ValueError(
+                    "teacher_target_mode and training_implementation_version "
+                    "are inconsistent"
+                )
         if payload["stage"] != "stage1":
             raise ValueError("Stage 1 PEFT metadata must describe stage1")
         if (
@@ -586,7 +620,7 @@ class Stage1PeftMetadata:
             raise ValueError("peft_version must be a non-empty string")
 
         return cls(
-            schema_version=STAGE1_PEFT_SCHEMA_VERSION,
+            schema_version=payload["schema_version"],
             stage="stage1",
             base_model_reference=payload["base_model_reference"],
             base_model_architecture=architecture,
@@ -611,6 +645,11 @@ class Stage1PeftMetadata:
             output_row_shape=output_shape,
             peft_version=payload["peft_version"],
             repository_format_version=STAGE1_REPOSITORY_FORMAT_VERSION,
+            ema_setting=payload.get("ema_setting"),
+            teacher_target_mode=payload.get("teacher_target_mode"),
+            training_implementation_version=payload.get(
+                "training_implementation_version"
+            ),
         )
 
 
@@ -1196,11 +1235,22 @@ def _architecture_json(architecture: Mapping[str, object]) -> bytes:
         ) from error
 
 
-def _validate_base_source(requested: str, expected: str) -> None:
+def _validate_base_source(requested: str, expected: str, *,
+                          v5_resume_artifact: Path | None = None) -> None:
     if not isinstance(requested, str) or not requested:
         raise ValueError(
             "Stage 1 PEFT requested base source must be a non-empty string"
         )
+    if v5_resume_artifact is not None:
+        # Only v5's mandatory saved full-base content identity authorizes local
+        # source relocation. Legacy callers retain exact source-string checks.
+        from stage1.v5_resume import load_v5_contract
+        from stage1.v5_reference import _base_identity
+        saved = load_v5_contract(v5_resume_artifact)
+        actual, _ = _base_identity(Path(requested))
+        if actual != saved['reference']['base_content_sha256']:
+            raise ValueError('Stage1-v5 original base content mismatch')
+        return
     if requested != expected:
         raise ValueError(
             "Stage 1 PEFT base source mismatch: "
@@ -1258,6 +1308,7 @@ def preflight_stage1_peft_artifact(
     requested_base_model_reference: str,
     metadata_snapshot: Stage1PeftMetadataSnapshot | None = None,
     model_factory: Callable[[object], nn.Module] = _build_meta_stage1_base,
+    v5_resume: bool = False,
 ) -> Stage1PeftPreflightWitness:
     """Validate a PEFT artifact completely without loading base weights."""
 
@@ -1286,7 +1337,8 @@ def preflight_stage1_peft_artifact(
     tokenizer = _validate_processor(processor, validated)
     _validate_latent_config(base_config, validated)
     _validate_base_source(
-        requested_base_model_reference, validated.base_model_reference
+        requested_base_model_reference, validated.base_model_reference,
+        v5_resume_artifact=artifact if v5_resume else None,
     )
     adapter_config_json = _read_regular_payload(
         artifact / _ADAPTER_CONFIG_FILENAME,
@@ -1351,6 +1403,7 @@ def load_stage1_peft_artifact(
     requested_base_model_reference: str,
     is_trainable: bool,
     preflight: Stage1PeftPreflightWitness | None = None,
+    v5_resume: bool = False,
 ) -> nn.Module:
     """Validate, resize, and restore one Stage 1 PEFT artifact in strict order."""
 
@@ -1367,6 +1420,7 @@ def load_stage1_peft_artifact(
             qwen.config,
             artifact,
             requested_base_model_reference=requested_base_model_reference,
+            v5_resume=v5_resume,
         )
     elif not isinstance(preflight, Stage1PeftPreflightWitness):
         raise TypeError("preflight must be a Stage1PeftPreflightWitness")
@@ -1384,7 +1438,8 @@ def load_stage1_peft_artifact(
     _validate_latent_config(qwen.config, metadata)
     _validate_architecture(qwen, metadata, resized=False)
     _validate_base_source(
-        requested_base_model_reference, preflight.base_model_reference
+        requested_base_model_reference, preflight.base_model_reference,
+        v5_resume_artifact=artifact if v5_resume else None,
     )
     actual_architecture_json = _architecture_json(
         capture_qwen2_5_vl_architecture(qwen.config)

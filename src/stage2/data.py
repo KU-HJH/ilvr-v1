@@ -15,9 +15,42 @@ from transformers.models.qwen2_5_vl.stage2_latent_rollout import (
     LatentTokenIds,
     parse_latent_spans,
 )
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_CONCATENATED,
+    PlanCharSpan,
+    ReasoningStepPlan,
+    build_assistant_plan,
+    canonical_sample_id,
+    expand_qwen_image_placeholders,
+    map_reasoning_step_spans,
+    normalize_preference_target_scope,
+)
+from step_preference.negatives import StepNegative, tokenize_step_completion
 
 
 logger = logging.getLogger(__name__)
+
+
+class _ImmutableDict(dict):
+    """A JSON-object-compatible dictionary that rejects ordinary mutation."""
+
+    def _reject_mutation(self, *args, **kwargs):
+        raise TypeError("immutable dictionary cannot be modified")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __ior__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return type(self), (dict(self),)
 
 
 @dataclass(frozen=True)
@@ -27,12 +60,26 @@ class Stage2PreparedExample:
     conversation: list[dict]
     original_image_paths: tuple[str, ...]
     latent_block_count: int
+    sample_id: str = ""
+    sequence_plan: tuple[_ImmutableDict, ...] = ()
+    plan_char_spans: tuple[PlanCharSpan, ...] = ()
+    reasoning_steps: tuple[ReasoningStepPlan, ...] = ()
+
+
+def parse_jsonl_examples(contents: str) -> list[dict]:
+    """Parse non-empty JSON Lines records from one text snapshot."""
+    return [json.loads(line) for line in contents.splitlines() if line.strip()]
 
 
 def load_jsonl_examples(path: Path) -> list[dict]:
     """Load non-empty JSON Lines records without altering their contents."""
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+    return parse_jsonl_examples(path.read_text(encoding="utf-8"))
+
+
+def select_packed_capacity_example(prepared, authenticated_admission, sample_id):
+    """Select privately only after the full retained cohort authenticates."""
+    from step_preference.capacity_evidence import select_capacity_sample
+    return select_capacity_sample(prepared, authenticated_admission, sample_id)
 
 
 def resolve_image_root_path(
@@ -87,31 +134,19 @@ def resolve_original_images(sample: dict, image_root: Path) -> tuple[str, ...]:
     )
 
 
-def _assistant_text(sequence_plan: list, latent_size: int) -> tuple[str, int]:
-    if latent_size <= 0:
-        raise ValueError("latent_size must be positive")
-
-    latent_block = "<|latent_start|>" + "<|latent_pad|>" * latent_size + "<|latent_end|>"
-    assistant_parts: list[str] = []
-    latent_block_count = 0
-    for step in sequence_plan:
-        if not isinstance(step, dict):
-            raise ValueError("sequence_plan steps must be objects")
-        step_type = step.get("type")
-        if step_type == "text":
-            content = step.get("content")
-            if not isinstance(content, str):
-                raise ValueError("text step content must be a string")
-            assistant_parts.append(content)
-        elif step_type == "latent":
-            helper_image = step.get("helper_image")
-            if not isinstance(helper_image, str) or not helper_image:
-                raise ValueError("latent step is missing helper_image")
-            assistant_parts.append(latent_block)
-            latent_block_count += 1
-        else:
-            raise ValueError(f"unsupported sequence_plan step type: {step_type}")
-    return "".join(assistant_parts), latent_block_count
+def _assistant_text(
+    sequence_plan: list,
+    latent_size: int,
+    *,
+    assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED,
+) -> tuple[str, int]:
+    assistant_text, plan_char_spans, _ = build_assistant_plan(
+        sequence_plan,
+        latent_size,
+        require_reasoning_units=False,
+        assistant_plan_rendering=assistant_plan_rendering,
+    )
+    return assistant_text, sum(span.step_type == "latent" for span in plan_char_spans)
 
 
 def build_stage2_conversation(
@@ -119,6 +154,7 @@ def build_stage2_conversation(
     *,
     image_root: Path,
     latent_size: int,
+    assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED,
 ) -> list[dict]:
     """Convert a raw CoMT sample into a multimodal user/assistant conversation."""
     sequence_plan = sample.get("sequence_plan")
@@ -126,7 +162,11 @@ def build_stage2_conversation(
         raise ValueError("sequence_plan must be a list")
 
     original_images = resolve_original_images(sample, image_root)
-    assistant_text, _ = _assistant_text(sequence_plan, latent_size)
+    assistant_text, _ = _assistant_text(
+        sequence_plan,
+        latent_size,
+        assistant_plan_rendering=assistant_plan_rendering,
+    )
     text_input = sample.get("text_input")
     if not isinstance(text_input, str):
         raise ValueError("text_input must be a string")
@@ -144,14 +184,30 @@ def prepare_stage2_example(
     *,
     image_root: Path,
     latent_size: int,
+    require_reasoning_units: bool = False,
+    assistant_plan_rendering: str = ASSISTANT_PLAN_RENDERING_CONCATENATED,
 ) -> Stage2PreparedExample:
     """Build a conversation together with validated original-image metadata."""
-    conversation = build_stage2_conversation(sample, image_root=image_root, latent_size=latent_size)
-    _, latent_block_count = _assistant_text(sample["sequence_plan"], latent_size)
+    conversation = build_stage2_conversation(
+        sample,
+        image_root=image_root,
+        latent_size=latent_size,
+        assistant_plan_rendering=assistant_plan_rendering,
+    )
+    _, plan_char_spans, reasoning_steps = build_assistant_plan(
+        sample["sequence_plan"],
+        latent_size,
+        require_reasoning_units=require_reasoning_units,
+        assistant_plan_rendering=assistant_plan_rendering,
+    )
     return Stage2PreparedExample(
         conversation=conversation,
         original_image_paths=resolve_original_images(sample, image_root),
-        latent_block_count=latent_block_count,
+        latent_block_count=sum(span.step_type == "latent" for span in plan_char_spans),
+        sample_id=canonical_sample_id(sample),
+        sequence_plan=tuple(_ImmutableDict(step) for step in sample["sequence_plan"]),
+        plan_char_spans=plan_char_spans,
+        reasoning_steps=reasoning_steps,
     )
 
 
@@ -208,11 +264,41 @@ def _load_original_images(paths: tuple[str, ...]) -> list[Image.Image]:
 class Stage2DataCollator:
     """Tokenize exactly one complete CoMT sample without truncation."""
 
-    def __init__(self, processor, token_ids, latent_size, supervise_latent_boundaries):
+    def __init__(
+        self,
+        processor,
+        token_ids,
+        latent_size,
+        supervise_latent_boundaries,
+        step_preference_enabled=False,
+        negative_store=None,
+        packed_admission_records_by_sample_id=None,
+        max_packed_sequence_length=4608,
+        preference_target_scope="immediate_text",
+    ):
+        self.preference_target_scope = normalize_preference_target_scope(preference_target_scope)
+        if self.preference_target_scope != "immediate_text" and (
+            not step_preference_enabled or negative_store is not None
+        ):
+            raise ValueError("full target scope requires context-preference without negative artifacts")
         self.processor = processor
         self.token_ids = token_ids
         self.latent_size = latent_size
         self.supervise_latent_boundaries = supervise_latent_boundaries
+        self.step_preference_enabled = step_preference_enabled
+        if negative_store is not None and not step_preference_enabled:
+            raise ValueError("a negative store requires step preference metadata")
+        self.negative_store = negative_store
+        self.packed_admission_records_by_sample_id = (
+            _ImmutableDict(packed_admission_records_by_sample_id)
+            if packed_admission_records_by_sample_id is not None else None
+        )
+        self.max_packed_sequence_length = max_packed_sequence_length
+        if packed_admission_records_by_sample_id is not None:
+            if not step_preference_enabled or negative_store is None:
+                raise ValueError("packed admission requires joined step preference negatives")
+            if type(max_packed_sequence_length) is not int or max_packed_sequence_length != 4608:
+                raise ValueError("packed admission cap must match 4608")
         self.assistant_pattern = processor.tokenizer(
             "<|im_start|>assistant", add_special_tokens=False, return_tensors="pt"
         )["input_ids"][0]
@@ -221,17 +307,24 @@ class Stage2DataCollator:
         if len(examples) != 1:
             raise NotImplementedError("Stage 2 collator currently supports batch_size=1 only")
 
-        example = examples[0]
+        from .sampler import ReferenceSample
+        slot = examples[0] if isinstance(examples[0], ReferenceSample) else None
+        example = slot.example if slot is not None else examples[0]
         text = self.processor.apply_chat_template(
             example.conversation, tokenize=False, add_generation_prompt=False
         )
+        original_images = _load_original_images(example.original_image_paths)
         batch = self.processor(
             text=[text],
-            images=[_load_original_images(example.original_image_paths)],
+            images=[original_images],
             padding=True,
             truncation=False,
             return_tensors="pt",
         )
+        if slot is not None:
+            batch["stage2_sample_weight"] = slot.weight
+            batch["stage2_sample_index"] = slot.index
+            batch["stage2_sample_latent_block_count"] = example.latent_block_count
         forbidden = {"pixel_values_latent", "image_grid_thw_latent"} & batch.keys()
         if forbidden:
             raise ValueError(f"helper-image tensors leaked into Stage 2: {sorted(forbidden)}")
@@ -252,6 +345,120 @@ class Stage2DataCollator:
             latent_size=self.latent_size,
             supervise_latent_boundaries=self.supervise_latent_boundaries,
         )
+        if self.step_preference_enabled:
+            tokenizer = self.processor.tokenizer
+            if not getattr(tokenizer, "is_fast", False):
+                raise ValueError("step preference span mapping requires a fast tokenizer")
+            expanded_text = expand_qwen_image_placeholders(
+                text,
+                image_grid_thw=batch["image_grid_thw"],
+                image_token=self.processor.image_token,
+                merge_size=self.processor.image_processor.merge_size,
+            )
+            offset_batch = tokenizer(
+                [expanded_text],
+                padding=True,
+                truncation=False,
+                return_tensors="pt",
+                return_offsets_mapping=True,
+            )
+            offset_mapping = offset_batch.pop("offset_mapping")
+            for key, value in offset_batch.items():
+                if key not in batch or not torch.equal(value, batch[key]):
+                    raise ValueError(
+                        f"offset tokenization does not match processor tensor: {key}"
+                    )
+
+            assistant_text = example.conversation[1]["content"][0]["text"]
+            reasoning_step_spans = map_reasoning_step_spans(
+                rendered_text=expanded_text,
+                assistant_text=assistant_text,
+                plan_char_spans=example.plan_char_spans,
+                reasoning_steps=example.reasoning_steps,
+                offset_mapping=offset_mapping,
+                input_ids=batch["input_ids"],
+                latent_pad_token_id=self.token_ids.pad_token_id,
+                preference_target_scope=self.preference_target_scope,
+            )
+            batch["sample_ids"] = (example.sample_id,)
+            batch["reasoning_step_spans"] = reasoning_step_spans
+            batch["step_preference"] = {
+                "expanded_rendered_text": expanded_text,
+                "offset_mapping": offset_mapping,
+                "steps": tuple({"span": span} for span in reasoning_step_spans),
+            }
+            if self.negative_store is not None:
+                assistant_text = example.conversation[1]["content"][0]["text"]
+                joined_steps = []
+                for plan_step, token_span in zip(
+                    example.reasoning_steps, reasoning_step_spans
+                ):
+                    key = (example.sample_id, plan_step.step_id)
+                    try:
+                        negative = self.negative_store[key]
+                    except KeyError as error:
+                        raise ValueError(f"missing negative join key: {key}") from error
+                    if not isinstance(negative, StepNegative):
+                        raise ValueError(f"invalid negative row for join key: {key}")
+                    chosen_text = assistant_text[
+                        plan_step.target_text.start : plan_step.target_text.end
+                    ]
+                    if negative.chosen_text != chosen_text:
+                        raise ValueError(
+                            f"negative chosen text does not match source step: {key}"
+                        )
+                    assistant_prefix = assistant_text[: plan_step.target_text.start]
+
+                    def encode_rejected(text_value):
+                        encoded = tokenize_step_completion(
+                            self.processor,
+                            conversation=example.conversation,
+                            images=original_images,
+                            assistant_prefix=assistant_prefix,
+                            completion_text=text_value,
+                        )
+                        return {
+                            "model_inputs": dict(encoded.model_inputs),
+                            "completion_token_positions": encoded.completion_token_positions,
+                            "completion_token_ids": encoded.completion_token_ids,
+                            "rendered_text": encoded.rendered_text,
+                        }
+
+                    joined_steps.append(
+                        {
+                            "span": token_span,
+                            "negative": negative,
+                            "visual_rejected": (
+                                encode_rejected(negative.rejected_visual_text)
+                                if negative.valid_visual_negative
+                                else None
+                            ),
+                            "textual_rejected": (
+                                encode_rejected(negative.rejected_textual_text)
+                                if negative.valid_textual_negative
+                                else None
+                            ),
+                        }
+                    )
+                batch["step_preference"]["steps"] = tuple(joined_steps)
+        if self.packed_admission_records_by_sample_id is not None:
+            from step_preference.packed_admission import PackedAdmissionRecord
+            from step_preference.packing import build_packed_tree_plan
+
+            record = self.packed_admission_records_by_sample_id.get(example.sample_id)
+            if (not isinstance(record, PackedAdmissionRecord)
+                    or record.sample_id != example.sample_id or record.admission_reason != "retained"):
+                raise ValueError("packed admission has no retained record for sample ID")
+            plan = build_packed_tree_plan(
+                clean_input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                reasoning_spans=batch["reasoning_step_spans"],
+                joined_steps=batch["step_preference"]["steps"],
+            )
+            if (plan.unpadded_length != record.packed_unpadded_length
+                    or plan.padded_length != record.packed_padded_length
+                    or self.max_packed_sequence_length != 4608
+                    or plan.padded_length > self.max_packed_sequence_length):
+                raise ValueError("packed admission natural plan lengths or cap do not match")
         return batch
 
 
@@ -290,12 +497,46 @@ class Stage2LengthStats:
     maximum: int
     latent_block_distribution: dict[int, int]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "latent_block_distribution",
+            _ImmutableDict(self.latent_block_distribution),
+        )
+
+
+def summarize_stage2_lengths(*, lengths, latent_block_counts, max_length):
+    """Summarize one already-measured sequence length per prepared example."""
+    lengths = tuple(lengths)
+    latent_block_counts = tuple(latent_block_counts)
+    if not lengths:
+        raise ValueError("cannot compute Stage 2 length statistics for an empty dataset")
+    if len(lengths) != len(latent_block_counts):
+        raise ValueError("lengths and latent block counts must have the same cardinality")
+
+    values = torch.tensor(lengths, dtype=torch.float64)
+    retained = sum(length <= max_length for length in lengths)
+    filtered = len(lengths) - retained
+    return Stage2LengthStats(
+        total=len(lengths),
+        retained=retained,
+        filtered=filtered,
+        filtered_percentage=100.0 * filtered / len(lengths),
+        minimum=min(lengths),
+        median=float(values.quantile(0.50)),
+        p90=float(values.quantile(0.90)),
+        p95=float(values.quantile(0.95)),
+        p99=float(values.quantile(0.99)),
+        maximum=max(lengths),
+        latent_block_distribution=dict(sorted(Counter(latent_block_counts).items())),
+    )
+
 
 def filter_stage2_examples(*, examples, measure_length, max_length):
     """Keep complete samples at or under ``max_length`` and summarize all samples."""
     kept = []
     lengths: list[int] = []
-    block_counts: Counter[int] = Counter()
+    latent_block_counts: list[int] = []
     for example in examples:
         length = int(measure_length(example))
         lengths.append(length)
@@ -312,27 +553,14 @@ def filter_stage2_examples(*, examples, measure_length, max_length):
                 )
             )
         )
-        block_counts[block_count] += 1
+        latent_block_counts.append(block_count)
         if length <= max_length:
             kept.append(example)
 
-    if not lengths:
-        raise ValueError("cannot compute Stage 2 length statistics for an empty dataset")
-
-    values = torch.tensor(lengths, dtype=torch.float64)
-    filtered = len(lengths) - len(kept)
-    stats = Stage2LengthStats(
-        total=len(lengths),
-        retained=len(kept),
-        filtered=filtered,
-        filtered_percentage=100.0 * filtered / len(lengths),
-        minimum=min(lengths),
-        median=float(values.quantile(0.50)),
-        p90=float(values.quantile(0.90)),
-        p95=float(values.quantile(0.95)),
-        p99=float(values.quantile(0.99)),
-        maximum=max(lengths),
-        latent_block_distribution=dict(sorted(block_counts.items())),
+    stats = summarize_stage2_lengths(
+        lengths=lengths,
+        latent_block_counts=latent_block_counts,
+        max_length=max_length,
     )
     logger.info("Stage 2 length statistics: %s", asdict(stats))
     return kept, stats

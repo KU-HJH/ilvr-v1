@@ -1167,6 +1167,7 @@ def build_tiny_stage2_parser() -> argparse.ArgumentParser:
         "--phase", choices=("lifecycle", "initial", "resume"), default="lifecycle"
     )
     parser.add_argument("--experiment-id", required=True)
+    parser.add_argument("--shared-prefix", action="store_true")
     parser.add_argument("--deepspeed")
     parser.add_argument("--zero-stage", type=int, choices=(1, 2, 3))
     parser.add_argument(
@@ -1183,6 +1184,10 @@ def parse_args(argv: list[str] | None = None):
 
 def main():
     args = parse_args()
+    if args.shared_prefix:
+        from shared_prefix_smoke import run_shared_prefix_smoke
+        run_shared_prefix_smoke(args)
+        return
     run_harness(
         phase=args.phase,
         experiment_id=args.experiment_id,

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ from transformers import Trainer
 from transformers.models.qwen2_5_vl.stage2_latent_rollout import LatentTokenIds
 
 import main
+import stage2.length_manifest as length_manifest_module
 from .helpers import tiny_stage2_qwen
 from main import (
     CustomTrainerStage1,
@@ -43,9 +46,11 @@ from stage2.sampler import LatentBlockBalancedSampler
 class DiagnosticStage2Model:
     def __init__(self):
         self.last_inputs = None
+        self.diagnostics_requests = []
 
     def __call__(self, **inputs):
         self.last_inputs = inputs
+        self.diagnostics_requests.append(inputs["collect_stage2_diagnostics"])
         return SimpleNamespace(
             loss=torch.tensor(2.0, requires_grad=True),
             stage2_diagnostics={
@@ -60,9 +65,16 @@ class DiagnosticStage2Model:
         )
 
 
+def stage2_trainer_for_compute_loss(*, diagnostics_interval):
+    trainer = object.__new__(Stage2Trainer)
+    trainer.stage2_diagnostics_interval = diagnostics_interval
+    trainer._stage2_microbatch_index = 0
+    return trainer
+
+
 def test_stage2_trainer_collects_detached_model_native_diagnostics():
     """Catches generic Trainer calls silently disabling Stage 2 observability."""
-    trainer = object.__new__(Stage2Trainer)
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=1)
     model = DiagnosticStage2Model()
 
     loss, outputs = trainer.compute_loss(
@@ -72,6 +84,7 @@ def test_stage2_trainer_collects_detached_model_native_diagnostics():
     assert loss.item() == 2.0
     assert outputs.loss is loss
     assert model.last_inputs["collect_stage2_diagnostics"] is True
+    assert model.last_inputs["stage2_loss_only"] is False
     assert set(trainer._latest_stage2_diagnostics) == {
         "block_count",
         "latent_l2_norms",
@@ -81,6 +94,41 @@ def test_stage2_trainer_collects_detached_model_native_diagnostics():
         not value.requires_grad
         for value in trainer._latest_stage2_diagnostics.values()
     )
+
+
+def test_stage2_trainer_requests_loss_only_when_outputs_are_not_returned():
+    """Catches ordinary training projecting full logits unnecessarily."""
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
+    model = DiagnosticStage2Model()
+
+    loss = trainer.compute_loss(
+        model, {"input_ids": torch.ones(1, 3)}, return_outputs=False
+    )
+
+    assert loss.item() == 2.0
+    assert model.last_inputs["stage2_loss_only"] is True
+
+
+def test_stage2_trainer_diagnostics_interval_schedules_microbatches():
+    """Catches diagnostics running every batch or drifting from a zero-based cadence."""
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=2)
+    model = DiagnosticStage2Model()
+
+    for _ in range(5):
+        trainer.compute_loss(model, {"input_ids": torch.ones(1, 3)})
+
+    assert model.diagnostics_requests == [True, False, True, False, True]
+
+
+def test_stage2_trainer_diagnostics_interval_zero_disables_diagnostics():
+    """Catches the opt-in default still requesting diagnostic tensor work."""
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
+    model = DiagnosticStage2Model()
+
+    for _ in range(3):
+        trainer.compute_loss(model, {"input_ids": torch.ones(1, 3)})
+
+    assert model.diagnostics_requests == [False, False, False]
 
 
 def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(
@@ -93,7 +141,7 @@ def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(
         "log",
         lambda self, logs, start_time=None: emitted.append((dict(logs), start_time)),
     )
-    trainer = object.__new__(Stage2Trainer)
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
     trainer._latest_stage2_diagnostics = {
         "block_count": torch.tensor(2),
         "latent_l2_norms": torch.tensor([[3.0, 4.0]]),
@@ -122,7 +170,7 @@ def test_stage2_trainer_enriches_one_ordinary_log_then_clears_diagnostics(
 
 def test_stage2_trainer_rejects_helper_image_tensors_before_model_call():
     """Catches Stage 1 helper-image tensors leaking past the Trainer boundary."""
-    trainer = object.__new__(Stage2Trainer)
+    trainer = stage2_trainer_for_compute_loss(diagnostics_interval=0)
     model = DiagnosticStage2Model()
 
     with pytest.raises(ValueError, match="helper-image tensors leaked"):
@@ -221,6 +269,47 @@ def test_boundary_supervision_is_one_default_true_boolean():
     )
 
 
+def test_stage2_diagnostics_interval_defaults_to_disabled():
+    """Catches Stage 2 diagnostics becoming an implicit training cost."""
+    assert parse_args(["--stage", "stage2"]).stage2_diagnostics_interval == 0
+
+
+def test_ordinary_stage2_vision_attention_defaults_to_language_backend():
+    """Catches the new vision option changing ordinary Stage 2 loader behavior."""
+    defaults = parse_args(["--stage", "stage2"])
+    eager = parse_args(
+        ["--stage", "stage2", "--attention_implementation", "eager"]
+    )
+    mixed = parse_args(
+        [
+            "--stage",
+            "stage2",
+            "--attention_implementation",
+            "sdpa",
+            "--vision_attention_implementation",
+            "flash_attention_2",
+        ]
+    )
+
+    assert defaults.vision_attention_implementation == "sdpa"
+    assert eager.vision_attention_implementation == "eager"
+    assert mixed.vision_attention_implementation == "flash_attention_2"
+
+
+@pytest.mark.parametrize("interval", [-1, -2])
+def test_stage2_rejects_negative_diagnostics_interval(interval):
+    """Catches negative diagnostic cadences reaching the trainer."""
+    with pytest.raises(ValueError, match="diagnostics interval"):
+        parse_args(
+            [
+                "--stage",
+                "stage2",
+                "--stage2_diagnostics_interval",
+                str(interval),
+            ]
+        )
+
+
 def test_fresh_stage2_tuning_defaults_to_full():
     """Catches fresh Stage 2 runs defaulting to a PEFT method."""
     args = parse_args(["--stage", "stage2"])
@@ -272,6 +361,8 @@ def test_stage2_resume_leaves_omitted_method_for_sidecar_resolution():
             "stage2",
             "--resume_from_checkpoint_path",
             "checkpoint-7",
+            "--ce_weight",
+            "1",
         ]
     )
 
@@ -424,7 +515,9 @@ def stage2_args(**overrides):
     values = dict(
         load_model_path="stage1/model",
         resume_from_checkpoint_path=None,
+        ce_weight=1.,
         attention_implementation="sdpa",
+        vision_attention_implementation="sdpa",
         latent_size=4,
         supervise_latent_boundaries=True,
         data_path="data/train.jsonl",
@@ -448,16 +541,85 @@ def stage2_args(**overrides):
         lora_alpha=8,
         lora_dropout=0.0,
         lora_target_modules="q_proj,v_proj",
+        stage2_diagnostics_interval=0,
+        stage2_length_manifest=None,
+        stage2_length_manifest_sha256=None,
+        dataloader_num_workers=0,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--stage2_length_manifest", "manifest.json"], "must be provided together"),
+        (["--stage2_length_manifest_sha256", "a" * 64], "must be provided together"),
+        (["--dataloader_num_workers", "-1"], "must be non-negative"),
+    ],
+)
+def test_stage2_cli_rejects_incomplete_length_manifest_or_negative_dataloader_num_workers(argv, message):
+    """Catches Stage 2 accepting an unverifiable manifest or invalid workers."""
+    with pytest.raises(ValueError, match=message):
+        parse_args(["--stage", "stage2", *argv])
+
+
+def test_stage2_length_manifest_rejects_wrong_sha_or_configuration(
+    monkeypatch, tmp_path
+):
+    """Catches ranks accepting a different sealed file or a conflicting length policy."""
+    import hashlib
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"sealed manifest")
+    data_path = tmp_path / "data.jsonl"
+    data_path.write_bytes(b"[]\n")
+    manifest = SimpleNamespace(
+        data_sha256=hashlib.sha256(data_path.read_bytes()).hexdigest(),
+        processor_sha256="processor-digest",
+        latent_size=2,
+        supervise_latent_boundaries=True,
+        max_sequence_length=8,
+        assistant_plan_rendering="concatenated-v1",
+    )
+    monkeypatch.setattr(
+        length_manifest_module, "read_stage2_length_manifest", lambda path: manifest
+    )
+    monkeypatch.setattr(
+        length_manifest_module, "_processor_sha256", lambda processor: "processor-digest"
+    )
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        length_manifest_module.validate_stage2_length_manifest(
+            path=manifest_path,
+            expected_sha256="0" * 64,
+            data_path=data_path,
+            image_root=tmp_path,
+            processor=object(),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=8,
+        )
+    with pytest.raises(ValueError, match="configuration"):
+        length_manifest_module.validate_stage2_length_manifest(
+            path=manifest_path,
+            expected_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            data_path=data_path,
+            image_root=tmp_path,
+            processor=object(),
+            latent_size=2,
+            supervise_latent_boundaries=True,
+            max_sequence_length=9,
+        )
+
+
 def _stub_stage2_data_pipeline(monkeypatch, calls):
     monkeypatch.setattr(main, "load_jsonl_examples", lambda path: [1, 2, 3])
 
-    def prepare(item, *, image_root, latent_size):
-        calls.prepared.append((item, image_root, latent_size))
+    def prepare(item, *, image_root, latent_size, assistant_plan_rendering):
+        calls.prepared.append(
+            (item, image_root, latent_size, assistant_plan_rendering)
+        )
         return item
 
     monkeypatch.setattr(main, "prepare_stage2_example", prepare)
@@ -553,8 +715,13 @@ def test_stage2_components_compose_full_or_adapter_models_from_decision(
     assert calls.wrap_states == [("stage2", True, None, True)]
     assert isinstance(components.model, PeftModel) is expected_peft
     assert processor.tokenizer.ids == tokenizer_ids_before
-    assert [item for item, _, _ in calls.prepared] == expected_examples
-    assert all(str(root) == "images" and size == 2 for _, root, size in calls.prepared)
+    assert [item for item, _, _, _ in calls.prepared] == expected_examples
+    assert all(
+        str(root) == "images"
+        and size == 2
+        and rendering == "concatenated-v1"
+        for _, root, size, rendering in calls.prepared
+    )
     assert calls.filtered == (expected_examples, "measure", 8192)
     assert components.processor is processor
     assert components.train_dataset == expected_examples
@@ -588,6 +755,199 @@ def test_stage2_components_compose_full_or_adapter_models_from_decision(
             "model.layers.0.self_attn.q_proj",
             "model.layers.0.self_attn.v_proj",
         )
+
+
+def test_stage2_components_route_distinct_vision_backend_through_shared_loader(
+    monkeypatch,
+):
+    """Catches Stage 2 flattening a requested FlashAttention2 vision backend."""
+    processor = CompositionProcessor()
+    model = tiny_stage2_qwen(attn_implementation="sdpa")
+    model.config.stage = "stage1"
+    model.config.supervise_latent_boundaries = True
+    decision = Stage2LoadDecision(
+        base_model_source="stage1/base",
+        processor_source="stage1/processor",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=Stage2TuningConfig(
+            method="full", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+        ),
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **_kwargs: decision)
+    calls = SimpleNamespace(prepared=[], filtered=None, mixed=[], validated=[])
+    _stub_stage2_data_pipeline(monkeypatch, calls)
+
+    load_config = lambda *_args, **_kwargs: model.config
+    load_model = lambda *_args, **_kwargs: pytest.fail(
+        "direct one-backend loader must not run"
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: None,
+        load_config=load_config,
+        load_processor=lambda _source, **_kwargs: processor,
+        load_model=load_model,
+    )
+
+    def load_mixed(source, **kwargs):
+        calls.mixed.append((source, kwargs))
+        return model
+
+    monkeypatch.setattr(main, "load_qwen2_5_vl_with_attention", load_mixed)
+    monkeypatch.setattr(
+        main,
+        "validate_qwen2_5_vl_attention_backends",
+        lambda selected, **kwargs: calls.validated.append((selected, kwargs)),
+    )
+
+    components = build_stage2_training_components(
+        stage2_args(vision_attention_implementation="flash_attention_2"),
+        source_dependencies=dependencies,
+    )
+
+    assert components.model is model
+    assert calls.mixed == [
+        (
+            "stage1/base",
+            {
+                "attention_implementation": "sdpa",
+                "vision_attention_implementation": "flash_attention_2",
+                "config_load_kwargs": {},
+                "model_load_kwargs": {},
+                "load_config": load_config,
+                "load_model": load_model,
+            },
+        )
+    ]
+    assert calls.validated == [
+        (
+            model,
+            {
+                "attention_implementation": "sdpa",
+                "vision_attention_implementation": "flash_attention_2",
+            },
+        )
+    ]
+
+
+def test_stage2_components_select_length_manifest_indices_without_remeasuring_images(
+    monkeypatch, tmp_path
+):
+    """Catches each rank repeating image-aware length filtering after a sealed audit."""
+    calls = SimpleNamespace(prepared=[], filtered=None, sources=[])
+    processor = CompositionProcessor()
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    decision = Stage2LoadDecision(
+        base_model_source="stage1/base",
+        processor_source="stage1/processor",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=Stage2TuningConfig(
+            method="full", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+        ),
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"sealed manifest")
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", lambda source: processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **kwargs: model,
+    )
+    _stub_stage2_data_pipeline(monkeypatch, calls)
+    monkeypatch.setattr(
+        main,
+        "build_prepared_example_length_measure",
+        lambda processor: pytest.fail("manifest path must not remeasure image-aware lengths"),
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_stage2_length_manifest",
+        lambda **kwargs: SimpleNamespace(
+            manifest=SimpleNamespace(retained_indices=(2, 0)),
+            raw_examples=(1, 2, 3),
+            prepared_examples=(1, 2, 3),
+        ),
+        raising=False,
+    )
+
+    components = build_stage2_training_components(
+        stage2_args(
+            stage2_length_manifest=str(manifest_path),
+            stage2_length_manifest_sha256=__import__("hashlib").sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+        )
+    )
+
+    assert calls.filtered is None
+    assert components.train_dataset == [3, 1]
+
+
+@pytest.mark.parametrize(
+    ("sample_limit", "expected_examples"),
+    [(2, [1]), (3, [1, 3])],
+)
+def test_stage2_manifest_indices_respect_max_train_samples(
+    monkeypatch, tmp_path, sample_limit, expected_examples
+):
+    """Catches retained raw indices outside a requested prefix indexing the prepared data."""
+    processor = CompositionProcessor()
+    model = tiny_stage2_qwen()
+    model.config.supervise_latent_boundaries = True
+    decision = Stage2LoadDecision(
+        base_model_source="stage1/base",
+        processor_source="stage1/processor",
+        adapter_source=None,
+        trainer_resume_path=None,
+        tuning=Stage2TuningConfig(
+            method="full", r=4, alpha=8, dropout=0.0, target_modules=("q_proj",)
+        ),
+        latent_size=2,
+        supervise_latent_boundaries=True,
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"sealed manifest")
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **kwargs: decision)
+    monkeypatch.setattr(main.AutoProcessor, "from_pretrained", lambda source: processor)
+    monkeypatch.setattr(
+        main.Qwen2_5_VLForConditionalGeneration,
+        "from_pretrained",
+        lambda source, **kwargs: model,
+    )
+    monkeypatch.setattr(
+        main,
+        "load_jsonl_examples",
+        lambda path: pytest.fail("manifest path must consume its sealed data snapshot"),
+    )
+    monkeypatch.setattr(
+        main,
+        "validate_stage2_length_manifest",
+        lambda **kwargs: SimpleNamespace(
+            manifest=SimpleNamespace(retained_indices=(0, 2)),
+            raw_examples=(1, 2, 3),
+            prepared_examples=(1, 2, 3),
+        ),
+        raising=False,
+    )
+
+    components = build_stage2_training_components(
+        stage2_args(
+            max_train_samples=sample_limit,
+            stage2_length_manifest=str(manifest_path),
+            stage2_length_manifest_sha256=__import__("hashlib").sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+        )
+    )
+
+    assert components.train_dataset == expected_examples
 
 
 def test_stage2_peft_resume_validates_stage1_before_mutation_and_preserves_sidecar(
@@ -694,6 +1054,19 @@ def test_stage2_training_arguments_create_fresh_optimizer_configuration():
     assert training_args.gradient_checkpointing_kwargs == {"use_reentrant": False}
 
 
+@pytest.mark.parametrize("worker_count", (0, 2))
+def test_stage2_training_arguments_set_requested_dataloader_workers(worker_count):
+    """Catches Stage 2 silently falling back to an implicit data-loader worker count."""
+    training_args = build_stage2_training_arguments(
+        stage2_args(dataloader_num_workers=worker_count)
+    )
+
+    assert training_args.dataloader_num_workers == worker_count
+    assert training_args.dataloader_prefetch_factor == (
+        None if worker_count == 0 else 2
+    )
+
+
 def test_stage2_training_arguments_omit_checkpoint_kwargs_when_disabled():
     """Catches inactive checkpointing carrying mode-specific runtime kwargs."""
     training_args = build_stage2_training_arguments(
@@ -756,6 +1129,539 @@ class RecordingSavedProcessor:
         self.saved_path = path
 
 
+def test_main_keeps_stage2b_preflight_out_of_startup_log_and_reuses_snapshot(
+    monkeypatch,
+):
+    """Catches validated prompts and rejections leaking through argparse logging."""
+    secret_prompt = "stage2b-secret-prompt-7bbf85"
+    secret_rejected = "stage2b-secret-rejected-40a32c"
+    preflight = main.Stage2BPreflight(
+        prepared_examples=(SimpleNamespace(prompt=secret_prompt),),
+        negative_store={
+            ("sample-1", 0): SimpleNamespace(rejected_text=secret_rejected)
+        },
+    )
+    args = stage2_args(
+        stage="stage2",
+        log_file="unused.log",
+        step_preference_config=main.StepPreferenceConfig(
+            enabled=True,
+            mode="stage2b",
+            objective="legacy_dpo",
+            stage2a_checkpoint_path="stage2a/checkpoint",
+            negative_path="negatives.jsonl",
+            negative_manifest="negatives.manifest.json",
+        ),
+    )
+    logged_records = []
+    routed_preflights = []
+
+    monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(main, "validate_generated_artifact_paths", lambda selected: None)
+    monkeypatch.setattr(main, "preflight_stage2b_artifacts", lambda selected: preflight)
+    monkeypatch.setattr(main, "bind_deepspeed_runtime_profile", lambda selected: None)
+    monkeypatch.setattr(main, "seed_everything", lambda **kwargs: None)
+    monkeypatch.setattr(main.logging, "FileHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "StreamHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "basicConfig", lambda **kwargs: None)
+    monkeypatch.setattr(
+        main.logging, "info", lambda value: logged_records.append(str(value))
+    )
+
+    def record_stage2(selected):
+        routed_preflights.append(selected._stage2b_preflight)
+        return "stage2b-result"
+
+    monkeypatch.setattr(main, "run_stage2", record_stage2)
+
+    result = main_train()
+
+    startup_log = "\n".join(logged_records)
+    assert result == "stage2b-result"
+    assert routed_preflights == [preflight]
+    assert routed_preflights[0] is preflight
+    assert secret_prompt not in startup_log
+    assert secret_rejected not in startup_log
+    assert "_stage2b_preflight" not in startup_log
+
+
+def test_stage2b_preflight_binds_space_lf_rendering_to_prepare_and_negative_load(
+    monkeypatch, tmp_path
+):
+    """Catches Stage 2B preparing or authenticating a different assistant stream."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="legacy_dpo",
+        stage2a_checkpoint_path=str(tmp_path / "stage2a"),
+        negative_path=str(tmp_path / "negatives.jsonl"),
+        negative_manifest=str(tmp_path / "manifest.json"),
+    )
+    args = stage2_args(
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        latent_size=8,
+        max_train_samples=None,
+        step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
+    )
+    manifest = SimpleNamespace(
+        source_sha256=source_sha256,
+        generation_settings_dict={"min_tokens": 2, "max_new_tokens": 32},
+    )
+    prepared = SimpleNamespace(
+        sample_id="sample-a",
+        reasoning_steps=(
+            SimpleNamespace(step_id=0, target_text=SimpleNamespace(start=0, end=6)),
+        ),
+        conversation=[
+            {"role": "user", "content": []},
+            {"role": "assistant", "content": [{"type": "text", "text": "chosen"}]},
+        ],
+    )
+    prepare_calls = []
+    load_calls = []
+    monkeypatch.setattr(main, "read_negative_manifest", lambda _path: manifest)
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+
+    def prepare(item, **kwargs):
+        prepare_calls.append((item, kwargs))
+        return prepared
+
+    monkeypatch.setattr(main, "prepare_stage2_example", prepare)
+    monkeypatch.setattr(main, "validate_stage2b_peft_base_identity", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "inspect_stage2a_checkpoint_identity",
+        lambda _path: ((), "tokenizer-v1"),
+    )
+
+    def load(**kwargs):
+        load_calls.append(kwargs)
+        return {("sample-a", 0): SimpleNamespace(chosen_text="chosen")}
+
+    monkeypatch.setattr(main, "load_negative_store", load)
+
+    result = main.preflight_stage2b_artifacts(args)
+
+    assert result.prepared_examples == (prepared,)
+    assert prepare_calls[0][1]["assistant_plan_rendering"] == (
+        "adjacent-text-space-lf-v1"
+    )
+    assert load_calls[0]["expected_assistant_plan_rendering"] == (
+        "adjacent-text-space-lf-v1"
+    )
+    assert load_calls[0]["expected_generation_settings"] == {
+        "attention_implementation": "sdpa",
+        "vision_attention_implementation": "flash_attention_2",
+        "device": "cuda:0",
+        "max_new_tokens": 32,
+        "min_tokens": 2,
+        "torch_dtype": "bfloat16",
+        "seed": 42,
+        "decoding": "greedy-argmax-v1",
+    }
+
+
+def test_direct_stage1_preflight_uses_fresh_dora_resolution_without_stage2a(
+    monkeypatch, tmp_path
+):
+    """Catches direct V-only Stage 2B falling back to Stage 2A initialization."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="context_preference",
+        visual_only_context_preference=True,
+        direct_from_stage1=True,
+    )
+    args = stage2_args(
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        stage1_adapter_path="stage1-adapter",
+        step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
+    )
+    prepared = SimpleNamespace(sample_id="sample-a", reasoning_steps=())
+    decisions = []
+    decision = SimpleNamespace(
+        base_model_source="stage1-base",
+        processor_source="stage1-adapter",
+        stage1_adapter_source="stage1-adapter",
+        stage1_metadata_snapshot=object(),
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: None,
+        load_config=lambda source: {"source": source},
+        load_processor=lambda source: {"source": source},
+        load_model=lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+    monkeypatch.setattr(main, "prepare_stage2_example", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(main, "_default_stage2_source_dependencies", lambda: dependencies)
+    monkeypatch.setattr(
+        main,
+        "resolve_stage2_load_decision",
+        lambda **kwargs: decisions.append(kwargs) or decision,
+    )
+    monkeypatch.setattr(main, "preflight_stage1_peft_artifact", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        main,
+        "validate_stage2b_peft_base_identity",
+        lambda **_kwargs: pytest.fail("direct mode used Stage 2A validation"),
+    )
+
+    result = main.preflight_stage2b_artifacts(args)
+
+    assert result.prepared_examples == (prepared,)
+    assert result.negative_store is None
+    assert decisions[0]["resume_from_checkpoint_path"] is None
+    assert decisions[0]["stage1_adapter_path"] == "stage1-adapter"
+
+
+def test_direct_stage1_preflight_rejects_invalid_adapter_payload_before_return(
+    monkeypatch, tmp_path
+):
+    """Catches valid adapter metadata masking a missing required payload until build."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="context_preference",
+        visual_only_context_preference=True,
+        direct_from_stage1=True,
+    )
+    args = stage2_args(
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        stage1_adapter_path="stage1-adapter",
+        step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
+    )
+    metadata_snapshot = object()
+    decision = SimpleNamespace(
+        base_model_source="stage1-base",
+        processor_source="stage1-adapter",
+        stage1_adapter_source="stage1-adapter",
+        stage1_metadata_snapshot=metadata_snapshot,
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: None,
+        load_config=lambda source: {"source": source},
+        load_processor=lambda source: {"source": source},
+        load_model=lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
+    calls = []
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+    monkeypatch.setattr(
+        main, "prepare_stage2_example",
+        lambda *_args, **_kwargs: SimpleNamespace(sample_id="sample-a", reasoning_steps=()),
+    )
+    monkeypatch.setattr(main, "_default_stage2_source_dependencies", lambda: dependencies)
+    monkeypatch.setattr(main, "resolve_stage2_load_decision", lambda **_kwargs: decision)
+
+    def reject_payload(processor, base_config, artifact, **kwargs):
+        calls.append((processor, base_config, artifact, kwargs))
+        raise ValueError("adapter_model.safetensors is required")
+
+    monkeypatch.setattr(main, "preflight_stage1_peft_artifact", reject_payload)
+
+    with pytest.raises(ValueError, match="adapter_model.safetensors is required"):
+        main.preflight_stage2b_artifacts(args)
+
+    assert calls == [
+        (
+            {"source": "stage1-adapter"},
+            {"source": "stage1-base"},
+            Path("stage1-adapter"),
+            {
+                "requested_base_model_reference": "stage1-base",
+                "metadata_snapshot": metadata_snapshot,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("attention_implementation", "vision_attention_implementation"),
+    (("eager", "eager"), ("sdpa", "sdpa")),
+)
+def test_stage2b_preflight_rejects_noncanonical_attention_before_source_read(
+    tmp_path,
+    attention_implementation,
+    vision_attention_implementation,
+):
+    """Catches Stage 2B authenticating a mutually matching noncanonical manifest."""
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="legacy_dpo",
+        stage2a_checkpoint_path=str(tmp_path / "stage2a"),
+        negative_path=str(tmp_path / "negatives.jsonl"),
+        negative_manifest=str(tmp_path / "manifest.json"),
+    )
+    args = stage2_args(
+        data_path=str(tmp_path / "must-not-be-read.jsonl"),
+        step_preference_config=config,
+        attention_implementation=attention_implementation,
+        vision_attention_implementation=vision_attention_implementation,
+    )
+
+    with pytest.raises(ValueError, match="Stage 2B requires"):
+        main.preflight_stage2b_artifacts(args)
+
+
+@pytest.mark.parametrize(
+    ("attention_implementation", "vision_attention_implementation"),
+    (("eager", "eager"), ("sdpa", "sdpa")),
+)
+def test_stage2b_components_reject_noncanonical_attention_with_cached_preflight(
+    tmp_path,
+    attention_implementation,
+    vision_attention_implementation,
+):
+    """Catches an injected preflight bypass reaching configuration/model loading."""
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="legacy_dpo",
+        stage2a_checkpoint_path=str(tmp_path / "stage2a"),
+        negative_path=str(tmp_path / "negatives.jsonl"),
+        negative_manifest=str(tmp_path / "manifest.json"),
+    )
+    args = stage2_args(
+        step_preference_config=config,
+        attention_implementation=attention_implementation,
+        vision_attention_implementation=vision_attention_implementation,
+        _stage2b_preflight=main.Stage2BPreflight((), {}),
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: pytest.fail(
+            "artifact discovery must not start"
+        ),
+        load_config=lambda *_args, **_kwargs: pytest.fail(
+            "configuration loading must not start"
+        ),
+        load_processor=lambda *_args, **_kwargs: pytest.fail(
+            "processor loading must not start"
+        ),
+        load_model=lambda *_args, **_kwargs: pytest.fail(
+            "model loading must not start"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Stage 2B requires"):
+        main.build_stage2_training_components(args, source_dependencies=dependencies)
+
+
+def test_stage2b_preflight_rejects_changed_vision_backend_before_model_load(
+    monkeypatch, tmp_path
+):
+    """Catches trusting a schema-3 manifest's producer-selected vision backend."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    stage2a = tmp_path / "stage2a"
+    stage2a.mkdir()
+    negatives = tmp_path / "negatives.jsonl"
+    negatives.write_bytes(b"")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "selected_row_indices": [0],
+                "stage2a_checkpoint_path": str(stage2a.resolve()),
+                "checkpoint_files": [],
+                "tokenizer_config_identity": "tokenizer-v1",
+                "latent_size": 8,
+                "assistant_plan_rendering": "adjacent-text-space-lf-v1",
+                "generation_settings": {
+                    "attention_implementation": "sdpa",
+                    "vision_attention_implementation": "sdpa",
+                    "device": "cuda:0",
+                    "max_new_tokens": 32,
+                    "min_tokens": 2,
+                    "torch_dtype": "bfloat16",
+                },
+                "negative_sha256": hashlib.sha256(b"").hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="legacy_dpo",
+        stage2a_checkpoint_path=str(stage2a),
+        negative_path=str(negatives),
+        negative_manifest=str(manifest_path),
+    )
+    args = stage2_args(
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        latent_size=8,
+        step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
+    )
+    prepared = SimpleNamespace(
+        sample_id="sample-a",
+        reasoning_steps=(
+            SimpleNamespace(step_id=0, target_text=SimpleNamespace(start=0, end=6)),
+        ),
+        conversation=[
+            {"role": "user", "content": []},
+            {"role": "assistant", "content": [{"type": "text", "text": "chosen"}]},
+        ],
+    )
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+    monkeypatch.setattr(
+        main, "prepare_stage2_example", lambda *_args, **_kwargs: prepared
+    )
+    monkeypatch.setattr(
+        main, "validate_stage2b_peft_base_identity", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        main,
+        "inspect_stage2a_checkpoint_identity",
+        lambda _path: ((), "tokenizer-v1"),
+    )
+    dependencies = main.Stage2SourceDependencies(
+        find_adapter_config=lambda *_args, **_kwargs: None,
+        load_config=lambda *_args, **_kwargs: pytest.fail("config load must not start"),
+        load_processor=lambda *_args, **_kwargs: pytest.fail(
+            "processor load must not start"
+        ),
+        load_model=lambda *_args, **_kwargs: pytest.fail("model load must not start"),
+    )
+
+    with pytest.raises(ValueError, match="generation settings do not match"):
+        main.build_stage2_training_components(args, source_dependencies=dependencies)
+
+
+def test_main_stage2b_rejects_legacy_negative_manifest_before_model_construction(
+    monkeypatch, tmp_path
+):
+    """Catches enabled main routing accepting a schema-2 rendering-less artifact."""
+    source = tmp_path / "data.jsonl"
+    source.write_bytes(b'{"sample_id":"sample-a"}\n')
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "selected_row_indices": [0],
+                "stage2a_checkpoint_path": str((tmp_path / "stage2a").resolve()),
+                "checkpoint_files": [],
+                "tokenizer_config_identity": "tokenizer-v1",
+                "latent_size": 8,
+                "generation_settings": {"min_tokens": 2, "max_new_tokens": 32},
+                "negative_sha256": "0" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = main.StepPreferenceConfig(
+        enabled=True,
+        mode="stage2b",
+        objective="legacy_dpo",
+        stage2a_checkpoint_path=str(tmp_path / "stage2a"),
+        negative_path=str(tmp_path / "negatives.jsonl"),
+        negative_manifest=str(manifest_path),
+    )
+    args = stage2_args(
+        stage="stage2",
+        data_path=str(source),
+        image_root=str(tmp_path / "images"),
+        latent_size=8,
+        log_file=str(tmp_path / "train.log"),
+        step_preference_config=config,
+        vision_attention_implementation="flash_attention_2",
+    )
+    prepared = SimpleNamespace(
+        sample_id="sample-a",
+        reasoning_steps=(
+            SimpleNamespace(step_id=0, target_text=SimpleNamespace(start=0, end=6)),
+        ),
+        conversation=[
+            {"role": "user", "content": []},
+            {"role": "assistant", "content": [{"type": "text", "text": "chosen"}]},
+        ],
+    )
+    monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(main, "validate_generated_artifact_paths", lambda _args: None)
+    monkeypatch.setattr(main, "load_jsonl_examples", lambda _path: [object()])
+    monkeypatch.setattr(main, "prepare_stage2_example", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(main, "validate_stage2b_peft_base_identity", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "inspect_stage2a_checkpoint_identity",
+        lambda _path: ((), "tokenizer-v1"),
+    )
+    monkeypatch.setattr(
+        main,
+        "load_negative_store",
+        lambda **_kwargs: {("sample-a", 0): SimpleNamespace(chosen_text="chosen")},
+    )
+    monkeypatch.setattr(main, "bind_deepspeed_runtime_profile", lambda _args: None)
+    monkeypatch.setattr(main, "seed_everything", lambda **_kwargs: None)
+    monkeypatch.setattr(main.logging, "FileHandler", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(main.logging, "StreamHandler", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(main.logging, "basicConfig", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "run_stage2",
+        lambda _args: pytest.fail("model construction reached for legacy artifact"),
+    )
+
+    with pytest.raises(ValueError, match="unknown or missing fields|schema_version"):
+        main_train()
+
+
+def test_main_disabled_startup_log_has_no_private_preflight_field(monkeypatch):
+    """Catches disabled startup logs gaining a private ``None`` payload field."""
+    args = stage2_args(
+        stage="stage2",
+        log_file="unused.log",
+        step_preference_config=main.StepPreferenceConfig(),
+    )
+    logged_records = []
+
+    monkeypatch.setattr(main, "get_args", lambda: args)
+    monkeypatch.setattr(main, "validate_generated_artifact_paths", lambda selected: None)
+    monkeypatch.setattr(
+        main,
+        "preflight_stage2b_artifacts",
+        lambda selected: pytest.fail("disabled training must not run Stage 2B preflight"),
+    )
+    monkeypatch.setattr(main, "bind_deepspeed_runtime_profile", lambda selected: None)
+    monkeypatch.setattr(main, "seed_everything", lambda **kwargs: None)
+    monkeypatch.setattr(main.logging, "FileHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "StreamHandler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main.logging, "basicConfig", lambda **kwargs: None)
+    monkeypatch.setattr(
+        main.logging, "info", lambda value: logged_records.append(str(value))
+    )
+    monkeypatch.setattr(main, "run_stage2", lambda selected: "stage2-result")
+
+    result = main_train()
+
+    assert result == "stage2-result"
+    assert "_stage2b_preflight" not in "\n".join(logged_records)
+
+
 @pytest.mark.parametrize(
     ("world_process_zero", "expected_processor_path"),
     [(True, "out"), (False, None)],
@@ -770,6 +1676,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         log_file=str(tmp_path / "train.log"),
         cache_dir=str(tmp_path / "cache"),
         save_final_model=True,
+        stage2_diagnostics_interval=3,
     )
     processor = RecordingSavedProcessor()
     model = object()
@@ -807,6 +1714,7 @@ def test_main_stage2_uses_only_stage2_components_and_validated_resume(
         "processing_class": processor,
         "stage2_peft_metadata": "preserved-sidecar",
         "deepspeed_runtime_profile": args.deepspeed_runtime_profile,
+        "stage2_diagnostics_interval": 3,
     }
     assert trainer.resume_path == "stage2/checkpoint-4"
     assert trainer.saved_path == "out"
@@ -899,3 +1807,33 @@ def test_direct_main_rejects_artifacts_before_importing_transformers(tmp_path):
     assert completed.returncode != 0
     assert "canonical checkpoint root" in completed.stderr
     assert "transformers import reached before preflight" not in completed.stderr
+
+
+def test_direct_main_help_uses_documented_top_level_pythonpath():
+    """Catches optional evidence imports requiring the repository root on PYTHONPATH."""
+    repo_root = Path(main.__file__).resolve().parents[1]
+    run_id = "step-preference-phase-a-20260903T133145Z"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        (str(repo_root / "transformers/src"), str(repo_root / "src"))
+    )
+
+    completed = subprocess.run(
+        [
+            str(Path(sys.executable)),
+            str(Path(main.__file__).resolve()),
+            "--save_model_path",
+            str(repo_root / "checkpoints" / run_id),
+            "--log_file",
+            str(repo_root / "logs" / run_id / "stage2b.log"),
+            "--help",
+        ],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--step_preference_enabled" in completed.stdout

@@ -577,7 +577,9 @@ def _stub_empty_stage2_data(monkeypatch):
         "filter_stage2_examples",
         lambda **unused: ([], SimpleNamespace(retained=0)),
     )
-    monkeypatch.setattr(main, "Stage2DataCollator", lambda *unused: object())
+    monkeypatch.setattr(
+        main, "Stage2DataCollator", lambda *unused, **unused_keywords: object()
+    )
 
 
 def _injected_stage2_source_dependencies(find_adapter_config):

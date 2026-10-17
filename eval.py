@@ -13,6 +13,7 @@ import torch
 from PIL import Image
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
+    AutoConfig,
     AutoProcessor,
 )
 
@@ -29,7 +30,10 @@ from stage2.checkpointing import (
     inspect_stage2_artifact,
     resolve_latent_token_ids,
 )
-from stage2.backend_fallback import is_flash_attention_initialization_error
+from stage2.attention_backend import (
+    load_qwen2_5_vl_with_attention,
+    validate_qwen2_5_vl_attention_backends,
+)
 from stage2.inference import (
     Stage2InferenceController,
     build_stage2_generation_config,
@@ -40,6 +44,7 @@ from stage2.peft import (
 )
 from multinode_evaluation import (
     dataset_identity,
+    authenticated_dataset_identity,
     iter_owned_samples,
     resolve_evaluation_image_paths,
     resolve_model_identity,
@@ -120,16 +125,30 @@ def get_eval_args():
                         help="Task name (used for bookkeeping and branching logic).")
     parser.add_argument("--output_json_path", type=str, default="evaluation_results.jsonl",
                         help="Path to save per-sample evaluation results.")
+    parser.add_argument("--runtime_identity_path", type=str, required=True)
     parser.add_argument("--cache_dir", type=str, default="./cache",
                         help="Hugging Face cache directory.")
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--max_sequence_length", type=int, default=32768)
     parser.add_argument("--repetition_penalty", type=float, default=1.05)
+    parser.add_argument(
+        "--generation-limit-policy",
+        choices=("bounded", "external_full_latent_block"),
+        default="bounded",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--disable-latent-generation", action="store_true",
+                        help="Stage 1 diagnostic: suppress latent START generation.")
+    parser.add_argument("--use-kv-cache", action="store_true",
+                        help="Cache Stage 1 OFF decoding (requires --disable-latent-generation).")
+    parser.add_argument("--static-inference-cache", action="store_true",
+                        help="Reuse fixed Stage 1 OFF inference state (requires --use-kv-cache).")
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--model-identity", type=str)
+    parser.add_argument("--canonical-dataset-identity", type=str)
+    parser.add_argument("--expected-dataset-sha256", type=str)
     return parser.parse_args()
 
 
@@ -152,32 +171,25 @@ def load_processor(model_dir: str, cache_dir: str):
 
 
 def load_model(model_dir: str, cache_dir: str):
-    """
-    Prefer flash_attention_2 for efficiency; automatically fall back
-    to eager attention if flash attention is unavailable.
-    """
-    try:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_dir,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
-            attn_implementation="flash_attention_2",
-        )
-    except Exception as e:
-        if not is_flash_attention_initialization_error(e):
-            raise
-        logging.warning(
-            f"flash_attention_2 initialization failed ({e}); "
-            f"falling back to eager attention."
-        )
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_dir,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
-            attn_implementation="eager",
-        )
+    """Load the fixed authenticated SDPA-language/FlashAttention2-vision pair."""
+    model = load_qwen2_5_vl_with_attention(
+        model_dir,
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
+        config_load_kwargs={"cache_dir": cache_dir},
+        model_load_kwargs={
+            "device_map": "auto",
+            "torch_dtype": torch.bfloat16,
+            "cache_dir": cache_dir,
+        },
+        load_config=AutoConfig.from_pretrained,
+        load_model=Qwen2_5_VLForConditionalGeneration.from_pretrained,
+    )
+    validate_qwen2_5_vl_attention_backends(
+        model,
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
+    )
 
     model.eval()
     try:
@@ -211,10 +223,15 @@ def load_evaluation_artifacts(
             requested_base_model_reference=base_model_dir,
             is_trainable=False,
         )
+        validate_qwen2_5_vl_attention_backends(
+            resolve_qwen2_5_vl_model(model),
+            attention_implementation="sdpa",
+            vision_attention_implementation="flash_attention_2",
+        )
         model.eval()
         return model, processor
 
-    artifact_inspection = inspect_stage2_artifact(model_dir)
+    artifact_inspection = inspect_stage2_artifact(model_dir, for_inference=True)
     if artifact_inspection.artifact_kind is Stage2ArtifactKind.FULL:
         if base_model_dir is not None:
             raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
@@ -232,6 +249,11 @@ def load_evaluation_artifacts(
             source, selectors["cache_dir"]
         ),
         artifact_inspection=artifact_inspection,
+    )
+    validate_qwen2_5_vl_attention_backends(
+        resolve_stage2_qwen_model(model),
+        attention_implementation="sdpa",
+        vision_attention_implementation="flash_attention_2",
     )
     return model, processor
 
@@ -337,6 +359,8 @@ def run_one_example(
     processor,
     sample: Dict[str, Any],
     gen_kwargs: Dict[str, Any],
+    *, disable_latent_generation: bool = False, use_kv_cache: bool = False,
+    static_inference_cache: bool = False,
 ) -> Dict[str, Any]:
     """
     Run inference on a single example and return raw output,
@@ -376,6 +400,16 @@ def run_one_example(
         raise ValueError("checkpoint config must contain a positive latent_size")
     token_ids = resolve_latent_token_ids(processor.tokenizer, qwen_model.config)
     stage = getattr(qwen_model.config, "stage", None)
+    if type(use_kv_cache) is not bool:
+        raise TypeError("use_kv_cache must be a boolean")
+    if use_kv_cache and (stage != "stage1" or not disable_latent_generation):
+        raise ValueError("KV cache requires Stage 1 with latent generation disabled")
+    if type(static_inference_cache) is not bool:
+        raise TypeError("static_inference_cache must be a boolean")
+    if static_inference_cache and not use_kv_cache:
+        raise ValueError("static inference cache requires Stage 1 OFF with KV cache")
+    if disable_latent_generation and stage != "stage1":
+        raise ValueError("disable_latent_generation is a Stage 1 diagnostic only")
     if stage == "stage1":
         if not isinstance(qwen_model, ContinuousLatentModelProtocol):
             raise TypeError(
@@ -416,6 +450,9 @@ def run_one_example(
                 pixel_values=inputs.get("pixel_values"),
                 image_grid_thw=inputs.get("image_grid_thw"),
                 return_latent_states=False,
+                disable_latent_generation=disable_latent_generation,
+                use_kv_cache=use_kv_cache,
+                static_inference_cache=static_inference_cache,
             )
             out_ids = generation_result.sequences
         else:
@@ -466,6 +503,17 @@ def run_one_example(
     }
 
 
+def publish_evaluation_runtime_identity(model, model_dir, output_path):
+    from step_preference.capacity_evidence import EvaluationRuntimeIdentity, publish_json, git_identity
+    from stage2.attention_backend import validate_qwen2_5_vl_attention_backends
+    qwen = resolve_qwen2_5_vl_model(model)
+    validate_qwen2_5_vl_attention_backends(qwen, attention_implementation="sdpa", vision_attention_implementation="flash_attention_2")
+    value = EvaluationRuntimeIdentity(1, "stage2-evaluation-runtime-identity", git_identity(), True,
+        str(Path(model_dir).resolve(strict=True)), "Qwen2_5_VLSdpaAttention", len(qwen.model.layers),
+        "Qwen2_5_VLVisionFlashAttention2", len(qwen.visual.blocks))
+    return publish_json(output_path, value, EvaluationRuntimeIdentity)
+
+
 def main():
     args = get_eval_args()
     logging.basicConfig(
@@ -487,6 +535,18 @@ def main():
     if not dataset_path.is_file():
         raise ValueError("evaluation test data must be a file")
     dataset_root = dataset_path.parent
+    dataset_auth = dict(
+        canonical_identity_json=getattr(args, 'canonical_dataset_identity', None),
+        expected_sha256=getattr(args, 'expected_dataset_sha256', None),
+        num_shards=args.num_shards,
+    )
+    authenticated_dataset_identity(args.test_data_path, **dataset_auth)
+    runtime_identity_path = getattr(args, "runtime_identity_path", None)
+    if runtime_identity_path is not None:
+        from step_preference.capacity_evidence import git_identity, require
+        git_identity()
+        require(not Path(runtime_identity_path).exists() and not Path(runtime_identity_path).is_symlink(),
+                "evaluation runtime identity output already exists")
 
     logging.info(f"Loading model from: {args.model_dir}")
     model, processor = load_evaluation_artifacts(
@@ -494,6 +554,8 @@ def main():
         base_model_dir=args.base_model_dir,
         cache_dir=args.cache_dir,
     )
+    if runtime_identity_path is not None:
+        publish_evaluation_runtime_identity(model, args.model_dir, runtime_identity_path)
 
     # Load test data
     data = []
@@ -512,6 +574,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         max_sequence_length=args.max_sequence_length,
         repetition_penalty=args.repetition_penalty,
+        generation_limit_policy=getattr(args, "generation_limit_policy", "bounded"),
         temperature=args.temperature,
         top_p=args.top_p,
         do_sample=(args.temperature > 0),
@@ -541,7 +604,13 @@ def main():
                 sample.get("image_input", []), dataset_root
             )
             pred = run_one_example(
-                model, processor, evaluation_sample, gen_kwargs
+                model, processor, evaluation_sample, gen_kwargs,
+                **({"disable_latent_generation": True}
+                   if getattr(args, "disable_latent_generation", False) else {}),
+                **({"use_kv_cache": True}
+                   if getattr(args, "use_kv_cache", False) else {}),
+                **({"static_inference_cache": True}
+                   if getattr(args, "static_inference_cache", False) else {}),
             )
             sample_infer_time = pred.get("inference_time", None)
             if sample_infer_time is not None:
@@ -617,8 +686,7 @@ def main():
 
         except Exception as e:
             logging.error(f"[{i}] Evaluation failed: {e}")
-            if sharded:
-                worker_failed = True
+            worker_failed = True
             error_result = {
                 "index": i,
                 "task_name": args.task_name,
@@ -653,6 +721,21 @@ def main():
                 })
             results.append(error_result)
 
+    import hashlib
+    diagnostic_identity = {
+        "disable_latent_generation": getattr(args, "disable_latent_generation", False),
+        "use_kv_cache": getattr(args, "use_kv_cache", False),
+        **({"static_inference_cache": True}
+           if getattr(args, "static_inference_cache", False) else {}),
+        "model_identity": resolve_model_identity(args.model_dir, getattr(args, "model_identity", None)),
+        "model_artifact": str(Path(args.model_dir).resolve()),
+        "source_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+        "generation_profile": {key: value for key, value in gen_kwargs.items() if key != "do_sample"},
+    } if (getattr(args, "disable_latent_generation", False)
+          or getattr(args, "model_identity", None) is not None) else {}
+    for row in results:
+        row.update(diagnostic_identity)
+
     metric_total = worker_total if sharded else total
     score_summary = (
         EvaluationScoreSummary.from_rows(results, metric_total)
@@ -669,11 +752,12 @@ def main():
 
     with open(args.output_json_path, "w", encoding="utf-8") as fout:
         for r in results:
-            fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+            fout.write(json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n")
         if not sharded:
             # Write a summary line as the last entry
             summary = {
                 "summary": True,
+                **diagnostic_identity,
                 "num_samples": total,
                 "average_inference_time_sec": avg_inference_time,
                 "total_inference_time_sec": total_inference_time,
@@ -690,13 +774,13 @@ def main():
                     "coverage_accuracy": score_summary.coverage_accuracy,
                     "valid_gold_accuracy": score_summary.valid_gold_accuracy,
                 })
-            fout.write(json.dumps(summary, ensure_ascii=False) + "\n")
+            fout.write(json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n")
 
     if sharded:
         write_shard_manifest(
             shard_manifest_path(args.output_json_path),
             shard_jsonl=args.output_json_path,
-            dataset_identity=dataset_identity(args.test_data_path),
+            dataset_identity=authenticated_dataset_identity(args.test_data_path, **dataset_auth),
             model_identity=resolve_model_identity(
                 args.model_dir, args.model_identity
             ),
@@ -704,8 +788,18 @@ def main():
                 "max_new_tokens": args.max_new_tokens,
                 "max_sequence_length": args.max_sequence_length,
                 "repetition_penalty": args.repetition_penalty,
+                "generation_limit_policy": getattr(
+                    args, "generation_limit_policy", "bounded"
+                ),
                 "temperature": args.temperature,
                 "top_p": args.top_p,
+                **({"disable_latent_generation": True}
+                   if getattr(args, "disable_latent_generation", False) else {}),
+                **({"use_kv_cache": getattr(args, "use_kv_cache", False)}
+                   if (getattr(args, "disable_latent_generation", False)
+                       or getattr(args, "use_kv_cache", False)) else {}),
+                **({"static_inference_cache": True}
+                   if getattr(args, "static_inference_cache", False) else {}),
             },
             shard_index=args.shard_index,
             num_shards=args.num_shards,
@@ -719,7 +813,7 @@ def main():
         f"Evaluation finished: {success}/{report_total} correct; accuracy={acc:.4f}"
     )
     print(f"Accuracy = {acc:.4f} ({success}/{report_total})")
-    if sharded:
+    if sharded or worker_failed:
         return 1 if worker_failed else 0
 
 

@@ -48,6 +48,15 @@ def test_stage1_legacy_use_lora_resolves_only_to_lora():
     assert tuning.method == "lora"
 
 
+def test_textual_states_parser_defaults_accepts_all_and_rejects_invalid_values():
+    assert parse_args(["--stage", "stage1"]).textual_states == "previous"
+    assert parse_args(
+        ["--stage", "stage1", "--textual_states", "all"]
+    ).textual_states == "all"
+    with pytest.raises(SystemExit):
+        parse_args(["--stage", "stage1", "--textual_states", "invalid"])
+
+
 def test_stage1_explicit_lora_is_a_canonical_tuning_method():
     """Catches explicit Stage 1 LoRA being rejected despite its PEFT support."""
     args = parse_args(["--stage", "stage1", "--tuning_method", "lora"])
@@ -91,6 +100,8 @@ def test_stage1_explicit_target_order_is_preserved_after_normalization():
                 "/a",
                 "--resume_from_checkpoint_path",
                 "/b",
+                "--ce_weight",
+                "1",
             ],
             "mutually exclusive",
         ),
@@ -163,3 +174,44 @@ def test_stage1_runtime_config_is_immutable():
 
     with pytest.raises(FrozenInstanceError):
         runtime.seed = 7
+
+
+QUERY_V5 = ['--stage', 'stage1', '--stage1_variant', 'v5', '--tuning_method', 'dora',
+            '--per_device_train_batch_size', '1', '--attention_implementation', 'sdpa']
+
+
+def test_history_query_cli_defaults_and_explicit_values_are_separate_from_loss():
+    args = parse_args(['--stage', 'stage1'])
+    assert args.stage1_query_config.mode == 'legacy'
+    assert args.stage1_query_explicit_values == {}
+    args = parse_args([*QUERY_V5, '--query_mode=adaptive'])
+    assert (args.stage1_query_config.mode, args.stage1_query_config.text_gamma,
+            args.stage1_query_config.attention_layers) == ('adaptive', .9, 'last')
+    assert args.stage1_query_explicit_values == {'query_mode': 'adaptive'}
+    assert 'query_mode' not in args.stage1_v5_explicit_values
+
+
+@pytest.mark.parametrize('extra', [
+    ['--query_mode', 'adaptive', '--history_attention_layers', 'all'],
+    ['--query_mode', 'adaptive', '--history_attention_layers', 'last4'],
+    ['--query_mode', 'other'], ['--history_text_gamma', 'nan'],
+    ['--history_text_gamma', '1.01'], ['--history_attention_layers', 'first'],
+    ['--query_mode', 'legacy', '--history_text_gamma', '.9'],
+    ['--query_mode', 'legacy', '--history_attention_layers', 'last'],
+    ['--query_mode=adaptive', '--textual_sta=all'],
+    ['--query_m=adaptive', '--textual_states', 'previous'],
+    ['--query_mode', 'adaptive', '--stage', 'stage2'],
+    ['--query_mode', 'adaptive', '--stage1_variant', 'standard'],
+    ['--query_mode', 'adaptive', '--tuning_method', 'full'],
+    ['--query_mode', 'adaptive', '--per_device_train_batch_size', '2'],
+])
+def test_history_query_cli_rejects_unsupported_or_conflicting_requests(extra):
+    with pytest.raises((ValueError, SystemExit)):
+        parse_args([*QUERY_V5, *extra])
+
+
+def test_history_query_unique_abbreviations_and_equals_track_registered_dest():
+    args = parse_args([*QUERY_V5, '--query_m=adaptive', '--history_text_g=.55',
+                       '--history_attention_l=last'])
+    assert args.stage1_query_explicit_values == {
+        'query_mode': 'adaptive', 'history_text_gamma': .55, 'history_attention_layers': 'last'}

@@ -48,17 +48,19 @@ data_path=${STAGE1_DATA_PATH:-}
 source_data_path=${STAGE1_SOURCE_DATA_PATH:-}
 image_root=${STAGE1_IMAGE_ROOT:-}
 output_dir=${STAGE1_OUTPUT_DIR:-}
-micro_batch=${STAGE1_MICRO_BATCH:-8}
-epochs=${STAGE1_EPOCHS:-3}
-learning_rate=${STAGE1_LEARNING_RATE:-1e-5}
+micro_batch=${STAGE1_MICRO_BATCH:-1}
+epochs=${STAGE1_EPOCHS:-1}
+learning_rate=${STAGE1_LEARNING_RATE:-5e-5}
+ce_weight=${STAGE1_CE_WEIGHT:-${CE_WEIGHT:-}}
 gradient_accumulation=${STAGE1_GRADIENT_ACCUMULATION:-2}
-ema_tau=${STAGE1_EMA_TAU:-0.999}
+ema_tau=${STAGE1_EMA_TAU:-1.0}
 seed=${STAGE1_SEED:-42}
 deepspeed_config=${STAGE1_DEEPSPEED_CONFIG:-"$script_dir/configs/deepspeed_zero3.json"}
 stage1_num_processes=${STAGE1_NUM_PROCESSES:-2}
 attention_implementation=${STAGE1_ATTENTION_IMPLEMENTATION:-flash_attention_2}
 save_strategy=${STAGE1_SAVE_STRATEGY:-no}
 save_steps=${STAGE1_SAVE_STEPS:-612}
+textual_states=${STAGE1_TEXTUAL_STATES:-previous}
 resume_path=${STAGE1_RESUME_PATH:-}
 log_file=${STAGE1_LOG_FILE:-}
 max_steps=${STAGE1_MAX_STEPS:-}
@@ -66,6 +68,9 @@ benchmark_run_config=${STAGE1_BENCHMARK_RUN_CONFIG:-}
 benchmark_evidence_path=${STAGE1_BENCHMARK_EVIDENCE_PATH:-}
 benchmark_smoke_resume_witness=${STAGE1_BENCHMARK_SMOKE_RESUME_WITNESS:-}
 training_evidence_path=
+extra_worker_arguments=()
+query_mode=legacy
+declare -A requested_options=()
 dry_run=false
 final_save=true
 legacy_use_lora=false
@@ -153,8 +158,46 @@ require_value() {
     fi
 }
 
+# Keep environment knobs as explicit requests; unset/empty values are fallbacks.
+for binding in STAGE1_MICRO_BATCH:--micro-batch STAGE1_EPOCHS:--epochs STAGE1_LEARNING_RATE:--learning-rate \
+    STAGE1_CE_WEIGHT:--ce-weight CE_WEIGHT:--ce-weight STAGE1_GRADIENT_ACCUMULATION:--gradient-accumulation \
+    STAGE1_EMA_TAU:--ema-tau STAGE1_SEED:--seed STAGE1_ATTENTION_IMPLEMENTATION:--attention-implementation \
+    STAGE1_SAVE_STRATEGY:--save-strategy STAGE1_SAVE_STEPS:--save-steps STAGE1_TEXTUAL_STATES:--textual_states \
+    STAGE1_MAX_STEPS:--max-steps; do
+    env_name=${binding%%:*}
+    if [[ -v $env_name && -n ${!env_name} ]]; then requested_options[${binding#*:}]=1; fi
+done
+
 while (( $# )); do
+    requested_options[$1]=1
     case $1 in
+        --query_mode) require_value "$@"; query_mode=$2; extra_worker_arguments+=(--query_mode "$2"); shift 2 ;;
+        --history_text_gamma|--history_attention_layers) require_value "$@"; extra_worker_arguments+=("$1" "$2"); shift 2 ;;
+        --sim-weight) require_value "$@"; extra_worker_arguments+=(--sim_weight "$2"); shift 2 ;;
+        --stage1-v5-debug) extra_worker_arguments+=(--stage1_v5_debug); shift ;;
+        --no-stage1-v5-debug) extra_worker_arguments+=(--no-stage1_v5_debug); shift ;;
+        --stage1-variant) require_value "$@"; extra_worker_arguments+=(--stage1_variant "$2"); shift 2 ;;
+        --stage1-loss-type) require_value "$@"; extra_worker_arguments+=(--stage1_loss_type "$2"); shift 2 ;;
+        --lambda-preference) require_value "$@"; extra_worker_arguments+=(--lambda_preference "$2"); shift 2 ;;
+        --lambda-topk-entropy) require_value "$@"; extra_worker_arguments+=(--lambda_topk_entropy "$2"); shift 2 ;;
+        --lambda-entropy) require_value "$@"; extra_worker_arguments+=(--lambda_entropy "$2"); shift 2 ;;
+        --preference-topk-k) require_value "$@"; extra_worker_arguments+=(--preference_topk_k "$2"); shift 2 ;;
+        --preference-topk-mode) require_value "$@"; extra_worker_arguments+=(--preference_topk_mode "$2"); shift 2 ;;
+        --lambda-topk-mass) require_value "$@"; extra_worker_arguments+=(--lambda_topk_mass "$2"); shift 2 ;;
+        --lambda-topk-chosen-mass) require_value "$@"; extra_worker_arguments+=(--lambda_topk_chosen_mass "$2"); shift 2 ;;
+        --preference-entropy-top-percent) require_value "$@"; extra_worker_arguments+=(--preference_entropy_top_percent "$2"); shift 2 ;;
+        --stage1-v5-selection) require_value "$@"; extra_worker_arguments+=(--stage1_v5_selection "$2"); shift 2 ;;
+        --stage1-v5-text-kl-weight) require_value "$@"; extra_worker_arguments+=(--stage1_v5_text_kl_weight "$2"); shift 2 ;;
+        --loss-chunk-positions) require_value "$@"; extra_worker_arguments+=(--loss_chunk_positions "$2"); shift 2 ;;
+        --vision-attention-implementation) require_value "$@"; extra_worker_arguments+=(--vision_attention_implementation "$2"); shift 2 ;;
+        --warm-up-steps) require_value "$@"; extra_worker_arguments+=(--warm_up_steps "$2"); shift 2 ;;
+        --latent-size) require_value "$@"; extra_worker_arguments+=(--latent_size "$2"); shift 2 ;;
+        --max-seq-length-train) require_value "$@"; extra_worker_arguments+=(--max_seq_length_train "$2"); shift 2 ;;
+        --dataloader-num-workers) require_value "$@"; extra_worker_arguments+=(--dataloader_num_workers "$2"); shift 2 ;;
+        --step-preference-beta) require_value "$@"; extra_worker_arguments+=(--step_preference_beta "$2"); shift 2 ;;
+        --step-preference-margin) require_value "$@"; extra_worker_arguments+=(--step_preference_margin "$2"); shift 2 ;;
+        --topk-include-gt) extra_worker_arguments+=(--topk_include_gt); shift ;;
+        --no-topk-include-gt) extra_worker_arguments+=(--no-topk_include_gt); shift ;;
         --method) require_value "$@"; method=$2; shift 2 ;;
         --model) require_value "$@"; model=$2; shift 2 ;;
         --data-path) require_value "$@"; data_path=$2; shift 2 ;;
@@ -164,6 +207,7 @@ while (( $# )); do
         --micro-batch) require_value "$@"; micro_batch=$2; shift 2 ;;
         --epochs) require_value "$@"; epochs=$2; shift 2 ;;
         --learning-rate) require_value "$@"; learning_rate=$2; shift 2 ;;
+        --ce-weight) require_value "$@"; ce_weight=$2; shift 2 ;;
         --gradient-accumulation) require_value "$@"; gradient_accumulation=$2; shift 2 ;;
         --ema-tau) require_value "$@"; ema_tau=$2; shift 2 ;;
         --seed) require_value "$@"; seed=$2; shift 2 ;;
@@ -171,6 +215,7 @@ while (( $# )); do
         --attention-implementation) require_value "$@"; attention_implementation=$2; shift 2 ;;
         --save-strategy) require_value "$@"; save_strategy=$2; shift 2 ;;
         --save-steps) require_value "$@"; save_steps=$2; shift 2 ;;
+        --textual_states) require_value "$@"; textual_states=$2; shift 2 ;;
         --resume) require_value "$@"; resume_path=$2; shift 2 ;;
         --log-file) require_value "$@"; log_file=$2; shift 2 ;;
         --max-steps) require_value "$@"; max_steps=$2; shift 2 ;;
@@ -186,6 +231,9 @@ while (( $# )); do
         *) printf 'error: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+v5_resume=false
+if [[ -n $resume_path && -f $resume_path/stage1_v5.json ]]; then v5_resume=true; fi
 
 for required in method model data_path image_root output_dir; do
     value=${!required}
@@ -207,6 +255,10 @@ fi
 case $save_strategy in
     no|steps|epoch) ;;
     *) printf 'error: --save-strategy must be no, steps, or epoch\n' >&2; exit 2 ;;
+esac
+case $textual_states in
+    all|previous) ;;
+    *) printf 'error: --textual_states must be all or previous\n' >&2; exit 2 ;;
 esac
 case $attention_implementation in
     eager|sdpa|flash_attention_2) ;;
@@ -247,7 +299,7 @@ if [[ ! $ema_tau =~ ^\+?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))([eE][+-]?[0-9]+)?$ ]] |
 fi
 
 experiment_id=${output_dir##*/}
-canonical_log_root='/root/workspace/ILVR/logs/zero-stage-compatibility'
+canonical_log_root="$script_dir/logs/zero-stage-compatibility"
 if [[ -z $log_file ]]; then
     if [[ -n $resume_path ]]; then
         log_file="$canonical_log_root/$experiment_id/resume-$(date +%Y%m%dT%H%M%S)-$$.log"
@@ -354,22 +406,35 @@ command=(
     --image_root "$image_root"
     --save_model_path "$output_dir"
     --log_file "$log_file"
-    --per_device_train_batch_size "$micro_batch"
-    --epochs "$epochs"
-    --learning_rate "$learning_rate"
-    --gradient_accumulation_steps "$gradient_accumulation"
-    --ema_tau "$ema_tau"
-    --seed "$seed"
     --deepspeed_config "$deepspeed_config"
-    --attention_implementation "$attention_implementation"
-    --save_strategy "$save_strategy"
-    --save_steps "$save_steps"
-    --gradient_checkpointing
 )
 
-command+=(--tuning_method "$method")
+append_execution_option() {
+    local shell_option=$1 worker_option=$2 value=$3
+    if [[ $v5_resume != true || -v requested_options[$shell_option] ]]; then
+        command+=("$worker_option" "$value")
+    fi
+}
+append_execution_option --micro-batch --per_device_train_batch_size "$micro_batch"
+append_execution_option --epochs --epochs "$epochs"
+append_execution_option --learning-rate --learning_rate "$learning_rate"
+append_execution_option --gradient-accumulation --gradient_accumulation_steps "$gradient_accumulation"
+append_execution_option --ema-tau --ema_tau "$ema_tau"
+append_execution_option --seed --seed "$seed"
+append_execution_option --attention-implementation --attention_implementation "$attention_implementation"
+append_execution_option --save-strategy --save_strategy "$save_strategy"
+append_execution_option --save-steps --save_steps "$save_steps"
+if [[ $query_mode != adaptive || -v requested_options[--textual_states] ]]; then
+    append_execution_option --textual_states --textual_states "$textual_states"
+fi
+if [[ $v5_resume != true ]]; then command+=(--gradient_checkpointing); fi
 
-if [[ $method == lora || $method == dora ]]; then
+command+=(--tuning_method "$method" "${extra_worker_arguments[@]}")
+if [[ -n $ce_weight ]]; then
+    append_execution_option --ce-weight --ce_weight "$ce_weight"
+fi
+
+if [[ $v5_resume != true && ( $method == lora || $method == dora ) ]]; then
     command+=(
         --lora_r 32
         --lora_alpha 64
@@ -382,7 +447,7 @@ if [[ -n $resume_path ]]; then
     command+=(--resume_from_checkpoint_path "$resume_path")
 fi
 if [[ -n $max_steps ]]; then
-    command+=(--max_steps "$max_steps")
+    append_execution_option --max-steps --max_steps "$max_steps"
 fi
 if [[ -n $benchmark_run_config || -n $benchmark_evidence_path ]]; then
     if [[ -z $benchmark_run_config || -z $benchmark_evidence_path || -z $source_data_path ]]; then

@@ -194,6 +194,8 @@ def test_merge_sorts_rows_and_computes_accuracy_once(tmp_path):
             "repetition_penalty": 1.05,
             "temperature": 0.0,
             "top_p": 1.0,
+            "vision_ablation": "none",
+            "generation_limit_policy": "bounded",
         },
     }
     assert json.loads((tmp_path / "summary.json").read_text()) == summary
@@ -248,6 +250,8 @@ def test_merge_preserves_gold_denominators_and_invalid_gold_records(tmp_path):
             "repetition_penalty": 1.05,
             "temperature": 0.0,
             "top_p": 1.0,
+            "vision_ablation": "none",
+            "generation_limit_policy": "bounded",
         },
     }
 
@@ -284,6 +288,111 @@ def test_merge_rejects_generation_config_mismatch(tmp_path):
         _merge(tmp_path, shards, expected_sample_count=4)
 
 
+def test_merge_rejects_mixed_vision_ablation_modes(tmp_path):
+    configs = [
+        {
+            "max_new_tokens": 4096,
+            "max_sequence_length": 32768,
+            "repetition_penalty": 1.05,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "vision_ablation": "all",
+        }
+        for _ in range(4)
+    ]
+    configs[3] = {**configs[3], "vision_ablation": "interleaved"}
+
+    shards = _write_fake_shards(tmp_path, generation_configs=configs)
+
+    with pytest.raises(ValueError, match="generation config mismatch"):
+        _merge(tmp_path, shards, expected_sample_count=4)
+
+
+@pytest.mark.parametrize("condition", [None, False, True], ids=["absent", "on", "off"])
+def test_latent_condition_roundtrips_through_manifest_and_merge(tmp_path, condition):
+    """Normalization must retain explicit conditions without inventing legacy fields."""
+    config = {
+        "max_new_tokens": 4096, "max_sequence_length": 32768,
+        "repetition_penalty": 1.05, "temperature": 0.0, "top_p": 1.0,
+    }
+    if condition is not None:
+        config["disable_latent_generation"] = condition
+    shards = _write_fake_shards(tmp_path, generation_configs=[config] * 4)
+    summary = _merge(tmp_path, shards, expected_sample_count=4)
+
+    configs = [json.loads(path.read_text())["generation_config"] for path in shards]
+    configs.append(summary["generation_config"])
+    configs.append(json.loads((tmp_path / "summary.json").read_text())["generation_config"])
+    for saved in configs:
+        if condition is None:
+            assert "disable_latent_generation" not in saved
+        else:
+            assert saved["disable_latent_generation"] is condition
+
+
+@pytest.mark.parametrize("other_condition", [None, False], ids=["legacy-on", "explicit-on"])
+def test_merge_rejects_mixed_latent_conditions(tmp_path, other_condition):
+    """Dropping OFF metadata during reading would incorrectly permit this merge."""
+    config = {
+        "max_new_tokens": 4096, "max_sequence_length": 32768,
+        "repetition_penalty": 1.05, "temperature": 0.0, "top_p": 1.0,
+        "disable_latent_generation": True,
+    }
+    other = dict(config)
+    if other_condition is None:
+        other.pop("disable_latent_generation")
+    else:
+        other["disable_latent_generation"] = other_condition
+    shards = _write_fake_shards(tmp_path, generation_configs=[config] * 3 + [other])
+
+    with pytest.raises(ValueError, match="generation config mismatch"):
+        _merge(tmp_path, shards, expected_sample_count=4)
+    assert not (tmp_path / "merged.jsonl").exists()
+    assert not (tmp_path / "summary.json").exists()
+
+
+@pytest.mark.parametrize("boundary", ["writer", "reader"])
+@pytest.mark.parametrize("invalid", [0, 1, None, "true", [], {}])
+def test_latent_condition_rejects_non_boolean_values(tmp_path, boundary, invalid):
+    """Truthy values, including integer bool aliases, are not condition identities."""
+    config = {
+        "max_new_tokens": 4096, "max_sequence_length": 32768,
+        "repetition_penalty": 1.05, "temperature": 0.0, "top_p": 1.0,
+    }
+    if boundary == "writer":
+        config["disable_latent_generation"] = invalid
+        with pytest.raises(ValueError, match="generation config"):
+            _write_fake_shards(tmp_path, generation_configs=[config] * 4)
+        assert not (tmp_path / "shard-0.manifest.json").exists()
+    else:
+        shards = _write_fake_shards(tmp_path)
+        manifest = json.loads(shards[0].read_text())
+        manifest["generation_config"]["disable_latent_generation"] = invalid
+        shards[0].write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="generation config"):
+            _merge(tmp_path, shards, expected_sample_count=4)
+        assert not (tmp_path / "merged.jsonl").exists()
+
+
+@pytest.mark.parametrize("boundary", ["writer", "reader"])
+def test_latent_condition_does_not_allow_unknown_config_fields(tmp_path, boundary):
+    config = {
+        "max_new_tokens": 4096, "max_sequence_length": 32768,
+        "repetition_penalty": 1.05, "temperature": 0.0, "top_p": 1.0,
+        "disable_latent_generation": True, "unknown_condition": True,
+    }
+    if boundary == "writer":
+        with pytest.raises(ValueError, match="generation config"):
+            _write_fake_shards(tmp_path, generation_configs=[config] * 4)
+    else:
+        shards = _write_fake_shards(tmp_path)
+        manifest = json.loads(shards[0].read_text())
+        manifest["generation_config"].update(config)
+        shards[0].write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="generation config"):
+            _merge(tmp_path, shards, expected_sample_count=4)
+
+
 def test_merge_keeps_schema_one_sidecar_compatibility(tmp_path):
     shards = _write_fake_shards(tmp_path)
     for path in shards:
@@ -305,6 +414,8 @@ def test_merge_keeps_schema_two_generation_config_compatibility(tmp_path):
         manifest["schema_version"] = 2
         manifest["generation_config"].pop("max_sequence_length")
         manifest["generation_config"].pop("repetition_penalty")
+        manifest["generation_config"].pop("vision_ablation")
+        manifest["generation_config"].pop("generation_limit_policy")
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
     summary = _merge(tmp_path, shards, expected_sample_count=4)
@@ -316,6 +427,20 @@ def test_merge_keeps_schema_two_generation_config_compatibility(tmp_path):
     }
 
 
+def test_merge_keeps_pre_policy_manifest_compatibility(tmp_path):
+    """A schema-five result remains readable without inventing a saved policy."""
+    shards = _write_fake_shards(tmp_path)
+    for path in shards:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 5
+        manifest["generation_config"].pop("generation_limit_policy", None)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    summary = _merge(tmp_path, shards, expected_sample_count=4)
+
+    assert "generation_limit_policy" not in summary["generation_config"]
+
+
 def test_merge_keeps_schema_three_sequence_cap_compatibility(tmp_path):
     """Reading a pre-penalty sidecar must not require rewriting history."""
     shards = _write_fake_shards(tmp_path)
@@ -323,6 +448,8 @@ def test_merge_keeps_schema_three_sequence_cap_compatibility(tmp_path):
         manifest = json.loads(path.read_text(encoding="utf-8"))
         manifest["schema_version"] = 3
         manifest["generation_config"].pop("repetition_penalty")
+        manifest["generation_config"].pop("vision_ablation")
+        manifest["generation_config"].pop("generation_limit_policy")
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
     summary = _merge(tmp_path, shards, expected_sample_count=4)

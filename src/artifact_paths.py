@@ -8,16 +8,17 @@ from pathlib import Path
 from typing import Literal
 
 
-CANONICAL_REPOSITORY_ROOT = Path(
-    "/root/workspace/ILVR"
-)
+CANONICAL_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_CHECKPOINT_ROOT = CANONICAL_REPOSITORY_ROOT / "checkpoints"
 CANONICAL_EVALUATION_STAGING_ROOT = (
     CANONICAL_CHECKPOINT_ROOT / "evaluation-staging"
 )
 CANONICAL_RESULT_ROOT = CANONICAL_REPOSITORY_ROOT / "results"
+CANONICAL_REPOSITORY_LOG_ROOT = CANONICAL_REPOSITORY_ROOT / "logs"
 CANONICAL_LOG_ROOT = CANONICAL_REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
-EXPERIMENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
+EXPERIMENT_ID_PATTERN = re.compile(
+    r"^(?=.{3,128}$)[a-z0-9][a-z0-9-]*(?:[0-9]{8}T[0-9]{6}Z)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,8 @@ def resolve_run_artifact_paths(experiment_id: str) -> RunArtifactPaths:
     """Return the three canonical directories for a safe run identity."""
     if not EXPERIMENT_ID_PATTERN.fullmatch(experiment_id):
         raise ValueError(
-            "experiment ID must be 3-128 lowercase letters, digits, or hyphens"
+            "experiment ID must be 3-128 lowercase letters, digits, or hyphens, "
+            "optionally ending in a YYYYMMDDTHHMMSSZ UTC timestamp"
         )
     return RunArtifactPaths(
         experiment_id=experiment_id,
@@ -51,7 +53,7 @@ def require_canonical_artifact_path(
     roots = {
         "checkpoint": CANONICAL_CHECKPOINT_ROOT,
         "result": CANONICAL_RESULT_ROOT,
-        "log": CANONICAL_LOG_ROOT,
+        "log": CANONICAL_REPOSITORY_LOG_ROOT,
     }
     if path is None:
         raise ValueError(f"path must be below the canonical {kind} root: {roots[kind]}")
@@ -76,8 +78,18 @@ def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPa
     log_path = require_canonical_artifact_path(args.log_file, kind="log")
     experiment_id = checkpoint_dir.name
     paths = resolve_run_artifact_paths(experiment_id)
-    if checkpoint_dir != paths.checkpoint_dir or log_path.parent != paths.log_dir:
+    allowed_log_dirs = {
+        paths.log_dir,
+        CANONICAL_REPOSITORY_LOG_ROOT / experiment_id,
+    }
+    if checkpoint_dir != paths.checkpoint_dir or log_path.parent not in allowed_log_dirs:
         raise ValueError("checkpoint and log paths must share one experiment ID")
+    validated_paths = RunArtifactPaths(
+        experiment_id=experiment_id,
+        checkpoint_dir=paths.checkpoint_dir,
+        result_dir=paths.result_dir,
+        log_dir=log_path.parent,
+    )
     for attribute in (
         "benchmark_run_config",
         "benchmark_evidence_path",
@@ -101,7 +113,15 @@ def validate_generated_artifact_paths(args: argparse.Namespace) -> RunArtifactPa
             raise ValueError(
                 f"training_evidence_path must use result experiment ID {experiment_id}"
             )
-    return paths
+    manifest = getattr(args, "stage2_length_manifest", None)
+    if manifest is not None:
+        manifest_path = require_canonical_artifact_path(manifest, kind="result")
+        expected_manifest = paths.result_dir / "stage2-length-manifest.json"
+        if manifest_path != expected_manifest:
+            raise ValueError(
+                "stage2_length_manifest must use the run stage2-length-manifest.json"
+            )
+    return validated_paths
 
 
 def _json_paths(paths: RunArtifactPaths) -> str:
@@ -123,6 +143,7 @@ def _main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--benchmark-evidence-path")
     run_parser.add_argument("--benchmark-smoke-resume-witness")
     run_parser.add_argument("--training-evidence-path")
+    run_parser.add_argument("--stage2-length-manifest")
     args = parser.parse_args(argv)
     try:
         if args.command == "resolve":
@@ -138,6 +159,7 @@ def _main(argv: list[str] | None = None) -> int:
                     benchmark_evidence_path=args.benchmark_evidence_path,
                     benchmark_smoke_resume_witness=args.benchmark_smoke_resume_witness,
                     training_evidence_path=args.training_evidence_path,
+                    stage2_length_manifest=args.stage2_length_manifest,
                 )
             )
             print(_json_paths(paths))

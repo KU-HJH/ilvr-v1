@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +42,8 @@ from src.multinode_artifacts import (
     validate_loader_artifact,
 )
 from src.multinode_runtime import collect_checkpoint_artifacts
+from step_preference.config import StepPreferenceConfig
+from step_preference.dil_identity import build_dil_identity, read_dil_identity
 from src.multinode_runtime import (
     prepare_inference_artifacts,
     redistribute_resume_checkpoint,
@@ -851,12 +854,12 @@ def test_push_never_overwrites_and_is_scoped_to_the_run():
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
     )
     assert command[-2] == (
-        "/root/workspace/ILVR/checkpoints/"
+        f"{_REPOSITORY_ROOT}/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert command[-1] == (
         "korea@10.1.102.41:"
-        "/root/workspace/ILVR/checkpoints/"
+        f"{_REPOSITORY_ROOT}/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert not any("venv" in argument or "/data/" in argument for argument in command)
@@ -879,7 +882,7 @@ def test_pull_selects_only_local_process_ranks_and_common_metadata(tmp_path):
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
     )
     assert command[-2].startswith(
-        "korea@10.1.102.41:/root/workspace/ILVR/checkpoints/"
+        f"korea@10.1.102.41:{_REPOSITORY_ROOT}/checkpoints/"
     )
     assert command[-1] == f"{tmp_path}/checkpoint-copy/"
     assert "--checksum" not in command
@@ -1173,7 +1176,7 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
         log_root=tmp_path / "logs",
         command_runner=fake_command,
     )
-    checkpoint = Path("/root/workspace/ILVR/checkpoints") / plan.run_id / "checkpoint-2"
+    checkpoint = _REPOSITORY_ROOT / "checkpoints" / plan.run_id / "checkpoint-2"
 
     collected = collect_checkpoint_artifacts(
         runner,
@@ -1848,10 +1851,10 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
 
     assert mirror(manifest, destination) == manifest
 
-    python = "/root/workspace/ILVR/venv/ilvr-venv/bin/python"
+    python = str(_REPOSITORY_ROOT / "venv/ilvr-venv/bin/python")
     fixed_prefix = (
         "/usr/bin/env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
+        f"PYTHONPATH={_REPOSITORY_ROOT}:{_REPOSITORY_ROOT / 'src'}",
         python,
     )
     assert calls[0] == tuple(runtime_module.build_remote_exec(
@@ -1860,7 +1863,7 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
             "-m", "src.multinode", "prepare-inference-destination",
             "--destination", str(destination),
         ),
-        working_directory="/root/workspace/ILVR",
+        working_directory=_REPOSITORY_ROOT,
     ))
     files_path = (
         log_root / plan.run_id / plan.attempt_id
@@ -1871,7 +1874,7 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
     )
     assert build_push is not None
     assert calls[1] == build_push(
-        manifest, destination, files_from=files_path
+        manifest, destination, files_from=files_path, cluster=plan.cluster
     )
     assert calls[2] == tuple(runtime_module.build_remote_exec(
         (
@@ -1879,7 +1882,7 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
             "-m", "src.multinode", "prepared-inference-show",
             "--model-dir", str(destination),
         ),
-        working_directory="/root/workspace/ILVR",
+        working_directory=_REPOSITORY_ROOT,
     ))
     names = set(files_path.read_bytes().split(b"\0")) - {b""}
     assert names == {
@@ -2385,6 +2388,53 @@ def test_peft_loader_rejects_unsupported_legacy_adapter_marker(tmp_path, stage):
         validate_loader_artifact(artifact, loader_identity(stage, "lora"))
 
 
+def test_v5_completed_checkpoint_manifest_cli_retains_reference_for_resume(tmp_path, capsys):
+    """Catches the public manifest rejecting the approved v5 reference marker."""
+    from src.multinode import _main
+    from src.multinode_artifacts import select_common_metadata_entries
+    from stage1.checkpointing import classify_stage1_artifact, Stage1ArtifactKind
+
+    values = identity(tuning_method="dora", zero_stage=1, model_state_layout="replicated")
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint = checkpoint_root / values["run_id"] / "checkpoint-2"
+    write_observed_full_checkpoint(checkpoint, values=values)
+    (checkpoint / "model.safetensors").unlink()
+    write_loader_artifact(checkpoint, stage="stage1", method="dora")
+    for name, payload in {"stage1_v5.json": b'{}\n',
+                          "stage1_v5_reference.pt": b"initial selected reference"}.items():
+        (checkpoint / name).write_bytes(payload)
+    assert _main(["artifact-manifest", "--run-directory", str(checkpoint),
+        "--run-id", values["run_id"], "--checkpoint-root", str(checkpoint_root),
+        "--node-rank", "0", "--process-rank", "0", "--process-rank", "1",
+        "--runtime-identity-json", json.dumps(values), "--completion-marker"]) == 0
+    manifest = NodeArtifactManifest.from_json(json.loads(capsys.readouterr().out))
+    assert manifest.runtime_identity == values
+    validate_loader_artifact(checkpoint, values)
+    assert classify_stage1_artifact(checkpoint) is Stage1ArtifactKind.PEFT
+    pair = {Path("stage1_v5.json"), Path("stage1_v5_reference.pt")}
+    assert pair <= {entry.relative_path for entry in manifest.entries}
+    assert pair <= {entry.relative_path for entry in select_common_metadata_entries(manifest)}
+    assert pair <= {entry.relative_path for entry in select_resume_entries(manifest)}
+    assert pair.isdisjoint(entry.relative_path for entry in select_inference_entries(manifest))
+    assert (checkpoint / "stage1_v5_reference.pt").read_bytes() == b"initial selected reference"
+
+
+@pytest.mark.parametrize("stage,extra,expected", [
+    ("stage1", "unrecognized_reference.pt", "unknown"),
+    ("stage1", "model.safetensors", "mixed"),
+    ("stage2", "stage1_v5_reference.pt", "unknown"),
+])
+def test_v5_marker_acceptance_keeps_peft_weight_allowlist_strict(tmp_path, stage, extra, expected):
+    artifact = tmp_path / stage
+    write_loader_artifact(artifact, stage=stage, method="dora")
+    if stage == "stage1":
+        (artifact / "stage1_v5.json").write_text("{}\n")
+        (artifact / "stage1_v5_reference.pt").write_bytes(b"initial reference")
+    (artifact / extra).write_bytes(b"forbidden weight marker")
+    with pytest.raises(ValueError, match=expected):
+        validate_loader_artifact(artifact, loader_identity(stage, "dora"))
+
+
 def test_stage2_sparse_rows_are_required_only_by_strict_metadata(tmp_path):
     sparse = tmp_path / "stage2-sparse"
     write_loader_artifact(
@@ -2485,6 +2535,45 @@ def test_full_inference_accepts_standard_qwen_config_without_custom_stage(
     assert "config.json" in {
         entry.relative_path.name for entry in filtered.entries
     }
+
+
+def test_stage2_inference_manifest_retains_dil_config_without_optimizer_state(tmp_path):
+    artifact = tmp_path / "stage2-lora"
+    write_loader_artifact(artifact, stage="stage2", method="lora")
+    config_path = artifact / "config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    objective = StepPreferenceConfig(
+        enabled=True, mode="stage2b", objective="context_preference",
+        preference_loss_type="dil_bce_rf", beta=0.5,
+        lambda_entropy=0.0, direct_from_stage1=True,
+        shared_prefix_enabled=True,
+        visual_off_suppress_latent_boundaries=False,
+    )
+    identity_payload = build_dil_identity(objective)
+    payload["ilvr_context_preference"] = identity_payload
+    config_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    (artifact / "optimizer.pt").write_bytes(b"optimizer")
+    manifest = loader_manifest(artifact, stage="stage2", method="lora")
+    selected = build_inference_manifest(artifact, manifest)
+
+    class LocalTransfer:
+        def validate_inference_manifest(self, candidate):
+            assert candidate == selected
+
+        def pull_inference_artifacts(self, candidate, destination):
+            for entry in candidate.entries:
+                target = destination / entry.relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(artifact / entry.relative_path, target)
+
+    prepared = prepare_inference_copy(selected, tmp_path / "prepared", LocalTransfer())
+
+    names = {entry.relative_path.name for entry in selected.entries}
+    assert "config.json" in names
+    assert "optimizer.pt" not in names
+    assert not (prepared / "optimizer.pt").exists()
+    copied = json.loads((prepared / "config.json").read_text(encoding="utf-8"))
+    assert read_dil_identity(copied) == identity_payload
 
 
 def test_prepare_inference_help_is_local_and_side_effect_free(tmp_path):
@@ -2681,6 +2770,9 @@ def test_prepare_inference_cli_dispatches_without_building_training_commands(
         return destination
 
     monkeypatch.setattr(multinode_module, "_REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(
+        multinode_module, "_REMOTE_CONTAINER_REPOSITORY_BASE", repository
+    )
     monkeypatch.setattr(
         multinode_module, "_command_stdout", lambda *args, **kwargs: "b" * 40
     )

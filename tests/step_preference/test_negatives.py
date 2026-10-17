@@ -1,0 +1,598 @@
+import hashlib
+import json
+
+import pytest
+
+from step_preference.negatives import (
+    CheckpointFile,
+    NegativeManifest,
+    StepNegative,
+    filter_negative,
+    inspect_stage2a_checkpoint_identity,
+    load_negative_store,
+    write_negative_artifact,
+)
+from stage2.checkpointing import Stage2ArtifactInspection, Stage2ArtifactKind
+
+
+SOURCE_SHA256 = "c805f1e47450a7698e2e0b9f59b08d1f8945598a99ef24b5f25dbe046567307f"
+CHECKPOINT_SHA256 = "f51ebaa08e836519e3f22e9edef16a398c2c1539c1a4f373097ad6335d8d9a1d"
+
+
+def _negative(**changes):
+    values = {
+        "sample_id": "sample-a",
+        "step_id": 0,
+        "chosen_text": "chosen completion",
+        "rejected_visual_text": "visual negative",
+        "rejected_textual_text": "different negative",
+        "valid_visual_negative": True,
+        "valid_textual_negative": True,
+        "reference_chosen_score": -0.25,
+        "reference_visual_rejected_score": -1.25,
+        "reference_textual_rejected_score": -0.75,
+    }
+    values.update(changes)
+    return StepNegative(**values)
+
+
+def _identity(tmp_path):
+    checkpoint = tmp_path / "stage2a"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_bytes(b"checkpoint-content\n")
+    return {
+        "source_sha256": SOURCE_SHA256,
+        "selected_row_indices": (0,),
+        "stage2a_checkpoint_path": str(checkpoint.resolve()),
+        "checkpoint_files": (
+            CheckpointFile(
+                "config.json",
+                19,
+                CHECKPOINT_SHA256,
+                str(checkpoint.resolve()),
+            ),
+        ),
+        "tokenizer_config_identity": "tokenizer-config-v1",
+        "latent_size": 8,
+        "assistant_plan_rendering": "adjacent-text-space-lf-v1",
+        "generation_settings": {"max_new_tokens": 32, "min_tokens": 2},
+    }
+
+
+def _expected_identity(identity, source_path):
+    return {
+        "source_path": source_path,
+        "expected_source_sha256": identity["source_sha256"],
+        "expected_selected_row_indices": identity["selected_row_indices"],
+        "expected_stage2a_checkpoint_path": identity["stage2a_checkpoint_path"],
+        "expected_checkpoint_files": identity["checkpoint_files"],
+        "expected_tokenizer_config_identity": identity["tokenizer_config_identity"],
+        "expected_latent_size": identity["latent_size"],
+        "expected_assistant_plan_rendering": identity["assistant_plan_rendering"],
+        "expected_generation_settings": identity["generation_settings"],
+    }
+
+
+def test_stage2b_checkpoint_identity_includes_preferred_jinja_template(
+    monkeypatch, tmp_path
+):
+    """Catches Stage 2B accepting a tokenizer identity that omits its active template."""
+    import step_preference.negatives as negatives
+
+    checkpoint = tmp_path / "stage2a"
+    checkpoint.mkdir()
+    payloads = {
+        "config.json": b"config",
+        "model.safetensors": b"weights",
+        "tokenizer.json": b"tokenizer",
+        "chat_template.jinja": b"preferred-template",
+    }
+    for name, raw in payloads.items():
+        (checkpoint / name).write_bytes(raw)
+    monkeypatch.setattr(
+        negatives,
+        "inspect_stage2_artifact",
+        lambda _path: Stage2ArtifactInspection(Stage2ArtifactKind.FULL),
+    )
+
+    records, tokenizer_identity = inspect_stage2a_checkpoint_identity(checkpoint)
+
+    assert tuple(entry.relative_path for entry in records) == tuple(sorted(payloads))
+    tokenizer_payload = [
+        {
+            "relative_path": name,
+            "sha256": hashlib.sha256(payloads[name]).hexdigest(),
+            "size": len(payloads[name]),
+        }
+        for name in ("chat_template.jinja", "tokenizer.json")
+    ]
+    assert tokenizer_identity == hashlib.sha256(
+        json.dumps(
+            tokenizer_payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("rejected_text", "token_ids"),
+    [
+        ("chosen completion", (11, 12)),
+        (" chosen\n completion ", (11, 12)),
+        ("\t ", (11, 12)),
+        ("different", (11,)),
+    ],
+)
+def test_filter_negative_rejects_unusable_candidate_pairs(rejected_text, token_ids):
+    """Catches accepting exact, normalized, empty, or too-short negatives."""
+    assert not filter_negative(
+        chosen_text="chosen completion",
+        rejected_text=rejected_text,
+        scoreable_token_ids=token_ids,
+        min_tokens=2,
+    )
+
+
+def test_filter_negative_accepts_distinct_normalized_completion_at_minimum_length():
+    """Catches rejecting the boundary candidate used for a valid preference pair."""
+    assert filter_negative(
+        chosen_text="chosen completion",
+        rejected_text="different completion",
+        scoreable_token_ids=(51, 52),
+        min_tokens=2,
+    )
+
+
+def test_step_negative_represents_invalid_modalities_and_is_immutable():
+    """Catches treating an unavailable generated pair as an exception or score."""
+    row = _negative(
+        rejected_visual_text=None,
+        valid_visual_negative=False,
+        reference_visual_rejected_score=None,
+    )
+
+    assert row.rejected_visual_text is None
+    with pytest.raises(Exception):
+        row.step_id = 1
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"reference_chosen_score": float("nan")},
+        {"reference_visual_rejected_score": float("inf")},
+        {
+            "valid_textual_negative": False,
+            "reference_textual_rejected_score": -0.75,
+            "rejected_textual_text": None,
+        },
+        {
+            "valid_textual_negative": True,
+            "reference_textual_rejected_score": None,
+            "rejected_textual_text": "different negative",
+        },
+    ],
+)
+def test_step_negative_rejects_nonfinite_or_structurally_inconsistent_scores(changes):
+    """Catches rows that cannot safely contribute reference DPO terms."""
+    with pytest.raises(ValueError):
+        _negative(**changes)
+
+
+def test_write_and_load_artifact_bind_raw_bytes_and_every_expected_identity(tmp_path):
+    """Catches training against rows not frozen to the selected source and checkpoint."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negatives_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "negative-manifest.json"
+    identity = _identity(tmp_path)
+
+    manifest = write_negative_artifact(
+        negative_path=negatives_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    store = load_negative_store(
+        negative_path=negatives_path,
+        manifest_path=manifest_path,
+        expected_keys=(("sample-a", 0),),
+        **_expected_identity(identity, source),
+    )
+
+    assert manifest.source_sha256 == SOURCE_SHA256
+    assert manifest.negative_sha256 == (
+        "3323476b34b66fdff82c8814e925828fa08ef4131dfe54df4c55c59efdf5a399"
+    )
+    assert store == {("sample-a", 0): _negative()}
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest.assistant_plan_rendering == "adjacent-text-space-lf-v1"
+    assert manifest_payload["schema_version"] == 3
+    assert manifest_payload["assistant_plan_rendering"] == (
+        "adjacent-text-space-lf-v1"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda payload: payload.pop("assistant_plan_rendering"), "unknown or missing fields"),
+        (
+            lambda payload: payload.update(
+                assistant_plan_rendering="unknown-rendering-v1"
+            ),
+            "assistant_plan_rendering",
+        ),
+        (
+            lambda payload: payload.update(
+                assistant_plan_rendering="concatenated-v1"
+            ),
+            "assistant_plan_rendering",
+        ),
+    ],
+)
+def test_load_negative_store_rejects_missing_or_noncanonical_rendering(
+    tmp_path, mutation, message
+):
+    """Catches consuming negatives produced from a different assistant byte stream."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negative_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negative_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutation(payload)
+    manifest_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_negative_store(
+            negative_path=negative_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(identity, source),
+        )
+
+
+def test_load_negative_store_rejects_legacy_schema_two_manifest(tmp_path):
+    """Catches silently defaulting a schema-2 artifact to the active rendering."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negative_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negative_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 2
+    payload.pop("assistant_plan_rendering")
+    manifest_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_negative_store(
+            negative_path=negative_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(identity, source),
+        )
+
+
+def test_load_negative_store_rejects_expected_rendering_mismatch(tmp_path):
+    """Catches a consumer authenticating the artifact against the wrong rendering."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negative_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negative_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    expected_identity = _expected_identity(identity, source)
+    expected_identity["expected_assistant_plan_rendering"] = "concatenated-v1"
+
+    with pytest.raises(ValueError, match="assistant plan rendering does not match"):
+        load_negative_store(
+            negative_path=negative_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **expected_identity,
+        )
+
+
+def test_load_negative_store_rejects_duplicate_join_identity(tmp_path):
+    """Catches two artifact rows competing for the same sample reasoning step."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negatives_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "negative-manifest.json"
+    identity = _identity(tmp_path)
+    manifest = write_negative_artifact(
+        negative_path=negatives_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    duplicate = negatives_path.read_text(encoding="utf-8")
+    negatives_path.write_text(duplicate + duplicate, encoding="utf-8")
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_payload["negative_sha256"] = (
+        "3f4029a1c685587839a572eefa510d757b81191a7edf6be7e3567fc428676c48"
+    )
+    manifest_path.write_text(
+        json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate negative join key"):
+        load_negative_store(
+            negative_path=negatives_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(identity, source),
+        )
+    assert manifest.negative_sha256 != ""
+
+
+def test_load_negative_store_rejects_manifest_identity_and_missing_rows(tmp_path):
+    """Catches stale manifests and datasets whose required step row is absent."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negatives_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "negative-manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negatives_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+
+    with pytest.raises(ValueError, match="source JSONL SHA-256 does not match"):
+        load_negative_store(
+            negative_path=negatives_path,
+            manifest_path=manifest_path,
+            source_path=source,
+            expected_source_sha256="b" * 64,
+            expected_selected_row_indices=(0,),
+            expected_stage2a_checkpoint_path=identity["stage2a_checkpoint_path"],
+            expected_checkpoint_files=identity["checkpoint_files"],
+            expected_tokenizer_config_identity="tokenizer-config-v1",
+            expected_latent_size=8,
+            expected_assistant_plan_rendering="adjacent-text-space-lf-v1",
+            expected_generation_settings=identity["generation_settings"],
+            expected_keys=(("sample-a", 0),),
+        )
+    with pytest.raises(ValueError, match="missing or unexpected negative join keys"):
+        load_negative_store(
+            negative_path=negatives_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0), ("sample-a", 1)),
+            **_expected_identity(identity, source),
+        )
+
+
+def test_load_negative_store_rejects_changed_checkpoint_file_or_jsonl_bytes(tmp_path):
+    """Catches artifacts whose recorded Stage 2A files or negative bytes went stale."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negatives_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "negative-manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negatives_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    (tmp_path / "stage2a" / "config.json").write_bytes(b"different checkpoint\n")
+
+    with pytest.raises(ValueError, match="checkpoint file hash or size does not match"):
+        load_negative_store(
+            negative_path=negatives_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(identity, source),
+        )
+
+    (tmp_path / "stage2a" / "config.json").write_bytes(b"checkpoint-content\n")
+    negatives_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="negative artifact SHA-256 does not match"):
+        load_negative_store(
+            negative_path=negatives_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(identity, source),
+        )
+
+
+def test_load_negative_store_rejects_changed_source_bytes_despite_repeated_digest(tmp_path):
+    """Catches callers reusing a manifest digest after the source JSONL changed."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    negatives_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "negative-manifest.json"
+    identity = _identity(tmp_path)
+    write_negative_artifact(
+        negative_path=negatives_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    source.write_bytes(b'{"row":2}\n')
+
+    with pytest.raises(ValueError, match="source JSONL SHA-256 does not match"):
+        load_negative_store(
+            negative_path=negatives_path,
+            manifest_path=manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(identity, source),
+        )
+
+
+def test_generation_settings_preserve_nested_list_object_distinction(tmp_path):
+    """Catches serializing a JSON list of pairs as an indistinguishable object."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    list_identity = _identity(tmp_path)
+    list_identity["generation_settings"] = {"payload": [["key", 1]]}
+    object_identity = dict(list_identity)
+    object_identity["generation_settings"] = {"payload": {"key": 1}}
+    list_path = tmp_path / "list-negatives.jsonl"
+    list_manifest_path = tmp_path / "list-manifest.json"
+    object_path = tmp_path / "object-negatives.jsonl"
+    object_manifest_path = tmp_path / "object-manifest.json"
+
+    write_negative_artifact(
+        negative_path=list_path,
+        manifest_path=list_manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **list_identity,
+    )
+    write_negative_artifact(
+        negative_path=object_path,
+        manifest_path=object_manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **object_identity,
+    )
+
+    assert json.loads(list_manifest_path.read_text(encoding="utf-8"))["generation_settings"] == {
+        "payload": [["key", 1]]
+    }
+    assert json.loads(object_manifest_path.read_text(encoding="utf-8"))["generation_settings"] == {
+        "payload": {"key": 1}
+    }
+    with pytest.raises(ValueError, match="generation settings do not match"):
+        load_negative_store(
+            negative_path=list_path,
+            manifest_path=list_manifest_path,
+            expected_keys=(("sample-a", 0),),
+            **_expected_identity(object_identity, source),
+        )
+
+
+def test_negative_manifest_is_immutable():
+    """Catches a frozen reference identity being mutable after validation."""
+    manifest = NegativeManifest(
+        schema_version=3,
+        source_sha256=SOURCE_SHA256,
+        selected_row_indices=(0,),
+        stage2a_checkpoint_path="/checkpoint",
+        checkpoint_files=(
+            CheckpointFile("config.json", 19, CHECKPOINT_SHA256, "/checkpoint"),
+        ),
+        tokenizer_config_identity="tokenizer-config-v1",
+        latent_size=8,
+        assistant_plan_rendering="adjacent-text-space-lf-v1",
+        generation_settings={"max_new_tokens": 32},
+        negative_sha256="c" * 64,
+    )
+
+    with pytest.raises(Exception):
+        manifest.latent_size = 4
+
+
+@pytest.mark.parametrize("schema_version", [2, 3.0, True, "3"])
+def test_negative_manifest_requires_exact_integer_schema_version(
+    tmp_path, schema_version
+):
+    """Catches legacy or JSON-compatible non-integers entering schema 3."""
+    identity = _identity(tmp_path)
+
+    with pytest.raises(ValueError, match="schema_version"):
+        NegativeManifest(
+            schema_version=schema_version,
+            **identity,
+            negative_sha256="c" * 64,
+        )
+
+
+def test_load_negative_store_revalidates_every_checkpoint_load_root(tmp_path):
+    """Catches a PEFT base model changing behind an otherwise valid adapter manifest."""
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"row":1}\n')
+    adapter = tmp_path / "stage2a-adapter"
+    adapter.mkdir()
+    (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
+    base = tmp_path / "stage2a-base"
+    base.mkdir()
+    (base / "model.safetensors").write_bytes(b"base")
+    adapter_record = CheckpointFile(
+        relative_path="adapter_model.safetensors",
+        size=7,
+        sha256="a183428b1e10e9c20acb5bd2175b9373892104e1e597dea7b9642f7a48c8705a",
+        load_root=str(adapter.resolve()),
+    )
+    base_record = CheckpointFile(
+        relative_path="model.safetensors",
+        size=4,
+        sha256="cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2",
+        load_root=str(base.resolve()),
+    )
+    negative_path = tmp_path / "negatives.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    identity = {
+        "source_sha256": SOURCE_SHA256,
+        "selected_row_indices": (0,),
+        "stage2a_checkpoint_path": str(adapter.resolve()),
+        "checkpoint_files": (adapter_record, base_record),
+        "tokenizer_config_identity": "tokenizer-config-v1",
+        "latent_size": 8,
+        "assistant_plan_rendering": "adjacent-text-space-lf-v1",
+        "generation_settings": {
+            "device": "cuda:0",
+            "torch_dtype": "bfloat16",
+        },
+    }
+    write_negative_artifact(
+        negative_path=negative_path,
+        manifest_path=manifest_path,
+        negatives=(_negative(),),
+        source_path=source,
+        **identity,
+    )
+    (base / "model.safetensors").write_bytes(b"changed")
+
+    with pytest.raises(
+        ValueError, match=r"checkpoint file hash or size does not match.*model\.safetensors"
+    ):
+        load_negative_store(
+            negative_path=negative_path,
+            manifest_path=manifest_path,
+            source_path=source,
+            expected_source_sha256=SOURCE_SHA256,
+            expected_selected_row_indices=(0,),
+            expected_stage2a_checkpoint_path=adapter,
+            expected_checkpoint_files=(adapter_record, base_record),
+            expected_tokenizer_config_identity="tokenizer-config-v1",
+            expected_latent_size=8,
+            expected_assistant_plan_rendering="adjacent-text-space-lf-v1",
+            expected_generation_settings=identity["generation_settings"],
+            expected_keys=(("sample-a", 0),),
+        )

@@ -961,6 +961,12 @@ def test_stage1_stochastic_inventory_identifies_only_registered_and_deferred_sou
             "SampleStableStage1Dropout.forward",
             "torch.rand",
         ),
+        # Opt-in v5 owns F/packed source-coordinate Bernoulli draws.
+        (
+            "stage1/v5_execution.py",
+            "V5Execution.dropout_mask",
+            "torch.rand",
+        ),
         # Task 7 must replace this exact interim legacy source with
         # alignment_noise_bank before the final three-source inventory gate.
         (

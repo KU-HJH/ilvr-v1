@@ -30,6 +30,9 @@ from src.multinode_runtime import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def _identity(*, stage: str = "stage1") -> dict[str, object]:
     return {
         "stage": stage,
@@ -76,13 +79,13 @@ def _plan() -> EvaluationPlan:
     return EvaluationPlan(
         run_id="eval-four-gpu",
         attempt_id="initial",
-        model_dir=Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-            "trained-model-run/prepared-model"
+        model_dir=(
+            REPO_ROOT
+            / "checkpoints/evaluation-staging/trained-model-run/prepared-model"
         ),
-        test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
+        test_data_path=REPO_ROOT / "data/TEST.jsonl",
         task_name="zebra-cot",
-        output_dir=Path("/root/workspace/ILVR/results/eval-four-gpu"),
+        output_dir=REPO_ROOT / "results/eval-four-gpu",
     )
 
 
@@ -101,41 +104,39 @@ def test_evaluation_assigns_remote_zero_one_and_local_two_three():
 def test_local_inference_staging_is_checkpoint_owned():
     plan = _plan()
 
-    assert plan.local_model_dir == Path(
-        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-        "eval-four-gpu/local-model"
+    assert plan.local_model_dir == (
+        REPO_ROOT / "checkpoints/evaluation-staging/eval-four-gpu/local-model"
     )
 
 
 def test_evaluation_model_artifacts_are_checkpoint_owned():
     plan = EvaluationPlan(
         run_id="eval-four-gpu",
-        model_dir=Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-            "trained-model-run/prepared-model"
+        model_dir=(
+            REPO_ROOT
+            / "checkpoints/evaluation-staging/trained-model-run/prepared-model"
         ),
-        test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
+        test_data_path=REPO_ROOT / "data/TEST.jsonl",
         task_name="zebra-cot",
-        output_dir=Path("/root/workspace/ILVR/results/eval-four-gpu"),
+        output_dir=REPO_ROOT / "results/eval-four-gpu",
     )
 
-    assert plan.local_model_dir == Path(
-        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-        "eval-four-gpu/local-model"
+    assert plan.local_model_dir == (
+        REPO_ROOT / "checkpoints/evaluation-staging/eval-four-gpu/local-model"
     )
     with pytest.raises(ValueError, match="checkpoint"):
         dataclasses.replace(
             plan,
-            model_dir=Path(
-                "/root/workspace/ILVR/results/trained-model-run/prepared-model"
-            ),
+            model_dir=REPO_ROOT / "results/trained-model-run/prepared-model",
         )
 
 
 @pytest.mark.parametrize(
     ("stage", "evaluator"),
-    [("stage1", "/root/workspace/ILVR/eval.py"),
-     ("stage2", "/root/workspace/ILVR/src/evaluate_deepseed.py")],
+    [
+        ("stage1", REPO_ROOT / "eval.py"),
+        ("stage2", REPO_ROOT / "src/evaluate_deepseed.py"),
+    ],
 )
 def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
     stage, evaluator
@@ -147,7 +148,9 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
     assert len(commands.workers) == 4
     assert {dict(worker.node_spec.environment)["CUDA_VISIBLE_DEVICES"]
             for worker in commands.workers} == {"0", "1"}
-    assert all(evaluator in worker.node_spec.command for worker in commands.workers)
+    assert all(
+        str(evaluator) in worker.node_spec.command for worker in commands.workers
+    )
     assert [worker.node_spec.command[-1] for worker in commands.workers] == [
         "0", "1", "2", "3"
     ]
@@ -182,6 +185,52 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
         ]
         for worker in commands.workers
     } == {"1.05"}
+
+
+def test_worker_commands_forward_external_generation_limit_policy():
+    """Losing the coordinator option would silently restore bounded generation."""
+    plan = dataclasses.replace(
+        _plan(), generation_limit_policy="external_full_latent_block"
+    )
+
+    commands = build_evaluation_commands(
+        plan, inference_manifest=_manifest(), commit="b" * 40
+    )
+
+    assert {
+        worker.node_spec.command[
+            worker.node_spec.command.index("--generation-limit-policy") + 1
+        ]
+        for worker in commands.workers
+    } == {"external_full_latent_block"}
+
+
+def test_evaluation_worker_environment_imports_worktree_transformers():
+    """Catches the shared venv editable path selecting another checkout."""
+    commands = build_evaluation_commands(
+        _plan(), inference_manifest=_manifest(), commit="b" * 40
+    )
+    environment = dict(commands.workers[0].node_spec.environment)
+
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+            "-c",
+            (
+                "from pathlib import Path; import transformers; "
+                "print(Path(transformers.__file__).resolve())"
+            ),
+        ],
+        cwd="/",
+        env={**environment,"PYTHONDONTWRITEBYTECODE":"1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    imported = Path(completed.stdout.strip())
+    assert imported.is_relative_to((REPO_ROOT / "transformers/src").resolve())
 
 
 def test_worker_supervisors_bind_exact_evaluation_shard_identity():
@@ -488,7 +537,7 @@ def test_production_runner_transfer_publishes_exact_list_before_fake_rsync(
 
     runner.pull_remote_results(commands)
 
-    assert files_path.read_bytes() == evaluation_result_files_bytes()
+    assert files_path.read_bytes() == evaluation_result_files_bytes(include_runtime_identity=True)
     assert calls == [commands.remote_pull]
     assert "--secluded-args" in calls[0]
     assert calls[0][calls[0].index("--rsync-path") + 1] == (
@@ -650,10 +699,10 @@ def test_cleanup_exception_does_not_mask_launch_timeout_or_skip_later_workers():
 
 
 def test_remote_result_pull_is_fixed_container_rsync_with_explicit_nul_list():
-    output_dir = Path("/root/workspace/ILVR/results/eval-four-gpu")
-    files_path = Path(
-        "/root/workspace/ILVR/logs/multinode/eval-four-gpu/initial/"
-        "evaluation-pull.files"
+    output_dir = REPO_ROOT / "results/eval-four-gpu"
+    files_path = (
+        REPO_ROOT
+        / "logs/multinode/eval-four-gpu/initial/evaluation-pull.files"
     )
 
     payload = evaluation_result_files_bytes()
@@ -678,8 +727,8 @@ def test_remote_result_pull_is_fixed_container_rsync_with_explicit_nul_list():
         "--rsync-path",
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "korea@10.1.102.41:/root/workspace/ILVR/results/eval-four-gpu/",
-        "/root/workspace/ILVR/results/eval-four-gpu/",
+        f"korea@10.1.102.41:{REPO_ROOT}/results/eval-four-gpu/",
+        f"{REPO_ROOT}/results/eval-four-gpu/",
     )
     assert "--recursive" not in command
 
@@ -701,14 +750,14 @@ def test_unsafe_result_component_is_rejected_before_runner_creation(
     with pytest.raises(ValueError, match="safe component"):
         EvaluationPlan(
             run_id="eval-four-gpu",
-            model_dir=Path(
-                "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-                "trained-model-run/prepared-model"
+            model_dir=(
+                REPO_ROOT
+                / "checkpoints/evaluation-staging/trained-model-run/prepared-model"
             ),
-            test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
+            test_data_path=REPO_ROOT / "data/TEST.jsonl",
             task_name="zebra-cot",
             output_dir=(
-                Path("/root/workspace/ILVR/results")
+                REPO_ROOT / "results"
                 / unsafe_component
                 / "eval-four-gpu"
             ),
@@ -719,30 +768,30 @@ def test_prepared_inference_backtick_source_is_rejected_before_rsync():
     with pytest.raises(ValueError, match="safe component"):
         build_prepared_inference_pull_command(
             _manifest(),
-            Path(
-                "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-                "bad`touch-owned`/prepared-model"
+            (
+                REPO_ROOT
+                / "checkpoints/evaluation-staging/bad`touch-owned`/prepared-model"
             ),
-            Path(
-                "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-                "eval-four-gpu/local-model"
+            (
+                REPO_ROOT
+                / "checkpoints/evaluation-staging/eval-four-gpu/local-model"
             ),
-            files_from=Path("/root/workspace/ILVR/logs/evaluation.files"),
+            files_from=REPO_ROOT / "logs/evaluation.files",
         )
 
 
 def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
-    files_path = Path("/root/workspace/ILVR/logs/evaluation.files")
+    files_path = REPO_ROOT / "logs/evaluation.files"
 
     command = build_prepared_inference_pull_command(
         _manifest(),
-        Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-            "trained-model-run/prepared-model"
+        (
+            REPO_ROOT
+            / "checkpoints/evaluation-staging/trained-model-run/prepared-model"
         ),
-        Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-            "eval-four-gpu/local-model"
+        (
+            REPO_ROOT
+            / "checkpoints/evaluation-staging/eval-four-gpu/local-model"
         ),
         files_from=files_path,
     )
@@ -760,10 +809,9 @@ def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
         "--rsync-path",
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "korea@10.1.102.41:/root/workspace/ILVR/"
-        "checkpoints/evaluation-staging/trained-model-run/prepared-model/",
-        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-        "eval-four-gpu/local-model/",
+        f"korea@10.1.102.41:{REPO_ROOT}/checkpoints/evaluation-staging/"
+        "trained-model-run/prepared-model/",
+        f"{REPO_ROOT}/checkpoints/evaluation-staging/eval-four-gpu/local-model/",
     )
 
 
@@ -801,13 +849,13 @@ def test_prepared_inference_pull_accepts_resolved_local_checkpoint_destination(
 
 
 def test_prepared_inference_push_has_exact_container_rsync_argv():
-    files_path = Path("/root/workspace/ILVR/logs/prepared-push.files")
+    files_path = REPO_ROOT / "logs/prepared-push.files"
 
     command = build_prepared_inference_push_command(
         _manifest(),
-        Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-            "trained-model-run/prepared-model"
+        (
+            REPO_ROOT
+            / "checkpoints/evaluation-staging/trained-model-run/prepared-model"
         ),
         files_from=files_path,
     )
@@ -825,10 +873,9 @@ def test_prepared_inference_push_has_exact_container_rsync_argv():
         "--rsync-path",
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+        f"{REPO_ROOT}/checkpoints/evaluation-staging/trained-model-run/",
+        f"korea@10.1.102.41:{REPO_ROOT}/checkpoints/evaluation-staging/"
         "trained-model-run/",
-        "korea@10.1.102.41:/root/workspace/ILVR/checkpoints/"
-        "evaluation-staging/trained-model-run/",
     )
 
 
@@ -869,7 +916,7 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
             manifest,
             shard_jsonl=jsonl,
             dataset_identity={
-                "path": "/root/workspace/ILVR/data/TEST.jsonl",
+                "path": str(REPO_ROOT / "data/TEST.jsonl"),
                 "size": 10,
                 "mtime_ns": 20,
             },
@@ -880,6 +927,7 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
                 "repetition_penalty": 1.05,
                 "temperature": 0.0,
                 "top_p": 1.0,
+                "generation_limit_policy": "bounded",
             },
             shard_index=shard_index,
             num_shards=4,
@@ -902,6 +950,7 @@ def test_incomplete_success_sidecar_is_rejected_before_merge(tmp_path):
                 "repetition_penalty": 1.05,
                 "temperature": 0.0,
                 "top_p": 1.0,
+                "generation_limit_policy": "bounded",
             },
         )
 
@@ -922,11 +971,10 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
             "evaluate",
             "--run-id", "eval-four-gpu",
             "--model-dir",
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
-            "model/prepared-model",
-            "--test-data-path", "/root/workspace/ILVR/data/TEST.jsonl",
+            str(REPO_ROOT / "checkpoints/evaluation-staging/model/prepared-model"),
+            "--test-data-path", str(REPO_ROOT / "data/TEST.jsonl"),
             "--task-name", "zebra-cot",
-            "--output-dir", "/root/workspace/ILVR/results/eval-four-gpu",
+            "--output-dir", str(REPO_ROOT / "results/eval-four-gpu"),
             "--dry-run",
         ]
     )
@@ -941,6 +989,8 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
         "shard-0.jsonl.manifest.json",
         "shard-1.jsonl",
         "shard-1.jsonl.manifest.json",
+        "shard-0.runtime-identity.json",
+        "shard-1.runtime-identity.json",
     ]
     for commands in payload["worker_commands_by_observed_stage"].values():
         for command in commands:
@@ -954,3 +1004,34 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
                 assert command[option + 1] == "1.05"
             else:
                 assert "--repetition_penalty 1.05" in command[-1]
+
+
+def test_vision_ablation_dry_run_keeps_stage2_commands_and_marks_stage1_unsupported(
+    monkeypatch, capsys
+):
+    import src.multinode_runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "EvaluationSubprocessRunner",
+        lambda *args, **kwargs: pytest.fail("dry-run constructed live runner"),
+    )
+
+    assert _main(
+        [
+            "evaluate",
+            "--run-id", "eval-four-gpu",
+            "--model-dir",
+            str(REPO_ROOT / "checkpoints/evaluation-staging/model/prepared-model"),
+            "--test-data-path", str(REPO_ROOT / "data/TEST.jsonl"),
+            "--task-name", "zebra-cot",
+            "--output-dir", str(REPO_ROOT / "results/eval-four-gpu"),
+            "--vision-ablation", "all",
+            "--dry-run",
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert "unsupported" in payload["worker_commands_by_observed_stage"]["stage1"]
+    stage2 = payload["worker_commands_by_observed_stage"]["stage2"]
+    assert all("--vision-ablation all" in " ".join(command) for command in stage2)

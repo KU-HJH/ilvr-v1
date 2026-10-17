@@ -257,6 +257,14 @@ def _stage2_adapter_target_names(
             for pattern in configured_targets
         )
     }
+    unmatched_configured_targets = tuple(
+        pattern
+        for pattern in configured_targets
+        if not any(
+            name == pattern or name.endswith(f".{pattern}")
+            for name in expected_targets
+        )
+    )
     if (
         not target_names
         or config.modules_to_save is not None
@@ -269,7 +277,8 @@ def _stage2_adapter_target_names(
     ):
         raise ValueError("Stage 2 PEFT adapter targets must be decoder LoRA modules")
     if (
-        configured_matches != expected_targets
+        unmatched_configured_targets
+        or configured_matches != expected_targets
         or set(target_names) != expected_targets
     ):
         raise ValueError("loaded adapter targets do not match Stage 2 tuning")
@@ -595,10 +604,10 @@ def _decode_stage2_adapter_config(payload: bytes) -> PeftConfig:
 def _decode_stage2_inference_witness(witness):
     from .checkpointing import (
         Stage2PeftMetadataSnapshot,
-        decode_stage2_peft_metadata_snapshot,
+        decode_stage2_inference_metadata_snapshot,
     )
 
-    metadata = decode_stage2_peft_metadata_snapshot(
+    metadata = decode_stage2_inference_metadata_snapshot(
         Stage2PeftMetadataSnapshot(
             artifact_dir=witness.artifact_dir,
             metadata_json=witness.metadata_json,
@@ -630,7 +639,7 @@ def _preflight_stage2_inference_artifact(
         Stage2ArtifactInspection,
         Stage2ArtifactKind,
         configure_stage2_metadata,
-        decode_stage2_peft_metadata_snapshot,
+        decode_stage2_inference_metadata_snapshot,
         inspect_stage2_artifact,
         resolve_latent_token_ids,
         validate_stage2_adapter_tensor_contract,
@@ -640,7 +649,7 @@ def _preflight_stage2_inference_artifact(
     )
 
     if artifact_inspection is None:
-        inspection = inspect_stage2_artifact(stage2_artifact_path)
+        inspection = inspect_stage2_artifact(stage2_artifact_path, for_inference=True)
     else:
         if type(artifact_inspection) is not Stage2ArtifactInspection:
             raise TypeError(
@@ -655,7 +664,7 @@ def _preflight_stage2_inference_artifact(
     requested_artifact = Path(stage2_artifact_path).resolve(strict=False)
     if requested_artifact != metadata_snapshot.artifact_dir:
         raise ValueError("Stage 2 artifact inspection path witness mismatch")
-    metadata = decode_stage2_peft_metadata_snapshot(metadata_snapshot)
+    metadata = decode_stage2_inference_metadata_snapshot(metadata_snapshot)
     if metadata.peft_version != peft.__version__:
         raise ValueError(
             "Stage 2 PEFT version mismatch: "
@@ -788,6 +797,7 @@ def load_stage2_model_for_inference(
         attach_sparse_output_token_rows,
     )
     from .checkpointing import (
+        _read_stage2_regular_payload,
         configure_stage2_metadata,
         prepare_stage2_sparse_token_base,
         resolve_latent_token_ids,
@@ -828,10 +838,29 @@ def load_stage2_model_for_inference(
         load_config=load_config,
         artifact_inspection=artifact_inspection,
     )
+    from step_preference.dil_identity import NAMESPACE, read_dil_identity
+
+    config_path = witness.artifact_dir / "config.json"
+    if config_path.exists() or config_path.is_symlink():
+        try:
+            artifact_config = json.loads(_read_stage2_regular_payload(
+                config_path, label="Stage 2 objective identity config"
+            ))
+            dil_identity = read_dil_identity(artifact_config)
+        except (OSError, json.JSONDecodeError, TypeError) as error:
+            raise ValueError("invalid Stage 2 DIL objective identity config") from error
+    else:
+        dil_identity = None
     base_model = load_model(
         str(base_model_path), **source_kwargs, **model_kwargs
     )
     metadata, adapter_config = _decode_stage2_inference_witness(witness)
+    qwen_config = resolve_qwen2_5_vl_model(base_model).config
+    if dil_identity is None:
+        if hasattr(qwen_config, NAMESPACE):
+            delattr(qwen_config, NAMESPACE)
+    else:
+        setattr(qwen_config, NAMESPACE, dil_identity)
     tokenizer = getattr(processor, "tokenizer", None)
     if (
         _canonical_source_reference(base_model_path) != witness.base_model_source

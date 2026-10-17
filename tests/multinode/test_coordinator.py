@@ -5,6 +5,7 @@ import signal
 import stat
 import subprocess
 import threading
+from types import SimpleNamespace
 from dataclasses import replace
 from pathlib import Path
 
@@ -40,6 +41,46 @@ from stage1.training_evidence import publish_stage1_training_evidence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_stage2_coordinator_waits_for_length_preprocessing(monkeypatch):
+    """Stage 2 length admission can take longer than the control RPC timeout."""
+    for key, value in {
+        "STAGE1_CHECKPOINT": "/models/base", "DATA_PATH": "/data/train.jsonl",
+        "IMAGE_ROOT": "/data", "TUNING_METHOD": "dora",
+    }.items():
+        monkeypatch.setenv(key, value)
+    commit = multinode_module._repository_git_stdout(("rev-parse", "HEAD"))
+    monkeypatch.setattr(multinode_module, "collect_node_snapshot", lambda *a, **kw: None)
+    monkeypatch.setattr(multinode_module, "validate_preflight", lambda *a: SimpleNamespace(commit=commit))
+    monkeypatch.setattr(multinode_module, "SubprocessCoordinatorRunner", lambda *a, **kw: None)
+
+    class BothNodesStarted(Exception):
+        pass
+
+    def start_after_preprocessing(launch_plan, unused_runner, **kwargs):
+        elapsed = [0.0]
+        started = []
+        runner = SimpleNamespace(
+            prepare_plan=lambda plan: None,
+            start_remote=lambda command: started.append(0),
+            rank0_is_ready=lambda plan: elapsed[0] >= 45,
+            start_local=lambda command: started.append(1),
+            sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+            cleanup_owned=lambda *a, **kw: True,
+        )
+        with monkeypatch.context() as clock_patch:
+            clock_patch.setattr(runtime_module.time, "monotonic", lambda: elapsed[0])
+            start_rank0_then_rank1(launch_plan, runner, **kwargs)
+        assert started == [0, 1]
+        raise BothNodesStarted
+
+    monkeypatch.setattr(multinode_module, "start_rank0_then_rank1", start_after_preprocessing)
+    with pytest.raises(BothNodesStarted):
+        multinode_module._training_main("stage2", [
+            "--run-id", "stage2-preprocessing-test", "--zero-stage", "2",
+            "--main-process-port", "29631", "--max_steps", "1", "--save_steps", "1",
+        ])
 
 
 def plan(stage="stage1", method="lora"):
@@ -354,7 +395,7 @@ def test_tmux_commands_use_fixed_sessions_and_quote_shell_metacharacters():
 def test_training_supervisors_import_from_the_canonical_repository():
     """Catches production rank 0 exiting before ownership from container cwd ``/``."""
     commands = build_owned_tmux_commands(plan(), commit="a" * 40)
-    repository = "/root/workspace/ILVR"
+    repository = str(REPO_ROOT)
 
     for spec in commands.node_specs:
         environment = dict(spec.environment)
@@ -924,7 +965,7 @@ def test_stage2_forwards_only_allowlisted_environment_and_safe_arguments():
     )
     effective = dict(commands.node_specs[0].environment)
     assert effective["PATH"].startswith(
-        "/root/workspace/ILVR/venv/ilvr-venv/bin:/usr/local/sbin:"
+        f"{REPO_ROOT / 'venv/ilvr-venv/bin'}:/usr/local/sbin:"
     )
     assert effective["HOME"] == "/root"
     assert "UNRELATED_SECRET" not in effective
@@ -999,9 +1040,9 @@ def test_stage2_coordinator_owns_a_fresh_producer_evidence_path():
 
 def test_ordinary_stage1_coordinator_owns_training_evidence_path_and_argv():
     launch_plan = plan(stage="stage1", method="full")
-    producer = Path(
-        "/root/workspace/ILVR/results/stage1-full-zero3-four-gpu/"
-        "initial-producer-evidence.json"
+    producer = (
+        REPO_ROOT
+        / "results/stage1-full-zero3-four-gpu/initial-producer-evidence.json"
     )
 
     commands = build_owned_tmux_commands(
@@ -1237,6 +1278,8 @@ plan = build_launch_plan(
     zero_stage=1,
     run_id="stage2-full-zero1-production-import",
     main_process_port=29631,
+    remote_repo_root=Path.cwd(),
+    remote_host_repo_root=Path("/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/native-test"),
 )
 _finite_loss_reference(
     Path(sys.argv[1]),
@@ -1261,6 +1304,7 @@ _finite_loss_reference(
             "PATH": str(REPO_ROOT / "venv/ilvr-venv/bin"),
             "PYTHONPATH": f"{REPO_ROOT}:{REPO_ROOT / 'src'}",
             "PYTHONUNBUFFERED": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
         },
         capture_output=True,
         text=True,
@@ -1352,6 +1396,8 @@ def test_stage1_wrapper_dry_run_builds_both_nodes_without_remote_calls(tmp_path)
             "3",
             "--main-process-port",
             "29631",
+            "--remote-repo-root", str(REPO_ROOT),
+            "--remote-host-repo-root", "/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/native-test",
             "--dry-run",
             "--method",
             "lora",
@@ -1798,12 +1844,12 @@ def test_subprocess_runner_transfers_only_attempt_plan_with_size_and_sha(tmp_pat
         command_runner.calls, ("prepare-attempt", "receive-plan"), strict=True
     ):
         remote = shlex.split(call[0][6])
-        assert remote[remote.index("--workdir") + 1] == "/root/workspace/ILVR"
+        assert remote[remote.index("--workdir") + 1] == str(REPO_ROOT)
         inner = shlex.split(remote[-1])
         assert inner[:6] == [
             "/usr/bin/env",
-            "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-            "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+            f"PYTHONPATH={REPO_ROOT}:{REPO_ROOT / 'src'}",
+            str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
             "-m",
             "src.multinode",
             subcommand,

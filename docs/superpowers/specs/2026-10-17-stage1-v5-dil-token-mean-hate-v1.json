@@ -1,0 +1,4 @@
+{
+  "root": "A token sum is not a global token mean unless the denominator counts exactly the tokens contributing loss across every rank and microbatch of the same optimizer window. Reusing the block scale or averaging per-rank/per-microbatch token means would violate equal token weighting, especially on unequal lengths and partial tails.",
+  "first_nail": "After implementation approval, use one CPU witness of actual parent Trainer dispatch over four logical ranks, unequal token counts, an empty rank/microbatch and a partial tail. Compare the rank-averaged DIL gradient to an independently concatenated global sum/token-count objective, while entropy/mass and native terms retain their existing denominators. A mismatch falsifies the design implementation before any training launch. Proposed; not run and not runtime evidence."
+}

@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import logging
 import math
 import os
@@ -17,6 +19,8 @@ from deepspeed_runtime import bind_deepspeed_runtime_profile
 def _preflight_direct_main(argv: list[str]) -> object:
     """Validate generated ownership before importing the training runtime."""
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--stage")
+    parser.add_argument("--tuning_method")
     parser.add_argument("--save_model_path", default="./checkpoints/model_stage1")
     parser.add_argument("--log_file")
     parser.add_argument("--benchmark_run_config")
@@ -42,7 +46,9 @@ _DIRECT_MAIN_PROFILE = (
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
+
+from step_preference import packed_admission as packed_admission_artifacts
 
 import torch
 from transformers import (
@@ -53,6 +59,7 @@ from transformers import (
 from transformers.utils.peft_utils import find_adapter_config_file
 from trl import SFTConfig
 from peft import PeftConfig
+from peft_common import resolve_qwen2_5_vl_model
 
 from qwen_vl_utils import process_vision_info
 
@@ -69,6 +76,8 @@ from stage2.checkpointing import (
     prepare_stage2_sparse_token_base,
     resolve_latent_token_ids,
     resolve_stage2_load_decision,
+    resolve_stage2b_initialization_decision,
+    validate_stage2b_peft_base_identity,
     validate_stage2_peft_compatibility,
     validate_stage2_sparse_processor,
 )
@@ -79,15 +88,53 @@ from stage2.data import (
     load_jsonl_examples,
     prepare_stage2_example,
 )
-from stage2.evidence import observe_stage2_checkpoint_artifact
+from stage2.length_manifest import validate_stage2_length_manifest
+from stage2.sampler import select_stage2_sampler_policy
+from stage2.attention_backend import (
+    load_qwen2_5_vl_with_attention,
+    validate_qwen2_5_vl_attention_backends,
+)
 from stage2.peft import (
     build_stage2_tuned_model,
     load_stage1_dora_for_fresh_stage2,
     resolve_stage2_target_module_names,
     validate_stage2_parameter_boundary,
 )
+from step_preference.config import StepPreferenceConfig
+from step_preference.dil_config import validate_dil_runtime
+from step_preference.dil_identity import validate_dil_resume
+from step_preference.negatives import (
+    inspect_stage2a_checkpoint_identity,
+    load_negative_store,
+    read_negative_manifest,
+)
+from step_preference.spans import (
+    ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF,
+    reject_duplicate_sample_ids,
+    resolve_assistant_plan_rendering,
+)
 
 platform.python_version = _platform_python_version
+
+
+_PHASE_A_SUMMARY_PREFIX = "STEP_PREFERENCE_PHASE_A_SUMMARY "
+_PHASE_A_METRIC_NAMES = (
+    "loss/total",
+    "loss/ce",
+    "loss/dpo_visual",
+    "loss/dpo_text",
+    "loss/entropy_visual",
+    "loss/entropy_text",
+    "stats/valid_visual_pairs",
+    "stats/valid_textual_pairs",
+)
+
+
+def observe_stage2_checkpoint_artifact(*args, **kwargs):
+    """Load optional producer-evidence dependencies only when evidence is requested."""
+    from stage2.evidence import observe_stage2_checkpoint_artifact as observe
+
+    return observe(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -117,6 +164,18 @@ class Stage2TrainingComponents:
     trainer_class: type
     trainer_resume_path: str | None
     peft_metadata: Stage2PeftMetadata | None
+    step_preference_config: StepPreferenceConfig | None = None
+
+
+@dataclass(frozen=True)
+class Stage2BPreflight:
+    """Read-only validated inputs required before Stage 2B may construct runtime."""
+
+    prepared_examples: tuple[object, ...]
+    negative_store: Mapping[tuple[str, int], object] | None
+    packed_admission: packed_admission_artifacts.PackedAdmissionManifest | None = None
+    packed_admission_records_by_sample_id: Mapping[str, object] | None = None
+    stage1_peft_preflight: object | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +196,252 @@ def _default_stage2_source_dependencies() -> Stage2SourceDependencies:
         load_config=AutoConfig.from_pretrained,
         load_processor=AutoProcessor.from_pretrained,
         load_model=Qwen2_5_VLForConditionalGeneration.from_pretrained,
+    )
+
+
+def _require_stage2b_attention_contract(args) -> None:
+    if (
+        args.attention_implementation != "sdpa"
+        or getattr(args, "vision_attention_implementation", None)
+        != "flash_attention_2"
+    ):
+        raise ValueError(
+            "Stage 2B requires attention_implementation='sdpa' and "
+            "vision_attention_implementation='flash_attention_2'"
+        )
+
+
+def validate_packed_admission_inputs(args, config):
+    """Authenticate admission, its verifier, and the original-to-retained chain."""
+    artifacts = packed_admission_artifacts
+    if not all((config.packed_admission_manifest, config.packed_admission_manifest_sha256,
+                config.packed_admission_verification, config.packed_admission_verification_sha256)):
+        raise ValueError("normal packed Stage 2B requires all four admission artifacts")
+    manifest, manifest_raw = artifacts._strict_json(
+        config.packed_admission_manifest, "packed admission manifest",
+        artifacts._manifest_from_payload, config.packed_admission_manifest_sha256,
+    )
+    verification, verification_raw = artifacts._strict_json(
+        config.packed_admission_verification, "packed admission verification",
+        artifacts._verification_from_payload, config.packed_admission_verification_sha256,
+    )
+    identity = manifest.identity
+    expected_verification = artifacts.PackedAdmissionVerification(
+        1, artifacts.PACKED_ADMISSION_VERIFICATION_KIND, "pass",
+        str(Path(config.packed_admission_manifest).resolve(strict=True)),
+        config.packed_admission_manifest_sha256, identity.clean_data_sha256,
+        identity.retained_data_sha256, identity.negative_sha256, identity.negative_manifest_sha256,
+        len(manifest.records), manifest.retained_source_indices, manifest.filtered_source_indices, (),
+    )
+    if verification != expected_verification:
+        raise ValueError("packed admission verification does not match manifest")
+    for name, supplied, expected in (
+        ("packed data", args.data_path, identity.retained_data_path),
+        ("negative", config.negative_path, identity.negative_path),
+        ("negative manifest", config.negative_manifest, identity.negative_manifest_path),
+        ("checkpoint", config.stage2a_checkpoint_path, identity.checkpoint_path),
+        ("image root", args.image_root, identity.image_root_path),
+    ):
+        path = Path(supplied)
+        if path.is_symlink() or str(path.resolve(strict=True)) != expected:
+            raise ValueError(f"packed admission {name} path does not match")
+    if (args.latent_size, args.max_seq_length_train, args.supervise_latent_boundaries,
+            config.max_packed_sequence_length) != (
+            identity.latent_size, identity.clean_model_limit, True, identity.max_packed_sequence_length):
+        raise ValueError("packed admission runtime configuration does not match")
+    if args.max_train_samples is not None:
+        raise ValueError("packed admission does not permit max_train_samples truncation")
+    chain = artifacts.validate_clean_source_chain(SimpleNamespace(
+        original_data_path=identity.original_data_path, clean_data_path=identity.clean_data_path,
+        clean_length_manifest=identity.clean_length_manifest_path,
+        clean_length_manifest_sha256=identity.clean_length_manifest_sha256,
+        source_map_path=identity.source_map_path, source_map_sha256=identity.source_map_sha256,
+        image_root=identity.image_root_path, checkpoint_path=identity.checkpoint_path,
+        negative_path=identity.negative_path, negative_manifest=identity.negative_manifest_path,
+        max_packed_sequence_length=identity.max_packed_sequence_length,
+    ))
+    for name, expected in chain.identity_values.items():
+        if getattr(identity, name) != expected:
+            raise ValueError(f"packed admission source identity does not match: {name}")
+    if (tuple(row.source_index for row in manifest.records) != chain.original_source_indices
+            or tuple(row.sample_id for row in manifest.records) != chain.sample_ids
+            or manifest.counts.original != chain.original_count
+            or manifest.counts.clean_admissible != chain.clean_admissible_count):
+        raise ValueError("packed admission records do not match authenticated source map")
+    retained_raw = artifacts._read_strict_bytes(args.data_path, "packed retained source")
+    artifacts._authenticate(retained_raw, identity.retained_data_sha256, "packed retained source")
+    if retained_raw != artifacts._retained_bytes(chain, manifest.retained_source_indices):
+        raise ValueError("packed admission retained bytes/order do not match source")
+    artifacts._check_unchanged(chain)
+    for path, raw in ((config.packed_admission_manifest, manifest_raw),
+                      (config.packed_admission_verification, verification_raw)):
+        if artifacts._read_strict_bytes(path, "packed admission artifact") != raw:
+            raise ValueError("packed admission artifact changed during preflight")
+    return manifest
+
+
+def preflight_stage2b_artifacts(args) -> Stage2BPreflight:
+    """Validate Stage 2B source, checkpoint, and negatives without runtime writes."""
+    config = getattr(args, "step_preference_config", None)
+    if config is None:
+        config = StepPreferenceConfig.from_args(args)
+    if not isinstance(config, StepPreferenceConfig) or not config.is_stage2b:
+        raise ValueError("Stage 2B artifact preflight requires Stage 2B configuration")
+    assistant_plan_rendering = resolve_assistant_plan_rendering(
+        getattr(args, "stage2_assistant_plan_rendering", "auto"), config.enabled
+    )
+    _require_stage2b_attention_contract(args)
+    if (
+        config.packing_enabled
+        and assistant_plan_rendering
+        != ASSISTANT_PLAN_RENDERING_ADJACENT_TEXT_SPACE_LF
+    ):
+        raise ValueError(
+            "packed Stage 2B requires assistant plan rendering "
+            "adjacent-text-space-lf-v1"
+        )
+
+    admission = (
+        validate_packed_admission_inputs(args, config)
+        if config.packing_enabled and not getattr(args, "_stage2b_capacity_probe", False)
+        else None
+    )
+    source_path = Path(admission.identity.clean_data_path if admission is not None else args.data_path)
+    source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    raw_examples = load_jsonl_examples(source_path)
+    selected_examples = (
+        raw_examples
+        if admission is not None or args.max_train_samples is None
+        else raw_examples[: args.max_train_samples]
+    )
+    prepared = tuple(
+        prepare_stage2_example(
+            item,
+            image_root=Path(args.image_root),
+            latent_size=args.latent_size,
+            require_reasoning_units=True,
+            assistant_plan_rendering=assistant_plan_rendering,
+        )
+        for item in selected_examples
+    )
+    reject_duplicate_sample_ids(example.sample_id for example in prepared)
+
+    if config.is_dil_resume:
+        validate_dil_resume(Path(config.resume_from_checkpoint_path), config)
+        saved_state = json.loads(
+            (Path(config.resume_from_checkpoint_path) / "trainer_state.json").read_text()
+        )
+        saved_max_steps = saved_state.get("max_steps")
+        if type(saved_max_steps) is not int or saved_max_steps <= 0 or args.max_steps != saved_max_steps:
+            raise ValueError("DIL resume --max_steps must match positive saved trainer_state.json max_steps")
+
+    if config.direct_from_stage1 or config.is_dil_resume:
+        source_dependencies = _default_stage2_source_dependencies()
+        decision = resolve_stage2_load_decision(
+            load_model_path=args.load_model_path,
+            stage1_adapter_path=args.stage1_adapter_path,
+            resume_from_checkpoint_path=config.resume_from_checkpoint_path,
+            load_config=source_dependencies.load_config,
+            discover_adapter_config=source_dependencies.find_adapter_config,
+            source_provenance_kwargs=build_stage2_source_provenance_kwargs(args),
+            latent_size=args.latent_size,
+            supervise_latent_boundaries=args.supervise_latent_boundaries,
+            latent_activation_checkpointing=getattr(args, "stage2_latent_activation_checkpointing", False),
+            tuning_method=args.tuning_method,
+            tuning_method_explicit=args.tuning_method_explicit,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_target_modules=args.lora_target_modules,
+        )
+        processor = source_dependencies.load_processor(decision.processor_source)
+        if config.is_dil_resume:
+            if decision.peft_metadata is not None and decision.peft_metadata.token_row_source == "sparse_adapter":
+                validate_stage2_sparse_processor(processor.tokenizer, decision.peft_metadata)
+            return Stage2BPreflight(prepared_examples=prepared, negative_store=None)
+        stage1_preflight = preflight_stage1_peft_artifact(
+            processor,
+            source_dependencies.load_config(decision.base_model_source),
+            Path(decision.stage1_adapter_source),
+            requested_base_model_reference=decision.base_model_source,
+            metadata_snapshot=decision.stage1_metadata_snapshot,
+        )
+        return Stage2BPreflight(
+            prepared_examples=prepared,
+            negative_store=None,
+            stage1_peft_preflight=stage1_preflight,
+        )
+
+    validate_stage2b_peft_base_identity(
+        stage2a_checkpoint_path=config.stage2a_checkpoint_path,
+        requested_base_model_path=args.load_model_path,
+    )
+    checkpoint_files, tokenizer_identity = inspect_stage2a_checkpoint_identity(
+        config.stage2a_checkpoint_path
+    )
+    if config.is_context_preference:
+        return Stage2BPreflight(prepared_examples=prepared, negative_store=None)
+    manifest = read_negative_manifest(config.negative_manifest)
+    if manifest.source_sha256 != source_sha256:
+        raise ValueError("source JSONL SHA-256 does not match negative manifest")
+    expected_generation_settings = {
+        "attention_implementation": args.attention_implementation,
+        "vision_attention_implementation": getattr(
+            args,
+            "vision_attention_implementation",
+            args.attention_implementation,
+        ),
+        "device": "cuda:0",
+        "max_new_tokens": config.max_new_tokens,
+        "min_tokens": config.min_tokens,
+        "torch_dtype": "bfloat16",
+        "seed": 42,
+        "decoding": "greedy-argmax-v1",
+    }
+    expected_keys = tuple(
+        (example.sample_id, step.step_id)
+        for example in prepared
+        for step in example.reasoning_steps
+    )
+    negative_store = load_negative_store(
+        negative_path=config.negative_path,
+        manifest_path=config.negative_manifest,
+        source_path=source_path,
+        expected_source_sha256=source_sha256,
+        expected_selected_row_indices=tuple(range(len(prepared))),
+        expected_stage2a_checkpoint_path=config.stage2a_checkpoint_path,
+        expected_checkpoint_files=checkpoint_files,
+        expected_tokenizer_config_identity=tokenizer_identity,
+        expected_latent_size=args.latent_size,
+        expected_assistant_plan_rendering=assistant_plan_rendering,
+        expected_generation_settings=expected_generation_settings,
+        expected_keys=expected_keys,
+    )
+    for example in prepared:
+        assistant_text = example.conversation[1]["content"][0]["text"]
+        for step in example.reasoning_steps:
+            key = (example.sample_id, step.step_id)
+            chosen = assistant_text[step.target_text.start : step.target_text.end]
+            if negative_store[key].chosen_text != chosen:
+                raise ValueError(
+                    f"negative chosen text does not match source step: {key}"
+                )
+    records_by_sample_id = None
+    if admission is not None:
+        by_sample_id = {example.sample_id: example for example in prepared}
+        prepared = tuple(by_sample_id[sample_id] for sample_id in admission.retained_sample_ids)
+        records_by_sample_id = MappingProxyType({
+            row.sample_id: row for row in admission.records if row.admission_reason == "retained"
+        })
+    from step_preference.capacity_evidence import validate_capacity_options
+    if validate_capacity_options(args):
+        from stage2.data import select_packed_capacity_example
+        prepared = select_packed_capacity_example(prepared, admission, args.step_packed_capacity_sample_id)
+    return Stage2BPreflight(
+        prepared_examples=prepared,
+        negative_store=MappingProxyType(dict(negative_store)),
+        packed_admission=admission,
+        packed_admission_records_by_sample_id=records_by_sample_id,
     )
 
 
@@ -205,24 +510,64 @@ def validate_stage2_distributed_settings(
         )
 
 
+def validate_stage2_dil_model(
+    config: StepPreferenceConfig, model, *, supervise_latent_boundaries: bool
+) -> None:
+    """Validate DIL against the resolved output head before its first forward."""
+    if config.preference_loss_type == "dpo":
+        return
+    output_head = model.get_output_embeddings()
+    if output_head is None or not hasattr(output_head, "weight"):
+        raise ValueError("DIL-BCE requires model output embeddings")
+    validate_dil_runtime(
+        config,
+        vocab_size=int(output_head.weight.shape[0]),
+        supervise_latent_boundaries=supervise_latent_boundaries,
+    )
+
+
 def build_stage2_training_components(
     args, *, source_dependencies: Stage2SourceDependencies | None = None
 ) -> Stage2TrainingComponents:
     from stage2.trainer import Stage2Trainer
 
+    step_preference_config = getattr(args, "step_preference_config", None)
+    if step_preference_config is None:
+        step_preference_config = StepPreferenceConfig.from_args(args)
+    if not isinstance(step_preference_config, StepPreferenceConfig):
+        raise TypeError("step_preference_config must be a StepPreferenceConfig")
+    if step_preference_config.is_stage2b:
+        _require_stage2b_attention_contract(args)
+    assistant_plan_rendering = resolve_assistant_plan_rendering(
+        getattr(args, "stage2_assistant_plan_rendering", "auto"),
+        step_preference_config.enabled,
+    )
+    stage2b_preflight = getattr(args, "_stage2b_preflight", None)
+    if step_preference_config.is_stage2b:
+        if stage2b_preflight is None:
+            stage2b_preflight = preflight_stage2b_artifacts(args)
+        elif not isinstance(stage2b_preflight, Stage2BPreflight):
+            raise TypeError("_stage2b_preflight must be a Stage2BPreflight")
+        elif (step_preference_config.packing_enabled
+              and not getattr(args, "_stage2b_capacity_probe", False)
+              and stage2b_preflight.packed_admission is None):
+            stage2b_preflight = preflight_stage2b_artifacts(args)
     source_dependencies = (
         source_dependencies or _default_stage2_source_dependencies()
     )
     source_provenance_kwargs = build_stage2_source_provenance_kwargs(args)
-    decision = resolve_stage2_load_decision(
+    latent_activation_checkpointing = getattr(
+        args, "stage2_latent_activation_checkpointing", False
+    )
+    decision_kwargs = dict(
         load_model_path=args.load_model_path,
         stage1_adapter_path=getattr(args, "stage1_adapter_path", None),
-        resume_from_checkpoint_path=args.resume_from_checkpoint_path,
         load_config=source_dependencies.load_config,
         discover_adapter_config=source_dependencies.find_adapter_config,
         source_provenance_kwargs=source_provenance_kwargs,
         latent_size=args.latent_size,
         supervise_latent_boundaries=args.supervise_latent_boundaries,
+        latent_activation_checkpointing=latent_activation_checkpointing,
         tuning_method=args.tuning_method,
         tuning_method_explicit=args.tuning_method_explicit,
         lora_r=args.lora_r,
@@ -230,6 +575,26 @@ def build_stage2_training_components(
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
     )
+    if step_preference_config.is_dil_resume:
+        decision = resolve_stage2_load_decision(
+            resume_from_checkpoint_path=step_preference_config.resume_from_checkpoint_path,
+            **decision_kwargs,
+        )
+    elif step_preference_config.direct_from_stage1:
+        decision = resolve_stage2_load_decision(
+            resume_from_checkpoint_path=None,
+            **decision_kwargs,
+        )
+    elif step_preference_config.is_stage2b:
+        decision = resolve_stage2b_initialization_decision(
+            stage2a_checkpoint_path=step_preference_config.stage2a_checkpoint_path,
+            **decision_kwargs,
+        )
+    else:
+        decision = resolve_stage2_load_decision(
+            resume_from_checkpoint_path=args.resume_from_checkpoint_path,
+            **decision_kwargs,
+        )
     sparse_resume = (
         decision.peft_metadata is not None
         and decision.peft_metadata.token_row_source == "sparse_adapter"
@@ -242,28 +607,73 @@ def build_stage2_training_components(
         validate_stage2_sparse_processor(
             processor.tokenizer, decision.peft_metadata
         )
-    stage1_preflight = None
+    manifest_path = getattr(args, "stage2_length_manifest", None)
+    manifest_sha256 = getattr(args, "stage2_length_manifest_sha256", None)
+    if bool(manifest_path) != bool(manifest_sha256):
+        raise ValueError(
+            "--stage2_length_manifest and --stage2_length_manifest_sha256 "
+            "must be provided together"
+        )
+    manifest_snapshot = (
+        validate_stage2_length_manifest(
+            path=manifest_path,
+            expected_sha256=manifest_sha256,
+            data_path=args.data_path,
+            image_root=args.image_root,
+            processor=processor,
+            latent_size=decision.latent_size,
+            supervise_latent_boundaries=decision.supervise_latent_boundaries,
+            max_sequence_length=args.max_seq_length_train,
+            assistant_plan_rendering=assistant_plan_rendering,
+        )
+        if manifest_path is not None
+        else None
+    )
+    stage1_preflight = (
+        stage2b_preflight.stage1_peft_preflight
+        if step_preference_config.direct_from_stage1
+        else None
+    )
     stage1_metadata = None
     if decision.stage1_adapter_source is not None:
-        base_config = source_dependencies.load_config(decision.base_model_source)
-        stage1_preflight = preflight_stage1_peft_artifact(
-            processor,
-            base_config,
-            Path(decision.stage1_adapter_source),
-            requested_base_model_reference=decision.base_model_source,
-            metadata_snapshot=decision.stage1_metadata_snapshot,
-        )
+        if stage1_preflight is None:
+            base_config = source_dependencies.load_config(decision.base_model_source)
+            stage1_preflight = preflight_stage1_peft_artifact(
+                processor,
+                base_config,
+                Path(decision.stage1_adapter_source),
+                requested_base_model_reference=decision.base_model_source,
+                metadata_snapshot=decision.stage1_metadata_snapshot,
+            )
         stage1_metadata = decode_stage1_peft_metadata_snapshot(
             decision.stage1_metadata_snapshot
         )
-    model_only_kwargs = {
-        "attn_implementation": args.attention_implementation,
-    }
-    base_model = source_dependencies.load_model(
-        decision.base_model_source,
-        **sparse_source_kwargs,
-        **model_only_kwargs,
+    vision_attention_implementation = getattr(
+        args, "vision_attention_implementation", None
     )
+    use_mixed_attention = (
+        vision_attention_implementation is not None
+        and vision_attention_implementation != args.attention_implementation
+    )
+    if use_mixed_attention:
+        base_model = load_qwen2_5_vl_with_attention(
+            decision.base_model_source,
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=vision_attention_implementation,
+            config_load_kwargs=sparse_source_kwargs,
+            model_load_kwargs=sparse_source_kwargs,
+            load_config=source_dependencies.load_config,
+            load_model=source_dependencies.load_model,
+        )
+    else:
+        model_only_kwargs = {
+            "attn_implementation": args.attention_implementation,
+        }
+        base_model = source_dependencies.load_model(
+            decision.base_model_source,
+            **sparse_source_kwargs,
+            **model_only_kwargs,
+        )
     if decision.stage1_adapter_source is not None:
         model = load_stage1_dora_for_fresh_stage2(
             base_model,
@@ -299,6 +709,7 @@ def build_stage2_training_components(
         token_ids,
         latent_size=decision.latent_size,
         supervise_latent_boundaries=decision.supervise_latent_boundaries,
+        latent_activation_checkpointing=latent_activation_checkpointing,
     )
     configure_stage2_model_backend(
         base_model,
@@ -342,6 +753,17 @@ def build_stage2_training_components(
                 adapter_path=decision.adapter_source,
                 is_trainable=True,
             )
+    validate_stage2_dil_model(
+        step_preference_config,
+        model,
+        supervise_latent_boundaries=decision.supervise_latent_boundaries,
+    )
+    if use_mixed_attention:
+        validate_qwen2_5_vl_attention_backends(
+            resolve_qwen2_5_vl_model(model),
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=vision_attention_implementation,
+        )
     sparse_continuation = (
         decision.stage1_adapter_source is not None
         or decision.peft_metadata is not None
@@ -396,30 +818,65 @@ def build_stage2_training_components(
             ),
         )
 
-    raw_examples = load_jsonl_examples(Path(args.data_path))
-    selected_examples = (
-        raw_examples
-        if args.max_train_samples is None
-        else raw_examples[: args.max_train_samples]
-    )
-    prepared = [
-        prepare_stage2_example(
-            item,
-            image_root=Path(args.image_root),
-            latent_size=decision.latent_size,
+    if stage2b_preflight is not None and stage2b_preflight.packed_admission is not None:
+        kept = stage2b_preflight.prepared_examples
+    elif manifest_snapshot is None:
+        if step_preference_config.is_stage2b:
+            prepared = stage2b_preflight.prepared_examples
+        else:
+            raw_examples = load_jsonl_examples(Path(args.data_path))
+            selected_examples = (
+                raw_examples
+                if args.max_train_samples is None
+                else raw_examples[: args.max_train_samples]
+            )
+            prepared = [
+                prepare_stage2_example(
+                    item,
+                    image_root=Path(args.image_root),
+                    latent_size=decision.latent_size,
+                    assistant_plan_rendering=assistant_plan_rendering,
+                )
+                for item in selected_examples
+            ]
+        kept, _length_stats = filter_stage2_examples(
+            examples=prepared,
+            measure_length=build_prepared_example_length_measure(processor),
+            max_length=args.max_seq_length_train,
         )
-        for item in selected_examples
-    ]
-    kept, _length_stats = filter_stage2_examples(
-        examples=prepared,
-        measure_length=build_prepared_example_length_measure(processor),
-        max_length=args.max_seq_length_train,
+    else:
+        if step_preference_config.is_stage2b:
+            prepared = stage2b_preflight.prepared_examples
+        else:
+            prepared = (
+                manifest_snapshot.prepared_examples
+                if args.max_train_samples is None
+                else manifest_snapshot.prepared_examples[: args.max_train_samples]
+            )
+        kept = [
+            prepared[index]
+            for index in manifest_snapshot.manifest.retained_indices
+            if index < len(prepared)
+        ]
+
+    negative_store = (
+        stage2b_preflight.negative_store
+        if step_preference_config.is_stage2b
+        else None
     )
     collator = Stage2DataCollator(
         processor,
         token_ids,
         decision.latent_size,
         decision.supervise_latent_boundaries,
+        step_preference_enabled=step_preference_config.is_stage2b,
+        preference_target_scope=step_preference_config.target_scope,
+        negative_store=negative_store,
+        packed_admission_records_by_sample_id=(
+            stage2b_preflight.packed_admission_records_by_sample_id
+            if step_preference_config.is_stage2b else None
+        ),
+        max_packed_sequence_length=step_preference_config.max_packed_sequence_length,
     )
     return Stage2TrainingComponents(
         model=model,
@@ -429,16 +886,27 @@ def build_stage2_training_components(
         trainer_class=Stage2Trainer,
         trainer_resume_path=decision.trainer_resume_path,
         peft_metadata=peft_metadata,
+        step_preference_config=step_preference_config,
     )
 
 
 def build_stage2_training_arguments(args) -> SFTConfig:
     validate_stage2_distributed_settings(args.per_device_train_batch_size)
+    dataloader_num_workers = getattr(args, "dataloader_num_workers", 0)
+    if dataloader_num_workers < 0:
+        raise ValueError("Stage 2 dataloader_num_workers must be non-negative")
+    dataloader_kwargs = {"dataloader_num_workers": dataloader_num_workers}
+    if dataloader_num_workers > 0:
+        dataloader_kwargs["dataloader_prefetch_factor"] = 2
     checkpointing_kwargs = _stage2_gradient_checkpointing_kwargs(
         gradient_checkpointing=args.gradient_checkpointing,
         tuning_method=args.tuning_method,
         deepspeed_runtime_profile=bind_deepspeed_runtime_profile(args),
     )
+    step_preference_config = getattr(args, "step_preference_config", None)
+    if step_preference_config is None:
+        step_preference_config = StepPreferenceConfig.from_args(args)
+    phase_steps = step_preference_config.phase_steps
     return SFTConfig(
         output_dir=args.save_model_path,
         num_train_epochs=args.epochs,
@@ -453,16 +921,18 @@ def build_stage2_training_arguments(args) -> SFTConfig:
         save_total_limit=1,
         optim="adamw_torch",
         bf16=True,
+        seed=getattr(args, "seed", 42),
         report_to=[],
         remove_unused_columns=False,
         dataset_text_field="",
         dataset_kwargs={"skip_prepare_dataset": True},
         max_seq_length=args.max_seq_length_train,
-        max_steps=args.max_steps,
+        max_steps=args.max_steps if phase_steps is None else phase_steps,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs=checkpointing_kwargs,
         deepspeed=args.deepspeed_config,
         ddp_find_unused_parameters=False,
+        **dataloader_kwargs,
     )
 
 # ==============================================================
@@ -595,32 +1065,117 @@ def publish_stage2_training_evidence(args, *, trainer, train_result, profile):
     )
 
 
+def publish_step_preference_phase_a_summary(args, *, trainer, train_result):
+    """Log one rank-zero scalar summary for the focused Stage 2B verifier."""
+    config = getattr(args, "step_preference_config", None)
+    if config is None:
+        config = StepPreferenceConfig.from_args(args)
+    if (
+        not config.is_stage2b
+        or config.objective != "legacy_dpo"
+        or not trainer.is_world_process_zero()
+    ):
+        return None
+    latest = next(
+        (
+            entry
+            for entry in reversed(trainer.state.log_history)
+            if isinstance(entry, Mapping)
+            and all(name in entry for name in _PHASE_A_METRIC_NAMES)
+        ),
+        None,
+    )
+    if latest is None:
+        raise ValueError("Stage 2B trainer log history has no complete metric record")
+    summary = {
+        "schema_version": 1,
+        "global_step": trainer.state.global_step,
+        "optimizer_step": trainer._observed_optimizer_step,
+        "training_loss": train_result.training_loss,
+        "total_loss": latest["loss/total"],
+        "gradient_norm": trainer._representative_gradient_norm,
+        "metrics": {
+            name: latest[name]
+            for name in _PHASE_A_METRIC_NAMES
+            if name != "loss/total"
+        },
+    }
+    encoded = json.dumps(
+        summary, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    logging.info(_PHASE_A_SUMMARY_PREFIX + encoded)
+    return summary
+
+
 def run_stage2(args):
     """Run the existing Stage 2 path without importing Stage 1 Trainer code."""
 
     profile = bind_deepspeed_runtime_profile(
         args, world_size=int(os.environ.get("WORLD_SIZE", "1"))
     )
+    from step_preference.capacity_evidence import (
+        validate_capacity_options, CapacitySampleRecorder, begin_capacity_memory, finish_capacity_memory,
+        publish_training_runtime, publish_distributed_capacity,
+    )
+    capacity = False
+    if any(getattr(args, name, None) is not None for name in (
+        "step_packed_capacity_evidence_path", "step_packed_capacity_sample_id",
+        "step_packed_gpu_snapshot", "step_packed_gpu_snapshot_sha256",
+    )):
+        capacity = validate_capacity_options(args, world_size=profile.world_size, zero_stage=profile.zero_stage)
     components = build_stage2_training_components(args)
-    trainer = components.trainer_class(
+    recorder = (CapacitySampleRecorder(components.data_collator, args.step_packed_capacity_sample_id)
+                if capacity else None)
+    trainer_kwargs = dict(
         model=components.model,
         args=build_stage2_training_arguments(args),
         train_dataset=components.train_dataset,
-        data_collator=components.data_collator,
+        data_collator=recorder if capacity else components.data_collator,
         processing_class=components.processor,
         stage2_peft_metadata=components.peft_metadata,
         deepspeed_runtime_profile=profile,
+        stage2_diagnostics_interval=args.stage2_diagnostics_interval,
     )
+    if getattr(args, "stage2_stop_after_checkpoint", None) is not None:
+        trainer_kwargs["stage2_stop_after_checkpoint"] = args.stage2_stop_after_checkpoint
+    sampler_policy = select_stage2_sampler_policy(
+        getattr(args, "stage2_sampler_policy", "auto"), profile=profile,
+        config=components.step_preference_config, resume=components.trainer_resume_path)
+    if sampler_policy in ("reference_random", "historical_balanced_2rank"):
+        trainer_kwargs["stage2_sampler_policy"] = sampler_policy
+    if getattr(args, "stage2_reference_sampler_probe_dir", ""):
+        trainer_kwargs["stage2_reference_sampler_probe_dir"] = args.stage2_reference_sampler_probe_dir
+    if (
+        components.step_preference_config is not None
+        and components.step_preference_config.is_stage2b
+    ):
+        trainer_kwargs["step_preference_config"] = components.step_preference_config
+    if getattr(args, "stage2_reproduction_probe_dir", ""):
+        trainer_kwargs["stage2_reproduction_probe_dir"] = args.stage2_reproduction_probe_dir
+    trainer = components.trainer_class(**trainer_kwargs)
+    baseline = begin_capacity_memory(trainer.accelerator.device) if capacity else None
     train_result = trainer.train(
         resume_from_checkpoint=components.trainer_resume_path
+    )
+    peak = finish_capacity_memory(trainer.accelerator.device,baseline) if capacity else None
+    publish_step_preference_phase_a_summary(
+        args, trainer=trainer, train_result=train_result
     )
     publish_stage2_training_evidence(
         args, trainer=trainer, train_result=train_result, profile=profile
     )
     if args.save_final_model:
         trainer.save_model(args.save_model_path)
+        if capacity or (components.step_preference_config and components.step_preference_config.packing_enabled):
+            trainer.accelerator.wait_for_everyone()
         if trainer.is_world_process_zero():
             components.processor.save_pretrained(args.save_model_path)
+        if capacity or (components.step_preference_config and components.step_preference_config.packing_enabled):
+            trainer.accelerator.wait_for_everyone()
+    if components.step_preference_config and components.step_preference_config.packing_enabled:
+        runtime_path, runtime_sha = publish_training_runtime(args, trainer)
+        if capacity:
+            publish_distributed_capacity(args,trainer,train_result,recorder,peak,runtime_path,runtime_sha)
 
 
 def route_training(args, *, stage1_handler=None, stage2_handler=None):
@@ -638,25 +1193,37 @@ def route_training(args, *, stage1_handler=None, stage2_handler=None):
 # ==============================================================
 def main_train():
     args = get_args()
+    if hasattr(args, "_stage2b_capacity_probe"):
+        raise ValueError("the private capacity probe is not a normal training option")
     validate_generated_artifact_paths(args)
+    step_preference_config = getattr(args, "step_preference_config", None)
+    if step_preference_config is None:
+        step_preference_config = StepPreferenceConfig.from_args(args)
+    stage2b_preflight = None
+    if step_preference_config.is_stage2b:
+        stage2b_preflight = preflight_stage2b_artifacts(args)
+    if getattr(args, "stage2b_preflight_only", False):
+        return 0
     if _DIRECT_MAIN_PROFILE is not None:
         args.deepspeed_runtime_profile = _DIRECT_MAIN_PROFILE
     bind_deepspeed_runtime_profile(args)
     seed_everything(seed=42 if args.stage == "stage2" else args.seed)
 
+    log_handlers = [logging.StreamHandler()]
+    if not getattr(args, "stage2_launcher_log_capture", False):
+        log_handlers.insert(0, logging.FileHandler(args.log_file, mode='a', encoding='utf-8'))
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[
-            logging.FileHandler(args.log_file, mode='a', encoding='utf-8'),
-            logging.StreamHandler()
-        ],
+        handlers=log_handlers,
     )
     logging.info('==' * 20)
     logging.info(args)
     logging.info('==' * 20)
 
+    if stage2b_preflight is not None:
+        args._stage2b_preflight = stage2b_preflight
     return route_training(args)
 
 

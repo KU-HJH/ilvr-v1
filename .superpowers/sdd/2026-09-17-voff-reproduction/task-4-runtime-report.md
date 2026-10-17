@@ -1,0 +1,68 @@
+# Task 4 runtime continuation — implementation ready for independent review; distributed evidence pending
+
+Implementer `/root/repro_runtime_witness_impl`, base `eb476bc`. Original Task4 brief, runtime handoff, global constraints and preceding report read. No subagents or paperthin; no GPU execution. The process stop below was recovered under root direction; the final revision is ready for independent review, not GPU launch approval.
+
+## Process gap discovered and reported
+
+Required: TDD RED before every behavior implementation, minimal code for tested behavior. Actual: helper arithmetic/RNG tests failed before module creation; CLI/compute_loss wiring tests failed before wiring. However the initial `ReproductionObserver` class (initialization, before_step/after_step, ZeRO hook/clip observation) was authored without a pre-existing boundary behavior test. Helper tests alone do not verify that orchestration. Affected: new class in `src/stage2/reproduction_probe.py`; no production run or commit has occurred. Remaining uncertainty: orchestration correctness and runtime fidelity are unverified. A later test/review cannot retroactively establish the omitted order.
+
+Progression stopped and root informed before final test/commit/review. Proposed recovery: remove affected class, write independent scalar/group CPU boundary contracts, observe missing-class RED, implement fresh, then focused final verification. Distributed/ZeRO boundary doubles in CPU tests must be disclosed as such, never reported as actual four-rank evidence. Root retains recovery routing and phase ownership.
+
+## Current evidence (not final verification)
+
+- `logs/voff-reproduction-task4-runtime/red.log`: four missing-runtime-module RED tests.
+- `green.log`: four helper tests pass. Actual pinned DeepSpeed post-accumulate hook invoked only by later backward, not autograd.grad; nonreentrant checkpoint dropout RNG and existing leaf accumulation preserved; reference equals ordinary subsequent gradient.
+- `wiring-red.log`: two failures for missing CLI field and unobserved trainer loss. `wiring-green.log`: six pass after opt-in wiring.
+- `shapes-red.log`: missing-vector comparison exposed ValueError; fail-closed shape guard added, not yet final verified.
+- `focused.log`: 80 pass, 2 failures because default main path added an empty observer kwarg. Root cause isolated to changed default constructor contract; fixed by forwarding only when enabled. Final verification pending.
+- Tiny-model RED in `model-red.log`; preference-extension RED in `preference-red.log`. Failed preference attempts preserved (`preference-first.stderr`: invalid branch-mode spelling; `preference-second.stderr`: autograd requested frozen vision parameters). Targeted fixes use actual accepted `independent` branch mode and filter requires-grad parameters.
+- `preference-third.json`/stderr: real current and supplied Qwen source classes, one/two latent blocks, image input, full real tokenizer vocabulary, hidden8/layer1, dense CPU attention, FP32, seed42/dropout0, selective latent checkpointing ON. Each source executes its own V-off sidecar model path, plan builder and beta.1 preference primitive. Clean scores, V-off scores, combined CE+preference and every named parameter gradient agree exactly; preference-only gradient is nonzero. Fifteen parameters have connected gradients, frozen visual parameters and image pixels are disconnected in both. Exact names/differences and hashes recorded in JSON. Source pre/post file size/mtime inventory unchanged.
+
+The model witness shares the current Transformers scaffold explicitly because supplied package is incomplete. It is source-level tiny model evidence, not supplied historical runtime, DoRA/dropout.05, BF16/Flex or full-model-scale equivalence. Final canonical model JSON must be placed under results/, not logs/; pending final verification after recovery.
+
+## Proposed runtime interface / frozen numerical contract
+
+`STAGE2_REPRODUCTION_PROBE_DIR` forwarded by existing coordinator to launcher `--stage2_reproduction_probe_dir`; empty disables. Relative path under current results tree works on both nodes; per-rank files created exclusively. Arithmetic observer requires four ranks, ZeRO2, microbatch1/GAS4, fresh global_step0, at most three updates and <=100M trainable elements. No full-model clone; CPU reference gradient/moment/delta buffers and transient per-parameter device collectives only. Longest-input memory run must omit this flag.
+
+Runtime gradients compare all named trainable parameters against independently summed production unscaled per-example gradients divided by observed group count, and separately configured16. Actual sampled IDs gathered at real engine-step boundaries. FP32 master parameters and effective full gradients use pinned safe_get_full_fp32_param/safe_get_full_grad on every rank. CPU FP32 AdamW moments are separate for actual-group numerator and observed effective gradients; each delta is conditioned on observed pre-step master weights. Effective LR/betas/eps/weight decay are read from actual optimizer groups. Clips use independent global norm1 formula; wrapper records actual clipping calls/global norms.
+
+Tolerances fixed before production results: elementwise rtol=.02, atol=1e-7 for gradient/delta comparisons, with finite checks and raw L2/max errors. This is a bounded BF16-rounding allowance, not a proven analytical error bound; small components near zero are governed by atol. It does not justify increasing tolerance after a failure. Warmup LR0 first delta is vacuous; require observed nonzero-LR full-group delta and final partial. CPU actual-group partial counterexample stays a failure and full212 remains blocked. Instrumented runtime is not yet independently reviewed or executed.
+
+## Root-authorized recovery executed
+
+Root recorded/reported the gap and explicitly routed targeted recovery to this implementer. The removed class scope/hash is preserved in `logs/voff-reproduction-task4-runtime/tdd-recovery-removed-class.json`; original affected code was deleted without keeping a source backup. `boundary-recovery-red.log` observes `AttributeError: module 'runtime_probe' has no attribute 'ReproductionObserver'` from the new independent boundary test. The class was implemented anew; `boundary-recovery-green.log`: **1 passed**.
+
+This test uses real scalar autograd and torch AdamW and explicitly doubles distributed transport/full-ZeRO reads. Independently expected groups16,16,4; true fixed-divisor gradients; actual-group mismatch only on partial; zero warmup delta followed by known nonzero .0102 delta; clipping invocation per optimizer partition group; and recorded partial delta despite mismatch are asserted. It is a CPU orchestration contract, not a substitute for actual four-rank engine evidence. Recovery does not retroactively establish earlier TDD compliance.
+
+Skills actually executed: TDD/writing-good-tests (initial helper and wiring RED/GREEN; recovered class RED/GREEN), systematic-debugging (actual default-kwargs regression and tiny-model API error causes), verification-before-completion (fresh final focused suite and canonical model output below). This is a delegated implementer handoff; branch finishing does not apply here. Root retains independent specification/quality review and launch ownership.
+
+## Final scope / outstanding runtime gates
+
+Code only observes production loss/gradients/steps; it does not change objective, accumulation denominator, optimizer or training topology. Callback installation remains opt-in; default main constructor kwargs remain identical. Shell flag is managed and coordinator environment allowlisted; existing coordinator is the only launch path. Exact launch syntax is the ordinary coordinator command with `STAGE2_REPRODUCTION_PROBE_DIR=results/<fresh-probe-id>` in its effective environment, plus already-approved reproduction settings. Root must retain `STAGE2_TOTAL_STEPS=3` for arithmetic; leave observer flag empty for separate normal-memory probe.
+
+Root-provided arithmetic36 cohort is expected to yield16+16+4, but observer JSON group IDs/counts are the evidence. Every rank's file must be collected; a configured world4 alone proves nothing. Data sampling/padding should be compared to cohort IDs. The code records actual optimizer options rather than inferring LR schedule; root must verify observed0,5e-6,1e-5 for warmup10/LR5e-5 and at least one nonzero-LR full group. It also records actual clipped global norms/call counts. Mismatched comparisons do not interrupt collection; nonfinite/unavailable prerequisites raise rather than produce false success.
+
+Per-example extra backward guards: CPU and touched-device CUDA RNG state unchanged, leaf-gradient object/version unchanged, actual ZeRO process_gradients hook counter unchanged. CPU pinned hook/dropout test validates the narrow PyTorch/post-accumulate behavior. Actual production DoRA.05/selective checkpoint hook noninterference remains unobserved until the four-rank probe; guards alone are not proof of complete state equivalence. Instrumented arithmetic memory is not normal-memory evidence. No GPU was used and no full212 run authorized.
+
+Tiny final model comparison uses actual current and supplied clean+V-off model-sidecar execution, corresponding source plan/loss functions, beta.1/weight1, no-cache latent recurrence, checkpointing ON, full tokenizer vocabulary and one/two-block image inputs. It compares combined-loss parameter gradients, clean/V-off scores and preference loss; preference-only gradients are nonzero in both. Discrete input IDs are nondifferentiable; image-pixel gradients are absent in both frozen-vision routes. The tiny fixture uses source-compatible span records, not another actual TRAIN collator pass (the preceding Task4 CPU report covers actual TRAIN data). Shared current Transformers dependencies and each supplied modeling/rollout/sidecar/packing/loss file are hashed; bytecode suppression precedes all external imports. No original external-runtime, production-scale, DoRA or BF16/Flex equivalence is claimed.
+
+## Final verification and generated result
+
+- Fresh focused command before the final clipping-identity clarification: `PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q tests/stage2/test_reproduction_runtime.py tests/stage2/test_reproduction_probe.py tests/stage2/test_routing.py` — **83 passed in31.37s**, complete output `logs/voff-reproduction-task4-runtime/final-tests.log`.
+- Root clarified actual ZeRO clipping: pinned stage_1_and_2.py step loops groups, assigns master partition.grad, scales that group once using the same global norm, and updates the group. Added a real tensor-identity mapping from each clipping call to its FP32 partition group, preserving per-group counts and common global divisor. `clip-identity-red.log` fails on missing recorded `clip_group_indices`. After implementation, the only newly affected suite was run fresh: same environment, `pytest -q tests/stage2/test_reproduction_runtime.py` — **10 passed in12.34s**, `final-runtime-tests.log`. This final targeted run includes the model differential and recovered update-boundary test. No identical broad suite rerun.
+- Final canonical model result: `results/voff-model-path-20260917-runtime-review/comparison.json`; execution stderr: `logs/voff-reproduction-task4-runtime/model-final.stderr`. Direct script command: same CPU environment, `./venv/ilvr-venv/bin/python scripts/verify_voff_model_path.py > results/voff-model-path-20260917-runtime-review/comparison.json`. Exit0. Two cases, **33 named parameters each,15 connected**, all gradient comparisons pass with max error0; combined loss, preference loss, clean scores and V-off scores max error0. Pixel gradients absent on both frozen-vision paths. Preference-only gradients nonzero. External inventory unchanged. The differential uses rtol1e-5/atol1e-6 fixed before model observations; observed exact matches do not depend on those tolerances.
+- `git diff --check` and `bash -n run_stage2_training.sh` pass. No GPU, four-rank engine, full-project suite or independent-review claim. Existing untracked worktree __pycache__ directories were present on intake and left untouched; external sources remained read-only throughout this continuation.
+
+Actual production effective gradients/AdamW, runtime four-rank participation/grouping/padding, real DoRA/dropout replay, longest-input normal-memory capacity and full212 authorization remain unresolved. The earlier independent actual-group partial normalization counterexample remains a failure. Nothing in this handoff changes its status.
+
+## Reviewed-content identity for handoff
+
+- `src/stage2/reproduction_probe.py` SHA256 `a053d84fcaa85015505c02b4c45a8dd4a76ae04d251d692733a204591066c25e`
+- `scripts/verify_voff_model_path.py` SHA256 `439768ccb05d754f0720b01c42b2ae4dba8e482aa841f939d3b4b14940fdc0c7`
+- `tests/stage2/test_reproduction_runtime.py` SHA256 `7fda2606f774cd830909756eeba03548721b8dd530f5b4d329dc02a4e6e57267`
+- `src/stage2/trainer.py` SHA256 `f700304ebe3a95247a8f01a30a95d76bec0757ea6b2482ae7af2a90a4f1078e4`
+- `src/main.py` SHA256 `4e061b5ffac083a15ca9a0607d6b8ebe1ea52b49bbb890b4e88363eeaeb93c2a`
+- `src/multinode_runtime.py` SHA256 `7f58ac9c077b571c81453eab467681a3749705794b14a0a3d0a1effca64617b1`
+- `src/utils_deepseed.py` SHA256 `2000f4904c55b461105c7e4b60b43420bb0e1e821e73fe3c02b15d13129fd47b`
+- `run_stage2_training.sh` SHA256 `750849aa83b2781842a54369801206ed3a9fef49354513f1229fe43fab62b25c`
+- `results/voff-model-path-20260917-runtime-review/comparison.json` SHA256 `a5bd2e58b06480878bc4de36a491cae56d1f7a55d7c9b2930cc22982ca60b3d6`

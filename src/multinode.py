@@ -56,7 +56,11 @@ from src.multinode_runtime import (
 )
 
 
-_REPOSITORY_ROOT = Path("/root/workspace/ILVR")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_REMOTE_CONTAINER_REPOSITORY_BASE = Path("/root/workspace/ILVR")
+_REMOTE_HOST_REPOSITORY_BASE = Path(
+    "/home/korea/Workspace/hjh/workspace/ILVR"
+)
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _TRAINING_REQUIRED_FREE_BYTES = 100 * 1024**3
 _ATTEMPT_TIMEOUT_SECONDS = 24 * 60 * 60
@@ -66,6 +70,11 @@ _PROC_ROOT = Path("/proc")
 
 def _evaluation_staging_root() -> Path:
     return _REPOSITORY_ROOT / "checkpoints" / "evaluation-staging"
+
+
+def _remote_host_repository_root(repository_root: Path) -> Path:
+    relative = repository_root.relative_to(_REMOTE_CONTAINER_REPOSITORY_BASE)
+    return _REMOTE_HOST_REPOSITORY_BASE / relative
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,7 @@ class ClusterSpec:
     remote_host_repo_root: Path
     master_addr: str
     socket_ifname: str
+    local_repo_root: Path
     remote_rank: int = 0
     local_rank: int = 1
     num_machines: int = 2
@@ -85,15 +95,48 @@ class ClusterSpec:
     num_processes: int = 4
 
     @classmethod
-    def default(cls) -> "ClusterSpec":
+    def default(
+        cls, *, local_repo_root: Path | None = None,
+        remote_repo_root: Path | None = None,
+        remote_host_repo_root: Path | None = None,
+    ) -> "ClusterSpec":
+        local = _repository_root(local_repo_root or _REPOSITORY_ROOT)
+        if (remote_repo_root is None) != (remote_host_repo_root is None):
+            raise ValueError("both remote repository roots must be explicit")
+        if remote_repo_root is None:
+            try:
+                remote_host_repo_root = _remote_host_repository_root(local)
+            except ValueError as error:
+                raise ValueError("native checkout requires explicit remote repository roots") from error
+            remote_repo_root = local
         return cls(
-            remote_host="korea@10.1.102.41",
-            remote_container="llm_kd",
-            remote_repo_root=_REPOSITORY_ROOT,
-            remote_host_repo_root=Path("/home/korea/Workspace/hjh/workspace/ILVR"),
-            master_addr="10.1.102.41",
-            socket_ifname="bond1.102",
+            remote_host="korea@10.1.102.41", remote_container="llm_kd",
+            local_repo_root=local,
+            remote_repo_root=_repository_root(remote_repo_root),
+            remote_host_repo_root=_repository_root(remote_host_repo_root),
+            master_addr="10.1.102.41", socket_ifname="bond1.102",
         )
+
+
+def _repository_root(value: str | Path) -> Path:
+    # Do not resolve a remote path against this machine's filesystem.
+    path = Path(value)
+    if (not path.is_absolute() or ".." in path.parts
+            or any(character in str(path) for character in ("\0", "\n", "\r"))):
+        raise ValueError("repository root must be absolute without traversal or control characters")
+    return path
+
+
+def validate_cluster_topology(cluster: ClusterSpec) -> None:
+    expected = dict(remote_host="korea@10.1.102.41", remote_container="llm_kd",
+        master_addr="10.1.102.41", socket_ifname="bond1.102", remote_rank=0,
+        local_rank=1, num_machines=2, gpus_per_node=2, num_processes=4)
+    for name, value in expected.items():
+        actual = getattr(cluster, name)
+        if type(actual) is not type(value) or actual != value:
+            raise ValueError(f"cluster must match the fixed ILVR topology: {name}")
+    for name in ("local_repo_root", "remote_repo_root", "remote_host_repo_root"):
+        _repository_root(getattr(cluster, name))
 
 
 @dataclass(frozen=True)
@@ -127,8 +170,7 @@ class LaunchPlan:
             or not 1024 <= self.main_process_port <= 65535
         ):
             raise ValueError("main_process_port must be between 1024 and 65535")
-        if self.cluster != ClusterSpec.default():
-            raise ValueError("cluster must match the fixed ILVR topology")
+        validate_cluster_topology(self.cluster)
         if self.world_size != self.cluster.num_processes:
             raise ValueError("world_size must equal the fixed four-process topology")
         if self.required_free_bytes != _TRAINING_REQUIRED_FREE_BYTES:
@@ -138,6 +180,7 @@ class LaunchPlan:
         expected_config = selected_deepspeed_config(
             self.stage, self.tuning_method, self.zero_stage
         )
+        expected_config = self.cluster.local_repo_root / "configs" / expected_config.name
         if self.deepspeed_config != expected_config:
             raise ValueError("deepspeed_config must match the selected ZeRO policy")
         if (
@@ -346,9 +389,15 @@ def build_launch_plan(
     run_id: str,
     main_process_port: int,
     attempt_id: str = "initial",
+    local_repo_root: Path | None = None,
+    remote_repo_root: Path | None = None,
+    remote_host_repo_root: Path | None = None,
 ) -> LaunchPlan:
     """Validate and build the fixed four-process training launch plan."""
-    cluster = ClusterSpec.default()
+    cluster = ClusterSpec.default(local_repo_root=local_repo_root,
+        remote_repo_root=remote_repo_root, remote_host_repo_root=remote_host_repo_root)
+    if cluster.local_repo_root.resolve() != _REPOSITORY_ROOT.resolve():
+        raise ValueError("local repository root must identify this checkout")
     config_path = selected_deepspeed_config(stage, tuning_method, zero_stage)
     source_config_path = (
         canonical_deepspeed_config_path(zero_stage)
@@ -375,6 +424,35 @@ def build_launch_plan(
         attempt_id=attempt_id,
     )
     return plan
+
+
+def decode_launch_plan(raw: bytes) -> LaunchPlan:
+    """Read the saved identity without reinterpreting it for this checkout."""
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f"duplicate launch plan field: {key}")
+            result[key] = value
+        return result
+    payload = json.loads(raw, object_pairs_hook=pairs)
+    if not isinstance(payload, dict) or not isinstance(payload.get("cluster"), dict):
+        raise ValueError("launch plan requires a cluster identity")
+    cluster = dict(payload["cluster"])
+    if "local_repo_root" not in cluster:
+        remote = _repository_root(cluster["remote_repo_root"])
+        try:
+            host = _remote_host_repository_root(remote)
+        except ValueError as error:
+            raise ValueError("unsupported legacy repository roots") from error
+        if str(host) != cluster.get("remote_host_repo_root"):
+            raise ValueError("legacy repository roots do not have same-root semantics")
+        cluster["local_repo_root"] = remote
+    for key in ("local_repo_root", "remote_repo_root", "remote_host_repo_root"):
+        cluster[key] = _repository_root(cluster[key])
+    payload["cluster"] = ClusterSpec(**cluster)
+    payload["deepspeed_config"] = Path(payload["deepspeed_config"])
+    return LaunchPlan(**payload)
 
 
 def validate_node_local_deepspeed_config(
@@ -852,6 +930,9 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", default="initial")
     parser.add_argument("--main-process-port", type=int, required=True)
+    parser.add_argument("--local-repo-root", type=Path)
+    parser.add_argument("--remote-repo-root", type=Path)
+    parser.add_argument("--remote-host-repo-root", type=Path)
 
 
 def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
@@ -862,6 +943,9 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
         run_id=args.run_id,
         main_process_port=args.main_process_port,
         attempt_id=args.attempt_id,
+        local_repo_root=args.local_repo_root,
+        remote_repo_root=args.remote_repo_root,
+        remote_host_repo_root=args.remote_host_repo_root,
     )
 
 
@@ -869,7 +953,7 @@ def _node_info(args: argparse.Namespace) -> NodeSnapshot:
     """Collect node-local evidence after validating the exact config bytes."""
     repository = Path(args.repository)
     if repository != _REPOSITORY_ROOT:
-        raise ValueError("node-info repository must be /root/workspace/ILVR")
+        raise ValueError(f"node-info repository must be {_REPOSITORY_ROOT}")
     expected_config = selected_deepspeed_config(
         args.stage, args.tuning_method, args.zero_stage
     )
@@ -995,7 +1079,7 @@ def _tmux_session_is_fresh(name: str) -> bool:
 def _remote_master_port_is_free(port: int) -> bool:
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        probe.bind((ClusterSpec.default().master_addr, port))
+        probe.bind(("10.1.102.41", port))
     except OSError:
         return False
     finally:
@@ -1313,7 +1397,7 @@ def _ownership_ready(argv: list[str]) -> int:
     ownership = read_ownership(args.ownership_path)
     if ownership.command_digest != args.command_digest:
         raise ValueError("ownership command digest mismatch")
-    if args.master_addr != ClusterSpec.default().master_addr:
+    if args.master_addr != "10.1.102.41":
         raise ValueError("readiness master address must match the fixed topology")
     if not 1024 <= args.main_process_port <= 65535:
         raise ValueError("readiness port must be between 1024 and 65535")
@@ -1649,7 +1733,168 @@ def _checkpoint_artifact_identity(
     }
 
 
+def _dil_full_model_probe_main(argv: list[str]) -> int:
+    """Fixed diagnostic terminal; ordinary training outputs are never consulted."""
+    from scripts.probe_dil_full_model import load_manifest, validate_rank_records
+    from src.multinode_runtime import build_dil_full_model_probe_commands, publish_small_file, _publish_bytes_no_replace
+
+    parser = argparse.ArgumentParser(prog="train-stage2 --dil-full-model-probe", allow_abbrev=False)
+    parser.add_argument("--dil-full-model-probe", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt-id", choices=("initial",), default="initial")
+    parser.add_argument("--zero-stage", type=int, choices=(2,), required=True)
+    parser.add_argument("--main-process-port", type=int, required=True)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        if any(os.environ.get(name) for name in ("RESUME_CHECKPOINT", "RESUME_FROM_CHECKPOINT", "STAGE2_STOP_AFTER_CHECKPOINT")):
+            raise ValueError("full-model diagnostic rejects training resume/update settings")
+        manifest_path = Path(args.dil_full_model_probe)
+        manifest = load_manifest(manifest_path, _REPOSITORY_ROOT)
+        digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        plan = build_launch_plan(stage="stage2", tuning_method="dora", zero_stage=2, run_id=args.run_id,
+                                 main_process_port=args.main_process_port)
+        commit = _repository_git_stdout(("rev-parse", "HEAD"))
+        commands = build_dil_full_model_probe_commands(plan, commit=commit, manifest=manifest_path, manifest_sha256=digest)
+        from scripts.probe_dil_full_model import SOURCE_LOCAL, SOURCE_REMOTE
+        selected_source = SOURCE_LOCAL if manifest["variant"] != "portTorch" else _REPOSITORY_ROOT
+        remote_source = SOURCE_REMOTE if manifest["variant"] != "portTorch" else _REPOSITORY_ROOT
+        common_inputs = (manifest_path, _REPOSITORY_ROOT / "scripts/probe_dil_full_model.py",
+                         *((_REPOSITORY_ROOT / "scripts/dil_boundary_observation.py",) if manifest.get("boundary_observation", False) else ()),
+                         plan.deepspeed_config,
+                         Path(manifest["data_path"]), Path(manifest["image_root"]),
+                         Path(manifest["initializer"]), Path(manifest["base"]))
+        roots = (_REPOSITORY_ROOT / "checkpoints", _REPOSITORY_ROOT / "results", _REPOSITORY_ROOT / "logs")
+        run_paths = (_REPOSITORY_ROOT / "checkpoints" / plan.run_id,
+                     _REPOSITORY_ROOT / "results" / plan.run_id,
+                     _REPOSITORY_ROOT / "logs/multinode" / plan.run_id / plan.attempt_id)
+        sessions = tuple(f"ilvr-{plan.run_id}-initial-rank{rank}" for rank in (0, 1))
+        # Common ordinary node resource preflight; source root identity has a
+        # node-specific authenticated preflight immediately before owned launch.
+        preflight = build_preflight_commands(plan, input_paths=common_inputs, artifact_roots=roots,
+                                            remote_run_paths=run_paths, local_run_paths=run_paths,
+                                            remote_tmux_sessions=(sessions[0],), local_tmux_sessions=(sessions[1],))
+        preflight_commands = []
+        from src.multinode_runtime import build_remote_exec
+        for machine_rank in (0, 1):
+            command = (str(_REPOSITORY_ROOT / "venv/ilvr-venv/bin/python"),
+                       str(_REPOSITORY_ROOT / "scripts/probe_dil_full_model.py"), "preflight",
+                       "--repository", str(_REPOSITORY_ROOT), "--manifest", str(manifest_path),
+                       "--manifest-sha256", digest, "--machine-rank", str(machine_rank))
+            preflight_commands.append(tuple(build_remote_exec(command)) if machine_rank == 0 else command)
+        if args.dry_run:
+            print(json.dumps({"kind": "dil-full-model-probe", "manifest_sha256": digest, "variant": manifest["variant"],
+                              "profile": manifest["profile"], "comparator": manifest["comparator"],
+                              "local": commands.local, "remote": commands.remote, "plan": _json_ready(plan),
+                              "local_source": str(selected_source), "remote_source": str(remote_source),
+                              "identity_preflight": preflight_commands, "resource_preflight": _json_ready(preflight)}, sort_keys=True))
+            return 0
+        def run(command):
+            return subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
+        remote = collect_node_snapshot(plan, node="remote", runner=run, commands=preflight,
+                                       input_paths=common_inputs, artifact_roots=roots, run_paths=run_paths,
+                                       tmux_sessions=(sessions[0],), repository=plan.cluster.remote_repo_root)
+        local = collect_node_snapshot(plan, node="local", runner=run, commands=preflight,
+                                      input_paths=common_inputs, artifact_roots=roots, run_paths=run_paths,
+                                      tmux_sessions=(sessions[1],), repository=plan.cluster.remote_repo_root)
+        if validate_preflight(remote, local).commit != commit:
+            raise ValueError("probe preflight commit changed")
+        for command in preflight_commands:
+            completed = run(command)
+            if completed.returncode:
+                raise RuntimeError(f"probe identity preflight failed: {completed.stderr}")
+            observed = json.loads(completed.stdout)
+            if observed["manifest_sha256"] != digest or observed["variant"] != manifest["variant"]:
+                raise ValueError("probe identity preflight changed")
+        runner = SubprocessCoordinatorRunner(plan, commands=commands, commit=commit,
+                                             log_root=_REPOSITORY_ROOT / "logs/multinode")
+        start_rank0_then_rank1(plan, runner, commands=commands, ready_timeout_seconds=600)
+        exits = monitor_owned_jobs(plan, runner, expected_commit=commit,
+                                   expected_command_digests={0: commands.command_digests[0], 1: commands.command_digests[1]})
+        if exits != {0: 0, 1: 0}:
+            raise RuntimeError(f"full-model diagnostic failed: {exits}")
+        records = [json.loads(runner.read_dil_full_model_probe_record(rank)) for rank in range(4)]
+        witness = validate_rank_records(records, plan.run_id, digest, manifest["variant"],
+                                        boundary_observation=manifest.get("boundary_observation", False))
+        result_dir = _REPOSITORY_ROOT / "results" / plan.run_id
+        for rank in (0, 1):
+            _publish_bytes_no_replace(result_dir / f"probe-rank-{rank}.json", json.dumps(records[rank], sort_keys=True).encode())
+        witness_path = result_dir / "initial-probe-witness.json"
+        # Four rank files remain the full evidence; keep the terminal metadata bounded.
+        witness["ranks"] = [{key: record[key] for key in ("rank", "host", "device", "machine_rank", "local_rank")}
+                            for record in witness["ranks"]]
+        publish_small_file(witness_path, json.dumps(witness, sort_keys=True).encode())
+        print(json.dumps({"probe_witness": str(witness_path)}, sort_keys=True))
+        return 0
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    return 2
+
+
+def _stage1_v5_witness_main(argv: list[str]) -> int:
+    """The fixed Stage1-v5 diagnostic uses ordinary coordinator ownership."""
+    from scripts.verify_stage1_v5 import selected_admission_geometry, validate_rank_records
+    from src.multinode_runtime import build_stage1_v5_witness_commands, publish_small_file
+    parser=argparse.ArgumentParser(prog='train-stage1 --stage1-v5-witness',allow_abbrev=False)
+    parser.add_argument('--stage1-v5-witness',action='store_true',required=True)
+    parser.add_argument('--run-id',required=True)
+    parser.add_argument('--zero-stage',type=int,choices=(1,),required=True)
+    parser.add_argument('--main-process-port',type=int,required=True)
+    for name in ('data-path','image-root','model','audit-json'):
+        parser.add_argument('--'+name,type=Path,required=True)
+    for name in ('local-repo-root','remote-repo-root','remote-host-repo-root'):
+        parser.add_argument('--'+name,type=Path)
+    parser.add_argument('--dry-run',action='store_true')
+    args=parser.parse_args(argv)
+    try:
+        plan=build_launch_plan(stage='stage1',tuning_method='dora',zero_stage=1,run_id=args.run_id,
+            main_process_port=args.main_process_port,local_repo_root=args.local_repo_root,
+            remote_repo_root=args.remote_repo_root,remote_host_repo_root=args.remote_host_repo_root)
+        commit=_repository_git_stdout(('rev-parse','HEAD'))
+        commands=build_stage1_v5_witness_commands(plan,commit=commit,data_path=args.data_path,
+            image_root=args.image_root,model=args.model,audit_path=args.audit_json)
+        inputs=(args.data_path,args.image_root,args.model,args.audit_json,
+                _REPOSITORY_ROOT/'scripts/verify_stage1_v5.py',plan.deepspeed_config)
+        roots=tuple(_REPOSITORY_ROOT/k for k in ('checkpoints','results','logs'))
+        paths=(_REPOSITORY_ROOT/'checkpoints'/plan.run_id,_REPOSITORY_ROOT/'results'/plan.run_id,
+               _REPOSITORY_ROOT/'logs/multinode'/plan.run_id/plan.attempt_id)
+        sessions=tuple(f'ilvr-{plan.run_id}-initial-rank{r}' for r in (0,1))
+        preflight=build_preflight_commands(plan,input_paths=inputs,artifact_roots=roots,
+            remote_run_paths=paths,local_run_paths=paths,remote_tmux_sessions=(sessions[0],),local_tmux_sessions=(sessions[1],))
+        if args.dry_run:
+            print(json.dumps(dict(kind='stage1-v5-witness',plan=_json_ready(plan),
+                local=commands.local,remote=commands.remote,node_specs=_json_ready(commands.node_specs),
+                resource_preflight=_json_ready(preflight)),sort_keys=True))
+            return 0
+        def run(command):
+            return subprocess.run(command,capture_output=True,text=True,check=False,timeout=_CONTROL_TIMEOUT_SECONDS)
+        remote=collect_node_snapshot(plan,node='remote',runner=run,commands=preflight,input_paths=inputs,
+            artifact_roots=roots,run_paths=paths,tmux_sessions=(sessions[0],))
+        local=collect_node_snapshot(plan,node='local',runner=run,commands=preflight,input_paths=inputs,
+            artifact_roots=roots,run_paths=paths,tmux_sessions=(sessions[1],))
+        if validate_preflight(remote,local).commit!=commit: raise ValueError('v5 witness preflight commit changed')
+        audited=json.loads(args.audit_json.read_text())
+        runner=SubprocessCoordinatorRunner(plan,commands=commands,commit=commit,log_root=_REPOSITORY_ROOT/'logs/multinode')
+        start_rank0_then_rank1(plan,runner,commands=commands,ready_timeout_seconds=600)
+        exits=monitor_owned_jobs(plan,runner,expected_commit=commit,
+            expected_command_digests={0:commands.command_digests[0],1:commands.command_digests[1]})
+        if exits!={0:0,1:0}: raise RuntimeError(f'Stage1-v5 witness failed: {exits}')
+        records=[json.loads(runner.read_stage1_v5_witness_record(rank)) for rank in range(4)]
+        result=validate_rank_records(records,run_id=plan.run_id,expected_geometry=selected_admission_geometry(audited),audited=audited)
+        path=_REPOSITORY_ROOT/'results'/plan.run_id/'coordinator-admission.json'
+        publish_small_file(path,json.dumps(result,sort_keys=True).encode())
+        print(json.dumps(dict(witness=str(path)),sort_keys=True))
+        return 0
+    except (OSError,RuntimeError,ValueError,json.JSONDecodeError) as error:
+        parser.error(str(error))
+    return 2
+
+
 def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
+    if stage == 'stage1' and '--stage1-v5-witness' in argv:
+        return _stage1_v5_witness_main(argv)
+    if stage == "stage2" and any(value == "--dil-full-model-probe" or value.startswith("--dil-full-model-probe=") for value in argv):
+        return _dil_full_model_probe_main(argv)
     parser = argparse.ArgumentParser(
         prog=f"python -m src.multinode train-{stage}", allow_abbrev=False
     )
@@ -1659,6 +1904,9 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
     parser.add_argument("--main-process-port", type=int, required=True)
     parser.add_argument("--result-root", default=str(_REPOSITORY_ROOT / "results"))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--local-repo-root", type=Path)
+    parser.add_argument("--remote-repo-root", type=Path)
+    parser.add_argument("--remote-host-repo-root", type=Path)
     args, stage_arguments = parser.parse_known_args(argv)
     try:
         result_root = Path(args.result_root)
@@ -1669,7 +1917,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             result_root.relative_to(canonical_result_root)
         except ValueError as error:
             raise ValueError(
-                "result_root must be inside /root/workspace/ILVR/results"
+                f"result_root must be inside {_REPOSITORY_ROOT / 'results'}"
             ) from error
         forwarded = tuple(stage_arguments)
         if stage == "stage1":
@@ -1716,6 +1964,16 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 benchmark_evidence_path=str(producer_evidence),
             )
             resume_requested = "RESUME_CHECKPOINT" in stage_environment
+        planned_stop = _argument_value(forwarded, "--stage2_stop_after_checkpoint") if stage == "stage2" else None
+        planned_stop_max_steps = None
+        if planned_stop is not None:
+            budget = _argument_value(forwarded, "--max_steps")
+            if not (planned_stop.isdecimal() and budget is not None and budget.isdecimal()
+                    and 0 < int(planned_stop) < int(budget)):
+                raise ValueError("stage2_stop_after_checkpoint requires 0 < stop < explicit max_steps")
+            if resume_requested:
+                raise ValueError("stage2_stop_after_checkpoint is fresh-run only")
+            planned_stop_max_steps = int(budget)
         if resume_requested and args.attempt_id == "initial":
             raise ValueError("resume requires a fresh --attempt-id, not 'initial'")
         if stage == "stage1" and resume_requested:
@@ -1738,6 +1996,9 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             run_id=args.run_id,
             main_process_port=args.main_process_port,
             attempt_id=args.attempt_id,
+            local_repo_root=args.local_repo_root,
+            remote_repo_root=args.remote_repo_root,
+            remote_host_repo_root=args.remote_host_repo_root,
         )
         commit = _repository_git_stdout(("rev-parse", "HEAD"))
         commands = build_owned_tmux_commands(
@@ -1790,6 +2051,15 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             )
             if "RESUME_CHECKPOINT" in stage_environment:
                 input_paths += (Path(stage_environment["RESUME_CHECKPOINT"]),)
+            if stage_environment.get("STEP_PREFERENCE_ENABLED") == "true":
+                input_paths += tuple(
+                    Path(stage_environment[name])
+                    for name in (
+                        "STAGE1_ADAPTER_PATH", "STAGE2A_CHECKPOINT_PATH",
+                        "STEP_NEGATIVE_PATH", "STEP_NEGATIVE_MANIFEST"
+                    )
+                    if stage_environment.get(name)
+                )
         artifact_roots = (checkpoint_root, result_root, _REPOSITORY_ROOT / "logs")
         run_paths = [control_directory, witness_path, stage_log_file]
         if commands.finite_loss_evidence_path is not None:
@@ -1839,7 +2109,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             artifact_roots=artifact_roots,
             run_paths=run_paths,
             tmux_sessions=(sessions[1],),
-            repository=plan.cluster.remote_repo_root,
+            repository=plan.cluster.local_repo_root,
         )
         report = validate_preflight(remote_snapshot, local_snapshot)
         if report.commit != commit:
@@ -1850,6 +2120,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             commit=commit,
             log_root=log_root,
         )
+        saved_stage1_resume = None
         if resume_requested:
             resume_source = (
                 Path(_argument_value(forwarded, "--resume"))
@@ -1873,7 +2144,16 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 requested_identity=resume_identity,
                 destination=redistributed,
             )
-        start_rank0_then_rank1(plan, runner, commands=commands)
+            if stage == 'stage1' and (redistributed / 'stage1_v5.json').exists():
+                # Capture the strict contract after authenticated redistribution,
+                # before Trainer can rotate away its source checkpoint.
+                from stage1.v5_resume import load_v5_contract
+                saved_stage1_resume = load_v5_contract(redistributed)
+        # Stage 2 measures the full dataset before opening the rendezvous port.
+        start_rank0_then_rank1(
+            plan, runner, commands=commands,
+            ready_timeout_seconds=600 if stage == "stage2" else 30,
+        )
         exit_codes = monitor_owned_jobs(
             plan,
             runner,
@@ -1897,7 +2177,21 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             from src.stage1.training_evidence import decode_stage1_training_evidence
 
             raw_evidence = runner.read_stage1_training_evidence(evidence_path)
+            saved_execution, saved_schedule = {}, {}
+            if saved_stage1_resume is not None:
+                saved_execution = saved_stage1_resume['execution']
+                saved_schedule = saved_stage1_resume['schedule']
+            producer_values = {}
+            for flag, key, fallback in (
+                ('--micro-batch', 'per_device_train_batch_size', '1'),
+                ('--gradient-accumulation', 'gradient_accumulation_steps', '2'),
+                ('--ema-tau', 'ema_tau', '1.0'), ('--seed', 'seed', '42'),
+            ):
+                supplied = _argument_value(forwarded, flag)
+                producer_values[key] = supplied if supplied is not None else saved_execution.get(key, fallback)
             step_value = _argument_value(forwarded, "--max-steps")
+            if step_value is None and 'configured_max_steps' in saved_schedule:
+                step_value = str(saved_schedule['configured_max_steps'])
             if step_value is None:
                 evidence_payload = json.loads(raw_evidence)
                 evidence_step = (
@@ -1926,16 +2220,13 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                     checkpoint_run_path / f"checkpoint-{final_step}"
                 ),
                 expected_global_step=final_step,
-                expected_micro_batch=int(
-                    _argument_value(forwarded, "--micro-batch") or "8"
+                expected_producer_checkpoint=(
+                    plan.cluster.remote_repo_root / "checkpoints" / plan.run_id / f"checkpoint-{final_step}"
                 ),
-                expected_gradient_accumulation_steps=int(
-                    _argument_value(forwarded, "--gradient-accumulation") or "2"
-                ),
-                expected_ema_tau=float(
-                    _argument_value(forwarded, "--ema-tau") or "0.999"
-                ),
-                expected_seed=int(_argument_value(forwarded, "--seed") or "42"),
+                expected_micro_batch=int(producer_values['per_device_train_batch_size']),
+                expected_gradient_accumulation_steps=int(producer_values['gradient_accumulation_steps']),
+                expected_ema_tau=float(producer_values['ema_tau']),
+                expected_seed=int(producer_values['seed']),
             )
             publish_small_file(
                 evidence_path,
@@ -1952,22 +2243,37 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 raise ValueError(
                     f"{step_option} must identify the final checkpoint step"
                 )
-            final_step = int(step_value)
+            final_step = int(planned_stop) if planned_stop is not None else int(step_value)
         checkpoint_path = checkpoint_run_path / f"checkpoint-{final_step}"
         artifact_identity = _checkpoint_artifact_identity(
             plan,
             commit=commit,
             global_step=final_step,
         )
-        collect_checkpoint_artifacts(
+        collected_entries = collect_checkpoint_artifacts(
             runner,
             checkpoint_path=checkpoint_path,
             runtime_identity=artifact_identity,
             exit_codes=exit_codes,
             world_size=plan.world_size,
         )
+        if (stage == 'stage1' and not resume_requested
+                and _argument_value(forwarded, '--stage1-variant') == 'v5'):
+            required_v5 = {Path('stage1_v5.json'), Path('stage1_v5_reference.pt')}
+            if not required_v5 <= {entry.relative_path for entry in collected_entries}:
+                raise ValueError('Stage1-v5 final checkpoint lacks saved contract/initial reference')
+            # Reuse the existing exact-identity/delta/no-overwrite resume route
+            # so final v5 training state is retained physically on both nodes.
+            retained = redistribute_resume_checkpoint(
+                runner, checkpoint_path=checkpoint_path,
+                checkpoint_identity=artifact_identity, requested_identity=artifact_identity,
+                destination=checkpoint_path,
+            )
+            if not required_v5 <= {entry.relative_path for entry in retained}:
+                raise ValueError('Stage1-v5 local final checkpoint lacks saved reference state')
         if stage == "stage1":
-            batch_value = _argument_value(forwarded, "--micro-batch") or "8"
+            batch_value = (producer_values['per_device_train_batch_size'] if ordinary_stage1
+                           else _argument_value(forwarded, "--micro-batch") or "1")
             batch_per_gpu = int(batch_value)
         else:
             batch_per_gpu = 1
@@ -1980,6 +2286,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 batch_per_gpu=batch_per_gpu,
                 finite_loss_evidence_path=commands.finite_loss_evidence_path,
                 expected_global_step=final_step,
+                **({"planned_stop_max_steps": planned_stop_max_steps} if planned_stop is not None else {}),
             )
         except ValueError as error:
             incomplete = write_incomplete_attempt(
@@ -2176,8 +2483,19 @@ def _evaluate_main(argv: list[str]) -> int:
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--max-sequence-length", type=int, default=32768)
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
+    parser.add_argument(
+        "--generation-limit-policy",
+        choices=("bounded", "external_full_latent_block"),
+        default="bounded",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--vision-ablation", choices=("none", "all", "interleaved"), default="none"
+    )
+    parser.add_argument("--local-repo-root", type=Path)
+    parser.add_argument("--remote-repo-root", type=Path)
+    parser.add_argument("--remote-host-repo-root", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -2193,21 +2511,27 @@ def _evaluate_main(argv: list[str]) -> int:
             max_new_tokens=args.max_new_tokens,
             max_sequence_length=args.max_sequence_length,
             repetition_penalty=args.repetition_penalty,
+            generation_limit_policy=args.generation_limit_policy,
             temperature=args.temperature,
             top_p=args.top_p,
+            vision_ablation=args.vision_ablation,
+            cluster=(ClusterSpec.default(local_repo_root=args.local_repo_root, remote_repo_root=args.remote_repo_root,
+                remote_host_repo_root=args.remote_host_repo_root) if any((args.local_repo_root, args.remote_repo_root, args.remote_host_repo_root)) else None),
         )
         if args.dry_run:
             dry_identity = f"task6:{'0' * 64}"
-            variants = {
-                stage: _build_evaluation_commands_for_stage(
-                    plan,
-                    stage=stage,
-                    model_identity=dry_identity,
-                    commit="0" * 40,
-                )
-                for stage in ("stage1", "stage2")
-            }
-            first = variants["stage1"]
+            variants = {}
+            for stage in ("stage1", "stage2"):
+                try:
+                    variants[stage] = _build_evaluation_commands_for_stage(
+                        plan,
+                        stage=stage,
+                        model_identity=dry_identity,
+                        commit="0" * 40,
+                    )
+                except ValueError as error:
+                    variants[stage] = {"unsupported": str(error)}
+            first = variants["stage2"] if args.vision_ablation != "none" else variants["stage1"]
             print(
                 json.dumps(
                     {
@@ -2220,7 +2544,11 @@ def _evaluate_main(argv: list[str]) -> int:
                         ],
                         "remote_result_pull": list(first.remote_pull),
                         "worker_commands_by_observed_stage": {
-                            stage: [list(worker.launch) for worker in commands.workers]
+                            stage: (
+                                commands
+                                if isinstance(commands, dict)
+                                else [list(worker.launch) for worker in commands.workers]
+                            )
                             for stage, commands in variants.items()
                         },
                     },
@@ -2361,9 +2689,9 @@ def _main(argv: list[str] | None = None) -> int:
                 artifact_roots = tuple(Path(path) for path in args.artifact_root)
             else:
                 artifact_roots = (
-                    plan.cluster.remote_repo_root / "checkpoints",
-                    plan.cluster.remote_repo_root / "results",
-                    plan.cluster.remote_repo_root / "logs",
+                    plan.cluster.local_repo_root / "checkpoints",
+                    plan.cluster.local_repo_root / "results",
+                    plan.cluster.local_repo_root / "logs",
                 )
             remote_run_paths = tuple(
                 root / plan.run_id / plan.attempt_id for root in artifact_roots
@@ -2427,7 +2755,7 @@ def _main(argv: list[str] | None = None) -> int:
                 tmux_sessions=(sessions[1],),
                 runner=runner,
                 commands=commands,
-                repository=plan.cluster.remote_repo_root,
+                repository=plan.cluster.local_repo_root,
             )
             report = validate_preflight(remote, local)
             print(json.dumps(_json_ready(report), sort_keys=True))
