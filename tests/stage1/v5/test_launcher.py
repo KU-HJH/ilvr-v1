@@ -235,6 +235,9 @@ def test_actual_coordinator_adaptive_resume_omits_query_defaults_on_both_nodes(t
     local, remote = ROOT, tmp_path/'remote'
     run_id = 'query-resume-' + uuid.uuid4().hex
     saved = adaptive_contract()
+    assert saved['execution']['query_config']['schema_version'] == 2
+    assert saved['execution']['query_config']['formula_id'] == (
+        'stage1_placeholder_discounted_segments_cosine_relative_v2')
     saved['execution'].update(tuning_method='dora', per_device_train_batch_size=1,
                               attention_implementation='sdpa', textual_states='previous')
     try:
@@ -273,7 +276,7 @@ def test_actual_coordinator_adaptive_resume_omits_query_defaults_on_both_nodes(t
             args = parse_args(parser_argv)
             assert args.stage1_query_config.mode == 'adaptive'
             assert args.stage1_query_config.text_gamma == .55
-            assert args.stage1_query_config.attention_layers == 'last4'
+            assert args.stage1_query_config.attention_layers == 'last'
             assert args.data_path == str(root/'data/TRAIN.jsonl')
             assert args.image_root == str(root/'data/images')
     finally:
