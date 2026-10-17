@@ -16,8 +16,9 @@ supplied global workflow policy, and relevant skills were read.
 
 Active lifecycle: approved commitment v1 implemented through the retained
 Subagent-driven method; specification, quality and final reviews passed;
-fresh full-project verification passed. Finishing is at the human branch
-handoff choice, with no integration or cleanup authorized. Earlier pending
+fresh full-project verification passed. The human-selected local merge is
+complete, with independent integration review and merged full-suite PASS.
+Host-managed worktrees are preserved. Earlier pending
 entries below describe their time; later evidence sections give current status.
 
 The preliminary question distinguished a token denominator across all ranks
@@ -344,3 +345,109 @@ independent reviews and stated tests/contract checks. No real multi-node
 ZeRO gradient, production GPU resume, new trained checkpoint or generation
 improvement has been established. A new token-mean training run must be
 fresh and follow the standing separate launch policy.
+
+## Local integration authorization and merge
+
+The user replied `1` to the final four-option menu, explicitly authorizing
+local merge of `stage1_v5` into `Stage1-v5`. No repeated approval is needed.
+Root resumed finishing-a-development-branch Option1 and re-read canonical
+AGENTS and applicable finishing/verification/worktree/SDD instructions.
+This is integration of already approved and reviewed behavior, not a new
+design or behavior-change request. No implementation change was authored;
+new brainstorming/planning/TDD gates are therefore not triggered by the
+automatic Git merge. Any necessary code fix will use the retained SDD route
+with causal tests and independent reviews.
+
+Target is the existing host-managed linked worktree
+`/root/.codex/worktrees/6b9d/ILVR`, on `Stage1-v5`, at
+`52a39d780ab54ee6a4ab90c9b42262244d36045a`. Tracked files were clean;
+pre-existing untracked caches and
+`docs/superpowers/2026-10-15-stage1-v5-retrieval-workflow.md` are preserved.
+The target has separately reviewed throughput changes (attention hoisting,
+compact selector input, full-vision collation reuse) and equivalent reviewed
+worker forwarding. Root read their existing brief/approval/review/full-suite
+evidence rather than reimplementing those identical changes. The branch has
+no configured upstream; `git pull` has no applicable tracking branch and no
+remote integration or push was attempted. Canonical checkout remains untouched.
+
+Source is `stage1_v5` at `ac223097cc5e3108af40a73af9723ac1caa7ec5a`;
+its completed review/full-suite evidence above remains valid for that source.
+`git merge-tree --write-tree Stage1-v5 stage1_v5` exited0, predicted tree
+`c402779482a9c605e7a33cee6004cd21c0d59e00`, no conflicts. Root then ran
+`git merge --no-ff stage1_v5 -m 'Merge stage1_v5 query and global-token DIL into Stage1-v5'`
+in the existing target worktree. Exit0; actual merge
+`1c8647279cf272c4405e77b1f018ebf2bf6ea93e` has parents
+`52a39d7` and `ac22309`, and matches the predicted tree exactly.
+No manual conflict resolution or requested source/test edit was performed.
+
+The source-parent comparison retains target throughput files/tests and
+changes only the reviewed throughput hunks in data/selection/trace plus
+the compact selector call in `v5_trainer`; target-parent comparison retains
+adaptive query and token-DIL changes. Existing approval/review is reused for
+identical features. An independent integration review will check actual
+combined paths before one fresh full-suite run on merged content. Prior
+single-parent results do not establish the merged test-pass claim.
+
+Host-managed worktree ownership prevents removing these workspaces through
+Git cleanup. Source branch is still attached to the preserved host worktree;
+no forced deletion, detachment, cleanup or process signaling is performed.
+No training/evaluation campaign, dependency installation or remote write is
+authorized or required for this local merge.
+
+Fresh independent `/root/stage1_v5_merge_review` assessed actual combined
+runtime paths plus both-parent identity/diffs, reusing prior review of the
+identical components. Exact merge `1c86472`: **spec/quality/integration PASS**,
+zero Critical/Important/Minor findings; no requested code changes. Root read
+its complete report at
+`results/stage1-v5-local-merge-20261017/integration-review.md`, SHA256
+`4ab4a4a99528c1f126d819aa2ae3948ffd26afd77bad2090b5ade8fc89323c22`.
+Bounded fresh CPU witnesses:67passed,2CUDA cases skipped,11.16s. The review
+explicitly distinguishes preserved code, actual tiny Qwen/teacher/parent
+runtime observations and unverified production/GPU/distributed behavior.
+
+Root continued finishing Option1 and verification-before-completion after
+that PASS. Selected required merged-result witness: one full project suite
+using the same recorded venv/environment command, in the target worktree.
+This is a new merged-content claim, not a repetition of the single-parent
+suite. Output is `logs/stage1-v5-local-merge-20261017/full-suite.log`.
+No merged test-pass/completion claim is made before complete output/exit
+status are read. No additional product edit occurred after merge review.
+
+## Local merge verified and completed
+
+The required merged-result command ran once in the target worktree:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q
+```
+
+Root read the complete output and exit status: **4935 passed, 11 skipped,
+1 warning in1219.94s (20m19s)**, exit0. Full log:
+`logs/stage1-v5-local-merge-20261017/full-suite.log`, SHA256
+`38a8e02c83863861bbd6209fc1093126572119300bb1ed5b22204c242d2c78ef`.
+Warning is the same existing CPUAdam test's unset `TORCH_CUDA_ARCH_LIST`;
+skipped cases are reported as skipped, not executed passes. This one fresh
+merged-content run supplies both finishing Option1's post-merge test gate
+and verification-before-completion's merged test-pass claim. No repeated
+broad suite or new product fix was needed.
+
+Post-suite exact source equality with reviewed merge `1c86472` passed:
+`git diff --exit-code 1c8647279cf272c4405e77b1f018ebf2bf6ea93e -- src tests transformers/src scripts run_stage1_training.sh README.md`.
+Whitespace and source-ancestor checks passed. Merge HEAD, both parents and
+tree still matched the independently reviewed identities. Only this
+root-owned workflow record changed; existing untracked files remain.
+The following control-only commit records completion without changing the
+reviewed/tested product content.
+
+Finishing Option1 is complete: local merge `1c86472` incorporates the source
+branch into `Stage1-v5`, preserves target throughput and source query/token
+behavior, and passes merged verification. The user already selected this
+integration action, so no second integration menu or approval is requested.
+Both Codex host-managed worktrees remain intact under the ownership rule;
+the source branch stays attached to its preserved host workspace. No forced
+branch deletion, worktree removal, canonical checkout switch, remote push,
+dependency change or actual training/evaluation launch occurred.
+
+All completion evidence here concerns local code integration and tests.
+Actual training quality, four-rank GPU/ZeRO behavior, production GPU resume
+and end-to-end performance remain outside the authorized local-merge task.
