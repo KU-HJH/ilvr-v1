@@ -264,3 +264,34 @@ Active phase: required final independent whole-change review, covering both
 metric `9d1b03a` and activation `cc4336f`, before final full-suite verification.
 Unmeasured real-data relevance, GPU behavior/cost and accuracy remain unknown.
 No training/evaluation/real-data premise probe has been launched or authorized.
+
+## Final whole-change review and verification selection
+
+Distinct fresh `/root/content_metric_final_review` returned final whole-change
+PASS on `b39e0f2e4cea04dd8241a8ae358c4ca4ff0ee062..38d3852edde07876bde900224859195352afa9d2`.
+It inspected actual code/call/data/state and changed tests, read the complete
+548-pass log, checked the historical sidecar hash and diff hygiene; no edits or
+test-suite repetition. Critical/Important/Minor: none. Product is still exactly
+`9d1b03a` plus `cc4336f`; all independent gates are green, no unresolved finding.
+
+Root applied verification-before-completion and finishing-a-development-branch;
+announced both completion gates. Finishing applies to the feature handoff and
+its Step1 project full suite supplies the fresh test-pass witness for both
+gates. No extra full suite is added. Workspace is named/host-managed, Git dir
+differs from common dir; `main` exists with merge-base
+`2497ee7bafad1b51ef6c2aba6f40f084830916c4`. Human retains branch disposition;
+no worktree deletion/merge/push is authorized by this verification.
+
+Selected command, after final review and before any completion claim:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-v5-content-metric-20261017/final-pytest-r1 > logs/stage1-v5-content-metric-20261017/final-full-suite.log 2>&1
+```
+
+Pre-command guards freshly PASS: checkpoint link preserved; task-owned basetemp
+resolves beneath canonical checkpoint tree and does not exist (pytest clears
+explicit basetemp); output log is new; exact product-file equality against
+reviewed `38d3852` and `git diff --check` both exit0. Plan command updated only
+to keep any temporary scalar/model fixtures under the checkpoint namespace.
+This is not a product or formula change. Frozen proposal/commitment hashes
+rechecked unchanged. Full-suite result remains pending; no completion claim.

@@ -818,9 +818,12 @@ off the completed feature. Its project full suite is selected as the shared
 fresh test-pass witness, run once at the independently reviewed final revision:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q > logs/stage1-v5-content-metric-20261017/final-full-suite.log 2>&1
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-v5-content-metric-20261017/final-pytest-r1 > logs/stage1-v5-content-metric-20261017/final-full-suite.log 2>&1
 ```
 
+Before this command verify that the basetemp is under the canonical checkpoint
+symlink and does not exist: pytest clears its explicitly provided basetemp.
+Use this distinct task-owned path once, never an existing artifact directory.
 Expected: exit0 with all applicable tests passing; established skips may remain.
 Read complete output and preserve counts/duration/warnings. A configured process
 or test filename does not prove a runtime claim. Capture separate claim-specific
