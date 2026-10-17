@@ -213,6 +213,7 @@ def validate_runtime_binding(audited, binding):
         parent_epoch_update_budget=audited['optimizer_updates_for_one_exposure'],
         final_window_microbatches=audited['final_window_microbatches'],dataloader_drop_last=False,
         tail_native_denominator='configured_gas_world_size',
+        dil_denominator='actual_window_eligible_dil_tokens',
         auxiliary_denominator='actual_window_original_blocks_including_empty')
     for key,value in fixed.items():
         if schedule.get(key)!=value: raise ValueError(f'original contract/audit schedule mismatch: {key}')
@@ -284,6 +285,14 @@ def validate_rank_records(records, *, run_id, expected_geometry, audited):
                              else [[1,0],[1,1],[0,0],[0,2]])
             if counts!=expected_counts or sum(map(sum,counts))!=n:
                 raise ValueError('rank counts do not match global original-step denominator')
+            token_counts=w['all_rank_dil_token_counts']
+            expected_tokens=([[3,1,0,0],[1,0,1,0],[0,0,0,0],[1,3,0,1]] if m==4
+                             else [[1,0],[1,1],[0,0],[0,3]])
+            token_total=11 if m==4 else 6
+            if (token_counts!=expected_tokens or sum(map(sum,token_counts))!=token_total
+                    or w['global_dil_tokens']!=token_total
+                    or w['dil_scale']!=16/token_total or w['auxiliary_scale']!=16/n):
+                raise ValueError('rank counts/scales do not match global DIL-token denominator')
             for key,limit in (('gradient_error',.005),('update_error',2e-6)):
                 if not math.isfinite(w[key]) or w[key]>limit: raise ValueError('global oracle mismatch')
             if not math.isfinite(w['gradient_norm']) or w['gradient_norm']<=0: raise ValueError('nonfinite/zero gradient')
@@ -332,20 +341,24 @@ def tiny_learning_rate(optimizer_step):
 def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
     """Real parent training loop, checkpoint and optimizer; engine when distributed.
 
-    Scalar losses isolate parent/engine reduction. Full Qwen calls are witnessed
+    Scalar logits feed the actual objective to isolate parent/engine reduction. Full Qwen calls are witnessed
     separately by production_witness; this fixture never claims model equivalence.
     """
+    from copy import deepcopy
     import torch
     from torch.utils.data import SequentialSampler
     from transformers import Trainer, TrainingArguments
     from stage1.v5_trainer import CustomTrainerStage1V5
     from stage1.v5_metadata import V5BatchMetadata,V5Block
-    from stage1.v5_reduction import v5_auxiliary_scale
+    from stage1.v5_reduction import v5_auxiliary_scale, v5_dil_scale
+    from stage1.v5_config import Stage1V5Config
+    from stage1.v5_objective import compute_v5_loss_sums
     from tests.stage1.v5.test_reduction import FOUR_RANK_WINDOWS
     world=1 if use_cpu else 4
     counts=FOUR_RANK_WINDOWS[0]
     tails=FOUR_RANK_WINDOWS[1]
-    sources=[]; windows=[]; local_counts=[]
+    sources=[]; windows=[]; local_counts=[]; local_token_rows=[]; oracle_states=[]
+    config=Stage1V5Config(text_kl_weight=0.,lambda_topk_entropy=.1,preference_topk_k=2)
     class Scalar(torch.nn.Module):
         def __init__(self):
             super().__init__(); self.p=torch.nn.Parameter(torch.tensor(.2))
@@ -363,10 +376,18 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
         def _get_train_sampler(self): return SequentialSampler(self.train_dataset)
         def compute_loss(self,model,inputs,**kwargs):
             window=inputs['stage1_v5_window']
-            return .1*model().square()+v5_auxiliary_scale(window)*inputs['stage1_v5_metadata'].original_step_count*model().pow(3)
+            metadata=inputs['stage1_v5_metadata']
+            p=model(); n=len(metadata.query_keys)
+            clean=p*p.new_tensor([.2,-.5,.8]).repeat(n,1)
+            reference=p.new_tensor([.3,.6,-.4]).repeat(n,1)
+            off=p*p.new_tensor([.6,-.2,.1]).repeat(n,1)
+            sums=compute_v5_loss_sums(clean,reference,off,None,metadata,config)
+            return (.1*p.square()+v5_dil_scale(window)*sums.dil_sum
+                    +v5_auxiliary_scale(window)*.1*sums.entropy_sum)
         def training_step(self,model,inputs,*args,**kwargs):
             sources.append(inputs['source'])
             local_counts.append(inputs['stage1_v5_metadata'].original_step_count)
+            local_token_rows.append(tuple(b.target_ids for b in inputs['stage1_v5_metadata'].blocks))
             self.latest_window=inputs['stage1_v5_window']
             if not use_cpu and not getattr(self,'engine_observed',False):
                 engine=self.accelerator.deepspeed_engine_wrapped.engine
@@ -385,15 +406,37 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
     def before_step(trainer,engine=None):
         w=trainer.latest_window
         actual_counts=local_counts[-w.actual_microbatches:]
+        token_rows=local_token_rows[-w.actual_microbatches:]
         if not use_cpu:
             import torch.distributed as dist
-            gathered=[None]*4; dist.all_gather_object(gathered,actual_counts)
+            gathered_rows=[None]*4; dist.all_gather_object(gathered_rows,(actual_counts,token_rows))
+            gathered=[row[0] for row in gathered_rows]
+            rank_tokens=[row[1] for row in gathered_rows]
             if sum(map(sum,gathered))!=w.global_original_steps: raise ValueError('actual count collective mismatch')
-        else: gathered=[actual_counts]
+        else: gathered=[actual_counts]; rank_tokens=[token_rows]
         pending['all_rank_original_counts']=gathered
+        token_counts=[[sum(map(len,batch)) for batch in rank] for rank in rank_tokens]
+        if sum(map(sum,token_counts))!=w.global_dil_tokens:
+            raise ValueError('actual DIL token count collective mismatch')
+        pending['all_rank_dil_token_counts']=token_counts
         # Independent global arithmetic; no candidate scale/window helper used.
         oracle_optimizer.zero_grad()
-        objective=.1*w.actual_microbatches/4*oracle.square()+oracle.pow(3)
+        logp=(oracle*torch.tensor([.2,-.5,.8])).log_softmax(-1)
+        logmu=torch.tensor([.3,.6,-.4]).log_softmax(-1)
+        ratio=logp-logmu
+        logq=(oracle*torch.tensor([.6,-.2,.1]))[[0,2]].log_softmax(-1)
+        entropy=math.log(2)+(logq.exp()*logq).sum()
+        dil,aux=oracle*0,oracle*0
+        for rank in rank_tokens:
+            for batch in rank:
+                for targets in batch:
+                    if targets:
+                        dil=dil+torch.nn.functional.softplus(-ratio[list(targets)]).sum()
+                        dil=dil+len(targets)*(logmu.exp()*torch.nn.functional.softplus(ratio)).sum()
+                        aux=aux+.1*entropy
+        objective=(.1*w.actual_microbatches/4*oracle.square()
+            +(dil/w.global_dil_tokens if w.global_dil_tokens else dil*0)
+            +(aux/w.global_original_steps if w.global_original_steps else aux*0))
         objective.backward()
         if engine is None:
             observed=trainer.model.p.grad.detach().float().cpu()
@@ -418,15 +461,26 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
         else:
             from deepspeed.utils import safe_get_full_fp32_param
             actual=safe_get_full_fp32_param(trainer.model.p).detach().float().cpu()
+        # Save only the independent scalar oracle's parameter and AdamW state,
+        # after its literal token/block update, without retaining an autograd graph.
+        oracle_states.append((oracle.detach().clone(),deepcopy(oracle_optimizer.state_dict())))
         w=trainer.latest_window
         windows.append(dict(global_original_steps=w.global_original_steps,configured_gas=4,
+            global_dil_tokens=w.global_dil_tokens,dil_scale=v5_dil_scale(w),
+            auxiliary_scale=v5_auxiliary_scale(w),
             actual_microbatches=w.actual_microbatches,native_denominator=4*world,
-            optimizer_step=pending['optimizer_step'],learning_rate=pending['learning_rate'],all_rank_original_counts=pending['all_rank_original_counts'],gradient_error=pending['error'],gradient_norm=pending['norm'],update_error=float((actual-oracle.detach()).abs())))
+            optimizer_step=pending['optimizer_step'],learning_rate=pending['learning_rate'],
+            all_rank_original_counts=pending['all_rank_original_counts'],
+            all_rank_dil_token_counts=pending['all_rank_dil_token_counts'],
+            gradient_error=pending['error'],gradient_norm=pending['norm'],update_error=float((actual-oracle.detach()).abs())))
     def collate(rows):
         slot=rows[0]; micro=slot if use_cpu else slot//4; rank=0 if use_cpu else slot%4
-        local=(sum(c[micro%4] for c in counts) if micro<8 else sum(c[micro-8] for c in tails)) if use_cpu else (
-            counts[rank][micro%4] if micro<8 else tails[rank][micro-8])
-        blocks=tuple(V5Block(0,i,2*i,2*i+1,(),(),()) for i in range(local))
+        active_counts=counts if micro<8 else tails
+        position=micro%4 if micro<8 else micro-8
+        rows=[(r,i) for r in (range(4) if use_cpu else (rank,))
+              for i in range(active_counts[r][position])]
+        blocks=tuple(V5Block(0,j,8*j,8*j+1,tuple(range(8*j+2,8*j+3+i)),
+                            ((r+i)%3,)*(i+1),()) for j,(r,i) in enumerate(rows))
         return dict(source=micro,stage1_v5_metadata=V5BatchMetadata(blocks))
     def build(output):
         args=TrainingArguments(str(output),use_cpu=use_cpu,bf16=not use_cpu,
@@ -446,17 +500,18 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
     original=build(directory/'initial')
     original.train()
     full_windows=list(windows)
+    saved_oracles=tuple(oracle_states)
     del original
     continuations=[]
     # Each independently restored parent+ZeRO continuation retains absolute source positions.
     for saved in (1,2):
         sources.clear(); windows.clear(); local_counts.clear()
         trainer=build(directory/f'continuation-{saved}')
-        # Oracle restores exact independent AdamW state for the prior updates.
-        oracle.data.copy_(initial_value); oracle_optimizer=torch.optim.AdamW([oracle],lr=0.,weight_decay=.01)
-        for i in range(saved):
-            oracle_optimizer.zero_grad(); (.1*oracle.square()+oracle.pow(3)).backward()
-            oracle_optimizer.param_groups[0]['lr']=tiny_learning_rate(i); oracle_optimizer.step()
+        # Restore the exact independent new-objective state, including moments
+        # from the zero-LR first update. Deep copies keep continuations isolated.
+        parameter,state=saved_oracles[saved-1]
+        oracle.data.copy_(parameter); oracle_optimizer=torch.optim.AdamW([oracle],lr=0.,weight_decay=.01)
+        oracle_optimizer.load_state_dict(deepcopy(state))
         trainer.train(resume_from_checkpoint=str(directory/'initial'/f'checkpoint-{saved}'))
         continuations.append(dict(saved_step=saved,sources=list(sources),updates=len(windows),final_step=trainer.state.global_step,learning_rates=[w['learning_rate'] for w in windows]))
         if any(w['gradient_error']>.005 or w['update_error']>2e-6 for w in windows):

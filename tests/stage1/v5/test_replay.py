@@ -216,7 +216,7 @@ def oracle_losses(output,x,noise,labels,support):
     logp = clean.log_softmax(-1)
     logmu = output['reference'][0,list(PREDICTORS)].detach().float().log_softmax(-1)
     gt = (logp-logmu).gather(1,TARGETS[:,None]).squeeze(1)
-    dil = block_mean(F.softplus(-gt)+(logmu.exp()*F.softplus(logp-logmu)).sum(-1))
+    dil = (F.softplus(-gt)+(logmu.exp()*F.softplus(logp-logmu)).sum(-1)).mean()
     selected = output['v'].float().gather(-1,support)
     logq = selected.log_softmax(-1)
     entropy = block_mean(torch.log(torch.tensor(50.))+(logq.exp()*logq).sum(-1))

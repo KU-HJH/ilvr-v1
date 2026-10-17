@@ -4,6 +4,8 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd -- "$repo_root"
 run_id= port= remote_root= remote_host_root= max_steps= settings=
 dry_run=false
+query_mode=legacy history_text_gamma=0.9 history_attention_layers=last
+query_arguments=()
 while (( $# )); do
     case $1 in
         --run-id|--main-process-port|--remote-repo-root|--remote-host-repo-root|--max-steps|--settings)
@@ -14,6 +16,10 @@ while (( $# )); do
                 --max-steps) max_steps=$2 ;; --settings) settings=$2 ;;
             esac
             shift 2 ;;
+        --query_mode|--history_text_gamma|--history_attention_layers)
+            (( $# >= 2 )) && [[ -n $2 ]] || { printf 'error: %s requires a value\n' "$1" >&2; exit 2; }
+            query_arguments+=("$1" "$2")
+            shift 2 ;;
         --dry-run) dry_run=true; shift ;;
         *) printf 'error: unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -22,7 +28,24 @@ done
 [[ $max_steps =~ ^[1-9][0-9]*$ ]] || { printf 'error: --max-steps must come from the prepared-loader audit\n' >&2; exit 2; }
 [[ $port =~ ^[0-9]+$ ]] && (( 10#$port >= 1024 && 10#$port <= 65535 )) || { printf 'error: valid main process port required\n' >&2; exit 2; }
 [[ $remote_root == /* && $remote_host_root == /* ]] || { printf 'error: explicit absolute remote roots required\n' >&2; exit 2; }
+# Preserve caller query choices across sourced stale settings.
+readonly -a requested_query_arguments=("${query_arguments[@]}")
 if [[ -n $settings ]]; then source "$settings"; fi
+query_mode=legacy history_text_gamma=0.9 history_attention_layers=last
+history_requested=false
+for (( i=0; i<${#requested_query_arguments[@]}; i+=2 )); do
+    case ${requested_query_arguments[i]} in
+        --query_mode) query_mode=${requested_query_arguments[i+1]} ;;
+        --history_text_gamma) history_text_gamma=${requested_query_arguments[i+1]}; history_requested=true ;;
+        --history_attention_layers) history_attention_layers=${requested_query_arguments[i+1]}; history_requested=true ;;
+    esac
+done
+if [[ $query_mode != legacy && $query_mode != adaptive ]]; then
+    printf 'error: query mode must be legacy or adaptive\n' >&2; exit 2
+fi
+if [[ $query_mode == legacy && $history_requested == true ]]; then
+    printf 'error: legacy query does not accept history controls\n' >&2; exit 2
+fi
 # All selected settings below are explicit after sourcing. The original FULL
 # base is shared external pretrained input, never a previous trained checkpoint.
 base=/root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct
@@ -45,7 +68,14 @@ train=("$repo_root/run_multinode_stage1_training.sh" --run-id "$run_id" --zero-s
     --micro-batch 1 --gradient-accumulation 4 --epochs 1 --max-steps "$max_steps" --learning-rate 5e-5
     --seed 42 --warm-up-steps 10 --ema-tau 1.0 --latent-size 8 --attention-implementation sdpa
     --vision-attention-implementation flash_attention_2 --max-seq-length-train 32768 --dataloader-num-workers 0
-    --textual_states previous --save-strategy steps --save-steps "$max_steps" --final-save)
+    --save-strategy steps --save-steps "$max_steps" --final-save)
+train+=(--query_mode "$query_mode")
+if [[ $query_mode == adaptive ]]; then
+    unset STAGE1_TEXTUAL_STATES
+    train+=(--history_text_gamma "$history_text_gamma" --history_attention_layers "$history_attention_layers")
+else
+    train+=(--textual_states previous)
+fi
 prepare=("$python" -m src.multinode prepare-inference --stage stage1 --tuning-method dora --zero-stage 1
     --run-id "$run_id" --main-process-port "$port" "${roots[@]}" --checkpoint-step "$max_steps" --destination "$prepared")
 evaluate=("$python" -m src.multinode evaluate --run-id "$eval_id" "${roots[@]}" --model-dir "$prepared" --base-model-dir "$base"

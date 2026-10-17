@@ -1796,3 +1796,12 @@ def test_run_stage1_prevalidates_smoke_marker_and_embeds_it_in_producer_evidence
     assert sealed["smoke_resume_witness"]["resume_artifact_digest"] == marker[
         "marker_digest"
     ]
+
+
+
+def test_legacy_query_config_reaches_the_trainer_without_changing_textual_mode(tmp_path):
+    args = stage1_args(tmp_path, '--textual_states', 'all')
+    deps, _, _, _ = fake_dependencies([], metadata=object())
+    bundle = build_stage1_training_components(args, dependencies=deps)
+    assert bundle.trainer.kwargs['query_config'].mode == 'legacy'
+    assert bundle.trainer.kwargs['textual_states'] == 'all'

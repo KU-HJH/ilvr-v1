@@ -38,13 +38,18 @@ def test_recipe_dry_run_overrides_sourced_stale_profile(tmp_path):
         assert evaluate[evaluate.index(flag)+1]==value
     assert evaluate[evaluate.index('--run-id')+1]=='v5-flow-test-test400'
 
-def test_actual_recipe_reaches_coordinator_and_both_worker_dry_runs():
+@pytest.mark.parametrize('query_mode', ['legacy', 'adaptive'])
+def test_actual_recipe_reaches_coordinator_and_both_worker_dry_runs(query_mode, tmp_path):
     import json
     from utils_deepseed import parse_args
     from src.multinode_runtime import validate_stage1_arguments
     environment={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','CUDA_VISIBLE_DEVICES':'',
         'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1'}
-    recipe=run('--dry-run',env=environment)
+    settings=tmp_path/'query-stale.sh'
+    settings.write_text('export STAGE1_TEXTUAL_STATES=all\nquery_mode=legacy\nhistory_text_gamma=.2\nhistory_attention_layers=all\n')
+    recipe=run('--dry-run', '--settings', str(settings), '--query_mode', query_mode,
+               '--history_text_gamma', '.55', '--history_attention_layers', 'last4',
+               env=environment) if query_mode == 'adaptive' else run('--dry-run', env=environment)
     assert recipe.returncode==0,recipe.stderr
     train=shlex.split(recipe.stdout.splitlines()[0])
     coordinator=subprocess.run([*train,'--dry-run'],cwd=ROOT,env=environment,text=True,capture_output=True)
@@ -69,7 +74,8 @@ def test_actual_recipe_reaches_coordinator_and_both_worker_dry_runs():
         assert worker_environment['ILVR_NUM_PROCESSES']=='4'
         stage=owned[max(i for i,value in enumerate(owned) if value=='--')+1:]
         assert stage[:2]==['/usr/bin/bash',str(root/'run_stage1_training.sh')]
-        assert stage[stage.index('--textual_states')+1]=='previous'
+        if query_mode == 'legacy': assert stage[stage.index('--textual_states')+1]=='previous'
+        else: assert '--textual_states' not in stage
         # Run the unchanged local worker implementation with each node's mapped
         # arguments and environment; the remote filesystem is not exercised.
         worker=subprocess.run(['/usr/bin/bash',str(ROOT/'run_stage1_training.sh'),*stage[2:],'--dry-run'],
@@ -86,6 +92,10 @@ def test_actual_recipe_reaches_coordinator_and_both_worker_dry_runs():
             vision_attention_implementation='flash_attention_2',max_seq_length_train=32768,
             dataloader_num_workers=0,gradient_checkpointing=True).items():
             assert getattr(args,name)==value
+        assert args.stage1_query_config.mode == query_mode
+        if query_mode == 'adaptive':
+            assert args.stage1_query_config.text_gamma == .55
+            assert args.stage1_query_config.attention_layers == 'last4'
         assert args.stage1_v5_config.lambda_topk_entropy==.1
         assert args.stage1_v5_config.preference_topk_k==50
         assert args.stage1_v5_config.text_kl_weight==.01
@@ -97,7 +107,8 @@ def test_actual_recipe_reaches_coordinator_and_both_worker_dry_runs():
 
 @pytest.mark.parametrize('fail,events',[('', ['train_success','prepare_success','evaluate_TEST400']),
     ('train',['train_failure']),('prepare',['train_success','prepare_failure'])])
-def test_recipe_only_evaluates_selected_successful_final_artifact(tmp_path,fail,events):
+@pytest.mark.parametrize('query_mode', ['legacy', 'adaptive'])
+def test_recipe_only_evaluates_selected_successful_final_artifact(tmp_path,fail,events,query_mode):
     # Copy the real recipe into an isolated checkout with boundary stubs. This
     # executes its parsing, path derivation, sequencing, and shell fail-fast logic.
     assert RECIPE.is_file(), 'approved sequential recipe is missing'
@@ -106,15 +117,19 @@ def test_recipe_only_evaluates_selected_successful_final_artifact(tmp_path,fail,
     (tmp_path/'data').mkdir(); (tmp_path/'data/TEST.jsonl').write_text('{}\n'*400)
     (tmp_path/'venv/ilvr-venv/bin').mkdir(parents=True)
     capture=tmp_path/'events'
+    settings=tmp_path/'stale-query.sh'
+    settings.write_text('export STAGE1_TEXTUAL_STATES=all\nquery_mode=legacy\n')
     train=tmp_path/'run_multinode_stage1_training.sh'
-    train.write_text('#!/usr/bin/env bash\nif [[ $FAIL_STAGE == train ]]; then echo train_failure >> "$EVENTS"; exit 7; fi\necho train_success >> "$EVENTS"\n')
+    train.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "${STAGE1_TEXTUAL_STATES-absent}" > "$QUERY_ENV_CAPTURE"\nif [[ $FAIL_STAGE == train ]]; then echo train_failure >> "$EVENTS"; exit 7; fi\necho train_success >> "$EVENTS"\n')
     train.chmod(0o755)
     py=tmp_path/'venv/ilvr-venv/bin/python'
     py.write_text('#!/usr/bin/env bash\nif [[ $3 == prepare-inference ]]; then\n if [[ $FAIL_STAGE == prepare ]]; then echo prepare_failure >> "$EVENTS"; exit 8; fi\n echo prepare_success >> "$EVENTS"\nelif [[ $3 == evaluate ]]; then echo evaluate_TEST400 >> "$EVENTS"; else exit 9; fi\n')
     py.chmod(0o755)
-    done=subprocess.run(['bash',str(recipe),*ARGS],env={**os.environ,'EVENTS':str(capture),'FAIL_STAGE':fail},text=True,capture_output=True)
+    done=subprocess.run(['bash',str(recipe),*ARGS,'--settings',str(settings),'--query_mode',query_mode],
+        env={**os.environ,'EVENTS':str(capture),'FAIL_STAGE':fail,'QUERY_ENV_CAPTURE':str(tmp_path/'query-env')},text=True,capture_output=True)
     assert done.returncode == (0 if not fail else 7 if fail=='train' else 8),done.stderr
     assert capture.read_text().splitlines()==events
+    assert (tmp_path/'query-env').read_text().strip() == ('absent' if query_mode == 'adaptive' else 'all')
 
 def test_decoder_binds_managed_remote_producer_to_local_checkpoint(tmp_path,monkeypatch):
     import json
@@ -136,7 +151,8 @@ def test_decoder_binds_managed_remote_producer_to_local_checkpoint(tmp_path,monk
 
 @pytest.mark.parametrize('changed',[False,True])
 @pytest.mark.parametrize('debug',[False,True])
-def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper(tmp_path,monkeypatch,changed,debug):
+@pytest.mark.parametrize('query_mode', ['legacy', 'adaptive'])
+def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper(tmp_path,monkeypatch,changed,debug,query_mode):
     import copy
     from dataclasses import replace
     import json
@@ -156,8 +172,8 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
     from deepspeed_runtime import load_deepspeed_runtime_profile
     import artifact_paths
     ckroot=tmp_path/'checkpoints'; monkeypatch.setattr(artifact_paths,'CANONICAL_CHECKPOINT_ROOT',ckroot)
-    original=tiny_original_qwen(); old=tmp_path/'old-base'; original.save_pretrained(old)
-    new=tmp_path/'relocated-base'; shutil.copytree(old,new)
+    original=tiny_original_qwen(); old=ckroot/'old-base'; original.save_pretrained(old)
+    new=ckroot/'relocated-base'; shutil.copytree(old,new)
     tuning=stage1_tuning(); base=Qwen2_5_VLForConditionalGeneration.from_pretrained(old,local_files_only=True)
     base.resize_token_embeddings(RESIZED_VOCAB_SIZE)
     composition._configure_latent_model(base.config,LATENT_TOKEN_IDS,latent_size=2)
@@ -176,6 +192,10 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
     identity=capture_v5_reference(teacher,student,processor,base_path=old,directory=artifact)
     contract=build_v5_contract(Stage1V5Config(lambda_topk_entropy=.1,preference_topk_k=50),identity,
         ce_weight=.1,sim_weight=.1,schedule={},execution={'tuning_method':'dora','ema_tau':1.,'zero_stage':1})
+    from stage1.query import Stage1QueryConfig, query_execution_config
+    if query_mode == 'adaptive':
+        contract['execution']['query_config'] = query_execution_config(
+            Stage1QueryConfig('adaptive', .55, 'all'), (0,))
     (artifact/'stage1_v5.json').write_text(json.dumps(contract))
     if changed:
         with (new/'model.safetensors').open('ab') as stream: stream.write(b'changed-content')
@@ -198,6 +218,7 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
         def __init__(self,**kwargs):
             self.model=kwargs['model']; self.ema_teacher=kwargs['ema_teacher']
             self.stage1_v5_debug=kwargs['stage1_v5_debug']
+            self.query_config=kwargs['query_config']
             self.collect_stage1_diagnostics=kwargs['collect_stage1_diagnostics']
             calls.append('constructed')
     monkeypatch.setattr(v5_trainer,'CustomTrainerStage1V5',Trainer)
@@ -221,6 +242,10 @@ def test_actual_v5_resume_composition_authenticates_relocated_base_before_helper
         with pytest.warns(UserWarning,match="base_model_name_or_path.*renamed"):
             bundle=composition.build_stage1_training_components(args,dependencies=deps,deepspeed_runtime_profile=profile)
         assert calls==['load','load','constructed']
+        assert bundle.trainer.query_config.mode == query_mode
+        if query_mode == 'adaptive':
+            assert bundle.trainer.query_config.text_gamma == .55
+            assert bundle.trainer.query_config.attention_layers == 'all'
         assert bundle.trainer.stage1_v5_debug is debug
         assert bundle.trainer.collect_stage1_diagnostics is debug
         for name,value in teacher.state_dict()['parameters'].items():

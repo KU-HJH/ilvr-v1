@@ -125,6 +125,93 @@ The supported new-run operator commands live in
 is a Stage 1 compatibility wrapper; use it only with the guide's canonical
 checkpoint, result, and log roots rather than editing generic output paths.
 
+### Stage 1-v5 history queries
+
+Stage1-v5 defaults to `--query_mode legacy`; existing `textual_states` behavior
+is preserved. Adaptive queries are opt-in with `--query_mode adaptive`,
+`--history_text_gamma 0.9` and `--history_attention_layers last` (`last4` and
+`all` are also supported; `last4` requires at least four actual decoder layers).
+Adaptive mode rejects an explicitly supplied
+`--textual_states`, including the same value as the legacy default.
+
+Use the existing v5 recipe to preview the coordinator command, inference
+preparation and TEST400 evaluation commands. Set `STAGE1_MAX_STEPS` from the
+retained-data/prepared-loader audit, and set the two remote roots to the
+compatible reviewed checkout; the example only prints commands:
+
+```bash
+bash scripts/stage1_v5_train_eval.sh \
+  --run-id stage1-v5-adaptive-example \
+  --main-process-port 29683 \
+  --remote-repo-root /root/workspace/ILVR \
+  --remote-host-repo-root /home/korea/Workspace/hjh/workspace/ILVR \
+  --max-steps "${STAGE1_MAX_STEPS:?set from the prepared-loader audit}" \
+  --query_mode adaptive --history_text_gamma 0.9 \
+  --history_attention_layers last --dry-run
+```
+
+The first printed command invokes `run_multinode_stage1_training.sh`; append
+`--dry-run` to that command to inspect the coordinator's mapped node commands.
+A preview establishes arguments only. Actual execution requires the existing
+two-node/four-rank preflight and separately authorized launch, with compatible
+code/environments and the resolved profile recorded on both nodes. The recipe
+enforces its selected fresh-run profile after optional `--settings` sourcing:
+Qwen2.5-VL/DoRA r32/alpha64/dropout 0.05, latent size 8, per-device batch 1,
+GAS 4/global batch 16, frozen initial effective reference/tau 1, BF16,
+decoder SDPA, vision FlashAttention2, existing gradient checkpointing and
+ZeRO-1. It uses CE 0.1/alignment 0.1, v5 DIL beta 1/margin 0/preference weight 1,
+top-k entropy 0.1 with K 50, Text-off KL 0.01, LR 5e-5, seed 42 and warmup 10.
+The original base is the initializer; previous Stage2 weights are not inputs.
+
+Stage1-v5 DIL averages eligible token losses across the actual optimizer window
+and all four ranks. Entropy/mass still average original-block token means,
+including empty blocks in their denominator; CE/alignment/Text-off KL retain
+configured-GAS scaling. New token-mean training requires `selection=all` in both
+query modes. Historical block-mean sidecars remain readable for inspection;
+resuming those runs requires their original reviewed code. Changing to token
+mean requires a fresh run, which saves a distinct schema-2 reduction contract.
+
+Adaptive selection uses a prompt-only intent followed by one injected-prefix
+pass per latent block. Each prefix stops immediately before the current START;
+only previously selected raw targets replace active past pads. Discounted
+nonempty text segments contribute one vote each, and latent attention mass
+uses the full valid causal-key denominator without renormalizing that mass.
+Helper images remain candidate-extractor inputs. With M blocks, preparation
+costs one prompt plus M decoder forwards instead of the legacy helper forward.
+When F, immutable-reference scoring and packed OFF all run, the total is M+4
+original decoder calls; backward checkpoint recomputation is additional. Empty
+auxiliary targets skip reference/packed OFF, so M+4 is not an unconditional
+per-sample count. Query/key/head chunks 64/2048/4 bound observer workspace.
+
+The current full-causal guard checks every adaptive prefix length S, including
+the prompt and prefixes with no latent attention to observe: the native
+`sliding_window` must be `None` or S must be **at most** that configured window
+(last query index < window). A longer prefix fails before language execution,
+even when `use_sliding_window=False`, because this patched native mask still
+uses the configured window. The guard preserves native configuration; an input
+length setting of 32768 does not establish support beyond this boundary.
+
+`stage1_v5.json` records query formula identity separately from the loss:
+`stage1_legacy_query_v1` or
+`stage1_injected_prefix_discounted_segments_attention_mass_v1`. Adaptive
+records gamma, layer selector/resolved indices, chunk sizes and
+`full_causal_2d_v1`. Resume inherits saved settings and rejects semantic
+conflicts; a historical query-less checkpoint means legacy only. Switching a
+legacy run to adaptive requires a fresh run, and the recipe above is fresh-run
+only. Resume through the existing coordinator with the saved identity and a
+fresh attempt ID; omit query options to inherit them. Base/reference/source
+checks continue to apply.
+
+The CPU integration witnesses use tiny FP32 Qwen/DoRA models and the actual
+v5 parent-Trainer backward path. They check shared selected targets across
+F/reference/packed OFF, student gradients with a frozen reference, configured
+GAS denominators on partial windows and empty auxiliaries, decoder call counts,
+repeated-build RNG/hook cleanup, and saved-config next-target reproducibility.
+These tests do not run the production composition/ZeRO lifecycle, BF16/GPU or
+FlashAttention2 execution, four-rank training, long real inputs, performance or
+benchmark evaluation. Those runtime results remain unverified by this CPU
+integration check.
+
 <!-- BEGIN HISTORICAL NONCANONICAL PERFORMANCE WORKFLOW -->
 ### Historical Full and DoRA performance-workflow provenance — do not run
 

@@ -139,7 +139,7 @@ def test_new_deepspeed_support_rejects_unverified_version_or_scope(
     assert engine.global_steps==trainer._successful_optimizer_steps==0
 
 
-def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, debug=True):
+def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, debug=True, history_config=None):
     Trainer = api()
     student, reference, *_ = fixture(.05)
     q = resolve_qwen2_5_vl_model(student)
@@ -155,8 +155,27 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, 
     batch = dict(input_ids=IDS, labels=IDS.clone(), attention_mask=torch.ones_like(IDS),
         position_ids=POSITIONS, pixel_values_latent=torch.empty(0),image_grid_thw_latent=torch.empty(0),
         stage1_batch_metadata=metadata, stage1_v5_metadata=V5BatchMetadata(blocks))
+    history_case = None
+    if history_config is not None:
+        from tests.stage1.history_fixtures import make_history_case
+        history_case = make_history_case(layers=2)
+        for model in (q, reference_q):
+            for config in (model.config, model.model.config):
+                config.latent_token_id, config.latent_start_id, config.latent_end_id = 125, 126, 127
+        batch = dict(history_case.inputs, labels=history_case.inputs['input_ids'].clone(),
+            stage1_batch_metadata=history_case.metadata,
+            stage1_v5_metadata=V5BatchMetadata(tuple(
+                V5Block(0, i, span.start, span.end, () if empty else targets,
+                    () if empty else tuple(history_case.inputs['input_ids'][0, list(targets)].tolist()),
+                    candidates)
+                for i, span, targets, candidates in zip((0, 1),
+                    history_case.metadata.samples[0].latent_spans, ((17, 18), (23,)),
+                    ((11, 12), (11, 12, 17, 18))))))
+        batch['position_ids'], _ = q.get_rope_index(input_ids=batch['input_ids'],
+            image_grid_thw=batch['image_grid_thw'], attention_mask=batch['attention_mask'])
     calls, helper_active, forwards, backward_events = [], [False], [], []
-    q.model.register_forward_pre_hook(lambda *_: calls.append('F' if 'F' not in calls else 'packed'))
+    q.model.register_forward_pre_hook(lambda _m, _a, kw: calls.append(
+        'packed' if kw.get('stage2_prefix_key_values') is not None else 'F'), with_kwargs=True)
     reference_q.model.register_forward_pre_hook(lambda *_: calls.append('helper' if helper_active[0] else 'reference'))
     def inspect(_m,_a,kw):
         assert not any(k.startswith('stage1_v5') or k=='stage1_batch_metadata' for k in kw)
@@ -178,7 +197,7 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, 
     trainer.model = student; trainer.model_wrapped = student
     trainer.ema_teacher = Stage1EmaTeacher(student,decay=1.,method='dora',initial_reference_model=reference)
     trainer.target_builder=Helper(); trainer._ema_execution_device=None
-    if real_helper:
+    if real_helper or history_config is not None:
         from dataclasses import replace
         from stage1.targets import Stage1TeacherTargetBuilder
         class Tokenizer:
@@ -187,7 +206,10 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, 
                      '<|latent_pad|>':126,'<|latent_start|>':125,'<|latent_end|>':127,
                      '<|vision_start|>':81,'<|vision_end|>':83}
                 return {'input_ids':torch.tensor([[ids[text]]])}
-        native=Stage1TeacherTargetBuilder(Tokenizer(),image_pool_k=2,helper_group_L=2)
+        native=Stage1TeacherTargetBuilder(
+            history_case.tokenizer if history_case else Tokenizer(),
+            image_pool_k=2, helper_group_L=2,
+            **({'query_config': history_config} if history_case else {}))
         native.validate=debug; native.collect_diagnostics=debug
         class RealHelper:
             def build(self,teacher,inputs,meta):
@@ -197,12 +219,14 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, 
                     return self.targets
                 finally: helper_active[0]=False
         trainer.target_builder=RealHelper()
-        ids=IDS.clone(); ids[0,:4]=80
-        sample=replace(metadata.samples[0],original_grid_range=(0,1),helper_grid_range=(0,2),
-                       original_pixel_range=(0,4),helper_pixel_range=(0,8))
-        batch.update(input_ids=ids,pixel_values=torch.randn(4,12),image_grid_thw=torch.tensor([[1,2,2]]),
-            pixel_values_latent=torch.randn(8,12),image_grid_thw_latent=torch.tensor([[1,2,2],[1,2,2]]),
-            stage1_batch_metadata=Stage1BatchMetadata((sample,),1,26))
+        if history_case is None:
+            ids=IDS.clone(); ids[0,:4]=80
+            sample=replace(metadata.samples[0],original_grid_range=(0,1),helper_grid_range=(0,2),
+                           original_pixel_range=(0,4),helper_pixel_range=(0,8))
+            batch.update(input_ids=ids,pixel_values=torch.randn(4,12),image_grid_thw=torch.tensor([[1,2,2]]),
+                pixel_values_latent=torch.randn(8,12),image_grid_thw_latent=torch.tensor([[1,2,2],[1,2,2]]),
+                stage1_batch_metadata=Stage1BatchMetadata((sample,),1,26))
+    if history_config is not None: trainer.query_config = history_config
     trainer.ce_weight=trainer.sim_weight=.1; trainer.collect_stage1_diagnostics=debug
     trainer.v5_config=Stage1V5Config(lambda_topk_entropy=.1,preference_topk_k=50)
     trainer._v5_contract_ready=True; trainer._v5_step_stack=None
@@ -240,7 +264,8 @@ def test_actual_four_calls_one_parent_backward_native_update_and_reference_owned
         resolve_qwen2_5_vl_model(trainer.ema_teacher.model).model.embed_tokens(IDS))
     diagnostics=trainer._latest_stage1_diagnostics
     expected=(.1*diagnostics['ce_loss']+.1*diagnostics['alignment_loss']+
-        diagnostics['auxiliary_scale']*(diagnostics['dil_raw_sum']+.1*diagnostics['topk_entropy_raw_sum'])+
+        diagnostics['dil_scale']*diagnostics['dil_raw_sum']+
+        diagnostics['auxiliary_scale']*.1*diagnostics['topk_entropy_raw_sum']+
         .01*diagnostics['text_kl_raw'])/4
     torch.testing.assert_close(loss,expected)
     assert any(e['phase']=='recompute' for e in backs[0].events)
@@ -374,13 +399,13 @@ def test_get_batch_samples_reduces_original_blocks_once_even_empty_rank(tmp_path
             trainer=Trainer.__new__(Trainer)
             trainer.args=SimpleNamespace(average_tokens_across_devices=False,gradient_accumulation_steps=4)
             def reduce(value,**kw):
-                reductions.append(int(value))
-                return torch.tensor(total)
+                reductions.append(value.tolist())
+                return torch.tensor([total, 0])
             trainer.accelerator=SimpleNamespace(device=torch.device('cpu'),num_processes=4,reduce=reduce)
             original=[{'stage1_v5_metadata':V5BatchMetadata(tuple(
                 V5Block(0,i,2*i,2*i+1,(),(),()) for i in range(n)))} for n in slots]
             batches,_=trainer.get_batch_samples(iter(original),4)
-            assert reductions==[sum(slots)]
+            assert reductions==[[sum(slots), 0]]
             assert all(b['stage1_v5_window'].global_original_steps==total for b in batches)
             assert all(b['stage1_v5_window'].actual_microbatches==len(slots) for b in batches)
             assert all('stage1_v5_window' not in b for b in original)
@@ -434,7 +459,8 @@ def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejec
         assert saved['schedule']['configured_max_steps']==3
         assert saved['execution']['packages']['accelerate']=='1.10.1'
         assert saved['execution']['lora_target_modules']==','.join(DEFAULT_STAGE1_TARGET_SUFFIXES)
-        assert set(saved['execution']['source_sha256'])=={'v5_trainer','stage1_trainer','transformers_trainer'}
+        assert set(saved['execution']['source_sha256'])=={'v5_trainer','stage1_trainer','transformers_trainer',
+            'query','targets','history_attention','history_teacher'}
         parent_calls.append(kw)
         return 'parent-result'
     monkeypatch.setattr(CustomTrainerStage1,'train',parent)
@@ -447,7 +473,7 @@ def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejec
     assert len(parent_calls)==1 and calls==[]
 
 
-@pytest.mark.parametrize('changed', ['objective','lr','packages','source','base','processor','deepspeed'])
+@pytest.mark.parametrize('changed', ['objective','lr','packages','source','base','processor','deepspeed','query'])
 def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,monkeypatch,changed):
     from tests.stage1.v5.test_resume import contract
     from stage1.trainer import CustomTrainerStage1
@@ -464,9 +490,23 @@ def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,m
     elif changed == 'source': bad['execution']['source_sha256']['trainer']='e'*64
     elif changed == 'base': bad['reference']['base_content_sha256']='e'*64
     elif changed == 'deepspeed': bad['execution']['deepspeed_profile']['config_digest']='e'*64
+    elif changed == 'query':
+        bad['execution']['query_config'] = {
+            'schema_version': 1, 'mode': 'adaptive',
+            'formula_id': 'stage1_injected_prefix_discounted_segments_attention_mass_v1',
+            'text_mode': 'discounted_segments', 'latent_mode': 'attention_mass',
+            'text_gamma': .9, 'attention_layers': 'last', 'resolved_layer_indices': [3],
+            'query_chunk_size': 64, 'key_chunk_size': 2048, 'head_chunk_size': 4,
+            'mask_mode': 'full_causal_2d_v1',
+        }
     else: bad['reference']['processor_sha256']='e'*64
     def independent_digest(value):
         mapped=deepcopy(value)
+        # Historical sidecars predate query metadata and represent this exact
+        # legacy schema; keep the oracle independent of product normalization.
+        mapped['execution'].setdefault('query_config', {
+            'schema_version': 1, 'mode': 'legacy', 'formula_id': 'stage1_legacy_query_v1',
+        })
         mapped['execution']['model']=mapped['reference']['base_content_sha256']
         mapped['execution']['deepspeed_profile']['config_path']=mapped['execution']['deepspeed_profile']['config_digest']
         return torch.tensor(list(hashlib.sha256(json.dumps(mapped,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).digest()),dtype=torch.uint8)
@@ -490,11 +530,16 @@ def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,m
     assert calls == []
 
 
-def test_effective_contract_allows_only_content_equal_node_local_paths(tmp_path,monkeypatch):
+@pytest.mark.parametrize('explicit_legacy_ranks', [(), (1, 3)],
+                         ids=['historical', 'mixed_historical_explicit_legacy'])
+def test_effective_contract_allows_only_content_equal_node_local_paths(tmp_path,monkeypatch,explicit_legacy_ranks):
     from tests.stage1.v5.test_resume import contract
     from stage1.trainer import CustomTrainerStage1
     import hashlib,json
     mapped=contract()
+    mapped['execution']['query_config'] = {
+        'schema_version': 1, 'mode': 'legacy', 'formula_id': 'stage1_legacy_query_v1',
+    }
     mapped['execution'].update(model=mapped['reference']['base_content_sha256'],
         deepspeed_profile={'config_path':'d'*64,'config_digest':'d'*64})
     expected=torch.tensor(list(hashlib.sha256(json.dumps(mapped,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).digest())+[0]*33,dtype=torch.uint8)
@@ -503,6 +548,10 @@ def test_effective_contract_allows_only_content_equal_node_local_paths(tmp_path,
     for rank in range(4):
         trainer=api().__new__(api())
         local=contract()
+        if rank in explicit_legacy_ranks:
+            local['execution']['query_config'] = {
+                'schema_version': 1, 'mode': 'legacy', 'formula_id': 'stage1_legacy_query_v1',
+            }
         local['execution'].update(model=f'/node{rank//2}/models/base',
             deepspeed_profile={'config_path':f'/node{rank//2}/repo/zero1.json','config_digest':'d'*64})
         trainer.args=SimpleNamespace(output_dir=str(tmp_path))

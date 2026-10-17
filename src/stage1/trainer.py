@@ -30,6 +30,7 @@ from .ema import (
     _decode_ema_state,
 )
 from .targets import Stage1TeacherTargetBuilder
+from .query import Stage1QueryConfig
 from .types import Stage1BatchMetadata, Stage1TeacherTargets
 
 
@@ -228,6 +229,7 @@ class CustomTrainerStage1(SFTTrainer):
         ce_weight: float = 1.0,
         helper_group_L: int | None = 256,
         textual_states: str = "previous",
+        query_config: Stage1QueryConfig | None = None,
         ema_method: str | None = None,
         target_builder: Stage1TeacherTargetBuilder | None = None,
         ema_teacher: Stage1EmaTeacher | None = None,
@@ -251,6 +253,9 @@ class CustomTrainerStage1(SFTTrainer):
         self.image_pool_k = int(image_pool_k)
         self.helper_group_L = helper_group_L
         self.textual_states = textual_states
+        if query_config is not None and not isinstance(query_config, Stage1QueryConfig):
+            raise TypeError('query_config must be a Stage1QueryConfig')
+        self.query_config = query_config or Stage1QueryConfig()
         self.collect_stage1_diagnostics = bool(collect_stage1_diagnostics)
         self._latest_stage1_diagnostics = None
         self._representative_gradient_norm: float | None = None
@@ -282,6 +287,7 @@ class CustomTrainerStage1(SFTTrainer):
                 image_pool_k=self.image_pool_k,
                 helper_group_L=self.helper_group_L,
                 textual_states=self.textual_states,
+                query_config=self.query_config,
                 validate=self._stage1_checks_enabled(),
                 collect_diagnostics=self._stage1_checks_enabled(),
             )

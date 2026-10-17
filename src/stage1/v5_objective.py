@@ -1,4 +1,4 @@
-"""Raw original-block loss sums and independent sample-local Text-off KL."""
+"""Token DIL sums, block auxiliary sums and sample-local Text-off KL."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -61,9 +61,9 @@ def compute_v5_loss_sums(
 ) -> V5LossSums:
     """Consume selected [N,V] rows in metadata.query_keys order.
 
-    D/U/mass remain unweighted sums of original-block token means. The trainer
-    owns their global accumulation-window denominator; empty original blocks
-    remain counted. K instead averages queries per valid sample, then samples.
+    D is a sum of token losses. U/mass remain sums of original-block token
+    means, including empty blocks in their trainer-owned denominator. K instead
+    averages queries per valid sample, then samples.
     """
     if validate:
         _validate_selected_logits(clean_logits, metadata, 'clean')
@@ -99,8 +99,8 @@ def compute_v5_loss_sums(
             d = orig_components_chunked(clean, reference, targets,
                                         chunk_positions=config.loss_chunk_positions,
                                         validate=validate, collect_diagnostics=collect_diagnostics)
-            chosen_sum = chosen_sum + d.chosen.mean()
-            reference_sum = reference_sum + d.reference.mean()
+            chosen_sum = chosen_sum + d.chosen.sum()
+            reference_sum = reference_sum + d.reference.sum()
             if active_u:
                 off = voff_logits[cursor:cursor+count][mask]
                 u_parts, mass_parts, h_parts = [], [], []

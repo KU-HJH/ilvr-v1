@@ -22,11 +22,11 @@ def api():
 
 def test_scale_keeps_configured_gas_on_partial_tail_and_empty_blocks():
     Window, scale = api()
-    assert scale(Window(10, 4, 4, 4)) == 1.6
-    assert scale(Window(5, 2, 4, 4)) == 3.2
-    assert scale(Window(0, 2, 4, 4)) == 0.
+    assert scale(Window(10, 4, 4, 4, 23)) == 1.6
+    assert scale(Window(5, 2, 4, 4, 11)) == 3.2
+    assert scale(Window(0, 2, 4, 4, 0)) == 0.
     for bad in ((-1, 1, 4, 4), (1, 0, 4, 4), (1, 5, 4, 4), (1, 1, 0, 4)):
-        with pytest.raises(ValueError): Window(*bad)
+        with pytest.raises(ValueError): Window(*bad, global_dil_tokens=0)
 
 
 @pytest.mark.parametrize('counts', FOUR_RANK_WINDOWS)
@@ -54,7 +54,7 @@ def test_real_parent_dispatch_matches_independent_global_gradient(counts, tmp_pa
         trainer._prepare_inputs = lambda x: x
         trainer.accelerator = SimpleNamespace(distributed_type=DistributedType.DEEPSPEED,
             backward=lambda loss, **kw: (kwargs_seen.append(kw), loss.backward()))
-        window = Window(total, len(microbatches), 4, 4)
+        window = Window(total, len(microbatches), 4, 4, 0)
         trainer.compute_loss = lambda _m, x, **kw: .1 * parameter.square() + scale(window) * x['blocks'] * parameter.pow(3)
         batches, _ = Trainer.get_batch_samples(trainer, iter({'blocks': n} for n in microbatches), 4)
         assert len(batches) == len(microbatches)

@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 from typing import MutableMapping, Sequence
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
+from peft_common import resolve_qwen2_5_vl_model
+from stage1.history_attention import ReducedHistoryAttentionObserver
+from stage1.history_teacher import HistoryPrefixAdapter, HistorySelection
+from stage1.query import (
+    DiscountedTextState, Stage1QueryConfig, aggregate_history_latents,
+    compose_history_query, history_text_positions, resolve_query_layers,
+    update_text_history,
+)
 from stage1.types import (
     Stage1BatchMetadata,
     Stage1SampleMetadata,
@@ -33,6 +42,7 @@ class Stage1TeacherTargetBuilder:
         textual_states: str = "previous",
         validate: bool = True,
         collect_diagnostics: bool = True,
+        query_config: Stage1QueryConfig | None = None,
     ) -> None:
         if not math.isfinite(coverage_p) or not 0.0 < coverage_p <= 1.0:
             raise ValueError("coverage_p must be finite and in (0, 1]")
@@ -40,6 +50,9 @@ class Stage1TeacherTargetBuilder:
             raise ValueError("image_pool_k must be positive")
         if textual_states not in ("all", "previous"):
             raise ValueError("textual_states must be 'all' or 'previous'")
+        if query_config is not None and not isinstance(query_config, Stage1QueryConfig):
+            raise TypeError("query_config must be a Stage1QueryConfig or None")
+        self.query_config = query_config or Stage1QueryConfig()
         self.validate = bool(validate)
         self.collect_diagnostics = bool(collect_diagnostics)
         self.tokenizer = tokenizer
@@ -107,10 +120,24 @@ class Stage1TeacherTargetBuilder:
         helper_grid = self._require_tensor_value(
             helper_grid, "image_grid_thw_latent"
         )
-        if self.validate:
+        if self.validate or self.query_config.mode == "adaptive":
             self._validate_batch_shape(input_ids, attention_mask, metadata)
 
-        teacher.eval()
+        if self.query_config.mode == "adaptive":
+            if metadata.batch_size != 1:
+                raise ValueError("adaptive history requires batch size 1")
+            if any(module.training for module in teacher.modules()) or any(
+                p.requires_grad or p.grad is not None for p in teacher.parameters()
+            ):
+                raise ValueError("adaptive history teacher must be frozen and in eval mode")
+            sample_length = metadata.samples[0].unpadded_length
+            if (type(sample_length) is not int
+                    or not 0 < sample_length <= metadata.sequence_length
+                    or not bool((attention_mask[:, :sample_length] == 1).all())
+                    or not bool((attention_mask[:, sample_length:] == 0).all())):
+                raise ValueError("adaptive attention mask must match unpadded metadata length")
+        else:
+            teacher.eval()
         device = self._teacher_device(teacher, input_ids.device)
         teacher_ids = input_ids.to(device)
         teacher_attention = attention_mask.to(device)
@@ -185,7 +212,8 @@ class Stage1TeacherTargetBuilder:
                     ] = True
 
         latent_values = torch.cat(packed, dim=0)
-        if self.validate and latent_values.shape[0] != int(latent_mask.sum().item()):
+        if ((self.validate or self.query_config.mode == "adaptive")
+                and latent_values.shape[0] != int(latent_mask.sum().item())):
             raise RuntimeError(
                 "row-major latent target count does not match latent mask"
             )
@@ -199,6 +227,29 @@ class Stage1TeacherTargetBuilder:
         )
 
     def _build_sample(
+        self,
+        *,
+        teacher,
+        sample,
+        sample_ids,
+        sample_attention,
+        original_pixels,
+        original_grid,
+        helper_pixels,
+        helper_grid,
+        image_token_id,
+    ):
+        build_sample = (self._build_sample_adaptive
+                        if self.query_config.mode == "adaptive"
+                        else self._build_sample_legacy)
+        return build_sample(
+            teacher=teacher, sample=sample, sample_ids=sample_ids,
+            sample_attention=sample_attention, original_pixels=original_pixels,
+            original_grid=original_grid, helper_pixels=helper_pixels,
+            helper_grid=helper_grid, image_token_id=image_token_id,
+        )
+
+    def _build_sample_legacy(
         self,
         *,
         teacher,
@@ -335,6 +386,164 @@ class Stage1TeacherTargetBuilder:
             tuple(block_margins),
             row_hidden_last[:0],
         )
+
+    def _build_sample_adaptive(
+        self,
+        *,
+        teacher,
+        sample,
+        sample_ids,
+        sample_attention,
+        original_pixels,
+        original_grid,
+        helper_pixels,
+        helper_grid,
+        image_token_id,
+    ):
+        qwen = resolve_qwen2_5_vl_model(teacher)
+        owner = getattr(teacher, "module", teacher)
+        configs = getattr(owner, "peft_config", {})
+        if (getattr(qwen.config, "model_type", None) != "qwen2_5_vl"
+                or getattr(qwen.config, "stage", None) != "stage1"
+                or not configs or not all(getattr(c, "use_dora", False)
+                                           for c in configs.values())
+                or any(layer.attn_type != "sdpa" for layer in qwen.model.layers)):
+            raise ValueError("adaptive history requires Stage1 Qwen2.5-VL DoRA with SDPA")
+        row_ids = sample_ids[0]
+        assistant_start, assistant_end = self._assistant_bounds(row_ids, sample)
+        # Count unique starts, not overlapping short/long spellings of one header.
+        assistant_starts = set()
+        for pattern in self._assistant_patterns:
+            pattern = pattern.to(row_ids.device)
+            assistant_starts.update(
+                i for i in range(row_ids.numel() - pattern.numel() + 1)
+                if torch.equal(row_ids[i:i + pattern.numel()], pattern))
+        if assistant_starts != {assistant_start}:
+            raise ValueError("adaptive history requires a single assistant trajectory")
+        special_ids = frozenset(self._special_ids | set(
+            getattr(self.tokenizer, "all_special_ids", ())) | {image_token_id})
+        text_spans = history_text_positions(
+            row_ids, sample_attention[0], sample.latent_spans,
+            assistant_end, special_ids)
+        pad, start, end = (self._single_token_id(token) for token in
+                          ("<|latent_pad|>", "<|latent_start|>", "<|latent_end|>"))
+        if ((pad, start, end) != (qwen.config.latent_token_id,
+                                  qwen.config.latent_start_id, qwen.config.latent_end_id)
+                or len({pad, start, end}) != 3):
+            raise ValueError("adaptive tokenizer/model latent token IDs must agree")
+        expected_markers = {}
+        for span in sample.latent_spans:
+            expected_markers[span.start] = start
+            expected_markers[span.end] = end
+            expected_markers.update((p, pad) for p in span.latent_positions)
+        actual_markers = {i: token for i, token in enumerate(row_ids.tolist())
+                          if token in (pad, start, end)}
+        if actual_markers != expected_markers:
+            raise ValueError("adaptive latent markers must match complete metadata spans")
+        image_positions = (row_ids == image_token_id).nonzero().flatten().tolist()
+        if any(i >= assistant_start for i in image_positions):
+            raise ValueError("original images must precede the assistant trajectory")
+        counts = self._visual_token_counts(original_grid, teacher)
+        if (sum(counts) != len(image_positions)
+                or original_grid.dtype != torch.long
+                or bool((original_grid <= 0).any())
+                or bool((original_grid[:, 1:] % teacher.visual.spatial_merge_size != 0).any())
+                or original_pixels.ndim != 2
+                or original_pixels.shape[0] != int(original_grid.prod(dim=1).sum())):
+            raise ValueError("adaptive original image ownership must match pixels and tokens")
+        # Validate this even for a no-latent sample, without encoding its images.
+        tokens = row_ids.tolist()
+        if qwen.config.video_token_id in tokens:
+            raise ValueError("adaptive history video trajectories are unsupported")
+        vision_starts = [i for i, token in enumerate(tokens)
+                         if token == qwen.config.vision_start_token_id]
+        expected_images = tuple(p for i, count in zip(vision_starts, counts)
+                                for p in range(i + 1, i + 1 + count))
+        if (len(vision_starts) != len(counts)
+                or expected_images != tuple(image_positions)):
+            raise ValueError("adaptive original image markers must match owned grids")
+        if (len(sample.helper_to_block) != helper_grid.shape[0]
+                or helper_grid.ndim != 2 or helper_grid.shape[1] != 3
+                or bool((helper_grid <= 0).any())
+                or helper_pixels.ndim != 2
+                or helper_pixels.shape[0] != int(helper_grid.prod(dim=1).sum())
+                or any(type(i) is not int or not 0 <= i < len(sample.latent_spans)
+                       for i in sample.helper_to_block)
+                or set(sample.helper_to_block) != set(range(len(sample.latent_spans)))):
+            raise ValueError("adaptive history requires owned helper candidates for every block")
+        # This check covers prompt and first/empty-text blocks, where the observer
+        # deliberately has no hooks. Never change the teacher's native mask config.
+        stops = (assistant_end, *(span.start for span in sample.latent_spans))
+        window = qwen.model.config.sliding_window
+        if sample.latent_spans and window is not None and max(stops) > window:
+            raise ValueError("adaptive history requires full-causal prefixes within native "
+                             f"sliding_window={window}; required length={max(stops)}")
+        if not sample.latent_spans:
+            empty = qwen.model.embed_tokens.weight.new_empty(
+                (0, qwen.model.embed_tokens.weight.shape[1]))
+            return [], (), (), (), empty
+
+        adapter = HistoryPrefixAdapter(
+            teacher, input_ids=sample_ids, attention_mask=sample_attention,
+            original_pixels=original_pixels, original_grid=original_grid)
+        helper_features = teacher.visual(helper_pixels, grid_thw=helper_grid)
+        if not bool(torch.isfinite(helper_features).all()):
+            raise FloatingPointError("teacher helper visual features must be finite")
+        helper_images = self._split_visual_features(helper_features, helper_grid, teacher)
+        candidates = self._sample_helper_candidates(helper_images, sample)
+        if any(values.shape[0] == 0 for values in candidates):
+            raise ValueError("adaptive history requires nonempty candidates for every block")
+        layers = resolve_query_layers(self.query_config.attention_layers,
+                                      len(adapter.backbone.layers))
+        # Native wrapper exposes final-normalized hidden_states as one tensor;
+        # preserve that existing global-intent contract outside observer scope.
+        prompt = adapter.prepare(assistant_end, ())
+        prompt_hidden = adapter.forward(prompt).last_hidden_state
+        self._hidden_states(SimpleNamespace(hidden_states=prompt_hidden),
+                            (1, assistant_end), validate=True)
+        user_query = self._user_query(
+            teacher=teacher, sample=sample, sample_ids=prompt.input_ids[0],
+            hidden_pre=prompt_hidden[0], hidden_last=prompt_hidden[0],
+            input_embeddings=prompt.inputs_embeds[0], assistant_start=assistant_start,
+            image_token_id=image_token_id, original_grid=original_grid,
+            original_counts=counts)
+        packed, block_counts, block_indices, block_margins = [], [], [], []
+        ledger = []
+        state = DiscountedTextState()
+        for index, span in enumerate(sample.latent_spans):
+            prefix = adapter.prepare(span.start, tuple(ledger))
+            active_positions = tuple(p for selection in ledger for p in selection.positions)
+            with ReducedHistoryAttentionObserver(
+                adapter.backbone, layer_indices=layers,
+                query_positions=text_spans[index], latent_positions=active_positions,
+                attention_mask=prefix.attention_mask, config=self.query_config,
+            ) as observer:
+                hidden = adapter.forward(prefix).last_hidden_state
+            if (hidden.shape != prefix.inputs_embeds.shape
+                    or not bool(torch.isfinite(hidden).all())):
+                raise ValueError("adaptive prefix hidden states must be finite [1,S,H]")
+            current_mean = (hidden[0, list(text_spans[index])].float().mean(0, keepdim=True)
+                            if text_spans[index] else None)
+            state, text_summary = update_text_history(
+                state, current_mean, gamma=self.query_config.text_gamma)
+            latent_sum, mass = aggregate_history_latents(
+                hidden[0, list(active_positions)], observer.scores())
+            query = compose_history_query(user_query, text_summary, latent_sum, mass).query
+            selected, indices, margin = self._select(
+                candidates[index], query, max_count=len(span.latent_positions))
+            if (selected.ndim != 2 or not 0 < selected.shape[0] <= len(span.latent_positions)
+                    or selected.shape[1] != hidden.shape[-1]
+                    or not bool(torch.isfinite(selected).all())):
+                raise ValueError("adaptive selection must contain finite raw first-Kstar targets")
+            count = int(selected.shape[0])
+            ledger.append(HistorySelection(index, span.latent_positions[:count],
+                                           selected, indices))
+            packed.append(selected)
+            block_counts.append(count)
+            block_indices.append(indices)
+            block_margins.append(margin)
+        return (packed, tuple(block_counts), tuple(block_indices), tuple(block_margins),
+                prompt_hidden[0, :0])
 
     @staticmethod
     def _owned_slice(tensor, owned_range, sample, role):

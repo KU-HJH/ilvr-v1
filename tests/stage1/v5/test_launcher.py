@@ -224,3 +224,57 @@ def test_public_resume_shell_preserves_omissions_on_both_mapped_nodes(tmp_path,m
             for name,value in expected.items(): assert getattr(args,name)==value
             from stage1.types import resolve_stage1_tuning_config
             assert resolve_stage1_tuning_config(args).target_suffixes==('q_proj',)
+
+
+
+def test_actual_coordinator_adaptive_resume_omits_query_defaults_on_both_nodes(tmp_path):
+    import shutil
+    import uuid
+    from utils_deepseed import parse_args
+    from tests.stage1.v5.test_resume import adaptive_contract
+    local, remote = ROOT, tmp_path/'remote'
+    run_id = 'query-resume-' + uuid.uuid4().hex
+    saved = adaptive_contract()
+    saved['execution'].update(tuning_method='dora', per_device_train_batch_size=1,
+                              attention_implementation='sdpa', textual_states='previous')
+    try:
+        for root in (local, remote):
+            checkpoint = root/'checkpoints'/run_id/'checkpoint-1'
+            checkpoint.mkdir(parents=True)
+            (checkpoint/'stage1_v5.json').write_text(json.dumps(saved))
+        environment = {k:v for k,v in os.environ.items() if not k.startswith('STAGE1_') and k != 'CE_WEIGHT'}
+        environment['PYTHONDONTWRITEBYTECODE'] = '1'
+        done = subprocess.run([str(ROOT/'run_multinode_stage1_training.sh'), '--run-id', run_id,
+            '--attempt-id', 'query-resume-test', '--zero-stage', '1', '--main-process-port', '29683', '--local-repo-root', str(local),
+            '--remote-repo-root', str(remote), '--remote-host-repo-root', '/host/query-resume',
+            '--method', 'dora', '--model', '/original/base', '--data-path', str(local/'data/TRAIN.jsonl'),
+            '--image-root', str(local/'data/images'), '--resume', str(local/'checkpoints'/run_id/'checkpoint-1'),
+            '--dry-run'], env=environment, text=True, capture_output=True)
+        assert done.returncode == 0, done.stderr
+        emitted = json.loads(done.stdout)
+        assert emitted['plan']['world_size'] == 4
+        assert emitted['plan']['cluster']['num_machines'] == 2
+        remote_command = shlex.split(shlex.split(emitted['remote'][-1])[-1])
+        for rank, command, root in ((0, remote_command, remote), (1, emitted['local'], local)):
+            cursor = command.index('-i')+2
+            worker_env = {}
+            while '=' in command[cursor] and not command[cursor].startswith('--'):
+                name, value = command[cursor].split('=', 1); worker_env[name] = value; cursor += 1
+            stage = command[max(i for i, value in enumerate(command) if value == '--')+1:]
+            assert stage[:2] == ['/usr/bin/bash', str(root/'run_stage1_training.sh')]
+            worker = subprocess.run(['bash', str(ROOT/'run_stage1_training.sh'), *stage[2:], '--dry-run'],
+                                    env={**environment, **worker_env}, text=True, capture_output=True)
+            assert worker.returncode == 0, worker.stderr
+            argv = shlex.split(worker.stdout)
+            assert argv[argv.index('--machine_rank')+1] == str(rank)
+            assert argv[argv.index('--num_processes')+1] == '4'
+            parser_argv = argv[argv.index('src/main.py')+1:]
+            assert not {'--query_mode', '--history_text_gamma', '--history_attention_layers', '--textual_states'} & set(parser_argv)
+            args = parse_args(parser_argv)
+            assert args.stage1_query_config.mode == 'adaptive'
+            assert args.stage1_query_config.text_gamma == .55
+            assert args.stage1_query_config.attention_layers == 'last4'
+            assert args.data_path == str(root/'data/TRAIN.jsonl')
+            assert args.image_root == str(root/'data/images')
+    finally:
+        shutil.rmtree(local/'checkpoints'/run_id, ignore_errors=True)

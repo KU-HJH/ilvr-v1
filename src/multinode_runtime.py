@@ -828,6 +828,9 @@ def receive_launch_plan(
 
 
 _STAGE1_VALUE_OPTIONS = {
+    "--query_mode",
+    "--history_text_gamma",
+    "--history_attention_layers",
     "--sim-weight",
     "--stage1-variant",
     "--stage1-loss-type",

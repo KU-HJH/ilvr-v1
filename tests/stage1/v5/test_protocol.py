@@ -149,8 +149,10 @@ def valid_records(geometry=None):
         reference_before='b'*64,reference_after='b'*64,contract_digest=digest,
         runtime_binding=deepcopy(binding),fixture_contract=deepcopy(fixture),
         tiny_windows=[dict(global_original_steps=n,configured_gas=4,actual_microbatches=m,
+            global_dil_tokens=11 if m==4 else 6,dil_scale=16/(11 if m==4 else 6),auxiliary_scale=16/n,
             optimizer_step=i,learning_rate=lr,native_denominator=16,
             all_rank_original_counts=([[2,1,0,0],[1,0,1,0],[0,0,0,0],[1,2,0,1]] if m==4 else [[1,0],[1,1],[0,0],[0,2]]),
+            all_rank_dil_token_counts=([[3,1,0,0],[1,0,1,0],[0,0,0,0],[1,3,0,1]] if m==4 else [[1,0],[1,1],[0,0],[0,3]]),
             gradient_error=0.,update_error=0.,gradient_norm=1.) for i,(n,m,lr) in enumerate(((9,4,0.),(9,4,5e-6),(5,2,1e-5)))],
         continuations=[dict(saved_step=s,sources=list(range(4*s,10)),updates=3-s,final_step=3,
             learning_rates=([5e-6,1e-5] if s==1 else [1e-5])) for s in (1,2)],
@@ -163,7 +165,7 @@ def valid_records(geometry=None):
             source_indices=sorted(g['source_index'] for g in geometry),geometry=deepcopy(geometry))) for r in range(4)]
 
 
-@pytest.mark.parametrize('mutation', ['rank','denominator','counts','gradient','reference','continuation','hook','extra_call','geometry','norm'])
+@pytest.mark.parametrize('mutation', ['rank','denominator','counts','token_counts','token_total','dil_scale','auxiliary_scale','gradient','reference','continuation','hook','extra_call','geometry','norm'])
 def test_rank_verification_rejects_corrupt_runtime_evidence(mutation):
     records=valid_records()
     kwargs=dict(run_id='v5-protocol',audited=binding_fixture()[0],expected_geometry=[geometry_row()])
@@ -171,6 +173,9 @@ def test_rank_verification_rejects_corrupt_runtime_evidence(mutation):
     if mutation=='rank': records.pop()
     elif mutation=='denominator': records[2]['tiny_windows'][-1]['native_denominator']=8
     elif mutation=='counts': records[0]['tiny_windows'][0]['all_rank_original_counts'][0][0]=1
+    elif mutation=='token_counts': records[0]['tiny_windows'][0]['all_rank_dil_token_counts'][0][0]=2
+    elif mutation=='token_total': records[0]['tiny_windows'][0]['global_dil_tokens']=9
+    elif mutation in ('dil_scale','auxiliary_scale'): records[0]['tiny_windows'][0][mutation]=1.
     elif mutation=='norm': records[0]['production']['gradient_norms']=[]
     elif mutation=='gradient': records[0]['tiny_windows'][0]['gradient_error']=float('nan')
     elif mutation=='reference': records[1]['reference_after']='c'*64
@@ -216,6 +221,8 @@ def test_actual_parent_loop_checkpoint_continuation_retains_partial_tail(tmp_pat
     directory=Path(__file__).resolve().parents[3]/'checkpoints/stage1-v5-task7'/tmp_path.parent.name/tmp_path.name
     report=api().tiny_engine_witness(directory,use_cpu=True)
     assert [w['global_original_steps'] for w in report['tiny_windows']]==[9,9,5]
+    assert [w['global_dil_tokens'] for w in report['tiny_windows']]==[11,11,6]
+    assert all(w['dil_scale']==4/w['global_dil_tokens'] for w in report['tiny_windows'])
     assert report['scope']=='CPU actual parent loop'
     assert [w['native_denominator'] for w in report['tiny_windows']]==[4]*3
     assert [w['actual_microbatches'] for w in report['tiny_windows']]==[4,4,2]
@@ -223,6 +230,69 @@ def test_actual_parent_loop_checkpoint_continuation_retains_partial_tail(tmp_pat
     assert report['continuations']==[
         dict(saved_step=1,sources=[4,5,6,7,8,9],updates=2,final_step=3,learning_rates=[5e-6,1e-5]),
         dict(saved_step=2,sources=[8,9],updates=1,final_step=3,learning_rates=[1e-5])]
+
+
+def test_tiny_continuation_restores_exact_independent_token_objective_adamw_state(tmp_path, monkeypatch):
+    """Zero-LR step still changes moments; tiny parameter errors cannot hide it."""
+    from copy import deepcopy
+    import math
+    import torch.nn.functional as F
+    from transformers import Trainer
+    p = torch.nn.Parameter(torch.tensor(.2))
+    expected_optimizer = torch.optim.AdamW([p], lr=0., weight_decay=.01)
+    expected = {}
+    for saved_step in (1, 2):
+        expected_optimizer.zero_grad()
+        lp = (p * torch.tensor([.2, -.5, .8])).log_softmax(-1)
+        lm = torch.tensor([.3, .6, -.4]).log_softmax(-1)
+        r = lp - lm
+        # The literal first/full window has five GT-0 and six GT-1 tokens,
+        # across nine original blocks. All block entropy rows are identical.
+        dil = (5*F.softplus(-r[0]) + 6*F.softplus(-r[1]))/11
+        dil = dil + (lm.exp()*F.softplus(r)).sum()
+        logq = (p*torch.tensor([.6, -.2, .1]))[[0, 2]].log_softmax(-1)
+        entropy = math.log(2) + (logq.exp()*logq).sum()
+        (.1*p.square() + dil + .1*entropy).backward()
+        expected_optimizer.param_groups[0]['lr'] = 5e-6*(saved_step-1)
+        expected_optimizer.step()
+        expected[saved_step] = (p.detach().clone(), deepcopy(expected_optimizer.state[p]))
+
+    constructed, observed = [], []
+    real_init, real_train = torch.optim.AdamW.__init__, Trainer.train
+    def record_optimizer(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        constructed.append(self)
+    def inspect_before_continuation(self, *args, **kwargs):
+        checkpoint = kwargs.get('resume_from_checkpoint')
+        if checkpoint:
+            saved_step = int(Path(checkpoint).name.split('-')[-1])
+            # The fixture creates its independent restored oracle after building
+            # the resumed Trainer, immediately before entering native train().
+            oracle_optimizer = constructed[-1]
+            oracle = oracle_optimizer.param_groups[0]['params'][0]
+            wanted_parameter, wanted_state = expected[saved_step]
+            torch.testing.assert_close(oracle.detach(), wanted_parameter, rtol=0, atol=1e-7)
+            saved_optimizer = torch.load(Path(checkpoint)/'optimizer.pt',
+                                        weights_only=True, map_location='cpu')
+            saved_state, = saved_optimizer['state'].values()
+            print(dict(saved_step=saved_step, oracle_exp_avg=float(oracle_optimizer.state[oracle]['exp_avg']),
+                checkpoint_exp_avg=float(saved_state['exp_avg']), expected_exp_avg=float(wanted_state['exp_avg']),
+                oracle_exp_avg_sq=float(oracle_optimizer.state[oracle]['exp_avg_sq']),
+                checkpoint_exp_avg_sq=float(saved_state['exp_avg_sq']),
+                expected_exp_avg_sq=float(wanted_state['exp_avg_sq'])))
+            for key in ('step', 'exp_avg', 'exp_avg_sq'):
+                torch.testing.assert_close(oracle_optimizer.state[oracle][key], wanted_state[key],
+                                           rtol=1e-6, atol=1e-9, msg=f'oracle {key} at step {saved_step}')
+                torch.testing.assert_close(saved_state[key], wanted_state[key],
+                                           rtol=1e-6, atol=1e-9, msg=f'checkpoint {key} at step {saved_step}')
+            observed.append(saved_step)
+        return real_train(self, *args, **kwargs)
+    monkeypatch.setattr(torch.optim.AdamW, '__init__', record_optimizer)
+    monkeypatch.setattr(Trainer, 'train', inspect_before_continuation)
+    directory = Path(__file__).resolve().parents[3]/'checkpoints/stage1-v5-task7'/tmp_path.parent.name/tmp_path.name
+    report = api().tiny_engine_witness(directory, use_cpu=True)
+    assert observed == [1, 2]
+    assert [row['saved_step'] for row in report['continuations']] == observed
 
 
 def test_runtime_observer_records_real_helper_f_reference_packed_backward(tmp_path):
@@ -423,6 +493,7 @@ def binding_fixture():
         num_train_epochs=1.,one_exposure_window_updates=3,parent_epoch_update_budget=3,
         final_window_microbatches=2,dataloader_drop_last=False,
         tail_native_denominator='configured_gas_world_size',
+        dil_denominator='actual_window_eligible_dil_tokens',
         auxiliary_denominator='actual_window_original_blocks_including_empty')
     occurrences=[dict(rank=r,microbatch=i,source_index=(4*i+r)%37,source_id=str((4*i+r)%37))
                  for r in range(4) for i in range(10)]
@@ -439,7 +510,7 @@ def binding_fixture():
     return audit,binding
 
 
-@pytest.mark.parametrize('mutation',['coefficient','r','warmup','package','sampler','budget','occurrences','tail','input','helper_group','code_profile'])
+@pytest.mark.parametrize('mutation',['coefficient','r','warmup','package','sampler','budget','occurrences','tail','input','helper_group','code_profile','dil_denominator','auxiliary_denominator'])
 def test_runtime_binding_rejects_stale_audit_or_different_effective_profile(mutation):
     audited,binding=binding_fixture()
     assert hasattr(api(),'validate_runtime_binding'), 'expected-bound original loader/profile missing'
@@ -454,6 +525,8 @@ def test_runtime_binding_rejects_stale_audit_or_different_effective_profile(muta
     elif mutation=='tail': audited['final_window_microbatches']=1
     elif mutation=='code_profile': binding['contract']['execution']['source_sha256']['v5_trainer']='0'*64
     elif mutation=='helper_group': binding['contract']['execution']['helper_group_L']=128
+    elif mutation in ('dil_denominator','auxiliary_denominator'):
+        binding['contract']['schedule'][mutation]='wrong_denominator'
     else: binding['input_identity']['data_sha256']='0'*64
     with pytest.raises(ValueError): api().validate_runtime_binding(audited,binding)
 
